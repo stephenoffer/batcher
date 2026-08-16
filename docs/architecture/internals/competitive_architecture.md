@@ -4,6 +4,31 @@
 below was checked against code, not documentation. Where the docs and the code disagreed, the
 code won and the doc is named as wrong.
 
+**What the 2026-08-15 pass changed**, measured on a 96-core / 184 GiB node rather than the
+16-core one the older rows were taken on, so read it as a re-measurement and not only as
+movement. Against DuckDB's **native compressed store** — the harder of the two bars, and the
+one this scorecard's "single-node" rows are about — Batcher now leads TPC-H sf1 (0.76x, 17 of
+22), **the full 99-query TPC-DS** (0.96x, 44 wins, where it read 1.13x at the start of that
+day and 1.51x a week before), ClickBench (0.62x, 30 of 43), JSON (0.25x), the operator mix
+(0.64x) and the H2O.ai `join` task (0.95x). Two rows below are now understated by it, and one
+is confirmed:
+
+* **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
+* **Single-node ≥100M rows (vs DuckDB): L** — still L, and the boundary is now located rather
+  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is **1.27x**, a loss, where sf1 is 0.78x.
+  Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
+  q13 12.7x, q18 12.5x, q9 11.2x), and those four carry the highest-cardinality group-bys and
+  the largest intermediates in the benchmark.
+* **The Join Order Benchmark now completes.** This document's ceiling on it was recorded when
+  two runs were OOM-killed; all 113 queries now run with none killed (geomean 1.37x, 31
+  wins), and `job-q7c` — the query that took the process down — is a **win** at 291 ms against
+  DuckDB's 504. That is not a claim to have fixed the OOM: it was a 30 GiB box then and a
+  184 GiB one now, and peak RSS here is 15-22 GiB.
+
+Unchanged and still true: H2O.ai `groupby` loses to the native store (1.28x) because its keys
+are low-cardinality strings held dictionary-encoded there and read as full Arrow `Utf8` here —
+on identical Arrow input the same suite is **0.11x, winning 10 of 10**.
+
 **What the 2026-08-01 pass changed:** ceiling 3 no longer says the shuffle is RAM-only — a byte
 cap and a disk spill landed in `24d89d9e`/`f18d6a36`, so the memory half is closed and only the
 survivability half (no external shuffle service) remains, which is why the scorecard row is

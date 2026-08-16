@@ -135,16 +135,53 @@ def columns_for(learned: dict[str, Any], stat_key: str, source_key: str | None) 
         Column name to its learned value for this source.
     """
     table = learned.get(stat_key) or {}
-    prefix = f"{source_key}{_SOURCE_SEP}" if source_key is not None else None
-    out: dict[str, Any] = {}
-    qualified: dict[str, Any] = {}
+    unqualified, by_source = _grouped(stat_key, table)
+    if source_key is None:
+        return dict(unqualified)
+    # A measurement of *this* source beats a legacy global one.
+    return {**unqualified, **by_source.get(source_key, {})}
+
+
+#: The last table seen per `stat_key`, split by source — `{stat_key: (table, unqualified,
+#: {source_key: {column: value}})}`.
+#:
+#: Keyed on the table **object**, and that is exact rather than approximate:
+#: `merge_column_table` never mutates in place, it copies (`table = dict(existing)`) and
+#: stores the copy, so any change to a learned table produces a different object and any
+#: unchanged table is the same one. The entry holds a strong reference to the table it
+#: describes, so the `id()` of a freed table can never be recycled onto a stale grouping —
+#: the same discipline `plan_cache` and `orchestration.prepared` apply to their keys. It
+#: pins at most one table per statistic, five in all.
+_GROUPED: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]] = {}
+
+
+def _grouped(
+    stat_key: str, table: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """`table` split into its unqualified entries and its per-source ones, cached.
+
+    Without this, `columns_for` walked **every column of every source the session has ever
+    measured** to answer a question about one of them, and it is called once per statistic
+    per source per estimator. On TPC-DS — 24 registered tables — that is ~264,000 key
+    comparisons and 43,000 `str.startswith` calls *per query*, and it grows with the
+    session's history, which is the opposite of what a learning loop is for.
+
+    Rebuilt only when the table itself changes, so the walk is paid once per measurement
+    rather than once per lookup.
+    """
+    cached = _GROUPED.get(stat_key)
+    if cached is not None and cached[0] is table:
+        return cached[1], cached[2]
+    unqualified: dict[str, Any] = {}
+    by_source: dict[str, dict[str, Any]] = {}
     for key, value in table.items():
-        if _SOURCE_SEP not in key:
-            out[key] = value  # legacy: unqualified, applies to any source
-        elif prefix is not None and key.startswith(prefix):
-            qualified[key[len(prefix) :]] = value
-    out.update(qualified)  # a measurement of *this* source beats a legacy global one
-    return out
+        source, sep, column = key.partition(_SOURCE_SEP)
+        if not sep:
+            unqualified[key] = value  # legacy: unqualified, applies to any source
+        else:
+            by_source.setdefault(source, {})[column] = value
+    _GROUPED[stat_key] = (table, unqualified, by_source)
+    return unqualified, by_source
 
 
 def merge_column_table(

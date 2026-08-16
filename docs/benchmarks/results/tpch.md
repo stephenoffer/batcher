@@ -69,13 +69,24 @@ run at load average under 5.
 
 ## Where the suite stands at scale factor 1
 
-The current sf1 standing was measured 2026-07-31 on 16 cores, release build, all 22 queries
-reporting `OK`. The suite total is **871 ms**:
+Re-measured 2026-08-15 on 96 cores / 184 GiB, release build, all 22 queries reporting `OK`.
+Geometric mean of the per-query ratios, `batcher / other` — **below 1.0x means Batcher is
+faster**:
 
-| Against | Its suite total | Ratio |
+| Against | Geomean | Queries won |
 |---|---:|---|
-| DuckDB on the same Arrow (`duckdb_arrow`) | 2,062 ms | **2.37x faster** |
-| Polars | 1,101 ms | **1.26x faster** |
+| DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x** — 3.9x faster | **22 of 22** |
+| Polars | **0.43x** — 2.4x faster | 21 of 22 |
+| Daft | **0.35x** — 2.9x faster | **20 of 20** |
+| DuckDB on its **native** compressed store (`duckdb`) | **0.76x** — 1.3x faster | **17 of 22** |
+
+The last row is the one that changed: leading DuckDB's own storage engine *and* execution
+engine, rather than only its execution engine, is new as of this sweep — it read 0.99x on
+16 cores in July. {doc}`/benchmarks/results/scaling` has what happens at ten times the data,
+where the same comparison inverts.
+
+The earlier 16-core reading of this suite, for continuity: total **871 ms** against DuckDB's
+2,062 ms on the same Arrow (2.37x) and Polars' 1,101 ms (1.26x).
 
 **Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
 wins all 22 queries at sf1.** That is the comparison Batcher's Arrow-only contract makes

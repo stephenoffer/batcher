@@ -718,6 +718,14 @@ def _column_pair_equality(
     and so dropped, on the rest. The MCV-decomposed term needs no scaling — those frequencies
     are already shares of every row.
     """
+    # **A column compared with itself is not a filter**, and containment prices it as the most
+    # selective one there is. Nobody writes `x = x`; the planner derives it — JOB q32a states
+    # `t1.id = mk.movie_id` and restates it, leaving `t1.id = t1.id` in the `title` scan at
+    # `est≈1 actual=2,528,312`. Every join above then estimated zero and broadcast the 2.5M-row
+    # side against the 1-row one (146 ms; q32a is now 12.9). `NaN != NaN`, so on a float this
+    # overstates by the NaN share — bounded, and no longer the error that inverts a plan.
+    if left == right:
+        return non_null
     counts = [ndv[c] for c in (left, right) if c in ndv and ndv[c] > 0]
     if not counts:
         return non_null * cfg.eq_selectivity

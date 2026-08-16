@@ -976,6 +976,22 @@ class StatsEstimator:
         ):
             return RelStats(0.0, Provenance.DEFAULT, col_prop.join_columns(node, left, right, 0.0))
         rows, provenance = self._join_rows(node, left, right)
+        # An *estimated* join that prices itself below one row is making a claim it cannot
+        # support. Emptiness has a proof (`_join_provably_empty`, EXACT) and a deliberate
+        # heuristic (`_join_keys_range_disjoint`, above); both are returned before this line.
+        # What reaches here is the containment formula, and a fraction of a row out of it is
+        # the independence assumption compounding down a deep join tree, not evidence. It does
+        # not stay harmless: zero times the next join's rows is zero, so one such estimate
+        # takes every join above it with it — on JOB q13a, **21 of 733** join estimates fall
+        # below a row and the build-side rule then reads `left≈0 right≈2,609,129` and
+        # broadcasts the side that actually holds 1,354,883 rows.
+        #
+        # `_uniform_inequality_selectivity` already states this rule one screen up, for the
+        # fraction rather than the row count: a zero it returns would be a proof of emptiness,
+        # and it only has an assumption. A LEARNED count is a measurement and is left alone,
+        # including a measured zero.
+        if provenance is Provenance.DEFAULT:
+            rows = max(rows, 1.0)
         # A preserved column's values carry through as downgraded *bounds* (a join
         # removes/duplicates rows but invents no value); never EXACT. The output row
         # count caps each carried-forward `ndv`, so a join above a join still knows its

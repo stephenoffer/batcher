@@ -88,7 +88,7 @@ fn execute_plan(
                 match bc_interp::execute_streaming_parallel_or_hand_off(
                     &plan,
                     &sources,
-                    opts.workers(),
+                    bc_interp::auto_width(&opts, &sources, &plan),
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),
@@ -150,7 +150,7 @@ fn execute_plan_metered(
                 match bc_interp::execute_streaming_parallel_metered_or_hand_off(
                     &plan,
                     &sources,
-                    opts.workers(),
+                    bc_interp::auto_width(&opts, &sources, &plan),
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),
@@ -710,6 +710,7 @@ fn engine_features() -> Vec<&'static str> {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    hardware::tune_allocator();
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
     // The build profile, so the benchmark harness can refuse to report a timing taken
     // against an unoptimized engine. `just build` (the dev profile) sets no `opt-level`

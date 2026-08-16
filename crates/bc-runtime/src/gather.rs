@@ -226,10 +226,285 @@ pub fn take_column(col: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef, R
                     }
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(out) = take_fixed_width_parallel(col, indices) {
+                    return Ok(out);
+                }
+                if let Some(out) = take_chunked(col, indices) {
+                    return out;
+                }
+            }
         }
     }
     Ok(take(col, indices, None)?)
+}
+
+/// The last-resort parallel gather: split the index list, `take` each range with arrow, and
+/// concatenate the pieces in order — or `None` for a type or size that must not take it.
+///
+/// This is what a type with no single-buffer fill above still gets, so no large gather is left
+/// on one core. `take` is positional (`out[i] = source[indices[i]]`), so taking contiguous
+/// index ranges and concatenating them in order reproduces the single-shot result exactly;
+/// order is preserved by construction rather than by convention, which matters because a
+/// `LIMIT` over a join must return the same rows on every executor.
+///
+/// It writes every value twice — once into a chunk, again into the concatenation — which is
+/// why the fill paths above exist and why this runs only where they decline.
+///
+/// **Only for flat, self-describing types.** A **dictionary** is not one: `take` re-indexes
+/// keys against the original dictionary, while `concat` over several dictionary chunks may
+/// unify them into a *different* dictionary — logically the same values behind a different
+/// encoding. Nested types (list/struct/union/map) and run-end encoding carry the same class of
+/// representational question. None of that is worth reasoning about per type for a scheduling
+/// choice, so they take arrow's single-shot gather: slower on one column, unambiguously
+/// correct.
+fn take_chunked(col: &dyn Array, indices: &UInt32Array) -> Option<Result<ArrayRef, RuntimeError>> {
+    use arrow::datatypes::DataType as D;
+    let width = rayon::current_num_threads();
+    if indices.len() < PARALLEL_TAKE_MIN_ROWS
+        || width < 2
+        || !matches!(
+            col.data_type(),
+            D::Boolean
+                | D::Float16
+                | D::Binary
+                | D::LargeBinary
+                | D::Duration(_)
+                | D::Interval(_)
+                | D::Decimal128(_, _)
+                | D::Decimal256(_, _)
+        )
+    {
+        return None;
+    }
+    let rows = indices.len();
+    let chunk = rows.div_ceil(width);
+    let pieces: Result<Vec<ArrayRef>, RuntimeError> = (0..rows)
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|start| {
+            let slice = indices.slice(start, chunk.min(rows - start));
+            Ok(take(col, &slice, None)?)
+        })
+        .collect();
+    Some(pieces.and_then(|pieces| {
+        let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
+        concat_columns(&refs)
+    }))
+}
+
+/// A large fixed-width gather, spread across cores into one output buffer — or `None` for a
+/// type or a size this does not claim, leaving the caller on arrow's `take`.
+///
+/// Arrow's `take` is single-threaded, and its callers here compensated by splitting the index
+/// array into per-thread ranges, gathering each into its own array, and `concat`-ing the
+/// pieces back. That reaches every core but writes every value **twice** — once into a chunk
+/// and again into the concatenated result — and allocates a buffer per chunk on top. For a
+/// fixed-width type none of that is necessary: a row's output position is its index position,
+/// known before any value moves, so the output buffer can be allocated once and carved into
+/// disjoint chunks that each thread fills in place. Same values, same order, one write each.
+///
+/// A variable-width column genuinely does need the measure-then-copy dance (a row's output
+/// offset is the running sum of the ones before it), which is what [`take_strings_parallel`]
+/// does; this is the fixed-width case where that dependency does not exist.
+fn take_fixed_width_parallel(col: &dyn Array, indices: &UInt32Array) -> Option<ArrayRef> {
+    use arrow::datatypes::{
+        Date32Type, Date64Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
+        Time64NanosecondType, TimestampMicrosecondType, TimestampMillisecondType,
+        TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type,
+        UInt8Type,
+    };
+    if indices.len() < PARALLEL_TAKE_MIN_ROWS || rayon::current_num_threads() < 2 {
+        return None;
+    }
+    macro_rules! dispatch {
+        ($($variant:pat => $ty:ty),* $(,)?) => {
+            match col.data_type() {
+                $($variant => Some(Arc::new(take_primitive_parallel::<$ty>(
+                    col.as_any().downcast_ref()?,
+                    indices,
+                )) as ArrayRef),)*
+                _ => None,
+            }
+        };
+    }
+    dispatch! {
+        DataType::Int8 => Int8Type,
+        DataType::Int16 => Int16Type,
+        DataType::Int32 => Int32Type,
+        DataType::Int64 => Int64Type,
+        DataType::UInt8 => UInt8Type,
+        DataType::UInt16 => UInt16Type,
+        DataType::UInt32 => UInt32Type,
+        DataType::UInt64 => UInt64Type,
+        DataType::Float32 => Float32Type,
+        DataType::Float64 => Float64Type,
+        DataType::Date32 => Date32Type,
+        DataType::Date64 => Date64Type,
+        DataType::Time32(arrow::datatypes::TimeUnit::Second) => Time32SecondType,
+        DataType::Time32(arrow::datatypes::TimeUnit::Millisecond) => Time32MillisecondType,
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => Time64MicrosecondType,
+        DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond) => Time64NanosecondType,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => TimestampSecondType,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => TimestampMillisecondType,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => TimestampMicrosecondType,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => TimestampNanosecondType,
+    }
+}
+
+/// The fixed-width gather itself: one output buffer, filled in disjoint parallel chunks.
+///
+/// Every row's destination is known up front, so there is no prefix-sum phase and no scratch
+/// array — `out[k] = src[idx[k]]`, with the same fixed-distance prefetch the string path uses,
+/// because the source read is the identical dependent cache miss.
+///
+/// A gathered row is null exactly when its source row is, which is what arrow's `take` also
+/// produces for a non-null index array. The timezone/precision-carrying types keep their
+/// `DataType` through `with_data_type`, so a `Timestamp(_, Some(tz))` does not come back naive.
+fn take_primitive_parallel<T: arrow::datatypes::ArrowPrimitiveType>(
+    arr: &arrow::array::PrimitiveArray<T>,
+    indices: &UInt32Array,
+) -> arrow::array::PrimitiveArray<T>
+where
+    T::Native: Send + Sync,
+{
+    let src = arr.values();
+    let idx = indices.values();
+    // `vec![default; n]` is an `alloc_zeroed` for every native this dispatches (all of them
+    // are zero-valued at `Default`), which at this size is zero pages rather than a write pass
+    // — the same reasoning `take_strings_parallel`'s value buffer records.
+    let mut out: Vec<T::Native> = vec![T::Native::default(); idx.len()];
+    out.par_chunks_mut(TAKE_CHUNK_ROWS)
+        .zip(idx.par_chunks(TAKE_CHUNK_ROWS))
+        .for_each(|(dst, rows)| {
+            for (k, (slot, &i)) in dst.iter_mut().zip(rows).enumerate() {
+                if let Some(&far) = rows.get(k + PREFETCH_OFFSET_DISTANCE) {
+                    bc_arrow::prefetch_read(&src[far as usize]);
+                }
+                *slot = src[i as usize];
+            }
+        });
+    let nulls = arr
+        .nulls()
+        .map(|src| NullBuffer::from_iter(idx.iter().map(|&i| src.is_valid(i as usize))));
+    arrow::array::PrimitiveArray::<T>::new(ScalarBuffer::from(out), nulls)
+        .with_data_type(arr.data_type().clone())
+}
+
+/// Gather one output column from *several* string sources addressed by two `u32` planes:
+/// output row `k` is `cols[part_of[k]]` at row `row_of[k]`. `None` for anything that is not a
+/// uniform `Utf8`/`LargeUtf8` set, or whose characters overflow the offset width.
+///
+/// This is `arrow::compute::interleave` for the one type where it costs what a `take` of the
+/// same size costs: it builds through `MutableArrayData::extend`, a call and bounds checks per
+/// row to copy a handful of bytes, and it wants a materialized `&[(usize, usize)]` — sixteen
+/// bytes of index per output row where the planes are eight. The aggregate `combine` already
+/// avoids both for primitive columns and had nothing for string keys, which is the *common*
+/// high-cardinality group key: `interleave_bytes` was 6% of H2O `groupby` q2 (`sum(v1) BY id1,
+/// id2`, two string keys, 10,000 groups over 10M rows) and is on every `GROUP BY <string>`
+/// that reaches the parallel merge.
+///
+/// Same three phases as [`take_strings_parallel`], and for the same reason — a row's output
+/// offset is the running sum of the ones before it, which is a prefix sum and therefore
+/// decomposable. The only difference is that a row's bytes are found through a second plane.
+pub fn gather_strings(cols: &[&dyn Array], part_of: &[u32], row_of: &[u32]) -> Option<ArrayRef> {
+    let dt = cols.first()?.data_type();
+    if !cols.iter().all(|c| c.data_type() == dt) {
+        return None;
+    }
+    match dt {
+        DataType::Utf8 => Some(Arc::new(gather_strings_of::<i32>(cols, part_of, row_of)?)),
+        DataType::LargeUtf8 => Some(Arc::new(gather_strings_of::<i64>(cols, part_of, row_of)?)),
+        _ => None,
+    }
+}
+
+fn gather_strings_of<O: OffsetSizeTrait>(
+    cols: &[&dyn Array],
+    part_of: &[u32],
+    row_of: &[u32],
+) -> Option<GenericStringArray<O>> {
+    let arrs: Vec<&GenericStringArray<O>> = cols
+        .iter()
+        .map(|a| a.as_any().downcast_ref::<GenericStringArray<O>>())
+        .collect::<Option<_>>()?;
+    let n = part_of.len();
+
+    // Phase 1 (parallel): each row's source span, and each chunk's byte total. The span is
+    // recorded so phase 3 reads a sequentially-addressed scratch array rather than chasing
+    // `offsets[row_of[k]]` through a cold buffer a second time. Which *array* it came from is
+    // not recorded — `part_of` is already a sequential read in phase 3.
+    let mut spans: Vec<(u32, u32)> = vec![(0, 0); n];
+    let chunk_totals: Vec<Option<usize>> = spans
+        .par_chunks_mut(TAKE_CHUNK_ROWS)
+        .zip(part_of.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(row_of.par_chunks(TAKE_CHUNK_ROWS))
+        .map(|((out, parts), rows)| {
+            let mut total = 0usize;
+            for (slot, (&p, &r)) in out.iter_mut().zip(parts.iter().zip(rows)) {
+                let offsets = arrs.get(p as usize)?.value_offsets();
+                let start = offsets.get(r as usize)?.as_usize();
+                let len = offsets.get(r as usize + 1)?.as_usize() - start;
+                *slot = (u32::try_from(start).ok()?, u32::try_from(len).ok()?);
+                total += len;
+            }
+            Some(total)
+        })
+        .collect();
+    let chunk_totals: Vec<usize> = chunk_totals.into_iter().collect::<Option<_>>()?;
+
+    // Phase 2: exclusive prefix sum over chunks, and the offset-width check, once per chunk.
+    let mut bases: Vec<usize> = Vec::with_capacity(chunk_totals.len());
+    let mut running = 0usize;
+    for &t in &chunk_totals {
+        bases.push(running);
+        running += t;
+    }
+    O::from_usize(running)?;
+
+    // Phase 3: carve the output into the ranges phase 2 reserved and fill each in parallel.
+    let mut values = vec![0u8; running];
+    let mut rest = values.as_mut_slice();
+    let mut dsts: Vec<&mut [u8]> = Vec::with_capacity(chunk_totals.len());
+    for &t in &chunk_totals {
+        let (head, tail) = rest.split_at_mut(t);
+        dsts.push(head);
+        rest = tail;
+    }
+    let mut offsets: Vec<O> = vec![O::usize_as(0); n + 1];
+    offsets[1..]
+        .par_chunks_mut(TAKE_CHUNK_ROWS)
+        .zip(spans.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(part_of.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(dsts.into_par_iter().zip(bases.par_iter()))
+        .for_each(|(((offs, rows), parts), (dst, &base))| {
+            let mut at = 0usize;
+            for ((slot, &(start, len)), &p) in offs.iter_mut().zip(rows).zip(parts) {
+                let (start, len) = (start as usize, len as usize);
+                dst[at..at + len]
+                    .copy_from_slice(&arrs[p as usize].value_data()[start..start + len]);
+                at += len;
+                *slot = O::usize_as(base + at);
+            }
+        });
+
+    // A gathered row is null exactly when its source row is, which is what `interleave` also
+    // produces. Built only when some source actually has nulls, matching arrow.
+    let nulls = arrs.iter().any(|a| a.null_count() > 0).then(|| {
+        NullBuffer::from_iter(
+            part_of
+                .iter()
+                .zip(row_of)
+                .map(|(&p, &r)| arrs[p as usize].is_valid(r as usize)),
+        )
+    });
+    Some(GenericStringArray::<O>::new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        values.into(),
+        nulls,
+    ))
 }
 
 /// How far ahead [`take_strings`] prefetches the *offset* pair for an upcoming row.
@@ -474,6 +749,11 @@ fn take_strings_parallel<O: OffsetSizeTrait>(
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{
+        Decimal128Array, DictionaryArray, Float64Array, Int64Array, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::Int32Type;
+
     use super::*;
 
     fn idx(v: &[u32]) -> UInt32Array {
@@ -545,6 +825,123 @@ mod tests {
         // whole output is one repeated value — the degenerate prefix sum.
         let repeated: Vec<u32> = vec![5u32; rows];
         assert_matches_arrow(&a, &idx(&repeated));
+    }
+
+    /// The fixed-width parallel gather must equal arrow's `take` exactly, for every shape a
+    /// chunked fill can get wrong.
+    ///
+    /// This is the only test that reaches [`take_fixed_width_parallel`]: below
+    /// `PARALLEL_TAKE_MIN_ROWS` `take_column` hands every primitive straight to arrow, so a
+    /// broken chunk carve would be invisible to the rest of this module. The cases are a
+    /// scattered permutation (no chunk reads a contiguous source range), a straight ascending
+    /// copy, one repeated index, and a nullable source — validity travels beside the values
+    /// rather than in them, so it is the half a fill loop can silently drop.
+    #[test]
+    fn the_parallel_fixed_width_gather_equals_arrow_row_for_row() {
+        let rows = PARALLEL_TAKE_MIN_ROWS + TAKE_CHUNK_ROWS + 7; // not a chunk multiple
+        let dense = Int64Array::from((0..rows as i64).map(|i| i * 3 - 7).collect::<Vec<_>>());
+        let nullable = Int64Array::from(
+            (0..rows)
+                .map(|i| (i % 9 != 0).then_some(i as i64))
+                .collect::<Vec<Option<i64>>>(),
+        );
+        let floats = Float64Array::from((0..rows).map(|i| i as f64 * 0.5).collect::<Vec<f64>>());
+        // A timestamp carries a timezone in its `DataType` that the values do not, so it is
+        // the type that proves the gathered array keeps its full type and not just its width.
+        let stamped = TimestampMicrosecondArray::from((0..rows as i64).collect::<Vec<_>>())
+            .with_timezone("UTC");
+        let scattered: Vec<u32> = (0..rows).map(|i| ((i * 7919) % rows) as u32).collect();
+        let ascending: Vec<u32> = (0..rows as u32).collect();
+        let repeated: Vec<u32> = vec![5u32; rows];
+        for indices in [&scattered, &ascending, &repeated] {
+            assert_matches_arrow(&dense, &idx(indices));
+            assert_matches_arrow(&nullable, &idx(indices));
+            assert_matches_arrow(&floats, &idx(indices));
+            assert_matches_arrow(&stamped, &idx(indices));
+        }
+    }
+
+    /// The chunk-and-concat fallback must reproduce arrow's single-shot `take` exactly, and the
+    /// types that cannot take it must not.
+    ///
+    /// Exactness rather than multiset equality is the point: this preserves join and sort output
+    /// order, and a `LIMIT` above turns any reordering into wrong rows rather than a slow query.
+    /// `Decimal128` is the flat type it claims (and one whose `DataType` carries a precision and
+    /// scale that must survive the concat); a **dictionary** is the type it must decline, because
+    /// `concat` may unify the chunks' dictionaries into an encoding a single `take` would never
+    /// produce. Both are checked the same way — against arrow — so the decline is proved by the
+    /// answer rather than asserted about the type list.
+    #[test]
+    fn the_chunked_fallback_equals_arrow_row_for_row() {
+        let rows = PARALLEL_TAKE_MIN_ROWS + TAKE_CHUNK_ROWS + 7;
+        let indices = idx(&(0..rows)
+            .map(|i| ((i * 7919) % rows) as u32)
+            .collect::<Vec<u32>>());
+
+        let decimals = Decimal128Array::from(
+            (0..rows)
+                .map(|i| (i % 17 != 0).then_some(i as i128 * 101))
+                .collect::<Vec<Option<i128>>>(),
+        )
+        .with_precision_and_scale(20, 4)
+        .expect("in-range precision");
+        assert_matches_arrow(&decimals, &indices);
+        assert_eq!(decimals.data_type(), &DataType::Decimal128(20, 4));
+
+        let words: Vec<String> = (0..23).map(|i| format!("v{i}")).collect();
+        let dict: DictionaryArray<Int32Type> = (0..rows).map(|i| words[i % 23].as_str()).collect();
+        assert_matches_arrow(&dict, &indices);
+    }
+
+    /// The plane-addressed string gather must equal `arrow::compute::interleave` row for row.
+    ///
+    /// Sized past a chunk boundary and given varying widths, empty rows and nulls, because the
+    /// per-chunk prefix sum is what a fixed-width test cannot exercise: with every row the same
+    /// length a chunk's byte total is its row count times a constant, and a wrong base would
+    /// still land on a value boundary. Sources of *different lengths* matter too — a row's
+    /// coordinates name an array and a row inside it, and a single flattened offset would read
+    /// the wrong array without ever going out of bounds.
+    #[test]
+    fn the_plane_addressed_string_gather_equals_interleave() {
+        let a = StringArray::from(vec![Some("alpha"), None, Some(""), Some("dd")]);
+        let b = StringArray::from(vec![Some("z"), Some("yyyyyyyy"), None]);
+        let c = StringArray::from(
+            (0..TAKE_CHUNK_ROWS + 5)
+                .map(|i| (i % 6 != 0).then(|| "q".repeat(i % 23)))
+                .collect::<Vec<Option<String>>>(),
+        );
+        let lens = [a.len(), b.len(), c.len()];
+        let rows = TAKE_CHUNK_ROWS * 2 + 3;
+        let part_of: Vec<u32> = (0..rows).map(|i| (i % 3) as u32).collect();
+        let row_of: Vec<u32> = (0..rows)
+            .map(|i| ((i * 7919) % lens[i % 3]) as u32)
+            .collect();
+
+        let cols: Vec<&dyn Array> = vec![&a, &b, &c];
+        let pairs: Vec<(usize, usize)> = part_of
+            .iter()
+            .zip(&row_of)
+            .map(|(&p, &r)| (p as usize, r as usize))
+            .collect();
+        let want = arrow::compute::interleave(&cols, &pairs).unwrap();
+        let got = gather_strings(&cols, &part_of, &row_of).expect("the string plane path");
+        assert_eq!(want.as_ref(), got.as_ref());
+    }
+
+    /// Anything the plane-addressed gather does not model must decline rather than guess.
+    #[test]
+    fn the_plane_addressed_gather_declines_what_it_does_not_model() {
+        let s = StringArray::from(vec!["a", "b"]);
+        let i = Int64Array::from(vec![1, 2]);
+        let l = LargeStringArray::from(vec!["a", "b"]);
+        let planes = ([0u32, 1], [0u32, 1]);
+        // A non-string column, and a mixed Utf8/LargeUtf8 set, both fall back to `interleave`.
+        assert!(gather_strings(&[&i, &i], &planes.0, &planes.1).is_none());
+        assert!(gather_strings(&[&s, &l], &planes.0, &planes.1).is_none());
+        assert!(gather_strings(&[], &[], &[]).is_none());
+        // The types it does model still answer.
+        assert!(gather_strings(&[&s, &s], &planes.0, &planes.1).is_some());
+        assert!(gather_strings(&[&l, &l], &planes.0, &planes.1).is_some());
     }
 
     /// The parallel and serial paths must agree with each other, not just each with arrow.

@@ -161,6 +161,58 @@ pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
     before.saturating_sub(allocator_rss())
 }
 
+/// How long mimalloc holds a freed region before handing its pages back to the OS.
+///
+/// mimalloc's own default is 10 ms, which is tuned for a process whose allocation sizes sit in
+/// its per-thread caches. An analytical engine's do not: an operator's output buffer is tens or
+/// hundreds of megabytes, so a purge returns it to the kernel and the *next* query's identical
+/// buffer arrives as fresh zero pages that the kernel must clear on first touch. That clearing
+/// is not a rounding error — `clear_page_erms` was **9.3% of the whole query** on a 9M-row,
+/// 13-column hash join (h2o-join q5), a query that allocates and frees ~1 GB of output buffers
+/// per run and then does it again.
+///
+/// Ten seconds is long enough that consecutive queries reuse the same regions and short enough
+/// that an idle process still gives its peak back. Measured on that join, alternating arms over
+/// three rounds: **median 489 / 473 ms at the default against 422 / 432 ms at ten seconds**, and
+/// neutral on TPC-H sf1 and the operator mix (0.840/0.844 against 0.853/0.836), whose buffers are
+/// small enough never to reach the OS either way. `-1` (never purge) measured the same as this,
+/// so nothing is bought by giving up the release entirely.
+///
+/// The retention is safe *because the release valve already exists*: [`allocator_collect`] hands
+/// the arena back on demand, and Carbonite calls it under pressure before it spills. A user who
+/// wants mimalloc's own tuning sets `MIMALLOC_PURGE_DELAY` and this defers to it.
+const PURGE_DELAY_MS: std::ffi::c_long = 10_000;
+
+/// mimalloc's `purge_delay` option, named by its position rather than by a symbol.
+///
+/// `libmimalloc-sys` does not re-export this one, so it has to be given as an ordinal — and an
+/// ordinal into someone else's enum is exactly the kind of constant that silently comes to mean
+/// something different. It is therefore *derived* from a neighbour the crate does export
+/// unconditionally, and cross-checked against a second one: in both the v2 and v3 headers this
+/// crate can link, `purge_delay` sits immediately before `use_numa_nodes` and six past
+/// `reserve_os_memory`. If a future vendored mimalloc reorders them the assertion fails the
+/// **build**, rather than leaving the engine quietly setting some other option at run time.
+const MI_OPTION_PURGE_DELAY: std::ffi::c_int = libmimalloc_sys::mi_option_use_numa_nodes - 1;
+const _: () = assert!(
+    MI_OPTION_PURGE_DELAY == libmimalloc_sys::mi_option_reserve_os_memory + 6,
+    "mimalloc's option enum moved: purge_delay is no longer the option before use_numa_nodes, \
+     so this ordinal now names a different option"
+);
+
+/// Give the allocator the retention an analytical engine wants, unless the user set it.
+///
+/// Called once from the module initializer, which is the first moment the engine controls and
+/// is already after mimalloc has served allocations — `purge_delay` is read on each purge
+/// rather than latched at startup, so setting it here takes effect for everything that follows.
+pub(crate) fn tune_allocator() {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
+        return;
+    }
+    // SAFETY: `mi_option_set` takes two integers and is safe to call from any thread once the
+    // allocator is initialized, which it is — it served this frame.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS) };
+}
+
 /// mimalloc's current RSS estimate in bytes, for the before/after in [`allocator_collect`].
 fn allocator_rss() -> u64 {
     let (mut elapsed, mut user, mut sys) = (0usize, 0usize, 0usize);

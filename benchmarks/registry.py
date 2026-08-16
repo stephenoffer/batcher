@@ -59,12 +59,19 @@ def sql_case(query: str) -> CaseBuilder:
 
 @dataclass(frozen=True)
 class Case:
-    """One registered benchmark: a name, its family, its dataset, and its builder."""
+    """One registered benchmark: a name, its family, its dataset, and its builder.
+
+    ``ordered_by`` carries the query's outermost ``ORDER BY`` terms so the harness can check
+    that an engine claiming a sort actually performed one — the correctness gate compares row
+    *multisets*, which cannot see order at all (see ``sort_order``). Empty for a case that
+    asked for no order, and for a native (non-SQL) case that did not declare one.
+    """
 
     family: str
     name: str
     dataset: str
     build: CaseBuilder
+    ordered_by: tuple[tuple[str | int, bool], ...] = ()
 
 
 class Registry:
@@ -122,9 +129,31 @@ class Suite:
     family: str
     dataset: str
 
-    def case(self, name: str) -> Callable[[CaseBuilder], CaseBuilder]:
+    def case(
+        self, name: str, *, ordered_by: str | None = None
+    ) -> Callable[[CaseBuilder], CaseBuilder]:
+        """Register a native (per-engine callable) benchmark.
+
+        Args:
+            name: The case name, unique across the whole registry.
+            ordered_by: This case's ``ORDER BY`` terms (``"l_extendedprice DESC, l_orderkey"``)
+                when it asks for an order. A native case builds each engine's query itself, so
+                nothing else can tell the harness the result must come back sorted — and an
+                unchecked sort is a sort that can silently not happen (see ``sort_order``).
+                Stating it separately does repeat the case's own ``ORDER BY``; the two drifting
+                apart makes the check *fail*, which is the safe direction.
+        """
+
         def register(build: CaseBuilder) -> CaseBuilder:
-            REGISTRY.add(Case(family=self.family, name=name, dataset=self.dataset, build=build))
+            REGISTRY.add(
+                Case(
+                    family=self.family,
+                    name=name,
+                    dataset=self.dataset,
+                    build=build,
+                    ordered_by=_keys(f"SELECT 1 ORDER BY {ordered_by}" if ordered_by else None),
+                )
+            )
             return build
 
         return register
@@ -132,8 +161,23 @@ class Suite:
     def sql(self, name: str, query: str) -> None:
         """Register a SQL benchmark — one query string, fanned across SQL engines."""
         REGISTRY.add(
-            Case(family=self.family, name=name, dataset=self.dataset, build=sql_case(query))
+            Case(
+                family=self.family,
+                name=name,
+                dataset=self.dataset,
+                build=sql_case(query),
+                ordered_by=_keys(query),
+            )
         )
+
+
+def _keys(query: str | None) -> tuple[tuple[str | int, bool], ...]:
+    """`query`'s outermost `ORDER BY` terms, as the frozen tuple `Case` holds."""
+    if not query:
+        return ()
+    from harness import order_keys_of
+
+    return tuple(order_keys_of(query))
 
 
 def suite(family: str, *, dataset: str) -> Suite:

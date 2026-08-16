@@ -247,25 +247,6 @@ enum Admit {
 /// against its live reservations. The latter is the runtime backstop a static
 /// estimate cannot enforce on its own. With no envelope (the default) `op_budget`
 /// is `None`, so it always admits with no accounting and the fast path is unchanged.
-impl ExecOptions {
-    /// Worker threads this query may use — `parallelism`, or the machine's available cores when
-    /// it is `0` ("all available cores"). The streaming executor shards its driving scan by this.
-    ///
-    /// Reads `available_parallelism` rather than `rayon::current_num_threads` deliberately. The
-    /// latter reports the *global* pool's width, and on a Ray worker that pool is built before
-    /// the actor's CPU affinity is applied and so is stuck at one thread (the throttle
-    /// [`execute_parallel_with_metrics`] documents). Sizing the shard count from it would inherit
-    /// that mistake and split a whole partition into a single shard; `available_parallelism`
-    /// reads the affinity that has since landed.
-    pub fn workers(&self) -> usize {
-        if self.parallelism > 0 {
-            self.parallelism
-        } else {
-            bc_arrow::usable_cores()
-        }
-    }
-}
-
 fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
     match opts.pool.as_ref() {
         // The pool accounts *actual* bytes, so it is the spill authority: reserve the
@@ -388,7 +369,7 @@ pub fn execute_parallel_with_metrics(
 /// carries a media decode we lift the cap to all cores; the intra-kernel fan-out shares
 /// this same pool (rayon work-stealing, no oversubscription), so it is right whether the
 /// input is one morsel or many. Still scheduling only — the result is unchanged.
-fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) -> usize {
+pub fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) -> usize {
     if opts.parallelism > 0 {
         return opts.parallelism;
     }
@@ -396,7 +377,36 @@ fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) ->
     if plan.contains_media_decode() {
         return cores.max(1);
     }
-    cores.min(max_useful_workers(opts, sources)).max(1)
+    // **Every physical core, plus a third of the SMT siblings** (`bc_arrow::operator_cores`),
+    // rather than every logical CPU. A plan is not one kernel: it interleaves work that stalls
+    // on memory (hash build and probe, group assignment) with work that saturates bandwidth
+    // (gather, scan, concat). SMT hides the stalls of the first and doubles the cache pressure
+    // of the second, and on a query the second half plus rayon's own scheduling wins the
+    // argument — on TPC-DS q78, `crossbeam_epoch::pin` (9.3%), `try_advance` (6.1%) and
+    // `steal` (1.4%) are **16.8% of the query**, and the way to spend less of that is to have
+    // fewer workers rather than faster ones.
+    //
+    // Measured as whole suites, same binary, only this width changed (`b/duckdb` geomean):
+    //
+    // | suite | all logical (96) | this (64) |
+    // |---|---:|---:|
+    // | TPC-DS sf1 (99) | 1.140x | **1.057x** |
+    // | TPC-H sf1 (22) | 0.838x | **0.786x** |
+    // | operators (19) | 0.661x | **0.649x** |
+    // | ClickBench (43) | 0.626x | 0.627x |
+    // | H2O groupby (10) | **1.171x** | 1.219x |
+    // | H2O join (5) | **0.887x** | 0.939x |
+    //
+    // The trade is stated rather than hidden: 164 of the 198 queries prefer the narrower
+    // width, including the suite Batcher loses by the most, and the 15 H2O ones — a single
+    // large operator over 10M rows, where a region is long enough to amortize waking every
+    // logical CPU — pay 4-6% for it. An adaptive rule keyed on morsels-per-thread was tried
+    // and abandoned: `max_useful_workers` is byte-aware, so a wide table clears any threshold
+    // that a narrow one does, and it selected the wide width for TPC-H and TPC-DS too
+    // (0.838x / 1.154x — the 96 column, exactly).
+    bc_arrow::operator_cores()
+        .min(max_useful_workers(opts, sources))
+        .max(1)
 }
 
 /// An upper bound on workers that could have a morsel to process: the largest number of

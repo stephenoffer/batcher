@@ -1047,7 +1047,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `annotate.py` | 546 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 477 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
-| `column_tables.py` | 195 | The learned per-column statistics tables — their schema, their keys, and their bound. |
+| `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `common_subplan.py` | 278 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 192 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
@@ -1428,7 +1428,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 261 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 457 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1983 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1999 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1440,7 +1440,7 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 |---|---|---|
 | `arithmetic.py` | 242 | Reading a predicate through the arithmetic wrapped around its column. |
 | `combine.py` | 601 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 731 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `leaves.py` | 739 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 341 | What a text pattern says about how many rows it matches. |
 | `scalars.py` | 502 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
@@ -1569,7 +1569,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `gpu_transform.py` | 313 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 176 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
-| `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
+| `scan_only.py` | 162 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 189 | Column-statistics measurement — Core's lane. |
 | `streaming_runner.py` | 345 | How one micro-batch gets run — the seam between the loop and where the work happens. |
 
@@ -2728,9 +2728,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 667 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 193 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
-| `normalize.rs` | 510 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
+| `hardware.rs` | 245 | What the engine's own process knows about its hardware and its allocator. |
+| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `normalize.rs` | 514 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 136 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
 | `shuffle.rs` | 663 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -2753,7 +2753,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `lib.rs` | 713 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 374 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 451 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 606 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 539 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 260 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1535 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
@@ -2767,7 +2767,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 565 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 438 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 3289 | The multi-core executor. |
+| `par.rs` | 3299 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 595 | The breakers: operators that must see all of their input before they can emit any output. |
@@ -2799,7 +2799,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/finalize.rs` | 63 | The finalize dispatch — turning each aggregate's merged partial into its output column. |
 | `agg/fused.rs` | 638 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1370 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 535 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 561 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
@@ -2812,7 +2812,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 428 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 287 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 474 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 749 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
@@ -2969,7 +2969,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `dtype_name.rs` | 225 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
 | `float_ident.rs` | 154 | The engine's one definition of **float identity**. |
-| `hardware.rs` | 247 | Host CPU capability detection for adaptive execution. |
+| `hardware.rs` | 271 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 226 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 190 | `bc-arrow` — Arrow building blocks shared across the engine. |

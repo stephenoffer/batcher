@@ -26,7 +26,8 @@ needs GPUs and a distributed benchmark needs a cluster. Each is labeled where it
 
 | Family | Hardware |
 |---|---|
-| Operators, TPC-H, ClickBench, connectors | Single node, 16 cores, 30 GB |
+| Suite geomeans (TPC-H, TPC-DS, ClickBench, JOB, H2O, operators, JSON), 2026-08-15 | Single node, 96 cores, 184 GiB |
+| Older per-operator and connector figures | Single node, 16 cores, 30 GB |
 | Multimodal ingest (image, point cloud) | Single node, 96 cores |
 | `map_batches` ETL and training ingest | Single node, 96 cores, 188 GB |
 | GPU inference and embeddings | 8xT4 across a Ray cluster |
@@ -48,6 +49,8 @@ is timed on a different copy of the input. Timings are best-of-N warm.
 | Engine | Configuration | Why |
 |---|---|---|
 | Batcher | Single-node, in-process | Its low-overhead strength |
+| DuckDB (`duckdb`) | Its **native** store, ingested untimed before the query | DuckDB at its best — the harder bar |
+| DuckDB (`duckdb_arrow`) | The **same zero-copy Arrow** Batcher runs on | The like-for-like execution comparison |
 | Daft | Native multithreaded local engine (`DAFT_RUNNER=native`), or its Ray runner for the cluster grid | Its fastest runner for each shape |
 | DuckDB, Polars | In-process | The only way they run |
 | Distributed engines | Attached to the live cluster (`ray.init(address="auto")`) | Where they are designed to be strongest |

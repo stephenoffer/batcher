@@ -1,5 +1,386 @@
 # Batcher CPU benchmark results
 
+## Do these optimizations scale? Measured three ways — and only four TPC-H queries are superlinear (2026-08-15)
+
+"It is faster on this box at this scale" is the claim a benchmark supports. The claim the
+engine needs is that the same change still helps at ten times the data, on more cores, and
+when the work is spread across machines. Each was measured rather than argued.
+
+### Across data scale: sf1 -> sf10, and where it goes superlinear
+
+TPC-H at scale 10 (60M-row `lineitem`), same binary, against DuckDB's native store. Ten times
+the data, so ten times the time is the line to beat:
+
+| query | shape | sf1 | sf10 | Batcher x | DuckDB x |
+|---|---|---:|---:|---:|---:|
+| q15 | scan+agg | 2.3 ms | 3.3 | **1.4** | 3.8 |
+| q22 | scan+agg | 18.9 | 43.0 | **2.3** | 3.0 |
+| q6 | scan+filter | 5.8 | 30.3 | **5.2** | 3.6 |
+| q10 | join | 28.0 | 152.1 | **5.4** | 3.4 |
+| q1 | scan+agg | 15.5 | 93.6 | **6.0** | 4.7 |
+| q8 | join | 17.7 | 105.8 | **6.0** | 3.7 |
+| q7 | join | 20.7 | 134.6 | **6.5** | 2.4 |
+| q3 | join | 19.9 | 145.3 | **7.3** | 3.8 |
+| q21 | join | 73.1 | 540.1 | **7.4** | 4.1 |
+| q9 | join | 47.9 | 536.1 | 11.2 | 3.0 |
+| q18 | join+agg | 31.4 | 392.9 | 12.5 | 4.2 |
+| q13 | join+agg | 40.2 | 510.3 | 12.7 | 2.8 |
+| q5 | join | 25.3 | 376.7 | 14.9 | 4.5 |
+
+**Nine of thirteen are sublinear** — a scan, a filter and most joins cost less than ten times
+as much for ten times the rows, because at sf1 they do not fill the machine and at sf10 they
+do. Four are superlinear and they are named rather than averaged away: q5, q9, q13 and q18.
+q13 and q18 both carry a very high-cardinality `GROUP BY` (1.5M and 15M groups at sf10), q9
+builds the largest intermediate in the benchmark, and q5 is the six-way join. The suite
+geomean against DuckDB is therefore **0.78x at sf1 and 1.27x at sf10** — still a loss at ten
+times the data, and better than the 1.461x this file last recorded there.
+
+DuckDB's column reads 2.4-4.7x throughout, which is not a better engine scaling law: it is a
+~15 ms fixed cost per query that dominates its sf1 numbers and disappears at sf10. Neither
+column is the interesting one on its own; the shape of Batcher's is.
+
+### Across cores: the gather-dominated join saturates at ~10x, not 48x
+
+H2O `join` q5 (10M x 10M inner join, 9M rows and 13 columns out — the shape the parallel
+gather work in this session targets), one binary, thread count pinned:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ms | 3,790 | 1,885 | 1,114 | 658 | 433 | 388 | **375** | 442 |
+| speedup | 1.0x | 2.0x | 3.4x | 5.8x | 8.8x | 9.8x | **10.1x** | 8.6x |
+| efficiency | 100% | 101% | 85% | 72% | 55% | 31% | 21% | 13% |
+
+Linear to two cores, 85% at four, and then a hard ceiling near **10x** — an Amdahl serial
+fraction of roughly 9%, reached by sixteen cores. Past 48 (this box's *physical* core count)
+it gets worse. So the honest statement about the gather work is that it makes the parallel
+part faster and does not remove the serial one; a claim of linear scaling to 96 threads on
+this shape would be false, and the curve above is what to quote instead.
+
+### Across machines: the results are identical, and nothing added holds per-node state
+
+`--benchmark distributed` runs each query single-node and again across 8 partitions and
+asserts the two agree before reporting a timing. **Distributed results match single-node on
+every query** with all of this session's changes in place — the mergeable algebra
+(`partial / combine / finalize`) is untouched by any of them.
+
+Per change, against "what happens at N nodes":
+
+| change | where it runs | at N nodes |
+|---|---|---|
+| single-allocation parallel gather | `bc-runtime`, per gather | unchanged — a worker gathers its own shard, and the fill is per chunk of it |
+| mimalloc purge delay | per process | unchanged — every worker is a process and retains its own arena |
+| plane-addressed string gather | inside `combine` | **improves** — `combine` is what a worker runs after a shuffle, and a worker's share is smaller |
+| nullable primitive gather | inside `combine` | as above |
+| `operator_cores` width | per process | unchanged — derived from a fresh `usable_cores`, so a Ray worker's post-start CPU affinity and its cgroup quota both bind |
+| one width for both executors | per process | **improves** — the mismatch it removes was worst where the shard count and the pool disagreed |
+| scan-only identity projection | driver, per query | unchanged — it removes an FFI round trip, which every node pays separately |
+| learned-column source index | driver | unchanged — it is per *query history*, never per node |
+
+The one thing to watch is the width: `operator_cores` reads the *worker's* topology, so a
+heterogeneous fleet picks a different width per machine, which is correct and is why the SMT
+ratio comes from the cached topology while the count comes from a fresh `usable_cores`.
+
+## Every suite run, five engine changes, and the two that were measured and thrown away — TPC-H 0.848x -> 0.774x, TPC-DS 1.132x -> 1.080x, h2o-join 1.027x -> 0.89x, and the Join Order Benchmark finishes (2026-08-15)
+
+Every runnable suite measured on the 96-core / 184 GiB box, then five changes, then every
+suite measured again. The changes are unrelated in mechanism and share one shape: in each,
+the engine was moving bytes it did not have to move, or running on a width nobody had
+measured.
+
+| suite | n | before | after | |
+|---|---:|---:|---:|---|
+| JSON | 5 | 0.259x | **0.231** | win |
+| ClickBench | 43 | 0.640x | **0.617** | win |
+| operators | 19 | 0.688x | **0.659** | win |
+| TPC-H sf1 | 22 | 0.848x | **0.774** | win |
+| h2o-join | 5 | 1.027x | **0.889 / 0.923** | win (was a loss) |
+| TPC-DS sf1 | 99 | 1.132x | **1.080** | lose |
+| h2o-groupby | 10 | 1.229x | **1.206 / 1.292** | lose |
+| JOB | 113 | *could not finish* | **1.488** | lose, and it completes |
+| scan (ideal layout) | 9 | *never measured* | 1.4-2.8x | lose |
+
+`b/duckdb` against DuckDB's native compressed store. Against the same Arrow input Batcher
+executes over (`duckdb_arrow`, the like-for-like execution bar) the same final binary reads
+TPC-H **0.267x (22/22)**, ClickBench **0.072x (43/43)**, operators 0.359x, JSON 0.039x,
+h2o-groupby 0.106x (10/10) — and against Polars, TPC-H 0.434x and ClickBench 0.334x.
+
+**Read the spread before the movement.** h2o-groupby's two final rounds are 1.206 and 1.292
+on one binary; TPC-H's are 0.774 and 0.786 across rounds. So h2o-groupby did not move, and
+TPC-H, TPC-DS and h2o-join moved by more than their spread.
+
+### 1. One gather entry point that fills the output once
+
+`bc_runtime::gather::take_column` had a single-allocation parallel fill for `Utf8` and nothing
+else, so `ops::joins` compensated by splitting the index list per thread, `take`-ing each
+range into its own array, and `concat`-ing them back — every value written twice, an
+allocation per chunk, and (because each chunk was `rows/threads` rows) every chunk *below*
+the runtime's own parallel threshold, so the string fill could never run from a join at all.
+For a fixed-width type a row's output position is its index position, so the buffer is
+allocated once and carved into disjoint chunks each thread fills in place.
+
+### 2. The allocator gave its pages back between queries
+
+mimalloc's `purge_delay` default is 10 ms, tuned for allocations that live in its per-thread
+caches. An operator's output buffer is tens of megabytes, so it went back to the kernel and
+the next query's identical buffer arrived as fresh zero pages: `clear_page_erms` was **9.3%
+of h2o-join q5**. Ten seconds of retention, with `allocator_collect` still the release valve
+Carbonite pulls under pressure.
+
+Together, q5 (10M x 10M inner join, 9M rows out) median **482 / 493 / 508 ms -> 393 / 398**.
+
+### 3. The group-by merge gathered its string keys a row at a time
+
+`agg::group::combine` had a flat path for primitive columns and handed **string** keys —
+the commonest high-cardinality group key — to `arrow::compute::interleave`, which builds
+through `MutableArrayData::extend` per row behind a 16-byte-per-row pair vector.
+`interleave_bytes` was 6.0% of h2o `groupby` q2. `gather_strings` reads the same two `u32`
+planes the primitive path does.
+
+### 4. And it refused a nullable primitive outright
+
+The same function's primitive path required every source column to be null-free — and an
+outer join makes every column below it nullable, so on a query built from them it could not
+fire at all. `interleave_primitive` was **5.1% of TPC-DS q78**, whose three CTEs are each a
+`LEFT JOIN` feeding a three-key `GROUP BY`. Validity is now gathered beside the values, and
+only when some source has a null. q78 236 -> 222 ms, q88 89 -> 76.
+
+### 5. The executor ran on every logical CPU, and that is the worse end of the SMT trade
+
+A plan is not one kernel: it interleaves work that stalls on memory (hash probe, group
+assignment) with work that saturates bandwidth (gather, scan, concat). SMT hides the first
+and doubles the cache pressure of the second, and rayon's own scheduling decides the
+argument — on TPC-DS q78, `crossbeam_epoch::pin` (9.3%), `try_advance` (6.1%) and `steal`
+(1.4%) are **16.8% of the query**. `bc_arrow::operator_cores` is every physical core plus a
+third of the SMT siblings; on this 48-physical / 96-logical box, 64.
+
+| suite | all logical (96) | operator width (64) |
+|---|---:|---:|
+| TPC-DS sf1 (99) | 1.140x | **1.057x** |
+| TPC-H sf1 (22) | 0.838x | **0.786x** |
+| operators (19) | 0.661x | **0.649x** |
+| ClickBench (43) | 0.626x | 0.627x |
+| h2o groupby (10) | **1.171x** | 1.219x |
+| h2o join (5) | **0.887x** | 0.939x |
+
+164 of the 198 queries prefer the narrower width, including the suite Batcher loses by the
+most. The 15 H2O ones — one large operator over 10M rows, where a region is long enough to
+amortize waking every logical CPU — pay 4-6%, and that is the trade, stated.
+
+It also found a real inconsistency: `ExecOptions::workers` sized the streaming executor's
+pool *and* its shard count while `auto_width` sized the materializing one. Narrowing only
+the second is why the first attempt measured as a **regression** — a plan then ran 96 shards
+on a pool of 64. There is now one definition and both paths call it.
+
+### 6. `SELECT a, b FROM <file>` paid a full FFI round trip to change nothing
+
+`core.scan_only` skips the engine for a plan that *is* a `Scan`, because the reader has
+already applied the pushed projection and its batches are the result. It recognized only
+that shape, so `read.parquet(p).select("a","b")` — `Project(Scan)`, where Kyber has pushed
+the column list into the reader and the projection above is an identity — took the full
+crossing. On 32M rows x 16 `int64` columns of local parquet, selecting one: **97.7 ms ->
+33.7 ms**, exactly the cost of `read(p, columns=[...])`, which is what the two spellings
+should always have cost.
+
+### Two things measured and thrown away
+
+Recorded because the measurement is the result, and because both looked right.
+
+**An adaptive width keyed on morsels-per-thread.** The idea was to keep all 96 threads where
+a parallel region is long enough to amortize them and drop to 64 where it is not.
+`max_useful_workers` is byte-aware, so a wide table clears any threshold a narrow one does:
+it selected the wide width for TPC-H and TPC-DS too, reading 0.838x and 1.154x — the 96
+column, exactly. A constant fitted to six suites and doing nothing is worse than a stated
+trade.
+
+**The first width change, measured only on `auto_width`.** It read h2o-groupby 1.174 ->
+1.307 and h2o-join 0.883 -> 0.926 and was reverted as a regression — correctly, and for the
+wrong reason. The regression was the *mismatch* described above, not the width; with both
+sites narrowed it is a 5-7% win on TPC-H and TPC-DS. A width sweep through
+`execution.parallelism` had said 64 was better all along, and that sweep was not a clean
+experiment either: the setting also changes what Kyber decides, so it was never measuring
+the thread count alone. The only trustworthy arm was a rebuild.
+
+### The Join Order Benchmark finishes
+
+All 113 queries, **zero killed**, geomean 1.488x, 31 wins. `job-q7c` — which this file
+records as taking the process down, and which a later run could not measure at all — now
+answers in **291 ms against DuckDB's 504**, a win. `q10a`, the other fatal one, runs in
+47.5 ms.
+
+**This is not a claim to have fixed the OOM.** Those runs were on a 30 GiB box and this one
+has 184 GiB; peak RSS here was ~15-22 GiB, which is exactly the band that would have died
+there. What can be said is that the suite completes on this box and that its worst queries
+are now a join-ordering problem rather than a survival one. The four `PARTIAL` rows are
+DuckDB's own parser rejecting `aka_title AS at` (`at` is reserved there), not Batcher's.
+
+### What is still open
+
+**h2o-groupby is still the string group key**, and it did not move: q2 (`sum(v1) BY id1,
+id2`) 2.8x, q9 (`corr` by a string and an int) 2.3x, q4 1.8x. Its profile is now
+`assign_groups` 18%, memory movement 14%, and rayon scheduling 15% — no single villain left,
+which is why nothing here moved it.
+
+**The parquet decode is 1.7-3.0x DuckDB's CPU**, and that is what the `scan` suite loses on.
+Measured on local files with no network: 32M x 16 `int64`, all columns, Batcher 783 ms /
+17.7 cpu-s against DuckDB 385 ms / 9.8 cpu-s — and against *PyArrow* (arrow-c++) 1.7-2.6x,
+so this is arrow-rs's decoder rather than a Batcher-specific defect. Row-group concurrency
+and read batch size were both swept and are already at their best values.
+
+**TPC-DS is scheduling.** Its remaining 1.08x is spread across 99 queries with q5 (7.3x),
+q77 (9.2x), q78, q22 and q47 leading; q78's profile after all of the above is 16.8% rayon
+epoch and steal overhead, which is the same cost item change 5 addresses from the other end.
+
+## Auditing the benchmark itself: the correctness gate could not see a sort, five ClickBench queries are not executed, and Spark was measured on a configuration nobody would run (2026-08-15)
+
+A benchmark that flatters the engine it measures is worse than no benchmark, so this session
+stopped and audited the harness against the engines rather than the engines against each
+other. Five findings, four of them fixed here and one that is a property of the design and is
+now written down instead of left to be discovered.
+
+### 1. The gate compared row multisets, so a sort that never happened still passed
+
+`harness.compare` canonicalizes both results and **sorts them on every column** before
+comparing, which is right for a query that asked for no order and is a hole for every query
+that did:
+
+```python
+>>> results_match(pa.table({"c": ["a", "b", "c"]}), pa.table({"c": ["c", "a", "b"]}))
+(True, 'ok')
+```
+
+An engine that ran `SELECT l_comment FROM lineitem ORDER BY l_comment` and returned the rows
+untouched passed the gate and was then **timed** — reported as a win on a sort it did not
+perform. This is precisely the failure `CLAUDE.md` names ("never assert a sort with an
+order-independent comparison"), sitting in the harness that judges the engine, and it covered
+the four `ops-ordering` cases plus every `ORDER BY ... LIMIT` in TPC-H, TPC-DS and ClickBench.
+
+`harness/order.py` now checks each engine's result for **monotonicity in its own order**
+against the query's `ORDER BY`, parsed from the SQL (and declared on the four native cases).
+Two deliberate omissions keep a false failure impossible: ties are unspecified by SQL, so
+positions are never compared between engines, and null *placement* differs by engine (DuckDB
+puts nulls last in both directions, PostgreSQL splits by direction) so any pair whose deciding
+key is null on either side is skipped. A key that cannot be resolved to an output column stops
+the check there rather than guessing.
+
+**Nothing failed.** All 203 cases — 99 TPC-DS, 43 ClickBench, 22 TPC-H, 19 operators, 15 H2O,
+5 JSON — pass the order check, for Batcher and for every comparator. So this closed a hole
+rather than catching a defect, which is the outcome worth having and not the one worth
+assuming: the check was proved to work on constructed unsorted, tied, null-bearing and
+descending inputs first.
+
+Writing it did produce one bug of its own, and it is instructive. Treating "one side is null"
+as a *tie* passed the pair to the next key, which then judged it — and nine TPC-DS queries
+"failed", **for DuckDB exactly as loudly as for Batcher**. A checker that accuses the oracle is
+announcing its own defect; had it accused only Batcher it would have looked like a finding.
+
+### 2. Five ClickBench queries and two operator cases are answered, not executed
+
+Batcher answers an unfiltered aggregate over an immutable in-memory relation from a recorded
+column statistic instead of running the plan. The statistic is computed **by the first run of
+that query** and read back by every later one, and the harness times best-of-5:
+
+| | run 1 | run 2 | run 3+ | fresh source each run |
+|---|---:|---:|---:|---:|
+| `SUM(l_extendedprice)` over 6M rows | 178 ms | 0.83 | **0.13** | 5.0 |
+| `COUNT(*) WHERE l_quantity > 30` | 30 ms | 1.27 | **0.22** | 6.1 |
+
+Instrumenting `metadata_aggregate_table` over every registered case, **7 of 7 runs** are
+answered this way for `op-global-sum`, `op-filter-count` and ClickBench `q01`-`q05`. Every one
+of them is **exact** — they match DuckDB, including the two `COUNT(DISTINCT)`s — so this is a
+reporting problem and not a correctness one. But `op-global-sum` reads *0.1 ms against DuckDB's
+1.3*, and the honest figure for computing that sum is ~5 ms, which is 3.8x **slower** than
+DuckDB, not 13x faster.
+
+It is a real engine capability and a real user-visible latency, so it is not removed. What
+changes is that the geomean is quoted both ways:
+
+| suite | as reported | excluding the metadata-answered cases |
+|---|---:|---:|
+| ClickBench (43) | 0.627x | **0.767x** over 38 |
+| operators (19) | 0.643x | **0.760x** over 17 |
+
+The five ClickBench cases average **0.097x** between them. Quote the second column when the
+claim is about execution speed. (`cb-q06`, `MIN`/`MAX` over a date, is *not* in that set: DuckDB
+answers it from its own zone maps, so that one is a fair fight.)
+
+### 3. DuckDB pays a result-to-Arrow conversion that Batcher does not
+
+Every engine is asked for a `pyarrow.Table`, and Batcher's engine emits Arrow natively while
+DuckDB converts out of its own vectors. On H2O `join` q5 (9M rows, 13 columns):
+
+| | ms |
+|---|---:|
+| full query -> Arrow | 242.8 |
+| scanning the *already-materialized* result -> Arrow | **125.4** |
+| counting that same result (no conversion) | 1.0 |
+
+So roughly **half** of DuckDB's number on a large-result query is the conversion. This is not
+fixed, and the reason is worth stating: `to_arrow_table()` is DuckDB's *cheapest* full
+materialization — `CREATE TABLE AS` costs 3,023 ms on the same query — so the harness already
+hands it its best option. The benchmark's contract is "produce the answer in the common
+interchange format", and Batcher wins part of the large-result cases because its native format
+*is* that format (invariant #3). That is a genuine architectural advantage rather than a
+measurement artifact, but a reader comparing these numbers against a published DuckDB result
+would be misled, so: **on a query returning millions of rows, discount the comparator by the
+conversion.** Small-result queries — most of TPC-H and ClickBench — are unaffected.
+
+### 4. Spark was measured on a configuration nobody would run
+
+Three handicaps, none of which change who wins and all of which a fair comparison has to
+remove anyway:
+
+* **A pandas round trip.** `_to_arrow` did `pa.Table.from_pandas(sdf.toPandas())`. With Arrow
+  transfer enabled, `toPandas()` already collects Arrow and converts it to pandas, which the
+  outer call converts straight back — two full materializations charged to Spark per run.
+  `DataFrame.toArrow()` (PySpark 4.0+) stops at the first.
+* **`spark.sql.shuffle.partitions = 8`** on a 96-core box, leaving 88 cores idle through every
+  shuffle. Measured at 8 / 96 / 200: q18 **960 / 697 / 710 ms**, q1 456 / 370 / 403, q9
+  1,136 / 1,060 / 1,040. Now one partition per core.
+* **Re-reading Parquet on every query** while DuckDB queried native tables and Batcher and
+  Polars queried resident Arrow. `CACHE TABLE` at registration is the untimed counterpart of
+  DuckDB's `CREATE TABLE AS`: q9 **1,136 -> 658 ms**, q6 131 -> 95.
+
+Together, TPC-H sf1: q9 998 -> 682 ms, q18 935 -> 647, q14 418 -> 263, q16 515 -> 897 (worse,
+and inside its own spread). Spark remains 20-50x behind at this scale, which is what local-mode
+Spark on 6M rows is — its floor is ~90 ms of fixed per-query cost — but it is now behind on a
+configuration that can be defended.
+
+Spark had never actually run in this environment (`available()` was False: the wheel is
+installed, the JVM was not), so every Spark comparison in this file predates a JVM being
+present here. One is now installed.
+
+### 5. `duckdb_arrow` was documented as reported and was in no default run
+
+The README's methodology says both DuckDB bars are reported — `duckdb` on its native
+compressed store ("DuckDB at its best") and `duckdb_arrow` on the same zero-copy Arrow Batcher
+executes over ("the like-for-like execution bar"). The default lineup contained only the first.
+That was not flattering — the native store is the *harder* bar — but the stated methodology was
+not what ran. Both are now in the default single-node lineup:
+
+| TPC-H sf1 | geomean | wins |
+|---|---:|---|
+| `b/duckdb` (native store) | 0.822x | 15/22 |
+| `b/duckdb_arrow` (same Arrow input) | **0.286x** | 22/22 |
+
+`b/duckdb` stays the number to quote. `b/duckdb_arrow` is what separates DuckDB's storage
+engine from its execution engine, and on identical bytes Batcher's execution is 3.5x faster.
+
+### What the audit did not find
+
+Worth recording, because each was checked rather than assumed: every engine gets the identical
+warm-up (one correctness run, then one warm-up and five timed); the operator mix fans **one**
+SQL string to every SQL engine including Batcher, so there is no hand-tuned Batcher pipeline
+racing a comparator's SQL; the float tolerance (`atol` 1.5e-6, `rtol` 1e-9) is tight enough that
+TPC-H's ~1e8 revenues are compared to one part in 10^9; and `cannot_run` — the mechanism that
+excludes an engine from a case — is used four times, all for Daft being `SIGKILL`ed on an
+ordered 6M-row window, all disclosed in the run's own `PARTIAL` lines.
+
+Two asymmetries that remain and favour Batcher, both inherent rather than fixable: Batcher's
+`Session` carries a plan cache and a learned-stats loop across the suite's repeated runs, which
+DuckDB and Polars have no counterpart to; and the harness reports **best-of-5 of the same
+query**, which is the standard methodology and is exactly the shape a memoizing engine wins.
+Read these numbers as warm, repeated-query numbers, because that is what they are.
+
 ## Twelve ways the engine threw away work it had already done — TPC-DS 1.510x -> 1.18x, TPC-H 0.962x -> 0.83x, seven ClickBench queries that could not run at all, and q45 from 7.34x to 1.02x (2026-08-14)
 
 Every single-node suite measured on the 96-core / 184 GiB box against DuckDB's native

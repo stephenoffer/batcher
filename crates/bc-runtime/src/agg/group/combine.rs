@@ -26,21 +26,30 @@ type MergedPartition = (Vec<ArrayRef>, Vec<Vec<ArrayRef>>);
 
 /// Copy the rows named by `(part_of[i], row_of[i])` out of `cols` into one flat array.
 ///
-/// The whole-column move for a null-free primitive: read the source value, write the
-/// output, no bitmap and no builder. `PrimitiveArray::new(values, None)` is the same array
-/// `interleave` would have produced for null-free inputs.
+/// The whole-column move for a primitive: read the source value, write the output, no
+/// builder. Validity is gathered the same way and only when some source actually has a null,
+/// so a null-free column allocates no bitmap — the array `interleave` would have produced,
+/// either way.
+///
+/// **Nullable is not a special case here, and used to be.** Gathering only the values meant
+/// the caller had to refuse any column carrying a null and hand it to `interleave` instead —
+/// and a null is not rare in this position: an outer join makes every column below it
+/// nullable, so on a query built from them the fast path could not fire at all.
+/// `interleave_primitive` was **5.1% of TPC-DS q78**, whose three CTEs are each a `LEFT JOIN`
+/// feeding a three-key `GROUP BY`. A value under a null slot is unspecified but readable
+/// (arrow allocates the whole values buffer), so reading it and then masking it is exactly
+/// what arrow's own kernels do.
 fn gather_primitive<T: ArrowPrimitiveType>(
     cols: &[&dyn Array],
     part_of: &[u32],
     row_of: &[u32],
 ) -> ArrayRef {
     use arrow::array::PrimitiveArray;
+    use arrow::buffer::NullBuffer;
     use std::sync::Arc;
 
-    let vals: Vec<&[T::Native]> = cols
-        .iter()
-        .map(|c| c.as_primitive::<T>().values().as_ref())
-        .collect();
+    let arrs: Vec<&PrimitiveArray<T>> = cols.iter().map(|c| c.as_primitive::<T>()).collect();
+    let vals: Vec<&[T::Native]> = arrs.iter().map(|a| a.values().as_ref()).collect();
     let mut out: Vec<T::Native> = Vec::with_capacity(part_of.len());
     out.extend(
         part_of
@@ -48,7 +57,15 @@ fn gather_primitive<T: ArrowPrimitiveType>(
             .zip(row_of)
             .map(|(&p, &r)| vals[p as usize][r as usize]),
     );
-    Arc::new(PrimitiveArray::<T>::new(out.into(), None))
+    let nulls = arrs.iter().any(|a| a.null_count() > 0).then(|| {
+        NullBuffer::from_iter(
+            part_of
+                .iter()
+                .zip(row_of)
+                .map(|(&p, &r)| arrs[p as usize].is_valid(r as usize)),
+        )
+    });
+    Arc::new(PrimitiveArray::<T>::new(out.into(), nulls))
 }
 
 /// Gather one output column, taking the flat typed path when every source permits it.
@@ -62,10 +79,11 @@ fn gather_primitive<T: ArrowPrimitiveType>(
 ///
 /// This is the same trade `ops::repartition` already makes on the shuffle side, applied to
 /// the other place that gathers by row address. The `u32` planes are half the index bytes,
-/// and a null-free primitive column copies values directly.
+/// and a primitive column copies values (and, where it has any, validity) directly.
 ///
-/// Anything else — a string or binary key, a nested state, any column carrying a null —
-/// falls through to `interleave` unchanged, sharing one lazily built pair vector.
+/// Anything else — a nested state, a temporal or decimal type this does not name, a source
+/// set of mixed types — falls through to `interleave` unchanged, sharing one lazily built
+/// pair vector. Strings take their own bulk path (`gather::gather_strings`).
 fn gather(
     cols: &[&dyn Array],
     part_of: &[u32],
@@ -86,7 +104,7 @@ fn gather(
     let uniform = cols
         .split_first()
         .is_some_and(|(h, t)| t.iter().all(|c| c.data_type() == h.data_type()));
-    if uniform && cols.iter().all(|c| c.null_count() == 0) {
+    if uniform {
         fast! {
             DataType::Int8 => Int8Type, DataType::Int16 => Int16Type,
             DataType::Int32 => Int32Type, DataType::Int64 => Int64Type,
@@ -97,6 +115,13 @@ fn gather(
             DataType::Date32 => arrow::datatypes::Date32Type,
             DataType::Date64 => arrow::datatypes::Date64Type,
         }
+    }
+    // A string key is the *other* common high-cardinality group key, and arrow's `interleave`
+    // costs it what it costs any variable-width column: `MutableArrayData::extend` per row,
+    // through the sixteen-byte pair vector below. `gather_strings` reads the same two planes
+    // the primitive path does and fills one output buffer across cores.
+    if let Some(out) = crate::gather::gather_strings(cols, part_of, row_of) {
+        return Ok(out);
     }
     let pairs = pairs.get_or_insert_with(|| {
         part_of
@@ -532,4 +557,65 @@ pub fn concat_disjoint(parts: &[Partial]) -> Result<Partial, RuntimeError> {
         group_columns,
         states,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, Int64Array};
+
+    use super::*;
+
+    /// The typed gather must equal `interleave` element for element, **including validity**.
+    ///
+    /// Nulls are the half that was not covered: the fast path used to refuse a column with
+    /// any, so the values loop had never been asked to carry a bitmap. It is also the case
+    /// that matters, because an outer join makes every column below it nullable — which is
+    /// most of what a TPC-DS query is built from.
+    ///
+    /// Checked against arrow rather than against expected values, so this cannot drift into
+    /// pinning the shortcut's own idea of the answer.
+    #[test]
+    fn the_typed_gather_equals_interleave_with_and_without_nulls() {
+        let n = 500;
+        let a_int: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| (i % 7 != 0).then_some(i as i64))
+                .collect::<Vec<_>>(),
+        ));
+        let b_int: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| (i % 3 != 0).then_some(-(i as i64)))
+                .collect::<Vec<_>>(),
+        ));
+        let dense: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+        let floats: ArrayRef = Arc::new(Float64Array::from(
+            (0..n)
+                .map(|i| (i % 5 != 0).then_some(i as f64 / 4.0))
+                .collect::<Vec<_>>(),
+        ));
+
+        let part_of: Vec<u32> = (0..n).map(|i| (i % 2) as u32).collect();
+        let row_of: Vec<u32> = (0..n).map(|i| ((i * 131) % n) as u32).collect();
+        let pairs: Vec<(usize, usize)> = part_of
+            .iter()
+            .zip(&row_of)
+            .map(|(&p, &r)| (p as usize, r as usize))
+            .collect();
+
+        for sources in [
+            [a_int.clone(), b_int.clone()],   // nulls on both sides
+            [dense.clone(), a_int.clone()],   // nulls on one side only
+            [dense.clone(), dense.clone()],   // no nulls at all
+            [floats.clone(), floats.clone()], // a float with nulls
+        ] {
+            let cols: Vec<&dyn Array> = sources.iter().map(|c| c.as_ref()).collect();
+            let want = interleave(&cols, &pairs).unwrap();
+            let mut scratch = None;
+            let got = gather(&cols, &part_of, &row_of, &mut scratch).unwrap();
+            assert_eq!(want.as_ref(), got.as_ref(), "{:?}", cols[0].data_type());
+            assert_eq!(want.null_count(), got.null_count());
+        }
+    }
 }

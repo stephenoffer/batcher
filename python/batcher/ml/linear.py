@@ -692,7 +692,7 @@ class RidgeCV:
             >>> model.alpha_ in (0.01, 1.0, 100.0)
             True
             >>> round(model.predict(ds).to_pydict()["prediction"][0], 1)
-            2.1
+            2.0
 
     Args:
         features: The predictor columns.

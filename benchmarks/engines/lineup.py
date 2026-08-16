@@ -47,6 +47,20 @@ _ADAPTERS: dict[str, Engine] = {
 # it among the systems Batcher positions against, so a default run must not emit a column
 # that reads as a published comparison. Pass `--engines ...,ray` to measure against it
 # deliberately.
+# `duckdb_arrow` is **not** here, and the reason is a measurement rather than an oversight.
+# The README's methodology says both DuckDB bars are reported — `duckdb` on its native
+# compressed store ("DuckDB at its best") and `duckdb_arrow` on the same zero-copy Arrow
+# Batcher executes over ("the like-for-like execution bar") — so it was added to this lineup,
+# and TPC-DS then could not finish: DuckDB over registered Arrow views has no storage
+# statistics to order a many-way join with, and it was **SIGKILLed on q64** (`rc=137`, on a
+# 184 GiB box) and still climbing through 22 GiB after 30 minutes on q72. Both answer in
+# tens of milliseconds against DuckDB's *native* tables, so this is the Arrow-view binding
+# and not the queries.
+#
+# One engine dying that way takes the whole suite's process down with it, so a default run
+# that includes it reports nothing for 99 queries. It stays a deliberate `--engines
+# batcher,duckdb,duckdb_arrow` opt-in, and `BENCHMARK_RESULTS.md` carries both bars for the
+# suites where it survives. `b/duckdb` remains the number to quote either way.
 _DEFAULT_SINGLE = ("batcher", "duckdb", "polars", "pyarrow", "daft")
 _DEFAULT_MULTI = ("batcher", "daft")
 

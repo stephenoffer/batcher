@@ -132,3 +132,68 @@ def test_a_filtered_read_still_agrees_with_the_shortcut_read(source) -> None:
 
     assert filtered.schema.equals(everything.schema, check_metadata=False)
     assert filtered.num_rows == 2
+
+
+# --------------------------------------------------------------------------------------
+# A pure column selection over the scan takes the same shortcut
+# --------------------------------------------------------------------------------------
+
+
+def test_a_column_selection_over_a_scan_takes_the_shortcut(source) -> None:
+    """`SELECT a, b FROM <file>` is `Project(Scan)`, and the `Project` is an identity.
+
+    Kyber pushes the column list into the reader, so the batches it hands back already hold
+    exactly these columns — the projection above is a no-op and the round trip it forced was
+    the whole cost. On 32M rows x 16 `int64` columns, selecting one: 97.7 ms against 33.7 ms
+    for the same query written as `read(columns=...)`.
+    """
+    from batcher.io.source import read_source
+
+    ds = bt.read.parquet(source).select("i64", "s")
+    resolved = [read_source(s, None, None) for s in ds._sources]
+    out = scan_only_result(ds._plan, resolved)
+    assert out is not None
+    assert out.column_names == ["i64", "s"]
+
+
+def test_a_selection_that_is_not_an_identity_declines(source) -> None:
+    """Everything past "the same columns under the same names" is real work.
+
+    A rename is the sharp one: the reader's batches carry the *source* names and nothing on
+    this path renames them, so taking the shortcut would return a column called `i64` where
+    the plan promised `n`. The others are computation, which the engine has to do.
+    """
+    from batcher.io.source import read_source
+
+    resolved = [read_source(s, None, None) for s in bt.read.parquet(source)._sources]
+    for label, ds in [
+        ("rename", bt.read.parquet(source).select(n=col("i64"))),
+        ("computed", bt.read.parquet(source).select(i64=col("i64") + 1)),
+        ("literal", bt.read.parquet(source).with_columns(k=bt.lit(1))),
+        ("two operators", bt.read.parquet(source).select("i64").limit(1)),
+    ]:
+        assert scan_only_result(ds._plan, resolved) is None, label
+
+
+def test_a_selection_agrees_with_the_engine_column_for_column(source) -> None:
+    """The end-to-end invariant again, for the selection shape and in a non-file order.
+
+    `i64` comes *after* `s` in the file, so asking for them the other way round is exactly
+    the case where a shortcut that forgot to restate the plan's column order would return
+    two correct columns under each other's names.
+    """
+    shortcut = bt.read.parquet(source).select("s", "i64").collect()
+    engine = _engine_result(source).select(["s", "i64"])
+    assert shortcut.column_names == ["s", "i64"]
+    assert shortcut.schema.equals(engine.schema, check_metadata=False)
+    assert shortcut.equals(engine)
+
+
+def test_a_narrow_column_is_still_widened_under_a_selection(source) -> None:
+    """The widening the FFI boundary applies must not depend on which path ran."""
+    shortcut = bt.read.parquet(source).select("i8", "f32").collect()
+    engine = _engine_result(source).select(["i8", "f32"])
+    assert shortcut.schema.equals(engine.schema, check_metadata=False)
+    assert shortcut.schema.field("i8").type == pa.int64()
+    assert shortcut.schema.field("f32").type == pa.float64()
+    assert shortcut.equals(engine)
