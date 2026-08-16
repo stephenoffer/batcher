@@ -2773,7 +2773,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 595 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 236 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 541 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 601 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 696 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/parallel.rs` | 1366 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |

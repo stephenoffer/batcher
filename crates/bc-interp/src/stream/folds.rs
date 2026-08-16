@@ -29,15 +29,18 @@ use crate::InterpError;
 /// combine only every `N` morsels.
 const AGG_FOLD_EVERY: usize = 32;
 
-/// Partial rows a morsel may keep, per input row, before pre-aggregating it *alone* stops
+/// Partial rows a unit may keep, per input row, before grouping at that unit size stops
 /// paying — the streaming twin of `agg_par::REDUCTION_CEILING`, and the same number.
 ///
 /// A morsel is 16,384 rows. A key with 10,000 groups therefore fills a morsel's hash table
 /// almost completely: the partial keeps ~0.5 rows per input row, its group columns are `take`n
 /// out at that width, and `combine` inherits half the relation — all to discover a reduction
-/// the *shard* achieves 12x better. Above this ratio the fold buffers morsels and groups them
-/// together instead, which is `agg_par::chunked_partials`' argument driven by a measurement the
-/// stream can take as it goes rather than from a sample.
+/// the *shard* achieves 12x better. That is `agg_par::chunked_partials`' argument, driven by a
+/// measurement the stream can take as it goes rather than from a sample of the whole relation.
+///
+/// The same number then answers the other direction, which is what makes it safe: a unit whose
+/// partial keeps most of its rows has not reduced, whether that unit is a morsel or a chunk.
+/// See [`Unit`].
 const MORSEL_REDUCTION_CEILING: f64 = 0.20;
 
 /// Rows the chunked fold buffers before it groups them.
@@ -423,13 +426,13 @@ pub(crate) fn fold_partial(
     // per-expression cost once per core (~90× on a big box), which measured as a real fraction
     // of a low-cardinality aggregate — this hoists it to exactly one compile per query.
 
-    // Whether a morsel's own partial reduces enough to be worth taking — decided by the first
-    // one, then held. See [`MORSEL_REDUCTION_CEILING`]: below the ceiling this is the ordinary
-    // per-morsel fold; above it, morsels are buffered into [`CHUNK_FOLD_ROWS`]-row chunks and
-    // grouped together, so the hash build runs against the shard's cardinality rather than a
-    // morsel's. Same `partial`s over the same rows in the same order — a bigger unit, nothing
-    // else — so `combine`, `finalize`, the spill path and the distributed reduce are untouched.
-    let mut per_morsel: Option<bool> = None;
+    // How large a unit this fold groups at a time, adapted from what the units it has already
+    // grouped actually reduced. See [`Unit`]: a morsel is the default, and a key whose groups
+    // outnumber a morsel's rows moves to a [`CHUNK_FOLD_ROWS`]-row chunk — but only while the
+    // chunk earns its concatenation back. Same `partial`s over the same rows in the same order
+    // either way, so `combine`, `finalize`, the spill path and the distributed reduce are
+    // untouched; only the size of the unit changes.
+    let mut unit = Unit::Morsel;
     let mut chunk: Vec<RecordBatch> = Vec::new();
     let mut chunk_rows = 0usize;
 
@@ -440,19 +443,26 @@ pub(crate) fn fold_partial(
         }
         rows_in += morsel.num_rows() as u64;
         let jit = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &morsel));
-        if per_morsel == Some(false) {
+        if unit == Unit::Chunk {
             chunk_rows += morsel.num_rows();
             chunk.push(morsel);
             if chunk_rows >= CHUNK_FOLD_ROWS {
-                partials.push(group_chunk(&mut chunk, group_keys, aggregates, jit)?);
+                let partial = group_chunk(&mut chunk, group_keys, aggregates, jit)?;
+                if !reduces(&partial, chunk_rows) {
+                    // The chunk did not reduce either, so the key is near-unique over the whole
+                    // shard and no unit size reduces it. Chunking then buys nothing and costs a
+                    // `concat` per chunk, so fall back to the morsel — which is what the input
+                    // already arrives as. This is what keeps the trade one-sided: a wrong guess
+                    // costs one chunk's concatenation, not the relation's.
+                    unit = Unit::Morsel;
+                }
+                partials.push(partial);
                 chunk_rows = 0;
             }
         } else {
             let partial = ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?;
-            if per_morsel.is_none() {
-                let kept = partial.group_columns.first().map_or(0, |c| c.len());
-                per_morsel =
-                    Some((kept as f64 / morsel.num_rows() as f64) < MORSEL_REDUCTION_CEILING);
+            if unit == Unit::Morsel && chunk_would_reduce(&partial, morsel.num_rows()) {
+                unit = Unit::Chunk;
             }
             partials.push(partial);
         }
@@ -481,6 +491,55 @@ pub(crate) fn fold_partial(
         return Ok((None, rows_in));
     }
     Ok((Some(agg::combine(&partials, &funcs)?), rows_in))
+}
+
+/// How much input [`fold_partial`] groups at a time.
+///
+/// Widening is decided *before* it is paid for, by projecting the key's group count forward to
+/// the chunk's size (see [`chunk_would_reduce`]) — so a key that cannot benefit never buffers
+/// one. The measurement of each grouped chunk is then the backstop, and it can move back to the
+/// morsel: the projection assumes a uniform key, and a clustered or skewed one can clear the
+/// entry test and still not reduce. Being wrong then costs one chunk's concatenation, not the
+/// relation's.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Unit {
+    /// One morsel at a time — the input's own unit, and no copy.
+    Morsel,
+    /// [`CHUNK_FOLD_ROWS`] rows at a time, concatenated first.
+    Chunk,
+}
+
+/// Whether a partial over `rows` reduced enough to be worth taking at that unit size.
+fn reduces(partial: &agg::Partial, rows: usize) -> bool {
+    rows > 0 && (kept_rows(partial) as f64 / rows as f64) < MORSEL_REDUCTION_CEILING
+}
+
+/// Partial rows this unit's `partial` kept — the measurement both decisions read.
+fn kept_rows(partial: &agg::Partial) -> usize {
+    partial.group_columns.first().map_or(0, |c| c.len())
+}
+
+/// Whether grouping [`CHUNK_FOLD_ROWS`] rows of this key *would* reduce, judged from what one
+/// morsel of it kept.
+///
+/// This is the entry test, and it has to be a projection rather than the morsel's own ratio.
+/// "A morsel did not reduce" is true of two completely different keys: one with a few tens of
+/// thousands of groups, where a wider unit reduces enormously, and a **near-unique** one, where
+/// no unit reduces because the group count grows with the rows. Widening on the morsel's ratio
+/// alone treats them the same, so a `GROUP BY <customer id>` buffered and concatenated a chunk
+/// to rediscover that its key is unique — measured at ~5% on TPC-H q13 and q18, both of which
+/// are exactly that shape.
+///
+/// `agg_par::estimated_groups` is the projection: it inverts the coupon-collector curve on the
+/// morsel's `(rows, groups)` to recover the key's domain, then reads the curve forward to the
+/// chunk's row count. Shared with the materializing executor rather than restated, so the two
+/// paths cannot come to different conclusions about the same key.
+fn chunk_would_reduce(partial: &agg::Partial, rows: usize) -> bool {
+    if rows == 0 || reduces(partial, rows) {
+        return false; // the morsel already reduces; a wider unit is not needed
+    }
+    let projected = crate::agg_par::estimated_groups(rows, kept_rows(partial), 1, CHUNK_FOLD_ROWS);
+    (projected as f64 / CHUNK_FOLD_ROWS as f64) < MORSEL_REDUCTION_CEILING
 }
 
 /// Group a buffered run of morsels as one unit, draining the buffer.
@@ -538,4 +597,145 @@ pub(crate) fn combine_and_finalize(
         out.extend(finalize_partial(part, group_keys, aggregates)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod fold_unit_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bc_ir::{AggFunc, AggregateItem, ProjectionItem, RelOp};
+    use std::sync::Arc;
+
+    /// `n` rows whose key cycles through `groups` distinct values — a key whose cardinality
+    /// is exactly what the fold's unit choice is supposed to react to.
+    fn keyed(n: usize, groups: usize) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        (0..n)
+            .step_by(bc_arrow::DEFAULT_MORSEL_ROWS)
+            .map(|start| {
+                let end = (start + bc_arrow::DEFAULT_MORSEL_ROWS).min(n);
+                let k: ArrayRef = Arc::new(Int64Array::from(
+                    (start..end)
+                        .map(|i| (i % groups) as i64)
+                        .collect::<Vec<_>>(),
+                ));
+                let v: ArrayRef = Arc::new(Int64Array::from(
+                    (start..end).map(|i| i as i64).collect::<Vec<_>>(),
+                ));
+                RecordBatch::try_new(schema.clone(), vec![k, v]).unwrap()
+            })
+            .collect()
+    }
+
+    fn group_by_k_sum_v() -> RelOp {
+        RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            group_keys: vec![ProjectionItem {
+                alias: "k".into(),
+                expr: bc_expr::Expr::Col { name: "k".into() },
+            }],
+            aggregates: vec![AggregateItem {
+                alias: "s".into(),
+                func: AggFunc::Sum,
+                input: Some(bc_expr::Expr::Col { name: "v".into() }),
+                input2: None,
+                param: None,
+            }],
+        }
+    }
+
+    /// Whatever unit the fold picks, the answer is the sequential oracle's.
+    ///
+    /// The three cardinalities are the three regimes the unit choice distinguishes, and the
+    /// middle one is the only one the widening was written for: a key with far fewer groups
+    /// than a morsel has rows never leaves the morsel; one with far more never reduces at any
+    /// size and must come back to it; one in between is the case the chunk exists to serve.
+    /// Routing is a performance decision, so all three must agree with `execute` exactly.
+    #[test]
+    fn every_unit_choice_agrees_with_the_sequential_oracle() {
+        let rows = 400_000;
+        for groups in [8usize, 50_000, rows] {
+            let sources = vec![keyed(rows, groups)];
+            let plan = group_by_k_sum_v();
+            let streamed = crate::execute_streaming(&plan, &sources, 0).unwrap();
+            let oracle = crate::execute(&plan, &sources).unwrap();
+            let sums = |bs: &[RecordBatch]| -> Vec<(i64, i64)> {
+                let mut out: Vec<(i64, i64)> = bs
+                    .iter()
+                    .flat_map(|b| {
+                        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                        let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                        (0..b.num_rows())
+                            .map(|i| (k.value(i), s.value(i)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                out.sort_unstable();
+                out
+            };
+            assert_eq!(
+                sums(&streamed),
+                sums(&oracle),
+                "groups={groups}: the fold's unit choice changed the answer"
+            );
+            assert_eq!(sums(&streamed).len(), groups.min(rows));
+        }
+    }
+
+    /// A near-unique key does not stay on the chunked path.
+    ///
+    /// This is the regression the two-directional [`Unit`] exists for: such a key fails the
+    /// morsel test (it reduces at no unit size), and a widen-only rule would then pay a
+    /// `concat` per chunk forever for a reduction that was never available. Asserted on the
+    /// decision itself, because the cost it avoids is invisible in the result.
+    #[test]
+    fn a_key_that_reduces_at_no_size_returns_to_the_morsel() {
+        let rows = bc_arrow::DEFAULT_MORSEL_ROWS;
+        let unique = agg::Partial {
+            group_columns: vec![
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())) as ArrayRef,
+            ],
+            states: Vec::new(),
+        };
+        assert!(
+            !reduces(&unique, rows),
+            "a one-row-per-group partial reduces nothing"
+        );
+        let reduced = agg::Partial {
+            group_columns: vec![Arc::new(Int64Array::from(vec![0i64; 8])) as ArrayRef],
+            states: Vec::new(),
+        };
+        assert!(
+            reduces(&reduced, rows),
+            "eight groups over a morsel reduces"
+        );
+        assert!(
+            !chunk_would_reduce(&unique, rows),
+            "a near-unique key must not buffer a chunk it cannot benefit from"
+        );
+        assert!(
+            !chunk_would_reduce(&reduced, rows),
+            "a key the morsel already reduces needs no wider unit"
+        );
+
+        // The regime between them is the one the wider unit exists for: ~10,000 groups fill a
+        // morsel almost completely, and a chunk of the same key reduces about twelve-fold. The
+        // entry test has to tell it apart from the near-unique key *before* either pays a
+        // concatenation, which is why it projects rather than reading the morsel's own ratio.
+        let mid = agg::Partial {
+            group_columns: vec![
+                Arc::new(Int64Array::from((0..9_000i64).collect::<Vec<_>>())) as ArrayRef,
+            ],
+            states: Vec::new(),
+        };
+        assert!(!reduces(&mid, rows), "10k groups fill a morsel");
+        assert!(
+            chunk_would_reduce(&mid, rows),
+            "but a chunk of them reduces"
+        );
+    }
 }
