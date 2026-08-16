@@ -1,5 +1,85 @@
 # Batcher CPU benchmark results
 
+## Do these optimizations scale? Measured three ways — and only four TPC-H queries are superlinear (2026-08-15)
+
+"It is faster on this box at this scale" is the claim a benchmark supports. The claim the
+engine needs is that the same change still helps at ten times the data, on more cores, and
+when the work is spread across machines. Each was measured rather than argued.
+
+### Across data scale: sf1 -> sf10, and where it goes superlinear
+
+TPC-H at scale 10 (60M-row `lineitem`), same binary, against DuckDB's native store. Ten times
+the data, so ten times the time is the line to beat:
+
+| query | shape | sf1 | sf10 | Batcher x | DuckDB x |
+|---|---|---:|---:|---:|---:|
+| q15 | scan+agg | 2.3 ms | 3.3 | **1.4** | 3.8 |
+| q22 | scan+agg | 18.9 | 43.0 | **2.3** | 3.0 |
+| q6 | scan+filter | 5.8 | 30.3 | **5.2** | 3.6 |
+| q10 | join | 28.0 | 152.1 | **5.4** | 3.4 |
+| q1 | scan+agg | 15.5 | 93.6 | **6.0** | 4.7 |
+| q8 | join | 17.7 | 105.8 | **6.0** | 3.7 |
+| q7 | join | 20.7 | 134.6 | **6.5** | 2.4 |
+| q3 | join | 19.9 | 145.3 | **7.3** | 3.8 |
+| q21 | join | 73.1 | 540.1 | **7.4** | 4.1 |
+| q9 | join | 47.9 | 536.1 | 11.2 | 3.0 |
+| q18 | join+agg | 31.4 | 392.9 | 12.5 | 4.2 |
+| q13 | join+agg | 40.2 | 510.3 | 12.7 | 2.8 |
+| q5 | join | 25.3 | 376.7 | 14.9 | 4.5 |
+
+**Nine of thirteen are sublinear** — a scan, a filter and most joins cost less than ten times
+as much for ten times the rows, because at sf1 they do not fill the machine and at sf10 they
+do. Four are superlinear and they are named rather than averaged away: q5, q9, q13 and q18.
+q13 and q18 both carry a very high-cardinality `GROUP BY` (1.5M and 15M groups at sf10), q9
+builds the largest intermediate in the benchmark, and q5 is the six-way join. The suite
+geomean against DuckDB is therefore **0.78x at sf1 and 1.27x at sf10** — still a loss at ten
+times the data, and better than the 1.461x this file last recorded there.
+
+DuckDB's column reads 2.4-4.7x throughout, which is not a better engine scaling law: it is a
+~15 ms fixed cost per query that dominates its sf1 numbers and disappears at sf10. Neither
+column is the interesting one on its own; the shape of Batcher's is.
+
+### Across cores: the gather-dominated join saturates at ~10x, not 48x
+
+H2O `join` q5 (10M x 10M inner join, 9M rows and 13 columns out — the shape the parallel
+gather work in this session targets), one binary, thread count pinned:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ms | 3,790 | 1,885 | 1,114 | 658 | 433 | 388 | **375** | 442 |
+| speedup | 1.0x | 2.0x | 3.4x | 5.8x | 8.8x | 9.8x | **10.1x** | 8.6x |
+| efficiency | 100% | 101% | 85% | 72% | 55% | 31% | 21% | 13% |
+
+Linear to two cores, 85% at four, and then a hard ceiling near **10x** — an Amdahl serial
+fraction of roughly 9%, reached by sixteen cores. Past 48 (this box's *physical* core count)
+it gets worse. So the honest statement about the gather work is that it makes the parallel
+part faster and does not remove the serial one; a claim of linear scaling to 96 threads on
+this shape would be false, and the curve above is what to quote instead.
+
+### Across machines: the results are identical, and nothing added holds per-node state
+
+`--benchmark distributed` runs each query single-node and again across 8 partitions and
+asserts the two agree before reporting a timing. **Distributed results match single-node on
+every query** with all of this session's changes in place — the mergeable algebra
+(`partial / combine / finalize`) is untouched by any of them.
+
+Per change, against "what happens at N nodes":
+
+| change | where it runs | at N nodes |
+|---|---|---|
+| single-allocation parallel gather | `bc-runtime`, per gather | unchanged — a worker gathers its own shard, and the fill is per chunk of it |
+| mimalloc purge delay | per process | unchanged — every worker is a process and retains its own arena |
+| plane-addressed string gather | inside `combine` | **improves** — `combine` is what a worker runs after a shuffle, and a worker's share is smaller |
+| nullable primitive gather | inside `combine` | as above |
+| `operator_cores` width | per process | unchanged — derived from a fresh `usable_cores`, so a Ray worker's post-start CPU affinity and its cgroup quota both bind |
+| one width for both executors | per process | **improves** — the mismatch it removes was worst where the shard count and the pool disagreed |
+| scan-only identity projection | driver, per query | unchanged — it removes an FFI round trip, which every node pays separately |
+| learned-column source index | driver | unchanged — it is per *query history*, never per node |
+
+The one thing to watch is the width: `operator_cores` reads the *worker's* topology, so a
+heterogeneous fleet picks a different width per machine, which is correct and is why the SMT
+ratio comes from the cached topology while the count comes from a fresh `usable_cores`.
+
 ## Every suite run, five engine changes, and the two that were measured and thrown away — TPC-H 0.848x -> 0.774x, TPC-DS 1.132x -> 1.080x, h2o-join 1.027x -> 0.89x, and the Join Order Benchmark finishes (2026-08-15)
 
 Every runnable suite measured on the 96-core / 184 GiB box, then five changes, then every

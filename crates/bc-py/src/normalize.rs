@@ -78,7 +78,11 @@ pub(crate) fn widen_to(dt: &DataType) -> Option<DataType> {
 ///
 /// NOTE (2026-07-10): `assign_groups` *does* now have a dictionary fast path (grouping on
 /// codes is ~7x faster than the decoded string), so preserving a string dictionary here
-/// would win group-by/distinct/window. It is **not** yet safe to do so: the logical plan's
+/// would win group-by/distinct/window. Measured from the other side on 2026-08-15, the
+/// decode is what a dictionary input costs today: `GROUP BY id1, id2` over 10M rows runs in
+/// **38.8 ms on plain `Utf8` and 151.5 ms on the same two columns dictionary-encoded** —
+/// an encoding that exists to make this cheaper makes it 3.9x dearer, and the whole
+/// difference is this cast. It is **not** yet safe to preserve: the logical plan's
 /// schema treats a column by its Arrow type, so a preserved `Dictionary` propagates through
 /// intermediate schemas, and an operator that decodes it (e.g. `distinct`'s rep column) then
 /// produces a `Utf8` batch that fails the plan's `Dictionary` schema check. Enabling this is
