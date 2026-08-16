@@ -212,12 +212,25 @@ class StatsEstimator:
         self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
         self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
         # `row_width` memo, same identity discipline and same lifetime as `_row_cache`.
-        self._width_cache: dict[tuple[int, float], tuple[LogicalPlan, float]] = {}
+        self._width_cache: dict[tuple[object, float], tuple[LogicalPlan, float]] = {}
         # Per-source learned column stats (`{source_id: {column: ColumnStat}}`), built
         # lazily per source. Resolving them **per source** is the whole point: the learned
         # maps are keyed by `(source, column)`, so a `Scan` gets its *own* table's measured
         # ndv/quantiles/mcv/width and never another table's column of the same name.
         self._learned_cols: dict[int, dict[str, ColumnStat]] = {}
+        # `Scan` statistics, keyed by the **source object** rather than by the node or by
+        # the source *index*. A scan's estimate reads nothing but the source it binds — the
+        # source's declared statistics merged with what past runs measured for it — so every
+        # scan of one table computes the identical bundle.
+        #
+        # Neither existing memo collapses them. The node-identity one cannot, because a
+        # query naming a table more than once carries a distinct `Scan` node per reference
+        # (one per CTE, per union branch, per grouping level); and the index cannot either,
+        # because each of those references also gets **its own entry in the source list**
+        # pointing at the same object. TPC-DS q77 binds 9 tables through 48 source ids, and
+        # `scan_columns` — a `dataclasses.replace` per column of a 30-column dimension — was
+        # 12% of the query's warm wall time, all of it computing nine answers 48 times.
+        self._scan_cache: dict[tuple[int, int], RelStats] = {}
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -512,6 +525,46 @@ class StatsEstimator:
         # The `Scan` leaf is where measured statistics enter the plan, and where they are
         # bound to the source that was actually measured. Everything above reads them off
         # `RelStats.columns` as they propagate.
+        key = self._binding_key(node.source_id)
+        cached = self._scan_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._scan_relstats(node)
+        self._scan_cache[key] = result
+        return result
+
+    def _binding_key(self, source_id: int) -> tuple[int, int]:
+        """A key equal for two source ids whose scan statistics are provably identical.
+
+        Both halves of what `_scan_relstats` reads: the bound source object (which decides
+        the learned bundle, through `_source_key`) and the `SourceStatistics` entry (which
+        decides the declared bounds and the row count). `collect_source_stats` hands the
+        *same* statistics object to every index binding one source — it memoizes per source
+        — so the pair collapses q77's 48 bindings onto 9 keys.
+
+        Keying on the source object alone would be unsound, and the oracle test that caught
+        it is the reason to say so: `StatsEstimator([None] * n, source_stats=[...])` binds
+        every leaf to the same `None` placeholder while giving each a *different* row count,
+        so the object says "identical" where the statistics say "unrelated". Reading both is
+        exact rather than merely safer.
+
+        `id()` is sound for the estimator's lifetime because the estimator holds both lists,
+        so nothing keyed here can be freed and have its address reused. A source id past the
+        end of both lists — a plan estimated with no bound inputs at all — keys on itself, so
+        such scans memoize per id and never share.
+        """
+        source = self._sources[source_id] if source_id < len(self._sources) else None
+        stats = (
+            self._source_stats[source_id]
+            if self._source_stats is not None and source_id < len(self._source_stats)
+            else None
+        )
+        if source is None and stats is None:
+            return (-1 - source_id, -1 - source_id)
+        return (id(source), id(stats))
+
+    def _scan_relstats(self, node: Scan) -> RelStats:
+        """The scan's statistics, uncached — everything `_scan_cache` keys on producing it."""
         learned = self.learned_columns(node.source_id)
         src_stats = self._stats_for(node.source_id)
         if src_stats is not None:
@@ -1493,14 +1546,28 @@ class StatsEstimator:
         per-column byte map and sums over every column — and the join-order DP asks for it
         once per candidate it costs. Measured on `join_star(8)`, ~950 calls per `optimize`
         and **21% of the search**.
+
+        A `Scan` is memoized by what it *reads* instead — the bound source object and the
+        schema — for the reason `_scan_cache` gives: a query naming a table several times
+        carries one `Scan` node and one source id per reference, so node identity sees 48
+        different scans where the plan reads 9 tables.
         """
-        key = (id(node), default)
+        key = (self._width_key(node), default)
         hit = self._width_cache.get(key)
-        if hit is not None and hit[0] is node:
+        if hit is not None and (hit[0] is node or isinstance(node, Scan)):
             return hit[1]
         value = self._row_width_uncached(node, default)
         self._width_cache[key] = (node, value)
         return value
+
+    def _width_key(self, node: LogicalPlan) -> int | tuple[tuple[int, int], int]:
+        """The memo identity of `node` for [`row_width`] — see its note on scans.
+
+        The two shapes never collide: a scan keys on a tuple, everything else on an `int`.
+        """
+        if isinstance(node, Scan):
+            return (self._binding_key(node.source_id), id(node.schema))
+        return id(node)
 
     def _row_width_uncached(self, node: LogicalPlan, default: float) -> float:
         widths = _avg_bytes(self.estimate(node))
