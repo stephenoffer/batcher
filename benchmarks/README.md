@@ -145,13 +145,17 @@ python3 benchmarks/run.py --benchmark job --skip job-q7c       # complete a run 
 BENCH_JOB_LOCAL=/data/job python3 benchmarks/run.py --benchmark job   # relocate the mirror
 ```
 
-> **Batcher currently cannot finish this suite.** Two full runs were **OOM-killed** — at
-> `job-q7c`, and with that skipped at `job-q10a` — on a 30 GiB box, where DuckDB answers
-> q7c in 0.43 s. Both are many-way joins whose predicates are all top-level equalities, so
-> this is join ordering, not the disjunction problem TPC-DS q13 turned out to be. Pinning
-> `--memory-bytes` does not contain it: the allocation is outside the path Carbonite bounds,
-> so the process dies rather than spilling. Use `--skip` to complete a run around a fatal
-> query; `BENCHMARK_RESULTS.md` has the detail.
+> **Batcher finishes this suite on a large box, and its memory is still the thing to watch.**
+> All 113 queries complete with none killed on a 184 GiB box (geomean 1.488x, 31 wins), and
+> `job-q7c` — which two earlier runs were **OOM-killed** on, at 30 GiB — answers in 291 ms
+> against DuckDB's 504. That is not a fix: peak RSS here is ~15-22 GiB, which is the band
+> that would still die at 30 GiB, and pinning `--memory-bytes` does not contain it because
+> the allocation is outside the path Carbonite bounds. Run it under `--isolate` on a smaller
+> box, so a query that kills its process costs one row rather than the whole report, and use
+> `--skip` to complete a run around a fatal one. `BENCHMARK_RESULTS.md` has the detail.
+>
+> Four queries show `PARTIAL` for **DuckDB**, not for Batcher: q15a-d alias `aka_title AS at`,
+> and `at` is a reserved word in DuckDB's parser.
 
 ## The H2O.ai db-benchmark: groupby and join at dataframe scale
 
