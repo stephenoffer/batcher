@@ -166,3 +166,41 @@ class TestRecordColumnStatsStillWorks:
         record_column_stats(hub, ndv={"id": 42.0}, quantiles={}, source_key="any-source")
         learned = hub.load_keyed_params(STATS_NAMESPACE)
         assert columns_for(learned, NDV_KEY, "any-source") == {"id": 42.0}
+
+    def test_the_source_index_is_rebuilt_when_the_table_changes(self) -> None:
+        """`columns_for` caches the table split by source; a write must invalidate it.
+
+        The cache is keyed on the table **object**, which is exact only because
+        `merge_column_table` copies rather than mutating in place. This is the test that
+        holds that property: if a write ever started mutating the stored dict, the second
+        assertion below would read the first measurement back and the optimizer would plan
+        on a statistic it had already replaced.
+
+        Two sources are used because the split is per source, and the second one must not
+        appear under the first — the collision the qualified keys exist to prevent.
+        """
+        hub = _hub()
+        record_column_stats(hub, ndv={"id": 10.0}, quantiles={}, source_key="a")
+        learned = hub.load_keyed_params(STATS_NAMESPACE)
+        assert columns_for(learned, NDV_KEY, "a") == {"id": 10.0}
+        assert columns_for(learned, NDV_KEY, "b") == {}
+
+        record_column_stats(hub, ndv={"id": 99.0, "k": 3.0}, quantiles={}, source_key="a")
+        record_column_stats(hub, ndv={"id": 5.0}, quantiles={}, source_key="b")
+        learned = hub.load_keyed_params(STATS_NAMESPACE)
+        assert columns_for(learned, NDV_KEY, "a") == {"id": 99.0, "k": 3.0}
+        assert columns_for(learned, NDV_KEY, "b") == {"id": 5.0}
+        assert columns_for(learned, NDV_KEY, "never-measured") == {}
+
+    def test_a_column_name_holding_the_separator_is_still_split_at_the_first_one(self) -> None:
+        """A source key is everything before the *first* separator, as `qualify` writes it.
+
+        `str.partition` splits at the first occurrence and `key[len(prefix):]` stripped a
+        known prefix, so the two agree — but only for the first. Nothing generates a column
+        name containing `\\x1f`, and this pins that the two spellings of the split cannot
+        disagree if one ever does.
+        """
+        hub = _hub()
+        hub.put_keyed_param(STATS_NAMESPACE, NDV_KEY, {qualify("src", "od\x1fd"): 4.0})
+        learned = hub.load_keyed_params(STATS_NAMESPACE)
+        assert columns_for(learned, NDV_KEY, "src") == {"od\x1fd": 4.0}
