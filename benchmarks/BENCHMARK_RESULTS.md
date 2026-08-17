@@ -85,6 +85,19 @@ this input was systematically ~10x low**. `MATERIALIZE_AGG_MIN_GROUPS` is itself
 its docstring records a crossover "measured between 3,000 and 4,000 groups", measured against
 estimates that were an order of magnitude under the truth.
 
+**Where the damage actually is, for whoever picks this up.** It is not diffuse: on TPC-DS it
+is one query. `q98` goes 12.5 ms -> 44.0 ms and everything else moves 2-5%, inside the spread
+of a run where DuckDB itself sped up across the board (q78's comparator 64.3 -> 56.3 ms), which
+is what made the suite geomean look worse than the change is. And q98's regression is **not a
+plan change**: alone it runs at 14.1 ms with the fix (1.00x), and after the other 98 queries
+have run in the same process it runs at 43.7 ms — with an *identical* optimized plan, identical
+build-side decisions (L=2,736,384 R=29/30), an identical `prefer_materializing_aggregate=False`
+and an identical root estimate. What differs is one broadcast hash join whose build-side
+provenance flips `[default]` -> `[learned]` and which then takes 30.9 ms of the query's 45.8
+instead of ~5, at 42% CPU on a 2.88 M-row probe against a 31-row build. So the first thing to
+look at is not a threshold at all: it is what a `learned` provenance changes downstream of the
+build-side choice, once other queries in the process have written entries.
+
 So the honest statement is that this is not a one-line fix with a bad outcome — it is a
 one-line fix that *exposes* how much of the cost model is fitted on top of it. Landing it
 means re-deriving those constants against corrected cardinalities and re-measuring all nine
