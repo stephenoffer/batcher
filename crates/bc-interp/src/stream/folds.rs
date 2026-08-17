@@ -433,6 +433,7 @@ pub(crate) fn fold_partial(
     // either way, so `combine`, `finalize`, the spill path and the distributed reduce are
     // untouched; only the size of the unit changes.
     let mut unit = Unit::Morsel;
+    let mut asked = false;
     let mut chunk: Vec<RecordBatch> = Vec::new();
     let mut chunk_rows = 0usize;
 
@@ -461,8 +462,17 @@ pub(crate) fn fold_partial(
             }
         } else {
             let partial = ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?;
-            if unit == Unit::Morsel && chunk_would_reduce(&partial, morsel.num_rows()) {
-                unit = Unit::Chunk;
+            // Asked once, of the first morsel, and never again. The projection inverts the
+            // coupon-collector curve by bisection, which is far too much arithmetic to repeat
+            // per morsel — and repeating it answers nothing new, because the reduction a key
+            // achieves is a property of the key rather than of where the stream has reached.
+            // A shard whose later morsels disagree is covered from the other side: the chunk's
+            // own measurement below can send the fold back to the morsel.
+            if !asked {
+                asked = true;
+                if chunk_would_reduce(&partial, morsel.num_rows()) {
+                    unit = Unit::Chunk;
+                }
             }
             partials.push(partial);
         }
