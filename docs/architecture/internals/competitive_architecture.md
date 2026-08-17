@@ -1,8 +1,44 @@
 # Competitive architecture: where Batcher wins, where it loses, and what it must build
 
-**Status:** audit, 2026-07-14; partially re-audited 2026-07-29 and 2026-08-01. Every claim
-below was checked against code, not documentation. Where the docs and the code disagreed, the
+**Status:** audit, 2026-07-14; partially re-audited 2026-07-29, 2026-08-01, 2026-08-15 and
+2026-08-16. Every claim below was checked against code, not documentation. Where the docs and the code disagreed, the
 code won and the doc is named as wrong.
+
+**What the 2026-08-16 pass changed.** Re-measured every suite on the same 96-core / 184 GiB
+node, each on a **two-engine** lineup (`batcher,duckdb`) so no third engine's resident memory
+perturbs the timing — a four-engine run reads H2O `join` at 1.83x against 0.93x on two, so the
+lineup is part of the measurement and is now stated with every figure.
+
+Against DuckDB's **native compressed store**: JSON 0.245x (5/5), ClickBench 0.636x (28/43),
+operators 0.656x (11/19), TPC-H sf1 0.789x (16/22), H2O `join` **0.928x (3/5, now a win)**,
+TPC-DS 0.963x (38/98), H2O `groupby` **1.191x** (was 1.28x), JOB **1.285x** (was 1.37x). Six
+of eight.
+
+Against DuckDB on the **same zero-copy Arrow** — the bar `methodology.md` designates the
+like-for-like execution comparison — **every suite that can run it is a win**: JSON 0.039x
+(5/5), ClickBench 0.072x (43/43), H2O `groupby` 0.089x (10/10), H2O `join` 0.244x (5/5), TPC-H
+0.256x (22/22), operators 0.362x (15/19). TPC-DS and JOB have no figure on that bar because
+DuckDB over registered Arrow views has no storage statistics to order a many-way join with and
+is SIGKILLed on TPC-DS q64 — see `engines/lineup.py`.
+
+Two rows below move, and neither claim in them is retired:
+
+* **H2O `groupby` (1.28x -> 1.191x)** — still L against the native store, and still for the
+  reason recorded below (dictionary-encoded keys). What changed is the *composite* key: each
+  byte column's distinct values are now numbered in first-seen order and the ranked columns
+  take the ordinary integer grouper, which took a two-string-key group-by over 10M rows from
+  41.7 ms to 32.6 ms — identical to the same query with two `int64` keys, so nothing about the
+  strings is left to pay for. The suite's residue is its two single-key 100,000-distinct
+  queries (q3, q7), which is the dictionary case exactly.
+* **JOB (1.37x -> 1.285x)** — still L, and this pass located *why* the cross-run loop is not
+  answering it: `record_cardinality_outcome` files a measured row count under the plan **as
+  written**, whose root for any `SELECT ... GROUP BY` is a `Project` — a node type excluded
+  from the estimator's `_CORRECTABLE` set. Nine lookups, nine misses over three rounds of
+  three h2o group-bys, while the writer wrote the true count each time. Correcting the key
+  **regresses** the suites (TPC-DS 0.965 -> 0.988, JOB 1.252 -> 1.293), because every
+  threshold downstream was calibrated while that input was ~10x low. Recorded in
+  `BENCHMARK_RESULTS.md` and pinned as a strict xfail in
+  `tests/unit/test_learned_rows_scope.py`; it must land with that recalibration, not before.
 
 **What the 2026-08-15 pass changed**, measured on a 96-core / 184 GiB node rather than the
 16-core one the older rows were taken on, so read it as a re-measurement and not only as

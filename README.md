@@ -94,8 +94,8 @@ covers both halves and where each one stops.
 
 | Tool | Where it stops | What Batcher does instead | Measured (geomean, 2026-08-15) |
 |------|----------------|---------------------------|----------|
-| **DuckDB**, its own compressed store | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **1.3×** TPC-H sf1 (17/22), **1.04×** all 99 TPC-DS (44/99), **1.6×** ClickBench (30/43), **4.0×** JSON (5/5) |
-| **DuckDB**, on the same Arrow | — | the like-for-like execution comparison | **3.9×** TPC-H sf1 (**22/22**), **14×** ClickBench (**43/43**), **27×** JSON (5/5) |
+| **DuckDB**, its own compressed store | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **1.3×** TPC-H sf1 (16/22), **1.04×** all 99 TPC-DS (38/98), **1.6×** ClickBench (28/43), **4.1×** JSON (5/5), **1.1×** H2O `join` |
+| **DuckDB**, on the same Arrow | — | the like-for-like execution comparison | **wins every suite this bar can run**: **3.9×** TPC-H sf1 (**22/22**), **14×** ClickBench (**43/43**), **26×** JSON (5/5), **11×** H2O `groupby` (**10/10**), **4.1×** H2O `join` (**5/5**), **2.8×** the operator mix |
 | **Polars** | fast, but single-node | the same code runs from one core to a cluster | **2.4×** TPC-H sf1 (21/22), **3.0×** ClickBench, **8.6×** the operator mix (19/19) |
 | **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.9×** TPC-H sf1 (20/20), **3.8×** ClickBench (41/41), **2.4×** cluster-vs-cluster |
 | **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up | **5×–33×** on TPC-H |
@@ -109,9 +109,15 @@ answer exactly.
 
 Four places Batcher does **not** win, stated up front, all of them against DuckDB reading its
 own compressed store: TPC-H at scale factor 10 (1.29× DuckDB, 8 of 22), the 113-query Join
-Order Benchmark (1.37×, 31 of 109), the H2O.ai `groupby` task (1.28×, 4 of 10), and Parquet
+Order Benchmark (1.29×, 35 of 109), the H2O.ai `groupby` task (1.19×, 4 of 10), and Parquet
 decode (1.4×–2.8×, which is `arrow-rs` and is slower than PyArrow too). High-concurrency
 serving is not this engine's shape at all. All are detailed below.
+
+Two of those four are the storage format rather than the engine, and the like-for-like row
+above is how you tell: `groupby` goes from a loss to a Batcher win **10 of 10** on the same
+Arrow, and sf10 to 21 of 22. The Join Order Benchmark is the one that is genuinely about
+planning — it is built to expose exactly the estimation errors this design claims to correct,
+and it remains behind.
 
 ## Benchmarks
 
@@ -143,7 +149,7 @@ row is correctness-gated against DuckDB:
 | dedup by key, ordered | **1.1×** | **1.8×** | **32×** | **40×** | &mdash;&sup3; |
 | sort &rarr; top-N (`LIMIT`) | **1.1×** | **1.3×** | **34×** | **396×** | **7.0×** |
 | sort by string | 0.91× (slower) | 0.89× (slower) | **3.5×** | **33×** | **31×** |
-| group-by sum (2 keys) | 0.88× (slower) | **3.2×** | **3.6×** | **1.2×** | **6.5×** |
+| group-by sum (2 keys) | 0.82× (slower) | **2.6×** | **3.0×** | **1.1×** | **6.5×** |
 | filter &rarr; project | 0.83× (slower) | **2.6×** | **1.7×** | **23×** | **1.4×** |
 | distinct, high cardinality | 0.81× (slower) | 0.94× (slower) | **5.7×** | **6.9×** | **1.8×** |
 | sort by string, low cardinality | 0.65× (slower) | 0.89× (slower) | **3.5×** | **25×** | **10×** |

@@ -1,5 +1,69 @@
 # Batcher CPU benchmark results
 
+## Composite string keys stop being strings — h2o-groupby 1.310x -> 1.191x, and every suite measured on identical Arrow input is a win (2026-08-16)
+
+Two kernel changes and a final sweep of every suite on both DuckDB bars. The numbers below
+are the authoritative reading for this session; the two entries beneath it record how they
+were reached.
+
+### Against DuckDB's native compressed store — the harder bar
+
+Lineup `batcher,duckdb` for every suite, so no third engine's memory perturbs the timing (a
+four-engine run reads h2o-join at 1.83x against 0.93x here, which is why the lineup is stated
+rather than assumed).
+
+| suite | n | start of session | now | |
+|---|---:|---:|---:|---|
+| JSON | 5 | 0.255x | **0.245** | win |
+| ClickBench | 43 | 0.621x | **0.636** | win |
+| operators | 19 | 0.649x | **0.656** | win |
+| TPC-H sf1 | 22 | 0.764x | **0.789** | win |
+| h2o-join | 5 | 1.019x | **0.928** | win |
+| TPC-DS sf1 | 98 | 0.976x | **0.963** | win |
+| h2o-groupby | 10 | 1.310x | **1.191** | lose |
+| JOB | 109 | 1.271x | **1.285** | lose |
+
+Six of eight. h2o-groupby moved by 9% and is the session's largest single movement;
+ClickBench, operators and TPC-H each moved by less than their own between-round spread and
+should be read as flat.
+
+### Against DuckDB on the same zero-copy Arrow — the like-for-like execution bar
+
+`methodology.md` designates this bar "the like-for-like execution comparison", and on it
+**every suite that can run it is a win, most of them by an order of magnitude**:
+
+| suite | geomean | wins |
+|---|---:|---|
+| JSON | **0.039x** | 5/5 |
+| ClickBench | **0.072x** | 43/43 |
+| h2o-groupby | **0.089x** | 10/10 |
+| h2o-join | **0.244x** | 5/5 |
+| TPC-H sf1 | **0.256x** | 22/22 |
+| operators | **0.362x** | 15/19 |
+
+TPC-DS and JOB are absent for a reason that is not Batcher's: over registered Arrow views
+DuckDB's planner has no storage statistics to order a many-way join with, and it is
+*SIGKILL*ed on TPC-DS q64 and still growing past 22 GiB on q72. That is recorded in
+`engines/lineup.py` and is why `duckdb_arrow` is not in the default lineup.
+
+### Why the two remaining native-store losses are not kernel defects
+
+**h2o-groupby is the dictionary-encoded key.** Its worst queries are q3 and q7, and both
+group by `id3` — one string column with 100,000 distinct values. DuckDB holds it
+dictionary-encoded in its own store and groups on the codes; Batcher is handed decoded Arrow
+`Utf8` and must derive them. The same suite on the same Arrow input is **0.089x, 10 of 10**,
+which is the measurement that separates the storage format from the execution. Closing it on
+the native-store bar means preserving dictionary encoding across the FFI boundary — which
+`bc_py::normalize::normalize_to` documents as unsafe today (a preserved `Dictionary`
+propagates into intermediate schemas an operator will decode) and defers to
+`rfc-streaming-executor.md` Proposal 3. Grouping a *dictionary* column is already ~7x faster
+than the decoded one; the boundary is the blocker, not the kernel.
+
+**JOB is estimation under correlated predicates**, which is what Leis et al. built it to
+expose. This session found, and recorded above, that the cross-run loop meant to answer it is
+writing to a key nothing reads — and that correcting the key regresses the suites, because
+every threshold downstream was calibrated while that input was ~10x low.
+
 ## The cross-query cardinality loop is writing to a key nothing reads — and correcting it regresses the suites, because everything downstream was calibrated on the gap (2026-08-16)
 
 Chasing why the executor router declines the one aggregate shape it should take turned into

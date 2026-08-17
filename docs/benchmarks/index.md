@@ -46,14 +46,14 @@ same zero-copy Arrow Batcher runs on (the like-for-like one). Lower is better an
 | Suite | vs `duckdb` | vs `duckdb_arrow` | vs Polars | vs Daft |
 |---|---:|---:|---:|---:|
 | **Semi-structured JSON** (5) | **0.25x**, 5 of 5 | **0.04x**, 5 of 5 | **0.01x** | **0.02x** |
-| **ClickBench** (43) | **0.62x**, 30 of 43 | **0.07x**, 43 of 43 | **0.33x**, 36 of 40 | **0.26x**, 41 of 41 |
-| **Operator mix** (19) | **0.64x**, 12 of 19 | **0.35x**, 15 of 19 | **0.12x**, 19 of 19 | **0.12x**, 15 of 15 |
-| **TPC-H sf1** (22) | **0.76x**, 17 of 22 | **0.26x**, 22 of 22 | **0.43x**, 21 of 22 | **0.35x**, 20 of 20 |
-| **H2O.ai `join`** (5) | **0.95x**, 3 of 5 | **0.24x**, 5 of 5 | **0.63x** | — |
-| **TPC-DS sf1** (99) | **0.96x**, 44 of 99 | — | — | — |
-| **H2O.ai `groupby`** (10) | 1.28x, 4 of 10 | **0.11x**, 10 of 10 | **0.49x** | — |
+| **ClickBench** (43) | **0.64x**, 28 of 43 | **0.07x**, 43 of 43 | **0.33x**, 36 of 40 | **0.26x**, 41 of 41 |
+| **Operator mix** (19) | **0.66x**, 11 of 19 | **0.36x**, 15 of 19 | **0.12x**, 19 of 19 | **0.12x**, 15 of 15 |
+| **TPC-H sf1** (22) | **0.79x**, 16 of 22 | **0.26x**, 22 of 22 | **0.43x**, 20 of 22 | **0.35x**, 20 of 20 |
+| **H2O.ai `join`** (5) | **0.93x**, 3 of 5 | **0.24x**, 5 of 5 | **0.69x** | — |
+| **TPC-DS sf1** (99) | **0.96x**, 38 of 98 | — | — | — |
+| **H2O.ai `groupby`** (10) | 1.19x, 4 of 10 | **0.09x**, 10 of 10 | **0.42x** | — |
 | **TPC-H sf10** (22) | 1.29x, 8 of 22 | — | **0.37x**, 18 of 22 | **0.42x**, 16 of 20 |
-| **Join Order Benchmark** (113) | 1.37x, 31 of 109 | — | — | — |
+| **Join Order Benchmark** (113) | 1.29x, 35 of 109 | — | — | — |
 
 | Other workloads | Measured |
 |---|---|
