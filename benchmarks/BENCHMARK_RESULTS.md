@@ -67,7 +67,14 @@ And it makes the suites worse:
 | TPC-H sf1 | 0.765 | 0.760 |
 | operators | 0.633 | 0.628 |
 | h2o-groupby | 1.151 | **1.180** |
+| JOB | 1.252 | **1.293** |
 | TPC-DS sf1 | 0.965 | **0.988** |
+
+**JOB is the decisive row.** Leis et al. built it to show that cardinality estimation, not
+join-order search, is where optimizers lose — so it is the suite where a correct measurement
+should pay best, and it is where correcting one costs the most in absolute terms (q5b 3.29 ->
+4.85, q7a 2.04 -> 3.42, q5c 1.28 -> 2.49, and thirty more). An estimator that is accurate
+against a cost model tuned for an inaccurate one is not an improvement to either half.
 
 h2o q2 improves exactly as predicted (2.16 -> 2.04). What costs more than that is everything
 else: TPC-DS q98 **0.81 -> 3.09**, q5 5.94 -> 6.55, q78 3.35 -> 3.92, q37 2.56 -> 2.96, and
