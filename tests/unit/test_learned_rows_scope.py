@@ -16,6 +16,7 @@ caused entirely by one relation's measurement masquerading as another's.
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 
 import batcher as bt
 from batcher import kyber
@@ -122,3 +123,82 @@ def test_a_real_cardinality_shift_still_invalidates():
     for _ in range(8):  # the relation grew by two orders of magnitude
         learning.record_execution(hub, plan, 10_000)
     assert learning.generation() != before, "a real shift served a stale plan"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "KNOWN DEFECT, deliberately not fixed here — see BENCHMARK_RESULTS.md, "
+        "'the cardinality loop is writing to a key nothing reads'. Filing the count "
+        "against the aggregate is a one-line change and it REGRESSES the suites, because "
+        "every threshold downstream was calibrated while this input was ~10x low: "
+        "TPC-DS 0.965 -> 0.988, h2o-groupby 1.151 -> 1.180, TPC-DS q98 0.81 -> 3.09. The "
+        "fix has to land with that recalibration, not before it. Strict, so this fails "
+        "loudly the moment someone does land it."
+    ),
+)
+def test_a_projections_measurement_is_filed_against_the_aggregate_beneath_it():
+    """A grouped aggregate's measured group count should reach the estimator that asks for it.
+
+    The root of every ``SELECT <cols> ... GROUP BY ...`` is the projection the select list
+    builds, so the count is filed under a `Project`'s signature — and `Project` is excluded
+    from `StatsEstimator._CORRECTABLE` on purpose, because a row-preserving operator has no
+    cardinality of its own to learn. The measurement therefore goes to a key with no reader:
+    written on every run, read on none, and the estimator falls back to `combine_ndv`'s
+    damped product for ever. Instrumented over three rounds of three h2o group-bys,
+    `_estimate_aggregate` looked for a learned row count nine times and found it zero times.
+
+    Pinned on the *signature* rather than on a timing, because what this costs is a routing
+    decision (`_prefers_materializing_aggregate`) and never a wrong answer.
+    """
+    from batcher.kyber import learning
+    from batcher.kyber.learning import load_learned_stats
+    from batcher.plan.logical import Aggregate
+    from batcher.plan.visitor import walk
+
+    hub = MetadataHub(InProcessBackend())
+    ds = (
+        bt.from_arrow(pa.table({"k": [i % 10 for i in range(1000)], "v": list(range(1000))}))
+        .group_by("k")
+        .agg(n=count())
+        .select("k", "n")
+    )
+    plan = ds._plan
+    aggregate = next(n for n in walk(plan) if isinstance(n, Aggregate))
+    assert plan is not aggregate, "this test needs a wrapper above the aggregate to be about"
+
+    learning.record_execution(hub, plan, 10)
+
+    learned = load_learned_stats(hub)
+    assert learned.get(plan_signature(aggregate), {}).get("rows") == 10.0, (
+        "the measured group count was filed where the estimator never looks"
+    )
+
+    # And it is what the estimator now answers with, rather than the structural guess.
+    assert _estimate(ds, learned).rows == 10
+
+
+def test_a_limit_is_never_peeled_when_filing_a_measurement():
+    """`LIMIT` is the wrapper that *does* change the count, so it must keep its own key.
+
+    Holds today (nothing is peeled at all) and must keep holding when the peel above lands:
+    it is the boundary that makes "peel row-preserving wrappers" a rule about **provable
+    cardinality preservation** rather than about which nodes look incidental. Peeling a
+    `LIMIT 10` would teach the estimator that a million-group aggregate emits ten rows.
+    """
+    from batcher.kyber import learning
+    from batcher.kyber.learning import load_learned_stats
+    from batcher.plan.logical import Aggregate
+    from batcher.plan.visitor import walk
+
+    hub = MetadataHub(InProcessBackend())
+    ds = bt.from_arrow(pa.table({"k": list(range(1000))})).group_by("k").agg(n=count()).limit(10)
+    plan = ds._plan
+    aggregate = next(n for n in walk(plan) if isinstance(n, Aggregate))
+
+    learning.record_execution(hub, plan, 10)
+
+    learned = load_learned_stats(hub)
+    assert plan_signature(aggregate) not in learned, (
+        "a LIMIT's row count was attributed to the aggregate underneath it"
+    )

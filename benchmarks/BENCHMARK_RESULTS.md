@@ -1,5 +1,91 @@
 # Batcher CPU benchmark results
 
+## The cross-query cardinality loop is writing to a key nothing reads — and correcting it regresses the suites, because everything downstream was calibrated on the gap (2026-08-16)
+
+Chasing why the executor router declines the one aggregate shape it should take turned into
+a finding about the loop `CLAUDE.md` calls the moat. It is recorded here rather than fixed,
+and the reason it was not fixed is the more useful half.
+
+### The defect
+
+`record_cardinality_outcome` files a run's measured output row count under
+`plan_signature(plan)` where `plan` is **the query as written** — deliberately, so that a
+plan shape which changes as the estimate improves cannot move the key out from under its own
+history.
+
+The root of every `SELECT <cols> ... FROM ... GROUP BY ...` is the `Project` the select list
+builds. So the count is filed under a `Project`'s signature — and `Project` is excluded from
+`StatsEstimator._CORRECTABLE` on purpose, because a row-preserving operator has no
+cardinality of its own to learn; it inherits its input's. **The measurement therefore goes to
+a key that has no reader.**
+
+Both keys are visible in the store at once, which is what makes it unambiguous. For
+`SELECT id1, id2, sum(v1) FROM x GROUP BY id1, id2`:
+
+| signature | node | entry |
+|---|---|---|
+| `4eb5f59e8dc8b7b1` | the written plan's root `Project` | `{'rows': 10000.0, 'n_obs': 3}` |
+| `45d04de24d91c7aa` | the `Aggregate` under it (and the optimized root) | `{'row_bytes': 26.0}` |
+
+Measured *width* reaches the aggregate; measured *rows* does not. Instrumented over three
+rounds of three h2o group-bys, `_estimate_aggregate` looked for a learned row count **nine
+times and found it zero times**, while `record_execution` wrote the true count each time. The
+estimator falls back to `combine_ndv`'s damped product on every run, for ever: **1,005 for a
+two-key group-by whose true group count is 10,000**.
+
+That is not a small error in a place nothing reads. `_prefers_materializing_aggregate` gates
+on `>= MATERIALIZE_AGG_MIN_GROUPS` (4,000), so the 10x under-estimate is the difference
+between routing that aggregate to the executor that wins it and the one that does not.
+Forcing each executor, warm, on the h2o table:
+
+| case | streaming | materializing |
+|---|---:|---:|
+| q2 — 2 string keys, 10 k groups | 46.3 ms | **38.4** |
+| q1 — 1 string key, 100 groups | **8.6** | 17.7 |
+| q4 — 1 int key, 100 groups | **7.5** | 19.9 |
+
+### The one-line fix, and why it is not here
+
+Peeling the row-preserving wrappers before taking the signature — `Project` and `Sort` emit
+exactly the rows they were given, so the count *is* the node's beneath them — makes the loop
+work immediately. Every verdict becomes correct, and the estimates stop being estimates:
+
+| case | true groups | estimate before | after | verdict |
+|---|---:|---:|---:|---|
+| q1 | 100 | 100 | 100 | streaming (right) |
+| q4 | 100 | 99 | 100 | streaming (right) |
+| q2 | 10,000 | **1,005** | **10,000** | materializing (right) |
+| q3 | 100,000 | 100,204 | 100,000 | materializing |
+
+`Limit` must **not** be peeled — it is the one wrapper that changes the count, and peeling it
+would teach the estimator that a million-group aggregate emits ten rows.
+
+And it makes the suites worse:
+
+| suite | before | with the fix |
+|---|---:|---:|
+| TPC-H sf1 | 0.765 | 0.760 |
+| operators | 0.633 | 0.628 |
+| h2o-groupby | 1.151 | **1.180** |
+| TPC-DS sf1 | 0.965 | **0.988** |
+
+h2o q2 improves exactly as predicted (2.16 -> 2.04). What costs more than that is everything
+else: TPC-DS q98 **0.81 -> 3.09**, q5 5.94 -> 6.55, q78 3.35 -> 3.92, q37 2.56 -> 2.96, and
+seven more — and `prefer_materializing_aggregate` reads **False** on q98, q5 and q78, so the
+aggregate router is not what moved them. The corrected counts flow into join ordering, build-
+side selection, broadcast eligibility and admission, and **those thresholds were fitted while
+this input was systematically ~10x low**. `MATERIALIZE_AGG_MIN_GROUPS` is itself an example:
+its docstring records a crossover "measured between 3,000 and 4,000 groups", measured against
+estimates that were an order of magnitude under the truth.
+
+So the honest statement is that this is not a one-line fix with a bad outcome — it is a
+one-line fix that *exposes* how much of the cost model is fitted on top of it. Landing it
+means re-deriving those constants against corrected cardinalities and re-measuring all nine
+suites, which is a deliberate project rather than a change to slip in beside an unrelated one.
+
+`tests/unit/test_learned_rows_scope.py` carries the defect as a `strict` xfail, so the day
+someone does the recalibration the test fails loudly instead of being quietly satisfied.
+
 ## Three places the engine recomputed an answer it already had — h2o-groupby 1.310x -> 1.151x, operators 0.649 -> 0.633, TPC-DS 0.976 -> 0.965 (2026-08-16)
 
 Every suite measured on the 96-core / 184 GiB box, then four changes, then every suite
