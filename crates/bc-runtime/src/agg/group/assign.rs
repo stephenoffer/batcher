@@ -1001,34 +1001,47 @@ fn dense_multi_ids(
 ) -> (Vec<u32>, Vec<u32>) {
     let mut map: Vec<u32> = vec![u32::MAX; span];
     let mut reps: Vec<u32> = Vec::new();
-    let mut group_ids = Vec::with_capacity(num_rows);
-    let mut assign = |idx: usize, i: usize, reps: &mut Vec<u32>| {
-        let slot = &mut map[idx];
-        if *slot == u32::MAX {
-            *slot = reps.len() as u32;
-            reps.push(i as u32);
-        }
-        group_ids.push(*slot);
-    };
+    // Written through a pre-sized slice rather than pushed. `push` re-checks the capacity and
+    // re-reads the length on every row, and this loop's whole body is a handful of
+    // instructions — so that bookkeeping is a measurable share of it rather than noise.
+    let mut group_ids: Vec<u32> = vec![0; num_rows];
+    macro_rules! assign {
+        ($out:expr, $idx:expr, $row:expr) => {{
+            let slot = &mut map[$idx];
+            if *slot == u32::MAX {
+                *slot = reps.len() as u32;
+                reps.push($row as u32);
+            }
+            *$out = *slot;
+        }};
+    }
     match cols {
         [a, b] => {
-            let (va, vb) = (a.values(), b.values());
+            // Zipped, not indexed: iterating the two value slices together with the output
+            // elides the per-row bounds check on all three, which the index form re-emits
+            // because nothing proves `i` is in range for each of them independently.
             let (la, lb) = (lows[0], lows[1]);
             let (sa, sb) = (strides[0], strides[1]);
-            for i in 0..num_rows {
-                let idx =
-                    va[i].wrapping_sub(la) as usize * sa + vb[i].wrapping_sub(lb) as usize * sb;
-                assign(idx, i, &mut reps);
+            let rows = &a.values()[..num_rows];
+            let other = &b.values()[..num_rows];
+            for (row, ((x, y), out)) in rows
+                .iter()
+                .zip(other.iter())
+                .zip(group_ids.iter_mut())
+                .enumerate()
+            {
+                let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
+                assign!(out, idx, row);
             }
         }
         _ => {
             let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
-            for i in 0..num_rows {
+            for (row, out) in group_ids.iter_mut().enumerate() {
                 let mut idx = 0usize;
                 for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
-                    idx += v[i].wrapping_sub(low) as usize * stride;
+                    idx += v[row].wrapping_sub(low) as usize * stride;
                 }
-                assign(idx, i, &mut reps);
+                assign!(out, idx, row);
             }
         }
     }
