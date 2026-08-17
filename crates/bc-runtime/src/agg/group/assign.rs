@@ -17,6 +17,7 @@ use arrow::datatypes::{
 use arrow::row::{RowConverter, SortField};
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
+use std::sync::Arc;
 
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
@@ -152,6 +153,32 @@ pub(crate) fn assign_groups(
                 let group_columns = group_columns(group_keys, reps, num_rows)?;
                 return Ok((ids, num_groups, group_columns));
             }
+        }
+        // RANK EACH BYTE COLUMN TO A DENSE CODE, then group the codes as integers.
+        //
+        // A *single* short string key already routes to `int_group_ids`' dense direct map and
+        // is the fastest grouping path there is — measured on 10 M rows over 100 distinct
+        // 5-char values, `GROUP BY s` runs in 8.6 ms against DuckDB's 10.0. Add a second
+        // string column and the key leaves that world entirely: it packs into a `u128` and
+        // hashes, at 41.7 ms against DuckDB's 18.1. The two columns together hold 10,000
+        // combinations — an index, not a hash table.
+        //
+        // Ranking recovers the integer world instead of building a better hash: each column's
+        // distinct values are numbered in first-seen order, which is *injective*, so two rows
+        // share a code tuple exactly when they share a value tuple. The ranked columns are
+        // then handed to the ordinary `Int64` multi-key grouper, which takes its own dense
+        // mixed-radix map when the product of the cardinalities fits the budget and its hash
+        // path when it does not — and even that path is cheaper on `i64`s than on byte slices.
+        //
+        // Declines cost a bounded scan: ranking abandons a column once it passes
+        // `RANK_MAX_DISTINCT`, so a high-cardinality key pays about that many rows of hashing
+        // and then takes the packed path below exactly as before.
+        if let Some(ranked) = ranked_byte_columns(group_keys, num_rows) {
+            let cols: Vec<&Int64Array> = ranked
+                .iter()
+                .map(|a| a.as_primitive::<Int64Type>())
+                .collect();
+            return assign_groups_int64_multi(&cols, group_keys, num_rows);
         }
         // Packed fixed-width fast path: when the whole composite key fits in 16 bytes (short
         // strings + `Int64`s — e.g. `GROUP BY l_returnflag, l_linestatus`, two 1-char keys),
@@ -632,6 +659,23 @@ where
             let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
         }
+        // Medium strings (≤ 15 bytes): the same trick one register wider. The composite-key
+        // path already packs several such columns into a `u128` and compares that value
+        // *inline*; a single column is the same shape with one slot, and it is the shape a
+        // high-cardinality key most often has — an id, a SKU, a country-and-code, a formatted
+        // date. Without it the probe verifies against `rep_bytes[g]`, whose target lives at a
+        // random offset in a value buffer far too large to cache: on a 12-byte key with 100 k
+        // groups over 10 M rows, that miss is the whole difference.
+        //
+        // The `u128` layout is `packed_layout`'s single-column case exactly — a length tag
+        // then the bytes, little-endian — so distinct values map to distinct keys and the
+        // group ids match the hash path below.
+        if let Some(packed) = pack_medium_bytes::<T>(a, num_rows) {
+            let (group_ids, reps) = group_by_u128(&packed);
+            let num_groups = reps.len();
+            let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
+            return Ok((group_ids, num_groups, group_columns));
+        }
     }
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
@@ -858,6 +902,39 @@ where
     Some(out)
 }
 
+/// `(len, bytes)` packed into a `u128` per row, or `None` when some value exceeds 15 bytes.
+///
+/// The single-column form of [`pack_u128_keys`], and byte-for-byte the layout that produces
+/// for a one-column `packed_layout`: the length tag in byte 0, the value little-endian above
+/// it. Declines on the first over-long value, so a column of long strings pays one pass over
+/// the offsets rather than a full pack it would throw away.
+fn pack_medium_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<Vec<u128>>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    let offsets = a.value_offsets();
+    let data = a.value_data();
+    if offsets
+        .windows(2)
+        .any(|w| (w[1] - w[0]).as_usize() > PACKED_MAX_INLINE_BYTES)
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let (lo, hi) = (offsets[i].as_usize(), offsets[i + 1].as_usize());
+        let v = &data[lo..hi];
+        let mut buf = [0u8; 16];
+        buf[0] = v.len() as u8;
+        buf[1..1 + v.len()].copy_from_slice(v);
+        out.push(u128::from_le_bytes(buf));
+    }
+    Some(out)
+}
+
+/// Value bytes that fit beside their length tag inside one `u128` key.
+const PACKED_MAX_INLINE_BYTES: usize = 15;
+
 /// Multi-column all-`Int64` `assign_groups`: hash/compare the raw `i64` values of every
 /// key column directly, skipping the `RowConverter` encode the general path runs per row.
 /// `cols` are the (null-free) `Int64` key columns; `group_keys` the originals the
@@ -874,17 +951,13 @@ fn dense_multi_span(
     let mut lows = Vec::with_capacity(cols.len());
     let mut spans: Vec<usize> = Vec::with_capacity(cols.len());
     for c in cols {
-        let mut lo = c.value(0);
-        let mut hi = lo;
-        for i in 1..num_rows {
-            let v = c.value(i);
-            if v < lo {
-                lo = v;
-            }
-            if v > hi {
-                hi = v;
-            }
-        }
+        // Folded over the value slice rather than through `value(i)`, so the min/max pass
+        // vectorizes. It runs over every row of every key column before the grouping does,
+        // which makes it the one part of this decision that is never free.
+        let values: &[i64] = c.values().as_ref();
+        let (lo, hi) = values[..num_rows]
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         let span = usize::try_from(hi as i128 - lo as i128 + 1).ok()?;
         lows.push(lo);
         spans.push(span);
@@ -907,6 +980,74 @@ fn dense_multi_span(
     Some((lows, strides, total))
 }
 
+/// Dense direct-map group ids for a composite integer key, over the mixed-radix index
+/// [`dense_multi_span`] derived.
+///
+/// Two things keep this loop tight, and the version it replaces had neither. The index
+/// arithmetic runs in `usize`, not `i128`: every column's span was proved to fit the budget,
+/// so `value - low` lies in `0 .. span` and a wrapping subtract is exact — where the `i128`
+/// form emitted a 128-bit multiply per column per row. And the **two-column case is its own
+/// loop**, because that is what nearly every composite key is: with the column count known
+/// the bounds checks fold away and the two value slices stream contiguously, against a
+/// `Vec`-indexed inner loop the compiler could neither unroll nor hoist.
+///
+/// Group ids are handed out in first-seen row order, identical to the hash path below.
+fn dense_multi_ids(
+    cols: &[&Int64Array],
+    lows: &[i64],
+    strides: &[usize],
+    span: usize,
+    num_rows: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut map: Vec<u32> = vec![u32::MAX; span];
+    let mut reps: Vec<u32> = Vec::new();
+    // Written through a pre-sized slice rather than pushed. `push` re-checks the capacity and
+    // re-reads the length on every row, and this loop's whole body is a handful of
+    // instructions — so that bookkeeping is a measurable share of it rather than noise.
+    let mut group_ids: Vec<u32> = vec![0; num_rows];
+    macro_rules! assign {
+        ($out:expr, $idx:expr, $row:expr) => {{
+            let slot = &mut map[$idx];
+            if *slot == u32::MAX {
+                *slot = reps.len() as u32;
+                reps.push($row as u32);
+            }
+            *$out = *slot;
+        }};
+    }
+    match cols {
+        [a, b] => {
+            // Zipped, not indexed: iterating the two value slices together with the output
+            // elides the per-row bounds check on all three, which the index form re-emits
+            // because nothing proves `i` is in range for each of them independently.
+            let (la, lb) = (lows[0], lows[1]);
+            let (sa, sb) = (strides[0], strides[1]);
+            let rows = &a.values()[..num_rows];
+            let other = &b.values()[..num_rows];
+            for (row, ((x, y), out)) in rows
+                .iter()
+                .zip(other.iter())
+                .zip(group_ids.iter_mut())
+                .enumerate()
+            {
+                let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
+                assign!(out, idx, row);
+            }
+        }
+        _ => {
+            let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
+            for (row, out) in group_ids.iter_mut().enumerate() {
+                let mut idx = 0usize;
+                for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
+                    idx += v[row].wrapping_sub(low) as usize * stride;
+                }
+                assign!(out, idx, row);
+            }
+        }
+    }
+    (group_ids, reps)
+}
+
 fn assign_groups_int64_multi(
     cols: &[&Int64Array],
     group_keys: &[ArrayRef],
@@ -921,21 +1062,7 @@ fn assign_groups_int64_multi(
     // Same first-seen id order as the hash path below, so the output is identical.
     if num_rows > 0 {
         if let Some((lows, strides, span)) = dense_multi_span(cols, num_rows) {
-            let mut map: Vec<u32> = vec![u32::MAX; span];
-            let mut reps: Vec<u32> = Vec::new();
-            let mut group_ids = Vec::with_capacity(num_rows);
-            for i in 0..num_rows {
-                let mut idx = 0usize;
-                for (j, c) in cols.iter().enumerate() {
-                    idx += ((c.value(i) as i128 - lows[j] as i128) as usize) * strides[j];
-                }
-                let slot = &mut map[idx];
-                if *slot == u32::MAX {
-                    *slot = reps.len() as u32;
-                    reps.push(i as u32);
-                }
-                group_ids.push(*slot);
-            }
+            let (group_ids, reps) = dense_multi_ids(cols, &lows, &strides, span, num_rows);
             let num_groups = reps.len();
             let group_columns = group_columns(group_keys, reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
@@ -997,6 +1124,84 @@ fn assign_groups_int64_multi(
 
 /// A key column the mixed raw multi-key grouper can hash/compare directly: a null-free
 /// `Int64`, `Float64`, `Utf8`/`LargeUtf8`, or `Binary`/`LargeBinary` column.
+/// Distinct values a byte column may hold before ranking it stops paying.
+///
+/// Two things bound it, and they are the same two that bound `str_sort`'s rank path. The
+/// per-column map has to stay cache-resident for a lookup to beat comparing the bytes; and
+/// the *wasted* work when the guess is wrong is one hash per row until the cap trips, which
+/// is why the cap is a count of distinct values rather than a fraction of the rows. 65,536
+/// covers the composite keys this exists for — a status, a region, a category, an id-like
+/// code — and abandons a genuinely high-cardinality column after a few tens of thousands of
+/// rows.
+const RANK_MAX_DISTINCT: usize = 1 << 16;
+
+/// The key columns with every byte column replaced by dense `Int64` codes, or `None` when
+/// that would not pay.
+///
+/// `None` unless at least one column is actually a byte column (otherwise this is the
+/// identity and the caller should go straight to the integer grouper) and every column is
+/// either `Int64` or a null-free byte column inside [`RANK_MAX_DISTINCT`]. `Float64` is
+/// excluded deliberately: it is admitted to the raw multi-key path but its grouping identity
+/// is the canonicalized bit pattern (`crate::keys::canon_f64`), not the value, so ranking it
+/// here would be a second, divergent definition of float equality.
+///
+/// Codes are assigned in first-seen order, which makes the map injective — two rows get the
+/// same code exactly when they hold the same bytes — so the group ids and first-seen
+/// representatives the caller derives are identical to the packed/hash oracle's.
+fn ranked_byte_columns(cols: &[ArrayRef], num_rows: usize) -> Option<Vec<ArrayRef>> {
+    use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+
+    if !cols.iter().any(|a| {
+        matches!(a.data_type(), Utf8 | LargeUtf8 | Binary | LargeBinary) && a.null_count() == 0
+    }) {
+        return None;
+    }
+    let mut out: Vec<ArrayRef> = Vec::with_capacity(cols.len());
+    for a in cols {
+        match a.data_type() {
+            Int64 => out.push(Arc::clone(a)),
+            Utf8 => out.push(rank_bytes::<Utf8Type>(a, num_rows)?),
+            LargeUtf8 => out.push(rank_bytes::<LargeUtf8Type>(a, num_rows)?),
+            Binary => out.push(rank_bytes::<BinaryType>(a, num_rows)?),
+            LargeBinary => out.push(rank_bytes::<LargeBinaryType>(a, num_rows)?),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// One byte column's values as dense `Int64` codes in first-seen order, or `None` past
+/// [`RANK_MAX_DISTINCT`].
+///
+/// The map borrows the array's own value buffer, so no string is copied.
+fn rank_bytes<T>(arr: &ArrayRef, num_rows: usize) -> Option<ArrayRef>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    let a = arr.as_bytes::<T>();
+    if a.null_count() != 0 {
+        return None;
+    }
+    let mut ids: ahash::AHashMap<&[u8], i64> = ahash::AHashMap::new();
+    let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let value: &[u8] = a.value(i).as_ref();
+        let code = match ids.get(value) {
+            Some(&code) => code,
+            None => {
+                if ids.len() == RANK_MAX_DISTINCT {
+                    return None; // too many distinct values for ranking to pay
+                }
+                let code = ids.len() as i64;
+                ids.insert(value, code);
+                code
+            }
+        };
+        codes.push(code);
+    }
+    Some(Arc::new(Int64Array::from(codes)) as ArrayRef)
+}
+
 fn is_raw_multikey_col(a: &ArrayRef) -> bool {
     use arrow::datatypes::DataType::{Binary, Float64, Int64, LargeBinary, LargeUtf8, Utf8};
     a.null_count() == 0
@@ -1177,81 +1382,108 @@ fn assign_groups_packed(
     widths: &[usize],
     num_rows: usize,
 ) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
-    let cols: Vec<RawKeyCol> = group_keys
-        .iter()
-        .map(|a| {
-            use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
-            match a.data_type() {
-                Int64 => RawKeyCol::Int(a.as_primitive::<Int64Type>()),
-                Utf8 => RawKeyCol::Str32(a.as_string::<i32>()),
-                LargeUtf8 => RawKeyCol::Str64(a.as_string::<i64>()),
-                Binary => RawKeyCol::Bin32(a.as_binary::<i32>()),
-                LargeBinary => RawKeyCol::Bin64(a.as_binary::<i64>()),
-                _ => unreachable!("packed_layout gates the types"),
-            }
-        })
-        .collect();
-    // Slot offset of each column within the 16-byte key.
-    let mut offs = Vec::with_capacity(widths.len());
-    let mut acc = 0usize;
-    for &w in widths {
-        offs.push(acc);
-        acc += w;
-    }
-    let pack = |i: usize| -> u128 {
-        let mut buf = [0u8; 16];
-        for (c, &o) in cols.iter().zip(&offs) {
-            match c {
-                RawKeyCol::Int(a) => buf[o..o + 8].copy_from_slice(&a.value(i).to_le_bytes()),
-                // `packed_layout` only sizes Int64 / string / binary columns, so a float key
-                // never reaches the packed path (it takes `assign_groups_multi_raw` instead).
-                RawKeyCol::Float(_) => unreachable!("packed_layout excludes Float64"),
-                RawKeyCol::Str32(a) => write_bytes(&mut buf, o, a.value(i).as_bytes()),
-                RawKeyCol::Str64(a) => write_bytes(&mut buf, o, a.value(i).as_bytes()),
-                RawKeyCol::Bin32(a) => write_bytes(&mut buf, o, a.value(i)),
-                RawKeyCol::Bin64(a) => write_bytes(&mut buf, o, a.value(i)),
-            }
-        }
-        u128::from_le_bytes(buf)
-    };
-
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
-    let mut reps: Vec<u32> = Vec::new();
-    let mut keys: Vec<u128> = Vec::new();
-    let mut group_ids = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let pk = pack(i);
-        let hash = state.hash_one(pk);
-        let gid = match table.entry(
-            hash,
-            |&g| keys[g as usize] == pk,
-            |&g| state.hash_one(keys[g as usize]),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                keys.push(pk);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
+    let packed = pack_u128_keys(group_keys, widths, num_rows);
+    let (group_ids, reps) = group_by_u128(&packed);
     let num_groups = reps.len();
     let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
-/// Write a string/binary value into its slot: a length tag then the bytes. The `packed_layout`
-/// gate guarantees `1 + v.len()` fits the slot, so the length never exceeds 255.
-fn write_bytes(buf: &mut [u8; 16], off: usize, v: &[u8]) {
-    buf[off] = v.len() as u8;
-    buf[off + 1..off + 1 + v.len()].copy_from_slice(v);
+/// Pack every row's composite key into a `u128`, **one column at a time**.
+///
+/// Row-at-a-time was the obvious shape and is the slow one: the per-column `match` on the
+/// key's type sits inside the row loop, so a two-string key pays a branch per column per row
+/// against a `Vec` the compiler cannot know the length of, and nothing about the loop
+/// vectorizes. Filling column by column hoists that dispatch out — each column runs its own
+/// monomorphic pass over a contiguous slice, writing into a slot no other column touches.
+///
+/// The byte layout is unchanged: column `j` still owns bytes `offs[j] .. offs[j] + widths[j]`
+/// of the little-endian `u128`, a string still writes a length tag then its bytes, and the
+/// slots start zeroed — so `|=` writes exactly what the row-wise `copy_from_slice` wrote and
+/// the group ids are identical.
+fn pack_u128_keys(group_keys: &[ArrayRef], widths: &[usize], num_rows: usize) -> Vec<u128> {
+    use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+
+    let mut packed = vec![0u128; num_rows];
+    let mut off = 0usize;
+    for (a, &w) in group_keys.iter().zip(widths) {
+        let shift = (off * 8) as u32;
+        match a.data_type() {
+            Int64 => {
+                let values = a.as_primitive::<Int64Type>().values();
+                for (slot, &v) in packed.iter_mut().zip(values.iter()) {
+                    *slot |= ((v as u64) as u128) << shift;
+                }
+            }
+            Utf8 => pack_bytes_column(&mut packed, a.as_string::<i32>(), shift),
+            LargeUtf8 => pack_bytes_column(&mut packed, a.as_string::<i64>(), shift),
+            Binary => pack_bytes_column(&mut packed, a.as_binary::<i32>(), shift),
+            LargeBinary => pack_bytes_column(&mut packed, a.as_binary::<i64>(), shift),
+            _ => unreachable!("packed_layout gates the types"),
+        }
+        off += w;
+    }
+    packed
 }
 
-/// [`write_bytes`] over a plain slice, for the wide packed path's fixed-stride rows.
+/// OR one byte column's `(length, bytes)` into each row's slot at `shift`.
+///
+/// Reads the offsets and the value buffer directly rather than through `value(i)`, which
+/// re-derives both per call. `packed_layout` sized the slot from this column's own longest
+/// value, so the shifted contribution always fits inside it.
+fn pack_bytes_column<T>(packed: &mut [u128], a: &GenericByteArray<T>, shift: u32)
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    let offsets = a.value_offsets();
+    let data = a.value_data();
+    for (i, slot) in packed.iter_mut().enumerate() {
+        let (lo, hi) = (offsets[i].as_usize(), offsets[i + 1].as_usize());
+        let v = &data[lo..hi];
+        *slot |= (v.len() as u128) << shift;
+        if !v.is_empty() {
+            let mut buf = [0u8; 16];
+            buf[..v.len()].copy_from_slice(v);
+            *slot |= u128::from_le_bytes(buf) << (shift + 8);
+        }
+    }
+}
+
+/// Dense group ids for rows already reduced to one `u128` key each, with the key held
+/// **beside** the id.
+///
+/// The table stores `(key, group_id)` so verifying a probe compares a value the lookup has
+/// already pulled into cache — the same argument [`int_group_ids`] makes for its inlined key,
+/// and the reason a 12-byte string key stops chasing the source array's offsets on every
+/// hash-chain step. `reps` is still built for the output group columns, but nothing in the
+/// loop reads it.
+///
+/// Shared by every producer of a packed key so they cannot drift on group order: ids are
+/// handed out in first-seen row order, which is what `group_columns` assumes.
+fn group_by_u128(packed: &[u128]) -> (Vec<u32>, Vec<u32>) {
+    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+    let mut table: HashTable<(u128, u32)> =
+        HashTable::with_capacity(group_table_capacity(packed.len()));
+    let mut reps: Vec<u32> = Vec::new();
+    let mut group_ids = Vec::with_capacity(packed.len());
+    for (i, &pk) in packed.iter().enumerate() {
+        let hash = state.hash_one(pk);
+        let gid = match table.entry(hash, |&(k, _)| k == pk, |&(k, _)| state.hash_one(k)) {
+            Entry::Occupied(e) => e.get().1,
+            Entry::Vacant(e) => {
+                let gid = reps.len() as u32;
+                reps.push(i as u32);
+                e.insert((pk, gid));
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+    (group_ids, reps)
+}
+
+/// Write a string/binary value into its slot: a length tag then the bytes. The `packed_layout`
+/// gate guarantees `1 + v.len()` fits the slot, so the length never exceeds 255.
 fn write_bytes_at(buf: &mut [u8], off: usize, v: &[u8]) {
     buf[off] = v.len() as u8;
     buf[off + 1..off + 1 + v.len()].copy_from_slice(v);
@@ -2030,6 +2262,100 @@ mod tests {
     /// mis-applied `reserve` would corrupt, and a wrong one shows up as a wrong group
     /// count or a broken first-seen order rather than as a crash.
     ///
+    /// Ranking a byte column to a dense code must not change a single group.
+    ///
+    /// It is a *representation* change on the way to the integer grouper — injective per
+    /// column, so two rows share a code tuple exactly when they share a value tuple — and the
+    /// thing that would make it wrong is a collision between two distinct values. These
+    /// shapes are chosen to try to produce one: values that differ only in their last byte,
+    /// values that are prefixes of each other, an empty string beside a non-empty one, and a
+    /// column whose cardinality is high enough to abandon ranking mid-column while its
+    /// neighbour has already been ranked.
+    ///
+    /// The oracle is the `RowConverter` path, reached by making one column nullable — that
+    /// path is excluded from every raw fast path, so it cannot itself be the thing under
+    /// test.
+    #[test]
+    fn ranking_a_byte_key_reproduces_the_row_encoded_oracle() {
+        let n = 4_096usize;
+        let shapes: Vec<(&str, Vec<ArrayRef>)> = vec![
+            (
+                "two low-cardinality strings",
+                vec![
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| format!("id{:03}", i % 100))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| format!("id{:03}", i % 97))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            ),
+            (
+                "prefixes and an empty value",
+                vec![
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| match i % 4 {
+                                0 => String::new(),
+                                1 => "a".to_string(),
+                                2 => "ab".to_string(),
+                                _ => "abc".to_string(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Int64Array::from(
+                        (0..n as i64).map(|i| i % 3).collect::<Vec<_>>(),
+                    )),
+                ],
+            ),
+            (
+                "a string past the ranking cap beside one inside it",
+                vec![
+                    Arc::new(StringArray::from(
+                        (0..n).map(|i| format!("k{}", i % 8)).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..n).map(|i| format!("unique-{i:09}")).collect::<Vec<_>>(),
+                    )),
+                ],
+            ),
+        ];
+
+        for (name, cols) in shapes {
+            let (ids, groups, out) = assign_groups(&cols, n).unwrap();
+
+            // The oracle: the same keys with a nullable (all-valid) first column, which every
+            // raw/packed/ranked path declines, leaving the `RowConverter`.
+            let mut oracle_cols = cols.clone();
+            oracle_cols[0] = nullable_copy(&cols[0]);
+            let (want_ids, want_groups, want_out) = assign_groups(&oracle_cols, n).unwrap();
+
+            assert_eq!(groups, want_groups, "{name}: group count");
+            assert_eq!(ids, want_ids, "{name}: per-row group ids");
+            assert_eq!(out.len(), want_out.len(), "{name}: key column count");
+            for (col, want) in out.iter().zip(&want_out) {
+                assert_eq!(col.len(), want.len(), "{name}: representative rows");
+            }
+        }
+    }
+
+    /// A copy of `a` carrying a validity buffer with every row valid — same values, but a
+    /// shape the null-free fast paths refuse, so it lands on the row-encoded oracle.
+    fn nullable_copy(a: &ArrayRef) -> ArrayRef {
+        use arrow::buffer::NullBuffer;
+        let data = a
+            .to_data()
+            .into_builder()
+            .nulls(Some(NullBuffer::new_valid(a.len())))
+            .build()
+            .expect("valid null buffer");
+        arrow::array::make_array(data)
+    }
+
     /// Each shape below is built so every key appears exactly twice past the cap, which
     /// pins the group count at `n / 2` and the id of row `r` at `r / 2`.
     #[test]

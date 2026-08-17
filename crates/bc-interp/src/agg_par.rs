@@ -185,7 +185,7 @@ pub(crate) fn radix_width(estimated_groups: usize, threads: usize) -> usize {
 /// most one group per row. Note the floor is the average and **not** `sample_groups`, which
 /// sums the per-morsel counts and so counts a key once per morsel it appears in — bounding
 /// below by that sum reported 242 k groups for a 100 k-group key, over-partitioning by 2.4x.
-fn estimated_groups(
+pub(crate) fn estimated_groups(
     sample_rows: usize,
     sample_groups: usize,
     sample_morsels: usize,

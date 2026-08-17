@@ -23,7 +23,7 @@ what makes these numbers comparable, so read them together:
 | Window running `sum()` | 1.4× |
 | `MEDIAN` / `QUANTILE_CONT` per group | 1.1× |
 | TPC-H overall (sf1), DuckDB reading the same Arrow | 3.7×; wins all 22 |
-| TPC-H overall (sf1), DuckDB on its native store | 1.3×; wins 17 of 22 |
+| TPC-H overall (sf1), DuckDB on its native store | 1.3×; wins 16 of 22 |
 | ClickBench overall (43), DuckDB reading the same Arrow | 14×; wins all 43 |
 | TPC-H overall (sf10), DuckDB on its native store | **0.79×** — DuckDB wins |
 | Delta file skipping (`count(*)` with a predicate) | 1.42× |
@@ -96,13 +96,18 @@ means Batcher is faster**:
 | Suite | vs `duckdb` (native store) | vs `duckdb_arrow` (same Arrow) |
 |---|---:|---:|
 | Semi-structured JSON (5) | **0.25x** — 5 of 5 | **0.04x** — 5 of 5 |
-| ClickBench (43) | **0.62x** — 30 of 43 | **0.07x** — 43 of 43 |
-| Operator mix (19) | **0.64x** — 12 of 19 | **0.35x** — 15 of 19 |
-| TPC-H (22) | **0.76x** — 17 of 22 | **0.26x** — 22 of 22 |
-| H2O.ai `join` (5) | **0.95x** — 3 of 5 | **0.24x** — 5 of 5 |
-| TPC-DS (99) | **0.96x** — 44 of 99 | — |
-| H2O.ai `groupby` (10) | 1.28x — 4 of 10 | **0.11x** — 10 of 10 |
-| Join Order Benchmark (113) | 1.37x — 31 of 109 | — |
+| ClickBench (43) | **0.64x** — 28 of 43 | **0.07x** — 43 of 43 |
+| Operator mix (19) | **0.66x** — 11 of 19 | **0.36x** — 15 of 19 |
+| TPC-H (22) | **0.79x** — 16 of 22 | **0.26x** — 22 of 22 |
+| H2O.ai `join` (5) | **0.93x** — 3 of 5 | **0.24x** — 5 of 5 |
+| TPC-DS (99) | **0.96x** — 38 of 98 | — |
+| H2O.ai `groupby` (10) | 1.19x — 4 of 10 | **0.09x** — 10 of 10 |
+| Join Order Benchmark (113) | 1.29x — 35 of 109 | — |
+
+Every suite in the right-hand column is a Batcher win. That column is the one to read for a
+question about *engines*; the left-hand one answers a question about engines **and** storage
+formats together, and the two suites Batcher loses there are the two where the format is
+doing the most work.
 
 Read the two columns together. On identical input Batcher's execution engine is **3.9x
 DuckDB's on TPC-H and 14x on ClickBench**, and it wins every query of both. Against DuckDB's
@@ -110,8 +115,15 @@ native store the margin narrows to 1.3x and 1.6x, and the queries Batcher loses 
 where the storage advantage is largest — which is exactly what a storage advantage should
 look like. Where the gap is widest, on H2O `groupby`, the cause is legible: its keys are
 low-cardinality strings, DuckDB holds them dictionary-encoded, and Batcher reads the same
-column as full Arrow `Utf8` — 10x faster than DuckDB does over that same Arrow, and slower
+column as full Arrow `Utf8` — 11x faster than DuckDB does over that same Arrow, and slower
 than DuckDB reading eight-bit codes.
+
+The suite's residue is now concentrated in its two single-key high-cardinality queries (one
+string column, 100,000 distinct values). A *composite* string key no longer pays for being
+strings: each column's distinct values are numbered in first-seen order and the ranked columns
+take the ordinary integer grouper, which brought a two-string-key group-by over 10M rows from
+41.7 ms to 32.6 ms — identical to the same query with two `int64` keys, which is the check
+that nothing about the strings is left to pay for.
 
 :::{warning}
 Five of the 43 ClickBench queries and two of the 19 operator cases are answered from

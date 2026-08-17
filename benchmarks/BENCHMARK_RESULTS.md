@@ -1,5 +1,327 @@
 # Batcher CPU benchmark results
 
+## Composite string keys stop being strings — h2o-groupby 1.310x -> 1.191x, and every suite measured on identical Arrow input is a win (2026-08-16)
+
+Two kernel changes and a final sweep of every suite on both DuckDB bars. The numbers below
+are the authoritative reading for this session; the two entries beneath it record how they
+were reached.
+
+### Against DuckDB's native compressed store — the harder bar
+
+Lineup `batcher,duckdb` for every suite, so no third engine's memory perturbs the timing (a
+four-engine run reads h2o-join at 1.83x against 0.93x here, which is why the lineup is stated
+rather than assumed).
+
+| suite | n | start of session | now | |
+|---|---:|---:|---:|---|
+| JSON | 5 | 0.255x | **0.245** | win |
+| ClickBench | 43 | 0.621x | **0.636** | win |
+| operators | 19 | 0.649x | **0.656** | win |
+| TPC-H sf1 | 22 | 0.764x | **0.789** | win |
+| h2o-join | 5 | 1.019x | **0.928** | win |
+| TPC-DS sf1 | 98 | 0.976x | **0.963** | win |
+| h2o-groupby | 10 | 1.310x | **1.191** | lose |
+| JOB | 109 | 1.271x | **1.285** | lose |
+
+Six of eight. h2o-groupby moved by 9% and is the session's largest single movement;
+ClickBench, operators and TPC-H each moved by less than their own between-round spread and
+should be read as flat.
+
+### Against DuckDB on the same zero-copy Arrow — the like-for-like execution bar
+
+`methodology.md` designates this bar "the like-for-like execution comparison", and on it
+**every suite that can run it is a win, most of them by an order of magnitude**:
+
+| suite | geomean | wins |
+|---|---:|---|
+| JSON | **0.039x** | 5/5 |
+| ClickBench | **0.072x** | 43/43 |
+| h2o-groupby | **0.089x** | 10/10 |
+| h2o-join | **0.244x** | 5/5 |
+| TPC-H sf1 | **0.256x** | 22/22 |
+| operators | **0.362x** | 15/19 |
+
+TPC-DS and JOB are absent for a reason that is not Batcher's: over registered Arrow views
+DuckDB's planner has no storage statistics to order a many-way join with, and it is
+*SIGKILL*ed on TPC-DS q64 and still growing past 22 GiB on q72. That is recorded in
+`engines/lineup.py` and is why `duckdb_arrow` is not in the default lineup.
+
+### Why the two remaining native-store losses are not kernel defects
+
+**h2o-groupby is the dictionary-encoded key.** Its worst queries are q3 and q7, and both
+group by `id3` — one string column with 100,000 distinct values. DuckDB holds it
+dictionary-encoded in its own store and groups on the codes; Batcher is handed decoded Arrow
+`Utf8` and must derive them. The same suite on the same Arrow input is **0.089x, 10 of 10**,
+which is the measurement that separates the storage format from the execution. Closing it on
+the native-store bar means preserving dictionary encoding across the FFI boundary — which
+`bc_py::normalize::normalize_to` documents as unsafe today (a preserved `Dictionary`
+propagates into intermediate schemas an operator will decode) and defers to
+`rfc-streaming-executor.md` Proposal 3. Grouping a *dictionary* column is already ~7x faster
+than the decoded one; the boundary is the blocker, not the kernel.
+
+**JOB is estimation under correlated predicates**, which is what Leis et al. built it to
+expose. This session found, and recorded above, that the cross-run loop meant to answer it is
+writing to a key nothing reads — and that correcting the key regresses the suites, because
+every threshold downstream was calibrated while that input was ~10x low.
+
+## The cross-query cardinality loop is writing to a key nothing reads — and correcting it regresses the suites, because everything downstream was calibrated on the gap (2026-08-16)
+
+Chasing why the executor router declines the one aggregate shape it should take turned into
+a finding about the loop `CLAUDE.md` calls the moat. It is recorded here rather than fixed,
+and the reason it was not fixed is the more useful half.
+
+### The defect
+
+`record_cardinality_outcome` files a run's measured output row count under
+`plan_signature(plan)` where `plan` is **the query as written** — deliberately, so that a
+plan shape which changes as the estimate improves cannot move the key out from under its own
+history.
+
+The root of every `SELECT <cols> ... FROM ... GROUP BY ...` is the `Project` the select list
+builds. So the count is filed under a `Project`'s signature — and `Project` is excluded from
+`StatsEstimator._CORRECTABLE` on purpose, because a row-preserving operator has no
+cardinality of its own to learn; it inherits its input's. **The measurement therefore goes to
+a key that has no reader.**
+
+Both keys are visible in the store at once, which is what makes it unambiguous. For
+`SELECT id1, id2, sum(v1) FROM x GROUP BY id1, id2`:
+
+| signature | node | entry |
+|---|---|---|
+| `4eb5f59e8dc8b7b1` | the written plan's root `Project` | `{'rows': 10000.0, 'n_obs': 3}` |
+| `45d04de24d91c7aa` | the `Aggregate` under it (and the optimized root) | `{'row_bytes': 26.0}` |
+
+Measured *width* reaches the aggregate; measured *rows* does not. Instrumented over three
+rounds of three h2o group-bys, `_estimate_aggregate` looked for a learned row count **nine
+times and found it zero times**, while `record_execution` wrote the true count each time. The
+estimator falls back to `combine_ndv`'s damped product on every run, for ever: **1,005 for a
+two-key group-by whose true group count is 10,000**.
+
+That is not a small error in a place nothing reads. `_prefers_materializing_aggregate` gates
+on `>= MATERIALIZE_AGG_MIN_GROUPS` (4,000), so the 10x under-estimate is the difference
+between routing that aggregate to the executor that wins it and the one that does not.
+Forcing each executor, warm, on the h2o table:
+
+| case | streaming | materializing |
+|---|---:|---:|
+| q2 — 2 string keys, 10 k groups | 46.3 ms | **38.4** |
+| q1 — 1 string key, 100 groups | **8.6** | 17.7 |
+| q4 — 1 int key, 100 groups | **7.5** | 19.9 |
+
+### The one-line fix, and why it is not here
+
+Peeling the row-preserving wrappers before taking the signature — `Project` and `Sort` emit
+exactly the rows they were given, so the count *is* the node's beneath them — makes the loop
+work immediately. Every verdict becomes correct, and the estimates stop being estimates:
+
+| case | true groups | estimate before | after | verdict |
+|---|---:|---:|---:|---|
+| q1 | 100 | 100 | 100 | streaming (right) |
+| q4 | 100 | 99 | 100 | streaming (right) |
+| q2 | 10,000 | **1,005** | **10,000** | materializing (right) |
+| q3 | 100,000 | 100,204 | 100,000 | materializing |
+
+`Limit` must **not** be peeled — it is the one wrapper that changes the count, and peeling it
+would teach the estimator that a million-group aggregate emits ten rows.
+
+And it makes the suites worse:
+
+| suite | before | with the fix |
+|---|---:|---:|
+| TPC-H sf1 | 0.765 | 0.760 |
+| operators | 0.633 | 0.628 |
+| h2o-groupby | 1.151 | **1.180** |
+| JOB | 1.252 | **1.293** |
+| TPC-DS sf1 | 0.965 | **0.988** |
+
+**JOB is the decisive row.** Leis et al. built it to show that cardinality estimation, not
+join-order search, is where optimizers lose — so it is the suite where a correct measurement
+should pay best, and it is where correcting one costs the most in absolute terms (q5b 3.29 ->
+4.85, q7a 2.04 -> 3.42, q5c 1.28 -> 2.49, and thirty more). An estimator that is accurate
+against a cost model tuned for an inaccurate one is not an improvement to either half.
+
+h2o q2 improves exactly as predicted (2.16 -> 2.04). What costs more than that is everything
+else: TPC-DS q98 **0.81 -> 3.09**, q5 5.94 -> 6.55, q78 3.35 -> 3.92, q37 2.56 -> 2.96, and
+seven more — and `prefer_materializing_aggregate` reads **False** on q98, q5 and q78, so the
+aggregate router is not what moved them. The corrected counts flow into join ordering, build-
+side selection, broadcast eligibility and admission, and **those thresholds were fitted while
+this input was systematically ~10x low**. `MATERIALIZE_AGG_MIN_GROUPS` is itself an example:
+its docstring records a crossover "measured between 3,000 and 4,000 groups", measured against
+estimates that were an order of magnitude under the truth.
+
+**Where the damage actually is, for whoever picks this up.** It is not diffuse: on TPC-DS it
+is one query. `q98` goes 12.5 ms -> 44.0 ms and everything else moves 2-5%, inside the spread
+of a run where DuckDB itself sped up across the board (q78's comparator 64.3 -> 56.3 ms), which
+is what made the suite geomean look worse than the change is. And q98's regression is **not a
+plan change**: alone it runs at 14.1 ms with the fix (1.00x), and after the other 98 queries
+have run in the same process it runs at 43.7 ms — with an *identical* optimized plan, identical
+build-side decisions (L=2,736,384 R=29/30), an identical `prefer_materializing_aggregate=False`
+and an identical root estimate. What differs is one broadcast hash join whose build-side
+provenance flips `[default]` -> `[learned]` and which then takes 30.9 ms of the query's 45.8
+instead of ~5, at 42% CPU on a 2.88 M-row probe against a 31-row build. So the first thing to
+look at is not a threshold at all: it is what a `learned` provenance changes downstream of the
+build-side choice, once other queries in the process have written entries.
+
+So the honest statement is that this is not a one-line fix with a bad outcome — it is a
+one-line fix that *exposes* how much of the cost model is fitted on top of it. Landing it
+means re-deriving those constants against corrected cardinalities and re-measuring all nine
+suites, which is a deliberate project rather than a change to slip in beside an unrelated one.
+
+`tests/unit/test_learned_rows_scope.py` carries the defect as a `strict` xfail, so the day
+someone does the recalibration the test fails loudly instead of being quietly satisfied.
+
+## Three places the engine recomputed an answer it already had — h2o-groupby 1.310x -> 1.151x, operators 0.649 -> 0.633, TPC-DS 0.976 -> 0.965 (2026-08-16)
+
+Every suite measured on the 96-core / 184 GiB box, then four changes, then every suite
+measured again. The changes are unrelated in mechanism and share one shape, which is the
+shape this file keeps recording: **the engine asked a question whose answer it could not
+have changed since the last time it asked.** Once per scan of a table it had already
+sized; once per row of a key it had already packed; once per morsel of a decision that is
+a property of the key.
+
+| suite | n | before | after | |
+|---|---:|---:|---:|---|
+| JSON | 5 | 0.255x | **0.250** | win |
+| ClickBench | 43 | 0.621x | **0.621** | win |
+| operators | 19 | 0.649x | **0.633** | win |
+| TPC-H sf1 | 22 | 0.764x | **0.765** | win |
+| scan | 27 | 0.865x | *not separable* | win |
+| TPC-DS sf1 | 98 | 0.976x | **0.965** | win |
+| h2o-join | 5 | 1.019x | **1.026** | ~parity |
+| JOB | 109 | 1.271x | **1.252** | lose |
+| h2o-groupby | 10 | 1.310x | **1.151** | lose |
+
+`b/duckdb` against DuckDB's native compressed store. **Read the spread before the
+movement**: h2o-join reads 0.964 and 1.026 on two rounds of one binary, and TPC-H 0.765 and
+0.775, so neither moved. h2o-groupby, operators and TPC-DS moved by more than theirs.
+
+`scan` is left without an after-figure on purpose. It re-reads its corpus from S3 on every
+repeat, and across these rounds **DuckDB's own times move by two to three times** on the
+identical query (`scan-count-one_big` 132.0 ms then 122.1; `scan-sumwide-one_big` 414.8 then
+386.1). Nothing in this session touches the parquet reader, and a suite whose comparator
+swings that far cannot resolve a few percent either way. It reads 0.923 on the final binary;
+that is a number, not a measurement.
+
+JOB's first post-change round read **1.362** on the back of a single 33x outlier — `q30a` at
+2,700 ms where it answers in 89.7 ms run alone, and 105.4 ms on the very next full round. The
+suite is 113 queries over a 1.8 GiB database in one process; that reading did not reproduce
+and is not carried here. The 1.252 above is the round that did.
+
+### 1. A scan's statistics are a property of the source, not of the node
+
+A query that names a table more than once carries a distinct `Scan` node **and a distinct
+entry in the plan's source list** for every reference — one per CTE, per union branch, per
+grouping level. TPC-DS q77 binds nine tables through **forty-eight source ids**. The
+estimator memoizes `estimate` by node identity and `row_width` the same way, and neither
+can see through that: forty-eight scans, forty-eight identical column bundles, each a
+`dataclasses.replace` per column of a thirty-column dimension.
+
+A scan's estimate reads nothing but what it binds, so the memo is keyed on that instead —
+the bound source object (which decides the learned bundle, through `_source_key`) and the
+`SourceStatistics` entry (which decides the declared bounds and the row count).
+`collect_source_stats` hands the same statistics object to every id binding one source, so
+the pair collapses q77's forty-eight onto nine.
+
+Keying on the source object *alone* would be unsound, and the DPhyp oracle test caught it
+within a minute: `StatsEstimator([None] * n, source_stats=[...])` binds every leaf to one
+`None` placeholder while giving each a different row count. Reading the statistics entry
+too is exact rather than merely safer.
+
+The adaptive gate is where this was visible, because it builds a fresh estimator and sizes
+every scan on every `collect` — and its answer for these queries is always *no*:
+
+| | q77 | q5 | q78 | q54 |
+|---|---:|---:|---:|---:|
+| `_large_enough` before | 15.8 ms | 13.1 | 3.5 | 2.9 |
+| after | **1.7** | **1.7** | **1.1** | **1.1** |
+| warm query before | 71.2 ms | — | — | — |
+| after | **56.9** | | | |
+
+### 2. The group key was built and verified through indirections the loop did not need
+
+Four defects in `assign_groups`, all of one kind:
+
+* **`assign_groups_packed` packed row-at-a-time**, so the per-column type `match` sat inside
+  the row loop against a `Vec` whose length the compiler could not know. Filling one column
+  at a time hoists the dispatch out — each column runs its own monomorphic pass into a slot
+  no other column touches. Same bytes, same layout, same ids.
+* **The packed table held the group id alone**, so verifying a probe re-read the key through
+  `keys[g]` — the exact indirection `int_group_ids` documents as a guaranteed cache miss.
+  The key now sits beside the id, which is the argument that function already makes.
+* **A single string key had a `u64` path for values up to 7 bytes and nothing above it**
+  until the byte-slice hash table. A 15-byte `u128` covers the shape that is actually
+  common at high cardinality — an id, a SKU, a formatted date.
+* **The dense composite map did its index arithmetic in `i128`**, one 128-bit multiply per
+  column per row, when every span was already proved to fit the budget. It is `usize` now,
+  with the two-column case its own loop because that is what nearly every composite key is.
+
+Measured single-threaded on 4 M rows, one string key, 10,000 groups: **5-char 1.16x,
+12-char 1.43x, 20-char 1.86x** against DuckDB, which is flat at ~26 ns/row at every width.
+The 20-char case is past the `u128` and is where the remaining gap on this shape lives.
+
+### 3. The streaming fold pre-aggregated a morsel that was already full
+
+A morsel is 16,384 rows, so a key with 10,000 groups fills its hash table almost
+completely: the partial keeps ~0.5 rows per input row, its group columns are `take`n out at
+that width, and `combine` inherits half the relation — to discover a reduction the *shard*
+achieves twelve times better. That is `agg_par::chunked_partials`' argument, and the
+streaming fold did not make it. It groups 128 k-row chunks now.
+
+**Two attempts at the entry test, and the first one is the instructive half.** Widening on
+the morsel's own ratio treats two opposite keys the same, because "this morsel did not
+reduce" is equally true of a 10,000-group key, where a wider unit reduces enormously, and a
+**near-unique** one, where nothing reduces because the group count grows with the rows. So
+a `GROUP BY <customer id>` buffered and concatenated a chunk to rediscover that its key is
+unique — TPC-H q13 0.98 -> 1.13 and q18 0.95 -> 1.08, both exactly that shape.
+
+The test projects instead: `agg_par::estimated_groups` inverts the coupon-collector curve
+on the morsel's `(rows, groups)` to recover the key's domain and reads it forward to the
+chunk's row count. Shared with the materializing executor rather than restated, so the two
+paths cannot reach different conclusions about the same key. q13 returns to 0.93/0.98.
+
+**And then it was asked once.** That projection is a sixty-four-iteration bisection with an
+`exp` in each, and it ran on *every* morsel of a shard whose key does not reduce — which is
+precisely the near-unique key it exists to decline. Asking once, of the first morsel, is
+what took TPC-H back to its baseline and moved the other two suites:
+
+| | after change 3, per morsel | asked once |
+|---|---:|---:|
+| TPC-H sf1 | 0.775 | **0.765** |
+| operators | 0.657 | **0.633** |
+| h2o-groupby | 1.225 | **1.151** |
+
+The grouped chunk's own measurement stays as the backstop, and it can send the fold back to
+the morsel: the projection assumes a uniform key and a clustered one can clear the entry
+test without reducing. Being wrong then costs one chunk's concatenation.
+
+Nine of the ten h2o group-by queries end faster than they began: q7 1.95 -> 1.50, q9 2.17 ->
+1.74, q3 1.71 -> 1.43, q6 0.69 -> 0.51, q5 0.73 -> 0.58.
+
+### Measured and *not* shipped: the executor guard is refusing a real 1.47x
+
+`bc_py::execute_plan` routes a join-free grouped aggregate to the materializing executor
+only when `src_bytes * 8 < budget`. Forcing each executor and timing both, on the h2o
+groupby table:
+
+| case | streaming | materializing | DuckDB |
+|---|---:|---:|---:|
+| q2 — 2 string keys, 10 k groups | 54.6 ms | **37.1** | 17.7 |
+| q1 — 1 string key, 100 groups | **8.6** | 17.4 | 9.8 |
+| q4 — 1 int key, 100 groups | **7.7** | 19.2 | 4.5 |
+| q3 — 1 string key, 100 k groups | 75.4 | 75.4 | 42.7 |
+| q5 — 1 int key, 100 k groups | **38.8** | 44.3 | 41.7 |
+| q10 — 6 keys, 10 M groups | **210.8** | 215.3 | 129.2 |
+
+q2 is the suite's worst case and materializing answers it **1.47x faster**. The byte guard
+refuses it. But Kyber's `prefer_materializing_aggregate` reads **True for all six**,
+including q1 and q4 where materializing is two and a half times *worse* — so relaxing the
+guard would route those too, and the guard is currently acting as an accidental safety net
+for a rule that does not discriminate.
+
+The real fix is a cardinality-aware verdict in Kyber, not a looser byte threshold. It is
+recorded rather than fitted: six measurements on one generated table is not enough to set a
+constant with, and this file already records what happens when one is set that way.
+
 ## Do these optimizations scale? Measured three ways — and only four TPC-H queries are superlinear (2026-08-15)
 
 "It is faster on this box at this scale" is the claim a benchmark supports. The claim the

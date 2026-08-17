@@ -78,7 +78,7 @@ faster**:
 | DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x** — 3.9x faster | **22 of 22** |
 | Polars | **0.43x** — 2.4x faster | 21 of 22 |
 | Daft | **0.35x** — 2.9x faster | **20 of 20** |
-| DuckDB on its **native** compressed store (`duckdb`) | **0.76x** — 1.3x faster | **17 of 22** |
+| DuckDB on its **native** compressed store (`duckdb`) | **0.79x** — 1.3x faster | **16 of 22** |
 
 The last row is the one that changed: leading DuckDB's own storage engine *and* execution
 engine, rather than only its execution engine, is new as of this sweep — it read 0.99x on

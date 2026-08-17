@@ -26,7 +26,7 @@
   <div class="bt-stat">
     <span class="bt-stat-value">1.3&times;</span>
     <span class="bt-stat-label">faster than DuckDB's own compressed store</span>
-    <span class="bt-stat-src">TPC-H sf1 &mdash; storage engine and all, 17 of 22 won</span>
+    <span class="bt-stat-src">TPC-H sf1 &mdash; storage engine and all, 16 of 22 won</span>
   </div>
   <div class="bt-stat">
     <span class="bt-stat-value">43 / 43</span>
@@ -82,18 +82,23 @@ Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15:
 
 | Suite | vs DuckDB, same Arrow | vs DuckDB, native store |
 |---|---|---|
-| Semi-structured JSON, 5 queries | **27x**, won 5 of 5 | **4.0x**, won 5 of 5 |
-| ClickBench, 43 queries | **14x**, won 43 of 43 | **1.6x**, won 30 of 43 |
-| Operator mix, 19 kernels | **2.9x**, won 15 of 19 | **1.6x**, won 12 of 19 |
-| TPC-H sf1, 22 queries | **3.9x**, won 22 of 22 | **1.3x**, won 17 of 22 |
-| TPC-DS sf1, all 99 queries | — | **1.04x**, won 44 of 99 |
+| Semi-structured JSON, 5 queries | **26x**, won 5 of 5 | **4.1x**, won 5 of 5 |
+| ClickBench, 43 queries | **14x**, won 43 of 43 | **1.6x**, won 28 of 43 |
+| Operator mix, 19 kernels | **2.8x**, won 15 of 19 | **1.5x**, won 11 of 19 |
+| TPC-H sf1, 22 queries | **3.9x**, won 22 of 22 | **1.3x**, won 16 of 22 |
+| H2O.ai `join`, 5 queries | **4.1x**, won 5 of 5 | **1.1x**, won 3 of 5 |
+| TPC-DS sf1, all 99 queries | — | **1.04x**, won 38 of 98 |
+
+Read the first column before the second. On the **same Arrow input** — the comparison that
+isolates execution from storage — Batcher wins every suite that comparison can run, and
+`groupby`, a loss on the native store, is a Batcher win 10 of 10 there.
 
 And where it does not win, which is the half a benchmark page usually leaves out: H2O.ai
-`groupby` (1.28x), the 113-query Join Order Benchmark (1.37x), and TPC-H at scale factor 10
-(1.29x) all go to DuckDB's native store today. Two of the three flip on the same Arrow.
-`groupby` becomes a Batcher win 10 of 10 and sf10 becomes 21 of 22, which places that gap in
-the storage format rather than in the operators. The Join Order Benchmark has not been measured
-that way.
+`groupby` (1.19x), the 113-query Join Order Benchmark (1.29x), and TPC-H at scale factor 10
+(1.29x) all go to DuckDB's native store today. Two of the three flip on the same Arrow —
+`groupby` becomes 10 of 10 and sf10 becomes 21 of 22 — which places those gaps in the storage
+format rather than in the operators. The Join Order Benchmark cannot be measured that way:
+over Arrow views DuckDB's planner has no storage statistics to order a many-way join with.
 
 | Other workloads | Result |
 |---|---|

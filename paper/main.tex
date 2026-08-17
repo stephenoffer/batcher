@@ -96,11 +96,12 @@ everywhere, which is what lets \sys{} plan the next query from what it measured
 rather than from vendor constants.
 
 The result is breadth that costs nothing. On relational work, one 96-core machine
-leads DuckDB's own compressed store on TPC-H~\cite{tpch} sf1 ($0.76\times$), on all 99
+leads DuckDB's own compressed store on TPC-H~\cite{tpch} sf1 ($0.79\times$), on all 99
 queries of TPC-DS~\cite{tpcds} ($0.96\times$) and on ClickBench~\cite{clickbench}
-($0.62\times$), leads Polars and Daft by $2.3$--$2.9\times$, sweeps PyArrow's Acero
-engine, and wins every TPC-H and every ClickBench query against DuckDB reading the
-identical Arrow input. On eight nodes, aggregate shuffle
+($0.64\times$), leads Polars and Daft by $2.3$--$2.9\times$, sweeps PyArrow's Acero
+engine, and --- against DuckDB reading the \emph{identical} Arrow input, the bar that
+isolates execution from storage --- wins \emph{every suite that comparison can run},
+by between $2.8$ and $26\times$. On eight nodes, aggregate shuffle
 throughput rises superlinearly, $7.6\times$ for $4\times$ the hardware. On the AI
 pipelines a purpose-built runtime was designed for, it holds $2$--$3.6\times$ against
 Ray Data while treating decode and inference as relational operators. And streaming
@@ -110,10 +111,13 @@ at one million rows and 3.3\,MB at four million, against 198\,MB and 794\,MB for
 the evaluation attributes each rather than averaging it away. Two are storage: at ten
 times the data DuckDB's compressed store leads again ($1.29\times$ at sf10), and a
 group-by on low-cardinality string keys loses to that store's dictionary encoding while
-beating it $9\times$ on identical input. The third is not. The Join Order
+beating it $11\times$ on identical input. The third is not. The Join Order
 Benchmark~\cite{leis2015goodjoin} --- the suite built to expose the estimation errors
-this design claims to correct --- remains $1.37\times$ behind, and the losses trace to
-estimates this paper's own cost model gets wrong.
+this design claims to correct --- remains $1.29\times$ behind, and the losses trace to
+estimates this paper's own cost model gets wrong: the cross-run loop meant to answer
+them writes its measured cardinality to a key nothing reads, and correcting that key
+regresses the suites, because every threshold downstream was calibrated while the
+input was an order of magnitude low.
 \end{abstract}
 
 \begin{figure*}[tbp]
@@ -997,7 +1001,7 @@ the smaller sizes become $1.6$--$2.0\times$ wins.
 \cmidrule(lr){2-3}\cmidrule(lr){5-6}
 Baseline & geomean $b/x$ & wins & & geomean $b/x$ & wins & Note \\
 \midrule
-DuckDB (native compressed store) & \win \textbf{0.76}$\times$ & \win 17/22 & & \loss 1.29$\times$ & \loss 8/22 & compressed store \\
+DuckDB (native compressed store) & \win \textbf{0.79}$\times$ & \win 16/22 & & \loss 1.29$\times$ & \loss 8/22 & compressed store \\
 DuckDB (same Arrow input)        & \win \textbf{0.26}$\times$ & \win \textbf{22/22} & & --- & --- & like-for-like$^*$ \\
 Polars~\cite{polars}             & \win \textbf{0.43}$\times$ & \win 21/22 & & \win \textbf{0.37}$\times$ & \win 18/22 & \\
 Daft~\cite{daft}                 & \win \textbf{0.35}$\times$ & \win \textbf{20/20} & & \win \textbf{0.42}$\times$ & \win 16/20 & wrong answers on q6, q15$^\dagger$ \\
@@ -1050,7 +1054,7 @@ here are combinations of a non-default flag with a non-default path.
 Polars and Daft, \sys{} leads by $2.3$--$2.9\times$ in geometric mean at both scales,
 and against DuckDB on identical Arrow input it wins \emph{every} query at sf1 by
 $3.9\times$ overall. The result that changed is the third one: \sys{} now also leads
-DuckDB's \emph{compressed native store} at sf1, $0.76\times$ on 17 of 22 queries,
+DuckDB's \emph{compressed native store} at sf1, $0.79\times$ on 16 of 22 queries,
 where an earlier build of this system read $1.02\times$ on 12 of 22. That comparison
 gives DuckDB an untimed ingest into a compressed, dictionary-encoded, zone-mapped
 format and \sys{} nothing but raw Arrow, so it is a storage engine \emph{and} an
@@ -1142,7 +1146,7 @@ the same gap \cref{sec:eval}'s group-by results attribute to storage.
 On ClickBench~\cite{clickbench} (43 queries, correctness-gated) \sys{} wins 43 of 43
 against DuckDB on identical Arrow input --- every query, geomean $0.073\times$ --- and
 36 of 40 against Polars ($0.33\times$) and 41 of 41 against Daft ($0.26\times$).
-Against DuckDB's \emph{native} store it now wins the suite too, $0.62\times$ on 30 of
+Against DuckDB's \emph{native} store it now wins the suite too, $0.64\times$ on 28 of
 43. Five of those 43, however, \sys{} answers from a recorded statistic rather than by
 executing, so the figure an execution claim should use is $0.77\times$ over the other
 38. Both numbers say the same thing about attribution: the same engine on the same
@@ -1163,22 +1167,28 @@ three that are hardest to tune for and easiest to omit.
 Suite & Queries & geomean $b/\text{DuckDB}$ & wins \\
 \midrule
 JSON (semi-structured)   & 5   & \win \textbf{0.25}$\times$ & \win 5/5 \\
-ClickBench~\cite{clickbench} & 43 & \win \textbf{0.62}$\times$ & \win 30/43 \\
-Operator mix             & 19  & \win \textbf{0.64}$\times$ & \win 12/19 \\
-TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.76}$\times$ & \win 17/22 \\
-H2O.ai \texttt{join}     & 5   & \win \textbf{0.95}$\times$ & 3/5 \\
-TPC-DS~\cite{tpcds} sf1  & 99  & \win \textbf{0.96}$\times$ & 44/99 \\
+ClickBench~\cite{clickbench} & 43 & \win \textbf{0.64}$\times$ & \win 28/43 \\
+Operator mix             & 19  & \win \textbf{0.66}$\times$ & 11/19 \\
+TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.79}$\times$ & \win 16/22 \\
+H2O.ai \texttt{join}     & 5   & \win \textbf{0.93}$\times$ & 3/5 \\
+TPC-DS~\cite{tpcds} sf1  & 99  & \win \textbf{0.96}$\times$ & 38/98 \\
 \midrule
-H2O.ai \texttt{groupby}  & 10  & \loss 1.28$\times$ & \loss 4/10 \\
+H2O.ai \texttt{groupby}  & 10  & \loss 1.19$\times$ & \loss 4/10 \\
 TPC-H sf10               & 22  & \loss 1.29$\times$ & \loss 8/22 \\
-Join Order~\cite{leis2015goodjoin} & 113 & \loss 1.37$\times$ & \loss 31/109 \\
+Join Order~\cite{leis2015goodjoin} & 113 & \loss 1.29$\times$ & \loss 35/109 \\
 \bottomrule
 \end{tabular}
 \caption{Every relational suite in the harness against DuckDB's \emph{native
 compressed store} --- the harder of the two bars --- on one 96-core node, ordered by
-result. Six of nine go to \sys{}. On identical Arrow input the margins widen: TPC-H
-22/22 at $0.26\times$, ClickBench 43/43 at $0.07\times$, and H2O \texttt{groupby}, a
-loss above, 10 of 10 at $0.11\times$.}
+result. Six of nine go to \sys{}. Each row is a two-engine run: a four-engine lineup holds
+DuckDB's tables, its Arrow views and Polars' frames at once and read H2O \texttt{join} at
+$1.83\times$ against the $0.93\times$ here, so the lineup is part of the measurement.
+On identical Arrow input --- the like-for-like execution bar --- \emph{every suite that can
+run it is a win}: JSON $0.039\times$ (5/5), ClickBench $0.072\times$ (\textbf{43/43}), H2O
+\texttt{groupby} $0.089\times$ (\textbf{10/10}), H2O \texttt{join} $0.244\times$
+(\textbf{5/5}), TPC-H $0.256\times$ (\textbf{22/22}), the operator mix $0.362\times$ (15/19).
+TPC-DS and JOB have no entry on that bar because DuckDB over registered Arrow views has no
+storage statistics to order a many-way join with and is \emph{SIGKILL}ed on TPC-DS q64.}
 \label{tab:breadth}
 \end{table}
 
@@ -1198,7 +1208,7 @@ this paper's thesis, and the one \sys{} loses. Its 113 queries run over a real I
 snapshot whose predicates are correlated the way real data is, which is precisely
 where the independence assumptions in a textbook cost model fail; Leis et al. built it
 to show that estimation error, not the join-order search, is where optimizers lose. At
-$1.37\times$ it is the largest remaining relational gap, and the shape of the loss
+$1.29\times$ it is the largest remaining relational gap, and the shape of the loss
 confirms their finding rather than ours: on \texttt{q13a}, 21 of the 733 join
 estimates the search makes price a join below one row, and zero times the next join's
 rows is zero, so a single such estimate takes every join above it with it. One
@@ -1215,7 +1225,7 @@ process down, is now a win at 291\,ms against DuckDB's 504.
 
 \textbf{H2O.ai db-benchmark}~\cite{h2obenchmark} isolates the two things TPC-* buries
 inside larger plans: group-by state management, and join build-side selection. \sys{}
-takes the join task ($0.95\times$) and loses the group-by ($1.28\times$), and that
+takes the join task ($0.93\times$) and loses the group-by ($1.19\times$), and that
 split is legible rather than mysterious. The group-by keys are low-cardinality strings.
 DuckDB holds them dictionary-encoded and groups on eight-bit codes; \sys{} reads the
 same column as full Arrow \texttt{Utf8}, because \cref{sec:algebra}'s contract is that
@@ -1228,6 +1238,19 @@ Handing \sys{} DuckDB's own representation therefore makes it \emph{slower}, not
 faster. Preserving the encoding requires separating a plan's
 logical type from a morsel's physical one, which is the one place where the paper's
 central constraint is currently paid for in performance rather than repaid.
+
+What can be recovered without touching the boundary is the \emph{composite} key, and it is
+worth stating what that isolates. A single short string key already takes the dense
+direct-map path and beats DuckDB outright --- 8.6\,ms against 10.0 on 10M rows over 100
+distinct five-character values. Adding a second string column used to leave that path
+entirely for a 128-bit packed hash, at 41.7\,ms against 18.1. Numbering each column's
+distinct values in first-seen order is injective, so two rows share a code tuple exactly
+when they share a value tuple; the ranked columns then take the ordinary integer grouper.
+The two-string case now measures at 32.6\,ms --- \emph{identically} to the same query with
+two \texttt{int64} keys --- which is the check that the representation was the whole
+difference and that what remains is the integer path, not the strings. The suite's residue
+is concentrated in its two single-key high-cardinality queries (\texttt{q3}, \texttt{q7}:
+one column, 100{,}000 distinct values), which is exactly the dictionary case above.
 
 \subsection{The small case, which a warm benchmark never measures}
 \label{sec:smallquery}
