@@ -727,6 +727,14 @@ pub(crate) fn sort_indices_of(
         // primitive, but this type is off the fast path anyway.)
     }
     let options = sort_options(keys);
+    // Composite radix fast path: when every key is an integer or a temporal and their *measured*
+    // value ranges fit one `u64` between them, the whole tuple becomes a single order-preserving
+    // integer and the sort is a counting sort over it — no row encoding, no comparisons. See
+    // `radix_sort::packed_multi_sort_indices` for why the permutation is the same one the
+    // row-encoded sort below produces.
+    if let Some(idx) = radix_sort::packed_multi_sort_indices(vals, &options) {
+        return Ok(idx);
+    }
     // Row-encoded stable sort. Identical permutation to the `lexsort` fallback below, but
     // the ascending row-index tie-break lives in the *comparator* instead of being encoded
     // as a trailing key column — so the encoder writes and every comparison memcmps four

@@ -8,7 +8,7 @@ determinism machinery than any other, and why `sort(descending=True)` once silen
 unsorted data under spill while every gate stayed green.
 
 :::{important}
-The engine has four sort paths, and all four must produce the **identical permutation**, not
+The engine has five sort paths, and all five must produce the **identical permutation**, not
 merely a correctly sorted one. The parallel and spilling paths each sort a *slice* of the input
 and concatenate the results, so "sorted" is not enough: two paths that order tied rows
 differently produce different relations from the same query.
@@ -17,8 +17,9 @@ differently produce different relations from the same query.
 | Path | Taken when | Code |
 |---|---|---|
 | LSD radix | a single fixed-width key, a full sort, no `NaN` in the column, floats only up to 2^18 rows | `ops/radix_sort.rs` |
+| Composite radix | several keys, all integer or temporal, whose measured value ranges fit one `u64` between them | `ops/radix_sort.rs` |
 | Stable string sort | a `Utf8` key | `ops/str_sort.rs` |
-| Parallel sample-sort | above 2^17 rows, a full sort, leading key of type float / integer / string | `ops/sample_sort.rs` |
+| Parallel sample-sort | above 2^17 rows, a full sort, leading key of type float / integer / temporal / string | `ops/sample_sort.rs` |
 | External merge sort | the input exceeds the memory envelope | `ops/external_sort.rs` |
 
 ```text
@@ -28,12 +29,16 @@ differently produce different relations from the same query.
         │                                               sorted runs → bounded k-way merge
         │
         ├─ > 2^17 rows, full sort, leading key
-        │  is int / float / string? ────────────────► parallel sample-sort
+        │  is int / float / temporal / string? ─────► parallel sample-sort
         │                                               sample → range-partition → sort ranges
         │
         ├─ single fixed-width key, full sort, no NaN,
         │  floats only below 2^18 rows? ────────────► LSD radix sort
         │                                               O(n·w), order-preserving u64 transform
+        │
+        ├─ several integer / temporal keys whose
+        │  measured ranges fit one u64? ────────────► composite radix sort
+        │                                               narrow each key to its range, pack, radix
         │
         └─ otherwise ───────────────────────────────► comparison sort
                                                         (the stable string sort for Utf8 keys)
@@ -66,14 +71,70 @@ Arrow's `total_cmp` for floats. O(n·w) in the key width against the comparison 
 producing the identical relation.
 
 It declines rather than risks: a column containing a `NaN` (no single numeric position), a
-string or boolean key, a multi-key sort, or a top-N returns `None` and the caller uses the
-comparison sort. Floats also decline above 2^18 rows, where the random-scatter key array no
+string or boolean key, or a top-N returns `None` and the caller uses the comparison sort. A
+multi-key sort declines here too, and is picked up by the composite path below. Floats also decline above 2^18 rows, where the random-scatter key array no
 longer fits L2 and the radix loses to the comparison sort outright. Large float sorts arrive
 here only per-range (parallel) or per-run (spill), both below that bound.
 
 Nulls are grouped first or last per `nulls_first`, in input order. The sort is stable.
 
-## Path 2: stable string sort
+## Path 2: composite radix (several integer or temporal keys)
+
+A multi-key `ORDER BY` had no fast path. `ORDER BY o_orderdate, o_shippriority` fell to the
+comparison sort, which encodes every row into Arrow's comparable byte format and then pays
+`O(n log n)` memcmps over it. Those two columns hold about 2,400 and 5 distinct values between
+them: fifteen bits, against the ninety-six their declared types claim.
+
+`packed_multi_sort_indices` (`ops/radix_sort.rs`) measures each key column's live value range,
+gives it exactly `ceil(log2(range))` bits, and packs the whole tuple into one `u64` laid out
+most-significant key first. Comparing two packed keys as integers then compares their fields
+left to right, stopping at the first difference, which is the definition of lexicographic
+order. The sort becomes the same LSD radix path 1 uses, and a fifteen-bit key costs two
+counting passes rather than eight.
+
+The narrowing is the idea DuckDB calls compressed materialization
+(`src/optimizer/compressed_materialization/compress_order.cpp`), which rewrites a column to
+`value - min` at the smallest width its catalog statistics allow. Batcher measures the range on
+the rows in hand instead of reading it from a catalog, so it needs no statistics, is exact on
+every input, and narrows intermediates that no catalog describes.
+
+Four details carry the correctness:
+
+- **Direction lives in the key, not the sort.** Each column's field holds the order-preserving
+  `u64` the single-key radix already uses, which folds `descending` in by inverting. So a sort
+  can mix directions per key and the packed integer still sorts ascending.
+- **Nulls are encoded inside their field**, not partitioned out, because a multi-key sort's
+  nulls are per column and interleaved. A null takes the field's lowest value under
+  `nulls_first` and its highest otherwise, and the field is widened by one value to make room,
+  only when the column actually has a null.
+- **A constant column takes zero bits.** It cannot separate two rows, so it contributes nothing
+  and costs nothing.
+- **The radix is stable**, so rows equal on every key keep input order, which is the tie-break
+  every other path gets from its trailing row-index column.
+
+It declines to the comparison sort on a string, boolean or float key, on fewer than 64 rows, on
+more than eight keys, and whenever the measured ranges need more than 64 bits between them. The
+decline is cheap by construction: a range measured over a *prefix* of the rows can only widen,
+so 4,096 rows are enough to *reject* a key that will not fit, and the exact scan runs only for a
+key that might. Rejecting is always legal, which is what lets the probe be one-sided.
+
+Measured on 8 M rows, best of three interleaved runs against the path it replaces:
+
+| Shape | Before | After | |
+|---|---|---|---|
+| `ORDER BY <date>, <priority>` (12,000 distinct pairs) | 1,878 ms | 625 ms | **3.0x** |
+| `ORDER BY <int>, <int>` (3 M distinct pairs) | 112 ms | 59 ms | **1.9x** |
+| `ORDER BY <int> DESC, <int>` | 90 ms | 60 ms | **1.5x** |
+| `ORDER BY <int>, <int>, <int>` (narrow) | 133 ms | 71 ms | **1.9x** |
+| `ORDER BY <full-width int>, <full-width int>` (declines) | 66 ms | 61 ms | 1.1x |
+| `ORDER BY <string>, <int>` (declines) | 199 ms | 200 ms | 1.0x |
+
+Those figures isolate the packing. On the committed benchmark case the two changes on this page
+compound: `op-sort-multikey-narrow` (`ORDER BY l_shipdate, l_suppkey` over 6M `lineitem` rows)
+goes from **1,590 ms to 52 ms**, which is 37.1x slower than DuckDB to 1.28x. The packing alone
+accounts for about 3x of that; the rest is the sample-sort note under path 4.
+
+## Path 3: stable string sort
 
 `ops/str_sort.rs`. Strings had no radix path, so a string `ORDER BY` was the one sort whose tie
 order was nondeterministic, and that nondeterminism is precisely what blocked the parallel
@@ -85,10 +146,10 @@ non-null rows sorted byte-lexicographically (the ordering Arrow itself uses for 
 descending inverting only the key comparison, never the tie-break. Equal keys always keep input
 order, so the serial oracle and the per-range sorts produce the identical relation.
 
-## Path 3: parallel sample-sort
+## Path 4: parallel sample-sort
 
-`ops/sample_sort.rs`, above 2^17 rows, for a full sort with a float, integer, or string leading
-key.
+`ops/sample_sort.rs`, above 2^17 rows, for a full sort with a float, integer, temporal, or
+string leading key.
 
 Sample ~8,192 rows to estimate quantile boundaries, range-partition the rows by the leading key,
 and sort each range in parallel. The ranges are globally ordered relative to each other, so the
@@ -128,7 +189,20 @@ globally sorted multi-key relation.
 This is the single-node form of the distributed range sort, and it comes from the same
 `bc_runtime::shuffle` range partitioners: one implementation, two scales.
 
-## Path 4: external merge sort
+:::{note}
+A temporal leading key routes as `i64`, and until recently did not. The routing tested
+`DataType::is_integer()`, which is false for `Date32`, `Date64`, `Timestamp`, `Time32/64` and
+`Duration` — so every one of them fell through and `ORDER BY <date>` ran **serially**, on
+however many cores the box had. On 6M rows a date sort with 2,500 distinct values took 643 ms,
+against 38 ms for the same sort on an `Int64` column holding *more* distinct values. Those types
+are physically signed integers whose numeric order is the type's order, in every unit and with
+or without a time zone, so they take the same routing. Two stay out. `Interval` is not one
+integer: `MonthDayNano` is three fields in 128 bits and none orders it. `Time32` is one integer
+that Arrow will not widen, so admitting it would raise rather than sort; the routing also
+declines on a failed cast, which keeps that class of mistake to a missed optimization.
+:::
+
+## Path 5: external merge sort
 
 `ops/external_sort.rs`, when the input exceeds the memory envelope. Sort each input morsel into a
 run and spill it (dropping the input batch as you go), then merge the runs with a bounded-fan-in
@@ -193,6 +267,28 @@ print(ds.sort("g", "x", descending=[False, True]).to_pydict())   # multi-key, mi
 print(ds.sort("x", descending=True).limit(2).explain())
 ```
 
+The third line is the composite shape. With a text or binary leading key it takes the comparison
+sort;
+swap `g` for a second integer or date column and the same call takes the composite radix, with
+no change to the query and none to the result:
+
+```python
+import batcher as bt
+
+orders = bt.from_pydict(
+    {
+        "orderdate": [19_950_301, 19_950_302, 19_950_301, 19_950_302],
+        "shippriority": [0, 1, 1, 0],
+        "revenue": [10.0, 20.0, 30.0, 40.0],
+    }
+)
+print(orders.sort("orderdate", "shippriority", descending=[False, True]).to_pydict())
+```
+
+```text
+{'orderdate': [19950301, 19950301, 19950302, 19950302], 'shippriority': [1, 0, 1, 0], 'revenue': [30.0, 10.0, 20.0, 40.0]}
+```
+
 ```text
 {'x': [1, 2, 4, 5, None], 'g': ['b', 'b', 'a', 'a', 'c']}
 {'x': [5, 4], 'g': ['a', 'a']}
@@ -224,7 +320,7 @@ about.
 ## Where the code lives
 
 - `crates/bc-interp/src/ops/mod.rs`: `sort_batch`, `sort_indices`, `sort_indices_of`
-- `crates/bc-interp/src/ops/radix_sort.rs`: the LSD radix path
+- `crates/bc-interp/src/ops/radix_sort.rs`: the LSD radix path, and the composite key packed from measured ranges
 - `crates/bc-interp/src/ops/str_sort.rs`: the stable string permutation
 - `crates/bc-interp/src/ops/sample_sort.rs`: the parallel sample-sort
 - `crates/bc-interp/src/ops/external_sort.rs`: the spilling k-way merge
@@ -233,7 +329,7 @@ about.
 ## See also
 
 - {doc}`Architecture </architecture/index>`: why an order-defining operator needs its own determinism machinery.
-- {doc}`Execution engine </architecture/internals/execution>`: the sequential oracle the four paths must match.
+- {doc}`Execution engine </architecture/internals/execution>`: the sequential oracle the five paths must match.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the envelope that decides whether the sort goes out of core.
 - {doc}`Sorting </user-guide/transform/rows/sorting>`: the API, including `nulls_first` and mixed directions.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: why `sort().limit()` is not `sort()` then slice.

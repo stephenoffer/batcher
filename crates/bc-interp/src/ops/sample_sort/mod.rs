@@ -11,6 +11,16 @@
 //! ranges up front (and again to sort them, and a third time to concatenate) copied every
 //! column three times — on a 5 M-row, 6-column sort that was two thirds of the work.
 //!
+//! **A temporal leading key routes as `i64`, and used not to.** `DataType::is_integer()` is
+//! false for `Date32`, `Timestamp` and their neighbours, so the routing below fell to its
+//! `_ => return Ok(None)` arm and a date sort ran **serially** — on 96 cores. It is not a
+//! corner case: `ORDER BY <date>` and `ORDER BY <timestamp>` are the commonest sorts an
+//! analytic query writes, and the gap they left was 16x. Measured on 6 M rows,
+//! `ORDER BY <date>` with 2,500 distinct values: **617 ms serial against 38 ms** for the same
+//! sort on an `Int64` column holding *more* distinct values, which is the same shape taking
+//! this path. See [`is_integer_ordered_temporal`] for which types are admitted and why
+//! `Interval` is not.
+//!
 //! This is the single-node form of the distributed range sort (`dist/flight_sort.py`), so
 //! one implementation serves both: the boundaries and the routing come from the same
 //! `bc_runtime::shuffle` range partitioners.
@@ -26,6 +36,30 @@ use rayon::prelude::*;
 mod lowcard;
 
 use crate::error::InterpError;
+
+/// Two types are deliberately absent, for different reasons, and both are pinned by
+/// `every_admitted_temporal_type_casts_to_i64`.
+///
+/// `Interval` is not one integer at all: `MonthDayNano` is three fields in 128 bits, and no
+/// `i64` orders it — a month is not a fixed number of days, so two intervals are not even
+/// totally ordered by duration.
+///
+/// `Time32` *is* one integer, and arrow simply will not cast it: `can_cast_types(Time32, Int64)`
+/// is false in arrow-rs, and arrow C++ refuses `date32 -> int64` as well, so this is a gap the
+/// two implementations already answer differently rather than a hypothetical. Admitting it would
+/// turn `ORDER BY <a time column>` from a working serial sort into a **raise**. The routing
+/// below declines on a failed cast for the same reason, so this list being wrong costs a missed
+/// optimization and never an error.
+fn is_integer_ordered_temporal(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+    )
+}
 
 /// Rows below which the single-node sample-sort stays serial — the sampling + range
 /// partition overhead only pays off on a large full sort.
@@ -56,9 +90,9 @@ struct Range {
 /// Parallel single-node full sort by sample-sort.
 ///
 /// Returns `None` (caller uses the serial `sort_batch`) unless it applies: a full sort (no
-/// `LIMIT` — top-N is already cheap), a large input, and a **float, integer, or string**
-/// leading key (the boundaries route it exactly — floats by `f64`, integers by `i64`,
-/// strings lexicographically by bytes). Multi-key sorts are supported: rows bucket by the
+/// `LIMIT` — top-N is already cheap), a large input, and a **float, integer, temporal, or
+/// string** leading key (the boundaries route it exactly — floats by `f64`, integers and
+/// temporals by `i64`, strings lexicographically by bytes). Multi-key sorts are supported: rows bucket by the
 /// leading key (equal leading keys never span a boundary), then each range sorts by the
 /// full key list, so a plain concatenation in leading-key order is the globally sorted
 /// multi-key relation.
@@ -170,8 +204,13 @@ pub(crate) fn parallel_sort_batch(
             };
             bc_runtime::shuffle::range_part_of_str(key, &b, parts, k0.nulls_first, k0.descending)?
         }
-        dt if dt.is_integer() => {
-            let key_i64 = arrow::compute::cast(key, &DataType::Int64)?;
+        dt if dt.is_integer() || is_integer_ordered_temporal(dt) => {
+            // Decline rather than raise if arrow will not widen this key. Every type admitted
+            // above casts today; making the failure a decline means the day one stops, the
+            // query loses the parallel path instead of failing.
+            let Ok(key_i64) = arrow::compute::cast(key, &DataType::Int64) else {
+                return Ok(None);
+            };
             // Routing compares the leading key as i64. That is order-preserving for every
             // integer width except a `UInt64` value above `i64::MAX`, which the (safe) cast
             // turns into a null — so it would route by the null bucket (smallest/largest end
@@ -933,6 +972,133 @@ mod tests {
             .unwrap()
             .expect("in-range uint64 must keep the parallel path");
         assert_eq!(want, concat_ranges(&b.schema(), ranges));
+    }
+
+    /// A temporal leading key must both *engage* the parallel path and match the serial
+    /// oracle. Engaging is half the assertion on purpose: this shape used to be correct and
+    /// serial, so a test that only checked the relation would have passed on the bug.
+    #[test]
+    fn temporal_leading_keys_parallelize_and_match_serial() {
+        use arrow::array::{Date32Array, Date64Array, TimestampMicrosecondArray};
+
+        let n = 1usize << 18;
+        let mut s: u64 = 99;
+        let mut spread = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 40) as i64
+        };
+        let raw: Vec<i64> = (0..n).map(|_| spread()).collect();
+
+        // Nullable, so the routing's null placement is exercised in every direction.
+        let nullable = |f: &dyn Fn(usize) -> i64| -> Vec<Option<i64>> {
+            (0..n).map(|i| (i % 11 != 0).then(|| f(i))).collect()
+        };
+        let vals = nullable(&|i| raw[i]);
+
+        let cases: Vec<(DataType, ArrayRef)> = vec![
+            (
+                DataType::Date32,
+                Arc::new(Date32Array::from(
+                    vals.iter().map(|v| v.map(|x| x as i32)).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                DataType::Date64,
+                Arc::new(Date64Array::from(vals.clone())) as ArrayRef,
+            ),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                Arc::new(TimestampMicrosecondArray::from(vals.clone())) as ArrayRef,
+            ),
+        ];
+
+        for (dt, ka) in cases {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", dt.clone(), true),
+                Field::new("p", DataType::Int64, false),
+            ]));
+            let pa: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+            let b = RecordBatch::try_new(schema, vec![ka, pa]).unwrap();
+            for (descending, nulls_first) in [(false, false), (true, false), (false, true)] {
+                let keys = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                let want = sort_batch(&b, &keys, None).unwrap();
+                let ranges = parallel_sort_batch(&b, &keys, None)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{dt:?} must take the parallel path"));
+                assert_eq!(
+                    want,
+                    concat_ranges(&b.schema(), ranges),
+                    "{dt:?} sample-sort diverges (descending={descending} nulls_first={nulls_first})"
+                );
+            }
+        }
+    }
+
+    /// Every type [`is_integer_ordered_temporal`] admits must actually be *castable* to `i64`
+    /// by arrow, or the routing would raise where it means to decline. Arrow C++ refuses
+    /// `date32 -> int64` outright, so this is not a theoretical worry about a sibling
+    /// implementation — it is one arrow already answers differently in two places.
+    #[test]
+    fn every_admitted_temporal_type_casts_to_i64() {
+        use arrow::compute::can_cast_types;
+        use arrow::datatypes::{IntervalUnit, TimeUnit};
+        for dt in [
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Duration(TimeUnit::Millisecond),
+        ] {
+            assert!(
+                is_integer_ordered_temporal(&dt),
+                "{dt:?} should be admitted"
+            );
+            assert!(
+                can_cast_types(&dt, &DataType::Int64),
+                "{dt:?} is admitted but arrow cannot cast it to Int64"
+            );
+        }
+        // Arrow cannot widen `Time32`, so it must stay out of the routing and keep the serial
+        // sort — which is correct, only sequential.
+        for dt in [
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+        ] {
+            assert!(
+                !can_cast_types(&dt, &DataType::Int64),
+                "{dt:?} now casts — admit it"
+            );
+            assert!(
+                !is_integer_ordered_temporal(&dt),
+                "{dt:?} must not be admitted"
+            );
+        }
+        // `Interval` is excluded on the stronger ground that no single integer orders it.
+        assert!(!is_integer_ordered_temporal(&DataType::Interval(
+            IntervalUnit::MonthDayNano
+        )));
+    }
+
+    /// `Interval` has no single integer that orders it, so it must keep the serial sort
+    /// rather than be routed by a cast that would silently compare the wrong thing.
+    #[test]
+    fn an_interval_key_is_not_treated_as_an_integer() {
+        assert!(!is_integer_ordered_temporal(&DataType::Interval(
+            arrow::datatypes::IntervalUnit::MonthDayNano
+        )));
+        assert!(is_integer_ordered_temporal(&DataType::Date32));
+        assert!(is_integer_ordered_temporal(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            Some("UTC".into())
+        )));
     }
 
     #[test]

@@ -115,6 +115,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | **Unreachable** — decoded at the FFI boundary, so the dict-native kernels never see a dictionary from Python | Compounds with 2 |
 | 7 | Adaptive morsel sizing as a pluggable strategy | Daft | Fixed 16,384 rows | Small, and mostly a latency story |
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
+| 11 | Compressed materialization — narrow a key to its *measured* range | DuckDB | **Landed for the multi-key sort** (`packed_multi_sort_indices`); **measured and reverted** for the composite group key | 1.5-3.0x on a multi-key `ORDER BY`; 0.86x-1.04x on grouping, so not taken there — see 11 |
 
 **Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
 landed; item 6 was recorded as partially closed and is in fact *inert on the live path*. Three
@@ -1452,6 +1453,204 @@ concurrency limit, not a per-call one: at ~822 µs and four control calls per mo
 saturates at roughly 300 morsels/s, and the fix for *that* is fewer driver round trips rather
 than faster ones.
 
+## 11. Compressed materialization — narrow a key to its measured range (2026-08-18)
+
+**Source: DuckDB, `src/optimizer/compressed_materialization/`.** DuckDB rewrites a column to
+`value - min` at the smallest integer width its catalog statistics allow, immediately before any
+operator that *materializes* the value: `compress_aggregate.cpp`, `compress_comparison_join.cpp`,
+`compress_distinct.cpp`, `compress_order.cpp`. An `INTEGER` column whose statistics say
+`[1000, 1050]` becomes a `UTINYINT` offset, so the hash table entry, the sort payload and the
+join key all shrink.
+
+Nothing in this document had covered it: a grep of both ledgers for "compressed
+materialization", "zone map", "late materialization" and "radix partition" returned zero before
+this pass.
+
+Batcher can do the same narrowing **better in one respect and worse in another**, and both
+follow from where it would live. DuckDB's is a *planner* rewrite driven by catalog statistics, so
+it reaches only columns a catalog describes and only as well as the statistics are current.
+Batcher's data plane already holds the rows, so a min/max scan measures the range *exactly*, on
+every input, including intermediates no catalog has ever seen — but it must pay for that scan
+every time, where DuckDB's is free at plan time.
+
+That trade decides the result, and it came out differently for the two operators tried.
+
+### 11a. The multi-key sort — **landed, 1.5x to 3.0x**
+
+`ORDER BY <a>, <b>` had no fast path at all. `radix_sort_indices` takes a single column, so every
+multi-key sort fell to the row-encoded comparison sort: an encode of every row into arrow's
+comparable byte format, then `O(n log n)` memcmps over it. `ORDER BY o_orderdate,
+o_shippriority` is about 2,400 and 5 distinct values — fifteen bits, against the ninety-six the
+declared types claim and the twelve-plus bytes the encoder writes.
+
+`radix_sort::packed_multi_sort_indices` measures each key's live range, gives it
+`ceil(log2(range))` bits, and packs the tuple into one `u64` **most-significant key first** — so
+an integer comparison of two packed keys is a left-to-right comparison of their fields, which is
+the definition of lexicographic order. The sort is then the LSD radix that already existed, and
+`lsd_radix` skips a constant byte, so a fifteen-bit key costs two counting passes rather than
+eight.
+
+Measured on 8 M rows, best of three **interleaved** runs (base and candidate alternating, so a
+busy box's drift lands on both arms):
+
+| Shape | Before | After | |
+|---|---|---|---|
+| `ORDER BY <date>, <priority>`, 12,000 distinct pairs | 1,878 ms | 625 ms | **3.00x** |
+| `ORDER BY <int>, <int>`, 3 M distinct pairs | 112 ms | 59 ms | **1.92x** |
+| `ORDER BY <int> DESC, <int>` | 90 ms | 60 ms | **1.48x** |
+| `ORDER BY <int>, <int>, <int>`, narrow | 133 ms | 71 ms | **1.86x** |
+| two full-width `Int64` keys (declines) | 66 ms | 61 ms | 1.10x |
+| `ORDER BY <string>, <int>` (declines) | 199 ms | 200 ms | 1.00x |
+| single `Int64` key (untouched) | 45 ms | 43 ms | 1.05x |
+
+Four things carry the equality with the comparison sort, and all four are pinned by
+`packed_multi_key_tests`, which compares against arrow's own `lexsort_to_indices` with the
+row-index tie-break appended — the path this replaces, sharing no code with it:
+
+* **Direction lives in the key.** Each field holds the order-preserving `u64` the single-key
+  radix already uses, which folds `descending` in by inverting, so a sort may mix directions per
+  key and the packed integer still sorts ascending.
+* **Nulls are encoded inside their field**, not partitioned out, because a multi-key sort's nulls
+  are per column and interleaved. A null takes the field's lowest value under `nulls_first` and
+  its highest otherwise; the field widens by one value only when the column has a null.
+* **A constant column takes zero bits** — it cannot separate two rows, so it costs nothing.
+* **The radix is stable**, so full ties keep input order, which is the tie-break every other path
+  gets from its trailing row-index column.
+
+**Nobody else does this for a sort, and the reason is where each of them puts it.** DuckDB's
+narrowing is a *planner* rewrite off catalog statistics, so it does not reach a table registered
+from Arrow, an intermediate, or a stale-statistics column — the three cases that dominate here.
+Polars encodes multi-key sorts through its row format
+(`polars-core/src/chunked_array/ops/sort/arg_sort_multiple.rs::_get_rows_encoded`), and
+DataFusion hands them to arrow's `lexsort_to_indices`
+(`physical-plan/src/sorts/sort.rs:905`); both are the path this replaces. So this is DuckDB's
+idea moved into the data plane, where the range is a fact about the rows rather than a claim
+about the table.
+
+Two measured lessons are worth more than the ratios, because both were mistakes first:
+
+1. **Decide before materializing.** The first version measured each column's width from a
+   materialized rank array, which made the *decline* the expensive case: two full-width `Int64`
+   keys over 8 M rows built 128 MiB of ranks and then rejected the budget, at **1.41x slower**
+   than not trying. Widths now come from two values — the extreme ranks are the ranks of the
+   extreme values, because the encoding is monotone — so the scan allocates nothing and the
+   ordering rule is still stated once.
+2. **A prefix can reject but never accept.** A range measured over a subset can only widen, so
+   4,096 rows are enough to *prove* a key will not fit, while a prefix that fits proves nothing
+   and the exact scan still runs. That one-sidedness is what makes the guard safe to consult
+   before the real measurement rather than instead of it, and it takes the decline from 0.96x to
+   1.10x.
+
+### 11b. The composite group key — **built, measured, reverted**
+
+The same narrowing applied to `assign_groups`' composite-integer path, whose own notes record a
+probe costing **362.7 ns/row** at 1.7 M groups because verifying a hash hit reads the
+representative row in *every* key column. Packing the tuple into one `u64` and handing it to the
+single-integer grouper — whose table stores the key inline beside the group id — should have
+removed that read outright.
+
+It did not pay, on any shape, and the reason is worth recording so the next reader does not
+rebuild it:
+
+| Shape, 8 M rows | Base | Packed | |
+|---|---|---|---|
+| `GROUP BY <int>, <int>`, 8 M groups | 40.7 ms | 41.2 ms | 0.99x |
+| `GROUP BY <orderkey>, <orderdate>, <shippriority>` (TPC-H q3) | 52.5 ms | 61.0 ms | **0.86x** |
+| `GROUP BY <str>, <str>` via ranked codes | 33.6 ms | 32.2 ms | 1.04x |
+| `GROUP BY <int>, <int>`, 3 M groups | 42.4 ms | 43.2 ms | 0.98x |
+| low-cardinality composite (dense map, untouched) | 12.0 ms | 11.4 ms | 1.05x |
+
+**The premise was wrong: that per-column read is not on the common path.** `eq_rows` runs only
+when a probe *matches* — hashbrown's SIMD tag check dismisses a non-match without ever calling
+it. A high-cardinality group-by is mostly *inserts*, so the read the packing removes barely
+happens; what remains is the pack's own passes, which is why the three-key shape, paying three of
+them, is the worst row in the table. The 362-469 ns/row that motivated this is real, and it is
+a *match*-heavy measurement.
+
+A row floor (skip the packing below 2^17 rows, so the per-morsel partial aggregate keeps the
+existing path) removed the regression at morsel scale and left the whole-relation regroup, where
+the three-key shape still read 0.86x. There is no gate that rescues it, because the shape it
+would need — many matches, a table too large for cache, and wide key columns at once — is not
+one the measurements found.
+
+So: the aggregate/distinct/window grouper keeps its existing dispatch, which is already six
+specialized paths deep and good. **Do not re-derive this.** DuckDB's `compress_aggregate.cpp`
+looks like the same win as its `compress_order.cpp` and is not, because DuckDB's narrowing is
+free at plan time and Batcher's costs a scan — and a scan is only repaid by an operator that
+would otherwise touch the key many times per row. A sort does. A hash insert does not.
+
+### 11c. What the benchmark case found: a temporal key never parallelized at all
+
+Adding a case for the shape 11a optimizes is what made this visible, and it is the larger
+finding of the two. `op-sort-multikey-narrow` (`ORDER BY l_shipdate, l_suppkey` over 6 M
+`lineitem` rows) read **37.13x against DuckDB** — 1,590 ms to DuckDB's 43 — *after* 11a had
+already taken 3x off it.
+
+The cause is one predicate. `sample_sort::parallel_sort_batch` routes its leading key with
+`dt if dt.is_integer()`, and `arrow::datatypes::DataType::is_integer()` is **false for
+`Date32`, `Date64`, `Timestamp`, `Time32/64` and `Duration`**. Every temporal leading key fell
+through to the `_ => return Ok(None)` arm, so `ORDER BY <date>` — one of the commonest sorts an
+analytic query writes — ran **serially, on a 96-core box**, and had done since the sample-sort
+was written.
+
+Measured on 6 M rows, before the fix, which is what a missing parallel path looks like from
+outside:
+
+| Sort | Time |
+|---|---|
+| `ORDER BY <date>`, 2,500 distinct values | 643 ms |
+| `ORDER BY <int64>`, **10,000** distinct values — more work, same shape | 38 ms |
+
+Admitting the integer-ordered temporals to the same `i64` routing (`is_integer_ordered_temporal`)
+is the whole fix. Those types are physically signed integers whose numeric order *is* the type's
+order, in every unit and with or without a time zone — a zone changes the wall-clock rendering,
+never the instant.
+
+**Two types stay out, and the second one nearly shipped as a regression.** `Interval` is not one
+integer at all: `MonthDayNano` is three fields in 128 bits and no `i64` orders it. `Time32` *is*
+one integer, and **arrow will not widen it** — `can_cast_types(Time32(_), Int64)` is false in
+arrow-rs, and arrow C++ refuses `date32 -> int64` too, so this is a gap the two implementations
+already answer differently rather than a hypothetical. The first version of this change admitted
+`Time32`, which would have turned `ORDER BY <a time column>` over 2^17 rows from a working serial
+sort into a **raise** from inside the routing. What caught it was a test asserting that every type
+the predicate admits is one arrow can actually cast — a property no correctness test over *data*
+would have found, because the shape simply never appeared in one. The routing now also declines on
+a failed cast, so the list being wrong costs a missed optimization and never an error.
+
+End to end, on the committed benchmark case, against DuckDB on its native store:
+
+| Case | Before | After | vs DuckDB before | vs DuckDB after |
+|---|---|---|---|---|
+| `op-sort-multikey-narrow` | 1,590.4 ms | **52.1 ms** (30.5x) | 37.13x | **1.28x** |
+| `op-sort-multikey-wide` (both paths decline) | 68.6 ms | 71.6 ms | 0.97x | 1.17x |
+
+The two fixes compound and neither subsumes the other: on 6 M rows the date sort goes
+643 -> 50 ms from parallelism alone (12.9x), and the two-key sort 1,827 -> 58 ms (31.6x) from
+parallelism plus the packed key. The `-wide` row moved inside the box's noise band — DuckDB's own
+time on it swung 70.8 -> 61.1 ms across the same two runs — and is the decline path, which does
+no work either version did not.
+
+**The lesson is the one this document keeps relearning.** The gap was not subtle, it was 37x,
+and it survived because no benchmark case sorted on more than one fixed-width key. Item 9 records
+the same thing about string sorts. A shape with no case is a shape with no floor.
+
+One thing worth recording because it is the opposite of what you would guess: **the
+*distributed* sort had temporal keys all along.** `dist/executor.py::_range_partitionable_sort_key`
+admits `pa.types.is_temporal` explicitly and routes it through the order-preserving integer
+backing. So the single-node parallel path was the outlier, and the two had disagreed on which
+sorts parallelize for as long as both existed — a query that scaled out on a date key ran serially
+on one node.
+
+One thing this pass nearly recorded and should not have: that `lowcard::rank_part_of` — the
+rank routing that rescues a sort on a *seven-value* key — being string-only leaves a gap for
+low-cardinality integer and date keys. **The first measurement said so and was confounded**: it
+sorted a five-column table, so what it actually compared was the cost of gathering a string
+column. Repeated with the same payload on both sides, `ORDER BY <a seven-value Int64>` is
+**37.6 ms** against **51.6 ms** for the string equivalent *with* rank routing — so the plain
+boundary path integers already take is the faster of the two, and generalizing the rank path to
+them has no evidence behind it. What the clean measurement did surface is a different anomaly,
+recorded as backlog item 14.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -1602,6 +1801,73 @@ implements it, so the next reader can settle it with one grep instead of one day
 11. Post-shuffle partition coalescing from the sizes just written, not the previous run's
     (item 10d).
 12. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+13. **The sort's gather, which is now what is left on this operator (item 11, measured
+    2026-08-18).** With the two fixes in item 11 landed, the operator suite's ordering rows sit
+    at 1.06x-1.29x of DuckDB and the residue is no longer the comparison. Decomposed on 6 M rows
+    with a `float64` payload: `ORDER BY <int64>` returning two columns is **37.6 ms** where the
+    same query returning *one* column is the same time, so the cost is not the output width —
+    it is 96 MiB of **random-access** gather at about 2.5 GB/s, against the 11 GB/s the same two
+    columns copy at with no permutation. DuckDB answers the harder string version of that query
+    in 30.4 ms.
+
+    The mechanism is known and is not a tuning question: DuckDB sorts a **row-major payload**
+    (`TupleDataCollection`), so its final scan is sequential, where Batcher sorts a permutation
+    and then gathers every column through it. That is what the streaming-executor RFC's
+    **selection vectors** proposal is for, which makes that proposal the next structural item on
+    this operator rather than a leftover.
+
+    Do not read this as "the sort is slow". It is the *permuted* materialization that is.
+
+    **And do not fold `op-filter-project` (2.00x) into the same story**, which an earlier draft of
+    this entry did. A filter's compaction is a *sequential* write, not a permuted read, and it
+    measures accordingly: on 6 M rows, adding one output column to a filter costs 5.2 ms to read
+    48 MiB and write 25 MiB, about 14 GB/s. There is no gather cliff there to find. Whatever that
+    row is, it is not this.
+14. **A measured anomaly on this operator that is *not* yet diagnosed: a temporal key sorts
+    ~1.5x slower than the identical integer key.** 6 M rows, seven distinct values, same
+    `float64` payload, both taking the parallel sample-sort after item 11c:
+
+    | leading key | time |
+    |---|---|
+    | `Int64` | 31.1 ms |
+    | `Int32` (normalized to `Int64` at the FFI boundary, so the same path) | 36.8 ms |
+    | `Date32` | 47.0 ms |
+    | `Date64` | 44.8 ms |
+    | `Timestamp(us)` | 40.0 ms |
+
+    **Two of the three candidate causes are now eliminated by measurement, so the next reader
+    starts from a narrower question than this entry originally posed.**
+
+    *Not the widening cast.* `arrow::compute::cast` allocates even when the widths already match,
+    so the obvious suspect was the `8 x rows` buffer a `Timestamp` key builds on the way into a
+    routing that only reads it. A zero-copy reinterpretation was built (`ScalarBuffer` clone plus
+    the source's null buffer, pinned array-for-array against the cast it replaced) and measured
+    **1.0x**. It was reverted: it removes a real allocation, and the allocation is not the cost.
+    The table above already hinted at this and it was not read carefully enough — `Date64` and
+    `Timestamp` are `i64`-backed, so their cast is the cheap one, and they cost what `Date32`
+    costs.
+
+    *Not the output gather.* Sorting by a `Timestamp` key while projecting an `Int64` **mirror**
+    of the same values, so no temporal column reaches the output, still reads **47.4 ms** against
+    **37.6 ms** for the same query sorted by the mirror itself.
+
+    *And not a missing parallel path*, which item 11c would have made the natural guess: below
+    400,000 rows the two types are at parity (6.5 ms against 7.4 ms) and both show the ns/row
+    drop across `PARALLEL_SORT_MIN_ROWS`. The ratio appears between 400,000 and 1.5 M rows and
+    holds at 1.38-1.44 above it.
+
+    So it is inside the sort phase, it scales with the input, and it is neither the widening nor
+    the gather. That is where instrumentation should start; black-box probing has taken it as far
+    as it goes.
+
+    **And check the data before believing a number here.** A first run of this table read
+    `Date64` at **5.3 ms**, five times faster than `Int64`, which is not a plausible time for a
+    6 M-row sort. The cause was the test data: `Date64` is milliseconds that the Arrow spec
+    requires to be a whole number of days, the values used were raw day *numbers*, and every one
+    of them therefore fell inside 1970-01-01. The sort was correct, the input was degenerate, and
+    the identity short-circuit fired legitimately. The check written to catch exactly that —
+    comparing against pyarrow's own sort — **passed**, because it compared the rendered dates,
+    which were all equal. Day-aligning the values put the row back at 44.8 ms.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the

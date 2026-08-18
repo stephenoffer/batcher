@@ -2756,16 +2756,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 539 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 260 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1535 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1543 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
-| `ops/radix_sort.rs` | 297 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
+| `ops/radix_sort.rs` | 607 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 362 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
-| `ops/sample_sort/mod.rs` | 565 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort/mod.rs` | 604 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 438 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 3299 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
