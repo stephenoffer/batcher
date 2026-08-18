@@ -1800,14 +1800,41 @@ every other row of the census combined, which makes **selection vectors / deferr
 materialization** (RFC proposal 2) the highest-value structural item on the board by a wide
 margin, ahead of the string-key work it was previously ranked behind.
 
-**2. A small build side is where the join itself loses.** Against a 10,000-row build side
-Batcher's join-and-count is 22.0 ms where DuckDB's is 3.6 ms; against a 10-million-row one it is
-78.1 ms against 100.0 ms, a win. The loss is not the key type — the string key costs 1.5x the
-int32 one on both sides of the comparison — it is the *small* build. Whatever DuckDB does for a
-tiny build side (its perfect-hash join executor is the obvious candidate,
-`perfect_hash_join_executor.cpp`, which builds a direct-indexed table when the build key's range
-is small) Batcher does not. That is a second, independent item, and unlike the first it is
-cheap to scope.
+**2. The small-build-side row was measuring the optimizer, not the join — corrected.** The first
+draft of this entry read the 22.0 ms against DuckDB's 3.6 ms as a join-kernel gap and proposed
+building DuckDB's `perfect_hash_join_executor.cpp`. Both halves were wrong, and the correction is
+the more interesting finding.
+
+`crates/bc-runtime/src/join/dense.rs` **is** that executor — "a perfect hash for a small-range
+integer build key", the join-side counterpart of the dense direct map `agg::group::assign` uses.
+It was there the whole time, so the premise was false; a grep would have settled it and the
+measurement was trusted instead.
+
+And the 22.0 ms was not the join. Varying only *which column the aggregate reads*, on the same
+join:
+
+| `SELECT count(...) FROM x JOIN medium USING (id2)` | | |
+|---|---|---|
+| `count(v2)` — a right-side column, so nothing can be pushed | **8.9 ms** | plain join |
+| `count(id2)` — the join key, so `eager_aggregation` pushes | 21.1 ms | **2.4x slower** |
+| `count(v1)` — a left-side column, likewise | 23.2 ms | **2.6x slower** |
+
+`kyber/rules/agg_pushdown.py::eager_aggregation` pre-aggregates a join side to shrink its input,
+gated on `_MIN_PREAGG_REDUCTION = 8.0` — a **row-reduction ratio**. Here the ratio is ~1000x
+(10 M rows to 10,000 groups) so it fires with room to spare, and it is 2.4-2.6x slower than not
+firing.
+
+The gate is measuring the right quantity and comparing it against nothing. A 1000x reduction
+still costs a **full 10 M-row hash aggregate**, and what it buys back is a *broadcast probe
+against a 10,000-row build side*, which is almost free. No reduction ratio, however large, can
+justify the push when the join it replaces costs nothing — the missing term is what the join
+would have cost. The rule's own comment anticipates the shape of this ("the cost model cannot
+catch it — so the guard lives here, on the reduction the rewrite must actually achieve") and then
+picks the one quantity that cannot distinguish a saved shuffle from a saved broadcast.
+
+**What remains true about the join after the correction is much smaller**: `sum(v2)` over the
+same join is 8.8-13.3 ms against DuckDB's 4.7 ms. A ~2x on a small-build broadcast, not a 6x, and
+not the kernel.
 
 **Do not read finding 1 as "the join is slow".** It is not; it is the materialization, and the
 same materialization is behind the sort rows, the `cb-q32` row, and `op-filter-project`'s
@@ -2052,12 +2079,14 @@ from the code.** Two items move to the top and one new one appears:
     thirteen census rows combined. On `x JOIN big` Batcher's *join* already beats DuckDB's
     (78.1 ms against 100.0 ms) and the query still loses by 107 ms, entirely to the gather.
 
-0b. **A small-build-side join path.** Against a 10,000-row build side Batcher's join-and-count
-    is 22.0 ms where DuckDB's is 3.6 ms; against a 10-million-row build side Batcher wins. DuckDB
-    has `perfect_hash_join_executor.cpp` — a direct-indexed table for a build key whose range is
-    small — and Batcher has the equivalent for *grouping* (`assign::dense_span`) but not for
-    joining. Cheap to scope, and it is the only place the census found the join kernel itself
-    losing.
+0b. **Give `eager_aggregation` a cost term, not just a ratio.**
+    `kyber/rules/agg_pushdown.py` gates the push on `_MIN_PREAGG_REDUCTION = 8.0`, a row-reduction
+    ratio with no term for what the join would have cost. On a broadcast join against a
+    10,000-row build side it fires on a ~1000x reduction and is **2.4-2.6x slower** than not
+    firing (21.1 ms and 23.2 ms against 8.9 ms for the same query whose aggregate reads a
+    right-side column and therefore cannot be pushed). The push pays a full 10 M-row hash
+    aggregate to save a probe that was nearly free. Cheap to scope, and it is a *regression* the
+    rule introduces rather than a missing capability. See item 12.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the
