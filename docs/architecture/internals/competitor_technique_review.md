@@ -1651,6 +1651,179 @@ boundary path integers already take is the faster of the two, and generalizing t
 them has no evidence behind it. What the clean measurement did surface is a different anomaly,
 recorded as backlog item 14.
 
+## 12. The six-engine operator census, 2026-08-18
+
+Item 10 read the competitors' operator *inventories* once. This pass repeats it against every
+engine at once and, unlike that one, **checks each answer with a measurement rather than a grep**
+— which is what changed three of the conclusions below, in both directions.
+
+The sources are the physical-operator directories, which is where an engine's real vocabulary
+lives: `duckdb/src/execution/operator/{aggregate,join,order,projection,scan,set}`,
+`datafusion/datafusion/physical-plan/src`, `polars/crates/polars-stream/src/nodes`,
+`spark/sql/core/.../execution`, `Daft/src/daft-local-execution/src/{intermediate_ops,sinks}`,
+`arrow/cpp/src/arrow/acero`, and the installed `ray/data/_internal/execution/operators`.
+
+### What the inventory found
+
+**Almost nothing is missing.** Batcher's `Dataset` carries 177 public methods and its IR 18
+`RelOp` variants; every operator named by DuckDB, Polars, DataFusion, Spark, Daft, Acero and Ray
+Data has an equivalent, with four exceptions, all small:
+
+| Present elsewhere, absent here | Source | Verdict |
+|---|---|---|
+| `positional_join` (join two relations by row position) | DuckDB `physical_positional_join.cpp` | Expressible as `with_row_index` + an equi-join. Not worth an operator. |
+| `merge_sorted` (merge two already-sorted inputs) | Polars `merge_sorted.rs`, Acero `sorted_merge_node.cc` | The k-way merge exists inside the external sort; it is not reachable as a verb. Minor. |
+| positional `zip` of two relations | Ray Data `zip_operator.py`, Polars `zip.rs` | Same as `positional_join`. |
+| `cte_inlining`, `unnest_rewriter` | DuckDB optimizer | Parser-level; `_sql` already inlines non-recursive CTEs by substitution. |
+
+Polars' streaming node list is the one worth reading in full, because it is the longest and the
+most specialized (`forward_fill`, `backward_fill`, `interpolate`, `ewm`, `cum_agg`, `rle`,
+`rle_id`, `shift`, `peak_minmax`, `rolling_group_by`, `dynamic_group_by`, `is_first_distinct`,
+`sorted_unique`, `sorted_group_by`, `top_k`, `gather_every`, `with_row_index`). **Batcher has
+every one of them**, mostly as window functions rather than as nodes.
+
+DuckDB's `src/optimizer/` is the same exercise for plan-level work, and it is the better
+checklist because it is a flat list of 38 named passes. Kyber has an equivalent for all but two
+(the two named above), including the ones that are easy to assume are missing:
+`join_elimination`, `outer_join_simplification`, `partial_aggregate_pushdown`
+(`kyber/rules/agg_pushdown.py::eager_aggregation`), `remove_duplicate_groups`,
+`common_aggregate_optimizer`, `regex_range_filter`, `in_clause_rewriter`, `sampling_pushdown`,
+`topn_window_elimination`, `window_self_join`, `limit_pushdown`, `build_probe_side_optimizer`.
+
+### Three conclusions the measurements reversed
+
+The inventory is not the interesting part. These are, and each one is a case where reading the
+code gave the wrong answer:
+
+1. **`late_materialization` looked like a real gap and is not.** DuckDB has a whole optimizer
+   pass for it and a grep of Batcher for the term returns zero. Measured on 4 M rows x 31
+   columns, `SELECT * ORDER BY k LIMIT 10` costs **12.4 ms** against **8.0 ms** for
+   `SELECT k ORDER BY k LIMIT 10` — thirty extra columns for 4.4 ms, which is not a payload
+   being carried through a sort. The top-N path already ranks on the key and gathers `k` rows at
+   the end. (DuckDB is 7.5 ms and 3.1 ms: faster in absolute terms, by the fixed per-query
+   margin ceiling 8 records, and with the *same* scaling in column count.) Polars is 95.9 ms.
+
+2. **The window `rank_limit` looked like an asymptotic gap and Batcher wins it anyway.**
+   `qualify_to_partition_topn` fuses `rank <= k` into `Window.rank_limit`, but that bound is a
+   post-hoc mask: `window_batch_with` computes the full ranking for every row — sorting every
+   partition — and `filter_by_rank_limit` then drops the rest. Only `k = 1` escapes, via
+   `rank1_window_to_distinct_on`. Spark built a whole operator to avoid exactly this
+   (`WindowGroupLimitExec`), and Daft has `window_partition_and_dynamic_frame`. So the
+   expectation was a loss. Measured over 6 M rows in 200,000 partitions:
+
+   | top-k per group | Batcher | DuckDB | Polars |
+   |---|---|---|---|
+   | k = 1 | **33.2 ms** | 666.0 ms | 333.6 ms |
+   | k = 3 | **93.2 ms** | 1,252.9 ms | 306.5 ms |
+   | k = 10 | **131.5 ms** | 1,384.5 ms | 322.6 ms |
+
+   Batcher leads by 10-20x over DuckDB and 2.5-10x over Polars. The `k = 1` row is 2.8x faster
+   than `k = 3` on the same data, which is the `DISTINCT ON` rewrite showing through — so a
+   bounded-heap window would still be worth roughly 2x for `k > 1`. That is an *improvement to a
+   win*, not a gap, and it should be ranked as one.
+
+3. **The H2O `groupby` losses are not an aggregate-kernel gap.** Six of ten queries lose, and the
+   shape of the table invites the conclusion that some aggregate is slow — `q4` (three `avg`s)
+   reads **1.98x** while `q5` (three `sum`s, same shape) **wins at 0.65x**. Isolated on 10 M rows
+   with the aggregate as the only variable:
+
+   | | `sum` x3 | `avg` x3 | `avg` | `sum` | `max`-`min` |
+   |---|---|---|---|---|---|
+   | 100 groups | 1.02x | 1.72x | 1.63x | 1.11x | 0.80x |
+   | 1 M groups | **0.35x** | **0.44x** | **0.41x** | **0.34x** | **0.39x** |
+
+   At a million groups Batcher wins every aggregate by 2.3-3x. At a hundred groups the whole
+   query is 7-11 ms and the gap is a 3-5 ms *constant* — the per-query fixed cost ceiling 8
+   already measures, arriving on a query too fast to hide it. No aggregate function is slow.
+   What is left of the H2O row is what the scorecard already says it is: **string keys**, which is
+   ceiling #2 and the largest open item in the repository.
+
+### The measured census: 96 queries, four suites, ranked by what they actually cost
+
+The inventory says almost nothing is missing, so the bottlenecks have to be found by
+measurement. Every suite that runs in reasonable time was run on one 96-core node against
+DuckDB's **native store** (the harder of the two bars) with a two-engine lineup: H2O `groupby`
+(10), H2O `join` (5), ClickBench (43) and TPC-H sf1 (22).
+
+**Batcher wins 66 of the 80 queries** where a ratio is meaningful. What follows is the other
+fourteen, and the ordering is the point.
+
+**Rank by ratio and you optimize the wrong thing.** The three worst ratios in the whole census
+are `cb-q19` (2.64x), `h2o-gb-q2` (1.98x) and `h2o-gb-q4` (1.98x) — worth **1.2 ms, 18.3 ms and
+4.0 ms**. Ranked by the time actually lost:
+
+| Query | Batcher | DuckDB | Ratio | **Lost** | Shape |
+|---|---|---|---|---|---|
+| `h2o-join-q5` | 378.5 ms | 271.8 ms | 1.39x | **+106.7 ms** | `x JOIN big USING (id3)`, 1e7 x 1e7, `SELECT x.*` + 5 cols |
+| `h2o-join-q4` | 214.7 ms | 114.9 ms | 1.87x | **+99.8 ms** | `x JOIN medium USING (id5)`, `SELECT x.*` + 4 cols |
+| `h2o-gb-q8` | 115.0 ms | 69.2 ms | 1.66x | +45.8 ms | `row_number() OVER (PARTITION BY id6 ORDER BY v3 DESC) <= 2` |
+| `h2o-gb-q7` | 75.2 ms | 42.1 ms | 1.79x | +33.1 ms | `max(v1)-min(v2) GROUP BY id3` (string key) |
+| `h2o-gb-q3` | 72.5 ms | 45.5 ms | 1.59x | +27.0 ms | `sum,avg GROUP BY id3` (string key) |
+| `h2o-gb-q2` | 37.1 ms | 18.8 ms | 1.98x | +18.3 ms | `GROUP BY id1, id2` (two string keys) |
+| `h2o-gb-q9` | 40.4 ms | 27.4 ms | 1.47x | +13.0 ms | `corr GROUP BY id2, id3` (string keys) |
+| `cb-q32` | 31.1 ms | 21.9 ms | 1.42x | +9.2 ms | `GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10` |
+| `tpch-q13` | 47.4 ms | 41.1 ms | 1.15x | +6.3 ms | customer-order count distribution |
+| `h2o-gb-q4` | 8.1 ms | 4.1 ms | 1.98x | +4.0 ms | `avg x3 GROUP BY id4` (100 groups) |
+| `tpch-q5` | 31.2 ms | 27.3 ms | 1.15x | +3.9 ms | six-way join |
+| `tpch-q6` | 6.3 ms | 4.5 ms | 1.38x | +1.8 ms | filter + `sum` over `lineitem` |
+| `cb-q25` | 3.4 ms | 2.2 ms | 1.50x | +1.2 ms | `ORDER BY <string> LIMIT 10` |
+| `cb-q19` | 2.0 ms | 0.8 ms | 2.64x | +1.2 ms | `WHERE UserID = <literal>` |
+
+Read that way the census says something the per-suite geomeans do not: **two H2O join queries are
+the largest single-node losses in the repository, at about 100 ms each, and together they cost
+more than the other twelve rows combined.**
+
+#### The q2/q4 pair, instrumented — and it is not the join
+
+`h2o-join-q2` (`x JOIN medium USING (id2)`) is a **win** at 0.74x while `h2o-join-q4`
+(`x JOIN medium USING (id5)`) is a 1.87x loss, on the same two tables with nearly the same
+projection. The pair is a free controlled experiment, so it was run: separate the *join* from
+the *materialization* by asking each query for a `count` as well as for its rows. The H2O join
+schema matters here — `id1`, `id2`, `id3` are `int32` and `id4`, `id5`, `id6` are `string`.
+
+| | count only | `SELECT x.*` | materialization | DuckDB count |
+|---|---|---|---|---|
+| `x JOIN medium USING (id2)` — int32 key | 22.0 ms | 93.8 ms | **+71.8 ms** | 3.6 ms |
+| `x JOIN medium USING (id5)` — string key | 32.3 ms | 195.4 ms | **+163.1 ms** | 10.6 ms |
+| `x JOIN big USING (id3)` — int32, 1e7 x 1e7 | 78.1 ms | 390.5 ms | **+312.4 ms** | 100.0 ms |
+
+Two things fall out, and the first is the largest single finding in this census.
+
+**1. Three quarters of these queries is the output gather, not the join.** Materialization is
+77%, 83% and 80% of the three totals. On the big-by-big join Batcher's *join* is **faster than
+DuckDB's** (78.1 ms against 100.0 ms) and the query still loses by 107 ms, because 312 ms of it
+is gathering nine million rows of a wide, string-bearing result through join indices. This is the
+same ~2.5 GB/s permuted read backlog entry 13 measures on the sort, arriving through a different
+operator — and it unifies three separate rows of the table above (`h2o-join-q4`, `h2o-join-q5`,
+`cb-q32`) with the sort finding under **one root cause**. Together those are worth more than
+every other row of the census combined, which makes **selection vectors / deferred payload
+materialization** (RFC proposal 2) the highest-value structural item on the board by a wide
+margin, ahead of the string-key work it was previously ranked behind.
+
+**2. A small build side is where the join itself loses.** Against a 10,000-row build side
+Batcher's join-and-count is 22.0 ms where DuckDB's is 3.6 ms; against a 10-million-row one it is
+78.1 ms against 100.0 ms, a win. The loss is not the key type — the string key costs 1.5x the
+int32 one on both sides of the comparison — it is the *small* build. Whatever DuckDB does for a
+tiny build side (its perfect-hash join executor is the obvious candidate,
+`perfect_hash_join_executor.cpp`, which builds a direct-indexed table when the build key's range
+is small) Batcher does not. That is a second, independent item, and unlike the first it is
+cheap to scope.
+
+**Do not read finding 1 as "the join is slow".** It is not; it is the materialization, and the
+same materialization is behind the sort rows, the `cb-q32` row, and `op-filter-project`'s
+sequential-write cousin. Optimizing the join kernels would move none of it.
+
+Everything below the join rows falls into three buckets already named elsewhere, which is a
+useful result in itself — the census found **no new engine-level gap**:
+
+* **String group keys** (`q2`, `q3`, `q7`, `q9`, +91.4 ms together) — ceiling #2, the largest
+  open item, and the reason the H2O `groupby` geomean is above 1.
+* **Permuted materialization** (`h2o-join-q4/q5`, `cb-q32`) — item 11's backlog entry 13.
+* **Per-query fixed cost** (`h2o-gb-q4`, `cb-q19`, `cb-q07`, `tpch-q6`) — ceiling 8's warm gap.
+  These produce the largest *ratios* and the smallest *losses*, because a 1-4 ms constant is
+  most of a 2-8 ms query. `cb-q00` is 0.1 ms against DuckDB's 0.8 ms on the same dataset, so the
+  constant is not uniform and not a floor; it is work proportional to the plan, not the data.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -1868,6 +2041,23 @@ implements it, so the next reader can settle it with one grep instead of one day
     the identity short-circuit fired legitimately. The check written to catch exactly that —
     comparing against pyarrow's own sort — **passed**, because it compared the rendered dates,
     which were all equal. Day-aligning the values put the row back at 44.8 ms.
+
+**Re-ranked 2026-08-18 by the census in item 12, which measured 80 queries rather than reasoning
+from the code.** Two items move to the top and one new one appears:
+
+0a. **Deferred payload materialization (selection vectors), RFC proposal 2.** Now the
+    highest-value structural item on the board, ahead of the string work below. The census
+    measured it as **77-83% of the two largest single-node losses** (`h2o-join-q4/q5`), the cause
+    of `cb-q32`, and the residue on every sort row — one mechanism, worth more than the other
+    thirteen census rows combined. On `x JOIN big` Batcher's *join* already beats DuckDB's
+    (78.1 ms against 100.0 ms) and the query still loses by 107 ms, entirely to the gather.
+
+0b. **A small-build-side join path.** Against a 10,000-row build side Batcher's join-and-count
+    is 22.0 ms where DuckDB's is 3.6 ms; against a 10-million-row build side Batcher wins. DuckDB
+    has `perfect_hash_join_executor.cpp` — a direct-indexed table for a build key whose range is
+    small — and Batcher has the equivalent for *grouping* (`assign::dense_span`) but not for
+    joining. Cheap to scope, and it is the only place the census found the join kernel itself
+    losing.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the
