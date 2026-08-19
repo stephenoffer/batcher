@@ -143,20 +143,7 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
     convention); an ``(n, *shape)`` array with ``shape`` of rank >= 2 becomes a
     fixed-shape-tensor column that preserves the full per-row shape.
     """
-    import numpy as np
-
-    arr = np.asarray(ndarray)
-    if arr.ndim <= 1:
-        col: pa.Array = pa.array(arr)
-    elif arr.ndim == 2:
-        dim = arr.shape[1]
-        flat = pa.array(np.ascontiguousarray(arr).reshape(-1))
-        col = pa.FixedSizeListArray.from_arrays(flat, dim)
-    else:
-        from batcher.io.formats.ml.tensor import to_tensor_column
-
-        col = to_tensor_column(arr)
-    return InMemorySource([pa.RecordBatch.from_arrays([col], names=[column])])
+    return InMemorySource([pa.RecordBatch.from_arrays([_numpy_to_column(ndarray)], names=[column])])
 
 
 # ---- optional-framework adapters -----------------------------------------
@@ -283,30 +270,86 @@ def from_ray_dataset(ray_dataset: Any) -> Source:
 
 
 # ---- helpers --------------------------------------------------------------
-def _stack_torch_dataset(dataset: Any, to_np: Any) -> dict[str, Any]:
-    """Stack a map-style torch `Dataset` of tensor rows into Arrow columns."""
+def _numpy_to_column(ndarray: Any) -> pa.Array:
+    """One Arrow column from a NumPy array whose leading axis is the row axis.
+
+    The single place the rank rules live: 1-D is a scalar column, ``(n, dim)`` is a
+    ``FixedSizeList`` (the embedding convention), and anything deeper is a
+    fixed-shape-tensor column. :func:`from_numpy`, :func:`from_torch` and
+    :func:`from_tf` all route through here so a per-row vector has the same type
+    whichever door it came in by.
+    """
     import numpy as np
 
+    arr = np.asarray(ndarray)
+    if arr.ndim <= 1:
+        return pa.array(arr)
+    if arr.ndim == 2:
+        flat = pa.array(np.ascontiguousarray(arr).reshape(-1))
+        return pa.FixedSizeListArray.from_arrays(flat, arr.shape[1])
+    from batcher.io.formats.ml.tensor import to_tensor_column
+
+    return to_tensor_column(arr)
+
+
+def _column_from_rows(values: list[Any]) -> pa.Array:
+    """One Arrow column from a list of per-row NumPy values, of any rank.
+
+    Stacking straight into ``pa.array`` was the earlier spelling, and it raised
+    ``ArrowInvalid: only handle 1-dimensional arrays`` for every feature that was not a
+    scalar -- so ``from_tf`` accepted no vector feature at all, and ``from_torch``
+    accepted one only when it arrived as a bare tensor rather than inside a dataset.
+    """
+    import numpy as np
+
+    return _numpy_to_column(np.stack(values))
+
+
+def _stack_torch_dataset(dataset: Any, to_np: Any) -> dict[str, Any]:
+    """Stack a map-style torch `Dataset` of tensor rows into Arrow columns."""
     rows = [dataset[i] for i in range(len(dataset))]
     if not rows:
         raise PlanError(
             "from_torch() needs a non-empty dataset: the column names and types are read "
             "off the first row, so an empty dataset carries no schema to build from."
         )
-    return _stack_rows(rows, lambda v: pa.array(np.stack([to_np(r) for r in v])))
+    return _stack_rows(rows, lambda v: _column_from_rows([to_np(r) for r in v]))
+
+
+def _reject_batched_tf_dataset(tf_dataset: Any) -> None:
+    """Refuse a batched ``tf.data.Dataset``, because one element must be one row.
+
+    ``from_tf`` reads each element as a row, so a dataset that has been through
+    ``.batch(n)`` would silently turn each *batch* into a single row holding a list --
+    the values would all be present and every row count would be wrong. The batch axis
+    is visible in ``element_spec`` as a leading ``None``, so it is caught here and the
+    caller is pointed at ``.unbatch()`` rather than left with a reshaped result or, as
+    before this check existed, a raw ``pyarrow.ArrowInvalid`` from deep inside the stack.
+    """
+    spec = getattr(tf_dataset, "element_spec", None)
+    specs = (
+        spec.values() if isinstance(spec, dict) else spec if isinstance(spec, tuple) else (spec,)
+    )
+    for one in specs:
+        shape = getattr(one, "shape", None)
+        if shape is not None and len(shape) >= 1 and shape[0] is None:
+            raise PlanError(
+                "from_tf() reads one element as one row, so a batched tf.data.Dataset "
+                "would make each batch a single row. Call .unbatch() on it first, or "
+                "build the Dataset from the underlying arrays with bt.from_numpy()."
+            )
 
 
 def _stack_tf_dataset(tf_dataset: Any) -> dict[str, Any]:
     """Stack a ``tf.data.Dataset`` into Arrow columns via NumPy."""
-    import numpy as np
-
+    _reject_batched_tf_dataset(tf_dataset)
     rows = [_tf_element_to_np(el) for el in tf_dataset.as_numpy_iterator()]
     if not rows:
         raise PlanError(
             "from_tf() needs a non-empty dataset: the column names and types are read off "
             "the first element, so an empty dataset carries no schema to build from."
         )
-    return _stack_rows(rows, lambda v: pa.array(np.stack(v)))
+    return _stack_rows(rows, _column_from_rows)
 
 
 def _tf_element_to_np(element: Any) -> Any:

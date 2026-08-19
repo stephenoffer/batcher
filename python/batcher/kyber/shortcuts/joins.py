@@ -78,7 +78,15 @@ def estimated_join_rows(left: Facts, right: Facts, left_key: str, right_key: str
 
     Falls back to the cross-product size when neither key has a known distinct count, which is
     the honest worst case rather than an invented one.
+
+    A join `join_is_empty` **proves** empty estimates zero rather than running the containment
+    formula. Without that, the same two `Facts` answered "this join is provably empty" and
+    "this join produces two rows" at the same time -- and since this is the number the
+    optimizer orders joins by, the one join it could have skipped entirely was costed as
+    though it produced output.
     """
+    if join_is_empty(left, right, left_key, right_key):
+        return 0.0
     rows = left.estimated_rows * right.estimated_rows
     ndvs = [
         ndv
