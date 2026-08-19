@@ -38,6 +38,16 @@ cov-py:
 cov-rust:
     cargo llvm-cov --workspace --exclude bc-py --summary-only
 
+# Which *public API callables* does the suite actually execute? Line coverage answers
+# "is this file covered"; this answers "is this method ever called", which is the
+# question `tests/docs/test_api_coverage.py` cannot ask (it proves every public name is
+# *documented*, not that any of it is *run*). 82 geospatial functions had reference
+# pages, doctests and no test.
+#
+# Reads the `.coverage` a previous `cov-py` left behind, so run that first.
+api-coverage:
+    python3 tools/api_exercise_coverage.py
+
 # CI coverage gate: run the deterministic suite under coverage and fail below the
 # ratchet floor. The floor sits just below the achieved baseline so it blocks regressions;
 # raise it as coverage grows (see docs/architecture/internals/testing-strategy.md).

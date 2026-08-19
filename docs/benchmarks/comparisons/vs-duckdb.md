@@ -162,7 +162,7 @@ pushes down and skips the rest of the table.
 
 ## What DuckDB cannot do
 
-The gap that matters most doesn't appear on this page as a number. DuckDB is single-node and its optimizer is static. It commits to a plan before the first row is read and can't change its mind. Batcher re-optimizes at stage boundaries on measured cardinalities, the same granularity Spark AQE works at but available single-node too, and it carries a sketch-backed cross-query learned-stats loop that DuckDB has no equivalent for. The same mergeable operators then run across a cluster with a bit-identical result.
+The gap that matters most doesn't appear on this page as a number. DuckDB is single-node and its optimizer is static. It commits to a plan before the first row is read and can't change its mind. Batcher re-optimizes at stage boundaries on measured cardinalities, the same granularity Spark AQE works at but available single-node too, and it carries a sketch-backed cross-query learned-stats loop that DuckDB has no equivalent for. The same mergeable operators then run across a cluster and return the same rows, with float reductions agreeing to the last bits rather than to every bit, because the partition count sets the summation order.
 
 Stage-boundary re-optimization engages at 20M input rows and above, and it runs single-node, where Spark cannot go. See {doc}`/benchmarks/results/scaling`.
 
