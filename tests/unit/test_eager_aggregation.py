@@ -166,3 +166,43 @@ def test_a_fanning_join_still_pushes():
     dept = bt.from_pydict({"dept_id": list(range(100)), "name": [f"d{i}" for i in range(100)]})
     ds = _wide_emp().join(dept, on="dept_id").group_by("name").agg(top=col("sal").max())
     assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 100.0})) is not None
+
+
+def test_a_global_aggregate_over_a_non_amplifying_join_does_not_push():
+    """The gate that measurement added: an ungrouped aggregate has nothing to gain here.
+
+    Every other case in this file groups above the join, so the outer aggregate builds a hash
+    table either way and the only question is which input it reads. A **global** aggregate does
+    not: without the push it is a streaming reduction with `O(1)` state, the cheapest thing the
+    engine can do. Pushing replaces it with a *grouped* hash aggregate over the same rows, and
+    the join it shrinks emits no more rows than it reads, so nothing downstream is saved.
+
+    Measured on H2O `x JOIN medium USING (id2)` — 10 M probe rows against a unique 10,000-row
+    build side, a ~1000x reduction that clears every other gate by two orders of magnitude:
+    `sum(v1)` took **20.3 ms pushed against 9.1 ms not pushed**, and `min(v1)` 21.0 against 9.8.
+    """
+    ds = _emp().join(_dept(), on="dept_id").agg(top=col("sal").max())
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 3.0})) is None
+
+
+def test_a_global_aggregate_over_an_amplifying_join_still_pushes():
+    """And the veto must not become "never push for a global aggregate".
+
+    When the join *duplicates* the side being pre-aggregated, collapsing rows before the
+    multiplication is the classic eager-aggregation win and it applies to an ungrouped
+    aggregate exactly as it does to a grouped one. The only difference from the case above is
+    that the right side holds many rows per key, so the join emits far more rows than it reads.
+    """
+    dept = bt.from_pydict({"dept_id": [1, 2, 3] * 20, "name": [f"d{i}" for i in range(60)]})
+    ds = _emp().join(dept, on="dept_id").agg(top=col("sal").max())
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 3.0})) is not None
+
+
+def test_the_grouped_push_is_untouched_by_the_global_gate():
+    """The gate keys on the *outer* aggregate having no group keys, so grouped plans are unchanged.
+
+    Pinned separately because the veto reads `node.group_keys` and a future refactor that lost
+    that condition would silently disable the rule on its main shape rather than fail loudly.
+    """
+    ds = _grouped_max()
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 3.0})) is not None

@@ -284,6 +284,47 @@ It is only as good as the cardinalities feeding it. A cost model applied to a ro
 is 80× low produces a confident, precise, wrong answer. That is the cold-start join failure
 described in {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`.
 
+### A ratio is not a cost
+
+Some rewrites are gated outside the model, on a **row-reduction ratio** rather than a cost
+comparison, because the model prices a hash aggregate linearly in input rows and is blind to what
+a large group count does to cache. `eager_aggregation` and its siblings in
+`kyber/rules/agg_pushdown.py` are the case: they pre-aggregate one side of a join and require a
+measured reduction of at least 8x before firing.
+
+A ratio answers "how much smaller does this get?" and never "what was the alternative?". For an
+aggregate with a `GROUP BY` above the join the two questions have the same answer, because the
+outer aggregate builds a hash table either way and only its input size changes. For a **global**
+aggregate they do not: without the push the outer aggregate is a streaming reduction with `O(1)`
+state, the cheapest thing the engine can do, and the push replaces it with a *grouped* hash
+aggregate over the same rows.
+
+Measured on a 10 million row probe joined against a unique 10,000-row build side, varying only
+which column the aggregate reads so that only the push changes:
+
+| Query over the same join | Pushed? | Time |
+| --- | --- | --- |
+| `count()` of a right-side column | no | 7.6 ms |
+| `count()` of the join key | yes | 19.6 ms |
+| `sum()` of a left-side column | yes | 20.3 ms |
+| `min()` of a left-side column | yes | 21.0 ms |
+
+The reduction there is about 1000x, so it clears the 8x bar by two orders of magnitude and is
+still a 2.1x to 2.3x pessimization. The push pays a full ten-million-row grouped hash aggregate
+to save a broadcast probe that was nearly free.
+
+The gate that fixes it asks the question the ratio cannot: **does the join amplify?** Eager
+aggregation pays when the join duplicates the side being pre-aggregated, because collapsing rows
+early avoids paying for the copies. When the join emits no more rows than it reads there is
+nothing downstream to save, so for a global aggregate the push is refused. Grouped aggregates are
+untouched.
+
+One consequence is worth stating because it looks like a bug. The additive form of the rule
+(`sum`/`count`) requires the *other* side to be unique on the join key for correctness, and that
+is exactly the condition under which a join cannot amplify. So the gate withdraws that rule from
+global aggregates entirely, which is correct rather than over-eager: there was never a fan-out
+for it to save. It keeps firing wherever the outer aggregate groups.
+
 ## See also
 
 - {doc}`Architecture </architecture/index>`: Kyber decides, and the cost model is how.

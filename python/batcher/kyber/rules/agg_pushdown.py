@@ -127,6 +127,63 @@ def _join_out_reduces_more(ctx: OptimizerContext, pushed: LogicalPlan, join: Joi
     return ctx.estimator.estimate(pushed).rows >= join_rows
 
 
+def _global_aggregate_gains_nothing(
+    ctx: OptimizerContext, node: Aggregate, source: LogicalPlan, join: Join
+) -> bool:
+    """Veto: the outer aggregate is **global**, and the join does not multiply what it reads.
+
+    :func:`_reduces_enough` prices the push as a row-reduction *ratio* and
+    :func:`_join_out_reduces_more` vetoes when the join out-reduces it. Neither asks the one
+    question that decides an ungrouped aggregate: **what the plan would have cost without the
+    push.** For a global aggregate that cost is a streaming reduction with `O(1)` state — the
+    cheapest thing the engine can do — so replacing it with a *grouped* hash aggregate over the
+    same rows is strictly more work unless the join multiplies them.
+
+    Measured on H2O `x JOIN medium USING (id2)` (10 M probe rows, a unique 10,000-row build
+    side). Varying only which column the aggregate reads, so only the push changes:
+
+    ==========================================  =========  ==================
+    ``SELECT ... FROM x JOIN medium``            time       pushed?
+    ==========================================  =========  ==================
+    ``count(v2)``  (right column)                 7.7 ms    no
+    ``count(id2)`` (join key)                    19.3 ms    yes, **2.5x**
+    ``sum(v1)``    (left column)                 24.2 ms    yes, **3.1x**
+    ==========================================  =========  ==================
+
+    The reduction here is ~1000x (10 M rows to 10,000 groups), so it clears
+    :data:`_MIN_PREAGG_REDUCTION` by two orders of magnitude and is still a pessimization: the
+    push pays a full 10 M-row grouped hash aggregate to save a broadcast probe that was nearly
+    free, and the global reduction it replaces never built a hash table at all.
+
+    So the gate is `join_rows > source_rows` — does the join *amplify*? That is the condition
+    eager aggregation has always actually needed: it pays when the join duplicates the side being
+    pre-aggregated, because then collapsing rows early avoids paying for the copies. When the
+    join emits no more rows than it reads, there is nothing downstream to save.
+
+    Two consequences worth stating, because both look like bugs and are not:
+
+    * It effectively withdraws :func:`pre_aggregation_through_join` from *global* aggregates,
+      since that rule requires the other side to be **unique on the join key** for correctness —
+      which is exactly the condition that makes the join unable to amplify. The rule keeps
+      firing for grouped aggregates, where the outer aggregate builds a hash table either way.
+    * It does not cost the distributed path the classic "pre-aggregate before the shuffle" win.
+      A global aggregate is already `partial → combine` (`.claude/rules/rust-engine.md`), so
+      every partition reduces to one row before any exchange; there is no shuffle volume left
+      for an eager push to remove.
+
+    A **veto, not a license**: the gates above must approve first, so this only ever withdraws.
+    It therefore reads the join estimate at any provenance, as :func:`_join_out_reduces_more`
+    does and for the same reason.
+    """
+    if node.group_keys:
+        return False
+    source_rows = ctx.estimator.estimate(source).rows
+    join_rows = ctx.estimator.estimate(join).rows
+    if source_rows <= 0 or join_rows <= 0:
+        return False
+    return join_rows <= source_rows
+
+
 def _measured_as_non_reducing(ctx: OptimizerContext, node: Aggregate) -> bool:
     """Whether a *past run* measured this group-by as collapsing almost nothing.
 
@@ -264,6 +321,8 @@ def eager_aggregation(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | N
         return None
     if _join_out_reduces_more(ctx, pushed, join):
         return None
+    if _global_aggregate_gains_nothing(ctx, node, join.left, join):
+        return None
     if _measured_as_non_reducing(ctx, node):
         return None
 
@@ -357,6 +416,8 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
     if not _reduces_enough(ctx, pushed, join.left):
         return None
     if _join_out_reduces_more(ctx, pushed, join):
+        return None
+    if _global_aggregate_gains_nothing(ctx, node, join.left, join):
         return None
     if _measured_as_non_reducing(ctx, node):
         return None
@@ -471,6 +532,9 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
     if not _reduces_enough(ctx, pushed, m_input):
         return None
     if _join_out_reduces_more(ctx, pushed, join):
+        return None
+    # The measure side is the one being pre-aggregated here, and it is not always the left.
+    if _global_aggregate_gains_nothing(ctx, node, m_input, join):
         return None
     if _measured_as_non_reducing(ctx, node):
         return None

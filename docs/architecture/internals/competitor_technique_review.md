@@ -2079,6 +2079,17 @@ from the code.** Two items move to the top and one new one appears:
     thirteen census rows combined. On `x JOIN big` Batcher's *join* already beats DuckDB's
     (78.1 ms against 100.0 ms) and the query still loses by 107 ms, entirely to the gather.
 
+0b. ~~**Give `eager_aggregation` a cost term, not just a ratio.**~~ **Landed** as
+    `_global_aggregate_gains_nothing` (`kyber/rules/agg_pushdown.py`), wired into all three
+    pushdown rules. **2.29x / 2.23x / 2.14x** on the measured shapes
+    (`count(id2)` 19.6 -> 8.6 ms, `sum(v1)` 20.3 -> 9.1 ms, `min(v1)` 21.0 -> 9.8 ms), with the
+    two controls flat (0.94x on the aggregate that could not be pushed, 0.98x on the grouped
+    form). The gate is `join_rows > source_rows` for an **ungrouped** outer aggregate only —
+    "does the join amplify?", which is the condition eager aggregation always actually needed.
+    Pinned by `test_a_global_aggregate_over_a_non_amplifying_join_does_not_push`, its amplifying
+    twin, and a third test asserting the grouped path is untouched, so the veto cannot silently
+    become "never push". The original entry read below.
+
 0b. **Give `eager_aggregation` a cost term, not just a ratio.**
     `kyber/rules/agg_pushdown.py` gates the push on `_MIN_PREAGG_REDUCTION = 8.0`, a row-reduction
     ratio with no term for what the join would have cost. On a broadcast join against a
