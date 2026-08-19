@@ -182,6 +182,42 @@ its rows in increasing index order, so every partition ends up holding its rows 
 and with it the `seq == par` oracle, depends on that.
 :::
 
+### Which key types reach it
+
+The radix join's key has to be a single `Copy` value, because the partition pass carries the key
+*inline* next to the row index. Integer keys are such a value; a string is not, so for a long
+time a string-keyed join took the flat build-and-probe path instead. That path is serial, and on
+a 96-core machine the difference was not subtle: a 4-million-row join measured **2.10x**
+parallelism on a string key against **25.1x** on an integer key over the identical shape, which
+is 2,235 ms against 39 ms.
+
+The fix is not a second join algorithm. A byte key of fifteen bytes or fewer packs losslessly
+into one `u128` — the length in the top byte, the value bytes below it — and that *is* a `Copy`
+value, so it reaches the same radix join the integer paths use. The packing is **injective**, so
+"packs equal" and "bytes equal" are the same predicate, and the partitions, chains and matches
+are the ones the byte comparison would have produced. Longer keys keep the flat path.
+
+Fifteen bytes is chosen to cover what join keys are in practice: ids, codes, SKUs, ISO dates,
+categoricals. Measured on equal-sized string-keyed joins, against DuckDB:
+
+| rows per side | before | after | DuckDB |
+|---|---|---|---|
+| 250,000 | 117.3 ms | **22.3 ms** | 23.4 ms |
+| 1,000,000 | 633.1 ms | **46.1 ms** | 53.9 ms |
+| 4,000,000 | 2,617.3 ms | **124.2 ms** | 59.7 ms |
+| 10,000,000 | 6,835.6 ms | **304.8 ms** | 129.7 ms |
+
+Up to **22.4x**, and the two smaller scales move from a loss to a win. The tell that it is the
+parallelism rather than the packing is the shape of the cost: before, the join spent a flat
+~650 ns per row at every scale, which is what a serial loop does; after, it falls from 89 to
+30 ns per row as there is more work to spread.
+
+:::{note}
+The build side still has to clear `RADIX_MIN_BUILD_ROWS` (65,536) for any radix arm to fire, so
+a string join against a small dimension table keeps the flat path — correctly, since the whole
+build table fits in cache and partitioning it would be overhead.
+:::
+
 ## Skew and spill
 
 **Skew.** A hash-partitioned bucket that is far hotter than the average would leave one worker

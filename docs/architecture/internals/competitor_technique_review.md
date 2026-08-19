@@ -2347,6 +2347,70 @@ Recorded rather than fixed, deliberately. `CLAUDE.md` requires a recorded cluste
 `dist/` change, this box is a 4-CPU single node, and a locality fix validated only here would be
 validated on the one topology where locality is trivially true.
 
+## 17. The string-keyed join was serial — **landed, up to 22.4x** (2026-08-19)
+
+Found by chasing the one number entries 14-16 kept stepping over. Entry 14 measured
+`h2o-join-q4`'s `count(*)` at 4.34x DuckDB and set it aside as "the string-key work already on
+this list"; nobody had asked *why*. Varying only the key type on an otherwise identical join
+answered it immediately:
+
+| `count(*)` only, no output gather | batcher | duckdb | ratio |
+|---|---|---|---|
+| `x JOIN big USING (id3)` — int32, 1e7 x 1e7 | 95.2 ms | 101.0 ms | **0.94x, a win** |
+| `x JOIN big USING (id6)` — **string**, same shape | **4,999.4 ms** | 116.5 ms | **42.91x** |
+
+Same rows, same cardinality, same result — 52x more time for a string key than an integer one.
+That is not a comparison cost, and the scaling curve said so before any code was read: Batcher
+spent a **flat ~650 ns per row** from 250 k to 10 M rows while DuckDB's fell from 127 to 15. Flat
+per-row cost at every scale is what a serial loop looks like. Confirmed directly — 96 cores,
+4 M rows, `cpu_time / wall_time`:
+
+| key | wall | CPU | parallelism |
+|---|---|---|---|
+| `int64` | 38.6 ms | 968 ms | 25.1x |
+| `Utf8` | 2,234.9 ms | 4,692 ms | **2.10x** |
+
+**The cause is a trait bound, not a decision.** `radix_join_scalar` — the cache-radix join both
+integer fast paths use — is generic over `O: Copy`, because the partition pass carries the key
+inline beside the row index. A string is not such a value, so a string key fell to the flat
+build-and-probe path, which is serial. Nothing in the code says "strings run on one core"; it
+follows from a bound, which is exactly why it survived. `ops::byte_sort` records the identical
+failure for sorts — "`sample_sort` reads the same type list, so the sort then ran on **one core**
+whatever the machine" — so this is the second instance of one pattern: **a type list or trait
+bound that silently withholds the parallel path from byte keys.** Worth grepping for a third.
+
+**The fix is not a second join algorithm.** A byte key of <= 15 bytes packs losslessly into one
+`u128` (length in the top byte, value bytes below), which *is* `Copy`, so it reaches the same
+radix join unchanged. The packing is injective, so "packs equal" and "bytes equal" are the same
+predicate and the matches are identical by construction. Longer keys keep the flat path. Fifteen
+bytes covers what join keys are: ids, codes, SKUs, ISO dates, categoricals.
+
+| rows per side | before | after | duckdb | before | after |
+|---|---|---|---|---|---|
+| 250,000 | 117.3 ms | **22.3 ms** | 23.4 ms | 3.69x | **0.96x** |
+| 1,000,000 | 633.1 ms | **46.1 ms** | 53.9 ms | 7.12x | **0.86x** |
+| 4,000,000 | 2,617.3 ms | **124.2 ms** | 59.7 ms | 29.27x | 2.08x |
+| 10,000,000 | 6,835.6 ms | **304.8 ms** | 129.7 ms | 46.74x | 2.35x |
+
+**Up to 22.4x**, two scales from loss to win, parallelism 2.10x -> 19.38x, and the integer
+control unmoved (38.6 -> 39.1 ms). The H2O case that started it: 4,999.4 ms -> **284.8 ms**,
+42.91x -> **2.50x**.
+
+`x JOIN medium USING (id5)` barely moves and should not — its build side is 10 k rows, below
+`RADIX_MIN_BUILD_ROWS`, so the flat path stays and is right for a build table that fits in cache.
+
+### What this says about the entries before it
+
+Entries 14 and 15 concluded the remaining single-node deficit was "one operator and one data
+type", with `StringView` as the top item. That is still true of the *gather*, and this changes
+none of those measurements. But the largest string number in this document was never the gather:
+it was a join that was accidentally serial, worth 42.91x where the gather is worth 3.51x, and it
+sat inside a row (`h2o-join-q4`) that three separate entries had already looked at.
+
+Both times the lesson repeats: **the census ranked capabilities by whether they existed, then by
+ratio, and the biggest wins were inside things already marked done.** Entry 13 found 287x inside
+a "built" aggregate; this found 42.91x inside a "built" join. Neither needed a new feature.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to

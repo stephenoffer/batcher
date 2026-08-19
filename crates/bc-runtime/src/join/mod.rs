@@ -413,6 +413,36 @@ pub(crate) fn hash_join_indices_impl(
     // Single string/binary key fast path: hash and compare the raw bytes instead of
     // encoding every row of both sides through the `RowConverter`. See [`BytesKeys`].
     with_bytes_keys!(left_keys, right_keys, |keys| {
+        // Parallel cache-radix arm, for a byte key short enough to pack into one `u128`.
+        //
+        // The flat path below is a *serial* build and probe: on a 96-core box a 4 M-row
+        // string-keyed join measured 2.48x parallelism against the integer key's 28.6x on the
+        // identical shape, and 1,894 ms against 37 ms. The join was not slow because bytes are
+        // expensive to compare -- it was slow because it was the one key type that never
+        // reached [`radix_join_scalar`], whose key must be `Copy`.
+        //
+        // A short byte key *is* such a value once packed ([`pack_byte_key`]), and the packing
+        // is injective, so the partitions, the chains and the matches are the same ones the
+        // byte comparison produces. No new join algorithm: the same proven radix join the
+        // integer paths above use, reached with a different key witness.
+        //
+        // Fifteen bytes covers what join keys actually are -- ids, codes, SKUs, ISO dates,
+        // categoricals. Anything longer keeps the flat path.
+        if radix_eligible(join_type)
+            && right_rows > RADIX_MIN_BUILD_ROWS
+            && byte_keys_packable(&keys.right, right_rows)
+            && byte_keys_packable(&keys.left, left_rows)
+        {
+            return Ok(radix_join_scalar(
+                |i| pack_byte_key(keys.right.get(i)),
+                |l| pack_byte_key(keys.left.get(l)),
+                right_rows,
+                left_rows,
+                &right_null,
+                &left_null,
+                join_type,
+            ));
+        }
         return Ok(build_probe_flat(
             &keys,
             left_rows,
@@ -1148,6 +1178,41 @@ impl JoinTable {
 /// path stays flat. Left-driven join types only (Inner/Left/Semi/Anti) — Right/Full need
 /// cross-partition unmatched bookkeeping the flat oracle already does.
 const RADIX_MIN_BUILD_ROWS: usize = 1 << 16;
+
+/// The widest byte key that packs losslessly into a `u128`: fifteen value bytes under a
+/// length byte. See [`pack_byte_key`].
+const MAX_PACKED_KEY_BYTES: usize = 15;
+
+/// Pack a byte key into one `u128`, **injectively**.
+///
+/// The length goes in the top byte and the value bytes in the fifteen below it, most
+/// significant first. Two distinct keys therefore cannot share a word: different lengths
+/// differ in the top byte, and equal lengths differ wherever their bytes do. That is the
+/// whole correctness argument for the radix arm this feeds — the join over packed keys
+/// matches exactly the rows the byte-slice comparison matches, because "packs equal" and
+/// "bytes equal" are the same predicate.
+///
+/// It is not order-preserving and does not need to be: a hash join partitions and compares
+/// for equality, never for order. (`ops::byte_sort` packs for *ordering* and pays attention
+/// to exactly that difference.)
+#[inline]
+fn pack_byte_key(b: &[u8]) -> u128 {
+    let mut w = (b.len() as u128) << 120;
+    for (i, &c) in b.iter().enumerate() {
+        w |= (c as u128) << (8 * (14 - i));
+    }
+    w
+}
+
+/// Whether every value in `col` is short enough for [`pack_byte_key`].
+///
+/// Read from the offsets alone — no value bytes are touched — and in parallel, because on
+/// the ten-million-row side this decision sits in front of the join it is deciding about.
+fn byte_keys_packable<O: OffsetSizeTrait>(col: &ByteCol<'_, O>, rows: usize) -> bool {
+    (0..rows).into_par_iter().all(|i| {
+        col.offsets[i + 1].as_usize() - col.offsets[i].as_usize() <= MAX_PACKED_KEY_BYTES
+    })
+}
 
 /// Build-row floor for the **parallel broadcast** radix path. Higher than the
 /// single-threaded floor because a broadcast probe runs every core against one shared
@@ -3257,5 +3322,123 @@ mod semi_swap_tests {
         assert_eq!(semi.left.len(), 2_000);
         let anti = hash_join_indices(&l, &r, JoinType::Anti).unwrap();
         assert_eq!(anti.left.len(), 0);
+    }
+
+    /// The packing is the entire correctness argument for the byte radix arm, so it is
+    /// tested as the property it has to have: distinct keys never share a word.
+    #[test]
+    fn pack_byte_key_is_injective() {
+        use std::collections::HashMap;
+        let mut keys: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            // prefixes of one another, which a length-blind packing would collide
+            b"id1".to_vec(),
+            b"id10".to_vec(),
+            b"id100".to_vec(),
+            // embedded NUL, which a C-string-style packing would truncate
+            b"a\0b".to_vec(),
+            b"a\0".to_vec(),
+            // the widest packable key, and one differing only in its last byte
+            vec![0xFF; 15],
+            {
+                let mut v = vec![0xFF; 15];
+                v[14] = 0xFE;
+                v
+            },
+        ];
+        keys.push(b"id1000001".to_vec()); // the shape this arm exists for
+        let mut seen: HashMap<u128, Vec<u8>> = HashMap::new();
+        for k in &keys {
+            let w = pack_byte_key(k);
+            if let Some(prev) = seen.insert(w, k.clone()) {
+                panic!("collision: {prev:?} and {k:?} both pack to {w:#x}");
+            }
+        }
+        // ...and equal keys must pack equal, which is the other half of "same predicate".
+        assert_eq!(pack_byte_key(b"id1000001"), pack_byte_key(b"id1000001"));
+    }
+
+    #[test]
+    fn byte_keys_packable_boundary() {
+        let fits: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["123456789012345", "a"]))];
+        let over: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["1234567890123456", "a"]))];
+        let k = BytesKeys::<i32>::try_new(&fits, &fits).unwrap();
+        assert!(byte_keys_packable(&k.left, 2), "15 bytes must pack");
+        let k = BytesKeys::<i32>::try_new(&over, &over).unwrap();
+        assert!(!byte_keys_packable(&k.left, 2), "16 bytes must decline");
+    }
+
+    /// The byte-key counterpart of [`radix_matches_flat`]: the packed cache-radix path MUST
+    /// produce the identical relation as the flat byte oracle, for every left-driven join
+    /// type, over duplicates, misses, nulls, empty sides and keys that are prefixes of one
+    /// another.
+    #[test]
+    fn packed_byte_radix_matches_flat() {
+        fn arr(v: &[&str]) -> Vec<ArrayRef> {
+            vec![Arc::new(StringArray::from(v.to_vec())) as ArrayRef]
+        }
+        fn nulls(v: &[&str], is_null: &[usize]) -> Vec<ArrayRef> {
+            let opts: Vec<Option<&str>> = v
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| if is_null.contains(&i) { None } else { Some(x) })
+                .collect();
+            vec![Arc::new(StringArray::from(opts)) as ArrayRef]
+        }
+        let cases: Vec<(Vec<ArrayRef>, Vec<ArrayRef>)> = vec![
+            (
+                arr(&["id1", "id5", "id2", "id8", "id3", "id9"]),
+                arr(&["id3", "id1", "id3", "id7", "id5", "id5", "id2", "id4"]),
+            ),
+            // prefixes and the empty string, where a length-blind key would over-match
+            (arr(&["", "a", "ab", "abc"]), arr(&["a", "", "abc", "abcd"])),
+            (
+                nulls(&["id1", "id5", "id2", "id3", "id3"], &[2]),
+                nulls(&["id3", "id1", "id3", "id7", "id5"], &[3]),
+            ),
+            (arr(&[]), arr(&["a", "b", "c"])),
+            (arr(&["a", "b", "c"]), arr(&[])),
+        ];
+        for (li, ri) in &cases {
+            let lrows = li[0].len();
+            let rrows = ri[0].len();
+            let lnull = null_mask(li, lrows);
+            let rnull = null_mask(ri, rrows);
+            let keys = BytesKeys::<i32>::try_new(li, ri).unwrap();
+            for jt in [
+                JoinType::Inner,
+                JoinType::Left,
+                JoinType::Semi,
+                JoinType::Anti,
+            ] {
+                let flat = build_probe_flat(
+                    &keys,
+                    lrows,
+                    rrows,
+                    &lnull,
+                    &rnull,
+                    jt,
+                    false,
+                    BLOOM_FP_RATE,
+                );
+                let radix = radix_join_scalar(
+                    |i| pack_byte_key(keys.right.get(i)),
+                    |l| pack_byte_key(keys.left.get(l)),
+                    rrows,
+                    lrows,
+                    &rnull,
+                    &lnull,
+                    jt,
+                );
+                let mut a = pairs(&flat);
+                let mut b = pairs(&radix);
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "join type {jt:?} diverged on {li:?}");
+            }
+        }
     }
 }

@@ -13523,3 +13523,60 @@ bt.from_arrow(t).agg(r=bt.col("v").mode()).collect()
 
 The answer is compared against DuckDB's before any timing is taken; a build that disagrees is
 not timed at all.
+
+## The string-keyed hash join was running on 2 of 96 cores (2026-08-19)
+
+`radix_join_scalar` — the cache-radix join both integer fast paths use — takes its key as a
+single `Copy` value, because the partition pass carries the key inline beside the row index. A
+string is not such a value, so a string-keyed join fell to the flat build-and-probe path, which
+is serial. Nothing declared that; it followed from a trait bound.
+
+The cost, on a 96-core box, 4 M rows per side, varying only the key type:
+
+| key | wall | CPU | parallelism |
+|---|---|---|---|
+| `int64` | 38.6 ms | 968 ms | 25.1x |
+| `Utf8` | 2,234.9 ms | 4,692 ms | **2.10x** |
+
+A byte key of <= 15 bytes packs losslessly into one `u128` (length in the top byte, value bytes
+below), which *is* a `Copy` value, so it reaches the same radix join unchanged. The packing is
+injective, so the matches are identical by construction — no new join algorithm, a different key
+witness for the existing one.
+
+After, same box, same shapes:
+
+| key | wall | parallelism |
+|---|---|---|
+| `int64` (control) | 39.1 ms | 23.8x |
+| `Utf8` | **188.1 ms** | **19.38x** |
+
+**11.9x**, with the integer control unmoved.
+
+Equal-sized string-keyed joins, correctness gate passed against DuckDB at every scale:
+
+| rows per side | before | ns/row | after | ns/row | duckdb | before | after |
+|---|---|---|---|---|---|---|---|
+| 250,000 | 117.3 ms | 469 | **22.3 ms** | 89 | 23.4 ms | 3.69x | **0.96x** |
+| 1,000,000 | 633.1 ms | 633 | **46.1 ms** | 46 | 53.9 ms | 7.12x | **0.86x** |
+| 4,000,000 | 2,617.3 ms | 654 | **124.2 ms** | 31 | 59.7 ms | 29.27x | 2.08x |
+| 10,000,000 | 6,835.6 ms | 684 | **304.8 ms** | 30 | 129.7 ms | 46.74x | 2.35x |
+
+Up to **22.4x**; two of the four scales move from a loss to a win. The flat ~650 ns/row before,
+falling to 30 ns/row after, is the signature: a serial loop costs the same per row at every
+scale, a parallel one gets cheaper as there is more to spread.
+
+H2O join, the shape this was found on (`count(*)` only, so no output gather is involved):
+
+| | before | after | duckdb | before | after |
+|---|---|---|---|---|---|
+| `x JOIN big USING (id6)` — string, 1e7 x 1e7 | 4,999.4 ms | **284.8 ms** | 113.9 ms | 42.91x | **2.50x** |
+| `x JOIN big USING (id3)` — int32, control | 95.2 ms | 88.4 ms | 91.6 ms | 0.94x | 0.96x |
+
+`x JOIN medium USING (id5)` barely moves (103.8 -> 84.0 ms) and should not: its build side is
+10 k rows, below `RADIX_MIN_BUILD_ROWS`, so no radix arm fires and the flat path is the right
+answer for a build table that fits in cache.
+
+Verified by `packed_byte_radix_matches_flat` (the packed radix against the flat byte oracle over
+duplicates, misses, nulls, empty sides and keys that are prefixes of one another, for all four
+left-driven join types), `pack_byte_key_is_injective`, `byte_keys_packable_boundary`, and 1,361
+join differential tests against DuckDB.
