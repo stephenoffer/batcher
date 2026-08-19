@@ -2143,17 +2143,25 @@ that made 0a the top item are exactly the two it cannot help.
 of q5: `bc_runtime::gather` ~282 ms against `pyarrow.compute.take` at 4,254 ms on the identical
 indices. There is no ordinary optimization left in it.
 
-**3. The gap is concentrated in strings, and by a factor.** The same join under three
-projections, subtracting the `count(*)` time to isolate materialization:
+**3. The gap is concentrated in strings, and by a factor.** Same join, **same number of output
+columns**, varying only their type — so nothing is subtracted and no assumption about what
+`count(*)` skips is needed:
 
-| materialized | batcher | duckdb | ratio |
+| 3 output columns | batcher | duckdb | ratio |
 |---|---|---|---|
-| 4 numeric columns (3x `int32`, 1x `double`) | 40.7 ms | ~0 ms | -- |
-| **3 string columns** | **157.5 ms** | **37.4 ms** | **4.21x** |
-| all 10 (q5's projection) | 297.0 ms | 171.6 ms | 1.73x |
+| numeric (`int32`) | 105.8 ms | 101.1 ms | 1.05x |
+| **string** | **260.3 ms** | **145.1 ms** | **1.79x** |
+| **string premium over numeric** | **+154.5 ms** | **+44.0 ms** | **3.51x** |
 
-~10 ms per numeric column against ~52 ms per string column, on columns whose mean length is
-**6 characters**.
+Numeric materialization is at **parity**. The whole gap is the string columns, whose mean length
+is **six characters**.
+
+*A correction to this entry's first draft.* It reported 4.21x, obtained by subtracting each
+engine's `count(*)` time to isolate materialization. That subtraction assumes the join costs the
+same with and without a projection, which it does not — DuckDB's `count(*)` skips fetching
+payload columns entirely — and it inflated the number. The controlled form above needs no
+subtraction and gives 3.51x. The direction was right and the magnitude was not; the method is
+the part worth copying.
 
 ### Why six characters is the whole answer
 
@@ -2167,8 +2175,42 @@ Arrow's `Utf8View` is the same layout and the same 12-byte inline rule. The floo
 even though pyarrow 19 ships no `take` kernel for it: on the same 9 M indices, `take` on `Utf8`
 is 1,756 ms while `take` on an 8-byte fixed-width column is 130 ms. A 16-byte view gather is
 two of those, and it is the kernel `gather::take_fixed_width_parallel` already implements.
-Scaling Batcher's own per-column numbers the same way puts a string column near 20 ms instead
-of 52, which takes q5 from 369.6 ms to roughly parity with DuckDB's 204.8 ms.
+
+### The string length is the proof, and it says where the fix pays
+
+The same premium measured on a *different* string column settles the mechanism. TPC-H's
+`l_comment` averages **26.5** characters, past the 12-byte inline window, and there the gap
+halves — a sort over an identical random permutation, varying only the payload type:
+
+| payload | batcher | duckdb | premium |
+|---|---|---|---|
+| `l_orderkey` (`int64`) | 32.3 ms | 31.6 ms | -- |
+| `l_comment` (26.5 chars) | 129.9 ms | 90.4 ms | +97.6 ms vs +58.8 ms = **1.66x** |
+
+**6-character strings: 3.51x. 26.5-character strings: 1.66x.** That length dependence is the
+inline prefix and nothing else — past 12 bytes DuckDB has to copy characters too, and most of
+its advantage disappears. So `Utf8View` is worth roughly 3.5x on short string columns (keys,
+codes, identifiers, categoricals — the columns joins and group-bys are actually built on) and
+roughly 1.7x on prose. Size the work by that, not by the headline.
+
+### A hypothesis this measurement killed, recorded so nobody rebuilds it
+
+The obvious cheaper fix is a **cache-conscious partitioned gather**: radix-partition the indices
+by source region so each pass's reads stay inside cache, which is what Velox and DuckDB do for
+random access. It does not apply here, because **Batcher's gather is already almost
+locality-insensitive**:
+
+| gather of a 159 MB string column, 6 M rows | pyarrow | batcher | duckdb |
+|---|---|---|---|
+| random source order | 968.2 ms | 129.9 ms | 90.4 ms |
+| sorted / in-order source | 172.0 ms | 109.6 ms | 40.6 ms |
+| **penalty for random access** | **5.63x** | **1.19x** | **2.23x** |
+
+pyarrow pays 5.63x for scattered reads and a 64-bucket partitioning pass recovers 3.41x of it.
+Batcher pays **1.19x**, so the entire prize is ~20 ms of a 130 ms gather and a partitioning pass
+would spend most of it. The parallel chunked gather already solved this problem. What is left is
+not locality, it is the per-value work of a variable-length layout — which is the representation,
+which is `Utf8View`.
 
 ### What this changes on the board
 
@@ -2190,6 +2232,45 @@ IR's type vocabulary, with a planner decision about when to produce it (the same
 dictionary item 6, which was built, measured and reverted for want of exactly that decision).
 It should be started as its own piece of work with that precedent in view, not bolted onto a
 gather patch.
+
+## 15. The operator suite, re-run at HEAD and ranked by time lost (2026-08-18)
+
+`python benchmarks/run.py --benchmark operators`, one 96-core node, TPC-H sf1, five engines,
+**every correctness check passed**. Batcher beats Polars, PyArrow and Daft on all 21 cases —
+often by one to two orders of magnitude — so the only lineup worth tabulating is DuckDB.
+
+Fourteen of 21 are wins. Ranked by **time lost** rather than by ratio, which is the ordering
+entry 12 argued for and this table exists to keep honest:
+
+| case | batcher | duckdb | ratio | **lost** |
+|---|---|---|---|---|
+| `op-sort-string` | 162.5 ms | 140.5 ms | 1.16x | **+22.0 ms** |
+| `op-sort-multikey-narrow` | 50.8 ms | 36.5 ms | 1.39x | **+14.3 ms** |
+| `op-sort-multikey-wide` | 67.1 ms | 55.6 ms | 1.21x | +11.5 ms |
+| `op-sort-string-lowcard` | 45.7 ms | 34.4 ms | 1.33x | +11.3 ms |
+| `op-sort-string-limit` | 9.6 ms | 7.0 ms | 1.37x | +2.6 ms |
+| `op-distinct-high-card` | 20.0 ms | 17.6 ms | 1.13x | +2.4 ms |
+| `op-groupby-sum` | 5.5 ms | 3.2 ms | 1.73x | +2.3 ms |
+| `op-filter-project` | 10.3 ms | 8.1 ms | 1.28x | +2.2 ms |
+| `op-groupby-2key` | 5.7 ms | 5.4 ms | 1.07x | +0.3 ms |
+
+**Sorting is four of the top five and about 59 ms of the roughly 70 ms lost in total**, and
+three of those four sort a string. Everything that is not a sort costs under 3 ms.
+
+Two things follow, and the second is the one that matters.
+
+**The window operators have become a clear win** — `op-window-runsum` 0.20x, `op-window-lag`
+0.37x, `op-window-rank` 0.41x against DuckDB, with Daft OOM-killed on all three (it needs
+~22 GB for an ordered 6 M-row window and exceeds 30 GB on `lag`). That was a loss when this
+document started tracking it.
+
+**The remaining single-node deficit is one operator and one data type.** Entry 14 measured the
+string *payload gather* at 3.51x on short strings; this table adds the other half, the string
+*key ordering*, which `op-sort-string` isolates at 1.16x on a 26.5-character key. They are
+separate paths (`stable_sort_indices_str` and the string range-partitioner versus
+`gather::take_column`) and only the second is addressed by `Utf8View`. The multi-key rows are a
+third, unrelated thing: entry 11a's packed radix sort already landed there and they are still
+1.21-1.39x, so that path has something left in it that the packing did not reach.
 
 ## Things Batcher already has, so do not "add" them
 
