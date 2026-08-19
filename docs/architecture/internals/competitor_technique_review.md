@@ -1672,7 +1672,7 @@ Data has an equivalent, with four exceptions, all small:
 | Present elsewhere, absent here | Source | Verdict |
 |---|---|---|
 | `positional_join` (join two relations by row position) | DuckDB `physical_positional_join.cpp` | Expressible as `with_row_index` + an equi-join. Not worth an operator. |
-| `merge_sorted` (merge two already-sorted inputs) | Polars `merge_sorted.rs`, Acero `sorted_merge_node.cc` | The k-way merge exists inside the external sort; it is not reachable as a verb. Minor. |
+| `merge_sorted` (merge two already-sorted inputs) | Polars `merge_sorted.rs`, Acero `sorted_merge_node.cc` | **Measured and ruled out** — the shape it serves is already 5.3x faster here than in DuckDB. See 12b. |
 | positional `zip` of two relations | Ray Data `zip_operator.py`, Polars `zip.rs` | Same as `positional_join`. |
 | `cte_inlining`, `unnest_rewriter` | DuckDB optimizer | Parser-level; `_sql` already inlines non-recursive CTEs by substitution. |
 
@@ -1737,6 +1737,68 @@ code gave the wrong answer:
    already measures, arriving on a query too fast to hide it. No aggregate function is slow.
    What is left of the H2O row is what the scorecard already says it is: **string keys**, which is
    ceiling #2 and the largest open item in the repository.
+
+### 12c. What the census pass verified, across the four execution scopes
+
+Both optimizations this pass landed (item 11a's packed sort key, item 12's `eager_aggregation`
+gate) reach every executor by construction rather than by a per-scope implementation, which is
+what the mergeable/one-`Expr` design buys — but "by construction" is the claim that has been
+wrong here before, so it was checked:
+
+| Scope | How it is reached | Evidence |
+|---|---|---|
+| Batch, single-node serial | `sort_indices_of` is the oracle every path is compared against; Kyber rules are plan-level | 374 Rust tests; 18,819 unit tests |
+| Batch, single-node parallel | the sample-sort's per-range sorts and `window_with`'s per-bucket kernel call the same entry points | seq == par oracle tests |
+| Out-of-core | the external sort calls `sort_indices_of` per run | spill tests in the Rust suite |
+| Streaming | `stream/breaker.rs` and `stream/parallel.rs` both dispatch to `ops::parallel_sort_batch`/`sort_batch`; a Kyber rewrite is upstream of every executor | **32/32** across `test_stream_batch_parity`, `test_streaming_executor`, `test_streaming_rule_parity`, `test_streaming_pushdown_parity`, `test_diff_streaming_aggregate`, `test_diff_stream_interval_join` |
+| Distributed | per-partition sorts and the same plans | `test_distributed_aggregate_over_join_grouped_by_non_key` **2 passed on a fresh Ray cluster**; the sort files pass individually |
+
+`test_stream_batch_parity` is the one that matters most for the mandate's "batch and streaming"
+clause: it asserts the two paths agree, so a rewrite that changed one and not the other would
+fail there rather than in production.
+
+Two failures seen along the way were run to ground rather than attributed. `test_diff_agg_arg_extreme`'s
+distributed case fails against the **shared** Ray cluster and passes in 14 s against a fresh one
+(`RAY_ADDRESS=local`) — the stale-`.so` mode `concurrent-agents.md` documents.
+`test_distributed_multi_table_join_matches_single_node[flight]` times out identically on
+unmodified `HEAD` (`exit=124` on both sides, one dot each), so it is pre-existing.
+
+### 12b. `merge_sorted` is a capability gap that is not a gap
+
+The inventory table lists `merge_sorted` as one of four operators the competitors have and
+Batcher does not, on the reasonable ground that the k-way merge exists inside the external sort
+and is not reachable as a verb. Polars ships it as a streaming node and Acero as
+`sorted_merge_node.cc`, so it looked like a clean technique to adopt — and it has the property
+this document keeps asking for, being naturally streaming, batch, single-node and distributed at
+once.
+
+**Measure the shape before adding the operator.** Merging two 4 M-row sorted relations on an
+`int64` key, which is exactly what the operator is for:
+
+| | time |
+|---|---|
+| Batcher, `a.union(b).sort("k")` | **33.5 ms** |
+| DuckDB, `(a UNION ALL b) ORDER BY k` | 177.6 ms |
+| NumPy, stable sort of the concatenated key arrays alone | 100.1 ms |
+| Batcher, the same 8 M rows *unsorted* (what a general sort costs) | 248.9 ms |
+
+Batcher is **5.3x faster than DuckDB** on the shape, and faster than a hand-written NumPy sort of
+just the keys. The last row is the one that settles it: the same 8 M rows unsorted cost 248.9 ms,
+so the pre-sorted concatenation is already running **7.4x cheaper than a general sort**. The
+engine is *already* exploiting the sortedness — `radix_sort`'s `is_ordered` check, its skipping of
+constant key bytes, and the sample-sort's ranges arriving pre-ordered — without being told about
+it and without a dedicated operator.
+
+So the verb would add public API surface, a `RelOp`, a wire-contract change and four executor
+paths, to make a shape faster that is already the fastest of the three engines measured. That is
+the speculative generality `maintainability.md` forbids, and the inventory row is corrected rather
+than acted on.
+
+Worth separating two things the row conflated. Batcher genuinely cannot *spell* `merge_sorted`,
+and a user porting a Polars script has to write `union(...).sort(...)` instead — a one-line
+translation that belongs in the migration guide, not in the engine. What it cannot do is
+**assert** the inputs are sorted and skip the verification; that is the only real difference, it
+is worth a linear scan, and nothing measured suggests the scan is what costs.
 
 ### 12a. Spark's `WindowGroupLimitExec`, built and reverted — parallelism beat the algorithm
 
