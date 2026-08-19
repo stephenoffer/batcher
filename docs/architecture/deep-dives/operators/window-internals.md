@@ -144,8 +144,21 @@ optimizer sets it only when the window has a single ranking function, so the bou
 one appended column. For `row_number` that is the top k per partition; for `rank` / `dense_rank`
 it correctly keeps peers tied at the boundary.
 
-Without the fusion, "top 3 products per category" computes the full ranking over every partition
-and then throws almost all of it away.
+The fusion removes the separate filter node and stops the full windowed batch from reaching the
+operator above it. What it does **not** do is bound the work: `rank_limit` is applied as a mask
+*after* the ranking, so "top 3 products per category" still orders every partition and then
+discards almost all of it. Only `k = 1` escapes, and by a different route — Kyber rewrites
+`row_number() = 1` onto `DISTINCT ON`, which is a per-key argmin rather than a sort.
+
+Spark and Daft both build an operator to avoid the ordering (`WindowGroupLimitExec`,
+`window_partition_and_dynamic_frame`), and a bounded per-partition heap was built here and
+**reverted**: it is `O(n log k)` against the sort's `O(n log n)` and still 2 to 4x slower, because
+the ordering path runs across every core and the heap ran on one. Doing it properly means bounding
+inside the per-bucket kernel so the selection inherits that parallelism. The measurements and the
+design are in `docs/architecture/internals/competitor_technique_review.md`, item 12a.
+
+Worth keeping in proportion: on this shape Batcher is already 10-20x faster than DuckDB and
+2.5-10x faster than Polars, so this is an improvement to a win rather than a gap.
 
 ## Using it
 

@@ -1738,6 +1738,49 @@ code gave the wrong answer:
    What is left of the H2O row is what the scorecard already says it is: **string keys**, which is
    ceiling #2 and the largest open item in the repository.
 
+### 12a. Spark's `WindowGroupLimitExec`, built and reverted — parallelism beat the algorithm
+
+Item 12's second reversal recorded that the window's `rank_limit` is a post-hoc mask over a fully
+ordered partition, that Spark and Daft both built operators to avoid exactly that, and that a
+bounded heap looked worth ~2x for `k > 1`. It was built: `bc_runtime::window::topk`, one flat
+`groups x k` max-heap array with no per-partition allocation, ordering on
+`(packed order key, row index)` so the `k` rows it keeps are the `k` smallest under the *same*
+total order the sort produces. Seven tests pinned it against the ordering path — every `k`, both
+directions, tie-heavy input, a string partition key, an unpartitioned window, and the mask
+property that a non-survivor must never pass `rank <= k`. All green, answers identical.
+
+It is **2 to 4x slower**, interleaved best-of-3 on 6 M rows:
+
+| shape | ordering path | bounded heap | |
+|---|---|---|---|
+| 200,000 partitions, `k = 2` | 81.4 ms | 163.4 ms | 0.50x |
+| 200,000 partitions, `k = 3` | 87.0 ms | 204.4 ms | 0.43x |
+| 200,000 partitions, `k = 10` | 125.8 ms | 456.1 ms | 0.28x |
+| 1 M partitions, `k = 2` | 119.0 ms | 343.4 ms | 0.35x |
+| 1 M partitions, `k = 5` | 131.4 ms | 549.8 ms | 0.24x |
+| `rank()` instead of `row_number` (declines) | 102.9 ms | 96.4 ms | 1.07x |
+
+**`O(n log k)` beat `O(n log n)` and lost anyway, because the sort runs on 96 cores and the heap
+ran on one.** `window_with` hash-partitions rows so equal partition keys co-locate and then runs
+the serial kernel per bucket across rayon; hooking the bounded selection in at
+`window_batch_with` — above all of that — traded the parallelism for the better complexity. The
+last row is the control: a shape the bounded path declines is unchanged, so the decline works and
+the loss is entirely the path that fired.
+
+The fix is known and is not what was built: put the bound **inside** `window_serial`, which
+already runs once per bucket, so the selection inherits the bucketing instead of replacing it.
+That needs `rank_limit` threaded to the per-bucket kernel, and the natural carrier is
+`WindowCall` — which has **49 construction sites, 47 of them in tests**. That is a large, noisy
+diff in a file another session is actively refactoring, spent on a shape Batcher already wins by
+**10-20x over DuckDB and 2.5-10x over Polars** (item 12). Correct ranking: do it when the window
+file is quiet, not before the materialization work above it.
+
+The general lesson is the one this document keeps paying for in a new currency each time. Item 11b
+was a premise that did not hold (the read it removed was not on the common path); item 11's
+zero-copy attempt removed a real allocation that was not the cost; this one had the right
+complexity argument and the wrong *machine* model. **A complexity win is not a win until it is
+measured against what the engine actually does with the hardware.**
+
 ### The measured census: 96 queries, four suites, ranked by what they actually cost
 
 The inventory says almost nothing is missing, so the bottlenecks have to be found by
@@ -2090,7 +2133,7 @@ from the code.** Two items move to the top and one new one appears:
     twin, and a third test asserting the grouped path is untouched, so the veto cannot silently
     become "never push". The original entry read below.
 
-0b. **Give `eager_aggregation` a cost term, not just a ratio.**
+    **Give `eager_aggregation` a cost term, not just a ratio.**
     `kyber/rules/agg_pushdown.py` gates the push on `_MIN_PREAGG_REDUCTION = 8.0`, a row-reduction
     ratio with no term for what the join would have cost. On a broadcast join against a
     10,000-row build side it fires on a ~1000x reduction and is **2.4-2.6x slower** than not
