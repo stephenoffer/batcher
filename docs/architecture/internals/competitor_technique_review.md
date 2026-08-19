@@ -1763,6 +1763,36 @@ distributed case fails against the **shared** Ray cluster and passes in 14 s aga
 `test_distributed_multi_table_join_matches_single_node[flight]` times out identically on
 unmodified `HEAD` (`exit=124` on both sides, one dot each), so it is pre-existing.
 
+### 12e. The census re-verified in the *other* direction, by calling
+
+Item 12d's lesson cuts both ways and the second half had not been done. Five false *gaps* were
+found and corrected in this pass, all from asking whether a name exists. The claim that carried
+the most weight in item 12 — "Polars' streaming node list is the longest and most specialized of
+the six, and **Batcher has every one of them**" — rested on exactly the discredited method: a
+grep of the codebase, not a query.
+
+So each was called. The result confirms the claim, and the *way* it nearly did not is the
+interesting part: on the first attempt five of thirteen looked missing, and every one of those
+five was the probe's fault.
+
+| Node | Verdict |
+|---|---|
+| `forward_fill`, `backward_fill`, `interpolate`, `ewm_mean`, `rle_id` | **present** — they take their ordering from `.over(order_by=...)`, not an `order_by=` kwarg. Called wrongly, all five raise, and the raise reads like an absence |
+| `is_first_distinct` | **present** — needs `order_by`; a bare call is an arity error, the 2.4x overstatement mode this document already names |
+| rolling aggregates | **present** — `.over(order_by=…, frame=(-1, 0))`; the frame is `frame=`, not `rows=` |
+| `shift`, `peak_max`, `gather_every`, `with_row_index`, session/dynamic windows, `top_k` | **present**, called directly |
+| `rle` as a struct | **deliberate refusal**, and the error names the composition: number the runs with `rle_id().over(order_by=…)` and group by that |
+
+**A raise is not an absence.** Three distinct failure modes have now produced false gaps here — a
+bare-name diff, an arity error, and a competitor's spelling for a capability that exists under
+Batcher's own name (12d, where the error message printed the answer and it was read past). The
+only probe that has never lied is a query that returns rows.
+
+What survives across both directions is short and small: `list.argsort` (DuckDB `list_grade_up`,
+Polars `arg_sort`), `list.resize`, `equi_width_bins`, and a bounded-memory mode for the exact
+`top_k` (12d). Everything else the six engines have, Batcher has, and the remaining performance
+work is not a competitor technique at all — it is deferred payload materialization, item 0a.
+
 ### 12d. `approx_top_k` was already built — the fifth false gap, and the worst one
 
 **This entry previously specified `approx_top_k` as "the one adoption left" and ranked it 0 in
