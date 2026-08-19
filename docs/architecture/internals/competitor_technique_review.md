@@ -1763,6 +1763,68 @@ distributed case fails against the **shared** Ray cluster and passes in 14 s aga
 `test_distributed_multi_table_join_matches_single_node[flight]` times out identically on
 unmodified `HEAD` (`exit=124` on both sides, one dot each), so it is pre-existing.
 
+### 12d. `approx_top_k` — the one adoption left, traced to its insertion points
+
+DuckDB, ClickHouse (`topK`) and Spark all ship an approximate heavy-hitters aggregate and Batcher
+does not. It survived the "call it, do not grep it" filter that removed `implode` (it is
+`array_agg`), `list.index_of` (it is `list.position`) and `min_by`/`max_by` (they are
+`arg_min`/`arg_max`), so this is a real gap rather than a spelling one.
+
+It is also the *right* kind of gap: bounded memory. Exact `mode` keeps every value of every group
+(`median_state`), so one hot group can OOM — the same argument `hll.rs` makes for
+`approx_count_distinct` against exact `COUNT(DISTINCT)`. A Misra-Gries sketch bounds it, and
+because the sketch is mergeable the operator is `partial → combine → finalize` and inherits
+single-node, parallel, out-of-core, streaming and distributed with no per-scope work.
+
+**It was not built here, and the reason is worth stating plainly**: it crosses the JSON IR, and
+invariant #8 requires the Python and Rust tags to move in the same commit. That is the one change
+class the contract calls a *silent* correctness bug — nothing in Rust fails if the two drift. It
+is a nine-point vertical slice and it should be started with the room to finish and verify it,
+not appended to the end of a long pass.
+
+What follows is the tracing, so the next session starts from insertion points rather than from a
+search.
+
+**The prerequisite.** `bc_sketches::FrequentItems` has `merge` (it is `Mergeable`) but **no
+`to_bytes`/`from_bytes`**, which `hll.rs` relies on to move a sketch between `partial` and
+`combine`. Add them there first, with a round-trip test, exactly as `HyperLogLog` has them.
+
+**The template is `crates/bc-runtime/src/agg/hll.rs`**, and it answers the two design questions:
+
+* *How does the state travel?* One sketch per group serialized into a `Binary` column, row `g` =
+  group `g`. It then flows through `combine`'s generic state concatenation like any other state
+  column, and `merge` deserializes, unions per group and re-serializes.
+* *How is it type-generic?* `finalize_mode` (`agg/median.rs`) shows it: row-encode every value
+  once with `RowConverter`, count the encoded bytes, decode the winners back at the end. So
+  `FrequentItems<Vec<u8>>` over row-encoded values covers every type in one implementation, with
+  no per-type dispatch — and it inherits the float canonicalization `finalize_mode` already does,
+  which is what keeps `-0.0`/`0.0` and NaN from fracturing a group.
+
+**How `k` reaches the kernel.** Not as an enum field: `bc_ir::AggFunc::ApproxQuantile` is a bare
+variant and its `p` rides `AggregateItem::param`, while the *runtime* enum carries it
+(`bc_runtime::agg::AggFunc::ApproxQuantile(u16)`). Mirror that — `AggFunc::ApproxTopK` bare in
+`bc-ir`, `ApproxTopK(u16)` in `bc-runtime`.
+
+**The nine points**, in dependency order:
+
+1. `bc-sketches/src/frequent.rs` — `to_bytes`/`from_bytes` + round-trip test.
+2. `bc-runtime/src/agg/topk_freq.rs` (new) — `partial`/`merge`/`finalize`, mirroring `hll.rs`.
+3. `bc-runtime/src/agg/mod.rs` — the `ApproxTopK(u16)` variant, `name()`, and the state arm
+   (it needs its *own* arm rather than joining `median_state`'s group, which is the whole point).
+4. `bc-runtime/src/agg/finalize.rs` — the finalize arm.
+5. `bc-ir/src/lib.rs` — the `ApproxTopK` variant and its serde tag.
+6. `bc-py` — the IR-to-runtime conversion that reads `param` as `k`.
+7. `python/batcher/plan/ir_tags.py` — the tag, **in the same commit as (5)**.
+8. `python/batcher/api/functions.py` + the `Expr`/`Dataset` surface + `_sql/parser/expressions/aggregates.py`.
+9. Tests and docs: a differential against DuckDB's `approx_top_k` (compare the returned *set* on
+   well-separated frequencies, since both sides are approximate), the mergeability invariant
+   `combine_finalize(partition(partial(pₖ))) == single-node`, and the expressions reference,
+   which the API-coverage gate will fail until it is listed.
+
+**One naming decision to make deliberately.** Batcher's exact `mode` is `approx_top_k(1)` without
+the approximation, so the two should agree on ties: `mode` breaks them toward the smallest value
+to stay mergeable, and the new aggregate must either do the same or document why not.
+
 ### 12b. `merge_sorted` is a capability gap that is not a gap
 
 The inventory table lists `merge_sorted` as one of four operators the competitors have and
@@ -2192,6 +2254,12 @@ implements it, so the next reader can settle it with one grep instead of one day
 
 **Re-ranked 2026-08-18 by the census in item 12, which measured 80 queries rather than reasoning
 from the code.** Two items move to the top and one new one appears:
+
+0. **`approx_top_k` (item 12d).** The only competitor capability the census found that Batcher
+    lacks and that measurement did not talk it out of. Bounded-memory heavy hitters, mergeable, so
+    it inherits every execution scope; the sketch, the `hll.rs` state template and the
+    row-encoding trick are all in place and 12d names the nine insertion points. Crosses the wire
+    contract, so it needs a session with room to finish and verify it in one commit.
 
 0a. **Deferred payload materialization (selection vectors), RFC proposal 2.** Now the
     highest-value structural item on the board, ahead of the string work below. The census
