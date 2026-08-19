@@ -1,10 +1,13 @@
 """The distribution aggregates added this wave, against DuckDB.
 
-`entropy`, `mad`, `kurtosis_pop`, `quantile_disc` and `approx_top_k` all read a group's
-whole value list, so they share MEDIAN's mergeable state and differ only in how they
-finalize it. Each is checked against DuckDB's own answer, grouped and global, and each is
-checked to give the *same* answer through the multi-partition path — a value-list
-aggregate that is not partition-order-independent is the classic silent distributed bug.
+`entropy`, `mad`, `kurtosis_pop` and `quantile_disc` all read a group's whole value list, so
+they share MEDIAN's mergeable state and differ only in how they finalize it. `approx_top_k` is
+here too, but no longer for that reason: it counts values rather than keeping them
+(`bc-runtime`'s `agg::counted`, with its own matrix in `test_diff_agg_counted_state.py`).
+
+Each is checked against DuckDB's own answer, grouped and global, and each is checked to give
+the *same* answer through the multi-partition path -- an aggregate that is not
+partition-order-independent is the classic silent distributed bug.
 
 `any_value` is the exception, and is tested differently: DuckDB documents the chosen row
 as unspecified, so there is no answer to be differential about. What is pinned is that

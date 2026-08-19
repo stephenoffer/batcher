@@ -143,6 +143,72 @@ not one absolute count that is too high on a large box and too low on a small on
 value pins it. Group *order* differs from the serial path either way, which callers already treat
 as unspecified for a hash aggregate.
 
+## What the state costs
+
+Every aggregate's state sits in one of four families, and the family decides how the aggregate
+behaves under a group that is much larger than the others. That is the question worth asking of
+an aggregate before you run it at scale, because a plan that fits comfortably on average data
+can still be defeated by one hot key.
+
+| Family | State per group | Examples |
+|---|---|---|
+| Fixed accumulator | constant | `sum`, `count`, `min`, `max`, `mean`, `var`, `arg_min` |
+| Sketch | bounded by a configured error | `approx_count_distinct`, `approx_quantile` |
+| Counted values | one entry per distinct value | `mode`, `top_k` |
+| Value list | one entry per row | `median`, `quantile`, `count_distinct`, `array_agg` |
+
+The first two are the reason a `sum` over a billion rows costs nothing to hold: the state is
+the same size whether the group has ten rows or ten million. The last is the reason a `median`
+over the same group is not, and it is why the tip below points at the sketches.
+
+The third family is worth its own line, because the distinction between "one per distinct
+value" and "one per row" is the whole difference between the two ends of that table.
+{py:meth}`mode <batcher.plan.expr_ir.core.Expr.mode>` and
+{py:meth}`top_k <batcher.plan.expr_ir.core.Expr.top_k>` only ever ask how *often* a value
+occurs, never what the values in order are, so they carry each group's distinct values
+alongside their counts (`crates/bc-runtime/src/agg/counted.rs`) rather than the values
+themselves. Both were value-list aggregates before, which meant `top_k(3)` over ten million
+rows retained all ten million to return three.
+
+Counting keeps them exact. Nothing here is sampled, despite the `approx_top_k` spelling the SQL
+name carries for DuckDB compatibility, and nothing about merging changes: counts add, so
+`combine` re-groups the partials' pairs and sums them, and the single-node, parallel and
+distributed paths stay one implementation.
+
+```python
+import batcher as bt
+
+events = bt.from_pydict(
+    {
+        "user": ["ana"] * 4 + ["bo"] * 3 + ["cy"] * 2,
+        "page": ["home", "home", "docs", "home"]
+        + ["pricing", "docs", "pricing"]
+        + ["pricing", "docs"],
+    }
+)
+
+# The state holds one entry per distinct page per user, not one per event.
+top = events.group_by("user").agg(
+    favourite=bt.col("page").mode(),
+    top_two=bt.col("page").top_k(2),
+)
+print(top.sort("user").to_pydict())
+```
+
+```text
+{'user': ['ana', 'bo', 'cy'],
+ 'favourite': ['home', 'pricing', 'docs'],
+ 'top_two': [['home', 'docs'], ['pricing', 'docs'], ['docs', 'pricing']]}
+```
+
+Two properties in that output are contracts rather than incidental. `top_k` is ordered most
+frequent first, so testing it needs an order-sensitive assertion. And `cy` visited two pages
+once each, a tie resolved to the smaller value: without a deterministic tie-break the answer
+would depend on which partition happened to see which row first, and an aggregate whose answer
+depends on partitioning cannot be merged at all. That is the same requirement
+{doc}`mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>` places on every
+stateful operator.
+
 ## The decision the executor refuses to guess
 
 `partial → combine` is the right shape when grouping *reduces*. `GROUP BY l_returnflag` turns
@@ -309,12 +375,13 @@ state instead, and merge in constant space.
 
 ## Where the code lives
 
-- `crates/bc-runtime/src/agg/mod.rs`: `AggFunc`, `partial`, `combine`, `finalize`
+- `crates/bc-runtime/src/agg/mod.rs`: `AggFunc`, `partial`, `combine`
+- `crates/bc-runtime/src/agg/dispatch.rs`: `accumulate` and `finalize`, the per-function tables
 - `crates/bc-runtime/src/agg/group/assign.rs`: dense ids, the three key paths
 - `crates/bc-runtime/src/agg/group/combine.rs`: the parallel radix regroup
 - `crates/bc-runtime/src/agg/fused.rs`: the fused scalar accumulators
 - `crates/bc-runtime/src/agg/spill.rs`: grace aggregation
-- `crates/bc-runtime/src/agg/{var,median,qsketch,hll,stats,argextreme,distinct}.rs`: the state shapes
+- `crates/bc-runtime/src/agg/{var,median,sketch,stats,argextreme,distinct,counted}.rs`: the state shapes
 - `crates/bc-interp/src/agg_par.rs`: the measured partition-vs-preaggregate decision
 
 ## See also

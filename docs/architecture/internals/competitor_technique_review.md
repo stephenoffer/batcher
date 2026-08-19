@@ -2060,6 +2060,58 @@ useful result in itself — the census found **no new engine-level gap**:
   most of a 2-8 ms query. `cb-q00` is 0.1 ms against DuckDB's 0.8 ms on the same dataset, so the
   constant is not uniform and not a floor; it is work proportional to the plan, not the data.
 
+## 13. The state `mode` and `top_k` were carrying — **landed, 31x and 287x** (2026-08-18)
+
+Found by measuring the aggregate 12d had just finished proving already existed. `approx_top_k`
+was built, correct, wired end to end — and 22.9x *slower* than DuckDB on the shape it is for,
+holding 854 MB to return three values. Being present is not the same as being good, and this
+document had spent four entries checking presence.
+
+The cause was a shared state, not an algorithm. `mode` and `top_k` were listed alongside
+`entropy`, `mad` and `quantile_disc` as "the value-list family: they read a group's whole value
+list, so they share `Median`'s state and differ only in `finalize`". True of the other three.
+False of these two, which never read the list -- they only ever ask how *often* each value
+occurs. So the partial retained every value of every group and the counting happened at
+finalize, over ten million rows, to return three.
+
+The fix is `bc-runtime`'s `agg::counted`: per group, the distinct values and their counts, as
+two parallel `List` state columns. `O(distinct)` instead of `O(rows)`, still exact, and still
+mergeable because counts add -- so `combine` re-groups the pairs and sums, and the parallel,
+spilling and distributed paths inherit it with no second implementation. No IR or wire change:
+same `AggFunc`, same tags, only the state behind them.
+
+10M rows, one group, 50 distinct values, both builds `--release`, best of 3, all three engines
+agreeing on the answer:
+
+| | time | peak RSS |
+|---|---|---|
+| `top_k(3)` before | 547.6 ms | +687 MB |
+| **`top_k(3)` after** | **17.5 ms** | **+224 MB** |
+| DuckDB `approx_top_k(v, 3)` | 705.3 ms | — |
+| `mode()` before | 3,988.3 ms | +20 MB |
+| **`mode()` after** | **13.9 ms** | **+4 MB** |
+| DuckDB `mode(v)` | 109.4 ms | — |
+
+**31x and 287x** against the previous state; 40x and 7.9x against DuckDB. Peak RSS falls 3.1x
+rather than to nothing because `partial` still row-encodes the batch it is handed: the state is
+`O(distinct)`, the transient encoding is still `O(batch rows)`.
+
+Two divergences from DuckDB surfaced while testing, both **pre-existing** and both verified
+identical on a build without this change, so neither is a regression this introduced:
+
+* `mode` over NaN. Batcher folds every NaN into one value and answers `nan`; DuckDB answers
+  `2.5` on `[nan, nan, nan, 2.5, 2.5]` -- while its *own* `GROUP BY` on that column reports
+  `(nan, 3), (2.5, 2)`. DuckDB contradicts itself here; Batcher agrees with its own grouping,
+  which is the property worth keeping. Pinned in `test_diff_agg_counted_state.py` including
+  DuckDB's contradicting answer, so the test fails loudly if DuckDB ever fixes it.
+* `top_k` over an all-null group yields `[]` where DuckDB yields NULL. Recorded, not hidden.
+
+**The lesson for this document.** Entries 12d, 12e and 10n each ended "already built, do not
+re-implement", and that conclusion was right every time. It was also incomplete: none of them
+asked whether the thing that existed was any good. A census that checks presence finds false
+gaps and stops; the one bottleneck worth 287x was inside a feature already marked done. Measure
+the capabilities you rule out, not just the ones you rule in.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to

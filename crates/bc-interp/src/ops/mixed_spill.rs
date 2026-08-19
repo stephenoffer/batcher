@@ -1,9 +1,9 @@
 //! Bounded out-of-core aggregation for a *mix* of value-list and constant-state
 //! aggregates in one `GROUP BY`.
 //!
-//! A lone value-list aggregate (`median`/`n_unique`/`mode`) gets a bounded
-//! external-sort path ([`super::quantile_spill`]); but `median(x), sum(y)` — a
-//! value-list aggregate mixed with constant-state ones — falls to the in-memory
+//! A lone unbounded-state aggregate (`median`/`n_unique`/`mode`) gets a bounded
+//! external-sort path ([`super::quantile_spill`]); but `median(x), sum(y)` — an
+//! unbounded-state aggregate mixed with constant-state ones — falls to the in-memory
 //! grace path, whose per-group value list can still blow memory on a hot key. This
 //! bounds the mixed case **compositionally**, reusing the proven primitives:
 //!

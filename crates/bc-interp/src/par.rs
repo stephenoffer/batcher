@@ -2517,8 +2517,15 @@ fn exec_fused(
 }
 
 /// Whether any aggregate needs the raw input morsels (not just partials) for its
-/// out-of-core spill — the value-list aggregates whose per-group state is unbounded.
-/// Those keep the materializing path; everything else spills from partials via grace.
+/// out-of-core spill — the aggregates whose per-group state grows with the data rather than
+/// with the aggregate. Those keep the materializing path; everything else spills from
+/// partials via grace.
+///
+/// Most of them are value-list aggregates, holding one state entry per row. `Mode` and
+/// `ApproxTopK` are not: `bc_runtime::agg::counted` gives them one entry per *distinct*
+/// value, so the common hot-group case is cheap. They are listed anyway, because a column
+/// of unique values puts an entry back for every row and a spill path is sized against the
+/// worst case.
 fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
     aggregates.iter().any(|a| {
         matches!(

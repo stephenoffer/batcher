@@ -277,7 +277,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 
 | module | lines | what it is |
 |---|---|---|
-| `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
+| `_discovery.py` | 213 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 258 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1786 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1743 | The `ds.write` namespace — typed, per-format dataset sinks. |
@@ -1410,7 +1410,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `checks.py` | 266 | Predicate shortcuts — questions about a column's *values*, answered from its bounds. |
 | `distinct.py` | 121 | Cardinality shortcuts — how many distinct values, and whether a column is a key. |
 | `facts.py` | 237 | The one place a plan's statistics become *facts* — the substrate every shortcut reads. |
-| `joins.py` | 90 | Join shortcuts — the questions two relations' bounds answer about their join. |
+| `joins.py` | 98 | Join shortcuts — the questions two relations' bounds answer about their join. |
 | `moments.py` | 54 | Additive shortcuts — a column's total and its average, when something already recorded them. |
 | `nulls.py` | 110 | Null-shape shortcuts — how much of a column is missing, and which columns are complete. |
 | `ordering.py` | 63 | Ordering shortcuts — what the data is already sorted by, so a sort need not prove it. |
@@ -1679,7 +1679,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `credentials.py` | 177 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 521 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
-| `interop.py` | 324 | Framework-interop ingestion — build a `Source` from a foreign object. |
+| `interop.py` | 367 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
 
@@ -2218,7 +2218,7 @@ Ecosystem-compatible spellings bound onto `Expr`.
 | module | lines | what it is |
 |---|---|---|
 | `binder.py` | 45 | Attach the compatibility aliases onto `Expr`. |
-| `guidance.py` | 254 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `guidance.py` | 257 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 | `names.py` | 453 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
 | `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
@@ -2233,7 +2233,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | `_descriptions.py` | 481 | The curated per-accessor docstrings, keyed by accessor name. |
 | `collections.py` | 1713 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4382 | The `.str` accessor namespace. |
+| `strings.py` | 4406 | The `.str` accessor namespace. |
 | `temporal.py` | 1323 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -2767,7 +2767,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 604 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 438 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 3299 | The multi-core executor. |
+| `par.rs` | 3306 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 595 | The breakers: operators that must see all of their input before they can emit any output. |
@@ -2794,19 +2794,19 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg/accum.rs` | 765 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 103 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
+| `agg/counted.rs` | 227 | Value-frequency state for the aggregates that only ever ask "how often?". |
+| `agg/dispatch.rs` | 208 | The per-function dispatch: the two steps where the aggregates stop being alike. |
 | `agg/distinct.rs` | 560 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
-| `agg/finalize.rs` | 63 | The finalize dispatch — turning each aggregate's merged partial into its output column. |
 | `agg/fused.rs` | 638 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1602 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 561 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 562 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
-| `agg/hll.rs` | 115 | APPROX_COUNT_DISTINCT — bounded-memory distinct count via per-group HyperLogLog. |
-| `agg/median.rs` | 674 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
-| `agg/mod.rs` | 799 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
-| `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
+| `agg/median.rs` | 546 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
+| `agg/mod.rs` | 665 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
 | `agg/spill/store.rs` | 791 | The two spill stores and the codec that writes them. |
 | `agg/stats.rs` | 428 | Two-input covariance/correlation and single-input skewness/kurtosis. |

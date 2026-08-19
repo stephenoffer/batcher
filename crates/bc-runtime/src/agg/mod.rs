@@ -27,18 +27,20 @@ use crate::error::RuntimeError;
 
 mod accum;
 mod argextreme;
-mod finalize;
+mod dispatch;
 
-// The finalize dispatch lives in its own module; re-exported so every
-// caller's `agg::finalize(..)` is unchanged by the move.
-pub use finalize::finalize;
+// The per-function dispatch lives in its own module; `finalize` is re-exported so every
+// caller's `agg::finalize(..)` is unchanged by the move, and `accumulate` is reachable as
+// `crate::agg::accumulate` for `group::combine`.
+use dispatch::accumulate;
+pub use dispatch::finalize;
+mod counted;
 mod distinct;
 mod distinct_on;
 mod fused;
 mod group;
-mod hll;
 mod median;
-mod qsketch;
+mod sketch;
 pub mod spill;
 mod stats;
 mod var;
@@ -47,6 +49,7 @@ use accum::{
     bitfold_acc, bool_acc, concat_col, kahan_acc, minmax_acc, product_acc, require, sum_acc,
 };
 use argextreme::{arg_extreme_state, merge_arg_extreme};
+use counted::{counted_state, merge_counted};
 use distinct::{
     bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
     merge_distinct,
@@ -55,13 +58,14 @@ pub use distinct::{distinct_dense, distinct_parts, distinct_prefix, DistinctPref
 pub use distinct_on::{distinct_on, distinct_on_parts, OrderKey};
 pub(crate) use group::assign_groups;
 pub use group::concat_disjoint;
-use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
     finalize_entropy, finalize_histogram, finalize_list_agg, finalize_mad, finalize_median,
-    finalize_mode, finalize_quantile, finalize_quantile_disc, finalize_top_k, listagg_state,
-    median_state, merge_median,
+    finalize_quantile, finalize_quantile_disc, listagg_state, median_state, merge_median,
 };
-use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
+use sketch::{
+    approx_distinct_state, approx_quantile_state, finalize_approx_distinct,
+    finalize_approx_quantile, merge_approx_distinct, merge_approx_quantile,
+};
 use stats::{
     covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_kurtosis_pop,
     finalize_skewness, merge_covar, merge_moments, moment_state,
@@ -179,6 +183,7 @@ impl AggFunc {
     pub fn state_arity(self) -> usize {
         match self {
             AggFunc::Mean | AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::KahanSum => 2,
+            AggFunc::Mode | AggFunc::ApproxTopK(_) => 2, // distinct values AND their counts
             AggFunc::Var | AggFunc::Stddev => 3,
             AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => 5,
             AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => 6,
@@ -486,145 +491,6 @@ pub fn radix_parallel_threshold(configured: usize) -> usize {
     } else {
         group::radix_parallel_default()
     }
-}
-
-/// Produce the partial-state columns for one aggregate in a single scan.
-fn accumulate(
-    func: AggFunc,
-    values: Option<&ArrayRef>,
-    group_ids: &[u32],
-    num_groups: usize,
-) -> Result<Vec<ArrayRef>, RuntimeError> {
-    Ok(match func {
-        AggFunc::CountStar => {
-            let mut counts = vec![0i64; num_groups];
-            for &g in group_ids {
-                counts[g as usize] += 1;
-            }
-            vec![Arc::new(Int64Array::from(counts))]
-        }
-        AggFunc::Count => vec![count_non_null(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-        )],
-        AggFunc::CountDistinct => {
-            vec![distinct_state(
-                require(values, func)?,
-                group_ids,
-                num_groups,
-            )?]
-        }
-        AggFunc::Sum => vec![sum_acc(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-            func,
-        )?],
-        AggFunc::Min => vec![minmax_acc(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-            true,
-            func,
-        )?],
-        AggFunc::Max => vec![minmax_acc(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-            false,
-            func,
-        )?],
-        AggFunc::Mean => {
-            let v = require(values, func)?;
-            vec![
-                sum_acc(v, group_ids, num_groups, func)?,
-                count_non_null(v, group_ids, num_groups),
-            ]
-        }
-        // Variance/stddev carry a Welford (mean, M2, count) state, mergeable via Chan's
-        // parallel formula (see `merge_welford`) — so they distribute like every other
-        // aggregate, but without the sum-of-squares cancellation the naive form suffered.
-        AggFunc::Var | AggFunc::Stddev => {
-            var_state(require(values, func)?, group_ids, num_groups, func)?
-        }
-        AggFunc::Median
-        | AggFunc::Quantile(_)
-        | AggFunc::Mode
-        | AggFunc::Histogram
-        // The contiguity statistics differ from `Median` only in their finalize.
-        | AggFunc::NLength(_)
-        | AggFunc::LCount(_)
-        | AggFunc::AuN => {
-            vec![median_state(require(values, func)?, group_ids, num_groups)?]
-        }
-        // `array_agg`/`list_agg` KEEPS null elements (SQL semantics), unlike the
-        // null-filtering `median_state` the others share.
-        AggFunc::ListAgg => {
-            vec![listagg_state(
-                require(values, func)?,
-                group_ids,
-                num_groups,
-            )?]
-        }
-        AggFunc::BoolAnd => vec![bool_acc(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-            true,
-            func,
-        )?],
-        AggFunc::BoolOr => vec![bool_acc(
-            require(values, func)?,
-            group_ids,
-            num_groups,
-            false,
-            func,
-        )?],
-        AggFunc::ApproxCountDistinct => {
-            vec![approx_distinct_state(
-                require(values, func)?,
-                group_ids,
-                num_groups,
-            )?]
-        }
-        AggFunc::ApproxQuantile(_) => {
-            vec![approx_quantile_state(
-                require(values, func)?,
-                group_ids,
-                num_groups,
-            )?]
-        }
-        AggFunc::Product => vec![product_acc(require(values, func)?, group_ids, num_groups)?],
-        AggFunc::KahanSum => kahan_acc(require(values, func)?, group_ids, num_groups)?,
-        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
-            vec![bitfold_acc(
-                require(values, func)?,
-                group_ids,
-                num_groups,
-                func,
-            )?]
-        }
-        AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => {
-            moment_state(require(values, func)?, group_ids, num_groups, func)?
-        }
-        // The value-list family: entropy, the median absolute deviation, the discrete
-        // quantile and the exact top-k all read a group's whole value list, so they
-        // share `Median`'s state and differ only in `finalize`.
-        AggFunc::Entropy | AggFunc::Mad | AggFunc::QuantileDisc(_) | AggFunc::ApproxTopK(_) => {
-            vec![median_state(require(values, func)?, group_ids, num_groups)?]
-        }
-        // `any_value` folds with the same min reducer its combine uses, so a partial
-        // and a combined partial are the same shape and the fold is order-independent.
-        AggFunc::AnyValue => accumulate(AggFunc::Min, values, group_ids, num_groups)?,
-        // arg_min/arg_max and covar/corr are two-input; `partial` builds their state
-        // directly (it has access to the second input), so they never reach the
-        // single-input `accumulate`.
-        AggFunc::ArgMin | AggFunc::ArgMax => unreachable!("arg_extreme handled in partial"),
-        AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
-            unreachable!("covar/corr handled in partial")
-        }
-    })
 }
 
 /// Step 2: merge partial results (across partitions) into one partial result.

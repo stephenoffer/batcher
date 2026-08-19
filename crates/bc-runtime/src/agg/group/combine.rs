@@ -16,8 +16,8 @@ use rayon::prelude::*;
 use super::assign::assign_groups;
 use super::hash::hash_partial_keys;
 use crate::agg::{
-    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_covar,
-    merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
+    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_counted,
+    merge_covar, merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
 };
 use crate::error::RuntimeError;
 
@@ -325,7 +325,6 @@ pub(crate) fn merge_state(
         AggFunc::Median
         | AggFunc::Quantile(_)
         | AggFunc::ListAgg
-        | AggFunc::Mode
         // The contiguity statistics carry `Median`'s value list, so they merge by the same
         // concatenation. This arm *is* their mergeability.
         | AggFunc::NLength(_)
@@ -334,10 +333,12 @@ pub(crate) fn merge_state(
         | AggFunc::Histogram
         | AggFunc::Entropy
         | AggFunc::Mad
-        | AggFunc::QuantileDisc(_)
-        | AggFunc::ApproxTopK(_) => {
+        | AggFunc::QuantileDisc(_) => {
             vec![merge_median(&state[0], group_ids, num_groups)?]
         }
+        // Counted states merge by summing the counts of equal values (see `agg::counted`);
+        // addition is associative and commutative, which is this pair's mergeability.
+        AggFunc::Mode | AggFunc::ApproxTopK(_) => merge_counted(state, group_ids, num_groups)?,
         // `any_value` merges with the same min reducer that built its partial.
         // Compensated states merge by compensated-adding the sums and summing the
         // compensations — the same fold the partial performs, so `combine([p]) == p`.

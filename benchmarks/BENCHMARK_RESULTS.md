@@ -13476,3 +13476,50 @@ Projecting only the decoded tensor — the like-for-like shape with Daft's pipel
 produces the image column and nothing else — reaches **324.4 ms / 6,165 img/s**. The
 benchmark's own figure is kept as the headline because it is what a user gets by typing the
 obvious thing, and it has Batcher building eight columns against Daft's two.
+
+## `mode` and `top_k`: counting values instead of keeping them (2026-08-18)
+
+`mode` and `top_k` (SQL `approx_top_k`) carried MEDIAN's value-list state, so their partial
+held every value of every group and the counting happened at finalize. Both only ever ask how
+*often* a value occurs, so they now carry each group's distinct values and their counts
+(`crates/bc-runtime/src/agg/counted.rs`): a state bounded by the group's cardinality rather
+than by its row count, still exact, still mergeable because counts add.
+
+The shape that shows it is the one the state was wrong for — one hot group with far fewer
+distinct values than rows. 10M rows, a single group, 50 distinct values, weighted so the
+ranking is unambiguous. Both engine builds are `--release`, measured in separate processes on
+the same box minutes apart, best of 3:
+
+| | time | peak RSS | answer |
+|---|---|---|---|
+| baseline `top_k(3)` (value-list state) | 547.6 ms | +687 MB | `[0, 1, 2]` |
+| **counted `top_k(3)`** | **17.5 ms** | **+224 MB** | `[0, 1, 2]` |
+| DuckDB `approx_top_k(v, 3)` | 705.3 ms | — | `[0, 1, 2]` |
+| baseline `mode()` | 3,988.3 ms | +20 MB | `0` |
+| **counted `mode()`** | **13.9 ms** | **+4 MB** | `0` |
+| DuckDB `mode(v)` | 109.4 ms | — | `0` |
+
+So **31x on `top_k` and 287x on `mode`** against the previous state, and 40x and 7.9x against
+DuckDB. All three engines agree on the answer, which is the only reason the timings are worth
+printing.
+
+Two things this table should not be read as claiming. The peak-RSS column for `top_k` falls
+3.1x but not to nothing, because `partial` still row-encodes the batch it is handed: the
+*state* is `O(distinct)`, the transient encoding is still `O(batch rows)`. And DuckDB's
+`approx_top_k` is a space-saving sketch rather than an exact answer, so its 705 ms is not a
+like-for-like implementation of the same guarantee — Batcher returns the exact top k here.
+
+To reproduce, build both engines with `cargo build --release -p bc-py --features
+pyo3/extension-module` into separate target directories, point `PYTHONPATH` at a sandbox
+holding each `.so` (`.claude/rules/concurrent-agents.md` has the recipe), and time this in one
+process per engine, taking the best of three and reading `ru_maxrss` around each call:
+
+```python
+weights = np.arange(50, 0, -1, dtype=float); weights /= weights.sum()
+t = pa.table({"v": pa.array(np.random.default_rng(7).choice(50, size=10_000_000, p=weights))})
+bt.from_arrow(t).agg(r=bt.col("v").top_k(3)).collect()
+bt.from_arrow(t).agg(r=bt.col("v").mode()).collect()
+```
+
+The answer is compared against DuckDB's before any timing is taken; a build that disagrees is
+not timed at all.
