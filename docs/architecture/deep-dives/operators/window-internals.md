@@ -145,20 +145,44 @@ one appended column. For `row_number` that is the top k per partition; for `rank
 it correctly keeps peers tied at the boundary.
 
 The fusion removes the separate filter node and stops the full windowed batch from reaching the
-operator above it. What it does **not** do is bound the work: `rank_limit` is applied as a mask
-*after* the ranking, so "top 3 products per category" still orders every partition and then
-discards almost all of it. Only `k = 1` escapes, and by a different route — Kyber rewrites
-`row_number() = 1` onto `DISTINCT ON`, which is a per-key argmin rather than a sort.
+operator above it. It also **bounds the work**, which it did not always do: `rank_limit` used to
+be a mask applied *after* the ranking, so "top 3 products per category" ordered every partition
+and then discarded almost all of it.
 
-Spark and Daft both build an operator to avoid the ordering (`WindowGroupLimitExec`,
-`window_partition_and_dynamic_frame`), and a bounded per-partition heap was built here and
-**reverted**: it is `O(n log k)` against the sort's `O(n log n)` and still 2 to 4x slower, because
-the ordering path runs across every core and the heap ran on one. Doing it properly means bounding
-inside the per-bucket kernel so the selection inherits that parallelism. The measurements and the
-design are in `docs/architecture/internals/competitor_technique_review.md`, item 12a.
+`rank_limit` is now threaded down to `window_serial`, and when the only function is `row_number`
+with a single numeric order key, `bc_runtime::window::topk` selects each partition's best `k` with
+a bounded max-heap instead of ordering it. That is `O(n log k)` against `O(n log n)`, and for the
+usual `k` of one to ten the `log k` is two or three comparisons. Spark and Daft build operators for
+exactly this (`WindowGroupLimitExec`, `window_partition_and_dynamic_frame`).
 
-Worth keeping in proportion: on this shape Batcher is already 10-20x faster than DuckDB and
-2.5-10x faster than Polars, so this is an improvement to a win rather than a gap.
+**Where the bound is applied is the whole difference.** A first version hooked the selection above
+`window_with`, over the whole batch, and was **2 to 4x slower** — it traded the operator's
+bucketed parallelism for the better complexity, running `O(n log k)` on one core against
+`O(n log n)` on ninety-six. Applied inside the per-bucket kernel it inherits that parallelism
+instead, and each worker heaps only the partitions it owns.
+
+Measured on 6M rows, interleaved best-of-three, `QUALIFY row_number() <= k`:
+
+| Partitions | `k` | Ordering | Bounded | |
+|---|---|---|---|---|
+| 100 x 60,000 rows | 10 | 63.2 ms | 45.1 ms | **1.40x** |
+| 100 x 60,000 rows | 3 | 60.8 ms | 45.2 ms | **1.35x** |
+| 2,000 x 3,000 rows | 10 | 58.0 ms | 44.4 ms | **1.31x** |
+| 50,000 x 120 rows | 3 | 65.6 ms | 52.5 ms | **1.25x** |
+| 1,000,000 x 6 rows | 2 | 116.7 ms | 98.4 ms | **1.19x** |
+| `rank()` instead of `row_number` (declines) | 3 | 101.5 ms | 97.4 ms | 1.04x |
+
+The win grows with partition size, which is what the complexity predicts. `k = 1` is unchanged
+because Kyber sends it down a different route entirely: `row_number() = 1` rewrites onto
+`DISTINCT ON`, a per-key argmin rather than any kind of sort.
+
+The bounded path declines to the ordering path on anything it does not cover — more than one
+order key, a non-numeric or nullable one, more than one partition key, or a `groups x k` heap
+large next to the rows it selects from. A non-survivor is marked `k + 1` rather than null or
+zero, because the caller's mask is `rank <= k` and a zero would pass it.
+
+Keep it in proportion: on this shape Batcher was already 10-20x faster than DuckDB and 2.5-10x
+faster than Polars, so this makes a win larger rather than closing a gap.
 
 ## Using it
 

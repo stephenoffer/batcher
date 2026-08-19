@@ -1800,48 +1800,64 @@ translation that belongs in the migration guide, not in the engine. What it cann
 **assert** the inputs are sorted and skip the verification; that is the only real difference, it
 is worth a linear scan, and nothing measured suggests the scan is what costs.
 
-### 12a. Spark's `WindowGroupLimitExec`, built and reverted — parallelism beat the algorithm
+### 12a. Spark's `WindowGroupLimitExec` — **landed**, after being reverted once
 
-Item 12's second reversal recorded that the window's `rank_limit` is a post-hoc mask over a fully
-ordered partition, that Spark and Daft both built operators to avoid exactly that, and that a
-bounded heap looked worth ~2x for `k > 1`. It was built: `bc_runtime::window::topk`, one flat
-`groups x k` max-heap array with no per-partition allocation, ordering on
-`(packed order key, row index)` so the `k` rows it keeps are the `k` smallest under the *same*
-total order the sort produces. Seven tests pinned it against the ordering path — every `k`, both
-directions, tie-heavy input, a string partition key, an unpartitioned window, and the mask
-property that a non-survivor must never pass `rank <= k`. All green, answers identical.
+`Window.rank_limit` was a post-hoc mask over a fully ordered partition: Kyber folded
+`rank <= k` into it, and `window_batch_with` then ranked every row — ordering every partition —
+before `filter_by_rank_limit` threw all but `k` away. Only `k = 1` escaped, by the `DISTINCT ON`
+rewrite. Spark built `WindowGroupLimitExec` and Daft `window_partition_and_dynamic_frame` to
+avoid exactly that.
 
-It is **2 to 4x slower**, interleaved best-of-3 on 6 M rows:
+`bc_runtime::window::topk` is Batcher's: one flat `groups x k` max-heap array with no
+per-partition allocation, ordering on `(packed order key, row index)` so the `k` rows kept are
+the `k` smallest under the *same* total order the ordering path produces.
 
-| shape | ordering path | bounded heap | |
-|---|---|---|---|
-| 200,000 partitions, `k = 2` | 81.4 ms | 163.4 ms | 0.50x |
-| 200,000 partitions, `k = 3` | 87.0 ms | 204.4 ms | 0.43x |
-| 200,000 partitions, `k = 10` | 125.8 ms | 456.1 ms | 0.28x |
-| 1 M partitions, `k = 2` | 119.0 ms | 343.4 ms | 0.35x |
-| 1 M partitions, `k = 5` | 131.4 ms | 549.8 ms | 0.24x |
-| `rank()` instead of `row_number` (declines) | 102.9 ms | 96.4 ms | 1.07x |
+**It was built, measured 2-4x slower, and reverted — and the reason it lost is the reason it now
+wins.** The first version hooked the selection above `window_with`, over the whole batch, which
+traded the operator's bucketed parallelism for the better complexity: `O(n log k)` on one core
+against `O(n log n)` on ninety-six, at 0.24-0.50x. `rank_limit` is now threaded through
+`window_with` -> `window_parallel` -> `window_serial`, so the selection runs *inside* the
+per-bucket kernel and each worker heaps only the partitions it owns.
 
-**`O(n log k)` beat `O(n log n)` and lost anyway, because the sort runs on 96 cores and the heap
-ran on one.** `window_with` hash-partitions rows so equal partition keys co-locate and then runs
-the serial kernel per bucket across rayon; hooking the bounded selection in at
-`window_batch_with` — above all of that — traded the parallelism for the better complexity. The
-last row is the control: a shape the bounded path declines is unchanged, so the decline works and
-the loss is entirely the path that fired.
+The plumbing is also why the first attempt was abandoned rather than fixed, and that call was
+wrong. It was costed against putting `rank_limit` on `WindowCall` — **49 construction sites, 47
+in tests** — without costing the alternative. Threading it through three signatures is **16 call
+sites**, most of them a literal `None` in a test. A rejected design was priced and the cheaper one
+next to it was not.
 
-The fix is known and is not what was built: put the bound **inside** `window_serial`, which
-already runs once per bucket, so the selection inherits the bucketing instead of replacing it.
-That needs `rank_limit` threaded to the per-bucket kernel, and the natural carrier is
-`WindowCall` — which has **49 construction sites, 47 of them in tests**. That is a large, noisy
-diff in a file another session is actively refactoring, spent on a shape Batcher already wins by
-**10-20x over DuckDB and 2.5-10x over Polars** (item 12). Correct ranking: do it when the window
-file is quiet, not before the materialization work above it.
+Measured on 6 M rows, interleaved best-of-three:
 
-The general lesson is the one this document keeps paying for in a new currency each time. Item 11b
-was a premise that did not hold (the read it removed was not on the common path); item 11's
-zero-copy attempt removed a real allocation that was not the cost; this one had the right
-complexity argument and the wrong *machine* model. **A complexity win is not a win until it is
-measured against what the engine actually does with the hardware.**
+| Partitions | `k` | Ordering | Bounded | |
+|---|---|---|---|---|
+| 100 x 60,000 rows | 10 | 63.2 ms | 45.1 ms | **1.40x** |
+| 100 x 60,000 rows | 3 | 60.8 ms | 45.2 ms | **1.35x** |
+| 2,000 x 3,000 rows | 10 | 58.0 ms | 44.4 ms | **1.31x** |
+| 2,000 x 3,000 rows | 3 | 56.7 ms | 45.3 ms | **1.25x** |
+| 50,000 x 120 rows | 3 | 65.6 ms | 52.5 ms | **1.25x** |
+| 200,000 x 30 rows | 3 | 91.9 ms | 75.2 ms | **1.22x** |
+| 1,000,000 x 6 rows | 2 | 116.7 ms | 98.4 ms | **1.19x** |
+| `k = 1` (takes `DISTINCT ON`, untouched) | 1 | 26.8 ms | 27.6 ms | 0.97x |
+| `rank()` instead of `row_number` (declines) | 3 | 101.5 ms | 97.4 ms | 1.04x |
+
+The win grows with partition size, which is what `O(n log k)` against `O(n log n)` predicts, and
+the two control rows are flat — `k = 1` goes down Kyber's `DISTINCT ON` route and never reaches
+this path, and a declining shape falls through to the ordering path unchanged.
+
+Seven tests pin the equivalence **through the real operator at both thresholds**, so the bucketed
+parallel path is exercised rather than only the serial kernel: every `k`, both directions,
+tie-heavy input (where the row-index tie-break is the thing that can silently disagree), a string
+partition key, an unpartitioned window, a declining shape, and the property that a non-survivor
+can never pass a `rank <= k` mask — it is marked `k + 1`, because a zero or a null would pass and
+silently keep every row of every partition.
+
+One subtlety the tests caught rather than the author: a *declining* shape returns the ordering
+path's **unmasked** ranks from `window_serial`, since the mask lives in `bc_interp`. Comparing a
+masked bounded result against an unmasked ordering one fails on a shape where nothing is wrong.
+The comparison masks both sides, which is also the operator's real contract — the rows kept and
+their ranks must agree, not the intermediate column.
+
+Keep it in proportion: Batcher already led this shape by 10-20x over DuckDB and 2.5-10x over
+Polars, so this makes a win larger rather than closing a gap.
 
 ### The measured census: 96 queries, four suites, ranked by what they actually cost
 

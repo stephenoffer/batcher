@@ -28,6 +28,7 @@ pub(crate) fn window_parallel(
     funcs: &[WindowCall],
     num_rows: usize,
     nbuckets: usize,
+    rank_limit: Option<usize>,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     let buckets = partition_row_indices(partition_keys, num_rows, nbuckets)?;
 
@@ -39,7 +40,7 @@ pub(crate) fn window_parallel(
     // dominates — otherwise stay on the parallel path.
     let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
     if max_bucket > num_rows / 2 {
-        return window_serial(partition_keys, order_keys, funcs, num_rows);
+        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
     }
 
     // Each bucket gathers its rows' keys/order/values and runs the serial kernel over
@@ -68,7 +69,7 @@ pub(crate) fn window_parallel(
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            window_serial(&bk, &bo, &bc, idx.len())
+            window_serial(&bk, &bo, &bc, idx.len(), rank_limit)
         })
         .collect::<Result<_, _>>()?;
 
@@ -367,8 +368,8 @@ mod tests {
         ];
         for call in cases {
             let f = [call];
-            let par = window_with(std::slice::from_ref(&part), &order, &f, n, 1).unwrap();
-            let ser = window_serial(std::slice::from_ref(&part), &order, &f, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &order, &f, n, 1, None).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &order, &f, n, None).unwrap();
             assert_eq!(par[0].as_ref(), ser[0].as_ref(), "{:?}", f[0].func);
         }
     }

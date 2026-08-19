@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1347 Python modules across 203 packages and 264 Rust files across 15 crates.
+Covering 1347 Python modules across 203 packages and 265 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -2756,7 +2756,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 539 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 260 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1543 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1548 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -2835,10 +2835,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 412 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 585 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1273 | Window functions — partition, order, and append one column per function. |
-| `window/parallel.rs` | 289 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
+| `window/mod.rs` | 1299 | Window functions — partition, order, and append one column per function. |
+| `window/parallel.rs` | 290 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 342 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
 | `window/series.rs` | 311 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
+| `window/topk.rs` | 178 | `row_number() OVER (PARTITION BY … ORDER BY …) <= k` without ordering the partitions. |
 
 ### `bc-codegen`
 

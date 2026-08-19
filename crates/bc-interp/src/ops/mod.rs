@@ -1380,12 +1380,17 @@ pub(crate) fn window_batch_with(
         });
     }
 
+    // `rank_limit` goes *down* to the per-bucket kernel rather than being applied here: the
+    // bounded top-N it enables must inherit `window_with`'s parallelism, not replace it. The
+    // mask below still runs — the bounded path marks a non-survivor `k + 1` — so this is a
+    // pure short-circuit and the filter stays the one place the bound is enforced.
     let cols = window::window_with(
         &part_arrays,
         &order_arrays,
         &calls,
         num_rows,
         parallel_row_threshold,
+        rank_limit,
     )?;
 
     // input columns + one appended column per function alias.
