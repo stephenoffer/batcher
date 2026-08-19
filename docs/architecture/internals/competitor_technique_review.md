@@ -1788,10 +1788,23 @@ bare-name diff, an arity error, and a competitor's spelling for a capability tha
 Batcher's own name (12d, where the error message printed the answer and it was read past). The
 only probe that has never lied is a query that returns rows.
 
-What survives across both directions is short and small: `list.argsort` (DuckDB `list_grade_up`,
-Polars `arg_sort`), `list.resize`, `equi_width_bins`, and a bounded-memory mode for the exact
-`top_k` (12d). Everything else the six engines have, Batcher has, and the remaining performance
-work is not a competitor technique at all — it is deferred payload materialization, item 0a.
+That list of survivors was itself checked, and shrank again:
+
+* **`list.argsort` — false gap number six.** Batcher spells it `list.arg_sort`, with the
+  underscore, consistent with `arg_min`/`arg_max` beside it; `bt.col("l").list.arg_sort()`
+  returns `[[1, 2, 0]]`. Polars' `argsort` and DuckDB's `list_grade_up` were the names checked.
+  Same mode as 12d, for the sixth time.
+* **`equi_width_bins`** — `Expr.cut(breaks)` does the binning with Polars/pandas semantics
+  (`['(-inf, 3]', '(3, 7]', '(7, inf]']`). DuckDB's function computes *boundaries* the user then
+  bins with, so this is a convenience over `cut`, not a capability.
+* **`list.resize`** — genuinely absent; `list.slice` covers truncation but not padding. Minor.
+* **A bounded-memory mode for the exact `top_k`** (12d) — the one substantive item.
+
+**Six false gaps in one pass, every one from checking a competitor's spelling instead of calling
+the capability.** The names that misled were `implode`, `list.index_of`, `min_by`/`max_by`,
+`approx_top_k`, the `.over(order_by=…)` fill family, and `argsort`. That is the finding: the
+distance between these engines and Batcher is mostly *vocabulary*, and any future pass should
+budget for the probe being wrong far more often than the engine is.
 
 ### 12d. `approx_top_k` was already built — the fifth false gap, and the worst one
 
