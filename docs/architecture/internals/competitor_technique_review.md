@@ -2272,6 +2272,81 @@ separate paths (`stable_sort_indices_str` and the string range-partitioner versu
 third, unrelated thing: entry 11a's packed radix sort already landed there and they are still
 1.21-1.39x, so that path has something left in it that the packing did not reach.
 
+## 16. The distributed path, measured — and one open question about the object-store claim (2026-08-19)
+
+Everything in entries 12-15 measures the single-node engine. The mandate names streaming,
+batch, single-node **and distributed**, and `CLAUDE.md` says CI installs no Ray, so the
+distributed path is the one nothing routinely runs. This is what it does at `HEAD`, on a
+**single-node local Ray cluster (4 CPUs)** at TPC-H sf1 with 8 partitions
+(`benchmarks/run.py --benchmark distributed`, `RAY_ADDRESS=local`).
+
+**Correctness first, and it holds:** *"Distributed results match single-node on every query."*
+The mergeable algebra does what it claims. What follows is only about time.
+
+| query | single-node | distributed | |
+|---|---|---|---|
+| `groupby-agg` | 4.8 ms | 635.0 ms | 132x slower |
+| `groupby-2key` | 5.3 ms | 669.6 ms | 126x slower |
+| `join+groupby` | 34.4 ms | 11,066.3 ms | **322x slower** |
+| `distinct` | 6.0 ms | 493.8 ms | 82x slower |
+
+**Distributing an sf1 query is not supposed to pay** — the adaptive loop is gated off below 20 M
+rows precisely because of this, and no one should read these ratios as a defect on their own.
+Two things underneath them are worth an owner.
+
+### The group-by warms up and the join never does
+
+Repeating each query four times in one session, with the session fleet on (the default):
+
+```
+group_by       run1=11063ms  run2= 721ms  run3= 661ms  run4= 643ms
+join+group_by  run1=11571ms  run2=11035ms run3=11267ms run4=24196ms
+```
+
+The group-by pays a large first call and then settles at ~650 ms. The join pays ~11 s **every
+run**. `ShuffleFleet.spawn` was traced through all six runs and fired **zero** times, so neither
+number is fleet spawn: the first call is Ray cluster init, and the join's 11 s is the query.
+
+It is also flat in partition count — 11.2 s, 10.9 s, 11.8 s, 11.4 s at 2, 4, 8 and 16 partitions
+— so it is not per-partition work, and it grows with both row count and column width
+(a 2-column synthetic join of the same 6 M x 1.5 M shape costs 3.8 s against the 16-column
+`lineitem`'s 11 s). That points at bytes moved, which is the next section.
+
+**Caveat that limits how far this can be read.** These inputs are driver-resident Arrow tables,
+so distributing them means shipping ~850 MB out to the workers before any shuffle. A real
+distributed job scans into the workers and never pays that. The measurement is honest about
+what it is: the cost of distributing an in-memory table, not of a cluster-native scan.
+
+### The transport numbers, and the claim they qualify
+
+`benchmarks/run.py --benchmark shuffle`, 8 partitions x 64 batches = 128 MiB, same box:
+
+| transport | | |
+|---|---|---|
+| Ray object store | 108.6 ms | 1,178.4 MiB/s |
+| Carbonite Flight, **network path** (`locality=0.00`) | 331.8 ms | **385.8 MiB/s** |
+| Carbonite **co-located** (`DIRECT_MEMORY`, `locality=1.00`) | 6.4 ms | **19,890.9 MiB/s** |
+
+`competitive_architecture.md` states that bypassing the Ray object store "is the single biggest
+reason Batcher beats Ray Data 50-450x". The co-located row supports that emphatically — 16.9x
+Ray's object store. The network row does not: on same-node loopback it is **0.33x**, three times
+*slower* than the thing it bypasses. The harness labels that row "same-node loopback" itself, and
+loopback is not Flight's design point, so this is not a refutation of the claim.
+
+**It is an open question about which path the operators actually take.** The 51x gap between
+those two rows is entirely a locality decision, and a single-node cluster is the case where
+locality should always win. A distributed join on that same cluster costs ~11 s for roughly
+850 MB, which is the arithmetic of the 386 MiB/s row and not of the 19.9 GiB/s one. Either the
+operators are not reaching the co-located path where the microbenchmark can, or the join's time
+is going somewhere else entirely. **Nothing here settles which**, and the next person on this
+should settle it before optimizing anything: instrument which transfer mode the join's shuffle
+actually uses (`carbonite/transfer/server.py` already counts bytes served over the same-node
+fast paths), on a cluster-native scan rather than driver-resident tables.
+
+Recorded rather than fixed, deliberately. `CLAUDE.md` requires a recorded cluster run for any
+`dist/` change, this box is a 4-CPU single node, and a locality fix validated only here would be
+validated on the one topology where locality is trivially true.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
