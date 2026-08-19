@@ -2201,7 +2201,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 338 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6013 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6052 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 418 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2219,7 +2219,7 @@ Ecosystem-compatible spellings bound onto `Expr`.
 |---|---|---|
 | `binder.py` | 45 | Attach the compatibility aliases onto `Expr`. |
 | `guidance.py` | 254 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
-| `names.py` | 426 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
+| `names.py` | 453 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
 | `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
 

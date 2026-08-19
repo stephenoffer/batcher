@@ -36,6 +36,7 @@ __all__ = [
     "cumcount",
     "cummax",
     "cummin",
+    "cumprod",
     "cumsum",
     "fillna",
     "isin",
@@ -249,6 +250,32 @@ def kurt(self: Expr) -> AggExpr:
             {'g': ['a'], 'r': [3.152000000000001]}
     """
     return self.kurtosis()
+
+
+def cumprod(
+    self: Expr,
+    *,
+    partition_by: Iterable[IntoExpr] = (),
+    order_by: Iterable[IntoExpr] = (),
+) -> WindowExpr:
+    """Running product — the pandas ``cumprod`` spelling of :meth:`cum_prod`.
+
+    Args:
+        partition_by: Restart the accumulation within each group.
+        order_by: Order the rows before accumulating.
+
+    Returns:
+        A window expression computing the running product.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [2.0, 3.0, 4.0]})
+            >>> ds.with_columns(cp=bt.col("x").cumprod()).to_pydict()
+            {'x': [2.0, 3.0, 4.0], 'cp': [2.0, 6.0, 24.0]}
+    """
+    return self.cum_prod(partition_by=partition_by, order_by=order_by)
 
 
 def cumsum(
