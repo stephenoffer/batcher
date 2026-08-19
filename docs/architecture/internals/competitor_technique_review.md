@@ -2411,6 +2411,86 @@ Both times the lesson repeats: **the census ranked capabilities by whether they 
 ratio, and the biggest wins were inside things already marked done.** Entry 13 found 287x inside
 a "built" aggregate; this found 42.91x inside a "built" join. Neither needed a new feature.
 
+## 18. DuckDB's sort key, read rather than measured — and three hypotheses it killed (2026-08-19)
+
+Every entry above measures competitors as black boxes. This one reads one, because entry 17's
+win came from a *mechanism* (a trait bound withholding parallelism) that no timing could have
+named. The remaining single-node deficit is sorting (entry 15: four of the top five rows,
+~59 ms of ~70 ms), so the thing to read was DuckDB's sort.
+
+### What DuckDB actually does
+
+`src/common/sort/sort.cpp` lowers the whole `ORDER BY` list into **one** `create_sort_key`
+expression, and `src/function/scalar/create_sort_key.cpp:52-67` decides its physical type:
+
+```cpp
+bool all_constant = true;
+idx_t constant_size = 0;
+for (idx_t i = 0; i < arguments.size(); i += 2) {
+    auto physical_type = arguments[i]->GetReturnType().InternalType();
+    if (!TypeIsConstantSize(physical_type)) { all_constant = false; }
+    else { constant_size += GetTypeIdSize(physical_type) + 1; }  // +1 validity byte
+}
+if (all_constant && constant_size <= sizeof(int64_t)) {
+    function.SetReturnType(LogicalType::BIGINT);   // else: BLOB
+}
+```
+
+A single `BIGINT` normalized key when every key column is fixed-width and their **declared**
+widths plus one validity byte each fit in eight bytes; otherwise a `BLOB` and a comparison sort.
+
+**Batcher's rule is strictly stronger, and there is nothing here to adopt.**
+`radix_sort::packed_multi_sort_indices` (entry 11a) packs from the keys' *measured value ranges*
+rather than their declared widths. The benchmark case is the proof:
+`ORDER BY l_shipdate, l_suppkey` is `4+1 + 4+1 = 10` bytes by DuckDB's rule, so DuckDB takes the
+BLOB path; Batcher measures ~2,500 days and ~10,000 suppliers, packs 26 bits into one `u64`, and
+counting-sorts it.
+
+### And yet Batcher loses that case 2.06x, so three hypotheses were tested and all three failed
+
+`ORDER BY l_shipdate, l_suppkey` over 6 M rows, varying only the projection:
+
+| returned | batcher | duckdb | ratio |
+|---|---|---|---|
+| 1 narrow column | 54.1 ms | 26.3 ms | **2.06x** |
+| both keys | 53.6 ms | 31.1 ms | 1.72x |
+| both keys + 2 more | 83.8 ms | 65.7 ms | 1.28x |
+| *delta for the two added columns* | **+30.2 ms** | +34.5 ms | — |
+
+1. **Not the key encoding.** Batcher takes the better of the two paths, as above.
+2. **Not the payload gather.** Adding two columns costs Batcher **less** than DuckDB (+30.2 ms
+   against +34.5 ms). The gather is a Batcher strength here, and the ratio *improves* as the
+   projection widens because the fixed deficit is amortized.
+3. **Not parallelism** — which is what entry 17 predicted, and it was wrong. Entry 17 closed by
+   naming these multi-key rows as the likely third instance of "a type list or bound that
+   silently withholds the parallel path". Measured, `cpu_time / wall_time` on 96 cores:
+
+   | sort | wall | cpu | parallelism |
+   |---|---|---|---|
+   | 1 key, `date32` | 47.3 ms | 782 ms | 16.55x |
+   | 1 key, `Utf8` | 169.2 ms | 4,394 ms | 25.97x |
+   | **2 keys, the 2.06x case** | **51.1 ms** | **1,304 ms** | **25.49x** |
+   | 2 keys, `(int32, int64)` | 45.3 ms | 1,686 ms | 37.20x |
+
+   Every shape is properly parallel. **The prediction is retired; there is no third instance in
+   the sort.**
+
+### What is left, stated as what it is
+
+The entire gap is a fixed ~28 ms of *work*: Batcher spends 1,304 ms of CPU to finish in 51 ms
+where DuckDB finishes in 26 ms. That is not a missing technique, a wrong path, or a serial
+loop — it is CPU efficiency, and it is the cost `CLAUDE.md` already names when it says Batcher
+"buys several of its wall-clock wins with 1.4-4.4x more CPU". An eight-pass LSD radix over 6 M
+`u64` keys moves ~384 MB and does 48 M scattered writes; DuckDB's comparison sort over 10-byte
+keys stays in cache within each block and merges. Below some row count the radix's guaranteed
+`O(n)` stops paying for its memory traffic, and 6 M rows on this machine is evidently below it.
+
+**So the next move on multi-key sorts is a crossover, not a new algorithm**: measure where the
+packed radix loses to the row-encoded comparison sort and gate on it, exactly as
+`ops::byte_sort::radix_sort_live` already does for byte keys (it declines above 2^18 rows for
+this very reason, and `report_the_byte_radix_crossover` records the measurement). The packed
+multi-key path has no such ceiling and should.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
