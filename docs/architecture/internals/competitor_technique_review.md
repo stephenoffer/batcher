@@ -2112,6 +2112,85 @@ asked whether the thing that existed was any good. A census that checks presence
 gaps and stops; the one bottleneck worth 287x was inside a feature already marked done. Measure
 the capabilities you rule out, not just the ones you rule in.
 
+## 14. Item 0a re-measured, and it is the wrong lever — the gap is the string *representation* (2026-08-18)
+
+Entry 13 ended with "measure the capabilities you rule out, not just the ones you rule in."
+Applying that to this document's own top item retires it.
+
+**0a said**: deferred payload materialization (selection vectors) is the highest-value
+structural item, worth 77-83% of the two largest single-node losses (`h2o-join-q4/q5`), more
+than the other thirteen census rows combined. Re-measured at `HEAD` on the same shapes and the
+same bar the census used (DuckDB's **native store**, 1e7 x 1e7, best of 3):
+
+| | batcher | duckdb | ratio |
+|---|---|---|---|
+| `x JOIN big USING (id3)`, full projection | 369.6 ms | 204.8 ms | 1.80x |
+| ...`count(*)` only, so the join without the gather | 87.9 ms | 98.5 ms | **0.89x** |
+| `x JOIN medium USING (id5)`, full projection | 231.7 ms | 74.2 ms | 3.12x |
+| ...`count(*)` only | 101.3 ms | 23.4 ms | **4.34x** |
+
+The census's structural claim survives on q5 and only q5: the join beats DuckDB, the query
+loses by 165 ms, and 76% of Batcher's time is the gather. **But three measurements say the
+proposed fix cannot collect it.**
+
+**1. Deferring cannot help a query that returns every row.** `SELECT x.*, ...` over an inner
+join emits all nine million rows. A selection vector defers materialization; it does not remove
+it. It pays where a *downstream* operator discards rows — `cb-q32`'s `LIMIT 10`, a sort's
+top-k — and those shapes are worth single-digit milliseconds each in the census. The two rows
+that made 0a the top item are exactly the two it cannot help.
+
+**2. The gather kernel is already 15x faster than arrow's.** Gathering the ten output columns
+of q5: `bc_runtime::gather` ~282 ms against `pyarrow.compute.take` at 4,254 ms on the identical
+indices. There is no ordinary optimization left in it.
+
+**3. The gap is concentrated in strings, and by a factor.** The same join under three
+projections, subtracting the `count(*)` time to isolate materialization:
+
+| materialized | batcher | duckdb | ratio |
+|---|---|---|---|
+| 4 numeric columns (3x `int32`, 1x `double`) | 40.7 ms | ~0 ms | -- |
+| **3 string columns** | **157.5 ms** | **37.4 ms** | **4.21x** |
+| all 10 (q5's projection) | 297.0 ms | 171.6 ms | 1.73x |
+
+~10 ms per numeric column against ~52 ms per string column, on columns whose mean length is
+**6 characters**.
+
+### Why six characters is the whole answer
+
+DuckDB's `string_t` is a 16-byte struct with the first 12 bytes of the string stored *inline*.
+For a column averaging six characters, every value is inline, so DuckDB's gather is a
+**fixed-width 16-byte copy** — no character buffer, no offset prefix-sum, no second read.
+Batcher's `Utf8` gather copies characters, which is a scattered read of the source values plus
+a dependent prefix-sum over the offsets, and that is what the 4.21x is.
+
+Arrow's `Utf8View` is the same layout and the same 12-byte inline rule. The floor is measurable
+even though pyarrow 19 ships no `take` kernel for it: on the same 9 M indices, `take` on `Utf8`
+is 1,756 ms while `take` on an 8-byte fixed-width column is 130 ms. A 16-byte view gather is
+two of those, and it is the kernel `gather::take_fixed_width_parallel` already implements.
+Scaling Batcher's own per-column numbers the same way puts a string column near 20 ms instead
+of 52, which takes q5 from 369.6 ms to roughly parity with DuckDB's 204.8 ms.
+
+### What this changes on the board
+
+**`StringView` (arrow `Utf8View`) replaces deferred materialization as the top structural
+item.** `CLAUDE.md` already names "no `StringView`" as one of the four specific gaps against
+DuckDB single-node; this measurement is what it costs, on the queries that cost the most.
+
+Deferred materialization is **not** retired, it is **re-ranked**: it is the right mechanism for
+`cb-q32` and the sort-plus-limit shapes, which are worth a few milliseconds each, not the
+~165 ms rows it was promoted on.
+
+And q4 needs a second thing besides: its `count(*)` alone loses 4.34x, so a string *join key*
+is slow independently of the output gather. That is the string-key work already on this list,
+and this is the first measurement that separates it cleanly from the gather it was tangled with.
+
+**Scope, stated honestly.** `Utf8View` is not a contained change: it is a new physical type
+through `bc-arrow`, every `bc-expr` string kernel, the row encoder, the FFI boundary, and the
+IR's type vocabulary, with a planner decision about when to produce it (the same shape as the
+dictionary item 6, which was built, measured and reverted for want of exactly that decision).
+It should be started as its own piece of work with that precedent in view, not bolted onto a
+gather patch.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -2333,12 +2412,21 @@ implements it, so the next reader can settle it with one grep instead of one day
 **Re-ranked 2026-08-18 by the census in item 12, which measured 80 queries rather than reasoning
 from the code.** Two items move to the top and one new one appears:
 
-0a. **Deferred payload materialization (selection vectors), RFC proposal 2.** Now the
-    highest-value structural item on the board, ahead of the string work below. The census
-    measured it as **77-83% of the two largest single-node losses** (`h2o-join-q4/q5`), the cause
-    of `cb-q32`, and the residue on every sort row — one mechanism, worth more than the other
-    thirteen census rows combined. On `x JOIN big` Batcher's *join* already beats DuckDB's
-    (78.1 ms against 100.0 ms) and the query still loses by 107 ms, entirely to the gather.
+0a. **~~Deferred payload materialization (selection vectors), RFC proposal 2.~~ Superseded as
+    the top item by `StringView` — see entry 14, which re-measured this at `HEAD`.** Deferring
+    cannot collect the two rows it was promoted on: `h2o-join-q4/q5` return every joined row, so
+    the materialization is required rather than deferrable, and the gather kernel is already 15x
+    faster than arrow's `take`. The measured gap is the string *representation* — 4.21x on string
+    columns against 1.0x on numeric ones, over values averaging six characters, which fit inside
+    DuckDB's inline `string_t` and inside arrow's `Utf8View`. Selection vectors remain the right
+    mechanism for the shapes with a discarding operator downstream (`cb-q32`'s `LIMIT`, sort
+    top-k), which the census prices at single-digit milliseconds each.
+
+0a'. **`StringView` (arrow `Utf8View`) — the new top structural item.** Entry 14 has the
+    measurement and the scope. It is a physical type through `bc-arrow`, the `bc-expr` string
+    kernels, the row encoder and the FFI boundary, plus a planner decision about when to produce
+    it — the same shape as the dictionary item 6, which was built and reverted for want of that
+    decision. Worth roughly parity-to-a-win on the two largest single-node losses.
 
 0b. ~~**Give `eager_aggregation` a cost term, not just a ratio.**~~ **Landed** as
     `_global_aggregate_gains_nothing` (`kyber/rules/agg_pushdown.py`), wired into all three
