@@ -628,7 +628,7 @@ pub enum WindowFn {
     /// (DuckDB, Spark, Polars) allows any aggregate over a window; these are the ones
     /// whose running form is O(1) per row, which is what lets them share the same
     /// whole-partition and running machinery as the five above. Order statistics
-    /// (`median`/`quantile`/`mode`) are deliberately absent — see `bc_runtime::window::agg`.
+    /// (`quantile`/`mode`) are deliberately absent — see `bc_runtime::window::agg`.
     Var,
     Stddev,
     Product,
@@ -638,6 +638,11 @@ pub enum WindowFn {
     BitOr,
     BitXor,
     CountDistinct,
+    /// The one order statistic with a running form cheap enough to sit beside the folds
+    /// above: whole-partition it is a single quickselect, and along an ordered partition a
+    /// two-heap keeps it `O(log n)` per row. An *explicit* frame still declines, because a
+    /// sliding median needs deletion the heaps do not have.
+    Median,
     /// The whole-prefix series recurrences. Unlike every function above, each row's
     /// answer is a function of the entire ordered prefix carried in a running state, so
     /// they take no frame and, like the fills, require an ORDER BY.

@@ -29,8 +29,6 @@ negation, and CASE/COALESCE/IN structure.
 
 from __future__ import annotations
 
-import json
-
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
@@ -45,7 +43,7 @@ from batcher.plan.expr_ir import (
     Not,
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
-from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.expr_rewrite import expr_key, map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import Filter, LogicalPlan, Project
 
@@ -70,8 +68,15 @@ _NEGATED_COMPARISON = {"eq": "ne", "ne": "eq", "lt": "ge", "le": "gt", "gt": "le
 
 
 def _key(expr: Expr) -> str:
-    """A hashable structural identity for an expression (its IR rendered stable)."""
-    return json.dumps(expr.to_ir(), sort_keys=True)
+    """A hashable structural identity for an expression (its IR rendered stable).
+
+    Delegates to `plan.expr_rewrite.expr_key`, the canonical one, which memoizes the
+    result on the (immutable) node. Six rule modules had each written this line out, so the
+    same subexpression was re-serialized once per module per pass — measured at ~0.9 ms per
+    query of `json.dumps` across the optimizer, on queries whose whole execution is a few
+    milliseconds. The value is identical; only the second computation is gone.
+    """
+    return expr_key(expr)
 
 
 def _keys(exprs: list[Expr]) -> list[str]:

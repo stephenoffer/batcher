@@ -185,6 +185,14 @@ def _install_interrupt_handler(query_id: str):
 
 _hub: MetadataHub | None = None
 _hub_backend_key: tuple[str, str | None] | None = None
+# The hub is a process singleton and `execution.max_concurrent_queries` lets several queries
+# run at once, so two threads reaching `default_hub()` before either has built one each build
+# their own and one assignment wins. The loser is not merely wasted work: whichever caller
+# already holds it keeps recording into a hub nothing will ever read again, so that query's
+# whole feedback is lost — and against a durable backend it is a second connection to the same
+# store left open. `carbonite.cache.result_cache` guards its singleton for the same reason;
+# this one did not.
+_hub_lock = threading.Lock()
 
 
 def reset_default_hub() -> None:
@@ -196,8 +204,9 @@ def reset_default_hub() -> None:
     deterministic without changing production behavior.
     """
     global _hub, _hub_backend_key
-    _hub = None
-    _hub_backend_key = None
+    with _hub_lock:
+        _hub = None
+        _hub_backend_key = None
 
 
 def default_hub() -> MetadataHub:
@@ -209,10 +218,14 @@ def default_hub() -> MetadataHub:
     global _hub, _hub_backend_key
     meta = active_config().metadata
     key = (meta.backend, meta.uri)
-    if _hub is None or key != _hub_backend_key:
-        _hub = MetadataHub(_build_backend(meta.backend, meta.uri))
-        _hub_backend_key = key
-    return _hub
+    hub = _hub
+    if hub is not None and key == _hub_backend_key:
+        return hub  # the steady state, and it stays lock-free
+    with _hub_lock:
+        if _hub is None or key != _hub_backend_key:
+            _hub = MetadataHub(_build_backend(meta.backend, meta.uri))
+            _hub_backend_key = key
+        return _hub
 
 
 def _build_backend(backend: str, uri: str | None):

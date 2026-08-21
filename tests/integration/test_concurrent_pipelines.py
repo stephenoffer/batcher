@@ -20,6 +20,7 @@ import pytest
 import batcher as bt
 import batcher.dist.fleet._fleet as _fleet
 import batcher.dist.fleet.plan_id as plan_id_mod
+import batcher.dist.fleet.query as query_mod
 from batcher.dist import flight_worker as fw
 from batcher.dist.fleet.plan_id import query_plan_id, query_shuffle_scope
 
@@ -27,13 +28,17 @@ from batcher.dist.fleet.plan_id import query_plan_id, query_shuffle_scope
 class _FakeFleet:
     """A session fleet stand-in: real `plan_id`/grant, no Ray actors."""
 
-    def __init__(self, plan_id: int, n: int = 2) -> None:
+    def __init__(self, plan_id: int, n: int = 2, num_cpus: float = 0.0) -> None:
         self.plan_id = plan_id
         self.actors = [object() for _ in range(n)]
         self.pg = None
         self.addrs = ["host:1"] * n
         self.credits = 8
         self.cfg_json = "{}"
+        # The per-worker core grant `_fleet_is_too_thin` reads. `ShuffleFleet` defaults it to
+        # 0.0 meaning "not recorded", which that check reads as "leave the fleet alone" — the
+        # behaviour every test here assumes, since none of them is about respawn-on-collapse.
+        self.num_cpus = num_cpus
 
     @property
     def workers(self) -> int:
@@ -231,10 +236,15 @@ def _force_query_fleet_path(monkeypatch, spawned: list) -> None:
 
     cfg = active_config()
     monkeypatch.setattr(type(cfg.distributed), "persistent_fleet", property(lambda _s: True))
-    monkeypatch.setattr(_fleet, "available_cpu_count", lambda: 8)
+    # `maybe_spawn_query_fleet` lives in `fleet.query`, not `fleet._fleet`, so the names it
+    # resolves are that module's — patching them on `_fleet` silently patches nothing.
+    monkeypatch.setattr(query_mod, "available_cpu_count", lambda: 8)
     mod = "batcher.dist.executors.ray_runtime"
     monkeypatch.setattr(f"{mod}._ensure_ray", lambda *_a, **_k: None)
-    monkeypatch.setattr(f"{mod}.clamp_workers", lambda w: w)
+    # Sized against the fleet's own per-worker grant, so the stub takes the extra arguments
+    # rather than pinning a signature this test is not about.
+    monkeypatch.setattr(f"{mod}.clamp_workers", lambda w, *_a, **_k: w)
+    monkeypatch.setattr(f"{mod}.current_envelope", lambda *_a, **_k: None)
     monkeypatch.setattr(f"{mod}.resolve_transport", lambda *_a: "flight")
     monkeypatch.setattr(f"{mod}.request_autoscale", lambda *_a, **_k: None)
     monkeypatch.setattr(f"{mod}.release_autoscale", lambda *_a, **_k: None)
@@ -262,7 +272,7 @@ def test_a_concurrent_pipeline_shares_the_fleet_instead_of_reserving_a_second(mo
     # Pipeline A is already running in another context when B asks for a fleet.
     got: list = []
     _run_second_pipeline_while(
-        lambda: got.append(_fleet.maybe_spawn_query_fleet(8, "flight")), first=lambda: None
+        lambda: got.append(query_mod.maybe_spawn_query_fleet(8, "flight")), first=lambda: None
     )
     fleet = got[0]
 
@@ -275,10 +285,10 @@ def test_a_lone_pipeline_still_spawns_its_query_fleet(monkeypatch):
     _install_fake_session(monkeypatch, _FakeFleet(plan_id=4242))
     spawned: list = []
     _force_query_fleet_path(monkeypatch, spawned)
-    monkeypatch.setattr(_fleet, "release_session_fleet", lambda: None)
+    monkeypatch.setattr(query_mod, "release_session_fleet", lambda: None)
 
     with _fleet.session_fleet_lease():
-        fleet = _fleet.maybe_spawn_query_fleet(8, "flight")
+        fleet = query_mod.maybe_spawn_query_fleet(8, "flight")
 
     assert fleet is not None and spawned == [8]
 

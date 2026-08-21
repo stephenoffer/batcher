@@ -1,17 +1,10 @@
-"""The running-state folds a streaming aggregate is built on, and their memory bound.
+"""`_WindowedAggFold` — the watermark-bounded windowed aggregate, its spill tier and its
+changelog.
 
-An aggregation is mergeable (`partial -> combine -> finalize`), so it can run over an
-unbounded / larger-than-memory source one micro-batch at a time: each batch's partial state
-is folded into a single running state — bounded by the number of groups, not the input size
-— via the native `combine`. `_AggFold` is that running state; `_WindowedAggFold` adds the
-watermark that *releases* it, evicting each window as it closes so memory is bounded by the
-number of open windows rather than by the stream's lifetime.
-
-The two release state differently, which is why they diagnose an over-budget state
-differently while sharing one check (`check_agg_state_bounded`).
-
-Core's lane: this drives the engine (`batcher._native`) over the plan it is given; it makes
-no optimization decisions.
+The operator whose state has a *cold end*: the watermark only moves forward, so windows
+evict in increasing order. That one property is what lets this fold spill to disk and read a
+window back exactly once, and — because eviction removes a prefix of a totally ordered axis —
+what lets it record a changelog whose whole tombstone is a single integer.
 """
 
 from __future__ import annotations
@@ -26,171 +19,11 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.mergeable import RunningAggregate
-from batcher.io.source import Source, iter_source
+from batcher.core.streaming.folds.shared import check_agg_state_bounded
 from batcher.plan.logical import Aggregate
 from batcher.plan.streaming import StateOperatorProgress, WatermarkTracker
 
-__all__ = ["check_agg_state_bounded", "empty_global_aggregate", "streaming_state_budget"]
-
-
-def empty_global_aggregate(agg: Aggregate, schema: pa.Schema) -> pa.RecordBatch | None:
-    """The one row a *keyless* aggregate owes an input that had none.
-
-    A global `count`/`sum` over zero rows still yields exactly one row — `0`, `NULL` — which
-    is what SQL, DuckDB, and `collect()` all produce. The incremental fold cannot produce
-    it: it skips empty batches, so with nothing to finalize it yields nothing at all and the
-    stream silently disagrees with the oracle. Asking the engine for the empty-input result
-    through the ordinary plan path means the identity element falls out of the mergeable
-    algebra rather than being special-cased per aggregate function.
-
-    Takes a schema rather than a source, so both the `iter_batches` driver and the
-    micro-batch processor — which has a plan and no source — can reach the same answer.
-
-    Args:
-        agg: The keyless aggregate.
-        schema: The input schema, to type the empty batch fed through the plan.
-
-    Returns:
-        The one-row result, or `None` if the engine produced none.
-    """
-    nat = engine()
-    empty = pa.RecordBatch.from_pylist([], schema=schema)
-    out = nat.execute_plan(json.dumps(agg.to_ir()), [[empty]], active_config().engine_config_json())
-    return next((b for b in out if b.num_rows), None)
-
-
-def _rebatch(result: pa.RecordBatch, batch_size: int | None) -> Iterator[pa.RecordBatch]:
-    """Yield `result` whole, or sliced into `batch_size`-row chunks."""
-    if batch_size is None:
-        yield result
-    else:
-        for off in range(0, result.num_rows, batch_size):
-            yield result.slice(off, batch_size)
-
-
-def _read(source: Source, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
-    """Read `source` through the projection Kyber decided for this plan.
-
-    Every driver in this module used to call ``source.iter_batches(None)`` — decoding *every*
-    column of every message regardless of what the plan touched, while `_iter_streaming` on
-    the neighbouring path already read through the pushdown. On a wide topic that is the
-    dominant cost of a streaming aggregate: a `group_by("user").sum("cents")` over a
-    forty-column event decoded thirty-eight columns it then discarded, per micro-batch,
-    forever.
-
-    Core does not compute the projection — the conductor asks Kyber for it and passes it in,
-    keeping the decision in Kyber's lane. `iter_source` degrades safely, so a source that
-    cannot narrow its read simply returns everything and the plan is unaffected.
-
-    Args:
-        source: The stream to read.
-        projection: Columns the plan needs, or ``None`` to read everything.
-
-    Returns:
-        An iterator of the source's record batches, narrowed where the source can.
-    """
-    return iter_source(source, projection, None)
-
-
-def streaming_state_budget() -> int:
-    """The byte envelope a streaming operator's retained state must stay inside."""
-    return active_config().memory.streaming_state_budget_bytes()
-
-
-def check_agg_state_bounded(fold, cap: int, cause: str, *, label: str) -> None:
-    """Raise an actionable `ResourceError` when a running aggregate has outgrown `cap`.
-
-    Streaming state is only bounded by something that *releases* it, and the two folds here
-    release differently — the windowed one by an advancing watermark, the plain one not at
-    all — so the diagnosis differs while the check does not. Sharing the check is what keeps
-    them from drifting into one operator that guards its state and one that does not, which
-    is exactly what had happened.
-
-    Args:
-        fold: The running aggregate to measure.
-        cap: The byte budget.
-        cause: Why the state grew, and what the user can do about it.
-        label: The operator's name, quoted back in the message.
-
-    Raises:
-        ResourceError: When the retained state exceeds `cap`.
-    """
-    size = fold.nbytes()
-    if size > cap:
-        from batcher._internal.errors import ResourceError
-
-        raise ResourceError(f"{label} state reached {size} bytes (cap {cap}): {cause}.")
-
-
-class _AggFold:
-    """Running partial-aggregate state folded across micro-batches.
-
-    Each pushed source batch is run through the breaker-free input pipeline, then
-    `partial`-aggregated and `combine`d into one running state (bounded by the group
-    count, not the input size) entirely in Rust. `finalize()` materializes the
-    current result. This is the shared kernel under both the one-shot streaming
-    aggregate driver and the long-running streaming-query engine's complete/update
-    output modes — the running state is the same Arrow `RecordBatch` the engine
-    snapshots for checkpoint recovery.
-    """
-
-    __slots__ = ("_cfg", "_fold", "_input_ir", "_nat", "_updated")
-
-    def __init__(self, agg: Aggregate) -> None:
-        self._nat = engine()
-        self._fold = RunningAggregate(agg)
-        self._input_ir = json.dumps(agg.input.to_ir())  # scans source 0
-        # Constant for the query, so read and serialize it once. `push` runs per micro-batch
-        # and rebuilt this every time — a config lookup plus a JSON dump charged to the
-        # latency of every epoch, which is exactly what S10 hoisted out of `stream_topn`.
-        self._cfg = active_config().engine_config_json()
-        # Partial rows this fold last absorbed, reported as `num_rows_updated`. See `metrics`.
-        self._updated = 0
-
-    def push(self, batch: pa.RecordBatch) -> int:
-        """Fold one source batch into the running state; return rows consumed."""
-        self._updated = 0
-        if batch.num_rows == 0:
-            return 0
-        rows = self._nat.execute_plan(self._input_ir, [[batch]], self._cfg)
-        if not rows or sum(b.num_rows for b in rows) == 0:
-            return 0
-        self._fold.push(rows)
-        self._updated = sum(b.num_rows for b in rows)
-        return batch.num_rows
-
-    def metrics(self) -> StateOperatorProgress:
-        """This fold's state after the last `push` — what the progress record reports.
-
-        A streaming aggregation with no watermark never evicts, so `num_rows_removed` is
-        always zero and `num_rows_total` is the whole answer: it is the number that grows
-        without bound when the group key is too wide, and the one an operator watches to
-        see it happening before the memory guard fires.
-        """
-        state = self._fold.state()
-        return StateOperatorProgress(
-            operator_name="aggregate",
-            num_rows_total=0 if state is None else state.num_rows,
-            num_rows_updated=self._updated,
-            memory_used_bytes=self._fold.nbytes(),
-        )
-
-    def finalize(self) -> pa.RecordBatch | None:
-        """Materialize the current aggregate result, or None if no groups yet."""
-        return self._fold.finalize()
-
-    def nbytes(self) -> int:
-        """Bytes the running partial state currently holds — the streaming memory bound."""
-        return self._fold.nbytes()
-
-    def state(self) -> pa.RecordBatch | None:
-        """The running partial state, for a checkpoint snapshot (None if empty)."""
-        return self._fold.state()
-
-    def restore(self, state: pa.RecordBatch) -> None:
-        """Seed the running partial state from a checkpoint snapshot."""
-        self._fold.restore(state)
-
+__all__ = ["_WindowedAggFold", "_window_key"]
 
 _EPOCH = datetime.datetime(1970, 1, 1)
 
@@ -204,6 +37,21 @@ def _td(micros: int) -> datetime.timedelta:
 #: The `StateStore` persists exactly one `RecordBatch`, and the watermark state is a small
 #: JSON document — this is how it rides along without forking that contract.
 _WATERMARK_META = b"batcher.watermark_micros"
+
+#: The highest window start this fold has already evicted, carried alongside the watermark.
+#:
+#: This one integer is the whole tombstone a changelog for a *windowed* aggregate needs. A
+#: changelog records what was folded in and has no way to say what was taken out, which is
+#: why the evicting operators keep whole snapshots — but eviction here is not an arbitrary
+#: deletion. It removes windows whose start is at or below a threshold, on a totally ordered
+#: axis, so what it removes is always a **prefix**. A prefix is described by its upper bound,
+#: and replaying `combine` over the partials and then dropping everything at or below that
+#: bound reconstructs exactly the open set, without recording a single key.
+#:
+#: Applying the bound to a *whole* snapshot is a no-op, because that state is already
+#: post-eviction — so restore does it unconditionally rather than branching on which kind of
+#: checkpoint it is reading.
+_EVICTED_META = b"batcher.evicted_through_micros"
 
 
 class _WindowKey(NamedTuple):
@@ -314,6 +162,23 @@ def _scan_filter_ir(predicate) -> str:
     )
 
 
+def _median_window(state: pa.RecordBatch, window_column: str) -> int | None:
+    """The median window start in `state`, as int64 microseconds, or None if unusable.
+
+    One Arrow kernel over the window column — no per-row Python, and no sort of the whole
+    state, which is the cost the spill exists to avoid paying.
+    """
+    import pyarrow.compute as pc
+
+    from batcher.plan.streaming import event_micros
+
+    column = event_micros(state.column(window_column))
+    if column.null_count == len(column):
+        return None
+    value = pc.approximate_median(column).as_py()
+    return None if value is None else int(value)
+
+
 class _WindowedAggFold:
     """Watermark-bounded windowed aggregation: fold, evict closed windows, emit.
 
@@ -337,7 +202,9 @@ class _WindowedAggFold:
     __slots__ = (
         "_cap",
         "_cfg",
+        "_delta",
         "_drop",
+        "_evicted_micros",
         "_evicted_through",
         "_fold",
         "_hop",
@@ -346,6 +213,8 @@ class _WindowedAggFold:
         "_nat",
         "_partition_cols",
         "_removed",
+        "_spill",
+        "_spilled_rows",
         "_time_col",
         "_tracker",
         "_updated",
@@ -394,6 +263,10 @@ class _WindowedAggFold:
         # The index of the last window the watermark had closed at the previous sweep. See
         # `_evict`; `None` means nothing has been swept yet.
         self._evicted_through: int | None = None
+        # The highest window start already evicted, and this epoch's changelog entry. See
+        # `_EVICTED_META` and `take_delta`.
+        self._evicted_micros: int | None = None
+        self._delta: list[pa.RecordBatch] = []
         # The retained open-window state is bounded by the watermark advancing; cap it
         # so a stalled watermark fails loudly instead of OOMing (read once here).
         self._cap = active_config().memory.streaming_state_budget_bytes()
@@ -404,11 +277,16 @@ class _WindowedAggFold:
         self._late_dropped = 0
         self._removed = 0
         self._updated = 0
+        # The disk tier under the state cap, created only if the cap is ever reached. See
+        # `_spill_cold_windows`.
+        self._spill: Any = None
+        self._spilled_rows = 0
 
     def push(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
         from batcher.plan.expr_ir import col, lit
 
         self._late_dropped = self._removed = self._updated = 0
+        self._delta = []
         if batch.num_rows == 0:
             return []
         cfg = self._cfg
@@ -436,7 +314,9 @@ class _WindowedAggFold:
             if b.num_rows == 0:
                 continue
             partial = self._nat.execute_plan(self._input_ir, [[self._narrow(b)]], cfg)
-            self._fold.push(partial)
+            folded = self._fold.push(partial)
+            if folded is not None:
+                self._delta.append(folded)
             self._updated += sum(p.num_rows for p in partial)
         out = self._evict(cfg)
         # After eviction, what remains is the open-window state; if it has outgrown the
@@ -457,14 +337,83 @@ class _WindowedAggFold:
         return batch.drop_columns(present) if present else batch
 
     def _check_state_bounded(self) -> None:
+        """Keep resident state under the cap — by spilling cold windows, then by failing.
+
+        Reaching the cap used to end the query. That is the wrong answer for the shape that
+        reaches it most legitimately: an open set `allowed_lateness / hop` windows wide, one
+        row per group key, behaving exactly as designed and simply large. Spilling the oldest
+        windows to disk trades latency for survival, which is the trade every mature streaming
+        engine makes, and the watermark's one-way motion is what makes it cheap here — a
+        spilled window is read back once, when it closes, and never sought into.
+
+        The `ResourceError` still exists and still means something, but it now means what it
+        says: the state cannot be spilled far enough because the *newest* windows alone
+        exceed the cap. No amount of disk fixes that; it is a key space too wide for the
+        envelope, or a watermark that has stopped closing anything.
+        """
+        if self._fold.nbytes() > self._cap:
+            self._spill_cold_windows()
         check_agg_state_bounded(
             self._fold,
             self._cap,
             f"the watermark on '{self._time_col}' is not advancing, so closed windows never "
-            "evict (an event-time gap or an idle source), or the key space is too large. "
-            "Advance event time, narrow the keys, or raise memory.streaming_state_max_bytes",
+            "evict (an event-time gap or an idle source), or the key space is too large — "
+            "and the newest windows alone exceed the cap, so spilling the older ones to disk "
+            "did not help. Advance event time, narrow the keys, or raise "
+            "memory.streaming_state_max_bytes",
             label="windowed streaming aggregate",
         )
+
+    def _spill_cold_windows(self) -> None:
+        """Move the oldest half of the open windows to disk, repeatedly, until under the cap.
+
+        The split point is the **median** window start, taken with an Arrow kernel over the
+        state's window column. A median rather than a tuned fraction because it needs no
+        tuning and halves resident state on every pass whatever the distribution: a run of
+        passes reaches the target in a logarithmic number of steps, and each one leaves the
+        newest windows — the ones incoming rows actually land in — resident.
+
+        Stops when a pass moves nothing, which is the unspillable case: every remaining row
+        shares the newest window start. The caller then raises, because that is genuinely a
+        state too large rather than a state in the wrong place.
+        """
+        from batcher.core.streaming.spill import SpilledWindows
+        from batcher.plan.expr_ir import col, lit
+
+        target = self._cap // 2
+        while self._fold.nbytes() > target:
+            state = self._fold.state()
+            if state is None or state.num_rows <= 1:
+                return
+            split = _median_window(state, self._w_alias)
+            if split is None:
+                return
+            wk = col(self._w_alias)
+            thr = _EPOCH + _td(split)
+            cold = [
+                b
+                for b in self._nat.execute_plan(
+                    _scan_filter_ir(wk <= lit(thr)), [[state]], self._cfg
+                )
+                if b.num_rows
+            ]
+            hot = [
+                b
+                for b in self._nat.execute_plan(
+                    _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[state]], self._cfg
+                )
+                if b.num_rows
+            ]
+            if not cold or not hot:
+                # Everything is on one side of its own median: one window start holds the
+                # whole state, so there is no colder half to move.
+                return
+            if self._spill is None:
+                self._spill = SpilledWindows(self._w_alias)
+            for batch in cold:
+                self._spill.spill(batch)
+            self._fold.combine_all(hot)
+            self._spilled_rows = self._spill.rows()
 
     def _evict(self, cfg: str) -> list[pa.RecordBatch]:
         """Emit and drop every window the watermark has closed since the last sweep.
@@ -503,20 +452,32 @@ class _WindowedAggFold:
         if bucket == self._evicted_through:
             return []
         self._evicted_through = bucket
+        self._evicted_micros = threshold
         thr = _EPOCH + _td(threshold)  # window_start ≤ thr ⟺ window closed
         wk = col(self._w_alias)
-        closed = [
-            b
-            for b in self._nat.execute_plan(_scan_filter_ir(wk <= lit(thr)), [[state]], cfg)
-            if b.num_rows
-        ]
-        open_ = [
-            b
-            for b in self._nat.execute_plan(
-                _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[state]], cfg
+        # Everything that can hold a window this sweep closes: the resident state, plus the
+        # spilled runs whose range reaches the threshold. A run comes back whole and is split
+        # by the same predicate the resident state is, so there is one rule for what "closed"
+        # means rather than two that have to agree.
+        sources = [state]
+        if self._spill is not None:
+            sources.extend(self._spill.drain_through(threshold))
+            self._spilled_rows = self._spill.rows()
+        closed: list[pa.RecordBatch] = []
+        open_: list[pa.RecordBatch] = []
+        for source in sources:
+            closed.extend(
+                b
+                for b in self._nat.execute_plan(_scan_filter_ir(wk <= lit(thr)), [[source]], cfg)
+                if b.num_rows
             )
-            if b.num_rows
-        ]
+            open_.extend(
+                b
+                for b in self._nat.execute_plan(
+                    _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[source]], cfg
+                )
+                if b.num_rows
+            )
         self._removed = sum(b.num_rows for b in closed)
         self._fold.combine_all(open_)
         result = self._fold.finalize_partials(closed)
@@ -530,9 +491,14 @@ class _WindowedAggFold:
         the output, so the only symptom was a total that was slightly too low.
         """
         state = self._fold.state()
+        resident = 0 if state is None else state.num_rows
         return StateOperatorProgress(
             operator_name="windowed_aggregate",
-            num_rows_total=0 if state is None else state.num_rows,
+            # Rows on disk are still state. Reporting only the resident half would make a
+            # spilling query look like it had *shed* state rather than moved it, which is
+            # exactly backwards for the operator watching this number to decide whether the
+            # key space is too wide.
+            num_rows_total=resident + self._spilled_rows,
             num_rows_updated=self._updated,
             num_rows_removed=self._removed,
             memory_used_bytes=self._fold.nbytes(),
@@ -541,8 +507,48 @@ class _WindowedAggFold:
         )
 
     def flush(self) -> pa.RecordBatch | None:
-        """Finalize and emit every remaining (open) window — the end-of-stream flush."""
+        """Finalize and emit every remaining (open) window — the end-of-stream flush.
+
+        Spilled runs come back first. A flush that ignored them would drop every window the
+        memory pressure had moved to disk — silently, and only on the streams large enough to
+        have spilled at all, which is the worst possible place for a quiet loss.
+        """
+        if self._spill is not None:
+            self._fold.combine_all([*self._resident(), *self._spill.drain_all()])
+            self._spill.close()
+            self._spill = None
+            self._spilled_rows = 0
         return self._fold.take()
+
+    def _resident(self) -> list[pa.RecordBatch]:
+        """The in-memory partial state as a list, empty when nothing has been folded."""
+        state = self._fold.state()
+        return [] if state is None else [state]
+
+    def _drop_evicted(self, threshold: int) -> None:
+        """Remove every window at or below `threshold` from the state, emitting nothing."""
+        from batcher.plan.expr_ir import col, lit
+
+        state = self._fold.state()
+        if state is None:
+            return
+        wk = col(self._w_alias)
+        thr = _EPOCH + _td(threshold)
+        open_ = [
+            b
+            for b in self._nat.execute_plan(
+                _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[state]], self._cfg
+            )
+            if b.num_rows
+        ]
+        self._fold.combine_all(open_)
+
+    def close(self) -> None:
+        """Release the spill scratch. Idempotent; safe on a fold that never spilled."""
+        if self._spill is not None:
+            self._spill.close()
+            self._spill = None
+            self._spilled_rows = 0
 
     def state(self) -> pa.RecordBatch | None:
         """The open-window partials **and the watermark state**, as one checkpointable batch.
@@ -566,10 +572,70 @@ class _WindowedAggFold:
         running = self._fold.state()
         if running is None and self._wm is None:
             return None
-        meta = {_WATERMARK_META: self._tracker.to_json().encode()}
+        meta = self._meta()
         if running is None:
             return pa.RecordBatch.from_pylist([], schema=pa.schema([], metadata=meta))
         return running.replace_schema_metadata({**(running.schema.metadata or {}), **meta})
+
+    def _meta(self) -> dict[bytes, bytes]:
+        """The scalars that must ride with any checkpointed batch of this fold.
+
+        The tracker's whole per-partition state, not the frontier alone — restoring the
+        frontier by itself restarts every partition's maximum from nothing, so the first
+        partition to speak after a restart sets the minimum on its own — plus the eviction
+        bound that makes a changelog expressible at all (see `_EVICTED_META`).
+        """
+        meta = {_WATERMARK_META: self._tracker.to_json().encode()}
+        if self._evicted_micros is not None:
+            meta[_EVICTED_META] = str(self._evicted_micros).encode()
+        return meta
+
+    def take_delta(self) -> pa.RecordBatch | None:
+        """Take this micro-batch's changelog entry — what it folded in, plus the eviction bound.
+
+        **Reading consumes it**, for the reason the running aggregate's does: the engine
+        commits epochs that never push (the end-of-drain marker, an idle trigger), and an
+        entry left in place is written a second time under a new batch id and replayed twice.
+
+        The entry is the partial as it was folded *in*, before eviction ran. Replaying a
+        chain therefore rebuilds the pre-eviction state, and the bound in the metadata is
+        what turns that back into the open set — which is why this operator can offer a
+        changelog at all despite removing state, and why the bound must travel with every
+        entry rather than only with the base.
+
+        Returns:
+            One combined partial for the epoch, or None when it folded nothing in.
+        """
+        delta, self._delta = self._delta, []
+        if not delta:
+            return None
+        combined = delta[0] if len(delta) == 1 else self._nat.combine(*self._fold.spec, delta)
+        return combined.replace_schema_metadata(
+            {**(combined.schema.metadata or {}), **self._meta()}
+        )
+
+    def state_parts(self) -> Iterator[pa.RecordBatch]:
+        """The whole open-window state as a stream of parts — resident first, then spilled.
+
+        `state()` returns the resident half, which is all there is until the fold spills. Once
+        it has, a snapshot built from that alone would persist only what happened to be in
+        memory and silently drop every window the memory pressure had moved to disk — on
+        exactly the queries large enough to spill, which is the worst place for a quiet loss.
+
+        A stream rather than one concatenated batch because a spilled fold's state is larger
+        than the memory cap by construction; the snapshot writer consumes this run by run, so
+        the peak is one part. The spilled runs are read **without** being consumed, so a
+        snapshot leaves the fold exactly as it found it.
+
+        Yields:
+            The resident state (carrying the watermark in its schema metadata), then one
+            batch per spilled run.
+        """
+        resident = self.state()
+        if resident is not None:
+            yield resident
+        if self._spill is not None:
+            yield from self._spill.iter_runs()
 
     def restore(self, state: pa.RecordBatch) -> None:
         """Resume the open windows and the watermark state from a checkpoint snapshot.
@@ -578,10 +644,57 @@ class _WindowedAggFold:
         is read as a single global partition — so a query checkpointed before per-partition
         watermarks existed resumes rather than rewinding its event time.
         """
-        raw = (state.schema.metadata or {}).get(_WATERMARK_META)
+        self.restore_parts([state])
+
+    def restore_parts(self, parts: Sequence[pa.RecordBatch]) -> None:
+        """Resume from a multi-part snapshot: the resident state plus any spilled runs.
+
+        The parts are combined rather than concatenated, which is what makes the split into
+        parts invisible to the result: they hold *partial* aggregate state and `combine` is
+        associative and commutative (invariant #7), so where the window rows happened to sit
+        when the snapshot was taken cannot change what they fold to.
+
+        The watermark rides in the schema metadata of whichever part carries it — the
+        resident one, written first — so it is recovered from the first part that has it
+        rather than assumed to be on any particular one.
+
+        Args:
+            parts: The snapshot's batches, in the order they were written.
+        """
+        raw = next(
+            (
+                (part.schema.metadata or {}).get(_WATERMARK_META)
+                for part in parts
+                if (part.schema.metadata or {}).get(_WATERMARK_META)
+            ),
+            None,
+        )
         self._tracker.restore(raw.decode() if raw else None)
         self._wm = self._tracker.watermark
         # A restored fold has swept nothing yet, so the next push must evict rather than
         # assume the recovered watermark's windows were already emitted by the dead run.
         self._evicted_through = None
-        self._fold.restore(state if state.num_columns else None)
+        evicted = next(
+            (
+                (part.schema.metadata or {}).get(_EVICTED_META)
+                for part in reversed(list(parts))
+                if (part.schema.metadata or {}).get(_EVICTED_META)
+            ),
+            None,
+        )
+        rows = [part for part in parts if part.num_columns and part.num_rows]
+        self._fold.combine_all(rows)
+        if evicted is not None:
+            # Re-apply the prefix eviction the chain's partials predate. A no-op on a whole
+            # snapshot, whose state is already post-eviction — which is why this is
+            # unconditional rather than branching on the checkpoint's kind. Silent by
+            # design: these windows were emitted before the crash, so emitting them again
+            # under a new batch id is a duplicate no sink's by-batch-id idempotency absorbs.
+            self._evicted_micros = int(evicted)
+            self._drop_evicted(self._evicted_micros)
+            self._evicted_through = self._evicted_micros // self._hop
+        # Recovery can land more state than the cap allows — the snapshot it came from was
+        # spilled precisely because it did. Re-spill now rather than waiting for the next
+        # push, so a restart cannot hold more than a live query would.
+        if rows:
+            self._check_state_bounded()

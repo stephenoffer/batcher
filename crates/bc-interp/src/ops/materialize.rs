@@ -14,6 +14,29 @@ use std::sync::Arc;
 
 use crate::error::InterpError;
 
+/// Concatenate morsels into one batch, or `None` when there are none.
+///
+/// The bounded-memory breakers all begin by concatenating their input, and all of them
+/// have to answer "what if the input is empty?". [`materialize`] answers it with
+/// `EmptyJoinInput`, which invited every one of them to spell the empty case as
+/// `match materialize(..) { Ok(b) => .., Err(_) => Vec::new() }` — and that discards
+/// *every* error, not just the empty one. A schema mismatch between morsels, a `Utf8`
+/// column whose concatenation overflows 32-bit offsets into a type the rebuilt schema
+/// rejects, an allocation that fails on a large breaker: each of those returned **zero
+/// rows and reported success**. Two of the five sites were in `exec_seq`, the Tier-0
+/// oracle every other tier is checked against, so the silently-empty answer was the
+/// reference answer.
+///
+/// Separating "there was nothing to concatenate" from "concatenating failed" is what
+/// makes the empty case expressible without a catch-all, so callers can propagate the
+/// real error with `?`.
+pub(crate) fn materialize_opt(batches: &[RecordBatch]) -> Result<Option<RecordBatch>, InterpError> {
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    materialize(batches).map(Some)
+}
+
 /// Concatenate morsels into one batch. Errors if there are none (no schema).
 pub(crate) fn materialize(batches: &[RecordBatch]) -> Result<RecordBatch, InterpError> {
     let first = batches.first().ok_or(InterpError::EmptyJoinInput)?;
@@ -354,5 +377,27 @@ mod tests {
         // An unchanged column reuses the input schema object.
         let same = widened_schema(&schema, &[Arc::clone(batches[0].column(0))]);
         assert!(Arc::ptr_eq(&schema, &same));
+    }
+
+    /// No input is `None`; it is the *only* thing that is.
+    #[test]
+    fn empty_input_is_none_not_an_error() {
+        assert!(materialize_opt(&[]).unwrap().is_none());
+        let one = materialize_opt(std::slice::from_ref(&int_batch(&[1, 2]))).unwrap();
+        assert_eq!(one.unwrap().num_rows(), 2);
+    }
+
+    /// The distinction the breakers depend on: morsels that cannot be concatenated are an
+    /// **error**, never an empty relation.
+    ///
+    /// Every breaker used to spell its empty case as `Err(_) => Vec::new()`, so this input
+    /// produced zero rows and reported success — in `exec_seq`, the oracle included. The
+    /// mismatch here (`s: Utf8` then `i: Int64`) stands in for the ones a real corpus
+    /// produces: a schema that drifted between files, a column concatenated past 32-bit
+    /// offsets.
+    #[test]
+    fn mismatched_morsels_error_rather_than_vanish() {
+        let mixed = [str_batch(&["a"]), int_batch(&[1])];
+        assert!(materialize_opt(&mixed).is_err());
     }
 }

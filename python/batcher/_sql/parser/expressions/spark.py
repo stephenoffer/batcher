@@ -52,6 +52,25 @@ def spark_function(tr, node) -> Expr | None:
             .then(tr._scalar(node.args["true"]))
             .otherwise(tr._scalar(node.args["false"]))
         )
+    if isinstance(node, exp.SafeDivide):
+        # `try_divide(a, b)` is Spark's null-on-failure division, and a zero divisor is
+        # the failure it exists for. The engine's `/` follows IEEE there and answers
+        # `inf`/`nan` (which is DuckDB's answer too), so the null has to be written in
+        # rather than inherited — aliasing `try_divide` onto `/` would return an infinity
+        # where Spark returns NULL.
+        #
+        # Its three siblings — `try_add`/`try_subtract`/`try_multiply` — are deliberately
+        # *not* here. They differ from the plain operators only on integer overflow, and
+        # the engine wraps there rather than raising, so there is nothing to test for: a
+        # composition would have to detect the wrap after the fact, and getting that wrong
+        # returns a wrapped number where Spark returns NULL. They keep raising a clear
+        # "not supported" instead.
+        divisor = tr._scalar(node.expression)
+        return (
+            when(divisor == lit(0))
+            .then(_typed_null(divisor))
+            .otherwise(tr._scalar(node.this) / divisor)
+        )
     if isinstance(node, exp.EqualNull):
         # Null-safe equality: two nulls are equal, and a null never equals a value.
         return tr._scalar(node.this).eq_missing(tr._scalar(node.expression))
@@ -254,3 +273,13 @@ def _find_in_set(tr, args) -> Expr | None:
         return None
     parts = tr._scalar(args[1]).str.split(",")
     return coalesce(parts.list.position(needle.this), lit(0))
+
+
+def _typed_null(like: Expr) -> Expr:
+    """A NULL that carries `like`'s type, for a CASE branch that must not change it.
+
+    `when(...).then(NULL)` has no literal spelling — a bare `None` has no type — so the
+    null is made by nulling a value of the right type out. `nullif(x, x)` is the engine's
+    idiom for it and is what the rest of the translator uses.
+    """
+    return nullif(like, like)

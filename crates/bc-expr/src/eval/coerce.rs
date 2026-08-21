@@ -121,6 +121,17 @@ pub(crate) fn coerce_numeric(
         return Ok((l.clone(), r.clone()));
     }
     match (l.data_type(), r.data_type()) {
+        // An all-`Null` operand adopts the other's type. A bare `NULL` literal, and a
+        // column arrow types as `Null` because every value in it is missing, both arrive
+        // here — and every arm below is keyed on a concrete pair, so the lattice
+        // fallthrough was reached and answered nothing for the non-numeric types. The
+        // result was that `coalesce(NULL, <a list column>)` — the ordinary "default this
+        // to an empty list" shape, and the `ifnull` Spark spells it with — raised
+        // "arguments need to have the same data type" on a valid query. Casting `Null` to
+        // any type is total (it is all nulls whatever the target), so this can only turn a
+        // hard error into the right answer.
+        (DataType::Null, other) => Ok((cast(l, other)?, r.clone())),
+        (other, DataType::Null) => Ok((l.clone(), cast(r, other)?)),
         (Int64, Float64) => Ok((cast(l, &Float64)?, r.clone())),
         (Float64, Int64) => Ok((l.clone(), cast(r, &Float64)?)),
         // An *integer* against a decimal adopts the decimal's precision/scale, so the

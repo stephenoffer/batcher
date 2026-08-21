@@ -9,7 +9,9 @@ decide, `ml` to measure — and neither may import the other.
   scheduler pins with, not just ordinals) and how much is really free on each, including what
   a co-tenant holds.
 * `torch_memory` — reading and configuring PyTorch's caching allocator, whose fragmentation
-  is what makes a stage die at 60% VRAM reporting plenty free.
+  is what makes a stage die at 60% VRAM reporting plenty free. Vendor-agnostic through one
+  namespace table, so NVIDIA, AMD, Intel XPU, Apple, Gaudi and Ascend all answer the same
+  four questions rather than only the first two.
 * `oom` — telling the three device out-of-memory failures apart, and releasing memory in the
   order that actually recovers it.
 
@@ -44,7 +46,12 @@ from batcher._internal.hardware.devices.scope import (
 from batcher._internal.hardware.devices.torch_memory import (
     ALLOC_CONF_ENV,
     FRAGMENTATION_THRESHOLD,
+    TORCH_NAMESPACE,
+    accelerator_namespace,
     allocator_initialized,
+    device_memory_used_fraction,
+    device_total_memory_bytes,
+    device_utilization,
     fragmentation_ratio,
     set_alloc_conf,
     set_memory_fraction,
@@ -55,17 +62,22 @@ __all__ = [
     "DEVICE_ORDER_ENV",
     "FRAGMENTATION_THRESHOLD",
     "PCI_BUS_ORDER",
+    "TORCH_NAMESPACE",
     "VISIBLE_DEVICE_ENVS",
     "DeviceScope",
     "OomKind",
     "OomVerdict",
+    "accelerator_namespace",
     "allocator_initialized",
     "classify_oom",
     "current_ordinal",
     "current_physical_index",
     "device_free_bytes",
+    "device_memory_used_fraction",
     "device_order_env",
     "device_scope",
+    "device_total_memory_bytes",
+    "device_utilization",
     "fragmentation_ratio",
     "is_device_oom",
     "min_visible_capacity_bytes",

@@ -20,7 +20,6 @@ import dataclasses
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
-from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.base import (
     AdmissionPolicy,
     FlowControlPolicy,
@@ -45,7 +44,7 @@ from batcher.carbonite.policies import (
     measured_bdp_window,
     shuffle_window_is_stable,
 )
-from batcher.carbonite.policies.cpu_budget import effective_core_budget
+from batcher.carbonite.policies.cpu_budget import reduced_core_budget
 from batcher.carbonite.policies.morsel import (
     MIN_MORSEL_BYTES,
     MIN_MORSEL_ROWS,
@@ -320,11 +319,9 @@ class ResourceManager:
         Returns:
             The reduced core budget, or `None` to leave parallelism alone.
         """
-        configured = self._config.execution.parallelism
-        if configured > 0:
+        if self._config.execution.parallelism > 0:
             return None  # an explicit setting is an instruction, not an estimate
-        budget = effective_core_budget()
-        return budget if budget < available_cpu_count() else None
+        return reduced_core_budget()
 
     def recommended_config(
         self, families: Iterable[str] | None = None, plan: object | None = None
@@ -369,6 +366,34 @@ class ResourceManager:
         """
         return self._spill.spill_reason(plan)
 
+    def going_out_of_core(self) -> int:
+        """Hand the allocator's retained pages back, at the moment a query starts spilling.
+
+        Called by the executor once it has committed to the out-of-core path, not by the gate
+        that decides it — the decision has three independent routes (admission's counter-offer,
+        the spill estimate, and the resident input size) and only one of them passes through a
+        live pressure reading, so trimming inside that reading covered a third of the spills and
+        missed the two most common ones.
+
+        Result-invariant, and never raises: it changes the process's resident set, never what a
+        query computes and never whether it spills. Self-limiting through
+        `memory.reclaim`'s backoff, so the shapes with no out-of-core path — which reach here and
+        then fall back to memory — do not pay for it repeatedly.
+
+        Two out-of-core entry points do not call it yet: an explicit `collect(spill=True)`, which
+        routes in `api.terminal.core` before the resource manager is consulted, and the
+        reservation-denied fallback in `api.orchestration.run`. Both reach `dist.spill`'s
+        `spill_collect` directly, which is the one chokepoint all three share and so the place
+        this belongs; moving it there is a change to a file another session is mid-edit in.
+
+        Returns:
+            Bytes the allocator reported releasing; `0` when the attempt was skipped by the
+            cooldown, freed nothing, or the engine cannot report. The caller does not act on it.
+        """
+        from batcher.carbonite.memory.reclaim import reclaim_before_spill
+
+        return reclaim_before_spill()
+
     def stats(self) -> dict[str, object]:
         """One reading of every resource Carbonite governs, for telemetry and `explain`.
 
@@ -383,9 +408,11 @@ class ResourceManager:
             cache) are omitted rather than reported as zero, which would be a lie about a
             thing that does not exist.
         """
+        from batcher._internal.hardware import swap_configured
         from batcher.carbonite.cache import current_result_cache
         from batcher.carbonite.memory.kernel import kernel_stats
         from batcher.carbonite.memory.pool import current_process_pool, engine_pool_stats
+        from batcher.carbonite.memory.reclaim import reclaim_stats
         from batcher.carbonite.policies.concurrency import process_limiter
         from batcher.carbonite.spill.disk import scratch_disk_stats
 
@@ -410,6 +437,19 @@ class ResourceManager:
             # spilled with an empty pool and no cache was throttled at `memory.high` or is in a
             # cgroup already carrying an OOM kill. Empty off Linux.
             **kernel_stats(),
+            # What the cheap alternative to spilling has achieved. A rising attempt count with
+            # no released bytes is the signature of a process whose allocator arena is genuinely
+            # live, which is what separates "the engine is holding memory it does not need" from
+            # "the box is full" — opposite problems with opposite fixes.
+            "reclaim": reclaim_stats(),
+            # What overshooting the budget *means* on this node, which changes the answer and
+            # which nothing else here reports. With swap it degrades: pages go out, the query
+            # slows, it finishes. Without it — the default on Kubernetes and on every Ray
+            # worker pod — the kernel kills the largest process, which is this one, and the
+            # query is lost along with every partition it had already computed. No budget
+            # reads it; it is here so a person tuning `memory.soft_limit` can see which node
+            # they are on.
+            "swap": swap_configured(),
         }
         pool = current_process_pool()
         if pool is not None:

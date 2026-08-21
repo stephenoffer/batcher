@@ -14,7 +14,6 @@ Both are unconditionally semantics-preserving: they do not consult cardinality o
 from __future__ import annotations
 
 import datetime as _dt
-import json as _json
 
 from batcher.kyber.expr_cost import jit_compilable
 from batcher.kyber.pass_base import OptimizerContext
@@ -24,6 +23,7 @@ from batcher.plan.expr_ir import Binary, Col, Expr, InList, Lit
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
     combine_disjuncts,
+    expr_key,
     split_conjuncts,
     split_disjuncts,
 )
@@ -131,7 +131,7 @@ def _ir_key(expr: Expr) -> str:
     the same wire form the engine is handed, so two keys match exactly when the engine would
     evaluate the same thing.
     """
-    return _json.dumps(expr.to_ir(), sort_keys=True)
+    return expr_key(expr)
 
 
 # Fold an OR-of-equals chain into `IN` once it has at least this many branches — below

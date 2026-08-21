@@ -123,9 +123,15 @@ class ONNXAdapter(BaseAdapter):
             provides="onnxruntime",
             extra="onnx",
         )
-        available = set(ort.get_available_providers())
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
-        return ort.InferenceSession(path, providers=providers or None)
+        from batcher.ml.runtimes.providers import onnx_providers
+
+        # The provider choice is the same question the deep-model path answers, so it is
+        # answered in the same place: `onnx_providers` covers ROCm, MIGraphX, DirectML and
+        # CoreML as well as CUDA, and — unlike the two-name list this replaced — it declines
+        # to name an accelerated provider on a host with no visible accelerator, which is
+        # where a GPU-build wheel otherwise fails at session creation.
+        resolved = onnx_providers(None, list(ort.get_available_providers()))
+        return ort.InferenceSession(path, providers=resolved or None)
 
     def feature_names(self, model: Any) -> list[str] | None:
         """ONNX inputs are tensors, not named features, so there is nothing to compare."""
@@ -144,11 +150,17 @@ class ONNXAdapter(BaseAdapter):
         which is where those converters put the probability tensor — as a list of
         ``{class: probability}`` maps for a ZipMap-enabled graph, which is flattened here
         back into a dense matrix.
+
+        The feature matrix is cast to **the dtype the graph declares**, not to float32
+        whenever the declaration mentions "float". That substring test read ``tensor(float16)``
+        as float32 — so every half-precision export was fed the wrong width and rejected — and
+        read ``tensor(double)`` as *not* float, so a float64 graph got whatever the matrix
+        happened to be.
         """
         self._check_method(method)
-        input_name = options.get("input_name") or model.get_inputs()[0].name
-        expected = model.get_inputs()[0].type
-        feed = {input_name: matrix.astype("float32") if "float" in expected else matrix}
+        spec = model.get_inputs()[0]
+        input_name = options.get("input_name") or spec.name
+        feed = {input_name: _as_graph_dtype(matrix, spec.type)}
         outputs = model.run(None, feed)
         if method == "predict":
             return outputs[0]
@@ -158,6 +170,22 @@ class ONNXAdapter(BaseAdapter):
                 f"this ONNX model has {len(outputs)}. Use method='predict'."
             )
         return _dense_probabilities(outputs[1])
+
+
+def _as_graph_dtype(matrix: np.ndarray, declared: str) -> np.ndarray:
+    """The feature matrix in the element type the graph's input declares.
+
+    An ONNX graph does not coerce: it rejects a feed whose dtype is not the one it was
+    exported with, and reports that as a message about the tensor's *shape*. `ONNX_TO_NUMPY`
+    is the single mapping both this path and the deep-model runtime resolve against, so an
+    element type either is handled in both or is left alone in both.
+    """
+    from batcher.ml.runtimes.onnx import ONNX_TO_NUMPY
+
+    target = ONNX_TO_NUMPY.get(declared)
+    if target is None:
+        return matrix  # a string/sequence input; leave it for the runtime to judge
+    return matrix.astype(target, copy=False)
 
 
 def _dense_probabilities(output: Any) -> Any:

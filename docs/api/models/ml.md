@@ -149,10 +149,14 @@ import batcher.ml as ml
 ### LLM inference
 
 An *engine* is any callable from a list of prompts to a list of completions. That is the
-whole contract, which is why a local vLLM engine, a remote OpenAI-compatible endpoint, and
-a hosted Claude model are interchangeable: swap {py:obj}`vllm_engine <batcher.ml.vllm_engine>`
-for {py:obj}`http_engine <batcher.ml.http_engine>` or
-{py:obj}`anthropic_engine <batcher.ml.anthropic_engine>` and nothing else changes.
+whole contract, which is why a local vLLM engine, a local SGLang engine, a remote
+OpenAI-compatible endpoint, and a hosted Claude model are interchangeable: swap
+{py:obj}`vllm_engine <batcher.ml.vllm_engine>` for
+{py:obj}`sglang_engine <batcher.ml.sglang_engine>`,
+{py:obj}`http_engine <batcher.ml.http_engine>` or
+{py:obj}`anthropic_engine <batcher.ml.anthropic_engine>`,
+{py:obj}`bedrock_engine <batcher.ml.bedrock_engine>` or
+{py:obj}`gemini_engine <batcher.ml.gemini_engine>` and nothing else changes.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml
@@ -162,8 +166,11 @@ for {py:obj}`http_engine <batcher.ml.http_engine>` or
    :nosignatures:
 
    vllm_engine
+   sglang_engine
    http_engine
    anthropic_engine
+   bedrock_engine
+   gemini_engine
    llm_generate
    llm_udf
    json_schema
@@ -197,15 +204,21 @@ evaluation data that leaked into a web-scale corpus. See {doc}`/ml/training/trai
 
 ### Retrieval reranking
 
-Rerank a retrieved candidate set for diversity as well as relevance, so a context window is not
-spent on the same passage several times. See {doc}`/ml/retrieval/rag`.
+Rerank a retrieved candidate set before it reaches a model.
+{py:obj}`cross_encoder_rerank_udf <batcher.ml.cross_encoder_rerank_udf>` rescores candidates
+with a model that reads the query and each passage together, which a vector search cannot do;
+{py:obj}`mmr_rerank_udf <batcher.ml.mmr_rerank_udf>` then drops the near-duplicates, so a
+context window is not spent on the same passage several times. See {doc}`/ml/retrieval/rag`.
 
 ```{eval-rst}
 .. autosummary::
    :toctree: generated
    :nosignatures:
 
+   cross_encoder_rerank_udf
    mmr_rerank_udf
+
+.. autodata:: CrossEncoderScorer
 ```
 
 ### Model-graded evaluation
@@ -221,6 +234,23 @@ contract, appending one parsed column rather than a string you still have to int
    llm_score_udf
    llm_pairwise_udf
    llm_verify_udf
+```
+
+### Local model runtimes
+
+Run an exported model inside the worker, with no serving process between the data and the
+model. Each is a load-once class UDF built on `serving_udf`, so all three inherit its batch
+splitting, in-flight pipelining, and output alignment. ONNX Runtime's execution providers are
+also how TensorRT is reached. See {doc}`/ml/inference/runtimes`.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   onnx_predictor
+   torch_predictor
+   openvino_predictor
 ```
 
 ### Model serving

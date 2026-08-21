@@ -140,10 +140,17 @@ def test_an_all_null_frame_is_null_not_the_fold_identity(duck, table):
 
 @pytest.mark.differential
 def test_the_aggregates_with_no_sliding_form_still_refuse_a_frame():
-    """`var`/`stddev` keep a Welford state whose combine is Chan's formula, and
-    `count_distinct` needs a multiset — neither is a fold, so both must keep raising
-    rather than being handed a frame the kernel cannot honour."""
+    """`count_distinct` needs a multiset and `median` needs an order statistic — neither is
+    expressible as this slide's combine, so both must keep raising rather than being handed
+    a frame the kernel cannot honour.
+
+    `var`/`stddev` were on this list and are no longer: the slide never required an
+    *operator*, only an associative combine, and Welford has one in Chan's parallel formula.
+    Merging two sorted halves is associative too, which is exactly why `median` needs saying
+    out loud — it *could* be carried here, at `O(k)` a step, and that is the cost the slide
+    exists to avoid.
+    """
     ds = bt.from_pydict({"g": ["a", "a"], "o": [1, 2], "x": [1.0, 2.0]})
-    for build in (lambda: col("x").std(), lambda: col("x").var(), lambda: col("x").n_unique()):
+    for build in (lambda: col("x").n_unique(), lambda: col("x").median()):
         with pytest.raises(Exception, match="frame"):
             ds.select(r=build().over("g", order_by="o", frame=(-1, 0))).collect()

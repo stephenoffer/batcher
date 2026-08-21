@@ -118,6 +118,12 @@ def struct_field_type(struct_t: pa.DataType | None, field: str) -> pa.DataType |
 
 def mapfunc_type(fn: str, map_t: pa.DataType | None) -> pa.DataType | None:
     """The Arrow type a `map` accessor function produces over `map_t`."""
+    if map_t is not None and pa.types.is_struct(map_t) and fn == "map_keys":
+        # `.struct.keys()` is the same node as `.map.keys()` — a struct is a keyed
+        # container and the kernel answers both — but its keys come from the *type*, so
+        # they are always text. Without this arm the whole `.struct.keys()` column
+        # declared `null` while producing `List<Utf8>`.
+        return pa.list_(pa.string())
     if map_t is None or not pa.types.is_map(map_t):
         return None
     if fn == "map_keys":

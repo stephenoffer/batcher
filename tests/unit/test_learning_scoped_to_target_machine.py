@@ -190,3 +190,37 @@ def test_the_planner_contract_carries_the_class_it_plans_for():
         ).fingerprint
         == _WORKER
     )
+
+
+def test_op_stats_by_kind_reads_the_class_the_scope_is_planning_for() -> None:
+    """The default resolves through `planning_for`, not straight to this process.
+
+    A distributed run wraps its whole plan-admit-execute span in `planning_for(workers)` so a
+    read and a write cannot key the same learned quantity differently. Two consumers of this
+    view pass no class at all — `carbonite.memory.learned`, which fits the memory model behind
+    admission and the per-task grant, and `dist.adaptive_sizing`, whose subject is how to shape
+    a task on a worker — so a default that ignored the scope handed both the *driver's* rows.
+    On the ordinary Ray shape (a small head node, large workers) that is an empty view, and
+    both silently kept their cold-start defaults on the deployment they exist for.
+    """
+    from batcher.metadata.hardware_scope import planning_for
+
+    hub = MetadataHub(InProcessBackend())
+    hub.record(
+        OperatorFeedback(
+            op_id=OpId(1),
+            kind="aggregate",
+            n_actual=10,
+            t_op_ms=1.0,
+            m_peak_bytes=1024,
+            selectivity=1.0,
+            batch_size=16_384,
+            hw_fingerprint="worker-class",
+        )
+    )
+    assert hub.op_stats_by_kind() == {}, "the driver measured nothing, and says so"
+    with planning_for("worker-class"):
+        assert list(hub.op_stats_by_kind()) == ["aggregate"]
+    # An explicit class still wins over the scope, so every existing caller is unaffected.
+    with planning_for("worker-class"):
+        assert hub.op_stats_by_kind("some-other-class") == {}

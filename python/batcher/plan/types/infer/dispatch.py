@@ -25,7 +25,7 @@ from batcher.plan.types.infer.collections import (
     mapfunc_type,
     struct_field_type,
 )
-from batcher.plan.types.infer.scalars import datefunc_type, strfunc_type
+from batcher.plan.types.infer.scalars import datefunc_type, make_temporal_type, strfunc_type
 from batcher.plan.types.lattice import promote
 from batcher.plan.types.media import audiofunc_type, imagefunc_type, videofunc_type
 from batcher.plan.types.registry import resolve_dtype
@@ -64,6 +64,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
+    from batcher.plan.expr_ir.func_nodes import ListTransform, MakeTemporal
     from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
@@ -72,6 +73,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         DateTrunc,
         ListBinary,
         ListContains,
+        ListFilter,
         ListFunc,
         ListGet,
         ListPosition,
@@ -169,6 +171,11 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     if isinstance(expr, (ListSlice, ListSet)):
         # Sub-range / set-op of a list: the element type is unchanged.
         return as_list_type(infer_type(list_operand(expr), schema))
+    if isinstance(expr, ListFilter):
+        # A filter selects elements, it does not change them: the list type is the input's.
+        return as_list_type(infer_type(expr.input, schema))
+    if isinstance(expr, ListTransform):
+        return _list_transform_type(expr, schema)
     if isinstance(expr, ListGet):
         return list_element_type(infer_type(expr.input, schema))
     if isinstance(expr, ListFunc):
@@ -179,6 +186,8 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return mapfunc_type(expr.fn, infer_type(expr.input, schema))
     if isinstance(expr, Sequence):
         return pa.list_(pa.int64())  # `sequence` always yields a List<Int64> series
+    if isinstance(expr, MakeTemporal):
+        return make_temporal_type(expr.fn)
     if isinstance(expr, MakeStruct):
         return _make_struct_type(expr.fields, schema)
     return None
@@ -233,3 +242,26 @@ def _fold_promote(types: Iterable[pa.DataType | None]) -> pa.DataType | None:
             if result is None:
                 return None
     return result
+
+
+def _list_transform_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
+    """`list.transform(body)` — a list of whatever `body` makes of one element.
+
+    The body is written against `element()`, which is a `Col` under a reserved name with
+    no binding in the operator's own schema, so inferring it needs that name bound to the
+    input's *element* type first. Everything else follows from the ordinary recursion, and
+    a body the recursion cannot type still yields `None` rather than a guess.
+    """
+    from batcher.plan.functions.collection import _ELEMENT_COL
+    from batcher.plan.schema import SchemaRef as _SchemaRef
+
+    element_t = list_element_type(infer_type(expr.input, schema))
+    if element_t is None:
+        return None
+    bound = _SchemaRef.from_arrow(
+        pa.schema([*schema.arrow, pa.field(_ELEMENT_COL, element_t, nullable=True)])
+        if not schema.has(_ELEMENT_COL)
+        else schema.arrow
+    )
+    body_t = infer_type(expr.func, bound)
+    return pa.list_(body_t) if body_t is not None else None

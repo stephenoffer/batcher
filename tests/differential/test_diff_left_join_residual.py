@@ -1,10 +1,15 @@
 """Outer-join ON residual vs DuckDB — the residual filters match eligibility, not the result.
 
-``A LEFT JOIN B ON A.k = B.k AND <cond on B>`` must keep every A row (B columns null
-where nothing matched); the residual filters which B rows are eligible, so it pre-
-filters B rather than post-filtering the joined result. Regression test for the bug
-where the residual was applied as a post-join filter and dropped the null-extended
-rows (TPC-H Q13 shape).
+``A LEFT JOIN B ON A.k = B.k AND <cond>`` must keep every A row (B columns null where
+nothing matched), so the residual decides *which rows may match* — it is not a predicate
+on the result. Two one-sided shapes are expressible and both are taken: a residual reading
+only the null-extended side pre-filters that side (the TPC-H Q13 shape, where applying it
+as a post-join filter dropped the null-extended rows), and a residual reading only a
+*preserved* side becomes an extra join key, so a row failing it matches nothing and is
+null-extended — which covers FULL, where both sides are preserved.
+
+A residual reading *both* sides is a real theta join and still raises; that refusal is
+pinned here too, because turning it into a filter would drop rows.
 """
 
 from __future__ import annotations
@@ -79,16 +84,35 @@ def test_inner_join_residual_unchanged(duck, cust_orders):
     assert_same(out, duck.sql(query))
 
 
-def test_left_join_residual_on_preserved_side_rejected(cust_orders):
-    """A residual touching the preserved side can't be expressed — reject, don't mis-answer."""
+def test_left_join_residual_on_preserved_side(duck, cust_orders):
+    """A residual reading only the *preserved* side becomes an extra join key.
+
+    A left row failing it must match nothing, and "matches nothing" is what an equi-join
+    already does to a key value the other side does not hold — so the predicate joins
+    against the constant TRUE, and the outer join null-extends the rest. This used to be
+    refused outright, which is the ordinary
+    ``LEFT JOIN ... ON a.k = b.k AND a.active`` shape.
+    """
     customer, orders = cust_orders
     query = (
         "SELECT c_custkey, o_orderkey "
         "FROM customer LEFT OUTER JOIN orders "
         "ON c_custkey = o_custkey AND c_custkey > 1"
     )
-    with pytest.raises(NotImplementedError):
-        bt.sql(query, customer=customer, orders=orders).collect()
+    out = bt.sql(query, customer=customer, orders=orders).collect()
+    assert_same(out, duck.sql(query))
+
+
+def test_a_full_join_residual_on_one_side(duck, cust_orders):
+    """FULL preserves both sides, so the same marker rule is what makes it expressible."""
+    customer, orders = cust_orders
+    query = (
+        "SELECT c_custkey, o_orderkey "
+        "FROM customer FULL OUTER JOIN orders "
+        "ON c_custkey = o_custkey AND c_custkey > 1"
+    )
+    out = bt.sql(query, customer=customer, orders=orders).collect()
+    assert_same(out, duck.sql(query))
 
 
 # --- residuals over a column present on BOTH sides --------------------------
@@ -128,8 +152,13 @@ def test_inner_join_residual_both_sides_null_row_is_dropped(duck, both_sides_v):
 
 
 def test_left_join_residual_across_both_sides_rejected(both_sides_v):
-    """The same residual on a LEFT join references the preserved side — refuse, don't mis-answer."""
+    """A residual reading *both* sides is a real theta join — refuse, don't mis-answer.
+
+    The marker rewrite that handles a one-sided residual cannot express this one: the
+    eligibility of a left row depends on which right row it is paired with, so there is no
+    key to compute before the join.
+    """
     a, b = both_sides_v
     query = "SELECT a.k AS k, b.v AS bv FROM a LEFT JOIN b ON a.k = b.k AND a.v < b.v"
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="reads both sides"):
         bt.sql(query, a=a, b=b).collect()

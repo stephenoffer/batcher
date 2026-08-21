@@ -124,8 +124,8 @@ def test_each_type_still_reuses_its_own_grid():
     """Separating the shapes must not cost the optimization it exists to keep."""
     from batcher.dist.sort_boundaries import (
         load_learned_grids,
+        sort_grid_kind,
         sort_key_identity,
-        sort_key_is_string,
         sort_shape_key,
     )
 
@@ -136,6 +136,6 @@ def test_each_type_still_reuses_its_own_grid():
     query = _strings()
     query.sort("k").collect(distributed=True, num_workers=3)
     source = query._sources[0]
-    assert sort_key_is_string(source, "k") is True
+    assert sort_grid_kind(source, "k") == "text"
     key = sort_shape_key('{"op": "scan", "source_id": 0}', "k", sort_key_identity(source, "k"))
-    assert load_learned_grids(key, True), "the string sort's own grid must be reusable"
+    assert load_learned_grids(key, "text"), "the string sort's own grid must be reusable"

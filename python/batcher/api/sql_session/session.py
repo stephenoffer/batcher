@@ -45,13 +45,22 @@ class Session:
             {'total': [6]}
     """
 
-    __slots__ = ("_dialect", "_functions", "_generation", "_models", "_plan_cache", "_tables")
+    __slots__ = (
+        "_dialect",
+        "_engines",
+        "_functions",
+        "_generation",
+        "_models",
+        "_plan_cache",
+        "_tables",
+    )
 
     def __init__(self, *, dialect: str = "duckdb") -> None:
         """Create an empty session reading SQL in `dialect` (the sqlglot read dialect)."""
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, RegisteredFunction] = {}
         self._models: dict[str, Any] = {}
+        self._engines: dict[str, Any] = {}
         self._dialect = dialect
         # Prepared-statement cache: (dialect, query, bound names) ->
         # (catalog generation, bound objects, Dataset).
@@ -391,6 +400,58 @@ class Session:
         """
         return sorted(self._models)
 
+    def register_engine(self, name: str, engine: Any) -> None:
+        """Register an LLM engine that SQL can call with ``AI_GENERATE`` and friends.
+
+        The generative counterpart to `register_model`. An engine is a callable holding an
+        endpoint, credentials and sampling settings — `batcher.ml.http_engine`,
+        `vllm_engine`, `anthropic_engine` or any zero-argument callable returning a
+        ``list[str] -> list[str]`` function — so unlike a model it has no path spelling and
+        must be built in Python and bound to a name here. Putting an endpoint and an API key
+        in query text is the thing this avoids.
+
+        Registering never calls the model; generation happens when a query naming the engine
+        runs.
+
+        Args:
+            name: The SQL name the engine is called by.
+            engine: An `EngineFactory` — a zero-argument callable returning the engine.
+
+        Raises:
+            PlanError: If `name` is not a non-empty string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> shouty = lambda: (lambda prompts: [p.upper() for p in prompts])
+                >>> s.register_engine("shouty", shouty)
+                >>> s.list_engines()
+                ['shouty']
+        """
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"an engine name must be a non-empty string, got {name!r}")
+        self._engines[name] = engine
+        self._bump()
+
+    def list_engines(self) -> list[str]:
+        """The sorted names of all registered engines.
+
+        Returns:
+            The registered engine names, sorted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> s.register_engine("a", lambda: (lambda p: p))
+                >>> s.list_engines()
+                ['a']
+        """
+        return sorted(self._engines)
+
     def list_functions(self) -> list[str]:
         """The sorted names of all registered functions.
 
@@ -511,6 +572,7 @@ class Session:
             ast,
             functions=self._functions,
             models=self._models,
+            engines=self._engines,
             **{**self._tables, **tables},
         )
 
@@ -546,6 +608,7 @@ class Session:
         view._tables = self._tables
         view._functions = self._functions
         view._models = self._models
+        view._engines = self._engines
         view._dialect = dialect
         view._plan_cache = self._plan_cache
         view._generation = self._generation

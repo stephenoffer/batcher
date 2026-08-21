@@ -145,7 +145,15 @@ def load_cpu_utilization(
         return cached[2]
     # The previously learned map (if any) is the smoothing anchor: a refreshed median is
     # blended toward its prior value so a family's grant tracks a stable trend, not noise.
-    prior = cached[2] if cached is not None else {}
+    #
+    # Only a prior of the **same key**, for the reason the key exists. One hub serves several
+    # machine classes across a session (a driver planning for its workers, then for itself),
+    # and these medians are in machine units — anchoring a worker's fresh median to the
+    # driver's previous one hands each the other's measurements, which is exactly what
+    # bucketing per fingerprint is there to prevent. `calibrate._settled` guards its blend the
+    # same way; this one did not, so a driver/worker alternation dragged every family's share
+    # halfway toward the other machine's on every refresh.
+    prior = cached[2] if cached is not None and cached[1] == key else {}
     try:
         out: dict[str, float] = {}
         for tag, rows in hub.op_stats_by_kind(hw_fingerprint).items():

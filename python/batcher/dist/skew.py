@@ -190,13 +190,22 @@ def salting_preserves_result(join: Join, reducer_finalizes: bool) -> bool:
     )
 
 
-def hot_keys_from_column_stats(join: Join, sources, fraction: float, partitions: int) -> list[str]:
+def hot_keys_from_column_stats(
+    join: Join, sources, fraction: float, partitions: int
+) -> tuple[list[str], float]:
     """The join key's hot values as Kyber already measured them — no pass over the data.
 
     Kyber owns the column statistics (Core measures, Kyber decides), so *which values are
     hot* is asked of it rather than re-derived here. Skew is a property of the column, not
     of the query: if one value is 40% of the rows that is true of every join on it,
     including this one's first ever run, so this costs nothing and needs no opt-in.
+
+    The hottest value's **measured share** comes back with the values, because it is what
+    sizes the fan-out and Kyber has it in hand. Returning the values alone made this path
+    substitute `fraction` — the threshold at which a value starts counting as hot — and
+    `salt_factor(0.10, 8)` floors to a fan-out of 2 whatever the real skew is. That is the
+    same defect `resolve_hot_keys` records having fixed on the *detection* path, left
+    standing on the path that fires first and needs no opt-in.
 
     Args:
         join: The join whose key is being examined.
@@ -205,16 +214,17 @@ def hot_keys_from_column_stats(join: Join, sources, fraction: float, partitions:
         partitions: The shuffle's reducer count, which sets how badly a hot key overloads.
 
     Returns:
-        The hot values as strings, or an empty list when nothing is known.
+        `(hot values as strings, the hottest one's measured share)`; `([], 0.0)` when
+        nothing is known.
     """
     try:
         from batcher import kyber
         from batcher.core import default_hub
 
-        return kyber.hot_join_values(join, sources, default_hub(), fraction, partitions)
+        return kyber.hot_join_value_shares(join, sources, default_hub(), fraction, partitions)
     except Exception as exc:  # pragma: no cover - statistics must never break a join
         note_suppressed("dist", "read hot keys from column stats", exc)
-        return []
+        return [], 0.0
 
 
 def resolve_hot_keys(
@@ -271,8 +281,7 @@ def resolve_hot_keys(
     if learned is not None:
         hot, share = learned
     else:
-        hot = hot_keys_from_column_stats(join, sources, fraction, partitions)
-        share = 0.0
+        hot, share = hot_keys_from_column_stats(join, sources, fraction, partitions)
         if not hot and (salt > 0 or _detect_is_worth_it(join, sources)):
             hot, share = detect()
             persist_hot_keys(shape_key, hot, share)
@@ -288,9 +297,11 @@ def resolve_hot_keys(
     # really is. A value holding 40% of a side across 8 reducers needs `ceil(0.40 x 8) = 4`;
     # it was getting 2, which is why the default path still ran ~12.5 s where an explicit
     # `skew_join_salt=8` ran ~1.9 s. The formula was right and its input was the threshold
-    # rather than the measurement. `share` is 0.0 when genuinely unknown (a column-stats hit,
-    # or a learned record written before the share was stored), and then `fraction` is the
-    # only figure available and stands as the conservative floor it always was.
+    # rather than the measurement. `share` is 0.0 only when genuinely unknown — a learned
+    # record written before the share was stored, or a hot set with no frequency behind it —
+    # and then `fraction` is the only figure available and stands as the conservative floor it
+    # always was. The column-statistics path used to land there too, on a measurement it was
+    # already holding; it now carries it.
     return hot, salt if salt > 0 else salt_factor(max(share, fraction), partitions)
 
 

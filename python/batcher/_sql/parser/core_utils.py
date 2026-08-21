@@ -301,7 +301,8 @@ def _source_columns(tr, node, depth: int = 0) -> list[str] | None:
     if depth > _MAX_DERIVED_DEPTH:
         return None
     if isinstance(node, exp.Table):
-        rel = tr._registry.get(node.name)
+        key = tr.registry_key(node.name)
+        rel = None if key is None else tr._registry[key]
         return list(rel.columns) if rel is not None else None
     if isinstance(node, exp.Subquery):
         return _source_columns(tr, node.this, depth + 1)
@@ -336,6 +337,66 @@ def _source_columns(tr, node, depth: int = 0) -> list[str] | None:
             return None
         out.append(name)
     return out or None
+
+
+def _fold_reference_case(node, per_source) -> None:
+    """Rewrite this SELECT's column references to the case its sources store, in place.
+
+    The join disambiguator matches a qualified ``a.col`` against the source's own column
+    list, so a reference typed in another case (``a.I`` against a column ``i``) matched
+    nothing and the rename it needed was never applied — a self-join then failed as
+    "columns can't be enumerated". Folding here, before any of that reads the tree, is
+    what makes case-insensitivity reach the join path as well as the projection.
+
+    Only a name with exactly one case-insensitive match across the sources is rewritten,
+    and only when the exact spelling is absent, so a genuine ``id``/``ID`` pair is left
+    alone.
+
+    Args:
+        node: The `Select` whose own column references are folded.
+        per_source: The `(source, alias, columns)` triples the caller enumerated.
+    """
+    exact: set[str] = set()
+    folded: dict[str, set[str]] = {}
+    for _, _alias, cols in per_source:
+        for c in cols:
+            exact.add(c)
+            folded.setdefault(c.lower(), set()).add(c)
+    if not exact:
+        return
+    for c in node.find_all(exp.Column):
+        if c.find_ancestor(exp.Select) is not node:
+            continue
+        name = c.name
+        if name in exact:
+            continue
+        match = folded.get(name.lower())
+        if match is not None and len(match) == 1:
+            c.this.set("this", next(iter(match)))
+
+
+def _top_level_equalities(on) -> list:
+    """The ``=`` conjuncts of a join's ON that actually become join keys.
+
+    Only an equality reachable through ``AND`` is a key; one buried under an ``OR`` is
+    part of a theta predicate the join cannot merge on. Treating those as keys marked
+    their column "merged, keep its bare name", so both sides of
+    ``ON t.i = u.i OR t.s = u.k`` kept the name ``i`` — and the cross-join-plus-filter
+    lowering then had two columns called ``i`` and refused the query as ambiguous.
+
+    Args:
+        on: The ON condition, or None.
+
+    Returns:
+        The top-level `EQ` conjuncts, in order.
+    """
+    if on is None:
+        return []
+    if isinstance(on, exp.Paren):
+        return _top_level_equalities(on.this)
+    if isinstance(on, exp.And):
+        return _top_level_equalities(on.this) + _top_level_equalities(on.expression)
+    return [on] if isinstance(on, exp.EQ) else []
 
 
 def _disambiguate_columns(tr, node) -> None:
@@ -390,7 +451,7 @@ def _disambiguate_columns(tr, node) -> None:
         protected |= {u.name for u in j.args.get("using") or ()}
         natural = natural or (j.args.get("method") or "").upper() == "NATURAL"
         on = j.args.get("on")
-        for eq in on.find_all(exp.EQ) if on is not None else ():
+        for eq in _top_level_equalities(on):
             a, b = eq.this, eq.expression
             if isinstance(a, exp.Column) and isinstance(b, exp.Column) and a.name == b.name:
                 protected.add(a.name)
@@ -417,6 +478,8 @@ def _disambiguate_columns(tr, node) -> None:
         per_source.append((t, alias, cols))
         for c in set(cols):
             counts[c] = counts.get(c, 0) + 1
+
+    _fold_reference_case(node, per_source)
 
     shared = {c for c, n in counts.items() if n > 1}
     if natural:  # NATURAL merges every shared column; leave them all bare.

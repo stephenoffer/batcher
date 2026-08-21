@@ -211,6 +211,44 @@ None of this changes the answer, only the time. If the key you have is a string,
 The point is to reach for a fixed-width key when one is genuinely available, rather than to
 reshape data around the sort.
 
+### Binary keys
+
+A `binary` column is a first-class sort key and is ordered by the same byte comparison a string
+is, so a hash, a UUID, a checksum, or a key you encoded yourself sorts without being decoded
+first. All three Arrow spellings work and order identically: variable-length `binary` and
+`large_binary`, and fixed-width `binary(n)`.
+
+```python
+import pyarrow as pa
+
+records = pa.table(
+    {
+        "key": pa.array([b"\x02\x00", b"\x00\xff", b"\x01\x7f"], type=pa.binary(2)),
+        "payload": ["c", "a", "b"],
+    }
+)
+print(bt.from_arrow(records).sort("key").to_pydict()["payload"])
+# ['a', 'b', 'c']
+```
+
+Prefer `binary(n)` when your values are genuinely fixed width, for the key and for the payload
+alike. It costs no offset buffer; the engine can prove that a padded comparison of its bytes is
+exact, which a variable-length column holding a zero byte does not allow; and moving it through
+a sort is a fixed-stride copy rather than an offset chase, which is the cheapest gather there
+is.
+
+A binary key distributes like any other: `collect(distributed=True)` range-partitions on sampled
+byte quantiles and each worker sorts its own range, so a sort whose keys are bytes is not capped
+at one machine.
+
+That holds even when the key is badly skewed. A range partition keeps equal keys together, so
+one dominant value would otherwise pin its whole share on a single worker no matter how many you
+add; the engine detects that from the sample and gives the value a bucket of its own, spread
+across several workers. You do not configure it, and it does not change the result.
+
+`examples/relational/sorting_binary_keys.py` works all of this end to end, including null
+placement and the fixed-layout record shape.
+
 ## Sorting large results: spill
 
 A sort that does not fit in the memory budget spills sorted runs to disk and merges
@@ -252,6 +290,8 @@ ds.sort("team", "score").repartition(by="team").write("out/")
 - {doc}`Performance </user-guide/operate/tuning/performance>`: the spill path and the memory budget.
 - {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the run generation and k-way merge
   that make the spilled result identical to the in-memory one.
+- {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`: what happens to a distributed sort as
+  the cluster grows, and how a skewed key is kept from pinning one worker.
 - {doc}`Dataset API </api/relational/dataset>`: the `sort`, `top_k`, and `limit` reference.
 - {doc}`Top k per group </cookbook/analytics/aggregates/top-k-per-group>`: the window recipe, worked
   end to end.

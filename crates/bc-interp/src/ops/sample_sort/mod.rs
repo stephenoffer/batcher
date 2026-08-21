@@ -30,13 +30,23 @@ use arrow::array::{
 };
 use arrow::compute::take;
 use arrow::datatypes::DataType;
+use std::sync::Arc;
+
 use bc_ir::SortKey;
+use bc_runtime::byte_key::is_byte_key;
 use rayon::prelude::*;
 
 mod lowcard;
 
 use crate::error::InterpError;
 
+/// Temporal types whose physical value is a signed integer *whose numeric order is the type's
+/// order*, so the leading-key routing may cast them to `i64` and compare them as integers.
+///
+/// Days since the epoch, milliseconds, microseconds and nanoseconds all order as their integer
+/// value does, in every unit and with or without a time zone — a zone shifts the wall-clock
+/// rendering, never the instant the value encodes, and the routing orders instants.
+///
 /// Two types are deliberately absent, for different reasons, and both are pinned by
 /// `every_admitted_temporal_type_casts_to_i64`.
 ///
@@ -152,11 +162,37 @@ pub(crate) fn parallel_sort_batch(
                 .filter(|b| !b.is_empty())
                 .flat_map(|b| b.chunks(b.len().div_ceil(b.len().div_ceil(fair)).max(1)))
                 .collect();
-            // The rank already carries `descending`, so the bucket order *is* the final
-            // order and nothing may be reversed.
+            // Every output column is the key on the shape this arm exists for
+            // (`SELECT k FROM t ORDER BY k`), and a bucket holds exactly one key value — so
+            // the piece's answer is **one row repeated**, not a gather of its rows.
+            //
+            // That is worth distinguishing because a repeated index is not merely a smaller
+            // gather, it is a different memory access pattern: every read hits the same cache
+            // line and only the writes remain. Measured on `l_shipmode` (6 M rows, seven
+            // distinct values, ~8 bytes each) a single-threaded arrow `take` costs **668.8 ms
+            // scattered against 38.5 ms with a constant index** — 17x, and this arm was
+            // spending essentially all of its time in the scattered one.
+            //
+            // `Arc`-identity again (see `gather_ranges`): the key here is the array
+            // `normalize_sort_key` returned, and only pointer identity proves it was not
+            // rewritten and so still carries the column's stored values.
+            let constant_out = batch.columns().iter().all(|c| Arc::ptr_eq(c, key));
             let sorted: Vec<RecordBatch> = pieces
                 .par_iter()
-                .map(|idx| bc_runtime::shuffle::gather_rows(batch, idx).map_err(InterpError::from))
+                .map(|idx| {
+                    if constant_out {
+                        if let Some(&rep) = idx.first() {
+                            let repeated = UInt32Array::from(vec![rep; idx.len()]);
+                            let columns = batch
+                                .columns()
+                                .iter()
+                                .map(|c| take(c.as_ref(), &repeated, None))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            return Ok(RecordBatch::try_new(batch.schema(), columns)?);
+                        }
+                    }
+                    bc_runtime::shuffle::gather_rows(batch, idx).map_err(InterpError::from)
+                })
                 .collect::<Result<_, InterpError>>()?;
             return Ok(Some(sorted));
         }
@@ -184,57 +220,39 @@ pub(crate) fn parallel_sort_batch(
                 k0.descending,
             )?
         }
-        DataType::Utf8 => {
-            let a = key
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("Utf8 downcast");
-            let Some(b) = sample_boundaries_str(a, parts) else {
+        // Every byte-lexicographic key — text and binary alike — routes through one sampler
+        // and one partitioner. Binary used to fall past this match to its `_` arm, so a
+        // `Binary` `ORDER BY` ran serially however many cores the machine had.
+        dt if is_byte_key(dt) => {
+            let Some(b) = sample_boundaries_bytes(key, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_part_of_str(key, &b, parts, k0.nulls_first, k0.descending)?
-        }
-        DataType::LargeUtf8 => {
-            let a = key
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-                .expect("LargeUtf8 downcast");
-            let Some(b) = sample_boundaries_str(a, parts) else {
-                return Ok(None);
-            };
-            bc_runtime::shuffle::range_part_of_str(key, &b, parts, k0.nulls_first, k0.descending)?
+            bc_runtime::shuffle::range_part_of_bytes(key, &b, parts, k0.nulls_first, k0.descending)?
         }
         dt if dt.is_integer() || is_integer_ordered_temporal(dt) => {
-            // Decline rather than raise if arrow will not widen this key. Every type admitted
-            // above casts today; making the failure a decline means the day one stops, the
-            // query loses the parallel path instead of failing.
-            let Ok(key_i64) = arrow::compute::cast(key, &DataType::Int64) else {
-                return Ok(None);
-            };
             // Routing compares the leading key as i64. That is order-preserving for every
-            // integer width except a `UInt64` value above `i64::MAX`, which the (safe) cast
-            // turns into a null — so it would route by the null bucket (smallest/largest end
-            // by flag) instead of by its true, largest unsigned magnitude. That silently
-            // reorders a descending or nulls-first sort. When the cast loses a value this
-            // way, decline: the caller's serial sort compares `u64` by unsigned order and is
-            // correct. (A `UInt64` column that fits in i64 keeps the parallel fast path.)
-            if key_i64.null_count() > key.null_count() {
-                return Ok(None);
+            // integer width except a `UInt64` value above `i64::MAX`, which has no i64 at all
+            // — routing it as one would place it by a wrapped or nulled value instead of by
+            // its true, largest unsigned magnitude, silently reordering a descending or
+            // nulls-first sort. `UInt64` is therefore checked against the widening cast, which
+            // turns exactly those values into nulls, and declined: the caller's serial sort
+            // compares `u64` by unsigned order and is correct. (A `UInt64` column that fits in
+            // i64 keeps the parallel fast path.) Every other width widens exactly.
+            if matches!(dt, DataType::UInt64) {
+                let Ok(widened) = arrow::compute::cast(key, &DataType::Int64) else {
+                    return Ok(None);
+                };
+                if widened.null_count() > key.null_count() {
+                    return Ok(None);
+                }
             }
-            let keyv = key_i64
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("cast to Int64");
-            let Some(b) = sample_boundaries_i64(keyv, parts) else {
+            // Sampled and routed in the key's **native width** — see
+            // `bc_runtime::shuffle::int_buckets` for why the `Int64` materialization this used
+            // to do was 41% of a two-key sort.
+            let Some(b) = sample_boundaries_int(key, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_part_of_i64(
-                &key_i64,
-                &b,
-                parts,
-                k0.nulls_first,
-                k0.descending,
-            )?
+            bc_runtime::shuffle::range_part_of_i64(key, &b, parts, k0.nulls_first, k0.descending)?
         }
         _ => return Ok(None),
     };
@@ -322,6 +340,40 @@ fn gather_ranges(
     keys: &[SortKey],
     composite_rows: Option<&arrow::row::Rows>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
+    // Which output column *is* one of the sort keys, so the sorted form can be produced from
+    // the key gather this range already paid for instead of gathering the column a second time.
+    //
+    // The general arm below gathers each range's key columns to sort them, and then gathers the
+    // payload. When a key column is also an output column — `ORDER BY k` selecting `k` — that
+    // column is gathered **twice out of the whole relation**, and both gathers are the random
+    // access a sort's permutation implies. It is invisible on a wide payload (one extra column
+    // among many) and it is the dominant cost on a narrow one, which is exactly where this
+    // operator loses: measured on a 6 M-row `ORDER BY` of a single `int64`, Batcher pays a
+    // fixed ~16 ms against DuckDB's ~7 ms while *beating* DuckDB per additional payload column
+    // (5.4 ms/col against 9.6 ms/col). Re-gathering the key is a large part of that fixed cost.
+    //
+    // Matched by `Arc` identity rather than by name or expression, and that is a correctness
+    // requirement rather than a shortcut. `key_arrays` holds keys put through
+    // `normalize_sort_key`, which canonicalizes `-0.0` to `0.0` and quiets `NaN` so routing and
+    // per-range sorting rank a float the same way. Those are *ordering* equivalences, not value
+    // equivalences: emitting a normalized key as the output column would turn a stored `-0.0`
+    // into `0.0` and a signalling `NaN` into a quiet one. `canon_float_array` returns the same
+    // `Arc` when it rewrites nothing, so pointer identity says precisely "this array was not
+    // rewritten", which is the only case where reuse is value-preserving.
+    let reuse: Vec<Option<usize>> = batch
+        .columns()
+        .iter()
+        .map(|col| key_arrays.iter().position(|k| Arc::ptr_eq(k, col)))
+        .collect();
+    // **Every** column, not merely some. Reuse pays by removing the whole-relation gather, and
+    // it only removes it when nothing is left behind to gather: a range then produces its output
+    // entirely from key arrays it has already materialized, and the `global` index composition
+    // is not needed either. Applied to a *partial* match it merely swaps one column's random
+    // gather for a local one while the rest still pay the full pass, and that measured a **9.9%
+    // regression** on a four-column sort keyed on two of them (`op-sort-multikey-wide`, 127.4 ms
+    // -> 140.0 ms interleaved) against a 5.6-7.9% gain on the shapes where the payload is
+    // exactly the keys. So the gate is all-or-nothing.
+    let reuse_all = reuse.iter().all(Option::is_some);
     ranges
         .par_iter()
         .map(|range| -> Result<RecordBatch, InterpError> {
@@ -348,8 +400,23 @@ fn gather_ranges(
                 .map(|a| take(a.as_ref(), &take_idx, None))
                 .collect::<Result<_, _>>()?;
             let local = super::sort_indices_of(&range_keys, keys)?;
-            let global: Vec<u32> = local.values().iter().map(|&l| idx[l as usize]).collect();
-            Ok(bc_runtime::shuffle::gather_rows(batch, &global)?)
+            if !reuse_all {
+                let global: Vec<u32> = local.values().iter().map(|&l| idx[l as usize]).collect();
+                return Ok(bc_runtime::shuffle::gather_rows(batch, &global)?);
+            }
+            // Every column permutes the range's own key gather — a few tens of thousands of
+            // rows, cache-resident — so the whole-relation gather does not happen at all.
+            let columns: Vec<ArrayRef> = reuse
+                .iter()
+                .map(|m| {
+                    take(
+                        range_keys[m.expect("all-or-nothing gate")].as_ref(),
+                        &local,
+                        None,
+                    )
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(RecordBatch::try_new(batch.schema(), columns)?)
         })
         .collect()
 }
@@ -548,6 +615,76 @@ fn sample_boundaries_f64(key: &arrow::array::Float64Array, parts: usize) -> Opti
 
 /// Sample `parts-1` ascending i64 quantile boundaries from an integer key column (the
 /// exact-integer analog of [`sample_boundaries_f64`]). `None` if too few non-null values.
+/// [`sample_boundaries_i64`] over any fixed-width integer or integer-ordered temporal key,
+/// read in its **native width** so the column is never materialized as `Int64` to be sampled.
+///
+/// Widening one sampled value costs a register move; widening the column costs a pass over it,
+/// and the sample only ever reads `SAMPLE_TARGET` of the rows.
+fn sample_boundaries_int(key: &ArrayRef, parts: usize) -> Option<Vec<i64>> {
+    macro_rules! sample {
+        ($arr:ty) => {{
+            let a = key.as_any().downcast_ref::<$arr>()?;
+            let n = a.len();
+            let target = SAMPLE_TARGET.min(n).max(parts);
+            let stride = (n / target).max(1);
+            let mut s: Vec<i64> = (0..n)
+                .step_by(stride)
+                .filter(|&i| a.is_valid(i))
+                .map(|i| a.value(i) as i64)
+                .collect();
+            if s.len() < parts {
+                return None;
+            }
+            s.sort_unstable();
+            let m = s.len();
+            return Some((1..parts).map(|j| s[(j * m / parts).min(m - 1)]).collect());
+        }};
+    }
+    use arrow::datatypes::TimeUnit;
+    match key.data_type() {
+        DataType::Int8 => sample!(arrow::array::Int8Array),
+        DataType::Int16 => sample!(arrow::array::Int16Array),
+        DataType::Int32 => sample!(arrow::array::Int32Array),
+        DataType::Int64 => sample!(arrow::array::Int64Array),
+        DataType::UInt8 => sample!(arrow::array::UInt8Array),
+        DataType::UInt16 => sample!(arrow::array::UInt16Array),
+        DataType::UInt32 => sample!(arrow::array::UInt32Array),
+        DataType::Date32 => sample!(arrow::array::Date32Array),
+        DataType::Date64 => sample!(arrow::array::Date64Array),
+        DataType::Time32(TimeUnit::Second) => sample!(arrow::array::Time32SecondArray),
+        DataType::Time32(TimeUnit::Millisecond) => sample!(arrow::array::Time32MillisecondArray),
+        DataType::Time64(TimeUnit::Microsecond) => sample!(arrow::array::Time64MicrosecondArray),
+        DataType::Time64(TimeUnit::Nanosecond) => sample!(arrow::array::Time64NanosecondArray),
+        DataType::Timestamp(TimeUnit::Second, _) => sample!(arrow::array::TimestampSecondArray),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            sample!(arrow::array::TimestampMillisecondArray)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            sample!(arrow::array::TimestampMicrosecondArray)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            sample!(arrow::array::TimestampNanosecondArray)
+        }
+        DataType::Duration(TimeUnit::Second) => sample!(arrow::array::DurationSecondArray),
+        DataType::Duration(TimeUnit::Millisecond) => {
+            sample!(arrow::array::DurationMillisecondArray)
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            sample!(arrow::array::DurationMicrosecondArray)
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => sample!(arrow::array::DurationNanosecondArray),
+        // `UInt64` (and anything new) still goes through the widening cast, which the caller
+        // has already proved lossless for this column.
+        _ => {
+            let widened = arrow::compute::cast(key, &DataType::Int64).ok()?;
+            let a = widened
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()?;
+            sample_boundaries_i64(a, parts)
+        }
+    }
+}
+
 fn sample_boundaries_i64(key: &arrow::array::Int64Array, parts: usize) -> Option<Vec<i64>> {
     let n = key.len();
     let target = SAMPLE_TARGET.min(n).max(parts);
@@ -569,32 +706,36 @@ fn sample_boundaries_i64(key: &arrow::array::Int64Array, parts: usize) -> Option
     )
 }
 
-/// Sample `parts-1` ascending string quantile boundaries, compared byte-lexicographically
-/// (Rust's `str` `Ord`), which is exactly how arrow orders a `Utf8` column.
+/// Sample `parts-1` ascending quantile boundaries of a **byte-lexicographic** key —
+/// `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary` — compared by its bytes,
+/// which is exactly how arrow orders all five.
 ///
-/// Returns `None` when there are too few non-null values to split, or when the sample is
-/// so skewed that the boundaries collapse to a single distinct value — in that case every
-/// row would route to one bucket and the sample-sort would be pure overhead, so the caller
-/// falls back to the serial sort.
-fn sample_boundaries_str<O: OffsetSizeTrait>(
-    key: &GenericStringArray<O>,
-    parts: usize,
-) -> Option<Vec<String>> {
-    let n = key.len();
+/// Returns `None` when the key is not a byte key, when there are too few non-null values to
+/// split, or when the sample is so skewed that the boundaries collapse to a single distinct
+/// value — in that case every row would route to one bucket and the sample-sort would be pure
+/// overhead, so the caller falls back to the serial sort.
+fn sample_boundaries_bytes(key: &ArrayRef, parts: usize) -> Option<Vec<Vec<u8>>> {
+    // Imported here rather than at module scope: `ByteKeys` names `len`/`is_null`, which every
+    // concrete arrow array also has through `Array`, and bringing both into scope makes those
+    // calls ambiguous everywhere else in this file.
+    use bc_runtime::byte_key::{ByteKeyColumn, ByteKeys};
+
+    let keys = ByteKeyColumn::new(key)?;
+    let n = keys.len();
     let target = SAMPLE_TARGET.min(n).max(parts);
     let stride = (n / target).max(1);
-    let mut sample: Vec<&str> = (0..n)
+    let mut sample: Vec<&[u8]> = (0..n)
         .step_by(stride)
-        .filter(|&i| key.is_valid(i))
-        .map(|i| key.value(i))
+        .filter(|&i| !keys.is_null(i))
+        .map(|i| keys.key(i))
         .collect();
     if sample.len() < parts {
         return None;
     }
     sample.sort_unstable();
     let m = sample.len();
-    let bounds: Vec<String> = (1..parts)
-        .map(|j| sample[(j * m / parts).min(m - 1)].to_string())
+    let bounds: Vec<Vec<u8>> = (1..parts)
+        .map(|j| sample[(j * m / parts).min(m - 1)].to_vec())
         .collect();
     if bounds.first() == bounds.last() {
         return None;
@@ -1170,6 +1311,68 @@ mod tests {
     /// [`oversized_constant_ranges_are_actually_split`] is the machine-independent proof that
     /// the splitting itself is exercised; without it, a low-core CI box would run this test
     /// green while never touching the code it was written for.
+    /// A **low-cardinality binary** key must take the ranked path too, and produce the
+    /// serial relation.
+    ///
+    /// This is the shape the ranked path exists for wearing a different type: a category, an
+    /// enum, a fixed-width code someone stored as bytes. While `rank_part_of` matched `Utf8`
+    /// alone it fell through to the quantile routing, which is the wrong algorithm for a
+    /// handful of distinct values — every row binary-searches duplicate boundaries and the
+    /// proof pass then reads every row of every oversized bucket.
+    ///
+    /// Asserting the ranked path is *taken* is what makes this more than a duplicate of the
+    /// string case: without it the test passes just as happily through the fallback.
+    #[test]
+    fn a_low_cardinality_binary_key_ranks_and_matches_serial() {
+        use arrow::array::FixedSizeBinaryArray;
+
+        let n = 1 << 19;
+        let codes: Vec<[u8; 4]> = (0..7u8).map(|c| [c, 0xff, c, 0x01]).collect();
+        for with_nulls in [false, true] {
+            let vals: Vec<Option<Vec<u8>>> = (0..n)
+                .map(|i| {
+                    (!(with_nulls && i % 11 == 0))
+                        .then(|| codes[(i * 7 + i / 5) % codes.len()].to_vec())
+                })
+                .collect();
+            let key_col: ArrayRef = Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(vals.into_iter(), 4)
+                    .expect("uniform width"),
+            );
+            let b = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("s", key_col.data_type().clone(), true),
+                    Field::new("v", DataType::Int64, false),
+                ])),
+                vec![
+                    key_col.clone(),
+                    Arc::new(arrow::array::Int64Array::from(
+                        (0..n as i64).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            for descending in [false, true] {
+                for nulls_first in [false, true] {
+                    assert!(
+                        lowcard::rank_part_of(&key_col, descending, nulls_first).is_some(),
+                        "seven distinct byte values must reach the ranked path"
+                    );
+                    let keys = key(descending, nulls_first);
+                    let want = sort_batch(&b, &keys, None).unwrap();
+                    let ranges = parallel_sort_batch(&b, &keys, None)
+                        .unwrap()
+                        .expect("sample-sort should engage on a 512 K-row binary key");
+                    assert_eq!(
+                        want,
+                        concat_ranges(&b.schema(), ranges),
+                        "nulls={with_nulls} desc={descending} nulls_first={nulls_first}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_split_low_cardinality_string_key_matches_serial() {
         let n = 1 << 19;
@@ -1306,5 +1509,62 @@ mod tests {
                 assert_matches_serial(&b, &key(descending, nulls_first));
             }
         }
+    }
+
+    /// A float sort key that is also an output column keeps its **stored** value.
+    ///
+    /// `gather_ranges` may produce an output column from the key gather it already paid for,
+    /// which is only sound when that key array is the batch's own column. `key_arrays` holds
+    /// keys put through `normalize_sort_key`, and for a float that rewrites `-0.0` to `0.0` so
+    /// routing and the per-range sort agree on where a signed zero ranks. Reusing the rewritten
+    /// array would order the rows correctly and hand back the wrong *values* — a defect a
+    /// multiset comparison of the sorted output cannot see, because `-0.0 == 0.0`.
+    #[test]
+    fn a_reused_float_key_column_keeps_its_signed_zero() {
+        let n = super::PARALLEL_SORT_MIN_ROWS * 2;
+        // Alternating -0.0 / 0.0 with a spread of other values, so the sample-sort engages.
+        let vals: Vec<f64> = (0..n)
+            .map(|i| match i % 4 {
+                0 => -0.0f64,
+                1 => 0.0f64,
+                2 => -(i as f64),
+                _ => i as f64,
+            })
+            .collect();
+        let negative_zeros = vals
+            .iter()
+            .filter(|v| v.is_sign_negative() && **v == 0.0)
+            .count();
+        assert!(negative_zeros > 0, "fixture must contain -0.0");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+        let col: ArrayRef = Arc::new(arrow::array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let keys = vec![SortKey {
+            expr: Expr::Col { name: "f".into() },
+            descending: false,
+            nulls_first: false,
+        }];
+
+        let ranges = parallel_sort_batch(&batch, &keys, None)
+            .unwrap()
+            .expect("a float key above the row floor takes the parallel path");
+        let got = concat_ranges(&schema, ranges);
+        let out = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+
+        let kept = (0..out.len())
+            .filter(|&i| out.value(i).is_sign_negative() && out.value(i) == 0.0)
+            .count();
+        assert_eq!(
+            kept, negative_zeros,
+            "the sort must not rewrite -0.0 to 0.0 on its way out"
+        );
+        // And it is still the answer the sequential oracle gives.
+        let want = sort_batch(&batch, &keys, None).unwrap();
+        assert_eq!(got, want);
     }
 }

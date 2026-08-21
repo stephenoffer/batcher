@@ -45,7 +45,8 @@ _MISSING = object()
 # one namespace *per source path*, so a session that reads thousands of distinct files would
 # otherwise retain every one of their decoded blobs — bounds, blooms, and quantile grids
 # included — for the life of the process. The cap sits well above the working set of any
-# single query and evicts in insertion order, so what a served query re-reads stays warm.
+# single query and evicts least-recently-used (`_generation` moves a namespace to the end of
+# the roster on every touch), so what a served query re-reads stays warm.
 _NAMESPACE_CACHE_MAX = 256
 
 
@@ -283,8 +284,19 @@ class LearnedParams:
         Registration is what lets `_bound` see a namespace that has only ever been *read*:
         the counter is the roster the eviction walks, so a namespace that entered a view
         without one would be invisible to the bound and retained forever.
+
+        Touching also moves the namespace to the **end** of that roster, which is what makes
+        the eviction least-recently-*used* rather than first-registered. The distinction is
+        not cosmetic: source statistics take one namespace per source path, so a session
+        reading a few hundred files pushes the roster past its bound — and the namespaces
+        registered earliest are the fixed ones every query reads (`kyber.stats`, which holds
+        the column tables, and `kyber.calibration`). Evicting in registration order threw
+        those out first and made the next query re-scan and re-parse the largest blob in the
+        store, which is the opposite of what the cache is for.
         """
-        return self._generations.setdefault(namespace, 0)
+        generation = self._generations.pop(namespace, 0)
+        self._generations[namespace] = generation
+        return generation
 
     def _bound(self) -> None:
         """Evict the oldest cached namespaces once more than `_NAMESPACE_CACHE_MAX` are held.

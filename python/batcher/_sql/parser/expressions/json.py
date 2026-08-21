@@ -1,10 +1,13 @@
 """SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection.
 
-Every SQL JSON *extraction* form lowers to the one ``.json.extract_string`` accessor: it
-reads the value at a path as text (scalars verbatim, objects/arrays as compact JSON), and a
-surrounding ``CAST`` supplies numeric/boolean typing — the ``CAST(json_extract(...) AS
-BIGINT)`` idiom. This keeps a single JSON path in the engine (the Rust ``.json`` kernel)
-behind both the SQL and the DataFrame surfaces.
+SQL has *two* extraction forms and they differ on two leaf kinds: ``json_extract`` / ``->``
+report the value **as JSON text** (a string keeps its quotes, a JSON null is the token
+``null``), while ``json_extract_string`` / ``->>`` unquote the string and report a JSON null
+as SQL NULL. Lowering both to the unquoting accessor — which is what this used to do —
+answered ``json_extract('{"a":"x"}', '$.a')`` with ``x`` instead of ``"x"``, and collapsed
+"the key is absent" and "the key is present and null" into one answer. A surrounding
+``CAST`` supplies numeric/boolean typing either way (the ``CAST(json_extract(...) AS
+BIGINT)`` idiom).
 
 The *inspection* functions (``json_valid``, ``json_exists``, ``json_keys``,
 ``json_array_length``) go through the same accessor family. ``json_type`` is deliberately
@@ -45,12 +48,25 @@ def json_path(node) -> str:
 
 
 def json_extract(tr, node) -> Expr:
-    """``json_extract`` / ``json_extract_string`` / ``->`` / ``->>`` → ``.json.extract_string``.
+    """``json_extract`` / ``->`` / ``json_extract_string`` / ``->>`` → the right accessor.
 
-    Every form returns the value at the path as text; a surrounding ``CAST`` supplies the
-    numeric/boolean typing when the caller wants it.
+    sqlglot separates the two: ``JSONExtract`` is the JSON-text form and
+    ``JSONExtractScalar`` the unquoting one. The difference shows only on a string leaf
+    (quotes) and a JSON null (token vs SQL NULL), which is what made it invisible.
+
+    Args:
+        tr: The translator.
+        node: The `JSONExtract` or `JSONExtractScalar` node.
+
+    Returns:
+        The extraction expression.
     """
-    return tr._scalar(node.this).json.extract_string(json_path(node.expression))
+    from batcher.plan.expr_ir import StrFunc
+
+    doc, path = tr._scalar(node.this), json_path(node.expression)
+    if isinstance(node, exp.JSONExtractScalar):
+        return doc.json.extract_string(path)
+    return StrFunc("json_extract", doc, pattern=path)
 
 
 # `f(doc[, path])` → the `.json` accessor of the same shape. The path defaults to the
@@ -72,6 +88,17 @@ def json_function(tr, node) -> Expr | None:
     Handles both the typed node sqlglot promotes (``JSONKeys``) and the names it leaves
     anonymous (``json_valid``, ``json_exists``, ``json_array_length``).
     """
+    if isinstance(node, exp.JSONType):
+        # A refusal with a reason, not a node-type error: DuckDB names the *SQL* type the
+        # value would cast to (`UBIGINT`, `VARCHAR`) where the engine's `.json.type_of`
+        # names the *JSON* type (`number`, `string`). Answering one with the other returns
+        # a plausible string for a different question.
+        raise NotImplementedError(
+            "json_type() is not supported: DuckDB reports the SQL type a value would cast "
+            "to (UBIGINT, VARCHAR), which is not the JSON type the engine's accessor "
+            "reports (number, string). Use json_valid() to test parseability, or cast the "
+            "extracted value to the type you expect"
+        )
     if isinstance(node, exp.JSONKeys):
         doc = tr._scalar(node.this)
         path = node.args.get("expression")

@@ -482,6 +482,38 @@ def _dtype_name(to) -> str:
     raise NotImplementedError(f"CAST to {to.sql()} is not supported; Batcher has no dtype for it")
 
 
+def _sql_int_div(tr, a: Expr, b: Expr) -> Expr:
+    """SQL ``//`` (and its ``divide()`` spelling), which is two operators under one symbol.
+
+    On **integers** it is division truncating toward zero (`divide(-7, 2)` is -3), NULL on a
+    zero divisor. On **floating** operands DuckDB does not round at all — `7.0 // 2.0` is
+    `3.5` — while still answering NULL rather than `inf` when the divisor is zero. Applying
+    the integer rule to a float pair returned `3.0`, a silently different number.
+
+    The operand types decide, and they are read from the control plane's own static
+    inference; when it cannot state one (an opaque sub-expression), the integer rule stands,
+    which is what the operator means on the types SQL most often applies it to.
+
+    Args:
+        tr: The translator, for the in-scope schema.
+        a: The dividend.
+        b: The divisor.
+
+    Returns:
+        The quotient expression.
+    """
+    import pyarrow as pa
+
+    from batcher.plan.expr_ir.constructors import nullif
+
+    types = [tr.expr_type(a), tr.expr_type(b)]
+    if any(t is not None and pa.types.is_floating(t) for t in types):
+        # `a / b` already propagates nulls; only the zero divisor needs a guard, and
+        # `nullif(b, 0)` supplies it without evaluating the quotient twice.
+        return a / nullif(b, lit(0.0))
+    return _trunc_div(a, b)
+
+
 def _trunc_div(a: Expr, b: Expr) -> Expr:
     """SQL `//` — integer division truncating *toward zero*, built on the engine's floor.
 
@@ -515,6 +547,8 @@ def _build_binops():
         exp.Div: lambda a, b: a / b,
         # SQL `//` is integer division that truncates *toward zero* (DuckDB/C
         # semantics), not Python's floor: `-7 // 3` is `-2`, not `-3`.
+        # `//` is type-dependent; the wrapper is applied at the call site, which has the
+        # translator. This entry is the integer reading, kept so the table stays total.
         exp.IntDiv: _trunc_div,
         exp.Pow: lambda a, b: a**b,  # SQL `^` / power() / `**`
         exp.Mod: lambda a, b: a % b,

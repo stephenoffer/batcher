@@ -146,16 +146,41 @@ def _is_plain_column(node) -> bool:
 def _reject_correlated(select_node) -> None:
     """Raise if `select_node` references a table outside its own FROM/JOINs.
 
-    A correlated subquery refers to a column qualified by an *outer* table.
-    We approximate correlation by collecting the table names and aliases the
-    subquery introduces and flagging any qualified column outside that set.
-    Unqualified columns are assumed local (we cannot resolve them otherwise).
+    This is the **safety net** under every rewrite in this package, and the last thing
+    between an unrecognized correlation and a wrong answer. Each rewrite pulls the
+    correlations it understands out of the inner `WHERE` and hands the remainder to the
+    inner relation as local predicates; anything still reaching outward at that point is a
+    shape nobody handled, and running it would silently resolve the outer name against the
+    inner relation instead of refusing.
+
+    Correlation is approximated by collecting the names the subquery introduces and
+    flagging any qualified column outside that set. Unqualified columns are assumed local
+    (they cannot be resolved otherwise).
+
+    **An aliased table contributes only its alias.** SQL scoping shadows the base name:
+    inside ``FROM orders o`` the name ``orders`` is not in scope, so a reference to it is
+    an outer one. Adding the base name as well — which this did — made the net miss exactly
+    the case where the inner query aliases the *same table the outer query reads*, which is
+    the commonest correlated-subquery shape there is:
+
+        SELECT k FROM a WHERE EXISTS (SELECT 1 FROM a u WHERE u.v = a.v + 1)
+
+    `a.v` is an outer reference, and it was classified local because the inner `FROM a u`
+    contributed ``a``. The predicate then became ``u.v = u.v + 1``, always false, and the
+    query returned **no rows** where it should have returned five — no error, nothing in
+    the plan to look at. With the outer query *aliased* (``FROM a x``) the same query was
+    correctly refused, so the defect was invisible to anyone who writes aliases. This is
+    the rule `_local_tables` already applies twenty lines above, for the same reason.
+
+    Args:
+        select_node: The inner SELECT, already detached from the outer AST.
+
+    Raises:
+        NotImplementedError: If any column names a table this SELECT does not introduce.
     """
     local: set[str] = set()
     for t in select_node.find_all(exp.Table):
-        local.add(t.name)
-        if t.alias:
-            local.add(t.alias)
+        local.add(t.alias or t.name)
     for sub in select_node.find_all(exp.Subquery):
         if sub.alias:
             local.add(sub.alias)
@@ -163,4 +188,11 @@ def _reject_correlated(select_node) -> None:
     for c in select_node.find_all(exp.Column):
         tbl = c.table
         if tbl and tbl not in local:
-            raise NotImplementedError("correlated subqueries not supported")
+            raise NotImplementedError(
+                f"correlated subquery: {tbl}.{c.name} reaches outside the subquery, which "
+                f"introduces {sorted(local) or 'no tables'}. Batcher decorrelates an "
+                "equality between two plain columns (EXISTS/IN/scalar); a correlation "
+                "through an expression (outer.c + 1, a function call) is not one, and is "
+                "refused rather than answered wrongly. Rewrite it as an explicit join, or "
+                "compute the expression as a column of the outer query first."
+            )

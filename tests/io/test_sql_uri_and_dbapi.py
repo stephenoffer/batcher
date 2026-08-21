@@ -355,8 +355,16 @@ def test_dbapi_applies_projection(db) -> None:
 
 
 def test_dbapi_split_carries_the_pushdown_and_is_picklable(db) -> None:
+    """Identifiers are delimited now that the source can name its dialect.
+
+    Unquoted, three ordinary column names break: a reserved word (``order``, ``key``), a
+    name holding a space (which parses as a column *aliased* to the second word, returning
+    the wrong column under the right name), and an unaliased aggregate from a user's own
+    query. Every other SQL connector already quoted; this one could not until `dialect`
+    existed, and passed the delimiter through to `range_predicates` too.
+    """
     split = _source(db, table="ev").splits(predicate=_COUNTRY_IS_US, projection=["id"])[0]
-    assert "WHERE country = 'US'" in split.sql
+    assert "WHERE \"country\" = 'US'" in split.sql
     assert pickle.loads(pickle.dumps(split)).identity() == split.identity()
 
 
@@ -646,7 +654,7 @@ def test_partition_fragment_is_parenthesized_against_the_predicate(skewed_db) ->
         num_partitions=2,
     )
     sql = source.splits(predicate=_COUNTRY_IS_US)[0].sql
-    assert "(country = 'US') AND (id < 50.0 OR id IS NULL)" in sql
+    assert '("country" = \'US\') AND ("id" < 50.0 OR "id" IS NULL)' in sql
 
 
 def test_partition_on_requires_bounds() -> None:
@@ -666,8 +674,8 @@ def test_adbc_range_partitions_when_the_driver_cannot(skewed_db) -> None:
     )
     fragments = [split.sql for split in source.splits()]
     assert len(fragments) == 4
-    assert "id < 25.0 OR id IS NULL" in fragments[0]
-    assert "id >= 75.0" in fragments[-1]
+    assert '"id" < 25.0 OR "id" IS NULL' in fragments[0]
+    assert '"id" >= 75.0' in fragments[-1]
 
 
 def test_range_predicates_cover_every_row_exactly_once() -> None:
@@ -931,8 +939,8 @@ def test_a_direct_read_still_pushes_the_predicate_down(skewed_db) -> None:
         num_partitions=4,
     )
     sql = adbc._direct_splits(_COUNTRY_IS_US, ["id"])[0].sql
-    assert "WHERE country = 'US'" in sql
-    assert "SELECT id" in sql
+    assert "WHERE \"country\" = 'US'" in sql
+    assert 'SELECT "id"' in sql
 
 
 def test_every_partitionable_connector_spells_it_the_same_way() -> None:

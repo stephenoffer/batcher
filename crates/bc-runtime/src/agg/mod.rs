@@ -28,6 +28,7 @@ use crate::error::RuntimeError;
 mod accum;
 mod argextreme;
 mod dispatch;
+mod inputs;
 
 // The per-function dispatch lives in its own module; `finalize` is re-exported so every
 // caller's `agg::finalize(..)` is unchanged by the move, and `accumulate` is reachable as
@@ -39,11 +40,25 @@ mod distinct;
 mod distinct_on;
 mod fused;
 mod group;
-mod median;
+pub(crate) mod median;
 mod sketch;
 pub mod spill;
 mod stats;
 mod var;
+
+/// The 128-bit sum state an integer `Mean` accumulates into: `Decimal128(38, 0)` *is* an
+/// `i128`, so reusing it makes an exact AVG a wider *accumulator* rather than a new state
+/// type to thread through partial/fused/combine/spill/distributed.
+///
+/// 38 digits holds any `i64` sum: the widest possible is `2^63 · 2^63 = 2^126 ≈ 8.5e37`.
+///
+/// **The state is 128-bit; the input is not widened to reach it.** `accum::sum_acc` and
+/// `fused` accumulate an `Int64` column straight into `i128` group slots. Casting the whole
+/// column first — which is what this used to do — allocated and wrote 16 bytes per row to
+/// read 8, and then paid `Decimal128`'s scatter (a validity branch, a `checked_add` and a
+/// `valid[g]` write per row) where the integer path has a branch-free no-null form. On
+/// `AVG` over three 10M-row integer columns that widening was most of the query.
+pub(crate) const MEAN_INT_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
 
 use accum::{
     bitfold_acc, bool_acc, concat_col, kahan_acc, minmax_acc, product_acc, require, sum_acc,
@@ -313,11 +328,11 @@ pub fn partial(
     // need no such step — `assign_groups` routes a dictionary key through arrow's
     // `RowConverter`, which encodes it natively. Identity (no realloc) when no input is a
     // dictionary, so the common case pays only one `data_type()` check per call.
-    let decoded = decode_dict_call_inputs(calls)?;
+    let decoded = inputs::decode_dict_call_inputs(calls)?;
     let calls = decoded.as_deref().unwrap_or(calls);
-    let denulled = coerce_null_call_inputs(calls)?;
-    let calls = denulled.as_deref().unwrap_or(calls);
-    let widened = widen_mean_inputs(calls)?;
+    let normalized = inputs::normalize_call_inputs(calls)?;
+    let calls = normalized.as_deref().unwrap_or(calls);
+    let widened = inputs::widen_mean_inputs(calls)?;
     let calls = widened.as_deref().unwrap_or(calls);
     // Global aggregate (no GROUP BY): every row is one group, so each aggregate's partial
     // state is the whole-column reduction — computable with arrow's SIMD kernels and, for
@@ -350,134 +365,6 @@ pub fn partial(
         group_columns,
         states,
     })
-}
-
-/// Decode any dictionary-encoded value/ordering-key input to its plain value type,
-/// returning a fresh call list only when some input was a dictionary (else `None`, so the
-/// common non-dictionary path allocates nothing). Keeps the typed accumulator kernels
-/// oblivious to dictionary encoding, mirroring the scalar `decode_dict` at the `Col` leaf.
-fn decode_dict_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    let is_dict = |a: &Option<ArrayRef>| {
-        matches!(
-            a.as_ref().map(|x| x.data_type()),
-            Some(DataType::Dictionary(..))
-        )
-    };
-    if !calls.iter().any(|c| is_dict(&c.values) || is_dict(&c.key)) {
-        return Ok(None);
-    }
-    let decode = |a: &Option<ArrayRef>| -> Result<Option<ArrayRef>, RuntimeError> {
-        match a {
-            Some(arr) => match arr.data_type() {
-                DataType::Dictionary(_, v) => Ok(Some(arrow::compute::cast(arr, v)?)),
-                _ => Ok(Some(arr.clone())),
-            },
-            None => Ok(None),
-        }
-    };
-    let out = calls
-        .iter()
-        .map(|c| {
-            Ok(AggCall {
-                func: c.func,
-                values: decode(&c.values)?,
-                key: decode(&c.key)?,
-            })
-        })
-        .collect::<Result<Vec<_>, RuntimeError>>()?;
-    Ok(Some(out))
-}
-
-/// The 128-bit sum state an integer `Mean` accumulates into: `Decimal128(38, 0)` *is* an
-/// `i128`, so reusing it makes an exact AVG a wider *accumulator* rather than a new state
-/// type to thread through partial/fused/combine/spill/distributed.
-///
-/// 38 digits holds any `i64` sum: the widest possible is `2^63 · 2^63 = 2^126 ≈ 8.5e37`.
-///
-/// **The state is 128-bit; the input is not widened to reach it.** `accum::sum_acc` and
-/// `fused` accumulate an `Int64` column straight into `i128` group slots. Casting the whole
-/// column first — which is what this used to do — allocated and wrote 16 bytes per row to
-/// read 8, and then paid `Decimal128`'s scatter (a validity branch, a `checked_add` and a
-/// `valid[g]` write per row) where the integer path has a branch-free no-null form. On
-/// `AVG` over three 10M-row integer columns that widening was most of the query.
-pub(crate) const MEAN_INT_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
-
-/// Widen every `Mean` call's Decimal128/Decimal256 input to Float64. Returns a fresh call
-/// list only when some widening happened (else `None`, so the common path allocates nothing).
-///
-/// **An integer `Mean` sums exactly, and is deliberately *not* widened here.** Accumulating
-/// in Float64 is only lossless while every partial sum stays under 2^53, and an `i64` column
-/// routinely is not: `AVG` over `[-1, 2^62, -2^62, 2, -3, 0]` returned `-1/6` (or `0`,
-/// depending on the order the groups were reduced in) where the true mean is `-2/6`. The
-/// values were exactly representable — the *running sum* was not, so each large addend
-/// swallowed the small ones. That is a wrong answer, not a rounding difference, and it is
-/// silent: a column of IDs, nanosecond timestamps or cents hits it at ordinary magnitudes.
-/// DuckDB sums into a HUGEINT for exactly this reason. Batcher does too, but in the
-/// accumulator rather than in the input — see [`MEAN_INT_ACCUMULATOR`]. `finalize_mean`
-/// divides the exact sum by the count in f64, so only the final division rounds.
-///
-/// Decimal *is* widened to Float64: its sums are already exact in `sum_acc`, but they carry
-/// the *input's* declared precision, which a sum can exceed — and `avg` returns DOUBLE in
-/// DuckDB either way, so the promotion costs nothing a decimal AVG could have kept.
-fn widen_mean_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    // The accumulator each widened type takes, or `None` for a type that stays as it is.
-    let target = |c: &AggCall| -> Option<DataType> {
-        if c.func != AggFunc::Mean {
-            return None;
-        }
-        match c.values.as_ref()?.data_type() {
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Some(DataType::Float64),
-            _ => None,
-        }
-    };
-    if !calls.iter().any(|c| target(c).is_some()) {
-        return Ok(None);
-    }
-    let mut out = Vec::with_capacity(calls.len());
-    for c in calls {
-        let values = match target(c) {
-            Some(dt) => Some(arrow::compute::cast(c.values.as_ref().unwrap(), &dt)?),
-            None => c.values.clone(),
-        };
-        out.push(AggCall::with_key(c.func, values, c.key.clone()));
-    }
-    Ok(Some(out))
-}
-
-/// Coerce any `Null`-typed value/ordering input to an all-null `Int64` column, returning a
-/// fresh call list only when some coercion happened (else `None`, so the common path allocates
-/// nothing). A column that is entirely null carries Arrow's `Null` data type, which the typed
-/// accumulator kernels reject ("aggregate `sum` is not supported for column type Null") — so
-/// `SUM`/`MIN`/`MAX`/`AVG` over an all-null column *errored* where DuckDB returns NULL, and
-/// `COUNT` over it counted every row instead of 0. An all-null `Int64` array flows through
-/// every kernel correctly (sum/min/max/mean → NULL; count of non-null → 0), and the exact
-/// result type is immaterial since the value is null. Runs before [`widen_mean_inputs`] so a
-/// `Null` `AVG` input becomes `Int64` here, then Float64 there.
-fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    let is_null =
-        |a: &Option<ArrayRef>| matches!(a.as_ref().map(|x| x.data_type()), Some(DataType::Null));
-    if !calls.iter().any(|c| is_null(&c.values) || is_null(&c.key)) {
-        return Ok(None);
-    }
-    let coerce = |a: &Option<ArrayRef>| -> Result<Option<ArrayRef>, RuntimeError> {
-        match a {
-            Some(arr) if matches!(arr.data_type(), DataType::Null) => {
-                Ok(Some(arrow::compute::cast(arr, &DataType::Int64)?))
-            }
-            other => Ok(other.clone()),
-        }
-    };
-    let out = calls
-        .iter()
-        .map(|c| {
-            Ok(AggCall::with_key(
-                c.func,
-                coerce(&c.values)?,
-                coerce(&c.key)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, RuntimeError>>()?;
-    Ok(Some(out))
 }
 
 /// The partial-row count above which `combine` regroups in parallel (hash-radix), resolving

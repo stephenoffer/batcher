@@ -823,6 +823,164 @@ rest of this ledger: a capability that worked, reached through a path that did n
 argument, that the error is *not* a `TypeError`, that plain literals still work, and that
 `.map.contains` correctly reports via the `list.contains` slot it is composed over.
 
+### 301. The census over-reports gaps, by roughly a third, and for the mirror of the old reason
+
+All four censuses were re-run on 2026-08-18. Their raw counts:
+
+| Reference | scored | match | gap | mismatch |
+|---|---:|---:|---:|---:|
+| DuckDB | 331 | 260 (79%) | 56 | 15 |
+| Spark | 268 | 160 (60%) | 73 | 35 |
+| Polars | 98 | 70 | 11 | 17 |
+| Daft | 227 | 175 (77%) | 52 | — |
+
+The 181 reported gaps were then re-probed by hand, one query each, with **arguments a user
+would actually write** rather than the harness's synthesized literals. **77 of them already
+worked.** `list_cat([1,2],[3])` was reported missing and answers `[1,2,3]`; so do `rlike`,
+`unix_date`, `time_bucket`, `array_sort`, `array_insert`, `vector_norm`, `xxhash64`, and
+seventy more. The real figure is **104**.
+
+This is the denominator trap from the section below, inverted. That one said a gap must be
+*proven* by an error saying the function is unreachable, never assumed from any failure —
+and the classifier does check for that. What it cannot check is whether the *call it built*
+is one the engine should accept: `list_cat` is unreachable **as the harness spelled it**,
+because sqlglot cannot parse a list literal, and the classifier faithfully reports the
+unreachability of a query that was never valid. So the rule needs its second half: **a gap
+is a name the engine cannot reach from a call a user would write.** Both halves are now
+mechanical — `tests/unit/test_parity_census_classifier.py` pins the first, and the hand
+re-probe is recorded here so the next pass starts from 104 rather than re-deriving it.
+
+The mismatch columns needed the same treatment and shrank further. Most of Spark's 35 are
+the harness reading its own oracle wrongly (`ltrim('    SparkSQL   ')` is compared against
+an expected value the parser had already trimmed) or a session timezone; most of Polars' 17
+are a documented convention Batcher follows DuckDB on. Four were real and are recorded
+below.
+
+### 302-306. Five lakehouse partition transforms, as ordinary expressions
+
+`bt.partition_years`/`_months`/`_days`/`_hours`/`_truncate` (`plan/functions/partitioning.py`),
+reachable under the same names from SQL. Iceberg stores a *transform* of the partition
+column rather than the column, and the reader side already understood them
+(`io/formats/lakehouse/iceberg`); this is the writer and query side, so the value a table
+will be partitioned by is computable, groupable and filterable before it is written.
+
+Exact against the specification, which matters because a partition value computed a
+different way sends a row to the wrong partition and nothing errors. Two traps, both pinned:
+the time transforms are **negative** before 1970 (`days` of 1969-06-01 is -214), and
+`truncate` floors toward negative infinity, so `truncate(-7, 5)` is -10 where the obvious
+`v - v % W` gives -5.
+
+`bucket` is deliberately absent: Iceberg pins it to a specific 32-bit MurmurHash3 over each
+type's canonical byte encoding, and the engine's hash family is none of those. A near-miss
+there is worse than an absence.
+
+### 307-316. Ten SQL names that were a composition of kernels the engine already had
+
+`format`/`printf`/`format_string` (one builder — the three differ only in how the template
+marks its holes, and the printf spellings are rewritten to brace form at plan-build time),
+`quote`, `signbit`, `list_select`/`array_select`, `try_divide`, `date_from_unix_date`, and
+the five partition transforms above reaching SQL.
+
+Three of the ten were closed *wrongly* first, and each is worth recording because the
+composition looked right:
+
+* `signbit` is not `x < 0` — it is true for `-0.0` — and it is not `1/x < 0` either, which
+  reads `-inf` as false because `1 / -inf` is `-0.0`. It needs both terms.
+* `format`/`printf` returns NULL when **any** argument is NULL, which the `format_string`
+  builder does not do: it composes `concat`, and `concat` treats a null as empty. Without an
+  explicit guard the template came back with a hole where DuckDB returns NULL.
+* `%d` is a C *truncating* conversion, and `.cast("int64")` rounds, so `printf('%d', 3.7)`
+  gave `4`. A width or precision (`%05.2f`) is refused outright rather than answered
+  unpadded.
+
+`try_add`/`try_subtract`/`try_multiply` are **not** here, deliberately. They differ from the
+plain operators only on integer overflow, where this engine wraps rather than raising, so a
+composition would have to detect the wrap after the fact — and returning the wrapped number
+where Spark returns NULL is exactly the plausible-wrong-answer this ledger exists to catch.
+
+### 317-318. Two engine defects the re-probe found, both silent
+
+* **`strptime` with a partial format returned NULL for the whole column.** `strptime('1900',
+  '%Y')` is a query DuckDB answers, and every coarse rollup key is written this way. chrono's
+  two whole-value parsers each demand a complete date or a complete instant, so a format
+  naming only some fields matched neither. Worse, the date-only fallback *did* match
+  `'2024-03-05 13'` with `%Y-%m-%d %H` — `NaiveDate::parse_from_str` ignores time fields — and
+  answered midnight, thirteen hours off, which is worse than the NULL. Both are now one path
+  through `chrono::format::Parsed`, defaulting month and day to 1 and the time to zero the
+  way DuckDB, Python and Spark all do. A format naming no year is still refused: there is no
+  instant to invent.
+* **`coalesce` over a bare `NULL` and a nested column raised.** Every arm of the operand
+  coercion is keyed on a concrete type pair, so a `Null`-typed operand — a bare `NULL`, or a
+  column arrow types as `Null` because every value in it is missing — fell through to the
+  promotion lattice and matched nothing for the nested types. `coalesce(NULL, <a list
+  column>)`, and the `ifnull` Spark spells it with, failed with "arguments need to have the
+  same data type" on a query DuckDB answers.
+
+### 319-325. Seven families where `Dataset.schema` declared a type no execution produces
+
+Not a parity gap and the largest single finding of the pass. `available_schema` is what
+Kyber plans against, what a write validates against, what the device tier is held to without
+a GPU, and what a user reads; a node with no inference rule declares `null`. A sweep of the
+whole expression surface against a non-empty execution found: the temporal constructors
+(`make_date`, `make_timestamp`, `from_unix_*`), four `.json` accessors, `.struct.keys`, the
+two list higher-order operations, and every `decimal <op> int` — the shape `price * qty`
+produces.
+
+The seventh was the optimizer's. `x * 1 -> x` and `x - 0 -> x` fired without checking that
+`x` keeps its type, and a **Boolean** `x` does not: the arithmetic promotes it to Int64. No
+differential test could see it, because `assert_same` compares values and DuckDB rejects
+`b * 1` outright. Guarding on "provably numeric" also closed three shapes where the rewrite
+answered a query DuckDB rejects (`t - 0`, `d * 1`, `s * 1`), so the family no longer answers
+two different ways depending on whether the literal happens to be the identity element.
+
+### 326. A Delta table with a struct column could not be written
+
+Every Delta write records per-file statistics, because they are the next query's
+file-skipping index. The bounds already skipped nested columns — "an absent stat is always
+sound, a wrong one silently loses rows" — but the **null count** was recorded for every
+column including a struct, as a plain number. Delta's protocol spells a struct's
+`nullCount` as an *object* mirroring the struct's fields, so the commit carried
+`{"st": 1}` where the reader demands `{"st": {"k": 1}}` and the kernel refused it:
+`CommitError: Kernel error: Json error: whilst decoding field 'nullCount'`.
+
+What kept it hidden is that it did not fail on every such table. A struct column **alone**
+committed fine, and so did `int + struct`; it took a second column of a particular type in
+the same file for the kernel to reach the strict decode, and the reproducer that found it
+was `boolean + struct`. Nothing about booleans is the cause, which is why the regression
+test varies the neighbour rather than pinning the one pair that happened to fail.
+
+### 327-330. Four IO round-trip findings, measured by writing every format and reading it back
+
+A sweep wrote a nine-column table — every leaf type plus a list, a struct and a decimal —
+through each writer and read it back, comparing values *and* column types.
+
+* **`bt.read_json` cannot read the timestamps `ds.write.json` writes.** The writer is
+  correct: it emits `{"d":"2024-03-05","ts":"2024-03-05 13:45:30.000000"}`, which is what
+  DuckDB writes too. The reader is pyarrow's, and pyarrow only infers a timestamp from a
+  *zone-suffixed* ISO string, so the column comes back as **text**; a bare date comes back
+  as `timestamp[s]` at midnight rather than a `date32`. DuckDB's `read_json` infers `DATE`
+  and `TIMESTAMP` for the same file. So write-then-read is not an identity for temporal
+  columns, and it fails silently — the values are all there, as strings. Closing it means a
+  post-inference pass over the string columns, the way DuckDB and `pandas.read_json`'s
+  `convert_dates` both do.
+* **Lance has a writer and a registry source but no `bt.read_lance`.** `bt.read_*` lists
+  thirteen readers and none of them is Lance. The data is *not* stranded — the generic
+  registry door reads it (`bt.read_table("lance", path)` returns the rows) — so this is a
+  missing convenience wrapper rather than a missing capability. Recorded with that
+  correction because the first reading of the sweep said "cannot be read back through the
+  public API", which is what checking only the `bt.read_<fmt>` attributes shows and is not
+  true: the sweep probed one door and concluded about the building.
+* **The IPC pair is spelled two different ways**: `ds.write.arrow` writes it and
+  `bt.read_ipc` reads it. The round-trip is exact — every one of the nine columns survives
+  unchanged, the only format in the sweep to manage that — but the two halves do not share
+  a name, and nothing else in the surface has that asymmetry.
+* **ORC widens a timestamp**: `timestamp[us]` in, `timestamp[ns]` back. That is ORC's own
+  storage unit rather than a defect, and no value moves; it is recorded so the next sweep
+  does not re-derive it.
+
+Parquet's `list<item: int64>` becoming `list<element: int64>` is *not* on this list: that is
+Arrow's Parquet naming for a list's child and it round-trips through Delta the same way.
+
 ## Divergences pinned rather than closed
 
 Recorded because a later pass will otherwise rediscover them and "fix" one the wrong way.
@@ -852,6 +1010,24 @@ Recorded because a later pass will otherwise rediscover them and "fix" one the w
 * **`round` half-away-from-zero.** Polars rounds half to even (`round(-2.5)` is `-2.0`);
   DuckDB and Batcher round half away from zero (`-3.0`). DuckDB is the oracle.
 * **`list_sum` of an empty list** is `NULL` here and in DuckDB, `0` in Polars.
+* **Statistical moments follow DuckDB's convention, and Polars' default is the other one.**
+  `skewness` and `kurtosis` here divide the *sample* moment (Fisher, bias-corrected), which
+  is DuckDB's `skewness`/`kurtosis`; Polars' `skew()`/`kurtosis()` default to `bias=True`,
+  the population form, and report different numbers for the same column. Both spellings
+  exist — `kurtosis_pop` is the population form — so this is a choice of default, not a
+  missing capability. The census reports it as a mismatch on every run and it is not one.
+* **Integer overflow wraps here and raises in DuckDB.** `9223372036854775807 + 1` is
+  `-9223372036854775808` in Batcher (as in Spark with ANSI off, and in Polars) and an
+  `OutOfRangeException` in DuckDB. This is the one arithmetic divergence from the oracle
+  that no differential test covers, because the suite has no overflowing case. It is also
+  why Spark's `try_add`/`try_subtract`/`try_multiply` are declined rather than aliased.
+* **`.dt.epoch()` is seconds; Polars' `dt.epoch()` defaults to microseconds.** The name
+  follows DuckDB's `epoch()`, and `epoch_ms`/`epoch_us`/`epoch_ns` spell the others. A
+  ported Polars script that calls `dt.epoch()` bare gets a number a million times smaller.
+* **`.dt.month_start()` returns a midnight Timestamp; Polars preserves a Date input.** The
+  whole `truncate` family does, matching DuckDB's `date_trunc`. `month_end` is the one
+  member that returns a Date (it is `last_day`), so the pair does not share a type — worth
+  knowing before writing a `BETWEEN` over both.
 
 ## The four censuses, and what each is good for
 
@@ -926,6 +1102,16 @@ worth remembering the next time a reference engine will not run.
 
 Ordered by measured value, from the same censuses and a capability probe of the DataFrame
 surface.
+
+**Re-run 2026-08-18: the list below predates entries 301-325 and several of its items are
+closed there.** Entry 6's `chr`/`bin`/`to_base`/`format_bytes` were already built when it
+was written (`bc-expr::eval::str::numfmt`), `bar` and `equi_width_bins` remain, and
+`printf`/`format` are now closed. Entry 4's `map_*` kernels are still the largest open
+family: `map(...)` has no constructor, which is what blocks ten Spark names at once
+(`map_keys`, `map_values`, `map_entries`, `map_concat`, `map_from_arrays`,
+`map_from_entries`, `map_filter`, `map_zip_with`, `transform_keys`, `transform_values` all
+fail on the *argument*, not the function). That is the next wave's highest-value single
+item.
 
 **Re-check this list against the code before working from it.** On 2026-07-30 two of its six
 entries were already closed — entry 5's `ds.rollup`/`cube`/`grouping_sets` had shipped in

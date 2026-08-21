@@ -49,6 +49,7 @@ __all__ = [
     "FatalShuffleError",
     "FormatError",
     "IOError",
+    "MemoryBudgetExceededError",
     "MissingDependencyError",
     "OptimizationError",
     "PerformanceWarning",
@@ -620,9 +621,18 @@ def unknown_value(
 # the native depth limit used to overflow the deserializer's stack, which Rust reports as
 # an *uncatchable* `SIGABRT`. It is now an error, and giving it a type is what lets a
 # caller building plans in a loop catch it rather than lose the process.
+#
+# `MemoryBudgetExceededError` is the memory envelope's own refusal. Most stateful operators
+# spill when they would exceed it; a few cannot, because they need one global order over the
+# whole relation (a window with no PARTITION BY, an ASOF join with no `by` keys, the right
+# side of a range join). Those raise instead of risking the process. It is the one execution
+# failure with an obvious programmatic answer — raise the envelope, or re-plan so the
+# non-spillable operator is not on the path — and it only ever reaches a caller who set a
+# ceiling to begin with, so it earns a type rather than a message to match on.
 try:
     from batcher._native import (
         FatalShuffleError,
+        MemoryBudgetExceededError,
         PlanTooDeepError,
         QueryCancelledError,
         RetryableShuffleError,
@@ -640,3 +650,6 @@ except ImportError:
 
     class QueryCancelledError(ExecutionError):  # type: ignore[no-redef]
         """The query was cancelled; it stopped at the next morsel boundary."""
+
+    class MemoryBudgetExceededError(ResourceError):  # type: ignore[no-redef]
+        """An operator that cannot spill needs more than the configured memory budget."""

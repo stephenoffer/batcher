@@ -29,6 +29,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import IOError, PlanError
 from batcher._internal.optional import require
+from batcher.io.formats.streaming.codecs.base import build_payload_codecs
 from batcher.io.formats.streaming.sinks import STREAM_SINKS
 
 __all__ = ["KafkaStreamSink"]
@@ -116,9 +117,11 @@ class KafkaStreamSink:
     __slots__ = (
         "_config",
         "_flush_timeout",
+        "_key_codec",
         "_producer",
         "_reported",
         "_topic",
+        "_value_codec",
     )
 
     def __init__(
@@ -127,12 +130,36 @@ class KafkaStreamSink:
         topic: str | None = None,
         bootstrap_servers: str = "localhost:9092",
         flush_timeout: float = 30.0,
+        value_format: Any = None,
+        value_schema: Any = None,
+        value_subject: str | None = None,
+        key_format: Any = None,
+        key_schema: Any = None,
+        key_subject: str | None = None,
+        schema_registry: Any = None,
+        schema_registry_auth: str | None = None,
         **options: Any,
     ) -> None:
         if flush_timeout <= 0:
             raise PlanError(f"kafka sink flush_timeout must be > 0, got {flush_timeout}")
         self._topic = topic
         self._flush_timeout = flush_timeout
+        # The same codec vocabulary the source reads with, so a pipeline that decodes Avro
+        # off one topic and writes Avro to another names the format once per side rather
+        # than hand-rolling a serializer in a `map_batches`.
+        self._value_codec, self._key_codec = build_payload_codecs(
+            topic or "",
+            {
+                "value_format": value_format,
+                "value_schema": value_schema,
+                "value_subject": value_subject,
+                "key_format": key_format,
+                "key_schema": key_schema,
+                "key_subject": key_subject,
+                "schema_registry": schema_registry,
+                "schema_registry_auth": schema_registry_auth,
+            },
+        )
         self._config = {
             "bootstrap.servers": bootstrap_servers,
             **{k.replace("_", "."): v for k, v in options.items()},
@@ -170,6 +197,7 @@ class KafkaStreamSink:
             IOError: If any record was rejected, or deliveries did not complete within
                 `flush_timeout`.
         """
+        table = self._encode(table)
         self._validate(table.schema)
         if table.num_rows == 0:
             return f"kafka:{self._topic}:{batch_id}:0"
@@ -197,6 +225,23 @@ class KafkaStreamSink:
         producer.flush(self._flush_timeout)
 
     # --- internals --------------------------------------------------------
+    def _encode(self, table: pa.Table) -> pa.Table:
+        """Serialize the payload columns through this sink's codecs, if it has any.
+
+        Before `_validate`, deliberately: with a codec the incoming `value` is a struct,
+        which the payload-type check exists to reject when there is *no* codec to turn it
+        into bytes. Validating first would refuse exactly the shape this feature accepts.
+        """
+        for name, codec in (("value", self._value_codec), ("key", self._key_codec)):
+            if codec is None:
+                continue
+            index = table.schema.get_field_index(name)
+            if index < 0:
+                continue
+            encoded = codec.encode(table.column(name).combine_chunks())
+            table = table.set_column(index, pa.field(name, pa.binary()), encoded)
+        return table
+
     def _validate(self, schema: pa.Schema) -> None:
         """Refuse a table Kafka cannot carry, before a single record is enqueued."""
         missing = [c for c in _REQUIRED if schema.get_field_index(c) < 0]

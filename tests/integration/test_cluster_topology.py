@@ -16,6 +16,7 @@ ray = pytest.importorskip("ray", reason="ray not installed")
 
 from _ray_cluster import init_test_ray, shutdown_test_ray  # noqa: E402  (after importorskip)
 from batcher import dist  # noqa: E402  (after importorskip)
+from batcher.dist.executors.ray_runtime import scaling  # noqa: E402  (after importorskip)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -27,10 +28,28 @@ def _ray_session():
 
 @pytest.fixture
 def _fake_nodes(monkeypatch):
-    """Patch ``ray.nodes`` to report a chosen number of alive nodes."""
+    """Patch ``ray.nodes`` to report a chosen number of alive worker nodes.
 
-    def _set(n: int) -> None:
-        monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}] * n)
+    Each record carries a ``Resources`` dict, because the topology readers size the fan-out
+    from **per-node** resources (head excluded, drain excluded) rather than from
+    ``ray.cluster_resources()`` totals. A bare ``{"Alive": True}`` therefore reads as a node
+    with zero CPUs, and `clamp_workers` takes its documented "Ray reports no CPUs" no-op
+    branch instead of the clamp the test means to exercise.
+
+    Each call also drops the `_LIVE_TTL_S` topology window. That window reuses `ray.nodes()`
+    for 50 ms to keep a distributed query from making O(nodes) GCS round trips, so two
+    different cluster shapes stubbed inside one test are otherwise both answered from the
+    first snapshot — a test that reads process state, and one that passes or fails depending
+    on how fast the box is.
+    """
+
+    def _set(n: int, cpus_per_node: float = 1.0) -> None:
+        nodes = [
+            {"Alive": True, "Resources": {"CPU": cpus_per_node, "memory": float(2**30)}}
+            for _ in range(n)
+        ]
+        monkeypatch.setattr(ray, "nodes", lambda: nodes)
+        scaling._reset_topology_cache()
 
     return _set
 
@@ -64,10 +83,20 @@ def test_shared_filesystem_keeps_disk_on_multi_node(_fake_nodes):
 
 
 def test_cluster_topology_counts_alive_nodes(monkeypatch):
-    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}, {"Alive": False}, {"Alive": True}])
+    """Dead nodes are not counted, and CPUs are summed from the nodes that survive."""
+    monkeypatch.setattr(
+        ray,
+        "nodes",
+        lambda: [
+            {"Alive": True, "Resources": {"CPU": 4.0}},
+            {"Alive": False, "Resources": {"CPU": 4.0}},
+            {"Alive": True, "Resources": {"CPU": 4.0}},
+        ],
+    )
+    scaling._reset_topology_cache()
     topo = dist.cluster_topology()
     assert topo["nodes"] == 2
-    assert topo["cpus"] >= 1.0
+    assert topo["cpus"] == 8.0  # the two alive nodes only; the dead one contributes nothing
 
 
 def test_clamp_workers_to_available_cpus(monkeypatch):
@@ -75,8 +104,9 @@ def test_clamp_workers_to_available_cpus(monkeypatch):
     group can't over-subscribe the cluster (the autoscaler hint is best-effort)."""
     from batcher.dist.executors import ray_runtime
 
-    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 2.0}}])
     monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 2.0})
+    scaling._reset_topology_cache()
     assert ray_runtime.clamp_workers(8) == 2  # clamped down to available
     assert ray_runtime.clamp_workers(1) == 1  # already fits
 
@@ -109,27 +139,32 @@ def test_autoscale_request_high_water_then_reclaims(monkeypatch):
     resets to 0 only when the LAST scope ends — so concurrent queries compose (a scope
     never lowers a sibling's floor) and a finished big query stops pinning the cluster
     scaled up (the autoscaler can reclaim the idle nodes)."""
-    from batcher.dist.executors.ray_runtime import scaling
+    from batcher.dist.executors.ray_runtime import autoscale_request
 
-    # The floor lifecycle lives in `scaling`; patch there so its same-module calls to
-    # `_apply_autoscale_floor` are intercepted. It now takes (cpus, gpus) — capture the
-    # CPU floor (the GPU floor stays 0 for these CPU-only scopes).
+    # Patch the module that *defines* the floor lifecycle, so its same-module calls to
+    # `_apply_autoscale_floor` are intercepted. That module is `autoscale_request`, not
+    # `scaling` — patching the latter silently stopped applying when the lifecycle moved,
+    # and a monkeypatch that no longer binds is a test that passes while testing nothing.
+    # `_apply_autoscale_floor` takes (cpus, gpus, resources); capture the CPU floor (the
+    # GPU floor and the custom resources stay empty for these CPU-only scopes).
     applied: list[int] = []
 
-    def _capture(cpus, gpus=0):
+    def _capture(cpus, gpus=0, resources=()):
         applied.append(cpus)
 
-    monkeypatch.setattr(scaling, "_apply_autoscale_floor", _capture)
-    monkeypatch.setattr(scaling, "_autoscale_active", 0)
-    monkeypatch.setattr(scaling, "_autoscale_floor", 0)
-    monkeypatch.setattr(scaling, "_autoscale_gpu_floor", 0)
+    monkeypatch.setattr(autoscale_request, "_apply_autoscale_floor", _capture)
+    monkeypatch.setattr(autoscale_request, "_autoscale_active", 0)
+    monkeypatch.setattr(autoscale_request, "_autoscale_floor", 0)
+    monkeypatch.setattr(autoscale_request, "_autoscale_gpu_floor", 0)
 
-    scaling.request_autoscale(100)  # scope A: scale to 100
-    scaling.request_autoscale(50)  # scope B: max(100, 50) → still 100
+    autoscale_request.request_autoscale(100)  # scope A: scale to 100
+    autoscale_request.request_autoscale(50)  # scope B: max(100, 50) → still 100
     assert applied == [100, 100]
-    scaling.release_autoscale()  # A ends, B still in flight → floor unchanged (no reclaim)
+    # A ends, B still in flight → floor unchanged (no reclaim)
+    autoscale_request.release_autoscale()
     assert applied == [100, 100]
-    scaling.release_autoscale()  # last scope ends → reset to 0 so idle nodes are reclaimed
+    # last scope ends → reset to 0 so idle nodes are reclaimed
+    autoscale_request.release_autoscale()
     assert applied == [100, 100, 0]
 
 
@@ -139,8 +174,9 @@ def test_clamp_workers_autoscale_times_out_and_clamps(monkeypatch):
     it never hangs on a scale-up that cannot happen."""
     from batcher.dist.executors import ray_runtime
 
-    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 2.0}}])
     monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 2.0})  # never grows
+    scaling._reset_topology_cache()
     cfg = Config().replace(
         distributed=DistributedConfig(autoscale_wait_s=0.05, autoscale_poll_s=0.01)
     )
@@ -156,6 +192,10 @@ def test_auto_distribute_resolution(monkeypatch):
     assert _resolve_distributed(True) is True
     assert _resolve_distributed(False) is False
     monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}, {"Alive": True}])
+    scaling._reset_topology_cache()
     assert _resolve_distributed("auto") is True
     monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    # Drop the 50 ms topology window: without this the single-node stub below is answered
+    # from the two-node snapshot above, and the assertion passes only on a slow machine.
+    scaling._reset_topology_cache()
     assert _resolve_distributed("auto") is False

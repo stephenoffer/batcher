@@ -42,6 +42,12 @@ authority, not a static plan estimate. The estimate is only what the operator as
 The per-operator budget path, `op_budget` keyed by Kyber's pre-order `op_id`, is the
 fallback for pool-less contexts.
 
+The pool's decision is binary and reactive: it admits until it cannot. It also reports a
+*level* — nominal, elevated, critical — which the control plane can read through
+`engine_pool_stats()` but which nothing inside the data plane acts on yet. Spilling before the
+cap rather than at it is the better strategy on paper and trades throughput for headroom, so it
+waits on a benchmark rather than on an opinion.
+
 If `EngineConfig.memory_budget_bytes` is 0, `agg_spill` is `None` and the engine runs fully
 in memory with no spill machinery engaged at all. That's the zero-cost default when you opt
 out with `memory.unbounded_memory`.

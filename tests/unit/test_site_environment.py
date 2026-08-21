@@ -9,8 +9,6 @@ the moment two jobs share the node.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from batcher._internal.site import provider, scheduler, scratch
@@ -24,28 +22,14 @@ _REAL_DMI = provider.dmi_identity.__wrapped__
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Strip every signal these probes read, so the host's own environment cannot leak in."""
-    for name in list(os.environ):
-        if name.startswith(
-            ("SLURM", "PBS_", "LSB_", "RUNPOD", "COREWEAVE", "LAMBDA", "CRUSOE", "NEBIUS")
-        ):
-            monkeypatch.delenv(name, raising=False)
-    for name in (
-        "BATCHER_PROVIDER",
-        "BATCHER_SCRATCH_DIR",
-        "KUBERNETES_SERVICE_HOST",
-        "RAY_ADDRESS",
-        "RAY_NODE_IP_ADDRESS",
-        "NODE_NAME",
-        "AWS_REGION",
-        "AWS_DEFAULT_REGION",
-        "AWS_EXECUTION_ENV",
-        "GOOGLE_CLOUD_PROJECT",
-        "AZURE_CLIENT_ID",
-        "NVIDIA_VISIBLE_DEVICES",
-    ):
-        monkeypatch.delenv(name, raising=False)
+def _clean_env(monkeypatch, clean_site_env):
+    """Strip every signal these probes read, so the host's own environment cannot leak in.
+
+    The stripping itself is `clean_site_env` in the unit suite's conftest, which assembles its
+    variable list from the scheduler and accelerator tables so a platform added there cannot
+    leak in unnoticed. What is left here is what only this module wants: silencing the
+    firmware probe, and resetting the memoized probes on both sides of the test.
+    """
     # The firmware is a *fallback* identity, and this suite is about the environment. Silence
     # it by default so a test asserting "no marker means unknown" is not answered by the host
     # the suite happens to run on; the DMI tests below re-enable it deliberately.
@@ -190,8 +174,11 @@ def test_zero_padding_is_preserved_because_it_is_the_node_name():
 
 def test_a_malformed_range_is_passed_through_not_silently_dropped():
     # Yielding no nodes for a list we failed to parse would read as an empty allocation.
-    assert scheduler.expand_nodelist("gpu-[5-2]") == ("gpu-5-2",)
-    assert scheduler.expand_nodelist("gpu-[x-y]") == ("gpu-x-y",)
+    # Passed through *verbatim*, brackets and all: it is what the scheduler said, and a
+    # de-bracketed rewrite is a hostname nobody wrote and nothing resolves either.
+    assert scheduler.expand_nodelist("gpu-[5-2]") == ("gpu-[5-2]",)
+    assert scheduler.expand_nodelist("gpu-[x-y]") == ("gpu-[x-y]",)
+    assert scheduler.expand_nodelist("gpu-[1-2") == ("gpu-[1-2",)
 
 
 def test_kubernetes_reports_the_node_the_pod_landed_on(monkeypatch):
@@ -497,6 +484,25 @@ def test_the_dashboard_snapshot_carries_the_site_where_there_is_one(monkeypatch)
     assert site["scratch_dir"] == "/ephemeral"
 
 
+def test_the_snapshot_and_the_accelerator_report_describe_the_same_site(monkeypatch):
+    # They assembled the description separately and had drifted, so the dashboard and
+    # `bt.accelerators()` showed different facts about one machine — and the job's shape,
+    # which only the shared summary carries, reached neither.
+    from batcher.observe.system import system_snapshot
+
+    monkeypatch.setenv("SLURM_JOB_ID", "77")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "gpu-[01-04]")
+    monkeypatch.setenv("SLURM_GPUS_ON_NODE", "8")
+    monkeypatch.setenv("SLURM_JOB_PARTITION", "h100")
+    provider.reset_provider_probe()
+    site = system_snapshot()["site"]
+    summary = provider.site_summary()
+    assert site["scheduler"] == summary["scheduler"] == "slurm"
+    assert site["nodes"] == summary["nodes"] == 4
+    assert site["gpus_per_node"] == 8
+    assert site["partition"] == "h100"
+
+
 def test_a_machine_with_no_site_facts_gets_no_site_section(monkeypatch):
     from batcher.observe.system import system_snapshot
 
@@ -580,6 +586,35 @@ def test_a_hypervisor_vendor_reports_a_virtual_machine(monkeypatch, tmp_path):
     monkeypatch.setattr(provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor="QEMU"))
     assert provider.dmi_identity()[2] is True
     assert provider.site_profile().virtualized is True
+
+
+@pytest.mark.parametrize(
+    ("vendor", "expected"),
+    [
+        ("Vultr", "vultr"),
+        ("Linode", "linode"),
+        # Akamai bought Linode; both names are the one platform, and a caller comparing
+        # provider names wants one answer rather than two.
+        ("Akamai", "linode"),
+        ("Nutanix", "nutanix"),
+    ],
+)
+def test_the_firmware_names_the_smaller_platforms_too(monkeypatch, tmp_path, vendor, expected):
+    # None of these exports an environment marker, so the firmware is the only identity they
+    # have — and on a private estate the alternative is reporting `unknown` for every node.
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor=vendor))
+    assert provider.detect_provider() == expected
+
+
+@pytest.mark.parametrize("vendor", ["KVM", "Red Hat", "Nutanix"])
+def test_a_private_clouds_hypervisor_is_recognized_as_one(monkeypatch, tmp_path, vendor):
+    # An OpenStack or oVirt estate reports one of these. Without them its nodes read as bare
+    # metal, which makes an empty fabric probe there look conclusive when it is only the
+    # hypervisor's view of the PCI tree.
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor=vendor))
+    assert provider.dmi_identity()[2] is True
 
 
 def test_unreadable_firmware_says_nothing_rather_than_not_a_vm(monkeypatch, tmp_path):

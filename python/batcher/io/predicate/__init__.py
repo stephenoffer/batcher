@@ -37,6 +37,9 @@ two are now one mechanism rather than two.
 
 from __future__ import annotations
 
+from batcher.io.predicate._shapes import _combine as combine_conjunction
+from batcher.io.predicate._shapes import _conjuncts as conjuncts
+from batcher.io.predicate._shapes import _pinned_columns as pinned_columns
 from batcher.io.predicate.arrow import to_pyarrow_expression
 from batcher.io.predicate.iceberg import to_iceberg_expression
 from batcher.io.predicate.mongo import to_mongo_filter
@@ -44,6 +47,9 @@ from batcher.io.predicate.native import to_native_predicate
 from batcher.io.predicate.sql import to_sql_where
 
 __all__ = [
+    "combine_conjunction",
+    "conjuncts",
+    "pinned_columns",
     "to_iceberg_expression",
     "to_mongo_filter",
     "to_native_predicate",

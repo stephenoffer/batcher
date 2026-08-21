@@ -114,6 +114,42 @@ def test_json_writers_match_duckdb(duck, docs, q):
     assert_same(bt.sql(q, docs=docs).collect(), duck.sql(q))
 
 
+#: Arrays whose structure is decided by *unification*, not by the first element. Each is a
+#: shape the "first element" reading answered differently, or one that pins the lattice it
+#: was replaced by. Held as its own fixture because the `docs` table above has no array whose
+#: first entry is narrower than a later one -- which is exactly why the defect survived it.
+_STRUCTURE_ARRAYS = [
+    "[null,1]",  # widens to the later element; was ["NULL"]
+    "[]",  # no element to describe; was ["JSON"]
+    "[1,null]",
+    "[null,null]",
+    "[-1,1]",  # signed and unsigned need the wider integer
+    "[1,2.5]",
+    "[true,null]",
+    '[1,"a"]',  # no common structure at all
+    "[[1],1]",
+    '[{"a":1},{"b":2}]',  # objects merge over the union of their keys
+    '[{"a":null},{"a":1}]',
+    "[[],[1]]",
+    "[[]]",
+]
+
+
+@pytest.mark.parametrize("doc", _STRUCTURE_ARRAYS)
+def test_an_array_structure_unifies_its_elements_like_duckdb(duck, doc):
+    """`json_structure` over a heterogeneous array.
+
+    The old kernel described an array by its *first* element, on the stated belief that this
+    was DuckDB's rule. It is not: DuckDB unifies every element, so `[null, 1]` is
+    `["UBIGINT"]` and an empty array is `["NULL"]`. Both were wrong here, and neither is the
+    kind of wrong an error surfaces -- the answer was a well-formed structure string.
+    """
+    t = pa.table({"j": [doc]})
+    duck.register("arr", t)
+    q = "SELECT json_structure(j) AS r FROM %s"
+    assert_same(bt.sql(q % "arr", arr=t).collect(), duck.sql(q % "arr"))
+
+
 def test_json_value_answers_only_for_a_scalar(duck, docs):
     # The whole distinction from `json_extract_string`, asserted side by side so neither
     # can drift into the other.

@@ -15,6 +15,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
+from batcher._internal.errors.hierarchy import PlanError
 
 
 @pytest.fixture
@@ -48,7 +49,13 @@ def test_float_division_by_zero_is_inf(t):
 
 
 def test_sum_of_string_column_raises(t):
-    with pytest.raises(RuntimeError, match="sum is not supported"):
+    """Rejected while the plan is built, naming the column and the fix.
+
+    This used to surface as a bare ``RuntimeError`` from Rust *after* the scan had run,
+    which on a large input meant paying the whole read to be told the query was never
+    valid. It is now a `PlanError` raised from schema analysis, before any row is touched.
+    """
+    with pytest.raises(PlanError, match="aggregate 'sum' needs numeric input"):
         bt.from_arrow(t).group_by().agg(x=col("s").sum()).collect()
 
 

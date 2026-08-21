@@ -84,7 +84,13 @@ class GroupApply:
 
         out: list[pa.RecordBatch] = []
         for row in range(batch.num_rows):
-            out.extend(_coerce_udf_result(self._call_one(self._group(batch, row))))
+            # The group is also the reference schema: a non-Arrow `batch_format` carries a
+            # string column with no non-null value in it as an untyped `object`, and without
+            # something to restore the type from it comes back as neither `string` nor even
+            # `null` here -- the group reassembly reads the type-less column as a list. The
+            # `fn` sees this schema, so it is the one the result is held to.
+            group = self._group(batch, row)
+            out.extend(_coerce_udf_result(self._call_one(group), group.schema))
         if not out:
             # No groups in this batch, so there is no output schema to report. A zero-column
             # empty table unifies with the real batches of the same stage, the way an empty

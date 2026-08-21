@@ -50,6 +50,11 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    make_timestamp
    from_epoch
    from_unix_date
+   partition_years
+   partition_months
+   partition_days
+   partition_hours
+   partition_truncate
    range
    date_range
    sequence

@@ -64,8 +64,22 @@ def skewed(tmp_path_factory):
         # `nk` is the same key with the hot value NULLED, so a sort on it puts the
         # dominant share in the null bucket — the one the split must refuse to touch.
         nk = pa.array([None if v == HOT else int(v) for v in k], type=pa.int64())
+        # The same skew spelled as a text and a fixed-width binary key. Those families used to
+        # be refused the split outright, so a skewed `ORDER BY <string>` stopped scaling with
+        # the cluster; they carry the identical distribution so a difference between them and
+        # `k` is the split's doing and not the data's.
+        text = pa.array([f"{int(v):06d}" for v in k], type=pa.string())
+        blob = pa.array([int(v).to_bytes(8, "big") for v in k], type=pa.binary(8))
         pq.write_table(
-            pa.table({"k": k, "nk": nk, "payload": np.arange(i * n, (i + 1) * n, dtype="int64")}),
+            pa.table(
+                {
+                    "k": k,
+                    "nk": nk,
+                    "tk": text,
+                    "bk": blob,
+                    "payload": np.arange(i * n, (i + 1) * n, dtype="int64"),
+                }
+            ),
             os.path.join(base, f"skew_{i}.parquet"),
         )
     return base
@@ -179,3 +193,49 @@ def test_a_skewed_sort_with_nulls_keeps_them_at_the_right_end(skewed, disk_shuff
     dist = ds.collect(distributed=True, num_workers=8)
     assert dist.column("nk").to_pylist() == single.column("nk").to_pylist()
     assert _rows(single) == _rows(dist)
+
+
+# --- text and binary keys: the families the split used to be withheld from ------------
+
+
+@pytest.mark.parametrize("key", ["tk", "bk"], ids=["text", "binary"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_a_skewed_lexical_sort_returns_the_single_node_relation(
+    skewed, disk_shuffle, key, descending
+):
+    """The rearrangement is only sound because the moved rows tie, so the relation must be
+    byte-identical to single-node — keys in order, and the same rows carrying them."""
+    ds = bt.read.parquet(skewed).sort(key, descending=descending)
+    single = ds.collect()
+    dist = ds.collect(distributed=True, num_workers=8)
+
+    keys = dist.column(key).to_pylist()
+    assert keys == sorted(keys, reverse=descending)
+    assert keys == single.column(key).to_pylist()
+    assert _rows(dist) == _rows(single)
+
+
+@pytest.mark.parametrize("key", ["tk", "bk"], ids=["text", "binary"])
+def test_splitting_a_lexical_hot_value_changes_nothing_about_the_result(
+    skewed, disk_shuffle, no_split, key
+):
+    """Split against unsplit, on the same data through the same executor.
+
+    A skew bug here does not lose keys — it returns the right keys carrying the wrong rows, so
+    this compares the full row multiset as well as the key order. `no_split` is what makes it a
+    comparison rather than a restatement.
+    """
+    ds = bt.read.parquet(skewed).sort(key)
+    unsplit = ds.collect(distributed=True, num_workers=8)
+    del no_split  # the fixture is undone by monkeypatch after this test
+    assert unsplit.column(key).to_pylist() == sorted(unsplit.column(key).to_pylist())
+    single = ds.collect()
+    assert _rows(unsplit) == _rows(single)
+
+
+@pytest.mark.parametrize("key", ["tk", "bk"], ids=["text", "binary"])
+def test_a_skewed_lexical_limited_sort_selects_the_same_rows(skewed, disk_shuffle, key):
+    """`ORDER BY <lexical> LIMIT k` over a dominant value: the sub-buckets must concatenate in
+    mapper order, or the limit keeps a different set of tied rows than one node would."""
+    ds = bt.read.parquet(skewed).sort(key).limit(500)
+    assert _rows(ds.collect(distributed=True, num_workers=8)) == _rows(ds.collect())

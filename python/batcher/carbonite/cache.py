@@ -108,13 +108,17 @@ class _Entry:
 
 
 class CacheStore:
-    """A thread-safe, byte-bounded LRU cache of `pyarrow.Table` results.
+    """A thread-safe, byte-bounded, cost-aware cache of `pyarrow.Table` results.
 
-    Bounded by `max_bytes`: an insert evicts least-recently-used entries until the
+    Bounded by `max_bytes`: an insert evicts the **lowest-keep-value** entries until the
     total fits, and a single result larger than the whole budget is **not** cached
     (caching it would evict everything else for one entry — Spark's `MemoryStore`
-    rule). A `get` hit refreshes recency. All operations are guarded by one lock; the
-    store is shared process-wide, so concurrent queries see one consistent budget.
+    rule). The ranking is Greedy-Dual-Size-Frequency, not recency — see `_Entry.value`
+    and `_evict_to`. A `get` counts as an access and raises the entry's *frequency*; it
+    does not reorder anything by time, and nothing here does, so an entry that is
+    expensive, small and often served outlives a recently-touched cheap large one. All
+    operations are guarded by one lock; the store is shared process-wide, so concurrent
+    queries see one consistent budget.
 
     The bytes counted are what an entry keeps *resident* (`_retained_bytes`), not the
     size of the rows it addresses, so a slice cannot enter the cache reporting a fraction
@@ -260,8 +264,16 @@ class CacheStore:
         return key in self._entries
 
     def clear(self) -> None:
-        """Evict everything, returning all storage memory."""
+        """Evict everything, returning all storage memory.
+
+        Counted as evictions, because it is what `on_pressure(CRITICAL)` does and that is
+        the store yielding its RAM rather than a reset. `stats` offers the eviction count
+        precisely to separate "nobody asked again" from "it was dropped before they could",
+        and a whole cache discarded under pressure is the strongest instance of the second —
+        it read as zero.
+        """
         with self._lock:
+            self._evictions += len(self._entries)
             self._entries.clear()
             self._used = 0
 

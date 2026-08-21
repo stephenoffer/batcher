@@ -1,6 +1,6 @@
 """LLM batch inference — the Ray Data LLM competitor (offline text generation).
 
-Run a text-generation engine (vLLM, an OpenAI-compatible endpoint, or any callable)
+Run a text-generation engine (vLLM, SGLang, an OpenAI-compatible endpoint, or any callable)
 over millions of rows. `engines` holds the pluggable backends; `generate` holds the
 columnar work (prompt templating, vision/LoRA request building, JSON parsing, token
 usage). Reached as `ds.ml.generate(...)`, or as `llm_generate` over a batch stream.
@@ -16,7 +16,10 @@ from batcher.ml.llm.engines import (
     Engine,
     EngineFactory,
     anthropic_engine,
+    bedrock_engine,
+    gemini_engine,
     http_engine,
+    sglang_engine,
     vllm_engine,
 )
 from batcher.ml.llm.generate import llm_generate, llm_udf
@@ -29,6 +32,8 @@ __all__ = [
     "Engine",
     "EngineFactory",
     "anthropic_engine",
+    "bedrock_engine",
+    "gemini_engine",
     "http_engine",
     "json_schema",
     "kv_cache_concurrency",
@@ -40,5 +45,6 @@ __all__ = [
     "llm_udf",
     "llm_verify_udf",
     "pack_sequences",
+    "sglang_engine",
     "vllm_engine",
 ]

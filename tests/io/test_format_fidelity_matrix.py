@@ -69,8 +69,18 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "iceberg": "needs a catalog URI; covered by tests/io/test_lakehouse_iceberg.py",
     "hudi": "Batcher supports Hudi reads only — the writer raises BackendError by design",
     "mongo": "needs a running MongoDB server",
+    "dynamodb": "needs DynamoDB (or DynamoDB Local); covered by tests/io/test_nosql_sinks.py",
+    "cassandra": "needs a Cassandra cluster; covered by tests/io/test_nosql_sinks.py",
+    "redis": "needs a Redis server; covered by tests/io/test_nosql_sinks.py",
+    "elasticsearch": "needs an Elasticsearch cluster; covered by tests/io/test_nosql_sinks.py",
+    "hbase": "needs an HBase Thrift server; covered by tests/io/test_nosql_sinks.py",
     "snowflake": "needs Snowflake credentials",
     "adbc": "needs a live ADBC driver/database",
+    # The DB-API sink writes rows into a *table*, so it has no path to round-trip through
+    # and no extension to name. It is exercised against a real database all the same —
+    # sqlite3 ships with Python — including the type fidelity this matrix is about, which
+    # is where SQLite's type affinity converts several classes.
+    "dbapi": "writes a table, not a file; round-tripped by tests/io/test_sql_dbapi_sink.py",
     "ipc": "the same writer as `arrow`, reached through a second registry name",
     "feather": "the same writer as `arrow`, reached through a second registry name",
     # The bioinformatics sinks take a **fixed schema**, not an arbitrary relation: a FASTA

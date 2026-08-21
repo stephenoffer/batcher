@@ -345,12 +345,12 @@ fn run_with_cache(
             // result-identical to the serial `sort_batch` oracle and used unchanged from `par.rs`.
             // It declines for small/limit/unsupported keys, where the serial sort runs. Without it
             // a large full sort ran arrow's single-threaded `lexsort` (~16x DuckDB at 6M rows).
-            _ => match ops::materialize(&rows) {
-                Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
+            _ => match ops::materialize_opt(&rows)? {
+                Some(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
                     Some(sorted) => sorted,
                     None => vec![ops::sort_batch(&combined, keys, *limit)?],
                 },
-                Err(_) => Vec::new(),
+                None => Vec::new(),
             },
         };
         if let Some(m) = meter {
@@ -1165,7 +1165,7 @@ fn spine_join_blocks_sharding(
 }
 
 /// Hash joins anywhere in `plan` — build sides included.
-fn count_hash_joins(plan: &RelOp) -> usize {
+pub(crate) fn count_hash_joins(plan: &RelOp) -> usize {
     let here = usize::from(matches!(plan, RelOp::HashJoin { .. }));
     here + plan
         .children()
@@ -1182,7 +1182,7 @@ fn count_hash_joins(plan: &RelOp) -> usize {
 /// would then emit the *whole* materialized relation while believing it held a shard of it, and the
 /// concatenated result would be `workers x` too many rows. Returning `None` declines the shard
 /// instead, which is free: the expensive half already ran on every core.
-fn leftmost_scan(plan: &RelOp, mats: Option<&MatCache>) -> Option<usize> {
+pub(crate) fn leftmost_scan(plan: &RelOp, mats: Option<&MatCache>) -> Option<usize> {
     if is_materialized(plan, mats) {
         return None;
     }

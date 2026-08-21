@@ -89,7 +89,20 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
         Math2Func::Atan2 => x.atan2(y),
         Math2Func::Round => {
             let f = 10f64.powi(y as i32);
-            (x * f).round() / f
+            let scaled = x * f;
+            // A magnitude that overflows when scaled has no representable fractional
+            // part at that scale, so it rounds to itself. Dividing the resulting
+            // infinity back down returned +/-inf, which is what `round(1e308, 1)`
+            // answered where DuckDB answers 1e308.
+            if !f.is_finite() || !scaled.is_finite() {
+                x
+            } else if f == 0.0 {
+                // `10^y` underflowed: every value rounds to the nearest multiple of a
+                // number larger than any f64, which is zero.
+                0.0
+            } else {
+                scaled.round() / f
+            }
         }
         Math2Func::Hypot => x.hypot(y),
         // One ULP toward `y`. `f64::next_after` is unstable in std; stepping the

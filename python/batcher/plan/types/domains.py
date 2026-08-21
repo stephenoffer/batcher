@@ -65,10 +65,13 @@ def _is_orderable(dt: pa.DataType) -> bool:
 
 #: Aggregates whose input must be numeric, and the hint each one's failure carries.
 #:
-#: `sum` and `mean` accumulate in decimal when given one, so they take the full numeric
-#: domain. The rest work in `f64` and reject a decimal input, so they take `_is_real` --
-#: which is a real gap against DuckDB (`STDDEV(decimal)` runs there) rather than a semantic
-#: boundary, and is stated as such in the message.
+#: `_REAL` used to exclude DECIMAL, because these accumulate in `f64` and the kernels
+#: rejected one. That was a gap against DuckDB (`STDDEV(price)` over a DECIMAL runs there),
+#: not a semantic boundary, and it is closed at the input rather than here: the aggregate
+#: pre-pass widens a decimal to Float64 for exactly this set
+#: (`bc_runtime::agg::inputs::widens_decimal`), which costs nothing a DOUBLE-returning
+#: aggregate could have kept. Both names are retained because the *other* rejections they
+#: carry -- a string, a list, a timestamp -- are real.
 _NUMERIC: dict[str, str] = dict.fromkeys(("sum", "mean"), "numeric")
 _REAL: dict[str, str] = dict.fromkeys(
     (
@@ -154,9 +157,8 @@ def aggregate_domain_error(func: str, column: str, dt: pa.DataType) -> str | Non
         return None
     if func in _NUMERIC and not _is_numeric(dt):
         return _reject(func, column, dt, "numeric")
-    if func in _REAL and not _is_real(dt):
-        domain = "integer or floating-point" if pa.types.is_decimal(dt) else "numeric"
-        return _reject(func, column, dt, domain)
+    if func in _REAL and not _is_real(dt) and not pa.types.is_decimal(dt):
+        return _reject(func, column, dt, "numeric")
     if func in _BITWISE and not pa.types.is_integer(dt):
         return _reject(func, column, dt, "integer")
     if func in _BOOLEAN and not pa.types.is_boolean(dt):
@@ -185,6 +187,7 @@ _WINDOW_AS_AGGREGATE = {
     "bit_xor": "bit_xor",
     "bool_and": "bool_and",
     "bool_or": "bool_or",
+    "median": "median",
     # The exponentially-weighted statistics and the gap filler are weighted means over the
     # ordered prefix, so they need the same real-valued input `mean` does. They have no
     # aggregate spelling of their own, which is why they borrow one here.

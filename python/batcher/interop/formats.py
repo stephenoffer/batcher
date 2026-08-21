@@ -24,7 +24,7 @@ import pyarrow as pa
 
 from batcher.interop.arrays import arrays_to_torch, to_numpy_batches
 
-__all__ = ["FORMATS", "result_to_arrowable", "to_format"]
+__all__ = ["FORMATS", "restore_null_typed_columns", "result_to_arrowable", "to_format"]
 
 #: The batch formats a `map_batches` `fn` may speak. ``polars`` is Arrow-native (near
 #: zero-copy) and ``jax`` reuses the numpy path — the two most-requested Ray Data / Daft
@@ -70,6 +70,37 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
     raise ValueError(f"unknown batch_format {fmt!r}; expected one of {FORMATS}")
 
 
+def restore_null_typed_columns(batch: pa.RecordBatch, reference: pa.Schema) -> pa.RecordBatch:
+    """Give a column that came back Arrow-`null` its type from `reference` again.
+
+    A NumPy or pandas round-trip carries a string column as `object`, and an `object` column
+    with no non-null value in it -- empty, or all nulls -- says nothing about what it held.
+    Arrow infers `null`, so a `string` column returns as `null`: an identity `fn` changes a
+    column *type*, and only on the batches that happen to contain no data. A filter matching
+    nothing, or one empty partition out of many, is enough.
+
+    That is the same defect the device tier had and fixed by name
+    (`core/gpu_plan/backend.py::_restore_empty_strings`); this is the CPU pair of it.
+
+    The cast is unconditionally value-preserving, which is why it needs no guard on row count:
+    a `null`-typed array's values are *all* null, so reading them as `string` yields the same
+    nulls. Only the type moves, and it moves back to what the engine already declared. A
+    column the `fn` invented, or one it left non-null, is untouched.
+    """
+    if not any(pa.types.is_null(field.type) for field in batch.schema):
+        return batch
+    fields, columns = [], []
+    for column, field in zip(batch.columns, batch.schema, strict=True):
+        want = reference.field(field.name) if field.name in reference.names else None
+        if want is not None and pa.types.is_null(field.type) and not pa.types.is_null(want.type):
+            fields.append(field.with_type(want.type))
+            columns.append(column.cast(want.type))
+        else:
+            fields.append(field)
+            columns.append(column)
+    return pa.RecordBatch.from_arrays(columns, schema=pa.schema(fields))
+
+
 def _to_pandas(batch: pa.RecordBatch) -> Any:
     """`batch` as a `DataFrame`, with tensor columns kept shaped.
 
@@ -93,7 +124,33 @@ def _to_pandas(batch: pa.RecordBatch) -> Any:
         column = batch.column(name)
         if is_tensor_column(column) or is_ragged_tensor_column(column):
             frame[name] = list(_column_to_numpy(column))
+        elif column.null_count and pa.types.is_integer(column.type):
+            _warn_int_widening(column.type)
     return frame
+
+
+def _warn_int_widening(arrow_type: pa.DataType) -> None:
+    """Announce a nullable integer column returning from pandas as a float.
+
+    pandas' default integer dtype has no NA, so `to_pandas` widens the column to `float64`
+    and a `fn` that returns it untouched hands back `double`. That is a *type* change across
+    an identity function, which the distributed contract forbids of the column it applies to
+    -- and it is the one loss on this path with no compensating round-trip. A null survives
+    (it becomes NaN in the frame and `from_pandas` reads it back as a null, which is why the
+    values look fine) but `int64` does not come back.
+
+    The NumPy path announces the same widening; this one did not, so the case most likely to
+    hit it -- an ID or count column with missing values -- changed type in silence.
+    """
+    from batcher.interop.arrays import warn_conversion_loss
+
+    warn_conversion_loss(
+        f"a nullable {arrow_type} column has no pandas integer dtype with NA, so it becomes "
+        "float64 in the frame and returns as double rather than "
+        f"{arrow_type}",
+        keeps="`batch_format='pyarrow'` and `'polars'` keep the type",
+        stacklevel=4,
+    )
 
 
 #: Column sets already warned about, so a dropped column is reported once per stage rather

@@ -16,6 +16,7 @@ function outside `WINDOW_FRAMEABLE`. That is right for a function SQL gives no f
 answer: ``window(frame=(-1, 0), functions={"w": ("stddev", "f")})`` returned the *running*
 standard deviation, which is a wrong result rather than a missing feature. Exactly three
 functions are in that gap — `stddev`, `var`, `count_distinct` — and they now refuse.
+`median` joined the vocabulary later and is refused for the same reason `count_distinct` is.
 
 The frame cases compare against DuckDB *with* the frame and are also pinned against the
 running answer, because the defect was returning a real number that happened to answer the
@@ -67,10 +68,17 @@ _NEWLY_REACHABLE = [
     ("bool_or", "b"),
     ("stddev", "f"),
     ("variance", "f"),
+    # `median` is the one order statistic here. It is *not* a fold, so it reaches the
+    # running form through a two-heap rather than the sliding one — which is why it appears
+    # in `_NEWLY_REACHABLE` but not in `_FRAMEABLE` below.
+    ("median", "f"),
 ]
 
-#: The subset of the above the engine can also compute over an explicit frame.
-_FRAMEABLE = [(fn, c) for fn, c in _NEWLY_REACHABLE if fn not in {"stddev", "variance"}]
+#: The subset of the above the engine can also compute over an explicit frame — now all of
+#: them. `stddev`/`variance` joined once the sliding fold was given Welford's *combine*
+#: (Chan's parallel formula) instead of trying to subtract the leaving row, which Welford
+#: has no inverse for and which is why the pair used to refuse a frame.
+_FRAMEABLE = [pair for pair in _NEWLY_REACHABLE if pair[0] != "median"]
 
 
 @pytest.mark.parametrize(("fn", "col"), _NEWLY_REACHABLE)
@@ -116,21 +124,47 @@ def test_the_frame_actually_narrows_the_answer(duck, fn, col):
     )
 
 
-@pytest.mark.parametrize("fn", ["stddev", "var", "count_distinct"])
+@pytest.mark.parametrize("fn", ["count_distinct", "median"])
 def test_an_unframeable_aggregate_refuses_a_frame_instead_of_ignoring_it(fn):
-    """The regression guard: these silently returned the *running* answer to a framed query.
+    """The regression guard: this silently returned the *running* answer to a framed query.
 
-    `assert_same`-style checks cannot catch this — the returned column is a perfectly good
-    number, just the answer to the question without the frame.
+    `assert_same`-style checks cannot catch that — the returned column is a perfectly good
+    number, just the answer to the question without the frame. Two are left, for the same
+    shape of reason: `count_distinct` needs a multiset rather than a fold, and `median` needs
+    an order statistic. Merging two sorted halves *is* associative, so the sliding structure
+    could carry a median — at O(k) a step, which is O(n·k) behind an O(n) call shape. Both
+    still answer the running and whole-partition forms.
     """
     ds = bt.from_arrow(_table())
     with pytest.raises(bt.PlanError, match="does not support an explicit frame"):
         ds.window(order_by=["i"], frame=(-1, 0), functions={"w": (fn, "f")}).collect()
 
 
+def test_a_framed_variance_is_numerically_stable():
+    """The frame must not reintroduce the sum-of-squares cancellation Welford exists to avoid.
+
+    Over `[1e9+1, 1e9+2, 1e9+3]` a `(n, sum, sum-of-squares)` state answers exactly `0`
+    where the variance is `1`. The mergeable form has to keep the *centred* moment, and a
+    frame is where a naive implementation is most tempted not to.
+    """
+    t = pa.table(
+        {
+            "i": pa.array([1, 2, 3], pa.int64()),
+            "f": pa.array([1e9 + 1, 1e9 + 2, 1e9 + 3], pa.float64()),
+        }
+    )
+    got = (
+        bt.from_arrow(t)
+        .window(order_by=["i"], frame=(-2, 0), functions={"w": ("var", "f")})
+        .collect()
+        .to_pydict()["w"]
+    )
+    assert got[2] == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize("fn", ["stddev", "var"])
-def test_the_running_form_of_an_unframeable_aggregate_still_works(duck, fn):
-    """Refusing the frame must not cost the form that was always correct."""
+def test_the_running_form_of_a_moment_aggregate_still_works(duck, fn):
+    """Gaining the framed form must not cost the running one that was always correct."""
     t = _table()
     duck.register("t", t)
     duck_name = {"stddev": "stddev", "var": "variance"}[fn]

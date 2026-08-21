@@ -22,11 +22,19 @@ __all__ = ["ResumePlan", "recover"]
 
 @dataclass(frozen=True, slots=True)
 class ResumePlan:
-    """How a streaming query resumes: where to start, seek, and what state to restore."""
+    """How a streaming query resumes: where to start, seek, and what state to restore.
+
+    `state` is the base snapshot and `state_deltas` the changelog entries recorded after it.
+    They are reported separately rather than pre-combined because combining partials is the
+    *aggregate algebra*, which lives in `core`; this module is neutral and knows only that a
+    checkpoint holds a sequence of batches. A driver with no way to combine them restores
+    `state` alone, which is why a delta is only ever written for a fold that offered one.
+    """
 
     start_batch: int = 0
     seek: dict[int, dict] = field(default_factory=dict)
     state: pa.RecordBatch | None = None
+    state_deltas: tuple[pa.RecordBatch, ...] = ()
 
 
 def recover(store: CheckpointStore) -> ResumePlan:
@@ -44,5 +52,9 @@ def recover(store: CheckpointStore) -> ResumePlan:
         return ResumePlan()  # nothing committed yet → reprocess from the start
     resume_batch = last_commit + 1
     seek = store.offsets.position_at(last_commit)
-    state = store.state.restore(last_commit)
-    return ResumePlan(start_batch=resume_batch, seek=seek, state=state)
+    chain = store.state.restore_chain(last_commit)
+    if not chain:
+        return ResumePlan(start_batch=resume_batch, seek=seek)
+    return ResumePlan(
+        start_batch=resume_batch, seek=seek, state=chain[0], state_deltas=tuple(chain[1:])
+    )

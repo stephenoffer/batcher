@@ -16,10 +16,18 @@
 //! DataFrame spellings are composites over `var`/`stddev`), so a `WindowFn` variant would
 //! have nothing able to construct it.
 //!
-//! Order statistics (`median`, `quantile`, `mode`) are deliberately absent: their running
-//! form needs a sorted structure, so adding them here would put an `O(n log n)` — or
-//! worse — kernel behind the same call shape as an `O(n)` one, with nothing at the call
-//! site to say so. They stay unsupported until they get a structure that earns them.
+//! `median` is the one order statistic admitted, and only because it arrives with the
+//! structure the rest are still waiting for. Whole-partition it is a single quickselect —
+//! literally `agg/median.rs`'s kernel, so a window and a `GROUP BY` median over the same
+//! rows agree by construction. Along an ordered partition it is a **two-heap**: a max-heap
+//! of the lower half and a min-heap of the upper, rebalanced after each insert, which is
+//! `O(log n)` per row and `O(1)` to read. That is the same order as the folds above, not a
+//! sort hidden behind their call shape.
+//!
+//! What that structure cannot do is *delete*, so an **explicit frame** still declines: a
+//! sliding median would have to rebuild, and `O(n·k)` behind an `O(n)` call shape is
+//! exactly what this module refuses. `quantile` and `mode` stay out for the original
+//! reason — no structure yet earns them.
 //!
 //! Each family appears twice, and that is not duplication: the **whole-partition** form
 //! reduces by dense group id in one linear pass with no ordering at all, while the
@@ -34,8 +42,11 @@ use arrow::datatypes::{Float64Type, Int64Type};
 use arrow::row::Rows;
 
 use crate::error::RuntimeError;
+use crate::window::agg::median_state::RunningMedian;
 use crate::window::frame::RangeOrder;
 use crate::window::WindowFn;
+
+mod median_state;
 
 /// Running **Welford** `(n, mean, M2)` state for the moment aggregates.
 ///
@@ -67,6 +78,42 @@ impl Moments {
         let delta = v - self.mean;
         self.mean += delta / self.n as f64;
         self.m2 += delta * (v - self.mean);
+    }
+
+    /// The state for a single value — the identity for [`Moments::merge`]'s unit.
+    #[inline]
+    fn of(v: f64) -> Self {
+        Self {
+            n: 1,
+            mean: v,
+            m2: 0.0,
+        }
+    }
+
+    /// Two states combined, by Chan's parallel formula — the *mergeable* counterpart of
+    /// [`Moments::push`], and the same one `bc-runtime`'s distributed variance uses.
+    ///
+    /// It is associative and commutative in exact arithmetic, which is what lets a
+    /// sliding frame keep the state in the two-stack FIFO ([`SlidingFold`]) instead of
+    /// re-accumulating each frame from scratch: the window's state is the combine of the
+    /// two stacks' folds, so nothing is ever *subtracted* — the operation Welford has no
+    /// inverse for, and the reason this pair used to refuse a frame outright.
+    #[inline]
+    fn merge(a: &Self, b: &Self) -> Self {
+        if a.n == 0 {
+            return *b;
+        }
+        if b.n == 0 {
+            return *a;
+        }
+        let (na, nb) = (a.n as f64, b.n as f64);
+        let n = na + nb;
+        let delta = b.mean - a.mean;
+        Self {
+            n: a.n + b.n,
+            mean: a.mean + delta * nb / n,
+            m2: a.m2 + b.m2 + delta * delta * na * nb / n,
+        }
     }
 
     /// The variance under `ddof` (1 = sample), or `None` when there are too few values
@@ -106,6 +153,7 @@ pub(crate) fn is_extended_aggregate(func: WindowFn) -> bool {
             | WindowFn::BitOr
             | WindowFn::BitXor
             | WindowFn::CountDistinct
+            | WindowFn::Median
     )
 }
 
@@ -189,6 +237,23 @@ pub(crate) fn broadcast(
                 .iter()
                 .map(|&g| state[g as usize].len() as i64)
                 .collect();
+            Ok(Arc::new(out))
+        }
+        WindowFn::Median => {
+            let f = numeric(values, func)?;
+            // One value list per partition, then the *same* quickselect `GROUP BY` median
+            // runs — sharing the kernel is what keeps the two spellings from drifting.
+            let mut groups: Vec<Vec<f64>> = vec![Vec::new(); num_groups];
+            for (i, &g) in group_ids.iter().enumerate() {
+                if f.is_valid(i) {
+                    groups[g as usize].push(f.value(i));
+                }
+            }
+            let per_group: Vec<Option<f64>> = groups
+                .iter_mut()
+                .map(|v| (!v.is_empty()).then(|| crate::agg::median::quickselect_median(v)))
+                .collect();
+            let out: Float64Array = group_ids.iter().map(|&g| per_group[g as usize]).collect();
             Ok(Arc::new(out))
         }
         other => Err(unsupported(other, values)),
@@ -288,6 +353,27 @@ pub(crate) fn running(
                 }
             }
             Ok(Arc::new(Int64Array::from(out)))
+        }
+        WindowFn::Median => {
+            let f = numeric(values, func)?;
+            let mut out: Vec<Option<f64>> = vec![None; num_rows];
+            for part in ordered {
+                let mut state = RunningMedian::default();
+                let mut group_start = 0usize;
+                for pos in 0..part.len() {
+                    if f.is_valid(part[pos]) {
+                        state.push(f.value(part[pos]));
+                    }
+                    if peer_end(part, order_rows, pos) {
+                        let v = state.median();
+                        for j in group_start..=pos {
+                            out[part[j]] = v;
+                        }
+                        group_start = pos + 1;
+                    }
+                }
+            }
+            Ok(Arc::new(Float64Array::from(out)))
         }
         WindowFn::CountDistinct => {
             let reader = KeyReader::new(values)?;
@@ -582,10 +668,33 @@ pub(crate) fn framed(
             );
             Ok(Arc::new(Int64Array::from(out)))
         }
-        // `var`/`stddev` keep a Welford state, whose combine is Chan's parallel formula
-        // rather than a plain operator, and `count_distinct` needs a multiset rather
-        // than a fold. Neither is served by this slide, so both keep refusing a frame
-        // rather than being given a wrong one.
+        // Welford has no inverse, so a frame cannot be maintained by subtracting the
+        // leaving row — which is why this pair used to refuse one. It does not need to:
+        // `slide` is a *fold* over any associative combine, and `Moments::merge` is one
+        // (Chan's parallel formula). The state is therefore carried in the same two-stack
+        // FIFO every other framed aggregate uses, at the same O(n) amortized cost.
+        WindowFn::Var | WindowFn::Stddev => {
+            let f = numeric(values, func)?;
+            let folded = slide(
+                ordered,
+                frame,
+                order_rows,
+                range_order,
+                num_rows,
+                |row| f.is_valid(row).then(|| Moments::of(f.value(row))),
+                Moments::merge,
+            );
+            let out: Vec<Option<f64>> = folded
+                .into_iter()
+                .map(|m| m.and_then(|m| m.finish(func)))
+                .collect();
+            Ok(Arc::new(Float64Array::from(out)))
+        }
+        // `count_distinct` needs a multiset rather than a fold, and `median` needs an order
+        // statistic, which `slide`'s associative combine cannot express — merging two
+        // sorted halves is associative but costs O(k) a step, so it would be O(n·k) behind
+        // an O(n) call shape. Both keep refusing a frame rather than being given a wrong
+        // one; `median` still answers the frameless and running forms above.
         other => Err(RuntimeError::UnsupportedWindow {
             func: other.name().to_string(),
             dtype: "explicit frame".to_string(),
@@ -694,5 +803,24 @@ mod tests {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), None]));
         let out = broadcast(WindowFn::CountDistinct, &[0, 0, 0, 0], 1, &values).unwrap();
         assert_eq!(out.as_primitive::<Int64Type>().values(), &[2, 2, 2, 2]);
+    }
+
+    /// The whole-partition form must be the `GROUP BY` answer, per group, with nulls skipped
+    /// and an all-null group null rather than zero.
+    #[test]
+    fn the_broadcast_median_skips_nulls_and_leaves_an_empty_group_null() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(3.0),
+            None,
+            Some(8.0),
+            None,
+        ]));
+        let out = broadcast(WindowFn::Median, &[0, 0, 0, 0, 1], 2, &values).unwrap();
+        let out = out.as_primitive::<Float64Type>();
+        // Group 0 is [1, 3, 8] → 3; group 1 has only a null → null.
+        assert_eq!(out.value(0), 3.0);
+        assert_eq!(out.value(3), 3.0);
+        assert!(out.is_null(4));
     }
 }

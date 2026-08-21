@@ -39,12 +39,24 @@ def _canonical_edges(g: Graph) -> Dataset:
     Orienting by node id is what stops a triangle from being counted six times (once per
     ordering of its three vertices): with a consistent orientation only one of the six
     survives, so the join returns each triangle exactly once.
+
+    The orientation is a **swap**, not a filter, and the difference is the whole correctness
+    of this module. Filtering ``src < dst`` is only equivalent to orienting when both
+    directions of every edge are present, which is true after `to_undirected` symmetrizes a
+    *directed* graph -- and false for a graph the caller already built with
+    ``directed=False``, because `to_undirected` returns that one unchanged. On such a graph
+    the filter silently *discarded* every edge whose row happened to be written with the
+    larger endpoint first, so a triangle whose edges were spelled ``(2, 0)`` rather than
+    ``(0, 2)`` disappeared and `triangle_count` answered zero. Which endpoint a caller writes
+    first is not information in an undirected graph, so it cannot be allowed to change the
+    answer.
     """
+    edges = g.to_undirected().simple().edges
+    lo = bt.when(bt.col(SRC) <= bt.col(DST)).then(bt.col(SRC)).otherwise(bt.col(DST))
+    hi = bt.when(bt.col(SRC) <= bt.col(DST)).then(bt.col(DST)).otherwise(bt.col(SRC))
     return (
-        g.to_undirected()
-        .simple()
-        .edges.filter(bt.col(SRC) < bt.col(DST))
-        .select(SRC, DST)
+        edges.select(**{SRC: lo, DST: hi})
+        .filter(bt.col(SRC) != bt.col(DST))  # a self-loop closes no triangle
         .distinct()
     )
 
@@ -131,9 +143,18 @@ def clustering_coefficient(g: Graph) -> Dataset:
             >>> [round(v, 4) for v in out.to_pydict()["clustering"]]
             [1.0, 1.0, 0.3333, 0.0]
     """
-    undirected = g.to_undirected().simple()
-    # `out_degree` on a symmetrized graph is the neighbour count; `degree` would be twice it.
-    neighbours = out_degree(undirected).select(**{NODE: bt.col(NODE), "_k": bt.col("out_degree")})
+    # The neighbour count comes from the *canonical* undirected edge set, the same one
+    # `triangles` counts over, so the numerator and denominator of the ratio below can never
+    # be describing two different graphs. It used to come from `out_degree` on
+    # `g.to_undirected()`, which is only the neighbour count when that call actually
+    # symmetrized -- and it does not for a graph the caller already built with
+    # `directed=False`, leaving `out_degree` measuring a one-sided edge list. Every node in a
+    # triangle then scored 0.0 except whichever one happened to be written first.
+    canonical = _canonical_edges(g).cache()
+    endpoints = canonical.select(**{NODE: bt.col(SRC)}).union(
+        canonical.select(**{NODE: bt.col(DST)})
+    )
+    neighbours = endpoints.group_by(NODE).agg(_k=bt.count())
     tri = triangle_count(g)
     return neighbours.join(tri, on=NODE, how="left").select(
         **{

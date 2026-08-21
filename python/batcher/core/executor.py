@@ -23,6 +23,7 @@ import pyarrow as pa
 from batcher._internal.hardware import fingerprint
 from batcher._internal.hardware.cgroup import cgroup_throttled_ratio
 from batcher._internal.hardware.cpu import cpu_thermal_events
+from batcher._internal.logging import get_logger
 from batcher._internal.mathx import safe_div
 from batcher._internal.native import engine
 from batcher.config import active_config
@@ -32,6 +33,8 @@ from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
 
 __all__ = ["LocalExecutor", "execute_local", "execute_local_metered", "record_exec_metrics"]
+
+_log = get_logger("core")
 
 
 def record_exec_metrics(
@@ -53,8 +56,13 @@ def record_exec_metrics(
     if sink is None:
         return
     try:
-        ops = json.loads(metrics_json).get("ops", [])
+        doc = json.loads(metrics_json)
     except (ValueError, TypeError):
+        return
+    if not isinstance(doc, dict):
+        return  # a document of the wrong shape is not an error, it is nothing to record
+    ops = doc.get("ops") or []
+    if not isinstance(ops, list):
         return
     _record_op_feedback(sink, ops, batch_size, planned)
 
@@ -116,53 +124,92 @@ def _record_op_feedback(
     # whole uptime. Always `0` on a virtualized host, which does not expose the counters.
     local_thermal = cpu_thermal_events()
     for op in ops:
-        rows_in = op.get("rows_in", 0)
-        rows_out = op.get("rows_out", 0)
-        op_id = int(op.get("op_id", 0))
-        annotated = planned[op_id] if 0 <= op_id < len(planned) else None
-        sink.record(
-            OperatorFeedback(
-                op_id=OpId(op_id),
-                kind=op.get("kind", ""),
-                n_actual=int(rows_out),
-                t_op_ms=op.get("elapsed_ns", 0) / 1e6,
-                m_peak_bytes=int(op.get("peak_bytes", 0)),
-                selectivity=safe_div(rows_out, rows_in, 1.0),
-                batch_size=batch_size,
-                backend=op.get("backend", "interp"),
-                algorithm="spill" if op.get("spilled") else "",
-                spill_bytes=int(op.get("spill_bytes", 0) or 0),
-                peak_rss_bytes=int(op.get("peak_rss_bytes", 0) or 0),
-                cpu_utilization=cpu_utilization(
-                    op.get("cpu_ns", 0),
-                    op.get("elapsed_ns", 0),
-                    op.get("threads", 1),
-                    op.get("wall_span_ns", 0),
-                ),
-                threads=int(op.get("threads", 0) or 0),
-                n_input=int(rows_in),
-                n_build=int(op.get("rows_build", 0) or 0),
-                result_bytes=int(op.get("result_bytes", op.get("peak_bytes", 0)) or 0),
-                signature=_signature_of(annotated),
-                n_estimated=_raw_estimate_of(annotated),
-                expr_factor=annotated.properties.expr_factor if annotated else 1.0,
-                # The engine flattens its hardware counters into the same document, so they
-                # read as ordinary keys. `or 0` covers both an older engine that omits the key
-                # and a platform that reports null for a counter it cannot read.
-                minor_faults=int(op.get("minor_faults", 0) or 0),
-                major_faults=int(op.get("major_faults", 0) or 0),
-                vol_ctx_switches=int(op.get("vol_ctx_switches", 0) or 0),
-                invol_ctx_switches=int(op.get("invol_ctx_switches", 0) or 0),
-                io_read_bytes=int(op.get("io_read_bytes", 0) or 0),
-                io_write_bytes=int(op.get("io_write_bytes", 0) or 0),
-                hw_fingerprint=str(op.get("hw_fingerprint", "") or local_fingerprint),
-                # A distributed worker stamps its own reading into the document before it
-                # travels, exactly as it does the fingerprint, so a driver recording on its
-                # behalf attributes the throttling to the node that suffered it.
-                cpu_throttled_ratio=float(op.get("cpu_throttled_ratio") or local_throttled),
-                cpu_thermal_events=int(op.get("cpu_thermal_events") or local_thermal),
+        if not isinstance(op, dict):
+            continue
+        try:
+            _record_one(
+                sink, op, batch_size, planned, local_fingerprint, local_throttled, local_thermal
             )
+        except Exception:  # pragma: no cover - measurement must never break a query
+            _log.warning("skipped an unreadable operator metrics entry", exc_info=True)
+
+
+def _num(op: dict, key: str, default: float = 0.0) -> float:
+    """One numeric field of a metrics entry, with `null` read as `default`.
+
+    Every counter in the document is optional twice over: an older engine omits the key, and
+    a platform that cannot read a counter reports `null` for it. `dict.get(key, default)`
+    only covers the first — the second hands back `None`, and `None` reaches an arithmetic
+    comparison as a `TypeError` raised out of the *feedback* path and into the query, which
+    is precisely what "Core measures, best-effort" forbids. Most fields here already spelled
+    `or 0`; the ones feeding `cpu_utilization` and the elapsed time did not.
+    """
+    value = op.get(key)
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _record_one(
+    sink: FeedbackSink,
+    op: dict,
+    batch_size: int,
+    planned: Sequence[PhysicalOp],
+    local_fingerprint: str,
+    local_throttled: float,
+    local_thermal: int,
+) -> None:
+    """Transcribe one metrics entry into an `OperatorFeedback` and record it."""
+    rows_in = _num(op, "rows_in")
+    rows_out = _num(op, "rows_out")
+    op_id = int(_num(op, "op_id"))
+    annotated = planned[op_id] if 0 <= op_id < len(planned) else None
+    sink.record(
+        OperatorFeedback(
+            op_id=OpId(op_id),
+            kind=op.get("kind", ""),
+            n_actual=int(rows_out),
+            t_op_ms=_num(op, "elapsed_ns") / 1e6,
+            m_peak_bytes=int(_num(op, "peak_bytes")),
+            selectivity=safe_div(rows_out, rows_in, 1.0),
+            batch_size=batch_size,
+            backend=op.get("backend", "interp"),
+            algorithm="spill" if op.get("spilled") else "",
+            spill_bytes=int(_num(op, "spill_bytes")),
+            peak_rss_bytes=int(_num(op, "peak_rss_bytes")),
+            cpu_utilization=cpu_utilization(
+                _num(op, "cpu_ns"),
+                _num(op, "elapsed_ns"),
+                int(_num(op, "threads", 1.0)),
+                _num(op, "wall_span_ns"),
+            ),
+            threads=int(_num(op, "threads")),
+            n_input=int(rows_in),
+            n_build=int(_num(op, "rows_build")),
+            result_bytes=int(_num(op, "result_bytes") or _num(op, "peak_bytes")),
+            signature=_signature_of(annotated),
+            n_estimated=_raw_estimate_of(annotated),
+            expr_factor=annotated.properties.expr_factor if annotated else 1.0,
+            # The engine flattens its hardware counters into the same document, so they
+            # read as ordinary keys. `or 0` covers both an older engine that omits the key
+            # and a platform that reports null for a counter it cannot read.
+            minor_faults=int(_num(op, "minor_faults")),
+            major_faults=int(_num(op, "major_faults")),
+            vol_ctx_switches=int(_num(op, "vol_ctx_switches")),
+            invol_ctx_switches=int(_num(op, "invol_ctx_switches")),
+            io_read_bytes=int(_num(op, "io_read_bytes")),
+            io_write_bytes=int(_num(op, "io_write_bytes")),
+            hw_fingerprint=str(op.get("hw_fingerprint", "") or local_fingerprint),
+            # A distributed worker stamps its own reading into the document before it
+            # travels, exactly as it does the fingerprint, so a driver recording on its
+            # behalf attributes the throttling to the node that suffered it.
+            cpu_throttled_ratio=_num(op, "cpu_throttled_ratio") or local_throttled,
+            cpu_thermal_events=int(_num(op, "cpu_thermal_events")) or local_thermal,
         )
+    )
 
 
 def _signature_of(op: PhysicalOp | None) -> str:

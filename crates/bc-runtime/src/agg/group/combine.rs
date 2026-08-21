@@ -83,7 +83,7 @@ fn gather_primitive<T: ArrowPrimitiveType>(
 ///
 /// Anything else — a nested state, a temporal or decimal type this does not name, a source
 /// set of mixed types — falls through to `interleave` unchanged, sharing one lazily built
-/// pair vector. Strings take their own bulk path (`gather::gather_strings`).
+/// pair vector. Byte columns take their own bulk path (`gather::gather_bytes`).
 fn gather(
     cols: &[&dyn Array],
     part_of: &[u32],
@@ -118,9 +118,9 @@ fn gather(
     }
     // A string key is the *other* common high-cardinality group key, and arrow's `interleave`
     // costs it what it costs any variable-width column: `MutableArrayData::extend` per row,
-    // through the sixteen-byte pair vector below. `gather_strings` reads the same two planes
+    // through the sixteen-byte pair vector below. `gather_bytes` reads the same two planes
     // the primitive path does and fills one output buffer across cores.
-    if let Some(out) = crate::gather::gather_strings(cols, part_of, row_of) {
+    if let Some(out) = crate::gather::gather_bytes(cols, part_of, row_of) {
         return Ok(out);
     }
     let pairs = pairs.get_or_insert_with(|| {

@@ -27,9 +27,12 @@ use std::sync::Arc;
 use crate::error::InterpError;
 use crate::ops;
 use crate::par::SpillOptions;
+
+pub(crate) mod probe_stream;
 use crate::spill_split::{
     drain_repartition, grace_bucket_count, split_salt, MAX_GRACE_SPLIT_DEPTH,
 };
+use probe_stream::{chunk_by_bytes, ProbeStream};
 
 /// How many times larger the planner's build side must be than its probe side before the
 /// executor overrides the choice.
@@ -148,14 +151,22 @@ pub(crate) fn spilling_hash_join_streaming(
     output: &[bc_ir::JoinOutputCol],
     sp: &SpillOptions,
 ) -> Result<(Vec<RecordBatch>, u64), InterpError> {
-    // Enough partitions that each bucket's build side ≈ one budget — sized from the build
-    // batches' total size without materializing them, then capped (see `MAX_GRACE_FANOUT`).
-    let build_bytes: usize = right_batches
-        .iter()
-        .map(|b| b.get_array_memory_size())
-        .sum();
+    // Enough partitions that each bucket lands near one budget on **both** sides — sized from
+    // the batches' total size without materializing either, then capped (`MAX_GRACE_FANOUT`).
+    //
+    // Only the build side has to be resident, so only the build side bounds *memory*; the
+    // probe side is streamed past it in envelope-sized chunks. But the build table is rebuilt
+    // once per chunk, so sizing the fan-out from the build side alone is what decides how many
+    // times. A star join — a 200 MB dimension against a 200 GB fact — asked for two buckets,
+    // which left each probe bucket a thousand budgets long and rebuilt the same table a
+    // thousand times. Taking the larger side puts each probe bucket near one chunk, so the
+    // table is built once per bucket, which is what it was before the probe side was streamed.
+    //
+    // Past the fan-out cap the buckets are still too big for that, and the chunking is what
+    // keeps them bounded rather than resident. Correctness does not depend on either: equal
+    // keys co-partition for any `p`.
     let budget = sp.memory_budget_bytes.max(1);
-    let p = grace_bucket_count(build_bytes, budget);
+    let p = grace_fanout(side_bytes(left_batches), side_bytes(right_batches), budget);
 
     let mut lstore = DiskSpillStore::with_codec(sp.dir.join("join-left"), p, sp.codec)?;
     let mut rstore = DiskSpillStore::with_codec(sp.dir.join("join-right"), p, sp.codec)?;
@@ -189,9 +200,37 @@ pub(crate) fn spilling_hash_join_streaming(
     for i in 0..p {
         join_bucket(&mut lstore, &mut rstore, i, &ctx, 0, &mut out)?;
     }
+    // A join whose result is empty still has to say what its columns *are*. The per-bucket
+    // path always pushed one batch per bucket, so it carried the schema even when every
+    // bucket was empty; the streamed probe drops empty batches, so the empty relation is
+    // stated once, here, by joining the two empty sides through the ordinary assembler.
+    if out.is_empty() {
+        out.push(ops::join_batches(
+            &RecordBatch::new_empty(ctx.lschema.clone()),
+            &RecordBatch::new_empty(ctx.rschema.clone()),
+            left_keys,
+            right_keys,
+            join_type,
+            output,
+            bc_ir::JoinStrategy::Hash,
+        )?);
+    }
     // Both sides were streamed to disk; the spill volume is their combined written bytes.
     let spill_bytes = lstore.spilled_bytes() + rstore.spilled_bytes();
     Ok((out, spill_bytes))
+}
+
+/// A relation's in-memory footprint, without concatenating it.
+fn side_bytes(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.get_array_memory_size()).sum()
+}
+
+/// How many ways a grace join fans out, from the **larger** of its two sides.
+///
+/// Separated and named because the choice of side is the whole content of the decision, and
+/// it is not the obvious one. See the call site for why the build side alone is wrong.
+fn grace_fanout(left_bytes: usize, right_bytes: usize, budget: usize) -> usize {
+    grace_bucket_count(left_bytes.max(right_bytes), budget)
 }
 
 /// The parts of a grace join that do not change as buckets are re-split.
@@ -224,50 +263,106 @@ fn materialize_or_empty(
     ops::materialize(batches)
 }
 
-/// Join co-partitioned bucket `i` of the two stores, re-splitting it first if either side
-/// does not fit in the envelope.
+/// Join co-partitioned bucket `i` of the two stores, re-splitting it first if the **build**
+/// side does not fit in the envelope.
 ///
 /// The bucket count is sized from the build side's *average* bytes per bucket, so it is only
-/// an average-case fit. Under key skew one bucket holds far more than its share — and both
-/// sides were materialized whole before being joined, so a skewed bucket OOMs at exactly the
-/// point spilling was supposed to have prevented it. This is the failure mode that makes
+/// an average-case fit. Under key skew one bucket holds far more than its share, and the
+/// build side has to be resident to be a hash table — so a skewed bucket would OOM at exactly
+/// the point spilling was supposed to have prevented it. This is the failure mode that makes
 /// skewed joins the standard reason a Spark job dies, and the grace *aggregate* already
-/// guards against it by recursively re-partitioning an over-large partition; the join did
-/// not.
+/// guards against it by recursively re-partitioning an over-large partition.
 ///
-/// Both sides are asked *before* being read, which is the whole point: the decision to split
-/// has to happen without first pulling the partition that provably does not fit into memory.
-/// The probe side counts too, not just the build side — the bucket count is sized from the
-/// build side alone, so a fact table with a hot key can leave a probe bucket orders of
-/// magnitude over the envelope even when every build bucket fits.
+/// The build side is asked *before* being read, which is the whole point: the decision to
+/// split has to happen without first pulling the partition that provably does not fit.
 ///
 /// A re-split partitions **both** sides with a salt derived from the depth. The salt is a
 /// function of the depth alone, never of the row, so equal keys still co-locate on both
 /// sides and each sub-bucket remains an independent join whose union is the same relation.
+///
+/// ## Why the probe side is not part of that decision
+///
+/// It used to be: the split fired when *either* side was over budget, because both sides were
+/// materialized whole before being joined. That was the wrong shape twice over.
+///
+/// It is unnecessary — a grace join needs only the *build* bucket resident. The probe side is
+/// streamed through it batch by batch ([`stream_probe_bucket`]), so its size never bounds
+/// anything, and re-splitting on account of it wrote both sides to disk again to reach a
+/// state that was already fine.
+///
+/// And it does not work. Re-splitting is a re-hash, so it cannot separate rows that share a
+/// key — and a probe bucket is over budget precisely when it holds a *hot key*. A fact table
+/// whose `customer_id` is `-1` for 40% of its rows re-hashed to the same sub-bucket at every
+/// one of the three permitted levels, paying three full re-spills of the whole bucket, and
+/// then materialized it anyway. The dimension side it joins against holds one row for that
+/// key: nothing about this join ever needed more than a morsel of memory.
 fn join_bucket(
-    lstore: &mut dyn SpillStore,
-    rstore: &mut dyn SpillStore,
+    lstore: &mut DiskSpillStore,
+    rstore: &mut DiskSpillStore,
     i: usize,
     ctx: &BucketJoin<'_>,
     depth: u32,
     out: &mut Vec<RecordBatch>,
 ) -> Result<(), InterpError> {
-    let lbytes = lstore.partition_bytes(i) as usize;
     let rbytes = rstore.partition_bytes(i) as usize;
-    if depth < MAX_GRACE_SPLIT_DEPTH && lbytes.max(rbytes) > ctx.budget {
-        return split_and_join_bucket(lstore, rstore, i, ctx, depth, lbytes.max(rbytes), out);
+    if depth < MAX_GRACE_SPLIT_DEPTH && rbytes > ctx.budget {
+        return split_and_join_bucket(lstore, rstore, i, ctx, depth, rbytes, out);
     }
-    let lpart = materialize_or_empty(&lstore.read(i)?, &ctx.lschema)?;
-    let rpart = materialize_or_empty(&rstore.read(i)?, &ctx.rschema)?;
-    out.push(ops::join_batches(
-        &lpart,
-        &rpart,
-        ctx.left_keys,
-        ctx.right_keys,
-        ctx.join_type,
-        ctx.output,
-        bc_ir::JoinStrategy::Hash,
-    )?);
+    let build = materialize_or_empty(&rstore.read(i)?, &ctx.rschema)?;
+    stream_probe_bucket(lstore, i, &build, ctx, out)
+}
+
+/// Join every probe batch of bucket `i` against the resident `build` bucket, one at a time.
+///
+/// The bucket's rows are read straight off disk and handed to [`ProbeStream`], so the peak is
+/// the build bucket — which the caller has just proven fits the envelope — plus a single
+/// probe morsel, regardless of how many rows the probe bucket holds or how they are spread
+/// across keys. That is what makes the grace join's bound hold under the skew that
+/// re-partitioning cannot help.
+fn stream_probe_bucket(
+    lstore: &mut DiskSpillStore,
+    i: usize,
+    build: &RecordBatch,
+    ctx: &BucketJoin<'_>,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), InterpError> {
+    let stream = ProbeStream {
+        join_type: ctx.join_type,
+        output: ctx.output,
+        probe_schema: ctx.lschema.clone(),
+    };
+    let indices_of = |probe: &RecordBatch, build: &RecordBatch, jt: bc_ir::JoinType| {
+        let lkeys = ops::columns_by_name(probe, ctx.left_keys)?;
+        let rkeys = ops::columns_by_name(build, ctx.right_keys)?;
+        Ok(join::hash_join_indices(
+            &lkeys,
+            &rkeys,
+            ops::map_join_type(jt),
+        )?)
+    };
+
+    // `open_reader` is the streaming counterpart of `read`; `None` is a bucket nothing was
+    // ever routed to, which is ordinary at a 256-way fan-out (empty shards are not written).
+    //
+    // The shards are coalesced back to the envelope on the way in. Partitioning cut each input
+    // morsel `p` ways, so they arrive as fragments of a few dozen rows, and the build table is
+    // rebuilt once per chunk — one build per bucket when the probe side fits, which is what it
+    // has always been, rather than one per fragment.
+    let reader = lstore.open_reader(i)?;
+    let probe_rows = match reader {
+        Some(r) => stream.run(
+            chunk_by_bytes(r.map(|b| b.map_err(InterpError::from)), ctx.budget),
+            build,
+            &indices_of,
+            out,
+        )?,
+        None => stream.run(std::iter::empty(), build, &indices_of, out)?,
+    };
+    // `open_reader` streams, so it cannot make the short-read check `read`/`drain` make for
+    // themselves — and a truncated IPC stream reads back as a shorter *valid* one, which here
+    // would silently drop probe rows from the join. Asking the store to make its own
+    // comparison is what keeps that an error rather than a wrong answer.
+    lstore.verify_rows(i, probe_rows)?;
     Ok(())
 }
 
@@ -277,8 +372,8 @@ fn join_bucket(
 /// child store, so the bucket that did not fit is never held whole — the peak is one batch
 /// plus one sub-bucket, which is what the caller's budget was meant to describe all along.
 fn split_and_join_bucket(
-    lstore: &mut dyn SpillStore,
-    rstore: &mut dyn SpillStore,
+    lstore: &mut DiskSpillStore,
+    rstore: &mut DiskSpillStore,
     i: usize,
     ctx: &BucketJoin<'_>,
     depth: u32,
@@ -378,10 +473,18 @@ fn partition_batches_to_store(
 /// ASOF join and their union is the full result — identical to the in-memory path,
 /// with bounded memory. Bucket count is sized so the larger side's bucket ≈ one
 /// budget.
+///
+/// Takes the two sides as **morsels**, and streams each one through the partitioner into its
+/// store ([`partition_batches_to_store`], shared with the grace hash join) — so at no point
+/// is either input held whole. Taking them as one `RecordBatch` each, as this did, meant the
+/// caller had concatenated both sides before it could ask whether they fit: an ASOF join over
+/// inputs larger than the envelope OOMed at that concatenation, before the spill path it was
+/// on its way to could bound anything. That is the same defect the grace hash join was
+/// already fixed for, and this was the operator it was still live in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spilling_asof_join(
-    left: &RecordBatch,
-    right: &RecordBatch,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
     left_on: &str,
     right_on: &str,
     left_by: &[String],
@@ -392,29 +495,23 @@ pub(crate) fn spilling_asof_join(
     output: &[bc_ir::JoinOutputCol],
     sp: &SpillOptions,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let li = ops::key_indices(left, left_by)?;
-    let ri = ops::key_indices(right, right_by)?;
-    let bytes = left
-        .get_array_memory_size()
-        .max(right.get_array_memory_size());
+    // Sized from the morsels' summed size, so the fan-out is chosen without materializing.
+    let bytes = crate::batch_bytes(left_batches).max(crate::batch_bytes(right_batches)) as usize;
     // Capped like every other grace fan-out. Uncapped, a side three orders of magnitude over
     // the envelope asked for thousands of buckets per store — thousands of spill files, each
     // receiving shards too small to write efficiently — and the bucket that still did not fit
     // was materialized anyway, which is the failure the fan-out was trying to avoid.
     let budget = sp.memory_budget_bytes.max(1);
     let p = grace_bucket_count(bytes, budget);
-    let lb = shuffle::partition_by_keys(left, &li, p)?;
-    let rb = shuffle::partition_by_keys(right, &ri, p)?;
 
     let mut lstore = DiskSpillStore::with_codec(sp.dir.join("asof-left"), p, sp.codec)?;
     let mut rstore = DiskSpillStore::with_codec(sp.dir.join("asof-right"), p, sp.codec)?;
-    for i in 0..p {
-        lstore.append(i, &lb[i])?;
-        rstore.append(i, &rb[i])?;
-    }
-    drop(lb);
-    drop(rb);
+    partition_batches_to_store(left_batches, left_by, p, 0, &mut lstore)?;
+    partition_batches_to_store(right_batches, right_by, p, 0, &mut rstore)?;
 
+    // A side with no batches at all is shortcut upstream and never reaches this path, so both
+    // schemas are available — and both are needed, since a bucket may receive rows on one side
+    // only and still has to ASOF-join against an empty relation of the right shape.
     let asof = AsofBuckets {
         left_on,
         right_on,
@@ -427,8 +524,14 @@ pub(crate) fn spilling_asof_join(
         budget,
         codec: sp.codec,
         dir: &sp.dir,
-        lschema: left.schema(),
-        rschema: right.schema(),
+        lschema: left_batches
+            .first()
+            .ok_or(InterpError::EmptyJoinInput)?
+            .schema(),
+        rschema: right_batches
+            .first()
+            .ok_or(InterpError::EmptyJoinInput)?
+            .schema(),
     };
     let mut out = Vec::with_capacity(p);
     for i in 0..p {
@@ -830,5 +933,267 @@ mod tests {
             SKEW_BUCKET_FACTOR,
             SKEW_MIN_BUCKET_BYTES
         ));
+    }
+
+    /// The fan-out follows the larger side, so a small build against a huge probe does not
+    /// leave every probe bucket a thousand chunks long.
+    ///
+    /// Sizing from the build side alone was right while both sides were materialized whole —
+    /// only the build bounded memory. Once the probe is streamed past the build, the fan-out
+    /// stops being a memory decision and becomes a *rebuild-count* one: the build table is
+    /// rebuilt once per probe chunk, and the chunk count is `probe_bucket / budget`.
+    #[test]
+    fn the_grace_fanout_follows_the_larger_side() {
+        let budget = 1_000;
+        // A star join: a small dimension, a fact table a hundred budgets long. Sized from the
+        // build side this was the two-bucket floor; the probe side is what decides it.
+        assert_eq!(grace_fanout(100_000, 1_500, budget), 100);
+        // Symmetric — neither side is privileged.
+        assert_eq!(grace_fanout(1_500, 100_000, budget), 100);
+        // Both inside the budget is still the floor of two: a grace join that fans out one way
+        // has not partitioned anything.
+        assert_eq!(grace_fanout(500, 500, budget), 2);
+        // And it stays under the fan-out cap however lopsided the input.
+        assert_eq!(
+            grace_fanout(budget * 100_000, 1, budget),
+            crate::spill_split::MAX_GRACE_FANOUT
+        );
+    }
+
+    // --- the streamed probe: grace join under key skew ---------------------------------
+
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bc_ir::{JoinOutputCol, JoinSide, JoinType};
+
+    /// A two-column `(k, v)` batch, nullable so a null key is expressible.
+    fn kv(name_k: &str, name_v: &str, ks: &[Option<i64>], vs: &[i64]) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new(name_k, DataType::Int64, true),
+            Field::new(name_v, DataType::Int64, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ks.to_vec())),
+                Arc::new(Int64Array::from(vs.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn out_col(side: JoinSide, name: &str, alias: &str) -> JoinOutputCol {
+        JoinOutputCol {
+            side,
+            name: name.into(),
+            alias: alias.into(),
+        }
+    }
+
+    /// The result as an order-independent multiset of stringified rows, so the spilled and
+    /// in-memory relations compare as the unordered relations they are.
+    fn multiset(batches: &[RecordBatch]) -> Vec<String> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let cols: Vec<&Int64Array> = (0..b.num_columns())
+                .map(|c| b.column(c).as_any().downcast_ref::<Int64Array>().unwrap())
+                .collect();
+            for r in 0..b.num_rows() {
+                let cells: Vec<String> = cols
+                    .iter()
+                    .map(|c| match c.is_null(r) {
+                        true => "∅".to_string(),
+                        false => c.value(r).to_string(),
+                    })
+                    .collect();
+                rows.push(cells.join("|"));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn spill_opts(tag: &str) -> SpillOptions {
+        SpillOptions {
+            // One byte: every bucket is "over budget", so the split guard is exercised to
+            // its depth limit and the streamed probe is the only thing bounding memory.
+            memory_budget_bytes: 1,
+            dir: std::env::temp_dir().join(format!(
+                "bc_join_stream_{}_{}_{tag}",
+                std::process::id(),
+                SPILL_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
+            codec: bc_runtime::agg::spill::SpillCodec::None,
+        }
+    }
+
+    static SPILL_TEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Probe morsels dominated by one key, against a build side holding that key once —
+    /// the shape a `-1`/`unknown` sentinel in a fact table produces.
+    ///
+    /// `hot` rows of key `7` spread over `morsels` batches, plus a cold key per morsel and a
+    /// null key (which matches nothing but must still be emitted by the outer flavors).
+    fn skewed_inputs(morsels: usize, hot: usize) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+        let per = hot / morsels;
+        let left: Vec<RecordBatch> = (0..morsels)
+            .map(|m| {
+                let mut ks: Vec<Option<i64>> = vec![Some(7); per];
+                let mut vs: Vec<i64> = (0..per as i64).map(|i| (m * per) as i64 + i).collect();
+                ks.push(Some(100 + m as i64)); // a cold key, matched only for m == 0
+                vs.push(-1);
+                ks.push(None); // a null key matches nothing, on either side
+                vs.push(-2);
+                kv("lk", "lv", &ks, &vs)
+            })
+            .collect();
+        // The build side is one row for the hot key, one for a cold key that matches, and one
+        // for a key nothing probes (so `Right`/`Full` have a genuine unmatched remainder).
+        let right = vec![kv(
+            "rk",
+            "rv",
+            &[Some(7), Some(100), Some(999), None],
+            &[70, 1000, 9990, -9],
+        )];
+        (left, right)
+    }
+
+    /// The streamed probe computes the same relation the in-memory join does, for every
+    /// join flavor, on an input no re-partition can balance.
+    ///
+    /// This is the case the recursive split cannot fix and never could: the hot key re-hashes
+    /// to one sub-bucket at every level, so bounding memory has to come from *not holding the
+    /// probe bucket*, which is what the streamed probe does.
+    #[test]
+    fn a_skewed_grace_join_equals_the_in_memory_join_for_every_flavor() {
+        let (left, right) = skewed_inputs(8, 400);
+        let lmat = ops::materialize(&left).unwrap();
+        let rmat = ops::materialize(&right).unwrap();
+
+        let both = vec![
+            out_col(JoinSide::Left, "lk", "lk"),
+            out_col(JoinSide::Left, "lv", "lv"),
+            out_col(JoinSide::Right, "rk", "rk"),
+            out_col(JoinSide::Right, "rv", "rv"),
+        ];
+        // Semi/anti emit left columns only — the planner never names the other side for them.
+        let left_only = vec![
+            out_col(JoinSide::Left, "lk", "lk"),
+            out_col(JoinSide::Left, "lv", "lv"),
+        ];
+
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let output = match jt {
+                JoinType::Semi | JoinType::Anti => &left_only,
+                _ => &both,
+            };
+            let want = ops::join_batches(
+                &lmat,
+                &rmat,
+                &["lk".into()],
+                &["rk".into()],
+                jt,
+                output,
+                bc_ir::JoinStrategy::Hash,
+            )
+            .unwrap();
+            let (got, _) = spilling_hash_join_streaming(
+                &left,
+                &right,
+                &["lk".into()],
+                &["rk".into()],
+                jt,
+                output,
+                &spill_opts(&format!("{jt:?}")),
+            )
+            .unwrap();
+            assert_eq!(
+                multiset(std::slice::from_ref(&want)),
+                multiset(&got),
+                "{jt:?}: spilled relation differs from the in-memory one"
+            );
+        }
+    }
+
+    /// The probe bucket is *streamed*, not materialized — the property the memory bound
+    /// rests on, observed where a unit test can see it.
+    ///
+    /// Every probe row here carries the same key, so all of them land in one bucket however
+    /// the hash is salted. Holding that bucket produces exactly one output batch; consuming it
+    /// a morsel at a time produces one per morsel. The batch count is therefore a direct
+    /// reading of whether the bucket was held.
+    #[test]
+    fn a_single_key_probe_bucket_is_consumed_a_morsel_at_a_time() {
+        let morsels = 6;
+        let left: Vec<RecordBatch> = (0..morsels)
+            .map(|m| kv("lk", "lv", &[Some(7); 4], &[m as i64; 4]))
+            .collect();
+        let right = vec![kv("rk", "rv", &[Some(7)], &[70])];
+        let output = vec![
+            out_col(JoinSide::Left, "lv", "lv"),
+            out_col(JoinSide::Right, "rv", "rv"),
+        ];
+        let (got, _) = spilling_hash_join_streaming(
+            &left,
+            &right,
+            &["lk".into()],
+            &["rk".into()],
+            JoinType::Inner,
+            &output,
+            &spill_opts("stream"),
+        )
+        .unwrap();
+        assert_eq!(
+            got.len(),
+            morsels,
+            "one output batch per probe morsel; {} means the bucket was materialized",
+            got.len()
+        );
+        assert_eq!(got.iter().map(|b| b.num_rows()).sum::<usize>(), morsels * 4);
+    }
+
+    /// An empty result still carries the join's schema.
+    ///
+    /// The streamed probe drops empty batches, so the empty relation has to be stated once
+    /// rather than falling out of the per-bucket loop — and a caller that lost the schema
+    /// would fail downstream, far from here.
+    #[test]
+    fn an_empty_spilled_join_still_reports_its_columns() {
+        let left = vec![kv("lk", "lv", &[Some(1)], &[10])];
+        let right = vec![kv("rk", "rv", &[Some(2)], &[20])];
+        let output = vec![
+            out_col(JoinSide::Left, "lv", "lv"),
+            out_col(JoinSide::Right, "rv", "rv"),
+        ];
+        let (got, _) = spilling_hash_join_streaming(
+            &left,
+            &right,
+            &["lk".into()],
+            &["rk".into()],
+            JoinType::Inner,
+            &output,
+            &spill_opts("empty"),
+        )
+        .unwrap();
+        assert_eq!(got.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+        let schema = got
+            .first()
+            .expect("an empty join still emits a schema")
+            .schema();
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["lv", "rv"]
+        );
     }
 }

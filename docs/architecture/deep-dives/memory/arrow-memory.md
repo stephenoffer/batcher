@@ -206,6 +206,48 @@ crate is linked into, so one declaration covers the whole data plane. It changes
 where the bytes come from, and it is invisible to `cargo test` on the pure crates, which link no
 allocator and keep the system one.
 
+### Retention, and the valve that makes it safe
+
+Recycling pages instead of returning them is the point, so Batcher lengthens mimalloc's purge
+delay from its 10 ms default to 10 s. Consecutive queries then reuse the same regions instead of
+receiving fresh zero pages the kernel must clear on first touch, which was 9.3% of a 9M-row,
+13-column hash join.
+
+The cost is that the process's resident set keeps counting memory the engine has finished with,
+and the amount is not small. Three 8M-row Parquet group-bys whose results were dropped left a
+1,397 MiB resident set of which 1,289 MiB was the engine's arena, and one forced trim handed
+**408 MiB** of it back.
+
+So the retention has a release valve, and the valve is now pulled. The moment a query commits to
+the out-of-core path, and before the first bucket is written, Carbonite hands the retained arena
+back. A query that is spilling is a query on a box where memory is scarce, and holding a third of
+a gigabyte that nothing will use is a third of a gigabyte closer to an OOM kill, which on a
+swapless node is fatal rather than slow. The unmapping it costs is tens of milliseconds against a
+spill measured in seconds.
+
+The valve sits at the executor rather than at the decision, and the difference matters. Three
+independent signals route a query to disk — admission's counter-offer, the plan's estimated peak,
+and the resident size of the input — and only the second passes through a live pressure reading.
+A trim hung off that reading covers one route of the three and misses the estimate, which is the
+ordinary way a large query spills.
+
+It does **not** try to avoid the spill, and that is deliberate. By the time it runs the decision
+is already made. Even taken earlier it could not change one: the pressure level is the maximum
+of two buffer-pool utilizations and the process footprint, and a trim moves only the footprint —
+so a level driven by reservation accounting cannot come down however much arena is returned, and
+what is left is smoothed by a de-escalation average whose purpose is not to fall on one good
+reading. Re-reading it would pay a forced walk of every heap for an answer that mostly cannot
+change.
+
+Two details the measurements forced. The trim must be *forced*: a plain collect walks only the
+calling thread's heap and the engine allocates on rayon workers, so an unforced call from the
+control plane returned 0 MiB where the forced one returned 408. And the bytes released are
+measured against the kernel's own figure, because mimalloc's committed figure does not move on a
+collect at all — bracketing with it reported zero released, always, on precisely the occasions the
+valve gave the most. `ResourceManager.stats()["reclaim"]` reports the attempts and the bytes, and
+a rising attempt count with no bytes is the signature of a box that is genuinely full rather than
+an engine sitting on memory.
+
 ## The 2 GiB offset ceiling
 
 Arrow's `Utf8` and `Binary` use 32-bit offsets, so a single column cannot hold more than 2 GiB of

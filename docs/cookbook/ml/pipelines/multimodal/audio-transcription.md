@@ -170,7 +170,35 @@ this routinely removes a double-digit percentage of the rows, and it is free.
 
 ## Transcribe
 
-A model stage is a class: the constructor loads the weights once per worker, `__call__`
+The decoded waveform is an ordinary numeric list column, and
+{py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` reads the column's type to
+decide what the model is fed. So a Hugging Face ASR model id is the whole model stage:
+
+```python
+# docs: skip
+transcribed = long_enough.ml.infer(
+    "openai/whisper-small",
+    column="audio",
+    output_column="transcript",
+    task="automatic-speech-recognition",
+    batch_size=16,
+    num_gpus=1,
+    concurrency=4,
+    max_errored_rows=500,  # a truncated file costs one row, not the job
+)
+```
+
+The model loads once per worker, lands on the device at the right precision, and the whole
+Arrow batch goes through as one forward pass. The waveform column must already be at the rate
+the model expects, which is what the resample above is for: nothing downstream can tell a
+44.1 kHz waveform from a 16 kHz one, so a mismatch produces confident nonsense rather than an
+error.
+
+### When you need the model stage yourself
+
+Reach for a class when the forward pass needs options `ds.ml.infer` does not expose — return
+timestamps, a forced language, a beam width — or when the model is not a `transformers`
+pipeline at all. The constructor loads the weights once per worker, `__call__`
 runs the forward pass on each batch.
 
 :::{warning}

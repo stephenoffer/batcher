@@ -120,6 +120,30 @@ pub enum Expr {
         length: Option<i64>,
     },
 
+    /// A string function whose *parameters* are computed per row rather than fixed at
+    /// plan time.
+    ///
+    /// [`Expr::Str`] carries `pattern`/`replacement`/`start`/`length` as plan-time
+    /// constants, which is what every kernel in `eval::str` is written against. SQL does
+    /// not require them to be constant — `replace(s, old_col, new_col)`,
+    /// `substr(s, start_col, len_col)`, `s LIKE pattern_col` are all ordinary — so this
+    /// variant carries each parameter as a sub-expression instead. The evaluator groups
+    /// the rows by their distinct parameter tuple and calls the *same* kernel once per
+    /// group, so there is exactly one definition of each function's semantics.
+    StrDyn {
+        #[serde(rename = "fn")]
+        func: StrFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        pattern: Option<Box<Expr>>,
+        #[serde(default)]
+        replacement: Option<Box<Expr>>,
+        #[serde(default)]
+        start: Option<Box<Expr>>,
+        #[serde(default)]
+        length: Option<Box<Expr>>,
+    },
+
     /// A date/time field extraction over a Date/Timestamp sub-expression.
     Date {
         #[serde(rename = "fn")]
@@ -433,6 +457,12 @@ pub enum Expr {
     /// `list[index]` — the element at 0-based `index` of each row's `List`
     /// (null where the row is null or the index is out of range). Type-preserving.
     ListGet { input: Box<Expr>, index: i64 },
+
+    /// `list[index]` where the index is computed **per row** rather than fixed at plan
+    /// time (`a[i]`, `list_extract(a, i)` over an index column). Same addressing rule as
+    /// [`Expr::ListGet`], including negatives counting from the end; a null index yields
+    /// a null element.
+    ListGetDyn { input: Box<Expr>, index: Box<Expr> },
 
     /// A random-hyperplane (SimHash) signature of an embedding → `List<Int64>` of
     /// `num_bits` bits: the blocking key a vector similarity join needs, as
@@ -1981,6 +2011,11 @@ pub enum StrFunc {
     /// Extract the string value at JSON `pattern` path (e.g. `$.a.b`); null if the
     /// input isn't valid JSON or the path is missing. → Utf8.
     JsonExtractString,
+    /// The value at a JSON path rendered **as JSON text** (DuckDB `json_extract` / `->`):
+    /// a string keeps its quotes, a JSON null is the token `null`, and a container is
+    /// compacted. Distinct from [`StrFunc::JsonExtractString`] (which unquotes and maps a
+    /// JSON null to SQL NULL) and [`StrFunc::JsonValue`] (which also nulls a container).
+    JsonExtract,
     /// Extract the integer value at JSON `pattern` path; null if the input isn't
     /// valid JSON, the path is missing, or the value isn't integral. → Int64.
     JsonExtractInt,
@@ -2028,8 +2063,12 @@ pub enum StrFunc {
     /// **integer** input, so it is handled before the Utf8 downcast. → Utf8.
     Chr,
     /// The integer written in base `start` (2..=36), no padding, `-` for a negative
-    /// value (DuckDB `to_base`, and `bin` at base 2). Integer input. → Utf8.
+    /// value (DuckDB `to_base`, which refuses a negative outright). Integer input. → Utf8.
     ToBase,
+    /// The integer written in binary as its 64-bit **two's-complement** pattern for a
+    /// negative value (DuckDB `bin`, whose `bin(-3)` is sixty-four bits, not `-11`).
+    /// Distinct from [`StrFunc::ToBase`] at base 2 for exactly that reason. → Utf8.
+    Bin,
     /// A byte count as human-readable text with binary units — `1024` → `1.0 KiB`
     /// (DuckDB `format_bytes` / `formatReadableSize`). Integer input. → Utf8.
     FormatBytes,

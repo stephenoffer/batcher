@@ -275,6 +275,8 @@ pub(crate) fn analyze(
             Ok(result)
         }
         Expr::Str { .. } => Err(CodegenError::Unsupported("string function".into())),
+        Expr::StrDyn { .. } => Err(CodegenError::Unsupported("string function".into())),
+        Expr::ListGetDyn { .. } => Err(CodegenError::Unsupported("list element".into())),
         Expr::Date { .. } => Err(CodegenError::Unsupported("date function".into())),
         Expr::Image { .. } => Err(CodegenError::Unsupported("image function".into())),
         Expr::ImageCrop { .. } => Err(CodegenError::Unsupported("image crop".into())),

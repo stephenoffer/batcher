@@ -1240,8 +1240,19 @@ class DatasetML:
         Pass a **model identifier** (a HuggingFace ``transformers`` model id) and the
         `column` to score: the model loads once per worker and its prediction is
         appended as `output_column`. `task` selects the pipeline kind
-        (``"sentiment-analysis"``, ``"text-classification"``, …; inferred from the model
-        when omitted). Needs ``transformers`` (``batcher-engine[transformers]``).
+        (``"sentiment-analysis"``, ``"text-classification"``,
+        ``"automatic-speech-recognition"``, …; inferred from the model when omitted).
+        Needs ``transformers`` (``batcher-engine[transformers]``).
+
+        `column` may be text, a binary column of encoded bytes, or a decoded waveform or
+        image-tensor column — the column's type decides what the pipeline is fed, so an
+        audio or vision model reads the output of the native decode expressions directly.
+
+        For a model that was **exported** rather than loaded from the hub — an ONNX graph,
+        a TorchScript archive, an OpenVINO IR — use
+        `map_batches` with `bt.ml.onnx_predictor` / `bt.ml.torch_predictor` /
+        `bt.ml.openvino_predictor`, which run the exported form in the worker with no
+        framework load at all.
 
         Pass a **callable or class** instead for full control (a class loads the model
         once per worker — the GPU-inference pattern); the call then mirrors

@@ -852,20 +852,32 @@ def _engine_config_cache():
 
 def _record_source_rows(hub, source, rows: int) -> None:
     """Persist a run's measured total rows for `source` so the next run's partition count can
-    seed from it when the footer count is unknown. Best-effort; never breaks a query."""
-    with contextlib.suppress(Exception):
+    seed from it when the footer count is unknown. Best-effort; never breaks a query.
+
+    Noted rather than suppressed: a failed write is indistinguishable from a source that has
+    never run, so the partition count silently keeps falling back to the blunt cluster-fill
+    worker count on every future run, forever, with nothing saying why."""
+    try:
         from batcher.dist.adaptive_sizing import record_partition_rows
 
         record_partition_rows(_learning_hub(hub), source.identity(), rows)
+    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+        note_suppressed("dist", "record measured source rows", exc)
 
 
 def _record_actor_pool_reuse(hub, plan0, partitions: int) -> None:
     """Persist how many partitions this inference pool served, so a recurring pipeline can
-    right-size its actor pool next run. Best-effort; never breaks a query."""
-    with contextlib.suppress(Exception):
+    right-size its actor pool next run. Best-effort; never breaks a query.
+
+    Noted rather than suppressed, for the reason `_record_source_rows` gives: silence here
+    reads as "this pipeline has never run", and every later run keeps over-provisioning GPU
+    actors — each one a full model load."""
+    try:
         from batcher.dist.adaptive_sizing import record_actor_pool_reuse
 
         record_actor_pool_reuse(_learning_hub(hub), _pipeline_signature(plan0), partitions)
+    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+        note_suppressed("dist", "record inference actor-pool reuse", exc)
 
 
 def _spread_helps(shares: list[float]) -> bool:
@@ -1219,8 +1231,13 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
 
     total = _source_total_rows(source)
     if total is None:
-        with contextlib.suppress(Exception):
+        try:
             total = learned_partition_rows(_learning_hub(hub), source.identity())
+        except Exception as exc:  # pragma: no cover - a learned read must never break a query
+            # The read half of the same loop. `None` here is "never measured", which is what a
+            # broken read also produces — and the caller then takes the `fallback`, so a
+            # persistently failing read looks exactly like a source nothing has learned about.
+            note_suppressed("dist", "read the learned source row count", exc)
     if total is None:
         return fallback
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)

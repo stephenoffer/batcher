@@ -179,17 +179,29 @@ def test_the_frame_boundary_is_the_folds_versus_everything_else():
     associative, commutative operator gave all six **folds** a frame at once (see
     `test_diff_window_framed_folds.py`).
 
-    `var`/`stddev` and `count_distinct` did not follow, and cannot follow the same way:
-    the moment pair keeps a Welford state whose combine is Chan's parallel formula rather
-    than an operator, and a distinct count needs a multiset rather than a fold. They still
-    reject a frame at plan time rather than silently ignoring one.
+    `var`/`stddev` followed later, and the reason they could is the point of this test: the
+    slide never needed an *operator*, only an associative **combine**, and Welford has one —
+    Chan's parallel formula. Nothing is subtracted, so the numerical property
+    `test_variance_survives_a_large_mean_with_a_small_spread` guards is untouched.
+
+    `count_distinct` still cannot follow, and neither can `median`: a distinct count needs a
+    multiset rather than a fold, and a median needs an order statistic. Merging two sorted
+    halves *is* associative, so the slide could carry a median — at `O(k)` a step, which is
+    `O(n*k)` behind an `O(n)` call shape. Both reject a frame at plan time rather than
+    silently ignoring one, which is the failure mode this test exists for.
     """
     ds = bt.from_pydict({"g": ["a", "a"], "o": [1, 2], "x": [1.0, 2.0], "i": [1, 2]})
-    # The folds now honour a frame.
+    # The folds honour a frame, and so now do the moment pair.
     assert ds.select(r=col("x").product().over("g", order_by="o", frame=(-1, 0))).to_pydict()[
         "r"
     ] == [1.0, 2.0]
+    # A framed `stddev` over a two-row window is the population-vs-sample distinction, not
+    # the running answer: over rows 1..2 the sample stddev of [1, 2] is `sqrt(0.5)`, and the
+    # first row's one-value frame has no sample variance at all.
+    framed_std = ds.select(r=col("x").std().over("g", order_by="o", frame=(-1, 0))).to_pydict()
+    assert framed_std["r"][0] is None
+    assert framed_std["r"][1] == pytest.approx(0.5**0.5)
     # The two that are not folds still refuse one.
-    for build in (lambda: col("x").std(), lambda: col("x").var(), lambda: col("i").n_unique()):
+    for build in (lambda: col("i").n_unique(), lambda: col("x").median()):
         with pytest.raises(Exception, match="frame"):
             ds.select(r=build().over("g", order_by="o", frame=(-1, 0))).collect()

@@ -26,8 +26,15 @@
 //!   independent. `Right`/`Full` must reconcile unmatched build rows across every morsel and
 //!   keep the materialized path.
 //! * **Integer keys** (any number of `Int64` columns — the analytical join shape after the FFI
-//!   boundary normalizes narrow integers). A row-encoded key would need its `RowConverter`
-//!   shared across morsels; until that is threaded through, those joins fall back.
+//!   boundary normalizes narrow integers), **or one byte column** (`Utf8`/`LargeUtf8`/
+//!   `Binary`/`LargeBinary`). A *row-encoded* key would need its `RowConverter` shared across
+//!   morsels; until that is threaded through, those joins fall back — but a single byte
+//!   column needs no converter at all, because [`super::BytesKeys`] hashes and compares the
+//!   raw value bytes and carries no cross-morsel state. Restricting this to integers was
+//!   therefore stronger than its own reason, and it was expensive: a string-keyed join to a
+//!   small build fell through to the *partitioned* path, which shuffles both sides. Measured
+//!   on H2O `join` q4's shape — 10 M rows probing 10 k — the same join cost 8x the CPU of the
+//!   `int32` key the labels mirror.
 //!
 //! [`BroadcastProbe::new`] returns `None` for anything else, and the caller keeps its old
 //! path. Nothing silently changes shape.
@@ -35,13 +42,13 @@
 use arrow::array::ArrayRef;
 
 use super::{
-    null_mask, use_probe_bloom_with, I64Keys, I64x2Keys, I64xNKeys, JoinIndices, JoinTable,
-    JoinType,
+    null_mask, use_probe_bloom_with, BytesKeys, I64Keys, I64x2Keys, I64xNKeys, JoinIndices,
+    JoinTable, JoinType,
 };
 
 /// The build-side key shape a [`BroadcastProbe`] was built for. Each morsel's probe keys
 /// must present the same shape, which they do — both sides come from the same plan node.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum KeyShape {
     /// One `Int64` column.
     I64,
@@ -50,21 +57,42 @@ enum KeyShape {
     /// Three or more `Int64` columns, carrying how many — a probe morsel presenting a
     /// *different* count is a different shape and must be refused, not silently truncated.
     I64xN(usize),
+    /// One byte column, carrying its exact `DataType`.
+    ///
+    /// The type is part of the shape rather than just the offset width, because
+    /// [`super::BytesKeys`] requires both sides to carry the *same* byte type: a `Utf8` build
+    /// probed by a `Binary` morsel must be refused here, not compared as raw bytes.
+    Bytes(arrow::datatypes::DataType),
 }
 
 impl KeyShape {
-    /// The shape of `keys`, or `None` if it is not an integer fast-path shape.
+    /// The shape of `keys`, or `None` if it is not a streamable fast-path shape.
     fn of(keys: &[ArrayRef]) -> Option<Self> {
         use arrow::datatypes::DataType;
-        if keys.is_empty() || keys.iter().any(|k| k.data_type() != &DataType::Int64) {
+        if keys.is_empty() {
             return None;
         }
-        match keys.len() {
-            1 => Some(Self::I64),
-            2 => Some(Self::I64x2),
-            n => Some(Self::I64xN(n)),
+        if keys.iter().all(|k| k.data_type() == &DataType::Int64) {
+            return match keys.len() {
+                1 => Some(Self::I64),
+                2 => Some(Self::I64x2),
+                n => Some(Self::I64xN(n)),
+            };
         }
+        if keys.len() == 1 && is_byte_key(keys[0].data_type()) {
+            return Some(Self::Bytes(keys[0].data_type().clone()));
+        }
+        None
     }
+}
+
+/// Whether a type is a byte array [`super::BytesKeys`] serves.
+fn is_byte_key(dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    )
 }
 
 /// Whether a join type emits each probe row independently of the others, so a morsel can be
@@ -90,11 +118,27 @@ pub fn streaming_supported(
     key_types: &[&arrow::datatypes::DataType],
     build_rows: usize,
 ) -> bool {
-    use arrow::datatypes::DataType;
-    is_probe_driven(join_type)
+    streaming_shape_supported(join_type, key_types)
         && build_rows <= super::RADIX_MIN_BUILD_ROWS_BROADCAST
-        && !key_types.is_empty()
-        && key_types.iter().all(|t| *t == &DataType::Int64)
+}
+
+/// Whether [`BroadcastProbe`] can serve this join **at all**, ignoring how big the build is.
+///
+/// The capability half of [`streaming_supported`], split out because the two halves answer
+/// different kinds of question and only one of them is a preference. A `Right`/`Full` join or an
+/// unsupported key shape *cannot* be probed morsel by morsel — no caller may proceed. The row
+/// ceiling is a **cost** comparison against the partitioned radix join, and a caller whose real
+/// alternative is something else entirely is not entitled to that answer (the same distinction
+/// [`BroadcastProbe::over_any_build`] draws for the fused-aggregate path).
+pub fn streaming_shape_supported(
+    join_type: JoinType,
+    key_types: &[&arrow::datatypes::DataType],
+) -> bool {
+    use arrow::datatypes::DataType;
+    let streamable_shape = !key_types.is_empty()
+        && (key_types.iter().all(|t| *t == &DataType::Int64)
+            || (key_types.len() == 1 && is_byte_key(key_types[0])));
+    is_probe_driven(join_type) && streamable_shape
 }
 
 /// A hash table over a broadcast build side, ready to be probed morsel by morsel.
@@ -183,6 +227,17 @@ impl BroadcastProbe {
                 let keys = I64xNKeys::try_new(build_keys, build_keys)?;
                 JoinTable::build(&keys, build_rows, &build_null, use_bloom, bloom_fp_rate)
             }
+            // The two offset widths are separate instantiations; exactly one downcasts, and
+            // the probe below re-derives the same one from the same build type, so the table
+            // is always probed with the representation it was hashed with.
+            KeyShape::Bytes(_) => {
+                if let Some(keys) = BytesKeys::<i32>::try_new(build_keys, build_keys) {
+                    JoinTable::build(&keys, build_rows, &build_null, use_bloom, bloom_fp_rate)
+                } else {
+                    let keys = BytesKeys::<i64>::try_new(build_keys, build_keys)?;
+                    JoinTable::build(&keys, build_rows, &build_null, use_bloom, bloom_fp_rate)
+                }
+            }
         };
         Some(Self {
             table,
@@ -197,7 +252,7 @@ impl BroadcastProbe {
     /// Every morsel of a relation shares one schema, so the caller checks this once against
     /// the first morsel and can then treat [`Self::probe`] as infallible for the rest.
     pub fn accepts(&self, probe_keys: &[ArrayRef]) -> bool {
-        KeyShape::of(probe_keys) == Some(self.shape)
+        KeyShape::of(probe_keys).as_ref() == Some(&self.shape)
     }
 
     /// Probe one morsel. `left` indices are **local to `probe_keys`**; `right` indices are
@@ -259,6 +314,30 @@ impl BroadcastProbe {
                     &mut right,
                     None,
                 );
+            }
+            KeyShape::Bytes(_) => {
+                if let Some(keys) = BytesKeys::<i32>::try_new(probe_keys, &self.build_keys) {
+                    self.table.probe_range(
+                        &keys,
+                        0..rows,
+                        probe_null.as_deref(),
+                        self.join_type,
+                        &mut left,
+                        &mut right,
+                        None,
+                    );
+                } else {
+                    let keys = BytesKeys::<i64>::try_new(probe_keys, &self.build_keys)?;
+                    self.table.probe_range(
+                        &keys,
+                        0..rows,
+                        probe_null.as_deref(),
+                        self.join_type,
+                        &mut left,
+                        &mut right,
+                        None,
+                    );
+                }
             }
         }
         Some(JoinIndices {
@@ -392,16 +471,110 @@ mod tests {
         assert!(BroadcastProbe::new(&ok, JoinType::Inner, 1, 0.01, 1 << 16).is_some());
     }
 
-    /// A non-integer key, or a mix of one integer and one string, falls back rather than
-    /// silently taking a different path. Key *width* is no longer a reason to refuse.
+    /// A key shape with no per-morsel representation falls back rather than silently taking
+    /// a different path. Key *width* is no longer a reason to refuse, and neither is a
+    /// single byte column — but a **mix** of an integer and a string still is, because that
+    /// needs the row encoder whose converter is not shared across morsels.
     #[test]
     fn unsupported_key_shapes_are_refused() {
         use arrow::array::StringArray;
-        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
-        assert!(BroadcastProbe::new(&[strings], JoinType::Inner, 1, 0.01, 1 << 16).is_none());
         let mixed: Vec<ArrayRef> = vec![i64s(&[1]), Arc::new(StringArray::from(vec!["a"]))];
         assert!(BroadcastProbe::new(&mixed, JoinType::Inner, 1, 0.01, 1 << 16).is_none());
         assert!(BroadcastProbe::new(&[], JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+        // A float key has no byte or integer representation here either.
+        let floats: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0]));
+        assert!(BroadcastProbe::new(&[floats], JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+    }
+
+    /// A single **byte** key streams, and morsel-by-morsel reproduces the whole relation
+    /// exactly — the same invariant the integer path rests on, over the shape that used to
+    /// fall through to the partitioned (shuffling) join.
+    #[test]
+    fn byte_keys_stream_and_match_the_whole_relation() {
+        use arrow::array::StringArray;
+        let strs = |v: &[&str]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let build = vec![strs(&["ab", "cd", "ef"])];
+        let whole = vec![strs(&["ef", "ab", "zz", "cd", "ab"])];
+        let morsels = [vec![strs(&["ef", "ab"])], vec![strs(&["zz", "cd", "ab"])]];
+
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 5, 0.01, 1 << 16).unwrap();
+        assert!(probe.accepts(&whole));
+        let all = probe.probe(&whole).unwrap();
+        assert_eq!(
+            all.left.iter().collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(3), Some(4)]
+        );
+        assert_eq!(
+            all.right.iter().collect::<Vec<_>>(),
+            vec![Some(2), Some(0), Some(1), Some(0)]
+        );
+
+        let mut left: Vec<Option<u32>> = Vec::new();
+        let mut right: Vec<Option<u32>> = Vec::new();
+        let mut base = 0u32;
+        for morsel in &morsels {
+            let part = probe.probe(morsel).unwrap();
+            left.extend(part.left.iter().map(|l| l.map(|v| v + base)));
+            right.extend(part.right.iter());
+            base += morsel[0].len() as u32;
+        }
+        assert_eq!(left, all.left.iter().collect::<Vec<_>>());
+        assert_eq!(right, all.right.iter().collect::<Vec<_>>());
+    }
+
+    /// A null byte key matches nothing (`NULL = NULL` is unknown), including when the whole
+    /// probe column is null — arrow's `Null` type carries no validity buffer, which is the
+    /// shape that has produced a cartesian product here before.
+    #[test]
+    fn a_null_byte_key_matches_nothing() {
+        use arrow::array::StringArray;
+        let build: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            Some("ab"),
+            None,
+            Some("cd"),
+        ]))];
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 3, 0.01, 1 << 16).unwrap();
+        let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![None, Some("ab"), None]))];
+        let idx = probe.probe(&keys).unwrap();
+        assert_eq!(idx.left.iter().collect::<Vec<_>>(), vec![Some(1)]);
+        assert_eq!(idx.right.iter().collect::<Vec<_>>(), vec![Some(0)]);
+    }
+
+    /// The byte type is part of the shape: a `Utf8` table must refuse a `Binary` morsel
+    /// rather than compare the two as raw bytes.
+    #[test]
+    fn a_probe_of_a_different_byte_type_is_refused() {
+        use arrow::array::{BinaryArray, StringArray};
+        let build: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["ab"]))];
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 1, 0.01, 1 << 16).unwrap();
+        let binary: Vec<ArrayRef> = vec![Arc::new(BinaryArray::from(vec![&b"ab"[..]]))];
+        assert!(!probe.accepts(&binary));
+        assert!(probe.probe(&binary).is_none());
+    }
+
+    /// `streaming_supported` must agree with `BroadcastProbe::new` about byte keys — the two
+    /// are asked the same question by the same caller, one before materializing the build
+    /// side and one after, and a disagreement is how a shape silently loses its fast path.
+    #[test]
+    fn streaming_supported_agrees_with_the_probe_on_byte_keys() {
+        use arrow::array::{BinaryArray, LargeStringArray, StringArray};
+        use arrow::datatypes::DataType;
+        let cases: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(LargeStringArray::from(vec!["a"])),
+            Arc::new(BinaryArray::from(vec![&b"a"[..]])),
+            i64s(&[1]),
+        ];
+        for key in cases {
+            let dt = key.data_type().clone();
+            let supported = streaming_supported(JoinType::Inner, &[&dt], 1);
+            let built = BroadcastProbe::new(&[key], JoinType::Inner, 1, 0.01, 1 << 16).is_some();
+            assert_eq!(supported, built, "disagreement on {dt:?}");
+            assert!(supported, "{dt:?} should stream");
+        }
+        // ...and both refuse a type neither serves.
+        let dt = DataType::Float64;
+        assert!(!streaming_supported(JoinType::Inner, &[&dt], 1));
     }
 
     /// A probe presenting a different *number* of key columns than the table was built for

@@ -39,7 +39,7 @@ from .policies import (
 )
 from .readiness import await_autoscale
 from .reduce import gather_in_windows, run_bucket_reduce
-from .reducers import map_partitions, shuffle_partitions
+from .reducers import buckets_for_envelope, map_partitions, shuffle_partitions
 from .scaling import (
     alive_node_count,
     clamp_workers,
@@ -68,6 +68,7 @@ __all__ = [
     "alive_node_count",
     "await_autoscale",
     "blame_host_for_reduce_failure",
+    "buckets_for_envelope",
     "clamp_workers",
     "cluster_topology",
     "create_worker_placement",

@@ -22,8 +22,11 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 
 @pytest.fixture(scope="module")
 def _two_node_cluster():
+    import os
+
     from ray.cluster_utils import Cluster
 
+    prior_address = os.environ.get("RAY_ADDRESS")
     # A prior test module may have left a single-node Ray session up; with
     # ignore_reinit_error it would silently keep that session and the fleet couldn't
     # spread. Shut it down first so this module connects to its own 2-node cluster.
@@ -34,9 +37,21 @@ def _two_node_cluster():
     )
     cluster.add_node(num_cpus=2)
     ray.init(address=cluster.address, logging_level="ERROR", ignore_reinit_error=True)
-    yield cluster
-    ray.shutdown()
-    cluster.shutdown()
+    try:
+        yield cluster
+    finally:
+        # Tear the private cluster down *and leave the process able to find the shared one
+        # again*. `ray.init` records its address in the environment, so a module that
+        # replaces the session's cluster with a 2-node, 4-CPU one and then only shuts it
+        # down leaves every later module pointing at an address that no longer answers —
+        # which reads as a preemption or fleet test failing for reasons of its own. Restoring
+        # the address the module found is what keeps the failure local to this file.
+        ray.shutdown()
+        cluster.shutdown()
+        if prior_address is not None:
+            os.environ["RAY_ADDRESS"] = prior_address
+        else:
+            os.environ.pop("RAY_ADDRESS", None)
 
 
 def _norm(t: pa.Table) -> set:

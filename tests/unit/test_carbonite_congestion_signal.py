@@ -230,3 +230,18 @@ def test_a_regrant_does_not_lose_the_lifetime_counters() -> None:
     ctrl.observe_signal(CongestionSignal.SATURATED)
     ctrl.rewindow(8)
     assert ctrl.stats()["holds"] == 1
+
+
+def test_an_unmeasurable_round_holds_the_last_verdict_instead_of_growing() -> None:
+    """ "No opinion" is not "starving", and conflating them ratchets the window open.
+
+    `StarvationMeter.sample` returns `None` for any round that carried too little transfer to
+    divide — one served from locality, or one that moved a single tiny bucket. Treating that
+    as `STARVED` tells the controller to grow whatever the wire said, so a shuffle alternating
+    between measurable and unmeasurable rounds climbs to its ceiling regardless. Only a
+    controller that has *never* measured is permissive, and that is its initial state.
+    """
+    fused = ChannelCongestion(_cfg())
+    assert fused.observe(pressured=False, occupancy=1.0) is CongestionSignal.SATURATED
+    assert fused.observe(pressured=False, occupancy=None) is CongestionSignal.SATURATED
+    assert fused.signal is CongestionSignal.SATURATED

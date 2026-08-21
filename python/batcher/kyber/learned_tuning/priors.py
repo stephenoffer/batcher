@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber import plan_cache
-from batcher.metadata.hardware_scope import scoped
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -39,6 +38,24 @@ __all__ = [
 _NS_SIDES = "tuning.join_sides"  # per-signature measured (left_rows, right_rows)
 _NS_PART = "tuning.partition_rows"  # per-signature measured shuffle rows
 _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input rows
+
+# **Deliberately not hardware-scoped**, where the rest of `learned_tuning` is.
+#
+# `metadata.hardware_scope` draws the line at what the stored value *describes*: scope a
+# machine-unit measurement (nanoseconds, bytes of RAM, a batch size chosen against them), and
+# never scope a statement about data, because "scoping those would fragment the statistics that
+# took the most work to collect, turning a well-calibrated fleet into N poorly-calibrated ones
+# for no gain." All three values here are on the data side of that line and nothing else: a
+# join's two input row counts, a breaker's shuffled row count, and an aggregate's
+# `groups / input_rows` ratio. A relation has the same number of rows whichever machine counts
+# them.
+#
+# They were scoped, and the cost was exactly what the rule predicts. Every one is recorded on
+# the *driver* from the whole query's figures (`api.tuning.decisions`), never per shard — so
+# the same query planned single-node and then distributed wrote two separate entries for
+# identical data, and neither run could ever inform the other. An autoscaling fleet split them
+# again on every instance type it moved through. Unscoping costs one run of re-learning per
+# signature, which is what `hardware_scope` says a namespace change costs, and it is paid once.
 
 
 # Decision family — per-signature priors (build sides, partitions, pre-aggregation).
@@ -60,12 +77,12 @@ def _record_scalar(
     if hub is None or value < 0.0:
         return
     try:
-        entry = dict(hub.get_keyed_param(scoped(namespace), key) or {})
+        entry = dict(hub.get_keyed_param(namespace, key) or {})
         n = int(entry.get("n_obs", 0))
         prior = entry.get(field)
         entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, scoped(namespace), key, entry)
+        plan_cache.record_write(hub, namespace, key, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record scalar prior", exc)
 
@@ -94,13 +111,13 @@ def record_join_sides(
     if hub is None:
         return
     try:
-        entry = dict(hub.get_keyed_param(scoped(_NS_SIDES), signature) or {})
+        entry = dict(hub.get_keyed_param(_NS_SIDES, signature) or {})
         n = int(entry.get("n_obs", 0))
         for field, value in (("left", left_rows), ("right", right_rows)):
             prior = entry.get(field)
             entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        hub.put_keyed_param(scoped(_NS_SIDES), signature, entry)
+        hub.put_keyed_param(_NS_SIDES, signature, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record join sides", exc)
 
@@ -115,7 +132,7 @@ def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float,
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(scoped(_NS_SIDES), signature) or {}
+        entry = hub.get_keyed_param(_NS_SIDES, signature) or {}
         left, right = entry.get("left"), entry.get("right")
         if left is None or right is None:
             return None
@@ -142,7 +159,7 @@ def learned_partition_count(
     if hub is None or target_rows <= 0:
         return None
     try:
-        entry = hub.get_keyed_param(scoped(_NS_PART), signature) or {}
+        entry = hub.get_keyed_param(_NS_PART, signature) or {}
         rows = entry.get("rows")
         if rows is None or float(rows) <= 0.0:
             return None
@@ -174,7 +191,7 @@ def learned_partial_agg(
     if hub is None:
         return None
     try:
-        entry = hub.get_keyed_param(scoped(_NS_GROUP), signature) or {}
+        entry = hub.get_keyed_param(_NS_GROUP, signature) or {}
         ratio = entry.get("ratio")
         return None if ratio is None else float(ratio) <= engage_below
     except Exception as exc:  # pragma: no cover - best-effort learned prior

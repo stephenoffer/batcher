@@ -14,6 +14,7 @@ from batcher._internal.mathx import clamp
 from batcher.carbonite.memory.pressure import total_memory_bytes
 from batcher.carbonite.policies.congestion import CongestionSignal
 from batcher.config import Config, active_config
+from batcher.metadata.hardware_scope import scoped
 from batcher.metadata.smoothed import load_scalar_estimate, record_smoothed_scalar
 
 if TYPE_CHECKING:
@@ -33,6 +34,26 @@ __all__ = [
 
 # Learned-parameter namespace for the converged AIMD credit window, keyed by a shuffle
 # channel's stable signature. One smoothed integer window per signature.
+#
+# **Hardware-scoped**, because a credit window is a machine-unit quantity in exactly the sense
+# `metadata.hardware_scope` defines: one credit is one in-flight batch slot, the ceiling is
+# `credit_byte_budget` held under a share of `total_memory_bytes()`, and the target the
+# controller converges to is the path's `BtlBw x RTprop` — the node's RAM and the fabric's
+# bandwidth and delay, none of which transfers. The rule names "batch sizes chosen against
+# them" explicitly, and this is one.
+#
+# It was the only machine-unit learned scalar in Carbonite left unscoped; `io.throughput_mbps`
+# and `carbonite.pressure_flap` beside it both carry the fingerprint. Blended, a 100 Gb/s
+# node's converged window averages with a 10 Gb/s node's — and the damage is not merely a
+# poor warm start, because `shuffle_window_is_stable` reads the same entry to decide whether
+# to **skip slow start entirely**. Two machine classes that each converge tightly can average
+# to a figure that looks stable and describes neither, which pins a badly-sized channel with
+# no ramp to escape on: "strictly worse than never having learned", in this module's words.
+#
+# Ambient `scoped()` rather than an explicit local fingerprint, because both ends already sit
+# inside the conductor's `planning_for` span — the window is recorded by
+# `api.tuning.decisions` after the run and read by `ResourceManager` while planning the next
+# one — so read and write agree by construction, exactly as they do for `io.throughput_mbps`.
 _SHUFFLE_WINDOW_NS = "carbonite.shuffle_window"
 
 
@@ -609,7 +630,7 @@ def load_shuffle_window(hub: MetadataHub | None, signature: str) -> int | None:
     value here, because the two have different consumers — the credit grant wants only the
     number, and the adaptive controller wants both.
     """
-    estimate = load_scalar_estimate(hub, _SHUFFLE_WINDOW_NS, signature)
+    estimate = load_scalar_estimate(hub, scoped(_SHUFFLE_WINDOW_NS), signature)
     return None if estimate is None else round(estimate.value)
 
 
@@ -631,7 +652,7 @@ def shuffle_window_is_stable(hub: MetadataHub | None, signature: str) -> bool:
         was tracked — the conservative reading in every case, since an unknown spread is not
         a small one.
     """
-    estimate = load_scalar_estimate(hub, _SHUFFLE_WINDOW_NS, signature)
+    estimate = load_scalar_estimate(hub, scoped(_SHUFFLE_WINDOW_NS), signature)
     return estimate is not None and estimate.stable
 
 
@@ -645,4 +666,4 @@ def record_shuffle_window(
     warm-starts near it. Records nothing for a non-positive window."""
     if window <= 0:
         return
-    record_smoothed_scalar(hub, _SHUFFLE_WINDOW_NS, signature, float(window), config)
+    record_smoothed_scalar(hub, scoped(_SHUFFLE_WINDOW_NS), signature, float(window), config)

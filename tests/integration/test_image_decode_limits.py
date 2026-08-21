@@ -19,8 +19,11 @@ running on the machine.
 
 from __future__ import annotations
 
+import functools
+import pathlib
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 import pytest
@@ -35,6 +38,33 @@ _BOMB_EDGE = 20_000
 _CHILD_MEMORY_BYTES = 4 * 1024**3
 
 
+@functools.lru_cache(maxsize=1)
+def _bomb_file() -> pathlib.Path:
+    """Build the bomb PNG once, in the **parent**, and hand the child its path.
+
+    The child builds nothing. Encoding a 20000x20000 PNG means materializing the 1.2 GB
+    raster first, and doing that inside the cap makes the fixture, not the decoder, the
+    thing the cap binds -- the child died in `Image.new` before it had imported the engine.
+    The cap has to sit below a successful bomb decode, so it can never also sit above a
+    bomb *encode*; the two cannot both happen in one capped process.
+
+    It is also why the cap is a poor fit for a wide machine. `RLIMIT_AS` bounds virtual
+    address space, and the engine reserves that per core -- a rayon worker per CPU, each
+    with its own stack and allocator arena -- so the floor under the child rises with the
+    core count while the ceiling stays fixed. Building the fixture outside the cap keeps
+    the headroom for the engine, which is what the test is actually about.
+    """
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None  # Pillow guards its own writer; we want the bomb.
+    path = pathlib.Path(tempfile.gettempdir()) / f"batcher_bomb_{_BOMB_EDGE}.png"
+    if not path.exists():
+        Image.new("RGB", (_BOMB_EDGE, _BOMB_EDGE), (7, 7, 7)).save(
+            path, format="PNG", compress_level=9
+        )
+    return path
+
+
 def _run_in_capped_child(body: str) -> str:
     """Run `body` under an address-space rlimit and return its stdout.
 
@@ -43,8 +73,16 @@ def _run_in_capped_child(body: str) -> str:
     rather than a red build.
     """
     pytest.importorskip("PIL")
+    bomb_path = _bomb_file()
     script = textwrap.dedent(f"""
-        import resource
+        import os, resource
+        # Pin the child to two CPUs *before* the cap and before the engine loads. The engine
+        # sizes its pools from the affinity mask (`bc_arrow::hardware::usable_cores`), and
+        # `RLIMIT_AS` bounds virtual address space, which a rayon worker consumes per core
+        # for its stack and allocator arena. Unpinned on a 96-core host that floor alone
+        # exceeded the cap and the child died on a 64-byte malloc, so the test failed for
+        # having many cores rather than for anything about the decoder.
+        os.sched_setaffinity(0, {{0, 1}})
         resource.setrlimit(
             resource.RLIMIT_AS, ({_CHILD_MEMORY_BYTES}, {_CHILD_MEMORY_BYTES})
         )
@@ -54,11 +92,7 @@ def _run_in_capped_child(body: str) -> str:
         import batcher as bt
         from batcher import col
 
-        buf = io.BytesIO()
-        Image.new("RGB", ({_BOMB_EDGE}, {_BOMB_EDGE}), (7, 7, 7)).save(
-            buf, format="PNG", compress_level=9
-        )
-        bomb = buf.getvalue()
+        bomb = open({str(bomb_path)!r}, "rb").read()
         ds = bt.from_pydict({{"i": [bomb]}})
     """) + textwrap.dedent(body)
     done = subprocess.run(

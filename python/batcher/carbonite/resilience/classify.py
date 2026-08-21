@@ -259,6 +259,25 @@ _MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "slow_down",
             "rate limit",
             "throttl",
+            # The *code* spellings, which is how every cloud SDK actually words it. These
+            # markers are substring matches on the message text, so a spaced phrase does not
+            # match a concatenated code — and the omission was not a corner case: `SlowDown`
+            # is what S3 returns when a bucket is being written faster than a prefix will
+            # take, which is the commonest transient failure a large write meets. Boto and
+            # s3fs surface it verbatim (`An error occurred (SlowDown) ...`) with no status
+            # code in the message, so it matched nothing and fell through to `application` —
+            # not retryable — and failed the whole query on a throttle the next attempt would
+            # have served.
+            "slowdown",
+            "slow down",
+            "reduce your request rate",
+            "ratelimitexceeded",  # Google Cloud Storage
+            "requestlimitexceeded",  # AWS
+            "serverbusy",  # Azure Blob Storage
+            "serviceunavailable",
+            "toomanyrequests",  # Azure, and every Go/Java SDK
+            "requestthrottled",
+            "provisionedthroughputexceeded",  # Kinesis and DynamoDB
             # What a busy *model* endpoint says instead of a status code. An inference
             # stage is the main consumer of this taxonomy, and "the server is overloaded"
             # (OpenAI) / "model is currently loading" (HuggingFace) are the two phrasings
@@ -275,6 +294,15 @@ _MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "connection reset",
             "connection aborted",
             "connection refused",
+            "connection closed",
+            "connectionerror",
+            "could not connect to the endpoint",
+            # What urllib3 raises when a keep-alive connection is dropped mid-response, which
+            # on a long object-store read is ordinary and always worth another attempt.
+            "remotedisconnected",
+            "incompleteread",
+            "temporaryfailure",
+            "500 server error",
             "broken pipe",
             "nccl",
             "socket closed",
@@ -288,7 +316,12 @@ _MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "timeout",
         (
             "timed out",
+            # The concatenated code spelling, for the same reason as `slowdown` above: Azure
+            # answers `OperationTimedOut`, which the spaced phrase does not match.
+            "timedout",
             "timeout",
+            "gateway timeout",
+            "504 server error",
             "deadline exceeded",
         ),
     ),

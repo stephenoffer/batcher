@@ -74,10 +74,17 @@ def test_an_explicit_batch_size_is_what_the_stage_holds():
     # A stage re-batches to `batch_size` rows regardless of the morsel it was handed, so the
     # morsel byte cap does not bound it. At the batch sizes `kyber/gpu/sizing.py` seeds from
     # VRAM headroom, that is gigabytes on an image column.
-    ds = _images()
-    ops, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8192))
+    #
+    # The budget is `min(batch_size, rows) x width`: `_streaming_bytes` also caps every
+    # in-flight estimate at the rows that actually exist, because an operator cannot hold
+    # more rows than its input has. So the fixture is sized so the *batch* is what binds —
+    # a batch larger than the relation would measure the row cap instead, and eight rows of
+    # decoded image already clear the morsel byte budget several times over, which is the
+    # property under test.
+    ds = _images(rows=8)
+    ops, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8))
     stage = next(o for o in ops if o.kind == "MapBatches")
-    assert stage.bounds.m_max_bytes == pytest.approx(8192 * _IMAGE_BYTES, rel=0.01)
+    assert stage.bounds.m_max_bytes == pytest.approx(8 * _IMAGE_BYTES, rel=0.01)
     assert stage.bounds.m_max_bytes > active_config().execution.morsel_bytes
 
 
@@ -100,11 +107,13 @@ def test_a_narrow_stage_is_unchanged_by_either_fix():
 
 
 def test_the_batch_size_budget_scales_with_the_batch():
-    ds = _images()
-    small, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=256))
-    large, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8192))
+    # Both batch sizes stay at or under the relation's row count, so the batch is what binds
+    # in each case and the ratio is the batch ratio rather than the row cap's.
+    ds = _images(rows=8)
+    small, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=2))
+    large, _ = _annotate(ds.ml.map_batches(lambda b: b, batch_size=8))
 
     def mem(ops):
         return next(o for o in ops if o.kind == "MapBatches").bounds.m_max_bytes
 
-    assert mem(large) == pytest.approx(32 * mem(small), rel=0.01)
+    assert mem(large) == pytest.approx(4 * mem(small), rel=0.01)

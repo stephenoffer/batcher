@@ -311,6 +311,15 @@ def ndcg_at_k(
     Returns:
         The mean NDCG at `k` over queries with at least one relevant item, in ``[0, 1]``.
 
+    Note:
+        A query with no relevant item is **excluded** from the mean, because its ideal gain
+        is zero and NDCG is then ``0 / 0``. The other ranking metrics here score such a query
+        **0** and keep it (`map_at_k` does so explicitly), and so does scikit-learn's
+        ``ndcg_score``. So on a dataset with unanswerable queries this is a mean over a
+        *smaller query set* than the metric printed beside it, and it reads higher than
+        ``ndcg_score`` on the same input. Filter those queries out once, up front, if you
+        need the columns of an evaluation table to cover the same queries.
+
     Raises:
         PlanError: If `k` is less than 1.
         ColumnNotFoundError: If a named column is missing.
@@ -388,6 +397,11 @@ def map_at_k(
 
     Returns:
         The mean average precision at `k` over queries.
+
+    Note:
+        A query with no relevant item scores **0** and stays in the mean. `ndcg_at_k`
+        drops such a query instead, so the two average over different query sets when the
+        data has unanswerable queries.
 
     Raises:
         PlanError: If `k` is less than 1.

@@ -113,6 +113,20 @@ Or set `BATCHER_OBSERVABILITY_EVENT_LOG=false` in the environment before
 the process starts. Turning it off changes no result, only whether the profile is
 archived to disk.
 
+What it is worth is worth stating, because the answer depends entirely on how small the
+queries are. The document's cost is roughly fixed while the query's is not, so it is a large
+fraction of a tiny query and a rounding error on a real one. Measured on a 50,000-row SQLite
+table, release engine (`benchmarks/BENCHMARK_RESULTS.md`):
+
+| | event log on | off |
+| --- | --- | --- |
+| A terminal op over a one-row table, no operators | 1.945 ms | **0.733 ms** (-62%) |
+| A point lookup pushed to the database | 3.503 ms | **2.930 ms** (-16%) |
+| Point lookups per second, one process | 309 | **374** |
+
+So on a serving-shaped workload it is worth switching off, and on anything that reads more
+than a few thousand rows it is not worth thinking about.
+
 ### The small-query fast path
 
 On a query that returns in about a millisecond, the orchestration *is* the cost. Measured on
@@ -296,6 +310,11 @@ On a big job the local (NVMe) spill tier overflows to `memory.spill_remote_uri` 
 fsspec URL) once local disk fills. A skewed aggregate bucket that overflows
 `memory.spill_bucket_max_bytes` is re-partitioned and reduced one piece at a time, so
 a large or skewed query degrades gracefully instead of running out of memory.
+
+A few operators cannot spill at all, because they need one global order over the whole
+relation. Those raise rather than risking the process. See
+{doc}`Skewed keys and hostile data shapes <skew>` for which shapes those are, and for what
+Batcher does about a join key whose values are concentrated on one value.
 
 ## Running a query on the GPU
 

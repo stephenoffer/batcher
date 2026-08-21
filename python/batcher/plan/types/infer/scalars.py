@@ -32,12 +32,18 @@ _STR_INT = frozenset(
         "hash64",
         "xxhash64",
         "json_extract_int",
+        # `json_array_length` counts a JSON array's elements. It reads as a `.json`
+        # accessor rather than a string function, which is why it was missed while its
+        # `json_extract_int` sibling two lines up was not.
+        "json_array_length",
     }
 )
 _STR_FLOAT = frozenset({"json_extract_float", "jaccard_similarity"})
 
 _STR_STR = frozenset(
     {
+        # `json_type` names the root's JSON type (`object`/`array`/`number`/...).
+        "json_type",
         "squad_normalize",
         "strip_html",
         "upper",
@@ -104,6 +110,11 @@ _STR_STR_LIST = frozenset(
         "regexp_extract_all",  # every match of the pattern
         "regexp_split",
         "parse_path",  # the path's components
+        # The two `.json` accessors that return a list of *text*: an object's keys in
+        # source order, and an array's elements each rendered the way a leaf extract
+        # renders one. Both were declaring `null`.
+        "json_object_keys",
+        "json_array_values",
     }
 )
 
@@ -149,4 +160,35 @@ def datefunc_type(fn: str) -> pa.DataType | None:
     # Every remaining date field-extraction fn (year/month/day/hour/epoch/...) is Int64.
     if fn in DATE_FNS:
         return pa.int64()
+    return None
+
+
+#: The temporal constructors that build a calendar **date**; the rest of the family
+#: builds a microsecond timestamp. Both readings come from `bc_expr::eval_make_temporal`,
+#: which collects a `Date32Array` for these two and a `TimestampMicrosecondArray` for the
+#: four epoch scalings.
+_MAKE_TEMPORAL_DATE = frozenset({"make_date", "from_unix_date"})
+
+
+def make_temporal_type(fn: str) -> pa.DataType | None:
+    """The Arrow type a temporal *constructor* produces, or ``None`` if not certain.
+
+    The family had no rule at all, so `Dataset.schema` reported ``null`` for every
+    `make_date`, `make_timestamp` and `from_unix_*` column — a declared type that no
+    execution ever produces, which is worse than an unknown one: `available_schema` is
+    what the device tier is held against, what a `write` validates against, and what a
+    user reads. The values were always right; only the declaration was wrong.
+
+    Args:
+        fn: The constructor's `MakeTemporal` function name.
+
+    Returns:
+        The Arrow type, or ``None`` when `fn` is not one of the constructors.
+    """
+    from batcher.plan.expr_ir.fn_names import MAKE_TEMPORAL_FNS
+
+    if fn in _MAKE_TEMPORAL_DATE:
+        return pa.date32()
+    if fn in MAKE_TEMPORAL_FNS:
+        return pa.timestamp("us")
     return None

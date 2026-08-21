@@ -116,12 +116,23 @@ def test_a_degraded_host_link_moves_the_device_decision(monkeypatch):
 def test_the_scratch_volume_a_node_has_reaches_both_the_spill_and_its_price(monkeypatch, tmp_path):
     # Two consumers that must agree: where the bytes go, and what the optimizer thinks they
     # cost to put there. They resolve the directory the same three ways for that reason.
+    from batcher._internal.site.scratch import ScratchVolume
     from batcher.dist.spill.scratch import _work_dir
     from batcher.kyber import storage_cost
 
     volume = tmp_path / "ephemeral"
     volume.mkdir()
-    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: str(volume))
+    # Stub the volume *probe*, not `local_scratch_root` itself. Both consumers reach the one
+    # `local_scratch_root` function object, but they bind its name in different modules --
+    # `_work_dir` imports it from the `site` package, while `spill_scratch_dir` calls it as a
+    # same-module global in `site.scratch`. Replacing the package attribute therefore
+    # intercepts only the first, and the optimizer half silently kept pricing the node's real
+    # volume. Patching the probe they share makes the substitution reach both.
+    monkeypatch.delenv("BATCHER_SCRATCH_DIR", raising=False)
+    monkeypatch.setattr(
+        "batcher._internal.site.scratch.scratch_volumes",
+        lambda: (ScratchVolume(path=str(volume), device_class="nvme", total_bytes=1 << 40),),
+    )
     seen: list[str] = []
     monkeypatch.setattr(
         "batcher._internal.hardware.storage.device_class",

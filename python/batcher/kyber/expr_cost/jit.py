@@ -19,7 +19,19 @@ from __future__ import annotations
 
 import datetime
 
-from batcher.plan.expr_ir import Binary, Case, Cast, Col, Expr, Lit, Math2Expr, MathExpr, Not
+from batcher.plan.expr_ir import (
+    Binary,
+    Case,
+    Cast,
+    Col,
+    Expr,
+    IsNotNull,
+    IsNull,
+    Lit,
+    Math2Expr,
+    MathExpr,
+    Not,
+)
 from batcher.plan.ir_tags import COMPARISON_OPS
 
 __all__ = ["JIT_SPEEDUP", "jit_compilable"]
@@ -92,7 +104,7 @@ def jit_compilable(expr: Expr) -> bool:
             >>> jit_compilable(bt.col("s").str.contains("a"))
             False
             >>> jit_compilable(bt.col("x").is_null())
-            False
+            True
     """
     return _kind(expr) is not None
 
@@ -143,8 +155,13 @@ def _kind_inner(expr: Expr) -> str | None:
         return _math_kind(expr)
     if isinstance(expr, Math2Expr):
         return _math2_kind(expr)
-    # `is_null` / `is_not_null` / `is_nan` / `is_inf`, `in_list`, and every remaining
-    # function node fall back to the interpreter.
+    if isinstance(expr, (IsNull, IsNotNull)):
+        # `analyze` compiles both: it recurses into the operand and yields Bool, because
+        # under the Kleene ABI the answer is just the operand's validity bit. So the
+        # operand has to be in the subset, but its *kind* does not matter.
+        return _BOOL if _kind_inner(expr.input) is not None else None
+    # `is_nan` / `is_inf`, `in_list`, and every remaining function node fall back to the
+    # interpreter.
     return None
 
 

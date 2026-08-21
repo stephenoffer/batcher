@@ -7,6 +7,8 @@ are already pinned by the differential suite.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pyarrow as pa
 
 import batcher as bt
@@ -140,30 +142,67 @@ def test_window_eviction_is_skipped_when_no_window_can_have_closed():
     assert fold._evicted_through != previous
 
 
-def test_a_restored_fold_sweeps_on_its_next_push():
-    """A restored fold has swept nothing yet; assuming the dead run emitted its closed
-    windows would strand them forever."""
-    import datetime as dt
-
+def _windowed_fold(width: str):
+    """A one-column windowed sum over a 5-minute watermark, and its key."""
     from batcher.core.streaming import _window_key, _WindowedAggFold
 
-    base = dt.datetime(2024, 1, 1)
     plan = (
-        bt.from_pydict({"t": [base], "v": [1]})
+        bt.from_pydict({"t": [dt.datetime(2024, 1, 1)], "v": [1]})
         .with_watermark("t", "5m")
-        .group_by(w=bt.window(bt.col("t"), "1m"))
+        .group_by(w=bt.window(bt.col("t"), width))
         .agg(s=bt.col("v").sum())
         ._plan
     )
     key = _window_key(plan)
-    fold = _WindowedAggFold(plan, key)
+    return _WindowedAggFold(plan, key), plan, key
+
+
+def test_a_restored_fold_resumes_the_sweep_where_the_snapshot_left_it():
+    """A restore must not re-emit windows the snapshot records as already swept.
+
+    `sweep()` sets the eviction mark and *then* hands its closed windows to the sink, so a
+    snapshot carrying that mark describes windows the dead run had already emitted. Sweeping
+    them again republishes them under a new batch id, which no sink's by-batch-id idempotency
+    absorbs — so the restored fold adopts the mark and resumes above it.
+    """
+    from batcher.core.streaming import _WindowedAggFold
+
+    base = dt.datetime(2024, 1, 1)
+    fold, plan, key = _windowed_fold("1m")
     fold.push(pa.record_batch({"t": [base], "v": [1]}))
     fold.push(pa.record_batch({"t": [base + dt.timedelta(minutes=5)], "v": [1]}))
+    swept = fold._evicted_through
+    assert swept is not None, "the fixture must have swept something to restore"
     state = fold.state()
 
     revived = _WindowedAggFold(plan, key)
     revived.restore(state)
-    assert revived._evicted_through is None
+    assert revived._evicted_through == swept
+
+
+def test_a_restored_fold_carrying_no_eviction_mark_sweeps_on_its_next_push():
+    """The other half: a snapshot with no eviction mark must not be read as "all swept".
+
+    A checkpoint written by a run that never closed a window carries no mark, and a restore
+    that treated the recovered *watermark* as proof those windows had been emitted would
+    strand them forever. The mark is the only evidence, so its absence resets the sweep.
+    """
+    from batcher.core.streaming.folds.windowed import _EVICTED_META, _WindowedAggFold
+
+    base = dt.datetime(2024, 1, 1)
+    fold, plan, key = _windowed_fold("1m")
+    fold.push(pa.record_batch({"t": [base], "v": [1]}))
+    fold.push(pa.record_batch({"t": [base + dt.timedelta(minutes=5)], "v": [1]}))
+    snapshot = fold.state()
+    unmarked = snapshot.replace_schema_metadata(
+        {k: v for k, v in (snapshot.schema.metadata or {}).items() if k != _EVICTED_META}
+    )
+
+    revived = _WindowedAggFold(plan, key)
+    revived.restore(unmarked)
+    assert revived._evicted_through is None, "an absent mark was read as an eviction"
+    revived.push(pa.record_batch({"t": [base + dt.timedelta(minutes=25)], "v": [1]}))
+    assert revived._evicted_through is not None, "the restored fold never swept"
 
 
 # --------------------------------------------------------------------------

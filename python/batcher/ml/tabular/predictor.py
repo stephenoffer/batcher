@@ -125,6 +125,48 @@ def predicted_column_names(
     return [f"{output_column}_{i}" for i in range(width)]
 
 
+def _null_feature_error(exc: Exception, matrix: Any, features: Sequence[str]) -> PlanError | None:
+    """Translate a framework's NaN rejection into the feature columns that caused it.
+
+    scikit-learn answers a null feature with ``Input X contains NaN``, which is accurate and
+    unhelpful here for two reasons. The NaN is not in the caller's data — it is what a *null*
+    became on the way into the matrix, because `missing` defaults to NaN, which is XGBoost's
+    and LightGBM's convention rather than scikit-learn's. And the message names neither the
+    column nor either way out, so a single null in one row of one column fails the whole batch
+    (and, distributed, the whole task) with a message pointing at the solver.
+
+    Returns `None` for a `ValueError` that is not about missing values, so an unrelated failure
+    keeps its own message and traceback.
+
+    Args:
+        exc: The exception the framework raised.
+        matrix: The feature matrix that was scored, used to find the offending columns.
+        features: The feature column names, positionally aligned with `matrix`.
+
+    Returns:
+        A `PlanError` naming the columns and the remedies, or `None` if `exc` is unrelated.
+    """
+    text = str(exc)
+    if not any(token in text for token in ("NaN", "infinity", "missing values")):
+        return None
+    import numpy as np
+
+    bad = [
+        name
+        for index, name in enumerate(features)
+        if index < matrix.shape[1] and not np.isfinite(matrix[:, index]).all()
+    ]
+    named = ", ".join(repr(name) for name in bad) if bad else "the feature columns"
+    return PlanError(
+        f"this model cannot score a null feature, and {named} "
+        f"{'contains' if len(bad) == 1 else 'contain'} one. A null becomes NaN in the feature "
+        "matrix, which XGBoost and LightGBM read as missing but scikit-learn rejects. Either "
+        "fill the nulls before scoring (batcher.ml.SimpleImputer, or an sklearn.impute step "
+        "inside the pipeline), or pass missing=<value> to ds.ml.predict to substitute a "
+        f"constant. The framework said: {text.splitlines()[0]}"
+    )
+
+
 @functools.cache
 def _inspect_saved(path: str, framework: str) -> Any:
     """Load a saved model on the driver so its output width can be read (cached per path)."""
@@ -221,7 +263,13 @@ def tabular_predictor(
                 return append_columns(batch, _empty_outputs(output_column, names, as_list))
             matrix = feature_matrix(batch, feature_list, dtype=matrix_dtype, missing=missing)
             call_opts = {"missing": missing, "threads": self._threads, **opts}
-            raw = self._adapter.predict(self._model, matrix, method, call_opts)
+            try:
+                raw = self._adapter.predict(self._model, matrix, method, call_opts)
+            except ValueError as exc:
+                translated = _null_feature_error(exc, matrix, feature_list)
+                if translated is None:
+                    raise
+                raise translated from exc
             columns = prediction_columns(
                 raw, output_column=output_column, output_columns=names, as_list=as_list
             )

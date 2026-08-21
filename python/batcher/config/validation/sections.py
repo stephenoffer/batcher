@@ -358,6 +358,18 @@ def _check_optimizer(o: OptimizerConfig) -> None:
         0.0 <= o.learning_smoothing_alpha <= 1.0,
         f"optimizer.learning_smoothing_alpha must be in [0, 1], got {o.learning_smoothing_alpha}",
     )
+    # The *floor* on the same blend, and it needs the same bound for a sharper reason. Two of
+    # its three consumers (`kyber.learning._smooth`, `learned_tuning.priors`) use it as
+    # `alpha = max(floor, 1/(n+1))` and then `alpha*observed + (1-alpha)*prior` with no upper
+    # clamp, so a floor above 1 makes `(1 - alpha)` negative: the estimate moves *past* the
+    # observation, away from the prior, and diverges instead of converging. Blending 100
+    # toward 200 at a floor of 3.0 yields 400. `metadata.smoothed` clamps its step to 1.0 and
+    # so escapes it; the other two do not, and nothing stopped the value being set.
+    _check(
+        0.0 <= o.learned_scalar_alpha_floor <= 1.0,
+        "optimizer.learned_scalar_alpha_floor must be in [0, 1], got "
+        f"{o.learned_scalar_alpha_floor}",
+    )
     _check(
         o.reoptimize_error > 0,
         f"optimizer.reoptimize_error must be positive, got {o.reoptimize_error}",

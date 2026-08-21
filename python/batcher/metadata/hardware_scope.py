@@ -52,7 +52,7 @@ from collections.abc import Iterator
 
 from batcher._internal.hardware import fingerprint
 
-__all__ = ["planning_for", "scoped", "scoped_key"]
+__all__ = ["local_or_planned_fingerprint", "planning_for", "scoped", "scoped_key"]
 
 # The machine class the enclosing scope is planning *for*, when that is not this process.
 #
@@ -96,6 +96,22 @@ def planning_for(hw_fingerprint: str) -> Iterator[None]:
         _PLANNING_FOR.reset(token)
 
 
+def local_or_planned_fingerprint() -> str:
+    """The machine class in force here: the enclosing `planning_for` scope, else this process.
+
+    The bare fingerprint that `scoped` and `scoped_key` embed in a name, for the one consumer
+    that is not naming a namespace at all — `MetadataHub.op_stats_by_kind`, which buckets the
+    feedback rows by fingerprint and needs to know which bucket to read. Exposed rather than
+    re-derived there so all three resolve the class identically; a second resolution is exactly
+    how a read and a write come to disagree, which is the hazard `planning_for` exists to
+    remove.
+
+    Returns:
+        The fingerprint the enclosing scope names, or this process's own outside one.
+    """
+    return _PLANNING_FOR.get() or fingerprint()
+
+
 # Separator between a namespace and its hardware fingerprint. `@` reads as "measured on" and
 # appears in no existing namespace, so a scoped name can never collide with an unscoped one.
 _SEPARATOR = "@"
@@ -135,7 +151,7 @@ def scoped(namespace: str, hw_fingerprint: str = "") -> str:
     Returns:
         The namespace qualified with that machine class's fingerprint.
     """
-    return f"{namespace}{_SEPARATOR}{hw_fingerprint or _PLANNING_FOR.get() or fingerprint()}"
+    return f"{namespace}{_SEPARATOR}{hw_fingerprint or local_or_planned_fingerprint()}"
 
 
 def scoped_key(key: str, hw_fingerprint: str = "") -> str:
@@ -165,4 +181,4 @@ def scoped_key(key: str, hw_fingerprint: str = "") -> str:
     Returns:
         The key qualified with that machine class's fingerprint.
     """
-    return f"{key}{_SEPARATOR}{hw_fingerprint or _PLANNING_FOR.get() or fingerprint()}"
+    return f"{key}{_SEPARATOR}{hw_fingerprint or local_or_planned_fingerprint()}"

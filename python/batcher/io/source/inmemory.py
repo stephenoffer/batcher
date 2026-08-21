@@ -8,6 +8,7 @@ metadata without touching the data again. The heavy column passes live in `inmem
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 
 import pyarrow as pa
@@ -436,11 +437,36 @@ class InMemorySource:
         if self._stats is None:
             rows = self.row_count()
             if not self._zone_maps:
-                return SourceStatistics(row_count=rows)
+                return SourceStatistics(row_count=rows, byte_size=self._resident_bytes())
             from batcher.io.source import inmemory_stats
 
-            self._stats = inmemory_stats.statistics(self._build_column, self._schema, rows)
+            self._stats = dataclasses.replace(
+                inmemory_stats.statistics(self._build_column, self._schema, rows),
+                byte_size=self._resident_bytes(),
+            )
         return self._stats
+
+    def _resident_bytes(self) -> int:
+        """What the batches actually hold, which this source alone knows for free.
+
+        A `FileSource` reports its stored size here; the in-memory source reported nothing,
+        so every consumer sizing from `byte_size` -- the byte-bounded map, the read-time
+        prediction, the ordered-window bucket count -- fell back to a coarse
+        `rows x type-width` guess. On a wide string column that guess is the optimizer's
+        64-byte-per-string default against a real average an order of magnitude larger, and
+        under-sizing is the direction that overruns a memory budget rather than wasting one.
+
+        Deliberately paired with `content_byte_size` left **False**: the width estimator must
+        keep its type-derived answer. `SourceStatistics.content_byte_size` records why --
+        feeding it a sharper width re-tunes the broadcast threshold and was measured making
+        TPC-H plans worse. This reports the size; it does not re-tune anything.
+
+        Returns:
+            The retained size of the resident batches, in bytes.
+        """
+        from batcher.plan.types.footprint import retained_bytes
+
+        return sum(retained_bytes(b) for b in self._batches)
 
     def _widened(self, bi: int, name: str, col: pa.Array) -> pa.Array:
         """The widened (and cached) form of column `name` in batch `bi`, or `col` as-is."""

@@ -29,7 +29,7 @@ import dataclasses
 from decimal import Decimal
 
 from batcher.plan.expr_ir import Binary, Col, Expr, Greatest, Least, Lit, NullIf
-from batcher.plan.stats import ColumnStat, Provenance, RelStats
+from batcher.plan.stats import AXIS_NUMERIC, ColumnStat, Provenance, RelStats
 
 __all__ = ["derived_projection_stat"]
 
@@ -210,9 +210,18 @@ def _transform_quantiles(grid, op: str, c, col_on_left: bool):
         mapped = [_apply(scale, float(v)) for v in values]
     except (TypeError, ValueError):  # pragma: no cover - a non-numeric grid
         return None
+    # The axis travels with the grid. An affine map of a *numeric* column stays on the numeric
+    # axis, which is the only axis that reaches here (`_numeric` refuses a date bound, so a
+    # temporal column never gets this far), but the consumer reads the label rather than
+    # inferring it — so stating it is what keeps that true if the accepted set ever widens.
+    axis = str(grid.get("axis", AXIS_NUMERIC))
     if scale[0] > 0:
-        return {"probs": [float(p) for p in probs], "values": mapped}
-    return {"probs": [1.0 - float(p) for p in reversed(probs)], "values": list(reversed(mapped))}
+        return {"probs": [float(p) for p in probs], "values": mapped, "axis": axis}
+    return {
+        "probs": [1.0 - float(p) for p in reversed(probs)],
+        "values": list(reversed(mapped)),
+        "axis": axis,
+    }
 
 
 def _transform_mcv(mcv, op: str, c, col_on_left: bool):

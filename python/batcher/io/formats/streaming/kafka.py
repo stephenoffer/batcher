@@ -127,6 +127,59 @@ def _parse_starting_offsets(value: Any, topic: str) -> tuple[str, dict[int, int]
     return reset, {p: o for p, o in seeks.items() if o >= 0}
 
 
+def _parse_ending_offsets(value: Any, topic: str) -> tuple[bool, dict[int, int]] | None:
+    """Split ``ending_offsets`` into "stop at the head" and explicit per-partition ends.
+
+    Spark's ``endingOffsets`` is what turns a topic into a *bounded* relation: a batch read
+    of an offset range, which is how a backfill or a reprocess is expressed. Without it a
+    Kafka source can only be consumed by a streaming query, and `collect()` on one correctly
+    refuses because it could never terminate.
+
+    The accepted forms mirror `_parse_starting_offsets`, so the two options are written the
+    same way: ``"latest"`` for the head of each partition as of query start, or a
+    ``{partition: offset}`` map (Spark's nested ``{"topic": {...}}`` form included). The end
+    is **exclusive**, as in Spark: an end of 100 reads offsets up to and including 99.
+
+    Args:
+        value: The option as given.
+        topic: The topic being read, used to unwrap the nested form.
+
+    Returns:
+        None when unbounded, else ``(stop_at_head, {partition: end_offset})``. The flag and
+        the map are not exclusive: a map may name some partitions and leave the rest to the
+        head, which is what a partial backfill needs.
+
+    Raises:
+        PlanError: If the option is neither a recognized position nor a mapping.
+    """
+    from batcher._internal.errors import PlanError, suggestion
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value == "latest":
+            return True, {}
+        try:
+            import json
+
+            value = json.loads(value)
+        except ValueError:
+            hint = suggestion(value, ("latest",))
+            raise PlanError(
+                f"unknown ending_offsets {value!r}; use 'latest' or a {{partition: offset}} "
+                "mapping. 'earliest' is not an ending position." + (f" {hint}" if hint else "")
+            ) from None
+    if not isinstance(value, dict):
+        raise PlanError(f"ending_offsets must be 'latest' or a mapping, not {type(value).__name__}")
+    inner = value.get(topic, value)
+    if not isinstance(inner, dict):
+        raise PlanError(f"ending_offsets for topic {topic!r} must be a mapping of partition")
+    ends = {int(p): int(o) for p, o in inner.items()}
+    # Spark's `-1` sentinel means "the latest offset" on the ending side too.
+    stop_at_head = any(offset == -1 for offset in ends.values())
+    return stop_at_head, {p: o for p, o in ends.items() if o >= 0}
+
+
 def _is_no_offset(exc: BaseException) -> bool:
     """Whether a commit failure is the benign "nothing stored to commit" condition."""
     args = getattr(exc, "args", ())
@@ -205,7 +258,11 @@ class KafkaSource(BrokerSource):
 
     __slots__ = (
         "_consumer",
+        "_drained",
+        "_end_at",
+        "_end_spec",
         "_fail_on_data_loss",
+        "_finished",
         "_metadata_timeout",
         "_offset_reset",
         "_partitions",
@@ -225,6 +282,7 @@ class KafkaSource(BrokerSource):
         poll_timeout: float = 1.0,
         metadata_timeout: float = 10.0,
         starting_offsets: Any = None,
+        ending_offsets: Any = None,
         fail_on_data_loss: bool = True,
         **options: Any,
     ) -> None:
@@ -242,6 +300,15 @@ class KafkaSource(BrokerSource):
         # never reach the confluent-kafka config as bogus keys. See `_parse_starting_offsets`
         # and `_is_data_loss`.
         self._offset_reset, self._start_at = _parse_starting_offsets(starting_offsets, topic)
+        # `ending_offsets` makes the topic a *bounded* relation — an offset range rather than
+        # a live stream — which is what a backfill or a reprocess is. Parsed here so a typo
+        # is reported at construction; the per-partition end offsets are resolved against
+        # the cluster's watermarks on the first poll, which is the earliest moment "latest"
+        # has a value.
+        self._end_spec = _parse_ending_offsets(ending_offsets, topic)
+        self._end_at: dict[int, int] | None = None
+        self._finished: set[int] = set()
+        self._drained = False
         self._fail_on_data_loss = fail_on_data_loss
         # How long the *first* record of a poll is waited for. It bounds the micro-batch
         # loop's stop latency (a `stop()` is observed only between polls); the records that
@@ -253,6 +320,30 @@ class KafkaSource(BrokerSource):
         # the driver forever against an unreachable bootstrap server. Also kept out of
         # `options` for the same reason.
         self._metadata_timeout = metadata_timeout
+
+    @property
+    def bounded(self) -> bool:
+        """Whether this read terminates, so `collect()` is allowed to materialize it.
+
+        False for a live topic and True for an offset range (``ending_offsets=``). It has to
+        be answerable *before* the consumer is built, because it is what decides at plan
+        time whether a terminal is a `collect` or a streaming query — so it is derived from
+        the parsed option rather than from any cluster state.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io.formats.streaming.kafka import KafkaSource
+                >>> KafkaSource("t", partitions=[0]).bounded
+                False
+
+                >>> KafkaSource("t", partitions=[0], ending_offsets={0: 100}).bounded
+                True
+
+        Returns:
+            True when the source stops at a declared end offset.
+        """
+        return self._end_spec is not None
 
     def _client(self) -> Any:
         """Lazily construct and subscribe the underlying consumer."""
@@ -270,13 +361,40 @@ class KafkaSource(BrokerSource):
             **{k.replace("_", "."): v for k, v in opts.items()},
         }
         self._consumer = consumer_cls(config)
-        if self._partitions is None:
-            self._consumer.subscribe([self.topic], on_assign=self._on_assign)
-        else:
+        if self._partitions is not None:
             from confluent_kafka import TopicPartition
 
             self._consumer.assign([TopicPartition(self.topic, p) for p in self._partitions])
+        elif self._end_spec is not None:
+            # A bounded range read assigns every partition instead of joining the group.
+            # End-detection needs the full assigned set up front, and a group subscription
+            # cannot supply it: the set is decided by a rebalance that may hand this
+            # consumer a subset, so the read would stop at the end of *its* partitions and
+            # silently omit the rest of the range. Spark's batch Kafka source assigns for
+            # the same reason. `self._consumer` is already set, so the discovery below
+            # reuses this client rather than recursing into `_client`.
+            self._assign_all()
+        else:
+            self._consumer.subscribe([self.topic], on_assign=self._on_assign)
         return self._consumer
+
+    def _assign_all(self) -> None:
+        """Assign every partition of the topic, seeking each to its configured start."""
+        from confluent_kafka import TopicPartition
+
+        assigned = []
+        for partition in self._discover_partitions():
+            token = self._resume_from.get(partition)
+            if token is not None:
+                offset = int(token) + 1
+            elif partition in self._start_at:
+                offset = self._start_at[partition]
+            else:
+                from confluent_kafka import OFFSET_BEGINNING, OFFSET_END
+
+                offset = OFFSET_END if self._offset_reset == "latest" else OFFSET_BEGINNING
+            assigned.append(TopicPartition(self.topic, partition, offset))
+        self._consumer.assign(assigned)
 
     def _on_assign(self, consumer: Any, partitions: list[Any]) -> None:
         """On a group rebalance, resume each assigned partition from *Batcher's* checkpoint.
@@ -319,6 +437,38 @@ class KafkaSource(BrokerSource):
         consumer = self._client()
         consumer.seek(TopicPartition(self.topic, partition, int(token) + 1))
 
+    def _split_options(self) -> dict[str, Any]:
+        """The four settings this source consumes by name, so a worker rebuilds them.
+
+        Without these a distributed read silently ran a *different* query than the
+        single-node one: ``starting_offsets="latest"`` reverted to ``earliest`` and
+        replayed the whole topic on every worker, and ``fail_on_data_loss=False`` reverted
+        to True and stopped the query on exactly the condition the user chose to tolerate.
+
+        ``starting_offsets`` is re-derived rather than stored raw, so the Spark sentinels
+        and the nested ``{"topic": {...}}`` form are normalized once, here, instead of
+        being re-parsed identically on every worker.
+
+        Returns:
+            The constructor keyword arguments this class consumed.
+        """
+        starting: Any = self._offset_reset if not self._start_at else dict(self._start_at)
+        options: dict[str, Any] = {
+            "starting_offsets": starting,
+            "fail_on_data_loss": self._fail_on_data_loss,
+            "poll_timeout": self._poll_timeout,
+            "metadata_timeout": self._metadata_timeout,
+        }
+        if self._end_spec is not None:
+            # The *resolved* ends where they are known, so every worker stops at the same
+            # offsets the driver saw. Re-resolving `"latest"` per worker would end each
+            # partition at whatever the head was when that worker started, making the
+            # bounded read's answer depend on scheduling.
+            stop_at_head, explicit = self._end_spec
+            resolved = self._end_at if self._end_at is not None else explicit
+            options["ending_offsets"] = dict(resolved) if resolved or not stop_at_head else "latest"
+        return options
+
     def _discover_partitions(self) -> list[int]:
         """The topic's partition ids, from cluster metadata.
 
@@ -352,7 +502,95 @@ class KafkaSource(BrokerSource):
         # Deliberately does not commit. Polling is not processing: the engine has not staged,
         # let alone published, this batch yet. `BrokerSource.iter_batches` calls
         # `_commit_delivered` once the epoch is published — the only correct moment.
-        return self._decode(self._consume_eagerly())
+        if self._end_spec is None:
+            return self._decode(self._consume_eagerly())
+        if self._drained:
+            return None  # every partition reached its end offset on an earlier poll
+        return self._trim_to_range(self._decode(self._consume_eagerly()))
+
+    def _resolve_ends(self) -> dict[int, int]:
+        """The exclusive end offset per assigned partition, resolved once against the cluster.
+
+        ``"latest"`` has no value until a client can ask, so it is resolved here rather than
+        at construction: the high watermark as of the *first poll* is the range's end, which
+        is what makes a backfill reproducible — a partition that keeps growing during the
+        read does not extend it.
+
+        A partition whose end is at or below its low watermark has nothing in range and is
+        marked finished immediately. Without that, a range entirely behind the retention
+        cutoff would wait forever for a message that can never arrive, which presents as a
+        hung `collect()`.
+
+        Returns:
+            ``{partition: exclusive_end_offset}`` for every partition being read.
+        """
+        from confluent_kafka import TopicPartition
+
+        stop_at_head, explicit = self._end_spec  # type: ignore[misc]
+        consumer = self._client()
+        ends: dict[int, int] = {}
+        for partition in self._discover_partitions():
+            if partition not in explicit and not stop_at_head:
+                # Named neither explicitly nor by `"latest"`: this partition is outside the
+                # requested range, so it contributes nothing and must not hold the read open.
+                self._finished.add(partition)
+                continue
+            # One watermark call per partition, not two: it is a broker round trip, and a
+            # thousand-partition topic pays it once per partition at query start.
+            low, high = consumer.get_watermark_offsets(
+                TopicPartition(self.topic, partition), timeout=self._metadata_timeout
+            )
+            end = int(explicit.get(partition, high))
+            ends[partition] = end
+            if end <= low:
+                self._finished.add(partition)
+        return ends
+
+    def _trim_to_range(self, messages: list[BrokerMessage]) -> list[BrokerMessage]:
+        """Drop messages at or past their partition's end, and retire finished partitions.
+
+        Trimming rather than trusting the poll to stop: nothing tells librdkafka about the
+        range, so a poll routinely returns messages past the end, and keeping them would
+        make the bounded read return more rows than the range it was asked for.
+
+        A retired partition is `pause`d so the client stops fetching it, which matters on a
+        wide topic where one long partition otherwise keeps every other one's fetch traffic
+        flowing for the rest of the read.
+        """
+        if self._end_at is None:
+            self._end_at = self._resolve_ends()
+        kept: list[BrokerMessage] = []
+        retired: list[int] = []
+        for message in messages:
+            end = self._end_at.get(message.partition)
+            if end is None or message.partition in self._finished:
+                continue  # outside the range, or a partition already retired
+            if message.offset < end:
+                kept.append(message)
+            if message.offset >= end - 1:
+                self._finished.add(message.partition)
+                retired.append(message.partition)
+        if retired:
+            self._pause(retired)
+        if self._finished.issuperset(self._end_at):
+            # Report the last rows now and end on the next poll: returning None here would
+            # discard the very messages that completed the range.
+            self._drained = True
+        return kept
+
+    def _pause(self, partitions: list[int]) -> None:
+        """Stop fetching partitions that have reached their end. Best effort.
+
+        A client that cannot pause (an older librdkafka, a test double) simply keeps
+        fetching; the trim above still bounds what is returned, so this can cost throughput
+        and never correctness.
+        """
+        from contextlib import suppress
+
+        with suppress(Exception):
+            from confluent_kafka import TopicPartition
+
+            self._client().pause([TopicPartition(self.topic, p) for p in partitions])
 
     def _consume_eagerly(self) -> list[Any]:
         """Block only until the *first* record, then drain what is already buffered.

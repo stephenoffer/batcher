@@ -33,6 +33,7 @@ from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_r
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
+    buckets_for_envelope,
     engine_config_json,
     record_worker_metrics,
     shuffle_partitions,
@@ -46,8 +47,8 @@ from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.dist.sort_boundaries import (
     load_learned_grids,
     persist_grids,
+    sort_grid_kind,
     sort_key_identity,
-    sort_key_is_string,
     sort_shape_key,
 )
 from batcher.io.source import Source
@@ -84,7 +85,7 @@ def execute_global_window_disk(
     win_ir["functions"] = list(win_ir["functions"])
     avg_helpers = inject_avg_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
-    n_buckets = shuffle_partitions(workers)
+    n_buckets = buckets_for_envelope(shuffle_partitions(workers), sources[sid])
 
     work_dir = distributed_work_dir("batcher_dglobalwin_")
     try:
@@ -114,9 +115,9 @@ def execute_global_window_disk(
         # silently puts the whole input in a single bucket. See
         # `dist/sort_boundaries.sort_shape_key`. `expect_strings` re-checks on load, so an
         # entry written under the old colliding digest re-samples instead of raising.
-        key_is_str = sort_key_is_string(sources[sid], key_name)
+        key_kind = sort_grid_kind(sources[sid], key_name)
         shape_key = sort_shape_key(map_ir, key_name, sort_key_identity(sources[sid], key_name))
-        grids = load_learned_grids(shape_key, key_is_str)
+        grids = load_learned_grids(shape_key, key_kind)
         if grids is None:
             grids = gather_with_backups(
                 [_sample_for(w) for w in range(len(partitions))], _sample_for, pol

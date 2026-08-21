@@ -5,13 +5,29 @@ This page covers reading and writing any SQL database from a standard connection
 | | |
 | --- | --- |
 | **Read** | {py:meth}`bt.read.sql(query, uri=...) <batcher.api.io_namespace.reader.Reader.sql>`, {py:meth}`bt.read.sql(query, connection=...) <batcher.api.io_namespace.reader.Reader.sql>`, or {py:meth}`bt.read.table("dbapi", module=..., ...) <batcher.api.io_namespace.reader.Reader.table>` |
-| **Write** | {py:meth}`ds.write.sql(table, uri=...) <batcher.api.io_namespace.writer.Writer.sql>`, ADBC schemes only |
+| **Write** | {py:meth}`ds.write.sql(table, uri=..., mode=...) <batcher.api.io_namespace.writer.Writer.sql>`, every scheme on this page |
 | **Extra** | `pip install 'batcher-engine[sql]'` or `[connectorx]`, plus the per-database driver |
 | **Parallelism** | FlightSQL server-side partitions, or `partition_on=` range partitions on every other backend |
 | **Pushdown** | Projection and predicate, both folded into the submitted SQL |
 | **Credentials** | `password="env:VAR"` or `"file:/path"`, resolved on the worker |
 
 The warehouse-specific pages cover the connectors that are not URI-routed: {doc}`Snowflake </integrations/warehouses/snowflake>`, {doc}`BigQuery </integrations/warehouses/bigquery>`, and {doc}`Databricks </integrations/warehouses/databricks>`.
+
+## This is an analytical read path, not a serving one
+
+Batcher pushes a point lookup's predicate all the way down — the server does an index seek
+and returns one row — and the query still takes about 3.5 ms, against 0.01 ms for the same
+lookup through the driver directly. One Batcher process serves roughly 260 such queries a
+second, and threads do not raise that: the control plane is Python, so plan construction and
+optimization hold the GIL.
+
+The cost is fixed rather than proportional, which is the whole shape of an analytical
+engine: a `Dataset` terminal op over a one-row table with no operators at all still costs
+~1.9 ms. Amortized over a million rows that is nothing; at one row it *is* the query.
+
+So use these connectors to extract, join, aggregate and write back. Do not put them behind a
+request path that needs an answer per user action — call the driver for that. The measured
+figures are in `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## Which backend serves which scheme
 
@@ -141,11 +157,21 @@ Kyber pushes both the projection and the predicate into the SQL that is actually
 | --- | --- |
 | `.filter(...)` after the read | The database, as a `WHERE` below the projection |
 | {py:meth}`.select(...) <batcher.Dataset.select>` after the read | The database, as the submitted `SELECT` column list |
+| {py:meth}`.head(n) <batcher.Dataset.head>` / `.limit(n)` | The database, as a trailing `LIMIT`, where the dialect has one |
+| {py:meth}`.sort(...).head(n) <batcher.Dataset.sort>` | The database, as `ORDER BY … NULLS … LIMIT n`, where the dialect can spell it |
 | A predicate the translator cannot express | Your process, in the engine's `Filter` |
 
 The last row is a slowdown and never a wrong answer. An unpushed predicate is re-checked by the engine regardless, so the result is identical either way.
 
 The predicate is applied below the projection on purpose. Kyber pushes the two independently and routinely pushes a projection that omits the column the predicate filters on, so projecting first would produce SQL referencing a column that no longer exists.
+
+Column names are delimited for the dialect. Three ordinary names break unquoted: a reserved word such as `order`, `key` or `date`; a name holding a space, which parses as a column *aliased* to the second word and so returns the wrong column under the right name; and an unaliased aggregate from your own query, which comes back as a column literally called `count(*)`.
+
+### Two things that push only where the dialect is known
+
+A row cap and a top-N are pushed on an allow-list of dialects rather than on everything, and the asymmetry is deliberate. A missing cap costs the rows the server would have skipped. A cap the server cannot parse turns a working query into a syntax error, and a top-N pushed to a dialect with no `NULLS FIRST | LAST` clause returns the server's idea of the first n rather than the engine's — the *wrong rows*, silently, wherever a null sits.
+
+So `LIMIT` pushes to PostgreSQL, SQLite, DuckDB, MySQL and the rest of the allow-list, and not to SQL Server or Oracle, which spell it `TOP` and `FETCH FIRST`. A top-N pushes only where an explicit `NULLS` clause is accepted, which rules MySQL and SQL Server out entirely. A backend Batcher cannot place at all — ODBC, whose DSN names a driver rather than a dialect, or a `dbapi` read with no `uri=` and an unrecognized driver — pushes neither and quotes nothing, which is exactly what it did before it could name its dialect. Pass `dialect=` to say so yourself.
 
 ### The schema probe
 
@@ -255,7 +281,7 @@ ADBC prefers server-side partitioning when the driver has it. With `partition=Tr
 
 ## Writing
 
-`ds.write.sql(table, uri=...)` bulk-ingests Arrow into a destination table through ADBC. It takes the same URI and the same `password=` reference as the read, so a read and the write that follows it are spelled identically.
+`ds.write.sql(table, uri=...)` writes rows back, taking the same URI and the same `password=` reference as the read, so a read and the write that follows it are spelled identically.
 
 ```python
 # docs: skip
@@ -263,15 +289,14 @@ manifest = orders.write.sql(
     "orders_enriched",
     uri="postgresql://svc@warehouse:5432/shop",
     password="env:PGPASSWORD",
-    mode="append",
+    mode="upsert",
+    key_columns="order_id",
 )
 ```
 
-`mode` is passed to `adbc_ingest` and takes `"create"`, `"append"`, `"replace"`, or `"create_append"`, which is the default.
+`mode` says what the write does to the table: `append` and `overwrite` load it, and `upsert`, `update`, `delete` and `delete_insert` maintain it one key at a time. A bulk append goes through ADBC where a driver is installed, and every other write through the PEP 249 driver for the scheme, which is what lets a MySQL, Oracle or SQL Server table be written at all.
 
-There is no cross-shard transaction. Each shard of a distributed write ingests and commits its own rows as it finishes, and the driver's commit step is a no-op, so a write that dies halfway leaves the rows that already landed. Write to a staging table and swap, or key the data so a re-run is idempotent.
-
-Writing is ADBC only. A ConnectorX scheme has no sink, because ConnectorX is a reader.
+{doc}`Writing to a database </integrations/databases/writing>` covers the modes, the transaction and retry behavior, and the type limits.
 
 ## Any driver at all, through DB-API
 
@@ -379,7 +404,9 @@ The result is a lazy {py:class}`Dataset <batcher.Dataset>` rather than an eager 
 
 The `sql` extra installs `adbc-driver-manager` and `adbc-driver-flightsql` only. Per-database ADBC drivers are separate packages, so PostgreSQL also needs `pip install adbc-driver-postgresql`, SQLite needs `adbc-driver-sqlite`, and so on. ConnectorX schemes need `pip install 'batcher-engine[connectorx]'`.
 
-`table=` works on the ADBC path. A ConnectorX read takes a query.
+`table=` works on the ADBC and DB-API paths. A ConnectorX read takes a query.
+
+ConnectorX is a reader, so a ConnectorX scheme has no Arrow-native write path. Those writes go through the scheme's PEP 249 driver instead, which is what `pip install pymysql` buys you.
 
 `row_count()` returns `None` on every backend here, so the optimizer has no row estimate for a SQL source until it reads one.
 
@@ -391,6 +418,7 @@ A scheme Batcher cannot route raises a `BackendError` listing the ones it can. F
 
 ## See also
 
+- {doc}`Writing to a database </integrations/databases/writing>`: append, upsert, update and delete, and the transaction they run in.
 - {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`: the reader and writer surface, splits, and pushdown.
 - {doc}`Snowflake </integrations/warehouses/snowflake>`, {doc}`BigQuery </integrations/warehouses/bigquery>`, and {doc}`Databricks </integrations/warehouses/databricks>`: the warehouse connectors with their own read paths.
 - {doc}`MongoDB </integrations/databases/mongodb>` and {doc}`Elasticsearch </integrations/databases/elasticsearch>`: the non-relational stores.

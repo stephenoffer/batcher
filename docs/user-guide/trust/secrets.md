@@ -61,7 +61,14 @@ bt.read.clickhouse(query="SELECT ...", host="ch.internal", database="events",
 bt.read.table("connectorx", query="SELECT ...", conn_uri="file:/run/secrets/pg_uri")
 
 bt.read.mongo(uri="env:MONGO_URI", database="app", collection="events")
+
+bt.read.parquet("oss://bucket/events/*.parquet",
+                storage_options={"key": "env:OSS_KEY", "secret": "cmd:prod/oss-secret"})
 ```
+
+All three schemes work here, including `cmd:`, and so do the `storage_options` an object
+store takes. A connector resolves once when it opens its connection rather than per batch,
+so there is no cache in this path and a rotated secret is picked up by the next connection.
 
 The reference is resolved on the machine that *opens the connection*, not on the driver
 that builds the plan. The source object and the pickled split that reaches a Ray worker
@@ -99,9 +106,11 @@ name a program to execute would turn a secret reference into arbitrary code exec
 argument is passed as an argument, never through a shell, so metacharacters in a reference
 are inert.
 
-Resolutions are cached for `BATCHER_SECRET_TTL_SECONDS` (default 300, `0` disables),
-because references resolve on a per-batch path. Without a cache, a `cmd:` reference would
-fork a process for every Arrow batch. The TTL bounds how long a rotated secret stays stale.
+Key references resolve on a per-batch path, so they are cached for
+`BATCHER_SECRET_TTL_SECONDS` (default 300, `0` disables). Without a cache, a `cmd:` reference
+would fork a process for every Arrow batch. The TTL bounds how long a rotated secret stays
+stale. Connector credentials and storage options are not cached, because they resolve once
+per connection.
 
 ## Enforcing references in a regulated deployment
 

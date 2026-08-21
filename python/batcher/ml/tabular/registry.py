@@ -180,9 +180,23 @@ def register(adapter: TabularAdapter) -> TabularAdapter:
 
 
 def _load_adapters() -> None:
-    """Import the adapter modules so `FRAMEWORKS` is populated (idempotent)."""
-    if FRAMEWORKS:
-        return
+    """Import the adapter modules so `FRAMEWORKS` is populated (idempotent).
+
+    **No `if FRAMEWORKS: return` short-circuit**, and that is a correctness point rather than a
+    style one. `boosters` and `estimators` register at module scope, so a non-empty registry
+    proves only that *one* of them has been imported — and anything that imports `estimators`
+    first (directly, or through any module that does) then made this return before `boosters`
+    ever ran. XGBoost, LightGBM and CatBoost were simply absent for the life of the process,
+    and the symptom is not an import error: `detect_framework` falls through to the duck-typed
+    scikit-learn adapter, so `ds.ml.predict(booster)` reports "cannot tell which framework this
+    model belongs to ... one of ['onnx', 'sklearn']", or silently scores a `Booster` through
+    the sklearn path and fails inside XGBoost with a `DMatrix` type error.
+
+    Found as seven `test_ml_tabular_predict` failures that appeared only when the whole suite
+    ran in one process, and passed on their own — the import order is what differed. Re-running
+    the imports costs a `sys.modules` lookup once they are cached, which is what "idempotent"
+    should have meant here.
+    """
     from batcher.ml.tabular import boosters, estimators  # noqa: F401  (registration import)
 
 

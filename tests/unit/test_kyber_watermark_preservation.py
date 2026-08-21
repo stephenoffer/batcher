@@ -131,3 +131,78 @@ def test_a_watermarkless_aggregate_is_unaffected():
     )
     out = _rewrite(Filter(agg, col("k") > lit(0)))
     assert all(a.watermark is None for a in _aggregates(out))
+
+
+# --- The contract, not the three rules that broke it --------------------------------------
+#
+# The tests above each name one rule. That is why the bug kept coming back: the *next* rule to
+# rebuild an `Aggregate` positionally was covered by none of them, and there turned out to be
+# fifteen such sites across five files. This asserts the property instead -- for a spread of
+# aggregate shapes, whatever the optimizer does to them, a watermark that went in comes out.
+#
+# Two shapes here are not "carry the field" but "decline the rewrite": `count_distinct` and an
+# aggregate whose only function folds into a group key both rewrote into a `Distinct`, which
+# has **no** watermark field and so cannot carry one at all. A rewrite that cannot represent a
+# field has to decline rather than drop it.
+
+#: name -> a builder over a watermarked streaming Dataset.
+_WATERMARKED_SHAPES = {
+    "plain_sum": lambda d: d.group_by("k").agg(s=bt.col("v").sum()),
+    "multi_key": lambda d: d.group_by("k", "s").agg(tot=bt.col("v").sum()),
+    "global": lambda d: d.agg(s=bt.col("v").sum()),
+    "constant_group_key": lambda d: d.group_by("k", "c").agg(s=bt.col("v").sum()),
+    "duplicate_aggregates": lambda d: d.group_by("k").agg(a=bt.col("v").sum(), b=bt.col("v").sum()),
+    "count_of_a_constant": lambda d: d.group_by("k").agg(n=bt.lit(1).count()),
+    "sum_of_a_constant": lambda d: d.group_by("k").agg(n=bt.lit(1).sum()),
+    "over_a_filter": lambda d: d.filter(bt.col("v") > 1).group_by("k").agg(s=bt.col("v").sum()),
+    "over_a_sort": lambda d: d.sort("v").group_by("k").agg(s=bt.col("v").sum()),
+    "over_a_distinct": lambda d: d.distinct().group_by("k").agg(s=bt.col("v").sum()),
+    # These two rewrote into a `Distinct` and so dropped the watermark structurally.
+    "aggregate_of_a_group_key": lambda d: d.group_by("k").agg(m=bt.col("k").max()),
+    "count_of_a_group_key": lambda d: d.group_by("k").agg(n=bt.col("k").count()),
+    "count_distinct": lambda d: d.group_by("k").agg(n=bt.col("k").n_unique()),
+}
+
+
+def _streaming_frame():
+    return bt.from_pydict(
+        {"k": [1, 1, 2], "v": [3, 4, 5], "c": [9, 9, 9], "s": ["a", "b", "b"], "ts": [10, 20, 30]}
+    ).with_watermark("ts", "10m")
+
+
+@pytest.mark.parametrize("shape", sorted(_WATERMARKED_SHAPES))
+def test_a_watermark_survives_optimization_whatever_the_aggregate_shape(shape):
+    from batcher import core, kyber
+
+    ds = _WATERMARKED_SHAPES[shape](_streaming_frame())
+    assert any(a.watermark is not None for a in _aggregates(ds._plan)), (
+        "the shape must carry a watermark before optimization, or it proves nothing"
+    )
+    optimized = kyber.optimize_logical(ds._plan, sources=ds._sources, hub=core.default_hub())
+    carriers = [n for n in walk(optimized) if getattr(n, "watermark", None) is not None]
+    assert carriers, (
+        f"{shape}: the watermark was dropped by optimization. Either the rule that rebuilt the "
+        f"node must carry it (use `dataclasses.replace`), or -- if it rewrites into a node with "
+        f"no watermark field -- it must decline while one is set."
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(_WATERMARKED_SHAPES))
+def test_the_same_shapes_still_optimize_when_no_watermark_is_set(shape):
+    """The declines above are conditional: a bounded query keeps every rewrite it had."""
+    from batcher import core, kyber
+
+    ds = _WATERMARKED_SHAPES[shape](
+        bt.from_pydict(
+            {
+                "k": [1, 1, 2],
+                "v": [3, 4, 5],
+                "c": [9, 9, 9],
+                "s": ["a", "b", "b"],
+                "ts": [10, 20, 30],
+            }
+        )
+    )
+    optimized = kyber.optimize_logical(ds._plan, sources=ds._sources, hub=core.default_hub())
+    assert not [n for n in walk(optimized) if getattr(n, "watermark", None) is not None]
+    assert ds.collect().num_rows > 0

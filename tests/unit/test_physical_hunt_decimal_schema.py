@@ -61,7 +61,13 @@ def test_decimal_arith_declared_matches_actual(
 
 def test_decimal_div_stays_uncertain() -> None:
     """True division of decimals has an engine-derived scale we do not reproduce, so
-    inference must stay silent (fall back) rather than guess a wrong precision."""
+    inference must stay silent (fall back) rather than guess a wrong precision.
+
+    `mod` used to be silent for the same stated reason, and the reason was not true of it:
+    a remainder is bounded by the smaller operand, which makes its result type exactly
+    `min(p1 - s1, p2 - s2) + max(s1, s2)` at scale `max(s1, s2)`. That was measured against
+    the engine before it was written down, so `mod` is now declared and `div` alone stays
+    uncertain."""
     from batcher.plan.expr_ir import Binary, Col
     from batcher.plan.types.infer import infer_type
 
@@ -69,13 +75,25 @@ def test_decimal_div_stays_uncertain() -> None:
     inp = ds._plan.available_schema()  # type: ignore[attr-defined]
     assert inp is not None
     assert infer_type(Binary("div", Col("a"), Col("b")), inp) is None
-    # `mod` of two decimals is likewise left uncertain (not add/sub/mul).
-    assert infer_type(Binary("mod", Col("a"), Col("b")), inp) is None
+    assert infer_type(Binary("mod", Col("a"), Col("b")), inp) == pa.decimal128(8, 3)
+    # And it is the type the engine produces, not merely a rule that agrees with itself.
+    produced = ds.select(v=bt.col("a") % bt.col("b")).collect().schema.field("v").type
+    assert produced == pa.decimal128(8, 3)
 
 
-def test_decimal_mixed_with_int_stays_uncertain() -> None:
-    """A decimal mixed with a non-decimal operand is left uncertain — only the
-    two-decimal `add`/`sub`/`mul` result types are reproduced."""
+def test_decimal_mixed_with_int_declares_the_decimal_the_engine_produces() -> None:
+    """A decimal mixed with an integer used to be left uncertain, and need not be.
+
+    The engine's rule for the pair is exact: `coerce_numeric` brings the integer to the
+    *decimal operand's own type* and the two-decimal rule then applies, so
+    `decimal(10,2) + int64` is `decimal(11,2)` and `decimal(10,2) * int64` is
+    `decimal(21,4)` — scale doubled, because the coerced integer carries the decimal's
+    scale too. Leaving it uncertain meant `Dataset.schema` reported `null` for `price *
+    qty`, the most ordinary shape a money column appears in.
+
+    A decimal mixed with a **float** is not a decimal at all: DOUBLE dominates DECIMAL, so
+    the whole expression is a plain double.
+    """
     from batcher.plan.expr_ir import Binary, Col
     from batcher.plan.types.infer import infer_type
 
@@ -83,8 +101,20 @@ def test_decimal_mixed_with_int_stays_uncertain() -> None:
         {
             "a": pa.array([Decimal("1.50")], pa.decimal128(10, 2)),
             "i": pa.array([3], pa.int64()),
+            "f": pa.array([2.5], pa.float64()),
         }
     )
-    inp = bt.from_arrow(T)._plan.available_schema()  # type: ignore[attr-defined]
+    ds = bt.from_arrow(T)
+    inp = ds._plan.available_schema()  # type: ignore[attr-defined]
     assert inp is not None
-    assert infer_type(Binary("add", Col("a"), Col("i")), inp) is None
+    assert infer_type(Binary("add", Col("a"), Col("i")), inp) == pa.decimal128(11, 2)
+    assert infer_type(Binary("mul", Col("a"), Col("i")), inp) == pa.decimal128(21, 4)
+    assert infer_type(Binary("add", Col("a"), Col("f")), inp) == pa.float64()
+    # Each one against what the engine actually returns, which is the only thing that
+    # makes the rule above a fact rather than a second guess.
+    for expr, want in (
+        (bt.col("a") + bt.col("i"), pa.decimal128(11, 2)),
+        (bt.col("a") * bt.col("i"), pa.decimal128(21, 4)),
+        (bt.col("a") + bt.col("f"), pa.float64()),
+    ):
+        assert ds.select(v=expr).collect().schema.field("v").type == want

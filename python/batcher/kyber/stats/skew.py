@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
     from batcher.plan.logical import Join
 
-__all__ = ["hot_join_values"]
+__all__ = ["hot_join_value_shares", "hot_join_values"]
 
 
 def _frequencies(stats: RelStats, key: str) -> dict[str, float]:
@@ -110,6 +110,34 @@ def hot_join_values(
 ) -> list[str]:
     """The known-hot values of a single-key join's key, from measured column statistics.
 
+    The values alone, for a caller that only asks *whether* to salt. A caller that also has
+    to size the fan-out wants `hot_join_value_shares`, which returns the measured share as
+    well — the fan-out is `ceil(share x partitions)`, so a caller without the share has to
+    substitute the detection *threshold* and always arrives at the floor.
+
+    Args:
+        join: The join whose key is being checked for skew.
+        sources: The bound inputs, indexed by a `Scan`'s `source_id`.
+        hub: The metadata hub holding the measured column statistics.
+        min_fraction: The share of rows a value must hold to count as hot.
+        partitions: How many reduce partitions the shuffle fans into, or `None` for the
+            plain fraction test.
+
+    Returns:
+        The hot key values, sorted, as strings; empty when none are known.
+    """
+    return hot_join_value_shares(join, sources, hub, min_fraction, partitions)[0]
+
+
+def hot_join_value_shares(
+    join: Join,
+    sources: list,
+    hub: MetadataHub | None,
+    min_fraction: float,
+    partitions: int | None = None,
+) -> tuple[list[str], float]:
+    """The known-hot values of a single-key join's key, from measured column statistics.
+
     Values are returned as strings, the form the engine's salted partitioner keys on.
     Empty when the join is not single-key, when nothing has been measured, or when no value
     clears `min_fraction` — in every case the caller falls back to its existing behavior.
@@ -125,25 +153,37 @@ def hot_join_values(
             (see `_overloading`). Omitting it keeps the plain fraction test.
 
     Returns:
-        The hot key values, sorted, as strings; empty when none are known.
+        `(hot values sorted as strings, the hottest one's measured share)`. The share is the
+        largest measured frequency among the hot values, on either side, and `0.0` when
+        nothing was measured — which a caller must read as *unknown*, not as *not skewed*.
     """
     if len(join.left_keys) != 1 or len(join.right_keys) != 1:
-        return []  # salting is defined for a single key
+        return [], 0.0  # salting is defined for a single key
     try:
         estimator = StatsEstimator(sources, load_learned_stats(hub))
         left = estimator.estimate(join.left)
         right = estimator.estimate(join.right)
     except Exception:  # pragma: no cover - a statistics failure must never fail a join
-        return []
+        return [], 0.0
     # Either side being skewed overloads the reducer that owns the key, so both count.
     lk, rk = join.left_keys[0], join.right_keys[0]
+    left_freq = _frequencies(left, lk)
+    right_freq = _frequencies(right, rk)
     hot = _hot(left, lk, min_fraction) | _hot(right, rk, min_fraction)
     if partitions is not None:
         hot |= _overloading(
-            _frequencies(left, lk),
-            _frequencies(right, rk),
+            left_freq,
+            right_freq,
             left.column(lk).ndv,
             right.column(rk).ndv,
             partitions,
         )
-    return sorted(hot)
+    # The measurement the fan-out is sized from. It is read off the same frequency tables the
+    # hot set came from, so it costs nothing — and handing the caller the values without it
+    # forced it to substitute `min_fraction`, the threshold at which a value *starts* being
+    # hot. `salt_factor` is `ceil(share x partitions)`, so at the 0.10 default that is
+    # `ceil(0.10 x 8) = 1` and floors to a fan-out of 2 however skewed the key really is —
+    # the exact defect `dist.skew.resolve_hot_keys` documents having fixed on the *detection*
+    # path, left standing on the cheaper path that fires far more often.
+    share = max((max(left_freq.get(v, 0.0), right_freq.get(v, 0.0)) for v in hot), default=0.0)
+    return sorted(hot), share

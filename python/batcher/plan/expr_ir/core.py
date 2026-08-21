@@ -300,9 +300,9 @@ class Expr:
 
         The operation is **type-preserving for integers**: Int64 ``//`` Int64 stays
         Int64 and is computed exactly, including above 2^53 where routing through
-        Float64 would silently lose precision. A zero divisor yields NULL (matching
-        DuckDB and Polars) rather than ``inf``/``nan``. Float operands give the IEEE
-        ``floor(a / b)``."""
+        Float64 would silently lose precision. A zero divisor yields NULL on **both**
+        arms, matching DuckDB's ``//`` (``1.0 // 0.0`` is NULL there, not ``inf``);
+        otherwise a float pair gives ``floor(a / b)``."""
         return Binary("floor_div", self, _wrap(other))
 
     def __rfloordiv__(self, other: IntoExpr) -> Expr:

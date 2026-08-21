@@ -230,3 +230,58 @@ def test_target_encoder_unseen_maps_to_prior():
     got = enc.transform(test).collect().to_pydict()["c"]
     # a→1.0, b→0.0, unseen and null → prior (global mean 0.5)
     assert got == pytest.approx([1.0, 0.0, 0.5, 0.5])
+
+
+# --- how closely each binning strategy tracks scikit-learn -----------------------------
+#
+# The two strategies differ here and the class docstring now says so. `"uniform"` derives
+# its edges from min/max and is exact; `"quantile"` places them with a mergeable sketch
+# (`approx_quantile`), because the exact percentile costs 4-9x more on the same fit. These
+# pin both halves of that claim, so neither can drift silently: a regression that made
+# "uniform" approximate, or one that quietly swapped "quantile" onto the exact aggregate
+# and took the slowdown with it, fails here.
+
+
+def _sklearn_bins(values: list[float], n_bins: int, strategy: str) -> list[int]:
+    sk = pytest.importorskip("sklearn.preprocessing")
+    matrix = np.asarray(values, dtype=float).reshape(-1, 1)
+    binned = sk.KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy=strategy).fit_transform(
+        matrix
+    )
+    return [int(v) for v in binned[:, 0]]
+
+
+def test_kbins_uniform_matches_sklearn_exactly() -> None:
+    from batcher.ml.preprocessors import KBinsDiscretizer
+
+    rng = np.random.default_rng(0)
+    values = (rng.normal(size=500) * 3 + 5).tolist()
+    ds = bt.from_pydict({"x": values})
+    got = KBinsDiscretizer(["x"], n_bins=8, strategy="uniform").fit_transform(ds).to_pydict()["x"]
+    assert got == _sklearn_bins(values, 8, "uniform")
+
+
+def test_kbins_quantile_tracks_sklearn_without_matching_it() -> None:
+    """The sketch puts most rows in scikit-learn's bin and never more than one bin away."""
+    from batcher.ml.preprocessors import KBinsDiscretizer
+
+    rng = np.random.default_rng(0)
+    values = (rng.normal(size=2000) * 3 + 5).tolist()
+    ds = bt.from_pydict({"x": values})
+    got = KBinsDiscretizer(["x"], n_bins=10, strategy="quantile").fit_transform(ds).to_pydict()["x"]
+    want = _sklearn_bins(values, 10, "quantile")
+
+    off_by = [abs(a - b) for a, b in zip(got, want, strict=True)]
+    assert max(off_by) <= 1, "a sketched edge must never move a row more than one bin"
+    assert sum(1 for d in off_by if d) / len(off_by) < 0.15, "most rows land in sklearn's bin"
+
+
+def test_kbins_quantile_still_balances_the_bins_it_produces() -> None:
+    """What the quantile strategy actually promises: roughly equal counts, not exact edges."""
+    from batcher.ml.preprocessors import KBinsDiscretizer
+
+    rng = np.random.default_rng(1)
+    ds = bt.from_pydict({"x": (rng.normal(size=4000) * 3 + 5).tolist()})
+    binned = KBinsDiscretizer(["x"], n_bins=4, strategy="quantile").fit_transform(ds).to_pydict()
+    counts = [binned["x"].count(b) for b in range(4)]
+    assert min(counts) > 4000 * 0.20, f"a bin came out badly under-filled: {counts}"

@@ -32,7 +32,7 @@ from batcher.dist.executors.ray_runtime import (
     skew_join_salt,
 )
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
-from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_fleet
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_broadcast import broadcast_eligible, execute_broadcast_join_flight
@@ -148,6 +148,9 @@ def execute_join_flight(
     # Borrow the query-lifetime fleet when the adaptive loop installed one; else spawn
     # one we tear down. Every Flight operator must borrow it — spawning a second
     # placement group would contend with the fleet's held bundles and deadlock.
+    # See `fleet.borrows_session_fleet`: asked before the acquire, because that is the only
+    # point at which the three acquisition branches can still be told apart.
+    borrows_session = borrows_session_fleet()
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     # A join exchanges raw rows, so the bucket count is what bounds the build-side hash
     # table a reducer holds at once. Sized by the exchanged volume (`row_shuffle_reducer_count`),
@@ -306,7 +309,9 @@ def execute_join_flight(
             # A borrowed fleet is the query's (freed once by the adaptive loop), so the
             # source must not own it; only a self-spawned fleet is handed over to tear down.
             src_actors, src_pg = (actors, pg) if owns else (None, None)
-            return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+            return FlightMaterializedSource(
+                handles, schema, src_actors, src_pg, session_lease=borrows_session and not owns
+            )
         batches = out
     finally:
         # Collect what the workers measured before anything below can kill them. Nothing

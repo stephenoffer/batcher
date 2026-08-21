@@ -84,11 +84,43 @@ BASE = pa.table(
 #: tie groups, which is what a partitioned or spilled path has to get right.
 MULTIBATCH = pa.concat_tables([BASE] * 2400)  # 36,000 rows
 
+#: `MULTIBATCH`'s size with its keys collapsed onto **one value**: same row count, same
+#: columns, same types, one dominant key.
+#:
+#: Key *concentration* is a distinct axis from the ones above, and it was the one this matrix
+#: did not have. Every other shape here spreads its keys evenly, so a partitioned or spilled
+#: operator sees buckets of roughly equal size and never meets the case its bound has to
+#: survive: a key that lands every one of its rows in a single bucket. Re-partitioning cannot
+#: separate rows that share a key -- they re-hash together however they are salted -- so the
+#: hot bucket is exactly where an out-of-core path either holds or materializes the thing it
+#: spilled to avoid.
+#:
+#: The hot value matches on both join sides (`k=3` is in `RIGHT`, `g="a"` is in `RIGHT_STR`),
+#: so the join flavors produce a large hot result rather than an empty one, and `BASE` is
+#: appended so the nulls, the `-0.0`/NaN float key and the duplicates are still present in the
+#: tail. `window_*` partitions by `g`, which makes this one 36,000-row window partition -- the
+#: shape the window's grace path documents as the one it cannot subdivide.
+_HOT_ROWS = MULTIBATCH.num_rows - BASE.num_rows
+SKEWED = pa.concat_tables(
+    [
+        pa.table(
+            {
+                "k": pa.array([3] * _HOT_ROWS, pa.int64()),
+                "g": pa.array(["a"] * _HOT_ROWS),
+                "f": pa.array([1.5] * _HOT_ROWS, pa.float64()),
+                "v": pa.array([5] * _HOT_ROWS, pa.int64()),
+            }
+        ),
+        BASE,
+    ]
+)
+
 INPUTS = {
     "base": BASE,
     "empty": BASE.slice(0, 0),
     "single": BASE.slice(0, 1),
     "multibatch": MULTIBATCH,
+    "skewed": SKEWED,
 }
 RIGHT = pa.table(
     {"k": pa.array([1, 3, 5, 7, 9, None], pa.int64()), "w": ["p", "q", "r", "s", "u", "z"]}

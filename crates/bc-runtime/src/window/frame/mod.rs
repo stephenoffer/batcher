@@ -91,6 +91,20 @@ pub fn framed_aggregate(
             func: func.name().to_string(),
         });
     }
+    // The *reducing* aggregates read only `Int64`/`Float64` below, so a narrow integer, a
+    // narrow float or a `Decimal` column reached them as an unsupported type and aborted
+    // the query — while the frameless and running forms of the same aggregate answered,
+    // because both widen first (`window::coerce`). TPC-DS q51 is that shape:
+    // `sum(sales) OVER (… ROWS UNBOUNDED PRECEDING)` over a `DECIMAL(7,2)` column.
+    // `MIN`/`MAX` are left alone: they are type-preserving, and widening them would return
+    // a DOUBLE where the input was a DECIMAL.
+    let widened;
+    let values = if matches!(func, WindowFn::Sum | WindowFn::Avg | WindowFn::Count) {
+        widened = crate::window::coerce::widened_or_original(values)?;
+        &widened
+    } else {
+        values
+    };
     match func {
         WindowFn::Count => Ok(framed_count(
             ordered,
@@ -132,6 +146,26 @@ pub fn framed_aggregate(
                     range_order,
                     num_rows,
                 ))
+            }
+            // Every other orderable type — DATE, TIMESTAMP, DECIMAL — reached the error
+            // arm below, so `min(order_date) OVER (… ROWS …)` aborted the query while the
+            // *frameless* `min(order_date) OVER (…)` answered it (`coerce::select_extreme`
+            // covers that path). This is that same "compare through the row encoding, then
+            // gather" rule, run over the sliding frame, so the result keeps the input type
+            // exactly rather than being widened into a numeric kernel.
+            other
+                if matches!(func, WindowFn::Min | WindowFn::Max)
+                    && !matches!(other, DataType::Boolean) =>
+            {
+                framed_ordered_minmax(
+                    func,
+                    ordered,
+                    values,
+                    frame,
+                    order_rows,
+                    range_order,
+                    num_rows,
+                )
             }
             // Boolean framed MIN (AND) / MAX (OR), `false < true` — consistent with the
             // running and whole-partition boolean paths and DuckDB.
@@ -526,6 +560,72 @@ fn framed_str_minmax(
         }
     }
     Arc::new(StringArray::from(out))
+}
+
+/// `MIN`/`MAX` over an explicit frame for any orderable Arrow type.
+///
+/// The numeric and string kernels above compare values directly, which needs a kernel per
+/// type; this one compares through Arrow's `RowConverter` — the same total order the
+/// window's own ORDER BY encoding uses — so one implementation covers DATE, TIMESTAMP,
+/// DECIMAL, and anything else Arrow can order. The slide is the same monotonic deque, and
+/// the answer is produced by `take`ing the winning row, which preserves the input type
+/// exactly (widening a DECIMAL into the float kernel would return a DOUBLE instead).
+///
+/// Nulls are skipped, as SQL's `MIN`/`MAX` require; a frame with no non-null row is null.
+fn framed_ordered_minmax(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    values: &ArrayRef,
+    frame: Frame,
+    order_rows: Option<&Rows>,
+    range_order: Option<&RangeOrder>,
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    use arrow::row::{RowConverter, SortField};
+
+    let conv = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
+    let encoded = conv.convert_columns(std::slice::from_ref(values))?;
+    let is_min = func == WindowFn::Min;
+    let mut pick: Vec<Option<u32>> = vec![None; num_rows];
+    for part in ordered {
+        let len = part.len();
+        let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let (mut cur_a, mut cur_b) = (0usize, 0usize);
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        for pos in 0..len {
+            let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            while cur_b < b {
+                let row = part[cur_b];
+                if values.is_valid(row) {
+                    let v = encoded.row(row);
+                    while let Some(&back) = dq.back() {
+                        let bv = encoded.row(part[back]);
+                        if (is_min && bv >= v) || (!is_min && bv <= v) {
+                            dq.pop_back();
+                        } else {
+                            break;
+                        }
+                    }
+                    dq.push_back(cur_b);
+                }
+                cur_b += 1;
+            }
+            while cur_a < a {
+                cur_a += 1;
+            }
+            cur_b = cur_b.max(cur_a);
+            while let Some(&front) = dq.front() {
+                if front < cur_a {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            pick[part[pos]] = dq.front().map(|&f| part[f] as u32);
+        }
+    }
+    let idx: UInt32Array = pick.into_iter().collect();
+    Ok(take(values, &idx, None)?)
 }
 
 /// Boolean-input frame aggregate (`min`/`max` only), ordering `false < true` (min = AND,

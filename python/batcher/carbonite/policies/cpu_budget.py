@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from batcher._internal.hardware import available_cpu_count, cpu_oversubscription
 
-__all__ = ["effective_core_budget", "oversubscription_note"]
+__all__ = ["effective_core_budget", "oversubscription_note", "reduced_core_budget"]
 
 # Never cut fan-out below this fraction of the permitted budget, however bad the contention
 # reading. A pathological measurement — a transient load spike, a PSI file reporting a
@@ -45,6 +45,33 @@ MIN_BUDGET_FRACTION = 0.25
 # reports occasional single-digit-microsecond stalls on any live system. Acting on those would
 # make fan-out jitter query to query for no reason.
 CONTENTION_DEADBAND = 1.25
+
+
+def _measure() -> tuple[int, int, float]:
+    """`(permitted, reduced, pressure)` from **one** CPU probe and one contention read.
+
+    The three public entry points below all want some pair of these, and each used to take its
+    own readings — `effective_core_budget` probed the permitted count even when a configured
+    value made it irrelevant, `recommend_parallelism` called `effective_core_budget` and then
+    probed *again* to see whether the answer differed from permitted, and
+    `oversubscription_note` probed a third time to render the same comparison. Every one of
+    those readings is `available_cpu_count`, which walks the affinity mask, the CFS quota and
+    the batch scheduler's dozen environment variables at ~21 microseconds a call.
+
+    That is small until you count how often it happens: a 3-row filter costs ~1.3 ms end to
+    end, and `ResourceManager.recommend_parallelism` alone was **108 us** of it, most of it
+    the second and third reading of a number that had not changed since the first.
+
+    Taking the readings once here also makes the three answers *consistent* — two probes a
+    microsecond apart can straddle a load-average update and report a reduction that the
+    accompanying note then declines to explain.
+    """
+    permitted = max(1, available_cpu_count())
+    pressure = cpu_oversubscription()
+    if pressure <= CONTENTION_DEADBAND:
+        return permitted, permitted, pressure
+    floor = max(1, int(permitted * MIN_BUDGET_FRACTION))
+    return permitted, max(floor, int(permitted / pressure)), pressure
 
 
 def effective_core_budget(configured: int = 0) -> int:
@@ -61,14 +88,23 @@ def effective_core_budget(configured: int = 0) -> int:
     Returns:
         The core count to size thread pools and task fan-out against, at least 1.
     """
-    permitted = max(1, available_cpu_count())
     if configured > 0:
         return configured
-    pressure = cpu_oversubscription()
-    if pressure <= CONTENTION_DEADBAND:
-        return permitted
-    floor = max(1, int(permitted * MIN_BUDGET_FRACTION))
-    return max(floor, int(permitted / pressure))
+    return _measure()[1]
+
+
+def reduced_core_budget() -> int | None:
+    """The contention-reduced budget, or `None` when contention reduced nothing.
+
+    The question a caller sizing fan-out actually asks — "should I ask for fewer cores than I
+    am permitted, and how many?" — answered with one set of readings rather than two. `None`
+    means "nothing to do", which is the quiet machine and therefore the common case.
+
+    Returns:
+        The reduced core count, or `None` when the permitted count stands.
+    """
+    permitted, budget, _ = _measure()
+    return budget if budget < permitted else None
 
 
 def oversubscription_note() -> str:
@@ -81,11 +117,7 @@ def oversubscription_note() -> str:
     Returns:
         A short explanation, or `""` when the machine measured no contention.
     """
-    pressure = cpu_oversubscription()
-    if pressure <= CONTENTION_DEADBAND:
-        return ""
-    permitted = max(1, available_cpu_count())
-    budget = effective_core_budget()
+    permitted, budget, pressure = _measure()
     if budget >= permitted:
         return ""
     return (

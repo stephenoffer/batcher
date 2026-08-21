@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 
-def engine_pool_stats() -> dict[str, int | float] | None:
+def engine_pool_stats() -> dict[str, int | float | str] | None:
     """What the **data plane's** process-wide pool is holding, or `None` if none exists.
 
     There are two pools, and this is the other one. `BufferPool` below wraps a
@@ -47,9 +47,17 @@ def engine_pool_stats() -> dict[str, int | float] | None:
     bytes; one shared counter would charge both and spill a query at half its budget.
 
     Returns:
-        The engine pool's accounting, or `None` when no query has run under a memory budget
+        The engine pool's accounting — `limit_bytes`, `used_bytes`, `available_bytes`,
+        `peak_used_bytes`, `denied`, `spill_requests`, `utilization`, and the data plane's own
+        `soft_limit_bytes` / `pressure` — or `None` when no query has run under a memory budget
         in this process (or the extension is not built). `None` is distinct from a dict of
         zeros, which would assert something about a pool that has never existed.
+
+        The last two are what separate "the data plane is filling its envelope" from "the data
+        plane is idle and the box is full elsewhere". Those are opposite problems with opposite
+        fixes, and until the engine carried its own line out, a reader could see `used` and had
+        to assume where the line between them sat. An older extension omits them, so read with
+        `.get`.
     """
     reader = _engine_pool_reader()
     return None if reader is None else reader()

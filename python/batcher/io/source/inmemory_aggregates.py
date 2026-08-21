@@ -79,6 +79,18 @@ def column_mean(build: ColumnBuilder, name: str) -> float | None:
     integers, from opposite directions — it refuses an inexact total, this one computes an
     exact one.
 
+    **A decimal column is not averaged by `pc.mean` either, for a sharper version of the same
+    reason.** Arrow's decimal mean returns a *decimal at the column's own scale*, so the
+    average of `1.25`, `22.50` and `3.00` came back as `8.92` — rounded to two places — where
+    the engine, DuckDB and this module's own grouped path all answer the double
+    `8.9166666...`. That is the failure the integer paragraph above describes, except that the
+    loss is at the second decimal place rather than past 2^53, and it reached the user on a
+    three-row table. It also returned a `Decimal` from a function whose contract is
+    `float | None`, which is how the wrong type then propagated into the answer's schema.
+
+    So a decimal is summed exactly (the sum is representable at the column's scale) and
+    divided once, in f64 — the same exact-total-then-one-rounding shape as the integer path.
+
     A float column keeps `pc.mean`: the engine's float mean is itself an f64 accumulation, so
     matching it within tolerance is the contract there rather than a compromise.
     """
@@ -86,9 +98,25 @@ def column_mean(build: ColumnBuilder, name: str) -> float | None:
         col = _decoded(build(name))
         if pa.types.is_integer(col.type):
             return _integer_mean(col)
+        if pa.types.is_decimal(col.type):
+            return _decimal_mean(col)
         return pc.mean(col, skip_nulls=True).as_py()
     except _ARROW_ERRORS:
         return None
+
+
+def _decimal_mean(col: pa.ChunkedArray | pa.Array) -> float | None:
+    """The mean of a decimal column's non-null values as a float, or None when there are none.
+
+    `pc.sum` over a decimal is exact — Arrow widens the accumulator, and the total is
+    representable at the column's own scale — so the single f64 division is the only rounding,
+    and it lands on the same double the engine's `avg` produces.
+    """
+    non_null = len(col) - col.null_count
+    if not non_null:  # all-null or empty: SQL says NULL, and this would divide by zero
+        return None
+    total = pc.sum(col, skip_nulls=True).as_py()
+    return None if total is None else float(total) / non_null
 
 
 def _integer_mean(col: pa.ChunkedArray | pa.Array) -> float | None:

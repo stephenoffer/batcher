@@ -92,41 +92,92 @@ fn cfs_quota_cores() -> Option<usize> {
     None
 }
 
-/// Cores this Slurm allocation granted on this node, or `None` off Slurm.
+/// Environment variables in which a batch scheduler publishes its per-node core grant.
+///
+/// The same vocabulary the control plane reads (`_internal.site.scheduler.allocated_cpus`), so
+/// the two planes agree about the machine. `SLURM_CPUS_PER_TASK` is set when a job asked with
+/// `--cpus-per-task` and `SLURM_CPUS_ON_NODE` is the node's whole share; `PBS_NCPUS` is PBS'
+/// submitted request; `NSLOTS` is Grid Engine's slot grant. Each name belongs to exactly one
+/// scheduler, so its presence is enough. LSF publishes a per-host breakdown instead and is read
+/// separately.
+const CPU_GRANT_VARS: [&str; 4] = [
+    "SLURM_CPUS_PER_TASK",
+    "SLURM_CPUS_ON_NODE",
+    "PBS_NCPUS",
+    "NSLOTS",
+];
+
+/// Grant variables whose *name* belongs to nobody in particular, with the marker that makes one
+/// this scheduler's.
+///
+/// `NCPUS` is what PBS sets on the execution host and is the sharper of its two figures — but
+/// it is also a name unrelated tooling sets, and this bound narrows every thread pool the
+/// process starts, so it is believed only inside a PBS job.
+const GATED_CPU_GRANT_VARS: [(&str, [&str; 2]); 1] = [("NCPUS", ["PBS_JOBID", "PBS_NODEFILE"])];
+
+/// Cores this process's batch allocation granted it on this node, or `None` when unscheduled.
 ///
 /// A container is confined by cgroups, which the affinity mask and the CFS quota above already
-/// report. A Slurm allocation is not, unless the site configured `task/cgroup` confinement —
-/// and plenty of HPC sites do not. There the affinity mask reports every core on a shared node,
-/// so a job granted 8 cores starts a thread per host core: it oversubscribes the node, steals
-/// from the co-tenants Slurm placed there, and at a site with enforcement is what gets the job
-/// killed.
+/// report. A batch allocation is not, unless the site configured cgroup confinement — and
+/// plenty of HPC sites do not. There the affinity mask reports every core on a shared node, so
+/// a job granted 8 cores starts a thread per host core: it oversubscribes the node, steals from
+/// the co-tenants the scheduler placed there, and at a site with enforcement is what gets the
+/// job killed.
 ///
-/// This is the bound the Python control plane has always applied
-/// (`_internal.hardware.cpu._slurm_cpu_count`) and the data plane did not, so the two planes
-/// disagreed about the machine on exactly these nodes: the planner sized a fan-out to the grant
-/// while the executor sized its rayon pool and its tokio runtime to the whole node. The data
-/// plane is the half that actually spawns the threads, so it is the half where the gap bites.
+/// This is the bound the Python control plane applies and the data plane did not, so the two
+/// planes disagreed about the machine on exactly these nodes: the planner sized a fan-out to
+/// the grant while the executor sized its rayon pool and its tokio runtime to the whole node.
+/// The data plane is the half that actually spawns the threads, so it is the half where the gap
+/// bites.
+///
+/// **The smallest present grant wins, and no scheduler detection is consulted.** A job
+/// submitted through a compatibility wrapper carries two schedulers' variables at once, and the
+/// weakest bound is the one that keeps the co-tenants whole — the same reason
+/// [`slurm_expansion_min`] takes the minimum within a single variable.
+fn scheduler_granted_cores() -> Option<usize> {
+    let gated = GATED_CPU_GRANT_VARS.iter().filter_map(|(var, markers)| {
+        markers
+            .iter()
+            .any(|m| std::env::var(m).is_ok_and(|v| !v.trim().is_empty()))
+            .then_some(*var)
+    });
+    CPU_GRANT_VARS
+        .iter()
+        .copied()
+        .chain(gated)
+        .filter_map(|var| {
+            std::env::var(var)
+                .ok()
+                .and_then(|raw| slurm_expansion_min(raw.trim()))
+        })
+        .chain(lsf_min_slots())
+        .min()
+}
+
+/// The smallest per-host slot count LSF published, or `None`.
+///
+/// LSF's `LSB_DJOB_NUMPROC` is the *job-wide* slot total, so using it as a per-node bound
+/// over-counts by the number of hosts — the opposite of what a bound is for. `LSB_MCPU_HOSTS`
+/// is the per-host breakdown (`"hostA 8 hostB 8"`), and its minimum is the weakest safe bound
+/// when this host's own entry cannot be matched by name.
+fn lsf_min_slots() -> Option<usize> {
+    let raw = std::env::var("LSB_MCPU_HOSTS").ok()?;
+    raw.split_whitespace()
+        .skip(1)
+        .step_by(2)
+        .filter_map(|count| count.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .min()
+}
+
+/// The smallest per-node count in a scheduler CPU-count value, or `None` if it does not parse.
 ///
 /// `SLURM_CPUS_ON_NODE` is a run-length list on a heterogeneous job (`"4(x2),8"`). Which entry
 /// describes *this* node is not derivable from the variable, so the smallest is taken: under-
 /// parallelizing costs throughput, where over-parallelizing on the node that got the small
 /// grant is the failure this bound exists to prevent.
-fn slurm_granted_cores() -> Option<usize> {
-    // Most specific first: `SLURM_CPUS_PER_TASK` is set when the job asked with
-    // `--cpus-per-task`; `SLURM_CPUS_ON_NODE` is the node's whole share of the allocation and
-    // is the fallback for a job that did not.
-    ["SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"]
-        .iter()
-        .find_map(|var| {
-            std::env::var(var)
-                .ok()
-                .and_then(|raw| slurm_expansion_min(raw.trim()))
-        })
-}
-
-/// The smallest per-node count in a Slurm CPU-count value, or `None` if it does not parse.
 ///
-/// Split out from [`slurm_granted_cores`] so the parse is testable as a pure function: the
+/// Split out from [`scheduler_granted_cores`] so the parse is testable as a pure function: the
 /// lookup around it reads process-global environment, which no test can exercise without
 /// racing every other test in the binary.
 fn slurm_expansion_min(raw: &str) -> Option<usize> {
@@ -148,20 +199,20 @@ fn slurm_expansion_min(raw: &str) -> Option<usize> {
 }
 
 /// Cores this process may actually use: `available_parallelism` capped by the cgroup CFS
-/// quota and by any Slurm allocation. Never fewer than 1.
+/// quota and by any batch scheduler's allocation. Never fewer than 1.
 ///
 /// `available_parallelism` honors the CPU *affinity mask* (a cpuset pin) but not the CFS
 /// *bandwidth* quota, and Kubernetes' `cpu` limit is the latter — a pod limited to 15 cores
 /// on a 16-core node reports 16 and sizes every pool one thread too wide. Oversubscription
 /// does not merely waste a thread: exceeding the quota gets the whole cgroup throttled for
 /// the rest of the CFS period, so the extra worker buys stalls for *all* the others. It
-/// honors no scheduler grant either; see [`slurm_granted_cores`]. This is the figure to size
+/// honors no scheduler grant either; see [`scheduler_granted_cores`]. This is the figure to size
 /// thread pools and shard counts from.
 pub fn usable_cores() -> usize {
     let affinity = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    [cfs_quota_cores(), slurm_granted_cores()]
+    [cfs_quota_cores(), scheduler_granted_cores()]
         .into_iter()
         .flatten()
         .fold(affinity, usize::min)
@@ -372,7 +423,27 @@ mod slurm_grant_tests {
         assert_eq!(slurm_expansion_min("0"), None);
     }
 
-    /// The Slurm grant may only ever *narrow* the core budget, never widen it past what the
+    /// LSF publishes a per-host breakdown rather than a single count, and its job-wide total
+    /// (`LSB_DJOB_NUMPROC`) over-counts a per-node bound by the number of hosts — the opposite
+    /// of what a bound is for. The smallest per-host entry is the weakest safe answer.
+    #[test]
+    fn an_lsf_breakdown_binds_to_its_smallest_host() {
+        // Parsed as a pure function over the value, for the reason `slurm_expansion_min` is:
+        // the lookup around it reads process-global environment.
+        fn min_slots(raw: &str) -> Option<usize> {
+            raw.split_whitespace()
+                .skip(1)
+                .step_by(2)
+                .filter_map(|c| c.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .min()
+        }
+        assert_eq!(min_slots("gpu07 16 gpu08 8"), Some(8));
+        assert_eq!(min_slots("gpu07 16"), Some(16));
+        assert_eq!(min_slots(""), None);
+    }
+
+    /// The scheduler grant may only ever *narrow* the core budget, never widen it past what the
     /// affinity mask and the cgroup quota already allow.
     #[test]
     fn usable_cores_is_still_bounded_by_the_affinity_mask() {

@@ -58,12 +58,26 @@ def _table() -> pa.Table:
     )
 
 
-def _filter_backend(predicate) -> str:
-    """The tier the engine reports for a `Filter` on `predicate` over null-free input."""
-    ds = bt.from_arrow(_table()).filter(predicate)
+def _expr_backend(expr) -> str:
+    """The tier the engine reports for `expr` used as a computed group key, null-free input.
+
+    A **group key**, not a `Filter`, and that is the whole point of the helper. The default
+    (streaming) executor deliberately keeps filter and project on the interpreter -- a
+    measured choice recorded in `stream::build_with`, where wiring Tier-1 into that path
+    read 1.01x over TPC-H with five queries slower, because Arrow's compare and boolean
+    kernels are already SIMD and a scalar Cranelift loop has nothing to win against them.
+    Asking a filter which tier ran it therefore answers `"interp"` for *every* expression,
+    which makes the mirror untestable in both directions rather than making it wrong.
+
+    `ops::compile_agg` does compile, on exactly the subset `analyze.rs` accepts: it puts
+    each computed group key and aggregate input through `try_compile_computed`. So a
+    predicate spelled as `GROUP BY (x > 100)` reaches the same analysis the cost model
+    mirrors, and the reported tier answers the question this file exists to ask.
+    """
+    ds = bt.from_arrow(_table()).group_by(k=expr).agg(n=bt.count())
     ds.collect()
-    ops = [op for op in ds.stats().ops if op.kind == "filter"]
-    assert ops, "expected a filter operator to survive optimization"
+    ops = [op for op in ds.stats().ops if op.kind == "aggregate"]
+    assert ops, "expected an aggregate operator to survive optimization"
     return ops[0].backend
 
 
@@ -88,6 +102,10 @@ _COMPILED = [
     # Float division is IEEE — it yields inf/nan and never traps — so a non-constant
     # divisor still compiles, unlike the integer case below.
     ("non-constant float divisor", col("x") / (col("y") + 1.0) > 0.5),
+    # Under the Kleene ABI the answer is the operand's validity bit, so `analyze` compiles
+    # both by recursing into the operand and yielding Bool.
+    ("is_null", col("n").is_null()),
+    ("is_not_null", col("n").is_not_null()),
 ]
 
 # Expressions `analyze.rs` rejects. None may run on the JIT tier.
@@ -95,17 +113,21 @@ _INTERPRETED = [
     ("string literal compare", col("s") == "ab1"),
     ("string function", col("s").str.contains("b1")),
     ("regex", col("s").str.regexp_matches("^ab1")),
-    ("is_null", col("n").is_null()),
-    ("is_not_null", col("n").is_not_null()),
     # Integer `sdiv` traps on a zero divisor, so a non-constant integer divisor stays on
     # the interpreter. Built from the raw IR node: `Expr.__truediv__` casts to float64
     # first, which would make it the (compilable) IEEE float division above.
     ("non-constant int divisor", Binary("div", col("x"), col("x") + 1) > 0),
     # Math the JIT deliberately does not lower, to keep bit-for-bit parity with the
     # interpreter oracle: `round` (rounding mode), `sign` (select), `cbrt` (1 ULP).
-    ("round", col("y").round() > 100.0),
-    ("sign", col("y").sign() > 0.0),
-    ("cbrt", col("y").cbrt() > 2.0),
+    #
+    # Spelled bare rather than compared to a literal. Kyber rewrites a monotonic function
+    # under a comparison into a comparison on the bare column -- `round(y) > 100.0` becomes
+    # `y >= 100.5` -- so the compared form deletes the very node this case exists to check
+    # and the engine then (correctly) compiles the plain comparison left behind. The bare
+    # key reaches the JIT as written.
+    ("round", col("y").round()),
+    ("sign", col("y").sign()),
+    ("cbrt", col("y").cbrt()),
     # float64 -> int64: Arrow's rounding differs from cranelift's `fcvt`, so it falls
     # back. (An int64 -> int64 `try_cast` would be a self-cast the optimizer deletes.)
     ("try_cast", Cast(col("y"), "int64", True) > 100),
@@ -117,7 +139,7 @@ _INTERPRETED = [
 @pytest.mark.parametrize(("label", "predicate"), _COMPILED, ids=[c[0] for c in _COMPILED])
 def test_predicate_kyber_thinks_compiles_actually_compiles(label, predicate):
     assert jit_compilable(predicate), f"{label}: the cost model should call this compilable"
-    assert _filter_backend(predicate) == "jit", (
+    assert _expr_backend(predicate) == "jit", (
         f"{label}: Kyber prices this as compiled, but the engine ran it on the interpreter"
     )
 
@@ -126,7 +148,7 @@ def test_predicate_kyber_thinks_compiles_actually_compiles(label, predicate):
 @pytest.mark.parametrize(("label", "predicate"), _INTERPRETED, ids=[c[0] for c in _INTERPRETED])
 def test_predicate_kyber_thinks_is_interpreted_never_compiles(label, predicate):
     assert not jit_compilable(predicate), f"{label}: the cost model should call this interpreted"
-    assert _filter_backend(predicate) != "jit", (
+    assert _expr_backend(predicate) != "jit", (
         f"{label}: the engine compiled an expression Kyber prices as interpreted "
         f"(a false negative — safe, but the cost table is now stale)"
     )
@@ -142,4 +164,4 @@ def test_no_expression_is_priced_as_compiled_but_interpreted_by_the_engine():
     """
     for label, predicate in _COMPILED + _INTERPRETED:
         if jit_compilable(predicate):
-            assert _filter_backend(predicate) == "jit", label
+            assert _expr_backend(predicate) == "jit", label

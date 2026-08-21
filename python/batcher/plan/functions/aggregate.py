@@ -1,14 +1,13 @@
 """Aggregate free functions that compose existing mergeable aggregates.
 
-`count_if` desugars to ``sum(iff(cond, 1, 0))`` — counting the rows where a
+`count_if` desugars to ``sum(cast(cond AS BIGINT))`` — counting the rows where a
 predicate holds reuses the mergeable `sum` aggregate, so it stays identical
 single-node and distributed with no new engine state.
 """
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
-from batcher.plan.functions.scalar import iff
+from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
 
 def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:
@@ -105,7 +104,9 @@ def count_if(condition: Expr) -> AggExpr:
             >>> ds.group_by("g").agg(n=bt.count_if(bt.col("v") > 100)).sort("g").to_pydict()
             {'g': ['a', 'b'], 'n': [1, 0]}
     """
-    return iff(condition, Lit(1), Lit(0)).sum()
+    # The boolean cast is the whole implementation: TRUE is 1, FALSE is 0 and NULL stays
+    # NULL, so `sum` skips the unknown rows and answers NULL for a group with none known.
+    return condition.cast("int64").sum()
 
 
 def _as_column(value: str | Expr) -> Expr:

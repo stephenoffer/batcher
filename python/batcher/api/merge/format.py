@@ -35,7 +35,8 @@ def target_format(target: str, explicit: str | None = None) -> str:
         The format name.
 
     Raises:
-        FormatError: If the format cannot be inferred from the path or its contents.
+        FormatError: If the format cannot be inferred from the path or its contents, or if
+            `target` is a database connection URI rather than a table in storage.
     """
     import posixpath
 
@@ -43,6 +44,7 @@ def target_format(target: str, explicit: str | None = None) -> str:
     from batcher.io.detect import DATA_SUFFIXES, detect_format, format_for_extension
     from batcher.io.filesystem import resolve_filesystem
 
+    _refuse_a_connection_uri(target)
     try:
         return detect_format(target, explicit)
     except FormatError:
@@ -60,4 +62,35 @@ def target_format(target: str, explicit: str | None = None) -> str:
     raise FormatError(
         f"could not infer a format for the merge target {target!r} — it has no extension "
         "and no recognizable data files. Pass format=... (e.g. format='parquet')."
+    )
+
+
+def _refuse_a_connection_uri(target: str) -> None:
+    """Point a database `MERGE` at the call that performs one, instead of at a filesystem.
+
+    A merge target is a table in storage, and `resolve_filesystem` says so — but it says it
+    as ``unsupported storage scheme postgresql://: Protocol not known``, which reads as
+    "Batcher cannot reach PostgreSQL". It can, and the merge a user wants there has a name:
+    ``ds.write.sql(table, uri=..., mode="upsert", key_columns=...)``, which is a real
+    ``MERGE``/``ON CONFLICT`` executed by the database inside one transaction rather than a
+    copy-on-write rewrite of data files.
+
+    Raises:
+        FormatError: If `target` names a database Batcher can route a connection URI to.
+    """
+    from batcher._internal.errors import FormatError
+
+    scheme, separator, _rest = target.partition("://")
+    if not separator:
+        return
+    from batcher.io.formats.sql.uri import known_schemes
+
+    if scheme.split("+")[0].lower() not in known_schemes():
+        return
+    raise FormatError(
+        f"{target!r} is a database connection URI, not a table in storage, so there are "
+        "no data files to merge into. A database performs the merge itself: "
+        "ds.write.sql(table, uri=..., mode='upsert', key_columns=[...]), which runs one "
+        "ON CONFLICT / ON DUPLICATE KEY / MERGE statement inside a transaction. "
+        "ds.write.merge is the copy-on-write merge for a lakehouse or file table."
     )

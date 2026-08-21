@@ -207,7 +207,7 @@ def _flat_to_numpy(arr: pa.Array) -> np.ndarray:
     if out.dtype.kind in "biufc" or not (
         pa.types.is_boolean(arr.type) or pa.types.is_integer(arr.type)
     ):
-        if arr.null_count and pa.types.is_integer(arr.type):
+        if arr.null_count and (pa.types.is_integer(arr.type) or pa.types.is_floating(arr.type)):
             _warn_null_widening(arr.type)
         return out
     _warn_null_widening(arr.type)
@@ -215,15 +215,50 @@ def _flat_to_numpy(arr: pa.Array) -> np.ndarray:
 
 
 def _warn_null_widening(arrow_type: pa.DataType) -> None:
-    """Announce a nullable integer/boolean column widening to float with NaN."""
+    """Announce a nullable column's nulls becoming NaN.
+
+    A nullable *float* column is announced for the same reason a nullable integer or boolean
+    one is, and it was the case this warning originally missed. The other two are widened by
+    an explicit cast, so the guard was written against them; a float column needs no cast, so
+    it reached `to_numpy` directly and its nulls became NaN with nothing said. The outcome is
+    identical in all three -- a NaN where a null was -- and float64 is the *likeliest* of them
+    to be the label column this warning exists for.
+
+    The float case loses something the other two do not, so it says so: an integer column has
+    no NaN of its own, but a float column does, and NumPy has one representation for both. A
+    null and a genuine NaN are indistinguishable after the conversion, so a `fn` that returns
+    the array unchanged hands back NaN where the engine had a null.
+    """
+    import pyarrow as pa
+
+    if pa.types.is_floating(arrow_type):
+        detail = (
+            f"a nullable {arrow_type} column's nulls become NaN in NumPy, which cannot tell "
+            "them apart from a genuine NaN -- so they return as NaN, not as nulls"
+        )
+    else:
+        detail = (
+            f"a nullable {arrow_type} column has no NumPy/tensor equivalent, so it converts "
+            "to float64 with NaN for the nulls"
+        )
+    warn_conversion_loss(detail, keeps="`batch_format='pyarrow'` keeps the two distinct")
+
+
+def warn_conversion_loss(detail: str, keeps: str, stacklevel: int = 5) -> None:
+    """Announce that handing a column to a non-Arrow `batch_format` loses something.
+
+    Shared with the pandas path in `interop.formats`, which loses a *different* thing (a
+    nullable integer's type) and so states its own `detail`. Only the remedy is common, and
+    it is the half worth having in one place: it names the escape hatch, and a user who has
+    seen it once should not meet a second wording of it.
+    """
     import warnings
 
     warnings.warn(
-        f"a nullable {arrow_type} column has no NumPy/tensor equivalent, so it converts to "
-        "float64 with NaN for the nulls. Cast or fill it first "
-        "(`col(...).fill_null(0)`, or `ds.drop_null()`) if a NaN would be trained on.",
+        f"{detail}. Cast or fill it first (`col(...).fill_null(0)`, or `ds.drop_null()`) "
+        f"if the substitute value would be computed on. {keeps}.",
         UserWarning,
-        stacklevel=4,
+        stacklevel=stacklevel,
     )
 
 

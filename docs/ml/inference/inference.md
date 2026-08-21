@@ -138,11 +138,45 @@ print(out.to_pydict()["score"])
 # [0.8320183851339245, 0.14185106490048782, 0.5744425168116589]
 ```
 
+## Running on CPU
+
+Inference does not have to run on a GPU, and most of it does not. A model stage with no
+`num_gpus` is an ordinary CPU stage: it runs on the cluster's workers, `concurrency` sizes the
+pool, and the load-once class shape matters exactly as much, because loading a model per batch
+is expensive wherever it happens.
+
+Two things the engine does for you here, and they are the two a hand-written CPU stage usually
+misses.
+
+The forward runs under `torch.inference_mode()`. Without it every forward builds a backward
+graph nobody reads and holds each layer's activations alive for the whole call: measured on a
+12-layer forward over 8,192 rows, **409.5 MB of peak resident memory against 39.9 MB**. Speed
+is unchanged either way, so this is about how large a batch fits and whether the worker
+survives, not about throughput. A stage that computes a gradient as its *result* — a saliency
+map, an adversarial perturbation, an influence score — declines with
+`batcher_inference_mode = False` on the class.
+
+Half precision is *not* applied on CPU. It changes the numbers, it needs tensor cores to be
+worth that, and the probe that decides costs an extra forward. That is a GPU trade, so it stays
+on the GPU path.
+
+Thread counts are left alone unless a stage sets them. It is tempting to divide the math
+library's threads by the number of concurrent calls, and it is wrong: measured on a 96-core
+host, eight concurrent calls at full threads ran in 565 ms against 769 ms for the same work
+with threads divided evenly, and four concurrent calls went from 318 ms to 1,543 ms. Torch's
+intra-op pool is work-stealing, so oversubscription costs far less than starving each operator
+does. What the engine does cap is the pool to the *container's* usable cores under a cgroup
+quota, where torch would otherwise size itself to the host.
+
+For an exported model on CPU, {py:func}`bt.ml.openvino_predictor <batcher.ml.openvino_predictor>`
+and {py:func}`bt.ml.onnx_predictor <batcher.ml.onnx_predictor>` are usually faster than the
+framework; see {doc}`/ml/inference/runtimes`.
+
 ## GPU placement
 
-Inference does not have to run on a GPU. When it does, the placement is declared on
-the same call: `num_gpus` reserves a device per actor, `concurrency` sizes the pool.
-Preprocessing stays on CPU workers while the model runs on GPU actors.
+When inference does run on a GPU, the placement is declared on the same call: `num_gpus`
+reserves a device per actor, `concurrency` sizes the pool. Preprocessing stays on CPU workers
+while the model runs on GPU actors.
 {doc}`GPU scheduling </ml/inference/gpu>` covers fractional packing and how to keep the devices fed.
 
 ## Embeddings

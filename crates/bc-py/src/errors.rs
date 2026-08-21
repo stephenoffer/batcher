@@ -35,6 +35,12 @@ create_exception!(
     PyRuntimeError,
     "The plan IR nests deeper than the native stack can deserialize."
 );
+create_exception!(
+    _native,
+    MemoryBudgetExceededError,
+    PyRuntimeError,
+    "An operator that cannot spill needs more than the configured memory budget."
+);
 
 /// Map a plan-IR error to a Python exception, giving depth overflow its own type.
 ///
@@ -50,14 +56,24 @@ pub(crate) fn ir_to_pyerr(e: bc_ir::IrError) -> PyErr {
     }
 }
 
-/// Map an interpreter error to a Python exception, giving cancellation its own type.
+/// Map an interpreter error to a Python exception, giving cancellation and the memory
+/// envelope their own types.
 ///
 /// A cancelled query must not read as a generic runtime failure: the caller asked for it,
 /// and the code that asked needs to distinguish "I stopped this" from "this broke".
+///
+/// `MemoryBudgetExceeded` is typed for the mirror-image reason. It is the one execution
+/// failure with an obvious programmatic response — raise the envelope, or re-plan so the
+/// non-spillable operator is not on the path — and it is only ever raised to a caller who
+/// asked for a memory ceiling in the first place. As a bare `RuntimeError` the only way to
+/// recognize it was to match on the message text, which is not a contract.
 pub(crate) fn interp_to_pyerr(e: bc_interp::InterpError) -> PyErr {
     let msg = e.to_string();
     match e {
         bc_interp::InterpError::Cancelled => QueryCancelledError::new_err(msg),
+        bc_interp::InterpError::MemoryBudgetExceeded { .. } => {
+            MemoryBudgetExceededError::new_err(msg)
+        }
         _ => PyRuntimeError::new_err(msg),
     }
 }
@@ -85,6 +101,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "QueryCancelledError",
         m.py().get_type::<QueryCancelledError>(),
+    )?;
+    m.add(
+        "MemoryBudgetExceededError",
+        m.py().get_type::<MemoryBudgetExceededError>(),
     )?;
     Ok(())
 }

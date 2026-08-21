@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
@@ -62,6 +63,16 @@ __all__ = ["cache_key", "clear", "lookup", "record_write", "store"]
 # key used, so the ids cannot be recycled while the entry lives (see the module docs).
 _CACHE: OrderedDict[str, tuple[Any, tuple]] = OrderedDict()
 
+# The memo is process-global and `execution.max_concurrent_queries` lets several queries plan
+# at once, so its LRU bookkeeping is shared mutable state. The individual dict operations are
+# each atomic, but the *pairs* are not: `lookup` reads an entry and then reorders it, and an
+# eviction landing between the two raises `KeyError` out of `move_to_end` — into planning,
+# where nothing is catching it, on a path whose entire job is to be a transparent speed-up.
+# `store`'s eviction loop has the same shape against `popitem`. Every critical section here is
+# a handful of O(1) dict operations, so one lock costs nothing measurable next to the
+# optimization it is memoizing.
+_LOCK = threading.Lock()
+
 
 def clear() -> None:
     """Drop every cached plan. For tests and for a hub reset.
@@ -69,19 +80,21 @@ def clear() -> None:
     The bucket deadband goes with them: it is state *about* the keys, so leaving it behind
     would let one test's coefficients hold another's bucket.
     """
-    _CACHE.clear()
-    _BUCKET_STATE.clear()
+    with _LOCK:
+        _CACHE.clear()
+        _BUCKET_STATE.clear()
 
 
 def lookup(key: str | None) -> Any | None:
     """The cached optimizer result for `key`, or `None`. Refreshes its LRU position."""
     if key is None:
         return None
-    entry = _CACHE.get(key)
-    if entry is None:
-        return None
-    _CACHE.move_to_end(key)
-    return entry[0]
+    with _LOCK:
+        entry = _CACHE.get(key)
+        if entry is None:
+            return None
+        _CACHE.move_to_end(key)
+        return entry[0]
 
 
 def store(key: str | None, result: Any, sources: list | None, max_entries: int) -> None:
@@ -92,13 +105,12 @@ def store(key: str | None, result: Any, sources: list | None, max_entries: int) 
     # recycled underneath a live entry. A derivation-keyed source is named by *how it was
     # derived* rather than by its address, so pinning it would buy nothing and cost the whole
     # materialized intermediate staying resident until the entry is evicted.
-    _CACHE[key] = (
-        result,
-        tuple(s for s in (sources or ()) if not getattr(s, "derivation", None)),
-    )
-    _CACHE.move_to_end(key)
-    while len(_CACHE) > max_entries:
-        _CACHE.popitem(last=False)
+    keepalive = tuple(s for s in (sources or ()) if not getattr(s, "derivation", None))
+    with _LOCK:
+        _CACHE[key] = (result, keepalive)
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > max_entries:
+            _CACHE.popitem(last=False)
 
 
 def cache_key(

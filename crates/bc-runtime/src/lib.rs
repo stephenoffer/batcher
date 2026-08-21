@@ -20,6 +20,7 @@
 //! the same function signatures.
 
 pub mod agg;
+pub mod byte_key;
 mod error;
 pub mod gather;
 pub mod join;

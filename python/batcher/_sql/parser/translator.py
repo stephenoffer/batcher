@@ -34,7 +34,7 @@ from batcher._sql.parser.core_utils import (
 )
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
-from batcher.plan.expr_ir import AggExpr, Expr, col
+from batcher.plan.expr_ir import AggExpr, Expr, Lit, col, nullif
 from batcher.plan.types import dtype_name
 
 __all__ = ["sql", "translate_ast"]
@@ -46,6 +46,7 @@ def sql(
     dialect: str = "duckdb",
     functions: dict[str, Any] | None = None,
     models: dict[str, Any] | None = None,
+    engines: dict[str, Any] | None = None,
     **tables: Dataset | pa.Table,
 ) -> Dataset:
     """Parse `query` in `dialect` and translate it against the named tables/functions/models.
@@ -54,7 +55,11 @@ def sql(
     `batcher._internal.sql_errors.parse_sql`.
     """
     return translate_ast(
-        parse_sql(query, dialect=dialect), functions=functions, models=models, **tables
+        parse_sql(query, dialect=dialect),
+        functions=functions,
+        models=models,
+        engines=engines,
+        **tables,
     )
 
 
@@ -63,6 +68,7 @@ def translate_ast(
     *,
     functions: dict[str, Any] | None = None,
     models: dict[str, Any] | None = None,
+    engines: dict[str, Any] | None = None,
     **tables: Dataset | pa.Table,
 ) -> Dataset:
     """Translate an already-parsed sqlglot statement into a lazy `Dataset`.
@@ -71,14 +77,16 @@ def translate_ast(
     statement to dispatch ``CREATE``/``DROP``) share this one translator entry.
 
     `models` is the catalog `ML_PREDICT(t, m)` resolves a model name against; a query that
-    scores by path instead needs none.
+    scores by path instead needs none. `engines` is its generative counterpart, which
+    `AI_GENERATE(t, e)` and friends resolve against; an engine has no path spelling, so a
+    query using one always needs it.
     """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
     # Normalize the quantified comparisons into the `IN`/`NOT IN` they are defined as before
     # anything reads the tree, so every clause sees one spelling of set membership rather
     # than each having to learn a second.
     subquery.normalize_quantified(ast)
-    return _Translator(registry, functions or {}, models or {}).statement(ast)
+    return _Translator(registry, functions or {}, models or {}, engines or {}).statement(ast)
 
 
 # Iteration cap for a recursive CTE. A wrong or missing stop condition would otherwise
@@ -110,6 +118,43 @@ def _table_ref_count(root, name: str) -> int:
     not counted — only real references are.
     """
     return sum(1 for t in root.find_all(exp.Table) if t.name == name)
+
+
+def _align_setop_by_name(left: Dataset, right: Dataset) -> tuple[Dataset, Dataset]:
+    """Align two set-operation branches by column *name* (`UNION ... BY NAME`).
+
+    ``BY NAME`` pairs the branches on their column names rather than their positions, and
+    a name only one branch has becomes a NULL-filled column on the other. Without it the
+    positional rule applied regardless of the modifier, so ``SELECT i, g ... UNION ALL BY
+    NAME SELECT g, i ...`` paired an integer with a string and the whole query failed.
+
+    The output column order is the left branch's, then whatever names only the right
+    branch has, which is what DuckDB produces.
+
+    Args:
+        left: The left branch.
+        right: The right branch.
+
+    Returns:
+        Both branches, projected onto the same ordered column list.
+    """
+    order = list(left.columns) + [c for c in right.columns if c not in left.columns]
+    left_types = dict(zip(left.columns, left.schema.types, strict=True))
+    right_types = dict(zip(right.columns, right.schema.types, strict=True))
+
+    def fill(ds: Dataset, own: dict[str, Any], other: dict[str, Any]) -> Dataset:
+        missing = {}
+        for name in order:
+            if name in own:
+                continue
+            named = dtype_name(other.get(name))
+            typed = nullif(Lit(1), Lit(1))
+            missing[name] = typed.cast(named) if named is not None else typed
+        if missing:
+            ds = ds.with_columns(**missing)
+        return ds.select(*order)
+
+    return fill(left, left_types, right_types), fill(right, right_types, left_types)
 
 
 def _align_setop_columns(left: Dataset, right: Dataset) -> Dataset:
@@ -203,6 +248,7 @@ class _Translator:
         registry: dict[str, Dataset],
         functions: dict[str, Any],
         models: dict[str, Any] | None = None,
+        engines: dict[str, Any] | None = None,
     ) -> None:
         self._registry = registry
         self._functions = functions
@@ -211,12 +257,35 @@ class _Translator:
         # engine schedules, and giving it its own catalog is what keeps that distinction in
         # the surface rather than in a convention.
         self._models = models or {}
+        # Engines `AI_GENERATE`/`AI_CLASSIFY`/`AI_EXTRACT` can name. Separate from `_models`
+        # for the same reason that catalog is separate from `_functions`: a language model is
+        # reached through a different stage than a fitted estimator, and one catalog holding
+        # both would make `ML_PREDICT(t, e)` look legal.
+        self._engines = engines or {}
         self._agg_map: dict[str, tuple[str, AggExpr]] | None = None
         # Per select node (by id), which joined-relation column each source contributed:
         # `{alias: {bare column -> column now carrying it}}`. Written by
         # `_disambiguate_columns`, read by a qualified `x.*`.
         self._star_sources: dict[int, dict[str, dict[str, str]]] = {}
         self._agg_n = 0
+        # A window's select-list alias may shadow a source column, which the relational
+        # window operator cannot express (its output is appended to the input). When that
+        # happens the window is materialized under a hidden name; this maps the user's
+        # alias to it so the projection and a QUALIFY predicate can read it back.
+        self._win_physical: dict[str, str] = {}
+        # A window whose input had to be reshaped to reach the operator (an `avg` over a
+        # timestamp runs on the microsecond count) needs its output reshaped back; this
+        # maps the alias to the function that does it. Read by `_projection_map`.
+        self._win_rewrap: dict[str, Any] = {}
+        self._win_out_n = 0
+        # The column types currently in scope, when the plan can state them statically.
+        # SQL has several names whose meaning depends on the *type* of the argument —
+        # `epoch_ms(x)` builds a timestamp from an integer but reads one out of a
+        # timestamp, `len(x)` counts characters or elements — and the translator used to
+        # guess from the AST alone, which is only decidable for a literal. See
+        # `column_type`.
+        self._scope_types: dict[str, Any] = {}
+        self._scope_schema: Any = None
         self._scalar_sub_n = 0
         self._udf_n = 0
         self._win_arg_n = 0
@@ -355,9 +424,13 @@ class _Translator:
             # output names — not by name. Align the right side's names to the left's,
             # or an operand whose columns merely differ in name (`... id ... UNION
             # ... dept_id ...`) is wrongly rejected as "identical columns" required.
-            right = _align_setop_columns(left, right)
-            # A bare `NULL` in one branch has no type of its own; it takes the sibling's.
-            left, right = _type_untyped_nulls(left, right, node)
+            if bool(node.args.get("by_name")):
+                left, right = _align_setop_by_name(left, right)
+            else:
+                right = _align_setop_columns(left, right)
+                # A bare `NULL` in one branch has no type of its own; it takes the
+                # sibling's.
+                left, right = _type_untyped_nulls(left, right, node)
             distinct = bool(node.args.get("distinct"))
             if isinstance(node, exp.Union):
                 ds = left.union(right, distinct=distinct)
@@ -484,12 +557,107 @@ class _Translator:
         windowing._inline_named_windows(node)
 
     def _window(self, ds: Dataset, projections) -> Dataset:
+        # Scoped to this call: an earlier select's window may have recorded a rewrap under
+        # the same alias, and applying it here would reshape the wrong column. Cleared
+        # before the hoist, which is where a rewrap is recorded.
+        self._win_rewrap.clear()
         ds = windowing.hoist_window_args(self, ds, projections)
-        return windowing._window(ds, projections)
+        return windowing._window(self, ds, projections)
 
     # --- scalar expressions (expressions/) ---------------------------------
     def _scalar(self, node) -> Expr:
         return expressions._scalar(self, node)
+
+    def bind_scope(self, ds: Dataset) -> None:
+        """Record `ds`'s column types, for the name whose meaning depends on them.
+
+        Statically derived (`LogicalPlan.available_schema`), so it costs no rows and is
+        simply empty when the plan cannot state a schema — every caller treats it as a
+        hint and keeps its old behaviour when a name is absent.
+        """
+        schema = ds._plan.available_schema()
+        self._scope_schema = schema
+        self._scope_types = {f.name: f.type for f in schema.arrow} if schema is not None else {}
+
+    def registry_key(self, name: str) -> str | None:
+        """The registered table `name` refers to, matched case-insensitively as SQL does.
+
+        Args:
+            name: The identifier as written.
+
+        Returns:
+            The registry key, or None when nothing matches (or two entries differ only in
+            case, which is ambiguous rather than resolvable).
+        """
+        if name in self._registry:
+            return name
+        matches = [k for k in self._registry if k.lower() == name.lower()]
+        return matches[0] if len(matches) == 1 else None
+
+    def canonicalize_identifiers(self, select_node) -> None:
+        """Rewrite this SELECT's column references to the case the relation stores.
+
+        SQL identifiers are case-insensitive, and every engine Batcher is measured against
+        treats them so: DuckDB answers ``SELECT I FROM t`` with the column ``i``. The
+        relational layer is name-keyed and case-*sensitive*, so an unquoted identifier
+        typed in another case failed with "unknown column" — which is most of a ported
+        query when the source system upper-cases its DDL.
+
+        Only a name with exactly one case-insensitive match in scope is rewritten, and
+        only when the exact spelling is absent, so a relation that genuinely carries both
+        ``id`` and ``ID`` is left alone rather than silently resolved to one of them.
+
+        Args:
+            select_node: The `Select` whose own column references are canonicalized;
+                a nested sub-select owns its columns and is skipped.
+        """
+        if not self._scope_types:
+            return
+        folded: dict[str, list[str]] = {}
+        for name in self._scope_types:
+            folded.setdefault(name.lower(), []).append(name)
+        for c in select_node.find_all(exp.Column):
+            if c.find_ancestor(exp.Select) is not select_node:
+                continue
+            name = c.name
+            if name in self._scope_types:
+                continue
+            match = folded.get(name.lower())
+            if match is not None and len(match) == 1:
+                c.this.set("this", match[0])
+
+    def expr_type(self, expr) -> Any | None:
+        """The Arrow type `expr` produces over the columns in scope, or None if unknown.
+
+        The control plane's own static type analysis (`plan.types.infer.infer_type`), which
+        answers None rather than guessing — so a caller must treat None as "unknown", never
+        as a type.
+
+        Args:
+            expr: A built `Expr`.
+
+        Returns:
+            The Arrow `DataType`, or None.
+        """
+        if self._scope_schema is None:
+            return None
+        from batcher.plan.types.infer import infer_type
+
+        return infer_type(expr, self._scope_schema)
+
+    def column_type(self, node) -> Any | None:
+        """The Arrow type of `node` when it is a plain column currently in scope.
+
+        Args:
+            node: A sqlglot expression; only a bare `Column` can be resolved.
+
+        Returns:
+            The Arrow `DataType`, or None when the node is not a column or the plan
+            cannot state its type.
+        """
+        if not isinstance(node, exp.Column):
+            return None
+        return self._scope_types.get(node.name)
 
     # --- shared AST helpers (core_utils.py) --------------------------------
     def _has_aggregate(self, node) -> bool:

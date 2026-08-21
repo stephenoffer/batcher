@@ -192,12 +192,12 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // serial `sort_batch` oracle (`sample_sort` tests). It declines (`None`) for a small
             // input or an unsupported key, where the serial sort runs. Without this a large full
             // sort ran arrow's single-threaded `lexsort` — ~16x DuckDB on a 6M-row sort.
-            let out = match ops::materialize(&batches) {
-                Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
+            let out = match ops::materialize_opt(&batches)? {
+                Some(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
                     Some(sorted) => sorted,
                     None => vec![ops::sort_batch(&combined, keys, *limit)?],
                 },
-                Err(_) => Vec::new(),
+                None => Vec::new(),
             };
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 // A sort genuinely does hold its input — it is a full breaker — so its peak is
@@ -436,8 +436,8 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             Ok(out)
         }
 
-        // Everything else — `Window` and `AsofJoin` — is run by the sequential oracle over this
-        // subtree.
+        // Everything else — `Window`, `AsofJoin` and `RangeJoin` — is run by the sequential
+        // oracle over this subtree.
         //
         // That is a deliberate boundary, not an oversight. Each has a reason its streaming form
         // is more than a scheduling change: `Window` needs the spill-aware state the oracle
@@ -455,8 +455,8 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
     }
 }
 
-/// Run a deferred breaker (`Distinct`/`Window`/`Sample`/`AsofJoin`/`Union`) under the memory
-/// envelope. The streaming executor does not re-implement these — it hands them to the
+/// Run a deferred breaker (`Distinct`/`Window`/`Sample`/`AsofJoin`/`RangeJoin`/`Union`) under
+/// the memory envelope. The streaming executor does not re-implement these — it hands them to the
 /// sequential oracle — but the oracle holds their whole input in RAM, so a naive deferral OOMs
 /// under a tight budget where the *spilling* parallel executor would not.
 ///
@@ -504,7 +504,16 @@ fn exec_deferred_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch>,
     // top operator runs exactly once over exactly the rows the oracle would have produced —
     // identical result, no re-scan.
     let Some(rewritten) = rebuild_with_scan_children(plan, ctx.sources.len()) else {
-        // Not one of the deferred breakers (unreachable — `build_with` routes only those here).
+        // A deferred breaker this rewriter does not know how to re-root. The children above
+        // have already been drained, and there is no way to hand them to the oracle, so the
+        // whole subtree is executed again from its real sources.
+        //
+        // That is a fallback, not a plan. `RangeJoin` used to land here — it is routed to this
+        // function like every other non-streaming operator, while the arm was commented
+        // "unreachable" — so a range join over two non-trivial subtrees executed **both of them
+        // twice**, and the second run was the unbudgeted one. It is in the rewriter now. Keep
+        // the two in step: an operator reaching `exec_deferred_breaker` belongs in
+        // `rebuild_with_scan_children`, and this branch is what it costs when it is not.
         return crate::execute(plan, ctx.sources);
     };
     let mut sources: Vec<Vec<RecordBatch>> = ctx.sources.to_vec();
@@ -590,6 +599,107 @@ fn rebuild_with_scan_children(plan: &RelOp, base: usize) -> Option<RelOp> {
             allow_exact_matches: *allow_exact_matches,
             output: output.clone(),
         },
+        RelOp::RangeJoin {
+            conditions,
+            join_type,
+            output,
+            ..
+        } => RelOp::RangeJoin {
+            left: scan(0),
+            right: scan(1),
+            conditions: conditions.clone(),
+            join_type: *join_type,
+            output: output.clone(),
+        },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan() -> Box<RelOp> {
+        Box::new(RelOp::Scan { source_id: 0 })
+    }
+
+    /// Every operator that reaches [`exec_deferred_breaker`] must be re-rootable.
+    ///
+    /// The two halves are a pair and drift silently. `build_node` routes anything it cannot
+    /// stream here, `exec_deferred_breaker` drains that node's children, and
+    /// [`rebuild_with_scan_children`] is what lets the oracle consume the drained rows instead
+    /// of the original sources. An operator missing from the rewriter still *works* — it falls
+    /// back to re-executing its whole subtree — so nothing fails, and the input is simply
+    /// computed twice, the second time with no budget over it.
+    ///
+    /// That is not hypothetical: `RangeJoin` was in exactly that state, under a comment saying
+    /// the fallback was unreachable. This enumerates the deferred set so the next addition
+    /// fails here rather than doubling someone's scan.
+    #[test]
+    fn every_deferred_breaker_can_be_re_rooted() {
+        let deferred = [
+            RelOp::Distinct {
+                input: scan(),
+                keys: vec![],
+                order: vec![],
+                limit: None,
+            },
+            RelOp::Window {
+                input: scan(),
+                partition_keys: vec![],
+                order_keys: vec![],
+                functions: vec![],
+                rank_limit: None,
+            },
+            RelOp::Sample {
+                input: scan(),
+                fraction: 0.5,
+                seed: 1,
+                n: None,
+            },
+            RelOp::Union {
+                inputs: vec![RelOp::Scan { source_id: 0 }, RelOp::Scan { source_id: 1 }],
+                distinct: true,
+            },
+            RelOp::AsofJoin {
+                left: scan(),
+                right: scan(),
+                left_on: "t".into(),
+                right_on: "t".into(),
+                left_by: vec![],
+                right_by: vec![],
+                direction: bc_ir::AsofDirection::Backward,
+                tolerance: None,
+                allow_exact_matches: true,
+                output: vec![],
+            },
+            RelOp::RangeJoin {
+                left: scan(),
+                right: scan(),
+                conditions: vec![bc_ir::RangeCondition {
+                    left_key: "a".into(),
+                    right_key: "b".into(),
+                    op: bc_ir::RangeOp::Lt,
+                }],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![],
+            },
+        ];
+        for plan in deferred {
+            let rewritten = rebuild_with_scan_children(&plan, 2)
+                .unwrap_or_else(|| panic!("{plan:?} defers to the oracle but cannot be re-rooted"));
+            // Re-rooted onto the synthetic sources the drained children were appended at, and
+            // with the same arity — so the oracle reads the drained rows, all of them, once.
+            let sources: Vec<usize> = rewritten
+                .children()
+                .iter()
+                .map(|c| match c {
+                    RelOp::Scan { source_id } => *source_id,
+                    other => panic!("child was not re-rooted onto a scan: {other:?}"),
+                })
+                .collect();
+            let expected: Vec<usize> = (0..plan.children().len()).map(|i| 2 + i).collect();
+            assert_eq!(sources, expected, "{plan:?}");
+        }
+    }
 }

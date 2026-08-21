@@ -1067,28 +1067,53 @@ def _write(
     return _commit(sink, manifest, path, fmt, table.schema, auto_compact=auto_compact)
 
 
+def _accepts_keyword(fn, name: str) -> bool:
+    """Whether `fn` declares (or absorbs) a keyword called `name`.
+
+    Asked of a sink's `write`, this replaces a `try/except TypeError` that could not tell
+    the two meanings of a `TypeError` apart: "this function has no such parameter", and
+    "this function raised while running". The second is the dangerous one — a sink that
+    applied half its rows and *then* raised a `TypeError` was retried without the keyword,
+    so a database append wrote those rows a second time. Nothing about that is visible: the
+    call succeeds, and the table has duplicates.
+
+    `io.source.read._accepts` answers the mirror question for a source's `splits`, and for
+    the same reason. Signature inspection is the only way to ask it that cannot be
+    confused by what the callee does.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a builtin/C callable
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _sink_write(sink, table: pa.Table, path: str, *, resume: bool):
     """`sink.write`, tolerating sinks whose `write` has no `resume` parameter.
 
     The `Sink` protocol's `write(table, path)` does not include `resume`; only the file
     sinks (which write atomically to an idempotent path) added it. A warehouse/DB sink
-    (Snowflake/Mongo/ADBC/Lance) implements the bare protocol signature, so passing
+    (Snowflake/Mongo/ADBC/DB-API/Lance) implements the bare protocol signature, so passing
     `resume=` crashed. Resume is meaningless for an append-to-table sink, so drop it for
     those — but a *requested* `resume=True` the sink cannot honor is surfaced, never
     silently ignored (silently ignoring it would risk duplicate ingest on a re-run).
-    """
-    try:
-        return sink.write(table, path, resume=resume)
-    except TypeError:
-        if resume:
-            from batcher._internal.errors import PlanError
 
-            raise PlanError(
-                f"write(resume=True) is not supported by the {type(sink).__name__} sink "
-                "(resume is exactly-once only for the atomic file sinks). Write without "
-                "resume, or land the data in a file format first."
-            ) from None
-        return sink.write(table, path)
+    Which sinks take it is decided by `_accepts_keyword`, not by calling and catching. See
+    there for why the difference matters.
+    """
+    if _accepts_keyword(sink.write, "resume"):
+        return sink.write(table, path, resume=resume)
+    if resume:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            f"write(resume=True) is not supported by the {type(sink).__name__} sink "
+            "(resume is exactly-once only for the atomic file sinks). Write without "
+            "resume, or land the data in a file format first."
+        )
+    return sink.write(table, path)
 
 
 def _sink_write_partitioned(
@@ -1104,8 +1129,10 @@ def _sink_write_partitioned(
     `resume`/`max_rows_per_file` (warehouse/DB sinks — each shard just appends to one table).
 
     A *requested* `resume=True` a sink cannot honor is surfaced rather than silently dropped
-    (dropping it risks duplicate ingest on a re-run), mirroring `_sink_write`."""
-    try:
+    (dropping it risks duplicate ingest on a re-run), mirroring `_sink_write` — and, like it,
+    the capability is read off the signature rather than discovered by catching a
+    `TypeError` a running sink could equally well have raised itself."""
+    if _accepts_keyword(sink.write_partitioned, "resume"):
         return sink.write_partitioned(
             table,
             path,
@@ -1113,15 +1140,14 @@ def _sink_write_partitioned(
             resume=resume,
             max_rows_per_file=max_rows_per_file,
         )
-    except TypeError:
-        if resume:
-            from batcher._internal.errors import PlanError
+    if resume:
+        from batcher._internal.errors import PlanError
 
-            raise PlanError(
-                f"write(resume=True) is not supported by the {type(sink).__name__} sink "
-                "(resume is exactly-once only for the atomic file sinks)."
-            ) from None
-        return sink.write_partitioned(table, path, partition_by=partition_by)
+        raise PlanError(
+            f"write(resume=True) is not supported by the {type(sink).__name__} sink "
+            "(resume is exactly-once only for the atomic file sinks)."
+        )
+    return sink.write_partitioned(table, path, partition_by=partition_by)
 
 
 def _to_pydict(

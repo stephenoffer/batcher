@@ -106,6 +106,39 @@ class StrFunc(IRNode):
 
 
 @expr_node
+class StrFuncDyn(IRNode):
+    """A string function whose parameters are computed per row rather than fixed.
+
+    `StrFunc` carries ``pattern``/``replacement``/``start``/``length`` as plan-time
+    constants, which is what the engine's string kernels are written against. SQL does not
+    require them to be constant — ``replace(s, old_col, new_col)``,
+    ``substr(s, from_col, len_col)`` and ``s LIKE pattern_col`` are ordinary — so this node
+    carries each as a sub-expression instead. The engine groups rows by their distinct
+    parameter tuple and calls the *same* kernel per group, so there is one definition of
+    each function's semantics rather than two that can drift.
+
+    Built by the SQL front-end; the `.str` namespace keeps the constant-argument spelling,
+    which is what a DataFrame author writes.
+    """
+
+    tag = ExprTag.STR_DYN
+    vocab = STR_FNS
+    fn: str = scalar()
+    input: Expr = child()
+    pattern: Expr | None = child(omit_none=True, default=None)
+    replacement: Expr | None = child(omit_none=True, default=None)
+    start: Expr | None = child(omit_none=True, default=None)
+    length: Expr | None = child(omit_none=True, default=None)
+
+    def __repr__(self) -> str:
+        """Render the node the way `StrFunc` does, with the parameters as expressions."""
+        params = (self.pattern, self.replacement, self.start, self.length)
+        # `if a` would call `Expr.__bool__`, which refuses by design.
+        args = [repr(a) for a in params if a is not None]
+        return f"{self.input!r}.str.{self.fn}({', '.join(args)})"
+
+
+@expr_node
 class GeoFunc(IRNode):
     """A geospatial function over an argument list. Built by `plan.functions.geo`.
 
@@ -338,6 +371,22 @@ class ListGet(IRNode):
     tag = ExprTag.LIST_GET
     input: Expr = child()
     index: int = scalar()
+
+
+@expr_node
+class ListGetDyn(IRNode):
+    """`list[index]` with the index computed **per row** rather than fixed at plan time.
+
+    `ListGet` takes a plan-time index, which is what the `.list.get` accessor is typed
+    for. SQL does not require one — ``a[i]`` and ``list_extract(a, i)`` over an index
+    *column* are ordinary — and the constant node cannot carry it. Same addressing rule
+    as `ListGet`: 0-based, negatives count from the end, out of range is null, and a null
+    index yields a null element.
+    """
+
+    tag = ExprTag.LIST_GET_DYN
+    input: Expr = child()
+    index: Expr = child()
 
 
 @expr_node

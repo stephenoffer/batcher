@@ -42,6 +42,8 @@ in `watermark.py` documents the same hazard from the other direction.
 
 from __future__ import annotations
 
+import dataclasses
+
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
@@ -220,7 +222,12 @@ def stream_drop_sort_under_distinct(node: Distinct, ctx: OptimizerContext) -> Lo
     stripped = _strip_full_sort(node.input)
     if stripped is None:
         return None
-    return Distinct(stripped)
+    # `replace`, not `Distinct(stripped)` — the positional rebuild took one of the node's four
+    # fields, so a streaming `DISTINCT ON (k) ORDER BY ...` came back as a **whole-row**
+    # `DISTINCT`: one row per key became one row per distinct row, which is a wrong answer and
+    # not a slower one. Same three-of-five rebuild as `projections.py::_rewrite`, on a node with
+    # four fields instead of five.
+    return dataclasses.replace(node, input=stripped)
 
 
 @rule(

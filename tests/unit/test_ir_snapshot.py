@@ -54,6 +54,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListFilter,
     ListFunc,
     ListGet,
+    ListGetDyn,
     ListPosition,
     ListSet,
     ListSimhash,
@@ -65,6 +66,7 @@ from batcher.plan.expr_ir.func_nodes import (
     SpatialFunc,
     Strftime,
     StrFunc,
+    StrFuncDyn,
     Strptime,
     StructField,
     WindowBuckets,
@@ -165,6 +167,12 @@ def _representatives() -> dict[str, Any]:
         "str_contains": StrFunc("contains", Col("s"), pattern="x"),
         "str_substr": StrFunc("substr", Col("s"), start=1, length=3),
         "str_replace": StrFunc("replace", Col("s"), pattern="a", replacement="b"),
+        # The per-row-parameter form: each parameter is a child, and an absent one is
+        # omitted rather than emitted as null.
+        "str_dyn_full": StrFuncDyn(
+            "substr", Col("s"), start=Col("n"), length=Col("m"), pattern=Col("p")
+        ),
+        "str_dyn_min": StrFuncDyn("replace", Col("s"), pattern=Col("p")),
         # --- date/time ----------------------------------------------------------
         "date_func": DateFunc("year", Col("d")),
         "date_trunc": DateTrunc(Col("d"), "month"),
@@ -185,6 +193,7 @@ def _representatives() -> dict[str, Any]:
         "list_transform": ListTransform(Col("a"), _ELEM),
         "list_filter": ListFilter(Col("a"), _PRED),
         "list_get": ListGet(Col("a"), -1),
+        "list_get_dyn": ListGetDyn(Col("a"), Col("i")),
         "list_contains": ListContains(Col("a"), 5),
         "list_position": ListPosition(Col("a"), 5),
         "list_slice_min": ListSlice(Col("a"), 1),

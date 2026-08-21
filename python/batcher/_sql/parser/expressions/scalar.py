@@ -24,13 +24,24 @@ from batcher._sql.parser.expressions.literals import (
     _EXTRACT_PART,
     _TEMPORAL_KINDS,
     _apply_interval,
-    _const_str_arg,
     _dtype_name,
     _fold_const_arith,
-    _like_to_regex,
     _literal,
     _regexp_flags_prefix,
+    _sql_int_div,
     _temporal_literal,
+)
+from batcher._sql.parser.expressions.lowering import (
+    between,
+    binop_with_null,
+    const_str,
+    in_membership,
+    is_distinct_from,
+    like,
+    null_boolean,
+    positional_null,
+    str_call,
+    typed_null,
 )
 from batcher._sql.parser.expressions.temporal import _date_diff
 from batcher.plan.expr_ir import (
@@ -40,6 +51,8 @@ from batcher.plan.expr_ir import (
     Expr,
     ListJoin,
     Lit,
+    StrFuncDyn,
+    StructField,
     coalesce,
     col,
     greatest,
@@ -71,7 +84,13 @@ def _scalar(tr, node) -> Expr:
                     # so it used to fall through to the default ',' and wrongly join the values.
                     joined = ListJoin(col(entry[0]), ",")
                     return nullif(joined, joined)  # a string-typed NULL for every group
-                sep = sep.name if isinstance(sep, exp.Literal) else ","
+                if sep is not None and not isinstance(sep, exp.Literal):
+                    # Falling back to ',' answered with the *default* separator where the
+                    # query asked for a computed one — a wrong string, not a refusal.
+                    raise NotImplementedError(
+                        "string_agg() needs a constant separator; got " + sep.sql()
+                    )
+                sep = sep.name if sep is not None else ","
                 return ListJoin(col(entry[0]), sep)
             return col(entry[0])
     if isinstance(node, exp.Paren):
@@ -79,7 +98,17 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, exp.Columns):
         return _columns_selector(node)
     if isinstance(node, exp.Column):
+        # `st.a` where `st` is a *struct column* in scope, not a table alias. sqlglot
+        # cannot tell the two apart — both parse as a qualified column — and the
+        # qualified reading looked for a column `a`, so the dotted spelling of a struct
+        # field failed with "unknown column" while `struct_extract(st, 'a')` worked.
+        field = _struct_field_reference(tr, node)
+        if field is not None:
+            return field
         return col(node.name)
+    if isinstance(node, exp.Dot):
+        # `(expr).field` — the parenthesized spelling, which nests for a struct of structs.
+        return _dot_field(tr, node)
     if isinstance(node, exp.Literal):
         return _literal(node)
     if isinstance(node, exp.ByteString):
@@ -95,6 +124,9 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, (exp.Neg, exp.Negative)):
         return Lit(0) - tr._scalar(node.this)
     if isinstance(node, exp.Not):
+        # `NOT NULL` is a boolean NULL, not the negation of the Int64 typed null.
+        if isinstance(node.this, exp.Null):
+            return null_boolean()
         return ~tr._scalar(node.this)
     if isinstance(node, exp.Cast):
         # DATE '..' / TIMESTAMP '..' / CAST('..' AS DATE) parse as a cast of a
@@ -112,8 +144,11 @@ def _scalar(tr, node) -> Expr:
         return _case(tr, node)
     if isinstance(node, exp.Null):
         # A bare NULL literal — a typed NULL (`nullif(c, c)` is null for all
-        # rows). Used for `SELECT NULL`, `coalesce(x, NULL)`, etc.
-        return nullif(lit(1), lit(1))
+        # rows). Used for `SELECT NULL`, `coalesce(x, NULL)`, etc. The IR has no
+        # untyped null, so the type is read off the position the literal sits in:
+        # `upper(NULL)` needs a *string*-typed one, and the Int64 default reached the
+        # engine as "string function Upper expected a Utf8 argument, got Int64".
+        return positional_null(node)
     if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
         # x IS NULL  (x IS NOT NULL parses as Not(Is(...)), handled above)
         return tr._scalar(node.this).is_null()
@@ -129,34 +164,44 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, (exp.Select, exp.Union)):
         return _scalar_subquery(tr, node)
     if isinstance(node, exp.In):
-        return _in(tr, node)
+        return in_membership(tr, node)
     if isinstance(node, exp.Between):
-        return _between(tr, node)
+        return between(tr, node)
     if isinstance(node, exp.Escape):
         # `x [I]LIKE p ESCAPE e` → the inner Like/ILike with the escape char.
         inner = node.this
-        return _like(
+        return like(
             tr,
             inner,
             case_insensitive=isinstance(inner, exp.ILike),
             escape=node.expression.this,
         )
     if isinstance(node, exp.ILike):
-        return _like(tr, node, case_insensitive=True)
+        return like(tr, node, case_insensitive=True)
     if isinstance(node, exp.Like):
-        return _like(tr, node)
+        return like(tr, node)
     if isinstance(node, exp.Coalesce):
         return _coalesce(tr, node)
     if isinstance(node, exp.Nullif):
+        # `nullif(x, NULL)` is `x`: the comparison is never true, and building it would
+        # pair the value's type against the untyped null's Int64.
+        if isinstance(node.expression, exp.Null):
+            return tr._scalar(node.this)
+        if isinstance(node.this, exp.Null):
+            return positional_null(node.this)
         return nullif(tr._scalar(node.this), tr._scalar(node.expression))
     # sqlglot parses `nanvl` into a *typed* node, so the Anonymous fallback table that
     # also lists it (`anonymous.py`) is never consulted for this spelling.
     if isinstance(node, exp.Nanvl):
         return nanvl(tr._scalar(node.this), tr._scalar(node.expression))
-    if isinstance(node, exp.Greatest):
-        return greatest(*_scalar_args(tr, node))
-    if isinstance(node, exp.Least):
-        return least(*_scalar_args(tr, node))
+    if isinstance(node, (exp.Greatest, exp.Least)):
+        # A bare `NULL` argument is dropped for the same reason `COALESCE` drops one: it
+        # carries no type, and DuckDB's `greatest`/`least` ignore nulls anyway.
+        args = [a for a in _arg_nodes(node) if not isinstance(a, exp.Null)]
+        if not args:
+            return nullif(lit(1), lit(1))
+        built = [tr._scalar(a) for a in args]
+        return greatest(*built) if isinstance(node, exp.Greatest) else least(*built)
     if isinstance(node, exp.Array):
         return Array([tr._scalar(e) for e in node.expressions])
     list_fn = list_function(tr, node)
@@ -165,9 +210,9 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, (exp.Concat, exp.ConcatWs)):
         return _concat(tr, node)
     if isinstance(node, exp.NullSafeNEQ):  # a IS DISTINCT FROM b
-        return _is_distinct_from(tr, node)
+        return is_distinct_from(tr, node)
     if isinstance(node, exp.NullSafeEQ):  # a IS NOT DISTINCT FROM b
-        return ~_is_distinct_from(tr, node)
+        return ~is_distinct_from(tr, node)
     if isinstance(node, exp.Extract):
         part = node.this.name.lower()
         composite = _EXTRACT_COMPOSITE.get(part)
@@ -192,16 +237,28 @@ def _scalar(tr, node) -> Expr:
         # this is not LIKE with regex syntax bolted on. `regexp_matches` is unanchored,
         # hence the wrapping. The non-capturing group keeps an alternation in `p` from
         # binding past the anchors (`a|b` would otherwise mean `^a` or `b$`).
-        pattern = _const_str_arg(node.expression, "SIMILAR TO", "pattern")
-        return tr._scalar(node.this).str.regexp_matches(f"^(?:{pattern})$")
+        pattern = const_str(node.expression)
+        if pattern is not None:
+            return tr._scalar(node.this).str.regexp_matches(f"^(?:{pattern})$")
+        anchored = Binary(
+            "concat", Binary("concat", lit("^(?:"), tr._scalar(node.expression)), lit(")$")
+        )
+        return str_call(tr, "regexp_matches", node.this, pattern=anchored)
     if isinstance(node, exp.RegexpLike):  # regexp_matches(s, pattern[, options])
-        pat = _const_str_arg(node.expression, "regexp_matches", "pattern")
         flag_node = node.args.get("flag")
         is_str_lit = isinstance(flag_node, exp.Literal) and flag_node.is_string
         if flag_node is not None and not is_str_lit:
             raise NotImplementedError("regexp_matches options must be a constant string")
         prefix = _regexp_flags_prefix(flag_node.this if is_str_lit else None)
-        return tr._scalar(node.this).str.regexp_matches(prefix + pat)
+        pat = const_str(node.expression)
+        # A per-row pattern carries the flag prefix as an expression, since the constant
+        # slot cannot hold it.
+        pattern = (
+            prefix + pat
+            if pat is not None
+            else Binary("concat", lit(prefix), tr._scalar(node.expression))
+        )
+        return str_call(tr, "regexp_matches", node.this, pattern=pattern)
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
         return json_extract(tr, node)
 
@@ -217,11 +274,26 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, exp.DateDiff):
         return _date_diff(tr, node)
 
+    # A bare `NULL` operand has no type of its own — it takes the one its context needs.
+    # The IR has no untyped null (a bare NULL lowers to the Int64 `nullif(1, 1)`), so
+    # `NULL OR x` reached the engine as `or(Int64, Bool)` and `CASE s WHEN NULL` as
+    # `Utf8 == Int64`, both of which failed the query outright where SQL simply answers
+    # NULL.
+    if type(node) in _BINOPS and (
+        isinstance(node.this, exp.Null) or isinstance(node.expression, exp.Null)
+    ):
+        return binop_with_null(tr, node)
+
     # Fold `literal <op> literal` arithmetic with exact decimal semantics before the
     # generic binop path (so `0.06 + 0.01` is `0.07`, not IEEE `0.0699…`).
     folded = _fold_const_arith(node)
     if folded is not None:
         return folded
+
+    if isinstance(node, exp.IntDiv):
+        # `//` means truncating *integer* division on integers and plain division on
+        # floats; the operand types decide, so it cannot ride the operator table.
+        return _sql_int_div(tr, tr._scalar(node.this), tr._scalar(node.expression))
 
     binop = _BINOPS.get(type(node))
     if binop is not None:
@@ -244,6 +316,60 @@ def _scalar(tr, node) -> Expr:
     raise NotImplementedError(f"unsupported SQL expression: {type(node).__name__}")
 
 
+def _struct_field_reference(tr, node) -> Expr | None:
+    """`st.a` (or `db.st.a.b`) read as a struct field chain, or None if it is not one.
+
+    A qualified column and a dotted struct field parse identically, so which one a name
+    denotes is decided by the schema: the *first* part that names an in-scope struct column
+    starts the chain, and the parts after it are field names. A leading table qualifier
+    (`l.st.a`) is skipped for free, because `l` is not a column.
+
+    Args:
+        tr: The translator, for the in-scope column types.
+        node: The qualified `Column` node.
+
+    Returns:
+        The field expression, or None to keep the ordinary qualified-column reading.
+    """
+    import pyarrow as pa
+
+    parts = [p.name for p in (node.args.get(k) for k in ("catalog", "db", "table")) if p]
+    if not parts:
+        return None
+    parts.append(node.name)
+    for start, name in enumerate(parts[:-1]):
+        dtype = tr._scope_types.get(name)
+        if dtype is None or not pa.types.is_struct(dtype):
+            continue
+        built, current = col(name), dtype
+        for field in parts[start + 1 :]:
+            if not pa.types.is_struct(current) or current.get_field_index(field) < 0:
+                return None
+            built = StructField(built, field)
+            current = current.field(current.get_field_index(field)).type
+        return built
+    return None
+
+
+def _dot_field(tr, node) -> Expr:
+    """`(expr).field` — a struct field of a parenthesized expression.
+
+    Args:
+        tr: The translator.
+        node: The `Dot` node.
+
+    Returns:
+        The field expression.
+
+    Raises:
+        NotImplementedError: The right-hand side is not a plain field name.
+    """
+    name = node.expression
+    if not isinstance(name, (exp.Identifier, exp.Column)):
+        raise NotImplementedError(f"`.{name.sql()}` is not a struct field reference")
+    return StructField(tr._scalar(node.this), name.name)
+
+
 def _case(tr, node) -> Expr:
     # Simple CASE `CASE x WHEN v THEN …` compares the operand to each WHEN
     # value; searched CASE `CASE WHEN cond THEN …` has no operand.
@@ -252,15 +378,27 @@ def _case(tr, node) -> Expr:
     builder = None
     first_then = None
     for if_ in node.args.get("ifs", []):
+        if subject is not None and isinstance(if_.this, exp.Null):
+            # `CASE x WHEN NULL THEN …` compares with `=`, which is NULL for every row,
+            # so the branch can never be taken. Building the comparison instead reached
+            # the engine as `Utf8 == Int64` (the untyped NULL lowers to Int64) and failed.
+            continue
         when_val = tr._scalar(if_.this)
         cond = (subject == when_val) if subject is not None else when_val
         then = tr._scalar(if_.args["true"])
         if first_then is None:
             first_then = then
         builder = (when(cond) if builder is None else builder.when(cond)).then(then)
-    if builder is None:
-        raise NotImplementedError("CASE without WHEN is unsupported")
     default = node.args.get("default")
+    if builder is None:
+        # Every WHEN was a bare NULL (skipped above), so nothing can ever match: the
+        # CASE is its ELSE, or a NULL typed like the first THEN.
+        if not node.args.get("ifs"):
+            raise NotImplementedError("CASE without WHEN is unsupported")
+        if default is not None:
+            return tr._scalar(default)
+        first = tr._scalar(node.args["ifs"][0].args["true"])
+        return nullif(first, first)
     if default is not None:
         return builder.otherwise(tr._scalar(default))
     # No ELSE → SQL yields NULL (typed as the THEN value) where nothing
@@ -294,7 +432,7 @@ def _scalar_subquery(tr, select_node) -> Expr:
     if table.num_rows == 0:
         # SQL: a scalar subquery with no rows is NULL (typed as its output column),
         # not an error — e.g. `(SELECT sal FROM emp WHERE id=999)` is NULL per row.
-        return _typed_null(table.schema.field(0).type)
+        return typed_null(table.schema.field(0).type)
     if table.num_rows > 1:
         raise NotImplementedError(
             f"scalar subquery must return at most one row, got {table.num_rows}"
@@ -307,108 +445,19 @@ def _scalar_subquery(tr, select_node) -> Expr:
         # has no wire form (the IR has no untyped null literal), so this raised a bare
         # `TypeError: unsupported literal type: NoneType` from deep inside `to_ir` where
         # DuckDB simply returns no rows.
-        return _typed_null(table.schema.field(0).type)
+        return typed_null(table.schema.field(0).type)
     return lit(value)
 
 
-def _typed_null(arrow_type) -> Expr:
-    """A NULL literal typed to match `arrow_type` (the subquery's output column).
-
-    Built as `NULLIF(1, 1)` (a typed NULL of int) cast to the target type, so the
-    output schema matches DuckDB's — a scalar subquery yields a column of its own
-    type even when it produces no row.
-    """
-    import pyarrow as pa
-
-    typed = nullif(lit(1), lit(1))
-    if pa.types.is_floating(arrow_type):
-        return Cast(typed, "float64")
-    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
-        return Cast(typed, "string")
-    if pa.types.is_boolean(arrow_type):
-        return Cast(typed, "bool")
-    if pa.types.is_date(arrow_type):
-        return Cast(typed, "date")
-    if pa.types.is_timestamp(arrow_type):
-        return Cast(typed, "timestamp")
-    return typed  # integer (and any other) → the int-typed NULL
-
-
-def _null_boolean() -> Expr:
-    """A NULL of boolean type. `lit(None)` has no type to give it, so NULLIF supplies one."""
-    return nullif(lit(True), lit(True))
-
-
-def _in(tr, node) -> Expr:
-    items = node.expressions
-    if node.args.get("query") is not None:
-        # A membership test in *value* position — `SELECT x IN (SELECT …)`, or one buried in
-        # a CASE — has no relation to join against, which is why this used to refuse. It does
-        # not need one when the set is small: `subquery.core` already collects such a set and
-        # hands it to `Expr.is_in`, which is three-valued, so the same machinery answers here
-        # and returns an expression rather than a rewritten relation. A set past the inline cap
-        # still refuses, because the mark join it would need lives at the WHERE level.
-        from batcher._sql.parser.subquery.in_set import inline_in_subquery_values
-
-        values = inline_in_subquery_values(tr, node)
-        if values is None:
-            raise NotImplementedError(
-                "IN (subquery) must be handled at the WHERE level, not as a scalar"
-            )
-        return tr._scalar(node.this).is_in(values)
-    if not items:
-        raise NotImplementedError("IN requires an explicit value list")
-    target = tr._scalar(node.this)
-    # A NULL in the list is not a comparable value: `x IN (a, NULL)` is TRUE when x = a
-    # and NULL otherwise (never FALSE), which is exactly `(x IN (a)) OR NULL` under SQL's
-    # three-valued OR. Comparing against it instead built `x = NULL`, and the untyped NULL
-    # literal lowered as Int64 — so `g IN ('a', NULL)` on a text column died with
-    # `Invalid comparison operation: Utf8 == Int64` rather than answering.
-    values = [i for i in items if not isinstance(i, exp.Null)]
-    if len(values) != len(items):
-        if not values:
-            # `x IN (NULL)` is NULL for every row, x included.
-            return _null_boolean()
-        return _in_values(tr, target, values) | _null_boolean()
-    return _in_values(tr, target, values)
-
-
-def _in_values(tr, target: Expr, items) -> Expr:
-    # x IN (a, b, c)  →  (x == a) | (x == b) | (x == c)
-    result: Expr | None = None
-    for item in items:
-        eq = target == tr._scalar(item)
-        result = eq if result is None else (result | eq)
-    return result
-
-
-def _between(tr, node) -> Expr:
-    # x BETWEEN lo AND hi  →  (x >= lo) & (x <= hi)
-    target = tr._scalar(node.this)
-    low = tr._scalar(node.args["low"])
-    high = tr._scalar(node.args["high"])
-    return (target >= low) & (target <= high)
-
-
-def _is_distinct_from(tr, node) -> Expr:
-    """`a IS DISTINCT FROM b` — null-safe inequality (NULL is a comparable
-    value). Built as the negation of null-safe *equality* (both null, or both
-    non-null and equal); that form is null-free (the `a == b` term is masked by
-    `~an & ~bn`, so it never leaks a NULL into the boolean result).
-    """
-    a = tr._scalar(node.this)
-    b = tr._scalar(node.expression)
-    # `a == b` is NULL when either side is NULL; `coalesce` then falls back to
-    # "are both NULL?" — giving a null-free null-safe-equality without relying
-    # on Kleene `and`/`or` (which the engine does not implement).
-    not_distinct = coalesce(a == b, a.is_null() & b.is_null())
-    return ~not_distinct
+def _arg_nodes(node) -> list:
+    """All argument nodes of a variadic call (`this` + `expressions`), skipping absent ones."""
+    args = [node.this, *node.expressions] if node.this is not None else list(node.expressions)
+    return [a for a in args if a is not None]
 
 
 def _scalar_args(tr, node) -> list[Expr]:
     """All argument sub-expressions of a variadic node (`this` + `expressions`)."""
-    args = [node.this, *node.expressions] if node.this is not None else list(node.expressions)
-    return [tr._scalar(a) for a in args if a is not None]
+    return [tr._scalar(a) for a in _arg_nodes(node)]
 
 
 def _concat(tr, node) -> Expr:
@@ -425,26 +474,34 @@ def _concat(tr, node) -> Expr:
 
     if isinstance(node, exp.ConcatWs):
         sep_node, val_nodes = arg_nodes[0], arg_nodes[1:]
+        if isinstance(sep_node, exp.Null):
+            # DuckDB: a NULL separator makes the whole result NULL.
+            return nullif(empty, empty)
         sep = tr._scalar(sep_node)
-        # A constant separator lets us emit `sep || arg` only for non-null args and
-        # strip the single leading separator — the exact DuckDB null-skip semantics.
-        if isinstance(sep_node, exp.Literal) and sep_node.is_string:
-            sep_len = len(sep_node.this)
-            raw: Expr | None = None
-            for vn in val_nodes:
-                v = tr._scalar(vn)
-                piece = when(v.is_not_null()).then(Binary("concat", sep, v)).otherwise(empty)
-                raw = piece if raw is None else Binary("concat", raw, piece)
-            if raw is None:
-                return empty
-            stripped = raw.str.substr(sep_len + 1)  # drop the one leading separator
-            return when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
-        # Non-constant separator: best-effort (coalesce dropped args to '').
-        parts = [coalesce(tr._scalar(vn), empty) for vn in val_nodes]
-        out = None
-        for p in parts:
-            out = p if out is None else Binary("concat", Binary("concat", out, sep), p)
-        return out if out is not None else empty
+        # Emit `sep || arg` for each non-null arg and strip the single leading separator —
+        # the exact DuckDB null-skip semantics (a dropped argument takes its separator with
+        # it, so `concat_ws(',', NULL, 'x')` is `'x'`, not `',x'`).
+        raw: Expr | None = None
+        for vn in val_nodes:
+            v = tr._scalar(vn)
+            piece = when(v.is_not_null()).then(Binary("concat", sep, v)).otherwise(empty)
+            raw = piece if raw is None else Binary("concat", raw, piece)
+        if raw is None:
+            return empty
+        constant = const_str(sep_node)
+        if constant is not None:
+            stripped = raw.str.substr(len(constant) + 1)
+        else:
+            # A computed separator's length is a per-row value, so the strip is too. The
+            # old fallback coalesced a dropped argument to `''` and kept its separator,
+            # answering `'a,,b'` where DuckDB answers `'a,b'` — a wrong string, not a
+            # refusal, and only on the spelling that takes a column.
+            stripped = StrFuncDyn("substr", raw, start=sep.str.len() + lit(1))
+            joined = when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
+            # A NULL separator makes the whole result NULL, including when every value was
+            # dropped — which the length test above cannot see, since `raw` is `''` there.
+            return when(sep.is_null()).then(nullif(empty, empty)).otherwise(joined)
+        return when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
 
     # DuckDB's `concat` casts every argument to text (so `concat(id, name)` works on
     # a numeric column) and skips NULLs (treats them as ''). Coalescing to `''`
@@ -457,67 +514,20 @@ def _concat(tr, node) -> Expr:
     return out
 
 
-def _like(tr, node, case_insensitive: bool = False, escape: str | None = None) -> Expr:
-    pattern_node = node.expression
-    if not isinstance(pattern_node, exp.Literal) or not pattern_node.is_string:
-        raise NotImplementedError("LIKE supports only constant string patterns")
-    pattern = pattern_node.this
-    target = tr._scalar(node.this)
-    # ILIKE: fold both sides to lower case for a case-insensitive match.
-    if case_insensitive:
-        target = target.str.lower()
-        pattern = pattern.lower()
-
-    # Boundary-only `%` with no `_`/ESCAPE lowers to the anchored
-    # starts_with/ends_with/contains kernels — leanest, and the shape Kyber's
-    # `like_prefix_to_range` can further turn into a zone-map-prunable range.
-    #
-    # Anything richer goes to the native `like`, whose Rust matcher classifies the
-    # pattern *once per morsel* into the cheapest shape (prefix/suffix/ordered
-    # `memmem` segment scan) and falls back to a cached anchored regex only for `_`.
-    # It must not be spelled as `regexp_matches(_like_to_regex(...))`: that runs a
-    # regex automaton per row for `%a%b%`, which measured ~7x DuckDB on TPC-H q13's
-    # `o_comment NOT LIKE '%special%requests%'` (76ms vs 11ms) — and, lacking `(?s)`,
-    # also made `%` stop at a newline, which SQL says it must not.
-    #
-    # ESCAPE keeps the Python-desugared regex: the native matcher has no escape char.
-    simple = escape is None and "_" not in pattern and "%" not in pattern.strip("%")
-    if simple:
-        result = _like_simple(target, pattern)
-    elif escape is None:
-        result = target.str.like(pattern)
-    else:
-        result = target.str.regexp_matches(_like_to_regex(pattern, escape))
-
-    # `x NOT LIKE p` parses as a Like node with negate=True.
-    if node.args.get("negate"):
-        result = ~result
-    return result
-
-
-def _like_simple(target: Expr, pattern: str) -> Expr:
-    starts = pattern.startswith("%")
-    ends = pattern.endswith("%")
-    # Strip *all* boundary `%`, not just one: a pattern like `%%c` / `a%%` carries
-    # consecutive leading/trailing wildcards, and the caller's `simple` guard already
-    # proved the stripped core holds no `%`/`_`, so it is a pure literal. Peeling only a
-    # single `%` left an interior `%` in `inner` that `starts_with`/`ends_with`/`contains`
-    # then matched literally (`'abc' LIKE '%%c'` → false instead of true).
-    inner = pattern.strip("%")
-    if starts and ends:
-        return target.str.contains(inner)
-    if ends:  # 'abc%'
-        return target.str.starts_with(inner)
-    if starts:  # '%abc'
-        return target.str.ends_with(inner)
-    return target == lit(inner)  # no wildcards → exact match
-
-
 def _coalesce(tr, node) -> Expr:
     # COALESCE(a, b, ..., z)  →
     #   when(a.is_not_null()).then(a).when(b.is_not_null()).then(b)...otherwise(z)
-    args = [node.this, *node.expressions]
-    exprs = [tr._scalar(a) for a in args if a is not None]
+    args = [a for a in (node.this, *node.expressions) if a is not None]
+    # A bare `NULL` argument can never be the chosen value, and it has no type of its own —
+    # including it built a `CASE` mixing the Int64 typed null with the real arguments, so
+    # `coalesce(NULL, s)` on a text column died on "arguments need to have the same data
+    # type" where SQL simply answers `s`.
+    typed = [a for a in args if not isinstance(a, exp.Null)]
+    if not typed:
+        if not args:
+            raise NotImplementedError("COALESCE requires at least one argument")
+        return nullif(lit(1), lit(1))
+    exprs = [tr._scalar(a) for a in typed]
     if not exprs:
         raise NotImplementedError("COALESCE requires at least one argument")
     if len(exprs) == 1:

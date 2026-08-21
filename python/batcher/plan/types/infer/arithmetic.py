@@ -116,6 +116,13 @@ def _arith_promotable(dtype: pa.DataType) -> bool:
     return pa.types.is_null(dtype) or pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
 
 
+def _decimal_with_float(left: pa.DataType, right: pa.DataType) -> bool:
+    """Whether one operand is a decimal and the other a float — the pairing that yields DOUBLE."""
+    decimals = [pa.types.is_decimal(t) for t in (left, right)]
+    floats = [pa.types.is_floating(t) for t in (left, right)]
+    return (decimals[0] and floats[1]) or (floats[0] and decimals[1])
+
+
 def _both_temporal(left: pa.DataType, right: pa.DataType) -> bool:
     """Whether both operands are Date or Timestamp."""
     temporal = (pa.types.is_date, pa.types.is_timestamp)
@@ -185,20 +192,50 @@ def _date_shift(op: str, left: pa.DataType, right: pa.DataType) -> pa.DataType |
 
 
 def _decimal_arith_type(op: str, left: pa.DataType, right: pa.DataType) -> pa.DataType | None:
-    """The decimal128 result type of `add`/`sub`/`mul` over two decimal128 operands.
+    """The decimal128 result type of `add`/`sub`/`mul` when either operand is a decimal128.
 
-    Returns ``None`` (fall back) unless *both* operands are decimal128 and `op` is one of
-    the three whose result precision/scale the engine derives deterministically. A decimal
-    mixed with an int/float, ``mod``, or ``div`` is left uncertain on purpose.
+    Returns ``None`` (fall back) unless at least one operand is decimal128 and `op` is one
+    of the four whose result precision/scale the engine derives deterministically. ``div``
+    is left uncertain on purpose.
+
+    **A decimal mixed with an integer is answered here, not left uncertain**, because the
+    engine's rule for it is exact and reproducible: `coerce_numeric` brings the integer to
+    the *decimal operand's own type* and then applies the two-decimal rule. So
+    `decimal(10,2) * int64` is `decimal(21,4)` — the same answer as
+    `decimal(10,2) * decimal(10,2)`, scale doubled and all. Leaving it uncertain made
+    `Dataset.schema` report ``null`` for `price * qty`, the single most ordinary shape a
+    money column appears in, while the engine produced a decimal every time.
+
+    A decimal mixed with a **float** is not a decimal at all — `coerce_numeric` casts the
+    decimal *up* to Float64, because DOUBLE dominates DECIMAL — so that pairing is answered
+    by the numeric fallback below rather than here.
     """
-    if op not in ("add", "sub", "mul"):
+    if op not in ("add", "sub", "mul", "mod"):
         return None
-    if not (pa.types.is_decimal128(left) and pa.types.is_decimal128(right)):
+    if not (pa.types.is_decimal128(left) or pa.types.is_decimal128(right)):
         return None
+    if pa.types.is_floating(left) or pa.types.is_floating(right):
+        return None  # DOUBLE dominates: the numeric fallback answers Float64
+    # The integer side takes the decimal side's type, which is what the engine coerces it to.
+    if not pa.types.is_decimal128(left):
+        if not pa.types.is_integer(left):
+            return None
+        left = right
+    elif not pa.types.is_decimal128(right):
+        if not pa.types.is_integer(right):
+            return None
+        right = left
     p1, s1, p2, s2 = left.precision, left.scale, right.precision, right.scale
     if op == "mul":
         scale = s1 + s2
         precision = p1 + p2 + 1
+    elif op == "mod":
+        # A remainder is bounded by the *smaller* operand's magnitude, so the integer part
+        # follows the tighter of the two rather than the wider — `decimal(10,2) %
+        # decimal(12,3)` is `decimal(11,3)`, one digit narrower than the same pair's sum.
+        # Measured against the engine on four shapes before it was written down.
+        scale = max(s1, s2)
+        precision = min(p1 - s1, p2 - s2) + scale
     else:  # add / sub
         scale = max(s1, s2)
         precision = max(p1 - s1, p2 - s2) + scale + 1
@@ -218,6 +255,12 @@ def _arith_type(op: str, left: pa.DataType, right: pa.DataType) -> pa.DataType |
         return shifted
     if (dec := _decimal_arith_type(op, left, right)) is not None:
         return dec
+    if _decimal_with_float(left, right):
+        # `coerce_numeric` casts the decimal *up* to Float64 (DOUBLE dominates DECIMAL, as
+        # in DuckDB), so the result is a plain double. The lattice fallback below cannot
+        # answer this pair because a decimal is not `_arith_promotable`, which left
+        # `Dataset.schema` reporting ``null`` for every `decimal <op> double`.
+        return pa.float64()
     # `promote` answers "what type holds both of these" -- the right question for a
     # union, a coalesce, or a comparison, and the WRONG one for arithmetic. A
     # `decimal(10,2)` and an `int64` *union* to `decimal(21,2)` (wide enough for

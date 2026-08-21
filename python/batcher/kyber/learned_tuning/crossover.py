@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.kyber import plan_cache
 from batcher.kyber.ols import fit_ols, ols_update
@@ -186,8 +187,13 @@ def record_broadcast_timing(
             below="broadcast",
             above="shuffle",
         )
-    except Exception:  # pragma: no cover
-        return
+    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+        # Noted, not swallowed. This recorder had *no caller at all* until recently, so
+        # `learned_broadcast_max_bytes` returned `None` forever and the threshold never moved
+        # off its static default — with nothing in the log to say so. A silent failure here
+        # reproduces exactly that state, and it is what `note_suppressed` exists to separate:
+        # "this optimization did not apply" against "it has been broken since March".
+        note_suppressed("kyber", "record a broadcast-vs-shuffle timing", exc)
 
 
 def learned_broadcast_max_bytes(hub: MetadataHub | None, default: int | None = None) -> int | None:
@@ -218,8 +224,8 @@ def record_sort_merge_timing(
             below="hash",
             above="sort_merge",
         )
-    except Exception:  # pragma: no cover
-        return
+    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+        note_suppressed("kyber", "record a hash-vs-sort-merge timing", exc)
 
 
 def learned_sort_merge_min_rows(hub: MetadataHub | None, default: float) -> float | None:

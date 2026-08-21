@@ -21,7 +21,12 @@ from typing import Any
 
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, opaque_offset
+from batcher.io.formats.streaming.broker import (
+    BrokerMessage,
+    BrokerSource,
+    as_header_pairs,
+    opaque_offset,
+)
 
 __all__ = ["EventHubsSource"]
 
@@ -94,7 +99,9 @@ def _enqueued_ms(ev: Any) -> int:
     return 0 if enqueued is None else int(enqueued.timestamp() * 1000)
 
 
-def _event_to_message(ev: Any, partition_id: int, topic: str) -> BrokerMessage:
+def _event_to_message(
+    ev: Any, partition_id: int, topic: str, *, include_headers: bool = False
+) -> BrokerMessage:
     """Turn one ``EventData`` into a `BrokerMessage`, preserving raw bytes.
 
     ``resume_token`` carries the Event Hub *offset string* — the exact `event_position` a
@@ -113,6 +120,9 @@ def _event_to_message(ev: Any, partition_id: int, topic: str) -> BrokerMessage:
         timestamp=_enqueued_ms(ev),
         topic=topic,
         key=_as_bytes(ev.partition_key),
+        # Event Hubs' application *properties* are this broker's headers, and they reached
+        # the column as nulls until now. Read only when asked for: it is a per-message dict.
+        headers=as_header_pairs(getattr(ev, "properties", None)) if include_headers else None,
     )
 
 
@@ -320,11 +330,20 @@ class EventHubsSource(BrokerSource):
         from a return value.
         """
         messages: list[BrokerMessage] = []
+        budget = self._poll_budget()
         # Only the first partition waits. The rest take whatever has already arrived, so an
         # idle hub costs one wait per poll rather than one per partition — the serial loop
         # made the effective trigger cadence `partitions x max_wait_time`, which on eight
         # partitions was eight seconds of latency for a stream that had nothing to say.
-        for index, partition_id in enumerate(self._discover_partitions()):
+        #
+        # Rotated, so the partition that gets the long wait — and the one guaranteed to be
+        # read before the byte budget runs out — is a different one each poll. Always
+        # leading with partition 0 gives it the only real wait, and starves the tail of a
+        # wide hub; under a per-partition watermark a starved partition stalls the stream's
+        # frontier just as a silent one does.
+        for index, partition_id in enumerate(budget.order(self._discover_partitions())):
+            if budget.spent:
+                break  # the rest of the sweep is the next epoch's; nothing is lost
             consumer, buffer = self._consumer(partition_id)
             wait = _FIRST_WAIT_SECONDS if index == 0 else _DRAIN_WAIT_SECONDS
             consumer.receive(batch=True, max_batch_size=self.poll_size, max_wait_time=wait)
@@ -334,5 +353,12 @@ class EventHubsSource(BrokerSource):
             # than one callback's worth, and a buffer emptied under a still-registered
             # callback would drop whatever arrived between the read and the clear.
             events, buffer[:] = list(buffer), []
-            messages.extend(_event_to_message(ev, partition_id, self.topic) for ev in events)
+            decoded = [
+                _event_to_message(
+                    ev, partition_id, self.topic, include_headers=self._include_headers
+                )
+                for ev in events
+            ]
+            budget.spend(sum(len(m.value or b"") for m in decoded))
+            messages.extend(decoded)
         return messages

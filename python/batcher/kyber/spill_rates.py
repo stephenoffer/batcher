@@ -62,9 +62,16 @@ _PRIOR_STRENGTH = 24.0
 _MIN_SAMPLE_BYTES = 4 * 1024 * 1024
 
 #: Per-hub memo, keyed weakly so a dropped hub evicts its entry. Value is
-#: `(hub.version_bucket, storage_class, factor)`. Mirrors `calibration` and `cpu_shares`:
-#: planning must not re-scan the whole op-stats history on every query.
-_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, str, float | None]] = (
+#: `(hub.version_bucket, storage_class, machine class, factor)`. Mirrors `calibration` and
+#: `cpu_shares`: planning must not re-scan the whole op-stats history on every query.
+#:
+#: The **machine class** is in the key for the reason it is in theirs. One hub serves several
+#: across a session — a driver planning for its workers, then for itself — and this factor is
+#: fitted from spills that happened on one specific device. Keyed without it, whichever class
+#: was asked first answered for every other, so a driver on a network volume could hand its
+#: workers on local NVMe a thirtyfold spill price, or the reverse: a plan allowed out-of-core
+#: on the strength of a device it will never touch.
+_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, str, str, float | None]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -149,13 +156,15 @@ def learned_spill_factor(
         # Already at the floor: there is nothing a "the device is faster than you thought"
         # measurement could correct, so do not pay for the history scan.
         return None
-    key = (hub.version // _REFRESH_AFTER, storage_class) if hub is not None else (0, storage_class)
+    machine = hw_fingerprint or ""
+    version_bucket = hub.version // _REFRESH_AFTER if hub is not None else 0
+    key = (version_bucket, storage_class, machine)
     cached = _CACHE.get(hub) if hub is not None else None
-    if cached is not None and (cached[0], cached[1]) == key:
-        return cached[2]
+    if cached is not None and cached[:3] == key:
+        return cached[3]
     factor = _correct(hub, claimed, hw_fingerprint, min_samples)
     if hub is not None:
-        _CACHE[hub] = (key[0], key[1], factor)
+        _CACHE[hub] = (*key, factor)
     return factor
 
 

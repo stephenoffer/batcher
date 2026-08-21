@@ -18,16 +18,22 @@ from batcher.api.io_namespace._discovery import (
     unknown_attribute,
 )
 from batcher.api.io_namespace._write_opts import (
+    DATABASE_SINKS as _DATABASE_SINKS,
+)
+from batcher.api.io_namespace._write_opts import (
     MODE_AWARE_SINKS as _MODE_AWARE_SINKS,
 )
 from batcher.api.io_namespace._write_opts import (
+    SAVE_MODES,
     derive_partition_columns,
+    dml_write_modes,
     normalize_partition_by,
     normalize_save_mode,
     one_or_many,
     reject_row_index,
 )
 from batcher.api.session import read as _read
+from batcher.io.formats.sql.routing import write_backend
 from batcher.io.sink import check_write_options
 
 if TYPE_CHECKING:
@@ -428,7 +434,14 @@ class Writer:
         # (`.parquet`, `.delta`, …) funnels through this call, so a spelling accepted
         # here is accepted everywhere, and the sink below only ever sees canonical names.
         path = normalize_path(path, what="write path")
-        mode = normalize_save_mode(mode)
+        # A row-level DML verb (`upsert`, `update`, `delete`) is the sink's own vocabulary,
+        # not a save mode, so it is carried through untouched — `normalize_save_mode` would
+        # reject it as a misspelling of one. Only an explicitly named format can declare
+        # such a verb: nothing is detected from a path here, and a table name has no
+        # extension to detect from.
+        dml_mode = mode in dml_write_modes(format) and mode not in SAVE_MODES
+        if not dml_mode:
+            mode = normalize_save_mode(mode)
         partition_by = normalize_partition_by(opts, partition_by)
         reject_row_index(opts)
         if partition_by and any(not isinstance(k, str) for k in partition_by):
@@ -532,7 +545,9 @@ class Writer:
                 )
                 if drain is not None:
                     return drain
-            sink = self._stream_sink_for(path, fmt, opts, query_name, max_rows_per_file)
+            sink = self._stream_sink_for(
+                path, fmt, opts, query_name, max_rows_per_file, mode=mode if dml_mode else None
+            )
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
         # Resume is exactly-once only on a deterministic plan: the same input must
@@ -613,6 +628,15 @@ class Writer:
                     auto_compact=auto_compact,
                     **opts,
                 )
+        if partition_by and fmt in _DATABASE_SINKS:
+            raise PlanError(
+                f"write(partition_by={partition_by!r}) has no meaning for {fmt!r}: a "
+                "database table or a document store has no Hive directory layout to write "
+                "into, and the destination's own partitioning is a property of the table "
+                "rather than of the write. Drop partition_by, or partition the table on "
+                "the server side (a DynamoDB partition key, a Cassandra partition key, a "
+                "declarative partition in PostgreSQL) and write into it unchanged."
+            )
         if mode == "overwrite_partitions":
             _check_overwrite_partitions(fmt, partition_by)
         if mode == "append" and fmt not in _MODE_AWARE_SINKS:
@@ -626,8 +650,11 @@ class Writer:
                 "real commit. (Not write.hudi: Batcher reads Hudi but cannot write it.)"
             )
         # error/ignore are a pre-write existence gate (resume has its own per-file
-        # idempotence, so it is exempt).
-        if mode in ("error", "ignore") and not resume:
+        # idempotence, so it is exempt). It asks the *filesystem*, so it means nothing for
+        # a database sink, whose destination is a table name: asking whether a local file
+        # called `orders` exists always answered False, so `mode='error'` — the mode whose
+        # entire job is to refuse — permitted the write it was meant to stop.
+        if mode in ("error", "ignore") and not resume and fmt not in _DATABASE_SINKS:
             from batcher.io.filesystem import resolve_filesystem
 
             if resolve_filesystem(path).exists(path):
@@ -638,7 +665,9 @@ class Writer:
         # The lakehouse sinks consume append/overwrite as a constructor option; the
         # file sinks always overwrite, so `mode` only drives the gate above for them.
         sink_kwargs = dict(opts)
-        if fmt in _MODE_AWARE_SINKS:
+        if dml_mode:
+            sink_kwargs["mode"] = mode
+        elif fmt in _MODE_AWARE_SINKS:
             sink_kwargs["mode"] = mode if mode in ("append", "overwrite") else "overwrite"
 
         # A `repartition(...)` layout (set via ds.repartition) supplies write defaults:
@@ -854,6 +883,7 @@ class Writer:
         opts: dict[str, Any],
         query_name: str | None = None,
         max_rows_per_file: int | None = None,
+        mode: str | None = None,
     ) -> Any:
         """Build the per-micro-batch `StreamSink` for a path/format streaming write.
 
@@ -864,6 +894,14 @@ class Writer:
         `fmt` reaches the sink too, and used not to: every mode-aware format was handed to
         a Delta-pinned sink, so a streaming ``format="iceberg"`` write produced a Delta
         table at the Iceberg path, with the right rows and no error anywhere.
+
+        `mode` is passed only when it is a **row-level DML verb**, never a save mode. A
+        streaming write appends micro-batches by definition, so forwarding the writer's
+        default ``mode="overwrite"`` would make every batch replace the table. But
+        ``mode="upsert"`` against a database means something a stream genuinely needs and a
+        save mode cannot express — and dropping it silently turned a streaming upsert into
+        a streaming append, which duplicates a row on every batch that carries a key the
+        table already holds.
         """
         from batcher._internal.errors import PlanError
         from batcher.io.formats.streaming.sinks import FileStreamSink, TransactionalStreamSink
@@ -876,6 +914,8 @@ class Writer:
                     "it belongs to the table. Compact the table instead — "
                     "bt.compact(path, target_size_mb=...) — or write with auto_compact=True."
                 )
+            if mode is not None:
+                opts = {**opts, "mode": mode}
             return TransactionalStreamSink(path, fmt, query_name=query_name, **opts)
         return FileStreamSink(path, fmt, max_rows_per_file=max_rows_per_file, **opts)
 
@@ -1094,8 +1134,11 @@ class Writer:
             output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
             query_name: Optional name for the streaming query.
             checkpoint: Optional checkpoint location for offset tracking.
-            options: Further ``confluent-kafka`` producer configuration; underscores
-                become dots, so ``compression_type="zstd"`` sets ``compression.type``.
+            options: ``value_format=`` / ``key_format=`` to serialize a typed payload
+                column on the way out (the write side of `bt.read.kafka`'s decode, with
+                the same ``value_schema=`` / ``schema_registry=`` options), plus any
+                further ``confluent-kafka`` producer configuration; underscores become
+                dots, so ``compression_type="zstd"`` sets ``compression.type``.
 
         Returns:
             A `StreamingQuery` handle for the running Kafka write.
@@ -1664,20 +1707,57 @@ class Writer:
         return self(table_uri, "hudi", mode=mode, **opts)
 
     # --- SQL / warehouses --------------------------------------------------
-    def sql(self, table: str, **opts: Any) -> WriteManifest:
-        """Bulk-ingest into a database table via ADBC/FlightSQL.
+    def sql(
+        self,
+        table: str,
+        *,
+        mode: str = "append",
+        key_columns: str | list[str] | None = None,
+        **opts: Any,
+    ) -> WriteManifest:
+        """Write to a database table — bulk append, or row-level upsert/update/delete.
 
         Takes the same standard connection URI as `bt.read.sql`, so a read and the write
-        that follows it are spelled the same way. Rows are ingested as Arrow, in bulk,
-        never row by row.
+        that follows it are spelled the same way. Pass ``password="env:PGPASSWORD"`` rather
+        than embedding a credential in the URI.
 
-        Pass ``password="env:PGPASSWORD"`` rather than embedding a credential in the URI.
+        `mode` is what the write does to the table:
+
+        * ``"append"`` (default) — add every row. Creates the table if it is absent.
+        * ``"overwrite"`` — replace the table's contents with these rows.
+        * ``"upsert"`` — insert each row, or update the one already holding its key.
+          Needs `key_columns`. This is the mode an operational table is maintained with,
+          and the one Spark's JDBC writer has no spelling for at all.
+        * ``"update"`` — update the rows whose keys match, and insert nothing.
+        * ``"delete"`` — delete the rows whose keys match. Only `key_columns` need be
+          present in the frame.
+        * ``"delete_insert"`` — an upsert built from ANSI SQL alone (delete these keys,
+          then insert these rows, in one transaction), for a database whose upsert syntax
+          Batcher does not know.
+
+        **Two backends, chosen for you.** A plain append to a database with an ADBC driver
+        (PostgreSQL, SQLite, DuckDB, Snowflake, BigQuery, FlightSQL) goes through ADBC,
+        which ingests Arrow in bulk and never materializes a Python object. Everything else
+        — every row-level mode, and every database with no ADBC driver, which is MySQL,
+        MariaDB, Oracle, SQL Server and the rest of the operational estate — goes through
+        the PEP 249 driver installed for that scheme. Name a backend explicitly by calling
+        ``ds.write(table, "adbc", ...)`` or ``ds.write(table, "dbapi", ...)``.
+
+        Each shard of a distributed write runs its own transaction against the same table.
+        ``append``, ``upsert``, ``update`` and ``delete`` are all safe that way, because a
+        shard only ever touches the keys its own rows name; ``overwrite`` is refused,
+        because every shard would discard the shards before it.
 
         Args:
-            table: Destination table name.
+            table: Destination table name, optionally schema-qualified.
+            mode: One of the modes above.
+            key_columns: The column, or columns, identifying a row. Required by
+                ``upsert``/``update``/``delete``/``delete_insert``, and used as the
+                primary key when the table is created.
             opts: Connection options — ``uri=``, ``password=``, or an explicit
-                ``driver=``/``db_kwargs=`` pair — plus ``mode=`` (``"create"``,
-                ``"append"``, ``"replace"``, ``"create_append"``).
+                ``module=``/``connect_kwargs=`` pair (PEP 249) or ``driver=``/``db_kwargs=``
+                pair (ADBC) — plus the sink's own options, such as
+                ``rows_per_statement=`` and ``retries=``.
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -1690,8 +1770,17 @@ class Writer:
                 >>> ds.write.sql(  # doctest: +SKIP
                 ...     "orders", uri="postgresql://localhost/warehouse"
                 ... )
+
+                >>> ds.write.sql(  # doctest: +SKIP
+                ...     "orders",
+                ...     uri="mysql://db/shop",
+                ...     mode="upsert",
+                ...     key_columns="id",
+                ... )
         """
-        return self(table, "adbc", **opts)
+        if key_columns is not None:
+            opts["key_columns"] = tuple(one_or_many(key_columns))
+        return self(table, write_backend(mode, opts), mode=mode, **opts)
 
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
         """Write to a Snowflake table.
@@ -1721,11 +1810,17 @@ class Writer:
         """
         return self(table, "snowflake", **opts)
 
-    def mongo(self, collection: str, **opts: Any) -> WriteManifest:
-        """Write to a MongoDB collection.
+    def mongo(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Write to a MongoDB collection — upsert, append, overwrite, or delete.
+
+        `mode` defaults to ``"upsert"`` rather than to `ds.write`'s usual ``"overwrite"``:
+        a collection is an operational store that is maintained rather than replaced, and
+        defaulting to the destructive mode would empty it on a call that did not say so.
 
         Args:
             collection: Destination collection name.
+            mode: ``"upsert"`` (default), ``"append"``, ``"overwrite"``, or ``"delete"``.
+                ``upsert`` and ``delete`` match on ``key_field=`` (default ``"_id"``).
             opts: Connection (``uri=``), ``database=``, and write options as keywords.
 
         Returns:
@@ -1740,4 +1835,141 @@ class Writer:
                 ...     "orders", uri="mongodb://localhost:27017", database="shop"
                 ... )
         """
-        return self(collection, "mongo", **opts)
+        return self(collection, "mongo", mode=mode, **opts)
+
+    def dynamodb(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Write rows into a DynamoDB table with ``BatchWriteItem``.
+
+        `mode` defaults to ``"upsert"``, which is what a ``PutItem`` does: it replaces the
+        item holding the same primary key. There is no ``append`` here, because DynamoDB
+        has no batch operation that inserts only when the key is absent, and no
+        ``overwrite``, because emptying a table means scanning it to delete every item at
+        full read and write cost.
+
+        Args:
+            table: Destination table name.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``region_name=``, credentials, ``endpoint_url=``, plus ``key_field=`` and
+                ``sort_key_field=`` naming the table's keys for ``delete``.
+
+        Returns:
+            A `WriteManifest` describing the written rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": ["a"], "amount": [10]})
+                >>> ds.write.dynamodb(  # doctest: +SKIP
+                ...     "orders", region_name="us-east-1", key_field="id"
+                ... )
+        """
+        return self(table, "dynamodb", mode=mode, **opts)
+
+    def cassandra(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Write rows into a Cassandra or ScyllaDB table with one prepared statement.
+
+        `mode` defaults to ``"upsert"``, which is what a CQL ``INSERT`` does: it replaces
+        the row holding the same primary key. Statements run concurrently rather than in a
+        ``BATCH``, because a batch spanning partitions makes one coordinator responsible
+        for fanning every mutation out and is slower than sending them independently.
+
+        Args:
+            table: Destination table name.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``contact_points=``, ``keyspace=``, ``port=``, ``auth=``, plus
+                ``key_columns=`` naming the primary key for ``delete``.
+
+        Returns:
+            A `WriteManifest` describing the written rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "amount": [10]})
+                >>> ds.write.cassandra(  # doctest: +SKIP
+                ...     "orders", contact_points=["db"], keyspace="shop"
+                ... )
+        """
+        return self(table, "cassandra", mode=mode, **opts)
+
+    def redis(self, key_prefix: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Write rows into a Redis keyspace, one pipeline per batch.
+
+        A two-column ``(key, value)`` frame — the shape `bt.read.table("redis", ...)`
+        returns — is written as one string per key. A wider frame is written as one hash
+        per key, one field per remaining column.
+
+        Args:
+            key_prefix: Prepended to every key, so one keyspace can hold several relations.
+                Pass ``prefix=""`` in `opts` to write bare keys instead.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``host=``, ``port=``, ``db=``, ``password=``, plus ``key_field=`` naming
+                the key column and ``ttl_seconds=`` to expire what is written.
+
+        Returns:
+            A `WriteManifest` describing the written rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"key": ["u:1"], "value": ["active"]})
+                >>> ds.write.redis("session", host="cache")  # doctest: +SKIP
+        """
+        return self(key_prefix, "redis", mode=mode, **opts)
+
+    def elasticsearch(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Index rows into an Elasticsearch index over the ``_bulk`` API.
+
+        Every ``_bulk`` response is inspected per item rather than by status code, because
+        Elasticsearch reports per-document failures inside an HTTP 200.
+
+        Args:
+            index: Destination index name.
+            mode: ``"upsert"`` (default, indexing under each row's ``_id``), ``"append"``
+                (letting the cluster assign ids), ``"overwrite"``, or ``"delete"``.
+            opts: ``hosts=``, ``api_key=``, plus ``key_field=`` naming the ``_id`` column
+                and ``refresh=True`` to make the write searchable before returning.
+
+        Returns:
+            A `WriteManifest` describing the indexed documents.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": ["a"], "title": ["hello"]})
+                >>> ds.write.elasticsearch(  # doctest: +SKIP
+                ...     "docs", hosts="http://es:9200", key_field="id"
+                ... )
+        """
+        return self(index, "elasticsearch", mode=mode, **opts)
+
+    def hbase(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Write rows into an HBase table, one happybase batch per Arrow batch.
+
+        A column named ``family:qualifier`` keeps its family, and one without a colon is
+        placed in ``column_family=`` (default ``"cf"``). That is what lets a frame read by
+        {py:meth}`bt.read.hbase <batcher.api.io_namespace.reader.Reader.hbase>` round-trip
+        without renaming, and a plain relational frame be written without qualifying every
+        column by hand.
+
+        Args:
+            table: Destination table name.
+            mode: ``"upsert"`` (default, an HBase ``Put``) or ``"delete"``.
+            opts: ``host=``, ``port=``, plus ``key_field=`` naming the row-key column
+                (default ``"row_key"``) and ``column_family=``.
+
+        Returns:
+            A `WriteManifest` describing the written rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"row_key": ["r1"], "amount": [10]})
+                >>> ds.write.hbase("events", host="thrift")  # doctest: +SKIP
+        """
+        return self(table, "hbase", mode=mode, **opts)

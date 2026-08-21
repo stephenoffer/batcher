@@ -52,6 +52,57 @@ __all__ = [
 # client library on a path that runs inside every worker's poll loop.
 _DEADLINE_VARS = ("BATCHER_DEADLINE_EPOCH_S", "SLURM_JOB_END_TIME")
 
+# Env vars naming a *relative* lease, in seconds from when this process started. The absolute
+# form above is always preferred where a scheduler publishes one; this is for the ones that do
+# not, which is every scheduler here except Slurm. PBS, LSF, Grid Engine and HTCondor all know
+# a job's wall-clock limit and none of them export the moment it expires, so the only way to
+# reach the drain path under them is for the launcher to say how long the lease is.
+#
+# Measured from **process start**, which is the one approximation here: the lease begins when
+# the launcher exported it, and the closest instant this process can observe is its own start.
+# A job script that does ten minutes of setup before starting Python therefore gets a deadline
+# ten minutes late, and that error runs the *unsafe* way — it over-states the time remaining,
+# so the drain begins late or not at all. A launcher that knows the exact moment should export
+# `BATCHER_DEADLINE_EPOCH_S` instead, which has no approximation in it at all.
+_RELATIVE_DEADLINE_VARS = ("BATCHER_DEADLINE_SECONDS",)
+
+# When this module was first imported. The fallback base, and on a platform with no `/proc` the
+# only one available — it over-states the remaining lease by however long the process ran
+# before importing Batcher, which on a driver that imports it inside a long-lived service is a
+# lot. Hence the `/proc` read below, which is exact.
+_IMPORT_S = time.time()
+
+
+def _process_start_epoch() -> float:
+    """When this process started, in Unix epoch seconds.
+
+    Read from `/proc/self/stat` (the process's start time in clock ticks since boot) plus
+    `/proc/stat`'s `btime` (when the machine booted). Exact, and it is what makes the relative
+    deadline usable from a process that imports Batcher some way into its life — import time
+    over-states the remaining lease by exactly that gap, in the direction that drains late.
+
+    Falls back to this module's import time off Linux and anywhere `/proc` cannot be read.
+    """
+    try:
+        with open("/proc/self/stat") as f:
+            stat = f.read()
+        # The command name is field 2 and may itself contain spaces and parentheses, so the
+        # numeric fields are taken from after the *last* `)` rather than by splitting the line.
+        fields = stat.rpartition(")")[2].split()
+        # `starttime` is field 22 of the file, which is index 19 after the command name.
+        ticks = float(fields[19])
+        hz = os.sysconf("SC_CLK_TCK")
+        with open("/proc/stat") as f:
+            btime = next(float(line.split()[1]) for line in f if line.startswith("btime "))
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError):
+        return _IMPORT_S
+    return btime + ticks / hz if hz > 0 else _IMPORT_S
+
+
+#: The base a relative lease is measured from, resolved once — a process does not restart under
+#: itself.
+_PROCESS_START_S = _process_start_epoch()
+
 # A deadline further out than this is treated as no deadline at all. Slurm does not omit
 # `SLURM_JOB_END_TIME` for an unlimited job — it exports a saturated sentinel (`4294967294`,
 # early 2106) — so a naive read would report every unlimited job as "deadlined" and, through
@@ -73,8 +124,11 @@ DEADLINE_PAST_GRACE_S = 3600.0
 def deadline_epoch_s() -> float | None:
     """The Unix time this process expects to be killed at, or `None` if unbounded.
 
-    Reads the first of `BATCHER_DEADLINE_EPOCH_S` / `SLURM_JOB_END_TIME` that parses to a
-    time within `DEADLINE_PAST_GRACE_S` behind now and `DEADLINE_HORIZON_S` ahead of it. A
+    Reads the first of `BATCHER_DEADLINE_EPOCH_S` / `SLURM_JOB_END_TIME` /
+    `BATCHER_DEADLINE_SECONDS` that parses to a time within `DEADLINE_PAST_GRACE_S` behind now
+    and `DEADLINE_HORIZON_S` ahead of it. The last is relative to when this process started,
+    and is how a scheduler that publishes a wall-clock *limit* rather than an end time — PBS,
+    LSF, Grid Engine, HTCondor — reaches the drain path at all. A
     value that is unparseable, beyond the horizon (Slurm's unlimited-job sentinel), or far
     enough in the past to be a relative-seconds mistake reads as no deadline — so a
     malformed export degrades to today's behavior rather than draining the fleet forever.
@@ -83,12 +137,15 @@ def deadline_epoch_s() -> float | None:
         The absolute deadline in epoch seconds, or `None` when none is known.
     """
     now = time.time()
-    for var in _DEADLINE_VARS:
+    for var, base in (
+        *((v, 0.0) for v in _DEADLINE_VARS),
+        *((v, _PROCESS_START_S) for v in _RELATIVE_DEADLINE_VARS),
+    ):
         raw = os.environ.get(var, "").strip()
         if not raw:
             continue
         try:
-            epoch = float(raw)
+            epoch = float(raw) + base
         except ValueError:
             continue  # a malformed export must not be read as "expires now"
         if now - DEADLINE_PAST_GRACE_S <= epoch <= now + DEADLINE_HORIZON_S:

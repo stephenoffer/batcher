@@ -138,9 +138,11 @@ print(resilient_cluster.distributed.task_max_retries)
 ## Time-limited allocation
 
 On a batch scheduler your job is killed when its allocation ends, with no reclamation
-notice to poll. Batcher reads `SLURM_JOB_END_TIME` on its own, and any other launcher can
-export `BATCHER_DEADLINE_EPOCH_S` as Unix epoch seconds. Either one makes the job
-preemptible, which selects the `"spot"` profile automatically.
+notice to poll. Batcher reads `SLURM_JOB_END_TIME` on its own. Every other scheduler
+publishes a wall-clock *limit* rather than an end time, so export the lease as
+`BATCHER_DEADLINE_SECONDS`, or the exact moment as `BATCHER_DEADLINE_EPOCH_S` in Unix epoch
+seconds. Any one of them makes the job preemptible, which selects the `"spot"` profile
+automatically.
 
 `drain_lead_s` is the only knob worth tuning: it's how long before the deadline each
 worker stops taking new work and migrates its shuffle output to a survivor. Raise it when

@@ -39,7 +39,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
-from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_fleet
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
@@ -187,6 +187,9 @@ def _execute_keyed_flight(
 
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
+    # See `fleet.borrows_session_fleet`: asked before the acquire, because that is the only
+    # point at which the three acquisition branches can still be told apart.
+    borrows_session = borrows_session_fleet()
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     # A window exchanges raw rows and materializes a whole partition-run per bucket, so the
     # bucket count is what bounds that run. Sized by volume, never below the floor.
@@ -273,7 +276,9 @@ def _execute_keyed_flight(
             # A borrowed fleet is the query's (freed once by the adaptive loop), so the
             # source must not own it; only a self-spawned fleet is handed over to tear down.
             src_actors, src_pg = (actors, pg) if owns else (None, None)
-            return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+            return FlightMaterializedSource(
+                handles, schema, src_actors, src_pg, session_lease=borrows_session and not owns
+            )
     finally:
         # Collect what the workers measured before anything below can kill them. Nothing
         # subscribes to the event bus inside a Ray worker, so the measurements are pulled;

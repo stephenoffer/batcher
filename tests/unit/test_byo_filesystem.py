@@ -109,7 +109,6 @@ def test_storage_options_values_accept_secret_references(monkeypatch):
 
     monkeypatch.setenv("BATCHER_TEST_S3_SECRET", "AKIAsecretvalue")
     fsmod._resolve_uri_fs.cache_clear()
-    fsmod._resolve_uri_fs_opts.cache_clear()
     fs = fsmod.resolve_filesystem(
         "s3://bucket/k.parquet",
         storage_options={

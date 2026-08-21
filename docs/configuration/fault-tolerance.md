@@ -74,6 +74,14 @@ a filesystem error, counts fully. One that doesn't, such as an accelerator runni
 memory or a throttled model endpoint, counts nothing at all: quarantining a node over the
 workload's own behavior would take out the next node the retry lands on too.
 
+The cause is read from the exception's type and message, walking the cause chain, because the
+real error arrives wrapped by an SDK, an HTTP client, or Ray. Object-store throttling is
+matched by code as well as by phrase — `SlowDown` on S3, `RateLimitExceeded` on Google Cloud
+Storage, `ServerBusy` and `TooManyRequests` on Azure — which is what makes a large write survive
+a prefix being pushed harder than it will take. An unrecognized failure is treated as the
+workload's own and is not retried, because wrongly retrying a deterministic bug across a fleet
+costs the whole recovery budget and hides the real error.
+
 ## See also
 
 - {doc}`/user-guide/operate/running/unstable-nodes` for the task-oriented walkthrough.

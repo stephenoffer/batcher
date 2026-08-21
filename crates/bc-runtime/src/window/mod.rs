@@ -96,6 +96,9 @@ pub enum WindowFn {
     BitXor,
     /// Number of distinct non-null values. → Int64.
     CountDistinct,
+    /// Median of the non-null values, interpolated between the two middles for an even
+    /// count — the same rule `agg/median.rs` uses, and the same kernel. → Float64.
+    Median,
     /// Exponentially weighted moving mean / variance / standard deviation over the
     /// ordered partition, with the smoothing factor carried on [`WindowCall::alpha`].
     /// Each row's value depends on the whole prefix through a recurrence, so these
@@ -141,6 +144,7 @@ impl WindowFn {
             WindowFn::BitOr => "bit_or",
             WindowFn::BitXor => "bit_xor",
             WindowFn::CountDistinct => "count_distinct",
+            WindowFn::Median => "median",
             WindowFn::EwmMean => "ewm_mean",
             WindowFn::EwmVar => "ewm_var",
             WindowFn::EwmStd => "ewm_std",

@@ -102,15 +102,23 @@ pub(crate) fn allocator_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
         (0usize, 0usize, 0usize, 0usize, 0usize);
     // SAFETY: every pointer is to a live local `usize` for the duration of the call, which is
     // exactly the out-parameter contract `mi_process_info` documents.
+    //
+    // The order is `current_rss, peak_rss, current_commit, peak_commit`, and it was written
+    // `current_commit, peak_commit, current_rss, peak_rss` — so the two pairs were swapped and
+    // every reader of `peak_rss` got the peak *commit* and vice versa. Invisible in the current
+    // pair on Linux, where mimalloc estimates `current_rss` from `current_commit` and the two
+    // are equal by construction; plainly wrong in the peaks, which come from different sources
+    // (`getrusage` against mimalloc's own accounting) and measured 879 MiB against 1025 MiB on
+    // the same process.
     unsafe {
         libmimalloc_sys::mi_process_info(
             &mut elapsed,
             &mut user,
             &mut sys,
-            &mut commit,
-            &mut peak_commit,
             &mut rss,
             &mut peak_rss,
+            &mut commit,
+            &mut peak_commit,
             &mut faults,
         );
     }
@@ -140,13 +148,19 @@ pub(crate) fn allocator_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// path — it walks every heap, and forcing it re-imposes exactly the unmap cost the allocator
 /// exists to avoid.
 ///
+/// **`force` is not optional for this engine's memory.** A plain collect reaches only the
+/// calling thread's heap, and the engine allocates its operator state on rayon workers — so a
+/// collect from the control plane's thread frees essentially nothing. Measured on three
+/// Parquet group-bys: `force=false` returned 0 MiB and `force=true` returned 408 MiB of a
+/// 1,397 MiB resident set.
+///
 /// Args:
-///     force: Also release pages from other threads' heaps. Thorough and considerably
-///         more expensive; leave it false for a routine trim.
+///     force: Also release pages from other threads' heaps, which is where an engine's memory
+///         is. Thorough and considerably more expensive; false reaches this thread alone.
 ///
 /// Returns:
-///     Bytes of resident memory released, as the difference in mimalloc's own RSS
-///     accounting. Zero means there was nothing retained to give back.
+///     Bytes of resident memory released, measured against the kernel's own figure (see
+///     `allocator_rss`). Zero means there was nothing retained to give back.
 #[pyfunction]
 #[pyo3(signature = (force = false))]
 pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
@@ -215,6 +229,34 @@ pub(crate) fn tune_allocator() {
 
 /// mimalloc's current RSS estimate in bytes, for the before/after in [`allocator_collect`].
 fn allocator_rss() -> u64 {
+    // The kernel's own figure, not mimalloc's. On Linux `mi_process_info` *estimates*
+    // `current_rss` from `current_commit` — its own header says so — and `mi_collect` does not
+    // move the commit figure at all. Measured on three Parquet group-bys: the collect handed
+    // 408 MiB back to the operating system while mimalloc's committed figure stayed at
+    // 1,289 MiB either side of it. So bracketing the collect with mimalloc's own accounting
+    // reported **zero released, always**, and the caller — whose whole reason for asking is to
+    // find out whether the reading that is about to force a spill has moved — was told the
+    // valve had nothing to give on precisely the occasions it gave the most.
+    //
+    // `/proc/self/status`'s `VmRSS` is the resident set the cgroup and every pressure probe
+    // see, and it is already in kibibytes — `statm` would need the page size, which is 4 KiB
+    // on x86-64 and 16 or 64 KiB on the ARM parts this also runs on. Off Linux there is no
+    // such file and mimalloc's estimate is the best available.
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                if let Some(kib) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|f| f.parse::<u64>().ok())
+                {
+                    return kib.saturating_mul(1024);
+                }
+                break;
+            }
+        }
+    }
     let (mut elapsed, mut user, mut sys) = (0usize, 0usize, 0usize);
     let (mut rss, mut commit, mut peak_rss, mut peak_commit, mut faults) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -224,10 +266,10 @@ fn allocator_rss() -> u64 {
             &mut elapsed,
             &mut user,
             &mut sys,
-            &mut commit,
-            &mut peak_commit,
             &mut rss,
             &mut peak_rss,
+            &mut commit,
+            &mut peak_commit,
             &mut faults,
         );
     }

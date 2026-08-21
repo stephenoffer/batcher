@@ -15,6 +15,13 @@ the connector class, the (never-logged) connection kwargs, and the opaque
 partition locator; the worker reconstructs the connector from those and fetches
 just its partition. Missing optional drivers raise `BackendError` with an
 actionable ``pip install 'batcher-engine[<extra>]'`` hint.
+
+`BulkSink` is the mirror for the write path, and it exists for the same reason:
+writing one of these stores is also the same recipe every time. Where a warehouse is
+*loaded*, an operational store is **maintained** — a batch of rows is upserted onto
+the keys it already holds, a set of expired ones is deleted — so the vocabulary is
+`upsert`/`append`/`overwrite`/`delete` rather than a save mode, and every store that
+cannot express one of those declines it by name instead of approximating it.
 """
 
 from __future__ import annotations
@@ -27,8 +34,16 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.io.manifest import WrittenFile
 
-__all__ = ["ScanSource", "offset_windows", "rows_to_batches", "schema_from_rows"]
+__all__ = [
+    "STORE_WRITE_MODES",
+    "BulkSink",
+    "ScanSource",
+    "offset_windows",
+    "rows_to_batches",
+    "schema_from_rows",
+]
 
 # An opaque, picklable partition locator (token range, segment id, offset, …).
 # It is connector-defined; the base treats it as a black box it round-trips to
@@ -398,3 +413,167 @@ class ScanSource(ABC):
         so credentials in `_conn_kwargs` never leak into an identity string.
         """
         return "store"
+
+
+#: The write modes an operational store can be maintained with.
+#:
+#: This is the same vocabulary the SQL sink uses (`io.formats.sql.dbapi.sink.WRITE_MODES`),
+#: minus the two forms that only mean something with a statement engine underneath. Keeping
+#: the spelling identical is deliberate: "maintain this table by key" is one concept, and a
+#: user moving a pipeline from Postgres to DynamoDB should not have to relearn it.
+STORE_WRITE_MODES = ("upsert", "append", "overwrite", "delete")
+
+
+class BulkSink(ABC):
+    """Base for writing Arrow rows into a row-based operational store.
+
+    Concrete sinks override `_apply`, which receives one batch of already-converted
+    Python rows and applies `mode` to them in as few round trips as the driver allows.
+    Everything around that is the same for every store and lives here: validating the
+    mode against what this sink `supported_modes`, skipping an empty write, refusing a
+    destructive mode past the first shard of a distributed write, and returning the
+    `WrittenFile` the manifest is built from.
+
+    **Declining is a first-class answer.** These stores genuinely differ in what they can
+    express: a DynamoDB ``PutItem`` replaces by key, so it cannot be a true insert-only
+    append; emptying a Redis keyspace is a ``FLUSHDB`` nobody should reach by passing a
+    string. A sink lists what it implements in `supported_modes` and the base raises for
+    the rest, naming the mode that does work. An approximation would be a wrong answer
+    dressed as a feature.
+
+    Args:
+        key_field: The field identifying a row, for the modes that match on one.
+        mode: One of `supported_modes`.
+        conn_kwargs: Connection keywords, stored verbatim and never logged.
+
+    Raises:
+        BackendError: If `mode` is not one this sink implements.
+    """
+
+    #: The registry name, set by each subclass.
+    format_name: str = ""
+
+    #: Row-level writes, so `mode` is this sink's vocabulary rather than a save mode.
+    #: Derived from `supported_modes` below, never set by hand — see `__init_subclass__`.
+    dml_modes: tuple[str, ...] = STORE_WRITE_MODES
+
+    #: The subset of `STORE_WRITE_MODES` this store can express. Subclasses narrow it.
+    supported_modes: tuple[str, ...] = STORE_WRITE_MODES
+
+    #: Modes that discard rows the write itself did not supply.
+    destructive_modes: frozenset[str] = frozenset({"overwrite"})
+
+    __slots__ = ("_conn_kwargs", "key_field", "mode")
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Keep the writer's view of a sink's modes equal to what the sink implements.
+
+        `Writer.__call__` asks a sink class for `dml_modes` to decide whether a `mode` is a
+        row-level verb it should forward verbatim or a save mode it should normalize. Two
+        attributes saying nearly the same thing is how they drift: a sink that narrowed
+        `supported_modes` but left `dml_modes` alone would let a mode past the writer's gate
+        only to raise at construction. Deriving one from the other removes the question.
+        """
+        super().__init_subclass__(**kwargs)
+        cls.dml_modes = cls.supported_modes
+
+    def __init__(self, *, key_field: str = "id", mode: str = "upsert", **conn_kwargs: Any) -> None:
+        from batcher._internal.errors import BackendError
+
+        if mode not in self.supported_modes:
+            declined = set(STORE_WRITE_MODES) - set(self.supported_modes)
+            extra = (
+                f" {self.format_name} cannot express {sorted(declined)}."
+                if mode in declined
+                else ""
+            )
+            raise BackendError(
+                f"unknown {self.format_name or 'store'} write mode {mode!r}; this sink "
+                f"implements {list(self.supported_modes)}.{extra}"
+            )
+        self.key_field = key_field
+        self.mode = mode
+        self._conn_kwargs = conn_kwargs
+
+    def write(self, table: pa.Table, path: str) -> WrittenFile:
+        """Apply every row of `table` to `path` per `mode`, in as few round trips as possible.
+
+        Args:
+            table: The rows to apply.
+            path: The target's logical name (table, collection, index, key prefix).
+
+        Returns:
+            A `WrittenFile` recording the rows applied.
+        """
+        from batcher.plan.types import logical_bytes
+
+        rows = table.to_pylist()
+        if not rows and self.mode != "overwrite":
+            return WrittenFile(path=path, rows=0, bytes=0)
+        self._apply(rows, path)
+        return WrittenFile(path=path, rows=len(rows), bytes=logical_bytes(table))
+
+    def write_partitioned(
+        self,
+        table: pa.Table,
+        path: str,
+        *,
+        partition_by: list[str] | None = None,  # noqa: ARG002 - no Hive layout in these stores
+        file_index: int = 0,
+    ) -> list[WrittenFile]:
+        """Write one shard; every shard targets the same store.
+
+        A file sink gives each shard its own ``part-N`` file, so shards cannot collide. An
+        operational store has no such luxury: a mode that discards rows the shard did not
+        write is applied by *every* shard independently, so each one discards the shards
+        before it. It is invisible single-node, where there is only ever one shard, and
+        appears at cluster scale as missing rows rather than an error.
+
+        Raises:
+            BackendError: If a destructive `mode` meets a multi-shard write.
+        """
+        from batcher._internal.errors import BackendError
+
+        if file_index > 0 and self.mode in self.destructive_modes:
+            raise BackendError(
+                f"mode={self.mode!r} cannot be used for a distributed write to {path!r}: "
+                "every shard would apply it to the same target, so each one would discard "
+                "the shards before it. Use mode='upsert', or empty the target beforehand "
+                "and append."
+            )
+        return [self.write(table, path)]
+
+    def commit(self, manifest: Any, path: str) -> None:  # noqa: B027 - see below
+        """No-op: these stores have no commit phase — a write is visible when it lands.
+
+        Deliberately concrete and deliberately empty. The `Sink` protocol has a two-phase
+        shape because a transactional sink needs one: workers write data files and the
+        driver publishes them in a single commit. None of these stores works that way —
+        a document is live the moment ``bulk_write`` returns — so there is nothing for a
+        subclass to override, and marking it abstract would force every one of them to
+        write the same empty method.
+        """
+
+    def _secret(self, key: str) -> Any:
+        """A credential from the connection kwargs, resolving an ``env:``/``file:`` reference.
+
+        Call this where the connection is opened — on the worker — never in `__init__`, so
+        the pickled sink carries only the reference. This is `ScanSource._secret`'s twin,
+        and it exists because the failure it prevents already happened on the write side:
+        `MongoSink` dialed `MongoClient(self.uri)` on the raw attribute, so an ``env:``
+        reference that read fine was handed to the driver verbatim and failed to connect.
+        """
+        from batcher.io.credentials import resolve_secret
+
+        return resolve_secret(
+            self._conn_kwargs.get(key), what=f"{self.format_name or 'connector'} {key}"
+        )
+
+    @abstractmethod
+    def _apply(self, rows: list[dict[str, Any]], path: str) -> None:
+        """Apply `rows` to `path` under `self.mode`, in as few round trips as the driver allows.
+
+        Called with a whole batch, never one row at a time: every store here has a bulk
+        primitive (``bulk_write``, ``batch_writer``, a prepared-statement batch, a pipeline,
+        ``_bulk``) and using it is the difference between one round trip and thousands.
+        """

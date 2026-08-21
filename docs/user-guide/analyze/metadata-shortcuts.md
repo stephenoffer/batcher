@@ -289,10 +289,18 @@ assert storage.files() == []
 assert storage.partition_keys() == ()
 assert not storage.is_partitioned()
 assert storage.sorted_by() == ()
-assert storage.total_bytes() is None  # a Parquet source reports its footer's byte size,
-assert storage.row_group_count() is None  # ...and its row-group count
-assert storage.bytes_per_row() is None
+assert storage.row_group_count() is None  # no physical blocks to skip at
+
+assert storage.total_bytes() > 0  # what the resident Arrow batches retain
+assert storage.bytes_per_row() == storage.total_bytes() / storage.row_count()
 ```
+
+`total_bytes` reports whatever each source can state for free, so its meaning follows the
+source. A Parquet source reports the stored, compressed size from its footer, which is what
+predicts scan time. An in-memory relation reports the size its Arrow buffers actually
+retain, which is uncompressed and therefore wider per row. Both are exact for what they
+measure, and `row_group_count` stays `None` here because an in-memory relation has no
+physical blocks a zone-map prune could skip.
 
 On a Parquet source, `num_files` is the small-files diagnosis without a scan. A thousand
 files for a gigabyte means the query is about to spend its time on footers rather than on

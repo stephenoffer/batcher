@@ -83,6 +83,8 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
         return False
     if len(window.order_keys) != 1 or not isinstance(window.order_keys[0].expr, Col):
         return False
+    if not _single_source_input(window):
+        return False
     if not _key_type_partitionable(window):
         return False
     for fn in window.functions:
@@ -93,6 +95,24 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
         if fn.func in _NEEDS_COL_INPUT and not isinstance(fn.input, Col):
             return False
     return True
+
+
+def _single_source_input(window: Window) -> bool:
+    """Whether the window's input names exactly one source.
+
+    `stream_spilling_global_window` reaches `_relabel_single_source`, which **raises** on a
+    multi-source input rather than declining -- so a global window above a join answered
+    `collect()` and died under `collect(spill=True)` with `PlanError: expected a
+    single-source subplan to relabel`. Same defect, same fix and same reasoning as
+    `supports_spilling_window` and `supports_spilling_sort`: a predicate that answers
+    *whether* a path applies must never raise when the answer is "no".
+
+    Imported inside the function for the reason `_key_type_partitionable` gives: this module
+    is on `dist.executor`'s eager-import budget and `executors.plan_analysis` is not.
+    """
+    from batcher.dist.executors.plan_analysis import _single_source
+
+    return _single_source(window.input)
 
 
 def _key_type_partitionable(window: Window) -> bool:

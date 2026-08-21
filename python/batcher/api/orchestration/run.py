@@ -125,6 +125,12 @@ def run_relational(
     from batcher import carbonite
 
     scope: contextlib.AbstractContextManager = contextlib.nullcontext()
+    # One manager for the whole query, not one per question. It carries a `PressureMonitor`
+    # whose hysteresis average is documented as "per-`ResourceManager` and therefore
+    # per-query" — constructing a second one here to ask a second question gave that monitor
+    # a fresh, immediately-discarded average, which is the opposite of what the smoothing is
+    # for. Sharing it is both the cheaper and the more faithful reading.
+    rm = carbonite.ResourceManager(hub=ctx.hub)
     if active_config().execution.adaptive_morsel_sizing:
         # Pass the hub so the morsel target reflects the *learned* per-family peak memory
         # (Carbonite's `LearnedMemoryModel` over recorded `m_peak_bytes`), not just live
@@ -137,7 +143,7 @@ def run_relational(
         # learned width only exists after a query of this shape has run, and the first run
         # of a multimodal pipeline is the one that OOMs. The schema knows the width before a
         # row is read, and a measured width still wins wherever there is one.
-        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families, plan)
+        adapted = rm.recommended_config(families, plan)
         if adapted is not None:
             scope = config_context(adapted)
     # Hold an execution slot for the whole run, and narrow this query's pool to its share
@@ -154,7 +160,7 @@ def run_relational(
     # for Ctrl-C, and a scope inside `admit()` would not have been entered yet.
     with (
         query_scope(),
-        carbonite.ResourceManager(hub=ctx.hub).admit() as grant,
+        rm.admit() as grant,
         _with_grant(scope, grant),
     ):
         return _run_seeded_topn(plan, sources, ctx, distributed, materialize)
@@ -630,5 +636,10 @@ def _record_flap_rate(hub: object, rm: object) -> None:
         rate = rm.flap_rate()  # type: ignore[attr-defined]
         if rate is not None:
             record_flap_rate(hub, rate)  # type: ignore[arg-type]
-    except Exception:  # pragma: no cover - a learned write must never fail a run
-        return
+    except Exception as exc:  # pragma: no cover - a learned write must never fail a run
+        # Noted, not swallowed, and this is the write where the distinction matters most.
+        # It is the producer half of a loop that has already been permanently inert once
+        # (`PressureMonitor.flap_rate` records why), and a silent failure here reproduces
+        # that exactly: the reader keeps finding a cold store, the hysteresis keeps its
+        # static weight, and nothing anywhere says the write never happened.
+        note_suppressed("api", "record the measured pressure-flap rate", exc)

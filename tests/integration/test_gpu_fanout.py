@@ -18,6 +18,8 @@ covered by the translator's own differential suite.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -29,6 +31,7 @@ from batcher import col
 pytestmark = pytest.mark.integration
 
 ray = pytest.importorskip("ray", reason="the fan-out is Ray scheduling")
+cloudpickle = pytest.importorskip("ray.cloudpickle", reason="the fan-out is Ray scheduling")
 
 
 @pytest.fixture(scope="module")
@@ -36,7 +39,26 @@ def cluster(tmp_path_factory):
     """An isolated local Ray cluster, so this never joins one the environment already has."""
     import os
 
-    os.environ.pop("RAY_ADDRESS", None)
+    # Dropped so `ray.init(address="local")` really is local, and **restored afterwards**:
+    # this is a process-wide environment variable, and a module that leaves it unset makes
+    # every later module start its own single-node Ray instead of attaching to the session's
+    # cluster. That is invisible here and shows up three files later as a preemption or
+    # placement test failing on a cluster too small to schedule what it asks for.
+    prior_address = os.environ.pop("RAY_ADDRESS", None)
+    # Serialize this module's helpers **by value**, not by reference.
+    #
+    # The shard stubs below (`_host_shard`, and the injected `_failing`) are module-level
+    # functions of a pytest test module, and cloudpickle pickles a module-level function by
+    # reference when its module looks importable. The driver can import `test_gpu_fanout`
+    # because pytest put `tests/integration` on *its* `sys.path`; a Ray worker cannot, and
+    # every shard task died with `ModuleNotFoundError: No module named 'test_gpu_fanout'`.
+    #
+    # That failure was invisible, and in exactly the way this module exists to prevent: the
+    # recovery ladder caught it, recomputed the shard on the CPU engine, and every assertion
+    # about the *answer* still passed — so the whole file was green while the fan-out it
+    # tests never ran once. Registering by value makes the worker deserialize the function
+    # body instead of importing it.
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
     ray.init(
         address="local",
         num_cpus=4,
@@ -47,7 +69,10 @@ def cluster(tmp_path_factory):
     try:
         yield
     finally:
+        cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
         ray.shutdown()
+        if prior_address is not None:
+            os.environ["RAY_ADDRESS"] = prior_address
 
 
 @pytest.fixture(scope="module")
@@ -225,7 +250,13 @@ def test_a_failing_shard_still_produces_the_right_answer(
         return _host_shard(descriptor, ops)
 
     monkeypatch.setattr(tasks, "gpu_shard_partial", _failing)
-    monkeypatch.setattr(tasks, "gpu_task_options", lambda: {"num_gpus": 0, "max_retries": 0})
+    # Takes `num_gpus` like the real `gpu_task_options` does — the fan-out sizes the device
+    # share from its packing decision, so a zero-arg stub is not a stand-in for it.
+    monkeypatch.setattr(
+        tasks,
+        "gpu_task_options",
+        lambda num_gpus=1.0, **_: {"num_gpus": 0, "max_retries": 0},
+    )
 
     ds = bt.read.parquet(source_dir).group_by("g").agg(s=col("v").sum(), n=bt.count())
     scan, ops = gpu_plan_ops(ds._plan)

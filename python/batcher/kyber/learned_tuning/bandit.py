@@ -298,7 +298,11 @@ def learned_arm(
     try:
         stats = hub.get_keyed_param(scoped(namespace), key) or {}
         return _chosen_arm(stats, arms, min_total=min_total)
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - a learned read must never break planning
+        # `None` here means "the bandit has no opinion", which is indistinguishable from a
+        # cold store — so a read that is *failing* looks exactly like one that is merely
+        # young, and the arm the loop measured is never applied. Say which it was.
+        note_suppressed("kyber", "read a learned bandit arm", exc)
         return None
 
 

@@ -40,19 +40,35 @@ def test_autoscale_helpers_resolve_where_the_backend_imports_them():
     assert callable(request_autoscale)
 
 
-def test_with_gpu_capacity_reaches_its_run_callback():
+def test_with_gpu_capacity_reaches_its_run_callback(monkeypatch):
     """A stand-in for the whole outage: the function must get past its own imports.
 
     Asserted by giving it a `run` that records it was called. Before the import fix this never
     ran, on any cluster, for any query.
+
+    The three capacity helpers are stubbed rather than left to the ambient cluster. Off Ray
+    they *are* no-ops and the callback runs, which is what this used to rely on — but "off
+    Ray" is a property of the **process**, not of this test: a neighbour that connected to a
+    cluster makes the request real, and on a GPU-less one it waits, finds nothing, and returns
+    `None` instead of reaching `run`. The test then fails for a reason it is not about, and
+    only when something else ran first. What it asserts is the wiring, so the wiring is what
+    it should control.
     """
+    from batcher.api.terminal.gpu_backend import fanout
     from batcher.api.terminal.gpu_backend.fanout import _with_gpu_capacity
+    from batcher.dist.executors import ray_runtime
+    from batcher.dist.gpu import dispatch
     from batcher.kyber.gpu.policy import GpuDecision
+
+    monkeypatch.setattr(ray_runtime, "request_autoscale", lambda *_a, **_k: None)
+    monkeypatch.setattr(ray_runtime, "release_autoscale", lambda *_a, **_k: None)
+    monkeypatch.setattr(ray_runtime, "await_autoscale", lambda *_a, **_k: None)
+    monkeypatch.setattr(dispatch, "await_gpu_admission", lambda *_a, **_k: 1)
+    assert fanout is not None  # the module under test imported at all
 
     seen = []
     decision = GpuDecision(True, False, "test", 1, 1)
     result = _with_gpu_capacity(1, decision, lambda live: seen.append(live) or "ran")
-    # Off a Ray cluster the autoscale request is a no-op, so the callback still runs.
     assert result == "ran"
     assert seen
 

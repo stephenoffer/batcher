@@ -1,5 +1,5 @@
 % ===========================================================================
-% Batcher --- technical paper.  Author: Stephen Offer.
+% Batcher --- polished critical-review draft.  Author: Stephen Offer.
 %
 % Builds with stock TeX Live (`make`). Two-column, 10pt, conference formatting.
 % To retarget a venue, drop in its .sty at the STYLE lines below.
@@ -25,6 +25,15 @@
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage[skip=3pt,font=small]{caption}
 
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\scriptsize, columns=fullflexible, keepspaces=true,
+  language=Python, showstringspaces=false,
+  keywordstyle=\color{okBlue}\bfseries, stringstyle=\color{okGreen},
+  commentstyle=\itshape\color{pfigGray}, aboveskip=2pt, belowskip=0pt,
+  xleftmargin=2pt, frame=none, numbers=none,
+}
+
 \input{tikz-paper-styles}
 
 \newcommand{\sys}{Batcher}
@@ -33,32 +42,15 @@
 \newcommand{\pcf}{\ensuremath{\mathsf{partial}\!\rightarrow\!\mathsf{combine}\!\rightarrow\!\mathsf{finalize}}}
 \newcommand{\win}{\cellcolor{okSky!22}}
 \newcommand{\loss}{\cellcolor{okOrange!16}}
-
-% Coverage small-multiple: #1 x-offset (mm), #2 title, #3 covered "col/row" list,
-% #4 count label, #5 title colour.  Columns S,J,U,M left-to-right; rows
-% relational..LLM bottom-to-top.  One 4x4 grid per comparator group.
-\newcommand{\covpanel}[5]{%
-  \begin{scope}[xshift=#1mm]
-    \foreach \c in {0,1,2,3}{\foreach \r in {0,1,2,3}{
-      \draw[fill=white, draw=pfigLight, line width=0.5pt]
-        (\c*5.5,\r*5.5) rectangle +(5.5,5.5);}}
-    \foreach \c/\r in {#3}{
-      \draw[fill=okSky!60, draw=okBlue, line width=0.6pt]
-        (\c*5.5,\r*5.5) rectangle +(5.5,5.5);}
-    \node[font=\scriptsize\bfseries, text=#5, anchor=south, align=center]
-      at (11,23.6) {#2};
-    \foreach \c/\l in {0/S,1/J,2/U,3/M}{
-      \node[font=\tiny, text=pfigGray, anchor=north] at (\c*5.5+2.75,-0.8) {\l};}
-    \node[font=\scriptsize\bfseries, text=#5, anchor=north] at (11,-4.4) {#4};
-  \end{scope}}
+% The ratio used throughout: Batcher's milliseconds over the baseline's, so
+% below 1.00 is a Batcher win. Defined once here and named at every table.
+\newcommand{\bx}{\ensuremath{b/x}}
 
 \setlength{\abovedisplayskip}{4pt}
 \setlength{\belowdisplayskip}{4pt}
 
-\title{\sys{}: One Engine for Every Scale, Every Shape of Data,\\
-       and Every AI Workload\\
-       \large A Mergeable Algebra that Unifies Batch and Streaming,
-       from a Core to a Cluster}
+\title{\sys{}: Mergeable Operators for Unified Batch, Streaming,\\
+and Inference Execution}
 
 \author{Stephen Offer\\ \small Anyscale \quad\textbullet\quad \texttt{stephen.offer@anyscale.com}}
 \date{}
@@ -68,56 +60,37 @@
 
 \begin{abstract}
 \noindent
-The data stack most companies run was designed between 2009 and 2014, on assumptions
-that were all true then and have all since inverted. A single instance now carries 96
-to 192 cores and terabytes of memory. Change data capture removed the batch window.
-Object storage and schema drift removed the catalog, and the operators that replaced
-it, regexes, JSON paths, Python callbacks and models, carry no statistics at all.
-Machine-generated documents, images, audio and video became most of the corpus, and a
-model stopped consuming the finished dataset and started producing intermediate
-columns inside it. A pipeline is now I/O, then CPU decode, then GPU inference, then a
-CPU join, and it is written in Python.
+Modern data pipelines increasingly cross boundaries that data engines have traditionally
+implemented with separate execution paths: single-node and distributed execution, batch and
+streaming, relational operators and model inference, and CPU and GPU work. \sys{} explores
+how much of this fragmentation can be removed by imposing one restriction on the engine itself:
+a stateful operator is admitted only if it can be expressed as a mergeable
+\pcf{} triple over Apache Arrow. Under this contract, changing the partition count changes
+scheduling rather than operator semantics, and the same state transition can be used for
+incremental execution. Decode, embedding, and inference are represented in the same logical
+plan rather than delegated to an opaque per-row path.
 
-The engines did not move with any of it, so a team is asked the same question over
-and over. Pick a scale, pick batch or streaming, pick a shape of data, pick a tier of
-model, pick a device, pick a language: every answer is a different product, with glue
-in between.
+We evaluate the design first as a correctness invariant and then as a performance claim. All
+22 TPC-H queries produce equivalent results through the single-node and distributed
+executors, and the recovered results remain equivalent across five injected worker-loss
+configurations. To separate execution from storage effects, DuckDB is measured both on its
+native compressed representation and on the same Arrow input consumed by \sys{}. On identical
+Arrow input, \sys{} is faster on every suite for which that controlled comparison is available,
+by $2.8$--$26\times$; with DuckDB's native store, the comparison reverses on TPC-H at sf10.
+These results suggest that storage representation and storage statistics account for a
+substantial part of the remaining single-node gap, rather than execution kernels alone.
 
-\sys{} is an engine designed after all of them, and one constraint does most of
-the answering. A stateful operator may exist only once, as a mergeable triple \pcf{}
-in Rust over Apache Arrow, so one core, ninety-six cores and a cluster differ in
-scheduling and in nothing else: small queries pay nothing for distribution, and large
-ones need no rewrite. That same triple \emph{is} the incremental form, so a finite
-table is a stream that ends and both run under one memory bound. Decode, embedding,
-vector search and inference are expressions over those same Arrow batches under the
-same optimizer, across 30 file and table formats and 125 ML entry points. And because
-the operator is identical everywhere, a measurement taken anywhere is valid
-everywhere, which is what lets \sys{} plan the next query from what it measured
-rather than from vendor constants.
-
-The result is breadth that costs nothing. On relational work, one 96-core machine
-leads DuckDB's own compressed store on TPC-H~\cite{tpch} sf1 ($0.79\times$), on all 99
-queries of TPC-DS~\cite{tpcds} ($0.96\times$) and on ClickBench~\cite{clickbench}
-($0.64\times$), leads Polars and Daft by $2.3$--$2.9\times$, sweeps PyArrow's Acero
-engine, and --- against DuckDB reading the \emph{identical} Arrow input, the bar that
-isolates execution from storage --- wins \emph{every suite that comparison can run},
-by between $2.8$ and $26\times$. On eight nodes, aggregate shuffle
-throughput rises superlinearly, $7.6\times$ for $4\times$ the hardware. On the AI
-pipelines a purpose-built runtime was designed for, it holds $2$--$3.6\times$ against
-Ray Data while treating decode and inference as relational operators. And streaming
-inherits the batch operators unchanged: peak memory on a join-heavy query is 3.4\,MB
-at one million rows and 3.3\,MB at four million, against 198\,MB and 794\,MB for
-\sys{}'s own materializing executor on the same query. Three axes are not yet won, and
-the evaluation attributes each rather than averaging it away. Two are storage: at ten
-times the data DuckDB's compressed store leads again ($1.29\times$ at sf10), and a
-group-by on low-cardinality string keys loses to that store's dictionary encoding while
-beating it $11\times$ on identical input. The third is not. The Join Order
-Benchmark~\cite{leis2015goodjoin} --- the suite built to expose the estimation errors
-this design claims to correct --- remains $1.29\times$ behind, and the losses trace to
-estimates this paper's own cost model gets wrong: the cross-run loop meant to answer
-them writes its measured cardinality to a key nothing reads, and correcting that key
-regresses the suites, because every threshold downstream was calibrated while the
-input was an order of magnitude low.
+The evaluation also exposes costs that headline latency does not capture. On TPC-H sf1,
+\sys{} uses $1.86\times$ the CPU while achieving $0.78\times$ the wall time, using
+$2.4\times$ as many effective cores. In the measured fault-injection environment, shuffle
+replication makes recovery more expensive than recomputation. Conversely, the shared
+operators drain a streaming backlog at $3.2\times$ Spark Structured Streaming, and repeated
+execution converges toward steady-state performance by the third run in a control experiment
+that separates most cache-warming effects. \sys{} remains $1.29\times$ behind DuckDB on the
+Join Order Benchmark, and its streaming and storage subsystems provide weaker guarantees than
+mature specialized systems. Taken together, the results support mergeability as a practical
+unifying constraint while identifying the cases where that constraint is insufficient or
+costly.
 \end{abstract}
 
 \begin{figure*}[tbp]
@@ -141,541 +114,552 @@ input was an order of magnitude low.
 }
 % ---- Panel A: relational ---------------------------------------------------
 \begin{axis}[hbar, name=relA,
-  width=0.42\textwidth, xmax=4.0, xtick={0,1,2,3,4},
+  width=0.42\textwidth, xmax=4.4, xtick={0,1,2,3,4},
   symbolic y coords={store,polars,daft,duck},
   ytick={store,polars,daft,duck},
   yticklabels={DuckDB {\tiny(native store)},Polars,Daft,DuckDB {\tiny(same Arrow)}},
-  xlabel={\sys{} speedup ($\times$) --- higher is better},
-  title={Relational\\{\scriptsize\mdseries TPC-H sf1, one 96-core node}},
+  xlabel={\sys{} speedup ($\times$); dashed line is parity},
+  title={Relational\\{\scriptsize\mdseries TPC-H sf1, one 96-vCPU node}},
 ]
-\fill[okOrange!12] (axis cs:0,store) rectangle (axis cs:1,duck);
 \addplot[draw=okBlue, fill=okSky!60]
-  coordinates {(1.33,store) (2.35,polars) (2.86,daft) (3.85,duck)};
+  coordinates {(1.27,store) (2.33,polars) (2.86,daft) (3.91,duck)};
 \draw[draw=pfigGray, dashed, line width=0.7pt] (axis cs:1,store) -- (axis cs:1,duck);
 \end{axis}
 % ---- Panel B: AI pipelines -------------------------------------------------
 \begin{axis}[hbar, name=aiB, at={($(relA.east)+(20mm,0)$)}, anchor=west,
-  width=0.42\textwidth, xmax=4.0, xtick={0,1,2,3,4},
+  width=0.42\textwidth, xmax=4.4, xtick={0,1,2,3,4},
   symbolic y coords={frac,imgemb,resnet,ingest,video},
   ytick={frac,imgemb,resnet,ingest,video},
   yticklabels={fractional GPU,image embeddings,ResNet-50,training ingest,video clips},
-  xlabel={\sys{} speedup ($\times$) --- higher is better},
-  title={AI pipelines\\{\scriptsize\mdseries 8$\times$T4, real models}},
+  xlabel={\sys{} speedup ($\times$); dashed line is parity},
+  title={AI pipelines\\{\scriptsize\mdseries 8$\times$T4, real models, vs.\ Ray Data}},
 ]
-\fill[okOrange!12] (axis cs:0,frac) rectangle (axis cs:1,video);
 \addplot[draw=okBlue, fill=okSky!60]
   coordinates {(1.96,frac) (1.98,imgemb) (2.05,resnet) (3.00,ingest) (3.60,video)};
 \draw[draw=pfigGray, dashed, line width=0.7pt] (axis cs:1,frac) -- (axis cs:1,video);
 \end{axis}
 \end{tikzpicture}
-\caption{The claim in one picture: \sys{} is not a relational engine that tolerates
-AI, nor an AI runtime that tolerates SQL. On the left it beats the fastest native
-engines on a standard SQL benchmark; on the right it beats a runtime purpose-built
-for GPU pipelines, on that runtime's own workloads, while treating decode and
-inference as relational operators under the same optimizer. The bottom-left bar is the
-one to read carefully: it is DuckDB's compressed native store with zone maps against
-\sys{} reading raw Arrow --- a storage engine \emph{and} an execution engine against an
-execution engine alone --- and \sys{} leads it by $1.33\times$ at this scale but not at
-ten times it, where the same comparison inverts to $0.78\times$. \cref{sec:eval}
-isolates that to storage and to four superlinear query shapes, not to kernels.
-Two axes not shown here move the same way: aggregate shuffle throughput rises
-$7.6\times$ for $4\times$ the nodes, and a join-heavy streaming query holds 3.4\,MB
-where a materializing executor takes 198\,MB.}
+\caption{Performance across two workload classes. Left: TPC-H sf1 on one 96-vCPU
+node, correctness-gated and summarized by geometric mean. Right: GPU data pipelines on
+8$\times$T4 against Ray Data, with decode and inference represented as operators in the same
+logical plan as the surrounding relational work. The DuckDB native-store bar includes the
+benefit of DuckDB's compressed physical representation, while the same-Arrow bar isolates the
+execution comparison more directly. At sf10 the native-store result reverses; \cref{sec:eval-opmix}
+and \cref{sec:limitations} examine the evidence for attributing much of that gap to physical
+data representation and storage statistics.}
 \label{fig:headline}
 \end{figure*}
 
 % ===========================================================================
-\section{Seven shifts since Spark}
-\label{sec:shifts}
+\section{Introduction}
+\label{sec:intro}
 % ===========================================================================
 
-Every architecture encodes the world it was born into. The distributed data stack
-most companies still run was designed between 2009 and 2014, and it was designed
-well: the assumptions underneath it were all true at the time. Seven have since
-stopped being true, and none of them gradually. Each flipped hard enough to invert
-the design decision it justified. Six pillars answer the seven, because shifts four
-and five are two halves of one problem.
+Data systems have historically specialized along several boundaries: local versus distributed
+execution, bounded versus unbounded input, relational versus model-centric processing, and CPU
+versus accelerator work. Those boundaries were useful because each side imposed different
+constraints. They are less useful when a single production pipeline routinely crosses several
+of them. The result is often not one engine with several scheduling modes, but multiple
+execution models connected by serialization, materialization, and application-level glue.
 
-\textbf{Shift one: the machine inverted.} In 2012 a large server had 16 cores and
-64\,GB, so ``the data will not fit on one machine'' was simply a fact, and everything
-followed from it: a cluster you start before you ask a question, a scheduler between
-you and your data, serialization on every hop. A single cloud instance now has 96 to
-192 cores and up to twelve terabytes of memory, but the tax stayed anyway, so a query
-that would take twelve milliseconds in-process still takes seconds through a
-distributed runtime. \emph{Distribution stopped being a property of the engine and
-became a property of the query} (\cref{sec:algebra}).
+Two changes make that fragmentation increasingly visible. First, a single server can now
+execute workloads that previously required a cluster, so paying distributed-runtime overhead
+for every query is no longer an acceptable default. At the same time, continuously arriving
+data has made incremental execution a normal requirement rather than a separate niche. Second,
+modern pipelines contain operators whose costs and selectivities are difficult to know from a
+catalog: regular expressions, Python callbacks, media decode, embedding models, and LLM calls.
+They also mix devices, for example CPU decode followed by GPU inference and a CPU join. A plan
+that cannot represent these operations cannot optimize across them.
 
-\textbf{Shift two: data stopped arriving in batches.} Change data capture, event logs
-and continuously landing object storage removed the nightly window that ``daily
-freshness'' was built around. The engines of the era answered by bolting a second
-execution model beside the first, which leaves two sets of operator semantics to hold
-in agreement and a rewrite for any pipeline that crosses between them.
-\emph{Continuous arrival stopped being a special case and became the default}
-(\cref{sec:streaming}).
+\sys{} asks whether these boundaries can be reduced by constraining the operator vocabulary
+rather than by adding another execution layer. A stateful operator is admitted only if it can
+be expressed once as a mergeable \pcf{} triple over Arrow. The algebra is established; the
+design choice is to make mergeability an admission criterion rather than an optional fast path.
+That restriction gives the engine one semantic implementation of an operator while allowing
+one core, many cores, and many nodes to differ in scheduling. The same representation also
+provides an incremental state transition for micro-batch streaming.
 
-\textbf{Shift three: neither the data nor the transformations can be known before the
-query runs.} Classical optimizers assumed curated schemas, statistics refreshed on a
-schedule, and queries written once and run for years. That world had \texttt{ANALYZE}
-jobs and DBAs; this one has object storage, schema drift and JSON columns. Worse, the
-operators themselves became opaque: a regular expression, a JSON extraction, a Python
-callback, an embedding model, an LLM call, none of which has a catalog entry, a
-selectivity, or a cost anybody has measured. A filter assumed to keep a tenth of its
-rows may keep all of them, and a model call priced like a comparison is off by six
-orders of magnitude. \emph{Optimizing once, from numbers nobody measured, stopped
-being a performance choice and became a guess} (\cref{sec:learning-intro}).
+The restriction does not cover all computation. Exact order statistics, global ordering, some
+join forms, and stronger streaming state models require weaker contracts or remain outside the
+distributed path (\cref{sec:price,sec:limitations}). This scope is important: the paper does
+not claim that all data processing is mergeable. It asks whether a deliberately restricted
+stateful core is broad enough to cover a useful set of relational, streaming, multimodal, and
+inference workloads without maintaining separate operator implementations.
+\cref{tab:vocab} states that boundary in full: what is admitted as a mergeable triple, what is
+admitted under a weaker range-partitionable contract, and what is refused outright.
 
-\textbf{Shift four: the data became unstructured, and far larger.} Analyst
-projections put the unstructured fraction of enterprise data at 80 to 90
-percent~\cite{idc2018datasphere,idc2025structured}, a forecast and not a census. The
-share is the least interesting part of it: documents, logs, images, audio, video and
-sensor traces are produced continuously by machines, not periodically by
-people, so volume and rate rose together, and none of it arrives in columns. An
-engine whose type system stops at scalars can only treat this as an opaque blob to
-hand somewhere else. \emph{Most of the data stopped being representable in the engine
-that was supposed to process it} (\cref{sec:pipeline}).
+A second design choice follows from the first. Because the same operator semantics are used
+across execution modes, observations such as cardinalities and strategy outcomes can be
+associated with a stable operator identity and reused by later planning decisions. \sys{}
+therefore combines static rules with measurements collected during and across executions.
+Media decode, embedding, and inference are also represented as plan expressions, allowing the
+same optimizer and resource manager to reason about them together with filters, joins, and
+aggregations.
 
-\textbf{Shift five: AI moved from the end of the pipeline into the middle of it.}
-This is the shift we think is most often missed. When machine learning consumed a
-finished dataset, keeping it outside the engine cost only a file handoff. It no
-longer consumes the output; it \emph{produces} intermediate columns, and embedding a
-document or extracting fields with an LLM is a transformation with a join or a filter
-on both sides of it. Variety compounds it, because one team now runs generalized
-linear models, gradient-boosted trees, deep vision models and LLMs against the same
-tables, and each tier used to be a separate framework. \emph{A model stopped being a
-consumer of the pipeline and became an operator inside it} (\cref{sec:pipeline}).
+\subsection{Contributions}
 
-\textbf{Shift six: compute stopped being homogeneous.} The 2010s engine scheduled one
-resource, and a core was a core. A modern pipeline reads compressed bytes, decodes
-them on CPU, runs a model on GPU, and joins the result back on CPU, so the units are
-no longer interchangeable and the expensive one idles whenever the cheap one falls
-behind. \emph{Utilization stopped being about parallelism and became about overlap
-across unlike devices} (\cref{sec:gpu}).
+This paper makes five contributions:
+\begin{enumerate}\itemsep1pt \parskip0pt \topsep2pt
+\item \textbf{A mergeability-first operator contract.} \sys{} makes the
+\pcf{} factorization an admission criterion for stateful operators. The resulting algebraic
+contract is property-tested over arbitrary partitionings, and operators that do not satisfy it
+are explicitly identified rather than routed through a second general implementation
+(\cref{sec:algebra,sec:price}).
 
-\textbf{Shift seven: the interface moved from SQL to Python.} SQL did not go away and
-should not, but the practitioner is a Python programmer, the surrounding code is
-Python, and the model is a Python object. Engines answered with a
-user-defined-function escape hatch, which the optimizer cannot see into and which
-usually runs a row at a time in an interpreter, turning the natural way to express a
-transformation into the slowest way to run one. \emph{The default authoring language
-stopped being the one the engine optimizes} (\cref{sec:interface}).
+\item \textbf{One operator implementation across execution scales and micro-batch streaming.}
+Single-core, multicore, and distributed execution differ in how partial states are scheduled
+and combined. The same state transitions are reused incrementally for streaming, with the
+streaming-specific driver and checkpoint costs measured separately
+(\cref{sec:streaming,sec:eval-streaming}).
 
-Each shift dissolved a boundary that used to be an architectural seam and is now a
-line one job routinely crosses: single-node and distributed, batch and streaming,
-structured and unstructured, query and model, CPU and GPU, SQL and Python. An engine
-built around either side of any of them must treat the other as foreign, and the bill
-arrives as glue. Six pillars pay it off, in order: one algebra spans a core to a
-cluster (\cref{sec:algebra}), one set of operators serves batch and streaming
-(\cref{sec:streaming}), one optimizer plans from measurement
-(\cref{sec:learning-intro}), one expression surface covers every data shape and model
-tier (\cref{sec:pipeline}), one scheduler spans CPU and GPU (\cref{sec:gpu}), and one
-Python surface stays transparent to the optimizer (\cref{sec:interface}).
+\item \textbf{Measurement-driven planning with result-invariant adaptation.} \sys{} adapts
+predicate order, aggregation strategy, memory sizing, and other result-equivalent physical
+choices using observations collected at operator, stage, and cross-execution timescales. A
+controlled repeated-execution experiment distinguishes this loop from ordinary cache warming
+(\cref{sec:learning,sec:eval-learning}).
 
-The reason to care is \cref{fig:headline}. Breadth of this kind is normally bought by
-being second-best everywhere, and it is not bought that way here: on a standard SQL
-benchmark \sys{} leads the fastest native engines, and on GPU pipelines it leads the
-runtime built for them, in the same binary, from the same plan.
+\item \textbf{Relational and model operators in one plan.} Media transforms, embeddings, and
+inference are first-class expressions under the same logical plan, optimizer, memory manager,
+and heterogeneous CPU/GPU scheduler as relational operators
+(\cref{sec:interface,sec:pipeline}).
+
+\item \textbf{An evaluation that separates latency, compute cost, storage effects, and failure
+behavior.} The study reports correctness equivalence across schedulers, standard relational
+benchmarks, controlled Arrow-versus-native-storage comparisons, CPU cost, streaming overhead,
+GPU pipelines, and injected worker failures. It also reports negative results, including the
+Join Order Benchmark gap, higher CPU consumption, and recovery behavior that does not justify
+replication in the measured environment (\cref{sec:eval,sec:limitations}).
+\end{enumerate}
+
+\paragraph{Reading the numbers.}
+\label{sec:convention}
+Unless otherwise stated, a ratio written \bx{} is
+$\text{\sys{}}_{ms}/x_{ms}$ for baseline $x$, so \textbf{values below 1.00 indicate lower
+\sys{} latency}. Suite-level ratios are geometric means over the included queries. Bar charts
+invert this ratio and report speedup, where larger is better. DuckDB appears in two distinct
+configurations: \emph{native store}, after an untimed ingest into DuckDB's compressed,
+dictionary-encoded, zone-mapped representation; and \emph{same Arrow}, where DuckDB executes
+the same zero-copy Arrow input given to \sys{}. The native-store result reflects the system as
+normally used, while the same-Arrow result is intended to isolate execution more directly from
+physical storage representation.
 
 % ===========================================================================
-\section{Pillar one: one algebra, every scale}
+\section{Mergeable operators across execution scales}
 \label{sec:algebra}
 % ===========================================================================
 
-\emph{Shift one: the machine inverted, so distribution should be a decision and not
-an architecture.} An engine that assumes the cluster charges every small query for
-it; an engine that assumes the box cannot answer a large one. Both are now wrong
-often enough that neither is a safe default, so the choice has to move out of the
-engine and into the query.
-
-The obstacle is easy to state. Ask an engine builder how a \texttt{GROUP BY} works
-and you get two answers: on one machine a hash table, on a cluster a shuffle, a
-partial pass and a reduce. The two share a name, a SQL semantics, and not a line of
-code, which means two performance profiles, two sets of bugs, and eventually two
-different answers. A float key that hashes one way locally and another after a
-shuffle splits one group in two, and the single-node test suite stays green
-throughout, because the single-node implementation is correct.
+A common source of divergence is that the same logical operator is implemented through
+different physical paths at different scales. A \texttt{GROUP BY}, for example, may use a
+local hash table on one machine but a partial aggregation, shuffle, and reduce path on a
+cluster. The SQL semantics are intended to match, but independent implementations create
+independent performance behavior and correctness risks. One concrete failure encountered in
+\sys{}'s development was a float key that grouped correctly in the local path but split into
+two groups after a distributed shuffle.
 
 \begin{figure*}[tbp]
 \centering
-\begin{tikzpicture}
-% ---------- LEFT: the conventional design --------------------------------
+\begin{tikzpicture}[x=1mm, y=1mm,
+  bat/.style={draw=pfigGray, fill=pfigLight, minimum width=4.6mm, minimum height=3.2mm,
+              inner sep=0pt, font=\tiny},
+  ph/.style={draw=okBlue, fill=okSky!28, minimum width=6.4mm, minimum height=4mm,
+             inner sep=0pt, font=\tiny\bfseries, rounded corners=1pt},
+  cb/.style={draw=okBlue, fill=okSky!55, circle, minimum size=4.2mm, inner sep=0pt,
+             font=\tiny\bfseries},
+  fin/.style={draw=okBlue, fill=okSky!28, minimum width=7.6mm, minimum height=4mm,
+              inner sep=0pt, font=\tiny\bfseries, rounded corners=1pt},
+  lane/.style={draw=pfigGray!70, dashed, rounded corners=1.5pt, inner sep=1.1mm},
+  fl/.style={-{Stealth[length=1.5mm,width=1.1mm]}, draw=pfigGray, line width=0.4pt}]
+
+% ============ A: one core =====================================================
 \begin{scope}
-  \node[pfig/title] at (0,1.5) {The old way: two implementations};
-  \node[pfig/box, minimum width=26mm] (op1) at (-1.8,0.5) {Local operator\\\scriptsize hash table};
-  \node[pfig/box, minimum width=26mm] (op2) at ( 1.8,0.5) {Distributed operator\\\scriptsize shuffle + reduce};
-  \node[pfig/io,  minimum width=18mm] (r1)  at (-1.8,-1.15) {Result A};
-  \node[pfig/io,  minimum width=18mm] (r2)  at ( 1.8,-1.15) {Result B};
-  \draw[pfig/arrow] (op1) -- (r1);
-  \draw[pfig/arrow] (op2) -- (r2);
-  \draw[<->, line width=0.9pt, draw=okVermillion, dashed]
-        (r1) -- node[pfig/label]{\scriptsize\bfseries\color{okVermillion} may differ} (r2);
-  \node[font=\scriptsize, text=pfigGray, align=center] at (0,-1.95)
-        {rewrite to scale $\cdot$ divergence found in production};
+  \node[font=\scriptsize\bfseries, anchor=south] at (16,25) {one core};
+  \node[font=\tiny, text=pfigGray, anchor=north] at (16,-4.2) {fold in arrival order};
+  \foreach \i in {0,1,2,3}{\node[bat] (a\i) at (0,18-\i*5) {$b_\i$};}
+  \node[ph] (ap) at (13,10.5) {\textsf{partial}};
+  \node[cb] (ac) at (24,10.5) {$\oplus$};
+  \node[fin] (af) at (35,10.5) {\textsf{finalize}};
+  \foreach \i in {0,1,2,3}{\draw[fl] (a\i.east) -- (ap.west);}
+  \draw[fl] (ap) -- (ac); \draw[fl] (ac) -- (af);
+  \draw[fl] (ac.north) .. controls +(0,4) and +(0,4) .. (ap.north);
+  \node[lane, fit=(ap)(ac)(af), label={[font=\tiny,text=pfigGray,anchor=north]below:one thread}] {};
 \end{scope}
-% ---------- RIGHT: Batcher ------------------------------------------------
-\begin{scope}[xshift=92mm]
-  \node[pfig/title] at (0,1.5) {\sys{}: one algebra, three schedulers};
-  \node[pfig/new, minimum width=40mm] (tri) at (0,0.5)
-        {mergeable triple\\[1pt]\scriptsize\mdseries \pcf{}};
-  \node[pfig/box, minimum width=18mm] (s1) at (-2.6,-1.15) {1 core\\\scriptsize fold};
-  \node[pfig/box, minimum width=18mm] (s2) at ( 0.0,-1.15) {$n$ cores\\\scriptsize morselize};
-  \node[pfig/box, minimum width=18mm] (s3) at ( 2.6,-1.15) {$m$ nodes\\\scriptsize shuffle};
-  \draw[pfig/arrowNew] (tri) -- (s1);
-  \draw[pfig/arrowNew] (tri) -- (s2);
-  \draw[pfig/arrowNew] (tri) -- (s3);
-  \node[font=\scriptsize, text=pfigGray, align=center] at (0,-1.95)
-        {same code at every scale $\cdot$ equivalence is a property test};
+
+% ============ B: n cores ======================================================
+\begin{scope}[xshift=50mm]
+  \node[font=\scriptsize\bfseries, anchor=south] at (18,25) {$n$ cores};
+  \node[font=\tiny, text=pfigGray, anchor=north] at (18,-4.2) {combine in any tree shape};
+  \foreach \i in {0,1,2,3}{
+    \node[bat] (b\i) at (0,18-\i*5) {$b_\i$};
+    \node[ph]  (bp\i) at (11,18-\i*5) {\textsf{partial}};
+    \draw[fl] (b\i) -- (bp\i);}
+  \node[cb] (bc0) at (23,15.5) {$\oplus$};
+  \node[cb] (bc1) at (23,5.5)  {$\oplus$};
+  \node[cb] (bc2) at (32,10.5) {$\oplus$};
+  \node[fin] (bf) at (43,10.5) {\textsf{finalize}};
+  \draw[fl] (bp0) -- (bc0); \draw[fl] (bp1) -- (bc0);
+  \draw[fl] (bp2) -- (bc1); \draw[fl] (bp3) -- (bc1);
+  \draw[fl] (bc0) -- (bc2); \draw[fl] (bc1) -- (bc2); \draw[fl] (bc2) -- (bf);
+  \node[lane, fit=(bp0)(bp3), label={[font=\tiny,text=pfigGray,anchor=north]below:$n$ threads}] {};
+\end{scope}
+
+% ============ C: m nodes ======================================================
+\begin{scope}[xshift=110mm]
+  \node[font=\scriptsize\bfseries, anchor=south] at (20,25) {$m$ nodes};
+  \node[font=\tiny, text=pfigGray, anchor=north] at (20,-4.2)
+       {shuffle reduced state, never rows};
+  \foreach \i in {0,1}{
+    \node[bat] (c\i) at (0,17-\i*11) {$b_\i$};
+    \node[ph]  (cp\i) at (11,17-\i*11) {\textsf{partial}};
+    \draw[fl] (c\i) -- (cp\i);
+    \node[lane, fit=(c\i)(cp\i)] {};}
+  \node[cb] (cc0) at (27,17) {$\oplus$};
+  \node[cb] (cc1) at (27,6)  {$\oplus$};
+  \node[fin] (cf) at (39,11.5) {\textsf{finalize}};
+  \draw[fl] (cp0) -- (cc0); \draw[fl] (cp1) -- (cc1);
+  \draw[fl, draw=okBlue] (cp0.east) -- (cc1.west);
+  \draw[fl, draw=okBlue] (cp1.east) -- (cc0.west);
+  \draw[fl] (cc0) -- (cf); \draw[fl] (cc1) -- (cf);
+  \node[font=\tiny, text=okBlue, anchor=south] at (19,11.2) {shuffle};
+  \node[font=\tiny, text=pfigGray, anchor=south] at (7,21.2) {node 1};
+  \node[font=\tiny, text=pfigGray, anchor=south] at (7,10.2) {node 2};
 \end{scope}
 \end{tikzpicture}
-\caption{The decision the rest of the system is built on. \sys{} admits an operator
-only if it can be written as a mergeable triple, a partial pass, an associative and
-commutative combine, and a finalize, and then varies only the \emph{scheduling}.
-Aggregation, distinct, join build, window and top-$N$ all qualify. No second
-implementation exists to disagree with the first, so scaling up is a configuration
-change rather than a migration.}
-\label{fig:fork}
+\caption{The same operator under all three schedulers. Only the arrangement of
+$\mathsf{partial}$, $\oplus$ and $\mathsf{finalize}$ changes: one core folds each batch
+into a single accumulator, $n$ cores fold per morsel and combine up a tree, and $m$
+nodes fold per node and exchange \emph{already-reduced state} before combining.
+Associativity admits any tree shape, commutativity any arrival order, and the identity
+the empty partition, so the partition count is a free variable rather than a design
+decision. Because mappers publish state rather than rows, the bytes crossing the network
+on the right are bounded by the group count and not the input size, which is why per-
+node memory stays flat as the cluster widens.}
+\label{fig:schedulers}
 \end{figure*}
 
-\sys{} makes that split impossible. A stateful operator may exist only as a mergeable
-triple, and the three execution regimes vary only its scheduling (\cref{fig:fork}):
-one core folds a stream of batches, many cores partition and merge, and many machines
-partition, run the partial pass per node, ship pre-aggregated state, and combine in a
-tree. Formally, for any partitioning $\{p_k\}$ of an input $P$,
+\sys{} makes that split impossible. A stateful operator may exist only as a mergeable triple,
+and the three execution regimes vary only its scheduling (\cref{fig:schedulers}). One core
+folds a stream of batches. Many cores partition and merge. Many machines partition, run the
+partial pass per node, ship pre-aggregated state, and combine in a tree. Formally, for any
+partitioning
+$\{p_k\}_{k=1}^{n}$ of an input multiset $P$,
 \begin{equation}
-\mathsf{combine\_finalize}\big(\textstyle\bigcup_k \mathsf{partial}(p_k)\big)
-  = \mathsf{finalize}(\mathsf{partial}(P)),
+\mathsf{finalize}\Big(\textstyle\bigoplus_{k=1}^{n} \mathsf{partial}(p_k)\Big)
+  \;=\; \mathsf{finalize}\big(\mathsf{partial}(P)\big),
 \label{eq:merge}
 \end{equation}
-which is a property test and not a comment: a generator produces random
-partitionings and asserts equality against the single-pass result, and a separate
-test asserts that a distributed run and a single-node run of the same plan return
-identical rows.
+where $\bigoplus$ folds the per-partition states under the operator's combine. This holds
+exactly when the operator factors into $\mathsf{partial}\colon \mathcal{M}(R) \rightarrow
+S$, $\oplus\colon S \times S \rightarrow S$ and $\mathsf{finalize}\colon S \rightarrow
+\mathcal{M}(R')$, with $\mathcal{M}(\cdot)$ a multiset, $(S,\oplus)$ a commutative monoid,
+and $\mathsf{partial}$ a monoid homomorphism from $(\mathcal{M}(R), \uplus)$ to
+$(S,\oplus)$. Each law earns its keep --- associativity buys any tree shape, commutativity any
+arrival order, the identity the empty partition --- and together they make the partition count
+a free variable. That is the whole of the claim: one core, many cores and many machines are
+three values of it. \cref{eq:merge} is a property test and not a comment, asserted over
+generated random partitionings against the single-pass result.
 
-The paper's thesis follows from that. \textbf{There is no distribution tax on the
-small case}, because distribution is a scheduling decision made per query rather than
-a runtime you start. \textbf{And there is no rewrite on the way out}, because the
-operator that wins on one core is the operator that runs on eight nodes. Since
-mappers publish state that is already reduced, never raw, per-node memory stays
-bounded however wide the cluster grows, so shuffle throughput rises with node count
-instead of collapsing into contention (\cref{sec:scaleout}).
+One qualification belongs with \cref{eq:merge} rather than in a footnote, because
+overstating it would make the invariant unfalsifiable. Row multisets, column names and
+column types are exact under any partitioning, but floating-point reductions are
+identical only \emph{up to reassociation}: $\mathsf{combine}$ is associative in exact
+arithmetic, IEEE addition is not, and the partition count fixes the summation order.
+Neumaier compensation and Chan's parallel formula for variance hold that error near the
+last bits; nothing can remove it while the partition count is free.
 
-The triple itself is old: Gray et al.'s algebraic aggregate~\cite{gray1997datacube}
-and MapReduce's combiner~\cite{dean2004mapreduce}. Every distributed engine reaches
-for it somewhere, usually for aggregation. What differs here is treating it as an
-\emph{admission criterion} for every stateful operator, join build, window and
-top-$N$ included, so no second implementation ever exists to drift from the first.
-The cost is real and we pay it: an algorithm with no mergeable form does not get
-added.
+Two consequences follow. \textbf{There is no distribution tax on the small case},
+because distribution is a scheduling decision made per query rather than a runtime you
+start; and \textbf{there is no rewrite on the way out}, because the operator that wins
+on one core is the one that runs on eight nodes.
 
-% ===========================================================================
-\section{Pillar two: batch and streaming are one execution model}
-\label{sec:streaming}
-% ===========================================================================
-
-\emph{Shift two: arrival became continuous, so a streaming query should not be a
-different program.} A second execution model costs in three places: every operator is
-implemented and maintained twice, the two copies have to be proven to agree, and any
-pipeline that crosses between them has to be rewritten. That is every pipeline that
-succeeds, because freshness requirements only ever tighten.
-
-The constraint that settles the scale split settles this one too. \sys{}'s executor
-is a streaming executor for \emph{every} query. Operators pull small batches through
-a pipeline and materialize only at breakers, so peak memory is the breakers' state
-plus one batch per worker: a constant, independent of how much data arrives. On a
-join-heavy shape that is 3.4\,MB at one million rows and 3.3\,MB at four million,
-where \sys{}'s own materializing executor grows from 198\,MB to 794\,MB on the same
-query. The bounded case is not a special mode. A finite table is simply a stream that
-ends.
-
-That works because the mergeable triple \emph{is} the incremental form. An aggregate
-that folds each batch through $\mathsf{partial}$ and $\mathsf{combine}$ never reads
-its whole input, which is exactly what a continuous query needs: state that updates
-per arrival and finalizes on demand. The operator a batch query uses and the operator
-a continuous query needs are not two implementations that happen to agree. They are
-one implementation, and the difference is whether anything ever calls
-$\mathsf{finalize}$. The same property makes an operator a pipeline breaker for
-\emph{ordering} without making it a materialization point for \emph{memory}, which is
-what gives a streaming aggregation over an unbounded source a memory bound at all.
-
-So the memory story does not change with the source. A query over a hundred terabytes
-of Parquet and the same query over a Kafka topic run the same operators under the
-same bound, and a pipeline that outgrows its batch window does not get rewritten to
-survive.
-
-\section{Pillar three: an engine that learns}
-\label{sec:learning-intro}
-% ===========================================================================
-
-\emph{Shift three: neither the data nor the operators can be priced before the query
-runs.} An engine facing that can keep inventing numbers, which is what a static cost
-model does, or it can measure itself and plan from what it saw. Everything in this
-section follows from taking the second option seriously, including the parts that
-look like over-engineering: if the plan is going to be wrong, the engine needs to
-find out \emph{during} the query rather than after it.
-
-Measuring itself is only sound because of the first pillar. Because the same operator
-runs everywhere, \textbf{a measurement taken anywhere is valid everywhere}: a
-cardinality observed on one core is evidence about the same operator on ninety-six.
-Refusing to fork the operator is what licenses the engine to plan from its own
-history. Every other engine in \cref{tab:differs} ships its cost model as constants,
-chooses join strategy by heuristic, and sizes memory from a plan estimate, and those
-constants were tuned once, on hardware nobody here is running. \sys{} replaces each
-with a measurement.
-
-A single rule keeps this safe. \textbf{Every learned value is result-invariant.} Each
-bandit arm emits the same relation, a threshold picks between equivalent algorithms,
-a partition count only shards. Learning changes how much memory a query reserves,
-when it spills, how wide a batch is, and which of several equivalent algorithms runs.
-It can never change the answer. That is property-tested, and a cold store reproduces
-the untuned engine byte for byte, so the worst a stale value can do is cost
-throughput. This is a deliberately different bet from learned optimizers that predict
-plans~\cite{marcus2019neo,marcus2021bao,kipf2019learned}, which change which plan
-runs in ways that are hard to bound. A weaker signal buys a far stronger safety
-property, and that is what lets the feature ship on by default.
-
-\subsection{Three clocks, not one}
-\label{sec:timescales}
-
-Adaptive query processing usually means one thing: re-plan at a stage boundary.
-\sys{} does that too. It is the least interesting of the three places it adapts.
-
-\paragraph{Microseconds: the filter reorders itself.} A conjunctive filter evaluates
-its cheapest predicate first, which is what a static cost model can tell you. But
-cost is not selectivity, and the case a static model cannot fix even in principle is
-two predicates of identical cost where only one is selective. Write the broad one
-first and nothing gets removed, so the selective one runs at full width anyway.
-
-DuckDB solves this by hill-climbing over adjacent swaps. \sys{} measures instead:
-because the short-circuit evaluates conjuncts one at a time, it can attribute rows
-and nanoseconds to each \emph{individually} and order by time-per-row over
-fraction-removed, so the right order arrives after a \textbf{single morsel} where a
-hill-climb needs tens of batches to walk the permutation. On the adversarial shape,
-two regular-expression matches of identical static cost with the broad one written
-first, that is 48.64\,ms down to 28.18\,ms. Correctness costs nothing here, because
-the conjuncts of an \texttt{AND} commute and every order yields the identical mask.
-
-\paragraph{Microseconds: the aggregate picks its own algorithm.} A parallel aggregate
-normally hashes each morsel into its own table and merges the tables, which is right
-when grouping reduces and wrong when it does not: \texttt{GROUP BY l\_orderkey,
-l\_linenumber} over TPC-H \texttt{lineitem} reduces nothing at all, so every partial
-row survives and the merge inherits the whole relation. The alternative is to partition the input by key first and
-aggregate each partition exactly once. Measured on a 60M-row table across 96 cores,
-the two paths cross just under 0.18 rows kept per input row:
-
-\begin{center}\small
-\begin{tabular}{lrrr}
+\begin{table}[tbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llll@{}}
 \toprule
-rows kept per input row & 0.10 & 0.34 & 1.00 \\
+Operator & $\mathsf{partial}$ & state $S$ & $\oplus$ \\
 \midrule
-$\mathsf{partial}\rightarrow\mathsf{combine}$ (ms) & \win 125.7 & 350.9 & 1351.6 \\
-$\mathsf{partition}\rightarrow\mathsf{aggregate}$ (ms) & 198.2 & \win 185.3 & \win 370.2 \\
+\texttt{aggregate}   & hash to group states & group $\rightarrow$ acc. & merge by key \\
+\texttt{distinct}    & hash to key set      & key set                  & set union \\
+\texttt{join} (build)& hash to build side   & hash table               & merge by key \\
+\texttt{window}      & per-frame partials   & frame $\rightarrow$ acc. & merge by frame \\
+\texttt{top-}$N$     & bounded heap         & $N$ heaviest rows        & merge, re-truncate \\
+\midrule
+\multicolumn{4}{@{}l@{}}{\emph{admitted under a weaker contract} (range-partitionable, not mergeable)} \\
+\texttt{sort}, \texttt{rank} & ordered runs & sorted runs & boundary merge \\
+\midrule
+\multicolumn{4}{@{}l@{}}{\emph{refused}: exact median/percentile, inequality join
+(distributed), shared} \\
+\multicolumn{4}{@{}l@{}}{global hash build, shrinking streaming state --- \cref{sec:price}} \\
 \bottomrule
 \end{tabular}
-\end{center}
+\caption{\sys{}'s stateful operator vocabulary, and what each one must supply to be
+admitted. $\mathsf{finalize}$ is omitted: for every row it is the projection of $S$ back
+to rows. This is the whole of the engine's stateful surface --- an operator absent from
+it is one the constraint refuses, and \cref{sec:price} is that invoice rather than a
+limitations note.}
+\label{tab:vocab}
+\end{table}
 
-This is more than a tuned threshold, for two reasons. The choice comes from a
-\emph{measurement} and not an estimate: a distinct-count for a group key is a sketch,
-and after a filter it is a guess about a distribution nobody has looked at, so the
-executor partials a sample of morsels and reads the reduction those partials actually
-achieved, wasting no work either way. Second, the alternative path,
-$\mathsf{partition}\rightarrow\mathsf{partial}\rightarrow\mathsf{finalize}$, is the
-exact composition \sys{} runs \emph{across machines}, executed here across cores. The
-high-cardinality single-node aggregate is the distributed algorithm, chosen at
-runtime. Refusing to fork the operator did not only prevent a class of bug; it handed
-the single-node executor a second strategy for free.
+\subsection{Relationship to existing algebraic interfaces}
 
-\paragraph{Stages and runs.} The outer two clocks are the familiar ones. At a
-pipeline breaker the engine has already measured what it just processed, so it
-re-plans the remainder on real cardinalities. Across executions it accumulates
-sketches, refits cost coefficients and converges bandits. The three correct different
-errors, at timescales four orders of magnitude apart, and each reads only what has
-already been measured, so none of them is a prediction. The outer one is what makes a
-query cheaper the second time it runs, and none of the five comparators of
-\cref{sec:eval} has it.
+The algebra itself is established. Gray et
+al.'s algebraic aggregate~\cite{gray1997datacube} and MapReduce's
+combiner~\cite{dean2004mapreduce} are important precedents,
+Summingbird~\cite{boykin2014summingbird} made monoids the explicit unifying device, and
+the Dataflow model~\cite{akidau2015dataflow} generalized batch and streaming into one
+specification whose \texttt{CombineFn} has the shape of our triple. What we claim is the
+policy, and the difference is the word \emph{only}. In each of those systems
+mergeability is an \textbf{opportunity}: a library interface an operator may implement
+to run better, alongside a general execution path for everything that does not, so the
+fork survives one level down --- in the two engines Summingbird compiles onto, or in the
+runner Beam hands its specification to --- and that is where the divergences and the
+second set of bugs live. Here mergeability is an \textbf{admission criterion} for the
+engine's own operators: there is no general path to fall back to and no second runner
+underneath, so no second implementation can exist to drift from the first. That is a
+stronger claim and a more expensive one, and \cref{sec:price} is the trade-off.
 
-% ===========================================================================
-\section{Pillar four: every shape of data, every tier of model}
-\label{sec:pipeline}
-% ===========================================================================
+\subsection{Scope and excluded operator classes}
+\label{sec:price}
 
+A restriction is only interesting if something falls outside it, and \cref{tab:vocab}'s
+last two blocks are the list. \textbf{Exact order statistics} are not algebraic
+aggregates, because the state is the input; \sys{} admits the mergeable approximation (a
+KLL sketch~\cite{karnin2016kll}) and computes the exact form by falling back to a sort.
+\textbf{A global sort, a \texttt{rank()} over a total order and a recursive fixpoint}
+have no commutative combine, and no amount of design gives them one, so they are
+admitted under the weaker range-partitionable contract instead: the single algebra
+covers the stateful operators, not literally every operator.
 
-\begin{figure*}[tbp]
-\centering
-\begin{tikzpicture}[x=1mm,y=1mm]
-  % --- shared row labels (left of the first panel) --------------------------
-  \foreach \r/\l in {0/relational,1/classical ML,2/deep learning,3/LLM scale}{
-    \node[font=\tiny, text=pfigGray, anchor=east] at (-1.4,\r*5.5+2.75) {\l};}
-  % --- four coverage panels -------------------------------------------------
-  \covpanel{0}{DuckDB, Polars}{0/0,1/0}{2 of 16}{okOrange}
-  \covpanel{46}{Spark + MLlib}{0/0,1/0,0/1,1/1}{4 of 16}{okVermillion}
-  \covpanel{92}{Ray Data, Daft}{0/0,1/0,0/2,1/2,2/2,3/2,0/3,1/3,2/3,3/3}{10 of 16}{okGreen}
-  \covpanel{138}{\sys{}}{0/0,1/0,2/0,3/0,0/1,1/1,2/1,3/1,0/2,1/2,2/2,3/2,0/3,1/3,2/3,3/3}{16 of 16}{okBlue}
-  % --- what the column letters mean ----------------------------------------
-  \node[font=\tiny, text=pfigGray, anchor=north west] at (0,-9.5)
-    {data shape: \textbf{S}\,structured \quad \textbf{J}\,semi-structured \quad
-     \textbf{U}\,unstructured \quad \textbf{M}\,multimodal};
-\end{tikzpicture}
-\caption{The second fragmentation, and the one that costs teams a second system.
-Engines specialize by \emph{data shape} (columns) and by \emph{workload tier} (rows),
-and the two axes fragment independently, so a job in the cross product needs more
-than one engine. A shaded cell means the group reaches that combination
-\emph{natively, inside one optimized plan}, as characterized in this section; an
-unshaded cell is not a claim that the work is impossible there, only that it leaves
-the engine. \sys{} is the one column that fills the grid, over 30 file and table
-formats and 125 public ML entry points. Shading is deliberately generous to the
-comparators: Daft's relational tier is credited to the Ray Data pair, and every group
-is given the widest reading its documentation supports.}
-\label{fig:coverage}
-\end{figure*}
+\textbf{Operators we can express but cannot yet distribute.} The inequality join is the
+honest case, and it is a live cost rather than a historical one. IEJoin's sweep over a
+sorted union has no mergeable decomposition without the block-pair pruning
+of~\cite{khayyat2015iejoin}, so today the distributed planner executes the operator whole.
+It satisfies single-node $=$ distributed by not distributing, which satisfies the letter of
+the invariant and not its spirit (\cref{sec:limitations}).
 
-\emph{Shifts four and five: the data stopped being representable and the model
-stopped being downstream.} These arrive together and this pillar answers them
-together, because they are the two axes of one grid: the \emph{shape} of the data and
-the \emph{tier} of the model. Both fragmented independently, and a team lands in the
-cross product: a job that reads Parquet and JPEGs, embeds one and joins the other,
-then scores the result with a gradient-boosted tree and an LLM in the same pass.
+\textbf{Algorithms we declined.} A hash join that builds a shared global table across
+workers, and a streaming state backend with tombstones, have no mergeable form we could
+find; the first is why the join build side is replicated rather than shared, and the second
+is why the incremental checkpoint below is restricted to operators whose state never
+shrinks. Neither was added.
 
-Engines specialize by \emph{data shape}. DuckDB and Polars are superb over structured
-columns and have no image or audio surface at all. Ray Data and Daft handle
-multimodal data well, but Ray Data carries no relational optimizer and Daft's is
-rule-only, with no cost model to weigh a decode against the join above it. Spark
-covers structured and semistructured, and its multimodal story is a UDF. They
-specialize by \emph{workload tier} too: classical machine learning in one framework,
-deep-model inference in another, LLM generation in a third, and none of them is the
-system holding the data. A team whose job spans both axes, which describes most
-teams, runs several systems and maintains the glue between them.
+The restriction therefore has concrete costs: one operator class remains undistributed,
+one exact aggregate falls back to a sort, and two implementation strategies were rejected.
+These exclusions define the scope of the design and make the trade-off explicit rather than
+hiding it behind a fallback execution path.
 
-\sys{} reads 30 file and table formats and exposes 125 public ML entry points, from
-generalized linear models through GPU inference to LLM batch generation. The size of
-those numbers matters less than the fact that a single plan spans them:
-\cref{fig:coverage} is a four-by-four grid of data shape against model tier, and one
-optimizer covers all sixteen cells. The claim it supports is a bounded one, though:
-not that no engine can reach any given cell, but that none of the five comparators
-reaches all sixteen \emph{natively, in one plan, under one optimizer}.
+\subsection{Reusing operator state for batch and streaming}
+\label{sec:streaming}
 
-In \sys{}, preparing data for a model is not a different kind of work from querying
-it. Image decode, crop and normalization to a tensor are Arrow kernels in the data
-plane, not a Python UDF. So are audio decode, resampling, mel-spectrogram and MFCC,
-the last two matched to \texttt{torchaudio} within $10^{-6}$ and, across the
-comparator set of \cref{sec:eval}, without an in-engine equivalent anywhere else. So
-are vector distances, embedding pooling and fuzzy string matching. Vector search is a
-plain query. Batch inference runs against pools that load a model once per session
-and reuse it, with CPU decode and GPU compute overlapped so the accelerator is not
-idle while a JPEG is unpacked.
+The constraint that settles the scale split settles this one too, because the mergeable
+triple \emph{is} the incremental form. An aggregate that folds each batch through
+$\mathsf{partial}$ and $\mathsf{combine}$ never reads its whole input, which is exactly
+what a continuous query needs: state that updates per arrival and finalizes on demand. The
+operator a batch query uses and the operator a continuous query needs are not two
+implementations that happen to agree. They are one implementation, and the difference is
+whether anything ever calls $\mathsf{finalize}$.
 
-Epoch shuffling shows concretely what living inside the engine is worth. Permuting a
-training corpus normally means materializing an index of every sample, hundreds of
-gigabytes at ten billion of them, before the first batch is read. \sys{} replaces the
-list with a keyed bijection, a small Feistel network~\cite{luby1988feistel} with
-cycle walking~\cite{black2002ciphers}, so the order is computed, never stored, driver
-memory is constant in corpus size, and a mid-epoch resume is
-arithmetic~\cite{mosaicstreaming}.
+\sys{}'s executor is therefore a streaming executor for \emph{every} query. Operators
+pull small batches through a pipeline and materialize only at breakers, so peak memory
+is the breakers' state plus one batch per worker: a constant, independent of how much
+data arrives. On \sys{}'s own join-heavy q3/q4/q5 shape, same query and same engine, the
+streaming path holds 3.4\,MB at one million rows and 3.3\,MB at four million where the
+materializing path takes 198\,MB and 794\,MB. A bounded Parquet input and an unbounded source can therefore execute the same operator
+implementations under the same per-worker buffering model; long-running state size still
+depends on the admitted operator and is subject to the limitations in \cref{sec:limitations}. The one place an incremental operator still costs something is the checkpoint,
+and the algebra pays there too: recording the \emph{partial} each micro-batch folded in
+is linear where snapshotting the whole state is quadratic in the epoch count, and it is
+sound because a base plus every partial after it \emph{is} the state. We do not claim
+Flink's guarantees~\cite{carbone2015flink}: \sys{}'s streaming is a micro-batch driver,
+and \cref{sec:limitations} states exactly which guarantees that forecloses.
 
-So a retrieval pipeline, read a corpus, strip HTML, chunk, embed, write to a
-lakehouse table, is one plan and one pass over the data. So is a multimodal one: read
-images from object storage, decode and normalize, run a model, join the predictions
-against a customer table, then \texttt{MERGE} into Delta, with the filter that
-removes 90\% of the rows running \emph{before} the decode because one optimizer sees
-both. Others can do each of these things, and Daft in particular has a strong
-multimodal surface; what is unusual is that they are all expressions in one optimized
-plan over one columnar format, under one optimizer and one memory manager.
 
 % ===========================================================================
-% ===========================================================================
-\section{Pillar five: one scheduler across CPU and GPU}
-\label{sec:gpu}
-% ===========================================================================
-
-\emph{Shift six: compute stopped being homogeneous, so utilization became a question
-of overlap.} Run a chain of unlike costs, I/O then CPU decode then a forward pass
-then a CPU join, inside one worker and the accelerator idles through every decode.
-This is the most common reason a GPU pipeline underperforms its hardware, and the
-usual remedy is for the user to hand-tune a ratio of CPU workers to GPU workers per
-stage.
-
-\sys{} treats it as a scheduling problem the engine owns. A plan carrying a
-resource-class boundary is split there: a pool of CPU producers decodes and
-preprocesses, a pool of GPU consumers runs the model, and Arrow batches move between
-them over the same credit-bounded Flight transport the shuffle uses, so the window
-between the stages is bounded and a slow consumer applies backpressure instead of
-accumulating. Both stages run the identical sub-plan through the ordinary executor
-and only the placement differs, which is what keeps the split from becoming a second
-semantics. A chain with no resource boundary to split at falls back to the
-embarrassingly-parallel map, so a homogeneous pipeline pays nothing for the
-mechanism.
-
-Two smaller decisions carry more weight than they appear to. Models load once per
-\emph{session} and are reused across executions, so a pipeline that runs the same
-model twice pays for it once; respawning per execution instead makes model load a
-per-query tax that dominates short jobs. And a GPU is divisible, so several small
-models can be packed onto one device by fractional allocation, none of them
-reserving a whole card. \cref{sec:raydata} reports what this is worth against a
-runtime purpose-built for GPU pipelines: $2$--$3.6\times$, with fractional-GPU
-packing at the bottom of that range. The GPU stages achieving those numbers are relational operators, under
-the same optimizer as the joins around them.
-
-% ===========================================================================
-\section{Pillar six: a Python surface the optimizer can see through}
+\section{Programming model}
 \label{sec:interface}
 % ===========================================================================
 
-\emph{Shift seven: the interface moved to Python, so the escape hatch became the main
-road.} The historical bargain was that SQL is restrictive and therefore optimizable,
-while a user-defined function is expressive and therefore opaque. That bargain fails
-when the practitioner writes Python by default: the natural way to express a
-transformation becomes an opaque per-row callback, which the optimizer cannot
-reorder, cannot push a predicate through, and cannot run anywhere but a Python
-interpreter.
+\begin{figure}[tbp]
+\begin{lstlisting}
+import batcher as bt
 
-\sys{}'s answer has three parts, in order of preference. First, make the UDF
-unnecessary. The public surface is a Python expression API (\texttt{col("x") *
-col("y")}, \texttt{.str.contains(...)}, \texttt{.list.cosine\_similarity(...)},
-\texttt{.image.to\_tensor(...)}, \texttt{.audio.mel\_spectrogram(...)}), and every
-one of those lowers to the same \texttt{bc\_expr::Expr} the SQL front-end produces,
-so it is optimized, JIT-eligible and executed in Rust. Python builds the plan and
-never touches a row. That is what the breadth in \cref{fig:coverage} is for: the
-transformations that would otherwise be UDFs are operators.
+frames = bt.read.images("s3://clips/**/*.jpg")
+cat    = bt.read.parquet("s3://catalog/")
 
-Second, when a callback is genuinely required, make it batch-first. A \sys{} UDF
-receives a whole Arrow \texttt{RecordBatch} and returns one, so the interpreter is
-entered once per sixteen thousand rows, not once per row. A class-based UDF
-keeps its state, whether a loaded model, a tokenizer or a connection, across batches
-and across executions, which is what makes the session-warm pools of \cref{sec:gpu}
-possible at all.
+hot = (frames
+    .filter(bt.col("width") >= 640)     # below the decode
+    .with_columns(t=bt.col("image")
+                    .image.to_tensor(224, 224))
+    .ml.infer("resnet50", column="t",
+              output_column="label")    # a GPU operator
+    .join(cat, on="sku")
+    .group_by("label")                  # mergeable
+    .agg(n=bt.col("sku").count()))
 
-Third, keep SQL. It remains the right language for a relational question, so the same
-engine accepts it through \texttt{bt.sql} and a session catalog, parses it to the same
-\texttt{LogicalPlan}, and puts it through the same 725 rules. Vector search shows the
-two surfaces meeting: \texttt{ORDER BY list\_cosine\_similarity(emb, [...]) LIMIT k}
-is an ordinary SQL query, and it runs the same kernel the Python accessor calls.
-Neither surface wraps the other, because both lower to one plan.
+hot.collect(distributed="auto")         # the only scale knob
+\end{lstlisting}
+\caption{A \sys{} program. Decode, inference, join and aggregation are nodes in one
+logical plan, so the optimizer sees the filter and the decode together and runs the
+cheaper one first; nothing here is a user-defined function, and Python never touches a
+row. The last line is the only place scale appears: \texttt{distributed} changes which
+schedulers of \cref{fig:schedulers} run, not which operators and not the answer.}
+\label{fig:program}
+\end{figure}
 
-\section{Architecture}
+The historical bargain was that SQL is restrictive and therefore optimizable, while a
+user-defined function is expressive and therefore opaque. That bargain fails when the
+practitioner writes Python by default, because the natural way to express a
+transformation becomes a per-row callback the optimizer cannot reorder or push a
+predicate through. \sys{}'s answer has three parts, in order of preference, and
+\cref{fig:program} exercises all three.
+
+First, make the UDF unnecessary. The public surface is a Python \emph{expression} API
+--- \texttt{col("x") * col("y")}, \texttt{.str.contains(...)},
+\texttt{.list.cosine\_similarity(...)}, \texttt{.image.to\_tensor(...)},
+\texttt{.audio.mel\_spectrogram(...)} --- and every one lowers to the same
+\texttt{bc\_expr::Expr} the SQL front-end produces, so it is optimized, JIT-eligible and
+executed in Rust. That is what makes the filter in \cref{fig:program} movable below the
+decode: both are plan nodes with costs, not opaque calls. Second, when a callback is
+genuinely required, make it batch-first: a \sys{} UDF receives a whole Arrow
+\texttt{RecordBatch} and returns one, and a class-based UDF keeps a loaded model or a
+connection across batches and executions, which is what makes session-warm GPU pools
+possible. Third, keep SQL, which parses to the same \texttt{LogicalPlan} and runs the
+same rules and kernels. Neither surface wraps the other, because both lower to one plan.
+
+A \texttt{Dataset} is a lazy, immutable handle to that plan: every operation returns a
+new one and nothing executes until a terminal call, which is what lets the scale
+decision sit on the last line rather than in the constructor. It is the API-level
+statement of \cref{sec:algebra}: the program does not know how many machines will run
+it.
+
+% ===========================================================================
+\section{Measurement-driven optimization}
+\label{sec:learning}
+% ===========================================================================
+
+An engine that cannot price its data or its operators before running can keep inventing
+numbers, which is what a static cost model does, or it can measure itself and plan from
+what it saw. The shared operator implementation gives measurements a stable semantic identity across
+execution modes. In particular, observed cardinalities and result-equivalent strategy outcomes
+can be reused when the same logical operator is later scheduled with a different partition
+count. Runtime cost measurements still depend on the execution environment, but they no longer
+refer to distinct local and distributed implementations. \sys{} uses this history to augment
+static estimates rather than treating shipped constants as the only source of planning
+evidence.
+
+A single rule keeps this safe. \textbf{Every learned value is result-invariant.} Each
+bandit arm emits the same relation, a threshold picks between equivalent algorithms, a
+partition count only shards. Learning changes how much memory a query reserves, when it
+spills, how wide a batch is, and which of several equivalent algorithms runs. It can never
+change the answer, and that is property-tested: a cold store reproduces the untuned engine
+byte for byte, so the worst a stale value can do is cost throughput. This is a deliberately
+different bet from learned optimizers that predict
+plans~\cite{marcus2019neo,marcus2021bao,kipf2019learned}, which change which plan runs in ways
+that are hard to bound. A weaker signal buys a far stronger safety property, and that
+is what lets the feature ship on by default.
+
+\paragraph{Three clocks, not one.} Adaptive query processing usually means one thing:
+re-plan at a stage boundary. \sys{} does that too, and it is the least interesting of the
+three places it adapts.
+
+Two of the clocks run \emph{inside} an operator, at microsecond grain, and both replace
+a number a static model would have to invent with one the operator just observed. A
+conjunctive filter orders its predicates by measured time-per-row over fraction-removed
+rather than by static cost, which matters because cost is not selectivity, and two
+predicates of identical cost where only one is selective is a case a static model cannot
+fix even in principle ($1.86\times$ on the adversarial shape). A parallel aggregate
+chooses between per-morsel hash tables and pre-partitioning by key from the reduction a
+sample of morsels actually achieved rather than from a distinct-count estimate
+($3.7\times$ when grouping reduces nothing). The second matters architecturally rather
+than numerically: pre-partitioning \emph{is} the right-hand panel of
+\cref{fig:schedulers} executed across cores instead of machines, so the high-cardinality
+single-node aggregate is the distributed algorithm chosen at runtime. Refusing to fork
+the operator did not only delete a class of bug; it handed the single-node executor a
+second strategy for free.
+
+The outer two clocks are familiar. At a pipeline breaker the engine re-plans the
+remainder on real cardinalities --- the same mechanism and granularity as Spark
+AQE~\cite{sparkaqe}, and we claim no finer grain, though it runs single-node where AQE
+needs shuffle stages. Across executions the engine accumulates sketches, refits cost
+coefficients and converges bandits, which \cref{sec:eval-learning} measures. Each clock
+reads only what has already been measured, so none is a prediction.
+
+% ===========================================================================
+\section{Multimodal and heterogeneous execution}
+\label{sec:pipeline}
+% ===========================================================================
+
+The second fragmentation is a grid rather than a line: engines specialize by the
+\emph{shape} of the data and by the \emph{tier} of the model, the two axes fragment
+independently, and a team lands in the cross product. The systems evaluated here occupy different points in this design space. DuckDB and Polars
+focus primarily on structured analytical execution; Ray Data and Daft provide multimodal data
+paths; and Spark commonly exposes custom media/model logic through user-defined functions. The
+comparison of interest is therefore not feature count but whether decode and inference are
+visible to the same optimizer that reasons about surrounding relational operators.
+
+\sys{} exposes a broad set of source formats and ML operations, from classical models through
+GPU inference and LLM batch generation. The relevant design property is not the number of API
+entry points but that a single logical plan can span them, because preparing
+data for a model is not a different kind of work from querying it. Image decode, crop
+and normalization to a tensor are Arrow kernels in the data plane, not a Python UDF, and
+so are audio decode, resampling, mel-spectrogram and MFCC --- the last two matched to
+\texttt{torchaudio} within $10^{-6}$ and, across the comparator set of \cref{sec:eval},
+without an in-engine equivalent anywhere else. So are vector distances and embedding
+pooling. Two measurements bound what that is worth on the axis both sides run natively:
+against Ray Data's \texttt{read\_images} over the same corpus \sys{} decodes
+$6.4$--$6.6\times$ faster, entirely the difference between an engine expression and a
+per-batch Python UDF, and against Daft on the shared ingest path it leads by
+$1.9\times$, rising to $5.7\times$ on a pass Daft expresses as a per-row callback.
+
+\paragraph{One scheduler across CPU and GPU.}
+\label{sec:gpu}
+Run a chain of unlike costs --- I/O, then CPU decode, then a forward pass, then a CPU
+join --- inside one worker and the accelerator idles through every decode; the usual
+remedy is for the user to hand-tune a ratio of CPU workers to GPU workers, per stage.
+\sys{} treats it as a scheduling problem the engine owns: a plan carrying a resource-
+class boundary is split there, a pool of CPU producers decodes and preprocesses, a pool
+of GPU consumers runs the model, and Arrow batches move between them over the same
+credit-bounded Arrow Flight~\cite{arrowflight} transport the shuffle uses, so a slow
+consumer applies backpressure instead of accumulating. Both stages run the identical
+sub-plan through the ordinary executor; only the placement differs, which is what keeps
+the split from becoming a second semantics.
+
+Ray Data's streaming batch model~\cite{luan2025streamingbatch} attacks the same problem
+and is the work to compare against rather than the baseline to beat. Making the
+\emph{partition} the unit of execution buys it elasticity and partition-level fault
+tolerance, neither of which \sys{} has. What \sys{} buys instead is what that model does
+not attempt: both stages are the \emph{same relational plan} under the \emph{same cost
+model} as the joins around them, so the optimizer can push a filter below a decode
+because it sees both. The comparison is therefore a trade-off rather than an unqualified win, and
+\cref{sec:eval-dist} measures the half we are weaker on.
+
+% ===========================================================================
+\section{System architecture}
 \label{sec:arch}
 % ===========================================================================
 
 \begin{figure}[tbp]
 \centering
 \begin{tikzpicture}
-  \node[pfig/io,  minimum width=30mm] (user) at (0,2.55) {Python API / SQL};
-  \node[pfig/box, minimum width=58mm] (plan) at (0,1.75)
+  \node[pfig/io,  minimum width=32mm] (user) at (0,2.7) {Python API / SQL};
+  \node[pfig/box, minimum width=56mm] (plan) at (0,1.85)
         {\texttt{plan}: LogicalPlan, Expr, JSON IR};
-  \node[pfig/alt, minimum width=17mm] (ky) at (-1.95,0.75) {\kyber{}\\\scriptsize\emph{decides}};
-  \node[pfig/alt, minimum width=17mm] (ca) at ( 0.00,0.75) {\carbo{}\\\scriptsize\emph{protects}};
-  \node[pfig/alt, minimum width=17mm] (co) at ( 1.95,0.75) {Core\\\scriptsize\emph{measures}};
-  \node[pfig/store, minimum width=15mm] (hub) at (-1.95,-0.55) {\scriptsize Metadata Hub};
-  \node[pfig/new,  minimum width=58mm] (rust) at (0,-1.75)
+  \node[pfig/alt, minimum width=17mm] (ky) at (-1.90,0.80) {\kyber{}\\\scriptsize\emph{decides}};
+  \node[pfig/alt, minimum width=17mm] (ca) at ( 0.00,0.80) {\carbo{}\\\scriptsize\emph{protects}};
+  \node[pfig/alt, minimum width=17mm] (co) at ( 1.90,0.80) {Core\\\scriptsize\emph{measures}};
+  \node[pfig/store, minimum width=16mm] (hub) at (-1.90,-0.75) {\scriptsize Metadata Hub};
+  \node[pfig/new,  minimum width=56mm] (rust) at (0,-2.15)
         {Rust data plane over Arrow\\[1pt]\scriptsize\mdseries \pcf{} in \texttt{bc-runtime}};
 
   \draw[pfig/arrow] (user) -- (plan);
   \draw[pfig/arrow] (plan.south -| ky.north) -- (ky.north);
   \draw[pfig/arrow] (ky) -- node[pfig/label]{\scriptsize cost} (ca);
   \draw[pfig/arrow] (ca) -- node[pfig/label]{\scriptsize credits} (co);
-  \draw[pfig/arrow] (co.south) to[out=270,in=0]
-        node[pfig/label,pos=0.55]{\scriptsize JSON IR $\downarrow$ \, Arrow $\uparrow$} (rust.east);
+  \draw[<->, line width=0.8pt, draw=pfigGray, >=stealth] (co.south) -- (co.south |- rust.north);
   % The learning loop is the contribution, so it carries the accent, not the
   % routine cost/credit hand-offs above it.
-  \draw[pfig/arrowNew] (co.south west) to[out=250,in=0]
-        node[pfig/label,pos=0.65]{\scriptsize\bfseries measured} (hub.east);
+  \draw[pfig/arrowNew] (co.south) ++(0,-0.35) -- ++(0,0) -- (hub.east)
+        node[pfig/label, pos=0.5, below]{\scriptsize\bfseries measured};
   \draw[pfig/arrowNew] (hub.north) --
         node[pfig/label]{\scriptsize\bfseries learned} (ky.south);
   \begin{scope}[on background layer]
@@ -684,699 +668,714 @@ Neither surface wraps the other, because both lower to one plan.
     \node[pfig/lane, fit=(rust)] {};
   \end{scope}
 \end{tikzpicture}
-\caption{The contract loop. Python builds and optimizes a plan and ships it as JSON
-IR; all per-row work happens in Rust over Arrow and returns zero-copy. Core
-\emph{measures}, \kyber{} \emph{decides}, \carbo{} \emph{protects}, and the three
-cannot import one another, enforced on every commit. The highlighted path is the one
-the other engines do not have: what execution measured is what the next plan is built
-from, so a query gets cheaper the second time it runs.}
+\caption{The contract loop. Python builds and optimizes a plan and ships it down as JSON
+IR; all per-row work happens in Rust over Arrow and comes back zero-copy, which is the
+grey double arrow. Core \emph{measures}, \kyber{} \emph{decides}, \carbo{} \emph{protects},
+and the three cannot import one another, enforced on every commit. The blue path is the one
+the other engines do not have: what execution measured is what the next plan is built from,
+so a query gets cheaper the second time it runs.}
 \label{fig:arch}
 \end{figure}
 
 \sys{} is a Python control plane over a Rust data plane, with Arrow
-\texttt{RecordBatch} the only columnar contract at every internal boundary and across
-the FFI: roughly 100{,}000 lines of Rust across 13 crates and 233{,}000 of Python.
-Python builds a plan, optimizes it, and ships it as JSON; data returns zero-copy
-through the Arrow C Data Interface, and Python never iterates a row.
+\texttt{RecordBatch}~\cite{arrow} the only columnar contract at every internal boundary
+and across the FFI. Python builds a plan, optimizes it and ships it down as JSON; data
+returns zero-copy through the Arrow C Data Interface, and Python never iterates a row.
+That boundary is what makes a Python surface affordable: the control plane's cost is per
+\emph{query}, so seven phases of rules iterated to a fixpoint cost single-digit
+milliseconds because nothing in them is per-row (\cref{sec:smallquery}).
 
-The three subsystems in \cref{fig:arch} are isolated by a lint contract that forbids
-them importing one another. The rule reads as bureaucratic until you see what it
-prevents: an optimizer pass that starts collecting its own telemetry, or an executor
-path that starts making optimization decisions, will compile and pass every test
-while silently corrupting the feedback loop the design depends on. Two execution
-tiers likewise share one expression type: an interpreter that is the correctness
-oracle, and a compiled fast path that must be bit-for-bit identical on the subset it
-supports and fall back silently otherwise. A divergence there, one tier wrapping an
-integer overflow where the other raises, is invisible in any single result, because
-which tier ran depends only on whether the expression happened to compile.
+Three structural rules do the load-bearing work, and each exists because its violation
+is silent. \emph{The subsystems may not import one another.} \kyber{} decides, \carbo{}
+protects, Core measures, and a lint contract forbids any edge between them, which reads
+as bureaucratic until you see what it prevents: an optimizer pass that starts collecting
+its own telemetry, or an executor path that starts making optimization decisions,
+compiles and passes every test while quietly corrupting the feedback loop the design
+depends on. The only sound edge is the one through the Metadata Hub in \cref{fig:arch},
+and it is directed --- measurements flow out of execution into planning, never back.
+\emph{One expression type serves every execution tier.} An interpreter is the
+correctness oracle and a Cranelift~\cite{cranelift} compiled fast
+path~\cite{neumann2011compiling} consumes the \emph{same} expression, so it must be bit-
+for-bit identical on the subset it supports and fall back silently otherwise; a
+divergence --- one tier wrapping an integer overflow where the other raises --- is
+invisible in any single result, because which tier ran depends only on whether the
+expression happened to compile. \emph{The crate dependency graph points one way}, from
+the Arrow layer up through one expression type and one relational plan type to the
+interpreter, so a new backend cannot introduce a second definition of what a plan node
+means. Underneath all three the executor pulls small batches through linear runs of
+operators and materializes only at pipeline breakers~\cite{leis2014morsel} --- which is
+exactly where the middle clock of \cref{sec:learning} re-plans.
 
-% ===========================================================================
-\section{How \sys{} compares}
-\label{sec:differs}
-% ===========================================================================
-
-\begin{table*}[tbp]
-\centering\small
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{lllllll}
-\toprule
- & \textbf{\sys{}} & DuckDB & Polars & Spark & Ray Data & Daft \\
-\midrule
-Single-node / distributed & \win one algebra & single-node & single-node & two paths & two paths & two paths \\
-Optimizer & \win 725 rules, bushy DP & rules + DP & rules & Catalyst & n/a & rules \\
-Cardinality from & \win sketches + measured & table stats & estimates & table stats & n/a & estimates \\
-Cost model & \win refit from runtime & static & static & static & n/a & static \\
-Physical strategy & \win bandit over past runs & heuristic & heuristic & heuristic & n/a & heuristic \\
-Memory sizing & \win learned per-row & static & static & static & static & static \\
-Re-optimizes mid-query & stage boundary & \loss no & \loss no & stage boundary (AQE) & n/a & \loss no \\
-In-engine audio / mel & \win native kernels & \loss none & \loss none & \loss none & UDF & UDF \\
-Vector search in SQL & \win yes & \loss no & \loss no & \loss no & n/a & \loss no \\
-GPU batch inference & warm pools & \loss none & \loss none & external & actor pools & actor pools \\
-\bottomrule
-\end{tabular}
-\caption{\sys{}'s competitive set is DuckDB, Daft and Spark; Polars and Ray Data
-bracket the space, the latter an adjacent streaming ML runtime and not a relational
-engine, so its relational rows read n/a. Blue marks a capability no other column has,
-amber its absence. The decisive block is the middle: every input to a planning
-decision derived from a measured run rather than shipped as a constant. No other
-engine here has that, and \cref{sec:algebra}'s single algebra is what makes it sound,
-by making a measurement taken on one core valid on ninety-six.}
-\label{tab:differs}
-\end{table*}
-
-DuckDB, Daft and Spark set the bar \sys{} is measured against, with Polars and Ray
-Data bracketing the space. \textbf{DuckDB}~\cite{raasveldt2019duckdb} is
-the single-node bar: vectorized,
-a compressed native store with zone maps, optimized once before execution, and it
-does not distribute. \textbf{Spark}~\cite{zaharia2012rdd,armbrust2015sparksql}
-distributes, and its Adaptive Query Execution~\cite{sparkaqe} re-plans on measured
-statistics at stage boundaries, but its unit of movement is a row-shuffle over JVM
-serialization and its fixed per-query cost is large. \textbf{Ray
-Data}~\cite{raydata}, on Ray~\cite{moritz2018ray}, is a streaming runtime for ML
-pipelines with actor pools for GPU work and no relational optimizer. We benchmark
-against it throughout, because a data engine claiming to serve AI workloads should be
-held to the standard of the runtime those workloads use today; it is a yardstick
-rather than a rival. \textbf{Daft}~\cite{daft} and \textbf{Polars}~\cite{polars} are
-native Rust engines over Arrow~\cite{arrow}, and Daft distributes over Ray.
-
-\cref{tab:differs} places \sys{} against all of them, and the pattern in it is the
-paper's thesis in tabular form. \sys{} does not lead because its kernels are faster
-than everyone else's; on several rows it is at parity, and on storage --- a compressed,
-dictionary-encoded, zone-mapped format, which \cref{sec:algebra}'s Arrow-only contract
-forecloses --- it is behind, which \cref{sec:eval} shows is where every remaining
-relational loss lives.
-It leads where the previous generation shipped a constant and \sys{} ships a
-measurement, and where the previous generation required a second system.
-
-\paragraph{What we took from Spark, and where we depart.} Spark's authors got the
-hard parts right, and several of its ideas are still doing work here: treating a
-streaming query as a batch query over an unbounded table, re-planning once real
-cardinalities are known, and compiling inner loops instead of interpreting them.
-None of those were mistakes; they were right for the hardware of the time.
-
-The sharpest departure is the unit of movement. Spark moves rows through JVM
-serialization, which was reasonable when no ecosystem agreed on a columnar format,
-and Arrow settled that. \sys{} moves columnar batches with no serialization step: the
-memory one operator wrote is the memory the next one reads, and the boundary to
-Python is a pointer handoff. This is the largest single source of the gap in
-\cref{tab:tpch}, and it is an ecosystem change more than an engineering one. The
-other two follow from shifts already argued. Spark's fixed per-query overhead buys
-fault tolerance and elasticity that matter above a certain size, but its local and
-distributed paths are the same path, so unlike \sys{} it has no choice to make below
-that size. And Catalyst optimizes from catalog statistics with AQE correcting at
-shuffles, which \sys{} keeps and brackets with a clock on either side
-(\cref{sec:timescales}); the outer one has no Spark equivalent.
-
-\section{\kyber{}: an optimizer that learns}
+\paragraph{\kyber{}, the optimizer.}
 \label{sec:kyber}
-% ===========================================================================
+\kyber{} is a fixed sequence of phases over the plan, and the architecturally
+interesting property is not the rule count (726 at the commit these results were taken
+on) but the \emph{ordering of evidence}. Estimation starts from Selinger-style
+selectivities~\cite{selinger1979access} and is superseded, in a fixed order, by exact
+file footer metadata, then by sketches built during execution
+(HyperLogLog~\cite{flajolet2007hyperloglog}, KLL~\cite{karnin2016kll}, Count-
+Min~\cite{cormode2005countmin}), then by measured cardinalities filed under a plan
+signature, with a bandit~\cite{auer2002ucb} over result-equivalent physical strategies
+on top. Every sketch is mergeable under a fixed seed, so one built per partition merges
+identically to one built on a single node --- \cref{sec:algebra}'s algebra applied to
+statistics, and the reason a distributed run's evidence is admissible to a single-node
+plan. Every number also carries \emph{where it came from}, because two rewrites can
+corrupt a result rather than merely slow one and are gated on exact provenance, while
+everything else may consume an estimate whose worst outcome is a slower plan. A
+generator holds the rule set to result-preservation, and the suite carries a second
+obligation this design introduces: a learned component can be entirely \emph{inert}
+while every answer stays correct, so a test must assert that the learning happened and
+not only that the answer did.
 
-
-\subsection{725 rules, and what makes them safe}
-
-Seven phases run in a fixed order. The rewrite phases iterate to a fixpoint because
-their rules are confluent; the cost-based and physical phases run once, because they
-make a decision and do not converge to one. Measured evidence enters at three of
-them: cardinality drives join ordering, refit cost coefficients drive fusion, and a
-bandit drives the physical selection.
-
-A rule set this size is safe only if each rule preserves results and no two
-interfere, and \kyber{} proves both mechanically. Each rule carries a plan-shape unit
-test and a differential test against DuckDB across nulls, empties and the type edges,
-and the set as a whole is property-tested: a generator builds a random table and a
-random valid pipeline and asserts that the result under all 725 rules equals the
-result under none. The same suite proves confluence and termination, so the rules
-provably do not oscillate.
-
-\paragraph{Provenance gates the dangerous rules.}
-\label{sec:provenance}
-Every cardinality and column statistic carries \emph{where it came from}, and the two
-rule families that can corrupt a result rather than merely slow one, dropping a
-\texttt{Distinct} over a column proven unique and folding a subtree proven empty,
-fire only on \texttt{EXACT} provenance. A sketch estimate may never drive either,
-because dropping a \texttt{Distinct} on a wrong guess returns quickly, with duplicate
-rows, and nothing turns red. Everything else may consume an estimate, because the
-worst outcome there is a slower plan.
-
-Provenance says where a number came from and nothing about whether it was
-\emph{right}, which is a boundary easy to cross by accident: the gate deciding
-whether a query pays for stage-by-stage re-optimization used the label as a proxy for
-``we do not know this size,'' so a shape estimated to within a percent of actual
-still read as a guess. It now asks the evidence instead, treating a shape as
-confidently sized when its recorded history of predicted-against-actual rows stayed
-inside the re-optimization threshold every time. Over the 22 TPC-H queries,
-\textbf{15 of 22 routed to staging on a cold hub, and 0 once their estimates had
-demonstrably held up}, while all 15 still route to staging when the recorded history
-shows the estimates missing.
-
-\subsection{Cardinality and cost, from four sources}
-
-Estimation starts from Selinger-style selectivities~\cite{selinger1979access} and is
-superseded in fixed order by exact footer metadata, then by sketches built during
-execution (HyperLogLog~\cite{flajolet2007hyperloglog} for distinct counts,
-KLL~\cite{karnin2016kll} for quantiles), then by measured cardinalities recorded
-under a plan signature. Every sketch is mergeable with a fixed seed, so one built per
-partition merges identically to one built on a single node: the algebra of
-\cref{sec:algebra} applied to statistics.
-
-Getting this wrong is expensive in a specific way. TPC-H's
-\texttt{orders.o\_orderkey} carries no distinct count in any file footer, and without
-one the join estimator assumes a primary-key relationship, which is right for a
-fact-to-dimension join and catastrophic for a many-to-many key. At sf10 that priced
-one join at 1.5 million rows where the true output is about six billion, and the
-executor set about materializing it, passing 110\,GB resident. \kyber{} now measures
-the distinct count before the optimize that fixes join order for the whole query;
-seeded, the planner picks the order DuckDB picks, and that query falls from
-$8.81\times$ to $3.95\times$ of DuckDB. Cost itself collapses CPU, I/O and network to
-one scalar, with per-operator coefficients \emph{recalibrated from measured operator
-times}, and join ordering is dynamic programming over \emph{bushy} plans throughout.
-
-\subsection{Two learned primitives, and one testing obligation}
-\label{sec:kyber-learned}
-
-All of \kyber{}'s self-tuning reduces to two reusable pieces, both keyed by plan
-signature and scoped to the host's hardware profile, so a value learned on a 16-core
-laptop never steers a 96-core planner. A \textbf{deterministic UCB1
-bandit}~\cite{auer2002ucb} selects over a fixed arm set from measured per-arm
-latencies, driving the join-strategy choice and the staged-versus-one-shot routing
-decision above; there is no RNG, because a nondeterministic optimizer makes every
-performance regression unfalsifiable. An \textbf{OLS two-line crossover} learns a
-\emph{threshold} where the bandit learns a choice, solving for the build size at
-which the cheaper-below algorithm is overtaken. Both inherit the result-invariance of
-\cref{sec:learning-intro}, and every read is best-effort: a missing or malformed key
-yields the shipped default and never an exception into planning.
-
-\paragraph{What a learning loop has to test.}
-\label{sec:kyber-defects}
-A learned component can be entirely inert while every result stays correct, and that
-asymmetry is the one genuinely new hazard this design introduces. Three defects here
-had that shape, each producing right answers at every scale while the mechanism that
-makes plans improve did nothing at all; fixing one took an sf10 query's steady state
-from $\sim$340\,ms to $\sim$165\,ms. A learning system therefore needs assertions
-that \emph{the learning happened}, because a correctness suite passes identically
-whether the loop is running or switched off.
-
-% ===========================================================================
-\section{\carbo{}: resource decisions from measured footprints}
+\paragraph{\carbo{}, the resource manager.}
 \label{sec:carbonite}
-% ===========================================================================
+\carbo{} decides whether a plan is feasible, hands out memory reservations and shuffle
+credits, and decides when a query goes out of core; it never rewrites a plan and never
+computes a result, and that restriction dictates its interface. Conventional admission
+control answers a boolean, which is useless to a planner because it names no smaller
+thing to try, so \carbo{} returns the binding constraint, the \emph{operator} that
+binds, and a counter-offer \kyber{} can re-plan around --- precisely because the layer
+that may rewrite the plan is not this one. Flow control is credit-based, one credit
+being one in-flight batch slot, so a channel's window is a direct bound on its memory
+rather than an estimate of it, and the same transport carries the shuffle and the CPU-
+to-GPU hand-off of \cref{sec:gpu}. Bulk data never enters the Ray object store, which is
+what keeps distribution a scheduling concern rather than a serialization one.
 
-\carbo{} decides whether a plan is feasible, hands out memory reservations and
-shuffle credits, and decides when a query goes out of core. It never rewrites a plan
-and never computes a result.
-
-\subsection{Admission, and a memory model that is a ratio}
-
-Conventional admission control answers a boolean: does this plan fit? A rejection is
-useless to a planner, because it names no smaller thing to try. \carbo{} returns the
-binding constraint \emph{and} a counter-offer, a smaller credit window or a lower
-parallelism, that \kyber{} can re-plan around, and it names the \emph{operator} that
-binds, not the resource that ran out. This follows from the subsystem split:
-because \carbo{} may not rewrite the plan, the only useful thing it can return is
-enough information for the layer that may.
-
-Sizing used to come from the plan estimate alone, never from what operators actually
-used, and two of the choices in fixing that are forced, not tuned. Fit a
-per-input-row \emph{ratio} and not an absolute peak, because a family's absolute peak
-depends on query size while a bytes-per-row figure multiplies by this plan's
-estimated input rows; it is the same reason the cardinality layer learns selectivity
-and not a row count. And fit the 80th percentile and not the median, because memory
-sizing is one-sided: over-provisioning costs a little headroom, under-provisioning
-costs the process. A cold store is a pass-through, so a first run is byte-for-byte
-the pre-learning behavior.
-
-\subsection{Credits, spill, and transport}
-
-Flow control is credit-based: one credit is one in-flight batch slot, and a producer
-blocks at zero, so a channel's window is a direct bound on its memory. A recurring
-shuffle warm-starts from the window past runs converged on, and because learning
-moves only the starting point, a stale value costs a few round trips of convergence
-and never correctness.
-
-One spill property deserves separating out, because nothing accounted for it.
-Published shuffle output is memory nobody was reserving: a mapper hands a bucket to
-the node's transport layer and it stays resident until a reducer collects it, so with
-as many mappers as reducers a node holds its whole share of the shuffle against no
-reservation. It is now reserved, and deliberately the pool's \emph{first} spill
-victim, because a published bucket is finished work waiting to be collected.
-
-Bulk data never enters the Ray object store; it moves over Arrow
-Flight~\cite{arrowflight}, with a reducer's sources tiered automatically by locality.
-An eight-producer gather runs at 33.6\,GB/s over shared memory against 4.5\,GB/s over
-loopback, and a miss falls back transparently, so single-node equals distributed
-regardless.
-
-% ===========================================================================
-\section{Execution: six operator results and two proofs}
-\label{sec:mechanisms}
-% ===========================================================================
-
-
-The executor pulls small batches through linear runs of operators and materializes
-only at pipeline breakers, in the style of morsel-driven
-parallelism~\cite{leis2014morsel}. Six operator-level results came out of that model,
-each verified against the sequential oracle before it was timed: a short-circuiting
-conjunctive filter (1.5--5.7$\times$), a parallel \texttt{UNION ALL}
-(up to $24.5\times$), a runtime filter sunk across joins (1.9$\times$), a
-deterministic parallel join map (1.8$\times$), a bounded join fan-out ($18\times$ less
-memory), and a real inequality-join operator (up to $900\times$). Individually they are
-unremarkable. Three points about them are not.
-
-\paragraph{The union result is a lesson about where parallelism is lost.} A
-\texttt{UNION ALL}'s branches are independent, so a serial loop over them looks like it
-forfeits only their overlap --- a bounded factor equal to the branch count. It forfeits
-much more. A union root has no single driving relation to slice, so the whole query
-declines to shard and \emph{every branch also loses its own internal parallelism}.
-Measured on TPC-DS q22's five grouping levels over a three-table join, one level alone
-runs at $63.6$ cores in $106$\,ms while the five unioned ran at $5.8$ cores in
-$2{,}624$\,ms --- the same $15.1$\,s of CPU spread over a ninth of the machine, and
-$8\times$ the sum of the parts. Running the branches across the pool takes q22 from
-$5{,}036$\,ms to $206$\,ms ($24.5\times$), q18 $11.2\times$ and q14 $6.2\times$, and
-moves TPC-DS from $1.57\times$ to $1.28\times$ DuckDB's geometric mean. The general
-form of the lesson is that a plan-shape predicate which disables sharding costs the
-subtree's parallelism, not just the node's.
-
-\paragraph{Two rewrites that are correct by construction.} Most optimizations are
-justified by testing: apply the fast path, compare against the slow one, ship it when
-the tests pass. Two here rest on an argument instead, one short-circuiting a
-conjunctive filter by compacting rather than masking, the other comparing
-dictionary-encoded columns without decoding them. Both are bit-identical for reasons
-statable in a sentence, which is a stronger guarantee than a passing test suite and
-is what lets them live inside the correctness oracle instead of beside it.
-
-\paragraph{The memory bound is asserted, not assumed.} Every operator that preserves
-or reduces rows satisfies ``one batch in, one batch out'' for free, so
-\cref{sec:streaming}'s constant-memory bound is immediate for almost all of them. A
-join that \emph{multiplies} rows is the exception: a skewed key can turn each probe
-row into thousands of output rows, so the operator bounds both its output batches and
-the index arrays that describe them. On a query where the unbounded version peaked at
-13.1\,GB, that holds peak memory to 728\,MB, an $18\times$ reduction that also cuts
-runtime threefold with identical results. A correctness suite cannot observe a memory
-property, so a memory guarantee that is not asserted is not tested.
-
-\paragraph{Where the algebra charges rent.} Inequality joins used to lower to a
-cartesian product with a filter above it, quadratic in time and memory however few
-rows survive. They are now a real operator implementing
-IEJoin~\cite{khayyat2015iejoin}: a case that took 3.4 seconds at ten thousand rows
-now takes under four milliseconds, and cases that did not run at all now do. IEJoin
-is also more general than most inequality joins need, so a \emph{band}, \texttt{r.y
-BETWEEN l.a AND l.b}, and with it interval containment, temporal overlap and range
-lookup, earns an operator of its own: constraining one key from both sides makes the
-matches a contiguous slice, and one merge replaces a search per row. Measured against
-DuckDB reading its own store and correctness-gated at every size, the ratio at
-500\,K/1\,M/2\,M/5\,M rows per side moves from $0.69/0.98/1.29/2.24\times$ to
-$0.49/0.55/0.64/0.94\times$: a $2.2\times$ loss at the top end becomes parity, and
-the smaller sizes become $1.6$--$2.0\times$ wins.
+\paragraph{How \sys{} compares.}
+\label{sec:differs}
+\textbf{DuckDB}~\cite{raasveldt2019duckdb} is the single-node bar: vectorized in the
+MonetDB/X100 lineage~\cite{boncz2005monetdb}, a compressed native store with zone maps,
+optimized once before execution, and it does not distribute.
+\textbf{Spark}~\cite{zaharia2012rdd,armbrust2015sparksql} distributes, and its Adaptive
+Query Execution~\cite{sparkaqe} re-plans on measured statistics at stage boundaries.
+\textbf{Ray Data}~\cite{luan2025streamingbatch}, on Ray~\cite{moritz2018ray}, is a
+streaming batch runtime for ML pipelines with actor pools for GPU work and no relational
+optimizer; we benchmark against it throughout because a data engine claiming to serve AI
+workloads should be held to the standard of the runtime those workloads use today, which
+makes it a yardstick rather than a rival. \textbf{Daft}~\cite{daft} and
+\textbf{Polars}~\cite{polars} are native Rust engines over Arrow~\cite{arrow}. \sys{}
+does not lead because its kernels are faster than everyone else's; on several axes it is
+at parity, and on storage it is behind, because a compressed, dictionary-encoded, zone-
+mapped format is exactly what \cref{sec:algebra}'s Arrow-only contract forecloses. Its main architectural distinction in this comparison is the cross-execution measurement
+loop: cardinalities, cost coefficients, physical-strategy outcomes, and memory observations
+from prior executions can feed later planning decisions. A further difference is the internal data path. \sys{} keeps Arrow-compatible columnar
+batches across its operator boundaries, avoiding a format conversion at those boundaries. The
+Spark configuration evaluated here carries a substantially higher fixed per-query cost
+(\cref{tab:tpch}); this experiment does not isolate how much of that difference comes from
+serialization, scheduling, the JVM execution stack, or local-mode overhead, so we do not
+attribute the full gap to any one mechanism.
 
 % ===========================================================================
 \section{Evaluation}
 \label{sec:eval}
 % ===========================================================================
 
-\begin{table*}[tbp]
-\centering\small
-\begin{tabular}{lrrcrrl}
-\toprule
-& \multicolumn{2}{c}{\textbf{sf1}} & & \multicolumn{2}{c}{\textbf{sf10}} & \\
-\cmidrule(lr){2-3}\cmidrule(lr){5-6}
-Baseline & geomean $b/x$ & wins & & geomean $b/x$ & wins & Note \\
-\midrule
-DuckDB (native compressed store) & \win \textbf{0.79}$\times$ & \win 16/22 & & \loss 1.29$\times$ & \loss 8/22 & compressed store \\
-DuckDB (same Arrow input)        & \win \textbf{0.26}$\times$ & \win \textbf{22/22} & & --- & --- & like-for-like$^*$ \\
-Polars~\cite{polars}             & \win \textbf{0.43}$\times$ & \win 21/22 & & \win \textbf{0.37}$\times$ & \win 18/22 & \\
-Daft~\cite{daft}                 & \win \textbf{0.35}$\times$ & \win \textbf{20/20} & & \win \textbf{0.42}$\times$ & \win 16/20 & wrong answers on q6, q15$^\dagger$ \\
-Spark~\cite{armbrust2015sparksql}& 0.041$\times$ & 22/22 & & 0.074$\times$ & 22/22 & reads Parquet in timed region$^\ddagger$ \\
-
-\bottomrule
-\end{tabular}
-\caption{TPC-H, all 22 queries, correctness-gated, one 96-core node. $b/x$ is
-$\text{\sys{}}_{ms}/x_{ms}$: \textbf{below 1.00 means \sys{} is faster.} Suite
-totals (ms), sf1 / sf10: \sys{} 472 / 3{,}707; DuckDB 594 / 2{,}038; Polars
-1{,}173 / 9{,}914; Daft 1{,}152 / 8{,}680; Spark 14{,}555 / 57{,}781.
-$^*$DuckDB executing the same zero-copy Arrow \sys{} is given, not a compressed store it
-was allowed to build first; sf1 472 vs 1{,}632\,ms. It is not reported at sf10: over Arrow
-views DuckDB's planner has no storage statistics to order a many-way join with, and it was
-\emph{SIGKILL}ed on TPC-DS q64 and still growing past 22\,GiB on q72 for the same reason.
-Both arms must be timed on an otherwise idle machine: DuckDB-on-Arrow
-degrades far more than \sys{} under CPU contention, and a run sharing the box with a
-test suite inflated this ratio by roughly ten times (q17 read 1{,}033\,ms against 83\,ms
-idle) --- an error in \sys{}'s favour, which is the direction that gets published.
-$^\dagger$Daft covers the 20 queries it can express; \sys{} agrees with DuckDB on 22
-of 22 at both scales. $^\ddagger$Spark reads Parquet inside the timed region where
-the other four receive an in-memory Arrow handle, so its ratio is overstated. Ray
-Data is evaluated in \cref{sec:raydata} instead.}
-\label{tab:tpch}
-\end{table*}
-
-\paragraph{Setup.} One Intel Xeon Platinum 8275CL at 3.00\,GHz, 96 vCPU, 184\,GiB,
-Linux 6.8; distributed results on an 8-node Ray cluster, 128 vCPU; GPU results on
-8$\times$T4. DuckDB 1.5.5, Polars 1.36.1, Daft 0.7.21, Ray 2.56.0, PySpark 4.2.0,
-PyArrow 19.0.1. The harness refuses to report a timing for any query whose result
-does not match DuckDB, compared as an order-independent multiset, and timings are
-best-of-$N$ warm. Two measurement hazards deserve naming. A shared machine is not a
-benchmark machine: at load average 16--41 a repeated run swung $\pm$25\%, so claims
-moving less than $2\times$ are quoted from a run at load under 5. And an in-place
-rebuild of the compiled extension silently replaces the engine mid-benchmark, so we
-stamp its timestamp around every run and discard any run in which it moved.
-
-\subsection{Does the algebra remove the fork?}
-
-The central claim is architectural, so its evidence is a testing argument.
-\cref{eq:merge} is property-tested over random partitionings; an integration test
-asserts single-node equals multi-partition; and an operator matrix crosses
-$\{$collect, spill, iterate, distributed$\}$ with $\{$nulls, empty, one row,
-duplicates, $-0.0$/NaN, descending$\}$, because the defects that reach production
-here are combinations of a non-default flag with a non-default path.
-
-\subsection{TPC-H}
-
-\cref{tab:tpch} is the headline, and the line it splits along has moved. Against
-Polars and Daft, \sys{} leads by $2.3$--$2.9\times$ in geometric mean at both scales,
-and against DuckDB on identical Arrow input it wins \emph{every} query at sf1 by
-$3.9\times$ overall. The result that changed is the third one: \sys{} now also leads
-DuckDB's \emph{compressed native store} at sf1, $0.79\times$ on 16 of 22 queries,
-where an earlier build of this system read $1.02\times$ on 12 of 22. That comparison
-gives DuckDB an untimed ingest into a compressed, dictionary-encoded, zone-mapped
-format and \sys{} nothing but raw Arrow, so it is a storage engine \emph{and} an
-execution engine against an execution engine alone --- and it is the bar this paper
-previously conceded.
-
-It is conceded at sf10, where the same comparison reads $1.29\times$. That boundary is
-worth locating rather than bracketing, because it is not a uniform degradation. Going
-from sf1 to sf10 --- ten times the rows --- nine of thirteen measured shapes cost
-\emph{less} than ten times as much: q15 $1.4\times$, q22 $2.3\times$, q6 $5.2\times$,
-q10 $5.4\times$, q1 and q8 $6.0\times$, q7 $6.5\times$, q3 $7.3\times$, q21
-$7.4\times$. Four are superlinear and carry the loss between them: q5 ($14.9\times$),
-q13 ($12.7\times$), q18 ($12.5\times$) and q9 ($11.2\times$), which are the two
-highest-cardinality group-bys in the benchmark, its largest intermediate, and its
-six-way join. The gap at scale is those four shapes plus a compressed scan, not a
-uniformly slower engine.
-
-Correctness is not free for everyone. Daft gets TPC-H q6 wrong at both scales,
-dropping the \texttt{l\_discount = 0.07} rows because $0.06+0.01$ in IEEE double is
-$0.06999999999999999$; it also returns an empty q15 and cannot run q21 or q22, and
-Polars cannot parse eight of the 99 TPC-DS queries. Ground truth computed
-independently in PyArrow equals the official answer. Hence the gate on every timing,
-and the reporting of such a case as incomparable rather than as a win: a benchmark
-that does not check results reports the fastest wrong answer.
-
-\subsection{Operator mix and ClickBench}
-
 \begin{table}[tbp]
 \centering\footnotesize
-\setlength{\tabcolsep}{3.2pt}
-\begin{tabular}{lrrrrr}
+\setlength{\tabcolsep}{3.4pt}
+\begin{tabular}{lrrrr}
 \toprule
-& \multicolumn{2}{c}{DuckDB} & & & \\
-\cmidrule(lr){2-3}
-Operator case & native & Arrow & Polars & PyArrow & Daft \\
+& \multicolumn{2}{c}{\textbf{sf1}} & \multicolumn{2}{c}{\textbf{sf10}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Baseline & \bx{} & wins & \bx{} & wins \\
 \midrule
-\texttt{global\-sum}$^\S$      & \win 0.11 & \win 0.02 & \win 0.11 & \win 0.02 & \win 0.03 \\
-\texttt{filter\-count}$^\S$    & \win 0.31 & \win 0.02 & \win 0.04 & \win 0.00 & \win 0.06 \\
-\texttt{distinct\-limit}       & \win 0.19 & \win 0.16 & \win 0.13 & \win 0.02 & \win 0.17 \\
-\texttt{window\-runsum}        & \win 0.20 & \win 0.21 & \win 0.06 & --- & --- \\
-\texttt{window\-lag}           & \win 0.36 & \win 0.34 & \win 0.02 & --- & --- \\
-\texttt{window\-rank}          & \win 0.44 & \win 0.38 & \win 0.06 & --- & --- \\
-\texttt{distinct\-lowcard}   & \win 0.54 & \win 0.37 & \win 0.08 & \win 0.86 & \win 0.13 \\
-\texttt{window\-sum\-part}     & \win 0.65 & \win 0.58 & \win 0.65 & --- & \win 0.02 \\
-\texttt{dedup\-unordered}   & \win 0.80 & \win 0.64 & \win 0.10 & \win 0.02 & \win 0.45 \\
-\texttt{join\-agg}             & \win 0.83 & \win 0.35 & \win 0.65 & \win 0.14 & \win 0.19 \\
-\texttt{dedup\-ordered} & \win 0.92 & \win 0.57 & \win 0.03 & \win 0.03 & --- \\
-\texttt{sort\-limit}           & \win 0.94 & \win 0.78 & \win 0.03 & \win 0.00 & \win 0.14 \\
-\texttt{sort\-string}          & \loss 1.10 & \loss 1.12 & \win 0.28 & \win 0.03 & \win 0.03 \\
-\texttt{groupby\-2key}         & \loss 1.13 & \win 0.31 & \win 0.28 & \win 0.83 & \win 0.15 \\
-\texttt{filter\-project}       & \loss 1.21 & \win 0.39 & \win 0.58 & \win 0.04 & \win 0.72 \\
-\texttt{distinct\-highcard}  & \loss 1.24 & \loss 1.06 & \win 0.18 & \win 0.14 & \win 0.56 \\
-\texttt{sort\-str\-lowcard} & \loss 1.55 & \loss 1.13 & \win 0.28 & \win 0.04 & \win 0.09 \\
-\texttt{groupby\-sum}         & \loss 1.58 & \win 0.44 & \win 0.34 & \loss 1.18 & \win 0.14 \\
-\texttt{sort\-str\-limit}   & \loss 1.68 & \loss 1.04 & \win 0.03 & \win 0.00 & \win 0.12 \\
-\midrule
-geomean                        & \win \textbf{0.64} & \win \textbf{0.35} & \win \textbf{0.12} & \win \textbf{0.04} & \win \textbf{0.12} \\
-\textbf{\sys{} wins}           & 12/19 & 15/19 & \textbf{19/19} & 14/15 & \textbf{15/15} \\
+DuckDB (native store)              & \win \textbf{0.79} & \win 16/22 & \loss 1.29 & \loss 8/22 \\
+DuckDB (same Arrow)$^*$            & \win \textbf{0.26} & \win \textbf{22/22} & --- & --- \\
+Polars~\cite{polars}               & \win \textbf{0.43} & \win 21/22 & \win \textbf{0.37} & \win 18/22 \\
+Daft~\cite{daft}$^\dagger$         & \win \textbf{0.35} & \win \textbf{20/20} & \win \textbf{0.42} & \win 16/20 \\
+Spark~\cite{armbrust2015sparksql}$^\ddagger$ & 0.041 & 22/22 & 0.074 & 22/22 \\
 \bottomrule
 \end{tabular}
-\caption{Operator mix at sf1, all 19 cases, $\text{\sys{}}_{ms}/x_{ms}$; below 1.00 is
-a \sys{} win, and rows are sorted by the first column. Every engine takes the same
-in-memory Arrow input; the two DuckDB columns differ only in whether it was allowed to
-ingest that input into its own compressed store first, which is the single variable
-\cref{tab:tpch} could not isolate. PyArrow (Acero) has no window functions.
-$^\S$Two cases \sys{} answers from a recorded column statistic rather than by
-executing --- an unfiltered \texttt{SUM} or \texttt{COUNT} over an immutable relation,
-served from a figure the first run computed. The answers are exact and gate-checked,
-but the timing is a memo lookup rather than a scan; excluding both, the two DuckDB
-geomeans are $0.76$ and $0.50$ over 17 cases, and those are the figures an execution
-claim should use.}
-\label{tab:opmix}
+\caption{TPC-H, all 22 queries, correctness-gated, one 96-vCPU node; \bx{} below 1.00 means
+\sys{} is faster. Suite totals (ms), sf1 / sf10: \sys{} 472 / 3{,}707; DuckDB 594 / 2{,}038;
+Polars 1{,}173 / 9{,}914; Daft 1{,}152 / 8{,}680; Spark 14{,}555 / 57{,}781. $^*$DuckDB
+executing the same zero-copy Arrow \sys{} is given, not a compressed store it was allowed to
+build first; not reported at sf10, because over Arrow views DuckDB's planner has no storage
+statistics to order a many-way join with. $^\dagger$Daft covers 20 queries in this adapter; q6 and q15 do not pass the harness
+correctness gate. $^\ddagger$Spark runs in local mode, which is not the
+deployment it is built for; its roughly 90\,ms fixed per-query floor is most of the ratio at
+these scales, and no claim in this paper rests on the column.}
+\label{tab:tpch}
 \end{table}
 
-\cref{tab:opmix} is the cleanest comparison here: one input representation, one
-machine, no SQL front-end differences, no scan in the timed region for anybody, and
-DuckDB present twice differing only in whether it ingested first. \sys{} takes all 19
-cases from Polars, all 15 Daft can express, 11 of 12 from PyArrow's Acero engine, 15
-of 19 from DuckDB-on-Arrow and 12 of 19 from DuckDB's native store.
+Ratios follow the convention of \cref{sec:convention} throughout. The evaluation proceeds in four steps: it first tests cross-scheduler correctness, then
+measures relational performance and isolates storage-representation effects, then reports CPU
+cost in addition to wall-clock latency, and finally evaluates streaming, learning, scale-out,
+failure recovery, and GPU pipelines.
 
-The four it loses to DuckDB-on-Arrow are informative because they are the only cases
-where the input is genuinely equal and \sys{} is still behind: three string sorts and a
-high-cardinality \texttt{DISTINCT}. Arrow's \texttt{Utf8} keeps a string's bytes in a
-separate buffer behind a 32-bit offset, so ordering one is a gather through an
-indirection where DuckDB compares a 16-byte value with its first bytes inline. That is
-a data-layout gap in the columnar format itself rather than in either engine, and it is
-the same gap \cref{sec:eval}'s group-by results attribute to storage.
+\paragraph{Setup.} One Intel Xeon Platinum 8275CL at 3.00\,GHz, 96 vCPU (48 physical),
+184\,GiB, Linux 6.8; distributed results on an 8-node Ray cluster, 128 vCPU total, whose
+per-node inbound bandwidth we report as measured rather than as a specification. The
+injected-failure arms use a single-box local Ray cluster, which removes the network entirely. GPU results are on 8$\times$T4, two accelerator generations
+behind current hardware, so the CPU-to-GPU cost ratio those numbers assume is more favourable
+to CPU-side preprocessing than it would be on an H100. DuckDB 1.5.5, Polars 1.36.1, Daft
+0.7.21, Ray 2.56.0, PySpark 4.2.0, PyArrow 19.0.1. The harness refuses to report a timing for
+any query whose result does not match DuckDB, compared as an order-independent multiset at a
+float tolerance of $1.5\times10^{-6}$ absolute and $10^{-9}$ relative. Every engine receives
+the identical warm-up --- one correctness run, one warm-up, five timed --- and the operator
+mix fans one SQL string to every SQL engine including \sys{}, so no hand-written \sys{}
+pipeline races a comparator's SQL. \textbf{Each reported timing is the minimum of those five
+runs, in a single process}; the suites record no dispersion, so every ratio in this paper is a
+best-case point estimate rather than a distribution, and \cref{sec:limitations} treats that as
+a threat rather than a detail. \textbf{The compared boundary is a materialized
+\texttt{pyarrow.Table}}: every engine is asked for one, so the numbers are end-to-end
+materialization latency and not engine-internal execution time, which matters most where a
+result is large. Every statement about a comparator in this paper is an observation about the
+versions and adapter configurations named here. Each suite runs a two-engine
+lineup, because a four-engine run holding DuckDB's tables, its Arrow views and Polars' frames
+at once reads H2O \texttt{join} at $1.83\times$ against the $0.93\times$ a two-engine run
+reads: the lineup is part of the measurement. Two hazards produced a wrong number here before
+they were controlled for --- a shared machine is not a benchmark machine, and an in-place
+rebuild of the compiled extension silently replaces the engine mid-benchmark --- so the
+harness stamps the build profile and the extension's timestamp around every run.
 
-On ClickBench~\cite{clickbench} (43 queries, correctness-gated) \sys{} wins 43 of 43
-against DuckDB on identical Arrow input --- every query, geomean $0.073\times$ --- and
-36 of 40 against Polars ($0.33\times$) and 41 of 41 against Daft ($0.26\times$).
-Against DuckDB's \emph{native} store it now wins the suite too, $0.64\times$ on 28 of
-43. Five of those 43, however, \sys{} answers from a recorded statistic rather than by
-executing, so the figure an execution claim should use is $0.77\times$ over the other
-38. Both numbers say the same thing about attribution: the same engine on the same
-queries sweeps a compressed store's execution engine on identical input and leads it
-more narrowly when the store is allowed to compress. One variable, isolated, and the
-residue is storage, not kernels.
+\subsection{Cross-scheduler correctness}
+\label{sec:eval-algebra}
 
-\subsection{Breadth: TPC-DS, the Join Order Benchmark, and H2O.ai}
+The primary claim in this subsection is semantic rather than performance-oriented, so its
+main evidence is cross-mode equivalence testing rather than latency. \cref{eq:merge} is property-tested over random partitionings, and an
+integration test asserts that single-node equals multi-partition. An operator matrix
+then crosses every execution mode with every value edge, because the defects that reach
+production here are a non-default flag on a non-default path: a descending sort returned
+unsorted data under spill, and a distributed \texttt{GROUP BY} on a float key split one
+group in two, and both passed every single-axis test.
 
-Two suites and a wide table are enough to be tuned for. \cref{tab:breadth} adds the
-three that are hardest to tune for and easiest to omit.
+Two measurements go further than the test suite, because a generator only ever produces the
+case the algebra was designed for. \textbf{The whole suite, through both schedulers}: every
+TPC-H query was executed twice on the same box, once through the single-node executor and once
+through the distributed one, and compared as row multisets. \textbf{All 22 agree.} Distribution charges a geometric-mean $28.3\times$ at sf1, which is the correct answer
+for a six-million-row table on one machine and why the engine's \texttt{auto} policy
+declines it at this size. The claim is not that distribution is free; it
+is that it is a per-query decision whose price is visible, and that taking it does not change
+the answer. \textbf{And a partitioning nobody planned}: a worker dying mid-query leaves the
+surviving partials to be recombined in an order and a grouping no planner chose, which
+\cref{sec:eval-dist} injects across five fault configurations, with every recovered
+relation equivalent to the single-node answer under the comparison stated below. A system carrying a second distributed implementation would have to get
+that path right in that implementation too.
+
+\subsection{Relational benchmark coverage}
+\label{sec:eval-tpch}
 
 \begin{table}[tbp]
 \centering\footnotesize
 \setlength{\tabcolsep}{3.5pt}
 \begin{tabular}{lrrr}
 \toprule
-Suite & Queries & geomean $b/\text{DuckDB}$ & wins \\
+Suite & Queries & geomean \bx{} & wins \\
 \midrule
 JSON (semi-structured)   & 5   & \win \textbf{0.25}$\times$ & \win 5/5 \\
-ClickBench~\cite{clickbench} & 43 & \win \textbf{0.64}$\times$ & \win 28/43 \\
-Operator mix             & 19  & \win \textbf{0.66}$\times$ & 11/19 \\
+ClickBench~\cite{clickbench}$^\dagger$ & 43 & \win \textbf{0.64}$\times$ & \win 28/43 \\
+Operator mix             & 19  & \win \textbf{0.65}$\times$ & 12/19 \\
 TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.79}$\times$ & \win 16/22 \\
 H2O.ai \texttt{join}     & 5   & \win \textbf{0.93}$\times$ & 3/5 \\
-TPC-DS~\cite{tpcds} sf1  & 99  & \win \textbf{0.96}$\times$ & 38/98 \\
+TPC-DS~\cite{tpcds} sf1  & 98  & \win \textbf{0.96}$\times$ & 38/98 \\
 \midrule
 H2O.ai \texttt{groupby}  & 10  & \loss 1.19$\times$ & \loss 4/10 \\
 TPC-H sf10               & 22  & \loss 1.29$\times$ & \loss 8/22 \\
-Join Order~\cite{leis2015goodjoin} & 113 & \loss 1.29$\times$ & \loss 35/109 \\
+Join Order~\cite{leis2015goodjoin} & 109 & \loss 1.29$\times$ & \loss 35/109 \\
 \bottomrule
 \end{tabular}
-\caption{Every relational suite in the harness against DuckDB's \emph{native
-compressed store} --- the harder of the two bars --- on one 96-core node, ordered by
-result. Six of nine go to \sys{}. Each row is a two-engine run: a four-engine lineup holds
-DuckDB's tables, its Arrow views and Polars' frames at once and read H2O \texttt{join} at
-$1.83\times$ against the $0.93\times$ here, so the lineup is part of the measurement.
-On identical Arrow input --- the like-for-like execution bar --- \emph{every suite that can
-run it is a win}: JSON $0.039\times$ (5/5), ClickBench $0.072\times$ (\textbf{43/43}), H2O
-\texttt{groupby} $0.089\times$ (\textbf{10/10}), H2O \texttt{join} $0.244\times$
-(\textbf{5/5}), TPC-H $0.256\times$ (\textbf{22/22}), the operator mix $0.362\times$ (15/19).
-TPC-DS and JOB have no entry on that bar because DuckDB over registered Arrow views has no
-storage statistics to order a many-way join with and is \emph{SIGKILL}ed on TPC-DS q64.}
+\caption{Every relational suite in the harness against DuckDB's \emph{native compressed
+store} --- the harder of the two bars --- on one 96-vCPU node, ordered by result; six of nine
+go to \sys{}. On identical Arrow input, the like-for-like execution bar, \emph{every suite
+that can run it is a win}: JSON $0.039\times$ (5/5), ClickBench $0.072\times$
+(\textbf{43/43}), H2O \texttt{groupby} $0.089\times$ (\textbf{10/10}), H2O \texttt{join}
+$0.244\times$ (\textbf{5/5}), TPC-H $0.256\times$ (\textbf{22/22}), the operator mix
+$0.362\times$ (15/19). TPC-DS and JOB have no entry on that bar because DuckDB over Arrow
+views has no storage statistics to order a many-way join with. The operator-mix row is the
+controlled instrument discussed in \cref{sec:eval-opmix}: 19 single-operator cases, every
+engine on the same in-memory Arrow input, PyArrow (Acero) and Daft each unable to express
+some of them. $^\dagger$Five ClickBench queries are answered from a recorded statistic rather
+than executed; over the other 38 the figure is $0.77\times$, and two operator-mix cases are
+answered the same way, which moves its two DuckDB geomeans to $0.76$ and $0.50$ over 17
+cases.}
 \label{tab:breadth}
 \end{table}
 
-\textbf{TPC-DS}~\cite{tpcds} is 99 queries of roll-ups, grouping sets, correlated
-subqueries and snowflake joins, and every one of them is registered rather than a
-curated subset: a suite that registered only the queries the front-end already runs
-would report completeness and measure nothing. \sys{} takes the suite at $0.96\times$
-on 44 wins. What moved it there was not a kernel. A lookup of "what has been measured
-about this source's columns" walked every column of every source the session had ever
-seen, so on a 24-table schema each query paid roughly 264{,}000 key comparisons that
-grew with the session's own history --- the opposite of what a learning loop is for.
-Indexing it by source took the suite from $1.08\times$ to $0.96\times$ and moved no
-other suite at all, which is the signature of a fixed cost rather than a kernel.
+\cref{tab:tpch} reports TPC-H and \cref{tab:breadth} every relational suite in the
+harness. \sys{} leads DuckDB's \emph{compressed native store} at sf1 --- a storage
+engine \emph{and} an execution engine against an execution engine alone --- and trails
+it at sf10. That boundary is not a uniform degradation, and locating it matters. Of thirteen shapes
+whose cost can be tracked across the two scales, nine cost \emph{less} than ten times as much
+for ten times the rows; four are superlinear and carry the loss between them, and they are the
+benchmark's two highest-cardinality group-bys (q13, q18), its largest intermediate (q9) and
+its six-way join (q5). An engine uniformly slower at scale would show no such split.
 
-\textbf{The Join Order Benchmark}~\cite{leis2015goodjoin} is the one aimed squarely at
-this paper's thesis, and the one \sys{} loses. Its 113 queries run over a real IMDb
-snapshot whose predicates are correlated the way real data is, which is precisely
-where the independence assumptions in a textbook cost model fail; Leis et al. built it
-to show that estimation error, not the join-order search, is where optimizers lose. At
-$1.29\times$ it is the largest remaining relational gap, and the shape of the loss
-confirms their finding rather than ours: on \texttt{q13a}, 21 of the 733 join
-estimates the search makes price a join below one row, and zero times the next join's
-rows is zero, so a single such estimate takes every join above it with it. One
-instance of that we did fix, and it is instructive about how such estimates arise.
-\texttt{q32a} states \texttt{t1.id = mk.movie\_id} and then restates it; propagating
-the equivalence leaves \texttt{t1.id = t1.id} pushed into the scan, where containment
-prices a self-equality at $1/d$ --- \emph{one row} against an actual 2{,}528{,}312.
-The joins above then estimated zero and the build-side rule broadcast the 2.5M-row
-side against a 1-row one. Pricing a column compared with itself at its non-null share
-took that query from $22.4\times$ to $2.2\times$ and \texttt{q19b} from $10.1\times$
-to $1.3\times$. The suite also now completes: two earlier runs were killed by the
-memory a mis-ordered many-way join builds, and \texttt{q7c}, the query that took the
-process down, is now a win at 291\,ms against DuckDB's 504.
+The harness gates timing on result correctness. In these runs, Daft does not match the
+reference result for TPC-H q6 at either scale, and Polars cannot parse eight of the 99 TPC-DS
+queries. Such cases are reported as unsupported or incomparable rather than counted as
+performance wins.
 
-\textbf{H2O.ai db-benchmark}~\cite{h2obenchmark} isolates the two things TPC-* buries
-inside larger plans: group-by state management, and join build-side selection. \sys{}
-takes the join task ($0.93\times$) and loses the group-by ($1.19\times$), and that
-split is legible rather than mysterious. The group-by keys are low-cardinality strings.
-DuckDB holds them dictionary-encoded and groups on eight-bit codes; \sys{} reads the
-same column as full Arrow \texttt{Utf8}, because \cref{sec:algebra}'s contract is that
-Arrow is the only columnar representation any operator sees. On identical Arrow input
-the same suite is $0.11\times$ and 10 of 10. The gap is the encoding, and we can
-measure exactly what it is worth: a two-key group-by over 10M rows costs $38.8$\,ms
-when the columns arrive already decoded and $151.5$\,ms when they arrive
-dictionary-encoded, because the boundary decodes them to satisfy that same contract.
-Handing \sys{} DuckDB's own representation therefore makes it \emph{slower}, not
-faster. Preserving the encoding requires separating a plan's
-logical type from a morsel's physical one, which is the one place where the paper's
-central constraint is currently paid for in performance rather than repaid.
+Three rows merit additional context. \textbf{TPC-DS} is registered as the full 99-query
+suite rather than as a curated subset; 98 queries contribute to the paired timing row in
+\cref{tab:breadth}, and the excluded query is q67 for a reason that belongs to the harness
+rather than to either engine. The harness's shared loader casts every \texttt{DECIMAL}
+column to \texttt{float64} so that all engines read one input type, and q67 ranks a
+\texttt{SUM} over a \texttt{ROLLUP}. The two engines reassociate that floating sum
+differently, in the last bits, and \texttt{rank()} converts a last-bit difference into a
+different \emph{integer} --- which no float tolerance can absorb. Re-run against the source
+\texttt{DECIMAL} types both engines support natively, all 100 rows match exactly and in
+order and the sum agrees to the cent, so the disagreement is the comparison's rather than a
+result defect. The exclusion is symmetric: the gate reports no timing for \emph{any} engine
+on a case it fails, so q67 contributes to no engine's ratio. The cast stays in place because
+removing it changes every column type in every TPC-H and TPC-DS query, and so every timing
+in this paper --- a methodology change to make deliberately and re-measure, not a patch to
+apply to one query.
+\textbf{The Join Order Benchmark}~\cite{leis2015goodjoin} is directly relevant to the paper's
+measurement-driven planning thesis and is a suite \sys{} loses. Its IMDb workload contains
+correlated predicates for which classical independence assumptions can produce inaccurate
+cardinality estimates; Leis et al.\ use the benchmark to show how strongly such estimation
+errors can affect plan quality. \cref{sec:limitations} explains why \sys{}'s mechanism for
+feeding measured cardinalities back into this workload is currently ineffective.
+\textbf{H2O.ai}~\cite{h2obenchmark} isolates operators that TPC-style suites embed inside larger
+plans. Here \sys{} leads the join task and trails the group-by against DuckDB's native store;
+the group-by keys are low-cardinality strings that DuckDB stores dictionary-encoded, whereas
+\sys{} reads full Arrow \texttt{Utf8}. On identical Arrow input, the same group-by suite is
+$0.089\times$ and 10 of 10.
 
-What can be recovered without touching the boundary is the \emph{composite} key, and it is
-worth stating what that isolates. A single short string key already takes the dense
-direct-map path and beats DuckDB outright --- 8.6\,ms against 10.0 on 10M rows over 100
-distinct five-character values. Adding a second string column used to leave that path
-entirely for a 128-bit packed hash, at 41.7\,ms against 18.1. Numbering each column's
-distinct values in first-seen order is injective, so two rows share a code tuple exactly
-when they share a value tuple; the ranked columns then take the ordinary integer grouper.
-The two-string case now measures at 32.6\,ms --- \emph{identically} to the same query with
-two \texttt{int64} keys --- which is the check that the representation was the whole
-difference and that what remains is the integer path, not the strings. The suite's residue
-is concentrated in its two single-key high-cardinality queries (\texttt{q3}, \texttt{q7}:
-one column, 100{,}000 distinct values), which is exactly the dictionary case above.
+\subsection{Separating storage representation from execution}
+\label{sec:eval-opmix}
 
-\subsection{The small case, which a warm benchmark never measures}
+The operator mix of \cref{tab:breadth} holds everything but the one variable fixed: one input representation, one machine, no SQL
+front-end differences, no scan in the timed region, and DuckDB present twice differing
+\emph{only} in whether it was allowed to ingest that identical Arrow input into its own
+compressed store first. Across the 19 cases, \sys{} is faster in 15 comparisons against DuckDB-on-Arrow and in 12
+comparisons against DuckDB's native store. The difference between those two configurations
+shows that physical representation materially changes the result; it should not be interpreted
+as a pure kernel comparison.
+
+The four \sys{} loses to DuckDB-on-Arrow are the informative ones, because they are the only
+cases where the input is genuinely equal and \sys{} is still behind: three string sorts and a
+high-cardinality \texttt{DISTINCT}. Arrow's \texttt{Utf8} keeps a string's bytes in a
+separate buffer behind a 32-bit offset, so ordering one is a gather through an indirection
+where DuckDB compares a 16-byte value with its first bytes inline --- the German-string
+representation Umbra introduced~\cite{neumann2020umbra}. That is a data-layout gap in the
+columnar format rather than in either engine, and it is the gap the H2O group-by result
+attributes to storage. It is measurable directly: grouping a dictionary column is about
+$7\times$ faster than grouping the decoded one, so handing \sys{} DuckDB's own representation
+across the FFI makes it \emph{slower}, because the boundary decodes it to satisfy the
+Arrow-only contract. A change that would have let a dictionary reach the kernel was built,
+measured and reverted for regressing plainer shapes. This is the one place where the paper's
+central constraint is paid for in performance rather than repaid.
+
+On ClickBench~\cite{clickbench}, the same pattern appears at suite scale: \sys{} is faster
+on all 43 queries against DuckDB on identical Arrow input and also leads the native-store
+comparison, but by a smaller margin. Together with the operator-mix experiment, this supports
+the narrower conclusion that storage representation accounts for a substantial part of the
+observed gap; it does not establish that all remaining differences are attributable to storage.
+
+\subsection{CPU cost in addition to wall-clock latency}
+\label{sec:eval-cost}
+
+The preceding ratios measure wall-clock latency, which does not by itself measure compute
+consumption. An engine can reduce latency by using more parallel CPU time, so we report both
+metrics for the in-process TPC-H comparison. It is measurable here for a specific reason: \sys{}
+and DuckDB both execute in-process, so \texttt{getrusage} charges both engines' threads to one
+counter and the delta across a call is that engine's CPU time. On TPC-H sf1, all 22 queries,
+gated on correctness before timing: \textbf{\sys{} buys a $1.3\times$ wall-clock win with
+$1.9\times$ the CPU, by running on $2.4\times$ the cores} --- geometric-mean $0.78\times$ wall
+against $1.86\times$ CPU, at 21.9 effective cores against DuckDB's 9.2, excluding the one
+query answered from a recorded statistic rather than executed. The wall figure reproduces
+\cref{tab:tpch}'s $0.79$, which cross-checks that this is the same engine.
+
+This result bounds the latency claim. If otherwise-idle CPU capacity has low marginal cost,
+the lower wall-clock time may be desirable; when CPU time or energy is the constrained
+resource, the higher compute consumption can dominate the decision. Neither engine saturates
+the machine --- DuckDB remains below ten effective cores of 96 vCPUs in these runs --- so
+part of the latency difference reflects how much parallelism each engine extracts rather than
+per-core efficiency alone.
+
+\paragraph{Cold and small-query latency.}
 \label{sec:smallquery}
+\cref{sec:algebra}'s first consequence is that a small query pays no distribution tax, and a
+suite reporting best-of-$N$ warm timings structurally cannot check it, because such a suite
+never sees a shape for the first time --- which is what a user issues constantly. Measured
+separately, with a fresh literal per iteration so the plan cache cannot hit, optimizing a
+never-seen filter\,$\rightarrow$\,join\,$\rightarrow$\,group-by costs $2.75$\,ms, and end to
+end over twelve never-seen shapes at $n=10^4$ \sys{} runs at $0.80\times$ DuckDB on a cold
+filter and $0.27\times$ on a cold \texttt{count(*)}. DuckDB also pays a first-query cost, and the measured cold-start overhead does not erase
+\sys{}'s advantage on these two shapes. A warm gap remains on the narrowest case: 4.07\,ms
+versus 2.04\,ms. Only 0.002\,ms of the \sys{} time is attributed to planning, indicating that
+the residual fixed cost lies elsewhere in the per-query execution path, including the FFI
+boundary.
 
-\cref{sec:algebra}'s first consequence is that a small query pays no distribution
-tax, and a suite reporting best-of-$N$ warm timings cannot check it: it never sees a
-shape for the first time, which is what a user issues constantly. Measured
-separately, with a fresh literal per iteration so the plan cache cannot hit,
-optimizing a never-seen single-table filter costs $1.52$\,ms and a
-filter\,$\rightarrow$\,join\,$\rightarrow$\,group-by $2.75$\,ms, against $0.002$\,ms
-for a repeated shape. End to end over twelve never-seen shapes at $n=10^4$, \sys{}
-runs at $0.80\times$ DuckDB on a cold filter and $0.27\times$ on a cold
-\texttt{count(*)} over one. DuckDB pays a first-query cost too, and ours is the
-smaller. This is where a Python control plane could have been disqualifying and is
-not: $725$ rules over seven phases iterated to a fixpoint cost single-digit
-milliseconds because nothing in them is per-row.
+\subsection{Streaming throughput and driver overhead}
+\label{sec:eval-streaming}
 
-\subsection{Scaling out}
-\label{sec:scaleout}
+Two measurements test the shared-operator claim from opposite directions.
+\textbf{Against a streaming engine}, draining a four-million-row
+Parquet backlog through a grouped aggregation, correctness-gated, \sys{} runs at 18.9M rows/s
+against Spark Structured Streaming's~\cite{armbrust2018structured} 6.0M --- a $3.2\times$ lead
+--- under the memory bound flat in the input reported in \cref{sec:streaming}.
+\textbf{Against a batch engine}, DuckDB answers that same
+aggregation in 15.9\,ms as a one-shot query, $13\times$ faster than \sys{}'s streaming path.
+That gap is not the operators, which are shared and are the paper's claim; it is the
+streaming \emph{driver}, which plans a micro-batch, commits offsets and writes a checkpoint
+per trigger while a batch query does none of those things. What this supports is that the
+operators are one implementation and the memory bound holds for both, not that a streaming
+query is as cheap as a batch one. It is not, by an order of magnitude, and the cost is the
+driver.
 
-Aggregate all-to-all shuffle throughput runs 2.0\,GB/s at two worker nodes,
-6.9\,GB/s at four and 15.2\,GB/s at eight: superlinear, $7.6\times$ for $4\times$ the
-hardware. The mechanism is the algebra. Mappers publish pre-aggregated state rather
-than rows, so a combiner tree plus credit-based flow control keeps per-node memory
-bounded as the cluster widens, and adding nodes adds reduce capacity instead of
-contention. A \emph{single} reducer stays NIC-bound at $\sim$2.7\,GB/s, so the gain
-is in the aggregate. The superlinearity deserves separating from the headline: at two
-nodes the shuffle does not saturate the available reduce capacity, so part of the
-gain from 2 to 4 is recovered inefficiency. The claim we stand behind is the shape,
-that adding nodes adds throughput without a per-node memory penalty, and not a
-promise of $1.9\times$ per doubling forever.
+\subsection{Cross-execution adaptation}
+\label{sec:eval-learning}
 
-The single-query picture matches. On TPC-H sf10 q6 with every engine reading the same
-S3 Parquet and correctness-gated, \sys{} over 64 partitions runs 224.5\,ms against
-Daft on its Ray runner at 535.8\,ms and DuckDB-on-Arrow single-node at 457.3\,ms, and
-Daft returns the wrong answer described above. Across a pipeline suite at
-sf1/sf10/sf100 \sys{} is ahead of Ray Data on every pipeline and leads Daft on joins
-($1.7$--$2.2\times$), group-by and metadata-only counts.
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\columnwidth, height=40mm,
+  xmin=0.6, xmax=8.4, ymin=0.8, ymax=2.9,
+  xtick={1,2,3,4,5,6,7,8}, ytick={1.0,1.5,2.0,2.5},
+  axis lines=left, axis line style={draw=pfigGray},
+  ymajorgrids, grid style={pfigLight, line width=0.4pt},
+  tick style={draw=pfigGray},
+  xlabel={execution number, same query, fresh process},
+  ylabel={$\times$ own steady state},
+  xlabel style={font=\scriptsize}, ylabel style={font=\scriptsize},
+  xticklabel style={font=\scriptsize}, yticklabel style={font=\scriptsize},
+  legend style={font=\scriptsize, draw=pfigGray, at={(0.98,0.98)},
+                anchor=north east, legend columns=1},
+]
+\addplot[draw=okBlue, mark=*, mark size=1.6pt, line width=0.9pt]
+  coordinates {(1,2.60) (2,1.06) (3,0.97) (4,1.26) (5,1.19) (6,1.01) (7,1.00) (8,1.00)};
+\addlegendentry{\sys{}}
+\addplot[draw=okVermillion, mark=square*, mark size=1.4pt, dashed, line width=0.9pt]
+  coordinates {(1,1.15) (2,1.16) (3,1.06) (4,1.02) (5,1.02) (6,1.00) (7,1.02) (8,1.00)};
+\addlegendentry{DuckDB (control)}
+\draw[draw=pfigGray, dotted, line width=0.7pt] (axis cs:0.6,1) -- (axis cs:8.4,1);
+\end{axis}
+\end{tikzpicture}
+\caption{The learning loop, with the control that rules out the obvious alternative
+explanation. Each TPC-H query runs eight times back to back in a fresh process (the learned
+store is per-process, so a new process is a cold hub), normalized to that engine's own steady
+state; the curve is the geometric mean over 22 queries. DuckDB runs the identical loop on the
+identical data and has no cross-query learning, so its curve is the environmental floor ---
+page cache, JIT, allocator. \sys{}'s first execution costs $2.6\times$ steady state where the
+floor is $1.1\times$, and the excess is gone by the second or third execution. Runs 4--5
+reading $1.2$ is box noise, not a regression; a second six-run round read $2.69$.}
+\label{fig:learning}
+\end{figure}
+
+To evaluate cross-execution adaptation, a control is necessary: a simple
+before-and-after comparison is confounded by cache, JIT and allocator warm-up, because
+``the second execution is faster'' is exactly what those produce on their own.
+\cref{fig:learning} measures the
+whole curve against that control: DuckDB supplies the floor at $1.1\times$ on its first
+execution and flat after, while \sys{} pays $2.6\times$ and recovers it within two executions,
+so roughly a $2.4\times$ first-execution premium is attributable to something the control does
+not have. One limitation is that the first-to-second transition folds the \emph{plan cache}
+together with the \emph{learned store}, and this experiment does not separate them. It
+establishes that the loop exists and what it is worth end to end, not which half did the
+work.
+
+\subsection{Scale-out and worker-loss recovery}
+\label{sec:eval-dist}
+
+\begin{table}[tbp]
+\centering\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lrrl}
+\toprule
+Arm & ms & vs.\ no fault & Result \\
+\midrule
+no fault, replication\,$=$\,1        & 258.0 & 1.00$\times$ & \win equivalent \\
+no fault, replication\,$=$\,2        & 172.7 & 0.67$\times$ & \win equivalent \\
+1 lost at reduce, replication\,$=$\,1 & 733.6 & 2.84$\times$ & \win equivalent \\
+1 lost at reduce, replication\,$=$\,2 & 2167.1 & \loss 8.40$\times$ & \win equivalent \\
+2 lost at reduce, replication\,$=$\,2 & 2215.4 & \loss 8.59$\times$ & \win equivalent \\
+1 lost during map                    & 1723.1 & 6.68$\times$ & \win equivalent \\
+2 lost during map                    & 1755.7 & 6.81$\times$ & \win equivalent \\
+\bottomrule
+\end{tabular}
+\caption{Injected worker loss on a grouped aggregate, 8M rows over 5{,}000 keys, 8 workers,
+best of three. A worker lost \emph{at reduce} has already published its buckets, so they
+vanish; one lost \emph{during map} has published nothing, so its source split is relocated.
+The last column is load-bearing: a lost bucket reads back as an \emph{empty} bucket rather
+than as an error, so a defect here would drop rows silently. \emph{Equivalent} is the
+comparison of \cref{sec:eval}: an order-independent multiset at the stated float tolerance,
+which is the strongest claim \cref{eq:merge} supports once the partition count moves. Absolute
+times are from a single-box local Ray cluster, which removes the network that replication's
+premise rests on.}
+\label{tab:faults}
+\end{table}
+
+Aggregate all-to-all shuffle throughput on an 8-node Ray cluster is 2.0\,GB/s at two worker
+nodes, 6.9 at four and 15.2 at eight --- superlinear, $7.6\times$ for $4\times$ the nodes. The
+mechanism is the algebra: mappers publish pre-aggregated state rather than rows, so adding a
+node adds reduce capacity instead of contention, and a combiner tree plus credit-based flow
+control keeps per-node memory bounded as the cluster widens. Two qualifications belong with
+that number rather than after it. A \emph{single} reducer stays pinned at its NIC
+($\sim$2.7\,GB/s), so the gain is in the aggregate and not in any one channel; and at two
+nodes the shuffle does not saturate the available reduce capacity, so part of the 2-to-4 gain
+is recovered inefficiency rather than scaling. The shape is what we stand behind --- nodes add
+throughput at no per-node memory cost --- not $1.9\times$ per doubling forever. Distribution
+is also not always the right answer, and the engine says so: forcing
+\texttt{distributed=True} on in-process data costs 1.9--4.5\,s a query, which is exactly the
+tax \cref{sec:algebra} exists to make optional.
+
+Throughput alone does not characterize distributed execution; recovery behavior is also
+part of the design. \cref{tab:faults} injects the failure directly. Five fault-injection arms, two failure phases, up to two simultaneous losses, and every recovered
+relation equivalent to the single-node answer --- the assertion \cref{eq:merge} is for, tested
+against real failures rather than random partitionings. Recovery is also parallel across losses, since two workers lost costs what one costs,
+which falls out of the algebra too: what is regenerated is a partial, and partials
+regenerate independently. Replication, however, makes recovery worse. Copying every
+published bucket to a survivor is meant to convert a recompute into a re-fetch; instead
+it turns a $2.84\times$ recompute into an $8.40\times$ recovery. The environment is a
+confound --- replication's premise is that re-reading the source from object storage
+dominates, and on a single box with an in-memory source that premise is false --- so the
+measurement does not refute the design. It establishes that the benefit is unproven in
+every environment this system has been measured in, and that the fixed cost is real.
 
 \subsection{GPU and ML workloads}
 \label{sec:raydata}
 
-These are the workloads Ray Data was built for, which makes it the right yardstick
-and the wrong thing to keep score against. The question is whether an engine that
-treats decode and inference as relational operators can hold its own against a
-runtime purpose-built for them. It can. On 8$\times$T4 with real models: ResNet-50
-batch inference $2.05\times$, image embeddings $1.98\times$, fractional-GPU packing
-$1.96\times$, video-clip inference $3.6\times$, training-data ingest $3.0\times$,
-multimodal JPEG-to-GPU $1.3$--$2\times$.
+Ray Data is the most relevant comparator in this evaluation because it is designed for
+streaming batch execution of ML and GPU pipelines. On 8$\times$T4 with real models, \sys{}
+measures $2.05\times$ higher throughput on ResNet-50 batch inference, $1.98\times$ on image
+embeddings, $1.96\times$ on fractional-GPU packing, $3.6\times$ on video-clip inference, and
+$3.0\times$ on training-data ingest (\cref{fig:headline}, right). Larger ratios for audio
+feature extraction ($12.5\times$), LLM batch inference ($11.1\times$), and text embeddings
+($47\times$) primarily reflect scheduling and batching choices rather than faster model
+kernels, so we do not generalize from them. On a sufficiently large compute-bound job, both
+systems saturate the same GPU and converge to parity. The measured result is therefore that
+integrating these operators into the relational plan did not impose an observable throughput
+penalty on the tested workloads; it is not evidence of universally faster GPU kernels. These ratios
+are also only meaningful if the comparator is configured properly, and ours initially was not:
+our adapter registered each table as a single block, which is Ray Data's unit of parallelism,
+so a 6M-row table ran on one execution slot out of 96. That was our defect, and every number above is from
+the corrected adapter.
 
-Three figures are much larger and should not be quoted as general execution speed:
-audio feature extraction $12.5\times$, LLM batch inference $11.1\times$, text
-embeddings $47\times$. They come from scheduling, not kernels. The
-session-scoped model pools of \cref{sec:pipeline} amortize load across executions, so
-the ratio shrinks as jobs grow; and native in-engine preprocessing keeps
-mel-spectrogram and MFCC as Arrow kernels where the comparator runs a per-batch
-Python UDF. Neither is an architectural advantage, both are choices any runtime could
-adopt, and we expect the gap to close. The durable claim is the $2$--$3.6\times$
-range, which shows that putting AI operators inside a query engine costs nothing
-against a specialized runtime. One exception bounds it: on a maximally-large
-compute-bound job both engines saturate the same GPU at the same FLOPs, so the ratio
-is parity. Nothing here beats a specialized runtime at arithmetic, and nothing here
-claims to.
+% ===========================================================================
+\section{Limitations and threats to validity}
+\label{sec:limitations}
+% ===========================================================================
 
-\paragraph{A note on the harness.} These ratios are only meaningful if the comparator
-was configured properly, and ours initially was not: our adapter registered each
-table as a single block, which is Ray Data's unit of parallelism, so a 6M-row table
-ran on one core of 96. That was our defect and not a property of Ray Data. Every
-number above is from the corrected adapter, which reads tables back through the
-Parquet connector with row groups sized to Ray's own target block size.
+The preceding experiments span several workload classes, but they do not establish uniform
+superiority. This section separates known system limitations from threats to the validity and
+generality of the measurements.
+
+\paragraph{Storage is the largest open gap, and it is structural.} \sys{} owns no
+storage format: Arrow is the only columnar representation any operator sees, which
+forecloses a compressed, dictionary-encoded, zone-mapped store and a German-string
+layout~\cite{neumann2020umbra} in one stroke. Three results above reflect that decision --- TPC-H at sf10 ($1.29\times$), the H2O group-by ($1.19\times$), and the string
+sorts that lose even on identical input --- and closing it needs a plan's logical type
+separated from a morsel's physical one, an architectural change rather than a kernel
+one. The scan path is a second, independent term: \sys{}'s Parquet decode costs
+$1.7$--$3.0\times$ DuckDB's CPU, which places it in the Arrow Rust decoder rather than
+in anything specific to this engine.
+
+\paragraph{The learned loop does not yet improve the benchmark most sensitive to estimation error.} The Join
+Order Benchmark remains $1.29\times$ behind, and the mechanism this paper argues should
+close it is inert on the shape that matters: the key a measured cardinality is filed
+under and the key the estimator reads back disagree for the commonest aggregate shape,
+so the loop writes a true row count that nothing consumes. The defect also exposes a broader calibration issue: correcting the key alone makes the engine \emph{slower}
+--- TPC-DS moves $0.965 \rightarrow 0.988$ and JOB $1.252 \rightarrow 1.293$ --- because
+every threshold downstream of that input was calibrated while it was an order of
+magnitude low. A learning loop is a closed system, and repairing one edge is a
+recalibration rather than a patch; it is pinned as a failing test, not described as
+done. A second limit sits on the positive result: the $2.4\times$ first-execution
+premium of \cref{fig:learning} folds the plan cache together with the learned store. The
+experiment that would separate them is a three-arm ablation --- plan cache on with the learned
+store cold, the learned store warm with the plan cache disabled, and both on --- and it has not
+been run, so the paper reports the premium end to end and attributes it to neither half.
+
+\paragraph{Streaming is micro-batch, and does not reach Flink's guarantees.} There is no
+operator graph, no barrier protocol and no keyed state backend; the driver is a Python
+loop over pull, execute, write, and a single point of failure with no standby.
+Watermarks do not propagate across operators because there is no graph to propagate
+along, and streaming state is one in-memory Arrow batch that does not spill. The driver
+is also expensive in absolute terms (\cref{sec:eval-streaming}), so the shared-operator
+claim buys maintainability and a memory bound, not streaming performance competitive
+with a one-shot query. Exactly-once holds for Delta, for a file sink by batch position,
+and for a \emph{keyed} database write; an \texttt{append} to Iceberg or Hudi writes its
+rows twice on a replayed epoch.
+
+\paragraph{Recovery is correct in the tested cases, but replication is not yet beneficial.} Correctness under worker loss holds across every arm tested, which is the
+property the algebra is for; the performance half does not, and the one environment we
+can measure it in is also the one most hostile to its premise. Replicas are resident
+rather than on a durable tier, and \sys{} has no equivalent of Spark's external shuffle
+service, so a whole-node loss that takes every copy still costs a recompute round. The
+economics therefore remain untested where they are supposed to hold: repeating at least the
+two reduce-phase arms across separate machines, reading from object storage over a measured
+network, is what would decide whether replication pays, and no such run exists here. Two
+operator-level ceilings stand as well: the CPU-to-GPU split happens at exactly one
+resource boundary, so a three-stage chain rides its third stage in the consumer, and the
+inequality join is not distributed at all (\cref{sec:price}). Finally, \sys{} owns no
+storage, so there is no transaction manager, no MVCC and no index --- an engine whose
+floor is milliseconds is not a read path an application points transactions at.
+
+\paragraph{Wall clock is not the only currency.} \cref{sec:eval-cost} measures rather
+than flags it: $0.78\times$ the wall time for $1.86\times$ the CPU, on $2.4\times$ the
+cores. When otherwise-idle CPU capacity has low marginal cost, that trade may be favorable; when
+CPU time or energy is the constrained resource, it may not. We report
+both and do not net them together.
+
+\paragraph{Threats to validity.} The following factors limit how broadly the benchmark
+results should be generalized. \emph{One machine}, and one of them for the distributed results too: the sf1-to-
+sf10 attribution is a two-point scaling study and not a scaling law, and the worker-loss
+arms run on a single-box local Ray cluster that removes the network replication's
+premise rests on. \emph{Warm, best-of-$N$}: the headline suites report the best of
+several runs of the same query, which is exactly the shape a memoizing engine wins, and
+\sys{}'s session carries a plan cache and a learned-stats loop across those repeats
+where DuckDB and Polars have no counterpart. \emph{The comparator pays a conversion
+\sys{} does not}: every engine is asked for a \texttt{pyarrow.Table}, and on a query
+returning nine million rows that conversion is roughly \emph{half} of DuckDB's measured
+time. \emph{The gate compares multisets}, and was blind to whether a sort had happened
+at all until the ordered cases were given an ordered comparison. \emph{Comparator
+configuration}: we found and fixed one adapter defect that cost Ray Data 95 of 96 cores,
+and three in the Spark adapter. \emph{Process}: continuous integration installs neither
+Ray nor a GPU, so the distributed and GPU results rest on recorded runs rather than on
+the gate that runs on every commit, and therefore have weaker continuous-reproducibility coverage than the single-node CPU results.
+
+\paragraph{What the next evaluation pass owes.} These threats are addressable by measurement
+rather than by argument, and naming the experiments is more useful than hedging the prose.
+Five stand out. \emph{Dispersion}: report per-query medians with an interval alongside the
+minimum, over repetitions in independent processes, so a ratio carries an error bar. \emph{A
+cold variant of the headline suites}: a fresh process and an empty learned store for every
+timed query, which is the configuration least favourable to this engine and the one a first-time
+user meets. \emph{The learning ablation} above, which is the only way to say what the
+cross-execution loop is worth on its own. \emph{A multi-node recovery experiment} with
+object-storage input, which is the only environment in which replication's premise is true.
+And \emph{a published artifact}: the adapters, command lines, configuration and raw per-query
+outputs for every table here, so that a reader can re-derive a geometric mean rather than trust
+one.
 
 % ===========================================================================
 \section{Related work}
+\label{sec:related}
 % ===========================================================================
 
-\sys{}'s execution is morsel-driven~\cite{leis2014morsel} over a vectorized Arrow
-representation in the MonetDB/X100 lineage~\cite{boncz2005monetdb}, with a compiled
-path for scalar expressions restricted to a subset carrying a proven-identical
-fallback. Volcano~\cite{graefe1994volcano} established the operator/exchange
-separation; the departure is that \sys{} has no distributed operator to separate.
-Mid-query re-optimization~\cite{kabra1998midquery}, progressive
-optimization~\cite{markl2004progressive} and eddies~\cite{avnur2000eddies} are the
-lineage of the stage-boundary clock, surveyed in~\cite{deshpande2007adaptive}, with
-Spark AQE~\cite{sparkaqe} its closest deployed relative. Learned
-optimizers~\cite{marcus2019neo,marcus2021bao} attack estimation with models, where
-\sys{} takes the lighter route of sketches~\cite{flajolet2007hyperloglog,karnin2016kll},
-refit cost coefficients and a bandit~\cite{auer2002ucb} over result-equivalent
-strategies, buying reproducibility and a cold start that is exactly the untuned
-system. \cite{leis2015goodjoin} is the standing argument for why measured
-cardinalities beat better estimators, and Structured Streaming's framing of a stream
-as an unbounded table~\cite{zaharia2013dstreams} is the one \cref{sec:streaming}
-adopts.
+\sys{} sits at the intersection of five lines of work, and takes something from each.
+
+\paragraph{Vectorized and compiled single-node execution.} The columnar, batch-at-a-time model
+begins with MonetDB/X100~\cite{boncz2005monetdb} and the compiled
+alternative with HyPer~\cite{neumann2011compiling};
+Umbra~\cite{neumann2020umbra} contributed the inlined-prefix string representation that
+\cref{sec:limitations} names as \sys{}'s largest structural gap. \sys{}'s execution is
+morsel-driven~\cite{leis2014morsel} and vectorized, with a Cranelift~\cite{cranelift} compiled
+path carrying a proven-identical fallback, and DuckDB~\cite{raasveldt2019duckdb} is the closest
+single-node comparator. Nearest to \sys{}'s \emph{implementation} choices are the embeddable
+Arrow-native engines --- Velox~\cite{pedreira2022velox}, Photon~\cite{behm2022photon} and
+DataFusion~\cite{lamb2024datafusion} --- which share the columnar contract and the
+library-rather-than-server posture. These systems share important implementation choices with \sys{}, including columnar
+execution and embeddability, but they are typically integrated into a larger host system for
+features such as distribution or end-to-end query orchestration. \sys{} differs in combining
+its operator contract, cross-execution measurement loop, and media/inference expressions in
+one engine.
+
+\paragraph{Distributed dataflow and cloud warehouses.} MapReduce's
+combiner~\cite{dean2004mapreduce} and Gray et al.'s algebraic
+aggregate~\cite{gray1997datacube} are where the mergeable triple comes from; \sys{}'s
+contribution is not the triple but the refusal to admit an operator without one.
+Spark~\cite{zaharia2012rdd,armbrust2015sparksql} is the direct ancestor of the design
+\cref{sec:differs} departs from, the cloud
+warehouses~\cite{sethi2019presto,dageville2016snowflake} answer the same scale question
+with a service rather than a library, and the lakehouse line~\cite{armbrust2020delta} is
+where \sys{}'s table formats come from. Volcano~\cite{graefe1994volcano} established the
+operator/exchange separation this paper leans on, and our departure is that there is no
+distributed operator to separate.
+
+\paragraph{Streaming and unified execution.} Structured Streaming's framing of a stream
+as an unbounded table~\cite{armbrust2018structured} is the framing \cref{sec:streaming} adopts. The
+two closest ancestors of this paper's central device are here rather than in the
+operator literature: Summingbird~\cite{boykin2014summingbird} made the monoid the
+explicit unifying abstraction so that one program compiles to both a batch and an online
+engine, and the Dataflow model~\cite{akidau2015dataflow} generalized the two into a
+single specification. The difference we claim over both is not the algebra but the
+level: they unify the program or the specification above two engines, and we make
+mergeability the admission test of one engine's own operators.
+Flink~\cite{carbone2015flink} and Naiad~\cite{murray2013naiad} are the dataflow answer,
+with the operator graph, barrier protocol and keyed state backend \sys{} does not have
+and does not claim, and DBSP~\cite{budiu2023dbsp} derives incremental operators from a
+query algebra --- close in spirit to reusing the triple as the incremental form, and
+more general.
+
+\paragraph{Adaptive and learned optimization.} Estimation begins with
+Selinger~\cite{selinger1979access}; mid-query re-optimization and
+eddies~\cite{avnur2000eddies} are the lineage of the stage-
+boundary clock, with Spark AQE~\cite{sparkaqe} its closest deployed relative --- the
+same mechanism and granularity, which this paper is careful not to overclaim past.
+Learned optimizers~\cite{marcus2019neo,marcus2021bao} attack estimation with models that
+change which plan runs; \sys{} takes the lighter route of
+sketches~\cite{flajolet2007hyperloglog,karnin2016kll,cormode2005countmin}, refit cost
+coefficients and a bandit~\cite{auer2002ucb} over \emph{result-equivalent} strategies,
+which buys reproducibility and a cold start that is exactly the untuned system, and
+gives up the ability to correct a genuinely bad plan choice. Leis et
+al.~\cite{leis2015goodjoin} is both the standing argument for measured cardinalities and
+the benchmark \sys{} still loses.
+
+\paragraph{Data systems for machine learning.} Ray~\cite{moritz2018ray} and Ray Data's
+streaming batch model~\cite{luan2025streamingbatch} are the runtime the AI evaluation is
+measured against and the closest system to \cref{sec:gpu}; Daft~\cite{daft} is the
+closest multimodal relational engine, and MosaicML's
+StreamingDataset~\cite{mosaicstreaming} is where the computed-permutation epoch order
+comes from. Putting a model inside the query optimizer is itself established:
+NoScope~\cite{kang2017noscope} and BlazeIt~\cite{kang2020blazeit} optimize queries over
+neural-network inference with cascades, proxy models and control variates. The
+difference is scope rather than ambition --- those systems optimize \emph{around}
+inference for a class of query, approximating where the semantics permit it, while
+\sys{} makes decode, embedding and inference ordinary expressions in the relational
+algebra, exact by construction. Their techniques can provide stronger optimizations for the query classes they target,
+whereas \sys{} emphasizes a uniform exact execution model across a broader operator surface.
 
 % ===========================================================================
 \section{Conclusion}
 % ===========================================================================
 
-The workarounds for the seven shifts are so familiar by now that they read as the
-cost of doing business. A warm cluster, so that small queries are bearable. A second
-execution model for anything fresher than a day. A shuffle width tuned by hand, and a
-CPU-to-GPU worker ratio picked the same way. A per-row callback for whatever SQL
-cannot say. And a duplicate of the data for whoever trains the models.
+\sys{} tests a deliberately restrictive systems hypothesis: many boundaries in modern data
+processing can be handled as scheduling and planning choices if the engine refuses to maintain
+separate stateful operator semantics for each execution regime. Its admission rule is simple:
+a stateful operator must factor into \pcf{} over Arrow, or it must use an explicitly weaker
+contract or remain outside the supported distributed path.
 
-None of it is necessary, and one constraint retires those boundaries together.
-Admitting an operator only as a mergeable triple removes the split between the fast
-engine and the scalable one, so speed is not re-earned at scale and scale is not paid
-for in advance. Because that triple is also the incremental form, it removes the
-split between batch and streaming. Because the operator is identical everywhere, a
-measurement taken anywhere is valid everywhere, which is what lets the optimizer plan
-from evidence rather than from constants chosen years ago for hardware nobody is
-running. And because decode, embedding, vector search and inference are expressions
-in that same algebra over the same Arrow batches, the pipeline that turns raw bytes
-into model input is one optimized plan instead of three systems and two copies of the
-data. One algebra did all of it, and the breadth is not four features bolted together
-but one decision, taken early and never broken.
+The evaluation provides evidence that this restriction is useful but not sufficient on its
+own. The same operator implementations produce equivalent TPC-H results through local and
+distributed schedulers and remain correct in the tested worker-loss configurations. The same
+state representation supports micro-batch execution, and the same logical plan can include
+relational, media, embedding, and inference operators. The measurement loop can adapt
+result-equivalent physical choices across executions without changing query semantics.
 
-\paragraph{Reproducibility.} Every number comes from a committed harness:
-\texttt{benchmarks/run.py} drives the engine adapters and \texttt{harness.py}
-enforces the correctness gate, refusing to time any query whose result does not match
-DuckDB. It records the engine build profile with each run, so a result cannot
-silently be attributed to a different build. Timings are best-of-$N$ warm on the
-machine described in \cref{sec:eval}.
+Performance depends strongly on what is held constant. On identical Arrow input, \sys{} is
+faster than DuckDB on every suite for which that comparison is available in the harness. When
+DuckDB uses its native compressed representation and storage statistics, the result reverses
+for TPC-H at sf10. The controlled operator experiments indicate that physical representation
+explains a substantial part of that difference, especially for strings and dictionary-encoded
+keys, but the current evaluation does not justify reducing all remaining system-level
+differences to storage alone.
+
+The costs are equally important. On TPC-H sf1, lower latency comes with $1.86\times$ the CPU
+consumption and $2.4\times$ the effective core use. The Join Order Benchmark remains
+$1.29\times$ behind. Streaming is implemented as a micro-batch driver with materially weaker
+state and fault-tolerance guarantees than Flink-class systems, and replication does not improve
+recovery in the environment measured here. These are not peripheral caveats; they identify the
+work required to test whether the mergeability-first design remains compelling as storage,
+streaming guarantees, optimizer calibration, and distributed recovery mature.
+
+The broader result is therefore narrower than ``one engine wins every workload.'' A single,
+mergeable operator vocabulary can remove several implementation forks while remaining
+competitive across relational and AI-oriented workloads. The next question is whether the
+same property continues to hold once the system gains richer physical representations and
+stronger distributed state management without reintroducing the semantic duplication the
+design was intended to avoid.
+
+\paragraph{Reproducibility.} Each reported experiment is produced by a named benchmark
+script in the committed harness: \texttt{benchmarks/run.py} drives the engine adapters and
+\texttt{harness.py} enforces the correctness gate, with \texttt{scenarios/cost\_bench.py},
+\texttt{cluster/robustness/worker\_loss.py}, \texttt{scenarios/streaming\_throughput.py},
+\texttt{scenarios/learning\_curve.py} and \texttt{scenarios/scheduler\_equivalence.py}
+producing \cref{sec:eval-cost}, \cref{tab:faults}, \cref{sec:eval-streaming},
+\cref{fig:learning} and the two-scheduler agreement of \cref{sec:eval-algebra} respectively.
+The harness refuses to time a debug build or a loaded box, and every result document opens
+with a machine fingerprint --- host, CPU model, cgroup-available and logical core counts,
+memory, kernel, Python, engine and build profile, git commit, and the exact command line ---
+because this project has already published ratios taken across four different machines as if
+they were one series. A result therefore cannot silently be attributed to a different build or
+a different box, which is a weaker property than a released artifact and is not a substitute
+for one.
 
 {\scriptsize
 \setlength{\bibsep}{0.6pt plus 0.2ex}
-\bibliographystyle{plain}
+\bibliographystyle{abbrv}
 \balance
 \bibliography{refs}
 }

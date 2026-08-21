@@ -123,6 +123,25 @@ An unrecognized option is an error naming the option, rather than being silently
 
 The legacy Azure Blob schemes `wasb://` and `wasbs://` are **not** supported by either backend. Use the current `abfs://` / `abfss://` spelling, which is. A `wasb://` path fails with an error saying exactly that rather than being silently mis-read.
 
+## Object stores outside the three hyperscalers
+
+Alibaba OSS (`oss://`), Tencent COS (`cos://`, `cosn://`), Huawei OBS (`obs://`), Oracle Cloud Object Storage (`oci://`), OpenStack Swift (`swift://`) and lakeFS (`lakefs://`) are reached through fsspec, so they need that scheme's driver installed. Batcher treats them as object stores: a write publishes in place rather than through a temp-then-rename, which on an object store is a full server-side copy of the object and is not atomic anyway.
+
+Credentials go in `storage_options`, which reaches an fsspec backend as **keyword arguments**. That is the vocabulary fsspec, delta-rs, Polars and pandas already speak, so a credential set that works with any of them works here unchanged.
+
+```python
+# docs: skip
+ds = bt.read.parquet(
+    "oss://bucket/events/*.parquet",
+    storage_options={"key": "...", "secret": "env:OSS_SECRET",
+                     "endpoint": "oss-cn-hangzhou.aliyuncs.com"},
+)
+```
+
+An option the backend does not accept is an error naming the option, rather than a connection that quietly used none of your settings.
+
+Any value there may be an `env:`, `file:` or `cmd:` reference, resolved on the machine that opens the connection — so a distributed read ships the reference to each worker and never the secret. See {doc}`/user-guide/trust/secrets`.
+
 ## Bring your own filesystem or credentials
 
 Every reader and writer accepts two optional keywords, so you are never limited to environment variables or a URI query string.

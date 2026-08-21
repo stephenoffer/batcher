@@ -14,10 +14,11 @@ import pytest
 
 from batcher.dist.executors.partition_io import merge_boundaries
 from batcher.dist.sort_boundaries import (
+    grid_kind_of,
     load_learned_grids,
     persist_grids,
+    sort_grid_kind,
     sort_key_identity,
-    sort_key_is_string,
     sort_shape_key,
 )
 
@@ -185,7 +186,7 @@ def test_an_unreadable_source_yields_no_identity():
         pass
 
     assert sort_key_identity(_Opaque(), "k") is None
-    assert sort_key_is_string(_Opaque(), "k") is None
+    assert sort_grid_kind(_Opaque(), "k") is None
 
 
 # --- the load-side guard, for entries written under the old colliding digest -----------
@@ -194,15 +195,15 @@ def test_an_unreadable_source_yields_no_identity():
 def test_a_string_grid_is_refused_for_a_numeric_key():
     key = sort_shape_key("MAP_IR_TYPE_STR", "k")
     persist_grids(key, [(["a", "b", "c"], 100)])
-    assert load_learned_grids(key, True) == [(["a", "b", "c"], 100)]
-    assert load_learned_grids(key, False) is None
+    assert load_learned_grids(key, "text") == [(["a", "b", "c"], 100)]
+    assert load_learned_grids(key, "numeric") is None
 
 
 def test_a_numeric_grid_is_refused_for_a_string_key():
     key = sort_shape_key("MAP_IR_TYPE_NUM", "k")
     persist_grids(key, [([0.0, 5.0, 10.0], 100)])
-    assert load_learned_grids(key, False) == [([0.0, 5.0, 10.0], 100)]
-    assert load_learned_grids(key, True) is None
+    assert load_learned_grids(key, "numeric") == [([0.0, 5.0, 10.0], 100)]
+    assert load_learned_grids(key, "text") is None
 
 
 def test_no_type_opinion_accepts_whatever_was_stored():
@@ -217,5 +218,63 @@ def test_a_mixed_store_is_refused_rather_than_partly_used():
     """One wrong-typed grid poisons the merge, so the whole entry is dropped."""
     key = sort_shape_key("MAP_IR_TYPE_MIXED", "k")
     persist_grids(key, [(["a", "b"], 10), ([1.0, 2.0], 10)])
-    assert load_learned_grids(key, True) is None
-    assert load_learned_grids(key, False) is None
+    assert load_learned_grids(key, "text") is None
+    assert load_learned_grids(key, "numeric") is None
+
+
+# --- binary grids: `bytes` boundaries through a JSON-only store ------------------------
+
+
+def test_a_binary_grid_round_trips_through_the_store():
+    """A byte key's boundaries are `bytes`, and the hub stores JSON, so they are encoded.
+
+    The round trip is the whole property: a boundary that came back as a hex *string*
+    would be handed to the byte range partitioner as text and route every row by the wrong
+    comparison. Hex is chosen because it orders the way the bytes do, so a grid also reads
+    back in the order it was written.
+    """
+    key = sort_shape_key("MAP_IR_BIN_ROUNDTRIP", "k")
+    grids = [([b"\x00\x01", b"\x7f\xff"], 100), ([b"\x00", b"\xff" * 4], 50)]
+    persist_grids(key, grids)
+    assert load_learned_grids(key, "binary") == grids
+
+
+def test_a_binary_grid_is_refused_for_a_numeric_or_text_key():
+    """The three-way kind guard, on the case a boolean flag could not express.
+
+    While the guard asked "is this a string grid", a *binary* grid answered no — the same
+    answer a float grid gives — so a stored float grid passed for a binary key and reached
+    the byte range partitioner.
+    """
+    key = sort_shape_key("MAP_IR_BIN_GUARD", "k")
+    persist_grids(key, [([b"\x01", b"\x02"], 100)])
+    assert load_learned_grids(key, "binary") == [([b"\x01", b"\x02"], 100)]
+    assert load_learned_grids(key, "numeric") is None
+    assert load_learned_grids(key, "text") is None
+
+    numeric = sort_shape_key("MAP_IR_BIN_GUARD_NUM", "k")
+    persist_grids(numeric, [([0.0, 5.0], 100)])
+    assert load_learned_grids(numeric, "binary") is None
+
+
+def test_grid_kind_names_every_key_family():
+    """One name per family, from the Arrow type, because three callers dispatch on it."""
+    import pyarrow as pa
+
+    assert grid_kind_of(pa.string()) == "text"
+    assert grid_kind_of(pa.large_string()) == "text"
+    assert grid_kind_of(pa.binary()) == "binary"
+    assert grid_kind_of(pa.large_binary()) == "binary"
+    assert grid_kind_of(pa.binary(10)) == "binary"
+    assert grid_kind_of(pa.int64()) == "numeric"
+    assert grid_kind_of(pa.float64()) == "numeric"
+    assert grid_kind_of(pa.date32()) == "numeric"
+
+
+def test_a_binary_grid_merges_lexicographically():
+    """`bytes` and `str` share the lexical merge, because both order that way in Python
+    and both order that way in the Rust router."""
+    grids = [([b"\x01", b"\x05", b"\x09"], 100), ([b"\x02", b"\x06", b"\x0a"], 100)]
+    cuts = merge_boundaries(grids, 3)
+    assert all(isinstance(c, bytes) for c in cuts), cuts
+    assert cuts == sorted(cuts)

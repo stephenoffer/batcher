@@ -48,9 +48,11 @@ from batcher.plan.expr_ir.namespaces import (
     ListContains,
     ListFunc,
     ListGet,
+    ListGetDyn,
     ListSimhash,
     ListSlice,
     StrFunc,
+    StrFuncDyn,
     StructField,
 )
 from batcher.plan.expr_ir.namespaces import _DtNamespace as _DtNamespace
@@ -93,6 +95,7 @@ __all__ = [
     "ListContains",
     "ListFunc",
     "ListGet",
+    "ListGetDyn",
     "ListJoin",
     "ListSimhash",
     "ListSlice",
@@ -102,6 +105,7 @@ __all__ = [
     "Not",
     "NullIf",
     "StrFunc",
+    "StrFuncDyn",
     "StructField",
     "WindowExpr",
     "array",

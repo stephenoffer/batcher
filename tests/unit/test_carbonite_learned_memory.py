@@ -474,3 +474,83 @@ def test_concurrent_refits_do_not_double_count_the_shared_prefix():
         f"concurrent refits diverged from the single-threaded fit "
         f"{want['aggregate']}: {set(results)}"
     )
+
+
+def test_spill_volume_is_predicted_against_input_rows_not_output_rows():
+    """The coefficient is fitted per *input* row, so it must be applied to input rows.
+
+    `_derive_samples` divides a measured `spill_bytes` by `_memory_basis_rows` — the
+    operator's input rows. Multiplying that back by `est_rows`, which `annotate_ops`
+    stamps with the *output* cardinality, disagrees by exactly the operator's
+    selectivity. A 10x-reducing aggregate is the shape that spills most, and it is the
+    shape the mismatch under-predicts most.
+    """
+    model = LearnedMemoryModel(
+        _bytes_per_row={},
+        _alpha=0.5,
+        _clamp=4.0,
+        _row_bytes=64,
+        _spill_per_row={"aggregate": 200.0},
+        _unknown_rows=1e12,
+    )
+    in_rows, out_rows = 50_000.0, 5_000.0
+    scan = PhysicalOp(
+        op_id=OpId(0),
+        kind="Scan",
+        backend="native",
+        algorithm="",
+        bounds=ResourceBounds(m_max_bytes=0, c_max_credits=0, n_max_parallelism=0),
+        inputs=(),
+        properties=PlanProperties(est_rows=in_rows),
+    )
+    agg = PhysicalOp(
+        op_id=OpId(1),
+        kind="Aggregate",
+        backend="native",
+        algorithm="",
+        bounds=ResourceBounds(m_max_bytes=0, c_max_credits=0, n_max_parallelism=0),
+        inputs=(OpId(0),),
+        properties=PlanProperties(est_rows=out_rows),
+    )
+    plan = PhysicalPlan(ir={}, output_schema=None, ops=(scan, agg))
+    assert model.predicted_spill_bytes(plan.ops) == int(200.0 * in_rows), (
+        "the aggregate consumes 50,000 rows and emits 5,000; a per-input-row coefficient "
+        "applied to the output count under-predicts the spill by the reduction ratio"
+    )
+
+
+def test_a_leaf_operator_still_predicts_against_its_own_estimate():
+    """A scan has no child to read input rows from, and its own estimate is the right basis."""
+    model = LearnedMemoryModel(
+        _bytes_per_row={},
+        _alpha=0.5,
+        _clamp=4.0,
+        _row_bytes=64,
+        _spill_per_row={"scan": 8.0},
+        _unknown_rows=1e12,
+    )
+    plan = _plan_with_est_rows("Scan", 64 * 1_000, 1_000.0)
+    assert model.predicted_spill_bytes(plan.ops) == int(8.0 * 1_000)
+
+
+def test_blend_peak_uses_the_input_row_basis_when_the_plan_supplies_it():
+    """The learned footprint is per input row; blending must not rescale it by selectivity.
+
+    A 10x-reducing aggregate whose family measured 256 B per input row really holds
+    ``256 x input_rows``. Recovering a row count from ``plan_estimate / row_size`` recovers
+    the *output* count, so the measurement arrives ten times too small and the blend pulls
+    the estimate down instead of up.
+    """
+    model = LearnedMemoryModel(
+        _bytes_per_row={"aggregate": 256.0},
+        _alpha=1.0,  # take the measurement whole, so the basis is what is under test
+        _clamp=1_000.0,  # wide enough that the clamp is not what decides
+        _row_bytes=64,
+        _spill_per_row={},
+        _unknown_rows=1e12,
+    )
+    in_rows, out_rows, width = 50_000.0, 5_000.0, 64.0
+    planned = int(out_rows * width)
+    assert model.blend_peak("Aggregate", planned, width, input_rows=in_rows) == int(256.0 * in_rows)
+    # Without the basis the older recovery stands, and it reads the output count.
+    assert model.blend_peak("Aggregate", planned, width) == int(256.0 * out_rows)

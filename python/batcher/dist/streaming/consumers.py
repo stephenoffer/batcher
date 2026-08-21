@@ -28,21 +28,50 @@ __all__ = [
 ]
 
 
+#: A partition ceiling high enough that `gpu_aware_pool_default`'s "never more actors than
+#: partitions" clamp cannot bind while we ask it how many actors the *devices* want. The same
+#: sentinel, for the same reason, as `executors.map._UNCLAMPED_PARTITIONS`.
+_UNCLAMPED_PARTITIONS = 1 << 30
+
+
 def consumer_pool_size(gpu_stage, workers: int, num_partitions: int) -> int:
-    """Actor count for the GPU consumer stage: its explicit `concurrency`, else a
-    GPU-aware default (one actor per GPU), clamped to the partition count."""
+    """Actor count for the GPU consumer stage: its explicit `concurrency`, else one per device.
+
+    **Not clamped to the partition count**, and that is the whole point. A consumer does not
+    read a partition: morsels arrive over Flight and `take_consumer` hands each one to whichever
+    consumer is free, so the number of consumers is independent of how the *source* happened to
+    shard. Clamping them to it inverted the causality — a 2.4 GB corpus takes the four-partition
+    floor, and four partitions then decided that eight of a twelve-GPU fleet got no actor at
+    all. The data was choosing how many accelerators were allowed to work, which is sublinear
+    scaling by construction: adding devices to the cluster changed nothing.
+
+    This is the same fix `executors.map._pool_partition_count` made on the batch path, applied
+    to the streaming one, which kept the inherited clamp. Stage 0 is genuinely partition-bound
+    and is still sized that way by the driver.
+
+    An explicit `concurrency` is honored as written, including a `(min, max)` range, which the
+    caller above resolves as an autoscaling bound rather than a target.
+
+    Args:
+        gpu_stage: The consumer stage, carrying its `concurrency` and accelerator ask.
+        workers: The worker count the run was sized for, used as the non-accelerator fallback.
+        num_partitions: Input partitions — the ceiling on *stage 0*, not on this stage.
+
+    Returns:
+        The number of consumer actors to open, at least 1.
+    """
     from batcher.dist.executors.map import _resolve_pool_size
     from batcher.ml.gpu import gpu_aware_pool_default
 
     default = gpu_aware_pool_default(
         gpu_stage.num_gpus,
         workers,
-        num_partitions,
+        _UNCLAMPED_PARTITIONS,
         getattr(gpu_stage, "accelerator_type", None),
         resources=dict(getattr(gpu_stage, "resources", ()) or ()),
     )
     size = _resolve_pool_size(gpu_stage.concurrency, num_partitions, default)
-    return clamp(num_partitions, 1, size)
+    return max(1, size)
 
 
 def consumer_pool_bounds(stage, workers: int, num_partitions: int) -> tuple[int, int]:
@@ -70,7 +99,8 @@ def consumer_pool_bounds(stage, workers: int, num_partitions: int) -> tuple[int,
     Args:
         stage: The resource stage, carrying its `concurrency` spec and accelerator ask.
         workers: The worker count the run was sized for.
-        num_partitions: Input partitions, the ceiling on stage-0 parallelism.
+        num_partitions: Input partitions, the ceiling on stage-0 parallelism — and on stage 0
+            only, since a consumer is fed by the Flight hand-off rather than by a partition.
 
     Returns:
         `(start, ceiling)`, both at least 1 and with `ceiling >= start`.
@@ -93,15 +123,28 @@ def record_consumer_feedback(consumers, plan: LogicalPlan, hub) -> None:
     _record_gpu_feedback(hub, plan, max(samples) if samples else None)
 
 
+#: How long the locality probe waits for a consumer to answer before giving up on locality.
+#:
+#: The probe is best-effort by design, but an unbounded `ray.get` is not a best-effort call —
+#: it is an unbounded one. An actor that cannot be placed never answers, so a pipeline whose
+#: consumers were pending behind a full cluster hung *here*, in an optimization, with no error
+#: and no timeout: `probe_consumer_hosts` at the top of the driver's stack for as long as the
+#: process lived. Thirty seconds is far longer than a live actor's reply (sub-millisecond) and
+#: far longer than a cold actor's start, so it never costs locality on a healthy fleet — it
+#: only converts a capacity problem into a slower run instead of a silent hang.
+_HOST_PROBE_TIMEOUT_S = 30.0
+
+
 def probe_consumer_hosts(consumers) -> dict:
     """Node host per consumer actor, for locality-aware morsel assignment.
 
     One fan-out at pool construction (and once per replacement), not per morsel. Returns
-    `{}` on any failure: locality is an optimization, so a probe that cannot run must
-    leave the pipeline scheduling exactly as it did before rather than fail the query.
+    `{}` on any failure *or timeout*: locality is an optimization, so a probe that cannot run
+    must leave the pipeline scheduling exactly as it did before rather than fail the query —
+    and, equally, must not hold it (see `_HOST_PROBE_TIMEOUT_S`).
     """
     try:
-        hosts = ray.get([c.node_host.remote() for c in consumers])
+        hosts = ray.get([c.node_host.remote() for c in consumers], timeout=_HOST_PROBE_TIMEOUT_S)
     except Exception as exc:  # pragma: no cover - best-effort probe
         from batcher._internal.logging import note_suppressed
 

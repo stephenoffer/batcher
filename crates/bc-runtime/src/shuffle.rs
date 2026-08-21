@@ -14,14 +14,15 @@ use std::collections::HashSet;
 use std::hash::BuildHasher;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, GenericBinaryArray, GenericStringArray,
-    LargeStringArray, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, AsArray, Float64Array, GenericBinaryArray, GenericStringArray, RecordBatch,
+    StringArray, UInt32Array,
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
 
+use crate::byte_key::{ByteKeyColumn, ByteKeys};
 use crate::error::RuntimeError;
 
 /// Below this row count the hash pass runs serially: rayon's fan-out/join costs more
@@ -576,40 +577,129 @@ pub fn range_part_of_i64(
     descending: bool,
 ) -> Result<Vec<u32>, RuntimeError> {
     let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
-    if !matches!(key_col.data_type(), t if t.is_integer()) {
+    if !is_int_ordered(key_col.data_type()) {
         return Err(RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),
         });
     }
-    let key = cast(key_col, &DataType::Int64)?;
-    let key = key
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .ok_or_else(|| RuntimeError::NonNumericRangeKey {
-            dtype: key_col.data_type().to_string(),
-        })?;
-    Ok(map_rows(key.len(), |i| {
-        if key.is_null(i) {
-            null_bucket
-        } else {
-            boundaries.partition_point(|&b| b <= key.value(i)) as u32
-        }
-    }))
+    Ok(int_buckets(key_col, boundaries, null_bucket))
 }
 
-/// Like [`range_partition_by_i64_key`], but for a **string** leading key compared
-/// **lexicographically by bytes** — exactly the ordering arrow's `sort_to_indices`
-/// gives a `Utf8`/`LargeUtf8` column, so the per-range sorts concatenate into the
-/// same relation a single global string sort produces. Boundaries are ascending
-/// string quantiles sampled from the key.
+/// Whether `dt` is a fixed-width key whose *physical* integer order is its value order.
 ///
-/// Without this, a string `ORDER BY` had no range partitioner, so the single-node
-/// sample-sort refused it and a whole-column string sort ran single-threaded — the
-/// one sort shape that never used more than one core.
-pub fn range_partition_by_str_key(
+/// The temporal types are stored as signed integers (days, millis, micros, ...), so they route
+/// exactly as the integer of the same width does. They are named here because the caller no
+/// longer widens the column to `Int64` before routing it — it passes the native array — and a
+/// guard that asked only `is_integer()` refused a `Date32` that had previously arrived already
+/// cast.
+fn is_int_ordered(dt: &DataType) -> bool {
+    dt.is_integer()
+        || matches!(
+            dt,
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::Duration(_)
+        )
+}
+
+/// Per-row bucket for a fixed-width integer or integer-ordered temporal key, reading the key
+/// in its **native width**.
+///
+/// The column used to be `cast` to `Int64` first, purely so this comparison could be written
+/// against one type. That cast is a full materialization of the column — on a `Date32` key it
+/// is a 6 M-element, 48 MB array nothing else ever reads — and it measured **18.0 ms of a
+/// 43.5 ms two-key sort, 41% of the operator**, against 4.4 ms for the routing it enables and
+/// 0.3 ms for the sampling that shares it. Widening a value is free in a register; widening a
+/// column is a pass over memory.
+///
+/// Widening is order-preserving for every type below, so the buckets are the ones the cast
+/// produced. `UInt64` is deliberately absent: a value above `i64::MAX` has no order-preserving
+/// `i64`, and the caller declines that key rather than routing it wrongly.
+fn int_buckets(key_col: &ArrayRef, boundaries: &[i64], null_bucket: u32) -> Vec<u32> {
+    macro_rules! route {
+        ($arr:ty) => {{
+            let a = key_col
+                .as_any()
+                .downcast_ref::<$arr>()
+                .expect("checked dtype");
+            return map_rows(a.len(), |i| {
+                if a.is_null(i) {
+                    null_bucket
+                } else {
+                    boundaries.partition_point(|&b| b <= a.value(i) as i64) as u32
+                }
+            });
+        }};
+    }
+    use arrow::datatypes::TimeUnit;
+    match key_col.data_type() {
+        DataType::Int8 => route!(arrow::array::Int8Array),
+        DataType::Int16 => route!(arrow::array::Int16Array),
+        DataType::Int32 => route!(arrow::array::Int32Array),
+        DataType::Int64 => route!(arrow::array::Int64Array),
+        DataType::UInt8 => route!(arrow::array::UInt8Array),
+        DataType::UInt16 => route!(arrow::array::UInt16Array),
+        DataType::UInt32 => route!(arrow::array::UInt32Array),
+        DataType::Date32 => route!(arrow::array::Date32Array),
+        DataType::Date64 => route!(arrow::array::Date64Array),
+        DataType::Time32(TimeUnit::Second) => route!(arrow::array::Time32SecondArray),
+        DataType::Time32(TimeUnit::Millisecond) => route!(arrow::array::Time32MillisecondArray),
+        DataType::Time64(TimeUnit::Microsecond) => route!(arrow::array::Time64MicrosecondArray),
+        DataType::Time64(TimeUnit::Nanosecond) => route!(arrow::array::Time64NanosecondArray),
+        DataType::Timestamp(TimeUnit::Second, _) => route!(arrow::array::TimestampSecondArray),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            route!(arrow::array::TimestampMillisecondArray)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            route!(arrow::array::TimestampMicrosecondArray)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            route!(arrow::array::TimestampNanosecondArray)
+        }
+        DataType::Duration(TimeUnit::Second) => route!(arrow::array::DurationSecondArray),
+        DataType::Duration(TimeUnit::Millisecond) => {
+            route!(arrow::array::DurationMillisecondArray)
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            route!(arrow::array::DurationMicrosecondArray)
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => route!(arrow::array::DurationNanosecondArray),
+        // Anything else (notably `UInt64`) falls back to the widening read, which is exact for
+        // every type that reaches here through the caller's own type gate.
+        _ => {
+            let key = cast(key_col, &DataType::Int64).expect("integer key casts to Int64");
+            let a = key
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("cast to Int64");
+            map_rows(a.len(), |i| {
+                if a.is_null(i) {
+                    null_bucket
+                } else {
+                    boundaries.partition_point(|&b| b <= a.value(i)) as u32
+                }
+            })
+        }
+    }
+}
+
+/// Like [`range_partition_by_i64_key`], but for a **byte-lexicographic** leading key —
+/// `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary` — compared by its bytes.
+///
+/// That is exactly the ordering arrow's `sort_to_indices` gives those columns, so the
+/// per-range sorts concatenate into the same relation a single global sort produces.
+/// Boundaries are ascending quantiles sampled from the key by [`byte_quantiles`].
+///
+/// Without this, a byte-keyed `ORDER BY` had no range partitioner, so the single-node
+/// sample-sort refused it and a whole-column sort ran single-threaded — the one sort shape
+/// that never used more than one core.
+pub fn range_partition_by_byte_key(
     batch: &RecordBatch,
     key_col: &ArrayRef,
-    boundaries: &[String],
+    boundaries: &[impl AsRef<[u8]> + Sync],
     n_buckets: usize,
     nulls_first: bool,
     descending: bool,
@@ -619,7 +709,7 @@ pub fn range_partition_by_str_key(
         return Ok(vec![batch.clone()]);
     }
     let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
-    let mut part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    let mut part_of = bytes_part_of(key_col, boundaries, null_bucket)?;
     // More split points than `n_buckets-1` would let `partition_point` return an id ==
     // `n_buckets` and index `scatter_into_buckets` out of bounds — a panic on a data path.
     // Clamp so an over-long boundary list degrades to fewer non-empty buckets, every row
@@ -632,17 +722,41 @@ pub fn range_partition_by_str_key(
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
-/// Cap on the values a single [`string_quantiles`] call sorts. Boundaries only need to
+/// [`range_partition_by_byte_key`] for the `Utf8`/`LargeUtf8` spelling of the same key, whose
+/// boundaries cross the FFI as `String`.
+///
+/// A wrapper rather than a second implementation: a `String` boundary *is* its bytes
+/// (`String: AsRef<[u8]>`), and UTF-8 compares byte-lexicographically, so there is exactly one
+/// routing here and both key families take it.
+pub fn range_partition_by_str_key(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[String],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    range_partition_by_byte_key(
+        batch,
+        key_col,
+        boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+}
+
+/// Cap on the values a single [`byte_quantiles`] call sorts. Boundaries only need to
 /// describe the *shape* of the key distribution, and a strided sample of this many values
 /// pins the quantiles of any realistic column to well under a bucket's width — while
 /// keeping the sample sort off the critical path of a wide split.
 const MAX_BOUNDARY_SAMPLE: usize = 1 << 16;
 
-/// Sample a string column's distribution as ascending values at `probs` — the sampling
-/// counterpart of [`range_partition_by_str_key`]'s `boundaries`.
+/// Sample a byte-key column's distribution as ascending values at `probs` — the sampling
+/// counterpart of [`range_partition_by_byte_key`].
 ///
 /// The numeric sort key gets its grid from the KLL sketch in `bc-sketches`, which is
-/// numeric-only, so a string key had no grid at all and the distributed sort refused it.
+/// numeric-only, so a byte key had no grid at all and the distributed sort refused it.
 /// A sketch is not needed here: the merge on the driver re-quantiles the union of every
 /// worker's sample anyway, so each worker only has to describe its own split. Strided
 /// sampling followed by a sort of the sample does that in bounded memory and time.
@@ -650,8 +764,8 @@ const MAX_BOUNDARY_SAMPLE: usize = 1 << 16;
 /// Nulls are skipped — they route to a dedicated end bucket rather than by comparison —
 /// and an all-null or empty column yields no boundaries, which the caller reads as "this
 /// split says nothing about the distribution".
-pub fn string_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<String>, RuntimeError> {
-    let mut sample = sample_strings(key_col)?;
+pub fn byte_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let mut sample = sample_bytes(key_col)?;
     if sample.is_empty() || probs.is_empty() {
         return Ok(Vec::new());
     }
@@ -663,10 +777,27 @@ pub fn string_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<String>
         .collect())
 }
 
-/// Collect up to [`MAX_BOUNDARY_SAMPLE`] non-null values of a `Utf8`/`LargeUtf8` column,
-/// strided so the sample spans the whole column rather than its prefix. A prefix sample
-/// would describe a *sorted* input as a single narrow range and route every row to one
-/// bucket — the exact skew the boundaries exist to prevent.
+/// [`byte_quantiles`] rendered as `String`, for a `Utf8`/`LargeUtf8` key whose boundaries
+/// cross the FFI as text.
+///
+/// Every sampled value came out of a UTF-8 column, so the re-decode cannot fail; it is written
+/// as a decline rather than an `expect` so that a future caller handing this a binary column
+/// loses the optimization instead of panicking on a data path.
+pub fn string_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<String>, RuntimeError> {
+    byte_quantiles(key_col, probs)?
+        .into_iter()
+        .map(|v| {
+            String::from_utf8(v).map_err(|_| RuntimeError::NonNumericRangeKey {
+                dtype: key_col.data_type().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Collect up to [`MAX_BOUNDARY_SAMPLE`] non-null values of a byte-key column, strided so the
+/// sample spans the whole column rather than its prefix. A prefix sample would describe a
+/// *sorted* input as a single narrow range and route every row to one bucket — the exact skew
+/// the boundaries exist to prevent.
 ///
 /// The stride walks the **non-null** positions, not every position. Striding the raw index
 /// range and discarding the nulls it happened to land on makes the sample size a function of
@@ -675,48 +806,46 @@ pub fn string_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<String>
 /// boundaries, so every row routes to a single bucket. Counting only what survives keeps the
 /// sample the size the cap intends whatever the null pattern is, in one pass and without
 /// materializing the surviving index list.
-fn sample_strings(key_col: &ArrayRef) -> Result<Vec<String>, RuntimeError> {
-    fn collect<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) -> Vec<String> {
-        let present = arr.len() - arr.null_count();
-        if present == 0 {
-            return Vec::new();
-        }
-        let stride = present.div_ceil(MAX_BOUNDARY_SAMPLE).max(1);
-        let mut sample = Vec::with_capacity(present.div_ceil(stride));
-        let mut seen = 0usize;
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                continue;
-            }
-            if seen % stride == 0 {
-                sample.push(arr.value(i).to_string());
-            }
-            seen += 1;
-        }
-        sample
-    }
-    let bad = || RuntimeError::NonNumericRangeKey {
+fn sample_bytes(key_col: &ArrayRef) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let keys = ByteKeyColumn::new(key_col).ok_or_else(|| RuntimeError::NonNumericRangeKey {
         dtype: key_col.data_type().to_string(),
-    };
-    match key_col.data_type() {
-        DataType::Utf8 => Ok(collect(
-            key_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(bad)?,
-        )),
-        DataType::LargeUtf8 => Ok(collect(
-            key_col
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(bad)?,
-        )),
-        _ => Err(bad()),
+    })?;
+    let present = keys.len() - keys.null_buffer().map_or(0, |nb| nb.null_count());
+    if present == 0 {
+        return Ok(Vec::new());
     }
+    let stride = present.div_ceil(MAX_BOUNDARY_SAMPLE).max(1);
+    let mut sample = Vec::with_capacity(present.div_ceil(stride));
+    let mut seen = 0usize;
+    for i in 0..keys.len() {
+        if keys.is_null(i) {
+            continue;
+        }
+        if seen % stride == 0 {
+            sample.push(keys.key(i).to_vec());
+        }
+        seen += 1;
+    }
+    Ok(sample)
 }
 
-/// The per-row bucket id [`range_partition_by_str_key`] would scatter by — the routing
+/// The per-row bucket id [`range_partition_by_byte_key`] would scatter by — the routing
 /// without the gather.
+pub fn range_part_of_bytes(
+    key_col: &ArrayRef,
+    boundaries: &[impl AsRef<[u8]> + Sync],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<u32>, RuntimeError> {
+    bytes_part_of(
+        key_col,
+        boundaries,
+        null_bucket_of(n_buckets, nulls_first, descending),
+    )
+}
+
+/// [`range_part_of_bytes`] for `String` boundaries — see [`range_partition_by_str_key`].
 pub fn range_part_of_str(
     key_col: &ArrayRef,
     boundaries: &[String],
@@ -724,59 +853,30 @@ pub fn range_part_of_str(
     nulls_first: bool,
     descending: bool,
 ) -> Result<Vec<u32>, RuntimeError> {
-    str_part_of(
-        key_col,
-        boundaries,
-        null_bucket_of(n_buckets, nulls_first, descending),
-    )
+    range_part_of_bytes(key_col, boundaries, n_buckets, nulls_first, descending)
 }
 
+/// Route every row of a byte-key column against ascending `boundaries`.
+///
 /// `partition_point(|b| b <= v)` routes a value equal to a boundary consistently to the
 /// higher bucket, so equal keys never straddle a boundary — the property the
 /// concatenation-without-merge relies on.
-fn route_str<O: OffsetSizeTrait>(
-    arr: &GenericStringArray<O>,
-    boundaries: &[String],
-    null_bucket: u32,
-) -> Vec<u32> {
-    map_rows(arr.len(), |i| {
-        if arr.is_null(i) {
-            null_bucket
-        } else {
-            let v = arr.value(i);
-            boundaries.partition_point(|b| b.as_str() <= v) as u32
-        }
-    })
-}
-
-/// Dispatch a string key to its `Utf8` / `LargeUtf8` array and route every row.
-fn str_part_of(
+fn bytes_part_of(
     key_col: &ArrayRef,
-    boundaries: &[String],
+    boundaries: &[impl AsRef<[u8]> + Sync],
     null_bucket: u32,
 ) -> Result<Vec<u32>, RuntimeError> {
-    let bad = || RuntimeError::NonNumericRangeKey {
+    let keys = ByteKeyColumn::new(key_col).ok_or_else(|| RuntimeError::NonNumericRangeKey {
         dtype: key_col.data_type().to_string(),
-    };
-    match key_col.data_type() {
-        DataType::Utf8 => Ok(route_str(
-            key_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(bad)?,
-            boundaries,
-            null_bucket,
-        )),
-        DataType::LargeUtf8 => Ok(route_str(
-            key_col
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(bad)?,
-            boundaries,
-            null_bucket,
-        )),
-        _ => Err(bad()),
-    }
+    })?;
+    Ok(map_rows(keys.len(), |i| {
+        if keys.is_null(i) {
+            null_bucket
+        } else {
+            let v = keys.key(i);
+            boundaries.partition_point(|b| b.as_ref() <= v) as u32
+        }
+    }))
 }
 
 /// Skew-aware partitioning for a **single-key** distributed join: a *hot* key's
@@ -1735,6 +1835,95 @@ mod tests {
             global.sort();
             assert_eq!(concat, global, "buckets={buckets}");
         }
+    }
+
+    /// The same routing, over every *binary* spelling of a byte key and with the null-bearing
+    /// and descending cases the string test does not reach.
+    ///
+    /// A binary key is the one the range partitioner used to refuse outright
+    /// (`NonNumericRangeKey`), which is what kept a `Binary` `ORDER BY` off both the parallel
+    /// sample-sort and the distributed sort. The property to hold is the same one the whole
+    /// range sort rests on: bucket-local sorts, concatenated in bucket order, are the global
+    /// sort.
+    #[test]
+    fn binary_boundaries_route_into_a_globally_ordered_concatenation() {
+        use arrow::array::{BinaryArray, FixedSizeBinaryArray, LargeBinaryArray};
+
+        let raw: Vec<Vec<u8>> = (0..500)
+            .map(|i| {
+                let v = ((i * 37) % 500) as u32;
+                // Ten bytes, most of them zero — the shape a fixed-width record key has, and
+                // the one a text-only sampler could not have carried.
+                let mut k = vec![0u8; 10];
+                k[6..].copy_from_slice(&v.to_be_bytes());
+                k
+            })
+            .collect();
+        let binary: ArrayRef = Arc::new(BinaryArray::from_iter(raw.iter().map(|v| Some(&v[..]))));
+        let large: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+            raw.iter().map(|v| Some(&v[..])),
+        ));
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                raw.iter().map(|v| Some(v.clone())),
+                10,
+            )
+            .expect("uniform width"),
+        );
+
+        for (name, key) in [
+            ("binary", binary),
+            ("large_binary", large),
+            ("fixed", fixed),
+        ] {
+            for buckets in [1usize, 2, 4, 7, 16] {
+                let probs: Vec<f64> = (1..buckets).map(|i| i as f64 / buckets as f64).collect();
+                let mut bounds = byte_quantiles(&key, &probs).unwrap();
+                bounds.dedup();
+                let part_of = range_part_of_bytes(&key, &bounds, buckets, false, false).unwrap();
+                let mut concat: Vec<&Vec<u8>> = Vec::new();
+                for b in 0..buckets {
+                    let mut in_bucket: Vec<&Vec<u8>> = raw
+                        .iter()
+                        .zip(&part_of)
+                        .filter(|(_, &p)| p as usize == b.min(bounds.len()))
+                        .map(|(w, _)| w)
+                        .collect();
+                    in_bucket.sort();
+                    concat.extend(in_bucket);
+                }
+                let mut global: Vec<&Vec<u8>> = raw.iter().collect();
+                global.sort();
+                assert_eq!(concat, global, "{name} buckets={buckets}");
+            }
+        }
+    }
+
+    /// Nulls must route to the end the flags name, for a binary key as for a numeric one — the
+    /// end bucket, not by comparison, and the opposite end when `descending` flips.
+    #[test]
+    fn binary_nulls_route_to_the_named_end() {
+        use arrow::array::BinaryArray;
+
+        let raw: Vec<Option<&[u8]>> = vec![Some(b"aa"), None, Some(b"bb"), None, Some(b"cc")];
+        let key: ArrayRef = Arc::new(BinaryArray::from(raw));
+        let bounds = byte_quantiles(&key, &[0.5]).unwrap();
+        assert_eq!(
+            bounds,
+            vec![b"bb".to_vec()],
+            "nulls are skipped by the sampler"
+        );
+
+        let nulls_first = range_part_of_bytes(&key, &bounds, 4, true, false).unwrap();
+        assert_eq!(
+            nulls_first[1], 0,
+            "nulls_first puts a null in the first bucket"
+        );
+        let nulls_last = range_part_of_bytes(&key, &bounds, 4, false, false).unwrap();
+        assert_eq!(
+            nulls_last[1], 3,
+            "nulls_last puts a null in the last bucket"
+        );
     }
 
     /// Equal keys must never straddle a boundary, or a bucket-local sort could not stand

@@ -12,6 +12,8 @@ convention.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pyarrow as pa
 import pytest
 
@@ -194,3 +196,128 @@ class TestTheScratchLifecycle:
             raise RuntimeError("breaker failed")
         assert captured["store"].total_bytes == 0
         assert list(owned.iterdir()) == []
+
+
+class TestTheOrderedBucketEnvelopeTracksTheMemoryBudget:
+    """`spill_bucket_max_bytes` is a *ceiling*, never a licence to exceed the budget.
+
+    It was the sole input to `_buckets_for_staged`, so the ordered split was sized against a
+    fixed 128 MiB whatever the envelope actually was. Lowering `max_memory_bytes` to 1 MiB
+    therefore still asked for 128 MiB buckets -- one bucket for a 7 MiB input -- which the
+    reader then pulls back whole. The out-of-core path was not bounded by the number it
+    exists to respect, and the failure surfaces as the engine refusing the bucket rather
+    than as anything a result can show.
+
+    `MemoryConfig.streaming_state_budget_bytes` resolves the same tension the same way, for
+    the reason it states: a cap has to scale with the configured envelope rather than be a
+    fixed magic number.
+    """
+
+    @staticmethod
+    def _envelope(**memory):
+        from batcher.dist.spill.buckets import bucket_envelope
+
+        base = Config()
+        scoped = base.replace(memory=dataclasses.replace(base.memory, **memory))
+        with config_context(scoped):
+            return bucket_envelope()
+
+    def test_a_small_budget_shrinks_the_bucket_below_the_configured_ceiling(self) -> None:
+        envelope = self._envelope(max_memory_bytes=1 << 20)
+        assert envelope <= (1 << 20), "a bucket may not exceed the whole memory budget"
+        assert envelope < Config().memory.spill_bucket_max_bytes
+
+    def test_a_large_budget_leaves_the_configured_ceiling_in_charge(self) -> None:
+        """The clamp is a `min`, so it never *raises* the bucket size."""
+        assert self._envelope(max_memory_bytes=64 << 30) == Config().memory.spill_bucket_max_bytes
+
+    def test_an_explicit_smaller_ceiling_still_wins(self) -> None:
+        envelope = self._envelope(max_memory_bytes=64 << 30, spill_bucket_max_bytes=4 << 20)
+        assert envelope == (4 << 20)
+
+    def test_opting_out_of_any_memory_bound_keeps_the_configured_ceiling(self) -> None:
+        """`unbounded_memory` means the user declined a budget; it must not zero the bucket."""
+        assert self._envelope(unbounded_memory=True) == Config().memory.spill_bucket_max_bytes
+
+
+class TestTheOrderedPathsRespectTheBucketEnvelope:
+    """A bucket is read back *whole*, so no path may read one larger than the envelope.
+
+    The aggregate, the join and the partitioned window each re-split an over-envelope bucket
+    before reading it. The two **ordered** paths -- the out-of-core sort and the global window
+    -- did not: `stage_and_partition` sizes the bucket count from the *total* staged bytes, so
+    it bounds the average bucket and not the largest, and the sampled boundaries leave buckets
+    uneven. Measured on 60k fat rows with a distinct key under a 1 MiB envelope, **33 of 65
+    buckets exceeded it**, the worst by 2x -- so the path quietly used several times the budget
+    it was given. The sort never raised, which is why nothing caught it: only the window kernel
+    refuses an oversized bucket, and the sort just used the memory.
+
+    Asserted on the bucket *sizes* rather than on the result, because the result was always
+    correct -- it is the bound that was broken.
+    """
+
+    @staticmethod
+    def _buckets_read(descending: bool, hot: bool) -> tuple[list[int], int]:
+        """Sizes of every bucket the spilled sort reads, and the memory budget in force.
+
+        Measured against the *budget*, not `bucket_envelope()`: the envelope is the thing
+        under test, so asserting a bucket fits it is circular -- at HEAD the envelope was a
+        fixed 128 MiB and every bucket "fitted" by definition. The budget is the number the
+        user actually set, and it is the same on both sides of the fix.
+        """
+        import numpy as np
+
+        import batcher as bt
+        import batcher.dist.spill.buckets as bucket_mod
+
+        rng = np.random.default_rng(3)
+        n = 60_000
+        keys = np.where(rng.random(n) < 0.7, 42.0, rng.random(n)) if hot else rng.random(n)
+        table = pa.table(
+            {
+                "k": pa.array(keys.tolist(), pa.float64()),
+                "s": pa.array(["z" * (i % 2000) for i in range(n)], pa.large_string()),
+            }
+        )
+        seen: list[int] = []
+        original = bucket_mod.read_reserved_bucket
+
+        def watched(store, handle):
+            if handle is not None:
+                seen.append(bucket_mod.resident_bytes(handle))
+            return original(store, handle)
+
+        import batcher.dist.spill_breakers.sort as sort_mod
+
+        bucket_mod.read_reserved_bucket = watched
+        sort_mod.read_reserved_bucket = watched
+        base = Config()
+        tiny = base.replace(memory=dataclasses.replace(base.memory, max_memory_bytes=1 << 20))
+        try:
+            with config_context(tiny):
+                budget = tiny.spill_budget_bytes()
+                bt.from_arrow(table).sort("k", descending=descending).collect()
+        finally:
+            bucket_mod.read_reserved_bucket = original
+            sort_mod.read_reserved_bucket = original
+        return seen, budget
+
+    @pytest.mark.parametrize("descending", [False, True])
+    def test_a_splittable_key_never_leaves_a_bucket_over_the_envelope(self, descending) -> None:
+        seen, budget = self._buckets_read(descending, hot=False)
+        assert seen, "no bucket was read, so this proves nothing about the bound"
+        over = [b for b in seen if b > budget]
+        assert not over, (
+            f"{len(over)} of {len(seen)} buckets exceeded the {budget:,}-byte memory budget "
+            f"(worst {max(over):,}) — an ordered path must re-split before reading"
+        )
+
+    def test_one_hot_key_is_the_documented_floor_and_not_a_leak(self) -> None:
+        """A single dominant key cannot be range-split — equal keys must be ordered together.
+
+        Pinned so the recursion floor stays a *known* ceiling rather than becoming the excuse
+        for the general case: at most one bucket may exceed, and it is the hot one.
+        """
+        seen, budget = self._buckets_read(descending=False, hot=True)
+        over = [b for b in seen if b > budget]
+        assert len(over) <= 1, f"{len(over)} buckets over the envelope; only the hot key may be"

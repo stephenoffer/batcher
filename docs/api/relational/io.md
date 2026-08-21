@@ -64,7 +64,7 @@ These submit a query to an external engine and stream the Arrow result back:
 
 ### NoSQL
 
-Each of these splits the keyspace so the collection reads in parallel:
+Each of these splits the keyspace so the store reads in parallel:
 
 | Reader | Reads |
 | --- | --- |
@@ -72,6 +72,10 @@ Each of these splits the keyspace so the collection reads in parallel:
 | {py:meth}`bt.read.cassandra(...) <batcher.api.io_namespace.reader.Reader.cassandra>` | Cassandra / Scylla via token-range splits |
 | {py:meth}`bt.read.dynamodb(...) <batcher.api.io_namespace.reader.Reader.dynamodb>` | DynamoDB via native parallel scan segments |
 | {py:meth}`bt.read.elasticsearch(...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` | Elasticsearch via ES\|QL Arrow / sliced scroll |
+| {py:meth}`bt.read.redis(...) <batcher.api.io_namespace.reader.Reader.redis>` | a Redis keyspace as `(key, value)` rows, by hash-slot range |
+| {py:meth}`bt.read.hbase(...) <batcher.api.io_namespace.reader.Reader.hbase>` | an HBase table, one split per region key range |
+
+A parallel scan is the right shape for reading a *table* and the wrong shape for reading one row. When a filter pins the partition key to a single value, DynamoDB and Cassandra skip the fan-out entirely and read the one partition that can hold a match. See {doc}`Key-value stores </integrations/databases/key-value-stores>`.
 
 ### Streaming
 
@@ -147,13 +151,20 @@ row and the row already in the table. See the
 
 ### Warehouses and databases
 
-These load the result into an external system:
+These load the result into an external system. `mode` says what the write does to the target, and every one of them defaults to the non-destructive choice. See {doc}`Writing to a database </integrations/databases/writing>` for the modes and the transaction they run in.
 
-| Writer | Writes |
-| --- | --- |
-| {py:meth}`ds.write.snowflake(table, connection_kwargs=) <batcher.api.io_namespace.writer.Writer.snowflake>` | a Snowflake table |
-| {py:meth}`ds.write.sql(table, driver=, db_kwargs=) <batcher.api.io_namespace.writer.Writer.sql>` | a database table via ADBC / FlightSQL |
-| {py:meth}`ds.write.mongo(...) <batcher.api.io_namespace.writer.Writer.mongo>` | a MongoDB collection |
+| Writer | Writes | `mode` |
+| --- | --- | --- |
+| {py:meth}`ds.write.snowflake(table, connection_kwargs=) <batcher.api.io_namespace.writer.Writer.snowflake>` | a Snowflake table | `append` / `overwrite` |
+| {py:meth}`ds.write.sql(table, uri=) <batcher.api.io_namespace.writer.Writer.sql>` | a SQL table, via ADBC for a bulk append and any PEP 249 driver otherwise | `append` / `overwrite` / `upsert` / `update` / `delete` / `delete_insert` |
+| {py:meth}`ds.write.mongo(collection, uri=) <batcher.api.io_namespace.writer.Writer.mongo>` | a MongoDB collection | `upsert` / `append` / `overwrite` / `delete` |
+| {py:meth}`ds.write.dynamodb(table, region_name=) <batcher.api.io_namespace.writer.Writer.dynamodb>` | a DynamoDB table, via `BatchWriteItem` | `upsert` / `delete` |
+| {py:meth}`ds.write.cassandra(table, contact_points=, keyspace=) <batcher.api.io_namespace.writer.Writer.cassandra>` | a Cassandra / Scylla table, one prepared statement run concurrently | `upsert` / `delete` |
+| {py:meth}`ds.write.redis(key_prefix, host=) <batcher.api.io_namespace.writer.Writer.redis>` | a Redis keyspace, one pipeline per batch | `upsert` / `delete` |
+| {py:meth}`ds.write.elasticsearch(index, hosts=) <batcher.api.io_namespace.writer.Writer.elasticsearch>` | an Elasticsearch index, via `_bulk` | `upsert` / `append` / `overwrite` / `delete` |
+| {py:meth}`ds.write.hbase(table, host=) <batcher.api.io_namespace.writer.Writer.hbase>` | an HBase table, one happybase batch per Arrow batch | `upsert` / `delete` |
+
+A mode a store cannot express is refused by name rather than approximated. DynamoDB has no `append`, because `PutItem` replaces the item holding the same key and no batch operation inserts only when the key is absent; Cassandra and HBase have none for the same reason, since a CQL `INSERT` and an HBase `Put` are both upserts. None of the four has `overwrite`, because emptying those stores is a scan-and-delete, a `TRUNCATE`, a `FLUSHDB`, or a disable-and-truncate through an admin API rather than a write.
 
 ## The connector surface
 

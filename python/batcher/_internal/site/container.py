@@ -23,6 +23,13 @@ here, and each one fails in a way that does not name itself:
   lakehouse table and a wide shuffle both reach for a lot of descriptors, and the failure is
   an `EMFILE` deep inside a reader.
 
+* **`RLIMIT_AS`** bounds the address space, and where it is set it binds harder than a cgroup:
+  overshooting a cgroup gets the process OOM-killed, while overshooting this makes the
+  allocator return NULL and the query die of `MemoryError` inside a kernel that had no chance
+  to spill. Batcher's memory ceiling honors it, so a query that fits *is* a query the process
+  can hold; the finding exists because a limit far below the machine's RAM is usually one
+  nobody meant to leave in place, and the failure it produces names nothing.
+
 Everything here is a *fact*, never a verdict: this module reports what the limits are, and
 whether they are worth acting on is the caller's. `container_findings` is the one exception and
 it is deliberately shaped as advice rather than as policy — it names the condition and the flag
@@ -44,6 +51,7 @@ import sys
 __all__ = [
     "DOCKER_DEFAULT_SHM_BYTES",
     "MIN_USEFUL_SHM_BYTES",
+    "address_space_limit_bytes",
     "container_findings",
     "in_container",
     "memlock_limit_bytes",
@@ -94,6 +102,26 @@ def memlock_limit_bytes() -> int:
         answer a caller wants and needs no action, so it shares the do-nothing sentinel.
     """
     return _rlimit("RLIMIT_MEMLOCK")
+
+
+def address_space_limit_bytes() -> int:
+    """Virtual address space this process may map, in bytes, or `0` when unlimited.
+
+    The memory ceiling nothing else reports. `RLIMIT_AS` is how Grid Engine enforces
+    `h_vmem`, how LSF enforces `-M`, how PBS enforces `pvmem`, and what a plain `ulimit -v`
+    sets — so on an HPC cluster it is frequently the *only* bound on a job's memory, and it
+    binds harder than a cgroup does: overshooting a cgroup gets the process OOM-killed, while
+    overshooting this makes the allocator return NULL and the query die of `MemoryError` deep
+    inside a kernel that had no way to spill instead.
+
+    Address space, not resident memory, so it is a conservative reading: a memory-mapped
+    Arrow file counts against it while occupying no anonymous memory. Conservative is the
+    right direction — the failure it prevents is fatal and the cost of under-sizing is a spill.
+
+    Returns:
+        The soft `RLIMIT_AS`, or `0` when it is unlimited or unreadable.
+    """
+    return _rlimit("RLIMIT_AS")
 
 
 def open_files_limit() -> int:
@@ -222,4 +250,29 @@ def container_findings() -> tuple[str, ...]:
             f"only {nofile} file descriptors: a partitioned scan or a wide shuffle will "
             "exhaust them. Raise it with `--ulimit nofile=65536`."
         )
+    address_space = address_space_limit_bytes()
+    host = _host_memory_bytes()
+    # Only when it is genuinely narrower than the machine. An address-space limit set at or
+    # above the RAM is doing nothing, and reporting it would be a line that costs a reader
+    # attention for a setting that changes no decision.
+    if 0 < address_space < host:
+        out.append(
+            f"address space is limited to {address_space / (1 << 30):.1f} GiB on a machine "
+            f"with {host / (1 << 30):.0f} GiB: an allocation past it fails with MemoryError "
+            "rather than spilling. Raise it with `ulimit -v unlimited`, or with your "
+            "scheduler's own knob (Grid Engine `h_vmem`, LSF `-M`, PBS `pvmem`)."
+        )
     return tuple(out)
+
+
+def _host_memory_bytes() -> int:
+    """This machine's RAM, or `0` when it cannot be read.
+
+    Read directly rather than through `hardware.machine_memory_bytes`, which is the *ceiling*
+    and already folds the address-space limit in — comparing the limit against a figure it
+    helped produce would make every limit look binding.
+    """
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return 0

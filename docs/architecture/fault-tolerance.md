@@ -179,10 +179,19 @@ full re-read of the source. Batcher checks three kinds of advance notice, becaus
 cluster offers only one of them:
 
 Cloud metadata answers on a spot instance. Batcher polls the AWS `instance-action`
-endpoint, the Google Cloud `preempted` flag, and Azure Scheduled Events, treating only
-`Preempt` and `Terminate` as reclamation so routine host maintenance doesn't migrate the
-fleet. The AWS probe presents an IMDSv2 session token, without which it is silently dead
-on any instance launched with `HttpTokens=required`.
+endpoint, the Google Cloud `preempted` flag, Azure Scheduled Events, and the Alibaba Cloud
+spot `termination-time`, treating only `Preempt` and `Terminate` as reclamation so routine
+host maintenance doesn't migrate the fleet. The AWS probe presents an IMDSv2 session token,
+without which it is silently dead on any instance launched with `HttpTokens=required`.
+
+Only one of those endpoints can answer on a given node, and on a neocloud, an HPC cluster or
+on-prem hardware none of them can. So Batcher skips the platforms this node isn't — using both
+the provider it detected from the environment and what the firmware says the node was built as,
+so a GPU cloud reselling hyperscaler capacity keeps the endpoint that answers for it — and
+stops probing an endpoint that has been unreachable three times running. A metadata service doesn't appear partway through a job, and
+the alternative was paying a timeout per endpoint on every poll for the life of the worker.
+Reachability is what resets that count, not the answer: a spot node spends its whole life
+being told "not draining", which still proves the endpoint is there.
 
 A signal arrives from an orchestrator. `SIGTERM` is what Kubernetes sends on eviction and
 what Slurm sends when a job hits its time limit. `SIGUSR1` is Slurm's early warning, sent
@@ -197,8 +206,21 @@ before it. Because this is a local clock comparison it needs no metadata service
 signal, and no cooperation from the scheduler, which is what makes it work on an on-prem
 HPC cluster where the other two sources are silent.
 
-Any launcher that knows when its own lease expires gets the same behavior by exporting
-the deadline as Unix epoch seconds:
+Slurm is the only scheduler that publishes the moment an allocation ends. PBS, LSF, Grid
+Engine and HTCondor publish a wall-clock *limit* instead, which is not a time. Export the
+lease and they reach the same drain path:
+
+```bash
+export BATCHER_DEADLINE_SECONDS=$(( 2 * 3600 ))
+```
+
+The lease is measured from when the process started, read from `/proc`. That is exact for a
+script that starts Python first, and over-states the remaining time by however long a job
+script spends before it — which drains late, so prefer the absolute form below when your
+launcher knows the moment.
+
+Any launcher that knows the exact moment its lease expires can give that instead, as Unix
+epoch seconds:
 
 ```bash
 export BATCHER_DEADLINE_EPOCH_S=$(( $(date +%s) + 4 * 3600 ))

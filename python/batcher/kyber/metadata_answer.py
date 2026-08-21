@@ -131,6 +131,17 @@ def answer_aggregate(
         aliases = [item.alias for item in rewritten.items]
     else:
         return None
+    # The answer below reads each output's `min` as *the* value, which is only what a column
+    # holds when the relation is one row. A keyless aggregate is one row by definition, so
+    # this is free on the shape that reaches here — but the `Project` branch above accepts a
+    # root the rewrite produced rather than one this function built, and a `Project` over a
+    # multi-row relation would hand back the minimum of a column instead of its aggregate. A
+    # bad rewrite would then surface as a silently wrong scalar rather than as a plan bug, on
+    # the one path in this module whose whole contract is that it never risks correctness.
+    if not stats.rows_exact or int(stats.rows) != 1:
+        return None
+    if not aliases:
+        return None  # nothing to answer; an empty dict would read as "answered"
 
     answer: dict[str, Any] = {}
     for alias in aliases:

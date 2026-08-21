@@ -128,12 +128,21 @@ def test_straggler_factor_high_for_uniform_times():
 
 
 def test_straggler_factor_lower_for_heavy_tail():
+    """Below the *default*, not merely below the top of the band.
+
+    `factor < default * 2.0` is the whole band's ceiling, so it held even while the formula
+    could not produce anything under `default` at all — every family with a coefficient of
+    variation at or above 1 was pinned exactly there, which made the loop's documented
+    behaviour ("a heavy-tailed family backs up sooner") unreachable and the `0.75 x default`
+    lower bound guard a region nothing could enter.
+    """
     hub = _hub()
     for t in (1.0, 1.0, 1.0, 1.0, 1.0, 200.0):  # a fat tail
         hub.record(_feedback("sort", t_ms=t))
     default = active_config().distributed.speculation_straggler_factor
     factor = az.learned_straggler_factor(hub, "sort")
-    assert factor is not None and factor < default * 2.0  # a real straggler → back up sooner
+    assert factor is not None and factor < default  # a real straggler → back up sooner
+    assert factor >= default * 0.75  # ...and no further than the band allows
 
 
 def test_straggler_factor_cold_is_none():

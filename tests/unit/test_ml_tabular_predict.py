@@ -433,3 +433,83 @@ def test_lightgbm_booster_predict_matches(sample, dataset) -> None:
     booster = lgb.LGBMClassifier(n_estimators=10, verbose=-1).fit(features, labels).booster_
     got = dataset.ml.predict(booster, features=["a", "b", "c"]).to_pydict()["prediction"]
     assert got == pytest.approx(booster.predict(features).tolist(), rel=1e-9)
+
+
+# --- a null feature -----------------------------------------------------------------
+
+
+@pytest.fixture
+def with_a_null(sample: tuple[np.ndarray, np.ndarray]) -> bt.Dataset:
+    """The same problem, with one null in column ``b`` and nowhere else."""
+    features, _ = sample
+    values = features[:, 1].tolist()
+    values[3] = None
+    return bt.from_pydict({"a": features[:, 0].tolist(), "b": values, "c": features[:, 2].tolist()})
+
+
+def test_a_null_feature_names_the_column_rather_than_the_solver(sample, with_a_null) -> None:
+    """scikit-learn answered this with "Input X contains NaN", naming neither column nor way out.
+
+    A null becomes NaN in the feature matrix because `missing` defaults to NaN, which is the
+    boosters' convention rather than scikit-learn's — so one null in one row failed the whole
+    batch with a message about the solver's input.
+    """
+    with pytest.raises(PlanError, match=r"'b' contains one"):
+        with_a_null.ml.predict(_logistic(sample), features=["a", "b", "c"]).to_pydict()
+
+
+def test_the_null_feature_error_keeps_the_frameworks_own_message(sample, with_a_null) -> None:
+    with pytest.raises(PlanError, match=r"Input X contains NaN"):
+        with_a_null.ml.predict(_logistic(sample), features=["a", "b", "c"]).to_pydict()
+
+
+def test_the_suggested_missing_remedy_actually_works(sample, with_a_null) -> None:
+    out = with_a_null.ml.predict(
+        _logistic(sample), features=["a", "b", "c"], missing=0.0
+    ).to_pydict()
+    assert len(out["prediction"]) == 200
+
+
+def test_a_booster_still_reads_a_null_as_missing(sample, with_a_null) -> None:
+    """XGBoost takes NaN natively, so the translation must not fire for it."""
+    xgb = pytest.importorskip("xgboost")
+    features, labels = sample
+    model = xgb.XGBClassifier(n_estimators=3).fit(features, labels)
+    out = with_a_null.ml.predict(model, features=["a", "b", "c"]).to_pydict()
+    assert len(out["prediction"]) == 200
+
+
+def test_an_unrelated_value_error_is_not_rewritten(sample, dataset: bt.Dataset) -> None:
+    """Only a missing-value rejection is translated; anything else keeps its own message."""
+
+    class _Blows:
+        def fit(self, *_):  # pragma: no cover - never called
+            return self
+
+        def predict(self, _matrix):
+            raise ValueError("something else entirely")
+
+    with pytest.raises(ValueError, match="something else entirely"):
+        dataset.ml.predict(_Blows(), features=["a", "b", "c"], framework="sklearn").to_pydict()
+
+
+def test_the_booster_adapters_register_even_when_estimators_imported_first() -> None:
+    """Import order must not decide which frameworks exist.
+
+    `_load_adapters` used to return early on a non-empty `FRAMEWORKS`, and both adapter
+    modules register at import. So anything that reached `estimators` first — directly or
+    through a module that imports it — left XGBoost, LightGBM and CatBoost unregistered for
+    the life of the process, and `ds.ml.predict(booster)` then reported that it could not
+    tell the framework, naming only `['onnx', 'sklearn']`.
+
+    The failure was invisible to this file run on its own, which is the point: it is a
+    property of the process, so it needs a test that states it rather than a suite that
+    happens to import things in a lucky order.
+    """
+    import batcher.ml.tabular.estimators  # noqa: F401  (registers sklearn/onnx first)
+    from batcher.ml.tabular.registry import FRAMEWORKS, _load_adapters
+
+    _load_adapters()
+    assert {"xgboost", "lightgbm", "catboost"} <= set(FRAMEWORKS), (
+        f"the booster adapters went unregistered; FRAMEWORKS = {sorted(FRAMEWORKS)}"
+    )

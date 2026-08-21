@@ -6,6 +6,7 @@ call. Everything else in this section is about where that work runs and how it i
 
 - {doc}`/ml/inference/inference`: the core loop, batch-first UDFs, and model reuse.
 - {doc}`/ml/inference/tabular-models`: scoring a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model.
+- {doc}`/ml/inference/runtimes`: running an exported model with ONNX Runtime, TensorRT, TorchScript, or OpenVINO.
 - {doc}`/ml/inference/calibration`: turning a classifier's scores into probabilities.
 - {doc}`/ml/inference/gpu`: placing work on devices, sizing batches, and keeping the GPU busy.
 - {doc}`/ml/inference/batch-scoring`: the offline scoring job end to end.
@@ -20,6 +21,7 @@ calibration
 gpu
 inference
 pytorch
+runtimes
 streaming
 tabular-models
 ```

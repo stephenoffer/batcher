@@ -91,37 +91,47 @@ def test_adaptive_path_collects_metadata():
     assert abs(_learned(hub, fact_ds).get("adk", 0) - 7) < 1  # learned from the fact scan
 
 
-def test_native_path_reports_cpu_utilization_as_unmeasured_not_fabricated():
-    """The CPU half of the adaptive loop is inert on this tier, deliberately and safely.
+def test_native_path_reports_a_measured_cpu_utilization_not_a_constant():
+    """The CPU half of the adaptive loop reports a *measured* figure, never a constant.
 
-    A utilization needs work-summed-across-threads *and* the wall span it spread over, and
-    the morsel meter has only the first: `elapsed_ns` is already summed over every worker,
-    and no operator owns a clock interval outright in a pipeline. So
-    `bc_interp::stream::meter` reports `cpu_ns: 0` — "not measured" — and
-    `plan.feedback.cpu_utilization` maps that to `0.0`, which every consumer
-    (`kyber.cpu_shares.load_cpu_utilization`) skips as "no signal", keeping its prior.
+    The morsel meter carries two numbers now: `elapsed_ns`, transform time summed over every
+    morsel and every worker, and `wall_span_ns`, the interval the operator actually occupied.
+    `plan.feedback.cpu_utilization` divides the first by ``span x threads``, so the result is
+    a real per-core busy fraction rather than the `0` this tier used to report.
 
-    This previously asserted a *positive* utilization, which held only while the meter
-    reported `elapsed_ns` as `cpu_ns` — dividing a number by itself, so every operator of
-    every query scored exactly `1 / threads` (a hardcoded 6.25% on a 16-core box).
-    `explain(analyze=True)` printed that as "CPU idle, not CPU-limited" on queries running
-    at 8-10x parallelism: confidently backwards. The `0` is the truthful answer until a
-    per-operator wall span is carried as its own `OpMetric` field, which is a two-sided IR
-    change. What must stay true is that the field is *present and non-fabricated*.
+    **What the guard has to catch, and what it must not.** The regression it exists for was
+    the meter handing `elapsed_ns` back as `cpu_ns` while the consumer also divided by
+    `elapsed_ns` — a number over itself, so *every operator of every query* scored exactly
+    ``1 / threads`` (a hardcoded 6.25% on a 16-core box), and `explain(analyze=True)` called
+    a query running at 8-10x parallelism "CPU idle". The fingerprint of that bug is that it
+    is **universal**.
+
+    A single operator legitimately scoring ``1 / threads`` is not that bug. A materializing
+    aggregate's combine is sequential, so one worker busy across its whole span out of the
+    pool's `threads` is exactly ``1 / threads`` — the truthful answer, and measured. Asserting
+    that *no* operator may show it therefore fails on every query containing an aggregate
+    while still not distinguishing the constant from a measurement; the two conditions below
+    do distinguish it. Measured here: aggregate 1/25, filter 0.154, scan 0.00006.
     """
     hub = core.default_hub()
+    before = _op_stats_count(hub)
     n = 1_000_000
     t = pa.table({"cuk": [i % 17 for i in range(n)], "cuv": list(range(n))})
-    bt.from_arrow(t).group_by("cuk").agg(s=col("cuv").sum()).collect()
+    # A filter as well as the aggregate, so the query spans operators whose utilizations
+    # must *differ* — which is the property the fabricated constant cannot have.
+    bt.from_arrow(t).filter(col("cuv") > 10).group_by("cuk").agg(s=col("cuv").sum()).collect()
     rows = [r for rs in hub.op_stats_by_kind().values() for r in rs]
-    assert rows, "operator feedback was recorded"
+    assert len(rows) > before, "this query's operator feedback was recorded"
     utils = [r.get("cpu_utilization") for r in rows]
     assert all(u is not None for u in utils), "the field must be carried, not dropped"
-    # Never the `1 / threads` fingerprint of the fabricated constant.
     threads = [r.get("threads") or 1 for r in rows]
-    assert not any(
+    fingerprint = [
         u > 0.0 and abs(u - 1.0 / th) < 1e-9 for u, th in zip(utils, threads, strict=True)
-    ), "utilization is dividing elapsed_ns by itself again"
+    ]
+    assert not all(fingerprint), (
+        "every operator scored exactly 1/threads: utilization is dividing a number by itself"
+    )
+    assert any(u > 0.0 for u in utils), "the tier reports no utilization at all"
 
 
 def _op_stats_count(hub) -> int:

@@ -18,7 +18,7 @@
 //! caller's existing counting-sort scatter then does the rest, and every bucket it produces
 //! is constant by construction — so the proof pass is not merely faster, it is not needed.
 //!
-//! This is the whole-relation, parallel half of the argument [`crate::ops::str_sort::rank_sort_live`]
+//! This is the whole-relation, parallel half of the argument [`crate::ops::byte_sort::rank_sort_live`]
 //! already makes for one range serially.
 //!
 //! ## Why the routing is exact
@@ -33,13 +33,13 @@
 //! ## Where it declines
 //!
 //! Above [`MAX_RANK_DISTINCT`] the bucket count stops being a sensible partitioning, so the
-//! caller keeps the sample-sort — which is the right algorithm again there. The pre-check is a strided sample, for the reason `str_sort` gives:
+//! caller keeps the sample-sort — which is the right algorithm again there. The pre-check is a strided sample, for the reason `byte_sort` gives:
 //! the first rows of a partitioned scan are not a sample of the column. A sample that
 //! under-estimates costs nothing, because the chunk pass abandons the path the moment the
 //! true distinct count passes the cap.
 
-use arrow::array::{Array, ArrayRef, GenericStringArray, OffsetSizeTrait};
-use arrow::datatypes::DataType;
+use arrow::array::ArrayRef;
+use bc_runtime::byte_key::{ByteKeyColumn, ByteKeys};
 use rayon::prelude::*;
 
 /// Distinct values above which ranking stops paying and the caller keeps the sample-sort.
@@ -58,43 +58,43 @@ const MAX_RANK_DISTINCT: usize = 256;
 /// Rows sampled to estimate the distinct count before committing to the ranked path.
 const SAMPLE_ROWS: usize = 4096;
 
+/// One chunk's contribution to the ranking: the distinct values it saw, in first-appearance
+/// order, and a chunk-local dense id per row (`u32::MAX` for a null).
+type Chunk<'a> = (Vec<&'a [u8]>, Vec<u32>);
+
 /// Per-row bucket id ordering `key` under `descending`/`nulls_first`, plus the bucket count —
-/// or `None` when `key` is not a string column or holds too many distinct values for ranking
-/// to beat comparing.
+/// or `None` when `key` is not a byte-lexicographic column or holds too many distinct values
+/// for ranking to beat comparing.
 ///
 /// Bucket `b` holds exactly the rows sharing one key value (or all the nulls), and the
 /// buckets are numbered in final sorted order, so the caller may concatenate them as they
 /// come with no merge and no reverse.
+///
+/// Every byte key qualifies, not just the text ones. A *low-cardinality binary* column — a
+/// category or enum someone encoded as bytes, a one-byte flag, a fixed-width code — is the
+/// same shape as a low-cardinality string and wants the same algorithm; while this matched
+/// `Utf8` alone it fell through to the quantile routing, which is precisely the wrong
+/// algorithm for it (see the module header: quantile boundaries drawn from a handful of
+/// distinct values cannot separate the ranges, so every row pays a binary search over
+/// duplicate boundaries and the proof pass then reads every row of every oversized bucket).
 pub(crate) fn rank_part_of(
     key: &ArrayRef,
     descending: bool,
     nulls_first: bool,
 ) -> Option<(Vec<u32>, usize)> {
-    match key.data_type() {
-        DataType::Utf8 => ranks_of(
-            key.as_any().downcast_ref::<GenericStringArray<i32>>()?,
-            descending,
-            nulls_first,
-        ),
-        DataType::LargeUtf8 => ranks_of(
-            key.as_any().downcast_ref::<GenericStringArray<i64>>()?,
-            descending,
-            nulls_first,
-        ),
-        _ => None,
-    }
+    ranks_of(&ByteKeyColumn::new(key)?, descending, nulls_first)
 }
 
 /// Whether a strided sample of `arr` holds few enough distinct values for ranking to pay.
-fn sample_is_low_cardinality<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) -> bool {
+fn sample_is_low_cardinality<A: ByteKeys>(arr: &A) -> bool {
     let n = arr.len();
     let step = (n / SAMPLE_ROWS).max(1);
-    let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
+    let mut seen: ahash::AHashSet<&[u8]> = ahash::AHashSet::new();
     for i in (0..n).step_by(step) {
         if arr.is_null(i) {
             continue;
         }
-        seen.insert(arr.value(i));
+        seen.insert(arr.key(i));
         if seen.len() > MAX_RANK_DISTINCT {
             return false;
         }
@@ -102,8 +102,8 @@ fn sample_is_low_cardinality<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) ->
     true
 }
 
-fn ranks_of<O: OffsetSizeTrait>(
-    arr: &GenericStringArray<O>,
+fn ranks_of<A: ByteKeys + Sync>(
+    arr: &A,
     descending: bool,
     nulls_first: bool,
 ) -> Option<(Vec<u32>, usize)> {
@@ -116,20 +116,20 @@ fn ranks_of<O: OffsetSizeTrait>(
     // Pass 1, parallel: each chunk maps its rows to *chunk-local* dense ids, so no two
     // threads share a map. `u32::MAX` is the reserved code for a null, which no local id can
     // reach — the cap keeps them in the low hundreds.
-    let coded: Option<Vec<(Vec<&str>, Vec<u32>)>> = (0..n)
+    let coded: Option<Vec<Chunk<'_>>> = (0..n)
         .into_par_iter()
         .step_by(chunk)
         .map(|start| {
             let end = (start + chunk).min(n);
-            let mut ids: ahash::AHashMap<&str, u32> = ahash::AHashMap::new();
-            let mut distinct: Vec<&str> = Vec::new();
+            let mut ids: ahash::AHashMap<&[u8], u32> = ahash::AHashMap::new();
+            let mut distinct: Vec<&[u8]> = Vec::new();
             let mut codes: Vec<u32> = Vec::with_capacity(end - start);
             for i in start..end {
                 if arr.is_null(i) {
                     codes.push(u32::MAX);
                     continue;
                 }
-                let value = arr.value(i);
+                let value = arr.key(i);
                 let id = match ids.get(value) {
                     Some(&id) => id,
                     None => {
@@ -151,7 +151,7 @@ fn ranks_of<O: OffsetSizeTrait>(
 
     // Merge the chunks' value sets and order them. These are the only byte comparisons this
     // path performs, and there are `d log d` of them for a `d` of 256 at worst.
-    let mut all: Vec<&str> = coded.iter().flat_map(|(d, _)| d.iter().copied()).collect();
+    let mut all: Vec<&[u8]> = coded.iter().flat_map(|(d, _)| d.iter().copied()).collect();
     all.sort_unstable();
     all.dedup();
     let d = all.len();
@@ -204,7 +204,7 @@ mod tests {
     use arrow::compute::SortOptions;
 
     use super::*;
-    use crate::ops::str_sort::stable_sort_indices_str;
+    use crate::ops::byte_sort::stable_sort_indices_bytes;
 
     /// A key column of `n` rows cycling through `values`.
     fn key(values: &[Option<&str>], n: usize) -> ArrayRef {
@@ -223,7 +223,7 @@ mod tests {
             .into_iter()
             .flatten()
             .collect();
-        let oracle = stable_sort_indices_str(&arr, opts).unwrap();
+        let oracle = stable_sort_indices_bytes(&arr, opts).unwrap();
         assert_eq!(got, oracle.values().to_vec(), "opts {opts:?}");
     }
 
@@ -301,8 +301,33 @@ mod tests {
         assert!(rank_part_of(&key(&values, 200_000), false, false).is_none());
     }
 
+    /// A high-cardinality **binary** key must decline too, and decline *cheaply*.
+    ///
+    /// This path is now consulted before every byte-keyed sample-sort, including the
+    /// high-cardinality ones it can do nothing for — a random fixed-width record key, say — so
+    /// what bounds its cost on those is that `sample_is_low_cardinality` stops the moment it
+    /// has seen more than `MAX_RANK_DISTINCT` distinct values. That is a few hundred rows of a
+    /// strided sample whatever the column's length, which is why the widening costs the
+    /// CloudSort shape nothing measurable.
     #[test]
-    fn a_non_string_key_declines() {
+    fn a_high_cardinality_binary_key_declines() {
+        use arrow::array::FixedSizeBinaryArray;
+
+        let values: Vec<Vec<u8>> = (0..8192u32)
+            .map(|i| i.wrapping_mul(2_654_435_761).to_be_bytes().to_vec())
+            .collect();
+        let key: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter(values.iter()).expect("uniform width"));
+        assert!(rank_part_of(&key, false, false).is_none());
+
+        // And the sampler itself declines, which is the half that bounds the cost: reaching
+        // `ranks_of` at all would hash every row before giving up.
+        let column = bc_runtime::byte_key::ByteKeyColumn::new(&key).unwrap();
+        assert!(!sample_is_low_cardinality(&column));
+    }
+
+    #[test]
+    fn a_non_byte_key_declines() {
         let numeric: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(0..1000));
         assert!(rank_part_of(&numeric, false, false).is_none());
     }

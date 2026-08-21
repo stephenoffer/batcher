@@ -84,8 +84,9 @@ A shortcut is only ever an optimization — never a semantic.
 
 Three families are not where a crate doc would lead you. Follow these, not intuition:
 
-- **Sorting** lives in `bc-interp/src/ops/` (`radix_sort`, `sample_sort`, `str_sort`,
-  `external_sort`), **not** in `bc-runtime`.
+- **Sorting** lives in `bc-interp/src/ops/` (`radix_sort`, `sample_sort`, `byte_sort`,
+  `external_sort`), **not** in `bc-runtime`. The one *reading* of a byte-lexicographic key
+  that the sort and the range partitioner share is `bc-runtime/src/byte_key.rs`.
 - **Window functions** split: kernels in `bc-runtime/src/window*.rs`, out-of-core
   execution in `bc-interp/src/window_spill.rs`.
 - **Spilling** is per-operator, not one module: `bc-runtime/agg/spill.rs`,
@@ -105,7 +106,9 @@ Three families are not where a crate doc would lead you. Follow these, not intui
 | `bc-sketches` `countmin` vs `frequent` | *How often is this key* vs. *which keys are heavy*. |
 | `minhash` (`eval/str/`) vs `simhash` (`eval/list_ops/`) | Jaccard over shingles vs. cosine over embeddings. |
 | `plan/expr_rewrite/` vs `kyber/rules/` | The traversal **mechanism** vs. the rewrite **policy**. |
-| `api/merge/` | SQL `MERGE INTO` (upsert) — *not* joining two datasets. |
+| `api/merge/` | SQL `MERGE INTO` (upsert) — *not* joining two datasets, and *not* the row-level upsert a database performs (`ds.write.sql(mode="upsert")`). This one rewrites data files. |
+| `io/stats/sql_catalog/probes.py::dialect_for_driver` vs `io/formats/sql/dbapi/_statements.py::dialect_for_driver` | Two vocabularies for two questions. The first maps *any* driver or scheme name to a **catalog** dialect key (`"postgres"`), by substring, to pick which system-catalog query to run. The second maps a **PEP 249 driver module** to a `uri` **scheme** (`"postgresql"`), exactly, to pick identifier quoting and an upsert spelling. Neither answers the other's question. |
+| `io/formats/sql/dbapi/sink.py::WRITE_MODES` vs `io/formats/nosql/base.py::STORE_WRITE_MODES` | The same vocabulary deliberately, minus the two forms that need a statement engine. A sink narrows it further in `supported_modes` and declines the rest by name. |
 | `carbonite/transfer/` | The shuffle engine. |
 | `dist/spill_breakers/` | Out-of-core sort/join/window ("breaker" = pipeline breaker). |
 
@@ -116,6 +119,8 @@ loop · `api/tuning` = *learned* adaptive decisions (not user knobs — those ar
 · `bc-py/src/process.rs` = process-wide singletons · `bc-expr/eval/str/chunk.rs` = the RAG
 text splitter · `bc-expr/eval/generate.rs` = `sequence`/`range`, not codegen ·
 `bc-runtime/agg/fused.rs` = one pass over `group_ids`, not operator fusion ·
+`io/formats/sql/routing.py` = which *backend* serves a call (ADBC / ConnectorX / PEP 249),
+not which node runs it ·
 `bc-runtime/keys.rs` = the canonical key encoding every hash path must agree on ·
 `bc-arrow/float_ident.rs` = the NaN/±0 identity contract for keys.
 

@@ -1,10 +1,14 @@
-"""Retry for the object-store failures that are worth retrying, and only those.
+"""Retry for the IO failures that are worth retrying, and only those.
 
-A read against object storage fails in two very different ways, and the IO layer used to
-treat them identically — as one exception, with no retry anywhere. A 503 slow-down, a
-throttle, a dropped connection or a timeout is a blip that the same GET a moment later
-serves fine; a 404 or a 403 is a fact that will not change, and retrying it only spends
-time before failing anyway.
+An IO call fails in two very different ways, and this layer used to treat them
+identically — as one exception, with no retry anywhere. A 503 slow-down, a throttle, a
+dropped connection, a timeout, a deadlock is a blip that the same call a moment later
+serves fine; a 404, a 403, a syntax error is a fact that will not change, and retrying it
+only spends time before failing anyway.
+
+Both halves of the IO layer meet the distinction: a scan against object storage, and a
+transactional write against a database, whose retryable failures are a different family
+with the same shape.
 
 Collapsing the two is worse than it first looks, because `ErrorPolicy` sits directly
 downstream. Under ``on_error="skip"`` a transient timeout was recorded as a *corrupt file*
@@ -82,6 +86,30 @@ _TRANSIENT_MARKERS = (
     # Prose forms two backends use instead of a code.
     "could not connect to the endpoint",
     "try again",
+    # --- Database concurrency ------------------------------------------------------
+    #
+    # An OLTP write meets a *different* family of transient failures from a scan against
+    # object storage, and every one of them is defined by the standard to be retryable:
+    # the server aborted this transaction so another could proceed, and re-running it is
+    # the prescribed response rather than a workaround. Left unclassified they surfaced as
+    # a failed write on a perfectly healthy database, which is exactly the misclassification
+    # the object-store half of this list exists to prevent.
+    #
+    # These phrases are unambiguous — no object store reports a deadlock or a serialization
+    # failure — so widening the classifier here cannot change how a storage error is read.
+    "deadlock",
+    "could not serialize access",
+    "serialization failure",
+    "lock wait timeout",
+    "database is locked",
+    "database table is locked",
+    "concurrent update",
+    "restart transaction",
+    "retry transaction",
+    "too many connections",
+    "server closed the connection",
+    "ssl connection has been closed",
+    "the database system is starting up",
 )
 
 # Message substrings that veto a retry even when a transient marker also matched. A
@@ -108,11 +136,12 @@ def is_transient(exc: BaseException) -> bool:
     """Whether `exc` is worth retrying, as opposed to a fact that will not change.
 
     Args:
-        exc: The failure raised by the storage backend.
+        exc: The failure raised by the storage backend or the database driver.
 
     Returns:
-        True for a throttle / timeout / dropped connection / 5xx, False for anything
-        else — including anything unrecognized, so a real bug is never retried.
+        True for a throttle / timeout / dropped connection / 5xx / deadlock / serialization
+        failure, False for anything else — including anything unrecognized, so a real bug
+        is never retried.
     """
     # A socket-level timeout is transient by construction, whatever its message says.
     if isinstance(exc, TimeoutError | ConnectionError):
@@ -137,11 +166,14 @@ def with_retry(
     at least half means a real outage is genuinely backed off, and randomizing the rest
     decorrelates a wide scan whose hundreds of concurrent file reads would otherwise be
     throttled together and then all retry on the same tick — turning one throttle into a
-    self-sustaining stampede.
+    self-sustaining stampede. The same shape is what keeps two deadlocked writers from
+    re-colliding: retrying in lockstep reproduces the deadlock, and the jitter is what
+    breaks the tie.
 
     Args:
-        op: The read to run. Must be safe to repeat — every caller here re-reads an
-            immutable object, so a retry returns the same bytes.
+        op: The operation to run. Must be safe to repeat: a reader re-reads an immutable
+            object, and a writer retries a transaction the server already rolled back, so
+            in both cases a retry starts from the same state the first attempt did.
         attempts: Total tries, including the first. `1` disables retrying entirely.
         backoff_base_s: The first retry's backoff ceiling; doubles each round. `0`
             retries immediately, which is what a test wants and a network does not.

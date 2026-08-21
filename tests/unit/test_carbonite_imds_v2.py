@@ -30,6 +30,19 @@ pytestmark = pytest.mark.unit
 _ACTION_URL = "http://169.254.169.254/latest/meta-data/spot/instance-action"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_probes():
+    """Forget the cached IMDS token and the endpoint circuit-breaker between tests.
+
+    Both are deliberately process-lifetime state — a token is valid for minutes and an
+    endpoint that has never answered never will — so a suite that shares them would have one
+    test's fake metadata service answer the next test's probe.
+    """
+    preemption.reset_preemption_probes()
+    yield
+    preemption.reset_preemption_probes()
+
+
 class _Response:
     def __init__(self, status: int, body: str = "") -> None:
         self.status = status

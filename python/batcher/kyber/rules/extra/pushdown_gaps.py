@@ -134,7 +134,14 @@ def push_filter_through_unnest(node: Filter, _ctx: OptimizerContext) -> LogicalP
     pushable, keep = _split_pushable(node.predicate, passthrough)
     if not pushable:
         return None
-    pushed = Unnest(Filter(unnest.input, combine_conjuncts(pushable)), unnest.column, unnest.alias)
+    # `replace`, not `Unnest(child, column, alias)` — the same three-of-five positional
+    # rebuild `projections.py::_rewrite` documents. It reset `outer` to its default, so
+    # pushing any predicate through an *outer* explode dropped every row kept only by
+    # `outer` (`explode(outer=True).filter(<on a carried column>)` returned the rows with a
+    # non-empty list and nothing else), and it dropped `index_alias`, so `posexplode`'s
+    # position column vanished from the output schema. Both are wrong answers rather than
+    # errors, and neither is visible in the unoptimized plan.
+    pushed = dataclasses.replace(unnest, input=Filter(unnest.input, combine_conjuncts(pushable)))
     return pushed if not keep else Filter(pushed, combine_conjuncts(keep))
 
 
@@ -172,7 +179,12 @@ def prefilter_unnest_by_list_contains(node: Filter, _ctx: OptimizerContext) -> L
         return None  # already pre-filtered — the rule has run (idempotence)
     below = [*_conjuncts_of(unnest.input), guard]
     source = unnest.input.input if isinstance(unnest.input, Filter) else unnest.input
-    filtered = Unnest(Filter(source, combine_conjuncts(below)), unnest.column, unnest.alias)
+    # `replace` for the same reason as `push_filter_through_unnest` above: the positional
+    # rebuild dropped `index_alias`, so a `posexplode` pre-filtered by this rule lost its
+    # position column. (`outer` happens to be unobservable here -- an outer-kept row has a
+    # NULL element and the retained `a = v` discards it either way -- but reconstructing the
+    # node field-by-field is what made that an argument to check rather than one to rely on.)
+    filtered = dataclasses.replace(unnest, input=Filter(source, combine_conjuncts(below)))
     return Filter(filtered, node.predicate)
 
 

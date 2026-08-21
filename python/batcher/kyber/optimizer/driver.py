@@ -289,9 +289,17 @@ def _run_phase(
         # gets then depends on `fixpoint_iterations`, which means some rule in this phase
         # is non-confluent or oscillating. Results stay correct (every rule is
         # semantics-preserving) but plan quality is silently non-reproducible, so say so.
+        #
+        # Name the phase. Without it the message says only that *something* among ~300 rules
+        # will not settle, which is a fact nobody can act on: the reader's next step is to
+        # bisect plan shapes until one reproduces it. `Phase`'s own docstring promises these
+        # phases converge "because their rules are confluent", so a warning here is that
+        # invariant breaking, and which phase broke it is the whole lead.
+        phases = sorted({rule.phase.name for rule in rules})
         get_logger("kyber").warning(
-            "phase did not reach a fixpoint in %d iterations; plan quality may depend on "
+            "%s phase did not reach a fixpoint in %d iterations; plan quality may depend on "
             "`OptimizerConfig.fixpoint_iterations` (a non-confluent rule?)",
+            "/".join(phases) if phases else "a",
             max_iterations,
         )
     if VERIFY_EXPR_MATCHES and uses_shapes and not _verifying:

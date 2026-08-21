@@ -180,6 +180,22 @@ Backlog quota bites eventually. A subscription that Batcher stops consuming, bec
 query was never restarted, accrues backlog against the namespace quota, and the broker will
 start rejecting producers. Delete the subscription when you retire a pipeline.
 
+## Message metadata
+
+Pulsar calls them *properties*; Kafka calls them headers. They are the same idea, so they
+arrive under the same option and in the same column type,
+`array<struct<key:string,value:binary>>`:
+
+```python
+# docs: skip
+events = bt.read.pulsar("persistent://public/default/events", include_headers=True)
+traced = events.with_columns(trace=bt.col("headers").list.get(0).struct.field("value"))
+```
+
+It is off by default because the nested column costs on every message of every poll. Values
+are carried as bytes whatever the client hands back, and a message that carried none reads
+as `null` rather than as an empty list.
+
 ## See also
 
 - {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, output modes, checkpoints.

@@ -279,6 +279,38 @@ def _multiset_sortable(schema: pa.Schema) -> bool:
     )
 
 
+def _warn_watermark_dropped(operation: str) -> None:
+    """Announce that a multi-input operation is not carrying its inputs' watermark through.
+
+    Every single-input transform carries the watermark (`filter`, `select`, `sort`, even
+    `distinct`), so a user who called `with_watermark` reasonably expects it to still be
+    there. `join` and `union` do not carry it, and neither consumer of it fails loudly when
+    it is gone. `groupby().agg()` builds an aggregate with ``watermark=None``, which is a
+    *valid* aggregate -- an unbounded one, whose state accumulates for the life of the stream
+    instead of being emitted and evicted as the watermark advances. A streaming session window
+    takes ``lateness=0`` (`_build/sessions.py`), so a row that arrives late is excluded from
+    its session rather than folded into it. `drop_duplicates_within_watermark` is the one
+    stateful operator *not* affected: it takes its own `event_time` and `lateness` arguments
+    and never reads this watermark at all.
+
+    Carrying it automatically is the tempting fix and is not obviously right: for a
+    stream-to-stream join the correct watermark is the *minimum* of the two sides, not the
+    left's, and picking one would quietly change emission on a path this project's own gate
+    never executes. So this announces the loss and names the one-line repair instead --
+    re-applying `with_watermark` after the join restores the bound exactly.
+    """
+    import warnings
+
+    warnings.warn(
+        f"{operation}() does not carry the event-time watermark through: a `groupby().agg()` "
+        "below it is unbounded and never evicts its state, and a streaming session "
+        "window below it takes zero allowed lateness. Re-apply "
+        "`.with_watermark(time_col, lateness)` to the result to restore the bound.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 class Dataset:
     """A lazy, immutable relation — the fluent entry point to the engine.
 
@@ -2555,6 +2587,8 @@ class Dataset:
         for other in others:
             plans.append(remap_sources(other._plan, len(sources)))
             sources.extend(other._sources)
+        if self._watermark is not None or any(o._watermark is not None for o in others):
+            _warn_watermark_dropped("union")
         return Dataset(Union(tuple(plans), distinct), sources)
 
     def intersect(self, other: Dataset, *, distinct: bool = True) -> Dataset:
@@ -3923,10 +3957,16 @@ class Dataset:
         return self.bottom_k(require_int(n, func="nsmallest", arg="n"), columns)
 
     def round(self, decimals: int = 0) -> Dataset:
-        """Round every numeric column to `decimals` places — the pandas ``round``.
+        """Round every numeric column to `decimals` places — the pandas ``round`` spelling.
 
         Non-numeric columns pass through untouched (the numeric selector picks the
         columns).
+
+        A tie rounds **away from zero**, which is SQL's rule and the rule
+        :meth:`~batcher.plan.expr_ir.core.Expr.round` follows, not NumPy's round-half-to-even
+        that pandas inherits. So ``0.5`` becomes ``1.0`` here and ``0.0`` in pandas. The name
+        is borrowed; the tie-breaking is the engine's, and it is the same in SQL and in the
+        DataFrame API so one query cannot disagree with itself.
 
         Args:
             decimals: How many decimal places to keep.
@@ -4560,6 +4600,8 @@ class Dataset:
             self._plan, right_plan, tuple(left_keys), tuple(right_keys)
         )
 
+        if self._watermark is not None or other._watermark is not None:
+            _warn_watermark_dropped("join")
         node = Join(left_plan, right_plan, tuple(left_keys), tuple(right_keys), how, tuple(output))
         if how != "full":
             return Dataset(node, combined_sources)

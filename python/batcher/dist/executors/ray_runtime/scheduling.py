@@ -281,13 +281,18 @@ def _resolve_placement_strategy(env: SchedulingEnvelope | None, workers: int | N
     if env is not None and env.gpu_collective:
         return "STRICT_PACK"
     pref = env.placement_strategy if env is not None else "SPREAD"
-    from batcher.dist.executors.ray_runtime.scaling import alive_node_count
+    from batcher.dist.executors.ray_runtime.scaling import cluster_node_count
 
     if pref == "STRICT_PACK":
         return pref
     if pref == "PACK":
         return pref if _gang_fits_one_node(env, workers) else "SPREAD"
-    nodes = alive_node_count()  # snapshot-aware: no extra `ray.nodes()` RPC inside a scope
+    # The whole cluster's node count, head included — not the worker-eligible one. The
+    # question here is "is there more than one machine to spread over", and the bundles this
+    # resolves a strategy for carry no head-excluding resource, so the head is one of the
+    # machines they can land on. Asking the worker-eligible count made a head-plus-one-worker
+    # cluster read as single-node and pinned its whole fleet to one machine.
+    nodes = cluster_node_count()  # snapshot-aware: no extra `ray.nodes()` RPC inside a scope
     return "PACK" if nodes == 1 else pref
 
 

@@ -20,8 +20,10 @@ use crate::{ExprError, StrFunc};
 /// Binary (IEC) and decimal (SI) unit ladders for the two `format_bytes` spellings.
 // The base unit is the word `bytes`, not `B` — DuckDB writes `512 bytes` and only uses
 // the letter for the scaled units (`1.5 KiB`).
-const IEC_UNITS: [&str; 7] = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-const SI_UNITS: [&str; 7] = ["bytes", "kB", "MB", "GB", "TB", "PB", "EB"];
+// DuckDB's ladder stops at PiB/PB — `format_bytes(2^63-1)` is `8191.9 PiB`, not `8.0 EiB`
+// — so an exbibyte row would answer a unit DuckDB never prints.
+const IEC_UNITS: [&str; 6] = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"];
+const SI_UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
 
 /// Evaluate a numeric-input string function, or `None` when `func` is not one of them.
 ///
@@ -36,6 +38,7 @@ pub(super) fn eval_numeric_input(
         func,
         StrFunc::Chr
             | StrFunc::ToBase
+            | StrFunc::Bin
             | StrFunc::FormatBytes
             | StrFunc::FormatBytesSi
             | StrFunc::Hex
@@ -68,6 +71,7 @@ pub(super) fn eval_numeric_input(
             base as u32
         }
         StrFunc::Hex => 16,
+        StrFunc::Bin => 2,
         _ => 10,
     };
 
@@ -80,9 +84,13 @@ pub(super) fn eval_numeric_input(
             Some(match func {
                 StrFunc::Chr => char::from_u32(u32::try_from(v).ok()?)?.to_string(),
                 StrFunc::ToBase => to_base(v, radix),
-                StrFunc::Hex => to_base(v, 16),
-                StrFunc::FormatBytes => format_bytes(v, 1024.0, &IEC_UNITS),
-                _ => format_bytes(v, 1000.0, &SI_UNITS),
+                StrFunc::Bin => to_base_unsigned(v as u64, 2),
+                // `hex` of a negative integer is its 64-bit two's-complement pattern
+                // (`hex(-3)` is `FFFFFFFFFFFFFFFD`), not a sign-prefixed magnitude. The
+                // sign-prefixed form is `to_base`'s, and DuckDB refuses a negative there.
+                StrFunc::Hex => to_base_unsigned(v as u64, 16),
+                StrFunc::FormatBytes => format_bytes(v, 1024, &IEC_UNITS),
+                _ => format_bytes(v, 1000, &SI_UNITS),
             })
         })
         .collect();
@@ -96,7 +104,16 @@ pub(super) fn eval_numeric_input(
 /// like every other value instead of panicking.
 fn to_base(value: i64, radix: u32) -> String {
     let negative = value < 0;
-    let mut magnitude = value.unsigned_abs();
+    let mut out = to_base_unsigned(value.unsigned_abs(), radix);
+    if negative {
+        out.insert(0, '-');
+    }
+    out
+}
+
+/// `magnitude` in `radix`, with uppercase letter digits and no sign — the form a
+/// two's-complement rendering needs.
+fn to_base_unsigned(mut magnitude: u64, radix: u32) -> String {
     if magnitude == 0 {
         return "0".to_string();
     }
@@ -106,9 +123,6 @@ fn to_base(value: i64, radix: u32) -> String {
         out.push(digits[(magnitude % radix as u64) as usize]);
         magnitude /= radix as u64;
     }
-    if negative {
-        out.push(b'-');
-    }
     out.reverse();
     String::from_utf8(out).unwrap_or_default()
 }
@@ -116,22 +130,27 @@ fn to_base(value: i64, radix: u32) -> String {
 /// A byte count as `"<value> <unit>"` with one decimal place, climbing the unit ladder
 /// while the magnitude is at least `step`. Matches DuckDB: exact bytes carry no decimal
 /// (`512` → `512 B`), larger values carry one (`1024` → `1.0 KiB`).
-fn format_bytes(value: i64, step: f64, units: &[&str; 7]) -> String {
-    let negative = value < 0;
-    let mut magnitude = value.unsigned_abs() as f64;
+fn format_bytes(value: i64, step: u64, units: &[&str; 6]) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = u128::from(value.unsigned_abs());
+    // The ladder is climbed on the *divisor*, in integer arithmetic. Scaling a `f64` copy
+    // instead lost the low bits of a large count: `i64::MAX` converts to `2^63` exactly,
+    // so it read as `8192.0 PiB` where DuckDB writes `8191.9 PiB`.
+    let mut divisor: u128 = 1;
     let mut unit = 0;
-    while magnitude >= step && unit + 1 < units.len() {
-        magnitude /= step;
+    while magnitude / divisor >= u128::from(step) && unit + 1 < units.len() {
+        divisor *= u128::from(step);
         unit += 1;
     }
-    let sign = if negative { "-" } else { "" };
     if unit == 0 {
-        return format!("{sign}{} {}", value.unsigned_abs(), units[0]);
+        // DuckDB writes the singular for exactly one byte (`1 byte`, `-1 byte`).
+        let word = if magnitude == 1 { "byte" } else { units[0] };
+        return format!("{sign}{magnitude} {word}");
     }
     // Truncated, not rounded: DuckDB writes 8,364 bytes as `8.1 KiB` (8.167…), and
-    // rounding would say 8.2.
-    let tenths = (magnitude * 10.0).floor() / 10.0;
-    format!("{sign}{tenths:.1} {}", units[unit])
+    // rounding would say 8.2. The truncation is the integer division.
+    let tenths = magnitude * 10 / divisor;
+    format!("{sign}{}.{} {}", tenths / 10, tenths % 10, units[unit])
 }
 
 #[cfg(test)]

@@ -552,6 +552,32 @@ def resolve_transport(transport: str, workers: int) -> str:
     return "flight" if cluster_topology()["nodes"] > 1 else "disk"
 
 
+def restore_unwrapped_tasks() -> None:
+    """Rebind every task function to its plain, un-`ray.remote`-wrapped original.
+
+    `_wrap_tasks` rebinds module-level names *in place*, so once any code path has brought Ray
+    up, `aggregate._reduce_task` (and eighteen others) are `RemoteFunction`s for the rest of
+    the process. That is exactly what the distributed executor wants and exactly what a test
+    calling one of them directly does not: it gets `TypeError: Remote functions cannot be
+    called directly`, from a module it never touched, because some *other* test in the same
+    worker happened to run first.
+
+    The failure is therefore a function of test *order*, which under `pytest-xdist` is a
+    function of how many workers there are — the same suite read 0, 17 and 45 failures across
+    three runs of one binary, all of them in files that pass alone. This is the undo, for a
+    conftest fixture to call between tests. A no-op before anything has been wrapped.
+    """
+    global _wrapped_resources
+    import importlib
+
+    with _wrap_lock:
+        for (mod_name, fn_name), original in _originals.items():
+            with contextlib.suppress(Exception):
+                setattr(importlib.import_module(mod_name), fn_name, original)
+        _originals.clear()
+        _wrapped_resources = None
+
+
 def _wrap_tasks(ray, resources: dict) -> None:
     """(Re)wrap the module task fns as `ray.remote(**resources, **fault_kwargs)`.
 

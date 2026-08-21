@@ -7,6 +7,11 @@ per region range, each issuing a bounded ``Scan`` over its half-open
 cover of the key space, so concatenating the splits equals a full scan. Each
 region's rows are assembled into Arrow at batch granularity.
 
+`HBaseSink` is the write half, over happybase's `Batch`: one round trip per batch of
+puts or deletes. An HBase ``Put`` replaces the cells it names and leaves the rest of the
+row alone, which is an upsert, so that is the mode this sink implements — along with
+``delete``, which removes whole rows by key.
+
 The ``happybase`` import is deferred; a missing driver raises `BackendError` with
 the ``hbase`` extra hint. Connection kwargs (host, port) are stored verbatim and
 never logged.
@@ -20,15 +25,16 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher.io.formats.base import SOURCES
+from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    BulkSink,
     PartitionSpec,
     ScanSource,
     require_driver,
     rows_to_batches,
 )
 
-__all__ = ["HBaseSource"]
+__all__ = ["HBaseSink", "HBaseSource"]
 
 # A region-range locator: half-open ``[start_key, stop_key)`` byte ranges; an
 # empty bound means unbounded on that side. Stored as hex strings to stay
@@ -151,3 +157,92 @@ def _to_hex(key: bytes) -> str:
 
 def _from_hex(key: str) -> bytes:
     return bytes.fromhex(key)
+
+
+@SINKS.register("hbase")
+class HBaseSink(BulkSink):
+    """Write rows into an HBase table, one happybase `Batch` per Arrow batch.
+
+    Every column but `key_field` becomes a cell, and its name is taken as the fully
+    qualified ``family:qualifier`` HBase expects. A column with no colon is placed in
+    `column_family`, so a frame read back from `HBaseSource` — whose column names already
+    carry the family — round-trips unchanged, and a plain relational frame does not have
+    to be renamed first.
+
+    ``append`` and ``overwrite`` are declined. A ``Put`` replaces the cells it names, so an
+    append would silently be an upsert; and emptying an HBase table means disabling and
+    truncating it through the admin API, which is a schema operation rather than a write.
+
+    Args:
+        host: The HBase Thrift host; never logged.
+        table: The target table, when it is not the write's destination name.
+        port: The Thrift port.
+        key_field: The column holding each row's row key (default ``"row_key"``, which is
+            what `HBaseSource` emits).
+        column_family: The family for a column whose name carries none.
+        mode: ``"upsert"`` (default) or ``"delete"``.
+    """
+
+    format_name = "hbase"
+    supported_modes = ("upsert", "delete")
+
+    __slots__ = ("column_family", "table")
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        table: str | None = None,
+        port: int = 9090,
+        key_field: str = "row_key",
+        column_family: str = "cf",
+        mode: str = "upsert",
+    ) -> None:
+        super().__init__(key_field=key_field, mode=mode, host=host, port=port)
+        self.table = table
+        self.column_family = column_family
+
+    def _connection(self) -> Any:
+        """A happybase connection, opened here so it is never pickled onto a worker."""
+        happybase = require_driver("happybase", "hbase")
+        kw = self._conn_kwargs
+        return happybase.Connection(host=kw["host"], port=kw["port"])
+
+    def _cells(self, row: dict[str, Any]) -> dict[bytes, bytes]:
+        """The ``{family:qualifier: value}`` cells `row` writes, as bytes."""
+        cells: dict[bytes, bytes] = {}
+        for name, value in row.items():
+            if name == self.key_field or value is None:
+                continue
+            qualified = name if ":" in name else f"{self.column_family}:{name}"
+            cells[qualified.encode()] = _encode(value)
+        return cells
+
+    def _apply(self, rows: list[dict[str, Any]], path: str) -> None:
+        """Send every row as one put or delete inside a single happybase batch."""
+        from batcher._internal.errors import BackendError
+
+        connection = self._connection()
+        try:
+            table = connection.table(self.table or path)
+            with table.batch() as batch:
+                for row in rows:
+                    if self.key_field not in row:
+                        raise BackendError(
+                            f"hbase write needs a {self.key_field!r} column to key each "
+                            f"row; this row has {sorted(row)}. Name it with key_field=."
+                        )
+                    key = _encode(row[self.key_field])
+                    if self.mode == "delete":
+                        batch.delete(key)
+                    else:
+                        batch.put(key, self._cells(row))
+        finally:
+            connection.close()
+
+
+def _encode(value: Any) -> bytes:
+    """Render a value as the bytes HBase stores; every cell is bytes and nothing else."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    return str(value).encode("utf-8")

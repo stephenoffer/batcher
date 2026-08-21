@@ -20,6 +20,7 @@ from batcher.api.io_namespace._discovery import (
 )
 from batcher.api.session import read as _read
 from batcher.api.session import read_table as _read_table
+from batcher.io.formats.sql.routing import read_backend
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1333,10 +1334,17 @@ class Reader:
             # used by this process, so it goes to the DB-API source, which reads on one
             # worker and refuses to be partitioned.
             return _read_table("dbapi", query=query, connection=connection, **opts)
+        backend = read_backend(uri, opts)
+        if backend == "dbapi":
+            # Either the caller named a PEP 249 driver themselves, or no Arrow-native
+            # driver for this scheme is installed and one of theirs is. `uri=` still
+            # supplies the connection: `DBAPISink` and `DBAPISource` resolve it to a
+            # driver and its connect kwargs the same way.
+            return _read_table("dbapi", query=query, uri=uri, **opts)
         if uri is not None:
             from batcher.io.formats.sql.uri import parse_uri
 
-            if parse_uri(uri).backend == "connectorx":
+            if backend == "connectorx":
                 # ConnectorX takes credentials *inside* its URI, so it gets the original
                 # string rather than the password-stripped one `parse_uri` returns. It has
                 # no separate password channel, and silently dropping one would leave the
@@ -1538,6 +1546,51 @@ class Reader:
         """
         return _read_table("elasticsearch", **opts)
 
+    def redis(self, **opts: Any) -> Dataset:
+        """Read a Redis keyspace as ``(key, value)`` rows, partitioned by hash slot.
+
+        The read walks the keyspace with ``SCAN`` over contiguous slot ranges, one split
+        per range, so it parallelizes on a cluster and never blocks the server the way
+        ``KEYS`` does. Narrow it with ``match=`` — a glob such as ``"session:*"`` — rather
+        than reading every key and filtering afterwards.
+
+        Args:
+            opts: ``host=``, ``port=``, ``db=``, ``password=`` and ``match=`` passed as
+                keywords, plus ``partition_spec=`` to set the number of slot ranges.
+
+        Returns:
+            A lazy `Dataset` of ``key`` and ``value`` columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.redis(host="cache", match="session:*")  # doctest: +SKIP
+        """
+        return _read_table("redis", **opts)
+
+    def hbase(self, **opts: Any) -> Dataset:
+        """Read an HBase table, one split per region key range.
+
+        Rows arrive as ``row_key`` plus one column per cell, named
+        ``family:qualifier`` and decoded as UTF-8, which is the shape
+        {py:meth}`ds.write.hbase <batcher.api.io_namespace.writer.Writer.hbase>` writes back.
+
+        Args:
+            opts: ``host=``, ``table=`` and ``port=`` passed as keywords, plus
+                ``partition_spec=`` as a fallback when region boundaries cannot be read.
+
+        Returns:
+            A lazy `Dataset` over the HBase table.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.hbase(host="thrift", table="events")  # doctest: +SKIP
+        """
+        return _read_table("hbase", **opts)
+
     # --- Streaming ---------------------------------------------------------
     def kafka(
         self,
@@ -1561,13 +1614,22 @@ class Reader:
                 ``poll_bytes``) to bound one micro-batch by message count and by payload
                 size, ``starting_offsets=`` (``"earliest"``, ``"latest"``, or a
                 ``{partition: offset}`` map) for where a first run begins,
+                ``ending_offsets=`` (``"latest"`` or a ``{partition: offset}`` map) to read
+                a bounded offset range instead of a live stream, which is what makes
+                `collect()` legal on a topic,
                 ``fail_on_data_loss=`` for whether aged-out offsets stop the query,
                 ``include_headers=True`` to add a ``headers`` column of
-                ``array<struct<key:string,value:binary>>``, and anything else the
-                ``confluent-kafka`` consumer accepts.
+                ``array<struct<key:string,value:binary>>``,
+                ``value_format=`` / ``key_format=`` (``"avro"``, ``"json"``,
+                ``"protobuf"``, ``"string"``, ``"bytes"``) to decode the payload into a
+                typed column, with ``value_schema=`` for the reader schema or
+                ``schema_registry=`` for a Confluent Schema Registry URL, and anything
+                else the ``confluent-kafka`` consumer accepts.
 
         Returns:
-            A lazy `Dataset` streaming from the Kafka topic.
+            A lazy `Dataset` streaming from the Kafka topic. ``value`` is raw ``binary``
+            unless a ``value_format=`` was given, in which case it carries that format's
+            decoded type and `Dataset.schema` reports it before a message is polled.
 
         Examples:
             .. doctest::
@@ -1575,6 +1637,13 @@ class Reader:
                 >>> import batcher as bt
                 >>> ds = bt.read.kafka(  # doctest: +SKIP
                 ...     "events", bootstrap_servers="localhost:9092"
+                ... )
+
+                >>> orders = bt.read.kafka(  # doctest: +SKIP
+                ...     "orders",
+                ...     bootstrap_servers="broker:9092",
+                ...     value_format="avro",
+                ...     schema_registry="http://schema-registry:8081",
                 ... )
         """
         return _read_table("kafka", topic, bootstrap_servers=bootstrap_servers, group=group, **opts)

@@ -24,12 +24,19 @@ Streaming tensors into a training loop, and a shard per DDP rank.
 Datasets in with no copy; model ids that load once per worker.
 :::
 
+:::{grid-item-card} {octicon}`server;1.1em` Batch schedulers
+:link: /integrations/compute/schedulers
+:link-type: doc
+Slurm, PBS, LSF, Kubernetes and the managed job services: sizing to the allocation, not the node.
+:::
+
 ::::
 
 ```{toctree}
 :hidden:
 
 ray
+schedulers
 pytorch
 huggingface
 ```

@@ -60,20 +60,10 @@ pub(crate) fn external_merge_sort(
     }
     // `open_reader` streams, so it cannot make the check `read`/`drain` make for themselves —
     // and a truncated IPC stream reads back as a shorter *valid* one, which here would mean
-    // silently returning a sorted prefix of the relation. Making the same comparison the
-    // store would have made is what keeps that an error rather than a wrong answer.
-    let expected = store.partition_rows(0);
-    if rows < expected {
-        return Err(InterpError::from(
-            bc_runtime::RuntimeError::SpillTruncated {
-                dir: dir.display().to_string(),
-                partition: 0,
-                expected_rows: expected,
-                got_rows: rows,
-                missing: expected - rows,
-            },
-        ));
-    }
+    // silently returning a sorted prefix of the relation. `verify_rows` is the store's own
+    // comparison, called by the streaming reader's caller because the reader cannot; this
+    // used to be a hand-rolled restatement of it, which is how the two come to disagree.
+    store.verify_rows(0, rows).map_err(InterpError::from)?;
     Ok((out, spill_bytes))
 }
 

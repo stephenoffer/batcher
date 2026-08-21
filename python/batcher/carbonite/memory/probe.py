@@ -21,7 +21,7 @@ import functools
 import os
 import time
 
-from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
+from batcher._internal.hardware import cgroup_v2_dirs, machine_memory_bytes, read_cgroup_bytes
 from batcher.config import active_config
 
 __all__ = [
@@ -51,11 +51,6 @@ __all__ = [
 # admission a touch conservative (older = smaller available), never over-admit unsafely.
 SAMPLE_TTL_SECONDS = 0.05
 
-# Process-constant host RAM (`SC_PAGE_SIZE * SC_PHYS_PAGES`), memoized on first read: it
-# cannot change for the process's lifetime, so re-running the two syscalls per call is
-# pure waste. `None` until first read / when sysconf is unavailable.
-_host_ram_bytes: int | None = None
-
 # Single-slot TTL cache for the live available-bytes reading: `(monotonic_deadline, value)`.
 _available_cache: tuple[float, int] | None = None
 
@@ -75,21 +70,23 @@ _total_cache: tuple[float, int | None] | None = None
 def reset_memory_sampling() -> None:
     """Drop every memoized memory reading, so the next sample re-reads the OS.
 
-    For tests that patch the underlying OS readers. This must clear the **cgroup cap**
-    too: it is the one figure memoized with `functools.lru_cache`, so a reset that only
-    cleared the module globals left `cgroup_limit_bytes` pinned to whatever the first
-    test in the process observed. Since `total_memory_bytes` takes the min of host RAM
-    and that cap, a stale cap silently overrode every later patch — the reset appeared to
-    work while the number it was supposed to refresh never moved.
+    For tests that patch the underlying OS readers. This must clear every memoized *ceiling*
+    too, not just the live samples: they are the figures memoized with `functools.lru_cache`,
+    so a reset that only cleared the module globals left them pinned to whatever the first
+    test in the process observed. Since the ceiling is a min over all of them, a stale one
+    silently overrode every later patch — the reset appeared to work while the number it was
+    supposed to refresh never moved.
     """
-    global _host_ram_bytes, _available_cache, _file_cache_cache, _total_cache
+    global _available_cache, _file_cache_cache, _total_cache
     from batcher.carbonite.memory.kernel import reset_kernel_sampling
 
-    _host_ram_bytes = None
     _available_cache = None
     _file_cache_cache = None
     _total_cache = None
     cgroup_limit_bytes.cache_clear()
+    # `total_memory_bytes` now delegates to the neutral probe, which memoizes the whole
+    # ceiling — so clearing only this module's caches would leave it pinned.
+    machine_memory_bytes.cache_clear()
     # The kernel snapshot (`memory.high`, `memory.events`, PSI) is sampled on its own TTL and
     # now feeds `effective_limit_bytes`, so a reset that left it cached would keep the same
     # silent-override failure this function's docstring describes for the cgroup cap.
@@ -300,23 +297,24 @@ def _proc_statm_rss_bytes() -> int | None:
 
 
 def total_memory_bytes() -> int:
-    """The memory ceiling: the min of host RAM and any cgroup/container limit.
+    """The memory ceiling every admission and pressure decision is taken against.
 
-    Falls back to `MemoryConfig.default_total_bytes` (one home for the fallback)
-    when the OS won't report host RAM. Host RAM and the cgroup cap are both fixed for
-    the process's lifetime, so both are memoized — this is read on every admission /
-    pressure check, and re-running the syscalls each time is hot-path waste.
+    Delegates to `_internal.hardware.machine_memory_bytes`, which is the one implementation
+    of "how much memory may this process actually have": host RAM less reserved hugepages,
+    every cgroup cap in the ancestry including `memory.high`, the batch scheduler's grant, and
+    `RLIMIT_AS`.
+
+    It used to compute its own, and the two had drifted — this copy missed reserved hugepages
+    and the `memory.high` throttle threshold, so on a node with either one Carbonite admitted
+    against memory the planner already knew was not there. The layer that was wrong is the one
+    that decides whether to spill, which is the worst place for the two views to differ.
+
+    Falls back to `MemoryConfig.default_total_bytes` (one home for the fallback) when the OS
+    reports nothing at all. The underlying probe is memoized for the process — every figure it
+    reads is fixed for a container's lifetime — while this is read on every admission and
+    pressure check.
     """
-    global _host_ram_bytes
-    host = _host_ram_bytes
-    if host is None:
-        try:
-            host = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            _host_ram_bytes = host
-        except (ValueError, OSError, AttributeError):
-            host = active_config().memory.default_total_bytes  # not memoized (config-derived)
-    cgroup = cgroup_limit_bytes()
-    return min(host, cgroup) if cgroup is not None else host
+    return machine_memory_bytes() or active_config().memory.default_total_bytes
 
 
 def proc_meminfo_available() -> int | None:

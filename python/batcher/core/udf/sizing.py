@@ -18,6 +18,7 @@ function of the hub plus one observation, with no morsel scheduling and no UDF c
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -135,7 +136,12 @@ def fold_ema(namespace: str, key: str | None, value: float) -> None:
     which namespace they mean.
 
     (A compact local copy of the dist learner's fold — `core` cannot import the `dist` layer.)"""
-    if key is None or value != value or value <= 0.0:
+    # NaN *and* infinity. This is the acknowledged local copy of the dist learner's fold, and
+    # it inherited the same half-guard: exponential smoothing propagates a non-finite value
+    # into the stored entry and from there into every later update, so one bad observation
+    # poisons the key for the life of the store with nothing raising. `metadata.smoothed`
+    # spells the argument out; `dist.adaptive_sizing._ema` carries the same guard.
+    if key is None or not math.isfinite(value) or value <= 0.0:
         return
     hub = _stream_hub()
     if hub is None:
@@ -165,7 +171,14 @@ def _read_ema(namespace: str, key: str | None) -> float | None:
     except Exception as exc:  # pragma: no cover
         note_suppressed("core", "read learned ema", exc)
         return None
-    return float(s["ema"]) if "ema" in s else None
+    if "ema" not in s:
+        return None
+    # A store outlives the build that wrote it, so the write guard is not enough alone:
+    # `learned_gpu_cap` does `int(learned)`, which raises `OverflowError` on an infinity —
+    # out of GPU batch sizing. Reading a non-finite value as "never measured" costs one cold
+    # estimate and keeps the config cap, which is the behaviour before anything was learned.
+    ema = float(s["ema"])
+    return ema if math.isfinite(ema) else None
 
 
 def learned_gpu_cap(op: MapBatches) -> int:

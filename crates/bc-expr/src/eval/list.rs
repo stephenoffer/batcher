@@ -324,36 +324,6 @@ pub(crate) fn eval_make_struct(
     )))
 }
 
-/// `list[index]`: gather the indexed element of each row's list, preserving the
-/// element type and producing null where out of range / null. A non-negative
-/// `index` counts from the front (0-based); a negative `index` counts from the
-/// back (`-1` is the last element), matching Polars/Python indexing.
-pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{Array, AsArray, UInt32Array};
-    use arrow::compute::take;
-
-    let arr = require_list(arr, "list.get")?;
-    let list = arr.as_list::<i32>();
-    let offsets = list.value_offsets();
-    let take_idx: UInt32Array = (0..list.len())
-        .map(|i| {
-            if list.is_null(i) {
-                return None;
-            }
-            let (start, end) = (offsets[i] as i64, offsets[i + 1] as i64);
-            // Negative indices address from the end (`-1` → last element). Saturating so a
-            // huge/`i64::MIN` index can't overflow — it just lands out of range → null.
-            let pos = if index < 0 {
-                end.saturating_add(index)
-            } else {
-                start.saturating_add(index)
-            };
-            (pos >= start && pos < end).then_some(pos as u32)
-        })
-        .collect();
-    Ok(take(list.values().as_ref(), &take_idx, None)?)
-}
-
 /// Pairwise reduction over two numeric `List` columns (`dot`/`cosine_similarity`/
 /// `l2_distance`) → Float64. The vector-distance ops require the two lists in a row to
 /// have equal length — a dimension mismatch is an error (matching DuckDB
@@ -1256,26 +1226,6 @@ mod tests {
         assert_eq!(s.value(0), ""); // empty list → ""
         assert_eq!(s.value(1), "a");
         assert!(s.is_null(2));
-    }
-
-    #[test]
-    fn list_get_saturates_on_extreme_index() {
-        use arrow::array::Array;
-        // i64::MIN as a negative index must not overflow `end + index`; it lands out of
-        // range and yields null rather than panicking.
-        let a = lists(&[Some(vec![10.0, 20.0])]);
-        let out = eval_list_get(&a, i64::MIN).unwrap();
-        assert!(out
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap()
-            .is_null(0));
-        let out2 = eval_list_get(&a, i64::MAX).unwrap();
-        assert!(out2
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap()
-            .is_null(0));
     }
 
     /// Build a `List<Int64>`; an inner `None` is a null *element*, an outer `None` a

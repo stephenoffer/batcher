@@ -106,6 +106,26 @@ fn partition_morsels_with(
         .map(|c| batches.iter().map(|b| b.column(c).as_ref()).collect())
         .collect();
     let plans: Vec<ColGather> = sources.iter().map(|s| plan_column(s)).collect();
+    // Each byte column's per-bucket byte total, measured once, **in row order**.
+    //
+    // `gather_bytes` needs the exact size of a bucket's value buffer before it can copy into
+    // one that never reallocates, and it used to get it by walking the bucket's bin and
+    // reading `offsets[r]`/`offsets[r+1]` for every row — a second *random* pass over the
+    // offsets, on top of the one the copy itself makes. A bucket owns about one row in
+    // `parts`, so that walk touches nearly every cache line of a 40 MB offsets array to use
+    // eight bytes from each.
+    //
+    // The same totals fall out of a sequential scan of the whole column, which the hardware
+    // prefetcher serves at streaming speed, and one such scan covers every bucket at once.
+    // Row order also has to be re-derived here (`bucket_csr` keeps only the binned ids), and
+    // that is deliberately cheap: it is a scan of a `u32` per row, not of the values.
+    let byte_totals: Vec<Option<Vec<usize>>> = plans
+        .par_iter()
+        .map(|plan| match plan {
+            ColGather::Bytes(cols) => Some(cols.bucket_byte_totals(&per_morsel, parts)),
+            _ => None,
+        })
+        .collect();
     let buckets: Vec<RecordBatch> = (0..parts)
         .into_par_iter()
         .map(|bucket| {
@@ -121,9 +141,15 @@ fn partition_morsels_with(
             let columns: Vec<ArrayRef> = plans
                 .iter()
                 .zip(&sources)
-                .map(|(plan, src)| match plan {
+                .zip(&byte_totals)
+                .map(|((plan, src), totals)| match plan {
                     ColGather::Fast(cols) => Ok(cols.gather(&per_morsel, bucket, total)),
-                    ColGather::Bytes(cols) => cols.gather(&per_morsel, bucket, total),
+                    ColGather::Bytes(cols) => cols.gather(
+                        &per_morsel,
+                        bucket,
+                        total,
+                        totals.as_ref().expect("a byte column has byte totals")[bucket],
+                    ),
                     ColGather::Interleave => {
                         let pairs = pairs.get_or_insert_with(|| {
                             let mut p = Vec::with_capacity(total);
@@ -207,27 +233,27 @@ fn gather_bytes<T: ByteArrayType>(
     per_morsel: &[(Vec<u32>, Vec<u32>)],
     bucket: usize,
     total: usize,
+    byte_total: usize,
 ) -> Result<ArrayRef, InterpError> {
+    // One pass, not two. `byte_total` is this bucket's exact value-byte count, measured for
+    // every bucket at once by `bucket_byte_totals` in a sequential scan — so the offsets and
+    // the bytes are now built together over a buffer that cannot reallocate, and the bin's
+    // random walk over the offsets array happens once instead of twice.
     let mut offsets: Vec<T::Offset> = Vec::with_capacity(total + 1);
+    let mut data: Vec<u8> = Vec::with_capacity(byte_total);
     let mut acc = 0usize;
     offsets.push(T::Offset::usize_as(0));
-    for (array, (rows, off)) in cols.iter().zip(per_morsel) {
-        let src = array.value_offsets();
-        for &r in &rows[off[bucket] as usize..off[bucket + 1] as usize] {
-            acc += src[r as usize + 1].as_usize() - src[r as usize].as_usize();
-            offsets.push(T::Offset::usize_as(acc));
-        }
-    }
-
-    let mut data: Vec<u8> = Vec::with_capacity(acc);
     for (array, (rows, off)) in cols.iter().zip(per_morsel) {
         let src = array.value_offsets();
         let bytes = array.value_data();
         for &r in &rows[off[bucket] as usize..off[bucket + 1] as usize] {
             let (s, e) = (src[r as usize].as_usize(), src[r as usize + 1].as_usize());
             data.extend_from_slice(&bytes[s..e]);
+            acc += e - s;
+            offsets.push(T::Offset::usize_as(acc));
         }
     }
+    debug_assert_eq!(acc, byte_total, "bucket byte total disagreed with the copy");
 
     let offsets = OffsetBuffer::new(offsets.into());
     Ok(Arc::new(GenericByteArray::<T>::try_new(
@@ -235,6 +261,45 @@ fn gather_bytes<T: ByteArrayType>(
         data.into(),
         None,
     )?))
+}
+
+/// Every bucket's value-byte total for one byte column, from a single sequential scan.
+///
+/// The bins hold row ids grouped by bucket; walking them to size a bucket's buffer reads the
+/// offsets array at a `parts`-row stride and pulls in a cache line per row. Reconstructing the
+/// row's bucket from the bins instead — a `u32` write per row into a scratch vector, then one
+/// in-order walk — reads both arrays straight through. See the call site for why the size has
+/// to be known before the copy at all.
+fn bucket_byte_totals_of<T: ByteArrayType>(
+    cols: &[&GenericByteArray<T>],
+    per_morsel: &[(Vec<u32>, Vec<u32>)],
+    parts: usize,
+) -> Vec<usize> {
+    cols.par_iter()
+        .zip(per_morsel.par_iter())
+        .map(|(array, (rows, off))| {
+            let src = array.value_offsets();
+            let mut bucket_of = vec![0u32; array.len()];
+            for b in 0..parts {
+                for &r in &rows[off[b] as usize..off[b + 1] as usize] {
+                    bucket_of[r as usize] = b as u32;
+                }
+            }
+            let mut totals = vec![0usize; parts];
+            for (row, &b) in bucket_of.iter().enumerate() {
+                totals[b as usize] += src[row + 1].as_usize() - src[row].as_usize();
+            }
+            totals
+        })
+        .reduce(
+            || vec![0usize; parts],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+                a
+            },
+        )
 }
 
 macro_rules! byte_cols {
@@ -248,9 +313,23 @@ macro_rules! byte_cols {
                 per_morsel: &[(Vec<u32>, Vec<u32>)],
                 bucket: usize,
                 total: usize,
+                byte_total: usize,
             ) -> Result<ArrayRef, InterpError> {
                 match self {
-                    $(ByteCols::$variant(cols) => gather_bytes(cols, per_morsel, bucket, total)),*
+                    $(ByteCols::$variant(cols) =>
+                        gather_bytes(cols, per_morsel, bucket, total, byte_total)),*
+                }
+            }
+
+            /// Every bucket's value-byte total — see [`bucket_byte_totals_of`].
+            fn bucket_byte_totals(
+                &self,
+                per_morsel: &[(Vec<u32>, Vec<u32>)],
+                parts: usize,
+            ) -> Vec<usize> {
+                match self {
+                    $(ByteCols::$variant(cols) =>
+                        bucket_byte_totals_of(cols, per_morsel, parts)),*
                 }
             }
         }

@@ -53,6 +53,81 @@ def _filter_to_case(node):
     return agg
 
 
+def _coerce_numeric_predicates(tr, where) -> None:
+    """Read a numeric column used *as* a condition as ``<> 0``, in place.
+
+    ``WHERE flag`` over an integer column is ordinary SQL — DuckDB, MySQL and SQLite all
+    read a number as a truth value — while the engine's filter takes a boolean and refused
+    the query outright ("filter predicate must be boolean, got Int64"). The coercion is
+    applied where a condition is expected: the whole predicate, and each operand of
+    ``AND``/``OR``/``NOT``, which is where a bare column can legally appear.
+
+    Args:
+        tr: The translator, read for the in-scope column types.
+        where: The `Where` node, rewritten in place.
+    """
+    import pyarrow as pa
+
+    def numeric(node) -> bool:
+        t = tr.column_type(node)
+        return t is not None and (pa.types.is_integer(t) or pa.types.is_floating(t))
+
+    def visit(node) -> None:
+        if isinstance(node, (exp.And, exp.Or)):
+            for side in (node.this, node.expression):
+                if numeric(side):
+                    side.replace(exp.NEQ(this=side.copy(), expression=exp.Literal.number(0)))
+                else:
+                    visit(side)
+        elif isinstance(node, (exp.Not, exp.Paren)):
+            inner = node.this
+            if numeric(inner):
+                inner.replace(exp.NEQ(this=inner.copy(), expression=exp.Literal.number(0)))
+            else:
+                visit(inner)
+
+    top = where.this
+    if numeric(top):
+        where.set("this", exp.NEQ(this=top.copy(), expression=exp.Literal.number(0)))
+        return
+    visit(top)
+
+
+def _inline_select_aliases(tr, select_node, predicate) -> None:
+    """Substitute select-list aliases a WHERE clause names, in place.
+
+    SQL proper evaluates WHERE before the projection, so an alias is not in scope there —
+    but DuckDB (and Batcher's oracle, therefore) resolves one anyway, and it is a common
+    spelling in ported queries. The alias is replaced by the expression it names, which is
+    exactly what evaluating it before the projection means; without it the query failed
+    with "filter references unknown column".
+
+    Only an alias that is *not* also a real column is substituted (a real column wins, as
+    it does in DuckDB), and an alias over an aggregate or a window is left alone — those
+    belong to HAVING/QUALIFY and cannot be computed per row.
+
+    Args:
+        tr: The translator, read for the columns in scope.
+        select_node: The SELECT whose aliases are visible.
+        predicate: The WHERE condition, rewritten in place.
+    """
+    aliases = {}
+    for p in select_node.expressions:
+        if not isinstance(p, exp.Alias):
+            continue
+        if _has_aggregate(p) or windowing._has_window(p):
+            continue
+        aliases[p.alias] = p.this
+    if not aliases:
+        return
+    for c in list(predicate.find_all(exp.Column)):
+        if c.table or c.name in tr._scope_types:
+            continue
+        target = aliases.get(c.name)
+        if target is not None:
+            c.replace(target.copy())
+
+
 def _project_ordered(tr, ds: Dataset, named, order, projections) -> Dataset:
     """Apply the SELECT projection, sorting first when there is an ORDER BY.
 
@@ -112,10 +187,18 @@ def _select(tr, node) -> Dataset:
         return tr._grouping_sets_union(node, group)
 
     ds = tr._from(node)
+    # Bind the column types now, so a name whose meaning depends on its argument's type
+    # (`epoch_ms`, `len`) can resolve it rather than guess from the AST.
+    tr.bind_scope(ds)
+    # SQL identifiers are case-insensitive; the relational layer is name-keyed. Fold the
+    # query's spellings onto the relation's before anything reads them.
+    tr.canonicalize_identifiers(node)
 
     residual = None
     where = node.args.get("where")
     if where is not None:
+        _inline_select_aliases(tr, node, where.this)
+        _coerce_numeric_predicates(tr, where)
         ds, residual = tr._apply_subquery_predicates(ds, where.this)
     # Correlated scalar subqueries (SELECT list / HAVING / residual WHERE)
     # decorrelate into LEFT JOINs before the value expressions are built.
@@ -139,6 +222,7 @@ def _select(tr, node) -> Dataset:
     # `SELECT unnest(xs)` expands the relation the projection is about to read, so it is
     # applied here — after WHERE, which SQL evaluates first, and before the projection.
     ds = select_unnest(tr, ds, projections)
+    tr.bind_scope(ds)
     group = node.args.get("group")
     order = node.args.get("order")
     limit = node.args.get("limit")
@@ -183,12 +267,16 @@ def _select(tr, node) -> Dataset:
         # `SELECT *, sum(x) OVER (...) AS s` expand the star over `s` as well and emit it
         # twice, where DuckDB emits it once.
         star_cols = list(ds.columns)
-        ds = tr._window(ds, [*projections, *nested])
+        # A window in the ORDER BY rides along in the same pass rather than a second one,
+        # so `SELECT sum(v) OVER (...) FROM t ORDER BY row_number() OVER (...)` computes
+        # both windows over the same relation.
+        ordwins, order = _order_windows(tr, order)
+        ds = tr._window(ds, [*projections, *nested, *ordwins])
         # QUALIFY filters on the window-function results (named by their SELECT
         # alias) — applied after the window columns exist, before the projection
         # drops any not in the final SELECT.
         if qualify is not None:
-            ds = ds.filter(tr._scalar(qualify.this))
+            ds = ds.filter(tr._scalar(_retarget_window_aliases(tr, qualify.this)))
         named = tr._projection_map(ds, projections, star_cols)
         ds = _project_ordered(tr, ds, named, order, projections)
     elif qualify is not None:
@@ -222,6 +310,13 @@ def _select(tr, node) -> Dataset:
         # Registered scalar functions in the SELECT list become materialized
         # columns before the projection references them.
         ds, projections = tr._hoist_udfs(ds, projections)
+        # `SELECT i FROM t ORDER BY row_number() OVER (...)` has no window in the SELECT
+        # list at all, so it reaches here rather than the window branch above. Without the
+        # hoist the sort key is an expression the scalar lowering has no node for, and the
+        # query failed with "unsupported SQL expression: Window".
+        ordwins, order = _order_windows(tr, order)
+        if ordwins:
+            ds = tr._window(ds, ordwins)
         named = tr._projection_map(ds, projections)
         ds = _project_ordered(tr, ds, named, order, projections)
 
@@ -240,6 +335,56 @@ def _select(tr, node) -> Dataset:
         n, skip = _row_window(limit, offset)
         ds = ds.limit(n, offset=skip)
     return ds
+
+
+def _order_windows(tr, order):
+    """Hoist any window function an ORDER BY sorts by into hidden output columns.
+
+    ``ORDER BY row_number() OVER (ORDER BY i DESC)`` sorts by a value the SELECT list
+    never mentions, so the column has to exist before the sort can name it. This is the
+    ORDER BY twin of `_qualify_windows`, and it carries the same two load-bearing details:
+    the window expression is *copied* into the synthetic alias before the order node is
+    rewritten to a bare column reference, and the alias keeps the `__bc_` prefix that
+    keeps a hidden column out of a star expansion.
+
+    `_project_ordered` sorts while the input columns are still in scope and selects
+    afterwards, so the hidden column is dropped without a second pass.
+
+    Args:
+        tr: The translator (unused today, taken for symmetry with the other hoists).
+        order: The `Order` node, or None.
+
+    Returns:
+        The synthetic `alias(window)` items to materialize, and the rewritten order node.
+        Both are empty/unchanged when the ORDER BY names no window.
+    """
+    del tr  # symmetry with `_qualify_windows`; the hoist needs no scope
+    if order is None or not any(e.find(exp.Window) for e in order.expressions):
+        return [], order
+    order = order.copy()
+    synthetic = []
+    for i, win in enumerate(order.find_all(exp.Window)):
+        alias = f"__bc_ordwin{i}"
+        synthetic.append(exp.alias_(win.copy(), alias))
+        win.replace(exp.column(alias))
+    return synthetic, order
+
+
+def _retarget_window_aliases(tr, pred):
+    """Point a QUALIFY predicate at the hidden columns any shadowed window alias used.
+
+    A window whose select-list alias repeats a source column name is materialized under a
+    `__bc_wout<n>` name (`windowing.window_output_name`). A QUALIFY naming that alias
+    would otherwise read the *source* column and filter on the wrong values.
+    """
+    if not tr._win_physical:
+        return pred
+    pred = pred.copy()
+    for c in pred.find_all(exp.Column):
+        physical = tr._win_physical.get(c.name)
+        if physical is not None and not c.table:
+            c.replace(exp.column(physical))
+    return pred
 
 
 def _qualify_windows(tr, ds: Dataset, qualify):

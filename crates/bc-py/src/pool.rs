@@ -24,9 +24,15 @@ use pyo3::types::PyDict;
 ///
 /// Returns:
 ///     A dict of `limit_bytes`, `used_bytes`, `available_bytes`, `peak_used_bytes`,
-///     `denied`, `spill_requests` and `utilization`, or `None` when no query has run under
-///     a memory budget in this process. `None` is deliberately distinct from a dict of
-///     zeros, which would assert something about a pool that has never existed.
+///     `denied`, `spill_requests`, `utilization`, `soft_limit_bytes` and `pressure`, or
+///     `None` when no query has run under a memory budget in this process. `None` is
+///     deliberately distinct from a dict of zeros, which would assert something about a pool
+///     that has never existed.
+///
+///     The last two are what let a reader tell "the data plane is filling its envelope" from
+///     "the data plane is idle and the box is full elsewhere" — opposite problems with
+///     opposite fixes, and until they were carried out the control plane could only see
+///     `used` and had to assume the line between them.
 #[pyfunction]
 pub(crate) fn engine_pool_stats(py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
     let Some(pool) = crate::process::shared_memory_pool_if_created() else {
@@ -44,6 +50,18 @@ pub(crate) fn engine_pool_stats(py: Python<'_>) -> PyResult<Option<Py<PyDict>>> 
     out.set_item("denied", stats.denied as u64)?;
     out.set_item("spill_requests", stats.spill_requests as u64)?;
     out.set_item("utilization", stats.utilization())?;
+    out.set_item("soft_limit_bytes", stats.soft_limit as u64)?;
+    // The level as a name rather than an ordinal: it is read by a person in a diagnostic and
+    // by `PressureLevel`-shaped code in the control plane, and an integer would have to be
+    // kept in step with an enum on the far side of the boundary.
+    out.set_item(
+        "pressure",
+        match stats.pressure() {
+            bc_resource::Pressure::Nominal => "NOMINAL",
+            bc_resource::Pressure::Elevated => "ELEVATED",
+            bc_resource::Pressure::Critical => "CRITICAL",
+        },
+    )?;
     Ok(Some(out.unbind()))
 }
 

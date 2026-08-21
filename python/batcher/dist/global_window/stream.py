@@ -32,8 +32,8 @@ from batcher.dist.global_window.offsets import (
     inject_avg_helpers,
 )
 from batcher.dist.spill import _fd_safe, map_projection
-from batcher.dist.spill.buckets import read_reserved_bucket, spill_scratch
-from batcher.dist.spill_breakers import stage_and_partition
+from batcher.dist.spill.buckets import spill_scratch
+from batcher.dist.spill_breakers import iter_ordered_buckets, stage_and_partition
 from batcher.io.source import Source
 from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import Window
@@ -90,15 +90,14 @@ def stream_spilling_global_window(
         for b in bucket_order(len(handles), desc):
             if handles[b] is None:
                 continue
-            # Released after the bucket is consumed, so peak scratch is the outstanding
-            # buckets rather than the whole spilled input. Read once, in global sort order.
-            bucket = read_reserved_bucket(store, handles[b])
-            store.release(handles[b])
-            if not bucket:
-                continue
-            out = nat.execute_plan(win_json, [bucket], cfg_json)
-            if not out:
-                continue
-            for batch in offsets.apply(pa.Table.from_batches(out)).to_batches():
-                if batch.num_rows:
-                    yield batch
+            # A bucket still over the envelope is re-split *in key order* before it is read,
+            # so the offsets see a finer sequence of ordered buckets rather than one that does
+            # not fit. Shared with the out-of-core sort: both are ordered partitions of the
+            # same shape, and stating the recursion twice is how the two drifted apart before.
+            for bucket in iter_ordered_buckets(store, handles[b], key_name, nulls_first, desc):
+                out = nat.execute_plan(win_json, [bucket], cfg_json)
+                if not out:
+                    continue
+                for batch in offsets.apply(pa.Table.from_batches(out)).to_batches():
+                    if batch.num_rows:
+                        yield batch

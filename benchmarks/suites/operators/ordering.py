@@ -162,10 +162,7 @@ def sort_multikey_wide(ctx: Context):
     saying no*. A packing decided from a materialized key array made the decline the expensive
     case; it is now decided from a bounded prefix, and this case is what holds that.
     """
-    sql = (
-        "SELECT l_partkey, l_extendedprice FROM lineitem "
-        "ORDER BY l_partkey DESC, l_extendedprice"
-    )
+    sql = "SELECT l_partkey, l_extendedprice FROM lineitem ORDER BY l_partkey DESC, l_extendedprice"
 
     def pyarrow(t: pa.Table) -> pa.Table:
         cols = t.select(["l_partkey", "l_extendedprice"])

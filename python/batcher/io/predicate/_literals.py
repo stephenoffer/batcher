@@ -83,6 +83,41 @@ def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, 
     return None
 
 
+def _col_and_untyped_literal(
+    left: dict[str, Any], right: dict[str, Any]
+) -> tuple[str, Any, bool] | None:
+    """`_col_and_literal`, refusing a temporal value a schemaless store cannot compare.
+
+    A date, a timestamp and a time have no representation of their own in DynamoDB or in
+    Elasticsearch: an application stores them as an ISO string, as epoch seconds, or as
+    epoch millis, and nothing in the data says which. So a comparison against one cannot be
+    pushed to those stores at all, and the two connectors that tried each did it by keeping
+    a private copy of `_col_and_literal` that skipped the temporal unwrapping — pushing the
+    **raw epoch offset**. ``created > date(2024, 1, 1)`` became ``created > 19723``.
+
+    Neither failure was visible. On DynamoDB a number never compares equal to a stored
+    string, so the *server* dropped every matching item and the engine's `Filter` had
+    nothing left to re-check — a filtered read returning too few rows, silently. On
+    Elasticsearch 19723 is read as epoch millis, so a range matched almost everything (slow
+    but correct) and an equality matched nothing (rows lost).
+
+    Refusing is the fix that cannot be wrong: an unpushed predicate is re-checked by the
+    engine, so the read costs bandwidth rather than correctness.
+
+    Args:
+        left: The left operand's IR node.
+        right: The right operand's IR node.
+
+    Returns:
+        ``(column, value, flipped)``, or None when this is not a column-vs-literal
+        comparison or the literal is temporal.
+    """
+    parsed = _col_and_literal(left, right)
+    if parsed is None or isinstance(parsed[1], _dt.date | _dt.time):
+        return None
+    return parsed
+
+
 def _col_and_pa_literal(
     left: dict[str, Any], right: dict[str, Any], schema: Any | None = None
 ) -> tuple[str, Any, bool] | None:

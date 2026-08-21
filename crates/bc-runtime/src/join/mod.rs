@@ -37,7 +37,7 @@ pub use asof::{asof_join_indices, AsofDirection, AsofSpec};
 pub use key_filter::KeyFilter;
 pub use range::{range_join_indices, RangeOp};
 pub use sort_merge::sort_merge_join_indices;
-pub use stream::{streaming_supported, BroadcastProbe};
+pub use stream::{streaming_shape_supported, streaming_supported, BroadcastProbe};
 
 /// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
 /// At 1% a bloom costs ~1.2 bytes/key — far less than the ~9 bytes/entry chained
@@ -1209,9 +1209,9 @@ fn pack_byte_key(b: &[u8]) -> u128 {
 /// Read from the offsets alone — no value bytes are touched — and in parallel, because on
 /// the ten-million-row side this decision sits in front of the join it is deciding about.
 fn byte_keys_packable<O: OffsetSizeTrait>(col: &ByteCol<'_, O>, rows: usize) -> bool {
-    (0..rows).into_par_iter().all(|i| {
-        col.offsets[i + 1].as_usize() - col.offsets[i].as_usize() <= MAX_PACKED_KEY_BYTES
-    })
+    (0..rows)
+        .into_par_iter()
+        .all(|i| col.offsets[i + 1].as_usize() - col.offsets[i].as_usize() <= MAX_PACKED_KEY_BYTES)
 }
 
 /// Build-row floor for the **parallel broadcast** radix path. Higher than the
@@ -1221,7 +1221,7 @@ fn byte_keys_packable<O: OffsetSizeTrait>(col: &ByteCol<'_, O>, rows: usize) -> 
 /// dominate the parallel-sliced probe. Below this, the sequential partitioning gather
 /// would cost more than the cache it saves (measured: radix regressed small broadcasts).
 /// ~2M `i64` rows ≈ a ~34 MB build table + key array, past a typical L3.
-const RADIX_MIN_BUILD_ROWS_BROADCAST: usize = 1 << 21;
+pub const RADIX_MIN_BUILD_ROWS_BROADCAST: usize = 1 << 21;
 
 /// Whether `join_type` is left-driven (every emitted row is keyed by a left/probe row),
 /// the shapes [`radix_join_scalar`] supports.

@@ -58,6 +58,7 @@ class ExprTag:
     IS_INF: Final = "is_inf"
     CASE: Final = "case"
     STR: Final = "str"
+    STR_DYN: Final = "str_dyn"
     MATH: Final = "math"
     MATH2: Final = "math2"
     COALESCE: Final = "coalesce"
@@ -80,6 +81,7 @@ class ExprTag:
     LIST_BINARY: Final = "list_binary"
     LIST_JOIN: Final = "list_join"
     LIST_GET: Final = "list_get"
+    LIST_GET_DYN: Final = "list_get_dyn"
     LIST_SIMHASH: Final = "list_simhash"
     LIST_CONTAINS: Final = "list_contains"
     LIST_POSITION: Final = "list_position"
@@ -183,10 +185,11 @@ WINDOW_AGGREGATES: Final = frozenset(
         "sum", "avg", "min", "max", "count",
         # DuckDB, Spark and Polars all allow any aggregate over a window. These are the
         # ones whose *running* form costs O(1) per row, which is what lets them share the
-        # existing whole-partition and running machinery. Order statistics
-        # (`median`/`quantile`/`mode`) need a sorted structure and are deliberately
-        # absent — see `bc_runtime::window::agg`.
-        "var", "stddev", "product",
+        # existing whole-partition and running machinery -- plus `median`, whose running
+        # form is O(log n) per row from a two-heap rather than a sort, and which reuses the
+        # `GROUP BY` median's own kernel whole-partition. `quantile`/`mode` still need a
+        # structure nobody has built, and stay absent -- see `bc_runtime::window::agg`.
+        "var", "stddev", "product", "median",
         "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor", "count_distinct",
     }
 )  # fmt: skip
@@ -218,14 +221,19 @@ WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW
 # leaving value, and `product` cannot divide out a zero while `bit_and`/`bool_and` cannot
 # un-AND at all.
 #
-# `var`/`stddev` and `count_distinct` are still absent, and for reasons the slide cannot
-# fix: the moment pair keeps a Welford state whose combine is Chan's parallel formula
-# rather than an operator, and a distinct count needs a multiset rather than a fold.
-# Listing either here would send a frame to a kernel that cannot honour it.
+# `var`/`stddev` are here because Welford's *combine* — Chan's parallel formula — is
+# associative, so the frame is carried in the same two-stack fold as everything else and
+# nothing is ever subtracted. Only `count_distinct` is still absent, and for a reason the
+# slide cannot fix: a distinct count needs a multiset rather than a fold, so listing it
+# would send a frame to a kernel that cannot honour it. `median` is absent for the same
+# shape of reason: merging two sorted halves is associative, but it costs O(k) a step, so a
+# framed median would be O(n*k) behind the same call shape as an O(n) one. Both still answer
+# the frameless and running forms.
 WINDOW_FRAMEABLE: Final = frozenset(
     {
         "sum", "avg", "min", "max", "count", "first_value", "last_value", "nth_value",
         "product", "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor",
+        "var", "stddev",
     }
 )  # fmt: skip
 

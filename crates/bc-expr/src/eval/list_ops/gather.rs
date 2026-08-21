@@ -12,7 +12,11 @@
 //!
 //! An index outside the row's bounds yields a null element rather than an error: a `head(k)`
 //! on a row shorter than `k` is a normal thing to write, and erroring there would make the
-//! common case the caller's problem. A negative index counts from the end, as `list.get` does.
+//! common case the caller's problem. A negative index counts from the end.
+//!
+//! `list.get` — one element rather than a list of them — is the same addressing rule with
+//! the same out-of-range and negative-index conventions, so it lives here too, in both its
+//! plan-time-constant and per-row forms.
 
 use std::sync::Arc;
 
@@ -20,6 +24,8 @@ use arrow::array::{Array, ArrayRef, AsArray, ListArray, UInt32Builder};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Int64Type};
+
+use crate::eval::list::require_list;
 
 use crate::ExprError;
 
@@ -77,11 +83,92 @@ pub(crate) fn eval_list_gather(
     )?))
 }
 
+/// `list[index]`: gather the indexed element of each row's list, preserving the
+/// element type and producing null where out of range / null. A non-negative
+/// `index` counts from the front (0-based); a negative `index` counts from the
+/// back (`-1` is the last element), matching Polars/Python indexing.
+pub(crate) fn eval_list_get_dyn(arr: &ArrayRef, index: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{Array, AsArray, UInt32Array};
+    use arrow::compute::{cast, take};
+    use arrow::datatypes::{DataType, Int64Type};
+
+    let arr = require_list(arr, "list.get")?;
+    let list = arr.as_list::<i32>();
+    let index = cast(index, &DataType::Int64)?;
+    let index = index.as_primitive::<Int64Type>();
+    let offsets = list.value_offsets();
+    let take_idx: UInt32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) || index.is_null(i) {
+                return None;
+            }
+            let (start, end) = (offsets[i] as i64, offsets[i + 1] as i64);
+            let want = index.value(i);
+            let pos = if want < 0 {
+                end.saturating_add(want)
+            } else {
+                start.saturating_add(want)
+            };
+            (pos >= start && pos < end).then_some(pos as u32)
+        })
+        .collect();
+    Ok(take(list.values().as_ref(), &take_idx, None)?)
+}
+
+pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{Array, AsArray, UInt32Array};
+    use arrow::compute::take;
+
+    use crate::eval::list::require_list;
+
+    let arr = require_list(arr, "list.get")?;
+    let list = arr.as_list::<i32>();
+    let offsets = list.value_offsets();
+    let take_idx: UInt32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) {
+                return None;
+            }
+            let (start, end) = (offsets[i] as i64, offsets[i + 1] as i64);
+            // Negative indices address from the end (`-1` → last element). Saturating so a
+            // huge/`i64::MIN` index can't overflow — it just lands out of range → null.
+            let pos = if index < 0 {
+                end.saturating_add(index)
+            } else {
+                start.saturating_add(index)
+            };
+            (pos >= start && pos < end).then_some(pos as u32)
+        })
+        .collect();
+    Ok(take(list.values().as_ref(), &take_idx, None)?)
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::array::{Int64Builder, ListBuilder, StringBuilder};
 
     use super::*;
+
+    /// `i64::MIN` as a negative index must not overflow `end + index`; it lands out of
+    /// range and yields null rather than panicking. Moved here with `eval_list_get`.
+    #[test]
+    fn list_get_saturates_on_extreme_index() {
+        use arrow::array::{Float64Array, Float64Builder, ListBuilder};
+
+        let mut b = ListBuilder::new(Float64Builder::new());
+        b.values().append_value(10.0);
+        b.values().append_value(20.0);
+        b.append(true);
+        let a: ArrayRef = Arc::new(b.finish());
+        for index in [i64::MIN, i64::MAX] {
+            let out = eval_list_get(&a, index).unwrap();
+            assert!(out
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .is_null(0));
+        }
+    }
 
     fn strings(rows: &[Option<Vec<&str>>]) -> ListArray {
         let mut b = ListBuilder::new(StringBuilder::new());

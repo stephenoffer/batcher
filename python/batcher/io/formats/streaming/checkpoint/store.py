@@ -72,6 +72,11 @@ class CheckpointStore:
         if state is not None:
             self.state.snapshot(batch_id, state)
 
+    def snapshot_state_delta(self, batch_id: int, delta: pa.RecordBatch | None) -> None:
+        """Record `batch_id`'s changelog entry instead of a whole snapshot (if any)."""
+        if delta is not None:
+            self.state.snapshot_delta(batch_id, delta)
+
     def commit(self, batch_id: int, sink_token: str | None = None) -> None:
         """Mark `batch_id` durably done (the last step of the micro-batch)."""
         self.commits.commit(batch_id, sink_token)
@@ -79,9 +84,10 @@ class CheckpointStore:
     def prune_state(self, keep_through: int) -> None:
         """Delete running-state snapshots older than `keep_through` (bounded state dir).
 
-        Recovery restores from the *latest committed* snapshot only, so every earlier one
-        is dead weight; pruning them after each commit keeps a long-running stateful query's
-        ``state/`` directory bounded (one live snapshot) instead of growing without limit.
+        Recovery restores from the newest snapshot at or before the last committed batch,
+        plus any deltas after it, so everything strictly older is dead weight; pruning after
+        each commit keeps a long-running stateful query's ``state/`` directory bounded
+        instead of growing without limit.
         """
         self.state.prune(keep_through)
 

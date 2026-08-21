@@ -32,7 +32,7 @@ from batcher.plan.logical import (
     remap_sources,
 )
 from batcher.plan.schema import SchemaRef
-from batcher.plan.visitor import children, scanned_source_ids
+from batcher.plan.visitor import children, reparent_unvalidated, scanned_source_ids
 
 # Single-input nodes we can carry as "post-aggregation" work above the breaker — re-run by
 # `_apply_above` over the breaker's fully-assembled driver-side result. Every one is a row-wise
@@ -244,7 +244,7 @@ def _rebuild_stage(group: list[LogicalPlan], base: LogicalPlan) -> LogicalPlan:
     for node in group:
         if isinstance(node, Scan):
             continue
-        cur = dataclasses.replace(node, input=cur)
+        cur = reparent_unvalidated(node, input=cur)
     return cur
 
 

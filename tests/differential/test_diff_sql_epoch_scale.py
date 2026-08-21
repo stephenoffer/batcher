@@ -14,9 +14,9 @@ epoch back out of a timestamp literal. The unscaled `to_timestamp` is deliberate
 anchor: DuckDB renders its result as TIMESTAMPTZ in the session time zone where Batcher
 returns naive UTC, a rendering difference the translator documents and accepts.
 
-Every case below passes a *literal*, which is the argument shape the scale fix covers. A
-column argument takes a different branch entirely and is still wrong; that is a separate
-defect with its own strict xfail at the bottom of this file.
+Every case below passes a *literal*. A column argument takes a different branch, decided
+by the column's declared type rather than by the argument's syntax; the last two tests
+pin both readings.
 """
 
 from __future__ import annotations
@@ -87,20 +87,25 @@ def test_the_scaled_form_survives_a_partitioned_collect():
     assert ds.collect().to_pydict() == ds.repartition(4).collect().to_pydict()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="epoch_ms/to_timestamp pick construct-vs-extract from the argument's *syntax* "
-    "(is it an integer literal?) rather than its type, so a column takes the extract "
-    "branch and returns an epoch count where DuckDB builds a timestamp. Fixing it needs "
-    "the relation schema threaded to the expression translator so `infer_type` can decide.",
-)
 def test_an_epoch_column_builds_a_timestamp_like_duckdb(duck):
-    """Known defect, pinned so it fails loudly the day it is fixed.
+    """A stored epoch *column* builds a timestamp, exactly as the literal form does.
 
-    `epoch_ms(n)` over an int64 column is the ordinary time-series shape -- a stored epoch
-    column -- and it is the one that does not work. The literal form does.
+    `epoch_ms(n)` is two functions under one name, and which one a call means depends on
+    the argument's *type*. Reading the syntax alone ("is it an integer literal?") sent a
+    column down the extract branch, which returned an epoch count -- 0 for every row of a
+    small column -- where DuckDB builds a timestamp. The translator now binds the
+    relation's column types before the expression is built (`_Translator.bind_scope`), so
+    the type decides.
     """
     table = pa.table({"n": pa.array([_EPOCH_SECONDS], type=pa.int64())})
     sql = "SELECT epoch_ms(n) AS r FROM t"
+    duck.register("t", table)
+    assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))
+
+
+def test_a_timestamp_column_still_reads_its_epoch_out(duck):
+    """The other reading must not regress: a timestamp argument extracts the count."""
+    table = pa.table({"ts": pa.array([_INSTANT], type=pa.timestamp("us"))})
+    sql = "SELECT epoch_ms(ts) AS r FROM t"
     duck.register("t", table)
     assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))

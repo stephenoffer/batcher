@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import pyarrow as pa
@@ -18,6 +19,7 @@ from batcher.io.formats.streaming.broker.schema import (
     broker_schema,
     redact_broker_options,
 )
+from batcher.io.formats.streaming.codecs.base import build_payload_codecs
 from batcher.io.splits import Split
 
 __all__ = ["BrokerSource"]
@@ -28,6 +30,47 @@ def _options_fingerprint(options: Any) -> str:
     from batcher.io.formats.sql._common import connection_fingerprint
 
     return connection_fingerprint(redact_broker_options(options))
+
+
+@dataclass(slots=True)
+class _PollBudget:
+    """One poll's remaining payload-byte allowance, and where to start spending it.
+
+    Mutable on purpose: it is threaded through a partition sweep and each partition spends
+    from the one object, which is what makes "stop when the batch is full" a single check
+    rather than a running total every loop has to maintain identically.
+    """
+
+    remaining: int
+    rotation: int
+
+    def spend(self, nbytes: int) -> None:
+        """Charge `nbytes` of payload against this poll."""
+        self.remaining -= nbytes
+
+    @property
+    def spent(self) -> bool:
+        """Whether this poll has taken all the payload bytes it may.
+
+        Returns:
+            True once the allowance is exhausted, so the sweep should stop early and leave
+            the rest for the next epoch.
+        """
+        return self.remaining <= 0
+
+    def order(self, items: list[Any]) -> list[Any]:
+        """`items` rotated so a different one leads each poll.
+
+        Args:
+            items: The partitions (or shards) to sweep, in their natural order.
+
+        Returns:
+            The same items, rotated by this poll's turn.
+        """
+        if len(items) < 2:
+            return items
+        start = self.rotation % len(items)
+        return items[start:] + items[:start]
 
 
 class BrokerSource(ABC):
@@ -73,12 +116,17 @@ class BrokerSource(ABC):
 
     __slots__ = (
         "_admission_limit",
+        "_codec_config",
         "_configured_poll_size",
         "_include_headers",
+        "_key_codec",
         "_options",
+        "_poll_rotation",
         "_positions",
         "_resume_from",
+        "_schema",
         "_should_stop",
+        "_value_codec",
         "poll_bytes",
         "topic",
     )
@@ -92,6 +140,16 @@ class BrokerSource(ABC):
         max_offsets_per_trigger: int | None = None,
         max_bytes_per_trigger: int | None = None,
         include_headers: bool = False,
+        value_format: Any = None,
+        value_schema: Any = None,
+        value_subject: str | None = None,
+        value_decode_mode: str = "fail",
+        key_format: Any = None,
+        key_schema: Any = None,
+        key_subject: str | None = None,
+        key_decode_mode: str = "fail",
+        schema_registry: Any = None,
+        schema_registry_auth: str | None = None,
         **options: Any,
     ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -99,6 +157,15 @@ class BrokerSource(ABC):
         ``poll_bytes`` additionally bounds a poll by payload size (see `DEFAULT_POLL_BYTES`);
         ``options`` are passed through to the concrete client (broker addresses,
         credentials, consumer group, …); subclasses document what they accept.
+
+        ``value_format`` / ``key_format`` name a wire format from
+        `io.formats.streaming.codecs` (``"avro"``, ``"json"``, ``"protobuf"``, ``"string"``,
+        ``"bytes"``), so the payload arrives as a typed column instead of raw bytes and the
+        source's declared schema says so. ``value_schema`` supplies the reader schema, or
+        ``schema_registry`` (a URL or a `SchemaRegistry`) resolves it from the subject —
+        ``"{topic}-value"`` / ``"{topic}-key"`` by the standard naming, overridable with
+        ``value_subject`` / ``key_subject``. ``*_decode_mode`` is ``"fail"`` (the default) or
+        ``"permissive"``, matching Spark's ``FAILFAST`` / ``PERMISSIVE``.
 
         ``max_offsets_per_trigger`` and ``max_bytes_per_trigger`` are the Spark spellings of
         the same two bounds, accepted so a ported job's options carry over verbatim. One
@@ -130,6 +197,23 @@ class BrokerSource(ABC):
         # leaves the column null rather than refusing the option.
         self._include_headers = include_headers
         self.topic = topic
+        # Kept verbatim (not as built codec objects) because a `BrokerSplit` is pickled to a
+        # worker and a live `SchemaRegistry` holds a lock, while a parsed Avro schema holds
+        # nothing a worker could reuse anyway. The worker rebuilds from this.
+        self._codec_config: dict[str, Any] = {
+            "value_format": value_format,
+            "value_schema": value_schema,
+            "value_subject": value_subject,
+            "value_decode_mode": value_decode_mode,
+            "key_format": key_format,
+            "key_schema": key_schema,
+            "key_subject": key_subject,
+            "key_decode_mode": key_decode_mode,
+            "schema_registry": schema_registry,
+            "schema_registry_auth": schema_registry_auth,
+        }
+        self._value_codec, self._key_codec = build_payload_codecs(topic, self._codec_config)
+        self._schema: pa.Schema | None = None
         # What the operator asked for. The live `poll_size` below holds it under whatever the
         # rate controller has narrowed this trigger to — see `set_admission_limit`.
         self._configured_poll_size = poll_size
@@ -145,6 +229,9 @@ class BrokerSource(ABC):
         self._resume_from: dict[int, Any] = {}
         # Set by a driver that can be stopped; consulted between polls. See `set_stop_signal`.
         self._should_stop: Any = None
+        # Advances once per poll so a multi-partition broker starts its sweep somewhere new.
+        # See `_poll_budget`.
+        self._poll_rotation = -1
 
     @property
     def poll_size(self) -> int:
@@ -200,7 +287,21 @@ class BrokerSource(ABC):
 
     # ---- shared, do-not-override ------------------------------------------
     def schema(self) -> pa.Schema:
-        return broker_schema(self._include_headers)
+        """This source's declared schema, built once.
+
+        Memoized because `_make_batch` asks for it on every poll, and a decoded source
+        cannot answer from the module-level shared instance the undecoded one returns — so
+        without this the codec branch reallocates a field list per micro-batch on the
+        latency-critical path, which is the cost the shared schema exists to avoid. A
+        codec's `arrow_type()` is fixed at construction, so there is nothing to invalidate.
+        """
+        if self._schema is None:
+            self._schema = broker_schema(
+                self._include_headers,
+                value_type=None if self._value_codec is None else self._value_codec.arrow_type(),
+                key_type=None if self._key_codec is None else self._key_codec.arrow_type(),
+            )
+        return self._schema
 
     def row_count(self) -> int | None:
         return None  # unbounded stream
@@ -307,8 +408,7 @@ class BrokerSource(ABC):
                 continue
             idle = 0.0
             self._track_positions(messages)
-            batch = self._make_batch(messages)
-            yield batch.select(projection) if projection is not None else batch
+            yield self._make_batch(messages, projection)
             # Control reaches here only when the consumer asks for the *next* batch — and the
             # consumer is the micro-batch loop, which asks only after it has staged,
             # write-ahead-logged, and **published** the epoch this batch became
@@ -395,6 +495,56 @@ class BrokerSource(ABC):
         """
         return [(self.topic, p) for p in self._discover_partitions()]
 
+    def _poll_budget(self) -> _PollBudget:
+        """A fresh per-poll payload-byte budget, and the partition order to spend it in.
+
+        `poll_bytes` was honoured by Kafka and Pulsar and **silently ignored** by Kinesis,
+        Pub/Sub and Event Hubs, so the memory bound the option exists for held on two
+        brokers out of five. What it guards is not a nicety: a `binary` Arrow column has
+        32-bit offsets, so a poll past 2 GiB fails inside the array builder with an overflow
+        that names nothing, and well before that the batch is held three times over.
+
+        The budget also carries a **rotating start index** for a broker that polls several
+        partitions in one pass. Stopping at the budget always walks the same order, so the
+        last partitions are read only when the earlier ones are quiet — and under a
+        per-partition watermark a partition that is never read never advances, so the
+        stream's frontier is the minimum over a partition that is being starved rather than
+        one that is idle. The whole query stalls until the idleness timeout fires, and
+        nothing says why. Rotating the start makes every partition the first one in turn.
+
+        Returns:
+            A budget to spend across this poll.
+        """
+        self._poll_rotation += 1
+        return _PollBudget(remaining=self.poll_bytes, rotation=self._poll_rotation)
+
+    def _split_options(self) -> dict[str, Any]:
+        """Constructor options a split must be handed back that ``_options`` does not carry.
+
+        A concrete broker pulls its own settings out of ``**options`` into named keyword
+        parameters — Kafka's ``starting_offsets`` and ``fail_on_data_loss``, Pulsar's
+        ``num_partitions``, Pub/Sub's ``pull_timeout`` — precisely so they never reach the
+        client config as bogus keys. The consequence is that ``self._options``, which is
+        what a `BrokerSplit` carries, no longer holds them, so a worker rebuilding the
+        source got the **constructor defaults** for every one.
+
+        That is not a degraded distributed read, it is a different query. A Kafka source
+        configured ``starting_offsets="latest"`` replayed the whole topic from the
+        beginning on every worker; one configured ``fail_on_data_loss=False`` died on the
+        aged-out offsets the user had explicitly chosen to tolerate. Nothing raised on the
+        single-node path, where the same object keeps its own attributes, so the divergence
+        appeared only under distribution.
+
+        A broker that consumes a named option therefore re-declares it here.
+        `tests/io/test_streaming_split_fidelity.py` holds every broker to that mechanically,
+        so a new option cannot reintroduce the bug by being forgotten.
+
+        Returns:
+            Constructor keyword arguments to merge into the split's options. Empty for a
+            broker that consumes nothing beyond what it forwards to this base.
+        """
+        return {}
+
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One :class:`BrokerSplit` per partition/shard (offset-locator only)."""
         from batcher.io.formats.streaming.broker.split import BrokerSplit
@@ -407,33 +557,61 @@ class BrokerSource(ABC):
                 poll_size=self.poll_size,
                 poll_bytes=self.poll_bytes,
                 include_headers=self._include_headers,
-                options=dict(self._options),
+                codecs=dict(self._codec_config),
+                options={**self._options, **self._split_options()},
             )
             for p in self._discover_partitions()
         ]
 
-    def _make_batch(self, messages: list[BrokerMessage]) -> pa.RecordBatch:
+    def _make_batch(
+        self, messages: list[BrokerMessage], projection: list[str] | None = None
+    ) -> pa.RecordBatch:
         """Assemble polled messages into one Arrow batch (column-at-a-time).
 
-        Builds each column from the whole message list in one pass — no per-row
-        Python beyond the unavoidable attribute reads — and returns a batch in
-        the broker schema this source was configured for.
+        Builds each column from the whole message list in one pass — no per-row Python
+        beyond the unavoidable attribute reads — and returns a batch in the broker schema
+        this source was configured for.
+
+        `projection` is applied **while building**, not after. The difference is the whole
+        cost of the poll on the two expensive columns: a `headers` column is assembled with
+        a per-row Python call each, and a decoded `value` runs the wire-format codec over
+        every payload. Building them and then calling `.select` — which is what the callers
+        used to do — paid both in full for a query that reads only `key` and `timestamp`,
+        and the codecs made that the dominant cost of the read rather than a rounding error.
+
+        Args:
+            messages: The poll's messages, in delivery order.
+            projection: Columns the batch must carry, in order. All of them when omitted.
+
+        Returns:
+            One `RecordBatch` in the projected schema.
         """
         from batcher.io.formats.streaming.broker.schema import HEADERS_TYPE
 
-        columns: dict[str, Any] = {
-            "key": pa.array([m.key for m in messages], type=pa.binary()),
-            "value": pa.array([m.value for m in messages], type=pa.binary()),
-            "partition": pa.array([m.partition for m in messages], type=pa.int64()),
-            "offset": pa.array([m.offset for m in messages], type=pa.int64()),
-            "timestamp": pa.array([m.timestamp for m in messages], type=pa.int64()),
-            "topic": pa.array([m.topic for m in messages], type=pa.string()),
-        }
-        if self._include_headers:
-            columns["headers"] = pa.array(
+        schema = self.schema()
+        if projection is not None:
+            schema = pa.schema([schema.field(name) for name in projection])
+        wanted = set(schema.names)
+
+        builders: dict[str, Any] = {
+            "key": lambda: pa.array([m.key for m in messages], type=pa.binary()),
+            "value": lambda: pa.array([m.value for m in messages], type=pa.binary()),
+            "partition": lambda: pa.array([m.partition for m in messages], type=pa.int64()),
+            "offset": lambda: pa.array([m.offset for m in messages], type=pa.int64()),
+            "timestamp": lambda: pa.array([m.timestamp for m in messages], type=pa.int64()),
+            "topic": lambda: pa.array([m.topic for m in messages], type=pa.string()),
+            "headers": lambda: pa.array(
                 [_header_rows(m.headers) for m in messages], type=HEADERS_TYPE
-            )
-        return pa.record_batch(columns, schema=broker_schema(self._include_headers))
+            ),
+        }
+        columns: dict[str, Any] = {name: builders[name]() for name in schema.names}
+        # Decode here rather than downstream: one call per column per poll, on the batch the
+        # source already holds, so the wire format never becomes per-row work in the plan.
+        if self._value_codec is not None and "value" in wanted:
+            columns["value"] = self._value_codec.decode(columns["value"])
+        if self._key_codec is not None and "key" in wanted:
+            columns["key"] = self._key_codec.decode(columns["key"])
+        return pa.record_batch(columns, schema=schema)
 
     # ---- override points --------------------------------------------------
     @abstractmethod

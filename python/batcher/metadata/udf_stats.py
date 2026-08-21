@@ -16,6 +16,32 @@ worthless if the writer and the reader spell the identity differently, and they 
 Core keys a local/lambda `fn` by its defining line precisely because `module.qualname` is not
 unique for one, while Kyber's cardinality identity omits the line and accepts the collision.
 Reading across those two spellings would hand one lambda's measured cost to another.
+
+## What actually seeds this table, and the size floor nobody chose for Kyber
+
+The only writer is `core.udf.strategy._fn_row_seconds`, and it is reached from exactly two
+places, both inside Core's *batch-sizing* decision: `thread_batch_target`, gated on
+``total_rows > _PROBE_MIN_ROWS`` (262,144), and the process-vs-thread probe. So the per-row
+cost Kyber's cost model reads is a **by-product of a decision about how coarsely to batch**,
+and it inherits that decision's threshold.
+
+The two want different things from it. Core's floor is right for Core: below it, coarsening
+cannot change the batch count enough to matter, so a small query must not pay the probe's
+latency. Kyber's question is not about batch counts at all — it is whether a `map_batches` is
+a trivial column map or the most expensive node in the plan, which decides whether a selective
+filter is pushed below it, and that is worth knowing at *every* size.
+
+The consequence is narrow but real, and it is the shape this module's opening paragraph says
+it closed: a workload whose inputs are always under ~262k rows never seeds this table, so its
+`map_batches` stays priced as `map_row x rows` forever. Measured: three runs of a 200,000-row
+`map_batches` record nothing; the same `fn` at 400,000 rows records on the first run, and the
+value then serves queries of any size, because it is keyed by `fn` identity rather than by
+input size.
+
+Stated rather than changed. Lowering the floor means probing on small queries — running the
+user's `fn` for real, several times, before the query has produced a row — and that latency is
+exactly what `_PROBE_MIN_ROWS` exists to avoid. Which side of the trade is right is a
+measurement (`python benchmarks/run.py` over a small-UDF workload), not an argument.
 """
 
 from __future__ import annotations

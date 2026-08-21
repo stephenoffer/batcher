@@ -46,6 +46,7 @@ __all__ = [
     "device_telemetry",
     "host_pid",
     "nvml_available",
+    "nvml_session",
     "own_device_memory",
     "own_process_ids",
     "reset_nvml_probe",
@@ -140,10 +141,21 @@ _THROTTLE_BITS = (
 
 @functools.lru_cache(maxsize=1)
 def _nvml():
-    """The initialized `pynvml` module, or `None` when it is unusable on this host.
+    """The initialized `pynvml` module for this process, or `None` when NVML is unusable.
 
     Memoized because `nvmlInit` is a driver handshake and the answer cannot change within a
     process: a driver that was absent at first call is absent for the run.
+
+    This is **the** NVML session for the process, and it is named rather than private because
+    `ml.gpu` needs the same one. There used to be a second `nvmlInit` there, so a worker that
+    sampled VRAM per batch — the throughput autobatcher's live cap, the adaptive `num_gpus`
+    loop — opened two refcounted sessions and enumerated the devices twice. Neither was
+    visible in a result, and the test asserting "one handshake for the whole process" was red
+    against it.
+
+    Returns:
+        The initialized `pynvml` module, or `None` on a CPU-only host, without the driver
+        mounted in the container, or without `pynvml` installed.
     """
     try:
         import pynvml
@@ -154,6 +166,14 @@ def _nvml():
     except Exception:
         return None  # driver absent, unmounted in the container, or refusing to initialize
     return pynvml
+
+
+#: The one NVML session, under a name another package may import. `ml.gpu` needs *this*
+#: session rather than one of its own: it used to open a second `nvmlInit`, so a single
+#: utilization sample initialized NVML twice and enumerated the devices twice, and clearing
+#: one memo left the other holding a stale module. Bound to the function object rather than
+#: wrapping it, so the memo is shared too and `reset_nvml_probe()` clears both views at once.
+nvml_session = _nvml
 
 
 def nvml_available() -> bool:

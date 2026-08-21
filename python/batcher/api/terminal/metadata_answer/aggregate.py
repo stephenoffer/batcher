@@ -208,7 +208,47 @@ def metadata_aggregate_table(
         return None
     if answer is None:
         return None
-    return pa.table({alias: [value] for alias, value in answer.items()})
+    return _typed_answer(plan, answer)
+
+
+def _typed_answer(plan: LogicalPlan, answer: dict) -> pa.Table | None:
+    """The one-row answer, carrying the **declared** column types rather than inferred ones.
+
+    `pa.table({alias: [value]})` types each column from its single Python value, which is not
+    the type the query has. On a `decimal(10,2)` column, `max` came back as `decimal(4,2)` —
+    the narrowest decimal holding `22.50` — so the metadata shortcut and an execution of the
+    same query returned different types for the same expression, and the shortcut's type
+    depended on the *data*: one more row could widen it. Everything downstream reads that
+    type (a `union` with a second relation, a write's schema check, a caller's `astype`), so a
+    silently narrowed decimal is a real divergence rather than cosmetics.
+
+    `available_schema` is the same static analysis `Dataset.schema` answers from, so building
+    against it makes the shortcut return exactly what an execution would. When it cannot state
+    the schema, or a value will not cast into it, the answer is **declined** rather than
+    guessed — the caller then executes, which is always correct and only ever slower. That is
+    the same trade `verify.enforce_schema_contract` makes for the device tier, for the same
+    reason: a result that disagrees with the declared schema is refused, never returned.
+    """
+    inferred = plan.available_schema()
+    if inferred is None:
+        return pa.table({alias: [value] for alias, value in answer.items()})
+    try:
+        fields = [inferred.field(alias) for alias in answer]
+    except KeyError as exc:  # an alias the schema does not name — do not guess its type
+        note_suppressed("api", "type the metadata aggregate answer", exc)
+        return None
+    try:
+        return pa.table(
+            {
+                field.name: pa.array([value], type=field.type)
+                for field, value in zip(fields, answer.values(), strict=True)
+            }
+        )
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+        # The derived value does not fit the type the plan declares. That is a defect in the
+        # derivation, not in the query, so the query must still be answered — by executing it.
+        note_suppressed("api", "cast the metadata aggregate answer to its declared type", exc)
+        return None
 
 
 def _answer_filtered_count_star(

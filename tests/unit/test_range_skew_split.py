@@ -24,7 +24,11 @@ import itertools
 import numpy as np
 import pytest
 
-from batcher.dist.executors.partition_io import merge_boundaries, sample_probs
+from batcher.dist.executors.partition_io import (
+    merge_boundaries,
+    sample_key_grid,
+    sample_probs,
+)
 from batcher.dist.executors.partition_io.ranges import (
     hot_key_share,
     hot_sub_bucket,
@@ -68,10 +72,24 @@ def test_a_uniform_key_reports_no_meaningful_share():
     assert got is None or got[1] < 0.01
 
 
-def test_a_string_grid_is_declined():
-    """A string key has no cheap successor to isolate it with, so the split is not offered
-    for one rather than offered wrongly."""
-    assert hot_key_share([(["a", "b", "b"], 3)]) is None
+@pytest.mark.parametrize(
+    ("grid", "hot"),
+    [(["a", "b", "b", "b"], "b"), ([b"\x01", b"\x02", b"\x02", b"\x02"], b"\x02")],
+    ids=["text", "binary"],
+)
+def test_a_lexical_grid_reports_its_dominant_value(grid, hot):
+    """A text or binary key is counted like any other, and this test used to assert the
+    opposite.
+
+    It read: "a string key has no cheap successor to isolate it with, so the split is not
+    offered for one." That reason was wrong. A byte key's immediate successor is the value
+    with a `\x00` appended — *exact*, where the float path's `nextafter` is only the nearest
+    representable — so the split was being withheld from the key families most likely to be
+    skewed, and a skewed string sort simply stopped scaling with the cluster.
+    """
+    value, share = hot_key_share([(grid, 100)])
+    assert value == hot
+    assert share == pytest.approx(0.75)
 
 
 def test_an_empty_sample_is_declined():
@@ -93,6 +111,39 @@ def test_isolating_a_value_gives_it_a_bucket_holding_only_it(hot):
     assert idx[0] == bucket, "the hot value lands in its own bucket"
     assert idx[1] != bucket, "the next value above does not"
     assert idx[2] != bucket, "nor the one below"
+
+
+@pytest.mark.parametrize(
+    ("boundaries", "hot", "successor"),
+    [
+        ([b"\x00", b"mmm", b"\xff"], b"kkk", b"kkk\x00"),
+        ([b"\x00", b"mmm", b"\xff"], b"mmm", b"mmm\x00"),
+        (["a", "m", "z"], "k", "k\x00"),
+        (["a", "m", "z"], "", "\x00"),
+    ],
+    ids=["binary", "binary-on-a-boundary", "text", "empty-text"],
+)
+def test_isolating_a_lexical_value_gives_it_a_bucket_holding_only_it(boundaries, hot, successor):
+    """The byte successor claim, stated as the routing property it has to produce.
+
+    Nothing sorts between `hot` and `hot + \x00`: a value above `hot` either has `hot` as a
+    proper prefix, so its next byte is at least `\x00` and it is at or above the successor, or
+    it differs inside `hot`'s own bytes and is above both. So `hot` gets a bucket to itself.
+    """
+    widened, bucket = isolate_hot_value(list(boundaries), hot)
+    assert widened == sorted(set(widened)), "boundaries stay ascending and deduplicated"
+    assert successor in widened, "the immediate successor is what closes the bucket"
+
+    def route(value):
+        return sum(1 for b in widened if b <= value)
+
+    assert route(hot) == bucket, "the hot value lands in its own bucket"
+    assert route(successor) != bucket, "the next value above does not"
+    assert route(hot + b"\x00\x00" if isinstance(hot, bytes) else hot + "\x00\x00") != bucket
+    # And the value immediately below, where there is one to name: dropping the last byte of
+    # a value gives a strict prefix, which sorts before it.
+    if hot:
+        assert route(hot[:-1]) != bucket, "nor the one below"
 
 
 def test_isolation_keeps_the_boundaries_ascending_and_deduplicated():
@@ -260,6 +311,50 @@ def test_the_busiest_bucket_shrinks_as_the_cluster_grows():
     for a, b in itertools.pairwise(split):
         assert b < a * 0.75, f"doubling the workers must shrink the busiest bucket: {split}"
     assert split[-1] < unsplit[-1] / 10
+
+
+@pytest.mark.parametrize("kind", ["binary", "text"])
+def test_a_skewed_lexical_key_keeps_scaling_as_the_cluster_grows(kind):
+    """The scaling property, for the key families that were denied it.
+
+    Without the split the busiest bucket does not move as the shuffle widens — 40% of the rows
+    tie, and equal keys cannot be separated — so the reduce is pinned and the speedup from more
+    nodes is capped at `1/share` however many are added. With it, the busiest bucket must track
+    the even share down.
+    """
+    import pyarrow as pa
+
+    from batcher.dist.executors.partition_io.ranges import bucketize
+
+    rows, share = 60_000, 0.40
+    hot = b"\x7f" * 8 if kind == "binary" else "z" * 8
+    cold = [
+        (i.to_bytes(8, "big") if kind == "binary" else f"{i:08d}")
+        for i in range(rows - int(rows * share))
+    ]
+    values = [hot] * int(rows * share) + cold
+    values = [values[(i * 7919) % rows] for i in range(rows)]
+    dtype = pa.binary(8) if kind == "binary" else pa.string()
+    batch = pa.table({"k": pa.array(values, type=dtype)}).to_batches()[0]
+
+    busiest = []
+    for buckets in (8, 16, 32):
+        grids = [(sample_key_grid([batch], "k", sample_probs(buckets, 1)), rows)]
+        bounds = merge_boundaries(grids, buckets)
+        split = plan_hot_split(grids, bounds, buckets, False, False)
+        assert split is not None, f"a {share:.0%} share over {buckets} buckets must be split"
+        widened, logical, hot_bucket, subs = split
+        sizes = [
+            sum(b.num_rows for b in part)
+            for part in bucketize([batch], "k", widened, logical, False, False)
+        ]
+        # The hot bucket is spread over `subs` physical sub-buckets, one per run of mappers.
+        cold_max = max(sizes[:hot_bucket] + sizes[hot_bucket + 1 :], default=0)
+        busiest.append(max(cold_max, sizes[hot_bucket] // subs))
+
+    for a, b in itertools.pairwise(busiest):
+        assert b < a * 0.75, f"doubling the buckets must shrink the busiest one: {busiest}"
+    assert busiest[-1] < rows / 32 * 1.2, "and it must land near the even share"
 
 
 def test_the_split_declines_on_a_key_that_carries_nan():

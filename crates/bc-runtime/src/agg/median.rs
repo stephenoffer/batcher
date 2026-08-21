@@ -202,7 +202,7 @@ pub(super) fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, 
 /// Median of `v` via quickselect — partition so the n/2-th smallest sits at index n/2
 /// (`total_cmp`, so NaN orders deterministically). For an even count the lower-middle is
 /// the max of the now-lesser partition, exactly the sorted `v[n/2-1]`.
-fn quickselect_median(v: &mut [f64]) -> f64 {
+pub(crate) fn quickselect_median(v: &mut [f64]) -> f64 {
     use crate::keys::float_total_cmp;
     let n = v.len();
     let (lo, mid, _) = v.select_nth_unstable_by(n / 2, |a, b| float_total_cmp(*a, *b));
@@ -261,7 +261,11 @@ pub(crate) fn finalize_entropy(state: &ArrayRef) -> Result<ArrayRef, RuntimeErro
     for group in counts {
         let total: i64 = group.iter().sum();
         if total == 0 {
-            out.append_null();
+            // DuckDB answers **0** for a group with no non-null value, not NULL: the
+            // Shannon entropy of an empty distribution is zero, and every other group in
+            // the same query reports a number, so a NULL there reads as "unknown" when the
+            // answer is known.
+            out.append_value(0.0);
             continue;
         }
         let n = total as f64;

@@ -66,12 +66,25 @@ num_frames=16)` appends `frames`. `point_cloud` needs no extra: every point of a
 `.pcd`/`.ply`/`.bin` sweep becomes a row plus a `frame` column. For what to *do* with
 these, see `build-an-ml-pipeline`.
 
-**Databases and warehouses** — `sql` (any ADBC/FlightSQL database, `uri=`), `snowflake`,
+**Databases and warehouses** — `sql` (any database from one `uri=`), `snowflake`,
 `bigquery` (Storage Read API), `databricks` (Unity Catalog credential vending),
-`clickhouse`, `mongo`, `cassandra`, `dynamodb`, `elasticsearch`. Pass a query positionally
-where the connector takes one; connection details are keywords. These fan out natively
-(BigQuery streams, Cassandra token ranges, DynamoDB scan segments) rather than pulling
-through one cursor.
+`clickhouse`, `mongo`, `cassandra`, `dynamodb`, `elasticsearch`, `redis`, `hbase`. Pass a
+query positionally where the connector takes one; connection details are keywords. These
+fan out natively (BigQuery streams, Cassandra token ranges, DynamoDB scan segments) rather
+than pulling through one cursor.
+
+`bt.read.sql(query, uri=...)` picks its own backend from the scheme *and* from what is
+installed: ADBC where an Arrow-native driver is present, ConnectorX where it is, and the
+scheme's PEP 249 driver otherwise. `module=`/`connection=` name a PEP 249 driver directly.
+
+A filter that **pins the partition key** stops the fan-out rather than filtering after it:
+DynamoDB issues one `Query` instead of N `Scan` segments (which are billed per item
+examined, filter or no filter), and Cassandra reads one partition instead of 64 token
+ranges with `ALLOW FILTERING`. It needs a top-level `key == literal` term; an `OR`, a range
+on the key, or a composite key only partly pinned falls back to the scan. The projection,
+the predicate, a row cap and a top-N all push into the submitted SQL, the last two only
+where the dialect is known — a cap the server cannot parse is a syntax error, and a top-N
+without a `NULLS` clause returns the *wrong rows*.
 
 **Streaming sources** — `kafka`, `kinesis`, `pulsar`, `pubsub`, `eventhubs`, `socket`,
 `rate`, and `files_incremental` (an Auto Loader analog: tracks already-seen files across
@@ -123,8 +136,9 @@ directly with no Spark in the path.
 `ds.write(path, format=None, *, mode=, partition_by=, resume=, max_rows_per_file=,
 sort_by=, replace_where=, distributed=, num_workers=, **opts)` is the general form;
 `ds.write.parquet/csv/json/orc/arrow/avro/lance/msgpack` are typed wrappers, and
-`ds.write.sql/snowflake/mongo` target databases. Lakehouse sinks and `merge`/`merge_into`
-belong to `manage-a-lakehouse-table`.
+`ds.write.sql/snowflake/mongo/dynamodb/cassandra/redis/elasticsearch/hbase` target
+databases and operational stores. Lakehouse sinks and `merge`/`merge_into` belong to
+`manage-a-lakehouse-table`.
 
 **Save modes** (`mode=`, Spark `SaveMode` parity) — `"overwrite"` (default), `"error"`
 (raise if the path exists), `"ignore"` (skip, return an empty manifest), `"append"`, and
@@ -133,9 +147,29 @@ belong to `manage-a-lakehouse-table`.
 ```python
 ds.write(p, mode="error")     # PlanError: path already exists
 ds.write(p, mode="ignore")    # returns a manifest with 0 files
-ds.write(p, mode="append")    # PlanError — append is delta/iceberg/hudi/snowflake only
+ds.write(p, mode="append")    # PlanError for a file sink; fine for a table sink
 ds.write(p, mode="overwrite_partitions", partition_by=["dt"])  # other dt= dirs survive
 ```
+
+**Row-level modes** are a *different vocabulary*, accepted only by the database and
+operational-store sinks, and they are not save modes: `upsert`, `update`, `delete` and
+`delete_insert` change only the rows whose keys match and leave every other row alone.
+Spark's JDBC writer has no spelling for any of them.
+
+```python
+ds.write.sql("orders", uri="mysql://db/shop", mode="upsert", key_columns="order_id")
+ds.write.sql("sessions", uri="postgresql://db/app", mode="delete", key_columns="sid")
+ds.write.dynamodb("scores", region_name="us-east-1")          # upsert is the default
+```
+
+Pass `key_columns=` on the write that *creates* the table too. An upsert conflicts on the
+target's `PRIMARY KEY`, and a table created by an earlier keyless `append` has none —
+PostgreSQL and SQLite then raise, and **MySQL silently duplicates every row**. A mode a
+store cannot express is refused by name rather than approximated (DynamoDB and Cassandra
+have no `append`, because their put/insert *is* an upsert). One `write` call is one
+transaction; a distributed write is one per shard, and `overwrite` is refused past the
+first shard because every shard would discard the ones before it. Full detail:
+`docs/integrations/databases/writing.md`.
 
 `overwrite_partitions` is Spark's `partitionOverwriteMode="dynamic"` and Hive's
 `INSERT OVERWRITE` (both spellings resolve to it). Reach for it on **any** reload of part

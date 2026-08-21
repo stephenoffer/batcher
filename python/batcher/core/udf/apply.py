@@ -248,8 +248,8 @@ def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.Reco
         return _run_sync_udf(op, batches, strategy)
 
     out = []
-    for result in results:
-        out.extend(_coerce_udf_result(result))
+    for source, result in zip(batches, results, strict=True):
+        out.extend(_coerce_udf_result(result, source.schema))
     return out
 
 
@@ -265,11 +265,28 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
     fn = build_udf_callable(op.fn)
     try:
         call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
-        if op.num_gpus > 0:
-            from batcher.ml.gpu import autocast_call, inference_mode_call
+        from batcher.ml.gpu import inference_mode_call
 
-            # Autograd off first (pure win, no numerics change), then half precision.
-            call = inference_mode_call(call)
+        # Autograd off, on **every** stage rather than only a GPU one. It was gated behind
+        # `num_gpus > 0`, so a CPU batch-inference stage — which this module's own comments
+        # call out as a first-class pattern — ran every forward building a backward graph
+        # nobody reads, holding each layer's activations alive for the whole call. Measured on
+        # a 12-layer CPU forward over 8,192 rows: **409.5 MB of peak RSS against 39.9 MB**, a
+        # 10.3x reduction, and that peak is what caps the batch size and what kills a worker.
+        #
+        # It is a *memory* fix and not a speed one, which is worth stating because the GPU
+        # rationale reads as both: the same forward timed 197 ms with autograd and 203 ms
+        # under `inference_mode`, i.e. no difference. The wrap is free when torch was never
+        # imported (a `sys.modules` lookup), so a numpy or scikit-learn UDF pays nothing, and
+        # a UDF that genuinely needs autograd as its *output* declines with
+        # `batcher_inference_mode = False`.
+        call = inference_mode_call(call)
+        if op.num_gpus > 0:
+            from batcher.ml.gpu import autocast_call
+
+            # Half precision stays GPU-only: it changes the numbers, it needs tensor cores to
+            # pay for that, and its probe re-executes the model — none of which a CPU stage
+            # wants.
             call = autocast_call(call)  # tensor-core half precision (no-op when off/CPU)
         # Retry a transient failure / bound a hung call BEFORE the error-budget bisection below,
         # so only a failure that survives every retry is charged against `max_errored_rows`.
@@ -303,8 +320,8 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
         else:
             results = [call(batch) for batch in batches]
         out = []
-        for result in results:
-            out.extend(_coerce_udf_result(result))
+        for source, result in zip(batches, results, strict=True):
+            out.extend(_coerce_udf_result(result, source.schema))
         return out
     finally:
         teardown_udf(fn, op)
@@ -367,7 +384,7 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
     call = wrap_resilient(call, op)  # transient-retry / timeout, inside the OOM-halving pool
 
     def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
-        coerced = _coerce_udf_result(call(batch))
+        coerced = _coerce_udf_result(call(batch), batch.schema)
         if not coerced:
             return batch.slice(0, 0)
         # `one_batch` is the shared compaction: it keeps every row and raises a clear error

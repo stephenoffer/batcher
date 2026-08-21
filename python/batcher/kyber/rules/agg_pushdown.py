@@ -15,6 +15,8 @@ registered via the `@rule` decorator (auto-discovered on import from
 
 from __future__ import annotations
 
+import dataclasses
+
 from batcher._internal.logging import note_suppressed
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
@@ -239,6 +241,15 @@ def count_distinct_to_distinct_count(node: Aggregate, ctx: OptimizerContext) -> 
     spec = node.aggregates[0]
     if spec.agg.func != "count_distinct" or spec.agg.input is None:
         return None
+    # Declines a watermarked (streaming) aggregate. The rewrite introduces a `Distinct` below
+    # the aggregate, and `Distinct` carries no watermark — so the bound that made the original
+    # aggregation's state finite would not apply to the new blocking operator underneath it.
+    # This rule is a parallelism optimization (see the cores gate below), so declining costs
+    # throughput on one shape and never a result. Same rule as
+    # `agg_extra.aggregate_without_aggs_to_distinct`: a rewrite that cannot represent a field
+    # must decline rather than drop it.
+    if node.watermark is not None:
+        return None
     # Fire only when the direct `count_distinct` is parallelism-starved: it partitions by the
     # group key (≤ `groups` cores busy), so once the group count meets the cores the rewrite's
     # value-parallel distinct only adds a full extra pass (TPC-H q16, ~2.4k groups on 92 cores:
@@ -345,7 +356,7 @@ def eager_aggregation(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | N
         AggregateSpec(spec.alias, AggExpr(spec.agg.func, Col(f"__eag_{i}")))
         for i, spec in enumerate(node.aggregates)
     )
-    return Aggregate(new_join, node.group_keys, final_aggs)
+    return dataclasses.replace(node, input=new_join, aggregates=final_aggs)
 
 
 @rule(name="pre_aggregation_through_join", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -438,7 +449,7 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
         AggregateSpec(spec.alias, AggExpr(_PREAGG_MERGE[spec.agg.func], Col(f"__pre_{i}")))
         for i, spec in enumerate(node.aggregates)
     )
-    return Aggregate(new_join, node.group_keys, final_aggs)
+    return dataclasses.replace(node, input=new_join, aggregates=final_aggs)
 
 
 @rule(name="pre_aggregate_join_measures", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -569,4 +580,4 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
         )
         for i, spec in enumerate(node.aggregates)
     )
-    return Aggregate(new_join, node.group_keys, final_aggs)
+    return dataclasses.replace(node, input=new_join, aggregates=final_aggs)

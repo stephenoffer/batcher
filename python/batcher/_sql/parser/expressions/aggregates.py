@@ -167,6 +167,7 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
         not served by this module and the caller should fall through to `_AGG_FUNCS`.
     """
     kind = type(node).__name__.lower()
+    _reject_top_n(node, kind)
     if kind in _TYPED_UNARY:
         return AggExpr(_TYPED_UNARY[kind], tr._scalar(node.this))
     composite = _TYPED_UNARY_COMPOSITE.get(kind)
@@ -197,6 +198,36 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
             "approx_quantile", tr._scalar(node.this), param=_fraction(node.args.get("quantile"))
         )
     return None
+
+
+#: Aggregates with a DuckDB "top N" overload — `max(x, n)`, `arg_max(x, y, n)` — whose
+#: result is a **list** of the n best values, not the single best. sqlglot parks the count
+#: in a different slot per node, so both are checked.
+_TOP_N_KINDS = {"max": "expressions", "min": "expressions", "argmax": "count", "argmin": "count"}
+
+
+def _reject_top_n(node, kind: str) -> None:
+    """Refuse the `max(x, n)` / `arg_max(x, y, n)` overloads rather than drop the count.
+
+    DuckDB's three-argument `arg_max` and two-argument `max` return a **list** of the n
+    best values. The count sits in a slot the two-input builder never reads, so the call
+    was answered with the plain one-value aggregate — a scalar where SQL asks for a list,
+    silently, on every row.
+
+    Args:
+        node: The aggregate node.
+        kind: Its lower-cased sqlglot class name.
+
+    Raises:
+        NotImplementedError: When the top-n overload is used.
+    """
+    slot = _TOP_N_KINDS.get(kind)
+    if slot is None or not node.args.get(slot):
+        return
+    raise NotImplementedError(
+        f"the top-N form of {kind}() returns a list of the N best values, which Batcher "
+        "has no aggregate for; use ORDER BY ... LIMIT N, or list(x ORDER BY ...)"
+    )
 
 
 def build_anon_agg(tr, node) -> AggExpr | Expr:

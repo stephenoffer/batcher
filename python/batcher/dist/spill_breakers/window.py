@@ -10,7 +10,7 @@ import json
 
 from batcher._internal.native import engine
 from batcher.config import active_config
-from batcher.dist.executor import _relabel_single_source
+from batcher.dist.executor import _relabel_single_source, _single_source
 from batcher.dist.spill import (
     _fd_safe,
     _iter_spill_morsels,
@@ -36,8 +36,20 @@ def supports_spilling_window(window: Window) -> bool:
     """A PARTITION BY window over plain-column keys can grace-partition by those keys.
 
     A keyless (global) window has a single partition that cannot be split, so it has
-    no bounded-memory spill path (it stays in-memory / materialized)."""
-    return bool(window.partition_keys) and all(isinstance(k, Col) for k in window.partition_keys)
+    no bounded-memory spill path (it stays in-memory / materialized).
+
+    The input must also name a *single* source, for exactly the reason
+    `supports_spilling_sort` records for `ORDER BY` above a join: `stream_spilling_window`
+    calls `_relabel_single_source`, which **raises** on a multi-source input rather than
+    declining. So a window over a join answered `collect()` fine and died under
+    `collect(spill=True)` with `PlanError: expected a single-source subplan to relabel` --
+    a predicate that answers *whether* a path applies must never raise when the answer is
+    "no". `supports_spilling_join`'s docstring already claimed "Sort and Window already gate
+    this way"; Sort did, Window did not.
+    """
+    if not (bool(window.partition_keys) and all(isinstance(k, Col) for k in window.partition_keys)):
+        return False
+    return _single_source(window.input)
 
 
 def stream_spilling_window(

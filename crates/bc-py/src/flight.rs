@@ -136,6 +136,18 @@ impl bc_resource::Spillable for ShuffleSpiller {
     }
 }
 
+/// Whether an advertise host is an IPv6 literal, and so needs an IPv6 listener.
+///
+/// A literal, not a name: Ray hands the node's IP, and resolving a name here would put a
+/// DNS round trip on the bind path. A name that resolves to IPv6 keeps the IPv4 wildcard,
+/// which is the pre-existing behavior rather than a new failure.
+fn is_ipv6_host(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::Ipv6Addr>()
+        .is_ok()
+}
+
 #[pymethods]
 impl FlightShuffleServer {
     /// Create a node-local Flight shuffle server.
@@ -190,10 +202,15 @@ impl FlightShuffleServer {
         };
         // A loopback bind for the single-host case; all-interfaces when a routable
         // advertise host is given so cross-node reducers can dial it.
-        let iface = if host.is_some() {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
+        //
+        // The family follows the advertise host. `0.0.0.0` binds no IPv6 interface at all,
+        // so on an IPv6-only cluster — IPv6-only EKS/GKE, and several on-prem fabrics —
+        // every cross-node fetch was refused at connect while the server sat listening on
+        // an address nothing could route to.
+        let iface = match host.as_deref() {
+            Some(h) if is_ipv6_host(h) => "[::]",
+            Some(_) => "0.0.0.0",
+            None => "127.0.0.1",
         };
         let ports: Vec<u16> = match (port_min, port_max) {
             (Some(lo), Some(hi)) => {

@@ -460,7 +460,29 @@ pub fn prefetch_read<T>(addr: *const T) {
             core::arch::x86_64::_mm_prefetch(addr as *const i8, core::arch::x86_64::_MM_HINT_T0);
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // AArch64 is not a fallback target here — Graviton, Ampere Altra and Grace are ordinary
+    // cloud instances, and a Grace-Hopper host is an aarch64 machine feeding an H100. Leaving
+    // the prefetch out on those was a silent loss on exactly the loops it exists for: the
+    // gather kernels issue it against an index the loop will reach several iterations later,
+    // which is where a random-access DRAM stall is otherwise unavoidable.
+    //
+    // Written as inline assembly rather than through `core::arch::aarch64::_prefetch`, which
+    // is still unstable; `prfm` is a two-operand hint instruction and the asm is as stable as
+    // the intrinsic would be.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `prfm` is architecturally a hint. It never faults, never dereferences
+        // architecturally, and has no effect on program state — only on cache residency.
+        // `pldl1keep` is the read-for-reuse variant, matching `_MM_HINT_T0` above.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{addr}]",
+                addr = in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = addr;
     }

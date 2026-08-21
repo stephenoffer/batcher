@@ -158,6 +158,45 @@ new files, in one catalog transaction. That is not a partition-scoped replace, a
 `replace_where` for Iceberg.
 :::
 
+## Computing a partition value
+
+An Iceberg table does not store the partition column, it stores a *transform* of it:
+`days(ts)`, `months(ts)`, `truncate(4, name)`. Batcher exposes those transforms as ordinary
+expressions, so you can compute the value a row will be partitioned by before it is written,
+group by it, or filter on it:
+
+```python
+import batcher as bt
+import datetime as dt
+
+events = bt.from_pydict(
+    {
+        "ts": [dt.datetime(2024, 3, 5, 13, 0), dt.datetime(2024, 3, 5, 21, 0)],
+        "amount": [10, 20],
+    }
+)
+by_day = events.group_by(day=bt.partition_days("ts")).agg(total=bt.col("amount").sum())
+print(by_day.to_pydict())
+# {'day': [19787], 'total': [30]}
+```
+
+The four time transforms count from the epoch and go negative before it, exactly as the
+specification says: {py:func}`bt.partition_years(ts) <batcher.partition_years>`,
+{py:func}`bt.partition_months(ts) <batcher.partition_months>`,
+{py:func}`bt.partition_days(ts) <batcher.partition_days>` and
+{py:func}`bt.partition_hours(ts) <batcher.partition_hours>`.
+{py:func}`bt.partition_truncate(value, width) <batcher.partition_truncate>` rounds a number
+down to a multiple of `width`, floored toward negative infinity, so `-7` at width `5` is
+`-10`. All five are also callable from SQL under the same names. For the text reading of
+`truncate`, take the prefix directly with `col("s").str.substr(1, width)`.
+
+:::{note}
+`bucket` is not provided. Iceberg pins it to a specific 32-bit MurmurHash3 over each type's
+canonical byte encoding, and computing it any other way would send rows to different files
+than the table's own writer chooses. A near-miss here is worse than an absence, because
+nothing errors.
+:::
+
 **Partitioning belongs to the catalog.** The table's partition spec is a table property, and
 `add_files` places each file according to it at commit time. A `partition_by=` on the write is
 ignored, so set the spec when the table is created.

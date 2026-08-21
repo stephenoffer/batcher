@@ -488,6 +488,17 @@
       "name": "a"
     }
   },
+  "list_get_dyn": {
+    "e": "list_get_dyn",
+    "index": {
+      "e": "col",
+      "name": "i"
+    },
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
   "list_join": {
     "e": "list_join",
     "input": {
@@ -866,6 +877,38 @@
       "name": "s"
     },
     "pattern": "x"
+  },
+  "str_dyn_full": {
+    "e": "str_dyn",
+    "fn": "substr",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "length": {
+      "e": "col",
+      "name": "m"
+    },
+    "pattern": {
+      "e": "col",
+      "name": "p"
+    },
+    "start": {
+      "e": "col",
+      "name": "n"
+    }
+  },
+  "str_dyn_min": {
+    "e": "str_dyn",
+    "fn": "replace",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": {
+      "e": "col",
+      "name": "p"
+    }
   },
   "str_replace": {
     "e": "str",

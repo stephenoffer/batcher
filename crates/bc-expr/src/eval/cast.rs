@@ -105,8 +105,27 @@ pub(crate) fn cast_expr(
             if int_target {
                 return parse_string_to_int(&trimmed, target, try_cast);
             }
+            if matches!(
+                target,
+                DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+            ) {
+                return parse_string_to_decimal(&trimmed, target, try_cast, &opts);
+            }
             return Ok(cast_with_options(&trimmed, target, &opts)?);
         }
+    }
+    // Boolean → Decimal: arrow has no such kernel and raises *"Casting from Boolean to
+    // Decimal128 not supported"* — which a `TRY_CAST` must never do, and which DuckDB
+    // answers with 1.00 / 0.00. A boolean *is* the integer 1 or 0, so route through Int64
+    // and let arrow's Int64→Decimal kernel (and its overflow handling) do the rest.
+    if matches!(arr.data_type(), DataType::Boolean)
+        && matches!(
+            target,
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+        )
+    {
+        let ints = cast_with_options(arr, &Int64, &opts)?;
+        return Ok(cast_with_options(&ints, target, &opts)?);
     }
     let float_src = matches!(arr.data_type(), Float16 | Float32 | Float64);
     // DuckDB's `DECIMAL → <integer>` rounds half-**away**-from-zero (`2.5 → 3`,
@@ -168,7 +187,62 @@ pub(crate) fn cast_expr(
         }
         return Ok(out);
     }
-    Ok(cast_with_options(arr, target, &opts)?)
+    match cast_with_options(arr, target, &opts) {
+        Ok(out) => Ok(out),
+        // `TRY_CAST` is documented as "NULL rather than an error", and a user reading that
+        // does not distinguish "this value does not convert" from "this *pair* has no
+        // kernel". Arrow raises for the second even under `safe`, so the promise held only
+        // for the conversions arrow implements.
+        Err(_) if try_cast => Ok(arrow::array::new_null_array(target, arr.len())),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `VARCHAR → DECIMAL`, on the two strings arrow's parser reads differently from DuckDB.
+///
+/// The empty string parses as **0** there, where DuckDB (and every other cast in this
+/// module) treats an unparseable value as NULL — so a blank cell in a CSV became a zero
+/// amount. And a scientific-notation value (`'1e3'`) is rejected outright, where DuckDB
+/// reads 1000. Both are handled here and everything else keeps arrow's exact decimal
+/// parser, which does not lose digits the way a detour through `f64` would.
+fn parse_string_to_decimal(
+    arr: &ArrayRef,
+    target: &arrow::datatypes::DataType,
+    try_cast: bool,
+    opts: &CastOptions<'_>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::StringArray;
+
+    let s = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ArrowError::CastError("expected a string array".into()))?;
+    let needs_help = |v: &str| v.is_empty() || v.contains(['e', 'E']);
+    if !s.iter().flatten().any(needs_help) {
+        return Ok(cast_with_options(arr, target, opts)?);
+    }
+    // Rewrite only the values arrow reads differently: an empty string becomes NULL, and a
+    // scientific-notation value is expanded through `f64` (whose 15-digit precision is
+    // ample for a value written with an exponent).
+    let rewritten: StringArray = s
+        .iter()
+        .map(|o| {
+            let v = o?;
+            if v.is_empty() {
+                return None;
+            }
+            if v.contains(['e', 'E']) {
+                return v.parse::<f64>().ok().map(|f| format!("{f}"));
+            }
+            Some(v.to_string())
+        })
+        .collect();
+    let rewritten: ArrayRef = Arc::new(rewritten);
+    match cast_with_options(&rewritten, target, opts) {
+        Ok(out) => Ok(out),
+        Err(_) if try_cast => Ok(arrow::array::new_null_array(target, arr.len())),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Parse one string to a bool the way DuckDB's `VARCHAR → BOOLEAN` cast does: ASCII
