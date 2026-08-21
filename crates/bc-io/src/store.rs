@@ -42,7 +42,32 @@ fn store_cache() -> &'static Mutex<HashMap<String, Arc<dyn ObjectStore>>> {
 }
 
 /// Build the object store + path for `uri`. A bare path (no `scheme://`) is local.
+/// Legacy and Hadoop-ecosystem scheme spellings, mapped to the one `object_store` answers to.
+///
+/// `object_store` recognizes `s3`, `s3a`, `gs`, `az`, `abfs` and friends, and nothing else. A
+/// URI spelled any other way fails to resolve here, and an unusable native reader falls back to
+/// PyArrow — correct results, quietly slower, with no diagnostic. Both spellings below are in
+/// wide use: `gcs://` is what a great deal of tooling writes for Google Cloud Storage, and
+/// `s3n://` is the oldest Hadoop spelling and still appears in inherited manifests and job
+/// configs. The Python IO layer already treats both as aliases for the native backend, and
+/// `docs/user-guide/moving-data/cloud-storage.md` states they are "aliases, not a slower path";
+/// without this they were exactly a slower path on the native reader.
+const SCHEME_ALIASES: [(&str, &str); 2] = [("s3n://", "s3://"), ("gcs://", "gs://")];
+
+/// `uri` with a legacy scheme rewritten to its canonical one, borrowed when there is nothing
+/// to change.
+fn canonical_uri(uri: &str) -> std::borrow::Cow<'_, str> {
+    for (alias, canonical) in SCHEME_ALIASES {
+        if let Some(rest) = uri.strip_prefix(alias) {
+            return std::borrow::Cow::Owned(format!("{canonical}{rest}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(uri)
+}
+
 pub(crate) fn resolve(uri: &str) -> Result<Resolved, IoError> {
+    let uri = canonical_uri(uri);
+    let uri = uri.as_ref();
     if !uri.contains("://") {
         // Local filesystem: object_store's LocalFileSystem keys off an absolute path.
         let abs = std::fs::canonicalize(uri).unwrap_or_else(|_| std::path::PathBuf::from(uri));
@@ -391,6 +416,47 @@ fn as_duration(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy spelling must reach the *native* reader, not fall through to the PyArrow
+    /// fallback. `object_store` answers to `s3`/`s3a`/`gs` and nothing else, so an unrewritten
+    /// `gcs://` or `s3n://` failed to resolve here and the scan degraded silently — correct
+    /// results, quietly slower, with nothing to say which path it took.
+    #[test]
+    fn legacy_scheme_spellings_are_canonicalized() {
+        assert_eq!(
+            canonical_uri("gcs://bucket/k.parquet"),
+            "gs://bucket/k.parquet"
+        );
+        assert_eq!(
+            canonical_uri("s3n://bucket/k.parquet"),
+            "s3://bucket/k.parquet"
+        );
+    }
+
+    /// Everything else is passed through untouched, including the spellings `object_store`
+    /// already answers to and a local path with no scheme at all.
+    #[test]
+    fn a_scheme_object_store_knows_is_left_alone() {
+        for uri in [
+            "s3://b/k",
+            "s3a://b/k",
+            "gs://b/k",
+            "abfss://c@a/k",
+            "/tmp/x.parquet",
+        ] {
+            assert_eq!(canonical_uri(uri), uri);
+        }
+    }
+
+    /// The rewrite is a *prefix* replacement, so a path that merely contains the alias text is
+    /// untouched — an object key called `gcs://` is not a scheme.
+    #[test]
+    fn an_alias_inside_a_key_is_not_a_scheme() {
+        assert_eq!(
+            canonical_uri("s3://bucket/gcs://weird"),
+            "s3://bucket/gcs://weird"
+        );
+    }
 
     fn opts_for(uri: &str) -> HashMap<String, String> {
         store_options(&Url::parse(uri).unwrap())

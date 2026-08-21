@@ -39,6 +39,55 @@ def _ray_already_live() -> bool:
     return "ray" in sys.modules
 
 
+# Set once the allocation has been *looked at*, whatever the answer was. Not once the notice
+# has been given: the shape of a job does not change under it, so a second look can only reach
+# the same conclusion — and on PBS, LSF or Grid Engine that look reads a host file, which on a
+# single-node allocation (where the notice never fires) would be a file read per terminal op
+# forever. Repeating the notice itself would also train the reader to skip it.
+_IDLE_ALLOCATION_WARNED = False
+
+
+def _warn_once_if_the_allocation_is_idle() -> None:
+    """Say so, once, when a multi-node allocation is about to run on one node.
+
+    The silent failure this exists for: `srun -N 64 python job.py` — or the PBS, LSF or Grid
+    Engine equivalent — gives the job sixty-four nodes, and a script that never starts Ray runs
+    the whole query on whichever one it landed on. It returns the right answer and uses a
+    sixty-fourth of the hardware it was billed for, with nothing anywhere to say so, because
+    from Batcher's side an unclustered process is a perfectly ordinary one.
+
+    The complement of `dist…capacity.warn_once_if_allocation_is_wider_than_ray`, which covers
+    the case where Ray *is* up but narrower than the allocation. That one lives beside the
+    placement code because it reads the live cluster; this one must not, because the whole
+    condition is that there is no cluster to read — importing `ray` to find that out is the
+    444 ms `_ray_already_live` exists to avoid.
+
+    Silent on an unscheduled process, on a single-node allocation, and on an explicit
+    `distributed=False`, which never reaches here.
+    """
+    global _IDLE_ALLOCATION_WARNED
+    if _IDLE_ALLOCATION_WARNED:
+        return
+    from batcher._internal.site import scheduler_job
+
+    job = scheduler_job()
+    _IDLE_ALLOCATION_WARNED = True
+    if not job.multi_node:
+        return
+    from batcher._internal.logging import get_logger, log_kv
+
+    log_kv(
+        get_logger("api"),
+        logging.WARNING,
+        f"this {job.kind} job holds {job.node_count} nodes but no Ray cluster is running, so "
+        "the query will use one of them. Start Ray across the allocation "
+        "(`ray start --head` on one node, `ray start --address` on the rest) and point "
+        "RAY_ADDRESS at it, or pass distributed=False to say the single node is what you meant",
+        scheduler=job.kind,
+        allocation_nodes=job.node_count,
+    )
+
+
 def resolve_distributed(
     distributed: bool | str,
     plan: LogicalPlan | None = None,
@@ -115,7 +164,10 @@ def _resolve_distributed(
     if distributed != "auto":
         return bool(distributed)
     if not _ray_already_live():
-        return False  # nothing imported Ray, so nothing initialized it — single-node
+        # Nothing imported Ray, so nothing initialized it — single-node. Which is the right
+        # answer on a laptop and a costly surprise inside a sixty-four-node allocation.
+        _warn_once_if_the_allocation_is_idle()
+        return False
     try:
         import ray
 

@@ -22,7 +22,7 @@ import pytest
 
 from batcher._internal.hardware.cpu import available_cpu_count
 from batcher.carbonite.resilience import PreemptionMonitor, termination_probe
-from batcher.config import Config, config_context
+from batcher.config import Config, config_context, deadline
 from batcher.config.deadline import (
     DEADLINE_HORIZON_S,
     DEADLINE_PAST_GRACE_S,
@@ -36,13 +36,66 @@ from batcher.config.profiles import detect_leased_allocation, detect_spot_enviro
 # than depend on whichever of them the host scheduler happens to have exported.
 _DEADLINE_VARS = ("BATCHER_DEADLINE_EPOCH_S", "SLURM_JOB_END_TIME")
 
+# The relative form, for the schedulers that publish a wall-clock *limit* and never the moment
+# it expires — which is every one of them except Slurm.
+_RELATIVE_VAR = "BATCHER_DEADLINE_SECONDS"
+
 
 @pytest.fixture
 def clean_env(monkeypatch):
     """No deadline in the environment, whatever the host scheduler set."""
-    for var in _DEADLINE_VARS:
+    for var in (*_DEADLINE_VARS, _RELATIVE_VAR):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
+
+
+@pytest.fixture
+def just_started(clean_env):
+    """Pin the relative lease's base to now, so the assertion does not depend on suite age.
+
+    The base is the process's real start time, which in a fifteen-minute test run is fifteen
+    minutes ago — so a 600-second lease has genuinely expired and the reading is correct while
+    the assertion about it would not be. Pinning it is what makes the test about the *reader*.
+    """
+    clean_env.setattr(deadline, "_PROCESS_START_S", time.time())
+    return clean_env
+
+
+def test_a_relative_lease_reaches_the_same_drain_path(just_started):
+    # PBS, LSF, Grid Engine and HTCondor all know a job's wall-clock limit and none of them
+    # export the moment it ends, so without a relative form none of them can drain at all.
+    just_started.setenv(_RELATIVE_VAR, "600")
+    remaining = seconds_remaining()
+    assert remaining is not None
+    assert 500 < remaining <= 600
+    assert detect_leased_allocation() is True
+
+
+def test_a_relative_lease_is_measured_from_when_the_process_started(clean_env):
+    # Not from when this module was imported. A driver that imports Batcher some way into its
+    # life would otherwise be told it has the whole lease left, and would drain late or not at
+    # all -- the failure the deadline path exists to prevent.
+    clean_env.setattr(deadline, "_PROCESS_START_S", time.time() - 500)
+    clean_env.setenv(_RELATIVE_VAR, "600")
+    remaining = seconds_remaining()
+    assert remaining is not None
+    assert 90 < remaining <= 100
+
+
+def test_an_expired_relative_lease_reads_as_no_time_left(just_started):
+    # Inside the kill grace period, which is precisely when draining matters most.
+    just_started.setattr(deadline, "_PROCESS_START_S", time.time() - 900)
+    just_started.setenv(_RELATIVE_VAR, "600")
+    assert seconds_remaining() == 0.0
+
+
+def test_an_absolute_deadline_outranks_a_relative_one(just_started):
+    # The absolute form is exact; the relative one is measured from process start, which is
+    # only ever at or after the moment the launcher meant. Where both are present the exact
+    # one is the answer.
+    just_started.setenv(_RELATIVE_VAR, "10000")
+    just_started.setenv("SLURM_JOB_END_TIME", str(time.time() + 100))
+    assert seconds_remaining() <= 100
 
 
 def test_no_deadline_reads_as_unbounded(clean_env):

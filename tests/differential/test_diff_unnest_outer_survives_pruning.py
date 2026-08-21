@@ -85,3 +85,55 @@ def test_non_outer_explode_still_drops_empty_and_null_lists():
     ds = bt.from_pydict(_ROWS)
     got = ds.with_columns(x=col("xs")).explode("x").select("id", "x").collect()
     assert got.to_pydict() == {"id": [1, 1, 2], "x": [10, 20, 30]}
+
+
+# --- The same three-of-five rebuild, in the PUSHDOWN phase -------------------------------
+#
+# `pushdown_gaps.push_filter_through_unnest` and `prefilter_unnest_by_list_contains` each
+# rebuilt the node the same positional way `rewrite_projection` did, so a *filter* over an
+# outer explode reset `outer` and dropped `index_alias` exactly as a projection did. The
+# trigger is different -- a predicate on a carried column, rather than a dropped column --
+# so none of the tests above reach it.
+
+
+def test_a_filter_on_a_carried_column_keeps_the_outer_rows():
+    """`Filter(Unnest(x, outer=True), p)` pushes `p` below the explode; `outer` must survive.
+
+    `p` reads only `id`, which the explode carries through unchanged, so the rule rewrites to
+    `Unnest(Filter(x, p), ...)`. Rebuilding the `Unnest` positionally turned it inner, and the
+    rows kept only by `outer` -- the empty list and the NULL one -- disappeared.
+    """
+    got = bt.from_pydict(_ROWS).explode("xs", alias="x", outer=True).filter(col("id") >= 3)
+    assert got.collect().to_pydict() == {"id": [3, 4], "x": [None, None]}
+
+
+def test_a_filter_on_a_carried_column_keeps_the_position_column():
+    """`index_alias` was lost by the same rebuild, so `posexplode` lost its position column."""
+    got = (
+        bt.from_pydict(_ROWS)
+        .explode("xs", alias="x", outer=True, index="i")
+        .filter(col("id") <= 2)
+        .collect()
+    )
+    assert got.column_names == ["id", "x", "i"]
+    assert got.to_pydict() == {"id": [1, 1, 2], "x": [10, 20, 30], "i": [0, 1, 0]}
+
+
+def test_the_list_contains_prefilter_keeps_the_position_column():
+    """`prefilter_unnest_by_list_contains` fires on `alias == literal` and rebuilt it too."""
+    got = bt.from_pydict(_ROWS).explode("xs", alias="x", index="i").filter(col("x") == 30).collect()
+    assert got.column_names == ["id", "x", "i"]
+    assert got.to_pydict() == {"id": [2], "x": [30], "i": [0]}
+
+
+def test_a_filter_over_an_outer_explode_matches_duckdb(duck):
+    """The SQL spelling of the same shape, against the oracle."""
+    duck.register("t", _t())
+    query = "SELECT id, x FROM t LEFT JOIN UNNEST(t.xs) AS u(x) ON TRUE WHERE id >= 3"
+    assert_same(bt.sql(query, t=bt.from_arrow(_t())).collect(), duck.sql(query))
+
+
+def test_a_non_outer_explode_under_a_filter_still_drops_empty_and_null_lists():
+    """Again, the default must not drift the other way."""
+    got = bt.from_pydict(_ROWS).explode("xs", alias="x").filter(col("id") >= 2).collect()
+    assert got.to_pydict() == {"id": [2], "x": [30]}

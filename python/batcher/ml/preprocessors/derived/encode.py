@@ -32,6 +32,7 @@ from batcher.ml.preprocessors.base import (
     Preprocessor,
     columns_arg,
     distinct_values,
+    require_categories,
 )
 from batcher.plan.expr_ir.constructors import col, lit, when
 
@@ -170,8 +171,12 @@ class LabelBinarizer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.classes_ = distinct_values(
-            ds, self.column, what="LabelBinarizer", max_categories=self.max_categories
+        self.classes_ = require_categories(
+            distinct_values(
+                ds, self.column, what="LabelBinarizer", max_categories=self.max_categories
+            ),
+            what="LabelBinarizer",
+            column=self.column,
         )
         self._fitted = True
         return self
@@ -270,11 +275,15 @@ class MultiLabelBinarizer(Preprocessor):
             self.labels_ = list(self.labels)
         else:
             exploded = ds.select(self.column).explode(self.column)
-            self.labels_ = distinct_values(
-                exploded,
-                self.column,
+            self.labels_ = require_categories(
+                distinct_values(
+                    exploded,
+                    self.column,
+                    what="MultiLabelBinarizer",
+                    max_categories=self.max_categories,
+                ),
                 what="MultiLabelBinarizer",
-                max_categories=self.max_categories,
+                column=self.column,
             )
         self._fitted = True
         return self

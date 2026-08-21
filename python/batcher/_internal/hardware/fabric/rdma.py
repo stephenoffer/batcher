@@ -327,16 +327,22 @@ def rdma_net_interfaces() -> tuple[str, ...]:
 
 
 def fabric_interface_address() -> str:
-    """The IPv4 address of this node's fastest active fabric interface, or `""`.
+    """The IP address of this node's fastest active fabric interface, or `""`.
 
     What a peer should dial to reach this node over the fabric rather than over whatever
     interface the default route happens to name. On a GPU node those are usually different
     wires by two orders of magnitude: the management NIC carries the node's advertised IP,
     while the InfiniBand ports carry nothing unless something addresses them.
 
+    IPv4 is preferred where the fabric has one, and a global IPv6 address is taken where it
+    does not — an IPv6-only fabric is not exotic on newer on-prem builds and on IPv6-only
+    Kubernetes, and reading only `AF_INET` there returned `""`, which silently sent the whole
+    shuffle back over the management NIC. Link-local addresses are skipped: `fe80::` is only
+    dialable with the peer's own zone index appended, which this node cannot know.
+
     Returns:
-        A dotted-quad address, or `""` when no active fabric interface has one — an
-        InfiniBand port with no IPoIB address configured is common and is not an error, it
+        A dotted-quad or an IPv6 address, or `""` when no active fabric interface has one —
+        an InfiniBand port with no IPoIB address configured is common and is not an error, it
         simply means the fabric is not IP-addressable and a caller must keep its existing
         address.
     """
@@ -352,12 +358,18 @@ def fabric_interface_address() -> str:
         stats = psutil.net_if_stats()
     except Exception:
         return ""
-    for name in interfaces:
-        # A configured-but-down interface has an address that nothing answers on, which is
-        # worse than having none: a peer dialing it waits for a timeout instead of failing.
-        if not getattr(stats.get(name), "isup", False):
-            continue
-        for addr in addrs.get(name, ()):
-            if addr.family == socket.AF_INET and addr.address:
-                return str(addr.address)
+    # A configured-but-down interface has an address that nothing answers on, which is worse
+    # than having none: a peer dialing it waits for a timeout instead of failing.
+    live = [n for n in interfaces if getattr(stats.get(n), "isup", False)]
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for name in live:
+            for addr in addrs.get(name, ()):
+                if addr.family != family or not addr.address:
+                    continue
+                # psutil appends the zone as `%eth0` on a link-local address. Both the scope
+                # and the suffix make the address undialable from another node.
+                text = str(addr.address).split("%", 1)[0]
+                if family == socket.AF_INET6 and text.lower().startswith(("fe80:", "::1")):
+                    continue
+                return text
     return ""

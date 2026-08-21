@@ -146,6 +146,7 @@ The table below lists the relational scripts in path order.
 | `examples/relational/self_referential_hierarchies.py` | Walking a hierarchy without recursion |
 | `examples/relational/set_operations.py` | Set operations: union, intersect, and except, with and without duplicates |
 | `examples/relational/sorting.py` | Sorting: direction per key, and where nulls land |
+| `examples/relational/sorting_binary_keys.py` | Sorting by a binary key: hashes, UUIDs, and fixed-layout records |
 | `examples/relational/top_k_per_group.py` | The top N rows within each group, two ways |
 | `examples/relational/wide_to_long_reports.py` | Turning a report into a tidy table, and back |
 | `examples/relational/window_free_top_n_per_group.py` | Top-N per group without a window, using a join against the group's threshold |

@@ -141,8 +141,12 @@ def _projection_map(tr, ds: Dataset, projections, star_cols=None) -> dict[str, E
             continue
         alias = _alias_of(p)
         if tr._is_window(p):
-            # The window pass already materialized this column under `alias`.
-            _put(named, alias, col(alias))
+            # The window pass already materialized this column — under `alias`, unless
+            # that name was already taken by a source column, in which case it recorded
+            # the hidden name it used instead.
+            value = col(tr._win_physical.get(alias, alias))
+            rewrap = tr._win_rewrap.get(alias)
+            _put(named, alias, rewrap(value) if rewrap is not None else value)
             continue
         expr = tr._scalar(_unwrap_alias(p))
         if has_selector(expr):
@@ -492,4 +496,39 @@ def _agg(tr, node) -> AggExpr | Expr:
         # correct for.
         tr._agg_pending_distinct.append((exprs[0].sql(), exprs[0]))
         return AggExpr(mapped, tr._scalar(exprs[0]))
-    return AggExpr(mapped, tr._scalar(arg))
+    return _numeric_reduction(tr, mapped, arg)
+
+
+def _numeric_reduction(tr, mapped: str, arg) -> AggExpr | Expr:
+    """Build a reducing aggregate, widening the two input types SQL admits and the IR does not.
+
+    `SUM`/`AVG` are defined on more than the numeric columns the engine's aggregates take,
+    and refusing them made a valid query fail rather than run:
+
+    * ``sum(bool)`` counts the TRUEs (DuckDB, Postgres and Spark all answer it).
+    * ``avg(date)`` / ``avg(timestamp)`` is the mean *instant*, which DuckDB returns as a
+      TIMESTAMP. Averaging the microsecond count and rebuilding the timestamp is the same
+      computation, and it keeps the result's type right.
+
+    Args:
+        tr: The translator, read for the in-scope column types.
+        mapped: The engine aggregate tag.
+        arg: The argument node.
+
+    Returns:
+        The aggregate, or an expression over one when the input had to be reshaped.
+    """
+    import pyarrow as pa
+
+    from batcher.plan.functions.temporal import from_epoch
+
+    value = tr._scalar(arg)
+    dtype = tr.column_type(arg)
+    if dtype is None:
+        return AggExpr(mapped, value)
+    if pa.types.is_boolean(dtype) and mapped in ("sum", "mean"):
+        return AggExpr(mapped, value.cast("int64"))
+    if mapped == "mean" and (pa.types.is_date(dtype) or pa.types.is_timestamp(dtype)):
+        micros = value.cast("timestamp").cast("int64")
+        return from_epoch(AggExpr("mean", micros).cast("int64"), "us")
+    return AggExpr(mapped, value)

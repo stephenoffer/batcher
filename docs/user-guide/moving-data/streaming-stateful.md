@@ -261,6 +261,139 @@ and for the same reason: one driver thread, and the source decides when its read
 :::
 
 
+## When state outgrows memory
+
+`memory.streaming_state_max_bytes` caps what one streaming operator may hold. A **windowed**
+aggregate that reaches it moves its oldest windows to disk and keeps running. Everything else
+still stops with a `ResourceError`.
+
+The asymmetry is not an oversight, it is what the operators make possible. A watermark only
+moves forward, so a windowed aggregate evicts its windows in increasing order — a window
+written to disk is read back exactly once, when it closes, and never searched for. That is an
+ordered run of files, which is cheap. A running aggregate with no watermark finalizes every
+group on every micro-batch, so its state has no cold end to shed; making that spill needs a
+keyed store with point lookups, which Batcher does not have.
+
+You do not configure any of this. Spilling starts when the cap is reached and stops when
+resident state is back under it, splitting at the median window start so the newest windows —
+the ones incoming rows land in — stay in memory:
+
+```python
+# docs: skip
+with bt.option_context("memory.streaming_state_max_bytes", 512 << 20):
+    query = (
+        events.with_watermark("ts", "1 hour")
+        .group_by(w=bt.window(col("ts"), "5 minutes"), user=col("user"))
+        .agg(total=col("amount").sum())
+        .write.delta("lake/rollups", checkpoint="s3://lake/_ckpt")
+    )
+```
+
+Spilled rows are still reported as state: `num_rows_total` in the progress record counts what
+is on disk as well as what is resident, because a spilling query has *moved* state, not shed
+it. Watch `memory_used_bytes` against `num_rows_total` to see the split.
+
+`memory_used_bytes` also counts what `update` output mode retains beside the aggregate. That
+mode diffs each result against a copy of the one before it, so a query in `update` holds the
+aggregate **twice** — and the cap counts both. If a query that used to run now reaches the
+cap sooner, this is why: it was always using that memory, and the budget was reporting half
+of it.
+
+A `ResourceError` still happens, and it now means something narrower than it used to: the
+**newest** windows alone exceed the cap. No amount of disk fixes that — it is a key space too
+wide for the envelope, or a watermark that has stopped closing anything.
+
+### What spilling costs
+
+Latency, on the micro-batch that spills and on the one that reads a run back. Nothing else:
+the answer is unchanged, which
+`tests/integration/test_streaming_state_spill.py::test_a_spilled_run_matches_the_unspilled_answer_exactly`
+pins against the same query run entirely in memory.
+
+Spilled runs go to `memory.spill_dir` when you set one, and to the engine's usual scratch
+location otherwise — the same disk every other spill uses. They are scratch: a restart rebuilds
+them from the checkpoint, and the query deletes them when it stops.
+
+## How state is checkpointed
+
+A stateful query with a `checkpoint=` location persists its state so a restart resumes
+instead of recomputing. What it writes per micro-batch depends on the operator.
+
+A **running aggregate** — a `group_by(...).agg(...)` with no watermark — records a
+*changelog*: the partial aggregate that micro-batch folded in, rather than the whole state.
+It can, because an aggregate's `combine` is associative and commutative, so combining a
+snapshot with every partial recorded after it reconstructs exactly the state the whole
+snapshot would have held. Recovery replays the chain.
+
+That matters because this is the operator whose state only grows. Nothing closes a group, so
+a query that has accumulated ten million of them was rewriting ten million rows on every
+trigger — a checkpoint whose cost rises for the life of the query, with the flush on the
+critical path of every epoch. A changelog entry costs the *batch's* distinct group count
+instead:
+
+| Micro-batches | Whole snapshot per epoch | Changelog | Reduction |
+|---|---|---|---|
+| 50 | 201,118 B | 58,398 B | 3.4x |
+| 100 | 721,618 B | 138,706 B | 5.2x |
+| 200 | 2,722,618 B | 416,186 B | 6.5x |
+| 400 | 10,564,618 B | 1,287,946 B | 8.2x |
+
+The reduction grows with the run because the two costs scale differently: writing the whole
+state every epoch is quadratic in the number of epochs, and writing a changelog is linear.
+The figures are bytes written to the checkpoint, one group per row on the `rate` source,
+from `benchmarks/scenarios/streaming/state_checkpoint.py` — run it to reproduce them. They
+are a write-volume measurement, not a wall-clock one: the flush is on the critical path of
+every epoch, so fewer bytes is less latency, but how much depends entirely on what the
+checkpoint is written to.
+
+A **windowed** aggregate records one too, for a different reason. It *removes* state, which
+is normally what disqualifies an operator: a changelog says what went in and has no way to
+say what came out, so replaying one would resurrect the windows eviction already emitted. It
+qualifies because its removal is not arbitrary. Eviction drops every window whose start is at
+or below a threshold, on a totally ordered axis, so what it removes is always a **prefix** —
+and a prefix is described by its upper bound. That single integer rides in each entry, and
+replay combines the partials and re-applies it.
+
+| Micro-batches | Whole snapshot per epoch | Changelog | Reduction |
+|---|---|---|---|
+| 40 | 1,092,754 B | 367,754 B | 3.0x |
+| 80 | 4,040,834 B | 908,834 B | 4.4x |
+
+**Deduplication and keyed state still snapshot whole.** Their TTL expires arbitrary keys at
+arbitrary times, so there is no bound that describes what went; they would need a real
+tombstone per key, which this changelog has no way to carry.
+
+`streaming.checkpoint_delta_interval` bounds how many changelog entries accumulate before a
+whole snapshot is written again, which is what bounds recovery: a longer chain writes less
+and replays more. Set it to `0` to disable the changelog entirely and snapshot whole state
+every epoch.
+
+```python
+# docs: skip
+with bt.option_context("streaming.checkpoint_delta_interval", 25):
+    query = (
+        events.group_by("user")
+        .agg(total=col("amount").sum())
+        .write.for_each_batch(upsert, checkpoint="s3://lake/_ckpt", output_mode="update")
+    )
+```
+
+A changelog entry is only written when it is genuinely smaller than the state — at least
+twice as small. A stream whose every micro-batch touches every group gets whole snapshots,
+because for that shape a chain would write more, not less. You do not have to know which
+shape you have.
+
+A windowed aggregate that has spilled writes a **multi-part** snapshot: its resident state and
+each spilled run go into one file, streamed, so the checkpoint never pulls a state larger than
+the memory cap back into memory to persist it. Recovery combines the parts — the same
+`combine` that makes the changelog sound makes the split into parts invisible. On an object
+store the snapshot buffers rather than streams, because a PUT needs the whole object.
+
+A **distributed** streaming query still snapshots whole state. The driver combines the
+workers' partials, so the same changelog would apply, but the distributed streaming path has
+no automated coverage and a state backend is not something to change without a recorded
+cluster run. The single-node behaviour is unaffected either way.
+
 ## See also
 
 - {doc}`streaming`: sources, sinks, triggers, output modes, windows, and checkpoints.

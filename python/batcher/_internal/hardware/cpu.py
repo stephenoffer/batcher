@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 
 from batcher._internal.hardware.cgroup import (
     cfs_quota_count,
@@ -32,6 +33,7 @@ __all__ = [
     "cpu_thermal_events",
     "cpu_thermal_throttle_count",
     "process_start_method_context",
+    "reset_cpu_probe",
 ]
 
 # Hard ceiling on how many partitions an inference actor keeps in flight at once (submit-ahead
@@ -55,70 +57,37 @@ def _affinity_count() -> int | None:
     return n if n > 0 else None
 
 
-# Slurm's per-task CPU allocation, most specific first. `SLURM_CPUS_PER_TASK` is set when the
-# job asked with `--cpus-per-task`; `SLURM_CPUS_ON_NODE` is the node's whole share of the
-# allocation and is the fallback for a job that did not.
-_SLURM_CPU_VARS = ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE")
+def _allocation_cpu_count() -> int | None:
+    """Cores this process's batch allocation granted it, or `None` when unscheduled.
 
+    Delegates to `site.scheduler.allocated_cpus`, which owns the per-scheduler variable
+    vocabulary for Slurm, PBS, LSF and Grid Engine. It lives there rather than here so there
+    is one place that knows how each scheduler spells its grant, and this module keeps its
+    single question: what may this process actually use.
 
-def _slurm_expansion_min(raw: str) -> int | None:
-    """The smallest per-node count in a Slurm `"4(x2),8"` expansion, or `None` if unparseable.
-
-    A heterogeneous job's `SLURM_CPUS_ON_NODE` is a run-length list: `"4(x2),8"` means two
-    nodes granted 4 cores and one granted 8. Which entry describes *this* node is not
-    derivable from the variable alone, so the minimum is taken, for the reason every binding
-    figure in this package takes the weakest: under-parallelizing costs throughput, while
-    over-parallelizing on the node that got the small grant is what oversubscribes a shared
-    node and gets the job killed at a site with enforcement.
-
-    Previously any value with a repeat count fell through entirely, so a heterogeneous
-    allocation had *no* Slurm bound at all and sized to the affinity mask — the whole node —
-    which is precisely the failure the Slurm bound exists to prevent, arriving on exactly the
-    layouts that need it most.
+    Imported inside the call because `site` reaches back into this package for the storage
+    probe, and a module-level edge would make that a cycle.
     """
-    counts: list[int] = []
-    for part in raw.split(","):
-        head = part.strip().split("(", 1)[0].strip()
-        if not head.isdigit():
-            return None  # an unrecognized shape: no bound beats a wrong one
-        value = int(head)
-        if value > 0:
-            counts.append(value)
-    return min(counts) if counts else None
+    from batcher._internal.site.scheduler import allocated_cpus
 
-
-def _slurm_cpu_count() -> int | None:
-    """Cores this Slurm allocation granted on this node, or `None` off Slurm.
-
-    A container is confined by cgroups, which the affinity mask and CFS quota already
-    report. A Slurm allocation is not, unless the site configured `task/cgroup` confinement
-    — and plenty of HPC sites do not. There the affinity mask reports every core on a
-    shared login-class node, so sizing to it fans a job allocated 8 cores out to 128
-    threads: it oversubscribes the node, steals from the co-tenants Slurm placed there, and
-    at a site with enforcement is exactly what gets the job killed. Slurm publishes the real
-    grant in the environment, so this reads it as one more upper bound rather than trusting
-    a mask the scheduler never narrowed.
-    """
-    for var in _SLURM_CPU_VARS:
-        raw = os.environ.get(var, "").strip()
-        if not raw:
-            continue
-        # A plain int is the common case; `_slurm_expansion_min` also handles it, so there is
-        # one parse rather than a fast path and a fallback that can disagree.
-        n = _slurm_expansion_min(raw)
-        if n is not None and n > 0:
-            return n
-    return None
+    return allocated_cpus()
 
 
 def available_cpu_count() -> int:
     """The number of CPUs this process may actually use — never fewer than 1.
 
     The minimum of the affinity-mask size (cpuset pin), the CFS-quota core count (bandwidth
-    throttle), and the Slurm allocation, floored by `os.cpu_count()` and finally 1. Prefer
-    this over `os.cpu_count()` anywhere thread pools or task fan-out are sized, so a
+    throttle), and the batch scheduler's core grant, floored by `os.cpu_count()` and finally 1.
+
+    Prefer this over `os.cpu_count()` anywhere thread pools or task fan-out are sized, so a
     container throttled to N cores fans out to N — not to the host core count it will never
     receive (which over-subscribes and thrashes the scheduler).
+
+    The scheduler bound is the one a container does not supply. A batch allocation is *not* a
+    cgroup unless the site configured confinement, and plenty of HPC sites do not: there the
+    affinity mask reports every core on a shared node, so sizing to it fans a job granted 8
+    cores out to 128 threads — which steals from the co-tenants the scheduler placed there
+    and, at a site with enforcement, is what gets the job killed.
 
     Examples:
         .. doctest::
@@ -130,13 +99,61 @@ def available_cpu_count() -> int:
     Returns:
         The effective logical-core budget, at least 1.
     """
-    bounds = (_affinity_count(), cfs_quota_count(), _slurm_cpu_count())
+    bounds = (_affinity_count(), cfs_quota_count(), _allocation_cpu_count())
     candidates = [c for c in bounds if c is not None]
     host = os.cpu_count() or 1
     return max(1, min([host, *candidates]))
 
 
+#: Window over which a contention reading is reused, in seconds.
+#:
+#: Every signal `cpu_contention` returns is either a **one-minute load average** or a ratio of
+#: cumulative counters, so none of them can move meaningfully inside this window — re-reading
+#: them twenty times a second is already far more often than they change. What the reading does
+#: cost is ~30 microseconds of `/proc` and PSI file parsing, and it sits on the per-query
+#: control path (`carbonite.recommend_parallelism` asks for it on every terminal op), where a
+#: sub-millisecond query pays it in full.
+#:
+#: This is the same trade `carbonite.memory.probe` already makes for the memory reading, and
+#: for the same reason its note gives: a stale reading can only *under*-report a spike, and the
+#: window is far shorter than the interval over which the number it reads is itself averaged.
+_CONTENTION_TTL_S = 0.05
+
+#: Single-slot TTL cache: `(monotonic_deadline, signals)`.
+_contention_cache: tuple[float, dict[str, float]] | None = None
+
+
+def reset_cpu_probe() -> None:
+    """Forget the memoized contention reading, so the next call re-measures.
+
+    For tests that stub the underlying counters and for any caller that wants a fresh probe.
+    """
+    global _contention_cache
+    _contention_cache = None
+
+
 def cpu_contention() -> dict[str, float]:
+    """How much of this machine's CPU is being taken by *other* work, right now.
+
+    Reused for `_CONTENTION_TTL_S` — see that constant for why that is sound and why it
+    matters. The measurement itself is `_measure_contention`, which this wraps; a test that
+    stubs *this* name replaces the cache along with it, so stubbing stays immediate.
+
+    Returns:
+        The contention signal map — see `_measure_contention` for the keys.
+    """
+    global _contention_cache
+
+    cached = _contention_cache
+    now = time.monotonic()
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    signals = _measure_contention()
+    _contention_cache = (now + _CONTENTION_TTL_S, signals)
+    return signals
+
+
+def _measure_contention() -> dict[str, float]:
     """How much of this machine's CPU is being taken by *other* work, right now.
 
     Low CPU utilization during a query has two completely different causes with opposite

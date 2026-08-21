@@ -11,7 +11,7 @@ correct as it grows multiple execution tiers and scales from one core to a clust
 bc-arrow → bc-expr →┤                     ├→ bc-interp → bc-py
                     └→ bc-codegen ────────┘
 near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in where needed:
-  bc-sketches  → bc-runtime (agg/hll, agg/qsketch), bc-py
+  bc-sketches  → bc-runtime (agg/sketch), bc-py
   bc-resource  → bc-interp, bc-py
   bc-transport → bc-py
   bc-io        → bc-py. Depends on `bc-arrow` for `usable_cores`: its Parquet-decode

@@ -171,3 +171,91 @@ def test_rays_synthesized_wrapper_is_still_scanned_by_text():
     exc = wrapper("ray::task() ... RuntimeError: CUDA out of memory")
     assert c.failure_class(exc) == "device_oom"
     assert c.is_retryable(exc) is True
+
+
+# --- The code spellings every cloud SDK actually uses -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # S3, and the commonest transient failure a large write meets: a bucket written
+        # faster than a prefix will take. Boto and s3fs surface the code verbatim with no
+        # status code in the message, so a spaced marker matched nothing at all.
+        ("An error occurred (SlowDown) when calling the PutObject operation", "throttled"),
+        ("Please reduce your request rate.", "throttled"),
+        ("An error occurred (RateLimitExceeded) when calling the objects.insert", "throttled"),
+        ("ServerBusy: Egress is over the account limit.", "throttled"),
+        ("TooManyRequests: retry after 3s", "throttled"),
+        ("ProvisionedThroughputExceededException: rate exceeded for shard", "throttled"),
+        ("OperationTimedOut", "timeout"),
+        ("RemoteDisconnected('Remote end closed connection without response')", "network"),
+        ("IncompleteRead(1024 bytes read, 4096 more expected)", "network"),
+    ],
+)
+def test_a_concatenated_error_code_is_classified_like_its_spaced_phrase(message, expected):
+    # The markers are substring matches on the message text, so `too many requests` does not
+    # match `TooManyRequests` and `slow_down` does not match `SlowDown`. Every one of these
+    # fell through to `application` — *not retryable* — and failed the whole query on a
+    # condition the next attempt would have served.
+    assert c.failure_class(RuntimeError(message)) == expected
+    assert c.is_retryable(RuntimeError(message)) is True
+
+
+def test_a_throttle_is_retried_here_rather_than_moved():
+    # A remote service asking for a slower rate says nothing about this node, so moving the
+    # work buys nothing and gives up a warm worker.
+    exc = RuntimeError("An error occurred (SlowDown) when calling the PutObject operation")
+    assert c.must_move(exc) is False
+    assert c.results_untrusted(exc) is False
+
+
+def test_the_storage_vocabulary_agrees_with_the_io_retry_loop():
+    """Every storage condition `io` calls transient must be retryable here too.
+
+    There are two classifiers, deliberately: `io.base._transient` answers "retry this read or
+    write", and this one answers "retry, move, or trust the results" for the scheduler. They
+    describe the same failures from different sides, and two lists of the same conditions is
+    exactly the shape that drifts — this one had already fallen behind on the *code* spellings
+    (`SlowDown`, `ServerBusy`, `TooManyRequests`) that `io` carries, so a throttle the reader
+    retried happily failed the task outright once the scheduler saw it.
+
+    The database half of `io`'s list is named below rather than asserted on: a deadlock or a
+    serialization failure is retried by the write path itself, one layer down, and the
+    scheduler seeing one means that loop already gave up.
+    """
+    from batcher.io.base._transient import _TRANSIENT_MARKERS
+
+    # Conditions the IO retry loop owns end to end. A deadlocked or serializing transaction is
+    # re-run by the writer, and "try again" is too generic to carry a category on its own.
+    io_owned = {
+        "deadlock",
+        "could not serialize access",
+        "serialization failure",
+        "lock wait timeout",
+        "database is locked",
+        "database table is locked",
+        "concurrent update",
+        "restart transaction",
+        "retry transaction",
+        "too many connections",
+        "server closed the connection",
+        "ssl connection has been closed",
+        "the database system is starting up",
+        "request has expired",
+        "operation aborted",
+        "try again",
+        "backenderror",
+        "internal error",
+        "internal server error",
+        "internalerror",
+    }
+    missed = [
+        marker
+        for marker in _TRANSIENT_MARKERS
+        if marker not in io_owned and not c.is_retryable(RuntimeError(f"backend said: {marker}"))
+    ]
+    assert not missed, (
+        "storage conditions the IO layer retries but the scheduler would not: "
+        f"{missed}. Add them to `classify._MARKERS`, or to `io_owned` above with the reason."
+    )

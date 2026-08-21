@@ -202,7 +202,7 @@ pub(super) fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, 
 /// Median of `v` via quickselect — partition so the n/2-th smallest sits at index n/2
 /// (`total_cmp`, so NaN orders deterministically). For an even count the lower-middle is
 /// the max of the now-lesser partition, exactly the sorted `v[n/2-1]`.
-fn quickselect_median(v: &mut [f64]) -> f64 {
+pub(crate) fn quickselect_median(v: &mut [f64]) -> f64 {
     use crate::keys::float_total_cmp;
     let n = v.len();
     let (lo, mid, _) = v.select_nth_unstable_by(n / 2, |a, b| float_total_cmp(*a, *b));
@@ -261,7 +261,11 @@ pub(crate) fn finalize_entropy(state: &ArrayRef) -> Result<ArrayRef, RuntimeErro
     for group in counts {
         let total: i64 = group.iter().sum();
         if total == 0 {
-            out.append_null();
+            // DuckDB answers **0** for a group with no non-null value, not NULL: the
+            // Shannon entropy of an empty distribution is zero, and every other group in
+            // the same query reports a number, so a NULL there reads as "unknown" when the
+            // answer is known.
+            out.append_value(0.0);
             continue;
         }
         let n = total as f64;
@@ -305,73 +309,6 @@ pub(crate) fn finalize_quantile_disc(state: &ArrayRef, q: f64) -> Result<ArrayRe
     })
 }
 
-/// The `k` most frequent values per group as a `List` (DuckDB `approx_top_k`), most
-/// frequent first, ties broken by the smaller value so the answer is deterministic and
-/// partition-order-independent.
-///
-/// Exact, not approximate: the value-list state already carries every value, so the
-/// space-saving sketch the name refers to would only *lose* accuracy here. The name is
-/// DuckDB's, so a ported query reads the same.
-pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, RuntimeError> {
-    let list = state.as_list::<i32>();
-    let child_ref = list.values();
-    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
-    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
-    let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
-    let rows = converter.convert_columns(std::slice::from_ref(child))?;
-    let offsets = list.value_offsets();
-
-    let mut keep: Vec<u32> = Vec::new();
-    let mut out_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
-    out_offsets.push(0);
-    for row in 0..list.len() {
-        let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-        // (row bytes → count, first index) so the winner can be `take`n back out.
-        //
-        // `ahash`, not std's SipHash: this map is rebuilt for every list row, so the per-probe
-        // hash is paid once per element per row, and `bc-runtime` already hashes its join and
-        // group tables this way. Safe by construction — the ranking below is a strict total
-        // order (distinct keys), so nothing observable comes from the map's iteration order.
-        let mut seen: HashMap<Vec<u8>, (i64, u32), ahash::RandomState> = HashMap::default();
-        for i in lo..hi {
-            if child.is_null(i) {
-                continue; // DuckDB's top-k ignores nulls, as every value aggregate does
-            }
-            let key = rows.row(i).as_ref().to_vec();
-            let entry = seen.entry(key).or_insert((0, i as u32));
-            entry.0 += 1;
-        }
-        let mut ranked: Vec<(i64, Vec<u8>, u32)> = seen
-            .into_iter()
-            .map(|(bytes, (c, i))| (c, bytes, i))
-            .collect();
-        // Descending by count, then ascending by the encoded value: the row encoding is
-        // order-preserving, so comparing its bytes is comparing the values themselves.
-        //
-        // `sort_unstable_by` is safe here and not merely faster: the entries come from a map
-        // keyed by those very bytes, so no two compare equal and the comparator is already a
-        // total order. That makes the unstable sort deterministic, and it skips the `n/2`
-        // scratch buffer the stable merge sort allocates.
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, _, idx) in ranked.into_iter().take(k) {
-            keep.push(idx);
-        }
-        out_offsets.push(keep.len() as i32);
-    }
-    let values = take(child.as_ref(), &UInt32Array::from(keep), None)?;
-    let field = Arc::new(arrow::datatypes::Field::new(
-        "item",
-        values.data_type().clone(),
-        true,
-    ));
-    Ok(Arc::new(arrow::array::ListArray::try_new(
-        field,
-        arrow::buffer::OffsetBuffer::new(out_offsets.into()),
-        values,
-        None,
-    )?))
-}
-
 /// Per-group value frequencies, as one count vector per group. Shared by the aggregates
 /// that read a distribution rather than an order statistic. Nulls are ignored, matching
 /// every other value aggregate.
@@ -386,7 +323,7 @@ fn per_group_value_counts(state: &ArrayRef) -> Result<Vec<Vec<i64>>, RuntimeErro
     let mut out = Vec::with_capacity(list.len());
     for row in 0..list.len() {
         let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-        // `ahash` for the same reason as `finalize_mode`'s map. The hasher cannot reach the
+        // `ahash` for the same reason as the counted state's map. The hasher cannot reach the
         // result: the only consumer sorts these counts before summing them, precisely because
         // a hash map's iteration order is arbitrary and float addition is not associative.
         let mut seen: HashMap<Vec<u8>, i64, ahash::RandomState> = HashMap::default();
@@ -399,67 +336,6 @@ fn per_group_value_counts(state: &ArrayRef) -> Result<Vec<Vec<i64>>, RuntimeErro
         out.push(seen.into_values().collect());
     }
     Ok(out)
-}
-
-/// Mode per group: the most frequent value in each group's list (same list state
-/// as MEDIAN, so it is type-general). Ties are broken by the **smallest** value, so
-/// the result is deterministic and partition-independent regardless of merge order.
-/// The output preserves the input element type; empty groups → null.
-pub(crate) fn finalize_mode(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
-    let list = state.as_list::<i32>();
-    // Canonicalize float leaves BEFORE grouping so `-0.0`/`0.0` (and every NaN bit pattern)
-    // count as one value — the same distinct identity `GROUP BY`, `count(distinct)`, and
-    // DuckDB use. Arrow's row format is NOT canonical for floats, so without this
-    // `mode([-0.0, -0.0, 0.0])` returned `-0.0` (a spurious 2-vs-1 frequency split) instead
-    // of `0.0`, and multi-NaN groups fractured. `take`ing the winner from the canonical
-    // column also returns the canonical representative (`0.0`, one quiet NaN) DuckDB does.
-    let child_ref = list.values();
-    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
-    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
-    // Encode every value once into arrow's order-preserving row format, so values
-    // of any type can be compared/grouped (and ties broken by the smallest value).
-    let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
-    let rows = converter.convert_columns(std::slice::from_ref(child))?;
-    let offsets = list.value_offsets();
-
-    let mut winners: Vec<Option<u32>> = Vec::with_capacity(list.len());
-    for row in 0..list.len() {
-        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-        if start == end {
-            winners.push(None);
-            continue;
-        }
-        // Sort the group's element indices by value, then the longest run of equal
-        // values is the mode; scanning with a strict `>` keeps the *first* (smallest)
-        // run on a frequency tie.
-        let mut idxs: Vec<u32> = (start as u32..end as u32).collect();
-        idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
-        let (mut best_idx, mut best_len) = (idxs[0], 1usize);
-        let (mut run_start, mut run_len) = (0usize, 1usize);
-        // One encoded-row read per element: the previous element's row was read on the
-        // previous iteration, and `idxs` is a permutation so neither index is sequential.
-        let mut prev = rows.row(idxs[0] as usize);
-        for j in 1..idxs.len() {
-            let cur = rows.row(idxs[j] as usize);
-            let same = cur == prev;
-            prev = cur;
-            if same {
-                run_len += 1;
-            } else {
-                if run_len > best_len {
-                    best_len = run_len;
-                    best_idx = idxs[run_start];
-                }
-                run_start = j;
-                run_len = 1;
-            }
-        }
-        if run_len > best_len {
-            best_idx = idxs[run_start];
-        }
-        winners.push(Some(best_idx));
-    }
-    Ok(take(child.as_ref(), &UInt32Array::from(winners), None)?)
 }
 
 /// `histogram` finalize: turn each group's value list into a `Map<value, count>`
@@ -676,59 +552,6 @@ pub(crate) fn finalize_contiguity(
 mod tests {
     use super::*;
     use arrow::array::Float64Array;
-
-    #[test]
-    fn mode_picks_most_frequent_tiebreak_smallest() {
-        use arrow::array::Int64Array;
-        // group 0: [5,5,7,5] → 5 (freq 3); group 1: [3,9,9,3] → tie(3,9) → 3 (smallest).
-        let values: ArrayRef = Arc::new(Int64Array::from(vec![5, 5, 7, 5, 3, 9, 9, 3]));
-        let group_ids = [0u32, 0, 0, 0, 1, 1, 1, 1];
-        let state = median_state(&values, &group_ids, 2).unwrap();
-        let modes = finalize_mode(&state).unwrap();
-        let m = modes.as_primitive::<Int64Type>();
-        assert_eq!(m.value(0), 5);
-        assert_eq!(m.value(1), 3); // tie broken to the smaller value → deterministic
-    }
-
-    #[test]
-    fn mode_empty_group_is_null() {
-        use arrow::array::Int64Array;
-        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(5), None]));
-        let state = median_state(&values, &[0u32, 1], 2).unwrap();
-        let modes = finalize_mode(&state).unwrap();
-        assert!(modes.is_valid(0) && !modes.is_valid(1));
-    }
-
-    /// `mode` over a Float64 group must fold `-0.0`/`0.0` (and every NaN) into one value —
-    /// the same distinct identity `GROUP BY`/`count(distinct)`/DuckDB use. Before the fix the
-    /// non-canonical row encoding split `[-0.0, -0.0, 0.0]` into a 2-vs-1 frequency race and
-    /// returned `-0.0`; the canonical mode is `0.0` (frequency 3).
-    #[test]
-    fn mode_folds_signed_zero_and_nan() {
-        let values: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, -0.0, 0.0]));
-        let state = median_state(&values, &[0u32, 0, 0], 1).unwrap();
-        let modes = finalize_mode(&state).unwrap();
-        let m = modes.as_primitive::<Float64Type>();
-        // Canonical `+0.0` (bits 0), NOT `-0.0` (bits 0x8000…): the two zeros are one value.
-        assert_eq!(
-            m.value(0).to_bits(),
-            0.0f64.to_bits(),
-            "mode must fold -0.0 into +0.0"
-        );
-
-        // Two differing NaN bit patterns are one value → mode is that (canonical) NaN, not a tie.
-        let nans: ArrayRef = Arc::new(Float64Array::from(vec![
-            f64::NAN,
-            f64::from_bits(0x7ff8_0000_0000_0001),
-            1.0,
-        ]));
-        let st = median_state(&nans, &[0u32, 0, 0], 1).unwrap();
-        let out = finalize_mode(&st).unwrap();
-        assert!(
-            out.as_primitive::<Float64Type>().value(0).is_nan(),
-            "the two NaNs collapse to frequency 2 and win over the single 1.0"
-        );
-    }
 
     /// `histogram` over a Float64 group must fold `-0.0`/`0.0` (and every NaN) into ONE key
     /// with the summed count. Before the fix `[0.0, -0.0]` produced two keys of count 1

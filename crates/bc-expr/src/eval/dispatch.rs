@@ -17,7 +17,7 @@ use crate::eval::generate::eval_sequence;
 use crate::eval::geo::eval_geo;
 use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
-    eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
+    eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_join,
     eval_list_position, eval_make_struct, rebuild_list, require_list,
 };
 use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
@@ -30,10 +30,11 @@ use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bo
 use crate::eval::spatial::eval_spatial;
 use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::temporal::date::{
-    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
-    eval_window_buckets, eval_window_start, parse_dtype,
+    eval_date, eval_date_offset, eval_date_trunc, eval_window_buckets, eval_window_start,
+    parse_dtype,
 };
 use crate::eval::temporal::make::eval_make_temporal;
+use crate::eval::temporal::text::{eval_strftime, eval_strptime};
 use crate::eval::temporal::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
@@ -165,6 +166,34 @@ impl Expr {
                     replacement.as_deref(),
                     *start,
                     *length,
+                )
+            }
+            Expr::StrDyn {
+                func,
+                input,
+                pattern,
+                replacement,
+                start,
+                length,
+            } => {
+                let arr = input.eval(batch)?;
+                let mut evaluated: [Option<ArrayRef>; 4] = [None, None, None, None];
+                for (slot, param) in [pattern, replacement, start, length]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(p) = param {
+                        evaluated[slot] = Some(p.eval(batch)?);
+                    }
+                }
+                let [p, r, st, ln] = &evaluated;
+                crate::eval::str::eval_str_dynamic(
+                    *func,
+                    &arr,
+                    p.as_ref(),
+                    r.as_ref(),
+                    st.as_ref(),
+                    ln.as_ref(),
                 )
             }
             Expr::Date { func, input } => {
@@ -366,7 +395,12 @@ impl Expr {
             }
             Expr::ListGet { input, index } => {
                 let arr = input.eval(batch)?;
-                eval_list_get(&arr, *index)
+                crate::eval::list_ops::gather::eval_list_get(&arr, *index)
+            }
+            Expr::ListGetDyn { input, index } => {
+                let arr = input.eval(batch)?;
+                let idx = index.eval(batch)?;
+                crate::eval::list_ops::gather::eval_list_get_dyn(&arr, &idx)
             }
             Expr::ListSimhash {
                 input,

@@ -88,13 +88,33 @@ pub(crate) fn range_join_batches(
     join_type: JoinType,
     output: &[JoinOutputCol],
 ) -> Result<RecordBatch, InterpError> {
+    let idx = range_join_indices(left, right, conditions, join_type)?;
+    gather_join_output(left, right, &idx, output)
+}
+
+/// The index pairs of a range join, before they are gathered into output columns.
+///
+/// Split out of [`range_join_batches`] so the bounded-memory path can reach them: a range
+/// join that streams its left side past a resident right side has to *record which right rows
+/// matched* before the pairs are discarded, which the gathered batch no longer says. Both
+/// callers go through this, so the two cannot drift on which condition maps to which operand.
+pub(crate) fn range_join_indices(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    conditions: &[bc_ir::RangeCondition],
+    join_type: JoinType,
+) -> Result<join::JoinIndices, InterpError> {
     let left_names: Vec<String> = conditions.iter().map(|c| c.left_key.clone()).collect();
     let right_names: Vec<String> = conditions.iter().map(|c| c.right_key.clone()).collect();
     let left_cols = columns_by_name(left, &left_names)?;
     let right_cols = columns_by_name(right, &right_names)?;
     let ops: Vec<join::RangeOp> = conditions.iter().map(|c| map_range_op(c.op)).collect();
-    let idx = join::range_join_indices(&left_cols, &right_cols, &ops, map_join_type(join_type))?;
-    gather_join_output(left, right, &idx, output)
+    Ok(join::range_join_indices(
+        &left_cols,
+        &right_cols,
+        &ops,
+        map_join_type(join_type),
+    )?)
 }
 
 /// Wire enum → runtime enum. Separate types because `bc-ir` sits *below* `bc-runtime`
@@ -192,10 +212,28 @@ pub(crate) fn gather_join_output(
         .zip(&columns)
         .map(|(col, gathered)| Field::new(&col.alias, gathered.data_type().clone(), true))
         .collect();
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
+    batch_with_rows(fields, columns, idx.left.len())
+}
+
+/// A `RecordBatch` from `fields`/`columns`, carrying `rows` explicitly.
+///
+/// A join whose output columns were *all* pruned away — `SELECT count(*) FROM a FULL JOIN b
+/// ON …`, where nothing but the row count is read — produces a zero-column batch, and
+/// `RecordBatch::try_new` refuses one: *"must either specify a row count or at least one
+/// column"*. The row count is the only thing such a batch carries, so it has to be stated.
+fn batch_with_rows(
+    fields: Vec<Field>,
+    columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch, InterpError> {
+    let schema = Arc::new(Schema::new(fields));
+    if columns.is_empty() {
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(rows));
+        return Ok(RecordBatch::try_new_with_options(
+            schema, columns, &options,
+        )?);
+    }
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// One output column's gather.
@@ -297,6 +335,14 @@ pub(crate) fn gather_join_output_with(
         // per join. `gather_join_output` beside it already routes through `take_column`; this
         // path was simply left on the slow kernel.
         columns.push(bc_runtime::gather::take_column(source.as_ref(), indices)?);
+    }
+    if columns.is_empty() {
+        // Every output column pruned away: the batch carries only its row count, and
+        // `try_new` refuses to infer one from no columns.
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(idx.left.len()));
+        return Ok(RecordBatch::try_new_with_options(
+            schema, columns, &options,
+        )?);
     }
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -497,10 +543,7 @@ fn gather_survivors(
         fields.push(Field::new(&col.alias, gathered.data_type().clone(), true));
         columns.push(gathered);
     }
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
+    batch_with_rows(fields, columns, n)
 }
 
 /// An empty batch with the join's output schema (types taken from the source buckets).
@@ -524,10 +567,7 @@ fn empty_output(
         fields.push(Field::new(&col.alias, dt.clone(), true));
         columns.push(arrow::array::new_empty_array(&dt));
     }
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
+    batch_with_rows(fields, columns, 0)
 }
 
 fn u32_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array, InterpError> {

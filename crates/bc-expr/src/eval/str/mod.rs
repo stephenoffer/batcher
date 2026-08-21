@@ -11,6 +11,7 @@ use crate::{ExprError, StrFunc};
 mod case;
 mod chunk;
 mod compress;
+mod dynamic;
 mod html;
 mod jaro;
 mod json;
@@ -20,6 +21,8 @@ mod numfmt;
 mod quality;
 mod regex_cache;
 mod uri_path;
+
+pub(crate) use dynamic::eval_str_dynamic;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
 /// Apply a string function to a **dictionary** column's distinct values and gather the
@@ -298,6 +301,9 @@ pub(crate) fn eval_str(
                 chars[begin..].iter().collect()
             }))
         }
+        // DuckDB's `ascii('')` is 0; its `ord`/`unicode` answer -1 for the same input, and
+        // the SQL front-end builds that difference on top of this kernel rather than
+        // forking it (`functions._empty_string_is_minus_one`).
         StrFunc::Ascii => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| v.chars().next().map_or(0i64, |c| c as i64)))
@@ -400,6 +406,14 @@ pub(crate) fn eval_str(
                     .collect::<StringArray>(),
             )
         }
+        StrFunc::JsonExtract => {
+            let path = json::parse_path(require_pattern(pattern, func)?);
+            Arc::new(
+                s.iter()
+                    .map(|o| o.and_then(|v| json::extract_json(v, &path)))
+                    .collect::<StringArray>(),
+            )
+        }
         StrFunc::JsonValue => {
             let path = json::parse_path(require_pattern(pattern, func)?);
             Arc::new(
@@ -428,7 +442,11 @@ pub(crate) fn eval_str(
         ),
         // Int → Utf8, handled before the Utf8 downcast above. Reaching here means the
         // argument was text, which these have no meaning for.
-        StrFunc::Chr | StrFunc::ToBase | StrFunc::FormatBytes | StrFunc::FormatBytesSi => {
+        StrFunc::Chr
+        | StrFunc::ToBase
+        | StrFunc::Bin
+        | StrFunc::FormatBytes
+        | StrFunc::FormatBytesSi => {
             return Err(ExprError::ExpectedString {
                 func: format!("{func:?}"),
                 got: "Utf8 (this function takes an integer)".into(),
@@ -756,8 +774,16 @@ pub(crate) fn eval_str(
             for o in s.iter() {
                 match o {
                     Some(v) => {
-                        for part in re.split(v) {
-                            builder.values().append_value(part);
+                        if v.is_empty() {
+                            // One empty piece, as DuckDB answers. An *empty pattern*
+                            // matches at position 0 of the empty string, so the regex
+                            // crate splits it into two pieces (`['', '']`); DuckDB reports
+                            // `['']`, and the difference is only visible on this one row.
+                            builder.values().append_value("");
+                        } else {
+                            for part in re.split(v) {
+                                builder.values().append_value(part);
+                            }
                         }
                         builder.append(true);
                     }

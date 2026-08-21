@@ -12,7 +12,7 @@ Spark-parity rule named, rather than mid-stream.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -132,6 +132,7 @@ class AggregateProcessor:
                 "Add .with_watermark(...) with a windowed group_by so closed windows evict, "
                 "narrow the group keys, or raise memory.streaming_state_max_bytes",
                 label="streaming aggregate",
+                extra_bytes=self._previous_bytes(),
             )
         result = self._fold.finalize()
         if result is None:
@@ -206,13 +207,65 @@ class AggregateProcessor:
         result = empty_global_aggregate(self._agg, schema.arrow)
         return [result] if result is not None else []
 
+    def _previous_bytes(self) -> int:
+        """Bytes held by the `update`-mode copy of the last emitted result.
+
+        Retained state that the fold does not know about: `update` diffs against a full copy
+        of what it last emitted, so a query in that mode holds the aggregate twice. Counting
+        it is what makes `memory.streaming_state_max_bytes` mean what it says.
+        """
+        if self._previous is None:
+            return 0
+        from batcher.plan.types import retained_bytes
+
+        return sum(retained_bytes(batch) for batch in self._previous.to_batches())
+
     def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
-        """This operator's retained state after the last micro-batch."""
-        return () if self._fold is None else (self._fold.metrics(),)
+        """This operator's retained state after the last micro-batch.
+
+        `memory_used_bytes` counts the `update`-mode previous-result copy as well as the
+        fold, because both are retained and an operator reading this number to decide
+        whether the key space is too wide needs the total rather than half of it.
+        """
+        if self._fold is None:
+            return ()
+        import dataclasses
+
+        metrics = self._fold.metrics()
+        extra = self._previous_bytes()
+        if extra:
+            metrics = dataclasses.replace(
+                metrics, memory_used_bytes=metrics.memory_used_bytes + extra
+            )
+        return (metrics,)
 
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The running partial state for a checkpoint snapshot."""
         return None if self._fold is None else self._fold.state()
+
+    def snapshot_delta(self) -> pa.RecordBatch | None:
+        """Take this micro-batch's changelog entry, or None when there is nothing to record.
+
+        Offering this is what lets the engine write an incremental checkpoint instead of
+        rewriting the whole running state every epoch. A processor that evicts state must
+        **not** offer one — see `_AggFold.take_delta` for why a delta chain cannot express a
+        removal — which is why this is an opt-in method rather than a field on the protocol.
+
+        Reading consumes the entry — see `_AggFold.take_delta` for the duplicate it
+        prevents.
+
+        Returns:
+            The partial the last `process` folded in, or None.
+        """
+        return None if self._fold is None else self._fold.take_delta()
+
+    def restore_state_chain(self, states: list[pa.RecordBatch]) -> None:
+        """Rebuild the running state from a base snapshot plus the deltas after it.
+
+        Args:
+            states: The base snapshot followed by each recorded delta, oldest first.
+        """
+        self._fold.restore_chain(states)
 
     def restore_state(self, state: pa.RecordBatch) -> None:
         """Resume from a checkpointed running partial state.
@@ -281,6 +334,49 @@ class WindowedAggregateProcessor:
         nicety.
         """
         return self._fold.state()
+
+    def snapshot_state_parts(self) -> Iterator[pa.RecordBatch]:
+        """The whole state as a stream of parts, so a spilled fold checkpoints in full.
+
+        Offered only by a processor whose state can live partly on disk. The engine prefers
+        it over `snapshot_state` when present, because that one reports the resident half —
+        correct until the fold spills, and a silent loss of the rest afterwards.
+
+        Yields:
+            The resident state, then one batch per spilled run.
+        """
+        return self._fold.state_parts()
+
+    def restore_state_parts(self, parts: list[pa.RecordBatch]) -> None:
+        """Resume from a multi-part snapshot, combining the parts back into one state."""
+        self._fold.restore_parts(parts)
+
+    def snapshot_delta(self) -> pa.RecordBatch | None:
+        """Take this micro-batch's changelog entry.
+
+        A windowed aggregate *removes* state, which is normally what disqualifies an
+        operator from a changelog — a chain cannot say what was taken out. It qualifies
+        because its removal is not arbitrary: eviction drops a **prefix** of the window
+        axis, so the whole tombstone is one integer that rides in the entry's metadata.
+        See `_EVICTED_META`.
+
+        Returns:
+            The epoch's combined partial, or None when it folded nothing in.
+        """
+        return self._fold.take_delta()
+
+    def restore_state_chain(self, states: list[pa.RecordBatch]) -> None:
+        """Rebuild from a base snapshot plus the changelog after it.
+
+        The same call as `restore_state_parts`: both are "combine these and re-apply the
+        eviction bound", and keeping them one implementation is what stops a chain and a
+        multi-part snapshot from drifting into two restore semantics.
+        """
+        self._fold.restore_parts(states)
+
+    def close(self) -> None:
+        """Release the fold's spill scratch. Idempotent; a no-op if it never spilled."""
+        self._fold.close()
 
     def restore_state(self, state: pa.RecordBatch) -> None:
         """Resume the open windows and the watermark from a checkpointed snapshot."""

@@ -1,15 +1,13 @@
 # Elasticsearch
 
-**Elasticsearch is read-only in Batcher.** There is a source; there is no sink.
-{py:meth}`bt.read.elasticsearch(...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` pulls an index into the engine. If you need to write *back* to
-Elasticsearch, use the cluster's own bulk API from your application. A search index is a serving
-system with its own mappings and refresh semantics, and a columnar batch writer has no business
-pretending otherwise.
+This page covers reading an Elasticsearch index into the engine, and indexing rows back into one.
+
+A search index is a serving system with its own mappings and refresh semantics, and that shapes what the writer does rather than whether it exists. Batcher indexes documents into an index **you** manage: it never creates a mapping, never changes one, and never forces a refresh unless you ask. What it does do is send `_bulk` requests and read the response, which is the part an application-side loop usually gets wrong.
 
 | | |
 | --- | --- |
 | **Read** | `bt.read.elasticsearch(hosts=..., index=..., esql=...)` |
-| **Write** | Not supported. Use the cluster's own bulk API. |
+| **Write** | {py:meth}`ds.write.elasticsearch(index, hosts=...) <batcher.api.io_namespace.writer.Writer.elasticsearch>`, over `_bulk` |
 | **Extra** | `pip install 'batcher-engine[elasticsearch]'` (ES 8.18+ for the Arrow path) |
 | **Parallelism** | Sliced scroll: one split per slice. The ES\|QL path is a single split. |
 | **Pushdown** | Predicates become an appended `\| WHERE` (ES\|QL) or a `bool` query (scroll) |
@@ -145,12 +143,43 @@ reason to prefer it.
 **No row count.** There is no cheap exact count, so `count()` reads. If you want a count, ask ES|QL
 for one (`| STATS COUNT(*)`) and let the cluster compute it.
 
+## Write
+
+`ds.write.elasticsearch(index, hosts=...)` sends one `_bulk` request per 1,000 documents.
+
+| Mode | Effect |
+| --- | --- |
+| `upsert` (default) | Index each document under `key_field`'s value as its `_id`, replacing what was there. |
+| `append` | Index without an `_id`, so the cluster assigns one. |
+| `overwrite` | `delete_by_query` the whole index, then index. |
+| `delete` | Delete the documents named by `key_field`. |
+
+```python
+# docs: skip
+scored.write.elasticsearch(
+    "products",
+    hosts="https://es.internal:9200",
+    api_key="env:ES_API_KEY",
+    key_field="sku",
+)
+```
+
+**Every response is read, not just its status code.** `_bulk` reports per-document failures inside an HTTP 200: a mapping conflict on one document leaves the other 999 indexed and the call looking successful. Batcher inspects each item and raises a `BackendError` naming how many failed and what the first one said, so a partial write is a failure rather than a silence.
+
+**Refresh is off by default**, as it is in Elasticsearch itself. Forcing a refresh per batch is the standard way to make a bulk load an order of magnitude slower. Pass `refresh=True` when the write must be searchable before the call returns, which is usually only true in a test.
+
+**The key column stays in the document body.** It is used as the `_id` *and* written as a field, because dropping it would make a read-write round trip lose it.
+
+`overwrite` is refused past the first shard of a distributed write: every shard would empty the index, so each would discard the shards before it. Distribute an `upsert` instead.
+
+Batcher does not manage the index. Create it with the mappings, shard count and analyzers you want first; an index Elasticsearch auto-creates from a bulk write gets dynamic mappings, which is rarely what a search index should have.
+
 ## See also
 
+- {doc}`Writing to a database </integrations/databases/writing>`: the same mode vocabulary across SQL and the operational stores.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, pushdown.
 - {doc}`Anomaly detection </cookbook/analytics/inference/anomaly-detection>`: the analysis a log index is
   usually pulled into.
-- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the {py:class}`Source <batcher.io.Source>`/{py:class}`Split <batcher.io.Split>` protocol, if you
-  need the sink this connector does not have.
-- {doc}`I/O API </api/relational/io>`: the full reader reference.
+- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the {py:class}`Source <batcher.io.Source>`/{py:class}`Split <batcher.io.Split>` protocol, for a store not listed.
+- {doc}`I/O API </api/relational/io>`: the full reader and writer reference.
 - {doc}`MongoDB </integrations/databases/mongodb>`: the other document store, read *and* write.

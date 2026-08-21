@@ -42,6 +42,12 @@ authority, not a static plan estimate. The estimate is only what the operator as
 The per-operator budget path, `op_budget` keyed by Kyber's pre-order `op_id`, is the
 fallback for pool-less contexts.
 
+The pool's decision is binary and reactive: it admits until it cannot. It also reports a
+*level* — nominal, elevated, critical — which the control plane can read through
+`engine_pool_stats()` but which nothing inside the data plane acts on yet. Spilling before the
+cap rather than at it is the better strategy on paper and trades throughput for headroom, so it
+waits on a benchmark rather than on an opinion.
+
 If `EngineConfig.memory_budget_bytes` is 0, `agg_spill` is `None` and the engine runs fully
 in memory with no spill machinery engaged at all. That's the zero-cost default when you opt
 out with `memory.unbounded_memory`.
@@ -131,9 +137,16 @@ incoming batches. Both sides are co-partitioned by join key into two stores, the
 
 ### The aggregates that would defeat grace
 
-`median`, `quantile`, `count_distinct`, and `mode` have no bounded intermediate state.
-Their "partial" is the whole value list, so grace partitioning by group key only moves an
-unbounded list to disk and back.
+`median`, `quantile`, `count_distinct`, and `mode` have no intermediate state that is bounded
+by a constant. Their "partial" grows with the data rather than with the aggregate, so grace
+partitioning by group key only moves an unbounded state to disk and back.
+
+`mode` and `top_k` arrive there for a different reason than the other three, which is worth
+separating. Their state holds one entry per *distinct* value rather than one per row, so a hot
+group over few distinct values costs almost nothing. Distinct count is not bounded either,
+though: a column of unique values puts one entry back in the state for every row. They are
+listed here because a spill path is designed against the worst case rather than the common
+one.
 
 For these, `bc-interp/src/ops/quantile_spill/` takes a different route. It sorts
 `(group_keys…, value)` out of core with the external sort, then streams the sorted run and

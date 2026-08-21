@@ -62,6 +62,8 @@ from batcher.ml.llm import (
     Engine,
     EngineFactory,
     anthropic_engine,
+    bedrock_engine,
+    gemini_engine,
     http_engine,
     json_schema,
     llm_generate,
@@ -70,6 +72,7 @@ from batcher.ml.llm import (
     llm_udf,
     llm_verify_udf,
     pack_sequences,
+    sglang_engine,
     vllm_engine,
 )
 from batcher.ml.loader import (
@@ -186,7 +189,8 @@ from batcher.ml.preprocessors import (
     save,
     to_dict,
 )
-from batcher.ml.retrieval import mmr_rerank_udf
+from batcher.ml.retrieval import CrossEncoderScorer, cross_encoder_rerank_udf, mmr_rerank_udf
+from batcher.ml.runtimes import onnx_predictor, openvino_predictor, torch_predictor
 from batcher.ml.sampling import (
     balanced_sample,
     class_counts,
@@ -227,6 +231,7 @@ __all__ = [
     "ColumnSelector",
     "Concatenator",
     "CountVectorizer",
+    "CrossEncoderScorer",
     "CyclicalEncoder",
     "DateTimeFeaturizer",
     "DropCorrelated",
@@ -329,12 +334,14 @@ __all__ = [
     "WorkerFactory",
     "anthropic_engine",
     "balanced_sample",
+    "bedrock_engine",
     "blend_predictions",
     "build_vector_index",
     "class_counts",
     "class_weights",
     "contamination_rate",
     "count_outliers",
+    "cross_encoder_rerank_udf",
     "cross_val_predict",
     "cross_val_score",
     "decontaminate",
@@ -344,6 +351,7 @@ __all__ = [
     "feature_importances",
     "flag_outliers",
     "from_dict",
+    "gemini_engine",
     "grid_search",
     "http_client",
     "http_engine",
@@ -365,7 +373,9 @@ __all__ = [
     "mmr_rerank_udf",
     "model_from_dict",
     "model_to_dict",
+    "onnx_predictor",
     "openai_embedding_encoder",
+    "openvino_predictor",
     "out_of_fold_features",
     "outlier_bounds",
     "oversample",
@@ -386,6 +396,7 @@ __all__ = [
     "save_model",
     "serve_deployment",
     "serving_udf",
+    "sglang_engine",
     "shard_stream_loader",
     "smote",
     "stratified_sample",
@@ -396,6 +407,7 @@ __all__ = [
     "to_numpy_batches",
     "to_tf_dataset",
     "to_torch_iterable",
+    "torch_predictor",
     "torchserve_client",
     "triton_client",
     "undersample",

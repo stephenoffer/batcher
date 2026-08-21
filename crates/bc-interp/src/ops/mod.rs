@@ -24,6 +24,7 @@ use bc_runtime::window::{self, WindowCall};
 
 use crate::error::InterpError;
 
+mod byte_sort;
 mod external_sort;
 mod joins;
 mod materialize;
@@ -35,16 +36,15 @@ mod radix_sort;
 mod repartition;
 mod reshape;
 mod sample_sort;
-mod str_sort;
 pub(crate) use external_sort::{
     external_merge_sort, external_sort_to_final_store, DEFAULT_RUN_TARGET_BYTES,
 };
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
     join_batches_with, join_output_schema, join_top_n, key_indices, map_join_type,
-    range_join_batches,
+    range_join_batches, range_join_indices,
 };
-pub(crate) use materialize::materialize;
+pub(crate) use materialize::{materialize, materialize_opt};
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
 pub(crate) use morsel::{morselize_par, remorselize, sliced_batch_bytes};
 pub(crate) use quantile_spill::{
@@ -443,10 +443,74 @@ pub(crate) fn parallel_distinct(batches: &[RecordBatch]) -> Result<Vec<RecordBat
     if let Some(out) = agg::distinct_dense(batches)? {
         return Ok(vec![out]);
     }
-    let partials: Vec<agg::Partial> = batches
-        .par_iter()
-        .map(distinct_partial)
-        .collect::<Result<_, InterpError>>()?;
+    // ONE PARTIAL PER WORKER, NOT PER MORSEL — when the shape says it pays.
+    //
+    // A dedup is a `GROUP BY` with no aggregate, and the grouped aggregate stopped hashing per
+    // 16,384-row morsel some time ago: the streaming executor folds each *shard* into one
+    // partial and `agg_par::chunked_partials` does the same for the materializing one, because
+    // the merge inheriting `morsels x groups` rows is what dominates. This still built a table
+    // per morsel, so `DISTINCT` paid a merge the aggregate had already stopped paying — and
+    // doing *less* work cost more than doing more: on 6 M rows of one string column, adding a
+    // `count(*)` to the same grouping ran **1.44x-1.58x faster** at 100, 10,000 and 1,000,000
+    // distinct values, purely because the aggregate folded per worker and the dedup did not.
+    //
+    // The choice is the aggregate's rule rather than a second one, asked in `agg_par::decide`'s
+    // own order: only when a morsel's partial does **not** already collapse its rows
+    // (`width_from_sample`) is chunking even considered, and then only when the
+    // `workers x groups` partial rows are smaller than the relation being concatenated
+    // (`chunking_pays`). Both halves are load-bearing — consulting the second alone regressed
+    // *both* ends of the range, 8.5 ms -> 10.0 ms at 100 groups (where the per-morsel merge is
+    // already trivial, so the concatenation is pure copying) and 54.6 ms -> 61.1 ms at
+    // 1,000,000 (where a near-unique key builds worker tables that dedup almost nothing).
+    // In the band between, 10,000 groups over 6 M rows, it is **30.7 ms -> 18.4 ms**.
+    //
+    // The partials are the same partials — `distinct_partial` over a contiguous run of the same
+    // rows, in the same order — so `combine` and the first-seen representatives are unchanged.
+    // This is invariant #7's `partial` computed over a bigger unit, and nothing else.
+    let threads = rayon::current_num_threads().max(1);
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let sample = distinct_partial(&batches[0])?;
+    let groups = crate::agg_par::groups_from_sample(
+        std::slice::from_ref(&sample),
+        batches[0].num_rows(),
+        1,
+        total_rows,
+    );
+    let does_not_reduce = crate::agg_par::width_from_sample(
+        std::slice::from_ref(&sample),
+        batches[0].num_rows(),
+        1,
+        total_rows,
+    )
+    .is_some();
+    let partials: Vec<agg::Partial> = if batches.len() > 1
+        && does_not_reduce
+        && crate::agg_par::chunking_pays(threads, groups, total_rows)
+    {
+        let per = batches.len().div_ceil(threads).max(1);
+        let schema = batches[0].schema();
+        batches
+            .par_chunks(per)
+            .map(|chunk| match chunk {
+                // One morsel is already contiguous; concatenating it copies for nothing.
+                [only] => distinct_partial(only),
+                many => {
+                    let joined = arrow::compute::concat_batches(&schema, many)?;
+                    distinct_partial(&joined)
+                }
+            })
+            .collect::<Result<_, InterpError>>()?
+    } else {
+        // The sample is the first morsel's partial, so it is kept rather than recomputed.
+        let mut all = vec![sample];
+        all.par_extend(
+            batches[1..]
+                .par_iter()
+                .map(distinct_partial)
+                .collect::<Result<Vec<_>, InterpError>>()?,
+        );
+        all
+    };
     let combined = agg::combine(&partials, &[])?;
     Ok(vec![RecordBatch::try_new(
         batches[0].schema(),
@@ -464,7 +528,9 @@ pub(crate) fn distinct_on_batches(
     keys: &[String],
     order: &[SortKey],
 ) -> Result<RecordBatch, InterpError> {
-    let combined = materialize(batches).map_err(|_| InterpError::EmptyAggregateInput)?;
+    // Only *no input* is `EmptyAggregateInput`. Mapping every error onto it reported an
+    // empty relation as the cause of a schema mismatch or an offset overflow.
+    let combined = materialize_opt(batches)?.ok_or(InterpError::EmptyAggregateInput)?;
     let ncols = combined.num_columns();
     let (wide, key_idx, ord) = distinct_on_widen(&combined, keys, order)?;
     let out = agg::distinct_on(&wide, &key_idx, &ord)?;
@@ -704,12 +770,14 @@ pub(crate) fn sort_indices_of(
             descending: k.descending,
             nulls_first: k.nulls_first,
         };
-        // A string key sorts through the stable permutation builder: arrow's
-        // `sort_to_indices` leaves ties in an arbitrary, input-size-dependent order, which
-        // would make the parallel sample-sort's per-range results disagree with this
-        // sequential oracle. Ties resolve to input order instead — deterministic, and the
-        // same guarantee the radix path already gives fixed-width keys.
-        if let Some(idx) = str_sort::stable_sort_indices_str(v, opts) {
+        // A byte key — `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`/`FixedSizeBinary` — sorts
+        // through the stable permutation builder: arrow's `sort_to_indices` leaves ties in an
+        // arbitrary, input-size-dependent order, which would make the parallel sample-sort's
+        // per-range results disagree with this sequential oracle. Ties resolve to input order
+        // instead — deterministic, and the same guarantee the radix path already gives
+        // fixed-width keys. A key narrow enough to pack into one `u64` word sorts by radix in
+        // there too, so a short byte key is `O(n)` rather than `O(n log n)`.
+        if let Some(idx) = byte_sort::stable_sort_indices_bytes(v, opts) {
             return Ok(idx);
         }
         // Radix fast path on a fixed-width integer/temporal key: O(n) vs the comparison
@@ -727,6 +795,14 @@ pub(crate) fn sort_indices_of(
         // primitive, but this type is off the fast path anyway.)
     }
     let options = sort_options(keys);
+    // Composite radix fast path: when every key is an integer or a temporal and their *measured*
+    // value ranges fit one `u64` between them, the whole tuple becomes a single order-preserving
+    // integer and the sort is a counting sort over it — no row encoding, no comparisons. See
+    // `radix_sort::packed_multi_sort_indices` for why the permutation is the same one the
+    // row-encoded sort below produces.
+    if let Some(idx) = radix_sort::packed_multi_sort_indices(vals, &options) {
+        return Ok(idx);
+    }
     // Row-encoded stable sort. Identical permutation to the `lexsort` fallback below, but
     // the ascending row-index tie-break lives in the *comparator* instead of being encoded
     // as a trailing key column — so the encoder writes and every comparison memcmps four
@@ -776,7 +852,7 @@ fn sort_options(keys: &[SortKey]) -> Vec<SortOptions> {
 }
 
 /// Gather `batch`'s rows in `indices` order (a single-threaded take of every column).
-fn take_batch(
+pub(crate) fn take_batch(
     batch: &RecordBatch,
     indices: &arrow::array::UInt32Array,
 ) -> Result<RecordBatch, InterpError> {
@@ -875,7 +951,7 @@ fn top_k_single_key(
         Vec::new()
     } else {
         radix_sort::top_k_live(values, opts.descending, live_k)
-            .or_else(|| str_sort::top_k_live(values, opts.descending, live_k))?
+            .or_else(|| byte_sort::top_k_live(values, opts.descending, live_k))?
     };
     if null_count == 0 {
         return Some(UInt32Array::from(live));
@@ -965,7 +1041,7 @@ fn top_k_indices_of(
     // Measured on 6 M random rows, `ORDER BY <i64> LIMIT 10`: the LSD radix runs five passes of
     // random-access counting and scatter to order 16,384 rows and keep ten of them — 199 ms
     // single-threaded, 53 ms across the pool. A `Utf8` key is worse still, because
-    // `stable_sort_indices_str` is a comparison sort: `ORDER BY <string> LIMIT 10` cost 401 ms
+    // `stable_sort_indices_bytes` is a comparison sort: `ORDER BY <string> LIMIT 10` cost 401 ms
     // where the same query with a second sort key — which fell through to the O(n) quickselect
     // below — cost 77 ms. **Fewer sort keys costing five times more was the tell**, the same
     // tell that had already moved float keys to the quickselect.
@@ -992,7 +1068,7 @@ fn top_k_indices_of(
         }
     }
     // A single key with a large `k`, or one whose type has no selection: the specialized full
-    // sort, sliced. `stable_sort_indices_str` for strings, the LSD radix for integer/temporal.
+    // sort, sliced. `stable_sort_indices_bytes` for strings, the LSD radix for integer/temporal.
     //
     // A float, decimal or boolean key has no specialized full sort. It used to full-`lexsort`
     // every morsel to keep `k` rows — an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64>
@@ -1018,7 +1094,7 @@ fn top_k_indices_of(
             v.data_type(),
             DataType::Float16 | DataType::Float32 | DataType::Float64
         );
-        let full = str_sort::stable_sort_indices_str(&v, opts).or_else(|| {
+        let full = byte_sort::stable_sort_indices_bytes(&v, opts).or_else(|| {
             (!is_float)
                 .then(|| radix_sort::radix_sort_indices(&v, opts))
                 .flatten()
@@ -1118,7 +1194,7 @@ fn top_k_by_leading_key(
     // without a separate null block: a live row may share the extreme rank, in which case both
     // are candidates and the exact pass — which knows `nulls_first` — orders them properly.
     let Some(mut ranks) = radix_sort::ranks(lead, opts.descending)
-        .or_else(|| str_sort::prefix_ranks(lead, opts.descending))
+        .or_else(|| byte_sort::prefix_ranks(lead, opts.descending))
     else {
         return Ok(None);
     };
@@ -1372,12 +1448,17 @@ pub(crate) fn window_batch_with(
         });
     }
 
+    // `rank_limit` goes *down* to the per-bucket kernel rather than being applied here: the
+    // bounded top-N it enables must inherit `window_with`'s parallelism, not replace it. The
+    // mask below still runs — the bounded path marks a non-survivor `k + 1` — so this is a
+    // pure short-circuit and the filter stays the one place the bound is enforced.
     let cols = window::window_with(
         &part_arrays,
         &order_arrays,
         &calls,
         num_rows,
         parallel_row_threshold,
+        rank_limit,
     )?;
 
     // input columns + one appended column per function alias.
@@ -1457,6 +1538,7 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::BitOr => window::WindowFn::BitOr,
         WindowFn::BitXor => window::WindowFn::BitXor,
         WindowFn::CountDistinct => window::WindowFn::CountDistinct,
+        WindowFn::Median => window::WindowFn::Median,
         WindowFn::EwmMean => window::WindowFn::EwmMean,
         WindowFn::EwmVar => window::WindowFn::EwmVar,
         WindowFn::EwmStd => window::WindowFn::EwmStd,
@@ -1887,7 +1969,7 @@ mod sort_tests {
     /// A **string** single sort key must agree with the eager stable oracle too.
     ///
     /// The int and float keys each have this test; the string key — which reaches
-    /// `top_k_indices_of` through a third path, `stable_sort_indices_str` — did not, so nothing
+    /// `top_k_indices_of` through a third path, `stable_sort_indices_bytes` — did not, so nothing
     /// pinned the one key type whose ordering is a hand-written comparator rather than arrow's.
     /// That gap is why replacing the path with a quickselect could be prototyped, measured and
     /// rejected on cost alone without any test objecting to the semantics.

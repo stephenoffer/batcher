@@ -45,6 +45,13 @@ from batcher.plan.functions.horizontal import (
     reduce_horizontal,
     sum_horizontal,
 )
+from batcher.plan.functions.partitioning import (
+    partition_days,
+    partition_hours,
+    partition_months,
+    partition_truncate,
+    partition_years,
+)
 from batcher.plan.functions.prompt import (
     chatml_prompt,
     conversation_turns,
@@ -176,6 +183,11 @@ __all__ = [
     "named_struct",
     "nanvl",
     "next_after",
+    "partition_days",
+    "partition_hours",
+    "partition_months",
+    "partition_truncate",
+    "partition_years",
     "product_horizontal",
     "prompt_token_estimate",
     "reduce_horizontal",

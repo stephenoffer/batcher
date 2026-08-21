@@ -49,6 +49,8 @@ _DEVICE_BACKENDS = {
     "inferentia": "neuron",
     "hpu": "hpu",
     "gaudi": "hpu",
+    "npu": "npu",
+    "ascend": "npu",
 }
 
 #: Canonical torch dtype names, plus the abbreviations the ecosystem uses

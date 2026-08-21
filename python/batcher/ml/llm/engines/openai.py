@@ -262,7 +262,12 @@ def _openai_body(
         response_format=defaults.response_format,
     )
     if defaults.logprobs:
-        body["logprobs"] = True
+        # The two routes spell this differently and neither accepts the other's spelling:
+        # `/chat/completions` takes a boolean, `/completions` takes the *number* of top
+        # alternatives to return. Sending `true` to the completions route is a 400 from
+        # OpenAI and from every server that validates the field, so `logprobs=True` on a
+        # base model failed the whole batch rather than returning a logprob.
+        body["logprobs"] = True if chat else 1
     if defaults.extra_body:
         body.update(defaults.extra_body)
     if not chat:

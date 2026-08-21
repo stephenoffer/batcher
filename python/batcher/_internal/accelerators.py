@@ -38,6 +38,7 @@ __all__ = [
     "binding_gpu_memory_bytes",
     "gpu_devices_absent",
     "gpu_inventory",
+    "has_ascend_device",
     "has_gaudi_device",
     "has_neuron_device",
     "is_accelerator_node",
@@ -48,14 +49,15 @@ __all__ = [
 def reset_accelerator_probes() -> None:
     """Forget the memoized device probes, so the next call re-reads the machine.
 
-    Both probes below answer once and remember: the device set attached to a running
+    Every probe below answers once and remembers: the device set attached to a running
     process does not change, and the probing itself is expensive (two optional-package
-    imports and several `/dev` globs) on a path every terminal op reaches. A test that
-    fakes the device nodes has to invalidate them; this is that hook, re-exported by
-    `hardware.reset_hardware_probes` so there is one call to make.
+    imports, a `sys.path` walk, and several `/dev` globs) on a path every terminal op
+    reaches. A test that fakes the device nodes has to invalidate them; this is that hook,
+    re-exported by `hardware.reset_hardware_probes` so there is one call to make.
     """
     gpu_devices_absent.cache_clear()
     _gpu_inventory_probe.cache_clear()
+    _tpu_available.cache_clear()
 
 
 def has_neuron_device() -> bool:
@@ -67,6 +69,15 @@ def has_neuron_device() -> bool:
 def has_gaudi_device() -> bool:
     """Intel Gaudi (Habana) via its `/dev/hl*` device nodes."""
     return bool(glob.glob("/dev/hl[0-9]*"))
+
+
+def has_ascend_device() -> bool:
+    """Huawei Ascend NPU via its `/dev/davinci*` device nodes.
+
+    A device-node check for the same reason the two above are: `torch_npu` initializes the CANN
+    runtime on import, which is seconds, and the node is already there to be stat'd.
+    """
+    return bool(glob.glob("/dev/davinci[0-9]*"))
 
 
 _GIB = 1 << 30
@@ -169,6 +180,7 @@ _ACCELERATOR_DEVICE_GLOBS = (
     "/dev/accel[0-9]*",
     "/dev/neuron[0-9]*",
     "/dev/hl[0-9]*",
+    "/dev/davinci[0-9]*",
     "/dev/vfio/[0-9]*",
 )
 
@@ -254,14 +266,15 @@ def _devices_masked_off() -> bool:
 
 def accelerator_backend() -> str:
     """The accelerator this host can compute on: ``cuda``/``rocm``/``xpu``/``mps``/``tpu``/
-    ``neuron``/``hpu``/``cpu``.
+    ``neuron``/``hpu``/``npu``/``cpu``.
 
     A hardware *fact*, so it lives here (the executor picks a device without importing `ml`);
     `ml.gpu.detect_backend` re-exports it. Detected via torch where one exists (ROCm through
     the CUDA API with ``torch.version.hip``; Intel ``torch.xpu``; Apple MPS; Cloud TPU
-    ``torch_xla``) and via device nodes for Trainium/Inferentia (``neuron``) and Gaudi
-    (``hpu``), whose frameworks are expensive to import. Naming the specific backend rather
-    than ``cpu`` lets such a host self-identify for diagnostics and `torch_device`.
+    ``torch_xla``) and via device nodes for Trainium/Inferentia (``neuron``), Gaudi (``hpu``)
+    and Huawei Ascend (``npu``), whose frameworks are expensive to import. Naming the specific
+    backend rather than ``cpu`` lets such a host self-identify for diagnostics and
+    `torch_device`.
     """
     if gpu_devices_absent() and not _tpu_available():
         return "cpu"  # cheap negative first: `torch.cuda.is_available()` costs a ~2 s import
@@ -278,14 +291,14 @@ def accelerator_backend() -> str:
             return "mps"
     except ImportError:
         pass  # no torch → fall through to the device-node accelerators
-    from batcher._internal.accelerators import has_gaudi_device, has_neuron_device
-
     if _tpu_available():
         return "tpu"
     if has_neuron_device():
         return "neuron"
     if has_gaudi_device():
         return "hpu"
+    if has_ascend_device():
+        return "npu"
     # AMD last among the device-node checks, and only once torch has declined: a ROCm torch
     # answers `torch.cuda.is_available()` above and is the better source. Without one, an
     # Instinct node with the driver loaded reported `cpu` — the same "nobody looked" that the
@@ -296,12 +309,22 @@ def accelerator_backend() -> str:
     return "rocm" if amd_present() else "cpu"
 
 
+@functools.lru_cache(maxsize=1)
 def _tpu_available() -> bool:
     """Whether a Cloud TPU is present, via `torch_xla` — import-gated and side-effect-free.
 
     `find_spec` avoids importing (and so initializing) the XLA runtime on the common
     no-TPU host; only when `torch_xla` is actually installed do we ask its runtime for the
-    device type. Any failure (older API, no device) reads as "no TPU"."""
+    device type. Any failure (older API, no device) reads as "no TPU".
+
+    Memoized for the same reason `gpu_devices_absent` is, and it is not an optimization worth
+    skipping: `find_spec` walks the whole of `sys.path`, and a *failed* spec lookup is never
+    cached by the import system, so an absent `torch_xla` re-walks it on every call. It is the
+    first thing `accelerator_backend` asks, and `accelerator_backend` is asked once per batch
+    by the memory sampler that feeds the out-of-memory guard — measured at **53 microseconds a
+    call, essentially all of it here**. A TPU cannot appear under a running process, so
+    answering once is correct.
+    """
     import importlib.util
 
     if importlib.util.find_spec("torch_xla") is None:
@@ -521,23 +544,50 @@ def _torch_inventory() -> list[dict[str, object]]:
         return []
 
 
+#: Device-node patterns for the accelerators no cross-vendor API enumerates, with the name
+#: each is reported under. Ordered by how likely a host is to be one; a host runs one vendor.
+_OTHER_ACCELERATOR_NODES = (
+    ("TPU", "/dev/accel[0-9]*"),
+    ("Neuron", "/dev/neuron[0-9]*"),
+    ("Gaudi", "/dev/hl[0-9]*"),
+    # Huawei Ascend, whose Ray resource (`NPU`) this module already recognizes while its
+    # device nodes went unenumerated — so an Ascend node reported no accelerator at all.
+    ("Ascend", "/dev/davinci[0-9]*"),
+)
+
+
+def _node_ordinal(path: str) -> int:
+    """The device number in a node's name, or `-1` when it has none.
+
+    Ordering device nodes lexicographically is wrong the moment a host has ten of them, which
+    is not exotic: a `trn1.32xlarge` has sixteen `/dev/neuron*`. Sorted as strings they run
+    0, 1, 10, 11, ..., 15, 2, 3 — so device 10 is reported as index 2, and every consumer that
+    lines an index up against a framework's device ordering addresses the wrong chip.
+    """
+    digits = "".join(ch for ch in os.path.basename(path) if ch.isdigit())
+    return int(digits) if digits else -1
+
+
 def _other_accelerator_inventory() -> list[dict[str, object]]:
     """Non-NVIDIA accelerators, so diagnostics stop reporting `[]` on a machine that has one.
 
     NVML and `torch.cuda` between them cover NVIDIA and (via HIP) AMD; everything else fell
     through to an empty list, which the observability page then rendered as "no GPUs" on a
-    TPU, Trainium, or Gaudi host. Reports what the device nodes say, since there is no
+    TPU, Trainium, Gaudi, or Ascend host. Reports what the device nodes say, since there is no
     portable cross-vendor API and no memory figure to be had without each vendor's runtime —
     an accurate name with unknown memory beats a confident, wrong "nothing here".
+
+    Indices run continuously across vendors rather than restarting per kind, so
+    `gpu_inventory()[i]["index"] == i` holds the way it does for every other probe here.
     """
     devices: list[dict[str, object]] = []
-    for kind, pattern in (
-        ("TPU", "/dev/accel[0-9]*"),
-        ("Neuron", "/dev/neuron[0-9]*"),
-        ("Gaudi", "/dev/hl[0-9]*"),
-    ):
-        for index, node in enumerate(sorted(glob.glob(pattern))):
+    for kind, pattern in _OTHER_ACCELERATOR_NODES:
+        for node in sorted(glob.glob(pattern), key=_node_ordinal):
             devices.append(
-                {"index": index, "name": f"{kind} ({os.path.basename(node)})", "memory_bytes": 0}
+                {
+                    "index": len(devices),
+                    "name": f"{kind} ({os.path.basename(node)})",
+                    "memory_bytes": 0,
+                }
             )
     return devices

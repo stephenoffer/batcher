@@ -33,6 +33,7 @@ one, which is slower than not partitioning at all.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import pairwise
 
 from batcher._internal.errors import BackendError
@@ -56,6 +57,7 @@ def range_predicates(
     lower_bound: float,
     upper_bound: float,
     num_partitions: int,
+    quote: Callable[[str], str] = lambda name: name,
 ) -> list[str | None]:
     """Disjoint, exhaustive SQL ``WHERE`` fragments splitting `column` into slices.
 
@@ -69,6 +71,9 @@ def range_predicates(
         upper_bound: Approximate maximum of `column`. A cut point, not a filter.
         num_partitions: How many parallel queries to produce. 1 means "do not partition"
             and yields a single `None` fragment.
+        quote: How to delimit `column` for the target dialect (`uri.quote_identifier`).
+            Defaults to leaving it verbatim, which is what a backend that cannot name its
+            dialect must do.
 
     Returns:
         One fragment per partition, in key order. A `None` entry means "no filter" —
@@ -87,6 +92,12 @@ def range_predicates(
             id >= 25.0 AND id < 50.0
             id >= 50.0 AND id < 75.0
             id >= 75.0
+
+            >>> from batcher.io.formats.sql.uri import quote_identifier
+            >>> range_predicates(
+            ...     "order", 0, 100, 2, quote=lambda n: quote_identifier(n, "postgresql")
+            ... )[1]
+            '"order" >= 50.0'
     """
     if num_partitions < 1:
         raise BackendError(f"num_partitions must be >= 1, got {num_partitions}")
@@ -107,7 +118,12 @@ def range_predicates(
     # NULL keys ride in the first partition: `col < x` and `col >= x` are both UNKNOWN
     # for NULL, so without this every NULL-keyed row would match no partition at all and
     # disappear from a read that reported success.
-    fragments: list[str | None] = [f"{column} < {cuts[0]} OR {column} IS NULL"]
-    fragments += [f"{column} >= {lo} AND {column} < {hi}" for lo, hi in pairwise(cuts)]
-    fragments.append(f"{column} >= {cuts[-1]}")
+    # Delimited for the dialect where one is known. A partition column is chosen for being
+    # indexed and numeric, which says nothing about its *name*: `order`, `key` and `end`
+    # are all reserved words and all plausible, and an unquoted one is a syntax error from
+    # the server on every split at once rather than a slow read.
+    name = quote(column)
+    fragments: list[str | None] = [f"{name} < {cuts[0]} OR {name} IS NULL"]
+    fragments += [f"{name} >= {lo} AND {name} < {hi}" for lo, hi in pairwise(cuts)]
+    fragments.append(f"{name} >= {cuts[-1]}")
     return fragments

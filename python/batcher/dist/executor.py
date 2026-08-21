@@ -1108,7 +1108,12 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
     would read `"12"` as `12.0` and order the buckets numerically, disagreeing with the
     single-node lexical sort.
 
-    The string case used to be refused here, which was the honest answer while it had no
+    A **binary** key — `Binary`, `LargeBinary` or `FixedSizeBinary` — is compared exactly the
+    same way and routes through the same partitioner, because arrow orders text and bytes
+    identically. Refusing it here is what kept the canonical large-sort shape (a short
+    fixed-width key over a wide payload) on a single node.
+
+    The string case used to be refused here too, which was the honest answer while it had no
     routing: the alternative was a `RuntimeError` from inside a Ray task. But refusing is
     only harmless when the fallback can *run*. Once an earlier stage leaves its result on
     the workers, every source is splittable and `_unsupported` raises rather than falling
@@ -1128,14 +1133,9 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
     dtype = infer_type(sort.keys[0].expr, schema)
     if dtype is None:
         return True
-    return (
-        pa.types.is_integer(dtype)
-        or pa.types.is_floating(dtype)
-        or pa.types.is_decimal(dtype)
-        or pa.types.is_temporal(dtype)
-        or pa.types.is_string(dtype)
-        or pa.types.is_large_string(dtype)
-    )
+    from batcher.dist.executors.partition_io import range_partitionable
+
+    return pa.types.is_decimal(dtype) or pa.types.is_temporal(dtype) or range_partitionable(dtype)
 
 
 def _hoist_computed_sort_key(sort: Sort):

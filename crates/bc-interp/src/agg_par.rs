@@ -154,6 +154,12 @@ const MAX_PARTITIONS: usize = 2_048;
 /// a performance choice only: the partitions are key-disjoint at any width, so the relation
 /// they union to is the same one.
 pub(crate) fn radix_width(estimated_groups: usize, threads: usize) -> usize {
+    // TEMPORARY: pin the width to measure how the split scales with it.
+    if let Ok(w) = std::env::var("BATCHER_AGG_PARTS") {
+        if let Ok(w) = w.parse::<usize>() {
+            return w.max(1);
+        }
+    }
     estimated_groups
         .div_ceil(GROUPS_PER_PARTITION)
         .clamp(threads.max(1), MAX_PARTITIONS)
@@ -327,7 +333,7 @@ pub(crate) fn decide(
 const CHUNK_MERGE_CEILING: f64 = 0.25;
 
 /// Whether one partial per worker beats partitioning, for a group count this size.
-fn chunking_pays(threads: usize, groups: usize, total_rows: usize) -> bool {
+pub(crate) fn chunking_pays(threads: usize, groups: usize, total_rows: usize) -> bool {
     if groups == 0 || total_rows == 0 || threads < 2 {
         return false;
     }
@@ -477,11 +483,24 @@ pub(crate) fn partitioned_partials(
     jit: &AggJit,
     partitions: usize,
 ) -> Result<Vec<agg::Partial>, InterpError> {
-    ops::partition_morsels(morsels, keys, partitions)?
+    let t0 = std::time::Instant::now();
+    let buckets = ops::partition_morsels(morsels, keys, partitions)?;
+    let split = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let out: Result<Vec<agg::Partial>, InterpError> = buckets
         .par_iter()
         .filter(|b| b.num_rows() > 0)
         .map(|bucket| ops::eval_partial_jit(bucket, group_keys, aggregates, jit))
-        .collect()
+        .collect();
+    if std::env::var("BATCHER_DEBUG_AGGSPLIT").is_ok() {
+        eprintln!(
+            "AGGSPLIT split={:?} aggregate={:?} parts={}",
+            split,
+            t1.elapsed(),
+            partitions
+        );
+    }
+    out
 }
 
 #[cfg(test)]

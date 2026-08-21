@@ -160,8 +160,33 @@ only control-plane metadata — size it small and give the memory to workers.
 `object_store_memory_bytes` applies **only when Batcher starts Ray locally** (Ray rejects it
 when attaching). Per-worker memory is not a knob: it derives from the *worker node's* RAM as
 `node_mem * memory.soft_limit / workers_per_node`, so a fat head node cannot mis-budget a thin
-worker. Flight has **no port setting** — the shuffle server binds an ephemeral port and
-advertises the Ray node IP, so open the node-to-node range rather than hunting a `flight_port`.
+worker. The shuffle server binds an ephemeral port by default and advertises the
+Ray node IP, so open the node-to-node range — or confine it with
+`distributed.shuffle_port_range` (`BATCHER_SHUFFLE_PORT_RANGE="40000-40100"`), which is what a
+firewalled or on-prem network wants. Make the range at least as wide as the workers sharing a
+node. `BATCHER_ADVERTISE_HOST` overrides the advertised address per node for a multi-homed or
+NAT'd host. IPv6 needs no configuration: an IPv6 advertise host binds an IPv6 listener and
+advertises a bracketed `[fd00::1]:40001` authority.
+
+## Under a batch scheduler
+
+Slurm, PBS, LSF, Grid Engine, Flux, HTCondor, Kubernetes, Nomad, YARN, AWS Batch, SageMaker,
+Vertex AI, Azure ML and SkyPilot are all read, and there is nothing to configure:
+`_internal.site.scheduler` sizes the run against the **allocation** rather than the node. That
+matters because the two differ silently — a Grid Engine job granted 8 of 128 cores sees all 128
+in its affinity mask, since most sites do not enable cgroup confinement.
+
+The one thing Batcher cannot do for you: **`srun -N 4 python job.py` does not start Ray across
+the allocation.** A bare `ray.init()` starts a local single-node Ray, the job returns the right
+answer, and it uses a quarter of the hardware. Batcher warns once when the allocation is wider
+than the cluster — including when there is no cluster at all — but bringing Ray up is the
+launcher's job. `docs/integrations/compute/schedulers.md` is the canonical page.
+
+Two exports are worth knowing. `BATCHER_DEADLINE_SECONDS` gives the drain path a lease on every
+scheduler except Slurm, which publishes `SLURM_JOB_END_TIME` itself — without one, a stage that
+cannot finish is started anyway and the kill lands mid-write. And the spill prefers the
+scheduler's own per-job scratch (`_CONDOR_SCRATCH_DIR`, `SLURM_TMPDIR`, `PBS_JOBFS`) over any
+mount it discovers, because a spill should not outlive its job.
 
 ## On a GPU fleet
 

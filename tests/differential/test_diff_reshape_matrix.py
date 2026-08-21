@@ -98,20 +98,33 @@ INTERVALS = pa.table(
 
 
 def _shapes(table: pa.Table) -> dict[str, pa.Table]:
-    """The four input shapes every operator here is run against.
+    """The five input shapes every operator here is run against.
 
     `multibatch` repeats the input past the 16,384-row morsel, so `iter_batches()` yields
     more than one batch and `collect(spill=True)` has something to split. Without it the
     three "paths" are three names for a single batch, and a row dropped or double-emitted
     at a morsel boundary — the failure mode these cardinality-changing operators are most
     prone to — cannot be observed at all.
+
+    `skewed` is `multibatch`'s size with its keys collapsed onto one value, and it is a
+    different axis from the four above rather than more of the same. They all spread their
+    keys evenly, so a partitioned or spilled operator only ever sees buckets of roughly equal
+    size. Rows that share a key re-hash together however they are salted, so a hot key is
+    precisely where an out-of-core path either holds its bound or materializes the thing it
+    spilled to avoid — and for an ASOF join, where one `by` group is the whole relation. The
+    base table is appended, so its nulls, duplicates and boundary values survive in the tail.
     """
-    repeats = 16_384 // table.num_rows + 2 if table.num_rows else 1
+    if not table.num_rows:
+        return dict.fromkeys(("base", "empty", "single", "multibatch", "skewed"), table)
+    repeats = 16_384 // table.num_rows + 2
+    multibatch = pa.concat_tables([table] * repeats)
+    hot_rows = multibatch.num_rows - table.num_rows
     return {
         "base": table,
         "empty": table.slice(0, 0),
         "single": table.slice(0, 1),
-        "multibatch": pa.concat_tables([table] * repeats),
+        "multibatch": multibatch,
+        "skewed": pa.concat_tables([table.take([0] * hot_rows), table]),
     }
 
 

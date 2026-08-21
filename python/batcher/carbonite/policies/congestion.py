@@ -170,11 +170,13 @@ class ChannelCongestion:
     is fed is a node-level reading (see the module docstring), so two controllers in a
     process agree about the wire and can still differ about where they sit in the band.
 
-    An unmeasured channel reports `STARVED`, which is deliberately the *permissive* verdict.
-    A window that has never been tested has not earned the right to stop growing, and it is
-    also what a build with no starvation counter — or a worker whose first round has not
-    completed — must fall back to if the credit window is to behave exactly as it did before
-    the measurement existed.
+    A channel that has never been measured reports `STARVED`, which is deliberately the
+    *permissive* verdict. A window that has never been tested has not earned the right to stop
+    growing, and it is also what a build with no starvation counter — or a worker whose first
+    round has not completed — must fall back to if the credit window is to behave exactly as
+    it did before the measurement existed. That is the **initial** state, not the answer to
+    every unmeasured round: once a real verdict has been taken, a round with nothing to
+    measure holds it, exactly as a round inside the band does.
     """
 
     __slots__ = ("_high", "_last", "_low")
@@ -212,7 +214,16 @@ class ChannelCongestion:
         if pressured:
             self._last = CongestionSignal.CONGESTED
         elif occupancy is None:
-            self._last = CongestionSignal.STARVED
+            # No opinion, so the retained verdict stands — the same rule as inside the band.
+            # Overwriting it with `STARVED` conflated two different things: a controller that
+            # has *never* measured (which starts at `STARVED`, and is the permissive cold
+            # start this class documents) and a *round* that carried too little transfer to
+            # divide. `StarvationMeter.sample` returns `None` for the second on any round
+            # served from locality or moving one tiny bucket, so a shuffle alternating between
+            # measurable and unmeasurable rounds was told to grow on every other one whatever
+            # the wire said — a ratchet, which is the exact failure this module opens by
+            # describing.
+            pass
         elif occupancy >= self._high:
             self._last = CongestionSignal.SATURATED
         elif occupancy <= self._low:

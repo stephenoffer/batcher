@@ -30,6 +30,7 @@ mod fill;
 mod parallel;
 mod partition_agg;
 mod series;
+mod topk;
 
 use std::sync::Arc;
 
@@ -95,6 +96,9 @@ pub enum WindowFn {
     BitXor,
     /// Number of distinct non-null values. → Int64.
     CountDistinct,
+    /// Median of the non-null values, interpolated between the two middles for an even
+    /// count — the same rule `agg/median.rs` uses, and the same kernel. → Float64.
+    Median,
     /// Exponentially weighted moving mean / variance / standard deviation over the
     /// ordered partition, with the smoothing factor carried on [`WindowCall::alpha`].
     /// Each row's value depends on the whole prefix through a recurrence, so these
@@ -140,6 +144,7 @@ impl WindowFn {
             WindowFn::BitOr => "bit_or",
             WindowFn::BitXor => "bit_xor",
             WindowFn::CountDistinct => "count_distinct",
+            WindowFn::Median => "median",
             WindowFn::EwmMean => "ewm_mean",
             WindowFn::EwmVar => "ewm_var",
             WindowFn::EwmStd => "ewm_std",
@@ -232,6 +237,7 @@ pub fn window(
         funcs,
         num_rows,
         PARALLEL_ROW_THRESHOLD,
+        None,
     )
 }
 
@@ -240,12 +246,17 @@ pub fn window(
 /// `parallel_row_threshold` is a performance-only knob: above it the independent
 /// per-partition sorts run across cores, below it single-threaded. The output
 /// columns are identical regardless of the choice.
+/// `rank_limit` is the optimizer's fused `QUALIFY <rank> <= k`. It is threaded all the way down
+/// to [`window_serial`] rather than applied here, because the bounded selection it enables
+/// ([`topk`]) must run *per bucket* to inherit this function's parallelism — applied at this
+/// level it replaced ninety-six cores with one and was measured 2-4x slower.
 pub fn window_with(
     partition_keys: &[ArrayRef],
     order_keys: &[(ArrayRef, SortOptions)],
     funcs: &[WindowCall],
     num_rows: usize,
     parallel_row_threshold: usize,
+    rank_limit: Option<usize>,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     // Parallelize across CORES by hash-partitioning rows on the PARTITION BY keys:
     // equal keys co-partition, so every window partition lands wholly inside one
@@ -297,9 +308,16 @@ pub fn window_with(
         && num_rows >= parallel_row_threshold
         && nthreads > 1;
     if !worth_parallel {
-        return window_serial(partition_keys, order_keys, funcs, num_rows);
+        return window_serial(partition_keys, order_keys, funcs, num_rows, rank_limit);
     }
-    crate::window::parallel::window_parallel(partition_keys, order_keys, funcs, num_rows, nthreads)
+    crate::window::parallel::window_parallel(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        nthreads,
+        rank_limit,
+    )
 }
 
 pub(crate) fn window_serial(
@@ -307,7 +325,19 @@ pub(crate) fn window_serial(
     order_keys: &[(ArrayRef, SortOptions)],
     funcs: &[WindowCall],
     num_rows: usize,
+    rank_limit: Option<usize>,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // Bounded top-N: the only function is `row_number` and the optimizer has already folded a
+    // `rank <= k` into `rank_limit`, so the answer is the `k` best rows of this bucket's
+    // partitions and ordering them to find it is the wrong algorithm. Identical rank column,
+    // declines to `None` on any shape it does not cover — see `topk`.
+    if let (Some(k), [f]) = (rank_limit, funcs) {
+        if f.func == WindowFn::RowNumber && !order_keys.is_empty() {
+            if let Some(col) = topk::row_number_top_k(partition_keys, order_keys, num_rows, k)? {
+                return Ok(vec![col]);
+            }
+        }
+    }
     // Fast path: PARTITION BY with no ORDER BY and only plain aggregates (no frame, no
     // ranking / value functions) is exactly "group-by the partition keys, aggregate,
     // broadcast back to each row". Assign dense group ids once via the shared native
@@ -1326,8 +1356,15 @@ mod tests {
         }];
         // Both the serial kernel (huge threshold) and the bucket-parallel path (threshold 1).
         for threshold in [1usize, 1 << 20] {
-            let got =
-                window_with(std::slice::from_ref(&part), &order, &call, n, threshold).unwrap();
+            let got = window_with(
+                std::slice::from_ref(&part),
+                &order,
+                &call,
+                n,
+                threshold,
+                None,
+            )
+            .unwrap();
             let got = ints(&got[0]);
             for r in 0..n {
                 // rank = 1 + number of same-partition rows with a strictly smaller order key.
@@ -1368,8 +1405,15 @@ mod tests {
             half_life: None,
         }];
         for threshold in [1usize, 1 << 20] {
-            let out =
-                window_with(std::slice::from_ref(&part), &order, &call, n, threshold).unwrap();
+            let out = window_with(
+                std::slice::from_ref(&part),
+                &order,
+                &call,
+                n,
+                threshold,
+                None,
+            )
+            .unwrap();
             let got = ints(&out[0]);
             for r in 0..n {
                 // DESC rank = 1 + number of same-partition rows with a strictly GREATER key.
@@ -1443,8 +1487,8 @@ mod tests {
         for call in cases {
             let funcs = [call];
             // threshold 1 forces the parallel path; usize::MAX keeps the serial oracle.
-            let par = window_with(std::slice::from_ref(&part), &order, &funcs, n, 1).unwrap();
-            let ser = window_serial(std::slice::from_ref(&part), &order, &funcs, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &order, &funcs, n, 1, None).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &order, &funcs, n, None).unwrap();
             assert_eq!(
                 opt_ints(&par[0]),
                 opt_ints(&ser[0]),
@@ -1473,8 +1517,8 @@ mod tests {
                 half_life: None,
             }];
             // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
-            let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1).unwrap();
-            let ser = window_serial(std::slice::from_ref(&part), &[], &funcs, n).unwrap();
+            let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1, None).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &[], &funcs, n, None).unwrap();
             assert_eq!(
                 ints(&par[0]),
                 ints(&ser[0]),
@@ -2074,9 +2118,17 @@ mod tests {
                 half_life: None,
             }];
             let order = [asc(ord.clone())];
-            let serial =
-                window_with(std::slice::from_ref(&part), &order, &funcs, n, usize::MAX).unwrap();
-            let parallel = window_with(std::slice::from_ref(&part), &order, &funcs, n, 1).unwrap();
+            let serial = window_with(
+                std::slice::from_ref(&part),
+                &order,
+                &funcs,
+                n,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let parallel =
+                window_with(std::slice::from_ref(&part), &order, &funcs, n, 1, None).unwrap();
             assert_eq!(opt_ints(&serial[0]), opt_ints(&parallel[0]), "{func:?}");
         }
     }

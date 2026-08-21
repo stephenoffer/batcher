@@ -54,6 +54,12 @@ from batcher.plan.expr_ir import Binary, Case, Cast, Col, InList, Lit
         # date filter, which `analyze` compiles.
         bt.col("d") < dt.date(1998, 1, 1),
         bt.col("t") >= dt.datetime(2020, 1, 1),
+        # Under the Kleene ABI the answer is the operand's validity bit, so `analyze`
+        # compiles these by recursing into the operand and yielding Bool. The operand must
+        # be in the subset; its kind does not matter.
+        bt.col("x").is_null(),
+        bt.col("x").is_not_null(),
+        (bt.col("x") + 1).is_null(),
     ],
 )
 def test_jit_compilable_accepts_supported_subset(expr):
@@ -68,8 +74,6 @@ def test_jit_compilable_accepts_supported_subset(expr):
         bt.col("b") == True,  # noqa: E712 - bool literal is explicitly unsupported
         bt.col("s").str.contains("a"),  # string function
         bt.col("s").str.regexp_matches("^a"),
-        bt.col("x").is_null(),
-        bt.col("x").is_not_null(),
         bt.col("x") % bt.col("y"),  # integer modulo by a non-constant divisor traps
         Binary("div", bt.col("x"), bt.col("y")),  # raw integer division
         bt.col("y").round(),  # rounding mode differs from the interpreter
@@ -81,6 +85,9 @@ def test_jit_compilable_accepts_supported_subset(expr):
         Lit(dt.date(2020, 1, 1)),  # a bare temporal is not a storable JIT output
         # `case` whose result is a string, not a numeric
         Case([(bt.col("x") > 1, Lit("a"))], Lit("b")),
+        # `is_null` recurses into its operand, so an operand the JIT cannot compile makes
+        # the whole node fall back too.
+        bt.col("s").str.contains("a").is_null(),
     ],
 )
 def test_jit_compilable_rejects_unsupported(expr):

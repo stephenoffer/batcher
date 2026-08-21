@@ -620,7 +620,16 @@ fn floor_div(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
                     if a.is_null(i) || b.is_null(i) {
                         return None;
                     }
-                    Some((a.value(i) / b.value(i)).floor())
+                    // A zero divisor is NULL on the float path too, exactly as it is on
+                    // the integer one above. Letting IEEE answer produced `inf`/`NaN`,
+                    // where DuckDB's `//` and `divide()` both return NULL — and a NaN
+                    // then compares false against everything, so the wrong answer
+                    // silently propagated through any predicate over it.
+                    let y = b.value(i);
+                    if y == 0.0 {
+                        return None;
+                    }
+                    Some((a.value(i) / y).floor())
                 })
                 .collect();
             Ok(Arc::new(out))
@@ -1508,10 +1517,16 @@ mod floor_div_tests {
         );
     }
 
-    /// Float64 is IEEE `(l / r).floor()`: a zero divisor yields ±inf / NaN just as
-    /// `Div` does, rather than the integer arm's NULL.
+    /// Float64 is `(l / r).floor()` with the integer arm's **NULL** on a zero divisor.
+    ///
+    /// This arm used to answer ±inf / NaN there, "just as `Div` does". `Div` is right to:
+    /// DuckDB's `/` on doubles is IEEE. Its `//` is not — `1.0 // 0.0` and `0.0 // 0.0`
+    /// are both NULL — and `divide()`, which lowers to this op, agrees. The two arms of
+    /// one operator disagreeing on a zero divisor was the defect; a NaN then compares
+    /// false against everything, so it propagated silently through any predicate over it.
+    /// (`fdiv()`, which *is* IEEE floor division, is built from `/` and `floor` instead.)
     #[test]
-    fn float_is_ieee_floor_of_the_quotient() {
+    fn float_zero_divisor_is_null_like_the_integer_arm() {
         let out = fd_f64(
             vec![
                 Some(7.0),
@@ -1536,9 +1551,9 @@ mod floor_div_tests {
         // -3.5 floors to -4, not -3 (truncation would give -3).
         assert_eq!(out[1], Some(-4.0));
         assert_eq!(out[2], Some(3.0));
-        assert_eq!(out[3], Some(f64::INFINITY));
-        assert_eq!(out[4], Some(f64::NEG_INFINITY));
-        assert!(out[5].expect("0.0/0.0 is NaN, not null").is_nan());
+        assert_eq!(out[3], None, "1.0 // 0.0 is NULL, as DuckDB answers");
+        assert_eq!(out[4], None);
+        assert_eq!(out[5], None, "0.0 // 0.0 is NULL too, not NaN");
         assert_eq!(out[6], None);
     }
 

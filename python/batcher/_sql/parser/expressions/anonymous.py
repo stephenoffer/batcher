@@ -33,6 +33,13 @@ import math
 
 from batcher.plan.expr_ir import Binary, Expr, array, atan2, lit, nullif, when
 from batcher.plan.functions.collection import element
+from batcher.plan.functions.partitioning import (
+    partition_days,
+    partition_hours,
+    partition_months,
+    partition_truncate,
+    partition_years,
+)
 from batcher.plan.functions.scalar import gcd, hypot, lcm, nanvl, next_after
 from batcher.plan.functions.temporal import current_date, make_date
 
@@ -70,7 +77,6 @@ _UNARY_STR = {
     # `length('Ünicode')` is 7. Mapping it onto `len` made the two synonyms, which they
     # are only for ASCII.
     "strlen": "octet_length",
-    "ord": "ascii",
     "crc32": "crc32",
     "initcap": "initcap",
     "soundex": "soundex",
@@ -166,15 +172,28 @@ _STR_TEXT = {
     "suffix": "ends_with",
 }
 
-# `f(a, b)` → an arithmetic operator. DuckDB exposes the operators under function
-# names too; `divide` is *integer* division on integer operands (`divide(3, 2)` is 1),
-# so it lowers to floor division, not `/`.
+#: The engine tag for a `_STR_TEXT` entry whose `.str` method name differs from it. Only
+#: `jaccard` does; the rest are the same word, and listing them would be a second copy to
+#: keep in step.
+_STR_TEXT_TAG = {"jaccard": "jaccard_similarity"}
+
+# `f(a, b)` → an arithmetic operator. DuckDB exposes the operators under function names
+# too, and the two division spellings are *not* the ones the names suggest:
+#
+# * `divide(a, b)` is the `//` operator — integer division truncating **toward zero**
+#   (`divide(-1, 3)` is 0, `divide(-7, 2)` is -3). Lowering it to `floordiv` rounded the
+#   other way on every negative quotient, and returned NaN rather than NULL on `0.0/0.0`.
+# * `fdiv(a, b)` is **floor** division returning a DOUBLE (`fdiv(-1, 3)` is -1.0). It is
+#   not true division: mapping it to `/` answered -0.333 where DuckDB answers -1. It is
+#   also not `//`: a zero divisor is IEEE there (`fdiv(1.0, 0)` is `inf`, `fdiv(0, 0)` is
+#   `NaN`) where `//` and `divide()` return NULL, so it is built from the float division
+#   rather than from the `floor_div` opcode.
 _ARITH = {
     "add": "add",
     "subtract": "sub",
     "multiply": "mul",
-    "divide": "floordiv",
-    "fdiv": "truediv",
+    "divide": "truncdiv",
+    "fdiv": "floordiv_double",
     "mod": "mod",
 }
 
@@ -190,6 +209,34 @@ def _floored_mod(a: Expr, b: Expr) -> Expr:
     """
     left, right = a.cast("float64"), b.cast("float64")
     return left - right * (left / right).floor()
+
+
+# `f(v)` → a one-argument top-level builder. The lakehouse partition transforms are
+# reachable from SQL under the same names the DataFrame API gives them, so a query can
+# group or filter by the value a table is partitioned by without leaving SQL. Iceberg's
+# own one-word spellings (`years`, `days`) are deliberately *not* aliased here: DuckDB
+# already gives `days(5)` a different meaning (an INTERVAL), and quietly redefining it
+# would change the answer of a query that never mentioned partitioning.
+def _signbit(value: Expr) -> Expr:
+    """DuckDB `signbit(x)` — is the value's IEEE sign bit set?
+
+    True for every negative value **and for `-0.0`**, which is the whole reason this is
+    not `x < 0`. It is also not `1/x < 0` on its own: that reads `-0.0` correctly but
+    reads `-inf` as false, because `1 / -inf` is `-0.0` and `-0.0 < 0` is false. The
+    disjunction is what covers both ends, and NaN stays false in every term, which is
+    DuckDB's answer for it.
+    """
+    x = value.cast("float64")
+    return (x < lit(0.0)) | ((lit(1.0) / x) < lit(0.0))
+
+
+_UNARY_FN = {
+    "signbit": _signbit,
+    "partition_years": partition_years,
+    "partition_months": partition_months,
+    "partition_days": partition_days,
+    "partition_hours": partition_hours,
+}
 
 
 # `f(a, b)` → a two-argument top-level builder.
@@ -301,6 +348,9 @@ _LIST_PAIR_NEGATED = {
     "array_negative_inner_product": "dot",
 }
 
+# `f(l, idx)` → gather by a list of 1-based positions (DuckDB's two spellings).
+_LIST_SELECT = frozenset({"list_select", "array_select"})
+
 # `f(v, …)` → a list literal of every argument (DuckDB's list constructors).
 _LIST_PACK = frozenset({"list_pack", "list_value", "array_value"})
 
@@ -320,7 +370,7 @@ def anonymous_scalar(tr, node):
         The `Expr` this call denotes, or `None` when the name is not one this
         module serves (the caller then raises its own "unknown function" error).
     """
-    from batcher._sql.parser.expressions.literals import _const_int_arg, _const_str_arg
+    from batcher._sql.parser.expressions.literals import _const_int_arg
 
     name = node.name.lower()
     args = list(node.expressions)
@@ -329,6 +379,13 @@ def anonymous_scalar(tr, node):
         nullary = _NULLARY.get(name)
         if nullary is not None:
             return nullary()
+
+    if name == "ord" and len(args) == 1:
+        # `ord('')` is -1 where `ascii('')` is 0; the kernel implements `ascii`, so the
+        # difference is layered on rather than forked into a second kernel.
+        from batcher._sql.parser.expressions.functions import _empty_string_is_minus_one
+
+        return _empty_string_is_minus_one(tr._scalar(args[0]))
 
     if name in _GRADE_UP and len(args) == 1:
         return tr._scalar(args[0]).list.arg_sort().list.transform(element() + lit(1))
@@ -360,26 +417,45 @@ def anonymous_scalar(tr, node):
             return getattr(tr._scalar(one).list, _UNARY_LIST[name])()
         if name in _UNARY_STRUCT:
             return getattr(tr._scalar(one).struct, _UNARY_STRUCT[name])()
+        unary = _UNARY_FN.get(name)
+        if unary is not None:
+            return unary(tr._scalar(one))
 
     if len(args) == 2:
         left, right = args
         if name in _STR_TEXT:
-            text = _const_str_arg(right, f"{name}()", "second argument")
-            return getattr(tr._scalar(left).str, _STR_TEXT[name])(text)
+            from batcher._sql.parser.expressions.lowering.dynamic import str_call
+
+            method = _STR_TEXT[name]
+            return str_call(tr, _STR_TEXT_TAG.get(method, method), left, pattern=right)
         if name in _ARITH:
             return _arith(tr, name, left, right)
         builder = _BINARY_FN.get(name)
         if builder is not None:
             return builder(tr._scalar(left), tr._scalar(right))
         if name in _ELEMENT_AT:
-            # DuckDB indexes lists from 1; `.list.get` is 0-based.
-            return tr._scalar(left).list.get(_const_int_arg(right, f"{name}(): index") - 1)
+            from batcher._sql.parser.expressions.lowering.dynamic import const_int
+
+            index = const_int(right)
+            if index is None:
+                return _element_at_dyn(tr._scalar(left), tr._scalar(right))
+            return _element_at(tr, left, index)
         if name in _MAP_KEY:
             return getattr(tr._scalar(left).map, _MAP_KEY[name])(_raw_literal(right))
         if name in _LIST_VALUE:
             return getattr(tr._scalar(left).list, _LIST_VALUE[name])(_raw_literal(right))
         if name in _LIST_PAIR:
             return getattr(tr._scalar(left).list, _LIST_PAIR[name])(tr._scalar(right))
+        if name in _LIST_SELECT:
+            # `list_select(l, idx)` gathers by a *list* of 1-based positions, repeats and
+            # reorderings included. `.list.gather` is the same operation 0-based, so the
+            # whole difference is the index origin — shifted inside the index list rather
+            # than at its call site, because the list is a column, not a constant.
+            return tr._scalar(left).list.gather(
+                tr._scalar(right).list.transform(element() - lit(1))
+            )
+        if name == "partition_truncate":
+            return _partition_truncate(tr, left, right)
         negated = _LIST_PAIR_NEGATED.get(name)
         if negated is not None:
             return lit(0.0) - getattr(tr._scalar(left).list, negated)(tr._scalar(right))
@@ -397,6 +473,54 @@ def anonymous_scalar(tr, node):
         return array(*(tr._scalar(a) for a in args))
 
     return None
+
+
+def _element_at_dyn(value: Expr, index: Expr) -> Expr:
+    """`list_extract(l, i)` with `i` computed per row.
+
+    The constant form folds SQL's 1-based, 0-is-out-of-range, negatives-from-the-end rule
+    into one integer at plan time. Per row that folding becomes a `CASE`: index 0 names no
+    element, a positive index shifts down to the 0-based accessor, and a negative one is
+    already what the accessor means.
+
+    Args:
+        value: The list expression.
+        index: The 1-based index expression.
+
+    Returns:
+        The element expression.
+    """
+    from batcher.plan.expr_ir import ListGet, ListGetDyn
+
+    zero_based = when(index > lit(0)).then(index - lit(1)).otherwise(index)
+    element = ListGetDyn(value, zero_based)
+    # Index 0 names no element. `nullif(x, x)` is a NULL of the element's own type.
+    empty = ListGet(value, 0)
+    return when(index == lit(0)).then(nullif(empty, empty)).otherwise(element)
+
+
+def _element_at(tr, value, index: int) -> Expr:
+    """`list_extract(l, i)` — DuckDB's 1-based element access, negatives from the end.
+
+    Blanket-subtracting one from the written index (the old rule) is right only for a
+    positive one. Index **0** is not the last element, it is out of range and NULL; and a
+    **negative** index already counts from the end, so shifting it moved every such call
+    one place too far — `list_extract(l, -1)` answered the second-to-last value.
+
+    Args:
+        tr: The translator.
+        value: The list argument node.
+        index: The constant index as written.
+
+    Returns:
+        The element expression, or a NULL of the element's type for index 0.
+    """
+    element = tr._scalar(value).list.get(0)
+    if index == 0:
+        # SQL indexes from 1, so 0 names no element. `nullif(x, x)` is a NULL of the
+        # element's own type, which keeps the column's type right.
+        return nullif(element, element)
+    return tr._scalar(value).list.get(index - 1 if index > 0 else index)
 
 
 def _raw_literal(node) -> object:
@@ -418,8 +542,37 @@ def _arith(tr, name: str, left, right) -> Expr:
     lower to the engine's own division semantics, including its divide-by-zero rule),
     so they are dispatched by attribute; `add`/`sub`/`mul` are plain binary nodes.
     """
+    from batcher._sql.parser.expressions.literals import _sql_int_div
+
     op = _ARITH[name]
     lhs, rhs = tr._scalar(left), tr._scalar(right)
+    if op == "truncdiv":
+        return _sql_int_div(tr, lhs, rhs)
+    if op == "floordiv_double":
+        return (lhs.cast("float64") / rhs.cast("float64")).floor()
     if op in ("floordiv", "truediv", "mod"):
         return getattr(lhs, op)(rhs)
     return Binary(op, lhs, rhs)
+
+
+def _partition_truncate(tr, value, width):
+    """`partition_truncate(v, W)` — Iceberg's transform, with its two readings separated.
+
+    On text the transform is the first `W` characters; on a number it is the largest
+    multiple of `W` at or below the value. They are different operations, and only the
+    argument's type says which one a call means — which is why `plan.functions.partitioning`
+    exposes the numeric one alone and leaves the text one to `.str.substr`. Here the type
+    *is* in scope, so both readings are reachable under the one name a user would write.
+
+    A column whose type the plan cannot state takes the numeric reading, matching the
+    DataFrame surface rather than guessing from the literal's shape.
+    """
+    import pyarrow as pa
+
+    from batcher._sql.parser.expressions.literals import _const_int_arg
+
+    chars = _const_int_arg(width, "partition_truncate(): width")
+    column = tr.column_type(value)
+    if column is not None and (pa.types.is_string(column) or pa.types.is_large_string(column)):
+        return tr._scalar(value).str.substr(1, chars)
+    return partition_truncate(tr._scalar(value), chars)

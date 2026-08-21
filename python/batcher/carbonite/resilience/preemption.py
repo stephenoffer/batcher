@@ -30,6 +30,7 @@ import contextlib
 import signal
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from batcher._internal.logging import note_suppressed
 
@@ -37,6 +38,7 @@ __all__ = [
     "PreemptionMonitor",
     "cloud_preemption_probe",
     "preemption_monitor",
+    "reset_preemption_probes",
     "termination_probe",
 ]
 
@@ -66,7 +68,14 @@ _PROBE_TIMEOUT_S = 0.3
 #
 # The TTL is short because the token is used once, immediately.
 _IMDS_TOKEN_URL = "http://169.254.169.254/latest/api/token"
-_IMDS_TOKEN_TTL_S = 60
+_IMDS_TOKEN_TTL_S = 300
+
+# The minted token and when it stops being usable. Re-minting on every poll cost a link-local
+# round trip per poll on EC2 and a *timeout* per poll everywhere else, which is the expensive
+# half of a probe that answers "no" all but once in a job's life. Re-minted a little before it
+# expires so a poll never presents one that has just aged out.
+_IMDS_TOKEN: dict[str, float | str] = {"value": "", "expires_at": 0.0}
+_IMDS_TOKEN_REFRESH_LEAD_S = 30.0
 
 
 def _imds_v2_headers() -> dict[str, str]:
@@ -74,13 +83,23 @@ def _imds_v2_headers() -> dict[str, str]:
 
     Empty is the right fallback rather than an error: it is what an IMDSv1-only instance
     and a non-EC2 host both produce, and the GET that follows still works on IMDSv1. So
-    this only ever adds reach, and costs one link-local round trip on a spot worker's poll.
+    this only ever adds reach.
+
+    Cached for the token's own lifetime. A failed mint is *not* cached, because the failure
+    modes it covers (a hop-limited IMDS, a momentarily unreachable link-local address) are
+    transient in a way a successful mint is not — and the endpoint circuit-breaker below
+    already bounds what a permanently unreachable IMDS costs.
 
     Returns:
         `{"X-aws-ec2-metadata-token": ...}`, or `{}`.
     """
+    import time
     import urllib.request
 
+    now = time.monotonic()
+    cached = str(_IMDS_TOKEN["value"])
+    if cached and now < float(_IMDS_TOKEN["expires_at"]):
+        return {"X-aws-ec2-metadata-token": cached}
     try:
         req = urllib.request.Request(
             _IMDS_TOKEN_URL,
@@ -91,6 +110,8 @@ def _imds_v2_headers() -> dict[str, str]:
             if resp.status == 200:
                 token = resp.read().decode("utf-8", "replace").strip()
                 if token:
+                    _IMDS_TOKEN["value"] = token
+                    _IMDS_TOKEN["expires_at"] = now + _IMDS_TOKEN_TTL_S - _IMDS_TOKEN_REFRESH_LEAD_S
                     return {"X-aws-ec2-metadata-token": token}
     except Exception as exc:
         # Off EC2, or IMDSv1-only, or IMDS hop-limited. All normal, none fatal.
@@ -116,52 +137,159 @@ def _azure_is_draining(body: str) -> bool:
     return any(e.get("EventType") in ("Preempt", "Terminate") for e in events)
 
 
+@dataclass(frozen=True, slots=True)
+class _CloudProbe:
+    """One cloud's reclamation endpoint.
+
+    Attributes:
+        provider: The `site.provider` name this endpoint belongs to. A probe is skipped
+            outright once the site is known to be some *other* platform.
+        url: The link-local metadata URL.
+        headers: Headers the platform requires, or a callable minting them per call where
+            the platform needs a session token.
+        is_drain: Reads the response body and says whether reclamation is announced.
+    """
+
+    provider: str
+    url: str
+    headers: dict[str, str] | Callable[[], dict[str, str]]
+    is_drain: Callable[[str], bool]
+
+
+#: Every cloud reclamation endpoint, one per platform.
+#:
+#: The AWS probe presents an IMDSv2 session token when one can be minted. Without it the probe
+#: is silently dead on any instance launched with `HttpTokens=required`, which is both the
+#: modern default and a common org-wide policy — the GET returns 401, that reads as "not
+#: draining" like every other error, and the fleet simply never drains.
+_CLOUD_PROBES: tuple[_CloudProbe, ...] = (
+    _CloudProbe(
+        "aws",
+        "http://169.254.169.254/latest/meta-data/spot/instance-action",
+        _imds_v2_headers,
+        bool,
+    ),
+    _CloudProbe(
+        "gcp",
+        "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
+        {"Metadata-Flavor": "Google"},
+        lambda body: body.strip().upper() == "TRUE",
+    ),
+    _CloudProbe(
+        "azure",
+        "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01",
+        {"Metadata": "true"},
+        _azure_is_draining,
+    ),
+    # Alibaba Cloud publishes a spot instance's reclamation time under its own metadata
+    # address rather than the link-local one the other three share, and answers 404 until
+    # one is scheduled — so a non-empty 200 body *is* the notice.
+    _CloudProbe(
+        "alibaba",
+        "http://100.100.100.200/latest/meta-data/instance/spot/termination-time",
+        {},
+        lambda body: bool(body.strip()),
+    ),
+)
+
+#: Consecutive unreachable results after which an endpoint stops being probed for the life of
+#: the process. A metadata service does not appear partway through a job, so an address that
+#: has never answered is one that never will — and on an unidentified site, or a neocloud, all
+#: four probes are in that state and each costs `_PROBE_TIMEOUT_S` on *every* poll.
+#:
+#: Reachability, not the answer, is what counts: a 200 saying "not draining" resets the count,
+#: because the endpoint is plainly there. Three rather than one so a momentary blip during
+#: node start-up does not switch off the one signal a spot worker has.
+_PROBE_FAILURE_LIMIT = 3
+
+#: Consecutive unreachable results per endpoint URL.
+_PROBE_FAILURES: dict[str, int] = {}
+
+
+def _probe_applies(probe: _CloudProbe, provider: str, machine: str) -> bool:
+    """Whether `probe` is worth making on this site.
+
+    An unidentified site (`unknown`) tries everything, which is what this did before and is
+    the only safe answer when the environment says nothing. A site that *has* identified itself
+    skips the other platforms' endpoints — on a neocloud or on-prem that is the whole set, and
+    each one costs a timeout per poll.
+
+    `machine` is what the *firmware* says the node was built as, and it is why this is not a
+    plain equality test. A GPU cloud reselling hyperscaler capacity exports its own marker
+    while its nodes are EC2 or GCE underneath — so the platform's reclamation endpoint really
+    does answer there, and dropping it on the strength of the environment marker alone would
+    take away the only preemption notice such a fleet gets.
+    """
+    return provider in ("unknown", probe.provider) or machine == probe.provider
+
+
+def reset_preemption_probes() -> None:
+    """Forget the endpoint circuit-breaker state and the cached IMDS token.
+
+    For tests, and for a process that has changed network namespace under itself. Nothing in
+    a running worker needs it: an endpoint that was unreachable stays unreachable.
+    """
+    _PROBE_FAILURES.clear()
+    _IMDS_TOKEN["value"] = ""
+    _IMDS_TOKEN["expires_at"] = 0.0
+
+
 def cloud_preemption_probe() -> bool:
     """Return True when the cloud metadata endpoint reports imminent reclamation.
 
     Checks the AWS spot ``instance-action`` endpoint (200 only when an action is
-    scheduled), the GCP ``preempted`` flag, and Azure Scheduled Events. Any error or
-    non-preempt response reads as "not draining", so a transient probe failure never
-    false-positives a drain. Cheap link-local HTTP with a tight timeout, called from the
-    poll thread — and only ever from a spot-profile worker, so a fixed on-prem cluster
-    never pays for probes its infrastructure would not answer.
+    scheduled), the GCP ``preempted`` flag, Azure Scheduled Events, and Alibaba Cloud's spot
+    ``termination-time``. Any error or non-preempt response reads as "not draining", so a
+    transient probe failure never false-positives a drain. Cheap link-local HTTP with a tight
+    timeout, called from the poll thread — and only ever from a spot-profile worker, so a
+    fixed on-prem cluster never pays for probes its infrastructure would not answer.
 
-    The AWS probe presents an IMDSv2 session token when one can be minted. Without it the
-    probe is silently dead on any instance launched with `HttpTokens=required`, which is
-    both the modern default and a common org-wide policy — the GET returns 401, that reads
-    as "not draining" like every other error, and the fleet simply never drains.
+    Two things bound what an *unanswerable* endpoint costs, because "unanswerable" is the
+    normal case for at least three of the four on any given host. The site's own identity — the
+    environment marker *and* what the firmware says the node was built as, so a GPU cloud
+    reselling hyperscaler capacity keeps the endpoint that answers for it — skips the platforms
+    it is not, and an endpoint that has been unreachable `_PROBE_FAILURE_LIMIT` times in a row
+    is not tried again, because a metadata service does not appear partway through a job.
+    Without either, a worker on an unidentified site paid four timeouts per poll, forever, to
+    learn nothing.
+
+    Returns:
+        Whether reclamation has been announced for this node.
     """
     import urllib.request
 
-    probes: tuple[tuple[str, dict[str, str], Callable[[str], bool]], ...] = (
-        (
-            "http://169.254.169.254/latest/meta-data/spot/instance-action",
-            _imds_v2_headers(),
-            bool,
-        ),
-        (
-            "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
-            {"Metadata-Flavor": "Google"},
-            lambda body: body.strip().upper() == "TRUE",
-        ),
-        (
-            "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01",
-            {"Metadata": "true"},
-            _azure_is_draining,
-        ),
-    )
-    for url, headers, is_drain in probes:
+    from batcher._internal.site.provider import detect_provider, dmi_identity
+
+    provider = detect_provider()
+    # Memoized, so this is a dict lookup after the first poll.
+    machine = dmi_identity()[0]
+    for probe in _CLOUD_PROBES:
+        if not _probe_applies(probe, provider, machine):
+            continue
+        if _PROBE_FAILURES.get(probe.url, 0) >= _PROBE_FAILURE_LIMIT:
+            continue
+        headers = probe.headers() if callable(probe.headers) else probe.headers
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(probe.url, headers=headers)
             with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
-                if resp.status == 200 and is_drain(resp.read().decode("utf-8", "replace")):
+                # Reachable, whatever it said: the endpoint is there, so reset the count.
+                _PROBE_FAILURES[probe.url] = 0
+                if resp.status == 200 and probe.is_drain(resp.read().decode("utf-8", "replace")):
                     return True
         except Exception as exc:
             # A probe that cannot be reached is the normal case off the matching cloud, so
             # it must not raise. Recording it is what separates "not on EC2" from "the
             # metadata endpoint has been unreachable since the VPC change", which otherwise
             # looks identical: a fleet that silently never sees a preemption notice.
-            note_suppressed("carbonite", f"probe preemption endpoint {url}", exc)
+            failures = _PROBE_FAILURES.get(probe.url, 0) + 1
+            _PROBE_FAILURES[probe.url] = failures
+            note_suppressed("carbonite", f"probe preemption endpoint {probe.url}", exc)
+            if failures == _PROBE_FAILURE_LIMIT:
+                note_suppressed(
+                    "carbonite",
+                    f"keep probing {probe.url} (unreachable {failures} times; giving up on it)",
+                    exc,
+                )
             continue
     return False
 

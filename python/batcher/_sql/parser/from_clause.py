@@ -16,6 +16,7 @@ from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 from batcher._sql.parser import udf
+from batcher._sql.parser.ai_functions import ai_table, is_ai_source
 from batcher._sql.parser.joins import and_conjuncts as _and_conjuncts
 from batcher._sql.parser.joins import asof_join, is_asof, outer_theta_join, swap_on_sides
 from batcher._sql.parser.joins.lateral import lateral_select, lateral_unnest
@@ -186,8 +187,12 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
     right_keys = [rk for _, rk in eq_pairs]
     # An ON residual on an outer join can't be a post-join filter — that would drop
     # the null-extended rows. Pre-filter the nullable side instead (or reject).
+    marker: str | None = None
     if extra is not None and how != "inner":
-        ds, right, extra = _outer_join_residual(tr, ds, right, extra, how)
+        ds, right, extra, marker = _outer_join_residual(tr, ds, right, extra, how)
+        if marker is not None:
+            left_keys = [*left_keys, marker]
+            right_keys = [*right_keys, marker]
     if extra is not None:
         _reject_ambiguous_residual(extra, ds, right, set(left_keys) | set(right_keys))
     if left_keys == right_keys:
@@ -203,6 +208,8 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
         ds = _join_keeping_both_keys(ds, right, left_keys, right_keys, how)
     if extra is not None:
         ds = ds.filter(tr._scalar(extra))
+    if marker is not None:
+        ds = ds.drop(marker)
     return ds
 
 
@@ -260,27 +267,70 @@ def _join_keeping_both_keys(
     return out
 
 
-def _outer_join_residual(tr, left: Dataset, right: Dataset, extra, how: str):
-    """Resolve a non-equi ON residual on an outer join by pre-filtering the nullable side.
+#: The eligibility column an outer join's one-sided ON residual is turned into.
+_JOIN_MARKER = "__bc_jmark"
 
-    In ``A LEFT JOIN B ON A.k = B.k AND <residual>``, the residual filters which B
-    rows are eligible to match — it is *not* a predicate on the result (B columns are
-    null where nothing matched, and those left rows must survive). When the residual
-    references only the null-extended side, applying it to that side before the join
-    is exactly correct. A residual touching the preserved side, or a FULL join (both
-    sides preserved), cannot be expressed this way and is rejected rather than
-    silently mis-answered. Returns ``(left, right, remaining_residual_or_None)``.
+
+def _outer_join_residual(tr, left: Dataset, right: Dataset, extra, how: str):
+    """Resolve a non-equi ON residual on an outer join, without turning it into a filter.
+
+    In ``A LEFT JOIN B ON A.k = B.k AND <residual>``, the residual decides *which rows may
+    match* — it is not a predicate on the result, because B's columns are null where
+    nothing matched and those A rows must survive. There are two one-sided shapes, and
+    both are exactly expressible:
+
+    * **The residual reads only the null-extended side.** It selects which of that side's
+      rows are eligible, so applying it to that side before the join is the whole of it.
+    * **The residual reads only a preserved side.** A row of that side failing the
+      residual must match nothing — and "matches nothing" is what an equi-join already
+      does to a key value the other side does not have. So the residual becomes an extra
+      *join key*: the predicate on the side it reads, the constant TRUE on the other. A
+      row whose predicate is false (or null) then carries a key no row opposite holds, and
+      the outer join null-extends it, which is the required answer. This covers ``FULL``
+      too, where both sides are preserved. It used to be rejected outright, which refused
+      the ordinary ``LEFT JOIN ... ON a.k = b.k AND a.active`` shape.
+
+    `coalesce(..., FALSE)` rather than the bare predicate: a NULL residual must not match,
+    and that must not depend on whether the join's key comparison is null-safe.
+
+    A residual reading *both* sides is a genuine theta join and still raises.
+
+    Args:
+        tr: The translator.
+        left: The left relation.
+        right: The right relation.
+        extra: The residual condition node.
+        how: The join type.
+
+    Returns:
+        ``(left, right, remaining_residual_or_None, marker_column_or_None)``.
+
+    Raises:
+        NotImplementedError: The residual reads both sides.
     """
+    from batcher.plan.expr_ir import coalesce, lit
+
     refs = {c.name for c in extra.find_all(exp.Column)}
     left_cols, right_cols = set(left.columns), set(right.columns)
-    if how == "left" and refs <= right_cols and not (refs & left_cols):
-        return left, right.filter(tr._scalar(extra)), None
-    if how == "right" and refs <= left_cols and not (refs & right_cols):
-        return left.filter(tr._scalar(extra)), right, None
+    only_left = bool(refs) and refs <= left_cols and not (refs & right_cols)
+    only_right = bool(refs) and refs <= right_cols and not (refs & left_cols)
+    if how == "left" and only_right:
+        return left, right.filter(tr._scalar(extra)), None, None
+    if how == "right" and only_left:
+        return left.filter(tr._scalar(extra)), right, None, None
+    if only_left or only_right:
+        eligible = coalesce(tr._scalar(extra), lit(False))
+        if only_left:
+            left = left.with_columns(**{_JOIN_MARKER: eligible})
+            right = right.with_columns(**{_JOIN_MARKER: lit(True)})
+        else:
+            left = left.with_columns(**{_JOIN_MARKER: lit(True)})
+            right = right.with_columns(**{_JOIN_MARKER: eligible})
+        return left, right, None, _JOIN_MARKER
     raise NotImplementedError(
-        f"{how} join with a non-equi ON condition that references the preserved side "
-        f"(or a FULL join) is not supported; the engine join is equi-only — move the "
-        f"condition to a WHERE clause or pre-filter the table"
+        f"{how} join with a non-equi ON condition that reads both sides is not supported; "
+        f"the engine join is equi-only — move the condition to a WHERE clause or "
+        f"pre-filter the table"
     )
 
 
@@ -366,6 +416,12 @@ def _table(tr, node) -> Dataset:
     if is_predict_source(node):
         return _apply_tablesample(predict_table(tr, node), node)
 
+    # FROM AI_GENERATE(t, engine, ...) / AI_CLASSIFY / AI_EXTRACT — the generative
+    # counterpart, read here for the same reason: these are built-ins, not something the
+    # user registered, so the lookup below has no entry for them.
+    if is_ai_source(node):
+        return _apply_tablesample(ai_table(tr, node), node)
+
     # FROM f(t) — a registered table function (`f` wraps the relation argument).
     if isinstance(node, exp.Table) and isinstance(node.this, exp.Anonymous):
         fname = node.this.name
@@ -386,15 +442,35 @@ def _table(tr, node) -> Dataset:
     elif isinstance(node, (exp.Select, exp.Union)):
         ds = tr.statement(node)
     else:
-        name = node.name
-        if name not in tr._registry:
-            known = list(tr._registry)
-            raise PlanError(
-                f"unknown table {name!r}; registered: {known}{suggest_columns(name, known)}"
-            )
+        name = _resolve_table_name(tr, node.name)
         ds = tr._registry[name]
     ds = _apply_tablesample(ds, node)
     return _apply_pivots(ds, pivots) if pivots else ds
+
+
+def _resolve_table_name(tr, name: str) -> str:
+    """The registered name `name` refers to, matching case-insensitively as SQL does.
+
+    A table identifier is case-insensitive in every engine this is measured against, so
+    ``FROM T`` must find the table registered as ``t``. An exact match always wins, and an
+    ambiguous fold (two registrations differing only in case) keeps raising rather than
+    picking one.
+
+    Args:
+        tr: The translator, for its registry.
+        name: The identifier as written.
+
+    Returns:
+        The registry key to read.
+
+    Raises:
+        PlanError: No registered table matches.
+    """
+    key = tr.registry_key(name)
+    if key is not None:
+        return key
+    known = list(tr._registry)
+    raise PlanError(f"unknown table {name!r}; registered: {known}{suggest_columns(name, known)}")
 
 
 def _apply_pivots(ds: Dataset, pivots) -> Dataset:

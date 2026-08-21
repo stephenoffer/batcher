@@ -543,9 +543,31 @@ class StreamingConfig:
     # estimator unbounded above, which is the useful default because the source's configured
     # limit already bounds it — this is for pinning a hard maximum independently of the source.
     backpressure_max_rows_per_trigger: int = 0
+    # How many changelog deltas a stateful checkpoint may record before it writes a whole
+    # snapshot again. Zero disables incremental checkpointing entirely.
+    #
+    # Rewriting the running state every micro-batch makes the checkpoint's cost grow with
+    # the state it protects: an aggregate with no watermark never evicts, so a query that
+    # accumulates ten million groups pays a ten-million-row write on every trigger, forever.
+    # A delta costs the *batch's* distinct group count instead, and recovery combines the
+    # newest snapshot with the deltas after it (sound because `combine` is associative and
+    # commutative, invariant #7).
+    #
+    # The interval is what bounds recovery: a longer chain writes less and replays more. Ten
+    # keeps the replay to at most ten combines while cutting the steady-state write cost by
+    # roughly the same factor, and the size rule in
+    # `core.streaming_query.state_policy::write_state` refuses a delta that is not actually
+    # smaller — so a stream whose every batch touches every group falls back to whole
+    # snapshots and can never be worse off than before.
+    checkpoint_delta_interval: int = 10
 
     def __post_init__(self) -> None:
         """Reject a cadence or history that cannot mean anything."""
+        if self.checkpoint_delta_interval < 0:
+            raise ValueError(
+                "streaming.checkpoint_delta_interval must be >= 0 (0 = always snapshot "
+                f"whole state), got {self.checkpoint_delta_interval}"
+            )
         if self.idle_poll_seconds <= 0:
             raise ValueError(
                 f"streaming.idle_poll_seconds must be > 0, got {self.idle_poll_seconds}: "

@@ -31,7 +31,7 @@ from typing import Any
 
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
+from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, as_header_pairs
 
 __all__ = ["PulsarSource"]
 
@@ -175,6 +175,25 @@ class PulsarSource(BrokerSource):
         )
         return self._consumer
 
+    def _split_options(self) -> dict[str, Any]:
+        """The three settings this source consumes by name, so a worker rebuilds them.
+
+        ``num_partitions`` is the load-bearing one: Pulsar does not tell a client how many
+        partitions a topic has, so it is declared — and a split that lost it rebuilt a
+        one-partition reader, which discovers the wrong partition set on the very worker
+        that was given a partition outside it. ``starting_position`` is already normalized
+        to Pulsar's own spelling, which `normalize_starting_position` accepts back
+        unchanged.
+
+        Returns:
+            The constructor keyword arguments this class consumed.
+        """
+        return {
+            "num_partitions": self._num_partitions,
+            "receive_timeout_millis": self._receive_timeout_millis,
+            "starting_position": self._starting_position,
+        }
+
     def _discover_partitions(self) -> list[int]:
         if self._partitions is not None:
             return list(self._partitions)
@@ -225,6 +244,10 @@ class PulsarSource(BrokerSource):
             timestamp=msg.publish_timestamp(),
             topic=msg.topic_name() if hasattr(msg, "topic_name") else self.topic,
             key=msg.partition_key().encode("utf-8") if msg.partition_key() else None,
+            # Pulsar's *properties* are the same idea as Kafka's headers, and they reached
+            # the `headers` column as nulls until now: the option was accepted and the data
+            # silently dropped. Read only when asked for, because it is a per-message dict.
+            headers=(as_header_pairs(_properties(msg)) if self._include_headers else None),
         )
 
     def _poll(self) -> list[BrokerMessage] | None:
@@ -382,4 +405,15 @@ def _deserialize_message_id(token: Any) -> Any:
     try:
         return pulsar.MessageId.deserialize(base64.b64decode(token))
     except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _properties(msg: Any) -> Any:
+    """One Pulsar message's properties, or None on a client that does not expose them."""
+    getter = getattr(msg, "properties", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:  # pragma: no cover - a client whose `properties()` refuses
         return None

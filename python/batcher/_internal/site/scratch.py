@@ -28,6 +28,7 @@ from dataclasses import dataclass
 __all__ = [
     "SCRATCH_CANDIDATES",
     "ScratchVolume",
+    "job_scratch_volume",
     "local_scratch_root",
     "reset_scratch_probe",
     "scratch_volumes",
@@ -43,10 +44,14 @@ SCRATCH_CANDIDATES = (
     "/scratch",
     "/raid",
     "/local",
+    "/local_disk0",
+    "/localscratch",
+    "/lscratch",
     "/mnt/local_disk",
     "/mnt/local_storage",
     "/mnt/localdisk",
     "/mnt/nvme",
+    "/mnt/scratch",
     "/mnt/disks/ssd0",
     "/mnt/resource",
     "/nvme",
@@ -153,6 +158,33 @@ def _measure(path: str) -> ScratchVolume | None:
 
 
 @functools.lru_cache(maxsize=1)
+def job_scratch_volume() -> ScratchVolume | None:
+    """The per-job scratch directory this process's scheduler created, if it is usable.
+
+    Ranked ahead of every mount this module discovers on its own, and that ordering is the
+    point rather than a preference. A scheduler-created job directory is on the execute node's
+    own disk, is private to this job, and is *removed when the job ends* — so a spill that
+    lands there cannot outlive the job and fill a shared mount for the next tenant, which is
+    the failure a site notices weeks later as a cluster that has run out of scratch. Under
+    HTCondor it is stronger still: `_CONDOR_SCRATCH_DIR` is the only directory a job is
+    guaranteed to be able to write to at all.
+
+    Still measured like any other candidate, so a site that points `TMPDIR` at a network home
+    directory is rejected rather than silently spilled to. The 16 GiB floor the discovered
+    mounts are held to deliberately does **not** apply: that floor exists to reject a config
+    mount that merely looks like scratch, and a directory the scheduler made for this job is
+    not that, whatever its size.
+
+    Returns:
+        The measured volume, or `None` when the scheduler named none or it is not usable.
+    """
+    from batcher._internal.site.scheduler import scheduler_scratch_dir
+
+    path = scheduler_scratch_dir()
+    return _measure(path) if path else None
+
+
+@functools.lru_cache(maxsize=1)
 def scratch_volumes() -> tuple[ScratchVolume, ...]:
     """Every usable node-local scratch directory, best first.
 
@@ -189,6 +221,12 @@ def local_scratch_root() -> str | None:
     2. The best measured local volume, by device class then free space.
     3. `None` — no fast local storage is mounted, so the caller's tempdir is already right.
 
+    Deliberately does **not** consult the scheduler's per-job scratch directory, which
+    [`spill_scratch_dir`] prefers. This answers "what is the node's fast local volume", and
+    the callers of *that* question want a location that outlives one job: the model cache is
+    the other one, and pointing it at a directory the scheduler deletes forces every job on
+    the node to re-download tens of gigabytes of weights.
+
     Returns:
         A directory path, or `None`. Never a path that was not verified writable at probe
         time, because a spill that discovers an unwritable scratch mid-query has already lost
@@ -204,10 +242,14 @@ def local_scratch_root() -> str | None:
 def spill_scratch_dir() -> str:
     """The directory a spill will actually land in — configured, measured, or the tempdir.
 
-    The three-step resolution every spill path answers "which disk?" with: the operator's
-    `memory.spill_dir` when they named one, else the best measured local volume, else the
-    system tempdir. Unlike `local_scratch_root` this always returns a path, because the
-    caller is about to write to one.
+    The resolution every spill path answers "which disk?" with: the operator's
+    `memory.spill_dir` when they named one, else the per-job scratch directory the scheduler
+    created, else the best measured local volume, else the system tempdir. Unlike
+    `local_scratch_root` this always returns a path, because the caller is about to write to
+    one.
+
+    The scheduler's directory is preferred here and nowhere else, because a spill is exactly
+    the thing that should not outlive its job — see [`job_scratch_volume`].
 
     It lives here rather than in Carbonite because more than one layer needs it and they must
     agree. When they disagree the failure is quiet: the hardware fingerprint that keys every
@@ -224,9 +266,12 @@ def spill_scratch_dir() -> str:
         configured = active_config().memory.spill_dir
     except Exception:  # pragma: no cover - config unavailable this early in a process
         configured = None
-    return configured or local_scratch_root() or tempfile.gettempdir()
+    job = job_scratch_volume()
+    job_path = job.path if job is not None else None
+    return configured or job_path or local_scratch_root() or tempfile.gettempdir()
 
 
 def reset_scratch_probe() -> None:
-    """Forget the memoized scratch probe, so the next call re-measures the mounts."""
+    """Forget the memoized scratch probes, so the next call re-measures the mounts."""
     scratch_volumes.cache_clear()
+    job_scratch_volume.cache_clear()

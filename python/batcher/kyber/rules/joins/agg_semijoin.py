@@ -41,6 +41,7 @@ reason as `runtime_join_filter`. The rewrite reintroduces a `Join` above the ver
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 from batcher.kyber.pass_base import OptimizerContext
@@ -129,7 +130,7 @@ def push_semijoin_into_decorrelated_aggregate(
     ctx.notes.setdefault("aggregate_semijoin_pushdown", []).append(node.join_type)
     return Join(
         node.left,
-        rewrap(Aggregate(restricted, agg.group_keys, agg.aggregates)),
+        rewrap(dataclasses.replace(agg, input=restricted)),
         node.left_keys,
         node.right_keys,
         node.join_type,

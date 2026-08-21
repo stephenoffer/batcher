@@ -37,8 +37,31 @@ __all__ = [
 
 # Learned-parameter namespace + key for the measured pressure-level flap rate (fraction
 # of samples that reversed direction). One process-wide figure; the hysteresis adapts to it.
+#
+# **Scoped to the machine that measured it**, and to *this* machine explicitly rather than
+# through the ambient `planning_for` scope. Whether a level oscillates is a fact about the box:
+# a 512 GiB node crosses the soft limit once and stays there, while a 16 GiB container crosses
+# it on every morsel — and this store holds exactly **one** key, so unscoped, a laptop, CI and
+# every node of a heterogeneous fleet blend into a single number that stiffens or relaxes the
+# hysteresis of all of them. That is the blend `metadata.hardware_scope` exists to prevent.
+#
+# The explicit local fingerprint matters because the reader and the writer both run on the
+# process whose `PressureMonitor` took the samples, while a distributed run has that process
+# inside a `planning_for(workers)` scope — so deferring to the ambient scope would file the
+# *driver's* oscillation under the *workers'* class, which is the same mis-attribution one
+# step sideways.
 _FLAP_NS = "carbonite.pressure_flap"
 _FLAP_KEY = "rate"
+
+
+def _flap_namespace() -> str:
+    """The flap-rate namespace, keyed to the machine this process runs on."""
+    from batcher._internal.hardware import fingerprint
+    from batcher.metadata.hardware_scope import scoped
+
+    return scoped(_FLAP_NS, fingerprint())
+
+
 # The static default de-escalation weight (kept in sync with `PressureMonitor._EWMA_ALPHA`).
 _DEFAULT_ALPHA = 0.5
 # How strongly a high flap rate stiffens the hysteresis: a fully-flapping history (rate 1.0)
@@ -397,7 +420,7 @@ def load_flap_rate(hub: MetadataHub | None) -> float | None:
 
     Best-effort: any read failure yields `None`, so the hysteresis keeps its static
     default and behavior is unchanged."""
-    return load_scalar(hub, _FLAP_NS, _FLAP_KEY)
+    return load_scalar(hub, _flap_namespace(), _FLAP_KEY)
 
 
 def record_flap_rate(
@@ -409,4 +432,4 @@ def record_flap_rate(
     it here; the value is smoothed so a single noisy run doesn't jerk the hysteresis. A
     scheduling signal only — never a result."""
     rate = min(1.0, max(0.0, flap_rate))
-    record_smoothed_scalar(hub, _FLAP_NS, _FLAP_KEY, rate, config)
+    record_smoothed_scalar(hub, _flap_namespace(), _FLAP_KEY, rate, config)

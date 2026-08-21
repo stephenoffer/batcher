@@ -74,17 +74,46 @@ _CONFIG_EXPORTS = [
 __all__ = [*_api.__all__, *_CONFIG_EXPORTS, "udf", "__version__"]
 
 
-def __getattr__(name: str) -> object:
-    """Turn a failed ``bt.<name>`` lookup into migration guidance (PEP 562).
+#: The public subpackages a user reaches as ``bt.<name>``, resolved lazily on first access.
+#:
+#: They are not imported at package load on purpose: `ml` pulls in the whole model surface,
+#: and every ``import batcher`` would pay for it whether or not the script does inference.
+#: But they were not reachable *at all* — ``bt.ml.vllm_engine(...)`` raised
+#: ``AttributeError``, which is the spelling every docstring and documentation page uses,
+#: because `io`, `config` and `governance` happen to be imported transitively by `api` and
+#: `ml` and `graph` do not. Nothing caught it: the examples that use this spelling all need a
+#: GPU or a model, so every one of them carries `+SKIP` and none has ever run.
+_PUBLIC_SUBPACKAGES = ("config", "governance", "graph", "io", "ml")
 
-    A migrant types the top-level name they know from pandas, Polars, or PySpark
-    (``bt.DataFrame``, ``bt.SparkSession``, ``bt.scan_csv``); the traceback names the
-    Batcher spelling instead of a bare ``module 'batcher' has no attribute``. Only
-    reached for names not already bound above, so it never shadows the real surface.
+
+def __getattr__(name: str) -> object:
+    """Resolve a public subpackage lazily, or turn the lookup into guidance (PEP 562).
+
+    ``bt.ml``/``bt.graph`` import on first touch, so the documented spelling works in a fresh
+    interpreter without every ``import batcher`` paying for the ML stack. Anything else is a
+    migrant typing the top-level name they know from pandas, Polars, or PySpark
+    (``bt.DataFrame``, ``bt.SparkSession``, ``bt.scan_csv``), and the traceback names the
+    Batcher spelling instead of a bare ``module 'batcher' has no attribute``. Only reached for
+    names not already bound above, so it never shadows the real surface.
+
+    Args:
+        name: The attribute that was not found on the module.
+
+    Returns:
+        The imported subpackage when `name` is one of the public subpackages.
+
+    Raises:
+        AttributeError: For any other name, carrying the migration hint.
     """
     # Dunder and private probes (import machinery, IPython, copy) must fail plainly.
     if name.startswith("_"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in _PUBLIC_SUBPACKAGES:
+        import importlib
+
+        module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module  # bind it, so the next lookup never reaches here
+        return module
     from batcher.api.session.onboarding import top_level_attribute_error
 
     raise top_level_attribute_error(name, __all__)

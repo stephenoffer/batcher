@@ -21,6 +21,7 @@ from batcher.plan.logical import Aggregate, Join, LogicalPlan, Project, Scan
 
 __all__ = [
     "children",
+    "reparent_unvalidated",
     "scanned_source_ids",
     "transform_down",
     "transform_up",
@@ -154,6 +155,47 @@ def with_children(node: LogicalPlan, new_children: list[LogicalPlan]) -> Logical
         # else: an ambiguous slot that is currently `None` consumed no child, so the
         # `new_children` cursor is not advanced and the field is left untouched.
     return node if not changes else dataclasses.replace(node, **changes)
+
+
+def reparent_unvalidated(node: LogicalPlan, **changes: object) -> LogicalPlan:
+    """`node` with `changes` applied, *without* re-running its `__post_init__` validation.
+
+    `dataclasses.replace` is the normal way to do this and is right almost everywhere: an
+    optimizer rewrite rebuilds a node onto a real input, so re-validating catches a rule that
+    produced a plan referencing a column its input does not have.
+
+    It is wrong in exactly one place — rebuilding a node onto a **stage boundary**. When the
+    distributed executor splits a plan into resource stages, each later stage is re-parented
+    onto a stand-in `Scan` representing the upstream stage's published morsels, and that scan
+    carries an empty schema because a `MapBatches` cannot report its output *types* through an
+    opaque `fn` (`available_schema()` returns `None` by design). Re-validating a `Project` or
+    `Filter` against that stand-in asks a question it was never able to answer, and the node
+    fails with ``references unknown column(s) ... available: []``. So any
+    ``map_batches(...).select(...)`` or ``.filter(...)`` — score then narrow, the ordinary
+    shape of batch inference — raised under ``distributed=True`` while working single-node.
+
+    Skipping the check is sound, not a workaround: these nodes were validated against their
+    real input when the plan was built, and every `__post_init__` on them is validation-only,
+    so nothing is normalized away by not running it. Giving the boundary scan the upstream's
+    column *names* was the alternative and is worse: that schema is also the one consulted when
+    the upstream yields no rows, so inventing types to pair with the names is the silent
+    wrong-column-type defect the device tier documents.
+
+    Use this only where the new input is a stand-in. Everywhere else `dataclasses.replace` and
+    `with_children` are correct, and their validation is worth keeping.
+
+    Args:
+        node: The node to rebuild, already validated against its original input.
+        changes: Fields to replace, by name.
+
+    Returns:
+        A new node of the same type with `changes` applied and every other field copied.
+    """
+    clone = object.__new__(type(node))
+    for field in dataclasses.fields(node):
+        value = changes[field.name] if field.name in changes else getattr(node, field.name)
+        object.__setattr__(clone, field.name, value)
+    return clone
 
 
 def transform_up(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) -> LogicalPlan:

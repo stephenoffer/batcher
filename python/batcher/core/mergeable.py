@@ -102,18 +102,33 @@ class RunningAggregate:
             else self._nat.combine(self._keys, self._aggs, [self._running, partial])
         )
 
-    def push(self, rows: Sequence[pa.RecordBatch]) -> None:
+    def push(self, rows: Sequence[pa.RecordBatch]) -> pa.RecordBatch | None:
         """Partial-aggregate `rows` and fold them into the running state.
 
         Empty input is a no-op, so a batch that filters away leaves the state — and
         therefore the finalized result — untouched.
 
+        The partial is **returned as well as absorbed**, because it is exactly the
+        changelog entry an incremental checkpoint needs. `combine` is associative and
+        commutative by invariant #7, so the running state after n pushes is the combination
+        of the n partials — which means a checkpoint can persist the partials and rebuild
+        the state from them, instead of rewriting the whole state every micro-batch. The
+        partial is bounded by the *batch's* distinct group count; the state is bounded by
+        the query's. On a high-cardinality stream those differ by orders of magnitude, and
+        the difference is what the per-epoch checkpoint costs. See
+        `core.streaming.folds._AggFold.take_delta`.
+
         Args:
             rows: Input batches to fold in.
+
+        Returns:
+            The partial that was folded in, or None when `rows` carried nothing.
         """
         if not rows or not sum(b.num_rows for b in rows):
-            return
-        self.absorb(self.partial(rows))
+            return None
+        partial = self.partial(rows)
+        self.absorb(partial)
+        return partial
 
     def combine_all(self, partials: Sequence[pa.RecordBatch]) -> None:
         """Replace the running state with the combination of `partials`.

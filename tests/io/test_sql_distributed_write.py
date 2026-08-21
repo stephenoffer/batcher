@@ -34,6 +34,9 @@ from batcher.io.formats.sql.snowflake import SnowflakeSink
 
 pytestmark = pytest.mark.unit
 
+#: The dispositions that discard rows a shard did not write.
+_DESTRUCTIVE = {"replace", "create"}
+
 
 class _Cursor:
     def __init__(self, log: list[tuple[str, int, str | None]]) -> None:
@@ -90,11 +93,19 @@ def test_adbc_single_shard_write_may_still_replace(ingest_log) -> None:
 
 
 def test_adbc_append_is_safe_across_shards(ingest_log) -> None:
+    """Every shard ingests its own rows, and none of them discards another's.
+
+    The disposition that reaches ADBC is ``create_append`` rather than ``append``: Batcher's
+    save mode ``append`` means "add these rows to the table" and, like Spark's
+    `SaveMode.Append`, creates the table when it is absent, where ADBC's own ``append``
+    fails there instead. Both are non-destructive, which is what this test is about.
+    """
     sink = ADBCSink(driver="d", db_kwargs={}, mode="append")
     for index in range(3):
         sink.write_partitioned(_shard(index), "orders", file_index=index)
     assert [rows for _, rows, _ in ingest_log] == [2, 2, 2]
-    assert {mode for *_, mode in ingest_log} == {"append"}
+    assert {mode for *_, mode in ingest_log} == {"create_append"}
+    assert not {mode for *_, mode in ingest_log} & _DESTRUCTIVE
 
 
 def test_adbc_default_mode_is_safe_across_shards(ingest_log) -> None:

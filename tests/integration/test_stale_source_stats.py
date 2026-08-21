@@ -36,13 +36,25 @@ def _clean_cache():
     _SOURCE_STATS_CACHE.clear()
 
 
+def _cached_for(path: str) -> list[str]:
+    """The memo keys held for `path`, whatever content version they were saved under.
+
+    The key is the source's identity qualified by its content version (`_cache_key`), so it
+    reads `parquet:<path>@<version>` rather than `parquet:<path>`. Matching the prefix is what
+    `invalidate_source_stats` itself does; asserting one exact spelling pinned the key format
+    instead of the eviction, and broke when the version qualifier arrived.
+    """
+    prefix = f"parquet:{path}"
+    return [k for k in _SOURCE_STATS_CACHE if k == prefix or k.startswith(prefix + "@")]
+
+
 def test_a_write_evicts_the_cached_statistics_for_that_path(tmp_path):
     path = str(tmp_path / "t.parquet")
     bt.from_pydict({"id": [1]}).write(path, format="parquet")
     bt.read.parquet(path).count()  # populates the memo
-    assert f"parquet:{path}" in _SOURCE_STATS_CACHE
+    assert _cached_for(path), f"the read cached nothing for {path}: {list(_SOURCE_STATS_CACHE)}"
     bt.from_pydict({"id": [2]}).write(path, format="parquet")
-    assert f"parquet:{path}" not in _SOURCE_STATS_CACHE
+    assert not _cached_for(path), f"the write left {_cached_for(path)} behind"
 
 
 def test_invalidate_uses_the_same_key_the_reader_caches_under(tmp_path):

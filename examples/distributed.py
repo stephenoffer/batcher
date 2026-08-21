@@ -2,8 +2,12 @@
 """Distributed execution: the same code, single-node or on a cluster.
 
 Scaling out is a deployment change, not a rewrite. The identical pipeline runs on one
-core or across Ray workers, and the result is bit-identical because every stateful
-operator is built from mergeable ``partial → combine → finalize`` primitives. Ray is
+core or across Ray workers, and the result is the same rows with the same column names
+and types because every stateful operator is built from mergeable
+``partial → combine → finalize`` primitives. A float reduction is the one stated
+exception: ``combine`` is associative in exact arithmetic and IEEE addition is not, so
+the partition count changes the summation order and the answer agrees to the last bits
+rather than to every bit. Ray is
 used for scheduling only; bulk data moves over Arrow Flight, never the object store.
 
 This runs against a *local* Ray cluster (Ray spins one up in-process), so it works on a

@@ -353,6 +353,9 @@ def _write_plan_shard(
     * `num_files`, which names a total and so cannot be resolved before the rows are
       counted. `target_bytes_per_file` is estimated from the first chunk's bytes-per-row
       instead, since it asks for a size rather than a count.
+
+    A **table** sink materializes for a third reason, and takes an entirely different exit:
+    it has no files at all. See `_write_table_shard`.
     """
     nat = engine()
     from batcher.dist.executors.partition_io import (
@@ -362,6 +365,8 @@ def _write_plan_shard(
     from batcher.io.sink import SINKS
 
     sink = SINKS.get(fmt)(**(sink_kwargs or {}))
+    if not hasattr(sink, "write_stream_shard"):
+        return _write_table_shard(sink, nat, map_ir, partition, engine_config, path, idx)
     if partition_by or (layout is not None and layout.num_files is not None):
         batches = read_partition_descriptor(partition)
         out = nat.execute_plan(map_ir, [batches], engine_config) if batches else []
@@ -404,6 +409,61 @@ def _write_plan_shard(
         file_index=idx,
         resume=resume,
     )
+
+
+def _write_table_shard(
+    sink: Any,
+    nat: Any,
+    map_ir: str,
+    partition: dict,
+    engine_config: str,
+    path: str,
+    idx: int,
+) -> list[WrittenFile]:
+    """Write one shard into a **table** sink, which has no files to lay out.
+
+    Every other exit from `_write_plan_shard` speaks the file-shard protocol: `resume`
+    skips a ``part-{idx}`` already present, `max_rows_per_file` rolls one shard into
+    several, and `write_stream_shard` encodes a shard without materializing it. None of
+    those means anything for a database table, a collection, or a key prefix — there is no
+    part file to skip, no file to roll over, and no encoder to stream into.
+
+    So the table sinks implement the narrow ``write_partitioned(table, path, *,
+    partition_by, file_index)`` and nothing else, and every distributed write to one died
+    inside a Ray worker with ``TypeError: write_partitioned() got an unexpected keyword
+    argument 'resume'`` — ADBC, Snowflake and MongoDB included, since long before the rest
+    of the table sinks existed. It was invisible to the gate twice over: CI installs no Ray,
+    and `tests/io/test_sql_distributed_write.py` calls `write_partitioned` directly, so the
+    suite that exists to pin distributed-write safety exercised a method the real path could
+    never reach.
+
+    The shard is **materialized** rather than streamed, and that is a deliberate bound
+    rather than an oversight. A table sink applies whatever rows it is handed as one unit —
+    for a SQL sink, one transaction — and an `overwrite` re-applied per chunk would have
+    each chunk discard the one before it, which is the same defect `write_partitioned`
+    refuses across shards. Per-worker memory is therefore one shard's output; raise the
+    shard count to lower it.
+
+    Args:
+        sink: The table sink, already constructed on this worker.
+        nat: The native engine handle.
+        map_ir: The breaker-free plan to run over this shard.
+        partition: This shard's durable partition descriptor.
+        engine_config: The serialized engine config.
+        path: The destination table / collection / prefix.
+        idx: This shard's index, which the sink uses to refuse a destructive mode past the
+            first shard.
+
+    Returns:
+        The `WrittenFile` records this shard produced, or empty when it had no rows.
+    """
+    from batcher.dist.executors.partition_io import read_partition_descriptor
+
+    batches = read_partition_descriptor(partition)
+    out = nat.execute_plan(map_ir, [batches], engine_config) if batches else []
+    if not out or sum(b.num_rows for b in out) == 0:
+        return []
+    return sink.write_partitioned(pa.Table.from_batches(out), path, file_index=idx)
 
 
 def _map_stream(nat: Any, map_ir: str, batches: Any, engine_config: str) -> Any:

@@ -372,9 +372,9 @@ fn exec_seq(
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
-            let out = match ops::materialize(&batches) {
-                Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
-                Err(_) => Vec::new(),
+            let out = match ops::materialize_opt(&batches)? {
+                Some(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
+                None => Vec::new(),
             };
             record_breaker(
                 m,
@@ -400,15 +400,15 @@ fn exec_seq(
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
-            let out = match ops::materialize(&batches) {
-                Ok(combined) => vec![ops::window_batch(
+            let out = match ops::materialize_opt(&batches)? {
+                Some(combined) => vec![ops::window_batch(
                     &combined,
                     partition_keys,
                     order_keys,
                     functions,
                     *rank_limit,
                 )?],
-                Err(_) => Vec::new(),
+                None => Vec::new(),
             };
             record_breaker(
                 m,

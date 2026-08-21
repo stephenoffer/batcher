@@ -169,6 +169,86 @@ Sorting to make a *later* operator cheaper is usually wasted too. A {py:meth}`gr
 it does not need sorted input, and a `join` builds a hash table. Sort at the end, once,
 for presentation or for the file layout you are writing.
 
+## What makes a sort fast
+
+The key's *type* decides which algorithm runs, and the difference is large enough to be worth
+knowing when you have a choice of key.
+
+A fixed-width key, such as an integer, a date or a timestamp, sorts by a counting sort over an
+order-preserving integer, which is linear in the rows. A string key has to compare bytes. Where
+a column is available in both forms, ordering by the fixed-width one is materially cheaper, and
+ordering by an `id` and rendering the label afterwards is cheaper still.
+
+Sorting by **several** fixed-width keys is not more expensive than sorting by one, as long as
+their combined value ranges are narrow. The engine measures each key's live range and packs the
+whole tuple into a single integer, so `ORDER BY <date>, <priority>` costs about what
+`ORDER BY <date>` costs. Mixed directions are free, and so is a key that turns out to be
+constant.
+
+| Leading key | What runs |
+| --- | --- |
+| One integer, date, or timestamp | counting sort over an integer transform |
+| Several integer/temporal keys, ranges narrow enough to pack | the same counting sort, over one packed integer |
+| A string or a binary column, up to 8 bytes wide | the same counting sort, over the key's own bytes |
+| A wider string or binary column | byte comparisons, with the first 8 bytes carried inline |
+| A float, or keys too wide to pack | a comparison sort over Arrow's row encoding |
+
+```python
+import datetime as dt
+
+events = bt.from_pydict(
+    {
+        "day": [dt.date(2026, 3, 2), dt.date(2026, 3, 1), dt.date(2026, 3, 2)],
+        "priority": [2, 1, 1],
+        "label": ["c", "a", "b"],
+    }
+)
+print(events.sort("day", "priority", descending=[False, True]).to_pydict()["label"])
+# ['a', 'c', 'b']
+```
+
+None of this changes the answer, only the time. If the key you have is a string, sort on it.
+The point is to reach for a fixed-width key when one is genuinely available, rather than to
+reshape data around the sort.
+
+### Binary keys
+
+A `binary` column is a first-class sort key and is ordered by the same byte comparison a string
+is, so a hash, a UUID, a checksum, or a key you encoded yourself sorts without being decoded
+first. All three Arrow spellings work and order identically: variable-length `binary` and
+`large_binary`, and fixed-width `binary(n)`.
+
+```python
+import pyarrow as pa
+
+records = pa.table(
+    {
+        "key": pa.array([b"\x02\x00", b"\x00\xff", b"\x01\x7f"], type=pa.binary(2)),
+        "payload": ["c", "a", "b"],
+    }
+)
+print(bt.from_arrow(records).sort("key").to_pydict()["payload"])
+# ['a', 'b', 'c']
+```
+
+Prefer `binary(n)` when your values are genuinely fixed width, for the key and for the payload
+alike. It costs no offset buffer; the engine can prove that a padded comparison of its bytes is
+exact, which a variable-length column holding a zero byte does not allow; and moving it through
+a sort is a fixed-stride copy rather than an offset chase, which is the cheapest gather there
+is.
+
+A binary key distributes like any other: `collect(distributed=True)` range-partitions on sampled
+byte quantiles and each worker sorts its own range, so a sort whose keys are bytes is not capped
+at one machine.
+
+That holds even when the key is badly skewed. A range partition keeps equal keys together, so
+one dominant value would otherwise pin its whole share on a single worker no matter how many you
+add; the engine detects that from the sample and gives the value a bucket of its own, spread
+across several workers. You do not configure it, and it does not change the result.
+
+`examples/relational/sorting_binary_keys.py` works all of this end to end, including null
+placement and the fixed-layout record shape.
+
 ## Sorting large results: spill
 
 A sort that does not fit in the memory budget spills sorted runs to disk and merges
@@ -210,6 +290,8 @@ ds.sort("team", "score").repartition(by="team").write("out/")
 - {doc}`Performance </user-guide/operate/tuning/performance>`: the spill path and the memory budget.
 - {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the run generation and k-way merge
   that make the spilled result identical to the in-memory one.
+- {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`: what happens to a distributed sort as
+  the cluster grows, and how a skewed key is kept from pinning one worker.
 - {doc}`Dataset API </api/relational/dataset>`: the `sort`, `top_k`, and `limit` reference.
 - {doc}`Top k per group </cookbook/analytics/aggregates/top-k-per-group>`: the window recipe, worked
   end to end.

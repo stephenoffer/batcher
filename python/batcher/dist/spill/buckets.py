@@ -199,12 +199,34 @@ def resident_bytes(handle: SpillHandle | None) -> int:
 
 
 def bucket_envelope() -> int:
-    """The configured per-bucket memory envelope, `<= 0` when unbounded.
+    """The per-bucket memory envelope — the configured ceiling, capped by the budget.
+
+    `<= 0` when unbounded.
+
+    This used to return `spill_bucket_max_bytes` alone, and that default is a fixed 128 MiB.
+    Because a bucket is read back **whole**, the envelope is the one number that has to track
+    the memory budget, and it did not: lowering `max_memory_bytes` to 1 MiB still authorized
+    128 MiB buckets. Every consumer inherited it — the ordered sizer cut a *single* bucket for
+    a 7 MiB input, and `over_envelope` (the aggregate, join and partitioned-window grace
+    recursion) never fired at all, because no bucket under a small budget ever reached the
+    128 MiB trigger. So the out-of-core paths were not bounded by the envelope they exist to
+    respect, and the failure surfaces as the engine refusing a bucket rather than as anything
+    a result can show.
+
+    `MemoryConfig.streaming_state_budget_bytes` resolves the same tension the same way, for
+    the reason it gives: a cap has to scale with the configured envelope rather than be a
+    fixed magic number. This is the `min` of the two, so an explicit `spill_bucket_max_bytes`
+    still lowers the bucket and never raises it above what can be read back.
 
     Returns:
-        `MemoryConfig.spill_bucket_max_bytes` from the active config.
+        The per-bucket byte ceiling, or `<= 0` when the user opted out of any bound.
     """
-    return active_config().memory.spill_bucket_max_bytes
+    config = active_config()
+    configured = config.memory.spill_bucket_max_bytes
+    budget = config.spill_budget_bytes()
+    if budget <= 0:  # explicit `unbounded_memory` — the caller declined a bound
+        return configured
+    return min(configured, budget) if configured > 0 else budget
 
 
 # How many times a bucket still over the envelope may be re-split, and how many ways.

@@ -163,7 +163,10 @@ STR_UNSUPPORTED: dict[str, str] = {
     "extractall": "Spelled .str.extract_all(pattern) here.",
     "find": "The index of a substring is .str.position(sub).",
     "findall": "All matches are .str.extract_all(pattern) or .str.regexp_extract_all(pattern).",
-    "fullmatch": ".str.match(pattern) anchors a full-string match.",
+    "fullmatch": (
+        ".str.match(pattern) anchors the start only, as pandas .str.match does; "
+        "anchor the end yourself with .str.regexp_matches('^(?:pattern)$')."
+    ),
     "get": "The i-th character is .str.slice(i, 1).",
     "index": "The index of a substring is .str.position(sub).",
     "isdecimal": "Spelled .str.isdigit() / .str.is_numeric() here.",

@@ -30,6 +30,25 @@ __all__ = ["ADBCSink"]
 #: single writer; ruinous when every shard of a distributed write applies one.
 _DESTRUCTIVE_MODES = frozenset({"replace", "create"})
 
+#: Batcher save mode → the `adbc_ingest` disposition that means the same thing.
+#:
+#: These are the two spellings `ds.write` itself uses, and neither reached this sink before:
+#: `mode` was consumed by the writer's save-mode gate and dropped, so `ds.write.sql(table,
+#: mode="overwrite")` — the default — silently *appended*, and `mode="append"` was refused
+#: outright as unsupported for this format. A save mode that quietly does the opposite of
+#: what it says is a data-corruption bug rather than a missing feature.
+#:
+#: ``append`` maps to ``create_append`` rather than to ADBC's own ``append``, and this
+#: mapping is checked **before** the passthrough below so the save mode wins the collision.
+#: Batcher's save mode means "add these rows to the table", and Spark's `SaveMode.Append`
+#: creates the table when it is absent; ADBC's ``append`` fails there instead, which would
+#: make the first run of a pipeline fail and every later one succeed.
+_SAVE_MODE_DISPOSITIONS = {"append": "create_append", "overwrite": "replace"}
+
+#: The `adbc_ingest` dispositions, which remain accepted verbatim for callers who want the
+#: distinction between ``create``, ``append`` and ``create_append`` that ADBC draws.
+_INGEST_MODES = frozenset({"create", "append", "replace", "create_append"})
+
 
 @SINKS.register("adbc")
 @dataclass(frozen=True, slots=True)
@@ -40,8 +59,9 @@ class ADBCSink:
         driver: The ADBC driver to load.
         db_kwargs: Driver/database connection kwargs (never logged).
         conn_kwargs: Extra ``connect()`` kwargs.
-        mode: Ingest disposition passed to ``adbc_ingest`` (``"create"``,
-            ``"append"``, ``"replace"``, ``"create_append"``).
+        mode: Either a Batcher save mode — ``"append"`` (create the table if absent, then
+            add) or ``"overwrite"`` (replace it) — or an ``adbc_ingest`` disposition
+            verbatim (``"create"``, ``"append"``, ``"replace"``, ``"create_append"``).
         uri: A standard connection URI (``postgresql://host:5432/db``) supplying
             `driver` and `db_kwargs`, exactly as `ADBCSource` accepts.
         password: The password, as a literal or an ``env:``/``file:`` reference
@@ -62,6 +82,15 @@ class ADBCSink:
     def __post_init__(self) -> None:
         from batcher._internal.errors import BackendError
 
+        disposition = _SAVE_MODE_DISPOSITIONS.get(self.mode)
+        if disposition is not None:
+            object.__setattr__(self, "mode", disposition)
+        elif self.mode not in _INGEST_MODES:
+            raise BackendError(
+                f"unknown ADBC write mode {self.mode!r}; expected a save mode "
+                f"({', '.join(sorted(_SAVE_MODE_DISPOSITIONS))}) or an adbc_ingest "
+                f"disposition ({', '.join(sorted(_INGEST_MODES))})."
+            )
         if self.uri is not None:
             from batcher.io.formats.sql.uri import adbc_connection
 

@@ -6,7 +6,7 @@ Read a collection into Arrow, write a dataset back as bulk upserts. Both directi
 | | |
 | --- | --- |
 | **Read** | {py:meth}`bt.read.mongo(uri=..., database=..., collection=...) <batcher.api.io_namespace.reader.Reader.mongo>` |
-| **Write** | {py:meth}`ds.write.mongo(collection, uri=..., database=...) <batcher.api.io_namespace.writer.Writer.mongo>`, a bulk upsert on `key_field` |
+| **Write** | {py:meth}`ds.write.mongo(collection, uri=..., database=..., mode=...) <batcher.api.io_namespace.writer.Writer.mongo>`, one bulk round trip: upsert, append, overwrite, or delete |
 | **Extra** | `pip install 'batcher-engine[mongo]'` |
 | **Parallelism** | Off by default. `PartitionSpec(segments=N)` splits the `_id` range. |
 | **Pushdown** | Predicates become a Mongo filter document, AND-merged into the `find` |
@@ -116,8 +116,16 @@ documents.
 
 ## Write
 
-`ds.write.mongo(collection, uri=..., database=...)` upserts every row, keyed on `key_field`
-(default `_id`), in one `bulk_write` per batch. Not a per-row round trip.
+`ds.write.mongo(collection, uri=..., database=...)` applies every row in one `bulk_write` per batch, never a per-row round trip. `mode` says what it applies:
+
+| Mode | Effect |
+| --- | --- |
+| `upsert` (default) | Replace the document holding the same `key_field`, or insert if absent. |
+| `append` | Insert every row. An `_id` collision is an error rather than a silent replace. |
+| `overwrite` | Empty the collection, then insert. |
+| `delete` | Remove the documents named by `key_field`. |
+
+`mode` defaults to `upsert` rather than to `ds.write`'s usual `overwrite`: a collection is a store that is maintained rather than replaced, and defaulting to the destructive mode would empty it on a call that never said so.
 
 ```python
 # docs: skip
@@ -164,16 +172,21 @@ splits, but the ranges will not be balanced.
 consumes it. If you see cursor-not-found errors on a long job, the fix is a smaller `segments`
 count with a faster drain, not a bigger timeout.
 
-**No transactions.** The bulk upsert is `ordered=False` and there is no commit phase. A write that
-fails halfway leaves the documents it already upserted in place. Idempotency on the key is your
+**No transactions.** The bulk write is `ordered=False` and there is no commit phase. A write that
+fails halfway leaves the documents it already applied in place. Idempotency on the key is your
 recovery story; there is no rollback.
+
+**`overwrite` is single-node only.** Past the first shard of a distributed write it is refused,
+because every shard would empty the one collection they all target and so discard the shards before
+it. Distribute an `upsert` instead, which only ever touches the keys its own rows name.
 
 ## See also
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, pushdown.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: sinks, modes, and idempotent re-runs.
+- {doc}`Writing to a database </integrations/databases/writing>`: the same mode vocabulary across SQL and the operational stores.
 - {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: the shape that ends in an upsert to
   a serving collection.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the {py:class}`Source <batcher.io.Source>`/{py:class}`Sink <batcher.io.Sink>`/{py:class}`Split <batcher.io.Split>` protocol.
 - {doc}`I/O API </api/relational/io>`: the full reader/writer reference.
-- {doc}`Elasticsearch </integrations/databases/elasticsearch>`: the other document store, read-only.
+- {doc}`Elasticsearch </integrations/databases/elasticsearch>`: the other document store, with the same write vocabulary.

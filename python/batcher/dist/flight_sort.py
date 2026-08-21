@@ -42,7 +42,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
-from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_fleet
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
@@ -50,8 +50,8 @@ from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_re
 from batcher.dist.sort_boundaries import (
     load_learned_grids,
     persist_grids,
+    sort_grid_kind,
     sort_key_identity,
-    sort_key_is_string,
     sort_shape_key,
 )
 from batcher.io.source import Source
@@ -230,6 +230,9 @@ def execute_sort_flight(
     _ps = _tt.perf_counter()
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
+    # See `fleet.borrows_session_fleet`: asked before the acquire, because that is the only
+    # point at which the three acquisition branches can still be told apart.
+    borrows_session = borrows_session_fleet()
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     # A sort exchanges raw rows and sorts one bucket at a time, so the bucket count is what
     # bounds the run a reducer materializes. Sized by volume, never below the floor.
@@ -302,9 +305,9 @@ def execute_sort_flight(
         # silently puts the whole input in a single bucket. See
         # `dist/sort_boundaries.sort_shape_key`. `expect_strings` re-checks on load, so an
         # entry written under the old colliding digest re-samples instead of raising.
-        key_is_str = sort_key_is_string(sources[sid], key_name)
+        key_kind = sort_grid_kind(sources[sid], key_name)
         shape_key = sort_shape_key(map_ir, key_name, sort_key_identity(sources[sid], key_name))
-        grids = load_learned_grids(shape_key, key_is_str)
+        grids = load_learned_grids(shape_key, key_kind)
         learned = grids is not None
         if not learned:
             # The grid is sized against the *bucket* count rather than fixed: `n_buckets`
@@ -421,7 +424,9 @@ def execute_sort_flight(
             # A borrowed fleet is the query's (freed once by the adaptive loop), so the
             # source must not own it; only a self-spawned fleet is handed over to tear down.
             src_actors, src_pg = (actors, pg) if owns else (None, None)
-            return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+            return FlightMaterializedSource(
+                handles, schema, src_actors, src_pg, session_lease=borrows_session and not owns
+            )
     finally:
         # Collect what the workers measured before anything below can kill them. Nothing
         # subscribes to the event bus inside a Ray worker, so the measurements are pulled;

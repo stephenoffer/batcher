@@ -193,6 +193,50 @@ def _isolate_metadata_hub():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cpu_probe():
+    """Drop the windowed CPU-contention reading around every test.
+
+    `hardware.cpu.cpu_contention` reuses its reading for `_CONTENTION_TTL_S` (50 ms), because
+    every signal in it is a one-minute load average or a counter ratio and the ~30 microsecond
+    `/proc` parse sits on the per-query control path. A test that stubs `os.getloadavg` or the
+    cgroup readers and then asks for the level runs in well under 50 ms, so without this it is
+    answered from whatever the *previous* test measured — the same hazard, and the same fix, as
+    `_isolate_topology_cache` below.
+
+    Looked up in `sys.modules` rather than imported, for the reason given there: only code that
+    already imported the module can have populated the window.
+    """
+    yield
+    cpu = sys.modules.get("batcher._internal.hardware.cpu")
+    if cpu is not None:
+        cpu.reset_cpu_probe()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ray_task_wrapping():
+    """Un-wrap the Ray-remote task functions after any test that caused them to be wrapped.
+
+    `ray_runtime._wrap_tasks` rebinds module-level names in place — `aggregate._reduce_task`
+    and eighteen others become `RemoteFunction`s the moment anything brings Ray up — and the
+    binding outlives the test that caused it. A later test in the same worker that calls one
+    of those functions *directly* then fails with `TypeError: Remote functions cannot be
+    called directly`, from a module it never touched.
+
+    That makes the failure a function of test order, and under `pytest-xdist` test order is a
+    function of the worker count: the same suite on the same binary read 0, 17 and 45 failures
+    across three runs, every one of them in a file that passes on its own. Restoring the
+    originals between tests removes the coupling rather than the symptom.
+
+    Looked up in `sys.modules` rather than imported, for the reason `_isolate_topology_cache`
+    gives below: only code that already imported the module can have wrapped anything.
+    """
+    yield
+    lifecycle = sys.modules.get("batcher.dist.executors.ray_runtime.lifecycle")
+    if lifecycle is not None:
+        lifecycle.restore_unwrapped_tasks()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_topology_cache():
     """Drop the windowed cluster-shape reads around every test.
 

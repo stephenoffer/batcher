@@ -29,6 +29,11 @@ from typing import TYPE_CHECKING, Any
 from batcher._internal.accelerators import VISIBLE_DEVICE_ENVS
 from batcher._internal.errors import PlanError
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
+from batcher._internal.hardware.devices import (
+    device_memory_used_fraction,
+    device_total_memory_bytes,
+)
+from batcher._internal.hardware.nvml import nvml_session
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.metadata.hardware_scope import scoped
@@ -348,10 +353,11 @@ _CONTEXT_OVERHEAD_GB = {
     "xpu": 0.3,
     "mps": 0.0,
     "tpu": 0.0,
-    # Neuron (Trainium/Inferentia) and Gaudi manage device memory through their own runtimes
-    # rather than a CUDA-style context reserve, so no separate host-side overhead is budgeted.
+    # Neuron (Trainium/Inferentia), Gaudi and Ascend manage device memory through their own
+    # runtimes rather than a CUDA-style context reserve, so no host-side overhead is budgeted.
     "neuron": 0.0,
     "hpu": 0.0,
+    "npu": 0.0,
     "cpu": 0.0,
 }
 # Budget peak inference VRAM at ~1.5x model size (activations + batch tensors). This is
@@ -441,7 +447,8 @@ def torch_device(backend: str | None = None) -> str:
 
     ROCm uses the ``cuda`` device string (HIP shims the CUDA API); Intel is ``xpu``,
     Apple ``mps``, a TPU and AWS Neuron (Trainium/Inferentia) are ``xla`` (both run through
-    torch_xla), Intel Gaudi is ``hpu`` (habana_frameworks), and CPU ``cpu``.
+    torch_xla), Intel Gaudi is ``hpu`` (habana_frameworks), Huawei Ascend is ``npu``
+    (torch_npu), and CPU ``cpu``.
 
     An unrecognized backend degrades to ``cpu`` rather than raising. This is a mapping of
     *names*, and the names come from places this function does not control — a caller
@@ -459,6 +466,7 @@ def torch_device(backend: str | None = None) -> str:
         "tpu": "xla",
         "neuron": "xla",  # torch-neuronx runs through XLA, same as Cloud TPU
         "hpu": "hpu",  # Intel Gaudi via habana_frameworks
+        "npu": "npu",  # Huawei Ascend via torch_npu
         "cpu": "cpu",
     }.get(b, "cpu")
 
@@ -468,26 +476,20 @@ def vram_context_overhead(backend: str | None = None) -> float:
     return _CONTEXT_OVERHEAD_GB.get(backend or detect_backend(), 0.4)
 
 
-@functools.cache
-def _nvml() -> Any | None:
-    """The initialized NVML module (`pynvml`) for this process, or `None`.
-
-    NVML is initialized **once** and held open for the process lifetime rather than
-    `nvmlInit`/`nvmlShutdown` around every sample: VRAM and utilization are sampled
-    per batch (the throughput autobatcher's live cap, the adaptive `num_gpus` loop),
-    so a driver init/shutdown handshake per call is pure per-batch overhead. The
-    session is refcounted and released at process exit. `None` when `pynvml` is
-    absent, NVML won't initialize, or the host exposes no devices — a stable fact for
-    a worker process, so caching the negative is correct."""
-    try:
-        import pynvml  # type: ignore[import-not-found]
-
-        pynvml.nvmlInit()
-        if pynvml.nvmlDeviceGetCount() == 0:
-            return None
-        return pynvml
-    except Exception:
-        return None
+#: The process's one NVML session, shared with `_internal.hardware.nvml` rather than opened a
+#: second time here.
+#:
+#: NVML is initialized **once** and held open for the process lifetime rather than
+#: `nvmlInit`/`nvmlShutdown` around every sample: VRAM and utilization are sampled per batch
+#: (the throughput autobatcher's live cap, the adaptive `num_gpus` loop), so a driver
+#: handshake per call is pure per-batch overhead.
+#:
+#: It is a binding rather than a wrapper because the *cache* has to be shared too, not just
+#: the behaviour. This module used to define its own `nvmlInit`, so a single utilization
+#: sample opened two sessions — this one, and the one `_visible_device_indices` reaches
+#: through `device_scope` — and clearing one memo left the other holding a stale module.
+#: Sharing the object makes `_nvml.cache_clear()` and `reset_nvml_probe()` the same act.
+_nvml = nvml_session
 
 
 @functools.cache
@@ -495,7 +497,10 @@ def _nvml_handles() -> tuple[Any, ...]:
     """Per-device NVML handles for this process (empty when NVML is unavailable).
 
     Cached alongside the session: a handle lookup is cheap, but resolving it once keeps
-    the per-sample path a bare counter read with no repeated device enumeration."""
+    the per-sample path a bare counter read with no repeated device enumeration. A host
+    where NVML initializes but exposes no devices yields the empty tuple, which every
+    caller already treats as "no NVML" — so the device-count check lives here, once, rather
+    than inside the shared session."""
     nvml = _nvml()
     if nvml is None:
         return ()
@@ -609,29 +614,22 @@ def gpu_vram_gb() -> float | None:
             return _nvml().nvmlDeviceGetMemoryInfo(handle).total / (1 << 30)
         except Exception as exc:
             note_suppressed("ml", "read total VRAM from NVML", exc)
+    # Every other accelerator, through the shared namespace table. `_bound_device_ordinal` is
+    # the device this process is *computing on*, not physical 0: on a mixed node those are
+    # different cards and so different capacities, and this figure sizes the actor count for
+    # the whole stage. Apple's unified memory answers with the budget torch will use before it
+    # pages, which is the right number to pack against.
     try:
-        import torch
+        from batcher._internal.hardware.devices import accelerator_namespace
 
-        if torch.cuda.is_available():
-            # `current_device()`, not `0`: a worker that has been `set_device`d onto its second
-            # visible board reads a different card's capacity from physical 0, and on a mixed
-            # node that is a different number.
-            return torch.cuda.get_device_properties(_bound_ordinal(torch.cuda)).total_memory / (
-                1 << 30
-            )
-        # Intel XPU: `cuda.is_available()` is False here, so without this branch the
-        # docstring's XPU claim was empty and an Intel GPU packed nothing.
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None and xpu.is_available():
-            return xpu.get_device_properties(_bound_ordinal(xpu)).total_memory / (1 << 30)
-        # Apple MPS shares unified memory; `recommended_max_memory` is the working
-        # budget torch will use before paging — the right number to pack against.
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            return torch.mps.recommended_max_memory() / (1 << 30)
+        namespace = accelerator_namespace()
+        if namespace is None:
+            return None
+        total = device_total_memory_bytes(ordinal=_bound_ordinal(namespace), _namespace=namespace)
     except Exception as exc:
         note_suppressed("ml", "read total accelerator memory", exc)
-    return None
+        return None
+    return total / (1 << 30) if total else None
 
 
 def _own_budget_fraction(used_by_pid: float, total: float, n_processes: int) -> float | None:
@@ -722,31 +720,25 @@ def sample_gpu_vram_fraction() -> float | None:
             return info.used / info.total if info.total else None
         except Exception as exc:
             note_suppressed("ml", "read used VRAM from NVML", exc)
+    # Every other accelerator, through the one namespace table in `devices.torch_memory`:
+    # CUDA/ROCm, Intel XPU, Apple MPS, Gaudi and Ascend all expose the same reserved-bytes and
+    # capacity API under a different module name. This used to be three hand-written branches,
+    # which is why Gaudi and Ascend had no reading at all — and a `None` here does not fail, it
+    # silently leaves the predictive cap inert and lets the hill-climb grow into a hard OOM,
+    # which is the exact failure the cap exists to prevent.
+    #
+    # The reading is torch's own reserved bytes, which are already this process's allocator, so
+    # this path needs no per-process attribution the way the NVML one above does.
     try:
-        import torch
+        from batcher._internal.hardware.devices import accelerator_namespace
 
-        if torch.cuda.is_available():
-            # The *current* device throughout, not physical 0. A worker pinned to its second
-            # visible board was dividing its own reserved bytes by another card's capacity —
-            # a ratio of two different devices, which on a mixed node is not even a fraction
-            # of anything. On the single-GPU host these develop on, the two are the same.
-            device = _bound_ordinal(torch.cuda)
-            total = torch.cuda.get_device_properties(device).total_memory
-            # torch's reserved bytes are already this process's own allocator, so this
-            # path needs no per-process attribution.
-            return torch.cuda.memory_reserved(device) / total if total else None
-        # Intel XPU: without this branch the predictive VRAM cap was inert on Intel GPUs,
-        # so the throughput hill-climb grew until a hard OOM — the failure the cap prevents.
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None and xpu.is_available():
-            device = _bound_ordinal(xpu)  # the bound board, not physical 0 — see the CUDA case
-            total = xpu.get_device_properties(device).total_memory
-            return xpu.memory_reserved(device) / total if total else None
-        # MPS unified memory: current allocation against the recommended budget.
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            total = torch.mps.recommended_max_memory()
-            return torch.mps.current_allocated_memory() / total if total else None
+        # Resolved once and threaded through both readings. This runs once per batch, and the
+        # resolution sits behind a backend detector that walks `sys.path`; taking it three
+        # times per sample cost 154us where taking it once costs 4us.
+        namespace = accelerator_namespace()
+        if namespace is None:
+            return None
+        return device_memory_used_fraction(ordinal=_bound_ordinal(namespace), _namespace=namespace)
     except Exception as exc:
         note_suppressed("ml", "read accelerator memory in use", exc)
     return None
@@ -836,11 +828,11 @@ def recommend_gpu_fraction(model_vram_gb: float, gpu_vram_gb: float, **kwargs: A
 def sample_gpu_utilization(backend: str | None = None) -> float | None:
     """Mean accelerator utilization now as a fraction in [0, 1], or `None` if unavailable.
 
-    Dispatches to the vendor's metrics via the `_UTILIZATION` registry: NVML for
-    NVIDIA, ROCm SMI for AMD, ``torch.xpu.utilization`` for Intel. Apple MPS and Cloud
-    TPU expose no stable per-process utilization API, so they (and CPU) return `None` —
-    the loop is then a no-op (the declared `num_gpus` stands). Any failure (no driver,
-    no SMI library, no device) also yields `None`."""
+    Dispatches to the vendor's metrics via the `_UTILIZATION` registry: NVML for NVIDIA, ROCm
+    SMI for AMD, and the torch namespace's own counter for Intel XPU, Intel Gaudi and Huawei
+    Ascend. Apple MPS, Cloud TPU and AWS Trainium expose no stable per-process utilization API,
+    so they (and CPU) return `None` — the loop is then a no-op (the declared `num_gpus`
+    stands). Any failure (no driver, no SMI library, no device) also yields `None`."""
     probe = _UTILIZATION.get(backend or detect_backend())
     return probe() if probe is not None else None
 
@@ -885,29 +877,65 @@ def _rocm_utilization() -> float | None:
         return None
 
 
-def _xpu_utilization() -> float | None:
-    """Mean Intel GPU utilization via ``torch.xpu.utilization`` (a percent); `None` if the
-    torch build doesn't expose it (older builds lack the sysman/Level-Zero counter)."""
-    try:
-        import torch
+def _torch_namespace_utilization(backend: str) -> Callable[[], float | None]:
+    """A utilization probe reading `torch.<backend>.utilization()`.
 
-        xpu = getattr(torch, "xpu", None)
-        if xpu is None or not xpu.is_available():
+    The accelerators with no SMI library the control plane can link — Intel XPU, Intel Gaudi,
+    Huawei Ascend — all expose the counter this way, as a percentage on their torch namespace.
+    One probe built per backend rather than three near-identical functions, because the only
+    thing that differed between the two that existed was the module name, and a fourth copy is
+    how one of them quietly stops reading the bound device.
+    """
+
+    def probe() -> float | None:
+        from batcher._internal.hardware.devices import accelerator_namespace
+
+        namespace = accelerator_namespace(backend)
+        if namespace is None:
             return None
-        # The bound device, not physical 0: an actor pinned to its second visible board was
-        # adapting `num_gpus` from a neighbour's load.
-        util = xpu.utilization(_bound_ordinal(xpu))  # percent, newer torch w/ Level-Zero sysman
-        return max(0.0, min(1.0, float(util) / 100.0))
+        try:
+            # The bound device, not physical 0: an actor pinned to its second visible board was
+            # adapting `num_gpus` from a neighbour's load.
+            util = namespace.utilization(_bound_ordinal(namespace))
+        except TypeError:
+            # A namespace whose `utilization` takes no ordinal (it reports for the current
+            # device). Asking again without one is right; treating it as unsupported is not.
+            util = _no_arg_utilization(namespace)
+        except Exception:
+            return None
+        if util is None:
+            return None
+        try:
+            return max(0.0, min(1.0, float(util) / 100.0))
+        except (TypeError, ValueError):
+            return None
+
+    return probe
+
+
+def _no_arg_utilization(namespace: Any) -> float | None:
+    """`namespace.utilization()` with no device argument, or `None` if it still refuses."""
+    try:
+        return namespace.utilization()
     except Exception:
         return None
 
 
-# Per-backend utilization probe. NVIDIA/AMD/Intel expose a counter; Apple MPS and
-# Cloud TPU have no stable per-process API (absent here → loop is a no-op).
+# Per-backend utilization probe — the input the actors-per-device loop steers by, so a backend
+# missing here is a backend the 80% packing target silently never applies to (`recommend_num_gpus`
+# returns the declared request unchanged when utilization is `None`).
+#
+# NVIDIA and AMD have vendor SMI libraries with richer per-device readings. Intel XPU, Intel
+# Gaudi and Huawei Ascend report through their torch namespace instead. Apple MPS, Cloud TPU and
+# AWS Trainium expose no stable per-process counter at all, and are absent on purpose: a probe
+# that returns a fabricated number would be worse than the no-op, because the loop would then
+# repack a fleet from it.
 _UTILIZATION = {
     "cuda": _nvml_utilization,
     "rocm": _rocm_utilization,
-    "xpu": _xpu_utilization,
+    "xpu": _torch_namespace_utilization("xpu"),
+    "hpu": _torch_namespace_utilization("hpu"),
+    "npu": _torch_namespace_utilization("npu"),
 }
 
 # NVIDIA compute capability with native FP8 tensor cores: Ada (8.9, L4/L40S) and
@@ -998,10 +1026,12 @@ def recommend_num_gpus(
     With `actors_per_device` — how many actors shared one device when `util_fraction` was
     measured — the request is sized to land the device at `_PACK_TOWARD`:
     ``ceil(actors x _PACK_TOWARD / util)`` actors per device, bounded by `max_actors` (what
-    VRAM allows) and `_MAX_ACTORS_PER_DEVICE`. Knowing the *configuration* that produced the
-    measurement is what makes this stable: the same 78% means "add an actor" at one per
-    device and "leave it alone" at two, and a loop that cannot tell those apart oscillates
-    between them forever.
+    VRAM allows), by `_MAX_ACTORS_PER_DEVICE`, and below by `_density_floor` — the fine floor
+    once VRAM has been measured, the coarse one while the fit is still a guess.
+
+    Knowing the *configuration* that produced the measurement is what makes this stable: the
+    same 78% means "add an actor" at one per device and "leave it alone" at two, and a loop
+    that cannot tell those apart oscillates between them forever.
 
     Without it, the older utilization-only rule stands:
 
@@ -1028,7 +1058,13 @@ def recommend_num_gpus(
             # Fed. Hold this density rather than chase the last few points: every change is
             # a pool rebuild (a model reload on every device), and the step past a satisfied
             # device measured both slower and less evenly spread than the density it left.
-            return min(requested, max(_UTIL_MIN_FRACTION, round(1.0 / held, 2)))
+            #
+            # "Hold" has to mean it. Against a floor of 0.25 this branch could not express any
+            # density above four, so a pipeline that had *reached* the target at six actors
+            # was told to run four, dropped to 60% busy, grew back to six, and oscillated
+            # there forever — rebuilding the pool every run, which is the one cost this branch
+            # exists to avoid. `_density_floor` is the same fix as on the growth path below.
+            return min(requested, max(_density_floor(max_actors), round(1.0 / held, 2)))
         ceiling = (
             _MAX_ACTORS_PER_DEVICE
             if max_actors is None
@@ -1036,13 +1072,40 @@ def recommend_num_gpus(
         )
         want = math.ceil(actors_per_device * _PACK_TOWARD / util_fraction)
         want = max(1, min(int(ceiling), want))
-        return min(requested, max(_UTIL_MIN_FRACTION, round(1.0 / want, 2)))
+        return min(requested, max(_density_floor(max_actors), round(1.0 / want, 2)))
     if requested >= 1.0 and util_fraction < _PACK_BELOW:
         frac = max(_UTIL_MIN_FRACTION, round(util_fraction, 2))
         return min(1.0, frac)
     if requested < 1.0 and util_fraction > _SATURATED_ABOVE:
         return 1.0
     return requested
+
+
+def _density_floor(max_actors: int | None) -> float:
+    """The smallest per-actor fraction the packing loop may ask for.
+
+    `_UTIL_MIN_FRACTION` (0.25) exists because packing from *utilization* says nothing about
+    whether the model's weights fit in the slice — so four actors per device is as far as a
+    guess should go. That reasoning holds only while the fit is a guess. Once `max_actors`
+    arrives it is derived from the peak VRAM a prior run actually used, so the fit is measured
+    and the coarse floor is being applied to a question it no longer answers.
+
+    Leaving it applied was not conservative, it was a ceiling nobody declared: 0.25 caps the
+    loop at **four** actors per device while `_MAX_ACTORS_PER_DEVICE` says eight, so any model
+    whose single actor drives the device below 0.9/4 = 22.5% could never reach the utilization
+    target at all. It settled at four, at 60% busy, and stopped — permanently leaving two
+    fifths of every device idle, with nothing in the result to say so. A closed-loop simulation
+    over the whole range of per-actor utilizations is what surfaced it; every single-step test
+    of this function passed throughout.
+
+    Args:
+        max_actors: The density measured VRAM allows, or `None` when nothing has measured it.
+
+    Returns:
+        The per-actor `num_gpus` floor: the fine one when the fit is known, the coarse one
+        while it is a guess.
+    """
+    return _MIN_FRACTION if max_actors is not None else _UTIL_MIN_FRACTION
 
 
 def recommend_inflight_depth(

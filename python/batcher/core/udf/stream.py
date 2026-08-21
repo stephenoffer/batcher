@@ -297,7 +297,7 @@ def _apply_udf_stream(
         out = (
             _resilient_call(call, sub, budget, is_gpu)
             if resilient
-            else _coerce_udf_result(call(sub))
+            else _coerce_udf_result(call(sub), sub.schema)
         )
         if record is not None:
             record(time.perf_counter_ns() - started, sub, out)

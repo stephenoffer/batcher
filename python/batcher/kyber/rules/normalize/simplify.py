@@ -92,16 +92,17 @@ def _simplify(expr: Expr, schema: SchemaRef | None = None) -> Expr:
         if _is_int_zero(left) and _is_integral(right, schema):
             return right
     elif op == "sub":
-        # `x - 0` preserves `-0.0` (IEEE: `-0.0 - 0.0 = -0.0`), so it needs no type guard.
-        if _is_int_zero(right):
+        # `x - 0` preserves `-0.0` (IEEE: `-0.0 - 0.0 = -0.0`), so it needs no *value*
+        # guard — but it does need a *type* one. See `_keeps_its_type`.
+        if _is_int_zero(right) and _keeps_its_type(left, schema):
             return left
     elif op == "mul":
-        if _is_int_one(right):
+        if _is_int_one(right) and _keeps_its_type(left, schema):
             return left
-        if _is_int_one(left):
+        if _is_int_one(left) and _keeps_its_type(right, schema):
             return right
     elif op == "div":
-        if _is_int_one(right):
+        if _is_int_one(right) and _keeps_its_type(left, schema):
             return left
     return expr
 
@@ -130,6 +131,32 @@ def _is_integral(expr: Expr, schema: SchemaRef | None) -> bool:
         return False
     dtype = infer_type(expr, schema)
     return dtype is not None and pa.types.is_integer(dtype)
+
+
+def _keeps_its_type(expr: Expr, schema: SchemaRef | None) -> bool:
+    """Whether `x` and `x <op> <identity>` have the same Arrow type, so dropping the op is sound.
+
+    Every identity here was guarded on the *value* and none on the *type*, and for a
+    **Boolean** operand the two differ: `b * 1` and `b - 0` are Int64 (arithmetic promotes
+    the boolean), while `b` is Boolean. Dropping the operation therefore returned a boolean
+    column where the query asked for an integer one — and it did so **after**
+    `available_schema` had already declared Int64, so `Dataset.schema` and the collected
+    batch disagreed on the column's type. No differential test could see it, because
+    `assert_same` compares values and DuckDB rejects `b * 1` outright, so there was nothing
+    to compare against.
+
+    The proof is that the operand is numeric: integer, float and decimal arithmetic against
+    an integer identity element all return the operand's own type. A non-numeric operand
+    (Boolean, and the temporal and string types the engine is more permissive about than
+    DuckDB) and an operand whose type cannot be inferred are both left alone — an unproven
+    type is not a proof, which is the stance the `+ 0` guard beside this one already takes.
+    """
+    dtype = infer_type(expr, schema) if schema is not None else None
+    if isinstance(expr, Lit) and isinstance(expr.value, (int, float)):
+        return not isinstance(expr.value, bool)
+    return dtype is not None and (
+        pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_decimal(dtype)
+    )
 
 
 def _is_int_one(expr: Expr) -> bool:

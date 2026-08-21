@@ -204,6 +204,16 @@ def spill_to_disk(
     # around the whole phase measure the same counters, and the reading is shaped exactly
     # like the engine's, so the profile consumes either without knowing which it got.
     watch = UsageStopwatch()
+    # The query is now committed to disk, so hand the engine's retained arena back before it
+    # starts writing. mimalloc keeps freed pages by design -- 408 MiB of a 1,397 MiB resident
+    # set, measured on three group-bys whose results had already been dropped -- and holding
+    # that through a spill is a third of a gigabyte closer to an OOM kill on a node with no
+    # swap, which is the default on Kubernetes. Here rather than in the spill *gate*: the gate
+    # has three independent routes and only one of them reads live pressure, so trimming there
+    # covered a third of the spills. A shape with no out-of-core path reaches this line and then
+    # falls back to memory, having paid one trim; `memory.reclaim`'s backoff is what stops that
+    # from being paid twice.
+    rm.going_out_of_core()
     # Force the learned spill codec (large IO-bound state compresses; small state does not).
     # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
     with spill_compression_scope(rm, opt):

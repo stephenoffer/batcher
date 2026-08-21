@@ -66,6 +66,53 @@ def _str_predicate(ir: dict[str, Any]) -> tuple[str, str, str] | None:
     return ir["input"]["name"], ir["fn"], pattern
 
 
+def _conjuncts(ir: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten a top-level ``AND`` chain into its terms; a non-``AND`` node is one term.
+
+    Only ``AND`` flattens, and the asymmetry is the same one `_combine` encodes. Every term
+    of a conjunction is true of every matching row, so a connector may read a narrower slice
+    of its store on the strength of any one of them. A disjunct proves nothing on its own:
+    reading only the partition one branch of an ``OR`` names would drop the rows the other
+    branch matched.
+
+    Args:
+        ir: A predicate in the engine's JSON IR.
+
+    Returns:
+        The conjunction's terms, in left-to-right order.
+    """
+    if ir.get("e") == "binary" and ir.get("op") == "and":
+        return _conjuncts(ir["left"]) + _conjuncts(ir["right"])
+    return [ir]
+
+
+def _pinned_columns(ir: dict[str, Any]) -> set[str]:
+    """The columns a top-level conjunct fixes to a single literal value.
+
+    This is what lets a partitioned store skip its fan-out: a predicate that pins every
+    partition-key column to one value can only match rows in one partition, so the read
+    goes there directly instead of asking every partition and discarding almost everything.
+    DynamoDB bills read capacity per item examined and Cassandra queries every token range,
+    so on both the difference is the whole cost of the read rather than a constant factor.
+
+    Args:
+        ir: A predicate in the engine's JSON IR.
+
+    Returns:
+        The names of columns fixed by a top-level ``col = <literal>`` term.
+    """
+    from batcher.io.predicate._literals import _col_and_literal
+
+    pinned: set[str] = set()
+    for term in _conjuncts(ir):
+        if term.get("e") != "binary" or term.get("op") != "eq":
+            continue
+        parsed = _col_and_literal(term.get("left", {}), term.get("right", {}))
+        if parsed is not None:
+            pinned.add(parsed[0])
+    return pinned
+
+
 def _combine(op: str, left: Any, right: Any, both: Any) -> Any | None:
     """Fold a translated `AND`/`OR` pair, keeping a partial conjunction.
 

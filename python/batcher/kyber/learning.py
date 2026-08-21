@@ -36,6 +36,7 @@ from batcher.kyber.measured_selectivity import measured_selectivities
 from batcher.kyber.measured_width import measured_widths
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
+from batcher.metadata.hardware_scope import local_or_planned_fingerprint
 from batcher.metadata.udf_stats import load_udf_row_seconds_table
 from batcher.plan.logical import LogicalPlan
 
@@ -153,9 +154,22 @@ def _smooth(prior: float, observed: float, n_obs: int) -> float:
     return alpha * observed + (1.0 - alpha) * prior
 
 
-#: The assembled bundle per hub, valid while the hub's two change counters stand still.
-#: Weakly keyed so a dropped hub evicts its own entry.
-_BUNDLE_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, dict[str, Any]]] = (
+#: The assembled bundle per hub, valid while the hub's two change counters stand still **and
+#: the machine class it was assembled for is the same one**. Weakly keyed so a dropped hub
+#: evicts its own entry.
+#:
+#: The machine class belongs in the key because one of the bundle's components is scoped by it:
+#: `load_udf_row_seconds_table` reads `scoped("udf.row_seconds")`, which resolves through the
+#: ambient `planning_for`. Without it, a driver that plans a distributed run (the workers'
+#: class) and then a local one (its own) serves each the other's measured per-row UDF costs
+#: under the same `(version, params_version)` pair — the two counters do not move, so the stale
+#: bundle looks current. Measured with one `fn` recorded at 1 ms/row on a worker and 1 ns/row
+#: on the driver: the worker-scoped read returned the driver's figure, a millionfold error in
+#: the number that decides whether a `map_batches` is priced as a trivial column map. It is the
+#: same machine-class blend `metadata.hardware_scope` exists to prevent, entering through a
+#: cache key rather than a namespace — the third time in this loop, after `cpu_shares` and
+#: `spill_rates`.
+_BUNDLE_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, str, dict[str, Any]]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -183,10 +197,10 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     """
     if hub is None:
         return {}
-    fingerprint = (hub.version, hub.params_version)
+    fingerprint = (hub.version, hub.params_version, local_or_planned_fingerprint())
     cached = _BUNDLE_CACHE.get(hub)
-    if cached is not None and cached[:2] == fingerprint:
-        return cached[2]
+    if cached is not None and cached[:3] == fingerprint:
+        return cached[3]
     stats = dict(hub.load_keyed_params(_NAMESPACE))
     corrections = _cardinality_corrections(hub)
     if corrections:

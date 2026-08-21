@@ -2,14 +2,17 @@
 
 Distribution in Batcher is a scheduling decision, not a second engine. One core or a
 hundred, the same mergeable operators (`partial → combine → finalize`) run, and a
-multi-node result is bit-identical to the single-node one. This page is what that buys.
+multi-node result holds the same rows, column names and column types as the single-node
+one. This page is what that buys.
 
 :::{important}
 Every pipeline's result signature is compared across engines before any timing is kept, and
 a distributed Batcher result is compared against the single-node one. The mergeable algebra
 is what makes that check pass rather than a coincidence: `combine` is associative and
-commutative, so partials merge in any order and a multi-node answer is bit-identical to a
-one-core answer.
+commutative, so partials merge in any order and a multi-node answer matches a one-core
+answer row for row. A float reduction is the exception the check tolerates: IEEE addition
+is not associative, so a different partition count sums in a different order and the two
+agree to the last bits rather than to every bit.
 :::
 
 :::{note}

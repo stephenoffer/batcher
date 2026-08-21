@@ -204,24 +204,24 @@ def _site() -> dict[str, Any]:
     this container cannot see; neither is visible anywhere else in the snapshot.
     """
     from batcher._internal.hardware.fabric import fabric_bandwidth_gbps, rdma_summary
-    from batcher._internal.site import local_scratch_root, scheduler_kind, site_profile
+    from batcher._internal.site import local_scratch_root, site_profile, site_summary
 
     profile = site_profile()
-    scheduler = scheduler_kind()
     fabric = rdma_summary()
     scratch = local_scratch_root()
-    if not (profile.known or scheduler != "none" or fabric["ports"] or scratch):
+    # `site_summary` is the one description of the site, shared with the accelerator report.
+    # Assembling a second one here is how the dashboard came to show a different set of facts
+    # than `bt.accelerators()` about the same machine — and the shape of the job, which only
+    # the summary carries, never reached the snapshot at all.
+    out: dict[str, Any] = dict(site_summary())
+    if not (profile.known or out["scheduler"] != "none" or fabric["ports"] or scratch):
         return {}
-    out: dict[str, Any] = {
-        "provider": profile.provider,
-        "neocloud": profile.neocloud,
-        "scheduler": scheduler,
-        "scratch_dir": scratch or "",
-    }
-    if profile.instance_type:
-        out["instance_type"] = profile.instance_type
-    if profile.region:
-        out["region"] = profile.region
+    out["scratch_dir"] = scratch or ""
+    # Empty strings say nothing and cost a reader a line; the summary keeps them so its own
+    # shape is stable, and this drops them because a snapshot is read by a person.
+    for key in ("instance_type", "region", "node_name"):
+        if not out.get(key):
+            out.pop(key, None)
     if fabric["ports"]:
         out["fabric_ports"] = fabric["active_ports"]
         out["fabric_gbps"] = fabric_bandwidth_gbps()

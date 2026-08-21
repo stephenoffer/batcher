@@ -4,8 +4,9 @@
 which returns an Arrow `Table` directly (no per-row Python). Parallel reads split
 the ``_id`` key space into contiguous ObjectId ranges: each split issues a bounded
 ``find`` over its half-open ``[lo, hi)`` range, so the ranges are a disjoint,
-exhaustive cover. `MongoSink` writes an Arrow table back as a batch of bulk
-upserts keyed by a chosen field.
+exhaustive cover. `MongoSink` maintains a collection with the
+same `upsert`/`append`/`overwrite`/`delete` vocabulary the SQL sink uses, one bulk
+round trip per call.
 
 Both defer ``pymongo`` / ``pymongoarrow`` so importing this module never requires
 the drivers; a missing driver raises `BackendError` with the ``mongo`` extra hint.
@@ -21,10 +22,13 @@ import pyarrow as pa
 
 from batcher._internal.errors import BackendError
 from batcher.io.formats.base import SINKS, SOURCES
-from batcher.io.formats.nosql.base import PartitionSpec, ScanSource, require_driver
-from batcher.io.manifest import WriteManifest, WrittenFile
+from batcher.io.formats.nosql.base import (
+    BulkSink,
+    PartitionSpec,
+    ScanSource,
+    require_driver,
+)
 from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.types import logical_bytes
 
 __all__ = ["MongoSink", "MongoSource"]
 
@@ -263,71 +267,69 @@ def _id_ranges(coll: Any, query: dict[str, Any], segments: int) -> list[_IdRange
 
 
 @SINKS.register("mongo")
-class MongoSink:
-    """Write an Arrow table to a MongoDB collection as batched bulk upserts.
+class MongoSink(BulkSink):
+    """Write an Arrow table to a MongoDB collection, in one bulk round trip.
 
-    Each row is upserted on `key_field` (replacing the matching document, or
-    inserting if absent), in one ``bulk_write`` per call — never a per-row network
-    round trip. Returns a `WrittenFile` recording the row count for the manifest.
+    Every mode issues a single ``bulk_write`` per call — never a per-row network round
+    trip — and returns a `WrittenFile` recording the row count for the manifest.
 
     Args:
-        uri: A MongoDB connection URI; never logged.
+        uri: A MongoDB connection URI; never logged, and an ``env:``/``file:`` reference
+            is resolved where the connection is dialed.
         database: The target database name.
-        collection: The target collection name.
-        key_field: The document field upserts match on (default ``"_id"``).
+        collection: The target collection, when it is not the write's destination name.
+            `ds.write.mongo("orders", ...)` already names it, so this is normally omitted;
+            requiring it made that documented call raise ``TypeError: missing 1 required
+            keyword-only argument: 'collection'`` on every invocation, because the writer
+            passes the collection as the *destination*, never as a keyword.
+        key_field: The document field `upsert` and `delete` match on (default ``"_id"``).
+        mode: One of `STORE_WRITE_MODES`.
     """
 
-    __slots__ = ("collection", "database", "key_field", "uri")
+    format_name = "mongo"
+
+    __slots__ = ("collection", "database", "uri")
 
     def __init__(
         self,
         *,
         uri: str,
         database: str,
-        collection: str,
+        collection: str | None = None,
         key_field: str = "_id",
+        mode: str = "upsert",
     ) -> None:
+        super().__init__(key_field=key_field, mode=mode, uri=uri)
         self.uri = uri
         self.database = database
         self.collection = collection
-        self.key_field = key_field
 
-    def write(self, table: pa.Table, path: str) -> WrittenFile:
-        """Upsert every row of `table`; `path` is the logical target identifier."""
-        pymongo = require_driver("pymongo", "mongo")
-        rows = table.to_pylist()
-        if not rows:
-            return WrittenFile(path=path, rows=0, bytes=logical_bytes(table))
-        ops = [
+    def _operations(self, pymongo: Any, rows: list[dict[str, Any]]) -> list[Any]:
+        """The bulk operations `mode` turns `rows` into."""
+        if self.mode == "delete":
+            return [pymongo.DeleteOne({self.key_field: row.get(self.key_field)}) for row in rows]
+        if self.mode in ("append", "overwrite"):
+            # An overwrite empties the collection first (below) and then inserts, so both
+            # modes insert here. Neither matches on a key: an append that silently replaced
+            # a document holding the same `_id` would be an upsert under another name.
+            return [pymongo.InsertOne(row) for row in rows]
+        return [
             pymongo.ReplaceOne({self.key_field: row.get(self.key_field)}, row, upsert=True)
             for row in rows
         ]
-        # Resolve the URI here, where the connection is dialed, exactly as `MongoSource`
-        # does via `_secret`. The sink was calling `MongoClient(self.uri)` on the raw
-        # attribute, so an ``env:``/``file:`` reference that read fine was handed to the
-        # driver verbatim and failed to connect — the reference form worked for reads and
-        # silently did not for writes.
-        from batcher.io.credentials import resolve_secret
 
-        client = pymongo.MongoClient(resolve_secret(self.uri, what="mongo uri"))
+    def _apply(self, rows: list[dict[str, Any]], path: str) -> None:
+        """Apply `rows` to the collection `path` names, or to an explicit `collection`."""
+        pymongo = require_driver("pymongo", "mongo")
+        ops = self._operations(pymongo, rows)
+        client = pymongo.MongoClient(self._secret("uri"))
         try:
-            client[self.database][self.collection].bulk_write(ops, ordered=False)
+            target = client[self.database][self.collection or path]
+            if self.mode == "overwrite":
+                target.delete_many({})
+            if ops:
+                target.bulk_write(ops, ordered=False)
         except Exception as exc:
-            raise BackendError(f"mongo bulk upsert failed: {exc}") from exc
+            raise BackendError(f"mongo bulk {self.mode} failed: {exc}") from exc
         finally:
             client.close()
-        return WrittenFile(path=path, rows=len(rows), bytes=logical_bytes(table))
-
-    def write_partitioned(
-        self,
-        table: pa.Table,
-        path: str,
-        *,
-        partition_by: list[str] | None = None,  # noqa: ARG002 - Mongo has no Hive layout
-        file_index: int = 0,  # noqa: ARG002
-    ) -> list[WrittenFile]:
-        """Write one shard; Mongo collections are unpartitioned, so this is `write`."""
-        return [self.write(table, path)]
-
-    def commit(self, manifest: WriteManifest, path: str) -> None:
-        """No-op: upserts are visible on write (no transactional commit phase)."""

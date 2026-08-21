@@ -41,6 +41,7 @@ __all__ = [
     "known_schemes",
     "parse_uri",
     "redact_uri",
+    "scheme_for_adbc_driver",
 ]
 
 #: Schemes served by an ADBC driver, mapped to the driver module ADBC loads.
@@ -167,6 +168,8 @@ class ParsedURI:
             reference resolved on the worker. Never included in `uri`.
         database: The database/catalog name from the URI path, if any.
         options: Query-string parameters (``?sslmode=require``) as a dict.
+        host: The server host, or None for a file-backed scheme that carried none.
+        port: The server port, or None when the URI relied on the driver's default.
     """
 
     backend: str
@@ -179,6 +182,12 @@ class ParsedURI:
     # `repr=False`: a query string is ordinary connection options most of the time,
     # but nothing stops a URI carrying `?password=` or `?token=` there.
     options: dict[str, str] = field(default_factory=dict, repr=False)
+    # Host and port are carried separately from `uri` because the ADBC and ConnectorX
+    # backends take the whole URI, while a PEP 249 driver takes them as discrete
+    # `connect()` kwargs. Re-splitting the URI a second time to recover them is how the
+    # two halves drift; the parse already has them.
+    host: str | None = None
+    port: int | None = None
 
     def db_kwargs(self) -> dict[str, Any]:
         """The driver connection kwargs for this URI, minus the password.
@@ -445,6 +454,52 @@ def supports_limit_clause(scheme: str) -> bool:
     return _normalize_scheme(scheme) in _LIMIT_CLAUSE_SCHEMES
 
 
+#: ADBC driver module → the scheme whose dialect it should be treated as.
+#:
+#: The inverse of `_ADBC_DRIVERS` cannot be computed: that table is many-to-one, and
+#: `adbc_driver_postgresql` alone serves fourteen schemes. Which of them is the *base* is a
+#: fact about the ecosystem rather than about the table, so it is stated rather than
+#: derived — a "shortest name wins" heuristic picks ``crate`` over ``postgresql``.
+#:
+#: The distinction only has to be right for the two questions this answers, identifier
+#: quoting and whether a row cap may be appended, and every scheme a given driver serves
+#: agrees on both.
+_ADBC_BASE_SCHEMES: dict[str, str] = {
+    "adbc_driver_postgresql": "postgresql",
+    "adbc_driver_sqlite": "sqlite",
+    "adbc_driver_duckdb": "duckdb",
+    "adbc_driver_snowflake": "snowflake",
+    "adbc_driver_bigquery": "bigquery",
+    "adbc_driver_flightsql": "flightsql",
+}
+
+
+def scheme_for_adbc_driver(driver: str | None) -> str | None:
+    """The URI scheme an ADBC driver module should be treated as speaking, or None.
+
+    A source constructed with an explicit ``driver=`` rather than a ``uri=`` still needs to
+    know its **dialect**: that is what decides how an identifier is delimited and whether a
+    row cap may be appended at all. Without it such a source emitted identifiers verbatim
+    and pushed no cap — the safe answer, and the slow one.
+
+    Args:
+        driver: An ADBC driver module name, or None.
+
+    Returns:
+        The scheme, or None when Batcher maps no dialect to that driver.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.formats.sql.uri import scheme_for_adbc_driver
+            >>> scheme_for_adbc_driver("adbc_driver_postgresql")
+            'postgresql'
+            >>> scheme_for_adbc_driver("adbc_driver_nonesuch") is None
+            True
+    """
+    return _ADBC_BASE_SCHEMES.get(driver) if driver else None
+
+
 def known_schemes() -> tuple[str, ...]:
     """Every connection-URI scheme Batcher can route, sorted.
 
@@ -648,4 +703,6 @@ def parse_uri(uri: str, *, password: str | None = None) -> ParsedURI:
         password=secret,
         database=_database_from_path(parts.path, scheme),
         options=dict(parse_qsl(parts.query)),
+        host=parts.hostname or None,
+        port=parts.port,
     )

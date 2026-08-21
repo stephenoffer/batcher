@@ -31,7 +31,7 @@ def machine_memory_bytes() -> int:
     cgroup cap — not the host's RAM — is the real ceiling: sizing to host RAM over-commits and
     gets the cgroup OOM-killed. Fixed for the process's lifetime, so memoized.
 
-    Three ceilings bind, and the tightest wins:
+    Five ceilings bind, and the tightest wins:
 
     * **Host RAM**, less any memory reserved into an explicit hugepage pool. Reserved
       hugepages are carved out of general-purpose memory and are unreachable by an ordinary
@@ -45,10 +45,21 @@ def machine_memory_bytes() -> int:
       crawl — so a budget sized to `memory.max` on a cgroup whose `high` sits below it buys a
       running-but-thrashing query rather than a spilling one. Spilling earlier is the strictly
       better trade, and it is the trade an operator asked for by setting `high` at all.
+    * **The batch scheduler's grant** (`site.scheduler.scheduler_memory_bytes`). A Slurm
+      allocation is not a cgroup unless the site configured confinement, and plenty do not: a
+      job granted 16 GiB on a 512 GiB node *sees* 512 GiB, sizes a hash table against it, and
+      is killed for exceeding a grant nothing in the process ever read. This is the memory
+      half of the core bound `available_cpu_count` applies, and it fails the same way.
+    * **`RLIMIT_AS`** (`site.container.address_space_limit_bytes`): how Grid Engine enforces
+      `h_vmem`, LSF `-M`, PBS `pvmem`, and what `ulimit -v` sets. It binds harder than a
+      cgroup — overshooting a cgroup gets the process OOM-killed, while overshooting this
+      makes the allocator return NULL and the query die of `MemoryError` inside a kernel that
+      had no chance to spill instead.
 
-    (Carbonite's `pressure.total_memory_bytes` computes the same ceiling for its own live
-    pressure sensing; this is the copy the layers that cannot import Carbonite — notably Kyber
-    — read, so the planner can size to real memory without reaching across a subsystem boundary.)
+    This is the one implementation. Carbonite's `memory.probe.total_memory_bytes` delegates to
+    it rather than computing its own, which is what keeps the planner's view of the machine and
+    the admission controller's from drifting — they had already diverged on reserved hugepages
+    and on `memory.high`, and the layer that was wrong was the one that decides whether to spill.
 
     Returns:
         The binding memory ceiling in bytes, or `0` when undetectable.
@@ -71,6 +82,17 @@ def machine_memory_bytes() -> int:
     v1 = read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")
     if v1 is not None:
         limits.append(v1)
+    # Imported inside the call: `site` reaches back into this package for the storage probe,
+    # so a module-level edge would make that a cycle.
+    from batcher._internal.site.container import address_space_limit_bytes
+    from batcher._internal.site.scheduler import scheduler_memory_bytes
+
+    grant = scheduler_memory_bytes()
+    if grant:
+        limits.append(grant)
+    address_space = address_space_limit_bytes()
+    if address_space:
+        limits.append(address_space)
     return min(limits) if limits else 0
 
 
@@ -118,9 +140,15 @@ def swap_configured() -> bool:
     kernel OOM-kills the largest process, which is the engine, and the whole query is lost
     along with every partition it had already computed.
 
-    A swapless node must therefore spill *earlier* and admit *less*, because it has no soft
-    landing between "fits" and "dead". Nothing in the engine could tell the two apart, so both
-    were budgeted as though a slow path existed.
+    A swapless node arguably wants to spill *earlier* and admit *less*, because it has no soft
+    landing between "fits" and "dead".
+
+    **Reported, not yet acted on.** No budget in the engine reads this: `memory.soft_limit` and
+    `memory.hard_limit` are the same on both kinds of node, and an operator who wants the
+    earlier line sets them. Saying otherwise here would be describing an intention — the
+    reading is surfaced in `ResourceManager.stats()` so a person tuning those fractions can see
+    which kind of node they are on. Making the engine choose is a throughput trade in the
+    direction of spilling more, so it wants a benchmark rather than an argument.
 
     Reads the cgroup's own swap allowance first where one is published, because a container
     with host swap can still be denied it (`memory.swap.max = 0`, which is what Kubernetes

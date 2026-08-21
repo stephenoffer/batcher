@@ -478,16 +478,17 @@ pub fn range_partition_batches(
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
-/// As [`range_partition_batches`], but for a **string** leading key compared
-/// lexicographically by bytes — the ordering arrow's sort gives a `Utf8`/`LargeUtf8`
-/// column, so the per-range sorts concatenate into the same relation a single global
-/// string sort produces. The numeric path compares as `f64` and would read `"12"` as
-/// `12.0`, disagreeing with that lexical order, which is why it refuses a string rather
-/// than casting one.
-pub fn range_partition_batches_str(
+/// As [`range_partition_batches`], but for a **byte-lexicographic** leading key — `Utf8`,
+/// `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary` — compared by its bytes, which is
+/// the ordering arrow's sort gives all five, so the per-range sorts concatenate into the same
+/// relation a single global sort produces.
+///
+/// The numeric path compares as `f64` and would read `"12"` as `12.0`, disagreeing with that
+/// lexical order, which is why a byte key needs its own routing rather than a cast.
+pub fn range_partition_batches_bytes(
     batches: &[RecordBatch],
     key_index: usize,
-    boundaries: &[String],
+    boundaries: &[impl AsRef<[u8]> + Sync],
     n_buckets: usize,
     nulls_first: bool,
     descending: bool,
@@ -495,7 +496,7 @@ pub fn range_partition_batches_str(
     let combined = ops::materialize(batches)?;
     let key = combined.column(key_index).clone();
     let parts = in_worker_pool(|| {
-        shuffle::range_partition_by_str_key(
+        shuffle::range_partition_by_byte_key(
             &combined,
             &key,
             boundaries,
@@ -507,9 +508,44 @@ pub fn range_partition_batches_str(
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
-/// Sample a string sort key's distribution as ascending values at `probs`, the string
+/// [`range_partition_batches_bytes`] for the `Utf8`/`LargeUtf8` spelling, whose boundaries
+/// cross the FFI as `String`. A `String` *is* its bytes, so this is a signature and not a
+/// second routing.
+pub fn range_partition_batches_str(
+    batches: &[RecordBatch],
+    key_index: usize,
+    boundaries: &[String],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
+    range_partition_batches_bytes(
+        batches,
+        key_index,
+        boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+}
+
+/// Sample a byte-lexicographic sort key's distribution as ascending values at `probs`, the
 /// counterpart of the KLL quantile grid the numeric distributed sort samples with.
 /// Returns an empty grid when the column is absent, empty, or entirely null.
+pub fn byte_key_quantiles(
+    batches: &[RecordBatch],
+    key_name: &str,
+    probs: &[f64],
+) -> Result<Vec<Vec<u8>>, InterpError> {
+    let combined = ops::materialize(batches)?;
+    match combined.column_by_name(key_name) {
+        None => Ok(Vec::new()),
+        Some(col) => Ok(shuffle::byte_quantiles(col, probs)?),
+    }
+}
+
+/// [`byte_key_quantiles`] rendered as text, for a `Utf8`/`LargeUtf8` key whose boundaries
+/// cross the FFI as `str`.
 pub fn string_key_quantiles(
     batches: &[RecordBatch],
     key_name: &str,

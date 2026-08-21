@@ -1,13 +1,14 @@
 """Credential resolution for connectors, plus Databricks Unity Catalog vending.
 
-**Credentials by reference.** Every connector password, token, API key, and
-connection URI accepts ``env:NAME`` or ``file:PATH`` in place of the literal secret.
-Only the *reference* is stored on the source object and pickled to workers; the secret
-is read on the machine that opens the connection, from *its* environment or a mounted
-secret file. This mirrors the crypto-key design in `plan.functions.security` and exists
-for the same reason: a distributed query must not ship secrets over the wire, and a
-secret that never enters the object cannot leak through a traceback, a log line, or a
-pickled split.
+**Credentials by reference.** Every connector password, token, API key, connection URI and
+object-store option accepts ``env:NAME``, ``file:PATH`` or ``cmd:NAME`` in place of the
+literal secret. Only the *reference* is stored on the source object and pickled to workers;
+the secret is read on the machine that opens the connection, from *its* environment, a
+mounted secret file, or the operator's own secret-fetching helper. This mirrors the crypto-key
+design in `plan.functions.security` — and it is the same three schemes the data plane's own
+resolver (`bc-secrets`) answers, so one vocabulary covers both sides. It exists for the reason
+that one does: a distributed query must not ship secrets over the wire, and a secret that
+never enters the object cannot leak through a traceback, a log line, or a pickled split.
 
 Resolution is deliberately **lazy** — call `resolve_secret` at connect time, never in a
 constructor. Resolving early would put the plaintext back on the object that gets
@@ -35,10 +36,32 @@ from typing import Any
 from batcher._internal.errors import BackendError
 from batcher._internal.optional import require
 
-__all__ = ["is_secret_ref", "resolve_secret", "vend_unity_credentials"]
+__all__ = ["SECRET_COMMAND_ENV", "is_secret_ref", "resolve_secret", "vend_unity_credentials"]
 
-#: Reference schemes resolved on the machine that opens the connection.
-_SECRET_REF_SCHEMES = ("env:", "file:")
+#: Reference schemes resolved on the machine that opens the connection. The same three the
+#: data plane's own resolver (`bc-secrets`) answers, so one vocabulary covers a connector
+#: password, a storage option, and an expression-level encryption key.
+_SECRET_REF_SCHEMES = ("env:", "file:", "cmd:")
+
+#: The operator-configured program `cmd:NAME` runs, with `NAME` as its single argument.
+#:
+#: **`cmd:` is inert unless this is set, and the reference supplies only the argument, never
+#: the program.** That asymmetry is the whole security story, and it is the same one
+#: `bc-secrets` states: a plan is data, it may arrive from somewhere less trusted than the
+#: cluster, and letting it name a program to execute would turn a secret reference into
+#: arbitrary code execution. The operator chooses the program; the plan chooses which secret
+#: to ask that program for.
+#:
+#: One knob reaches `vault kv get`, `aws secretsmanager get-secret-value`,
+#: `gcloud secrets versions access`, `az keyvault secret show`, or a bespoke fetcher — which
+#: is what lets a connector on a neocloud or an on-prem cluster use a key store this package
+#: takes no dependency on.
+SECRET_COMMAND_ENV = "BATCHER_SECRET_COMMAND"
+
+#: How long the helper may take. Not configurable, because the failure it guards against is a
+#: helper that never returns — which would hang the control plane on a connect with no
+#: diagnosis — and no real key-store fetch takes anywhere near this long.
+_SECRET_COMMAND_TIMEOUT_S = 30.0
 
 
 def is_secret_ref(value: str | None) -> bool:
@@ -54,7 +77,8 @@ def resolve_secret(value: str | None, *, what: str = "credential") -> str | None
     that has not been migrated, and a user who passes a raw password, both keep working.
 
     Args:
-        value: A literal secret, an ``env:NAME`` / ``file:PATH`` reference, or None.
+        value: A literal secret, an ``env:NAME`` / ``file:PATH`` / ``cmd:NAME`` reference,
+            or None.
         what: What is being resolved, for the error message (e.g. ``"ClickHouse password"``).
 
     Returns:
@@ -76,10 +100,56 @@ def resolve_secret(value: str | None, *, what: str = "credential") -> str | None
                 f"{what}: environment variable {target!r} is not set (referenced as {value!r})"
             )
         return resolved
+    if scheme == "cmd":
+        return _from_command(target, what=what, reference=str(value))
     try:
         return pathlib.Path(target).read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise BackendError(f"{what}: cannot read secret file {target!r}: {exc}") from exc
+
+
+def _from_command(name: str, *, what: str, reference: str) -> str:
+    """Run the operator's secret-fetching helper for `name` and take its stdout.
+
+    Never resolved through a shell, and the program is never taken from the reference — see
+    `SECRET_COMMAND_ENV`. Deliberately not cached: this is called once when a connection is
+    opened, not per batch the way the data plane's resolver is, so a cache would buy nothing
+    and would keep a rotated secret alive past its rotation.
+
+    Every failure names the reference and the helper's *stderr*, never its stdout, because
+    stdout is the secret.
+    """
+    import os
+    import shlex
+    import subprocess
+
+    command = os.environ.get(SECRET_COMMAND_ENV, "").strip()
+    if not command:
+        raise BackendError(
+            f"{what}: {reference!r} uses the `cmd:` scheme, but {SECRET_COMMAND_ENV} is not "
+            "set; an operator must configure the secret-fetching program (the reference "
+            "supplies only its argument, never the program itself)"
+        )
+    argv = [*shlex.split(command), name]
+    try:
+        # An argv list, never a shell string: the reference is data and must not be able to
+        # inject a second command through a shell metacharacter.
+        done = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_SECRET_COMMAND_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BackendError(f"{what}: secret command for {reference!r} failed: {exc}") from exc
+    if done.returncode != 0:
+        detail = done.stderr.strip()[:400] or f"exit status {done.returncode}"
+        raise BackendError(f"{what}: secret command for {reference!r} failed: {detail}")
+    secret = done.stdout.strip()
+    if not secret:
+        raise BackendError(f"{what}: secret command for {reference!r} returned nothing")
+    return secret
 
 
 def _require_databricks_sdk() -> Any:

@@ -155,3 +155,39 @@ def test_list_join_empty_and_null_match_duckdb(duck, lists):
 
     duck.register("t", tbl)
     assert_same(got, duck.sql("select l, array_to_string(l, ',') as r from t"))
+
+
+def test_coalesce_over_a_bare_null_and_a_nested_column(duck):
+    """A `NULL` operand must adopt the other's type instead of failing the query.
+
+    Every arm of the operand coercion was keyed on a concrete type pair, so a bare `NULL`
+    — which arrow types as `Null`, and which a column of all-missing values types as too —
+    fell through to the promotion lattice and matched nothing for the nested types. The
+    result was not a wrong value but a hard failure: `coalesce(NULL, <a list column>)`, the
+    ordinary "default this to an empty list" shape and the one Spark's `ifnull` spells,
+    raised "arguments need to have the same data type" on a query DuckDB answers.
+
+    Casting `Null` to any type is total — it is all nulls whatever the target — so the fix
+    can only turn the error into the right answer, never a value into a different one.
+    """
+    t = pa.table(
+        {
+            "l": pa.array([["a"], None], pa.list_(pa.string())),
+            "s": pa.array([{"k": 1}, None], pa.struct([("k", pa.int64())])),
+        }
+    )
+    duck.register("np_nested", t)
+    out = bt.sql(
+        "SELECT coalesce(NULL, l) AS a, coalesce(l, NULL) AS b FROM np_nested",
+        np_nested=bt.from_arrow(t),
+    ).collect()
+    assert_same(
+        out,
+        duck.sql("SELECT coalesce(NULL, l) AS a, coalesce(l, NULL) AS b FROM np_nested"),
+    )
+    # The struct side too, and the `ifnull` spelling Spark reaches this through.
+    assert bt.sql(
+        "SELECT ifnull(NULL, s) AS a FROM np_nested",
+        np_nested=bt.from_arrow(t),
+        dialect="spark",
+    ).to_pydict() == {"a": [{"k": 1}, None]}

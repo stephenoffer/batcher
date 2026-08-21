@@ -27,13 +27,13 @@ multi-core, and distributed — the derived projection is stateless. Only fires 
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import AggExpr, Binary, Col, Expr, Lit
+from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.logical import Aggregate, AggregateSpec, LogicalPlan, Project, Projection
 
 __all__ = ["decompose_linear_sum_aggregates"]
@@ -98,7 +98,7 @@ def _decompose(agg: AggExpr) -> tuple[Expr, bool, _Build] | None:
 
 def _base_key(base: Expr) -> str:
     """A stable identity for a base expression, so sums over the same base share it."""
-    return json.dumps(base.to_ir(), sort_keys=True)
+    return expr_key(base)
 
 
 @rule(name="decompose_linear_sum_aggregates", phase=Phase.REWRITE, matches=(Aggregate,))

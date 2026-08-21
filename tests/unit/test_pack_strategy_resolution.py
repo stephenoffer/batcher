@@ -38,6 +38,11 @@ def _nodes(monkeypatch, specs, alive=None):
     ]
     monkeypatch.setattr(scaling, "node_classes", lambda: classes)
     monkeypatch.setattr(scaling, "alive_node_count", lambda: alive or len(classes))
+    # The SPREAD-to-PACK degrade asks how many machines exist, head included — a placement
+    # bundle carries no head-excluding resource, so the head is one of them. `node_classes`
+    # here describes worker-eligible nodes, so the cluster is one larger unless the caller
+    # pins `alive` to say otherwise.
+    monkeypatch.setattr(scaling, "cluster_node_count", lambda: alive or len(classes))
 
 
 def test_pack_survives_when_a_node_can_hold_the_gang(monkeypatch):
@@ -93,6 +98,7 @@ def test_unreadable_topology_keeps_the_preference(monkeypatch):
     """Second-guessing a preference on no evidence is worse than honoring it."""
     monkeypatch.setattr(scaling, "node_classes", lambda: [])
     monkeypatch.setattr(scaling, "alive_node_count", lambda: 0)
+    monkeypatch.setattr(scaling, "cluster_node_count", lambda: 0)
     env = SchedulingEnvelope(num_cpus=4.0, n_tasks=8, placement_strategy="PACK")
     assert _resolve_placement_strategy(env) == "PACK"
 

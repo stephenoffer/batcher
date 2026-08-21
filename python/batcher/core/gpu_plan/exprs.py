@@ -395,6 +395,12 @@ DECLINED_EXPRS: dict[str, str] = {
     "list_set": "not translated",
     "list_simhash": "not translated",
     "list_slice": "not translated",
+    # The per-row-parameter forms. Their constant siblings (`str`, `list_get`) translate,
+    # but the engine answers these by grouping rows on the parameter and calling the same
+    # kernel per group — a shape with no cuDF equivalent, and one this package will not
+    # approximate by evaluating the parameter once.
+    "str_dyn": "not translated (a per-row string-function parameter)",
+    "list_get_dyn": "not translated (a per-row list index)",
     "list_transform": "not translated",
     "list_zip": "not translated",
     "make_struct": "not translated",

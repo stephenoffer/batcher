@@ -33,7 +33,8 @@ allows. See `batcher.io.formats.sql.partition`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import dataclasses
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -45,8 +46,9 @@ from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
     connection_fingerprint,
+    identifier_quoter,
     probe_is_typed,
-    push_down,
+    pushed_sql,
     schema_probe,
 )
 from batcher.io.formats.sql.dbapi._arrow import arrow_type, reconcile, rows_to_batch
@@ -209,6 +211,14 @@ class _DBAPISplit:
         does) does not poison the queries that follow. A **borrowed** connection is never
         rolled back and never closed — it belongs to the caller, who may be mid-transaction,
         and disturbing it is the kind of bug that surfaces far away in their next query.
+
+        Identical SQL is answered from a per-session memo rather than re-executed. The
+        probes are composed from independent pieces that do not know about each other, and
+        two of them genuinely want the same thing: on SQLite both `catalog_column_stats`
+        and `constraint_column_stats` ask `PRAGMA table_info`, so every planning pass issued
+        it twice. Memoizing is exact rather than approximate here — one connection, one
+        transaction, one answer — and it scopes to the session, so the next call still sees
+        a fresh catalog.
         """
         borrowed = self.borrowed is not None
         conn = (
@@ -216,12 +226,16 @@ class _DBAPISplit:
             if borrowed
             else _connect(self.module_name, self.connect_kwargs)
         )
+        memo: dict[tuple[str, bool], Any] = {}
 
         def _run(sql: str, *, many: bool) -> Any:
+            key = (sql, many)
+            if key in memo:
+                return memo[key]
             cur = conn.cursor()
             try:
                 cur.execute(sql)
-                return list(cur.fetchall()) if many else (cur.fetchone() or (None,))[0]
+                answer = list(cur.fetchall()) if many else (cur.fetchone() or (None,))[0]
             except Exception:
                 if not borrowed:  # never disturb a caller's live transaction
                     with suppress(Exception):
@@ -229,6 +243,8 @@ class _DBAPISplit:
                 raise
             finally:
                 cur.close()
+            memo[key] = answer
+            return answer
 
         try:
             yield (lambda sql: _run(sql, many=False), lambda sql: _run(sql, many=True))
@@ -308,6 +324,15 @@ class DBAPISource:
             ``Connection``/``Engine``\'s underlying DBAPI connection), the way
             ``pandas.read_sql(query, con)`` accepts one. Single-node only — see
             `splits` — and **never closed by Batcher**, since the caller owns it.
+        uri: A standard connection URI (``mysql://host/shop``), the same one `bt.read.sql`
+            takes, resolved to a driver and its connect kwargs. Supplies `module` and
+            `connect_kwargs`; anything passed in `connect_kwargs` wins over what it derives.
+        password: The password, as a literal or an ``env:``/``file:`` reference resolved
+            on the worker, so no secret is pickled onto a split.
+        dialect: The SQL dialect to generate for, overriding what `uri` or `module`
+            implies. It decides how an identifier is delimited and whether a row cap or a
+            top-N may be pushed at all, so name it when connecting through a driver that
+            does not say — ``pyodbc`` reaches SQL Server, Oracle and half a dozen others.
         query: The SQL to run. Mutually exclusive with `table`.
         table: A table to read in full (``SELECT * FROM table``).
         batch_size: Rows per ``fetchmany`` call and per Arrow batch produced. This is
@@ -336,6 +361,9 @@ class DBAPISource:
     module: str = ""
     connect_kwargs: dict[str, Any] = field(default_factory=dict, repr=False)
     connection: Any = field(default=None, repr=False, compare=False)
+    uri: str | None = None
+    password: str | None = field(default=None, repr=False)
+    dialect: str | None = None
     query: str | None = None
     table: str | None = None
     batch_size: int = DEFAULT_BATCH_SIZE
@@ -344,14 +372,40 @@ class DBAPISource:
     lower_bound: float | None = None
     upper_bound: float | None = None
     num_partitions: int = 1
+    #: Memoized `schema()`. `init=False` so it is not part of the public constructor, and
+    #: `compare=False` so two sources that describe the same relation stay equal whether or
+    #: not either has been asked for its schema yet — which matters because `identity()` and
+    #: the plan cache both key on what the source *is*, never on what it has cached.
+    _schema_cache: pa.Schema | None = field(default=None, init=False, repr=False, compare=False)
+    #: Memoized `statistics()`, on the same terms and for the same reasons.
+    _stats_cache: Any = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.query is None and self.table is None:
             raise BackendError("DBAPISource requires either query= or table=")
+        if self.uri is not None and not self.module:
+            # The same URI `bt.read.sql` takes, resolved to a driver and its connect
+            # kwargs. Doing it here rather than at the call site is what lets a URI reach
+            # this source through *every* entry point, including `bt.read.table('dbapi',
+            # uri=...)`, and keeps the resolution identical to the sink's.
+            from batcher.io.formats.sql.dbapi._dsn import resolve_connection
+
+            driver, kwargs, safe_uri, scheme = resolve_connection(
+                self.uri, password=self.password, connect_kwargs=self.connect_kwargs
+            )
+            object.__setattr__(self, "module", driver)
+            object.__setattr__(self, "connect_kwargs", kwargs)
+            object.__setattr__(self, "uri", safe_uri)
+            if self.dialect is None:
+                object.__setattr__(self, "dialect", scheme)
+        if self.dialect is None and self.module:
+            from batcher.io.formats.sql.dbapi._statements import dialect_for_driver
+
+            object.__setattr__(self, "dialect", dialect_for_driver(self.module))
         if not self.module and self.connection is None:
             raise BackendError(
-                "DBAPISource requires either module= (with connect_kwargs=) or an "
-                "already-open connection="
+                "DBAPISource requires uri= (e.g. 'mysql://host/shop'), module= with "
+                "connect_kwargs=, or an already-open connection="
             )
         if self.connection is not None and self.partition_on is not None:
             raise BackendError(
@@ -368,6 +422,69 @@ class DBAPISource:
                 "and rows outside them are still read."
             )
 
+    @property
+    def supports_limit(self) -> bool:
+        """Whether a row cap may be appended to this backend's SQL.
+
+        Gated on knowing the dialect, and an allow-list within that, for the reason
+        `uri.supports_limit_clause` states: a missing cap costs the rows the server would
+        have skipped, while a cap the server cannot parse turns a working query into a
+        syntax error. Until this source could name its dialect it declared nothing, so
+        ``bt.read.sql(table=...).head(10)`` read the whole table — over the one path in the
+        engine where every value crosses into Python.
+        """
+        from batcher.io.formats.sql.uri import supports_limit_clause
+
+        return bool(self.dialect) and supports_limit_clause(self.dialect)
+
+    @property
+    def supports_ordering(self) -> bool:
+        """Whether a top-N may be pushed: the dialect must accept an explicit ``NULLS`` clause.
+
+        Without it the server's "first n" and the engine's differ wherever they place a
+        null, so the read returns the *wrong rows* rather than merely extra ones.
+        """
+        from batcher.io.formats.sql.uri import supports_nulls_ordering
+
+        return bool(self.dialect) and supports_nulls_ordering(self.dialect)
+
+    @property
+    def _quote(self) -> Callable[[str], str]:
+        """How to delimit an identifier for this dialect; verbatim when it is unknown.
+
+        Every other connector here passes an unquoted reserved word, a name holding a
+        space, and an unaliased aggregate; this one could not until it knew its dialect.
+        """
+        return identifier_quoter(self.dialect)
+
+    def _pushed(
+        self,
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
+        extra_where: str | None = None,
+    ) -> str:
+        """The SQL one split runs, with every pushable part folded into it.
+
+        An *ordered* cap is only sound if the ordering goes with it: a dialect that takes
+        ``LIMIT`` but cannot spell ``NULLS FIRST|LAST`` must drop the cap too, or it
+        returns its own idea of the first n. That is the one pushdown that can be wrong
+        rather than merely incomplete, so it is decided here and in one place.
+        """
+        return pushed_sql(
+            self.query,
+            predicate=predicate,
+            projection=projection,
+            limit=limit,
+            ordering=ordering,
+            extra_where=extra_where,
+            table=self.table,
+            quote=self._quote,
+            supports_ordering=self.supports_ordering,
+            supports_limit=self.supports_limit,
+        )
+
     def _split(self, sql: str) -> _DBAPISplit:
         return _DBAPISplit(
             self.module,
@@ -379,24 +496,59 @@ class DBAPISource:
         )
 
     def schema(self) -> pa.Schema:
-        """The relation's columns, from a zero-row probe rather than the whole query."""
+        """The relation's columns, from a zero-row probe or one capped batch of real rows.
+
+        Cached on the instance after the first call, the way `nosql.ScanSource` caches its
+        own. Planning asks for the schema several times per terminal op — to resolve the
+        projection, to size the read, to type the operators — and each ask was two round
+        trips to the server.
+
+        **The fallback is capped.** `probe_is_typed` is `False` for essentially every PEP
+        249 driver, because PEP 249 exposes only four coarse type singletons and most
+        drivers report nothing at all for a zero-row result. So the fallback is not the rare
+        path its docstring implies here — it is *the* path, taken on every schema lookup —
+        and it submitted `SELECT * FROM t` with no cap at all.
+
+        The split reads one batch and abandons the cursor, which bounds what the *client*
+        holds and says nothing about what the *server* does. On PostgreSQL a default
+        psycopg2 cursor is client-side: `execute()` buffers the entire result set before
+        `fetchmany` returns a row, so typing the columns of a 100M-row table pulled the
+        whole table across the wire. A `LIMIT` makes the server's work match the one batch
+        that is actually read, and it is applied only where the dialect is known to accept
+        the clause — an unknown dialect submits exactly what it always did.
+        """
         if self.schema_override is not None:
             return self.schema_override
+        if self._schema_cache is not None:
+            return self._schema_cache
         probed = self._split(schema_probe(self.query, table=self.table)).schema()
-        if probe_is_typed(probed):
-            return probed
-        return self._split(push_down(self.query, table=self.table)).schema()
+        resolved = probed if probe_is_typed(probed) else self._split(self._sampling_sql()).schema()
+        object.__setattr__(self, "_schema_cache", resolved)
+        return resolved
+
+    def _sampling_sql(self) -> str:
+        """The read that types the columns from real values: one batch, capped where possible."""
+        return self._pushed(limit=self.batch_size)
 
     def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
     ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
+        return list(self.iter_batches(projection, predicate, limit, ordering))
 
     def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
     ) -> Iterator[pa.RecordBatch]:
-        sql = push_down(self.query, predicate, projection, table=self.table)
-        yield from self._split(sql).iter_batches(projection)
+        yield from self._split(self._pushed(predicate, projection, limit, ordering)).iter_batches(
+            projection
+        )
 
     def row_count(self) -> int | None:
         return None
@@ -414,9 +566,26 @@ class DBAPISource:
         ``sqlite3`` → SQLite, …); an unrecognized driver makes this a no-op. Best-effort
         throughout — a permission error, an un-analyzed table, or a view rather than a base
         table yields None and planning proceeds on defaults.
+
+        **Probed once per source, then remembered — advisory.** The probe is three catalog
+        queries plus a connect, and planning asks for it on every terminal op, so a repeated
+        point lookup spent about a quarter of its wall clock re-reading numbers that had not
+        moved. Caching them raises the question of what a *stale* statistic may be used for,
+        and this package already answers it (`api.source_stats.collect_source_stats`):
+        cached statistics sharpen cost and cardinality, and never answer an exact `count()`.
+
+        So the first call returns what the catalog said, exactness and all — a Snowflake or
+        SQL Server count is transactional and may answer a terminal. Every call after it
+        returns the same numbers marked `exact_rows=False`, which is what makes the cache
+        safe by construction rather than by argument: an advisory count cannot answer a
+        terminal, so a table that grew under a long-lived `Dataset` is *read* rather than
+        guessed at. A new `bt.read.sql(...)` re-probes.
         """
         if self.table is None:
             return None
+        if self._stats_cache is not None:
+            cached = self._stats_cache
+            return dataclasses.replace(cached, exact_rows=False) if cached.exact_rows else cached
         from batcher.io.stats import dialect_for_driver, sql_statistics
 
         driver = self.module or (
@@ -428,7 +597,12 @@ class DBAPISource:
         split = self._split("")  # a cursor host; the SQL it carries is unused by the session
         try:
             with split.catalog_session() as (run_scalar, run_rows):
-                return sql_statistics(dialect, self.table, run_scalar=run_scalar, run_rows=run_rows)
+                probed = sql_statistics(
+                    dialect, self.table, run_scalar=run_scalar, run_rows=run_rows
+                )
+            if probed is not None:
+                object.__setattr__(self, "_stats_cache", probed)
+            return probed
         except Exception:
             return None
 
@@ -456,6 +630,8 @@ class DBAPISource:
         target_size: int | None = None,  # noqa: ARG002 (protocol signature)
         predicate: dict | None = None,
         projection: list[str] | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
     ) -> list[Split]:
         """One split per key range, or a single split when not partitioned.
 
@@ -472,11 +648,17 @@ class DBAPISource:
         if self.partition_on is not None:
             assert self.lower_bound is not None and self.upper_bound is not None  # __post_init__
             fragments = range_predicates(
-                self.partition_on, self.lower_bound, self.upper_bound, self.num_partitions
+                self.partition_on,
+                self.lower_bound,
+                self.upper_bound,
+                self.num_partitions,
+                quote=self._quote,
             )
+        # A cap is per *split*, and there is only one unless the read is partitioned. Each
+        # range query would otherwise return up to `limit` rows of its own, so the union
+        # holds more than the plan asked for — still correct, since the engine keeps its own
+        # `Limit`, and still a saving over reading every row of every range.
         return [
-            self._split(
-                push_down(self.query, predicate, projection, table=self.table, extra_where=fragment)
-            )
+            self._split(self._pushed(predicate, projection, limit, ordering, fragment))
             for fragment in fragments
         ]

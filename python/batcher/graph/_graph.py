@@ -61,6 +61,11 @@ class Graph:
     edges: Dataset
     directed: bool = True
     weighted: bool = False
+    #: Whether the edge table already holds *both* directions of every edge. Distinct from
+    #: `directed`, which says only whether direction is meaningful: `from_edges` documents
+    #: that it does not symmetrize, so a graph can be undirected and one-sided at once. That
+    #: is the state `to_undirected` used to refuse to act on, because it keyed off `directed`.
+    symmetrized: bool = False
 
     @staticmethod
     def from_edges(
@@ -206,7 +211,17 @@ class Graph:
         # a zero-weight self-loop per declared node, which needs no second field — but a
         # self-loop is a real edge to a degree count and to a triangle count, so inventing
         # one would corrupt exactly the results this feature exists to make correct.
-        return _GraphWithNodes(self.edges, self.directed, self.weighted, declared)
+        # Keyword-passed, and carrying `symmetrized` explicitly: positionally, `declared`
+        # used to be the fourth argument, so adding a field to the base class silently routed
+        # the node table into it. Naming them makes a future field an error rather than a
+        # misdelivery.
+        return _GraphWithNodes(
+            edges=self.edges,
+            directed=self.directed,
+            weighted=self.weighted,
+            symmetrized=self.symmetrized,
+            declared=declared,
+        )
 
     def num_nodes(self) -> int:
         """The number of distinct nodes.
@@ -270,6 +285,16 @@ class Graph:
         than a flag you set. Self-loops are emitted once, since a self-loop reversed is
         itself.
 
+        Idempotent, and keyed on `symmetrized` rather than on `directed`. Those are not the
+        same question, and conflating them is what made this a no-op exactly where it was
+        needed: `from_edges` documents that an undirected graph is *not* symmetrized and that
+        you should call this when an algorithm needs both directions -- but the guard read
+        ``if not self.directed: return self``, so the call the documentation sends you to did
+        nothing for the graph it sends you there with. Fifteen call sites across `community`,
+        `components`, `similarity`, `summary` and `sampling` assume this method symmetrizes;
+        every one of them silently read a one-sided edge list for such a graph, and `pagerank`
+        on it disagreed with a reference implementation while `triangle_count` returned zero.
+
         **`degree` double-counts on the result.** Every edge is now present in both
         directions, so a node with one neighbour has two edge endpoints. Use `out_degree`
         for a neighbour count on a symmetrized graph; that is what `k_core` does, and
@@ -287,14 +312,14 @@ class Graph:
                 >>> g.to_undirected().num_edges()
                 2
         """
-        if not self.directed:
+        if self.symmetrized:
             return self
         loops = self.edges.filter(bt.col(SRC) == bt.col(DST))
         non_loops = self.edges.filter(bt.col(SRC) != bt.col(DST))
         both = non_loops.union(
             non_loops.select(**{SRC: bt.col(DST), DST: bt.col(SRC), WEIGHT: bt.col(WEIGHT)})
         )
-        return replace(self, edges=both.union(loops), directed=False)
+        return replace(self, edges=both.union(loops), directed=False, symmetrized=True)
 
     def without_self_loops(self) -> Graph:
         """The graph with every edge from a node to itself removed.

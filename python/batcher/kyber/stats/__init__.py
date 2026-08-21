@@ -9,6 +9,6 @@
 from __future__ import annotations
 
 from batcher.kyber.stats.estimator import StatsEstimator
-from batcher.kyber.stats.skew import hot_join_values
+from batcher.kyber.stats.skew import hot_join_value_shares, hot_join_values
 
-__all__ = ["StatsEstimator", "hot_join_values"]
+__all__ = ["StatsEstimator", "hot_join_value_shares", "hot_join_values"]

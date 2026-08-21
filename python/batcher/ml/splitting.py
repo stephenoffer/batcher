@@ -293,6 +293,12 @@ def time_series_split(
     aggregates = {f"q{i}": col(time_column).quantile(f) for i, f in enumerate(fractions)}
     row = ds.agg(**aggregates).collect()
     cuts = [row.column(f"q{i}")[0].as_py() for i in range(len(fractions))]
+    if any(cut is None for cut in cuts):
+        raise PlanError(
+            f"time_series_split cannot cut {time_column!r}: it has no non-null values, so "
+            "there are no time boundaries to split on. Check the column, or filter the "
+            "nulls out before splitting."
+        )
     splits = []
     for index in range(n_splits):
         start, end = cuts[index], cuts[index + 1]

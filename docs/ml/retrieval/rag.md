@@ -223,6 +223,84 @@ the prompt without a per-row Python string format. For a JSON answer, `parse_jso
 with a `guided_json` schema gets typed columns back instead of a string you have to
 regex. See {doc}`LLM inference </ml/retrieval/llm/index>`.
 
+## Reranking for relevance
+
+Retrieval is two stages, and a vector search is only the first. A bi-encoder embeds each passage
+once, offline, without knowing what will be asked of it, so the vector cannot encode anything
+about how the passage relates to a particular query. That is what makes it fast enough to run
+over a whole corpus, and it is also its ceiling.
+
+A **cross-encoder** reads the query and one passage together and scores that pair. It sees the
+interaction the bi-encoder had to discard, and it is substantially more accurate for it. It also
+cannot be precomputed, so it only ever runs over a candidate set the first stage already
+narrowed. Retrieve 100 with vectors, rerank to 5 with a cross-encoder, and the 5 that reach the
+model are meaningfully better than the top 5 the vector search alone returns.
+
+`bt.ml.cross_encoder_rerank_udf` is that stage. It takes the grouped shape a vector search
+leaves behind: one row per query, whose candidate columns are lists.
+
+```python
+import batcher as bt
+from batcher.ml import cross_encoder_rerank_udf
+
+hits = bt.from_pydict(
+    {
+        "question": ["how tall is everest"],
+        "passages": [["everest is 8849 m", "k2 is 8611 m", "a recipe for soup"]],
+        "ids": [["p1", "p2", "p3"]],
+    }
+)
+
+
+def scorer():  # stands in for a real cross-encoder in this example
+    return lambda pairs: [float("everest" in passage) for _, passage in pairs]
+
+
+reranked = hits.ml.map_batches(
+    cross_encoder_rerank_udf(
+        scorer,
+        query_column="question",
+        document_column="passages",
+        rerank_columns=("ids",),
+        k=2,
+    )
+)
+print(reranked.to_pydict()["passages"])
+# [['everest is 8849 m', 'k2 is 8611 m']]
+```
+
+In production the first argument is a model id and the model loads once per worker:
+
+```python
+# docs: skip
+reranked = hits.ml.map_batches(
+    cross_encoder_rerank_udf(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        query_column="question",
+        document_column="passages",
+        rerank_columns=("ids", "scores"),
+        k=5,
+        activation="sigmoid",
+    ),
+    num_gpus=1,
+    concurrency=4,
+)
+```
+
+Every `(query, passage)` pair in the batch is scored in **one** model call. A batch of 64
+queries with 100 candidates each is 6,400 pairs, which fills a GPU; scoring them row by row
+would be 64 forwards of 100 and leave the device mostly idle. Anything you list in
+`rerank_columns` is reordered alongside the passages, so ids and first-stage scores stay
+aligned, and the reranker's own scores land in `score_column`.
+
+`activation="sigmoid"` maps the raw logits into `[0, 1]`, which is what a threshold wants. It
+never changes the ordering, so leave it off if you only care about the ranking.
+
+Any callable works in place of a model id: `scorer` above is a zero-argument function returning
+a `CrossEncoderScorer`, which is the whole contract — a list of `(query, passage)` pairs in, one
+score per pair out, in order. That is the seam for a hosted reranking API, for a model this
+package does not know about, or for testing a pipeline with no GPU.
+
 ## Reranking for diversity
 
 A vector search returns the `k` nearest passages, and nearest is not the same as useful. On a
@@ -265,6 +343,11 @@ the passages, their scores, and their embeddings stay aligned.
 
 Similarity between candidates is cosine on normalized copies, so an unnormalized index works
 without a separate pass.
+
+The two rerankers compose, in that order. The cross-encoder decides which candidates are
+relevant and costs a model call; MMR then drops the near-duplicates among the survivors and
+costs nothing but the vectors you already have. Narrowing 100 to 20 by relevance and 20 to 5 by
+diversity spends the model on the stage where it changes the answer.
 
 ## Measuring the pipeline
 

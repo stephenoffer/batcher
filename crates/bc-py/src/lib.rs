@@ -45,7 +45,7 @@ mod sketches;
 mod tracing_init;
 use normalize::{
     narrow_output, normalize_batch, original_narrow_types, parse_aggregates, parse_group_keys,
-    resolve_cast_dtype, supported_cast_dtypes, unwrap_batches,
+    rebase_batch, rebase_nested_offsets, resolve_cast_dtype, supported_cast_dtypes, unwrap_batches,
 };
 use process::shared_memory_pool;
 
@@ -108,7 +108,7 @@ fn execute_plan(
             }
         })
         .map_err(errors::interp_to_pyerr)?;
-    let out = narrow_output(out, &narrow);
+    let out = rebase_nested_offsets(narrow_output(out, &narrow));
     Ok(out.into_iter().map(PyArrowType).collect())
 }
 
@@ -166,7 +166,7 @@ fn execute_plan_metered(
         })
         .map_err(errors::interp_to_pyerr)?;
     let metrics = metrics.with_query(query_watch);
-    let out = narrow_output(out, &narrow);
+    let out = rebase_nested_offsets(narrow_output(out, &narrow));
     Ok((
         out.into_iter().map(PyArrowType).collect(),
         metrics.to_json(),
@@ -399,7 +399,7 @@ fn partial_aggregate(
     let batches = unwrap_batches(batches)?;
     let out =
         bc_interp::dist::partial_aggregate(&group_keys, &aggregates, &batches).map_err(to_pyerr)?;
-    Ok(PyArrowType(out))
+    Ok(PyArrowType(rebase_batch(out)))
 }
 
 /// Execute `plan_json` and fold its output straight into partial-aggregate state,
@@ -453,7 +453,7 @@ fn execute_plan_aggregated(
             Ok(partial)
         }
     });
-    Ok(PyArrowType(out.map_err(to_pyerr)?))
+    Ok(PyArrowType(rebase_batch(out.map_err(to_pyerr)?)))
 }
 
 /// Distributed reduce step: merge partial-state batches and finalize.
@@ -468,7 +468,7 @@ fn combine_finalize(
     let partials = unwrap_batches(partials)?;
     let out =
         bc_interp::dist::combine_finalize(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
-    Ok(PyArrowType(out))
+    Ok(PyArrowType(rebase_batch(out)))
 }
 
 /// Combine step WITHOUT finalize: merge partial-state batches into a single partial
@@ -484,7 +484,7 @@ fn combine(
     let aggregates = parse_aggregates(aggregates_json)?;
     let partials = unwrap_batches(partials)?;
     let out = bc_interp::dist::combine(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
-    Ok(PyArrowType(out))
+    Ok(PyArrowType(rebase_batch(out)))
 }
 
 /// Native Parquet read of one object's selected row-groups into pyarrow batches.
@@ -752,16 +752,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::combine_finalize_spilling, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::partition_batches_salted, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::range_partition_batches, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::range_partition_batches_str, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::column_string_quantiles, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::gather_combine, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::gather_concat, m)?)?;
-    m.add_function(wrap_pyfunction!(shuffle::gather_to_files, m)?)?;
+    // The shuffle surface registers itself, because it is the one family that grows a pair of
+    // entry points at a time (a routing and its sampler, once per key family) and this list is
+    // at its size limit. `shuffle::register` keeps the growth beside the functions it names.
+    shuffle::register(m)?;
     m.add_function(wrap_pyfunction!(bloom::build_key_bloom, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::merge_blooms, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::bloom_filter_batches, m)?)?;

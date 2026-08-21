@@ -46,10 +46,17 @@ def save_source_stats(
         stats: The statistics to persist.
         version: The source's content version, when the caller can compute one.
     """
-    import contextlib
-
-    with contextlib.suppress(Exception):  # persistence must never break a write
+    try:
         hub.save_params(f"{_NAMESPACE}:{identity}", _encode(stats, version))
+    except Exception as exc:  # persistence must never break a write
+        # Noted, not swallowed — the read half of this module already does, and the write half
+        # is where silence lasts. A failed save is indistinguishable from a source Batcher has
+        # never written: `load_source_stats` returns `None`, the reader falls through to a full
+        # scan, and every later read does the same. That is the difference `note_suppressed`
+        # exists to make visible, and it matters most for the formats this module was written
+        # for — CSV and JSON have no footer, so a lost entry is a re-scan of the whole file
+        # rather than a slightly worse estimate.
+        note_suppressed("metadata", "persist source statistics", exc)
 
 
 def load_source_stats(

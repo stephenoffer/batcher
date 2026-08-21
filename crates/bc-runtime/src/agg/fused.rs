@@ -172,8 +172,12 @@ impl FusedAcc<'_> {
                 for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
                     let slot = &mut sums[gid as usize];
                     // Checked throughout, exactly as `accum::sum_acc` is: a silent i64 wrap
-                    // would be a wrong answer. It costs a not-taken branch, not a fast path.
-                    *slot = slot.checked_add(x).ok_or(RuntimeError::SumOverflow)?;
+                    // would be a wrong answer. It costs a not-taken branch, not a fast path —
+                    // provided the error is built only when it is taken (see `accum::sum_acc`).
+                    match slot.checked_add(x) {
+                        Some(n) => *slot = n,
+                        None => return Err(RuntimeError::SumOverflow),
+                    }
                 }
             }
             FusedAcc::SumF64 { v, sums, valid } => {

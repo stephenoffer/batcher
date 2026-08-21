@@ -26,7 +26,7 @@ from typing import Any
 
 from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
+from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, as_header_pairs
 
 __all__ = ["PubSubSource"]
 
@@ -119,6 +119,18 @@ class PubSubSource(BrokerSource):
             self._client_obj = subscriber_cls()
         return self._client_obj
 
+    def _split_options(self) -> dict[str, Any]:
+        """The pull deadline this source consumes by name, so a worker rebuilds it.
+
+        A split that lost it reverted to the ten-second default, which is the difference
+        between a trigger that fires promptly on an idle subscription and one that blocks a
+        worker for ten seconds per epoch.
+
+        Returns:
+            The constructor keyword arguments this class consumed.
+        """
+        return {"pull_timeout": self._pull_timeout}
+
     def _discover_partitions(self) -> list[int]:
         return [0]  # Pub/Sub has no user-visible partitions.
 
@@ -136,7 +148,13 @@ class PubSubSource(BrokerSource):
             if _is_pull_timeout(exc):
                 return []  # idle subscription: no data within the deadline, poll again later
             raise
-        received = response.received_messages
+        # Trim to the poll's payload budget. Safe here in a way it is not on a positional
+        # broker: a Pub/Sub message is redelivered unless it is acked, and only what reaches
+        # `_pending_acks` below is ever acked — so a message dropped from this batch comes
+        # back after the ack deadline rather than being lost. Without the trim `poll_bytes`
+        # / `max_bytes_per_trigger` was accepted and silently ignored, and a subscription of
+        # large messages built a batch bounded only by `poll_size` times 10 MiB.
+        received = self._within_budget(response.received_messages)
         messages = [
             BrokerMessage(
                 value=rm.message.data,
@@ -147,6 +165,10 @@ class PubSubSource(BrokerSource):
                 timestamp=int(rm.message.publish_time.timestamp() * 1000),
                 topic=self.topic,
                 key=(rm.message.ordering_key or "").encode("utf-8") or None,
+                # Pub/Sub *attributes* are this broker's headers. They reached the column as
+                # nulls until now, so a subscription publishing a trace id or a schema
+                # reference in its attributes could not read one back.
+                headers=(as_header_pairs(rm.message.attributes) if self._include_headers else None),
             )
             for rm in received
         ]
@@ -157,6 +179,46 @@ class PubSubSource(BrokerSource):
         # which runs only after the epoch is published.
         self._pending_acks.extend(rm.ack_id for rm in received)
         return messages
+
+    def _within_budget(self, received: list[Any]) -> list[Any]:
+        """The longest prefix of `received` whose payloads fit this poll's byte budget.
+
+        Always keeps at least one message: a single message larger than the whole budget
+        would otherwise be dropped and re-pulled forever, which is a stalled subscription
+        rather than a bounded one.
+        """
+        budget = self._poll_budget()
+        kept = []
+        for item in received:
+            kept.append(item)
+            budget.spend(len(item.message.data or b""))
+            if budget.spent:
+                break
+        return kept
+
+    def close(self) -> None:
+        """Close the subscriber, releasing its gRPC channel and background threads.
+
+        `SubscriberClient` owns a gRPC channel and the transport threads behind it, and
+        nothing was releasing either: the base `close` is a no-op and this class did not
+        override it. `BrokerSource.iter_batches` calls `close` from a `finally`, so the
+        omission leaked one channel and its threads on **every** query restart, trigger
+        abandonment, and generator teardown — a long-running driver that restarts a stream
+        accumulates them until the process runs out of file descriptors, with nothing in any
+        log naming the cause.
+
+        The handle is dropped in a `finally` for the reason Kafka's `close` is: a `close()`
+        that raises would otherwise leave the client set, so the next call — and
+        `iter_batches` guarantees one — re-closes a dead client and raises again, this time
+        out of a `finally` where it masks the original error.
+        """
+        if self._client_obj is None:
+            return
+        client, self._client_obj = self._client_obj, None
+        try:
+            client.close()
+        finally:
+            self._pending_acks.clear()
 
     def _commit_delivered(self) -> None:
         """Acknowledge the epoch that was just published.

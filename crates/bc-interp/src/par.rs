@@ -30,8 +30,9 @@ use crate::agg_par;
 use crate::error::InterpError;
 use crate::join_par::{
     broadcast_join, broadcast_join_streaming, build_side_swap_pays, flip_output, is_skewed_bucket,
-    is_skewed_bucket_bytes, skew_salting_eligible, spilling_asof_join,
-    spilling_hash_join_streaming,
+    is_skewed_bucket_bytes,
+    probe_stream::{chunk_slice_by_bytes, ProbeStream},
+    skew_salting_eligible, spilling_asof_join, spilling_hash_join_streaming,
 };
 use crate::metrics::{ExecMetrics, IdGen, OpMetric, Stopwatch};
 use crate::ops;
@@ -1298,8 +1299,8 @@ fn exec(
                     });
                 }
                 Admit::InMemory(_reservation) => {
-                    let out = match ops::materialize(&parts) {
-                        Ok(combined) => {
+                    let out = match ops::materialize_opt(&parts)? {
+                        Some(combined) => {
                             vec![ops::window_batch_with(
                                 &combined,
                                 partition_keys,
@@ -1309,7 +1310,7 @@ fn exec(
                                 opts.tuning.window_parallel_row_threshold,
                             )?]
                         }
-                        Err(_) => Vec::new(),
+                        None => Vec::new(),
                     };
                     (out, false, 0)
                 }
@@ -1361,8 +1362,6 @@ fn exec(
             let rows_build = count_rows(&right_batches);
             let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
             let t0 = Stopwatch::start();
-            let left = ops::materialize(&left_batches)?;
-            let right = ops::materialize(&right_batches)?;
             let mut spilled = false;
             let out = if left_by.is_empty() {
                 // A keyless ASOF needs one global order on `on`, so it cannot
@@ -1370,7 +1369,10 @@ fn exec(
                 // exceed it, fail loudly with a typed error rather than risk an OOM
                 // (mirrors the no-PARTITION-BY window). With no envelope (the default)
                 // it runs in memory exactly as before.
-                let bytes = left.get_array_memory_size() + right.get_array_memory_size();
+                // Measured from the morsels, *before* concatenating: the check exists to
+                // refuse an input that will not fit, so making it after the copy that does
+                // not fit answers the question too late to matter.
+                let bytes = (batch_bytes(&left_batches) + batch_bytes(&right_batches)) as usize;
                 if let Some(budget) = opts.op_budget(op_id) {
                     if bytes > budget {
                         return Err(InterpError::MemoryBudgetExceeded {
@@ -1380,6 +1382,8 @@ fn exec(
                         });
                     }
                 }
+                let left = ops::materialize(&left_batches)?;
+                let right = ops::materialize(&right_batches)?;
                 vec![ops::asof_join_batches(
                     &left,
                     &right,
@@ -1396,9 +1400,9 @@ fn exec(
                 // Spill to a grace ASOF join when the larger side exceeds the budget
                 // or the shared pool can't admit it; otherwise join each co-partitioned
                 // bucket in memory. Both yield the same relation.
-                let bytes = left
-                    .get_array_memory_size()
-                    .max(right.get_array_memory_size());
+                // From the morsels, so the admission decision is reached before anything is
+                // concatenated: a spilling ASOF join now never materializes either side.
+                let bytes = batch_bytes(&left_batches).max(batch_bytes(&right_batches)) as usize;
                 match admit(opts, op_id, bytes) {
                     Admit::Spill => {
                         let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
@@ -1407,8 +1411,8 @@ fn exec(
                         );
                         spilled = true;
                         spilling_asof_join(
-                            &left,
-                            &right,
+                            &left_batches,
+                            &right_batches,
                             left_on,
                             right_on,
                             left_by,
@@ -1421,6 +1425,9 @@ fn exec(
                         )?
                     }
                     Admit::InMemory(_reservation) => {
+                        // Only this arm concatenates, and only after admission proved it fits.
+                        let left = ops::materialize(&left_batches)?;
+                        let right = ops::materialize(&right_batches)?;
                         let p = rayon::current_num_threads().max(1);
                         let li = ops::key_indices(&left, left_by)?;
                         let ri = ops::key_indices(&right, right_by)?;
@@ -1468,24 +1475,68 @@ fn exec(
             join_type,
             output,
         } => {
-            // The inputs are computed in parallel; the join itself is one sweep. A range
+            // The inputs are computed in parallel; the join itself is one sweep, and a range
             // join *is* decomposable — a left row's matches depend on the whole right side
-            // and on nothing else about the left — so chunking the left side would
-            // parallelize the sweep, at the cost of re-sorting the right side per chunk.
-            // That trade only pays when the left side dominates, so it is left for the
-            // block decomposition that would also make this distributable, rather than
-            // guessed at here. Sequential O(n log n + k) already replaces a quadratic plan.
+            // and on nothing else about the left. So the left side streams past a resident
+            // right side, in chunks sized by the memory envelope: peak memory is the right
+            // side plus one chunk rather than both relations at once.
+            //
+            // With no envelope configured, or a left side that fits inside it, `chunk_by_bytes`
+            // yields exactly one chunk and this is the single-sweep join it has always been —
+            // same batch, same cost. Only a left side that genuinely exceeds the envelope pays
+            // for extra passes over the right side, which is the trade that buys the bound.
+            //
+            // The right side is *not* decomposable this way (its sort order is global), so it
+            // is still held whole. When even that will not fit, the join fails with a typed,
+            // catchable error rather than the process being killed — the same contract the
+            // keyless ASOF join and the un-partitioned window already state.
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
             let rows_in = count_rows(&left_batches);
             let rows_build = count_rows(&right_batches);
             let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
             let t0 = Stopwatch::start();
-            let left = ops::materialize(&left_batches)?;
+            let right_bytes = batch_bytes(&right_batches) as usize;
+            let budget = opts.op_budget(op_id);
+            if let Some(budget) = budget {
+                if right_bytes > budget {
+                    return Err(InterpError::MemoryBudgetExceeded {
+                        needed: right_bytes,
+                        budget,
+                        reason: "range join needs one global order over its right side",
+                    });
+                }
+            }
             let right = ops::materialize(&right_batches)?;
-            let out = vec![ops::range_join_batches(
-                &left, &right, conditions, *join_type, output,
-            )?];
+            let stream = ProbeStream {
+                join_type: *join_type,
+                output,
+                probe_schema: left_batches
+                    .first()
+                    .ok_or(InterpError::EmptyJoinInput)?
+                    .schema(),
+            };
+            let indices_of = |probe: &RecordBatch, build: &RecordBatch, jt: bc_ir::JoinType| {
+                ops::range_join_indices(probe, build, conditions, jt)
+            };
+            let mut out = Vec::new();
+            stream.run(
+                chunk_slice_by_bytes(&left_batches, budget.unwrap_or(usize::MAX)),
+                &right,
+                &indices_of,
+                &mut out,
+            )?;
+            // An empty result still has to say what its columns are; the streamed probe
+            // drops empty batches, so the empty relation is stated once, here.
+            if out.is_empty() {
+                out.push(ops::range_join_batches(
+                    &RecordBatch::new_empty(stream.probe_schema.clone()),
+                    &right,
+                    conditions,
+                    *join_type,
+                    output,
+                )?);
+            }
             push_breaker(
                 m,
                 op_id,
@@ -2517,8 +2568,15 @@ fn exec_fused(
 }
 
 /// Whether any aggregate needs the raw input morsels (not just partials) for its
-/// out-of-core spill — the value-list aggregates whose per-group state is unbounded.
-/// Those keep the materializing path; everything else spills from partials via grace.
+/// out-of-core spill — the aggregates whose per-group state grows with the data rather than
+/// with the aggregate. Those keep the materializing path; everything else spills from
+/// partials via grace.
+///
+/// Most of them are value-list aggregates, holding one state entry per row. `Mode` and
+/// `ApproxTopK` are not: `bc_runtime::agg::counted` gives them one entry per *distinct*
+/// value, so the common hot-group case is cheap. They are listed anyway, because a column
+/// of unique values puts an entry back for every row and a spill path is sized against the
+/// worst case.
 fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
     aggregates.iter().any(|a| {
         matches!(
@@ -5665,6 +5723,132 @@ mod tests {
         assert_eq!(rows(&in_mem), rows(&spilled), "spilled ASOF mismatch");
     }
 
+    // --- range join: the streamed probe side -------------------------------------------
+
+    /// A `RangeJoin` plan over the two scans, `l.v <op> r.v`, emitting both `v` columns.
+    fn range_plan(op: bc_ir::RangeOp, join_type: bc_ir::JoinType) -> RelOp {
+        use bc_ir::{JoinOutputCol, JoinSide};
+        RelOp::RangeJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            conditions: vec![bc_ir::RangeCondition {
+                left_key: "v".into(),
+                right_key: "v".into(),
+                op,
+            }],
+            join_type,
+            output: match join_type {
+                // Semi/anti name only the probe side, as the planner emits them.
+                bc_ir::JoinType::Semi | bc_ir::JoinType::Anti => vec![JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                }],
+                _ => vec![
+                    JoinOutputCol {
+                        side: JoinSide::Left,
+                        name: "v".into(),
+                        alias: "lv".into(),
+                    },
+                    JoinOutputCol {
+                        side: JoinSide::Right,
+                        name: "v".into(),
+                        alias: "rv".into(),
+                    },
+                ],
+            },
+        }
+    }
+
+    /// A range join whose left side is streamed in envelope-sized chunks computes the same
+    /// relation as the single-sweep oracle — every flavor, both comparison directions.
+    ///
+    /// The budget admits the right side but splits the left into several chunks, so the right
+    /// side is re-swept once per chunk. `Right` and `Full` are the load-bearing cases — their
+    /// unmatched-right rows are a property of the *whole* left side, so a chunked join that
+    /// forgot to carry the marks across chunks would emit each right row once per chunk that
+    /// failed to match it.
+    #[test]
+    fn a_chunked_range_join_equals_the_single_sweep_oracle() {
+        use bc_ir::{JoinType, RangeOp};
+
+        // Twelve morsels of sixteen rows. The values cycle so each flavor has a non-trivial
+        // answer — some left rows match nothing, some right rows match nothing — and matches
+        // straddle every chunk boundary.
+        let left: Vec<RecordBatch> = (0..12)
+            .map(|m: i64| {
+                let ks: Vec<i64> = (0..16).map(|i| m * 16 + i).collect();
+                let vs: Vec<i64> = (0..16).map(|i| (m * 16 + i) % 97).collect();
+                batch(&ks, &vs)
+            })
+            .collect();
+        // Four rows, so it sits inside the envelope below and the *left* decomposition is
+        // what is under test. One right value (200) is above every left value, so `Right`
+        // and `Full` have a genuine unmatched remainder no chunk can supply — the case that
+        // fails if the marks are not carried across chunks.
+        let right = vec![batch(&[1, 2, 3, 4], &[30, 60, 2, 200])];
+
+        // Above the right side's footprint and well below the left's, so the right side is
+        // admitted whole while the left splits into several chunks.
+        const BUDGET: usize = 512;
+
+        for op in [RangeOp::Lt, RangeOp::Ge] {
+            for jt in [
+                JoinType::Inner,
+                JoinType::Left,
+                JoinType::Right,
+                JoinType::Full,
+                JoinType::Semi,
+                JoinType::Anti,
+            ] {
+                let plan = range_plan(op, jt);
+                let oracle = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+                let opts = ExecOptions {
+                    agg_spill: Some(SpillOptions {
+                        memory_budget_bytes: BUDGET,
+                        dir: std::env::temp_dir()
+                            .join(format!("bc_range_chunk_{}", std::process::id())),
+                        codec: SpillCodec::None,
+                    }),
+                    ..ExecOptions::default()
+                };
+                let chunked =
+                    execute_parallel_with(&plan, &[left.clone(), right.clone()], &opts).unwrap();
+                assert_eq!(
+                    canonical_rows(&oracle),
+                    canonical_rows(&chunked),
+                    "{op:?}/{jt:?}: the chunked range join diverged from the oracle"
+                );
+            }
+        }
+    }
+
+    /// A range join whose *right* side exceeds the envelope fails with a typed error.
+    ///
+    /// The right side carries a global sort order, so it cannot be decomposed the way the
+    /// left one is. Before, there was no check at all and the process was simply killed;
+    /// a catchable error is what lets a caller retry with a larger envelope or a different
+    /// plan. Same contract as the keyless ASOF join and the un-partitioned window.
+    #[test]
+    fn a_range_join_over_its_envelope_errors_rather_than_ooming() {
+        let plan = range_plan(bc_ir::RangeOp::Lt, bc_ir::JoinType::Inner);
+        let left = vec![batch(&[1, 2, 3], &[10, 20, 30])];
+        let right = vec![batch(&[1, 2, 3], &[5, 15, 25])];
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1,
+                dir: std::env::temp_dir().join(format!("bc_range_env_{}", std::process::id())),
+                codec: SpillCodec::None,
+            }),
+            ..ExecOptions::default()
+        };
+        let err = execute_parallel_with(&plan, &[left, right], &opts).unwrap_err();
+        assert!(
+            matches!(err, InterpError::MemoryBudgetExceeded { .. }),
+            "expected a typed envelope error, got {err:?}"
+        );
+    }
+
     /// A keyless ASOF over a configured envelope it exceeds fails loudly with a typed
     /// error (it cannot grace-partition), instead of risking an OOM.
     #[test]
@@ -6305,9 +6489,11 @@ mod tests {
     /// (Spreading a 3-row dimension table across 8 buckets was never going to help anyway.)
     ///
     /// Salting is still exercised where the shuffle still runs:
-    /// `skewed_join_with_string_keys_still_salts` (below) and
     /// `skewed_right_join_matches_oracle_and_salts` (a `Right` join, which the streaming path
-    /// cannot serve — it must reconcile unmatched build rows across every morsel).
+    /// cannot serve — it must reconcile unmatched build rows across every morsel), and the
+    /// spilling cases (`spilling_join_with_skewed_buckets_matches_sequential`). A *string*
+    /// key used to be a third, and is no longer: it takes this same shared-build path now,
+    /// which `skewed_string_join_takes_the_shared_build_path` below pins.
     #[test]
     fn skewed_join_takes_the_shared_build_path_and_matches_the_oracle() {
         use bc_ir::{JoinOutputCol, JoinSide, JoinType};
@@ -6363,12 +6549,22 @@ mod tests {
         );
     }
 
-    /// The salting machinery itself, still on an *inner* join: a `Utf8` key is a shape the
-    /// streaming path cannot serve (it fast-paths integer keys only), so this falls through to
-    /// the shuffle — where a hot key really does concentrate one bucket, and the salt is what
-    /// spreads it. Same relation as the sequential oracle, and the skew path actually taken.
+    /// The string twin of the test above, and it changed when the streaming path learned byte
+    /// keys (`bc_runtime::join::stream`).
+    ///
+    /// A `Utf8` key used to be a shape the streaming path could not serve — it fast-pathed
+    /// `Int64` only — so a skewed string join fell through to the shuffle and needed the salt
+    /// to spread its hot bucket. A single byte column needs no `RowConverter` shared across
+    /// morsels, so it streams now, and the same skew-immunity argument the integer test makes
+    /// applies unchanged: the shared-build path buckets nothing, so a hot *probe* key cannot
+    /// make a straggler. Measured on 6 M rows with 80% of them on one key, this route answers
+    /// in 11.9 ms against DuckDB's 13.1 ms at 20x parallelism — the salt has nothing left to
+    /// repair.
+    ///
+    /// What this pins is therefore the routing *and* the relation: a skewed string join must
+    /// still equal the sequential oracle, whichever path serves it.
     #[test]
-    fn skewed_join_with_string_keys_still_salts() {
+    fn skewed_string_join_takes_the_shared_build_path() {
         use arrow::array::StringArray;
         use bc_ir::{JoinOutputCol, JoinSide, JoinType};
 
@@ -6425,7 +6621,11 @@ mod tests {
             .iter()
             .find(|m| m.kind == "hash_join")
             .map(|m| m.backend);
-        assert_eq!(join_backend, Some("interp-skew"), "skew path was not taken");
+        assert_eq!(
+            join_backend,
+            Some("interp-shared"),
+            "a tiny Utf8 build should be held as one table, not shuffled"
+        );
     }
 
     /// A skewed RIGHT join (hot key on the driving *right* side) salts via the

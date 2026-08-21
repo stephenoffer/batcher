@@ -21,7 +21,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from queue import Queue
+from queue import Full, Queue
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.mathx import clamp
@@ -31,6 +31,14 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
 __all__ = ["InferencePool", "Worker", "WorkerFactory"]
+
+#: Poll interval for the prefetch thread's stop-aware blocking `put`. A thread parked on a
+#: full queue must still notice that the consumer went away, or it outlives the query holding
+#: the source open. Matches `ml.pipeline`'s interval, which exists for the same reason.
+_POLL_S = 0.05
+#: How long to wait for the prefetch thread at teardown. It is woken by the drained slot, so
+#: this bounds a pathological case rather than the normal one.
+_JOIN_S = 5.0
 
 Worker = Callable[["pa.RecordBatch"], "pa.RecordBatch"]
 """Transforms one whole batch (e.g. runs a model forward pass over its columns)."""
@@ -67,7 +75,11 @@ def _empty_cuda_cache() -> None:
 
 
 def _run_with_oom_retry(
-    worker: Worker, batch: pa.RecordBatch, on_oom: Callable[[int], None] | None = None
+    worker: Worker,
+    batch: pa.RecordBatch,
+    on_oom: Callable[[int], None] | None = None,
+    *,
+    _failed: list[int] | None = None,
 ) -> tuple[pa.RecordBatch, float]:
     """Run `worker(batch)`, surviving a device OOM by releasing memory and shrinking.
 
@@ -95,10 +107,34 @@ def _run_with_oom_retry(
             the batch-size controller learns of a failure it could not predict; without it the
             halved batch succeeds, reports good throughput, and the climb grows straight back
             into the same OOM.
+        _failed: Row counts that have already failed in this bisection. Internal: the top-level
+            call creates it and the halves share it, which is what makes the whole ladder one
+            reported event — see below.
 
     Returns:
         `(output_batch, latency_ms)`; on a split, latency is the halves' sum.
+
+    **One event, one report — of the smallest size that failed.** Two things were wrong here
+    and they compound.
+
+    The controller counts *consecutive* out-of-memory failures and backs off harder on each,
+    reasoning that a repeat means the estimate of how much too big the batch was is itself
+    wrong. The levels of one bisection are not repeats — they are one failure being narrowed —
+    so reporting each of them inflated the streak by the depth of the ladder and compounded the
+    backoff by it. Measured against a model that accepts 16 rows: a single 256-row batch drove
+    the ceiling to **1 row**, and every later batch in the run was dispatched one row at a
+    time. Nothing failed, nothing warned, and the job ran at a sixteenth of the throughput the
+    device was capable of.
+
+    Reporting the *outermost* size instead is correct but nearly useless. A bisection ends
+    knowing that 32 failed and 16 fit — a bracket around the true limit — and saying only "256
+    failed" throws that away, leaving the ceiling to crawl down at the backoff ratio over eight
+    more failed batches. Reporting the smallest failure gives the controller the tightest upper
+    bound the event actually established, so it converges in two or three events instead of
+    eight, and lands just under the size that fits rather than far below it.
     """
+    top = _failed is None
+    failed = [] if top else _failed
     start = time.perf_counter()
     try:
         out = worker(batch)
@@ -111,22 +147,31 @@ def _run_with_oom_retry(
         verdict = classify_oom(exc)
         if not verdict.should_shrink:
             raise
-        if on_oom is not None:
-            with contextlib.suppress(Exception):  # telemetry must never fail a recoverable batch
-                on_oom(batch.num_rows)
+        failed.append(batch.num_rows)
         _empty_cuda_cache()
         if verdict.should_retry_same_size:
             try:
                 out = worker(batch)
+                if top:
+                    _report_oom(on_oom, failed)
                 return out, (time.perf_counter() - start) * 1000.0
             except Exception as retry_exc:
                 if not _is_cuda_oom(retry_exc):
                     raise
         if batch.num_rows <= 1:
+            if top:
+                _report_oom(on_oom, failed)
             raise
         mid = batch.num_rows // 2
-        left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid), on_oom)
-        right, right_ms = _run_with_oom_retry(worker, batch.slice(mid), on_oom)
+        try:
+            left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid), on_oom, _failed=failed)
+            right, right_ms = _run_with_oom_retry(worker, batch.slice(mid), on_oom, _failed=failed)
+        finally:
+            # After the bisection, so `failed` holds the whole bracket rather than only the
+            # size this level started with. In a `finally` because a ladder that ends in a
+            # genuine over-allocation still established a bound worth keeping.
+            if top:
+                _report_oom(on_oom, failed)
         from batcher.plan.types import one_batch
 
         # Concatenate the halves into a single batch. `one_batch` is the shared compaction:
@@ -136,8 +181,27 @@ def _run_with_oom_retry(
         return one_batch([left, right]), left_ms + right_ms
 
 
+def _report_oom(on_oom: Callable[[int], None] | None, failed: list[int]) -> None:
+    """Tell the batch-size controller the tightest size this bisection proved does not fit.
+
+    Once per event and never from inside the recursion. Best-effort: telemetry must not fail a
+    batch the ladder already recovered.
+    """
+    if on_oom is None or not failed:
+        return
+    with contextlib.suppress(Exception):
+        on_oom(min(failed))
+
+
 class _DynamicBatcher:
-    """Coalesce/split incoming batches to ~`target` rows (whole-batch Arrow ops)."""
+    """Coalesce/split incoming batches to ~`target` rows (whole-batch Arrow ops).
+
+    The buffer is touched only by the consumer thread that drives `run`, but **`target` is
+    written by whichever worker thread hit an out-of-memory** (`InferencePool._note_oom` lowers
+    it so the next batch is built smaller). That single cross-thread field is enough to corrupt
+    the output if it is read more than once inside one drain, so every read of it is snapshotted
+    into a local — see `_drain`.
+    """
 
     def __init__(self, target: int) -> None:
         import pyarrow as pa
@@ -148,6 +212,7 @@ class _DynamicBatcher:
         self._rows = 0
 
     def set_target(self, target: int) -> None:
+        """Retarget the coalescing. Called from a worker thread after a device OOM."""
         self._target = max(1, target)
 
     def push(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
@@ -160,19 +225,30 @@ class _DynamicBatcher:
         return self._drain()
 
     def _drain(self) -> list[pa.RecordBatch]:
+        # ONE read of the shared target for the whole drain. It was read afresh by the loop
+        # condition, by the slice, and by the offset advance — three reads of a field another
+        # thread writes — so a `set_target` landing mid-drain advanced `offset` by a different
+        # number than the slice had just consumed. That does not raise: it **duplicates or
+        # drops rows**, silently, and only when a device out-of-memory happens to coincide with
+        # a drain. Reproduced at 4 in 40 trials against an unmodified tree; the rows simply
+        # came out wrong.
+        #
+        # A snapshot is enough because the buffer itself is single-threaded: a retarget that
+        # lands mid-drain takes effect on the next one, which is the intended meaning anyway.
+        target = max(1, self._target)
         table = self._pa.Table.from_batches(self._buf)
         self._buf = []
         self._rows = 0
         out: list[pa.RecordBatch] = []
         offset = 0
-        while table.num_rows - offset >= self._target:
+        while table.num_rows - offset >= target:
             # `combine_chunks()` splits into MULTIPLE batches at the 32-bit offset limit,
             # so a target-row slice of large binary/string/list data is not always one
             # batch. Keep every piece: taking `[0]` here silently dropped rows for exactly
             # the wide inference outputs `_run_with_oom_retry` documents at the top of
             # this module.
-            out.extend(table.slice(offset, self._target).combine_chunks().to_batches())
-            offset += self._target
+            out.extend(table.slice(offset, target).combine_chunks().to_batches())
+            offset += target
         remainder = table.slice(offset).combine_chunks().to_batches()
         if remainder:
             self._buf = remainder
@@ -249,6 +325,9 @@ class InferencePool:
         min_batch_rows / max_batch_rows: bounds for the dynamic size.
         max_inflight: cap on submitted-but-unyielded batches, which bounds resident
             memory to the pool rather than the dataset. Defaults to ``num_workers * 4``.
+        prefetch: how many source batches to pull ahead on a background thread, so the
+            model is fed while the source is still producing. Set to 0 to pull the source
+            inline, which is what happened before this existed.
         learned_hub / learned_signature: opt into the persistent batch-size warm-start
             (throughput objective) — the pool records its plateau under `learned_signature`
             in the `MetadataHub` so the next run of the same job starts near the tuned size
@@ -267,6 +346,7 @@ class InferencePool:
         min_batch_rows: int = 1,
         max_batch_rows: int = 65_536,
         max_inflight: int | None = None,
+        prefetch: int = 2,
         learned_hub: Any = None,
         learned_signature: str | None = None,
     ) -> None:
@@ -281,6 +361,7 @@ class InferencePool:
         self._max_inflight = (
             max(1, max_inflight) if max_inflight is not None else self._num_workers * 4
         )
+        self._prefetch = max(0, prefetch)
         self._target_rows = max(1, target_batch_rows)
         self._batcher = _DynamicBatcher(self._target_rows)
         # Two adaptive objectives (see ml/autobatch). "latency" drives a PID toward
@@ -475,7 +556,7 @@ class InferencePool:
                     pending.append(pool.submit(dispatch, rebatched))
 
                 try:
-                    for batch in batches:
+                    for batch in _prefetched(batches, self._prefetch):
                         for rebatched in self._batcher.push(batch):
                             yield from submit(rebatched)
                             yield from drain(block=False)
@@ -493,6 +574,72 @@ class InferencePool:
                         future.cancel()
         finally:
             _close_workers(built)
+
+
+def _prefetched(batches: Iterable[pa.RecordBatch], depth: int) -> Iterator[pa.RecordBatch]:
+    """`batches`, pulled `depth` ahead on a background thread.
+
+    The pool's own measurement is what motivates this. `_publish_batch` reports `blocked_ms`
+    precisely to separate a *saturated* pool from a *starved* one, and a starved pool is the
+    common case for inference: the source is object storage plus a decode, the model is on a
+    device, and until now one thread did both in turn. While a batch was being read the
+    workers had nothing to do, and while the workers ran nothing was being read — so the two
+    costs added instead of overlapping, however many workers the pool had.
+
+    `depth` batches sit in a bounded queue, so peak memory grows by that many batches and no
+    more; the source blocks once the queue is full, which is the same backpressure the rest of
+    the engine applies. `depth=0` returns the iterable untouched, so the inline behaviour is
+    still reachable and costs nothing.
+
+    Three properties this has to get right, each of which is a way a prefetch thread goes
+    wrong: an exception raised by the source must surface **to the consumer** rather than
+    vanish on a daemon thread; a consumer that stops early (a `limit`, a `break`, an
+    exception) must not leave the thread blocked on a full queue forever; and the thread must
+    be joined before the generator returns so nothing outlives the pool.
+    """
+    if depth <= 0:
+        yield from batches
+        return
+    queue: Queue = Queue(maxsize=depth)
+    done = threading.Event()
+    _END = object()
+
+    def pump() -> None:
+        try:
+            for batch in batches:
+                while not done.is_set():
+                    try:
+                        queue.put(batch, timeout=_POLL_S)
+                        break
+                    except Full:
+                        continue  # the consumer is behind; check `done` and wait again
+                else:
+                    return  # the consumer abandoned the stream
+            queue.put(_END)
+        except BaseException as exc:  # re-raised on the consumer's thread, never swallowed
+            # Handed over rather than logged: a source that fails must fail the query, and a
+            # traceback printed on a worker thread is not a failure anyone sees.
+            with contextlib.suppress(Exception):
+                queue.put(exc)
+
+    thread = threading.Thread(target=pump, name="batcher-inference-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = queue.get()
+            if item is _END:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        done.set()
+        # Drain one slot so a producer blocked on `put` can notice `done` and exit, then join
+        # it: a thread still holding a reference to the source is a thread the caller's
+        # `finally` cannot close over.
+        with contextlib.suppress(Exception):
+            queue.get_nowait()
+        thread.join(timeout=_JOIN_S)
 
 
 def _close_workers(workers: list[Worker]) -> None:

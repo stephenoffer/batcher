@@ -66,6 +66,35 @@ def _is_stattable(dtype: pa.DataType) -> bool:
     return any(check(dtype) for check in _STATTABLE)
 
 
+def _has_countable_nulls(dtype: pa.DataType) -> bool:
+    """Whether Delta's ``nullCount`` for this column is a plain number.
+
+    It is, for every leaf type. For a **nested** one it is not: the protocol says a
+    struct's `nullCount` is an *object* with one entry per sub-field, mirroring the
+    struct's own shape, and a list's is not collected at all. Writing the column's own
+    null count there produced `{"st": 1}` where the reader demands `{"st": {"k": 1}}`,
+    and the Delta kernel refused the commit outright — "Json error: whilst decoding field
+    'nullCount'". So a table with a struct column could not be written.
+
+    It did not fail on every such table, which is what kept it hidden: a struct column
+    *alone* committed fine, and so did `int + struct`; it took a second column of a
+    particular type in the same file for the kernel to reach the strict decode. The
+    reproducer was `boolean + struct`, and nothing about booleans is the cause.
+
+    An absent statistic is always sound — the reader keeps a file it cannot decide on —
+    which is the same rule the bounds above already follow for nested columns. Emitting
+    the nested object instead would be sound too, and buys nothing today: nothing in
+    `io.stats.file_skipping` prunes on a sub-field's null count.
+    """
+    return not (
+        pa.types.is_struct(dtype)
+        or pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_map(dtype)
+    )
+
+
 def collect_file_stats(table: pa.Table) -> dict[str, Any]:
     """Per-column bounds for one data file, computed from the data already in memory.
 
@@ -87,7 +116,8 @@ def collect_file_stats(table: pa.Table) -> dict[str, Any]:
     nulls: dict[str, int] = {}
     for field in table.schema:
         column = table.column(field.name)
-        nulls[field.name] = column.null_count
+        if _has_countable_nulls(field.type):
+            nulls[field.name] = column.null_count
         if not _is_stattable(field.type) or len(column) == column.null_count:
             continue
         try:

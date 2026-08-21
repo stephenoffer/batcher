@@ -25,10 +25,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use thiserror::Error;
 
-/// Default soft-pressure line as basis points of the limit (8000 = 80%). Above it
-/// the pool reports [`Pressure::Elevated`] so the executor can spill *proactively*
-/// instead of waiting for the hard cap to stall the process. Carbonite overrides it
-/// from its memory envelope via [`MemoryPool::set_soft_fraction`].
+/// Default soft-pressure line as basis points of the limit (8000 = 80%). Above it the pool
+/// reports [`Pressure::Elevated`]. Nothing overrides it today — see
+/// [`MemoryPool::set_soft_fraction`] for what that would take and why it has not been done.
 const DEFAULT_SOFT_BPS: usize = 8000;
 
 /// Hard cap on cooperative-spill rounds inside one reservation attempt.
@@ -42,10 +41,20 @@ const DEFAULT_SOFT_BPS: usize = 8000;
 /// handles (it is the signal to spill itself).
 const MAX_SPILL_ROUNDS: usize = 32;
 
-/// Coarse memory-pressure level derived from `used / limit`. The one signal the
-/// executor's backpressure mechanisms (proactive spill, the morsel-admission gate,
-/// the distributed credit window) all read, so single-node and distributed throttle
-/// off the same envelope rather than each inventing a threshold.
+/// Coarse memory-pressure level derived from `used / limit`.
+///
+/// **Reported, not yet acted on inside the data plane.** This says what it is for rather
+/// than what it does, because the two had drifted: the level is carried out through
+/// [`PoolStats`] to the control plane, which is where every throttling decision is made
+/// today — the proactive spill, the morsel-admission gate and the credit window all read
+/// Carbonite's `PressureLevel`, taken from the operating system's own accounting. Nothing
+/// in `bc-runtime`, `bc-interp` or `bc-py` reads this one, and the comment that said all
+/// three did was describing an intention.
+///
+/// The intention is still the right one — an operator that could fit but would take the
+/// process to the wall is better off going out of core before it stalls there — and the
+/// seam is deliberately kept for it. What it needs is a benchmark, because spilling earlier
+/// trades throughput for headroom and neither direction is free.
 ///
 /// Ordered, so a caller can write `pressure >= Pressure::Elevated` the way the control
 /// plane's `PressureLevel` is compared. Without it every consumer of this enum had to
@@ -143,9 +152,35 @@ pub struct PoolStats {
     pub denied: usize,
     /// Times a registered consumer was asked to spill.
     pub spill_requests: usize,
+    /// The soft-pressure line in bytes (see [`Pressure`]).
+    ///
+    /// Carried in the snapshot rather than left to the reader to recompute, because the
+    /// fraction it comes from is not otherwise visible from outside — so a control plane
+    /// looking at `used` had no way to tell whether the data plane considered itself under
+    /// pressure, and could only guess at the line by assuming the default.
+    pub soft_limit: usize,
 }
 
 impl PoolStats {
+    /// The pressure this snapshot represents (see [`Pressure`]).
+    ///
+    /// The one definition of the level, which [`MemoryPool::pressure`] also reads. Two
+    /// copies of a three-way comparison is exactly the kind of thing that comes to disagree
+    /// at one boundary — and the boundary here is the one that decides whether an operator
+    /// is told the envelope is filling.
+    pub fn pressure(&self) -> Pressure {
+        if self.limit == 0 {
+            return Pressure::Nominal;
+        }
+        if self.used >= self.limit {
+            Pressure::Critical
+        } else if self.used >= self.soft_limit {
+            Pressure::Elevated
+        } else {
+            Pressure::Nominal
+        }
+    }
+
     /// `used / limit` in `[0, 1]`; `1.0` for a zero-limit (unconfigured) pool, which is
     /// full by definition rather than empty.
     pub fn utilization(&self) -> f64 {
@@ -246,7 +281,14 @@ impl MemoryPool {
             peak_used: self.peak_used(),
             denied: self.denied(),
             spill_requests: self.spill_requests(),
+            soft_limit: self.soft_limit(),
         }
+    }
+
+    /// The soft-pressure line in bytes — the fraction applied to the current limit.
+    pub fn soft_limit(&self) -> usize {
+        let limit = self.limit();
+        (limit as u128 * self.soft_bps.load(Ordering::Acquire) as u128 / 10_000) as usize
     }
 
     /// The pool's current limit in bytes.
@@ -412,8 +454,13 @@ impl MemoryPool {
     }
 
     /// Set the soft-pressure line as a fraction of the limit (clamped to `[0, 1]`).
-    /// Carbonite drives this from its memory envelope so [`Pressure::Elevated`]
-    /// fires at the same soft line the control plane uses.
+    ///
+    /// **Nothing calls this in production**, so the line sits at [`DEFAULT_SOFT_BPS`]. The
+    /// control plane's own soft line is `memory.soft_limit` of the *cap* while the pool's
+    /// limit is `hard_limit` of it, so the two are different absolute figures — and saying
+    /// they were the same, as this used to, hid that. Carrying the fraction across the
+    /// engine-config boundary is what would make them agree; it is a two-sided change and
+    /// belongs with the work that gives the level a consumer.
     pub fn set_soft_fraction(&self, fraction: f64) {
         let bps = (fraction.clamp(0.0, 1.0) * 10_000.0).round() as usize;
         self.soft_bps.store(bps, Ordering::Release);
@@ -423,21 +470,7 @@ impl MemoryPool {
     /// cap, `Elevated` at/above the soft line, else `Nominal`. A zero limit (unbounded
     /// / unconfigured) is always `Nominal`.
     pub fn pressure(&self) -> Pressure {
-        let limit = self.limit();
-        if limit == 0 {
-            return Pressure::Nominal;
-        }
-        let used = self.used();
-        if used >= limit {
-            return Pressure::Critical;
-        }
-        let soft =
-            (limit as u128 * self.soft_bps.load(Ordering::Acquire) as u128 / 10_000) as usize;
-        if used >= soft {
-            Pressure::Elevated
-        } else {
-            Pressure::Nominal
-        }
+        self.stats().pressure()
     }
 }
 
@@ -833,6 +866,40 @@ mod tests {
 
         r.try_resize(0).unwrap();
         assert_eq!(pool.used(), 0);
+    }
+
+    /// A snapshot has to be able to answer the pressure question on its own. The control
+    /// plane reads `stats()` across the FFI boundary and cannot call back into the pool, so
+    /// a snapshot that carried `used` and `limit` but not the line between them left the
+    /// reader guessing at the default.
+    #[test]
+    fn a_snapshot_answers_the_pressure_question_on_its_own() {
+        let pool = MemoryPool::new(1_000);
+        pool.set_soft_fraction(0.6);
+        let idle = pool.stats();
+        assert_eq!(idle.soft_limit, 600);
+        assert_eq!(idle.pressure(), Pressure::Nominal);
+
+        pool.try_reserve_bytes(700).unwrap();
+        let busy = pool.stats();
+        assert_eq!(busy.pressure(), Pressure::Elevated);
+        assert_eq!(
+            busy.pressure(),
+            pool.pressure(),
+            "one definition of the level"
+        );
+
+        pool.try_reserve_bytes(300).unwrap();
+        assert_eq!(pool.stats().pressure(), Pressure::Critical);
+    }
+
+    /// An unconfigured pool is unbounded, not full: reporting pressure on it would make
+    /// every process that never set a budget look like one about to spill.
+    #[test]
+    fn a_snapshot_of_an_unbounded_pool_is_nominal() {
+        let stats = MemoryPool::new(0).stats();
+        assert_eq!(stats.soft_limit, 0);
+        assert_eq!(stats.pressure(), Pressure::Nominal);
     }
 
     #[test]

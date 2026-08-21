@@ -35,10 +35,11 @@ from typing import Any
 from batcher._internal.logging import note_suppressed
 
 __all__ = [
+    "grid_kind_of",
     "load_learned_grids",
     "persist_grids",
+    "sort_grid_kind",
     "sort_key_identity",
-    "sort_key_is_string",
     "sort_shape_key",
 ]
 
@@ -139,34 +140,83 @@ def sort_key_identity(source: object, key_name: str) -> str | None:
     return f"{key}|{field.type}"
 
 
-def sort_key_is_string(source: object, key_name: str) -> bool | None:
-    """Whether `source`'s `key_name` column is a string key — `None` when it cannot be seen.
+def sort_grid_kind(source: object, key_name: str) -> str | None:
+    """Which flavour of quantile grid `source`'s `key_name` column produces — `None` when it
+    cannot be seen.
 
-    The one question the grid's element type has to answer, asked of the schema rather than
-    of the data, because `merge_boundaries` dispatches on exactly this distinction: a string
-    grid is merged lexically and everything else numerically. Best-effort by construction —
-    a source that cannot produce a schema yields `None`, which every caller reads as "no
-    type opinion" and which leaves behavior exactly as it was.
+    The one question the grid's element type has to answer, asked of the schema rather than of
+    the data, because every consumer dispatches on exactly this distinction: `merge_boundaries`
+    merges a `"text"` or `"binary"` grid lexically and a `"numeric"` one arithmetically, and
+    `bucketize` routes each through a different partitioner.
+
+    It answers with a name rather than a flag because there are three answers and there always
+    were. While this returned `is_string`, a *binary* key answered `False` — the same answer a
+    float key gives — so a stored float grid passed the load-side guard and reached the byte
+    range partitioner. Best-effort by construction: a source that cannot produce a schema
+    yields `None`, which every caller reads as "no type opinion" and which leaves behavior
+    exactly as it was.
 
     Args:
         source: The bound input the sort reads.
         key_name: The leading sort key's column name.
 
     Returns:
-        True for a string/large-string key, False for any other type, `None` if unknown.
+        `"text"` for a string key, `"binary"` for a binary one, `"numeric"` for anything else,
+        or `None` if the type cannot be read.
     """
     try:
-        import pyarrow as pa
-
         field = source.schema().field(key_name)  # type: ignore[attr-defined]
     except Exception as exc:
         note_suppressed("dist", "read the sort key's type", exc)
         return None
-    return bool(pa.types.is_string(field.type) or pa.types.is_large_string(field.type))
+    return grid_kind_of(field.type)
+
+
+def grid_kind_of(dtype: Any) -> str:
+    """The [`sort_grid_kind`] answer for an Arrow type already in hand.
+
+    Split out because the sampler sees the *batch's* schema rather than the source's, and the
+    two must not answer differently — a grid sampled as bytes and merged as text is a wrong
+    boundary list, not an error.
+
+    Args:
+        dtype: The leading sort key's Arrow type.
+
+    Returns:
+        `"text"`, `"binary"`, or `"numeric"`.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.dist.sort_boundaries import grid_kind_of
+            >>> grid_kind_of(pa.binary()), grid_kind_of(pa.string()), grid_kind_of(pa.int64())
+            ('binary', 'text', 'numeric')
+    """
+    import pyarrow as pa
+
+    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        return "text"
+    if (
+        pa.types.is_binary(dtype)
+        or pa.types.is_large_binary(dtype)
+        or pa.types.is_fixed_size_binary(dtype)
+    ):
+        return "binary"
+    return "numeric"
+
+
+def _kind_of_value(value: Any) -> str:
+    """The grid kind a stored or sampled boundary *value* belongs to."""
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, (bytes, bytearray)):
+        return "binary"
+    return "numeric"
 
 
 def load_learned_grids(
-    shape_key: str, expect_strings: bool | None = None
+    shape_key: str, expect_kind: str | None = None
 ) -> list[tuple[list[Any], int]] | None:
     """The per-worker quantile grids learned for this sort shape, or `None` if never
     measured.
@@ -176,7 +226,7 @@ def load_learned_grids(
     moves between runs, and boundaries sized for the wrong count would route rows past the
     last bucket.
 
-    `expect_strings` is the load-side half of the type guard `sort_shape_key` describes. It
+    `expect_kind` is the load-side half of the type guard `sort_shape_key` describes. It
     is deliberately a *second* check rather than a restatement of the first: keying by type
     stops the two shapes from sharing an entry from now on, and this stops an entry written
     before that — by an older build, under the colliding digest — from reaching the range
@@ -189,7 +239,7 @@ def load_learned_grids(
 
     Args:
         shape_key: The digest from [`sort_shape_key`].
-        expect_strings: Whether the leading key is a string, from [`sort_key_is_string`].
+        expect_kind: The grid flavour this key needs, from [`sort_grid_kind`].
 
     Returns:
         The stored grids, or `None` when this shape has never been sampled or what was
@@ -201,16 +251,16 @@ def load_learned_grids(
         stored = default_hub().get_keyed_param(_SORT_NAMESPACE, shape_key)
         if not stored:
             return None
-        grids = [(list(grid), int(n)) for grid, n in stored if grid and n]
-        if expect_strings is not None and any(
-            isinstance(grid[0], str) is not expect_strings for grid, _n in grids
+        grids = [(_decode_grid(list(grid)), int(n)) for grid, n in stored if grid and n]
+        if expect_kind is not None and any(
+            _kind_of_value(grid[0]) != expect_kind for grid, _n in grids
         ):
             note_suppressed(
                 "dist",
                 "reuse a learned sort grid",
                 TypeError(
-                    f"stored grid is {'not ' if expect_strings else ''}a string grid but the "
-                    f"sort key is {'' if expect_strings else 'not '}a string; re-sampling"
+                    f"stored grid is a {_kind_of_value(grids[0][0])} grid but the sort key "
+                    f"needs a {expect_kind} one; re-sampling"
                 ),
             )
             return None
@@ -237,9 +287,43 @@ def persist_grids(shape_key: str, grids: list[tuple[list[Any], int]]) -> None:
     try:
         from batcher.core import default_hub
 
-        kept = [[list(grid), int(n)] for grid, n in grids if grid and n][:_MAX_GRIDS]
+        kept = [[_encode_grid(list(grid)), int(n)] for grid, n in grids if grid and n][:_MAX_GRIDS]
         if not kept:
             return
         default_hub().put_keyed_param(_SORT_NAMESPACE, shape_key, kept)
     except Exception as exc:
         note_suppressed("dist", "persist learned sort boundaries", exc)
+
+
+# A binary grid's boundaries are `bytes`, and the hub stores JSON. Hex round-trips them exactly
+# and sorts in the same order the bytes do, so a grid written by one run reads back as the same
+# boundaries in the same order in the next. The marker prefix is what tells the two apart on the
+# way back in: a bare hex string is indistinguishable from a text key that happens to be hex.
+_BINARY_MARK = "0x"
+
+
+def _encode_grid(grid: list[Any]) -> list[Any]:
+    """`grid` with any `bytes` boundary rendered as a marked hex string, for JSON storage."""
+    return [
+        f"{_BINARY_MARK}{bytes(v).hex()}" if isinstance(v, (bytes, bytearray)) else v for v in grid
+    ]
+
+
+def _decode_grid(grid: list[Any]) -> list[Any]:
+    """The inverse of [`_encode_grid`]: marked hex strings back to `bytes`, everything else
+    untouched.
+
+    A value that is marked but not decodable is left as it found it rather than raised on: the
+    kind guard in [`load_learned_grids`] then rejects the grid and the sort re-samples, which is
+    this module's answer to every other kind of stored nonsense.
+    """
+    out: list[Any] = []
+    for v in grid:
+        if isinstance(v, str) and v.startswith(_BINARY_MARK):
+            try:
+                out.append(bytes.fromhex(v[len(_BINARY_MARK) :]))
+                continue
+            except ValueError:
+                pass
+        out.append(v)
+    return out

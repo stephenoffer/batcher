@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 from batcher._internal.errors import ConfigError
-from batcher._internal.hardware import fingerprint
 from batcher._internal.logging import get_logger
+from batcher.metadata.hardware_scope import local_or_planned_fingerprint
 from batcher.metadata.params import LearnedParams
 from batcher.metadata.store import MetadataBackend, check_backend
 from batcher.metadata.views import (
@@ -94,6 +95,15 @@ class MetadataHub:
         # offer it and keeps the `put` path unchanged.
         self._put_row = getattr(backend, "put_row", None)
         self._seq = 0
+        # The storage key's second element. Deliberately **not** `_seq`, which restarts at 0
+        # in every process: on a durable backend that made a second process's first row
+        # collide with the first process's first row, and `put` is an upsert, so it silently
+        # replaced it. A served workload — a process per request, a handful of operators each
+        # — therefore overwrote the same few keys forever and the store never grew past one
+        # run's worth of history, which is the whole of cross-run learning. Wall-clock
+        # nanoseconds are unique across processes and, unlike a per-process counter, order
+        # rows from different runs chronologically, which is what `build_views` reads them in.
+        self._stamp = 0
         # The learned-parameter half of the store, with its own parsed-read cache. A separate
         # object because it is a separate job: this class absorbs measurements and maintains
         # views over them, `LearnedParams` holds what the tuning loops read back at plan time.
@@ -115,9 +125,9 @@ class MetadataHub:
         self._signed_appends = 0
         # `record` is the one writer, and several queries call it at once: the hub is a
         # process singleton (`core.default_hub`), so two concurrent pipelines both fold
-        # their measurements in here. `self._seq += 1` is a read-modify-write, and `_seq`
-        # is half the storage key — a lost update makes two rows collide and one query's
-        # feedback silently overwrite another's. Measured with preemption forced: 124 of
+        # their measurements in here. `self._stamp` is a read-modify-write and is half the
+        # storage key — a lost update makes two rows collide and one query's feedback
+        # silently overwrite another's. Measured with preemption forced: 124 of
         # 32,000 rows collided. Core measures and Kyber consumes, so a dropped row is not
         # a wrong answer, it is a plan that quietly stops improving. `record` runs once per
         # operator per query, so serializing it costs nothing on the hot path.
@@ -149,7 +159,7 @@ class MetadataHub:
     def _record_locked(self, feedback: OperatorFeedback) -> None:
         """The body of `record`, serialized against concurrent writers by `_lock`."""
         self._seq += 1
-        key = (int(feedback.op_id), self._seq)
+        key = (int(feedback.op_id), self._next_stamp())
         row = _row_of(feedback)
         if self._put_row is not None:
             self._put_row(_OP_STATS, key, row)
@@ -170,6 +180,19 @@ class MetadataHub:
             trimmed(self._signed, SIGNED_HISTORY_MAX)
         if self._seq % _OP_STATS_PRUNE_EVERY == 0:
             self._prune_op_stats()
+
+    def _next_stamp(self) -> int:
+        """A strictly increasing, process-unique stamp for the next stored row's key.
+
+        Wall-clock nanoseconds, forced strictly increasing so that two rows recorded inside
+        one clock tick — the common case, since a query records every operator at once —
+        cannot collide with each other either. Held under `_lock` with the rest of the write.
+        """
+        stamp = time.time_ns()
+        if stamp <= self._stamp:
+            stamp = self._stamp + 1
+        self._stamp = stamp
+        return stamp
 
     def _prune_op_stats(self, keys: list[Any] | None = None) -> None:
         """Bound the stored operator feedback to its newest `_OP_STATS_MAX` rows.
@@ -266,11 +289,26 @@ class MetadataHub:
         far more than the median/regression its consumers fit needs, and enough to
         keep a long-lived session's planning cost flat.
 
+        **`None` resolves through the enclosing `planning_for` scope before falling back to
+        this process**, which is the same resolution `hardware_scope.scoped` performs and for
+        the same reason. A distributed run wraps its whole plan-optimize-admit-execute span in
+        `planning_for(workers)` precisely so that a read and a write cannot key the same
+        learned quantity differently — and a default that ignored it made this view the one
+        place they did. Two consumers passed nothing and so read the *driver's* rows while
+        deciding about the *workers*: `carbonite.memory.learned`, which fits the per-family
+        memory model that sizes admission and the distributed per-task grant, and
+        `dist.adaptive_sizing`, whose whole subject is how to shape a task on a worker. On any
+        cluster whose driver is a different machine class from its workers — the ordinary Ray
+        shape, a small head node and large workers — both read `{}` and silently kept their
+        cold-start defaults, on exactly the deployment they exist for. Passing an explicit
+        class still wins, so every caller that already names one is unaffected.
+
         Args:
             hw_fingerprint: The machine class to read, from `HardwareProfile.fingerprint`.
-                `None` reads this process's own class, which is the single-node answer and
-                what every caller without a cluster profile wants. An unknown class yields
-                an empty view rather than another machine's rows.
+                `None` reads the class the enclosing `planning_for` scope names, and this
+                process's own outside one — the single-node answer, and what every caller
+                without a cluster profile wants. An unknown class yields an empty view rather
+                than another machine's rows.
 
         Returns:
             `{kind: rows}` for that machine class, empty when it has measured nothing.
@@ -279,7 +317,7 @@ class MetadataHub:
         if self._by_fp is None:
             self._load_views()
         assert self._by_fp is not None
-        return self._by_fp.get(hw_fingerprint or fingerprint(), {})
+        return self._by_fp.get(hw_fingerprint or local_or_planned_fingerprint(), {})
 
     def op_stats_with_signature(self) -> list[dict[str, Any]]:
         """Signature-carrying operator feedback, **oldest first**.

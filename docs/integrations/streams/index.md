@@ -9,7 +9,7 @@ operators are the same ones you already use.
 :::{grid-item-card} {octicon}`broadcast;1.1em` Kafka
 :link: /integrations/streams/kafka
 :link-type: doc
-One reader per topic partition. No sink; publish back through {py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>`.
+One reader per topic partition, and a sink that publishes back to a topic.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Kinesis
@@ -36,6 +36,12 @@ A single reader, however big the cluster. Ack deadlines make the duplicates.
 Native AMQP, or the Kafka protocol endpoint that actually resumes.
 :::
 
+:::{grid-item-card} {octicon}`file-code;1.1em` Payload formats
+:link: /integrations/streams/payload-formats
+:link-type: doc
+Avro, JSON, and Protobuf payloads, and the Confluent Schema Registry.
+:::
+
 ::::
 
 ```{toctree}
@@ -46,4 +52,5 @@ kinesis
 pulsar
 pubsub
 eventhubs
+payload-formats
 ```

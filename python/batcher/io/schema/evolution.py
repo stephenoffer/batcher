@@ -58,6 +58,9 @@ def _common_supertype(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
         return _common_supertype(a.value_type, b)
     if pa.types.is_dictionary(b):
         return _common_supertype(a, b.value_type)
+    tensor = _tensor_common(a, b)
+    if tensor is not None:
+        return tensor
     if pa.types.is_struct(a) and pa.types.is_struct(b):
         return _merge_structs(a, b)
     if pa.types.is_map(a) and pa.types.is_map(b):
@@ -110,6 +113,64 @@ def _merge_structs(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
     a_names = {f.name for f in a}
     fields.extend(pa.field(f.name, f.type) for f in b if f.name not in a_names)
     return pa.struct(fields)
+
+
+def _is_ragged(dtype: pa.DataType) -> bool:
+    """Whether `dtype` is the ragged-tensor struct, without importing at module scope."""
+    from batcher.io.formats.ml.ragged import is_ragged_tensor_column
+
+    return is_ragged_tensor_column(dtype)
+
+
+def _tensor_common(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
+    """Two tensor columns that disagree on shape unify to the *ragged* encoding.
+
+    A `map_batches` UDF that returns arrays of differing shapes produces a ragged column
+    single-node, because one call sees every row and the shapes plainly differ. Distributed,
+    the same UDF runs per partition -- and a partition whose rows happen to agree yields a
+    `fixed_shape_tensor` of *that* shape. Two such partitions then have no common type and the
+    reconcile raised, so a ragged column was a `SchemaError` on the distributed path and a
+    result single-node. Which partitions agree depends on the partition count, so the same
+    query failed or succeeded according to how it was scheduled.
+
+    `struct<data, shape, dtype>` is the common type these actually have: it is what the
+    single-node path already picks for the same rows, so unifying to it makes the distributed
+    answer the single-node answer rather than inventing a third one.
+
+    Returns `None` for anything that is not a pair of tensor columns, so every other type
+    keeps the behaviour it had -- including two *identical* fixed-shape tensors, which unify
+    to themselves and must not be widened to ragged.
+    """
+    from batcher.io.formats.ml.ragged import is_ragged_tensor_column, ragged_tensor_type
+
+    def tensorish(t: pa.DataType) -> bool:
+        return isinstance(t, pa.FixedShapeTensorType) or is_ragged_tensor_column(t)
+
+    if not (tensorish(a) and tensorish(b)):
+        return None
+    return a if a.equals(b) else ragged_tensor_type()
+
+
+def _fixed_tensor_to_ragged(array: pa.Array) -> pa.Array:
+    """A fixed-shape-tensor column re-encoded as a ragged one, row shapes preserved.
+
+    The cast `normalize_batch` would otherwise reach for cannot do this: `struct` is not a
+    cast target for an extension type, and the row buffers have to be rewritten anyway.
+    """
+    from batcher.io.formats.ml.ragged import to_ragged_tensor_column
+
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if array.null_count:
+        # `to_numpy_ndarray` refuses a column with nulls, so the null rows are carried
+        # through as `None` -- which `to_ragged_tensor_column` stores as a null row.
+        valid = array.is_valid().to_pylist()
+        dense = array.drop_null().to_numpy_ndarray()
+        rows: list[object] = []
+        it = iter(dense)
+        rows = [next(it) if ok else None for ok in valid]
+        return to_ragged_tensor_column(rows)
+    return to_ragged_tensor_column(list(array.to_numpy_ndarray()))
 
 
 def _promote(a: pa.DataType, b: pa.DataType, *, column: str) -> pa.DataType:
@@ -216,6 +277,10 @@ def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
             arr = batch.column(field.name) if ambiguous else batch.column(index)
             if arr.type.equals(field.type):
                 cols.append(arr)
+            elif isinstance(arr.type, pa.FixedShapeTensorType) and _is_ragged(field.type):
+                # The one unification whose target is not reachable by a cast; see
+                # `_tensor_common` for why two partitions can disagree in the first place.
+                cols.append(_fixed_tensor_to_ragged(arr))
             else:
                 # `promote` picks `float64` for an int/float column mix — its one
                 # deliberately-lossy widening (a column stored as int in older files,

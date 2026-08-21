@@ -28,10 +28,149 @@ request, which is what `usage=True` reads to append the token-count columns.
 | Engine | Use |
 | --- | --- |
 | `vllm_engine(model, *, sampling, guided_json, guided_regex, lora_path, **engine_kwargs)` | Local vLLM on a GPU. `sampling` (max tokens, temperature, etc.), `guided_json` / `guided_regex` for structured output, `lora_path` for an adapter, and `engine_kwargs` for tensor parallelism, quantization, and the rest of vLLM's engine options. Needs `batcher-engine[vllm]`. |
+| `sglang_engine(model, *, chat, system, sampling, json_schema, regex, ebnf, lora_paths, **engine_kwargs)` | Local SGLang on a GPU. Same shape as `vllm_engine`; its RadixAttention cache reuses whatever prefix the rows happen to share rather than one configured prefix, which is the win on templated batches. `max_tokens` is accepted as an alias for SGLang's `max_new_tokens`, so a `sampling` dict moves between backends unchanged. Needs `batcher-engine[sglang]`. |
 | `http_engine(base_url, model, *, api_key, system, chat=True, max_tokens=512, temperature=0.0, on_error="raise", timeout=60.0)` | An OpenAI-compatible HTTP endpoint (vLLM server, llama.cpp, a hosted API). Applies the chat template server-side; retries on rate limits. `on_error="null"` skips a failed row instead of failing the batch. |
 | `anthropic_engine(model, *, api_key, system, max_tokens=1024, temperature=None, on_error="raise", concurrency=8)` | A hosted Claude model over the Anthropic Messages API. Same interchangeable engine contract; `temperature` is omitted unless set (some models reject it). Reads `$ANTHROPIC_API_KEY` when `api_key` is unset. |
+| `bedrock_engine(model, *, region, system, max_tokens=1024, temperature=None, additional_model_request_fields, on_error="raise", concurrency=8)` | Any model on AWS Bedrock, through the Converse API. One request shape across Claude, Llama, Mistral, Titan and Nova, so changing model family is a string change. Credentials come from the standard AWS chain, so a worker on EC2 or EKS needs none passed in. Needs `boto3`. |
+| `gemini_engine(model, *, api_key, base_url, system, max_tokens=1024, response_schema, safety_settings, on_error="raise", concurrency=8)` | A Gemini model over `generateContent`. Point `base_url` at a Vertex AI endpoint and pass an OAuth token to use Vertex instead. `response_schema` constrains the generation to a schema rather than asking for JSON. Reads `$GEMINI_API_KEY` or `$GOOGLE_API_KEY` when `api_key` is unset. |
 
 Both hosted engines also take `requests_per_minute` and `tokens_per_minute`, covered below.
+
+### Choosing between vLLM and SGLang
+
+Both are local, GPU-resident, and interchangeable through the same `EngineFactory` contract,
+so this is a measurement rather than a commitment. The difference that matters offline is what
+each caches.
+
+`vllm_engine` caches a prefix you configure. `sglang_engine` keeps every prompt's KV cache in a
+radix tree keyed by token prefix, so two rows that happen to share an opening share its
+prefill, and a third that shares a longer opening shares more. Batch inference is usually the
+*same template* over different rows, which is exactly the shape that pays: a shared system
+message, a shared instruction, a shared few-shot block, and a few hundred varying characters at
+the end.
+
+```python
+# docs: skip
+import batcher as bt
+
+engine = bt.ml.sglang_engine(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    chat=True,
+    system="Answer with a single sentence.",
+    sampling={"max_tokens": 128},
+    tp_size=2,
+)
+answered = ds.ml.generate(engine, prompt_column="question", num_gpus=2)
+```
+
+Structured output is one keyword rather than a separate object. Pass `json_schema=` to
+constrain generation to a schema, `regex=` to a pattern, or `ebnf=` to a grammar; exactly one
+of the three, because a generation is constrained by one grammar and silently preferring one
+over another produces output shaped by a rule you did not pick.
+
+```python
+# docs: skip
+engine = bt.ml.sglang_engine(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    chat=True,
+    json_schema={"type": "object", "properties": {"sentiment": {"type": "string"}}},
+)
+typed = ds.ml.generate(engine, prompt_column="review", parse_json=True)
+```
+
+Rows sharing a prefix hit the tree more often when they are adjacent, so ordering the input by
+the varying part is worth trying on a large run.
+
+### Reaching a cloud provider's own API
+
+`http_engine` covers everything that speaks the OpenAI chat-completions shape, which is most
+self-hosted servers and several hosted APIs. Three large providers do not, and each has its own
+engine for the same reason: the request body differs, and nothing else does.
+
+```python
+# docs: skip
+import batcher as bt
+
+# AWS: one Converse request shape across every model family Bedrock hosts.
+claude = bt.ml.bedrock_engine("anthropic.claude-sonnet-4-20250514-v1:0", region="us-west-2")
+llama = bt.ml.bedrock_engine("meta.llama3-1-70b-instruct-v1:0", region="us-west-2")
+
+# Google: the same engine reaches Vertex AI through `base_url` and an OAuth token.
+gemini = bt.ml.gemini_engine("gemini-2.0-flash")
+
+answered = ds.ml.generate(claude, prompt_column="question", concurrency=16)
+```
+
+Bedrock takes credentials from the standard AWS chain, so a worker running under an instance
+role or IRSA needs nothing passed in. `additional_model_request_fields` forwards whatever the
+underlying model accepts that Converse does not name, which is how you reach a Claude thinking
+block or a Llama repetition penalty without leaving the uniform request shape.
+
+Gemini constrains structured output with `response_schema=`, which is stronger than asking for
+JSON in the prompt: the decoding itself is constrained, so the result parses.
+
+```python
+# docs: skip
+engine = bt.ml.gemini_engine(
+    "gemini-2.0-flash",
+    response_schema={
+        "type": "object",
+        "properties": {"sentiment": {"type": "string"}, "score": {"type": "number"}},
+    },
+)
+typed = ds.ml.generate(engine, prompt_column="review", parse_json=True)
+```
+
+Both take the same `requests_per_minute` and `tokens_per_minute` caps as the other hosted
+engines, and both honor a `Retry-After` the provider sends rather than guessing a backoff.
+
+### Pointing `http_engine` at a self-hosted server
+
+The engines above load a model *into the worker*. This is the other deployment: the model
+already runs behind an HTTP server you operate, and the worker is a client of it. Reach for
+this when the server is shared with other consumers, or when it is scaled and scheduled
+separately from the batch job.
+
+`http_engine` is not tied to OpenAI. It posts to `{base_url}/chat/completions`, so it drives
+any server that speaks the OpenAI chat-completions shape, and most modern inference servers
+do. There is no separate engine to pick and nothing to subclass: set `base_url` to the
+server's `/v1` root and `model` to the name that server serves under.
+
+| Server | `base_url` |
+| --- | --- |
+| vLLM (`vllm serve`) | `http://<host>:8000/v1` |
+| SGLang (`python -m sglang.launch_server`) | `http://<host>:<port>/v1`, the port you passed `--port` |
+| Ollama | `http://<host>:11434/v1` |
+| Hugging Face TGI (Messages API, 1.4.0 and later) | `http://<host>:8080/v1` |
+| llama.cpp (`llama-server`) | `http://<host>:8080/v1` |
+
+```python
+# docs: skip
+import batcher as bt
+
+engine = bt.ml.http_engine("http://localhost:11434/v1", "llama3.1", api_key="ollama")
+scored = ds.ml.generate(engine, prompt_column="question", concurrency=16)
+```
+
+The ports above are each server's own default, so check the one your deployment actually
+binds. Anything the server accepts but the OpenAI schema does not name goes through
+`extra_body`, which is passed into the request body untouched.
+
+```python
+# docs: skip
+engine = bt.ml.http_engine(
+    "http://localhost:30000/v1",
+    "Qwen/Qwen2.5-7B-Instruct",
+    extra_body={"separate_reasoning": True},
+)
+```
+
+:::{note}
+A served endpoint and a local `vllm_engine` are not the same throughput story. The server
+already batches across every client that is talking to it, so the lever is `concurrency`
+(how many requests this worker keeps in flight), not an outer batch size. The
+"Batching and throughput" section below covers the difference.
+:::
 
 ### Staying inside a provider's quota
 

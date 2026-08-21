@@ -78,6 +78,28 @@ scored = reviews.ml.infer("distilbert-base-uncased-finetuned-sst-2-english",
                           batch_size=64, num_gpus=1, concurrency=(1, 4))
 ```
 
+For a model that was **exported** out of its framework — an ONNX graph, a TorchScript
+archive, an OpenVINO IR — there is no wrapper to write either. Each predictor is a load-once
+class UDF built on `serving_udf`, so it splits a batch against the model's own window, keeps
+in-flight requests pipelined, and releases the model with the worker:
+
+```python
+udf = bt.ml.onnx_predictor("resnet50.onnx", input_columns=["pixel_values"],
+                           output_columns=["logits"], providers=["cuda"])
+scored = images.ml.map_batches(udf, num_gpus=1, concurrency=8)
+```
+
+`providers=["tensorrt", "cuda"]` is how TensorRT is reached (an ONNX Runtime execution
+provider, not a separate integration). `bt.ml.torch_predictor(path_or_factory, ...)` runs a
+TorchScript archive or a factory-built module and applies `eval()` + `inference_mode()` for
+you; `bt.ml.openvino_predictor(...)` targets Intel CPU/GPU/NPU fleets and defaults to
+`performance_hint="THROUGHPUT"` rather than OpenVINO's own `LATENCY`, which is the right
+default for scoring a table. Full page: `docs/ml/inference/runtimes.md`.
+
+`ds.ml.infer(<model id>)` is not text-only: the column's Arrow *type* decides what the
+pipeline is fed, so a decoded waveform column (`col("bytes").audio.resample(16000)`) feeds an
+`automatic-speech-recognition` model directly, with the decode staying in the data plane.
+
 `input_columns=` must name **every** column the callable reads — projection pushdown prunes the
 scan to that list, so an omission is a correctness bug, not a perf nit; leave it `None`
 (the default) when unsure, which keeps every column alive. `output_columns=`
@@ -250,6 +272,15 @@ lora_path=None, quantization="auto", **engine_kwargs)` for local vLLM, or `http_
 model, *, api_key=None, chat=True, max_tokens=512, temperature=0.0, concurrency=8)` for an
 OpenAI-compatible endpoint. `extract(schema={...})` and `parse_json=True` give structured
 output; `image_column=` handles VLM prompts.
+
+Every engine satisfies the same `list[str] -> list[str]` contract, so swapping one is a
+one-line change and nothing columnar moves: `sglang_engine(model, *, chat, sampling,
+json_schema, regex, ebnf, lora_paths, **engine_kwargs)` for local SGLang (its RadixAttention
+cache reuses whatever prefix the rows share, which is the win on templated batches),
+`anthropic_engine(model, ...)`, `bedrock_engine(model, *, region, ...)` for any model on AWS
+Bedrock through the Converse API, and `gemini_engine(model, *, response_schema, ...)` for
+Gemini or Vertex AI. All the hosted ones take `requests_per_minute` / `tokens_per_minute`
+(per worker) and `on_error="null"` to skip a failed row instead of the batch.
 
 ## Errors, laziness, and output
 

@@ -86,8 +86,19 @@ def test_count_sample_distributed_equals_single_node():
 
 
 def test_sample_requires_exactly_one_of_fraction_n():
-    with pytest.raises(PlanError, match="exactly one"):
+    """Both branches of the sizing check, each against the message it actually raises.
+
+    The two are deliberately different and the test used to assert one regex for both, so
+    it failed on the first: giving *both* a fraction and a count reports the two values it
+    was given, because that is what tells a caller which argument to drop, while giving
+    *neither* can only name the options.
+    """
+    with pytest.raises(PlanError, match="not both") as both:
         _ds(10).sample(0.5, n=5)
+    assert "n=5" in str(both.value) and "fraction=0.5" in str(both.value), (
+        "the conflicting values are what make the message actionable"
+    )
+
     with pytest.raises(PlanError, match="exactly one"):
         _ds(10).sample()
 

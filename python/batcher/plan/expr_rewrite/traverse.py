@@ -37,6 +37,7 @@ from batcher.plan.expr_ir import (
     ListContains,
     ListFunc,
     ListGet,
+    ListGetDyn,
     ListJoin,
     ListSimhash,
     ListSlice,
@@ -45,6 +46,7 @@ from batcher.plan.expr_ir import (
     Not,
     NullIf,
     StrFunc,
+    StrFuncDyn,
     StructField,
 )
 from batcher.plan.expr_ir.audio import AudioFunc
@@ -184,10 +186,10 @@ def _derived(
 _REGULAR: tuple[type, ...] = (
     Array, AudioFunc, Binary, Cast, Coalesce, ConvertTimezone, DateFunc, DateOffset,
     DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc, IsInf, IsNan,
-    IsNotNull, IsNull, Least, ListBinary, ListContains, ListFunc, ListGet, ListJoin,
-    ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeTemporal, Math2Expr,
-    MathExpr, MapFunc, Not, NullIf, SeqFunc, Sequence, SpatialFunc, Strftime, Strptime,
-    StrFunc, StructField, VideoFunc, WindowBuckets, WindowStart,
+    IsNotNull, IsNull, Least, ListBinary, ListContains, ListFunc, ListGet, ListGetDyn,
+    ListJoin, ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeTemporal,
+    Math2Expr, MathExpr, MapFunc, Not, NullIf, SeqFunc, Sequence, SpatialFunc, Strftime,
+    Strptime, StrFunc, StrFuncDyn, StructField, VideoFunc, WindowBuckets, WindowStart,
 )  # fmt: skip
 
 # `func`/`pred` are element-scoped sub-expressions -- they close over `element()`, not

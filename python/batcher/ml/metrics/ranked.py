@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher.ml.stats._shared import require_columns as _require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
-from batcher.plan.expr_ir.nodes import cume_dist, rank, row_number
+from batcher.plan.expr_ir.nodes import cume_dist, rank
 from batcher.plan.functions.aggregate import count_if
 from batcher.plan.functions.aggregate import sum as sum_
 from batcher.plan.functions.metrics.model.classification import positive_mask
@@ -182,9 +182,14 @@ def average_precision(
 
     Computed as ``mean over positives of (positives seen so far / rows seen so far)`` with
     the rows in descending score order — the streaming definition, which needs one ordered
-    running sum rather than a threshold sweep. Rows with **equal scores** are broken in the
-    engine's sort order, so a dataset whose scores are heavily tied gives an optimistic
-    value; ``roc_auc`` is exact under ties and is the safer choice there.
+    running sum rather than a threshold sweep.
+
+    Both running counts share one window frame, so **tied scores** count as a single
+    threshold: every row of a tie group sees that group's totals. That is what scikit-learn's
+    ``average_precision_score`` does, and it is why this agrees with it under ties. Counting
+    the rows with ``row_number`` instead made the two counts disagree — positives counted per
+    tie *group* against rows counted per *row* — which is not a precision at all, and drove
+    both it and the AP above 1 on a heavily tied column.
 
     Args:
         ds: The scored dataset.
@@ -213,7 +218,7 @@ def average_precision(
     )
     running = labelled.with_columns(
         **{
-            _POSITION: row_number().over(partition_by=list(groups), order_by=[(y_score, True)]),
+            _POSITION: sum_(lit(1.0)).over(partition_by=list(groups), order_by=[(y_score, True)]),
             _CUM_POS: sum_(col(_LABEL)).over(partition_by=list(groups), order_by=[(y_score, True)]),
         }
     )

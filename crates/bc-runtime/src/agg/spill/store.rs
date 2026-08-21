@@ -634,7 +634,15 @@ impl DiskSpillStore {
     /// Only a *short* read is an error. Reading more than was written cannot happen from
     /// truncation and would mean the count itself is wrong, so it is not worth failing a
     /// query over.
-    fn verify_rows(&self, partition: usize, got: u64) -> Result<(), RuntimeError> {
+    ///
+    /// [`SpillStore::read`] and [`SpillStore::drain`] make this check for themselves.
+    /// A caller streaming a partition through [`DiskSpillStore::open_reader`] cannot —
+    /// the reader hands back batches and never learns how many there should have been —
+    /// so it MUST call this with the row count it saw. Public for exactly that: the
+    /// external sort's final pass and the grace join's streamed probe both do, and
+    /// before it was reachable each had hand-rolled the same comparison against
+    /// [`DiskSpillStore::partition_rows`].
+    pub fn verify_rows(&self, partition: usize, got: u64) -> Result<(), RuntimeError> {
         let expected = self.partition_rows(partition);
         if got >= expected {
             return Ok(());

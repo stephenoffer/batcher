@@ -272,7 +272,8 @@ print(ranked.sort("g", "t").to_pydict()["prev"])
 ```
 
 Cumulative and shift shorthands (Polars-style) build the same window expressions:
-`col("v").cum_sum()`, `.cum_min()`, `.cum_max()`, `.cum_count()` are running
+`col("v").cum_sum()`, `.cum_min()`, `.cum_max()`, `.cum_count()` and
+{py:meth}`.cum_prod() <batcher.plan.expr_ir.core.Expr.cum_prod>` are running
 aggregates in row order (pass `partition_by=`/`order_by=` for a grouped/ordered
 running value), and `col("v").shift(n)` lags (positive `n`) or leads (negative `n`).
 
@@ -280,6 +281,16 @@ running value), and `col("v").shift(n)` lags (positive `n`) or leads (negative `
 c = bt.from_pydict({"x": [1, 2, 3, 4]})
 print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pydict())
 # {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
+```
+
+`.cum_prod()` returns `Float64` even for an integer input, because a running product
+overflows an `Int64` far sooner than a running sum does and wrapping silently is the wrong
+answer for a compounding factor. Nulls are skipped, as they are for the rest of the family.
+
+```python
+rates = bt.from_pydict({"fund": ["a", "a", "b", "b"], "r": [1.1, 1.2, 2.0, 0.5]})
+print(rates.with_columns(growth=bt.col("r").cum_prod(partition_by="fund")).to_pydict()["growth"])
+# [1.1, 1.32, 2.0, 1.0]
 ```
 
 A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in {doc}`window functions </user-guide/analyze/window-functions>`. The shapes that come up most have their own names:
@@ -365,7 +376,7 @@ one of these delegates to the primary, so the plan is identical:
 | `.nunique()` | `.n_unique()` |
 | `.rename(name)` | `.alias(name)` |
 | `.skew()`, `.kurt()` | `.skewness()`, `.kurtosis()` |
-| `.cumsum()`, `.cummax()`, `.cummin()`, `.cumcount()` | `.cum_sum()`, `.cum_max()`, `.cum_min()`, `.cum_count()` |
+| `.cumsum()`, `.cummax()`, `.cummin()`, `.cumcount()`, {py:meth}`.cumprod() <batcher.plan.expr_ir.compat.names.cumprod>` | `.cum_sum()`, `.cum_max()`, `.cum_min()`, `.cum_count()`, `.cum_prod()` |
 | `.prod()` | `.product()` |
 | `.any()`, `.all()` | `.bool_or()`, `.bool_and()` |
 | `.log()` | `.ln()` (numpy's natural-log convention) |

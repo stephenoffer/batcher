@@ -123,7 +123,7 @@ def execute_aggregate_flight(
     import ray
 
     from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
-    from batcher.dist.fleet import acquire_fleet, release_session_lease
+    from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_session_lease
 
     _ensure_ray(workers)
 
@@ -148,9 +148,7 @@ def execute_aggregate_flight(
     # handed back, borrowing the adaptive loop's *query* fleet takes none. `current_fleet()`
     # tells them apart only before the acquire; asking again afterwards is how a lease meant
     # for one path gets released on the other.
-    from batcher.dist.fleet import current_fleet
-
-    borrows_session = current_fleet() is None
+    borrows_session = borrows_session_fleet()
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     # `workers` is the floor: a bucket is reduced by one worker, so fewer buckets than
     # workers idles the rest for the whole reduce phase (see `aggregate_reducer_count`).
@@ -309,7 +307,13 @@ def execute_aggregate_flight(
                 # only a self-spawned fleet is handed to the source to tear down.
                 src_actors, src_pg = (actors, pg) if owns else (None, None)
                 handles = [(a, t, n) for a, t, n, _s in out]
-                return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+                return FlightMaterializedSource(
+                    handles,
+                    schema,
+                    src_actors,
+                    src_pg,
+                    session_lease=borrows_session and not owns,
+                )
             batches = out
     finally:
         # Collect what the workers measured, before anything below can kill them. Nothing

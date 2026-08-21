@@ -146,6 +146,96 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Skew handling | — | — | **=** (AQE splits on a size rule; Batcher salts on measured hot keys, no opt-in) | — | = | L |
 | AI / GPU pipelines | — | — | — | — | **L** by default | — |
 | Lakehouse formats | — | — | L (all via pyiceberg/delta-rs) | — | = | L |
+| OLTP *interoperability* (drive a database) | — | — | **W** (row-level DML as a mode; Spark JDBC has append/overwrite only) | — | **W** (neither writes a database) | — |
+| OLTP *engine* (be the database) | **✗** | **✗** | **✗** | — | **✗** | **✗** |
+| OLTP *read speed* | **✗** — 369x a raw driver per query, **263 QPS/process**, GIL-bound | — | — | — | — | — |
+
+## OLTP: what Batcher does and does not have (verified in code, 2026-08-18)
+
+This row is split in two on purpose, because the two halves have opposite answers and the
+distinction is the whole of the honest claim.
+
+**Batcher is not an OLTP engine and cannot become one without a storage layer it does not
+have.** It owns no storage. It has no transaction manager, no MVCC, no lock manager, no
+write-ahead log, no crash recovery, and no index it builds or maintains. Two Batcher
+processes writing the same target coordinate through *that target*, not through Batcher.
+Nothing in `crates/` or `python/batcher/` implements any of those, and nothing on the
+roadmap proposes to: the engine's unit of work is a plan over Arrow batches, not a row in a
+page. A claim that Batcher "supports OLTP" is false in the sense that matters — you cannot
+point an application's transactions at it.
+
+**What it does have is OLTP interoperability, and there the comparison is favourable.** It
+can drive an OLTP system as a source and as a sink:
+
+- *Reads.* Predicate and projection push into the submitted SQL; a row cap and a top-N push
+  where the dialect can spell them (`io/formats/sql/dbapi/source.py`,
+  `adbc/source.py`). On a partitioned store a predicate that pins the partition key stops
+  the fan-out entirely — DynamoDB issues one `Query` rather than N `Scan` segments billed
+  per item *examined*, and Cassandra reads one partition rather than 64 token ranges
+  (`io/formats/nosql/{dynamodb,cassandra}.py`).
+- *Writes.* `append` / `overwrite` / `upsert` / `update` / `delete` / `delete_insert`, one
+  transaction per call, executed **by the database** as `ON CONFLICT` / `ON DUPLICATE KEY`
+  / `MERGE` (`io/formats/sql/dbapi/`). Spark's JDBC writer has save modes only; an upsert
+  there is `foreachPartition` and hand-written SQL. Ray Data and Daft write no database at
+  all.
+- *Streaming.* A keyed micro-batch write is exactly-once without a transaction log, because
+  replaying it writes the same keys to the same values.
+
+The transactional guarantee is therefore **the target's, scoped to one call**. There is no
+cross-shard and no cross-call transaction: a distributed write is one transaction per shard,
+which is safe for the keyed modes because a shard only ever touches the keys its own rows
+name, and which is why `overwrite` is refused past the first shard. Where cluster-wide
+atomicity is the requirement, a lakehouse commit is the mechanism that has it.
+
+**Speed settles it, and throughput settles it faster than latency does.** Measured against
+raw `sqlite3` over the same 50,000-row table with an `INTEGER PRIMARY KEY`
+(`BENCHMARK_RESULTS.md`, 2026-08-18, release engine):
+
+| | Batcher | raw `sqlite3` | ratio |
+|---|---|---|---|
+| Point lookup, **different key each call** | 3.555 ms | 0.010 ms | **369x** |
+| Point lookup, same key each call | 2.756 ms | 0.010 ms | 276x |
+| 1,000-row range scan | 4.475 ms | 0.607 ms | 7.4x |
+| 10,000-row upsert | 21.8 ms | 7.6 ms | 2.85x (459,189 rows/s) |
+
+| Throughput | QPS |
+|---|---|
+| Batcher, 1 / 8 / 16 threads | 225 / 320 / 312 |
+| Batcher, 8 processes | 2,106 (**263 per process**) |
+| Batcher **tuned** (`observability.event_log=False`), 1 thread | 374 |
+| raw `sqlite3`, 1 thread | **5,205** |
+
+The default event log costs 62% of the empty-query floor and 16% of a real point lookup, so
+the best supported configuration for this shape is 2.93 ms and ~374 QPS per process. That is
+still 14x short on throughput and ~290x on latency.
+
+Sixteen threads buy 1.4x and plateau; processes scale perfectly linearly. The ceiling is the
+**GIL** — the control plane is Python, and plan construction, optimization, IR serialization
+and routing all hold it. One raw driver thread out-serves Batcher across sixteen threads by
+16x.
+
+**Three quarters of it is the architecture, and the remaining quarter does not close the
+gap.** A `Dataset.to_pydict()` over a **one-row in-memory table with no operators** costs
+**1.9 ms** against pyarrow's own 0.0077 ms — the price of entering the engine at all. Of that,
+the engine itself (`execute_plan_metered`) is 17%; stubbing out every avoidable control-plane
+cost found — the event-bus close-out (0.32 ms) and Carbonite's per-query resource re-sizing
+(0.15 ms) — takes the floor to 1.43 ms, i.e. 527 -> 700 QPS per process against a single raw
+driver thread's 5,205. Worth collecting; not a path to OLTP. `count()` on the same table is
+0.078 ms precisely because it is answered from metadata *without entering the engine*.
+
+The designed mitigation does not reach this shape either: `orchestration/prepared.py`
+memoizes the whole derivation, but its entries are created only by `fast_path`, whose gate
+admits **resident Arrow sources only** and which is off by default. A database query is never
+resident.
+
+So the honest bound is: a fixed ~2 ms cost amortized over a large result, which is what an
+analytical engine is for. At one row that cost *is* the query. Closing the gap would mean a
+second terminal-op path that never builds a `LogicalPlan`, never crosses the optimizer and
+never leaves Python for one row — a different engine wearing the same API. **Do not treat it
+as a tuning backlog.**
+
+On files rather than a database, `ds.filter(col("id") == 5)` is a *pruned scan* — zone maps,
+then a bloom filter for the equality that lands inside `[min, max]` — not an index seek.
 
 ## AI-preprocessing coverage: the native expression surface (verified in code)
 
@@ -461,10 +551,66 @@ sequence so they cannot drift.
 
 **Still open, and structural:**
 
-- **State is still one in-memory Arrow batch rewritten in full every micro-batch.** No
-  incremental checkpoint, no changelog, no spillable state. The repo *has* an out-of-core spill
-  system; it is still not wired to any streaming operator. Where it is written is fixed; how much
-  is written per epoch is not.
+- **The windowed aggregate now spills; the other stateful operators still do not.** A
+  watermarked windowed aggregate reaching `memory.streaming_state_max_bytes` used to raise —
+  on the shape that reaches it most legitimately, an open set `allowed_lateness / hop` windows
+  wide with a row per group key, behaving exactly as designed and simply large. It now moves
+  its oldest windows to disk (`core/streaming/spill.py`), splitting on the median window start
+  so each pass halves resident state and leaves the newest windows — the ones incoming rows
+  land in — in memory.
+
+  What makes this cheap is the property this operator has and a general state store does not:
+  **the watermark only moves forward**, so windows are evicted in increasing order and a
+  spilled window is read back exactly once, never sought into. That turns the hard keyed
+  random-access problem into an ordered run of Arrow IPC files. Correctness rests on the same
+  invariant as everything else here — the runs hold *partial* state and `combine` is
+  associative and commutative (#7) — so a late row landing in an already-spilled window is not
+  a special case: it folds into memory and meets its spilled half at eviction.
+  `tests/integration/test_streaming_state_spill.py` pins the spilled answer against the
+  unspilled one, and pins that the same query *without* the tier still raises, so the equality
+  cannot pass vacuously.
+
+  Snapshots became multi-part to match: a spilled fold's state is larger than the cap by
+  construction, so the store streams the resident state and each run into one IPC file with a
+  single part resident at the peak, and recovery combines them back. The local tier streams;
+  the object-store tier still buffers, because a PUT needs the whole object.
+
+  **The windowed aggregate now writes a changelog too**, which is what keeps a *spilled* fold's
+  checkpoint affordable — otherwise it rewrote a state deliberately larger than the cap on
+  every epoch. It removes state, which is normally disqualifying, and qualifies on a property
+  worth stating because it generalizes: **eviction drops a prefix of a totally ordered axis**,
+  so the entire tombstone set compresses to one integer. Replay combines the partials and
+  re-applies the bound; on a whole snapshot the bound is a no-op, so restore does it
+  unconditionally rather than branching. 3.0x fewer checkpoint bytes at 40 micro-batches,
+  4.4x at 80. `tests/integration/test_streaming_window_changelog.py` pins it against a
+  negative control that strips the bound and asserts the windows *do* come back — without
+  which the positive test could pass for the wrong reason.
+
+  **Still open:** the *unwindowed* running aggregate and keyed state still raise at the cap.
+  Neither has a monotone eviction order to exploit — the running aggregate finalizes every
+  group every epoch, and keyed state expires arbitrary keys at arbitrary times — so both need
+  a genuinely keyed store with point lookups rather than an ordered run, and keyed state needs
+  a per-key tombstone its changelog cannot carry. That is a different piece of work.
+
+  **The changelog half is done, for the operator it mattered most for.** A running aggregate
+  — the one with no watermark, so nothing evicts and the state only grows — now records the
+  *partial* each micro-batch folded in rather than rewriting the whole state
+  (`core/streaming/folds.py::_AggFold.take_delta`, written by
+  `checkpoint/state_store.py::snapshot_delta`, replayed by `restore_chain`). It is sound for
+  exactly the reason the mergeable algebra exists: `combine` is associative and commutative
+  (invariant #7), so a base plus every partial after it *is* the state. Measured over a run,
+  whole-snapshot cost is quadratic in the epoch count and the changelog is linear — 3.4x
+  fewer bytes at 50 micro-batches, 8.2x at 400, and rising.
+
+  Two limits are deliberate and should not be read as oversights. A delta is written only
+  when it is at least twice as small as the state, so a stream that touches every group every
+  batch keeps whole snapshots and can never be worse off. And **only an operator whose state
+  never shrinks may use a chain**: the windowed aggregate, the watermark dedup and keyed state
+  all evict, a chain cannot express a removal, and replaying one would resurrect what they
+  dropped. That is opt-in per processor
+  (`streaming_query/processors.py::AggregateProcessor.snapshot_delta`) and pinned by
+  `tests/integration/test_streaming_state_changelog.py`, because nothing else would catch it
+  — a resurrected window is a wrong number, not an error.
 - **The driver is still a single point of failure.** `_run_resilient` restarts from the last
   committed checkpoint on a transient fault, which covers a preempted worker or a dropped
   connection *in process*; it does not cover the process. There is no standby and no leader
@@ -472,10 +618,13 @@ sequence so they cannot drift.
   resume correctly from the checkpoint, and only if the checkpoint is somewhere the supervisor's
   next host can read.
 
-Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good) and for the file sink
-by batch position (`resume=True` skips a `part-batch<id>` already present). Every other table
-format gets an ordinary append and `TransactionalStreamSink.open()` warns once that a replayed
-epoch writes its rows twice.
+Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good), for the file sink
+by batch position (`resume=True` skips a `part-batch<id>` already present), and — by a different
+route — for a **keyed** write to a database or operational store: `mode="upsert"`/`"update"`/
+`"delete"` writes the same keys to the same values, so a replayed micro-batch is a no-op with no
+transaction log involved (`TransactionalStreamSink._KEYED_MODES`). Everything else — Iceberg,
+Hudi, and any `mode="append"` — gets an ordinary append, and `TransactionalStreamSink.open()`
+warns once that a replayed epoch writes its rows twice.
 
 ### 5. The AI moat was shipped disabled — **fixed (the CPU→GPU overlap is now default)**
 
@@ -844,11 +993,15 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
    autoscaling.** The AI moat is now on out of the box. Remaining: the N-stage topology,
    per-stage autoscaling and keeping data resident on-device across ops. (The variable-shape
    tensor type this item used to list is done.)
-5. **~~Per-partition watermarks~~ (done) + ~~object-store checkpoints~~ (done); a real state
-   backend remains.** The frontier is now a minimum over per-partition maxima with idleness, and
-   a checkpoint can live on `s3://`/`gs://`/`hdfs://`. What is left is the state itself:
-   spillable and incremental rather than one Arrow batch rewritten whole every micro-batch, and a
-   driver that is not a single point of failure. Until those land, do not claim Flink parity —
+5. **~~Per-partition watermarks~~ (done) + ~~object-store checkpoints~~ (done) +
+   ~~incremental state checkpoints~~ (done for the running aggregate); a real state backend
+   remains.** The frontier is now a minimum over per-partition maxima with idleness, a
+   checkpoint can live on `s3://`/`gs://`/`hdfs://`, the running aggregate writes a changelog
+   instead of rewriting its whole state every epoch, and the *windowed* aggregate spills its
+   cold windows instead of raising. What is left is the state the ordered-eviction trick does
+   not reach: a keyed store with point lookups, so the **unwindowed** aggregate and keyed state
+   degrade instead of raising; a changelog for the evicting operators, which needs a tombstone
+   the current one has no way to express; and a driver that is not a single point of failure. Until those land, do not claim Flink parity —
    and refuse, loudly, the shapes that cannot be honoured (the distributed watermark gate and the
    unwindowed-watermark refusal both do).
 6. **Decouple tasks from nodes**; turn on speculation and skew splitting by default.

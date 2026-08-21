@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["Preprocessor", "columns_arg"]
+__all__ = ["Preprocessor", "columns_arg", "require_categories"]
 
 
 def columns_arg(columns: str | Sequence[str], *, what: str) -> list[str]:
@@ -251,6 +251,41 @@ def distinct_values(ds: Dataset, column: str, *, what: str, max_categories: int)
     values = bounded.collect().column(column).to_pylist()
     categories = sorted(v for v in values if v is not None)
     check_cardinality(what, column, len(categories), max_categories, exact=False)
+    return categories
+
+
+def require_categories(categories: list[Any], *, what: str, column: str) -> list[Any]:
+    """Reject an expanding encoder's fit that learned no categories at all.
+
+    An encoder that emits *one column per category* has nothing to emit when the category
+    set is empty, and the two ways that used to end were both bad. Three of them
+    (`LabelBinarizer`, `MultiLabelBinarizer`, `MultiHotEncoder`) reached ``with_columns()``
+    with no projections and failed with "requires at least one column" — an error from two
+    layers away naming neither the encoder nor the column. `OneHotEncoder` was worse: it
+    dropped the source column and appended nothing, so a fit on an empty split silently
+    deleted a column from every later `transform`.
+
+    Encoders that emit a *fixed* number of columns are unaffected and must not call this:
+    `OrdinalEncoder` and `LabelEncoder` map an unseen value to `unknown_value`, which is
+    exactly what an empty category set should do.
+
+    Args:
+        categories: The learned category set.
+        what: The calling preprocessor's class name, for the error message.
+        column: The column the categories were learned from.
+
+    Returns:
+        `categories` unchanged, so this can wrap a `distinct_values` call.
+
+    Raises:
+        PlanError: If `categories` is empty.
+    """
+    if not categories:
+        raise PlanError(
+            f"{what}: column {column!r} has no non-null values, so there are no categories "
+            "to expand into columns. Fit on a split that contains this column's values, or "
+            "pass the category set explicitly."
+        )
     return categories
 
 

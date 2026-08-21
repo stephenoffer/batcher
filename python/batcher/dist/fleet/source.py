@@ -94,16 +94,24 @@ class FlightMaterializedSource:
 
     When the producing stage *borrowed* a query-lifetime `ShuffleFleet` (the adaptive
     persistent-fleet path), `actors`/`pg` are `None`: the fleet owns those resources
-    and is freed once by the adaptive loop, so this source's `cleanup()` no-ops."""
+    and is freed once by the adaptive loop, so this source's `cleanup()` no-ops.
 
-    __slots__ = ("_actors", "_handles", "_pg", "_schema")
+    `session_lease` is a third case, and it is a *lease* rather than a resource. A stage that
+    borrowed the warm **session** fleet took one, and normally hands it straight back in its
+    own `finally`; a stage that *publishes* cannot, because dropping the last lease arms the
+    idle timer against an intermediate the next stage has not read yet. So the lease travels
+    here with the buckets and `cleanup()` hands it back, at the point the reader is done —
+    the same moment the actors would have been torn down on the owned path."""
+
+    __slots__ = ("_actors", "_handles", "_pg", "_schema", "_session_lease")
     bounded = True
 
-    def __init__(self, handles, schema: pa.Schema, actors, pg) -> None:
+    def __init__(self, handles, schema: pa.Schema, actors, pg, session_lease: bool = False) -> None:
         self._handles = handles  # [(addr, ticket, rows)] per non-empty reducer bucket
         self._schema = schema
         self._actors = actors
         self._pg = pg
+        self._session_lease = session_lease
 
     def _split(self, handle) -> FlightFetchSplit:
         addr, ticket, rows = handle
@@ -176,8 +184,22 @@ class FlightMaterializedSource:
         workers through stages `k+1..n`, so a deep adaptive query holds every stage's
         intermediate at once. Killing the actors, the old behaviour, only frees memory in
         the case where the actors were about to die anyway.
+
+        The session lease is handed back here for the same reason and at the same moment.
+        Without it the lease taken by the publishing stage was never returned at all: the
+        counter never reached zero, the idle timer was never armed, and the warm fleet held
+        every core in the cluster for the life of the process. The next query to run plain
+        Ray tasks — a broadcast join's probe — then pended forever behind it, with no error
+        and no timeout. That is the same failure `flight_aggregate`'s teardown comment
+        describes; it was fixed there for the *non*-publishing branch and left open on this
+        one, which is the branch that cannot release in its own `finally`.
         """
         self._release_buckets()
+        if self._session_lease:
+            self._session_lease = False  # idempotent: `cleanup()` may be called more than once
+            from batcher.dist.fleet._fleet import release_session_lease
+
+            release_session_lease()
         if self._actors is None:
             return
 

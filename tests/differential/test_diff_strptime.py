@@ -52,3 +52,39 @@ def test_to_date_parses_iso(duck):
         out,
         duck.sql("SELECT try_cast(try_strptime(s, '%Y-%m-%d') AS DATE) d FROM td"),
     )
+
+
+def test_a_partial_format_fills_the_fields_it_does_not_name(duck):
+    """`%Y` alone, `%Y-%m`, an hour bucket — every one of these returned NULL.
+
+    chrono's two whole-value parsers each demand a complete date or a complete instant, so
+    a format naming only some fields matched neither and the column came back all-NULL.
+    Silently: `strptime` is documented to null what it cannot parse, which is right for a
+    malformed *value* and wrong for a format it simply could not represent. DuckDB fills
+    the unnamed fields in, and every coarse rollup key is written this way.
+    """
+    t = pa.table({"s": ["1900", "2024", None, "not a year"]})
+    duck.register("py", t)
+    out = bt.from_arrow(t).select(d=col("s").str.to_datetime("%Y")).collect()
+    assert_same(out, duck.sql("SELECT try_strptime(s, '%Y') d FROM py"))
+
+
+def test_a_partial_format_keeps_the_fields_it_does_name(duck):
+    """The narrower half: the old date-only fallback *threw the hour away*.
+
+    `NaiveDate::parse_from_str` ignores time fields, so `'2024-03-05 13'` with
+    `%Y-%m-%d %H` parsed as the date and answered midnight — a plausible instant thirteen
+    hours from the right one, which is worse than the NULL the year-only case returned.
+    """
+    t = pa.table({"s": ["2024-03-05 13", "2024-03-05 00", None]})
+    duck.register("ph", t)
+    out = bt.from_arrow(t).select(d=col("s").str.to_datetime("%Y-%m-%d %H")).collect()
+    assert_same(out, duck.sql("SELECT try_strptime(s, '%Y-%m-%d %H') d FROM ph"))
+
+
+def test_a_format_with_no_year_stays_null(duck):
+    """There is no instant to default to, so it must refuse rather than invent one."""
+    t = pa.table({"s": ["12:30", None]})
+    duck.register("pn", t)
+    out = bt.from_arrow(t).select(d=col("s").str.to_datetime("%H:%M")).collect()
+    assert out.to_pydict()["d"] == [None, None]

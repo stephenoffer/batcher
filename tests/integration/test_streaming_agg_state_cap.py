@@ -105,3 +105,98 @@ def test_the_windowed_fold_still_names_its_own_cause():
 
 def test_the_memory_config_knob_is_the_same_one_for_both():
     assert isinstance(MemoryConfig().streaming_state_budget_bytes(), int)
+
+
+# --- what `update` mode retains beside the fold ----------------------------
+
+
+def _growing(epochs: int = 8, per_batch: int = 5_000):
+    """A stream introducing `per_batch` brand-new group keys every epoch."""
+    schema = pa.schema([("k", pa.string()), ("v", pa.int64())])
+
+    def batches():
+        for epoch in range(epochs):
+            start = epoch * per_batch
+            yield pa.record_batch(
+                {
+                    "k": pa.array([f"key-{start + i:08d}" for i in range(per_batch)]),
+                    "v": pa.array([1] * per_batch, type=pa.int64()),
+                },
+                schema=schema,
+            )
+
+    return bt.from_batches(batches, schema, bounded=False)
+
+
+def _run_update(cap: int | None = None):
+    """Run a keyed aggregate in `update` mode, returning its last progress record."""
+    import contextlib
+
+    from batcher.config import active_config, config_context
+
+    scope = contextlib.nullcontext()
+    if cap is not None:
+        config = active_config()
+        scope = config_context(
+            config.replace(memory=dataclasses.replace(config.memory, streaming_state_max_bytes=cap))
+        )
+    with scope:
+        query = (
+            _growing()
+            .group_by("k")
+            .agg(total=bt.col("v").sum())
+            .write.for_each_batch(
+                lambda _t, _b: None,
+                trigger=bt.Trigger.available_now(),
+                output_mode="update",
+            )
+        )
+        query.await_termination()
+        if query.exception() is not None:
+            raise query.exception()
+        return query.recent_progress[-1]
+
+
+def test_update_mode_counts_the_copy_it_diffs_against():
+    """`update` keeps a full copy of the last emitted result to diff against — exactly as
+    large as the fold's own state — and nothing counted it. A query configured with a
+    one-gigabyte cap therefore held two, and `memory_used_bytes` reported half of what the
+    operator was really using."""
+    from batcher.core.streaming.folds import streaming_state_budget  # noqa: F401
+
+    progress = _run_update()
+    operator = progress.state_operators[0]
+    rows = operator.num_rows_total
+    assert rows > 0
+    # The fold alone is a little over 24 bytes/row for this schema; the reported figure has
+    # to be materially above that, because the previous-result copy is the same size again.
+    assert operator.memory_used_bytes > rows * 40, (
+        f"{operator.memory_used_bytes} bytes for {rows} rows looks like the fold alone, so "
+        "the update-mode copy is still uncounted"
+    )
+
+
+def test_the_cap_now_refuses_usage_that_used_to_be_invisible():
+    """A budget between the fold's size and the true retained total. Before, this ran to
+    completion while using twice the configured envelope; the failure mode was an OOM at
+    2x the budget rather than the error the budget exists to produce."""
+    unbounded = _run_update().state_operators[0]
+    fold_only = unbounded.memory_used_bytes // 2
+    with pytest.raises(ResourceError, match="streaming aggregate state"):
+        _run_update(cap=int(fold_only * 1.4))
+
+
+def test_a_complete_mode_aggregate_keeps_no_such_copy():
+    """Only `update` diffs, so only `update` pays. Pinned so the accounting is not quietly
+    charged to a mode that does not hold the copy."""
+    query = (
+        _growing(epochs=3)
+        .group_by("k")
+        .agg(total=bt.col("v").sum())
+        .write.memory(
+            "cap_probe_complete", output_mode="complete", trigger=bt.Trigger.available_now()
+        )
+    )
+    query.await_termination()
+    operator = query.recent_progress[-1].state_operators[0]
+    assert operator.memory_used_bytes <= operator.num_rows_total * 40

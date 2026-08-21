@@ -202,6 +202,22 @@ assignment is one reader each, which is fine, until you run two queries on the s
 Throughput units throttle you. Ingress and egress are capped by the namespace's TUs (1 MB/s in
 and 2 MB/s out, per TU). Exceeding egress gets you `ServerBusyError`, not a slower read.
 
+## Message metadata
+
+Event Hubs calls them *application properties*; Kafka calls them headers. They are the same idea, so they
+arrive under the same option and in the same column type,
+`array<struct<key:string,value:binary>>`:
+
+```python
+# docs: skip
+events = bt.read.eventhubs("hub", connection_str="<your-connection-string>", include_headers=True)
+traced = events.with_columns(trace=bt.col("headers").list.get(0).struct.field("value"))
+```
+
+It is off by default because the nested column costs on every message of every poll. Values
+are carried as bytes whatever the client hands back, and a message that carried none reads
+as `null` rather than as an empty list.
+
 ## See also
 
 - {doc}`Kafka </integrations/streams/kafka>`: the protocol-compatible path, and the payload-decoding example.

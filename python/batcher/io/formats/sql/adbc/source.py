@@ -28,7 +28,8 @@ URI onto the right driver.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import dataclasses
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -39,8 +40,10 @@ from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
     connection_fingerprint,
+    identifier_quoter,
     probe_is_typed,
     push_down,
+    pushed_sql,
     require_module,
     schema_probe,
 )
@@ -267,6 +270,13 @@ class ADBCSource:
     partition: bool = False
     uri: str | None = None
     password: str | None = field(default=None, repr=False)
+    dialect: str | None = None
+    #: Memoized `schema()` / `statistics()`. `init=False` keeps them out of the public
+    #: constructor and `compare=False` keeps two sources describing the same relation equal
+    #: whether or not either has been asked yet — `identity()` and the plan cache key on
+    #: what a source *is*, never on what it has cached.
+    _schema_cache: pa.Schema | None = field(default=None, init=False, repr=False, compare=False)
+    _stats_cache: Any = field(default=None, init=False, repr=False, compare=False)
     partition_on: str | None = None
     lower_bound: float | None = None
     upper_bound: float | None = None
@@ -285,6 +295,10 @@ class ADBCSource:
             )
         if self.uri is not None:
             self._apply_uri()
+        if self.dialect is None:
+            from batcher.io.formats.sql.uri import scheme_for_adbc_driver
+
+            object.__setattr__(self, "dialect", scheme_for_adbc_driver(self.driver))
         if self.db_kwargs is None:
             object.__setattr__(self, "db_kwargs", {})
         if self.driver is None:
@@ -302,8 +316,13 @@ class ADBCSource:
         only becomes a secret inside the process that opens the connection. Assigning
         through `object.__setattr__` is how a frozen dataclass normalizes in `__post_init__`.
         """
-        from batcher.io.formats.sql.uri import adbc_connection
+        from batcher.io.formats.sql.uri import adbc_connection, parse_uri
 
+        if self.dialect is None:
+            # Read before `adbc_connection` replaces `uri` with the sanitized form: the
+            # scheme is what names the dialect, and it decides identifier quoting and
+            # whether a row cap may be pushed.
+            object.__setattr__(self, "dialect", parse_uri(str(self.uri)).scheme)
         driver, merged, sanitized = adbc_connection(
             self.uri, password=self.password, driver=self.driver, db_kwargs=self.db_kwargs
         )
@@ -315,26 +334,91 @@ class ADBCSource:
         # it from.
         object.__setattr__(self, "uri", sanitized)
 
-    def _sql(self, projection: list[str] | None = None, predicate: dict | None = None) -> str:
-        """The query with Kyber's pushed projection and predicate folded in (see `push_down`)."""
-        return push_down(self.query, predicate, projection, table=self.table)
+    @property
+    def supports_limit(self) -> bool:
+        """Whether a row cap may be appended to this backend's SQL.
+
+        An allow-list per `uri.supports_limit_clause`: a missing cap costs the rows the
+        server would have skipped, while a cap it cannot parse turns a working query into a
+        syntax error. Nothing was pushed at all before this source could name its dialect,
+        so ``bt.read.sql(query, uri=...).head(10)`` streamed the whole result over the wire.
+        """
+        from batcher.io.formats.sql.uri import supports_limit_clause
+
+        return bool(self.dialect) and supports_limit_clause(self.dialect)
+
+    @property
+    def supports_ordering(self) -> bool:
+        """Whether a top-N may be pushed: the dialect must accept an explicit ``NULLS`` clause.
+
+        Without it the server's "first n" and the engine's differ wherever they place a
+        null, so the read returns the wrong rows rather than merely extra ones.
+        """
+        from batcher.io.formats.sql.uri import supports_nulls_ordering
+
+        return bool(self.dialect) and supports_nulls_ordering(self.dialect)
+
+    @property
+    def _quote(self) -> Callable[[str], str]:
+        """How to delimit an identifier for this dialect; verbatim when it is unknown."""
+        return identifier_quoter(self.dialect)
+
+    def _sql(
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
+        extra_where: str | None = None,
+    ) -> str:
+        """The query with every pushable part of the plan folded in (see `push_down`).
+
+        An *ordered* cap is only sound if the ordering goes with it: a dialect that takes
+        ``LIMIT`` but cannot spell ``NULLS FIRST|LAST`` must drop the cap too, or it returns
+        its own idea of the first n — the wrong rows, silently.
+        """
+        return pushed_sql(
+            self.query,
+            predicate=predicate,
+            projection=projection,
+            limit=limit,
+            ordering=ordering,
+            extra_where=extra_where,
+            table=self.table,
+            quote=self._quote,
+            supports_ordering=self.supports_ordering,
+            supports_limit=self.supports_limit,
+        )
 
     def schema(self) -> pa.Schema:
         """The relation's columns, from a zero-row probe rather than the whole query.
 
         See `schema_probe`: this used to execute the full query and discard every row.
+
+        Memoized on the instance, the way `nosql.ScanSource` and `DBAPISource` memoize
+        theirs. Planning asks for the schema several times per terminal op, and each ask
+        opened a **connection** — against a warehouse that is a TLS handshake and an
+        authentication round trip, which dwarfs the probe it was opened for.
         """
+        if self._schema_cache is not None:
+            return self._schema_cache
         probed = _ADBCQuerySplit(
             self.driver,
             self.db_kwargs,
             self.conn_kwargs,
             schema_probe(self.query, table=self.table),
         ).schema()
-        if probe_is_typed(probed):
-            return probed
-        return self.splits()[0].schema()
+        resolved = probed if probe_is_typed(probed) else self.splits()[0].schema()
+        object.__setattr__(self, "_schema_cache", resolved)
+        return resolved
 
-    def _direct_splits(self, predicate: dict | None, projection: list[str] | None) -> list[Split]:
+    def _direct_splits(
+        self,
+        predicate: dict | None,
+        projection: list[str] | None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
+    ) -> list[Split]:
         """Splits for a read happening *here*, rather than fanned out across workers.
 
         Range partitioning exists to give N machines a query each. Executed on one
@@ -345,7 +429,7 @@ class ADBCSource:
         Server-side FlightSQL partitioning is different and is kept here: it splits one
         *already-submitted* result set, so it costs no extra query and can only help.
         """
-        sql = self._sql(projection, predicate)
+        sql = self._sql(projection, predicate, limit, ordering)
         if self.partition:
             parts = self._execute_partitions(sql)
             if parts is not None:
@@ -353,17 +437,25 @@ class ADBCSource:
         return [_ADBCQuerySplit(self.driver, self.db_kwargs, self.conn_kwargs, sql)]
 
     def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
     ) -> list[pa.RecordBatch]:
         out: list[pa.RecordBatch] = []
-        for split in self._direct_splits(predicate, projection):
+        for split in self._direct_splits(predicate, projection, limit, ordering):
             out.extend(split.read(projection))
         return out
 
     def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        limit: int | None = None,
+        ordering: tuple[tuple[str, bool, bool], ...] | None = None,
     ) -> Iterator[pa.RecordBatch]:
-        for split in self._direct_splits(predicate, projection):
+        for split in self._direct_splits(predicate, projection, limit, ordering):
             yield from split.iter_batches(projection)
 
     def row_count(self) -> int | None:
@@ -382,13 +474,21 @@ class ADBCSource:
             return None
         from batcher.io.stats import dialect_for_driver, sql_statistics
 
+        if self._stats_cache is not None:
+            cached = self._stats_cache
+            return dataclasses.replace(cached, exact_rows=False) if cached.exact_rows else cached
         dialect = dialect_for_driver(self.driver)
         if dialect is None:
             return None
         split = _ADBCQuerySplit(self.driver, self.db_kwargs or {}, self.conn_kwargs, "")
         try:
             with split.catalog_session() as (run_scalar, run_rows):
-                return sql_statistics(dialect, self.table, run_scalar=run_scalar, run_rows=run_rows)
+                probed = sql_statistics(
+                    dialect, self.table, run_scalar=run_scalar, run_rows=run_rows
+                )
+            if probed is not None:
+                object.__setattr__(self, "_stats_cache", probed)
+            return probed
         except Exception:
             return None
 
@@ -435,7 +535,11 @@ class ADBCSource:
                 ),
             )
             for fragment in range_predicates(
-                self.partition_on, self.lower_bound, self.upper_bound, self.num_partitions
+                self.partition_on,
+                self.lower_bound,
+                self.upper_bound,
+                self.num_partitions,
+                quote=self._quote,
             )
         ]
 

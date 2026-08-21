@@ -195,23 +195,41 @@ def learned_plan_peak(plan: PhysicalPlan, model) -> int:
     Returns:
         The envelope in bytes; `0` when nothing in the plan could be sized.
     """
-    return _peak(plan, _blender(model))[0]
+    return _peak(plan, _blender(model, plan))[0]
 
 
-def _blender(model):
+def _blender(model, plan: PhysicalPlan):
     """A `PhysicalOp -> bytes` sizer that folds the plan estimate toward measured reality.
 
     `None` when there is no model, which makes every walk use the plan's own estimate.
     Never raises: a model that cannot size an operator (a bare test double with no `kind`)
     falls back to the plan estimate rather than failing a query inside a memory guard.
+
+    The plan is threaded through so each operator's **input** rows can be resolved from its
+    children's estimates and handed to the model. That is the basis the learned per-row
+    footprint was fitted against; without it the model has to recover a row count by
+    dividing the estimate by its width, which recovers the *output* count and rescales the
+    measurement by the operator's selectivity. A model that does not accept the basis (a
+    test double with the older signature) is called exactly as before.
     """
     if model is None:
         return None
+    basis_of = getattr(model, "est_basis_rows", None)
+    by_id = {getattr(op, "op_id", None): op for op in plan.ops} if basis_of is not None else {}
 
     def size_of(op) -> int:
         planned = int(op.bounds.m_max_bytes)
         try:
-            return int(model.blend_peak(getattr(op, "kind", ""), planned, _row_size(op)))
+            if basis_of is None:
+                return int(model.blend_peak(getattr(op, "kind", ""), planned, _row_size(op)))
+            return int(
+                model.blend_peak(
+                    getattr(op, "kind", ""),
+                    planned,
+                    _row_size(op),
+                    input_rows=basis_of(op, by_id),
+                )
+            )
         except Exception:  # pragma: no cover - a memory guard never raises
             return planned
 

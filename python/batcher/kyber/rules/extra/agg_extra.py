@@ -20,10 +20,19 @@ The correctness reasoning threaded through these rules is SQL aggregate semantic
 Rules that move a computed output out of the aggregate wrap the aggregate in a
 `Project` that re-derives exactly the original output columns, in order — so the
 output schema is byte-identical and only the plan shape changes.
+
+**Rebuild with `dataclasses.replace`, never `Aggregate(input, keys, aggs)`.** `Aggregate`
+has a fourth field, `watermark`, set at plan-build time by a streaming `group_by` — and the
+positional three-argument rebuild reset it to `None`, silently un-bounding a streaming
+aggregation's state and stopping late rows being dropped. It is the same three-of-five
+rebuild `projections.py::_rewrite` documents for `Unnest`, and `replace` is what makes the
+next field added to the node carry through on its own. See `aggregate_algebra/extremes.py`,
+which threads `watermark=` explicitly for the same reason.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 from batcher.kyber.pass_base import OptimizerContext
@@ -31,6 +40,7 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import AggExpr, Col, Expr, Lit
 from batcher.plan.expr_ir.constructors import when
+from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
@@ -59,8 +69,12 @@ __all__ = [
 
 
 def _ir_key(expr: Expr) -> str:
-    """A hashable structural identity for an expression (its IR rendered stable)."""
-    return json.dumps(expr.to_ir(), sort_keys=True)
+    """A hashable structural identity for an expression (its IR rendered as JSON).
+
+    Delegates to `plan.expr_rewrite.expr_key`, the canonical one, which memoizes the
+    result on the (immutable) node — see the note there.
+    """
+    return expr_key(expr)
 
 
 def _agg_key(agg: AggExpr) -> str:
@@ -154,7 +168,7 @@ def dedupe_group_keys(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | 
             kept.append(key)
     if not dropped:
         return None
-    inner = Aggregate(node.input, tuple(kept), node.aggregates)
+    inner = dataclasses.replace(node, group_keys=tuple(kept))
     return _project_over(node, inner, key_map={a: Col(r) for a, r in dropped.items()})
 
 
@@ -179,7 +193,7 @@ def drop_constant_group_key(node: Aggregate, _ctx: OptimizerContext) -> LogicalP
     kept = [k for k in node.group_keys if k.alias not in const]
     if not kept:
         return None  # would become a global aggregate — empty-input semantics differ
-    inner = Aggregate(node.input, tuple(kept), node.aggregates)
+    inner = dataclasses.replace(node, group_keys=tuple(kept))
     return _project_over(node, inner, key_map=dict(const))
 
 
@@ -219,7 +233,7 @@ def redundant_aggregate_of_group_key(node: Aggregate, _ctx: OptimizerContext) ->
             kept.append(spec)
     if not folded:
         return None
-    inner = Aggregate(node.input, node.group_keys, tuple(kept))
+    inner = dataclasses.replace(node, aggregates=tuple(kept))
     return _project_over(node, inner, agg_map=folded)
 
 
@@ -252,7 +266,7 @@ def count_distinct_of_group_key(node: Aggregate, _ctx: OptimizerContext) -> Logi
             kept.append(spec)
     if not folded:
         return None
-    inner = Aggregate(node.input, node.group_keys, tuple(kept))
+    inner = dataclasses.replace(node, aggregates=tuple(kept))
     return _project_over(node, inner, agg_map=folded)
 
 
@@ -285,7 +299,7 @@ def count_of_group_key(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan |
         extra = (AggregateSpec(cnt_alias, AggExpr("count_star", None)),)
     target_aliases = {s.alias for s in targets}
     kept = [s for s in node.aggregates if s.alias not in target_aliases]
-    inner = Aggregate(node.input, node.group_keys, tuple(kept) + extra)
+    inner = dataclasses.replace(node, aggregates=tuple(kept) + extra)
     folded = {
         s.alias: when(Col(keymap[_ir_key(s.agg.input)]).is_null()).then(0).otherwise(Col(cnt_alias))
         for s in targets
@@ -327,7 +341,7 @@ def count_constant_to_count_star(node: Aggregate, _ctx: OptimizerContext) -> Log
             new.append(spec)
     if not changed:
         return None
-    return Aggregate(node.input, node.group_keys, tuple(new))
+    return dataclasses.replace(node, aggregates=tuple(new))
 
 
 @rule(name="sum_constant_to_count", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -360,7 +374,7 @@ def sum_constant_to_count(node: Aggregate, _ctx: OptimizerContext) -> LogicalPla
         extra = (AggregateSpec(cnt_alias, AggExpr("count_star", None)),)
     target_aliases = {s.alias for s in targets}
     kept = [s for s in node.aggregates if s.alias not in target_aliases]
-    inner = Aggregate(node.input, node.group_keys, tuple(kept) + extra)
+    inner = dataclasses.replace(node, aggregates=tuple(kept) + extra)
     folded = {s.alias: Lit(s.agg.input.value) * Col(cnt_alias) for s in targets}  # type: ignore[union-attr]
     return _project_over(node, inner, agg_map=folded)
 
@@ -391,7 +405,7 @@ def fold_constant_grouped_aggregate(node: Aggregate, _ctx: OptimizerContext) -> 
             kept.append(spec)
     if not folded:
         return None
-    inner = Aggregate(node.input, node.group_keys, tuple(kept))
+    inner = dataclasses.replace(node, aggregates=tuple(kept))
     return _project_over(node, inner, agg_map=folded)
 
 
@@ -429,7 +443,7 @@ def drop_distinct_before_agg(node: Aggregate, _ctx: OptimizerContext) -> Logical
         for spec in node.aggregates
     ):
         return None
-    return Aggregate(inner.input, node.group_keys, node.aggregates)
+    return dataclasses.replace(node, input=inner.input)
 
 
 @rule(name="aggregate_without_aggs_to_distinct", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -443,8 +457,16 @@ def aggregate_without_aggs_to_distinct(
     dedup kernel. Identical for NULLs (grouped as one) and empty input (0 rows either
     way). Requires at least one group key, so a keyless no-aggregate aggregate (the
     1-row global corner case) is left untouched.
+
+    Declines a **watermarked** aggregate. `Distinct` has no `watermark` field, so unlike the
+    other rewrites in this module this one cannot carry the streaming aggregation's watermark
+    across — the rewrite would silently un-bound its state and stop late rows being dropped.
+    The shape is reachable: `redundant_aggregate_of_group_key` folds ``max(k)`` on a group key
+    away, leaving exactly the no-aggregate node this rule matches. A rewrite that cannot
+    represent a field must decline, not drop it; `WatermarkDedup` is the node that carries a
+    watermark through a dedup.
     """
-    if node.aggregates or not node.group_keys:
+    if node.aggregates or not node.group_keys or node.watermark is not None:
         return None
     return Distinct(Project(node.input, node.group_keys))
 
@@ -475,5 +497,5 @@ def deduplicate_aggregate_exprs(node: Aggregate, _ctx: OptimizerContext) -> Logi
             kept.append(spec)
     if not dup:
         return None
-    inner = Aggregate(node.input, node.group_keys, tuple(kept))
+    inner = dataclasses.replace(node, aggregates=tuple(kept))
     return _project_over(node, inner, agg_map={a: Col(r) for a, r in dup.items()})

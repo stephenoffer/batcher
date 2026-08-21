@@ -68,6 +68,11 @@ SPILLING_SHAPES = {
     "sort_numeric": lambda d: d.sort(col("k")),
     "sort_descending": lambda d: d.sort(col("k"), descending=True),
     "sort_then_limit": lambda d: d.sort(col("k")).limit(10),
+    # Was a documented fallback: the range partitioner was numeric-only, so a string key had
+    # no boundaries and fell back in memory. `column_string_quantiles` /
+    # `range_partition_batches_str` gave it one, but this list was never updated -- the shape
+    # had been spilling correctly (all four ordering flags) while pinned as not spilling.
+    "sort_string_key": lambda d: d.sort(col("s")),
     "window_sum": lambda d: d.with_columns(x=col("v").sum().over(partition_by="k")),
     "join_inner": lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k", how="inner"),
     "join_left": lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k", how="left"),
@@ -85,11 +90,24 @@ NON_SPILLING_SHAPES = {
         lambda d: d.select(col("k"), (col("v") * 2).alias("d")),
         "a projection is streaming — same reason",
     ),
-    "sort_string_key": (
-        lambda d: d.sort(col("s")),
-        "the out-of-core sort range-partitions on a numeric key; a string key has no "
-        "partitioner, so it falls back in memory (see "
-        "test_diff_spill_paths.py::test_spilling_sort_on_string_key_falls_back_not_crashes)",
+    "limit_over_distinct": (
+        lambda d: d.select(col("k")).distinct().limit(10),
+        "a LIMIT re-applied above a spilled breaker takes the first k rows of hash-partition "
+        "order, where the in-memory path takes them in input order -- different rows, so a "
+        "wrong answer rather than a slower one (see "
+        "test_diff_spill_paths.py::test_a_limit_above_a_spilled_breaker_keeps_the_same_rows)",
+    ),
+    "limit_over_group_by": (
+        lambda d: d.group_by("k").agg(s=col("v").sum()).limit(10),
+        "same reason as limit_over_distinct: the spilled aggregate emits in partition order",
+    ),
+    "limit_over_join": (
+        lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k").limit(10),
+        "same reason as limit_over_distinct: the grace-partitioned join emits in bucket order",
+    ),
+    "limit_over_window": (
+        lambda d: d.with_columns(x=col("v").sum().over(partition_by="k")).limit(10),
+        "same reason as limit_over_distinct: the spilled window emits in partition order",
     ),
 }
 

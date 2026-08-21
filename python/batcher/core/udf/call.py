@@ -74,7 +74,7 @@ def _resilient_call(
     running count and the error text, so a running job reports the loss as it happens rather
     than at the end."""
     try:
-        return _coerce_udf_result(call(sub))
+        return _coerce_udf_result(call(sub), sub.schema)
     except Exception as exc:
         # Imported here, not at the top of the function: this is the only branch that needs
         # it, and on a clean batch the lookup — and the ML/torch import behind it — is work
@@ -166,25 +166,38 @@ def _formatted(fn: Any, fmt: str) -> Any:
     return _call
 
 
-def _coerce_udf_result(result: object) -> list[pa.RecordBatch]:
+def _coerce_udf_result(result: object, reference: pa.Schema) -> list[pa.RecordBatch]:
     """Normalize a `map_batches` return to Arrow batches the engine can import.
 
-    Two steps, deliberately separate. `_coerce_parts` decides *what shape* the user
+    Three steps, deliberately separate. `_coerce_parts` decides *what shape* the user
     returned; `importable_batch` then respells any Arrow **layout** the FFI reader cannot
     take. A UDF is the one place a column type is chosen by user code rather than by a
     source, so it is exactly where a layout the engine has never seen arrives -- a
     ``list_view`` built by a NumPy or Polars round-trip used to reach the user as
     ``Extracting byte ranges not supported for type list_view<item: int64>``.
 
+    `restore_null_typed_columns` is the third, and it needs `reference` -- the schema the
+    `fn` was *given*. A non-Arrow `batch_format` cannot tell an empty string column from an
+    empty column of nothing, so it returns Arrow `null` and the column silently changes type
+    on exactly the batches with no data in them. Passing the input schema is what lets the
+    original type be put back; callers that have it should pass it.
+
     Args:
         result: Whatever the user's `fn` returned.
+        reference: Schema of the batch the `fn` was called on, used to restore a column that
+            came back `null`-typed. Required rather than defaulted, so a new call site has to
+            decide what the result is held against instead of silently reintroducing the
+            type loss.
 
     Returns:
         Record batches, every column of which arrow-rs can import.
     """
+    from batcher.interop.formats import restore_null_typed_columns
     from batcher.plan.types.layout import importable_batch
 
-    return [importable_batch(b) for b in _coerce_parts(result)]
+    return [
+        restore_null_typed_columns(importable_batch(b), reference) for b in _coerce_parts(result)
+    ]
 
 
 def _coerce_parts(result: object) -> list[pa.RecordBatch]:

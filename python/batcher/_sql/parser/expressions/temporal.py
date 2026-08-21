@@ -171,6 +171,13 @@ def temporal_function(tr, node) -> Expr | None:
         return _query_now(tr)
     if len(args) == 1 and name == "unix_nanos":
         return tr._scalar(args[0]).dt.epoch_us() * lit(1_000)
+    if len(args) == 3 and name in ("date_sub", "datesub", "date_diff", "datediff"):
+        # DuckDB's three-argument `date_sub(part, start, end)` is `date_diff` under another
+        # name — both answer 60 for `('day', '2020-01-01', '2020-03-01')`. sqlglot leaves
+        # this spelling anonymous, so it reached the scalar translator as an unknown
+        # function. (The *two*-argument `date_sub(date, days)` is Spark's and parses to a
+        # typed `DateSub`, handled by the interval path.)
+        return _date_diff(tr, exp.DateDiff(this=args[2], expression=args[1], unit=args[0]))
     if len(args) == 2 and name == "try_strptime":
         # `strptime` raises on unparseable text in DuckDB and `try_strptime` returns
         # null; the engine's parser returns null either way, so this is the exact one.
@@ -414,9 +421,22 @@ def _unix_to_time(tr, node) -> Expr:
     if key not in _SCALE_UNIT:
         raise NotImplementedError(f"epoch scale {key} is not supported; use 0 (seconds), 3, 6 or 9")
     unit = _SCALE_UNIT[key]
-    if _is_integer_literal(node.this):
+    if _is_integer_literal(node.this) or _is_integer_column(tr, node.this):
         return from_epoch(tr._scalar(node.this), unit)
     return getattr(tr._scalar(node.this).dt, _UNIT_EPOCH_METHOD[unit])()
+
+
+def _is_integer_column(tr, node) -> bool:
+    """True when `node` is a column the plan says is an integer.
+
+    `epoch_ms(n)` on an integer *column* is the constructor just as much as on an integer
+    literal, and reading the AST alone cannot tell: the column reference looks the same
+    either way, so it took the extraction reading and answered 0 for every row.
+    """
+    import pyarrow as pa
+
+    t = tr.column_type(node)
+    return t is not None and pa.types.is_integer(t)
 
 
 def _is_integer_literal(node) -> bool:
@@ -481,6 +501,18 @@ _DIFF_MICROS = {
 #: DuckDB does.
 _DIFF_CALENDAR = {"MONTH": (12, "month"), "QUARTER": (4, "quarter")}
 
+#: `date_diff` units that are a difference of one `.dt` field. Each was refused as "unit
+#: not supported" where the accessor to answer it already existed.
+_DIFF_FIELD = {"DECADE": "decade", "ISOYEAR": "iso_year"}
+
+#: `date_diff` units counted as a difference of `year / n`, **not** of the same-named
+#: field. DuckDB's `century(DATE '2000-01-01')` is 20 and its `century(DATE '0001-01-01')`
+#: is 1 — the 1-based ordinal — but `date_diff('century', …)` between those two dates is
+#: 20, not 19, because the difference is taken on the *zero-based* period number. The two
+#: readings agree everywhere except across the year-1 boundary, which is exactly the kind
+#: of divergence a plausible answer hides.
+_DIFF_YEAR_SCALE = {"CENTURY": 100, "MILLENNIUM": 1000}
+
 
 def _epoch_cell(value: Expr, micros: int) -> Expr:
     """Which `micros`-wide cell of the epoch grid `value` falls in."""
@@ -511,12 +543,28 @@ def _date_diff(tr, node) -> Expr:
     if unit == "YEAR":
         return Cast(end.dt.year() - start.dt.year(), "int64")
 
+    field = _DIFF_FIELD.get(unit)
+    if field is not None:
+        return Cast(getattr(end.dt, field)() - getattr(start.dt, field)(), "int64")
+
+    scale = _DIFF_YEAR_SCALE.get(unit)
+    if scale is not None:
+        period = lambda v: Binary("floor_div", v.dt.year(), lit(scale))  # noqa: E731
+        return Cast(period(end) - period(start), "int64")
+
     if unit in _DIFF_CALENDAR:
         per, field = _DIFF_CALENDAR[unit]
         ordinal = lambda v: v.dt.year() * lit(per) + getattr(v.dt, field)()  # noqa: E731
         return Cast(ordinal(end) - ordinal(start), "int64")
 
+    known = {
+        *_DIFF_MICROS,
+        *_DIFF_CALENDAR,
+        *_DIFF_FIELD,
+        *_DIFF_YEAR_SCALE,
+        "WEEK",
+        "YEAR",
+    }
     raise NotImplementedError(
-        f"date_diff unit {unit} is not supported; use one of "
-        f"{', '.join(sorted({*_DIFF_MICROS, *_DIFF_CALENDAR, 'WEEK', 'YEAR'}))}"
+        f"date_diff unit {unit} is not supported; use one of {', '.join(sorted(known))}"
     )

@@ -218,6 +218,27 @@ class DistributedRunner:
         if self._fold is not None:
             self._fold.restore(state)
 
+    def restore_state_chain(self, states: list[pa.RecordBatch]) -> None:
+        """Rebuild the running state from a base snapshot plus the changelog after it.
+
+        This runner does not *write* deltas — a state backend is not something to change on
+        a path with no automated coverage — but it must be able to *read* one, because a
+        checkpoint is portable across runners and a single-node query restarted with
+        `distributed=True` resumes from exactly the chain the single-node run left behind.
+        Without this the engine would fall back to restoring the base alone and the query
+        would resume with a fraction of its aggregate: silently short totals, no error, and
+        only on the restart that changed configuration.
+
+        `combine_all` is the same algebra this runner already applies to worker partials on
+        every epoch, so replaying a chain is not a new code path — it is `_publish_aggregate`
+        with the partials coming off disk instead of off the wire.
+
+        Args:
+            states: The base snapshot followed by each recorded delta, oldest first.
+        """
+        if self._fold is not None:
+            self._fold.combine_all(list(states))
+
     def has_state(self) -> bool:
         return self._fold is not None
 

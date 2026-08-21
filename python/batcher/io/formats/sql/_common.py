@@ -21,13 +21,17 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher.io.formats.sql.uri import quote_identifier
+
 __all__ = [
     "apply_predicate",
     "apply_projection",
     "connection_fingerprint",
     "count_query",
+    "identifier_quoter",
     "probe_is_typed",
     "push_down",
+    "pushed_sql",
     "require_module",
     "schema_probe",
     "wrap_subquery",
@@ -307,6 +311,82 @@ def push_down(
         filtered = f"SELECT * FROM {wrap_subquery(query, table=table)} WHERE {where}"
         shaped = apply_projection(filtered, projection, quote=quote)
     return _capped(_ordered(shaped, order_by, quote), limit)
+
+
+def identifier_quoter(dialect: str | None) -> Callable[[str], str]:
+    """How to delimit an identifier for `dialect`; verbatim when it is unknown.
+
+    A projection reaches the server as a column list, and three ordinary names break
+    unquoted: a reserved word (``order``, ``user``, ``key``), a name holding a space
+    (which parses as a column *aliased* to the second word, returning the wrong column
+    under the right name), and an unaliased aggregate from a user's own query.
+
+    An unknown dialect renders verbatim rather than guessing a delimiter: ODBC names a
+    driver rather than a dialect, and quoting with the wrong character turns a working
+    query into a syntax error.
+
+    Args:
+        dialect: The connection-URI scheme naming the SQL dialect, or empty when it
+            cannot be known.
+
+    Returns:
+        A callable rendering one identifier for that dialect.
+    """
+    if not dialect:
+        return _identity
+    known = dialect
+    return lambda name: quote_identifier(name, known)
+
+
+def pushed_sql(
+    query: str,
+    *,
+    predicate: dict | None = None,
+    projection: list[str] | None = None,
+    limit: int | None = None,
+    ordering: tuple[tuple[str, bool, bool], ...] | None = None,
+    extra_where: str | None = None,
+    table: str | None = None,
+    quote: Callable[[str], str] = _identity,
+    supports_ordering: bool = False,
+    supports_limit: bool = False,
+) -> str:
+    """`query` with every part of the plan this backend can push folded into the SQL.
+
+    A thin capability gate in front of `push_down`, kept in one place because the rule it
+    encodes is the one pushdown that can be *wrong* rather than merely incomplete. An
+    ordered cap is only sound if the ordering goes with it: a dialect that takes ``LIMIT``
+    but cannot spell ``NULLS FIRST|LAST`` must drop the cap too, or the server returns its
+    own idea of the first n -- the wrong rows, silently, with no error anywhere.
+
+    Args:
+        query: The one logical query the source reads.
+        predicate: Kyber's pushed predicate, or None.
+        projection: The pushed column list, or None for every column.
+        limit: The pushed row cap, applied only when `supports_limit`.
+        ordering: The pushed sort keys as `(column, descending, nulls_first)`, applied
+            only when `supports_ordering`.
+        extra_where: A partitioning range clause ANDed with the predicate.
+        table: The table to select from when `query` names one.
+        quote: How to delimit an identifier, from `identifier_quoter`.
+        supports_ordering: Whether the dialect accepts an explicit ``NULLS`` clause.
+        supports_limit: Whether the dialect accepts a ``LIMIT`` clause.
+
+    Returns:
+        The SQL one split executes, pushdown included.
+    """
+    ordered = ordering if (ordering and supports_ordering) else None
+    capped = None if (ordering and ordered is None) else (limit if supports_limit else None)
+    return push_down(
+        query,
+        predicate,
+        projection,
+        table=table,
+        extra_where=extra_where,
+        limit=capped,
+        order_by=ordered,
+        quote=quote,
+    )
 
 
 def _ordered(

@@ -475,7 +475,13 @@ pub(super) fn object_keys(text: &str, path: &[PathPart]) -> Option<Vec<String>> 
     let raw = seek(text, path)?;
     let bytes = raw.as_bytes();
     if bytes.first()? != &b'{' {
-        return None;
+        // A value that exists and *parses* but is not an object has no keys, which DuckDB
+        // reports as the empty list (`json_keys('[]')` is `[]`); NULL is reserved for "no
+        // such path", and answering it here made the two indistinguishable. Malformed text
+        // is the third case and keeps its NULL: DuckDB raises there, and answering null
+        // rather than aborting the scan is this engine's documented divergence — reporting
+        // "no keys" instead would claim the row parsed.
+        return serde_json::from_str::<Value>(raw).ok().map(|_| Vec::new());
     }
     let mut i = skip_ws(bytes, 1);
     if bytes.get(i)? == &b'}' {
@@ -546,6 +552,27 @@ pub(super) fn json_value(text: &str, path: &[PathPart]) -> Option<String> {
     }
 }
 
+/// `json_extract(doc, path)` / `doc -> path` — the value at `path` **as JSON text**.
+///
+/// The third rendering of a leaf, and the one SQL's `json_extract` actually specifies.
+/// [`extract_string`] unquotes a string and reports a JSON null as SQL NULL (that is
+/// `json_extract_string` / `->>`); [`json_value`] additionally reports a container as SQL
+/// NULL. `json_extract` reports every leaf as the JSON that is there: `"x"` with its
+/// quotes, `null` as the three-letter token, and an object or array compacted.
+///
+/// Conflating it with `extract_string` — which is what the SQL front-end did — answered
+/// `json_extract('{"a":"x"}', '$.a')` with `x` instead of `"x"`, and a JSON null with SQL
+/// NULL, so "the key is absent" and "the key is present and null" became one answer.
+pub(super) fn extract_json(text: &str, path: &[PathPart]) -> Option<String> {
+    let raw = seek(text, path)?;
+    match serde_json::from_str::<Value>(raw).ok()? {
+        // A number is canonicalized (and a very large integer keeps its digits), exactly
+        // as the other two renderings do — `render_leaf` owns that rule.
+        Value::Number(_) => render_leaf(raw),
+        _ => Some(compact(raw)),
+    }
+}
+
 /// `json_contains(doc, needle)` — whether `needle` (itself a JSON value) appears as an
 /// element of a top-level array, as a value of a top-level object, or equals the whole
 /// document. Comparison is on the *parsed* values, so whitespace and key order in either
@@ -582,8 +609,17 @@ pub(super) fn pretty(text: &str) -> Option<String> {
 /// `json_structure(doc)` — the document's shape with each leaf replaced by the name of
 /// the SQL type it would cast to, e.g. `{"a": 1, "b": "x"}` → `{"a":"UBIGINT","b":"VARCHAR"}`.
 ///
-/// An array is described by its **first** element's structure, which is DuckDB's rule
-/// (a heterogeneous array has no single structure, and it reports the first).
+/// An array is described by the **unification** of every element's structure, not by its
+/// first element. Reading it as "the first element" was a plausible misreading of DuckDB
+/// and produced a different answer on any array whose first entry was not the widest:
+/// `[null, 1]` is `["UBIGINT"]` there and was `["NULL"]` here, and `[]` is `["NULL"]` there
+/// and was `["JSON"]` here.
+///
+/// The unification is a small lattice: `NULL` yields to anything, the integer widths widen
+/// (`UBIGINT` + `BIGINT` = `HUGEINT`) and any integer against `DOUBLE` is `DOUBLE`, objects
+/// merge field-wise over the union of their keys, and arrays unify elementwise. Anything
+/// else -- a number against a string, an array against a scalar -- has no common structure
+/// and is `JSON`, which is exactly what that name means here.
 pub(super) fn structure(text: &str) -> Option<String> {
     let value: Value = serde_json::from_str(text).ok()?;
     Some(structure_of(&value).to_string())
@@ -598,8 +634,12 @@ fn structure_of(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(vec![items
-            .first()
-            .map_or_else(|| Value::String("JSON".into()), structure_of)]),
+            .iter()
+            .map(structure_of)
+            // An empty array has no element to describe, and DuckDB describes it the way it
+            // describes an element it knows nothing about: `NULL`, the lattice's bottom.
+            .reduce(|a, b| unify(&a, &b))
+            .unwrap_or_else(|| Value::String("NULL".into()))]),
         Value::Null => Value::String("NULL".into()),
         Value::Bool(_) => Value::String("BOOLEAN".into()),
         Value::String(_) => Value::String("VARCHAR".into()),
@@ -614,6 +654,67 @@ fn structure_of(value: &Value) -> Value {
             .into(),
         ),
     }
+}
+
+/// The least structure describing both `a` and `b`, or `"JSON"` when there is none.
+fn unify(a: &Value, b: &Value) -> Value {
+    const NULL: &str = "NULL";
+    if a == b {
+        return a.clone();
+    }
+    if a == &Value::String(NULL.into()) {
+        return b.clone();
+    }
+    if b == &Value::String(NULL.into()) {
+        return a.clone();
+    }
+    match (a, b) {
+        // Field-wise over the *union* of the keys: a key only one side has is still part of
+        // the shape, and a key both have with different leaves unifies to `JSON`.
+        (Value::Object(x), Value::Object(y)) => {
+            let mut merged = x.clone();
+            for (k, v) in y {
+                match merged.get(k) {
+                    Some(prev) => {
+                        let joined = unify(prev, v);
+                        merged.insert(k.clone(), joined);
+                    }
+                    None => {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(merged)
+        }
+        // Each side is already normalized to a one-element array by `structure_of`.
+        (Value::Array(x), Value::Array(y)) => match (x.first(), y.first()) {
+            (Some(xa), Some(ya)) => Value::Array(vec![unify(xa, ya)]),
+            _ => Value::String("JSON".into()),
+        },
+        (Value::String(x), Value::String(y)) => match widen_numeric(x, y) {
+            Some(t) => Value::String(t.into()),
+            None => Value::String("JSON".into()),
+        },
+        _ => Value::String("JSON".into()),
+    }
+}
+
+/// The wider of two numeric type names, or `None` when either is not numeric.
+fn widen_numeric(x: &str, y: &str) -> Option<&'static str> {
+    let rank = |t: &str| match t {
+        "UBIGINT" | "BIGINT" => Some(1u8),
+        "HUGEINT" => Some(2),
+        "DOUBLE" => Some(3),
+        _ => None,
+    };
+    let (rx, ry) = (rank(x)?, rank(y)?);
+    // Same rank but different names can only be UBIGINT against BIGINT: one needs the
+    // unsigned top and the other the negative range, so neither holds both.
+    Some(match rx.max(ry) {
+        3 => "DOUBLE",
+        2 => "HUGEINT",
+        _ => "HUGEINT",
+    })
 }
 
 /// its compact JSON, a JSON `null` as `None`, everything else as its canonical form.
@@ -681,7 +782,20 @@ mod tests {
             Some(vec!["z".to_string(), "a".to_string(), "m".to_string()])
         );
         assert_eq!(object_keys("{}", &parts("$")), Some(vec![]));
-        assert_eq!(object_keys("[1]", &parts("$")), None);
+    }
+
+    /// A value that exists but is not an object has no keys — the empty list, as DuckDB
+    /// reports (`json_keys('[]')` is `[]`). NULL is reserved for "no such path"; returning
+    /// it for an array made the two answers indistinguishable.
+    #[test]
+    fn a_non_object_has_no_keys_rather_than_an_unknown_answer() {
+        assert_eq!(object_keys("[1]", &parts("$")), Some(vec![]));
+        assert_eq!(object_keys("1", &parts("$")), Some(vec![]));
+        assert_eq!(object_keys(r#"{"a": 1}"#, &parts("$.zz")), None);
+        // Malformed text is the third case: it did not parse, so "no keys" would be a
+        // claim about a value that is not there. It stays NULL.
+        assert_eq!(object_keys("nope", &parts("$")), None);
+        assert_eq!(object_keys("{", &parts("$")), None);
     }
 
     #[test]
@@ -1092,5 +1206,49 @@ mod tests {
             sink,
             sink2,
         );
+    }
+
+    /// Every one of these is a DuckDB answer, taken from `json_structure` directly. The
+    /// old "first element" reading agreed with exactly the rows whose first element was
+    /// already the widest, which is why it survived: the fixture had no `[null, 1]`.
+    #[test]
+    fn an_array_structure_unifies_every_element_the_way_duckdb_does() {
+        for (doc, want) in [
+            // The two the first-element reading got wrong.
+            ("[null,1]", r#"["UBIGINT"]"#),
+            ("[]", r#"["NULL"]"#),
+            // Unchanged by the rewrite, and here so the lattice cannot regress them.
+            ("[1,null]", r#"["UBIGINT"]"#),
+            ("[null]", r#"["NULL"]"#),
+            ("[null,null]", r#"["NULL"]"#),
+            // Integer widths widen; a signed and an unsigned need the wider type.
+            ("[-1,1]", r#"["HUGEINT"]"#),
+            ("[-1,-2]", r#"["BIGINT"]"#),
+            ("[1,2.5]", r#"["DOUBLE"]"#),
+            ("[1,null,2.5]", r#"["DOUBLE"]"#),
+            ("[true,null]", r#"["BOOLEAN"]"#),
+            // No common structure is `JSON`, which is what the name means here.
+            ("[1,\"a\"]", r#"["JSON"]"#),
+            ("[true,1]", r#"["JSON"]"#),
+            ("[[1],1]", r#"["JSON"]"#),
+            ("[null,\"a\",1]", r#"["JSON"]"#),
+            // Objects merge over the union of their keys; arrays unify elementwise.
+            (
+                "[{\"a\":1},{\"b\":2}]",
+                r#"[{"a":"UBIGINT","b":"UBIGINT"}]"#,
+            ),
+            ("[{\"a\":1},{\"a\":\"x\"}]", r#"[{"a":"JSON"}]"#),
+            ("[{\"a\":null},{\"a\":1}]", r#"[{"a":"UBIGINT"}]"#),
+            ("[{\"a\":1},null]", r#"[{"a":"UBIGINT"}]"#),
+            ("[[1],[null]]", r#"[["UBIGINT"]]"#),
+            ("[[],[1]]", r#"[["UBIGINT"]]"#),
+            ("[[]]", r#"[["NULL"]]"#),
+        ] {
+            assert_eq!(
+                structure(doc).as_deref(),
+                Some(want),
+                "json_structure({doc})"
+            );
+        }
     }
 }

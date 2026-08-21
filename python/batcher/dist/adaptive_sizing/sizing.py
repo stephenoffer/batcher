@@ -80,7 +80,13 @@ def _ema(hub: MetadataHub, namespace: str, key: str, value: float) -> None:
     both. An autoscaling group that mixes instance types is the ordinary case, not the exotic
     one, so the scoping is on by default rather than a cluster-mode flag.
     """
-    if hub is None or value != value or value < 0.0:  # None hub / NaN / negative guard
+    # NaN *and* infinity, not just NaN. Exponential smoothing is `a*value + (1-a)*prior`, so a
+    # non-finite observation does not merely produce one bad reading — it propagates into the
+    # stored value and from there into every later update, and the entry is poisoned for the
+    # life of the store with nothing raising. `metadata.smoothed.record_smoothed_scalar` guards
+    # `math.isfinite` for exactly this reason and spells the argument out; this is a second,
+    # independent EMA that had only caught half of it.
+    if hub is None or not math.isfinite(value) or value < 0.0:
         return
     try:
         s = hub.get_keyed_param(scoped(namespace), key) or {}
@@ -99,11 +105,17 @@ def _read_ema(hub: MetadataHub | None, namespace: str, key: str) -> float | None
         return None
     try:
         s = hub.get_keyed_param(scoped(namespace), key) or {}
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+        note_suppressed("dist", f"read the learned {namespace} EMA", exc)
         return None
     if int(s.get("n", 0)) < _MIN_SAMPLES or "ema" not in s:
         return None
-    return float(s["ema"])
+    ema = float(s["ema"])
+    # A store outlives the build that wrote it, so the write-side guard above is not enough on
+    # its own. Both consumers turn this into an integer (`int(ema)`, `round(served)`), and both
+    # raise `OverflowError` on an infinity — out of distributed *planning*, which is not a path
+    # prepared for it. Reading a non-finite value as "never measured" costs one cold estimate.
+    return ema if math.isfinite(ema) else None
 
 
 def _family_samples(hub: MetadataHub | None, family: str, field: str) -> list[float]:
@@ -294,7 +306,16 @@ def learned_straggler_factor(hub: MetadataHub | None, family: str) -> float | No
     variance = sum((t - mean) ** 2 for t in times) / len(times)
     cv = (variance**0.5) / mean
     default = float(active_config().distributed.speculation_straggler_factor)
-    factor = default * (1.0 + max(0.0, 1.0 - cv))
+    # `default x (2 - cv)`, bounded by the band below. A uniform family (cv ~ 0) doubles its
+    # bar and effectively opts out; a family at cv = 1 sits exactly on the configured
+    # default; a heavier tail than that drops below it, which is the half this used to make
+    # unreachable. The expression was `1 + max(0, 1 - cv)`, whose inner floor pinned every
+    # family with cv >= 1 at exactly the default — so the *only* families the loop could act
+    # on were the ones that never straggle, and the `0.75 x default` lower bound guarded a
+    # region nothing could enter. Every docstring describing this loop (here, `_faults`, and
+    # `speculation_straggler_factor` in config) states the opposite behaviour, which is the
+    # one restored here.
+    factor = default * (2.0 - cv)
     return max(default * 0.75, min(default * 2.0, factor))
 
 

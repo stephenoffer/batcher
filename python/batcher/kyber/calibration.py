@@ -75,9 +75,25 @@ def live_coefficients(hub: MetadataHub | None) -> CostCoefficients | None:
 # Each calibratable operator `kind` (the native `ExecMetrics` tag) maps to the cost
 # coefficient its dominant per-row term scales, plus the `basis(rows_in, rows_out)`
 # that term multiplies. `hash_build_row` is fit from `aggregate` (the purest hash-build
-# signal); `hash_probe_row` from `hash_join` (its per-row work over both sides). The
-# remaining coefficients (`output_row`, `map_row`, `bytes_per_row`) have no clean
-# single-family signal and keep their defaults.
+# signal); `hash_probe_row` from `hash_join`. The remaining coefficients (`output_row`,
+# `map_row`, `bytes_per_row`) have no clean single-family signal and keep their defaults.
+#
+# **The join's basis is its probe side alone, and the fit absorbs its build time anyway.**
+# `_samples` prefers `n_input`, which `ExecMetrics` narrowed to the probe rows when it gained
+# a separate `rows_build` (so that a join's `selectivity` means fan-out rather than nothing).
+# The numerator is still `t_op_ms`, the whole operator's wall time — build *and* probe — so
+# the fitted `hash_probe_row` is that whole time spread over probe rows, and
+# `cost.model._join_cost` then charges `hash_build_row x build_rows` on top of it. A
+# calibrated join is therefore priced above what it was measured to take, by its build term.
+#
+# This is stated rather than corrected because correcting it is a cost-model retune, not a
+# bug fix: the honest form is a two-coefficient regression over `(build_rows, probe_rows)`
+# against `t_op_ms`, which changes how every join ranks against every non-join and has to be
+# measured (`python benchmarks/run.py`) rather than reasoned about. What bounds the damage
+# meanwhile is that it is *uniform* — every join is over-charged by the same term — so
+# join-order and build-side choices, which compare joins with joins, are largely unaffected;
+# what moves is a join weighed against an aggregate or a sort. `shrink` and `clamp_factor`
+# bound how far the fit can travel from the shipped default in any case.
 _KIND_COEFF: dict[str, str] = {
     "scan": "scan_row",
     "filter": "filter_row",

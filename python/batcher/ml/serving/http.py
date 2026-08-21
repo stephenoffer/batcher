@@ -52,12 +52,21 @@ def post_json(
     timeout: float,
     retries: int = 3,
     backoff: float = 0.5,
+    max_retry_after: float = 60.0,
 ) -> dict[str, Any]:
     """POST `payload` as JSON to `url` and return the parsed JSON response.
 
     Retries up to `retries` times with jittered exponential backoff on connection errors
     and retryable HTTP status codes (408/425/429/5xx); other 4xx errors fail immediately
     (a bad request won't get better by retrying). Raises `BackendError` on exhaustion.
+
+    A ``Retry-After`` header wins over the computed backoff. Every hosted inference API
+    sends one on a 429 or a 503, and it is the *only* number that reflects when the quota
+    actually refills — a client-side ``0.5 * 2**attempt`` is a guess that is either too
+    short (retrying into the same rejection, which several providers count against the
+    quota, so the retries fund their own starvation) or too long. It is clamped to
+    `max_retry_after` so a provider naming a five-minute wait cannot stall a worker for
+    longer than the caller is willing to wait.
     """
     import json
     import urllib.error
@@ -66,6 +75,7 @@ def post_json(
     body = json.dumps(payload).encode()
     last: Exception | None = None
     for attempt in range(retries + 1):
+        wait: float | None = None
         req = urllib.request.Request(url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -83,12 +93,61 @@ def post_json(
         except urllib.error.HTTPError as exc:
             last = exc
             if exc.code not in (408, 425, 429, 500, 502, 503, 504):
-                raise BackendError(f"inference endpoint {url} returned {exc.code}") from exc
+                raise BackendError(
+                    f"inference endpoint {url} returned {exc.code}: {_error_detail(exc)}"
+                ) from exc
+            wait = _retry_after(exc, max_retry_after)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last = exc
         if attempt < retries:
-            time.sleep(_jittered_backoff(backoff, attempt))
+            time.sleep(wait if wait is not None else _jittered_backoff(backoff, attempt))
     raise BackendError(f"inference endpoint {url} failed after {retries + 1} attempts: {last}")
+
+
+def _retry_after(exc: Any, ceiling: float) -> float | None:
+    """The server's ``Retry-After`` delay in seconds, clamped, or `None` if it named none.
+
+    The header carries either a delay in seconds or an HTTP date; both spellings are in the
+    RFC and both are in use, so both are read. A value that does not parse is `None` rather
+    than an error — a malformed header is the server's problem and must not become a failed
+    inference job.
+    """
+    header = None
+    try:
+        header = exc.headers.get("Retry-After") if exc.headers is not None else None
+    except Exception:
+        return None
+    if not header:
+        return None
+    text = str(header).strip()
+    try:
+        return min(ceiling, max(0.0, float(text)))
+    except ValueError:
+        pass
+    from email.utils import parsedate_to_datetime
+
+    try:
+        import datetime as _dt
+
+        target = parsedate_to_datetime(text)
+        now = _dt.datetime.now(tz=target.tzinfo)
+        return min(ceiling, max(0.0, (target - now).total_seconds()))
+    except Exception:
+        return None
+
+
+def _error_detail(exc: Any) -> str:
+    """A short excerpt of an HTTP error body, for a message that says what went wrong.
+
+    A hosted API puts the actionable part of a 4xx in the body — which model name it did not
+    recognize, which field was malformed, which quota was exceeded — and the status code alone
+    sends the caller to the wrong place. Best-effort: an unreadable body yields the empty
+    string rather than masking the original failure with a second one.
+    """
+    try:
+        return exc.read()[:400].decode("utf-8", "replace")
+    except Exception:
+        return ""
 
 
 def _encode_value(arr: np.ndarray, encoding: str) -> Any:

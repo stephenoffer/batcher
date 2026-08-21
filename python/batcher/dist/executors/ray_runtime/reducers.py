@@ -70,6 +70,70 @@ def shuffle_partitions(workers: int) -> int:
     return n if cap <= 0 else max(1, min(n, cap))
 
 
+def buckets_for_envelope(hint: int, source) -> int:
+    """Raise `hint` until one *ordered* bucket is expected to fit the memory envelope.
+
+    `shuffle_partitions` sizes the reduce for parallelism -- one bucket per worker, raised
+    only by a **learned** shuffle volume -- which is right for a hash exchange, where a
+    reducer that finds its bucket too big still has grace re-partitioning underneath it. The
+    ordered global window has none: there is one partition, the kernel refuses an oversized
+    bucket outright (`MemoryBudgetExceededError: window without PARTITION BY cannot spill`),
+    and on a cold store the count was exactly `workers` whatever the input weighed. The
+    single-node twin has sized from the data since `_buckets_for_staged`; scheduling the same
+    algebra across machines does not change what a bucket costs to open.
+
+    Size comes from the source's declared `byte_size` where it has one, else from
+    `rows x schema_row_bytes` -- the same rows-times-width estimate `dist.gpu.shards` uses,
+    and the only one available for an in-memory relation, whose `SourceStatistics` carries a
+    row count but no `byte_size`. (Populating that field instead would feed the *width*
+    estimator a sharper number, which `SourceStatistics.content_byte_size` documents as a
+    measured plan regression and a separate, benchmark-driven change.)
+
+    Only ever *raises* the count, for the reason `shuffle_partitions` gives at length: the
+    worker count is a floor, and going below it idles workers for the whole reduce. Capped by
+    `distributed.max_shuffle_partitions`, like every other reducer count.
+
+    Args:
+        hint: The parallelism-derived bucket count, used as a floor.
+        source: The bound source, read for its size.
+
+    Returns:
+        The bucket count to cut, always `>= hint`.
+    """
+    from batcher.dist.spill.buckets import bucket_envelope
+
+    envelope = bucket_envelope()
+    if envelope <= 0:
+        return hint
+    total = _source_bytes(source)
+    if total <= 0:
+        return hint  # nothing measurable: keep the parallelism floor rather than guess
+    cap = active_config().distributed.max_shuffle_partitions
+    n = max(hint, -(-int(total) // envelope))
+    return n if cap <= 0 else max(1, min(n, cap))
+
+
+def _source_bytes(source) -> float:
+    """A source's total size in bytes, or `0` when nothing about it can be measured."""
+    from batcher.plan.types.widths import schema_row_bytes
+
+    try:
+        stats = source.statistics()
+    except Exception:  # pragma: no cover - a connector that cannot answer costs the floor
+        return 0.0
+    if stats is None:
+        return 0.0
+    if stats.byte_size:
+        return float(stats.byte_size)
+    rows = stats.row_count
+    if not rows:
+        return 0.0
+    try:
+        return float(rows) * schema_row_bytes(source.schema())
+    except Exception:  # pragma: no cover - unreadable schema: fall back to the floor
+        return 0.0
+
+
 def map_partitions(workers: int) -> int:
     """The number of map partitions a shuffle divides its input into — its **task unit**.
 

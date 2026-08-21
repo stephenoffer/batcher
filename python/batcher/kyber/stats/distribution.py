@@ -17,6 +17,8 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from batcher.plan.stats import AXIS_NUMERIC
+
 __all__ = [
     "distinct_after_selection",
     "geometric_mean",
@@ -358,7 +360,7 @@ def merge_quantile_grids(
     grids: Sequence[Mapping[str, Any] | None],
     weights: Sequence[float],
     points: int = 11,
-) -> dict[str, list[float]] | None:
+) -> dict[str, Any] | None:
     """Merge per-branch quantile grids into one, weighted by branch row count.
 
     A union's CDF is the row-weighted mixture of its branches' CDFs — ``F(x) = Σ nᵢ Fᵢ(x) / N``
@@ -370,21 +372,36 @@ def merge_quantile_grids(
     partition-union falls back from histogram interpolation to a flat constant, which is
     precisely where a partitioned fact table needs it most.
 
+    **The merged grid carries its branches' axis, and only merges branches that share one.**
+    A grid is a set of positions on one number line (`plan.stats.AXIS_DATE`, `AXIS_DATETIME`,
+    `AXIS_NUMERIC`), and the consumer refuses a grid whose axis is not the one its literal sits
+    on. Emitting the merge unlabelled defaulted it to `AXIS_NUMERIC`, so a union of `date`
+    columns produced a grid every `date` predicate above it declined — falling back to the flat
+    range constant on precisely the partitioned fact table this function exists for. Merging
+    grids measured on *different* axes is worse than declining: the mixture would be over two
+    unrelated number lines, and the result would be read as if it meant something.
+
     Args:
-        grids: Each branch's `{"probs": [...], "values": [...]}` grid, or None.
+        grids: Each branch's `{"probs": [...], "values": [...], "axis": ...}` grid, or None.
         weights: Each branch's row count, positionally aligned with `grids`.
         points: How many probability points the merged grid carries.
 
     Returns:
-        The merged grid, or None when no branch has a usable one.
+        The merged grid, or None when no branch has a usable one, the usable branches do not
+        agree on an axis, or `points` is too small to grid with.
     """
-    usable = [
-        (g, w)
-        for g, w in zip(grids, weights, strict=False)
-        if g and w > 0.0 and len(g.get("values", ())) >= 2
-    ]
+    if points < 2:
+        return None
+    usable = [(g, w) for g, w in zip(grids, weights, strict=False) if w > 0.0 and _usable(g)]
     if not usable:
         return None
+    # One number line, or none. `AXIS_NUMERIC` is the default a grid written before the axis
+    # was recorded carries, so an unlabelled grid merges with a numeric one and with nothing
+    # else — which is what its values actually are.
+    axes = {str(g.get("axis", AXIS_NUMERIC)) for g, _ in usable}
+    if len(axes) != 1:
+        return None
+    axis = axes.pop()
     total = sum(w for _, w in usable)
     lo = min(float(g["values"][0]) for g, _ in usable)
     hi = max(float(g["values"][-1]) for g, _ in usable)
@@ -401,7 +418,21 @@ def merge_quantile_grids(
     # interpolator relies on.
     for i in range(1, len(values)):
         values[i] = max(values[i], values[i - 1])
-    return {"probs": probs, "values": values}
+    return {"probs": probs, "values": values, "axis": axis}
+
+
+def _usable(grid: Mapping[str, Any] | None) -> bool:
+    """Whether one branch's grid can be read at all.
+
+    `probs` and `values` are read pairwise by `_grid_cdf`, so a grid whose two lists
+    disagree in length is not a partial grid — it is an `IndexError` raised into planning
+    from a truncated write or a build with a different grid shape.
+    """
+    if not grid:
+        return False
+    values = grid.get("values") or ()
+    probs = grid.get("probs") or ()
+    return len(values) >= 2 and len(probs) == len(values)
 
 
 def _grid_cdf(grid: Mapping[str, Any], x: float) -> float:

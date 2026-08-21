@@ -23,6 +23,7 @@ from batcher.dist.spill_breakers.join import (
 )
 from batcher.dist.spill_breakers.sort import (
     execute_spilling_sort,
+    iter_ordered_buckets,
     stage_and_partition,
     stream_spilling_sort,
     supports_spilling_sort,
@@ -36,6 +37,7 @@ __all__ = [
     "execute_spilling_join",
     "execute_spilling_sort",
     "iter_join_paths_spilling",
+    "iter_ordered_buckets",
     "reduce_join_paths_spilling",
     "stage_and_partition",
     "stream_spilling_join",

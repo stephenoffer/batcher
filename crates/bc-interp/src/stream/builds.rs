@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use bc_ir::{JoinType, RelOp};
-use bc_runtime::join::{streaming_supported, BroadcastProbe};
+use bc_runtime::join::{streaming_shape_supported, BroadcastProbe};
 
 use super::{parallel, runtime_filter, Meter};
 use crate::error::InterpError;
@@ -147,7 +147,16 @@ pub(crate) fn prebuild_joins(
     workers: usize,
 ) -> Result<Arc<BuildCache>, InterpError> {
     let mut cache = BuildCache::new();
-    collect_builds(plan, sources, &mut cache, meter, budget, workers)?;
+    // A plan with exactly one hash join can decline the per-morsel probe and still be run
+    // across every core, by handing off to the materializing executor
+    // (`parallel::unshardable_join_reason`) — which keeps the partitioned radix join too.
+    // With more than one join that hand-off declines by construction, so declining here
+    // selects the sequential pipeline instead. `flat_probe_pays` needs to know which.
+    let admission = Admission {
+        driving: driving_rows(plan, sources),
+        can_hand_off: parallel::count_hash_joins(plan) == 1,
+    };
+    collect_builds(plan, sources, &mut cache, meter, budget, workers, admission)?;
     // Every build side now exists, so every reducible join's key set is a known constant and can
     // be placed over the probe pipeline that is about to run. One pass per build key column; no
     // execution. See [`runtime_filter`] for which joins qualify and why it cannot regress.
@@ -162,6 +171,7 @@ fn collect_builds(
     meter: Option<&Meter>,
     budget: usize,
     workers: usize,
+    admission: Admission,
 ) -> Result<(), InterpError> {
     if let RelOp::HashJoin {
         left,
@@ -174,7 +184,7 @@ fn collect_builds(
         // Only the probe spine draws on *this* cache. The build side is executed below as one
         // self-contained unit, which prepares whatever joins it holds itself, so descending into
         // it here would build them twice.
-        collect_builds(left, sources, cache, meter, budget, workers)?;
+        collect_builds(left, sources, cache, meter, budget, workers, admission)?;
         // Shard the build side across the workers, exactly as the probe side is sharded. This
         // was the streaming executor's worst asymmetry: the probe ran on every core while the
         // build — the *whole* other relation — ran on one. It is hashed into a table either way,
@@ -187,7 +197,7 @@ fn collect_builds(
         // so declining here would abort the plan before the fact that decides it exists.
         let batches = parallel::run(right, sources, workers, meter, budget, false, None)?;
         if let Ok(side) = ops::materialize(&batches) {
-            let probe = make_probe(&side, right_keys, *join_type)?;
+            let probe = make_probe(&side, right_keys, *join_type, admission)?;
             cache.insert(node_key(plan), Arc::new(JoinBuild { side, probe }));
             // After the insert, not before: the check is on what is *resident*, and this side
             // is resident now. Declining before building it would be the thing the comment
@@ -197,9 +207,98 @@ fn collect_builds(
         return Ok(());
     }
     for child in plan.children() {
-        collect_builds(child, sources, cache, meter, budget, workers)?;
+        collect_builds(child, sources, cache, meter, budget, workers, admission)?;
     }
     Ok(())
+}
+
+/// Rows in the relation the probe spine will be sharded over, or 0 when there is none.
+///
+/// The probe side's size is not knowable without materializing it — the thing this executor
+/// exists to avoid — but its *driving scan* bounds it: every row the probe pipeline sees comes
+/// from there, and the operators between only drop rows. That bound is what
+/// [`flat_probe_pays`] weighs the build against.
+fn driving_rows(plan: &RelOp, sources: &[Vec<RecordBatch>]) -> usize {
+    let spine = match plan {
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input, .. } => input.as_ref(),
+        other => other,
+    };
+    parallel::leftmost_scan(spine, None)
+        .and_then(|sid| sources.get(sid))
+        .map(|b| b.iter().map(|x| x.num_rows()).sum())
+        .unwrap_or(0)
+}
+
+/// How far past its cache-sized ceiling a build may go and still be worth probing flat when the
+/// *probe* is the smaller side. ~16.8M rows is a ~270 MB table: past that, building it flat is a
+/// pathology on its own terms rather than a cache trade — TPC-H sf10 q18 builds 60M rows (~1 GB)
+/// and admitting it cost 378 -> 559 ms.
+const SMALL_PROBE_BUILD_CAP: usize = 8;
+
+/// How much larger the probe must be than the build before a flat probe past cache pays.
+///
+/// The flat probe pays about one cache miss per probe row; what it buys is the probe spine
+/// running on every core instead of one. So it wins at the *extremes* of the size ratio and
+/// loses in the middle, where the radix path's partition pass is cheap against both sides. Six
+/// is fitted to the measurements below rather than derived, and the band it sits in is narrow:
+/// TPC-H sf10 q9 wins at 7.5x and q21 loses at 4.0x.
+const PROBE_DOMINANCE: usize = 6;
+
+/// Whether a build above the ceiling may still take a per-morsel probe.
+///
+/// Declining is not free: a spine join with no per-morsel probe makes the whole probe spine
+/// un-shardable (`parallel::spine_is_shardable`), and a multi-join plan cannot hand off to the
+/// materializing executor either (`unshardable_join_reason` declines), so what the ceiling
+/// selects on those plans is **the sequential streaming pipeline** — 11-18 cores of 96 on TPC-H
+/// sf10 against DuckDB's 30-57, and the whole reason Batcher won sf1 and lost sf10 on every
+/// multi-way join.
+///
+/// The conditions are **fitted to measurement, not derived**, and are stated that way on
+/// purpose. Each has a mechanism, and each was measured in-process with the arms alternating by
+/// round (seven rounds, best of two, TPC-H sf10):
+///
+/// * **`Semi` / `Anti` are never admitted.** Their build is the side being *tested against*
+///   rather than the side being emitted, and a flat table over it is the whole cost of the
+///   join. q4 builds 37.9M rows for a `Semi` and q22 15M for an `Anti`: admitting them cost
+///   **146 -> 305 ms** and **43 -> 214 ms**. q13's `Left` join over a near-identical 14.8M-row
+///   build and the same 1.5M probe *gains* 515 -> 309, which is what rules out build size as
+///   the explanation.
+/// * **A probe that dominates the build** ([`PROBE_DOMINANCE`]) — the misses are bounded by the
+///   build while the serial time saved scales with the probe. q5 probes 60M against 2.28M
+///   (26x): **350 -> 177 ms**. q9, at 7.5x: **541 -> 449**.
+/// * **A probe smaller than the build**, up to [`SMALL_PROBE_BUILD_CAP`] — total misses are
+///   bounded by the small probe. q13 probes 1.5M against 14.8M: **515 -> 309 ms**.
+/// * **Never where the plan could hand off instead.** One hash join and a probe bigger than the
+///   build is the case `unshardable_join_reason` gives to the materializing executor, which
+///   spreads the probe across every core *and* keeps the cache-resident radix join. Pinned by
+///   `stream_oracle::a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks`.
+///
+/// Below the ceiling this admits everything, exactly as before.
+#[derive(Clone, Copy)]
+struct Admission {
+    /// Rows in the relation the probe spine is sharded over — the probe side's upper bound.
+    driving: usize,
+    /// Whether declining still leaves this plan a parallel path (the materializing hand-off).
+    can_hand_off: bool,
+}
+
+impl Admission {
+    fn admits(self, build_rows: usize, join_type: JoinType) -> bool {
+        let ceiling = bc_runtime::join::RADIX_MIN_BUILD_ROWS_BROADCAST;
+        if build_rows <= ceiling {
+            return true; // unchanged: this is the shape the ceiling was drawn for
+        }
+        if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            return false;
+        }
+        if self.can_hand_off && self.driving > build_rows {
+            return false;
+        }
+        let probe_dominates = self.driving >= build_rows.saturating_mul(PROBE_DOMINANCE);
+        let small_probe = self.driving < build_rows
+            && build_rows <= ceiling.saturating_mul(SMALL_PROBE_BUILD_CAP);
+        probe_dominates || small_probe
+    }
 }
 
 /// Identity of a plan node — its address in the (borrowed, immobile) plan tree.
@@ -209,16 +308,40 @@ pub(crate) fn node_key(plan: &RelOp) -> usize {
 
 /// The per-morsel probe table over `side`, or `None` when this join's shape cannot be served
 /// per morsel (`Right`/`Full`, or a non-integer key) and the materialized path must take over.
+///
+/// **The build side's size is deliberately not a condition here**, and that is the difference
+/// between this executor using the machine and using one core of it. `streaming_supported`'s row
+/// ceiling (`RADIX_MIN_BUILD_ROWS_BROADCAST`, ~2M rows ≈ an L3-sized table) compares a flat probe
+/// against the *partitioned radix* join, and for that comparison it is right. It is not the
+/// comparison this caller is making. A join with no per-morsel probe makes the whole probe spine
+/// un-shardable (`parallel::spine_is_shardable`), and a plan with more than one join cannot hand
+/// off to the materializing executor either (`unshardable_join_reason` declines) — so what the
+/// ceiling actually selects, on a multi-join plan, is **the sequential streaming pipeline**.
+///
+/// Measured on TPC-H sf10, where the filtered `orders` build side is 2,275,919 rows and the
+/// ceiling is 2,097,152 — 8% over, and the whole query changes character:
+///
+/// | query | before | after | cores before → after |
+/// |---|---:|---:|---|
+/// | q5  | 445 ms | (see BENCHMARK_RESULTS) | 11.5 → |
+///
+/// The cache misses a flat >L3 table pays are real, and they are bounded by the build side; the
+/// parallelism they buy is bounded by the machine. At sf1 the same build is 228k rows, under the
+/// ceiling, which is exactly why Batcher won sf1 and lost sf10 on every multi-way join.
 fn make_probe(
     side: &RecordBatch,
     right_keys: &[String],
     join_type: JoinType,
+    admission: Admission,
 ) -> Result<Option<BroadcastProbe>, InterpError> {
     let build_keys = ops::columns_by_name(side, right_keys)?;
     let key_types: Vec<&arrow::datatypes::DataType> =
         build_keys.iter().map(|k| k.data_type()).collect();
     let rt = ops::map_join_type(join_type);
-    if !streaming_supported(rt, &key_types, side.num_rows()) {
+    if !streaming_shape_supported(rt, &key_types) {
+        return Ok(None);
+    }
+    if !admission.admits(side.num_rows(), join_type) {
         return Ok(None);
     }
     let tuning = bc_arrow::RuntimeTuning::default();
@@ -226,7 +349,7 @@ fn make_probe(
     // pure short-circuit with no false negatives — the emitted rows are identical either way. A
     // streamed probe is by definition the large side, and its exact row count is not knowable
     // without materializing it, which is the thing this executor exists to avoid.
-    Ok(BroadcastProbe::new(
+    Ok(BroadcastProbe::over_any_build(
         &build_keys,
         rt,
         usize::MAX,

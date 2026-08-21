@@ -410,16 +410,230 @@
   urldate     = {2026-07-28}
 }
 
-% VERIFY BEFORE SUBMISSION: this is the IDC report series that actually forecasts
-% the structured/unstructured split. It is paywalled; we cite it by title and
-% document number and do NOT quote a figure from it, because we have not read it.
-@techreport{idc2025structured,
-  author      = {{International Data Corporation}},
-  title       = {Worldwide Global {DataSphere} Structured and Unstructured Data
-                 Forecast, 2025--2029},
-  institution = {International Data Corporation},
-  number      = {US52800025},
-  year        = {2025},
-  url         = {https://my.idc.com/getdoc.jsp?containerId=US52800025},
-  urldate     = {2026-07-28}
+
+% ---------------------------------------------------------------------------
+% Added for the related-work section. Every entry below names a work the authors
+% have read or used. Entries carrying "% VERIFY" have a field (usually the full
+% author list, page numbers, or an exact volume) written from memory and MUST be
+% checked against the publisher record before submission. None is a placeholder
+% for a work that does not exist.
+% ---------------------------------------------------------------------------
+
+% VERIFY: full author list (the paper has 12+ authors) and the exact ICDE page range.
+@inproceedings{zukowski2012vectorwise,
+  author    = {Zukowski, Marcin and van de Wiel, Mark and Boncz, Peter},
+  title     = {{Vectorwise}: A Vectorized Analytical {DBMS}},
+  booktitle = {IEEE International Conference on Data Engineering (ICDE)},
+  year      = {2012}
+}
+
+@inproceedings{kemper2011hyper,
+  author    = {Kemper, Alfons and Neumann, Thomas},
+  title     = {{HyPer}: A Hybrid {OLTP} \& {OLAP} Main Memory Database System Based on
+               Virtual Memory Snapshots},
+  booktitle = {IEEE International Conference on Data Engineering (ICDE)},
+  year      = {2011}
+}
+
+% VERIFY: full author list (22 authors) and page range.
+@inproceedings{behm2022photon,
+  author    = {Behm, Alexander and Palkar, Shoumik and Agarwal, Utkarsh and others},
+  title     = {{Photon}: A Fast Query Engine for Lakehouse Systems},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2022}
+}
+
+% VERIFY: full author list and the PVLDB volume/number/pages.
+@article{pedreira2022velox,
+  author  = {Pedreira, Pedro and Erling, Orri and Basmanova, Masha and others},
+  title   = {{Velox}: Meta's Unified Execution Engine},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {15},
+  number  = {12},
+  year    = {2022}
+}
+
+% VERIFY: full author list and the exact SIGMOD industrial-track title/pages.
+@inproceedings{lamb2024datafusion,
+  author    = {Lamb, Andrew and Shen, Yijie and others},
+  title     = {{Apache Arrow DataFusion}: A Fast, Embeddable, Modular Analytic
+               Query Engine},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2024}
+}
+
+% VERIFY: full author list and PVLDB volume/number/pages.
+@article{schulze2024clickhouse,
+  author  = {Schulze, Robert and Schreiber, Tom and Yatsishin, Ilya and others},
+  title   = {{ClickHouse} --- Lightning Fast Analytics for Everyone},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {17},
+  number  = {12},
+  year    = {2024}
+}
+
+% VERIFY: full author list and page range.
+@article{melnik2010dremel,
+  author  = {Melnik, Sergey and Gubarev, Andrey and Long, Jing Jing and
+             Romer, Geoffrey and Shivakumar, Shiva and Tolton, Matt and
+             Vassilakis, Theo},
+  title   = {{Dremel}: Interactive Analysis of Web-Scale Datasets},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {3},
+  number  = {1},
+  year    = {2010}
+}
+
+% VERIFY: full author list and page range.
+@inproceedings{sethi2019presto,
+  author    = {Sethi, Raghav and Traverso, Martin and Sundstrom, Dain and others},
+  title     = {{Presto}: {SQL} on Everything},
+  booktitle = {IEEE International Conference on Data Engineering (ICDE)},
+  year      = {2019}
+}
+
+% VERIFY: full author list (the paper has 20+ authors) and page range.
+@inproceedings{dageville2016snowflake,
+  author    = {Dageville, Benoit and Cruanes, Thierry and Zukowski, Marcin and others},
+  title     = {The {Snowflake} Elastic Data Warehouse},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2016}
+}
+
+% VERIFY: full author list and PVLDB volume/number/pages.
+@article{chattopadhyay2019procella,
+  author  = {Chattopadhyay, Biswapesh and Dutta, Priyam and Liu, Weiran and others},
+  title   = {{Procella}: Unifying Serving and Analytical Data at {YouTube}},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {12},
+  number  = {12},
+  year    = {2019}
+}
+
+% VERIFY: full author list and PVLDB volume/number/pages.
+@article{agiwal2021napa,
+  author  = {Agiwal, Ankur and Lai, Kevin and Manoharan, Gokul Nath Babu and others},
+  title   = {{Napa}: Powering Scalable Data Warehousing with Robust Query Performance
+             at {Google}},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {14},
+  number  = {12},
+  year    = {2021}
+}
+
+@inproceedings{murray2013naiad,
+  author    = {Murray, Derek G. and McSherry, Frank and Isaacs, Rebecca and
+               Isard, Michael and Barham, Paul and Abadi, Mart{\'\i}n},
+  title     = {{Naiad}: A Timely Dataflow System},
+  booktitle = {ACM Symposium on Operating Systems Principles (SOSP)},
+  year      = {2013}
+}
+
+% VERIFY: PVLDB volume/number and page range.
+@article{budiu2023dbsp,
+  author  = {Budiu, Mihai and McSherry, Frank and Ryzhyk, Leonid and Tannen, Val},
+  title   = {{DBSP}: Automatic Incremental View Maintenance for Rich Query Languages},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {16},
+  number  = {7},
+  year    = {2023}
+}
+
+% VERIFY: full author list and page range.
+@inproceedings{armbrust2018structured,
+  author    = {Armbrust, Michael and Das, Tathagata and Torres, Joseph and
+               Yavuz, Burak and Zhu, Shixiong and Xin, Reynold and
+               Ghodsi, Ali and Stoica, Ion and Zaharia, Matei},
+  title     = {Structured Streaming: A Declarative {API} for Real-Time Applications
+               in {Apache Spark}},
+  booktitle = {ACM SIGMOD International Conference on Management of Data},
+  year      = {2018}
+}
+
+% VERIFY: full author list and PVLDB volume/number/pages.
+@article{armbrust2020delta,
+  author  = {Armbrust, Michael and Das, Tathagata and Paranjpye, Sameer and others},
+  title   = {{Delta Lake}: High-Performance {ACID} Table Storage over Cloud
+             Object Stores},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {13},
+  number  = {12},
+  year    = {2020}
+}
+
+% VERIFY: full author list.
+@inproceedings{armbrust2021lakehouse,
+  author    = {Armbrust, Michael and Ghodsi, Ali and Xin, Reynold and Zaharia, Matei},
+  title     = {Lakehouse: A New Generation of Open Platforms that Unify Data
+               Warehousing and Advanced Analytics},
+  booktitle = {Conference on Innovative Data Systems Research (CIDR)},
+  year      = {2021}
+}
+
+% ---------------------------------------------------------------------------
+% Closest prior work on the mergeable/unified-execution axis and on query
+% optimization over model inference. Added after a coverage audit found the
+% paper's two nearest ancestors and its primary AI baseline uncited.
+% ---------------------------------------------------------------------------
+
+% VERIFY: full author list and the PVLDB volume/number/pages.
+@article{boykin2014summingbird,
+  author  = {Boykin, Oscar and Ritchie, Sam and O'Connell, Ian and Lin, Jimmy},
+  title   = {{Summingbird}: A Framework for Integrating Batch and Online
+             {MapReduce} Computations},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {7},
+  number  = {13},
+  year    = {2014}
+}
+
+% VERIFY: full author list (the paper has 12 authors) and page range.
+@article{akidau2015dataflow,
+  author  = {Akidau, Tyler and Bradshaw, Robert and Chambers, Craig and
+             Chernyak, Slava and Fern{\'a}ndez-Moctezuma, Rafael J. and
+             Lax, Reuven and McVeety, Sam and Mills, Daniel and
+             Perry, Frances and Schmidt, Eric and Whittle, Sam},
+  title   = {The Dataflow Model: A Practical Approach to Balancing Correctness,
+             Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data
+             Processing},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {8},
+  number  = {12},
+  pages   = {1792--1803},
+  year    = {2015}
+}
+
+@misc{luan2025streamingbatch,
+  author       = {Luan, Frank Sifei and Wang, Ron Yifeng and Gu, Yile and
+                  Mao, Ziming and Lin, Charlotte and Kamsetty, Amog and
+                  Chen, Hao and Su, Cheng and Veeramani, Balaji and Lee, Scott and
+                  Cho, SangBin and Zinzow, Clark and Liang, Eric and
+                  Stoica, Ion and Wang, Stephanie},
+  title        = {The Streaming Batch Model for Efficient and Fault-Tolerant
+                  Heterogeneous Execution},
+  howpublished = {arXiv:2501.12407},
+  year         = {2025},
+  url          = {https://arxiv.org/abs/2501.12407}
+}
+
+% VERIFY: page range.
+@article{kang2017noscope,
+  author  = {Kang, Daniel and Emmons, John and Abuzaid, Firas and
+             Bailis, Peter and Zaharia, Matei},
+  title   = {{NoScope}: Optimizing Neural Network Queries over Video at Scale},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {10},
+  number  = {11},
+  year    = {2017}
+}
+
+% VERIFY: page range.
+@article{kang2020blazeit,
+  author  = {Kang, Daniel and Bailis, Peter and Zaharia, Matei},
+  title   = {{BlazeIt}: Optimizing Declarative Aggregation and Limit Queries for
+             Neural Network-Based Video Analytics},
+  journal = {Proceedings of the VLDB Endowment},
+  volume  = {13},
+  number  = {4},
+  year    = {2020}
 }

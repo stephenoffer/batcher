@@ -1027,7 +1027,12 @@ class _StrNamespace:
         return self.regexp_matches(r"^\s+$")
 
     def is_upper(self) -> Expr:
-        """True where the string equals its uppercase form (pandas ``str.isupper``).
+        """True where the string equals its uppercase form.
+
+        A string with no cased characters at all -- ``"123"``, ``"  "``, ``""`` -- equals
+        its own uppercase form, so this is true for it. That is where the method parts
+        company with pandas ``str.isupper``, which requires at least one letter; use
+        :meth:`is_all_caps` for that reading.
 
         Returns:
             A Boolean expression, true for uppercase strings.
@@ -1036,14 +1041,17 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ABC", "Abc"]})
+                >>> ds = bt.from_pydict({"s": ["ABC", "Abc", "123"]})
                 >>> ds.select(r=bt.col("s").str.is_upper()).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, True]}
         """
         return self._e == self.upper()
 
     def is_lower(self) -> Expr:
-        """True where the string equals its lowercase form (pandas ``str.islower``).
+        """True where the string equals its lowercase form.
+
+        True for a string with no cased characters, for the same reason as
+        :meth:`is_upper`, and unlike pandas ``str.islower``.
 
         Returns:
             A Boolean expression, true for lowercase strings.
@@ -1052,9 +1060,9 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abc", "Abc"]})
+                >>> ds = bt.from_pydict({"s": ["abc", "Abc", "123"]})
                 >>> ds.select(r=bt.col("s").str.is_lower()).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, True]}
         """
         return self._e == self.lower()
 
@@ -1205,9 +1213,11 @@ class _StrNamespace:
         return self._char_ratio(r"[0-9]")
 
     def uppercase_ratio(self) -> Expr:
-        """Fraction of characters that are uppercase letters — high values mark shouting or headers.
+        """Fraction of characters that are ASCII uppercase letters, marking shouting or headers.
 
         A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+        The class is ``[A-Z]``, so an accented or non-Latin letter counts as neither case
+        and shows up in :meth:`non_ascii_ratio` instead.
 
         Returns:
             A Float64 expression of the ratio.
@@ -1223,9 +1233,11 @@ class _StrNamespace:
         return self._char_ratio(r"[A-Z]")
 
     def lowercase_ratio(self) -> Expr:
-        """Fraction of characters that are lowercase letters.
+        """Fraction of characters that are ASCII lowercase letters.
 
         A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+        The class is ``[a-z]``, so an accented or non-Latin letter counts as neither case
+        and shows up in :meth:`non_ascii_ratio` instead.
 
         Returns:
             A Float64 expression of the ratio.
@@ -2670,7 +2682,16 @@ class _StrNamespace:
         return self.ends_with(pattern)
 
     def match(self, pattern: str) -> StrFunc:
-        """True where the regex `pattern` matches — the pandas ``str.match``.
+        """True where `pattern` matches at the **start** of the string — pandas ``str.match``.
+
+        Anchored, like ``re.match`` and therefore like pandas: ``match("ello")`` is false for
+        ``"Hello"``. Use :meth:`regexp_matches` for an unanchored search. The distinction is
+        the whole difference between the two methods, and this one used to be a second
+        spelling of ``regexp_matches`` while its docstring claimed pandas parity -- so a
+        ported filter silently matched rows pandas rejects.
+
+        The pattern is wrapped rather than merely prefixed with ``^``, so a top-level
+        alternation still means what it says: ``match("a|b")`` anchors both arms.
 
         Args:
             pattern: The regular expression to test.
@@ -2682,11 +2703,14 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1", "ab"]})
+                >>> ds = bt.from_pydict({"s": ["a1", "ab", "ba1"]})
                 >>> ds.select(r=bt.col("s").str.match("[a-z][0-9]")).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, False]}
+
+                >>> ds.select(r=bt.col("s").str.regexp_matches("[a-z][0-9]")).to_pydict()
+                {'r': [True, False, True]}
         """
-        return self.regexp_matches(pattern)
+        return self.regexp_matches(f"^(?:{pattern})")
 
     def title(self) -> StrFunc:
         """Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.

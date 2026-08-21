@@ -531,14 +531,32 @@ class TransactionalStreamSink:
     ``SINKS.get("delta")`` while the conductor routed *every* mode-aware format to it, so
     ``write(path, format="iceberg", trigger=...)`` silently produced a Delta table — right
     rows, right path, wrong format, no error anywhere.
+
+    **A keyed write absorbs a replay without a log.** A database or operational-store sink
+    running ``upsert``/``update``/``delete`` is idempotent by construction: replaying a
+    micro-batch writes the same keys to the same values. That is a *second* route to
+    exactly-once, and it is the one a streaming upsert into an operational table takes —
+    Spark's ``foreachBatch`` + a hand-written ``MERGE``, spelled as a mode. The warning is
+    suppressed there rather than telling a user their idempotent write is at-least-once.
     """
 
     def __init__(
-        self, uri: str, fmt: str = "delta", *, query_name: str | None = None, **opts: Any
+        self,
+        destination: str,
+        fmt: str = "delta",
+        /,
+        *,
+        query_name: str | None = None,
+        **opts: Any,
     ) -> None:
-        self._uri = uri
+        # Positional-only, and named `destination` rather than `uri`: `**opts` is the
+        # sink's own keyword vocabulary, and a database sink's *connection* keyword is
+        # also called `uri`. With the parameter named `uri` and bindable by keyword, a
+        # streaming write to a database raised "got multiple values for argument 'uri'"
+        # from inside the constructor, naming an argument the caller never passed twice.
+        self._uri = destination
         self._fmt = fmt
-        self._app_id = query_name or f"batcher-stream:{uri.rstrip('/')}"
+        self._app_id = query_name or f"batcher-stream:{destination.rstrip('/')}"
         opts.setdefault("mode", "append")
         self._opts = opts
 
@@ -562,9 +580,16 @@ class TransactionalStreamSink:
             return cls(app_id=self._app_id, txn_version=batch_id, **extra, **self._opts)
         return cls(**extra, **self._opts)
 
+    #: Write modes that make a replayed micro-batch a no-op without any transaction log.
+    #:
+    #: Each one is keyed: replaying it writes the same keys to the same values. ``append``
+    #: is deliberately absent — replaying an append duplicates its rows, which is the whole
+    #: reason the ``(app_id, batch_id)`` check exists.
+    _KEYED_MODES = frozenset({"upsert", "update", "delete", "delete_insert"})
+
     def open(self) -> None:
         """Warn once when the destination format cannot absorb a replayed micro-batch."""
-        if self._idempotent():
+        if self._idempotent() or self._opts.get("mode") in self._KEYED_MODES:
             return
         import warnings
 
@@ -615,5 +640,5 @@ class DeltaStreamSink(TransactionalStreamSink):
     callers that mean Delta specifically should say so.
     """
 
-    def __init__(self, uri: str, *, query_name: str | None = None, **opts: Any) -> None:
-        super().__init__(uri, "delta", query_name=query_name, **opts)
+    def __init__(self, destination: str, /, *, query_name: str | None = None, **opts: Any) -> None:
+        super().__init__(destination, "delta", query_name=query_name, **opts)

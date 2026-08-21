@@ -9,10 +9,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{make_array, Array, ArrayRef, RecordBatch, RunArray, UInt64Array};
+use arrow::array::{
+    make_array, Array, ArrayRef, FixedSizeListArray, GenericListArray, OffsetSizeTrait,
+    RecordBatch, RunArray, StructArray, UInt64Array,
+};
+use arrow::buffer::OffsetBuffer;
 use arrow::compute::{cast, take};
 use arrow::datatypes::{
-    DataType, Field, Fields, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema,
+    DataType, Field, FieldRef, Fields, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema,
 };
 use arrow_pyarrow::PyArrowType;
 use bc_ir::{AggregateItem, ProjectionItem};
@@ -412,6 +416,127 @@ pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> PyResult
     batches.into_iter().map(|b| normalize_batch(&b.0)).collect()
 }
 
+/// Rebase every list-like offsets buffer in `batches` so its first offset is zero.
+///
+/// **A layout adaptation, not a value change** — the rows, types and names are identical,
+/// which is why it belongs beside the other boundary normalizations rather than in an
+/// operator.
+///
+/// `arrow-rs` slices a `ListArray` by advancing its *offsets buffer* and leaving the child
+/// whole, so a sliced list has `offset() == 0` and `offsets[0] != 0`. That is valid Arrow,
+/// and every Rust consumer reads it correctly. Arrow C++ writes it wrongly: its IPC writer
+/// trims the child to the referenced range `[offsets[0], offsets[len])` but emits the
+/// offsets unrebased, so the reader sees offsets pointing past the end of a child that is
+/// now `offsets[0]` elements too short.
+///
+/// The result is a `RecordBatch` that validates in memory, survives a row count and a
+/// column-name check, and is **structurally corrupt after a round trip** — the values only
+/// fail to resolve when something finally reads them. It reached the distributed join,
+/// where the probe output is split into morsels and written to an IPC artifact per task:
+/// a 12,000-row join over a `list<int64>` column came back with `offset for slot 489 out of
+/// bounds: 1490 > 1488`. Single-node was unaffected only because nothing serialized it.
+///
+/// Rebasing here rather than at each writer fixes every consumer at once — the disk
+/// shuffle, Flight, the spill store, and a user's own `ds.to_arrow()` followed by
+/// `write_feather`. Strings and binary are **not** affected (Arrow C++ handles a non-zero
+/// first offset correctly for them), so only the nested types are walked.
+///
+/// Costs one comparison per list-typed column when nothing needs rebasing, which is the
+/// overwhelmingly common case; a rebase copies the offsets buffer and re-slices the child
+/// (the child slice stays zero-copy).
+pub(crate) fn rebase_nested_offsets(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    batches.into_iter().map(rebase_batch).collect()
+}
+
+/// [`rebase_nested_offsets`] for a single batch — the mergeable-state and manifest exports
+/// hand back one batch rather than a stream.
+pub(crate) fn rebase_batch(batch: RecordBatch) -> RecordBatch {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+    for col in batch.columns() {
+        match rebase_array(col) {
+            Some(fixed) => {
+                changed = true;
+                columns.push(fixed);
+            }
+            None => columns.push(col.clone()),
+        }
+    }
+    if !changed {
+        return batch;
+    }
+    // The schema is unchanged (a rebase moves buffers, never types), so reuse it rather
+    // than rebuilding one; on failure keep the original, since a batch that cannot be
+    // rebuilt is still better than no batch.
+    RecordBatch::try_new(batch.schema(), columns).unwrap_or(batch)
+}
+
+/// The rebased form of `arr`, or `None` when it is already zero-based throughout.
+fn rebase_array(arr: &ArrayRef) -> Option<ArrayRef> {
+    match arr.data_type() {
+        DataType::List(field) => rebase_list::<i32>(arr, field),
+        DataType::LargeList(field) => rebase_list::<i64>(arr, field),
+        DataType::FixedSizeList(field, width) => {
+            // No offsets of its own, but its child can still carry some.
+            let list = arr.as_any().downcast_ref::<FixedSizeListArray>()?;
+            let values = rebase_array(list.values())?;
+            Some(Arc::new(
+                FixedSizeListArray::try_new(field.clone(), *width, values, list.nulls().cloned())
+                    .ok()?,
+            ))
+        }
+        DataType::Struct(fields) => {
+            let st = arr.as_any().downcast_ref::<StructArray>()?;
+            let mut children: Vec<ArrayRef> = Vec::with_capacity(st.num_columns());
+            let mut changed = false;
+            for child in st.columns() {
+                match rebase_array(child) {
+                    Some(fixed) => {
+                        changed = true;
+                        children.push(fixed);
+                    }
+                    None => children.push(child.clone()),
+                }
+            }
+            if !changed {
+                return None;
+            }
+            Some(Arc::new(
+                StructArray::try_new(fields.clone(), children, st.nulls().cloned()).ok()?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Rebase one `List`/`LargeList`, recursing into its child first.
+fn rebase_list<O: OffsetSizeTrait>(arr: &ArrayRef, field: &FieldRef) -> Option<ArrayRef> {
+    let list = arr.as_any().downcast_ref::<GenericListArray<O>>()?;
+    let offsets = list.value_offsets();
+    // An empty list array has a single trailing offset and nothing to rebase.
+    let first = *offsets.first()?;
+    let last = *offsets.last()?;
+    let start = first.as_usize();
+    let len = last.as_usize().saturating_sub(start);
+    // Slice the child to exactly what the offsets address, then recurse: a nested list
+    // must be rebased relative to the slice its parent keeps, not to the original child.
+    let child = list.values().slice(start, len);
+    let child = rebase_array(&child).unwrap_or(child);
+    if first.is_zero() && Arc::ptr_eq(&child, list.values()) {
+        return None;
+    }
+    let rebased: Vec<O> = offsets.iter().map(|o| *o - first).collect();
+    Some(Arc::new(
+        GenericListArray::<O>::try_new(
+            field.clone(),
+            OffsetBuffer::new(rebased.into()),
+            child,
+            list.nulls().cloned(),
+        )
+        .ok()?,
+    ))
+}
+
 /// Map each narrow-numeric *source* column name to its original (pre-widening)
 /// `DataType`, the target an output pass-through column can be re-narrowed back to.
 ///
@@ -669,5 +794,89 @@ mod tests {
             out.schema().field(0).data_type(),
             &DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into())
         );
+    }
+
+    /// The shape `arrow-rs` produces when it slices a list: the offsets buffer is advanced
+    /// and the child left whole, so `offset() == 0` while `offsets[0] != 0`.
+    fn sliced_list() -> ListArray {
+        let values = Arc::new(Int64Array::from((0..2000i64).collect::<Vec<_>>()));
+        let offsets: Vec<i32> = (0..=1000i32).map(|i| i * 2).collect();
+        let full = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(offsets.into()),
+            values,
+            None,
+        )
+        .unwrap();
+        full.slice(256, 744)
+    }
+
+    #[test]
+    fn rebase_makes_a_sliced_list_zero_based_without_moving_a_value() {
+        let sliced = sliced_list();
+        assert_eq!(
+            sliced.offset(),
+            0,
+            "arrow-rs slices the offsets, not the array"
+        );
+        assert_ne!(
+            sliced.value_offsets()[0],
+            0,
+            "…so the first offset is non-zero"
+        );
+
+        let before = batch_of("lst", Arc::new(sliced) as ArrayRef);
+        let after = rebase_batch(before.clone());
+
+        let col = after
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(col.value_offsets()[0], 0);
+        assert_eq!(col.len(), 744);
+        // The child now holds exactly what the offsets address, and every row is unchanged.
+        assert_eq!(col.values().len(), 1488);
+        let old = before
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for i in 0..old.len() {
+            let want = old.value(i);
+            let got = col.value(i);
+            assert_eq!(
+                want.as_any().downcast_ref::<Int64Array>().unwrap(),
+                got.as_any().downcast_ref::<Int64Array>().unwrap(),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebase_leaves_an_already_zero_based_batch_untouched() {
+        let arr = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
+        let batch = batch_of("x", arr);
+        let out = rebase_batch(batch.clone());
+        assert_eq!(out, batch);
+    }
+
+    #[test]
+    fn rebase_reaches_a_list_nested_inside_a_struct() {
+        let sliced = Arc::new(sliced_list()) as ArrayRef;
+        let st = StructArray::try_new(
+            vec![Field::new("l", sliced.data_type().clone(), true)].into(),
+            vec![sliced],
+            None,
+        )
+        .unwrap();
+        let out = rebase_batch(batch_of("s", Arc::new(st) as ArrayRef));
+        let st = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let inner = st.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(inner.value_offsets()[0], 0);
     }
 }

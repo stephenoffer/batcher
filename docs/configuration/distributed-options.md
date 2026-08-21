@@ -95,6 +95,8 @@ export BATCHER_SHUFFLE_PORT_RANGE=40000-40100
 
 `BATCHER_ADVERTISE_HOST` overrides the address a worker advertises to its peers. Batcher uses the node IP Ray reports, which is correct almost everywhere. Set this when the address peers must dial differs, such as on a multi-homed host whose shuffle belongs on a second network interface, or on a NAT'd or VPC-peered network. Set it per node, in the pod spec or the node environment, because the right value differs on each one.
 
+IPv6 works with no configuration. A worker whose advertised address is an IPv6 literal binds an IPv6 listener and advertises a bracketed authority such as `[fd00::1]:40001`, so an IPv6-only cluster needs no IPv4 address anywhere. On a dual-stack fabric Batcher prefers the IPv4 address, since it routes in more places; a link-local `fe80::` address is never advertised, because it is dialable only with the peer's own zone index appended.
+
 ### Cluster saturation and autoscaling
 
 Out of the box the distributed engine fills the whole cluster with no tuning. It attaches to the running cluster, even on a managed workspace that exports no `RAY_ADDRESS`. It fans out to one worker per node, gives each worker an even share of that node's cores so morsel parallelism saturates every core, and scales the shuffle reducer count with the worker count. On an autoscaling-capable cluster it also asks the autoscaler for the cores a query wants, then waits a bounded time for the new nodes to arrive before sizing the fan-out. A big query therefore runs on the grown cluster instead of clamping to the pre-scale size and leaving the new capacity for the next job.

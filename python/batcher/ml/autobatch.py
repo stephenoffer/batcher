@@ -19,6 +19,7 @@ inference pool feeds it measured throughput and (when available) VRAM.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
@@ -50,14 +51,24 @@ def learned_batch_size(hub: MetadataHub | None, signature: str | None) -> int | 
         note_suppressed("ml", "read learned batch size", exc)
         return None
     v = s.get("size")
-    return int(v) if isinstance(v, (int, float)) and v >= 1 else None
+    # `math.isfinite`, not just `>= 1`: an infinity satisfies `>= 1` and then `int(inf)` raises
+    # `OverflowError` out of batch sizing. A store outlives the build that wrote it, so the
+    # write guard below cannot be the only one. Reading a non-finite entry as "unseen" keeps
+    # the caller's default initial size, which is the pre-learning behaviour.
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 1:
+        return None
+    return int(v)
 
 
 def record_batch_size(hub: MetadataHub | None, signature: str | None, size: int) -> None:
     """Persist a model's settled throughput-optimal batch `size`, exp-smoothed across runs.
 
     Best-effort — never raises into the inference loop."""
-    if hub is None or signature is None or size < 1:
+    # `size < 1` rejects neither a NaN nor an infinity — both compare False against it — and
+    # exponential smoothing then propagates the non-finite value into the stored entry and into
+    # every later update, poisoning the key for the life of the store. The same half-guard as
+    # `dist.adaptive_sizing._ema` and `core.udf.sizing._ema`; `metadata.smoothed` documents why.
+    if hub is None or signature is None or not math.isfinite(size) or size < 1:
         return
     try:
         from batcher.config import active_config

@@ -159,7 +159,9 @@ def test_the_lattice_is_not_the_arithmetic_result_type():
     assert schema is not None
     # The lattice has an answer for the pair...
     assert promote(pa.decimal128(10, 2), pa.int64()) == pa.decimal128(21, 2)
-    # ...and arithmetic inference must not use it.
-    assert infer_type(Binary("add", Col("d"), Col("i")), schema) is None
+    # ...and arithmetic inference must not use it. It gives the *arithmetic* answer, one
+    # carry digit past the widest operand — a stronger statement than the silence this
+    # used to assert, and the one that would actually catch the lattice being wired in.
+    assert infer_type(Binary("add", Col("d"), Col("i")), schema) == pa.decimal128(11, 2)
     # The numeric operands, where the two answers do agree, still infer.
     assert infer_type(Binary("add", Col("i"), Col("f")), schema) == pa.float64()

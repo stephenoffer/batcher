@@ -52,7 +52,7 @@ from batcher.kyber.optimizer import (
     optimize_traced,
 )
 from batcher.kyber.rules.projections import required_columns_per_source
-from batcher.kyber.stats import hot_join_values
+from batcher.kyber.stats import hot_join_value_shares, hot_join_values
 
 __all__ = [
     "AVG_BYTES_KEY",
@@ -71,6 +71,7 @@ __all__ = [
     "approx_count_distinct",
     "columns_for",
     "estimate_is_reliable",
+    "hot_join_value_shares",
     "hot_join_values",
     "is_material_change",
     "load_learned_stats",

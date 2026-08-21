@@ -49,13 +49,31 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     # input widens: the value between two integers is generally not one.
     if fn.func == "avg" or fn.func in WINDOW_EWM or fn.func == "interpolate":
         return pa.float64()
+    # `bc_runtime::window::agg` builds a `Float64Array` for every one of these regardless of
+    # the input's width -- the moments and the median are ratios, and the fold accumulates in
+    # a double. They fell through to the `None` below, so `Dataset.schema` could not answer a
+    # column the engine's type was never in doubt about.
+    if fn.func in ("var", "stddev", "median", "product"):
+        return pa.float64()
     if fn.input is None:  # value/min/max/sum all need an input
         return None
     t = infer_type(fn.input, input_schema)
     if t is None:
         return None
     if fn.func == "sum":
-        return widen(t)
+        # A **windowed** sum folds in f64 (`bc_runtime::window::agg` accumulates every
+        # numeric fold there as a double), so a `decimal` input comes back as a double —
+        # unlike the *grouped* `sum`, which keeps the decimal, and unlike DuckDB, whose
+        # windowed `SUM` over a DECIMAL is a DECIMAL. `widen` returns the decimal unchanged,
+        # so the declared type said `decimal(10,2)` where the engine produced `double`: the
+        # one place in the window family where `Dataset.schema` disagreed with a run.
+        #
+        # Declared as what the engine makes rather than what DuckDB makes, because that is
+        # the contract this function has. The representation divergence itself is the same
+        # one the math family already carries for decimals and is recorded beside it in
+        # `competitor_parity_census.md`; closing it means giving the window fold a decimal
+        # accumulator, which is a kernel change rather than a declaration.
+        return pa.float64() if pa.types.is_decimal(t) else widen(t)
     if fn.func in WINDOW_VALUE or fn.func in {"min", "max"}:
         return t
     return None

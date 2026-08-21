@@ -7,6 +7,16 @@ ranges cover ``[0, 16384)`` disjointly, so the splits cover every key exactly
 once on a cluster; on a single node the same ranges still partition the cursor
 work. Keys and values are assembled into Arrow at batch granularity.
 
+`RedisSink` is the write half, and it writes the same ``(key, value)`` shape the
+source reads: one string value per key, or one hash per key when the frame has more
+columns than that. Both go through a pipeline, so a batch of ten thousand rows is one
+round trip rather than ten thousand.
+
+``overwrite`` is declined. Emptying a Redis keyspace is ``FLUSHDB``, which discards
+every key in the database rather than only the ones this write would replace, and a
+destructive operation of that reach should not be reachable by passing a string to a
+``mode`` argument.
+
 The ``redis`` import is deferred; a missing driver raises `BackendError` with the
 ``redis`` extra hint. Connection kwargs (host, password) are stored verbatim and
 never logged.
@@ -19,15 +29,16 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher.io.formats.base import SOURCES
+from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    BulkSink,
     PartitionSpec,
     ScanSource,
     require_driver,
     rows_to_batches,
 )
 
-__all__ = ["RedisSource"]
+__all__ = ["RedisSink", "RedisSource"]
 
 # Redis Cluster has a fixed number of hash slots (a protocol constant — it only
 # coincidentally equals the engine morsel size, and must not be tied to it).
@@ -172,3 +183,120 @@ def _crc16(data: bytes) -> int:
             crc = (crc << 1) ^ 0x1021 if crc & 0x8000 else crc << 1
             crc &= 0xFFFF
     return crc
+
+
+@SINKS.register("redis")
+class RedisSink(BulkSink):
+    """Write rows into a Redis keyspace, one pipeline per batch.
+
+    The value written depends on the frame's shape, and the rule is the one that makes a
+    round trip through `RedisSource` return what was written:
+
+    * two columns, ``key`` and ``value`` — the source's own shape — writes each value as a
+      plain string under its key;
+    * anything wider writes each row as a **hash** under its key, one field per remaining
+      column, which is how a record is represented in Redis.
+
+    ``append`` is declined because Redis has no such operation on a key: ``SET`` replaces,
+    which is an upsert. ``overwrite`` is declined because emptying the keyspace is
+    ``FLUSHDB``, which discards keys this write knows nothing about.
+
+    Args:
+        host: The Redis host; never logged.
+        port: The Redis port.
+        db: The database index.
+        password: The password, as a literal or an ``env:``/``file:`` reference.
+        key_field: The column holding each row's key (default ``"key"``).
+        prefix: Prepended to every key, so one keyspace can hold several relations.
+        ttl_seconds: Expiry set on every key written, or None to leave keys permanent.
+        mode: ``"upsert"`` (default) or ``"delete"``.
+
+    Raises:
+        BackendError: If `key_field` is absent from the rows being written.
+    """
+
+    format_name = "redis"
+    supported_modes = ("upsert", "delete")
+
+    __slots__ = ("prefix", "ttl_seconds")
+
+    def __init__(
+        self,
+        *,
+        host: str = "localhost",
+        port: int = 6379,
+        db: int = 0,
+        password: str | None = None,
+        key_field: str = "key",
+        prefix: str = "",
+        ttl_seconds: int | None = None,
+        mode: str = "upsert",
+    ) -> None:
+        super().__init__(
+            key_field=key_field,
+            mode=mode,
+            host=host,
+            port=port,
+            db=db,
+            password=password,
+        )
+        self.prefix = prefix
+        self.ttl_seconds = ttl_seconds
+
+    def _client(self) -> Any:
+        """A Redis client, built here so the credential is resolved on the worker."""
+        redis = require_driver("redis", "redis")
+        kw = self._conn_kwargs
+        return redis.Redis(
+            host=kw["host"],
+            port=kw["port"],
+            db=kw["db"],
+            password=self._secret("password"),
+            decode_responses=True,
+        )
+
+    def _key(self, row: dict[str, Any], path: str) -> str:
+        """The Redis key for `row`, prefixed by `prefix` or by the write's destination."""
+        from batcher._internal.errors import BackendError
+
+        if self.key_field not in row:
+            raise BackendError(
+                f"redis write needs a {self.key_field!r} column to key each row; this row "
+                f"has {sorted(row)}. Name the key column with key_field=."
+            )
+        prefix = self.prefix if self.prefix else (f"{path}:" if path else "")
+        return f"{prefix}{row[self.key_field]}"
+
+    def _apply(self, rows: list[dict[str, Any]], path: str) -> None:
+        """Queue every row onto one pipeline and execute it in a single round trip."""
+        client = self._client()
+        try:
+            pipe = client.pipeline(transaction=False)
+            for row in rows:
+                key = self._key(row, path)
+                if self.mode == "delete":
+                    pipe.delete(key)
+                    continue
+                fields = {k: v for k, v in row.items() if k != self.key_field}
+                if list(fields) == ["value"]:
+                    pipe.set(key, _as_text(fields["value"]))
+                else:
+                    pipe.hset(key, mapping={k: _as_text(v) for k, v in fields.items()})
+                if self.ttl_seconds is not None:
+                    pipe.expire(key, self.ttl_seconds)
+            pipe.execute()
+        finally:
+            client.close()
+
+
+def _as_text(value: Any) -> str:
+    """Render a value for Redis, which stores bytes and strings and nothing else.
+
+    A null becomes the empty string rather than the four characters ``None``, which is what
+    `str()` would have produced and what a reader would then have to know to undo.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value if isinstance(value, str) else str(value)

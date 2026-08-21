@@ -58,6 +58,13 @@ class BrokerSplit:
     #: the split: a worker that rebuilt the source without it would return a batch one
     #: column narrower than its siblings, and the epoch's concat would fail on the schema.
     include_headers: bool = False
+    #: The payload wire-format options (`value_format`, `value_schema`, `schema_registry`,
+    #: …) exactly as the source received them. They travel as *config*, not as built codec
+    #: objects: a live `SchemaRegistry` holds a lock and a socket, neither of which pickles,
+    #: and a worker that rebuilt the codec from config gets its own cache anyway. A split
+    #: that dropped them would return an undecoded `binary` column while its siblings
+    #: returned a struct, and the epoch's concat would fail on the schema.
+    codecs: dict[str, Any] = field(default_factory=dict, repr=False)
     #: `repr=False` because these are the *client* options — they carry `sasl.password`,
     #: `sasl_plain_password`, and Event Hubs' `connection_str` (a SAS key). A split is
     #: pickled to every worker and appears verbatim in any traceback that mentions it, so
@@ -74,10 +81,16 @@ class BrokerSplit:
             poll_bytes=self.poll_bytes,
             include_headers=self.include_headers,
             partitions=[self.partition],
+            **self.codecs,
             **self.options,
         )
 
     def schema(self) -> pa.Schema:
+        # Asked of the rebuilt reader rather than of `broker_schema` directly: a split with
+        # a payload codec advertises the *decoded* column types, and answering the raw
+        # schema here would disagree with the batches this very split produces.
+        if any(self.codecs.get(f"{side}_format") for side in ("value", "key")):
+            return self._reader().schema()
         return broker_schema(self.include_headers)
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
@@ -105,9 +118,7 @@ class BrokerSplit:
         if not messages:  # None (end of stream) or an empty poll
             return [], start_offset
         src._track_positions(messages)
-        batch = src._make_batch(messages)
-        if projection is not None:
-            batch = batch.select(projection)
+        batch = src._make_batch(messages, projection)
         # Fall back to `start_offset` rather than `None` when the poll carried nothing for
         # this partition. `_read_epoch` drops a `None` position from the epoch's offset map
         # entirely, so returning one does not mean "unchanged" — it means the driver loses

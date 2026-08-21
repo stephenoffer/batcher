@@ -17,6 +17,7 @@ from batcher.ml.preprocessors.base import (
     check_cardinality,
     columns_arg,
     distinct_values,
+    require_categories,
 )
 from batcher.plan.expr_ir import Expr, col, when
 
@@ -88,8 +89,10 @@ class OneHotEncoder(Preprocessor):
             PlanError: If a column has more than `max_categories` distinct values.
         """
         for c in self.columns:
-            self.categories_[c] = distinct_values(
-                ds, c, what="OneHotEncoder", max_categories=self.max_categories
+            self.categories_[c] = require_categories(
+                distinct_values(ds, c, what="OneHotEncoder", max_categories=self.max_categories),
+                what="OneHotEncoder",
+                column=c,
             )
         self._fitted = True
         return self
@@ -193,11 +196,15 @@ class MultiHotEncoder(Preprocessor):
         """
         if self.categories_ is None:
             exploded = ds.select(self.column).explode(self.column)
-            self.categories_ = distinct_values(
-                exploded,
-                self.column,
+            self.categories_ = require_categories(
+                distinct_values(
+                    exploded,
+                    self.column,
+                    what="MultiHotEncoder",
+                    max_categories=self.max_categories,
+                ),
                 what="MultiHotEncoder",
-                max_categories=self.max_categories,
+                column=self.column,
             )
         self._fitted = True
         return self

@@ -23,6 +23,7 @@ from time import perf_counter, time
 from typing import TYPE_CHECKING
 
 from batcher._internal.concurrency import start_context_thread
+from batcher.core.streaming_query.state_policy import write_state
 from batcher.plan.streaming import (
     SinkProgress,
     SourceProgress,
@@ -133,6 +134,9 @@ class StreamingQueryEngine:
         self._thread: threading.Thread | None = None
         self._progress: deque[StreamingQueryProgress] = deque(maxlen=_progress_history())
         self._batches = 0
+        # Changelog deltas written since the last whole snapshot. Bounds how long a chain
+        # recovery has to replay — see `_write_state`.
+        self._deltas_written = 0
         self._error: BaseException | None = None
         self._active = False
 
@@ -177,8 +181,26 @@ class StreamingQueryEngine:
         self._batches = plan.start_batch
         if plan.seek and 0 in plan.seek:
             self._runner.seek(plan.seek[0])
+        if plan.state is None:
+            return
+        # Continue the chain rather than restarting the count. A restart that reset this to
+        # zero could write another full interval of deltas on top of the ones it just
+        # replayed, so the chain recovery has to walk grows by an interval per restart — a
+        # query restarted often enough would replay an unbounded one.
+        self._deltas_written = len(plan.state_deltas)
+        if plan.state_deltas and getattr(self._runner, "restore_state_chain", None) is None:
+            # A multi-part *snapshot* (a spilled fold), not a changelog: the parts are halves
+            # of one state and are combined, which `restore_state_parts` does.
+            self._runner.restore_state_parts([plan.state, *plan.state_deltas])
+            return
+        chain = getattr(self._runner, "restore_state_chain", None)
+        if plan.state_deltas and chain is not None:
+            # A base plus the changelog after it. Combining is the aggregate algebra, so the
+            # runner does it — this layer only knows the checkpoint held a sequence.
+            chain([plan.state, *plan.state_deltas])
+            return
         restore = getattr(self._runner, "restore_state", None)
-        if plan.state is not None and restore is not None:
+        if restore is not None:
             restore(plan.state)
 
     def stop(self) -> None:
@@ -272,6 +294,11 @@ class StreamingQueryEngine:
             if self._checkpoint is not None:
                 with contextlib.suppress(Exception):
                     self._checkpoint.close()
+            # A spilling fold owns a scratch directory with the same lifetime as this loop.
+            with contextlib.suppress(Exception):
+                close = getattr(self._runner, "close", None)
+                if close is not None:
+                    close()
 
     def _run_resilient(self) -> None:
         """Run the micro-batch loop, restarting from the checkpoint on a transient fault.
@@ -580,7 +607,7 @@ class StreamingQueryEngine:
         stateful = getattr(self._runner, "has_state", None)
         snap = self._runner.snapshot_state if stateful is not None and stateful() else None
         if snap is not None:
-            self._checkpoint.snapshot_state(self._batches, snap())
+            write_state(self, snap)
         # Record *what* the sink wrote, not merely that the batch committed. Every sink
         # returns a token and the commit log has always had a column for it; nothing
         # carried the value between them, so the column was NULL for every row ever
@@ -588,9 +615,10 @@ class StreamingQueryEngine:
         # workers' files) simply does not define the accessor.
         token_of = getattr(self._runner, "last_sink_token", None)
         self._checkpoint.commit(self._batches, token_of() if token_of is not None else None)
-        # Recovery only ever restores the latest committed snapshot, so drop the older
-        # ones now — a long-running stateful stream keeps a bounded `state/` dir (one live
-        # snapshot) instead of accumulating one file per micro-batch forever.
+        # Recovery only ever needs the newest snapshot at or before the last committed
+        # batch, plus the deltas after it — so everything older goes now, and a long-running
+        # stateful stream keeps a bounded `state/` dir instead of accumulating one file per
+        # micro-batch forever.
         if snap is not None:
             self._checkpoint.prune_state(self._batches)
         # The offset/commit logs grow one row per micro-batch even for a *stateless* stream;

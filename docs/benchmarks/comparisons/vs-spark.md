@@ -58,7 +58,9 @@ and gives both engines' answer:
 The row that carries the most weight is the second-to-last. Batcher's stateful operators are
 built once as `partial → combine → finalize`, so one implementation serves a single core,
 many cores, and many machines. There is no separate distributed engine with its own
-semantics, and a distributed result is bit-identical to the single-node one. Spark's
+semantics, and a distributed result holds the same rows and types as the single-node one
+(float reductions agree to the last bits, since the partition count sets the summation
+order). Spark's
 single-node mode is its cluster machinery running with one executor.
 
 ## What this does not tell you

@@ -15,6 +15,12 @@ On-prem / self-hosted object stores work without code changes — point at your
 endpoint, e.g.
 ``read("s3://bucket/data/*.parquet?endpoint_override=https://minio.internal:9000")``
 or set ``AWS_ENDPOINT_URL`` (and HDFS via ``hdfs://namenode:8020/path``).
+
+The same is true of the object stores outside the three hyperscalers. Alibaba OSS, Tencent
+COS, Huawei OBS, Oracle OCI, OpenStack Swift and lakeFS are reached through the fsspec
+fallback, and they take their credentials as ``storage_options`` — the same dict fsspec,
+delta-rs, Polars and pandas accept — rather than through the URI query, because that is what
+an fsspec backend's constructor reads.
 """
 
 from __future__ import annotations
@@ -53,11 +59,46 @@ __all__ = [
 # so a write goes straight to the destination — a temp-then-rename would only add a
 # full-object server-side copy with no atomicity gain. Everything else (local, NFS,
 # HDFS) gets temp-write-then-rename so a crash never leaves a truncated file.
+#
+# Deliberately not only the three hyperscalers. The non-AWS object stores below are reached
+# through fsspec rather than natively, and an fsspec-backed store left out of this set gets
+# `atomic_rename=True` — so every write becomes temp-write-then-rename, which on an object
+# store is a full server-side copy of the object and is not atomic either. The cost is paid
+# per output file, on exactly the deployments least able to absorb it.
 _OBJECT_STORE_SCHEMES = frozenset(
-    {"s3", "s3a", "gs", "gcs", "abfs", "abfss", "az", "azure", "wasb", "wasbs"}
+    {
+        "s3",
+        "s3a",
+        "s3n",
+        "gs",
+        "gcs",
+        "abfs",
+        "abfss",
+        "adl",
+        "az",
+        "azure",
+        "wasb",
+        "wasbs",
+        "oss",  # Alibaba Cloud OSS
+        "cos",  # Tencent Cloud COS
+        "cosn",  # Tencent Cloud COS, the Hadoop spelling
+        "obs",  # Huawei Cloud OBS
+        "oci",  # Oracle Cloud Infrastructure Object Storage
+        "swift",  # OpenStack Swift, and the on-prem stores that speak it
+        "lakefs",
+    }
 )
-# Cloud scheme aliases → the canonical scheme `from_uri` / fsspec understand.
-_SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs", "wasbs": "wasb"}
+# Cloud scheme aliases → the canonical scheme `from_uri` / fsspec understand. `s3n` is the
+# oldest Hadoop spelling and still appears in inherited manifests and job configs; without the
+# alias it took the fsspec path, which is correct but slower and needs a driver installed.
+_SCHEME_ALIASES = {
+    "s3a": "s3",
+    "s3n": "s3",
+    "gcs": "gs",
+    "abfss": "abfs",
+    "wasbs": "wasb",
+    "cosn": "cos",
+}
 
 
 #: IO threads per usable core, and the band the result is clamped into. An IO thread spends
@@ -202,12 +243,11 @@ def resolve_filesystem(
     query = path.split("?", 1)[1] if "?" in path else ""
     authority = base.split("://", 1)[1].split("/", 1)[0] if "://" in base else ""
     reduced = f"{scheme}://{authority}" + (f"?{query}" if query else "")
-    if storage_options:
-        # A dict is unhashable and would defeat the lru_cache, so fold it into a hashable
-        # key rather than dropping the cache — a scan still resolves the FS once, not per
-        # split. Sorted so option order never splits the cache.
-        return _resolve_uri_fs_opts(reduced, tuple(sorted(storage_options.items())))
-    return _resolve_uri_fs(reduced)
+    # A dict is unhashable and would defeat the lru_cache, so it is folded into a hashable
+    # tuple rather than dropping the cache — a scan still resolves the FS once, not per
+    # split. Sorted so option order never splits the cache.
+    options = tuple(sorted(storage_options.items())) if storage_options else ()
+    return _resolve_uri_fs(reduced, options)
 
 
 def _wrap_user_filesystem(path: str, filesystem: Any) -> FileSystem:
@@ -240,28 +280,39 @@ def _wrap_user_filesystem(path: str, filesystem: Any) -> FileSystem:
     )
 
 
-@functools.lru_cache(maxsize=128)
-def _resolve_uri_fs_opts(uri: str, options: tuple[tuple[str, str], ...]) -> FileSystem:
-    """`_resolve_uri_fs` for an explicit `storage_options` set — folded into `?query` so the
-    one builder handles both the URI-carried and dict-carried config identically.
+def _resolved_options(options: tuple[tuple[str, object], ...]) -> list[tuple[str, object]]:
+    """Resolve any ``env:``/``file:``/``cmd:`` references in a `storage_options` set.
 
-    A value may be an ``env:NAME`` / ``file:PATH`` reference, resolved here — on the machine
-    building the filesystem, which on a distributed read is the worker. That keeps a secret
-    key out of the `storage_options` dict that rides the split (only the reference travels),
-    the same discipline the crypto-key and connector-credential paths already use. The
-    cache keys on the *reference*, so the resolved secret never enters a cache key either."""
+    Resolution happens on the machine building the filesystem, which on a distributed read is
+    the worker. That keeps a secret key out of the `storage_options` dict that rides the split
+    — only the reference travels — the same discipline the crypto-key and connector-credential
+    paths already use.
+
+    A non-string value passes through untouched. `storage_options` is the fsspec vocabulary and
+    it is not all strings: `anon=False`, `use_ssl=True` and `default_block_size=0` are ordinary
+    entries, and coercing a falsey one to `""` — which is what resolving every value did — turned
+    them into something the backend reads differently or not at all.
+    """
     from batcher.io.credentials import resolve_secret
 
-    resolved = [(k, resolve_secret(v, what=f"storage option {k}") or "") for k, v in options]
-    extra = "&".join(f"{k}={v}" for k, v in resolved)
-    joined = f"{uri}{'&' if '?' in uri else '?'}{extra}" if extra else uri
-    return _resolve_uri_fs(joined)
+    return [
+        (k, (resolve_secret(v, what=f"storage option {k}") or "") if isinstance(v, str) else v)
+        for k, v in options
+    ]
 
 
 @functools.lru_cache(maxsize=128)
-def _resolve_uri_fs(uri: str) -> FileSystem:
+def _resolve_uri_fs(uri: str, options: tuple[tuple[str, object], ...] = ()) -> FileSystem:
     """Build (once, cached) the `pyarrow.fs` façade for an object-store `uri` reduced to
-    `scheme://authority?query` (see `resolve_filesystem`)."""
+    `scheme://authority?query` (see `resolve_filesystem`).
+
+    `options` is the caller's `storage_options`, already sorted into a hashable tuple. It
+    reaches the two backends by different routes and that difference is the point: a native
+    pyarrow backend is configured through the URI query, while an fsspec backend takes
+    **keyword arguments** and would read a folded query as part of the object key. Folding for
+    both is what silently dropped every credential on every fsspec-backed scheme — Alibaba
+    OSS, Tencent COS, Huawei OBS, Swift, lakeFS, and any in-house backend — so a read with
+    correct keys failed as though it had none."""
     scheme = _scheme(uri)
     # Canonicalize BEFORE `from_uri`, not after. `s3a://` (the Hadoop spelling) and
     # `gcs://` name backends pyarrow implements natively but does not answer to under
@@ -272,8 +323,10 @@ def _resolve_uri_fs(uri: str) -> FileSystem:
     canonical_scheme = _SCHEME_ALIASES.get(scheme, scheme)
     if canonical_scheme != scheme:
         canonical_uri = f"{canonical_scheme}{uri[len(scheme) :]}"
+    resolved = _resolved_options(options)
+    native_uri = _with_query(canonical_uri, resolved)
     try:
-        fs, in_path = pafs.FileSystem.from_uri(canonical_uri)
+        fs, in_path = pafs.FileSystem.from_uri(native_uri)
     except (ValueError, OSError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
         # "Scheme not implemented natively" (→ fsspec) vs "implemented, but you passed an
         # option it does not take". Both arrive as ArrowInvalid; falling back on the second
@@ -287,10 +340,12 @@ def _resolve_uri_fs(uri: str) -> FileSystem:
             # Build it directly rather than refusing: refusing left Ceph-behind-a-proxy and
             # path-style-only deployments with no in-URI escape hatch at all.
             if canonical_scheme == "s3":
-                return _s3_with_options(uri)
+                return _s3_with_options(native_uri)
             raise IOError(f"unsupported option in {scheme}:// URI: {e}") from e
-        # A scheme pyarrow.fs doesn't implement natively → fsspec fallback.
-        return _fsspec_backed(scheme, uri)
+        # A scheme pyarrow.fs doesn't implement natively → fsspec fallback. The *original*
+        # URI, without the options folded in: fsspec takes them as keyword arguments, and a
+        # folded query would become part of the object key it asks for.
+        return _fsspec_backed(scheme, uri, dict(resolved))
     path = uri
     # The prefix is `scheme://authority`; compute it from the path with any `?query`
     # (config like endpoint_override) removed, since pyarrow's in_path excludes both.
@@ -317,6 +372,23 @@ def _resolve_uri_fs(uri: str) -> FileSystem:
     return _ArrowFileSystem(
         fs, prefix, atomic_rename=not is_object_store, cacheable=is_object_store, root=root
     )
+
+
+def _with_query(uri: str, options: list[tuple[str, object]]) -> str:
+    """Fold `storage_options` into a URI's query string, for the backends configured that way.
+
+    `pyarrow.fs.FileSystem.from_uri` and the `S3FileSystem` builder both read their
+    configuration out of the query, so this is how a dict-carried option and a URI-carried one
+    become the same thing. Values are percent-encoded: a secret key routinely contains `&`,
+    `+` or `/`, and an unencoded one truncates the query at the first separator — which
+    presents as an authentication failure with a perfectly correct key.
+    """
+    if not options:
+        return uri
+    from urllib.parse import quote
+
+    extra = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in options)
+    return f"{uri}{'&' if '?' in uri else '?'}{extra}"
 
 
 def _split_authority(uri: str) -> tuple[str, str]:
@@ -399,9 +471,15 @@ def _s3_with_options(uri: str) -> FileSystem:
     return _ArrowFileSystem(fs, "s3://", atomic_rename=False, cacheable=True)
 
 
-def _fsspec_backed(scheme: str, path: str) -> FileSystem:
+def _fsspec_backed(scheme: str, path: str, options: dict[str, str] | None = None) -> FileSystem:
     """Wrap an fsspec backend behind the `pyarrow.fs` interface (the escape hatch for
-    schemes pyarrow does not implement natively)."""
+    schemes pyarrow does not implement natively).
+
+    `options` is the caller's `storage_options`, passed through as fsspec keyword arguments.
+    That is the vocabulary fsspec, delta-rs, Polars and pandas all already speak — `key`,
+    `secret`, `endpoint_url`, `token`, `account_name` — so a credential set that works with
+    any of them works here unchanged, which is the whole point of the dict form.
+    """
     try:
         import fsspec
         from pyarrow.fs import FSSpecHandler, PyFileSystem
@@ -411,7 +489,14 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
         ) from exc
     protocol = _SCHEME_ALIASES.get(scheme, scheme)
     try:
-        fsspec_fs = fsspec.filesystem(protocol)
+        fsspec_fs = fsspec.filesystem(protocol, **(options or {}))
+    except TypeError as exc:
+        # An option this backend does not take. Named rather than swallowed, because fsspec
+        # rejects it by signature and the alternative is a connection that quietly used none
+        # of the caller's settings.
+        raise IOError(
+            f"{scheme}:// storage does not accept one of the given storage_options: {exc}"
+        ) from exc
     except ImportError as exc:
         # fsspec knows the protocol but its driver package is absent. Name the driver, not
         # the `[cloud]` extra — that extra carries s3fs/gcsfs/adlfs, and a scheme outside

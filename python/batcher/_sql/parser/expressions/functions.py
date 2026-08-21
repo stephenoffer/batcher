@@ -24,11 +24,16 @@ from batcher._sql.parser.expressions.literals import (
     _const_str_arg,
     _int_literal,
 )
+from batcher._sql.parser.expressions.lowering.dynamic import (
+    const_str,
+    dynamic_left,
+    str_call,
+)
 from batcher._sql.parser.expressions.maps import map_function
 from batcher._sql.parser.expressions.spark import spark_function
 from batcher._sql.parser.expressions.strings import string_function
 from batcher._sql.parser.expressions.temporal import datetime_pattern, temporal_function
-from batcher.plan.expr_ir import Cast, Expr, atan2, lit
+from batcher.plan.expr_ir import Binary, Cast, Expr, Math2Expr, atan2, lit, when
 from batcher.plan.functions.temporal import current_date, make_date
 
 # sqlglot node names for the nullary constant functions → the literal they denote.
@@ -50,6 +55,44 @@ _STR_CONST_ARG = {
 }
 
 
+def _empty_string_is_minus_one(value: Expr) -> Expr:
+    """`ord(s)`/`unicode(s)` — the first code point, or -1 for the empty string.
+
+    DuckDB draws a line the kernel does not: `ascii('')` is 0 while `ord('')` and
+    `unicode('')` are -1. A null argument stays null under both, which the `otherwise`
+    branch gives for free.
+
+    Args:
+        value: The string expression.
+
+    Returns:
+        The code-point expression.
+    """
+    return when(value.str.len() == lit(0)).then(lit(-1)).otherwise(value.str.ascii())
+
+
+def _collection_len(tr, arg):
+    """`len(x)` for a list or map column, or None when `x` is not one (or is unknown).
+
+    Args:
+        tr: The translator, for the in-scope column types.
+        arg: The argument node.
+
+    Returns:
+        The element-count expression, or None to fall through to the string reading.
+    """
+    import pyarrow as pa
+
+    t = tr.column_type(arg)
+    if t is None:
+        return None
+    if pa.types.is_map(t):
+        return tr._scalar(arg).map.len()
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        return tr._scalar(arg).list.len()
+    return None
+
+
 def _scalar_function(tr, node):
     """Map a SQL scalar function call to its `Expr` builder, or None."""
     name = type(node).__name__
@@ -62,11 +105,32 @@ def _scalar_function(tr, node):
         # `trunc(x, n)` truncates to `n` decimal places; the one-arg `.trunc()`
         # ignores `n` and silently truncated to a whole number. Scale, truncate,
         # unscale so `trunc(2.567, 1)` is `2.5`, not `2.0`.
-        digits = _const_int_arg(node.args["decimals"], "trunc(x, n): n")
-        factor = lit(10.0**digits)
-        return (tr._scalar(node.this) * factor).trunc() / factor
+        #
+        # `n` may be a column: the whole rewrite is arithmetic, so nothing about it needs
+        # a plan-time constant, and requiring one refused `trunc(x, scale)` outright.
+        decimals = node.args["decimals"]
+        digits = _int_literal(decimals)
+        factor = lit(10.0**digits) if digits is not None else lit(10.0) ** tr._scalar(decimals)
+        value = tr._scalar(node.this)
+        scaled = value * factor
+        # A magnitude that overflows when scaled has no representable fractional part at
+        # that scale, so it truncates to itself. Without the guard `trunc(1e308, 1)`
+        # scaled to +inf and came back as inf where DuckDB answers 1e308.
+        return when(scaled.is_finite()).then(scaled.trunc() / factor).otherwise(value)
     if name in _UNARY_MATH:
         return getattr(tr._scalar(node.this), _UNARY_MATH[name])()
+    if name == "Length":
+        # DuckDB's `len`/`length` is defined on strings, lists and maps alike; the
+        # argument's type picks the reading. Dispatching on the name alone sent a list
+        # column into the string kernel, which refused the whole query ("string function
+        # Len expected a Utf8 argument, got List").
+        collection = _collection_len(tr, node.this)
+        if collection is not None:
+            return collection
+    if name == "Unicode":
+        # `unicode('')`/`ord('')` is -1 where `ascii('')` is 0 — the kernel implements
+        # `ascii`, so the empty-string case is layered on here rather than forked there.
+        return _empty_string_is_minus_one(tr._scalar(node.this))
     if name in _UNARY_STR:
         if name == "ToBinary" and node.args.get("format") is not None:
             # DuckDB's `to_binary(s)` is a `0`/`1` *bit string*; Spark's
@@ -82,10 +146,15 @@ def _scalar_function(tr, node):
         return getattr(tr._scalar(node.this).dt, _DATE_PART[name])()
     if name == "Round":
         # `decimals` is the digit count; dropping it rounded to a whole number instead.
+        # It may be a column — the kernel takes the digit count per row — and demanding a
+        # literal refused `round(x, scale)`, an ordinary shape in a currency table.
         decimals = node.args.get("decimals")
         if decimals is None:
             return tr._scalar(node.this).round()
-        return tr._scalar(node.this).round(_const_int_arg(decimals, "ROUND(x, n): n"))
+        digits = _int_literal(decimals)
+        if digits is not None:
+            return tr._scalar(node.this).round(digits)
+        return Math2Expr("round", tr._scalar(node.this), tr._scalar(decimals))
     if name == "Log":
         # log(x) → log10(x); log10(x)/log2(x) parse as log(base, value) with
         # the base in `this` and the value in `expression`.
@@ -103,65 +172,75 @@ def _scalar_function(tr, node):
         # ltrim/rtrim (and `TRIM(LEADING/TRAILING …)`) carry a `position`; treating
         # them all as a both-sided trim silently stripped the wrong end. An optional
         # `expression` is the character set to strip (defaults to whitespace).
-        base = tr._scalar(node.this).str
-        chars_node = node.args.get("expression")
-        chars = chars_node.this if isinstance(chars_node, exp.Literal) else None
+        chars = node.args.get("expression")
         position = node.args.get("position") or "BOTH"
-        if position == "LEADING":
-            return base.lstrip(chars)
-        if position == "TRAILING":
-            return base.rstrip(chars)
-        return base.trim(chars)
+        tag = {"LEADING": "l_trim", "TRAILING": "r_trim"}.get(position, "trim")
+        return str_call(tr, tag, node.this, pattern=chars)
     if name == "Replace":
-        pat = _const_str_arg(node.expression, "replace()", "pattern")
-        repl = _const_str_arg(node.args.get("replacement"), "replace()", "replacement")
-        return tr._scalar(node.this).str.replace(pat, repl)
+        return str_call(
+            tr,
+            "replace",
+            node.this,
+            pattern=node.expression,
+            replacement=node.args.get("replacement"),
+        )
     if name == "SplitPart":
-        delim = _const_str_arg(node.args.get("delimiter"), "split_part()", "delimiter")
-        idx = _int_literal(node.args.get("part_index"))
-        if idx is None:
-            raise NotImplementedError("split_part() requires an integer field index")
-        return tr._scalar(node.this).str.split_part(delim, idx)
+        return str_call(
+            tr,
+            "split_part",
+            node.this,
+            pattern=node.args.get("delimiter"),
+            start=node.args.get("part_index"),
+        )
     if name == "StartsWith":
-        pat = _const_str_arg(node.expression, "starts_with()", "prefix")
-        return tr._scalar(node.this).str.starts_with(pat)
+        return str_call(tr, "starts_with", node.this, pattern=node.expression)
     if name == "Repeat":
-        times = _int_literal(node.args.get("times"))
-        if times is None:
-            raise NotImplementedError("repeat() requires an integer repeat count")
-        return tr._scalar(node.this).str.repeat(times)
+        return str_call(tr, "repeat", node.this, start=node.args.get("times"))
     if name == "Substring":
-        base = tr._scalar(node.this).str
-        # A negative start (`substr(s, -2)`) parses as a `Neg`, not a bare literal —
-        # `int(node.args["start"].this)` then raised a TypeError. `_int_literal`
-        # folds the sign; the engine's `.substr` handles negative offsets (matching
-        # DuckDB: it counts from the string end).
-        start = _const_int_arg(node.args["start"], "substr(): start")
-        length_node = node.args.get("length")
-        if length_node is None:
-            return base.substr(start)
-        return base.substr(start, _const_int_arg(length_node, "substr(): length"))
+        # A negative start (`substr(s, -2)`) parses as a `Neg`, not a bare literal, and
+        # either bound may be a column; `str_call` folds the sign and picks the constant
+        # or per-row form.
+        return str_call(
+            tr,
+            "substr",
+            node.this,
+            start=node.args["start"],
+            length=node.args.get("length"),
+        )
     if name in ("Left", "Right"):
-        n = _const_int_arg(node.expression, f"{name.lower()}(): length")
-        method = "left" if name == "Left" else "right"
-        return getattr(tr._scalar(node.this).str, method)(n)
+        if name == "Right":
+            return str_call(tr, "right", node.this, start=node.expression)
+        n = _int_literal(node.expression)
+        if n is None:
+            return dynamic_left(tr, node.this, node.expression)
+        return tr._scalar(node.this).str.left(n)
     if name in ("EndsWith", "Contains"):
-        pat = _const_str_arg(node.expression, f"{name.lower()}()")
-        method = "ends_with" if name == "EndsWith" else "contains"
-        return getattr(tr._scalar(node.this).str, method)(pat)
+        tag = "ends_with" if name == "EndsWith" else "contains"
+        return str_call(tr, tag, node.this, pattern=node.expression)
     if name in _STR_CONST_ARG:
-        # `f(s, t)` where the engine's method takes `t` as a Python string, not an
-        # expression: `split`/`str_split`, the edit-distance metrics, and
-        # `regexp_extract_all`. Each already exists on `.str`; only the row was missing.
-        method, role = _STR_CONST_ARG[name]
-        text = _const_str_arg(node.expression, f"{name.lower()}()", role)
-        return getattr(tr._scalar(node.this).str, method)(text)
+        # `jaro_winkler_similarity(a, b, scale)` carries a prefix scale factor the kernel
+        # has no parameter for (sqlglot parks it under `case_insensitive`). Dropping it
+        # answered the *default*-scale similarity — a plausible number that is not the one
+        # asked for — so the extra argument is refused instead.
+        extra = node.args.get("case_insensitive") or node.expressions
+        if extra:
+            raise NotImplementedError(
+                f"{name.lower()}() takes two arguments here; the third (the prefix scale "
+                "factor) is not a parameter the engine's kernel has"
+            )
+        # `f(s, t)` where the second operand fills the kernel's `pattern` slot:
+        # `split`/`str_split`, the edit-distance metrics, `regexp_split`.
+        tag, _role = _STR_CONST_ARG[name]
+        return str_call(tr, tag, node.this, pattern=node.expression)
     if name == "Translate":
-        # `translate(s, from, to)` — both character sets must be constants. sqlglot
-        # names the source set `from_`, not `expression`.
-        frm = _const_str_arg(node.args.get("from_"), "translate()", "source character set")
-        to = _const_str_arg(node.args.get("to"), "translate()", "target character set")
-        return tr._scalar(node.this).str.translate(frm, to)
+        # sqlglot names the source set `from_`, not `expression`.
+        return str_call(
+            tr,
+            "translate",
+            node.this,
+            pattern=node.args.get("from_"),
+            replacement=node.args.get("to"),
+        )
     if name == "TimeToStr":  # strftime(ts, fmt) / Spark date_format(ts, fmt)
         raw = _const_str_arg(node.args.get("format"), "strftime()", "format")
         pattern = datetime_pattern(raw)
@@ -211,28 +290,27 @@ def _scalar_function(tr, node):
         # Both carry an optional capture-group index. `regexp_extract_all` used to drop
         # it, so `regexp_extract_all('100-200', '(\\d+)-(\\d+)', 1)` collected the whole
         # matches (`['100-200']`) where DuckDB collects the group (`['100']`).
-        label = "regexp_extract()" if name == "RegexpExtract" else "regexp_extract_all()"
-        pat = _const_str_arg(node.expression, label, "pattern")
+        tag = "regexp_extract" if name == "RegexpExtract" else "regexp_extract_all"
         grp = node.args.get("group")
-        group = _const_int_arg(grp, f"{label} capture group") if grp is not None else 0
-        method = "regexp_extract" if name == "RegexpExtract" else "regexp_extract_all"
-        return getattr(tr._scalar(node.this).str, method)(pat, group)
+        return str_call(
+            tr, tag, node.this, pattern=node.expression, start=0 if grp is None else grp
+        )
     if name == "StrPosition":
-        pat = node.args["substr"]
-        if not isinstance(pat, exp.Literal) or not pat.is_string:
-            raise NotImplementedError("position() requires a string literal pattern")
-        return tr._scalar(node.this).str.position(pat.this)
+        return str_call(tr, "position", node.this, pattern=node.args["substr"])
     if name == "Pad":
         # A negative width (`lpad(s, -1, '*')`) parses as a `Neg` wrapping the
         # literal, so `int(node.args["expression"].this)` raised a TypeError on the
         # `Neg` node. `_int_literal` folds the sign; the engine's `.lpad`/`.rpad`
         # clamp a non-positive width to the empty string, matching DuckDB.
-        width = _const_int_arg(node.args["expression"], "lpad()/rpad(): width")
-        fill_node = node.args.get("fill_pattern")
-        fill = fill_node.this if fill_node is not None else " "
-        base = tr._scalar(node.this).str
-        is_left = bool(node.args.get("is_left"))
-        return base.lpad(width, fill) if is_left else base.rpad(width, fill)
+        fill = node.args.get("fill_pattern")
+        tag = "lpad" if bool(node.args.get("is_left")) else "rpad"
+        return str_call(
+            tr,
+            tag,
+            node.this,
+            start=node.args["expression"],
+            pattern=" " if fill is None else fill,
+        )
     if isinstance(node, exp.Anonymous):
         ml = _UNARY_ML.get(node.name.lower())
         if ml is not None and len(node.expressions) == 1:
@@ -296,8 +374,7 @@ def _regexp_replace(tr, node) -> Expr:
 
     from batcher._sql.parser.expressions.literals import _regexp_flags_prefix
 
-    pat = _const_str_arg(node.expression, "regexp_replace", "pattern")
-    repl = _const_str_arg(node.args.get("replacement"), "regexp_replace", "replacement")
+    pat_node, repl_node = node.expression, node.args.get("replacement")
     mods = node.args.get("modifiers")
     global_replace = False
     prefix = ""
@@ -309,7 +386,12 @@ def _regexp_replace(tr, node) -> Expr:
         # 'g' controls all-vs-first here (not a regex flag); the rest map to the inline
         # prefix, which raises on any option it can't reproduce bit-identically.
         prefix = _regexp_flags_prefix(flags.replace("g", ""))
-    s = tr._scalar(node.this)
-    if global_replace:
-        return s.str.regexp_replace_all(prefix + pat, repl)
-    return s.str.regexp_replace(prefix + pat, repl)
+    tag = "regexp_replace_all" if global_replace else "regexp_replace"
+    pat = const_str(pat_node)
+    if pat is not None:
+        pat_node = prefix + pat
+    elif prefix:
+        # A per-row pattern cannot carry the flag prefix through `str_call`'s literal
+        # slot, so the two are concatenated as an expression instead.
+        pat_node = Binary("concat", lit(prefix), tr._scalar(pat_node))
+    return str_call(tr, tag, node.this, pattern=pat_node, replacement=repl_node)

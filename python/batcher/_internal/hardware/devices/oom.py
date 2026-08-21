@@ -103,6 +103,37 @@ class OomVerdict:
         return self.kind is not OomKind.OCCUPIED
 
 
+#: Markers that identify a `MemoryError` as a *device* allocator's rather than the host's.
+#: `out_of_memory` and `bad_alloc` are what RMM puts in the message it raises from cuDF; the
+#: vendor names cover the allocators that report in their own words.
+#:
+#: **Every entry has to be unambiguous as a substring**, because that is how they are matched,
+#: and a short vendor prefix is exactly the marker that looks harmless and then fires on an
+#: ordinary word: `hip` is inside `relationship` and `npu` is inside **`input`**, which appears
+#: in a great many messages that have nothing to do with a device. They are spelled here as the
+#: longer forms the runtimes actually emit. The two failures want opposite responses — halving
+#: a batch relieves the device and does nothing for the host — so a false positive here retries
+#: into the same wall.
+_DEVICE_ALLOCATOR_MARKERS = (
+    "out_of_memory",
+    "outofmemory",
+    "bad_alloc",
+    "cuda",
+    "hiperror",
+    "rmm",
+    "xpu",
+    "hpu",
+    # Huawei Ascend's allocator names itself `npu`; Intel Gaudi's runtime is Synapse. Both were
+    # absent, so an exhaustion arriving as a `MemoryError` on either read as an ordinary *host*
+    # exhaustion.
+    "npu out of memory",
+    "synapse",
+    # Gaudi's runtime returns a `synStatus` and names it in the messages that carry one. This
+    # is the runtime's own identifier, not a guess at a sentence it might build from it.
+    "synstatus",
+)
+
+
 def is_device_oom(exc: BaseException) -> bool:
     """Whether `exc` is an accelerator out-of-memory error, checked without importing torch.
 
@@ -111,6 +142,13 @@ def is_device_oom(exc: BaseException) -> bool:
     how to report an error is a poor trade. The type name covers
     `torch.cuda.OutOfMemoryError`; the message covers the older
     `RuntimeError: CUDA out of memory`, XLA's `RESOURCE_EXHAUSTED`, and the HIP phrasing.
+
+    **The device tier does not raise a `RuntimeError` at all.** RMM — the allocator every cuDF
+    kernel runs on — raises a `MemoryError` carrying `std::bad_alloc: out_of_memory`, and a
+    `MemoryError` is not a `RuntimeError`, so the whole GPU relational path missed the halving
+    retry and failed a query that a smaller batch would have completed. A `MemoryError` is
+    accepted here only when its message names a *device* allocator, so an ordinary host
+    exhaustion — numpy's "Unable to allocate ... for an array" — is still not one of these.
 
     Args:
         exc: The exception a device stage raised.
@@ -124,19 +162,69 @@ def is_device_oom(exc: BaseException) -> bool:
             >>> from batcher._internal.hardware.devices import is_device_oom
             >>> is_device_oom(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
             True
+            >>> is_device_oom(MemoryError("std::bad_alloc: out_of_memory: CUDA error"))
+            True
+            >>> is_device_oom(MemoryError("Unable to allocate 1.2 GiB for an array"))
+            False
             >>> is_device_oom(ValueError("bad column"))
             False
     """
     if type(exc).__name__ in ("OutOfMemoryError", "ResourceExhaustedError"):
         return True
     message = str(exc).lower()
-    return isinstance(exc, RuntimeError) and (
+    if isinstance(exc, RuntimeError) and (
         "out of memory" in message
         or "resource_exhausted" in message
-        # HIP reports exhaustion under its own name, so a ROCm host matched none of the
-        # phrasings above and lost the halving retry entirely.
-        or "hip_error_out_of_memory" in message
+        or _names_a_failed_alloc(message)
+    ):
+        return True
+    # The device-allocator dialect, which arrives as a `MemoryError`. Gated on a marker that
+    # names a device so a host exhaustion is not mistaken for one — the two want opposite
+    # responses, since halving a batch relieves the device and does nothing for the host.
+    return isinstance(exc, MemoryError) and any(
+        marker in message for marker in _DEVICE_ALLOCATOR_MARKERS
     )
+
+
+#: Exhaustion phrasings matched after the message has had its spaces and underscores removed.
+#:
+#: Squashing is the entire point, and it is what the entry that used to sit here got wrong: it
+#: read `hip_error_out_of_memory`, and HIP's actual identifier is `hipErrorOutOfMemory` — no
+#: separators between the words — so it matched nothing a ROCm host has ever raised while its
+#: comment claimed to be the reason ROCm worked. Squashed, one pattern covers `out of memory`,
+#: `OutOfMemory`, `out_of_memory` and `hipErrorOutOfMemory` at once, so there is no per-vendor
+#: spelling left to get wrong.
+_SQUASHED_EXHAUSTION = ("outofmemory", "resourceexhausted", "memoryexhausted")
+
+#: A looser allocation-failure phrasing, accepted **only** alongside a device marker.
+#:
+#: Deliberately not accepted on its own. "Failed to allocate" is ordinary English that a host
+#: allocation, a socket, an arena or a file map can all raise, and treating one as a device
+#: out-of-memory sends it round the halving ladder — log2(rows) re-executions of a batch that
+#: was never going to succeed — before re-raising it with the wrong diagnosis. Pairing it with
+#: a marker that names a device allocator keeps the widening honest.
+_LOOSE_ALLOC_FAILURE = ("badalloc", "cannotallocate", "failedtoallocate", "allocationfailed")
+
+
+def _squash(message: str) -> str:
+    """A message with its separators removed, so one pattern covers every vendor's spelling."""
+    return message.replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _names_a_failed_alloc(message: str) -> bool:
+    """Whether a lowercased message says a *device* allocation failed, in any runtime's wording.
+
+    Two tiers, and the second is gated for a reason. An unambiguous exhaustion phrase stands on
+    its own; a merely plausible one has to be accompanied by a word naming a device allocator,
+    because the cost of a false positive here is a failing batch re-executed all the way down
+    to a single row before it reports the error it had on the first attempt.
+    """
+    squashed = _squash(message)
+    if any(word in squashed for word in _SQUASHED_EXHAUSTION):
+        return True
+    if not any(word in squashed for word in _LOOSE_ALLOC_FAILURE):
+        return False
+    return any(marker in message for marker in _DEVICE_ALLOCATOR_MARKERS)
 
 
 def classify_oom(exc: BaseException, *, device: int | None = None) -> OomVerdict:
@@ -242,9 +330,15 @@ def release_device_cache() -> bool:
     reinitialize, which would tear down every outstanding device buffer in the process — a far
     larger hammer than an OOM retry is allowed to swing.
 
-    Vendor-agnostic: NVIDIA and AMD share ``torch.cuda`` (ROCm shims the CUDA API), Intel is
-    ``torch.xpu``, Apple ``torch.mps``, and XLA has no cache to empty at all — a TPU or
-    Trainium releases by stepping its execution graph.
+    Vendor-agnostic through `TORCH_NAMESPACE`, the one table the memory layer resolves
+    backends with: NVIDIA and AMD share ``torch.cuda`` (ROCm shims the CUDA API), Intel is
+    ``torch.xpu``, Apple ``torch.mps``, Gaudi ``torch.hpu``, Ascend ``torch.npu``. XLA has no
+    cache to empty at all — a TPU or Trainium releases by stepping its execution graph.
+
+    Every namespace present is emptied rather than only the detected one. This runs on a
+    recovery path where being thorough is cheap and being wrong is not: a process that has
+    driven two backends in its life (a Gaudi worker that also touched CPU-side CUDA tensors)
+    has cached blocks under both, and the one this host "is" may not be the one holding them.
 
     Returns:
         True when at least one backend released something, False where none applies — which is
@@ -258,7 +352,9 @@ def release_device_cache() -> bool:
         return _xla_mark_step()
     gc.collect()
     released = False
-    for name in ("cuda", "xpu", "mps"):
+    from batcher._internal.hardware.devices.torch_memory import TORCH_NAMESPACE
+
+    for name in dict.fromkeys(TORCH_NAMESPACE.values()):
         backend = getattr(torch, name, None)
         empty = getattr(backend, "empty_cache", None)
         if empty is None:

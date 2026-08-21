@@ -306,6 +306,29 @@ def alive_node_count() -> int:
         return 0
 
 
+def cluster_node_count() -> int:
+    """Alive nodes in the **whole** cluster, head included — snapshot-aware like its
+    worker-eligible sibling.
+
+    Distinct from `alive_node_count`, and the distinction is load-bearing. That one answers
+    "how many nodes may a worker be *sized* for", which excludes the head because a fan-out
+    sized to include it asks for one more worker than can be placed. This one answers "is
+    this cluster one machine", which is a property of the cluster and not of who may run on
+    it: a placement group whose bundles carry no head-excluding resource lands on the head
+    like any other node, so a head-plus-one-worker cluster genuinely has two nodes to spread
+    across. Reading the worker-eligible count there made every such cluster look single-node
+    and silently downgraded SPREAD to PACK.
+
+    Returns:
+        The alive node count, or 0 on an unreadable topology (callers treat that as unknown).
+    """
+    try:
+        snap = _TOPOLOGY.get()
+        return len(snap.alive_nodes if snap is not None else _live_alive_nodes())
+    except Exception:
+        return 0
+
+
 def cluster_topology() -> dict:
     """Live cluster shape: alive node count + total CPUs/GPUs. Ray must be up.
 

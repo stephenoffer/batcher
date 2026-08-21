@@ -169,13 +169,37 @@ DMI_VENDORS: tuple[tuple[str, str], ...] = (
     ("digitalocean", "digitalocean"),
     ("hetzner", "hetzner"),
     ("scaleway", "scaleway"),
+    ("vultr", "vultr"),
+    # Akamai bought Linode and newer instances carry the new name; both are the one platform,
+    # and a caller comparing provider names wants one answer rather than two.
+    ("linode", "linode"),
+    ("akamai", "linode"),
+    # Not a cloud but a private one: Nutanix is what a great deal of on-premises capacity is
+    # virtualized by, and naming it beats reporting `unknown` for a whole estate.
+    ("nutanix", "nutanix"),
 )
 
 #: Firmware vendors that identify a *hypervisor* rather than a platform. Their presence says
 #: the node is virtualized, which is worth knowing on its own: a VM's `/sys` shows the
 #: hypervisor's view of the PCI tree, so a probe that finds no fabric there has not proved the
 #: host has none.
-_DMI_HYPERVISORS = ("qemu", "vmware", "xen", "bochs", "parallels", "innotek", "bhyve")
+#:
+#: `kvm` and `red hat` are the on-premises pair worth naming: an OpenStack or oVirt estate
+#: reports one of them, and without them a private cloud's nodes read as bare metal — which
+#: makes an empty fabric probe there look conclusive when it is only the hypervisor's view of
+#: the PCI tree.
+_DMI_HYPERVISORS = (
+    "qemu",
+    "kvm",
+    "red hat",
+    "vmware",
+    "xen",
+    "bochs",
+    "parallels",
+    "innotek",
+    "bhyve",
+    "nutanix",
+)
 
 #: Node-name variables shared across platforms. Kubernetes' downward API convention comes
 #: first because on a GPU fleet the pod is usually where the process actually runs.
@@ -357,19 +381,45 @@ def site_summary() -> dict:
 
     Returns:
         Provider, instance type, region, node name, whether this is a GPU-specialist cloud,
-        and what launched the process. Empty strings where the environment says nothing.
+        what launched the process, and the shape that scheduler gave the job. Empty strings
+        where the environment says nothing; the job-shape keys are present only when the
+        scheduler published a figure, so a reader can tell "one node" from "nobody said".
     """
-    from batcher._internal.site.scheduler import scheduler_kind
+    from batcher._internal.site.scheduler import scheduler_job
 
     profile = site_profile()
+    job = scheduler_job()
     out = {
         "provider": profile.provider,
         "instance_type": profile.instance_type,
         "region": profile.region,
-        "node_name": profile.node_name,
+        # The scheduler's own name for this node beats a hostname where it has one: it is what
+        # the node list and every placement label are written in.
+        "node_name": job.node_name or profile.node_name,
         "neocloud": profile.neocloud,
-        "scheduler": scheduler_kind(),
+        "scheduler": job.kind,
     }
+    # The job shape, each key only where it was actually published. This is what explains a
+    # parallelism or placement decision after the fact, and an absent key is the honest way to
+    # say the scheduler did not describe that part of the job.
+    for key, value in (
+        ("job_id", job.job_id),
+        ("partition", job.partition),
+        ("array_index", job.array_index),
+    ):
+        if value:
+            out[key] = value
+    for key, count in (
+        ("nodes", job.node_count),
+        ("gpus_per_node", job.gpus_per_node),
+        ("cpus_per_task", job.cpus_per_task),
+        ("tasks", job.tasks),
+        ("tasks_per_node", job.local_size),
+    ):
+        if count:
+            out[key] = count
+    if job.tasks > 1 or job.rank:
+        out["rank"] = job.rank
     if profile.virtualized is not None:
         # Reported only when the firmware answered. On bare metal an empty fabric probe is
         # conclusive; in a VM it is not, and a reader needs to know which one they have.

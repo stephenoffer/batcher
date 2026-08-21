@@ -180,6 +180,54 @@ pub(crate) fn column_string_quantiles(
     bc_interp::dist::string_key_quantiles(&batches, &column, &probs).map_err(to_pyerr)
 }
 
+/// As [`range_partition_batches_str`], but the leading key is **binary** — `Binary`,
+/// `LargeBinary` or `FixedSizeBinary` — and `boundaries` are ascending byte quantiles (from
+/// [`column_binary_quantiles`]).
+///
+/// Binary and text are one ordering (`memcmp` on the value bytes) and one routing in Rust;
+/// they are two entry points here only because a boundary crosses this seam as `bytes` in one
+/// case and `str` in the other. Without this a distributed `ORDER BY <binary column>` had no
+/// range partitioner at all, so the sort could not be distributed.
+#[pyfunction]
+pub(crate) fn range_partition_batches_binary(
+    batches: Vec<PyArrowType<RecordBatch>>,
+    key_index: usize,
+    boundaries: Vec<Vec<u8>>,
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, std::slice::from_ref(&key_index), n_buckets)?;
+    let parts = bc_interp::dist::range_partition_batches_bytes(
+        &batches,
+        key_index,
+        &boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+    .map_err(to_pyerr)?;
+    Ok(wrap_buckets(parts))
+}
+
+/// Sample a binary column's distribution as ascending values at `probs` — the binary
+/// counterpart of [`column_string_quantiles`], for the same reason it exists: the KLL sketch
+/// behind `column_quantiles` is numeric-only.
+///
+/// Each worker samples its own split and the driver merges the grids into the boundaries
+/// `range_partition_batches_binary` routes on. An absent, empty, or all-null column yields an
+/// empty grid, which the merge reads as "this split says nothing about the distribution".
+#[pyfunction]
+pub(crate) fn column_binary_quantiles(
+    column: String,
+    batches: Vec<PyArrowType<RecordBatch>>,
+    probs: Vec<f64>,
+) -> PyResult<Vec<Vec<u8>>> {
+    let batches = unwrap_batches(batches)?;
+    bc_interp::dist::byte_key_quantiles(&batches, &column, &probs).map_err(to_pyerr)
+}
+
 /// Skew-aware shuffle for a single-key distributed join: a hot key's rows are
 /// salted across reducers instead of overloading one. `hot_keys` are the hot values
 /// rendered as strings (matching `heavy_hitters`); `replicate=false` is the probe
@@ -545,7 +593,7 @@ pub(crate) fn combine_finalize_spilling(
             )
         })
         .map_err(to_pyerr)?;
-    Ok(PyArrowType(out))
+    Ok(PyArrowType(crate::normalize::rebase_batch(out)))
 }
 
 /// Buffer in front of a gather staging file.
@@ -660,4 +708,26 @@ fn parse_sources(sources: Vec<(String, String)>) -> PyResult<Vec<(String, Shuffl
         .into_iter()
         .map(|(addr, ticket)| Ok((addr, ShuffleTicket::from_string(&ticket).map_err(to_pyerr)?)))
         .collect()
+}
+
+/// Register every shuffle entry point on the `_native` module.
+///
+/// The registration list lives beside the functions rather than in `lib.rs` so that adding a
+/// routing and its sampler is one edit in one file. `lib.rs` is the module assembly point and
+/// is at its size limit; a family that grows in pairs is exactly the one that should not be
+/// spending that budget.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(combine_finalize_spilling, m)?)?;
+    m.add_function(wrap_pyfunction!(partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(partition_batches_salted, m)?)?;
+    m.add_function(wrap_pyfunction!(range_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(range_partition_batches_str, m)?)?;
+    m.add_function(wrap_pyfunction!(range_partition_batches_binary, m)?)?;
+    m.add_function(wrap_pyfunction!(column_string_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(column_binary_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(salted_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(gather_combine, m)?)?;
+    m.add_function(wrap_pyfunction!(gather_concat, m)?)?;
+    m.add_function(wrap_pyfunction!(gather_to_files, m)?)?;
+    Ok(())
 }

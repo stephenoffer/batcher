@@ -32,6 +32,10 @@ def create(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) ->
     Both forms register a *lazy* `Dataset`: Batcher is lazy throughout, so ``CREATE TABLE
     AS`` does not materialize, a terminal op does.
 
+    ``IF NOT EXISTS`` keeps the existing binding and returns it, which is the whole point
+    of the clause — refusing it (the old behaviour) made the idempotent spelling the one
+    that failed, so a script safe to re-run in every other engine could not be re-run here.
+
     Args:
         session: The session whose catalog gains the name.
         ast: The parsed ``CREATE`` statement.
@@ -41,12 +45,16 @@ def create(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) ->
         The registered relation.
 
     Raises:
-        PlanError: The name is taken and ``OR REPLACE`` was not given, or the statement
-            has no ``AS <select>`` body.
+        PlanError: The name is taken and neither ``OR REPLACE`` nor ``IF NOT EXISTS`` was
+            given, or the statement has no ``AS <select>`` body.
     """
     name = ast.this.name
-    if not bool(ast.args.get("replace")) and name in session._tables:
-        raise PlanError(f"table {name!r} already exists; use CREATE OR REPLACE")
+    if name in session._tables and not bool(ast.args.get("replace")):
+        if bool(ast.args.get("exists")):
+            return session._tables[name]
+        raise PlanError(
+            f"table {name!r} already exists; use CREATE OR REPLACE or CREATE IF NOT EXISTS"
+        )
     body = ast.expression
     if body is None:
         raise PlanError("CREATE TABLE/VIEW requires an AS <select> body")

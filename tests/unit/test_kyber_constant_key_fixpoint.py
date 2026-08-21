@@ -139,3 +139,83 @@ def test_the_rewrite_is_stable_under_the_iteration_cap():
             built = ds.select("k", "g").join(ds.select("k", "i"), on="k")
             plans.add(str(built.with_columns(z=col("i") + 1).explain()))
     assert len(plans) == 1, f"plan varies with the iteration cap: {plans}"
+
+
+# --- the diagnostic itself, and a shape that still cycles ------------------------------
+
+
+def test_the_warning_names_the_phase_that_would_not_settle(caplog):
+    """Without the phase the message is unactionable: it says *something* among ~300 rules
+    will not settle, so the reader's only next step is to bisect plan shapes until one
+    reproduces it. `Phase`'s docstring promises the rewrite phases converge "because their
+    rules are confluent", so this warning is that invariant breaking and naming the offender
+    is the whole lead.
+
+    Driven through the driver rather than a query, so it pins the message rather than any
+    particular plan continuing to cycle.
+    """
+    from batcher.kyber.optimizer.driver import _run_phase
+    from batcher.kyber.rule import Phase, Rule
+
+    ds = bt.from_pydict({"k": [1, 2]})
+    bare = ds._plan
+    projected = ds.select("k")._plan
+    flip = [False]
+
+    def _oscillate(plan, ctx):
+        # Alternates between two plans with genuinely different IR, so the driver's
+        # identity-then-IR fixpoint check can never settle.
+        flip[0] = not flip[0]
+        return projected if flip[0] else bare
+
+    rule = Rule(name="oscillator", phase=Phase.PUSHDOWN, fn=_oscillate)
+    with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
+        _run_phase(ds._plan, [rule], _context(ds), max_iterations=4)
+    warnings = _fixpoint_warnings(caplog)
+    assert warnings, "an oscillating rule must warn"
+    assert warnings[0].startswith("PUSHDOWN phase"), warnings[0]
+
+
+def _context(ds):
+    """An `OptimizerContext` over `ds`, built the way the other optimizer tests build one."""
+    from batcher.config import active_config
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.pass_base import OptimizerContext
+
+    return OptimizerContext(
+        config=active_config(),
+        sources=ds._sources,
+        hub=None,
+        estimator=CardinalityEstimator(ds._sources, {}),
+    )
+
+
+@pytest.mark.xfail(
+    reason="SMOTE's plan still cycles in PUSHDOWN; the constant-key fix above did not cover "
+    "this shape. Correctness is unaffected (every rule is semantics-preserving), but the "
+    "plan depends on the iteration cap and every call burns the whole budget. Reproduces at "
+    "HEAD, and burns whatever cap it is given (8 -> 17, 20 -> 20, 60 -> 60), so it is a "
+    "genuine cycle rather than a plan that merely needs more passes.",
+    strict=True,
+)
+def test_smote_reaches_a_fixpoint(caplog):
+    """A second PUSHDOWN cycle, found by auditing rather than by a failure.
+
+    Flips to XPASS the moment someone fixes it, which is the point of recording it here
+    next to the cycle that was fixed.
+    """
+    import numpy as np
+
+    from batcher.ml import smote
+
+    rng = np.random.default_rng(0)
+    n = 200
+    labels = np.where(rng.random(n) < 0.2, "rare", "common")
+    features = [f"f{i}" for i in range(3)]
+    values = rng.normal(size=(n, 3))
+    ds = bt.from_pydict(
+        {"y": labels.tolist(), **{f: values[:, i].tolist() for i, f in enumerate(features)}}
+    )
+    with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
+        smote(ds, "y", minority="rare", features=features, k=3, seed=0).to_pydict()
+    assert _fixpoint_warnings(caplog) == []

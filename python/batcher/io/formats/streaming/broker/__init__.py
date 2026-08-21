@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from batcher.io.formats.streaming.broker.schema import (
     BrokerMessage,
+    as_header_pairs,
     broker_schema,
     opaque_offset,
     redact_broker_options,
@@ -40,6 +41,7 @@ __all__ = [
     "BrokerMessage",
     "BrokerSource",
     "BrokerSplit",
+    "as_header_pairs",
     "broker_schema",
     "opaque_offset",
     "redact_broker_options",

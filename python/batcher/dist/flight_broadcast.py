@@ -25,7 +25,7 @@ from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import engine_config_json
-from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_fleet
 from batcher.dist.fleet.plan_id import next_result_stage
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
@@ -200,6 +200,9 @@ def execute_broadcast_join_flight(
         gk, aj = agg_spec_json(fused_agg)
 
     credits = _shuffle_credits()
+    # See `fleet.borrows_session_fleet`: asked before the acquire, because that is the only
+    # point at which the three acquisition branches can still be told apart.
+    borrows_session = borrows_session_fleet()
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     publish = materialize is False and not above and fused_agg is None
     keep_actors = False
@@ -250,7 +253,9 @@ def execute_broadcast_join_flight(
             )
             keep_actors = True
             src_actors, src_pg = (actors, pg) if owns else (None, None)
-            return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+            return FlightMaterializedSource(
+                handles, schema, src_actors, src_pg, session_lease=borrows_session and not owns
+            )
         batches = [b for part in done for b in part if b.num_rows]
     finally:
         if not keep_actors:

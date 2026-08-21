@@ -16,8 +16,8 @@ use rayon::prelude::*;
 use super::assign::assign_groups;
 use super::hash::hash_partial_keys;
 use crate::agg::{
-    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_covar,
-    merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
+    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_counted,
+    merge_covar, merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
 };
 use crate::error::RuntimeError;
 
@@ -83,7 +83,7 @@ fn gather_primitive<T: ArrowPrimitiveType>(
 ///
 /// Anything else — a nested state, a temporal or decimal type this does not name, a source
 /// set of mixed types — falls through to `interleave` unchanged, sharing one lazily built
-/// pair vector. Strings take their own bulk path (`gather::gather_strings`).
+/// pair vector. Byte columns take their own bulk path (`gather::gather_bytes`).
 fn gather(
     cols: &[&dyn Array],
     part_of: &[u32],
@@ -118,9 +118,9 @@ fn gather(
     }
     // A string key is the *other* common high-cardinality group key, and arrow's `interleave`
     // costs it what it costs any variable-width column: `MutableArrayData::extend` per row,
-    // through the sixteen-byte pair vector below. `gather_strings` reads the same two planes
+    // through the sixteen-byte pair vector below. `gather_bytes` reads the same two planes
     // the primitive path does and fills one output buffer across cores.
-    if let Some(out) = crate::gather::gather_strings(cols, part_of, row_of) {
+    if let Some(out) = crate::gather::gather_bytes(cols, part_of, row_of) {
         return Ok(out);
     }
     let pairs = pairs.get_or_insert_with(|| {
@@ -325,7 +325,6 @@ pub(crate) fn merge_state(
         AggFunc::Median
         | AggFunc::Quantile(_)
         | AggFunc::ListAgg
-        | AggFunc::Mode
         // The contiguity statistics carry `Median`'s value list, so they merge by the same
         // concatenation. This arm *is* their mergeability.
         | AggFunc::NLength(_)
@@ -334,10 +333,12 @@ pub(crate) fn merge_state(
         | AggFunc::Histogram
         | AggFunc::Entropy
         | AggFunc::Mad
-        | AggFunc::QuantileDisc(_)
-        | AggFunc::ApproxTopK(_) => {
+        | AggFunc::QuantileDisc(_) => {
             vec![merge_median(&state[0], group_ids, num_groups)?]
         }
+        // Counted states merge by summing the counts of equal values (see `agg::counted`);
+        // addition is associative and commutative, which is this pair's mergeability.
+        AggFunc::Mode | AggFunc::ApproxTopK(_) => merge_counted(state, group_ids, num_groups)?,
         // `any_value` merges with the same min reducer that built its partial.
         // Compensated states merge by compensated-adding the sums and summing the
         // compensations — the same fold the partial performs, so `combine([p]) == p`.

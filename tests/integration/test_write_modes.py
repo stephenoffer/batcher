@@ -55,6 +55,17 @@ def test_append_unsupported_on_file_format(tmp_path):
 
 
 def test_unknown_mode_raises(tmp_path):
+    """An unrecognized save mode is refused, and the message says what is accepted.
+
+    The regex used to be "unknown mode", which the error has not said for as long as it has
+    listed the accepted modes -- so this test failed at HEAD. What is asserted now is the
+    part a caller needs: the rejected value is quoted back, and the alternatives are there
+    to pick from.
+    """
     p = str(tmp_path / "out.parquet")
-    with pytest.raises(PlanError, match="unknown mode"):
+    with pytest.raises(PlanError, match="Unknown save mode") as refused:
         _ds().write(p, mode="upsert")
+    message = str(refused.value)
+    assert "'upsert'" in message, "the message must quote the mode it rejected"
+    for canonical in ("overwrite", "error", "ignore", "append"):
+        assert canonical in message, f"{canonical} is a canonical mode and must be offered"

@@ -332,7 +332,23 @@ def list_function(tr, node):
             if (as_map := map_subscript(tr, node)) is not None:
                 return as_map
             offset = int(node.args.get("offset") or 0)
+            if not _is_constant_subscript(idxs[0]):
+                # `a[i]` over an index *column*. sqlglot 0-bases a 1-based dialect by
+                # subtracting one from the *literal* it was given; it cannot do that to an
+                # expression, so a computed subscript arrives exactly as written — 1-based
+                # — under either dialect convention, and the per-row rewrite folds the
+                # rest (index 0 is out of range, a negative counts from the end).
+                from batcher._sql.parser.expressions.anonymous import _element_at_dyn
+
+                return _element_at_dyn(tr._scalar(node.this), tr._scalar(idxs[0]))
             index = _subscript_value(idxs[0])
+            written = index + 1 if offset == 0 else index
+            if written == 0:
+                # SQL subscripts from 1, so `a[0]` names no element and is NULL. sqlglot
+                # 0-bases the written index for duckdb, so a written 0 arrives as -1 and
+                # took the from-the-end branch — answering with the *first* element.
+                element = tr._scalar(node.this).list.get(0)
+                return nullif(element, element)
             if index < 0:
                 # A negative subscript counts from the end (`a[-1]` is the last element),
                 # which is what `.list.get` already means — but sqlglot 0-bases a 1-based
@@ -381,6 +397,13 @@ def list_function(tr, node):
             right = tr._scalar(node.expressions[1])
             return getattr(left.list, binary)(right)
     return None
+
+
+def _is_constant_subscript(node) -> bool:
+    """Whether a subscript is a plan-time integer (a literal, or a negated one)."""
+    if isinstance(node, exp.Neg):
+        return _is_constant_subscript(node.this)
+    return isinstance(node, exp.Literal) and not node.is_string
 
 
 def _subscript_value(node) -> int:

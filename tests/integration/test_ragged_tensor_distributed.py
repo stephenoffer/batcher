@@ -57,22 +57,29 @@ def test_a_ragged_column_is_identical_single_node_and_distributed():
     assert all(np.array_equal(a, b) for a, b in zip(one, lots, strict=True))
 
 
-def _decode(batch):
-    """Build each row's array from the row's own `id`, never from its position in the batch.
-
-    Deriving the shape from ``range(batch.num_rows)`` would make the *result* a function of
-    the partitioning, so the two sides could only ever be compared loosely — and a test that
-    compares loosely is the one that misses the divergence it exists to catch.
-    """
-    ids = batch.column("id").to_pylist()
-    return {
-        "id": batch.column("id"),
-        "img": [np.full((i % 3 + 1, 2), i % 251, "uint8") for i in ids],
-    }
-
-
 def test_it_survives_a_udf_stage_on_the_distributed_path():
     """The shape that produces a ragged column in the first place, run across workers."""
+
+    def _decode(batch):
+        """Build each row's array from the row's own `id`, never from its position in the batch.
+
+        Deriving the shape from ``range(batch.num_rows)`` would make the *result* a function of
+        the partitioning, so the two sides could only ever be compared loosely — and a test that
+        compares loosely is the one that misses the divergence it exists to catch.
+
+        Defined **inside** the test, which is load-bearing rather than stylistic. cloudpickle
+        sends a local function to the Ray worker by value; a module-level one it sends by
+        reference, and the worker cannot import `test_ragged_tensor_distributed` to resolve
+        that reference. As a module-level function this test raised
+        ``ModuleNotFoundError`` on every run that had Ray, and was skipped on every run that
+        did not -- so the distributed UDF path it exists to cover was never once executed.
+        """
+        ids = batch.column("id").to_pylist()
+        return {
+            "id": batch.column("id"),
+            "img": [np.full((i % 3 + 1, 2), i % 251, "uint8") for i in ids],
+        }
+
     plan = bt.from_pydict({"id": list(range(32))}).map_batches(
         _decode, output_columns=["id", "img"]
     )

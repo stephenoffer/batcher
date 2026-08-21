@@ -14,9 +14,11 @@ pub(crate) fn jaro(a: &str, b: &str) -> f64 {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let (la, lb) = (a.len(), b.len());
-    if la == 0 && lb == 0 {
-        return 1.0; // two empty strings are identical (matches DuckDB)
-    }
+    // An empty operand scores 0, *including* when both are empty. That reads as wrong —
+    // two empty strings are identical — but it is what DuckDB answers
+    // (`jaro_similarity('', '')` is 0.0), and the metric is only meaningful against the
+    // engine it is compared with. Returning 1.0 for the pair, which this used to do,
+    // disagreed on exactly the row an empty string reaches.
     if la == 0 || lb == 0 {
         return 0.0;
     }
@@ -90,8 +92,18 @@ mod tests {
     fn identical_and_disjoint() {
         assert!(close(jaro("abc", "abc"), 1.0));
         assert!(close(jaro("abc", "xyz"), 0.0));
-        assert!(close(jaro("", ""), 1.0));
         assert!(close(jaro("a", ""), 0.0));
+    }
+
+    /// Two empty strings score **0**, not 1.
+    ///
+    /// They are identical, so 1.0 is the reading the metric's definition suggests and the
+    /// one this used to return. DuckDB answers 0.0 (`jaro_similarity('', '')`), and this
+    /// kernel exists to agree with DuckDB — an entity-resolution score that disagrees on
+    /// the empty row is a different metric, not a rounding difference.
+    #[test]
+    fn two_empty_strings_score_zero_as_duckdb_does() {
+        assert!(close(jaro("", ""), 0.0));
     }
 
     #[test]

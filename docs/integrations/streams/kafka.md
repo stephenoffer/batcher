@@ -82,9 +82,25 @@ print(sorted(zip(*[totals.to_pydict()[c] for c in ("user", "total")], strict=Tru
 [('u1', 17), ('u2', 5)]
 ```
 
-Avro and Protobuf payloads have no built-in decoder, and there is no Schema Registry client.
-Reach for `map_batches` and decode the whole Arrow `value` column at once, per batch, never
-per row.
+That is the right shape for an ad-hoc look at a JSON topic. For anything long-running,
+name the wire format instead and the source decodes it for you, so `value` arrives as a
+typed column and the stream's schema is known before a message is polled:
+
+```python
+# docs: skip
+orders = bt.read.kafka(
+    "orders",
+    bootstrap_servers="broker-1:9092",
+    value_format="avro",
+    schema_registry="http://schema-registry:8081",
+)
+totals = orders.group_by(bt.col("value").struct.field("user")).agg(
+    total=bt.col("value").struct.field("amount").sum()
+)
+```
+
+Avro, JSON, Protobuf and text are supported, with Confluent Schema Registry framing and a
+policy for malformed records. See {doc}`Payload formats </integrations/streams/payload-formats>`.
 
 ## Where a query starts, and what happens when offsets age out
 
@@ -113,6 +129,33 @@ alternative is a dead pipeline, not to quiet a recurring alert: a query that kee
 it is falling behind retention, and the fix is more throughput or a longer retention.
 :::
 
+## Reading a bounded offset range
+
+A topic is unbounded, so `collect()` on one refuses: it could never terminate. Declaring
+`ending_offsets` makes the read a finite range instead, which is how you express a backfill,
+a reprocess, or a one-off query over a window of history:
+
+```python
+# docs: skip
+window = bt.read.kafka(
+    "orders",
+    bootstrap_servers="broker-1:9092",
+    starting_offsets={0: 1_000, 1: 1_000},
+    ending_offsets={0: 2_000, 1: 2_000},
+)
+window.count()
+```
+
+The end is exclusive, as in Spark: an end of 2000 reads up to and including offset 1999.
+`ending_offsets="latest"` reads to the head of each partition as of query start, so a
+partition that keeps growing during the read does not extend it and the same command run
+twice covers the same rows.
+
+A range read assigns every partition of the topic rather than joining the consumer group.
+It has to: a group hands this consumer whichever partitions a rebalance decides, so a
+subscribed read would stop at the end of *its* partitions and silently omit the rest of the
+range.
+
 ## Rate-limiting a micro-batch
 
 A backlogged topic hands over as much as one poll allows, and the two bounds that matter
@@ -130,6 +173,17 @@ bt.read.kafka(
     max_bytes_per_trigger=64 << 20,
 )
 ```
+
+Both bounds hold on every broker connector, not only this one. A byte bound is what keeps a
+poll inside Arrow's own limit as well as the machine's: a `binary` column carries 32-bit
+offsets, so a batch past 2 GiB fails inside the array builder rather than at any boundary
+you named.
+
+On a connector that sweeps several partitions or shards in one poll, the sweep stops when
+the budget runs out and starts from a different partition next time. Rotating matters more
+than it looks: a partition that is never reached never advances its event time, and the
+stream's watermark is the minimum across partitions, so a starved partition stalls the whole
+query exactly as a silent one would.
 
 ## Message headers
 
@@ -299,6 +353,7 @@ to materialize. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a 
 ## See also
 
 - {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, watermarks, output modes, checkpoints.
+- {doc}`Payload formats </integrations/streams/payload-formats>`: decoding Avro, JSON, and Protobuf payloads.
 - {doc}`Kafka ETL </cookbook/streaming/kafka-etl>`: this connector end to end, decode to sink.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: what the stable
   `query_name` above is buying you.

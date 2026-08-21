@@ -38,6 +38,7 @@ what every published result for them does:
 | JOB (IMDb) | `https://event.cwi.nl/da/job/imdb.tgz` — the archive the reference implementation distributes, converted to parquet at `~/bench-data/job/parquet/` on first run | HTTPS, ~1.2 GiB once |
 | H2O.ai     | built in-process to the benchmark's `groupby-datagen.R` / `join-datagen.R` spec (`datagen/h2o_tables.py`); db-benchmark ships no data | fixed seed, in memory |
 | JSON       | built in-process (`datagen/json_events.py`); no public nested-JSON corpus exists | fixed seed, in memory |
+| Geospatial | `s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/` — real Overture Maps places, extracted once to `~/bench-data/overture/` | S3, anonymous |
 
 The generated datasets are fixed-seed and shared as one Arrow table across every engine, so
 the correctness gate compares engines on byte-identical input. They are not byte-identical
@@ -446,6 +447,24 @@ dispatches the standalone benchmarks —
 `--benchmark distributed` (single-node == many-partition equivalence),
 `--benchmark optimizer` (Kyber planning latency), and
 `--benchmark shuffle` (Arrow Flight vs the Ray object store).
+
+Two benchmarks are run directly rather than through `run.py`, because each needs a shape
+`run.py`'s dataset lineup does not carry.
+
+`python benchmarks/geospatial.py [scales...]` compares the `ST_*` expression surface against
+**DuckDB's spatial extension** over real Overture Maps places, on the same zero-copy Arrow both
+engines read. It checks each case's two results agree before timing either, refuses to measure a
+debug build, and reports `n/a` for the grid encoders (geohash, S2, quadkey) that DuckDB has no
+equivalent for rather than dropping them.
+
+`python benchmarks/cloudsort.py [scales...]` sorts the **Sort Benchmark record** — a 10-byte
+binary key over a 90-byte payload, the layout GraySort, MinuteSort and CloudSort all define.
+That shape is not in TPC-H or ClickBench and is the extreme of a ratio every large sort has: the
+key is narrow, the payload is wide, and what the sort really costs is moving the payload once.
+Every case is timed with and without the payload so the gather is separated from the ordering,
+at both fixed and variable payload width, over all three binary spellings — and each result is
+compared against DuckDB row for row before either is timed, because a sort's *order* is its
+answer and a multiset comparison cannot see a sort bug.
 
 `just` shortcuts: `bench`, `bench-tpch`, `bench-clickbench`, `bench-tpcds`, `bench-job`,
 `bench-h2o-groupby`, `bench-h2o-join`, `bench-ops`, `bench-scan`, `bench-images`,

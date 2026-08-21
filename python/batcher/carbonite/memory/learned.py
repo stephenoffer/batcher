@@ -212,17 +212,63 @@ class LearnedMemoryModel:
     def predicted_spill_bytes(self, plan_ops: object) -> int:
         """Predicted total out-of-core spill volume for `plan_ops`, or `0` if unlearned.
 
-        For each op with a learned spill-per-row, multiply by that op's estimated input rows
-        (`_est_input_rows`) and sum. `0` when no op's family has a spill history — the caller
-        then keeps its peak-based sizing.
+        For each op with a learned spill-per-row, multiply by that op's estimated **input**
+        rows and sum. `0` when no op's family has a spill history — the caller then keeps its
+        peak-based sizing.
+
+        **Input rows, because that is the basis the coefficient was fitted against.**
+        `_derive_samples` divides a measured `spill_bytes` by `_memory_basis_rows`, which is
+        the operator's input rows (plus a join's build side). This multiplied it back by
+        `est_rows`, which `annotate_ops` stamps with the operator's *output* cardinality —
+        so the two ends of the model disagreed by exactly the operator's selectivity. On the
+        shape that spills most, a high-reduction aggregate, that is orders of magnitude in
+        the under-predicting direction: 1e9 rows folding to 1e3 groups predicted a
+        millionth of the volume it wrote, and spill scratch, bucket counts and the grace
+        recursion were all sized from it. A fan-out join errs the other way.
+
+        An operator's input rows are its children's estimated output rows, which the plan
+        already carries — `PhysicalOp.inputs` names them — so nothing new has to be
+        measured or published. A leaf (a scan, or an op whose inputs are not in this list)
+        falls back to its own estimate, which is what a source's input rows are.
         """
+        ops = list(plan_ops)  # type: ignore[call-overload]
+        by_id = {getattr(op, "op_id", None): op for op in ops}
         total = 0.0
-        for op in plan_ops:  # type: ignore[attr-defined]
+        for op in ops:
             spr = self.spill_bytes_per_row(getattr(op, "kind", ""))
             if spr is None:
                 continue
-            total += spr * self._est_input_rows(op)
+            total += spr * self._est_basis_rows(op, by_id)
         return int(total)
+
+    def est_basis_rows(self, op: object, by_id: dict) -> float:
+        """`_est_basis_rows` as a public read, for a caller walking a plan's operators.
+
+        `memory.estimator` blends each operator separately and needs the same basis this
+        module fits against, so the resolution lives here rather than being restated there.
+        """
+        return self._est_basis_rows(op, by_id)
+
+    def _est_basis_rows(self, op: object, by_id: dict) -> float:
+        """The op's estimated input rows — the basis its per-row coefficients were fitted on.
+
+        Summed over the op's children's estimated output rows, which is exactly what
+        `_memory_basis_rows` measures on the recording side (a join's probe plus its build).
+        Falls back to the op's own estimate for a leaf, for an op whose inputs are not in
+        the list handed over, or when no child could be sized — the pre-existing reading,
+        and the right one for a scan.
+        """
+        rows = 0.0
+        resolved = False
+        for child_id in getattr(op, "inputs", ()) or ():
+            child = by_id.get(child_id)
+            if child is None:
+                continue
+            child_rows = self._est_input_rows(child)
+            if child_rows > 0.0:
+                rows += child_rows
+                resolved = True
+        return rows if resolved else self._est_input_rows(op)
 
     def max_bytes_per_row(self, kinds: Iterable[str] | None = None) -> float | None:
         """The widest measured per-row footprint, or `None` if nothing is learned.
@@ -238,7 +284,13 @@ class LearnedMemoryModel:
         widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
         return max(widths) if widths else None
 
-    def blend_peak(self, kind: str, plan_estimate: int, row_size: float | None = None) -> int:
+    def blend_peak(
+        self,
+        kind: str,
+        plan_estimate: int,
+        row_size: float | None = None,
+        input_rows: float | None = None,
+    ) -> int:
         """Blend a plan's per-operator peak-byte estimate toward the measured reality.
 
         The plan sized the operator at roughly `rows x row_size` bytes; the learned
@@ -260,6 +312,20 @@ class LearnedMemoryModel:
         family was learned, and queries that fit were routed out-of-core. It is the same
         mistake `_est_input_rows` above already documents and avoids, one method apart.
 
+        **`input_rows` is the basis the coefficient was fitted on, and supplying it is what
+        makes the measurement mean what it says.** `bytes_per_row` is bytes per *input* row
+        (`_memory_basis_rows` on the recording side divides by the operator's input rows,
+        plus a join's build side). Recovering a row count from `plan_estimate / row_size`
+        instead recovers the operator's **output** rows, which `annotate_ops` is what sizes
+        the estimate — so the two ends of the model disagreed by exactly the operator's
+        selectivity. That is systematic rather than noisy, and it points the wrong way on
+        the shape that matters: a high-reduction aggregate's measured footprint was rescaled
+        *down* by its reduction ratio, so the more a family folds its input, the more this
+        under-sized it. The clamp bounds the damage, and does not remove it.
+
+        Without `input_rows` the older reading is kept, because it is the only one available
+        to a caller holding an operator with no plan around it.
+
         Args:
             kind: The operator's family name.
             plan_estimate: The peak bytes Kyber sized this operator at.
@@ -267,6 +333,9 @@ class LearnedMemoryModel:
                 (`PlanProperties.row_size`). `None` falls back to `optimizer.row_bytes`,
                 which is right only for a plan that sized with the flat default — a bare
                 test double, or an operator that published no width.
+            input_rows: The operator's estimated input rows, when the caller can resolve
+                them from the plan. `None` recovers a row count from the estimate instead,
+                which reads the output count.
 
         Returns:
             The blended peak in bytes.
@@ -274,6 +343,10 @@ class LearnedMemoryModel:
         bpr = self.bytes_per_row(kind)
         if bpr is None or plan_estimate <= 0:
             return plan_estimate
+        if input_rows is not None and math.isfinite(input_rows) and input_rows > 0.0:
+            measured = bpr * float(input_rows)
+            blended = blend(plan_estimate, measured, self._alpha)
+            return int(clamp_factor(blended, plan_estimate, self._clamp))
         assumed = float(row_size) if row_size is not None and row_size > 0 else self._row_bytes
         if assumed <= 0:
             return plan_estimate

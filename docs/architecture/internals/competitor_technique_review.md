@@ -115,6 +115,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | **Unreachable** — decoded at the FFI boundary, so the dict-native kernels never see a dictionary from Python | Compounds with 2 |
 | 7 | Adaptive morsel sizing as a pluggable strategy | Daft | Fixed 16,384 rows | Small, and mostly a latency story |
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
+| 11 | Compressed materialization — narrow a key to its *measured* range | DuckDB | **Landed for the multi-key sort** (`packed_multi_sort_indices`); **measured and reverted** for the composite group key | 1.5-3.0x on a multi-key `ORDER BY`; 0.86x-1.04x on grouping, so not taken there — see 11 |
 
 **Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
 landed; item 6 was recorded as partially closed and is in fact *inert on the live path*. Three
@@ -1452,6 +1453,1044 @@ concurrency limit, not a per-call one: at ~822 µs and four control calls per mo
 saturates at roughly 300 morsels/s, and the fix for *that* is fewer driver round trips rather
 than faster ones.
 
+## 11. Compressed materialization — narrow a key to its measured range (2026-08-18)
+
+**Source: DuckDB, `src/optimizer/compressed_materialization/`.** DuckDB rewrites a column to
+`value - min` at the smallest integer width its catalog statistics allow, immediately before any
+operator that *materializes* the value: `compress_aggregate.cpp`, `compress_comparison_join.cpp`,
+`compress_distinct.cpp`, `compress_order.cpp`. An `INTEGER` column whose statistics say
+`[1000, 1050]` becomes a `UTINYINT` offset, so the hash table entry, the sort payload and the
+join key all shrink.
+
+Nothing in this document had covered it: a grep of both ledgers for "compressed
+materialization", "zone map", "late materialization" and "radix partition" returned zero before
+this pass.
+
+Batcher can do the same narrowing **better in one respect and worse in another**, and both
+follow from where it would live. DuckDB's is a *planner* rewrite driven by catalog statistics, so
+it reaches only columns a catalog describes and only as well as the statistics are current.
+Batcher's data plane already holds the rows, so a min/max scan measures the range *exactly*, on
+every input, including intermediates no catalog has ever seen — but it must pay for that scan
+every time, where DuckDB's is free at plan time.
+
+That trade decides the result, and it came out differently for the two operators tried.
+
+### 11a. The multi-key sort — **landed, 1.5x to 3.0x**
+
+`ORDER BY <a>, <b>` had no fast path at all. `radix_sort_indices` takes a single column, so every
+multi-key sort fell to the row-encoded comparison sort: an encode of every row into arrow's
+comparable byte format, then `O(n log n)` memcmps over it. `ORDER BY o_orderdate,
+o_shippriority` is about 2,400 and 5 distinct values — fifteen bits, against the ninety-six the
+declared types claim and the twelve-plus bytes the encoder writes.
+
+`radix_sort::packed_multi_sort_indices` measures each key's live range, gives it
+`ceil(log2(range))` bits, and packs the tuple into one `u64` **most-significant key first** — so
+an integer comparison of two packed keys is a left-to-right comparison of their fields, which is
+the definition of lexicographic order. The sort is then the LSD radix that already existed, and
+`lsd_radix` skips a constant byte, so a fifteen-bit key costs two counting passes rather than
+eight.
+
+Measured on 8 M rows, best of three **interleaved** runs (base and candidate alternating, so a
+busy box's drift lands on both arms):
+
+| Shape | Before | After | |
+|---|---|---|---|
+| `ORDER BY <date>, <priority>`, 12,000 distinct pairs | 1,878 ms | 625 ms | **3.00x** |
+| `ORDER BY <int>, <int>`, 3 M distinct pairs | 112 ms | 59 ms | **1.92x** |
+| `ORDER BY <int> DESC, <int>` | 90 ms | 60 ms | **1.48x** |
+| `ORDER BY <int>, <int>, <int>`, narrow | 133 ms | 71 ms | **1.86x** |
+| two full-width `Int64` keys (declines) | 66 ms | 61 ms | 1.10x |
+| `ORDER BY <string>, <int>` (declines) | 199 ms | 200 ms | 1.00x |
+| single `Int64` key (untouched) | 45 ms | 43 ms | 1.05x |
+
+Four things carry the equality with the comparison sort, and all four are pinned by
+`packed_multi_key_tests`, which compares against arrow's own `lexsort_to_indices` with the
+row-index tie-break appended — the path this replaces, sharing no code with it:
+
+* **Direction lives in the key.** Each field holds the order-preserving `u64` the single-key
+  radix already uses, which folds `descending` in by inverting, so a sort may mix directions per
+  key and the packed integer still sorts ascending.
+* **Nulls are encoded inside their field**, not partitioned out, because a multi-key sort's nulls
+  are per column and interleaved. A null takes the field's lowest value under `nulls_first` and
+  its highest otherwise; the field widens by one value only when the column has a null.
+* **A constant column takes zero bits** — it cannot separate two rows, so it costs nothing.
+* **The radix is stable**, so full ties keep input order, which is the tie-break every other path
+  gets from its trailing row-index column.
+
+**Nobody else does this for a sort, and the reason is where each of them puts it.** DuckDB's
+narrowing is a *planner* rewrite off catalog statistics, so it does not reach a table registered
+from Arrow, an intermediate, or a stale-statistics column — the three cases that dominate here.
+Polars encodes multi-key sorts through its row format
+(`polars-core/src/chunked_array/ops/sort/arg_sort_multiple.rs::_get_rows_encoded`), and
+DataFusion hands them to arrow's `lexsort_to_indices`
+(`physical-plan/src/sorts/sort.rs:905`); both are the path this replaces. So this is DuckDB's
+idea moved into the data plane, where the range is a fact about the rows rather than a claim
+about the table.
+
+Two measured lessons are worth more than the ratios, because both were mistakes first:
+
+1. **Decide before materializing.** The first version measured each column's width from a
+   materialized rank array, which made the *decline* the expensive case: two full-width `Int64`
+   keys over 8 M rows built 128 MiB of ranks and then rejected the budget, at **1.41x slower**
+   than not trying. Widths now come from two values — the extreme ranks are the ranks of the
+   extreme values, because the encoding is monotone — so the scan allocates nothing and the
+   ordering rule is still stated once.
+2. **A prefix can reject but never accept.** A range measured over a subset can only widen, so
+   4,096 rows are enough to *prove* a key will not fit, while a prefix that fits proves nothing
+   and the exact scan still runs. That one-sidedness is what makes the guard safe to consult
+   before the real measurement rather than instead of it, and it takes the decline from 0.96x to
+   1.10x.
+
+### 11b. The composite group key — **built, measured, reverted**
+
+The same narrowing applied to `assign_groups`' composite-integer path, whose own notes record a
+probe costing **362.7 ns/row** at 1.7 M groups because verifying a hash hit reads the
+representative row in *every* key column. Packing the tuple into one `u64` and handing it to the
+single-integer grouper — whose table stores the key inline beside the group id — should have
+removed that read outright.
+
+It did not pay, on any shape, and the reason is worth recording so the next reader does not
+rebuild it:
+
+| Shape, 8 M rows | Base | Packed | |
+|---|---|---|---|
+| `GROUP BY <int>, <int>`, 8 M groups | 40.7 ms | 41.2 ms | 0.99x |
+| `GROUP BY <orderkey>, <orderdate>, <shippriority>` (TPC-H q3) | 52.5 ms | 61.0 ms | **0.86x** |
+| `GROUP BY <str>, <str>` via ranked codes | 33.6 ms | 32.2 ms | 1.04x |
+| `GROUP BY <int>, <int>`, 3 M groups | 42.4 ms | 43.2 ms | 0.98x |
+| low-cardinality composite (dense map, untouched) | 12.0 ms | 11.4 ms | 1.05x |
+
+**The premise was wrong: that per-column read is not on the common path.** `eq_rows` runs only
+when a probe *matches* — hashbrown's SIMD tag check dismisses a non-match without ever calling
+it. A high-cardinality group-by is mostly *inserts*, so the read the packing removes barely
+happens; what remains is the pack's own passes, which is why the three-key shape, paying three of
+them, is the worst row in the table. The 362-469 ns/row that motivated this is real, and it is
+a *match*-heavy measurement.
+
+A row floor (skip the packing below 2^17 rows, so the per-morsel partial aggregate keeps the
+existing path) removed the regression at morsel scale and left the whole-relation regroup, where
+the three-key shape still read 0.86x. There is no gate that rescues it, because the shape it
+would need — many matches, a table too large for cache, and wide key columns at once — is not
+one the measurements found.
+
+So: the aggregate/distinct/window grouper keeps its existing dispatch, which is already six
+specialized paths deep and good. **Do not re-derive this.** DuckDB's `compress_aggregate.cpp`
+looks like the same win as its `compress_order.cpp` and is not, because DuckDB's narrowing is
+free at plan time and Batcher's costs a scan — and a scan is only repaid by an operator that
+would otherwise touch the key many times per row. A sort does. A hash insert does not.
+
+### 11c. What the benchmark case found: a temporal key never parallelized at all
+
+Adding a case for the shape 11a optimizes is what made this visible, and it is the larger
+finding of the two. `op-sort-multikey-narrow` (`ORDER BY l_shipdate, l_suppkey` over 6 M
+`lineitem` rows) read **37.13x against DuckDB** — 1,590 ms to DuckDB's 43 — *after* 11a had
+already taken 3x off it.
+
+The cause is one predicate. `sample_sort::parallel_sort_batch` routes its leading key with
+`dt if dt.is_integer()`, and `arrow::datatypes::DataType::is_integer()` is **false for
+`Date32`, `Date64`, `Timestamp`, `Time32/64` and `Duration`**. Every temporal leading key fell
+through to the `_ => return Ok(None)` arm, so `ORDER BY <date>` — one of the commonest sorts an
+analytic query writes — ran **serially, on a 96-core box**, and had done since the sample-sort
+was written.
+
+Measured on 6 M rows, before the fix, which is what a missing parallel path looks like from
+outside:
+
+| Sort | Time |
+|---|---|
+| `ORDER BY <date>`, 2,500 distinct values | 643 ms |
+| `ORDER BY <int64>`, **10,000** distinct values — more work, same shape | 38 ms |
+
+Admitting the integer-ordered temporals to the same `i64` routing (`is_integer_ordered_temporal`)
+is the whole fix. Those types are physically signed integers whose numeric order *is* the type's
+order, in every unit and with or without a time zone — a zone changes the wall-clock rendering,
+never the instant.
+
+**Two types stay out, and the second one nearly shipped as a regression.** `Interval` is not one
+integer at all: `MonthDayNano` is three fields in 128 bits and no `i64` orders it. `Time32` *is*
+one integer, and **arrow will not widen it** — `can_cast_types(Time32(_), Int64)` is false in
+arrow-rs, and arrow C++ refuses `date32 -> int64` too, so this is a gap the two implementations
+already answer differently rather than a hypothetical. The first version of this change admitted
+`Time32`, which would have turned `ORDER BY <a time column>` over 2^17 rows from a working serial
+sort into a **raise** from inside the routing. What caught it was a test asserting that every type
+the predicate admits is one arrow can actually cast — a property no correctness test over *data*
+would have found, because the shape simply never appeared in one. The routing now also declines on
+a failed cast, so the list being wrong costs a missed optimization and never an error.
+
+End to end, on the committed benchmark case, against DuckDB on its native store:
+
+| Case | Before | After | vs DuckDB before | vs DuckDB after |
+|---|---|---|---|---|
+| `op-sort-multikey-narrow` | 1,590.4 ms | **52.1 ms** (30.5x) | 37.13x | **1.28x** |
+| `op-sort-multikey-wide` (both paths decline) | 68.6 ms | 71.6 ms | 0.97x | 1.17x |
+
+The two fixes compound and neither subsumes the other: on 6 M rows the date sort goes
+643 -> 50 ms from parallelism alone (12.9x), and the two-key sort 1,827 -> 58 ms (31.6x) from
+parallelism plus the packed key. The `-wide` row moved inside the box's noise band — DuckDB's own
+time on it swung 70.8 -> 61.1 ms across the same two runs — and is the decline path, which does
+no work either version did not.
+
+**The lesson is the one this document keeps relearning.** The gap was not subtle, it was 37x,
+and it survived because no benchmark case sorted on more than one fixed-width key. Item 9 records
+the same thing about string sorts. A shape with no case is a shape with no floor.
+
+One thing worth recording because it is the opposite of what you would guess: **the
+*distributed* sort had temporal keys all along.** `dist/executor.py::_range_partitionable_sort_key`
+admits `pa.types.is_temporal` explicitly and routes it through the order-preserving integer
+backing. So the single-node parallel path was the outlier, and the two had disagreed on which
+sorts parallelize for as long as both existed — a query that scaled out on a date key ran serially
+on one node.
+
+One thing this pass nearly recorded and should not have: that `lowcard::rank_part_of` — the
+rank routing that rescues a sort on a *seven-value* key — being string-only leaves a gap for
+low-cardinality integer and date keys. **The first measurement said so and was confounded**: it
+sorted a five-column table, so what it actually compared was the cost of gathering a string
+column. Repeated with the same payload on both sides, `ORDER BY <a seven-value Int64>` is
+**37.6 ms** against **51.6 ms** for the string equivalent *with* rank routing — so the plain
+boundary path integers already take is the faster of the two, and generalizing the rank path to
+them has no evidence behind it. What the clean measurement did surface is a different anomaly,
+recorded as backlog item 14.
+
+## 12. The six-engine operator census, 2026-08-18
+
+Item 10 read the competitors' operator *inventories* once. This pass repeats it against every
+engine at once and, unlike that one, **checks each answer with a measurement rather than a grep**
+— which is what changed three of the conclusions below, in both directions.
+
+The sources are the physical-operator directories, which is where an engine's real vocabulary
+lives: `duckdb/src/execution/operator/{aggregate,join,order,projection,scan,set}`,
+`datafusion/datafusion/physical-plan/src`, `polars/crates/polars-stream/src/nodes`,
+`spark/sql/core/.../execution`, `Daft/src/daft-local-execution/src/{intermediate_ops,sinks}`,
+`arrow/cpp/src/arrow/acero`, and the installed `ray/data/_internal/execution/operators`.
+
+### What the inventory found
+
+**Almost nothing is missing.** Batcher's `Dataset` carries 177 public methods and its IR 18
+`RelOp` variants; every operator named by DuckDB, Polars, DataFusion, Spark, Daft, Acero and Ray
+Data has an equivalent, with four exceptions, all small:
+
+| Present elsewhere, absent here | Source | Verdict |
+|---|---|---|
+| `positional_join` (join two relations by row position) | DuckDB `physical_positional_join.cpp` | Expressible as `with_row_index` + an equi-join. Not worth an operator. |
+| `merge_sorted` (merge two already-sorted inputs) | Polars `merge_sorted.rs`, Acero `sorted_merge_node.cc` | **Measured and ruled out** — the shape it serves is already 5.3x faster here than in DuckDB. See 12b. |
+| positional `zip` of two relations | Ray Data `zip_operator.py`, Polars `zip.rs` | Same as `positional_join`. |
+| `cte_inlining`, `unnest_rewriter` | DuckDB optimizer | Parser-level; `_sql` already inlines non-recursive CTEs by substitution. |
+
+Polars' streaming node list is the one worth reading in full, because it is the longest and the
+most specialized (`forward_fill`, `backward_fill`, `interpolate`, `ewm`, `cum_agg`, `rle`,
+`rle_id`, `shift`, `peak_minmax`, `rolling_group_by`, `dynamic_group_by`, `is_first_distinct`,
+`sorted_unique`, `sorted_group_by`, `top_k`, `gather_every`, `with_row_index`). **Batcher has
+every one of them**, mostly as window functions rather than as nodes.
+
+DuckDB's `src/optimizer/` is the same exercise for plan-level work, and it is the better
+checklist because it is a flat list of 38 named passes. Kyber has an equivalent for all but two
+(the two named above), including the ones that are easy to assume are missing:
+`join_elimination`, `outer_join_simplification`, `partial_aggregate_pushdown`
+(`kyber/rules/agg_pushdown.py::eager_aggregation`), `remove_duplicate_groups`,
+`common_aggregate_optimizer`, `regex_range_filter`, `in_clause_rewriter`, `sampling_pushdown`,
+`topn_window_elimination`, `window_self_join`, `limit_pushdown`, `build_probe_side_optimizer`.
+
+### Three conclusions the measurements reversed
+
+The inventory is not the interesting part. These are, and each one is a case where reading the
+code gave the wrong answer:
+
+1. **`late_materialization` looked like a real gap and is not.** DuckDB has a whole optimizer
+   pass for it and a grep of Batcher for the term returns zero. Measured on 4 M rows x 31
+   columns, `SELECT * ORDER BY k LIMIT 10` costs **12.4 ms** against **8.0 ms** for
+   `SELECT k ORDER BY k LIMIT 10` — thirty extra columns for 4.4 ms, which is not a payload
+   being carried through a sort. The top-N path already ranks on the key and gathers `k` rows at
+   the end. (DuckDB is 7.5 ms and 3.1 ms: faster in absolute terms, by the fixed per-query
+   margin ceiling 8 records, and with the *same* scaling in column count.) Polars is 95.9 ms.
+
+2. **The window `rank_limit` looked like an asymptotic gap and Batcher wins it anyway.**
+   `qualify_to_partition_topn` fuses `rank <= k` into `Window.rank_limit`, but that bound is a
+   post-hoc mask: `window_batch_with` computes the full ranking for every row — sorting every
+   partition — and `filter_by_rank_limit` then drops the rest. Only `k = 1` escapes, via
+   `rank1_window_to_distinct_on`. Spark built a whole operator to avoid exactly this
+   (`WindowGroupLimitExec`), and Daft has `window_partition_and_dynamic_frame`. So the
+   expectation was a loss. Measured over 6 M rows in 200,000 partitions:
+
+   | top-k per group | Batcher | DuckDB | Polars |
+   |---|---|---|---|
+   | k = 1 | **33.2 ms** | 666.0 ms | 333.6 ms |
+   | k = 3 | **93.2 ms** | 1,252.9 ms | 306.5 ms |
+   | k = 10 | **131.5 ms** | 1,384.5 ms | 322.6 ms |
+
+   Batcher leads by 10-20x over DuckDB and 2.5-10x over Polars. The `k = 1` row is 2.8x faster
+   than `k = 3` on the same data, which is the `DISTINCT ON` rewrite showing through — so a
+   bounded-heap window would still be worth roughly 2x for `k > 1`. That is an *improvement to a
+   win*, not a gap, and it should be ranked as one.
+
+3. **The H2O `groupby` losses are not an aggregate-kernel gap.** Six of ten queries lose, and the
+   shape of the table invites the conclusion that some aggregate is slow — `q4` (three `avg`s)
+   reads **1.98x** while `q5` (three `sum`s, same shape) **wins at 0.65x**. Isolated on 10 M rows
+   with the aggregate as the only variable:
+
+   | | `sum` x3 | `avg` x3 | `avg` | `sum` | `max`-`min` |
+   |---|---|---|---|---|---|
+   | 100 groups | 1.02x | 1.72x | 1.63x | 1.11x | 0.80x |
+   | 1 M groups | **0.35x** | **0.44x** | **0.41x** | **0.34x** | **0.39x** |
+
+   At a million groups Batcher wins every aggregate by 2.3-3x. At a hundred groups the whole
+   query is 7-11 ms and the gap is a 3-5 ms *constant* — the per-query fixed cost ceiling 8
+   already measures, arriving on a query too fast to hide it. No aggregate function is slow.
+   What is left of the H2O row is what the scorecard already says it is: **string keys**, which is
+   ceiling #2 and the largest open item in the repository.
+
+### 12c. What the census pass verified, across the four execution scopes
+
+Both optimizations this pass landed (item 11a's packed sort key, item 12's `eager_aggregation`
+gate) reach every executor by construction rather than by a per-scope implementation, which is
+what the mergeable/one-`Expr` design buys — but "by construction" is the claim that has been
+wrong here before, so it was checked:
+
+| Scope | How it is reached | Evidence |
+|---|---|---|
+| Batch, single-node serial | `sort_indices_of` is the oracle every path is compared against; Kyber rules are plan-level | 374 Rust tests; 18,819 unit tests |
+| Batch, single-node parallel | the sample-sort's per-range sorts and `window_with`'s per-bucket kernel call the same entry points | seq == par oracle tests |
+| Out-of-core | the external sort calls `sort_indices_of` per run | spill tests in the Rust suite |
+| Streaming | `stream/breaker.rs` and `stream/parallel.rs` both dispatch to `ops::parallel_sort_batch`/`sort_batch`; a Kyber rewrite is upstream of every executor | **32/32** across `test_stream_batch_parity`, `test_streaming_executor`, `test_streaming_rule_parity`, `test_streaming_pushdown_parity`, `test_diff_streaming_aggregate`, `test_diff_stream_interval_join` |
+| Distributed | per-partition sorts and the same plans | `test_distributed_aggregate_over_join_grouped_by_non_key` **2 passed on a fresh Ray cluster**; the sort files pass individually |
+
+`test_stream_batch_parity` is the one that matters most for the mandate's "batch and streaming"
+clause: it asserts the two paths agree, so a rewrite that changed one and not the other would
+fail there rather than in production.
+
+Two failures seen along the way were run to ground rather than attributed. `test_diff_agg_arg_extreme`'s
+distributed case fails against the **shared** Ray cluster and passes in 14 s against a fresh one
+(`RAY_ADDRESS=local`) — the stale-`.so` mode `concurrent-agents.md` documents.
+`test_distributed_multi_table_join_matches_single_node[flight]` times out identically on
+unmodified `HEAD` (`exit=124` on both sides, one dot each), so it is pre-existing.
+
+### 12e. The census re-verified in the *other* direction, by calling
+
+Item 12d's lesson cuts both ways and the second half had not been done. Five false *gaps* were
+found and corrected in this pass, all from asking whether a name exists. The claim that carried
+the most weight in item 12 — "Polars' streaming node list is the longest and most specialized of
+the six, and **Batcher has every one of them**" — rested on exactly the discredited method: a
+grep of the codebase, not a query.
+
+So each was called. The result confirms the claim, and the *way* it nearly did not is the
+interesting part: on the first attempt five of thirteen looked missing, and every one of those
+five was the probe's fault.
+
+| Node | Verdict |
+|---|---|
+| `forward_fill`, `backward_fill`, `interpolate`, `ewm_mean`, `rle_id` | **present** — they take their ordering from `.over(order_by=...)`, not an `order_by=` kwarg. Called wrongly, all five raise, and the raise reads like an absence |
+| `is_first_distinct` | **present** — needs `order_by`; a bare call is an arity error, the 2.4x overstatement mode this document already names |
+| rolling aggregates | **present** — `.over(order_by=…, frame=(-1, 0))`; the frame is `frame=`, not `rows=` |
+| `shift`, `peak_max`, `gather_every`, `with_row_index`, session/dynamic windows, `top_k` | **present**, called directly |
+| `rle` as a struct | **deliberate refusal**, and the error names the composition: number the runs with `rle_id().over(order_by=…)` and group by that |
+
+**A raise is not an absence.** Three distinct failure modes have now produced false gaps here — a
+bare-name diff, an arity error, and a competitor's spelling for a capability that exists under
+Batcher's own name (12d, where the error message printed the answer and it was read past). The
+only probe that has never lied is a query that returns rows.
+
+That list of survivors was itself checked, and shrank again:
+
+* **`list.argsort` — false gap number six.** Batcher spells it `list.arg_sort`, with the
+  underscore, consistent with `arg_min`/`arg_max` beside it; `bt.col("l").list.arg_sort()`
+  returns `[[1, 2, 0]]`. Polars' `argsort` and DuckDB's `list_grade_up` were the names checked.
+  Same mode as 12d, for the sixth time.
+* **`equi_width_bins`** — `Expr.cut(breaks)` does the binning with Polars/pandas semantics
+  (`['(-inf, 3]', '(3, 7]', '(7, inf]']`). DuckDB's function computes *boundaries* the user then
+  bins with, so this is a convenience over `cut`, not a capability.
+* **`list.resize`** — genuinely absent; `list.slice` covers truncation but not padding. Minor.
+* **A bounded-memory mode for the exact `top_k`** (12d) — the one substantive item.
+
+**Six false gaps in one pass, every one from checking a competitor's spelling instead of calling
+the capability.** The names that misled were `implode`, `list.index_of`, `min_by`/`max_by`,
+`approx_top_k`, the `.over(order_by=…)` fill family, and `argsort`. That is the finding: the
+distance between these engines and Batcher is mostly *vocabulary*, and any future pass should
+budget for the probe being wrong far more often than the engine is.
+
+### 12d. `approx_top_k` was already built — the fifth false gap, and the worst one
+
+**This entry previously specified `approx_top_k` as "the one adoption left" and ranked it 0 in
+the backlog, with a nine-point implementation plan. It is already built, and has been.** The
+plan was written, committed, and would have sent the next reader to build a duplicate aggregate
+across the wire contract. That is the failure this document has now recorded against itself four
+times, and this is the most expensive instance because the work had already been *specified* on
+top of the false premise.
+
+What exists at `HEAD`, end to end:
+
+* `bc_ir::AggFunc::ApproxTopK` with its serde tag, and `bc_runtime::agg::AggFunc::ApproxTopK(u16)`
+  carrying `k` — `finalize.rs` dispatches it to `finalize_top_k`;
+* `Expr.top_k(k)` in `plan/expr_ir/core.py`, lowering to `AggExpr("approx_top_k", param=k)`, with
+  a Google-style docstring and a runnable doctest;
+* DuckDB's own spelling wired in the SQL parser
+  (`_sql/parser/expressions/aggregates.py`: `"approx_top_k": lambda x, p: x.top_k(int(p))`);
+* the metadata-answer path (`api/dataset/meta/approx.py`) and a Kyber shortcut
+  (`kyber/shortcuts/approx.py`).
+
+Called rather than grepped, which is the whole lesson:
+`SELECT g, approx_top_k(v, 2) FROM ds GROUP BY g` returns `{'g': ['a','b'], 't': [['x','y'],
+['p','q']]}`.
+
+**How the probe failed this time is worth recording, because it is a new mode.** The earlier false
+gaps came from bare-name diffs. This one survived a diff *and* a call: `hasattr(Expr, "approx_top_k")`
+is `False`, and the attribute error even printed the answer — *"Did you mean 'top_k'?"* — which
+was read past. Batcher's spelling is `top_k`; `approx_top_k` is the DuckDB name it answers to in
+SQL. **Calling the competitor's name is not calling the capability**; the check has to be "does
+this query work", not "does this attribute exist".
+
+**The one real residue, and it is much smaller than the entry it replaces.** Batcher's is
+deliberately *exact*: the docstring says so, and the reasoning is sound — the aggregate already
+holds every value of the group in `median_state`, so a sketch could only lose accuracy for no
+saving. Ties break to the smaller value, which is what keeps it mergeable and partition-order
+independent.
+
+That leaves exactly one thing a Misra-Gries state would buy that the current one does not:
+**bounded memory under skew.** Exact top-k keeps every value of every group, so one hot group can
+OOM — the same argument `hll.rs` makes for `approx_count_distinct` against exact
+`COUNT(DISTINCT)`. `bc_sketches::FrequentItems` is `Mergeable` but has no `to_bytes`/`from_bytes`,
+which `hll.rs`'s state-in-a-`Binary`-column pattern needs. So the open item is not "add the
+aggregate", it is "give the existing aggregate a bounded-memory mode for the skewed case" — a
+smaller, differently-shaped piece of work, and one that must not cost the exact path its accuracy.
+
+### 12b. `merge_sorted` is a capability gap that is not a gap
+
+The inventory table lists `merge_sorted` as one of four operators the competitors have and
+Batcher does not, on the reasonable ground that the k-way merge exists inside the external sort
+and is not reachable as a verb. Polars ships it as a streaming node and Acero as
+`sorted_merge_node.cc`, so it looked like a clean technique to adopt — and it has the property
+this document keeps asking for, being naturally streaming, batch, single-node and distributed at
+once.
+
+**Measure the shape before adding the operator.** Merging two 4 M-row sorted relations on an
+`int64` key, which is exactly what the operator is for:
+
+| | time |
+|---|---|
+| Batcher, `a.union(b).sort("k")` | **33.5 ms** |
+| DuckDB, `(a UNION ALL b) ORDER BY k` | 177.6 ms |
+| NumPy, stable sort of the concatenated key arrays alone | 100.1 ms |
+| Batcher, the same 8 M rows *unsorted* (what a general sort costs) | 248.9 ms |
+
+Batcher is **5.3x faster than DuckDB** on the shape, and faster than a hand-written NumPy sort of
+just the keys. The last row is the one that settles it: the same 8 M rows unsorted cost 248.9 ms,
+so the pre-sorted concatenation is already running **7.4x cheaper than a general sort**. The
+engine is *already* exploiting the sortedness — `radix_sort`'s `is_ordered` check, its skipping of
+constant key bytes, and the sample-sort's ranges arriving pre-ordered — without being told about
+it and without a dedicated operator.
+
+So the verb would add public API surface, a `RelOp`, a wire-contract change and four executor
+paths, to make a shape faster that is already the fastest of the three engines measured. That is
+the speculative generality `maintainability.md` forbids, and the inventory row is corrected rather
+than acted on.
+
+Worth separating two things the row conflated. Batcher genuinely cannot *spell* `merge_sorted`,
+and a user porting a Polars script has to write `union(...).sort(...)` instead — a one-line
+translation that belongs in the migration guide, not in the engine. What it cannot do is
+**assert** the inputs are sorted and skip the verification; that is the only real difference, it
+is worth a linear scan, and nothing measured suggests the scan is what costs.
+
+### 12a. Spark's `WindowGroupLimitExec` — **landed**, after being reverted once
+
+`Window.rank_limit` was a post-hoc mask over a fully ordered partition: Kyber folded
+`rank <= k` into it, and `window_batch_with` then ranked every row — ordering every partition —
+before `filter_by_rank_limit` threw all but `k` away. Only `k = 1` escaped, by the `DISTINCT ON`
+rewrite. Spark built `WindowGroupLimitExec` and Daft `window_partition_and_dynamic_frame` to
+avoid exactly that.
+
+`bc_runtime::window::topk` is Batcher's: one flat `groups x k` max-heap array with no
+per-partition allocation, ordering on `(packed order key, row index)` so the `k` rows kept are
+the `k` smallest under the *same* total order the ordering path produces.
+
+**It was built, measured 2-4x slower, and reverted — and the reason it lost is the reason it now
+wins.** The first version hooked the selection above `window_with`, over the whole batch, which
+traded the operator's bucketed parallelism for the better complexity: `O(n log k)` on one core
+against `O(n log n)` on ninety-six, at 0.24-0.50x. `rank_limit` is now threaded through
+`window_with` -> `window_parallel` -> `window_serial`, so the selection runs *inside* the
+per-bucket kernel and each worker heaps only the partitions it owns.
+
+The plumbing is also why the first attempt was abandoned rather than fixed, and that call was
+wrong. It was costed against putting `rank_limit` on `WindowCall` — **49 construction sites, 47
+in tests** — without costing the alternative. Threading it through three signatures is **16 call
+sites**, most of them a literal `None` in a test. A rejected design was priced and the cheaper one
+next to it was not.
+
+Measured on 6 M rows, interleaved best-of-three:
+
+| Partitions | `k` | Ordering | Bounded | |
+|---|---|---|---|---|
+| 100 x 60,000 rows | 10 | 63.2 ms | 45.1 ms | **1.40x** |
+| 100 x 60,000 rows | 3 | 60.8 ms | 45.2 ms | **1.35x** |
+| 2,000 x 3,000 rows | 10 | 58.0 ms | 44.4 ms | **1.31x** |
+| 2,000 x 3,000 rows | 3 | 56.7 ms | 45.3 ms | **1.25x** |
+| 50,000 x 120 rows | 3 | 65.6 ms | 52.5 ms | **1.25x** |
+| 200,000 x 30 rows | 3 | 91.9 ms | 75.2 ms | **1.22x** |
+| 1,000,000 x 6 rows | 2 | 116.7 ms | 98.4 ms | **1.19x** |
+| `k = 1` (takes `DISTINCT ON`, untouched) | 1 | 26.8 ms | 27.6 ms | 0.97x |
+| `rank()` instead of `row_number` (declines) | 3 | 101.5 ms | 97.4 ms | 1.04x |
+
+The win grows with partition size, which is what `O(n log k)` against `O(n log n)` predicts, and
+the two control rows are flat — `k = 1` goes down Kyber's `DISTINCT ON` route and never reaches
+this path, and a declining shape falls through to the ordering path unchanged.
+
+Seven tests pin the equivalence **through the real operator at both thresholds**, so the bucketed
+parallel path is exercised rather than only the serial kernel: every `k`, both directions,
+tie-heavy input (where the row-index tie-break is the thing that can silently disagree), a string
+partition key, an unpartitioned window, a declining shape, and the property that a non-survivor
+can never pass a `rank <= k` mask — it is marked `k + 1`, because a zero or a null would pass and
+silently keep every row of every partition.
+
+One subtlety the tests caught rather than the author: a *declining* shape returns the ordering
+path's **unmasked** ranks from `window_serial`, since the mask lives in `bc_interp`. Comparing a
+masked bounded result against an unmasked ordering one fails on a shape where nothing is wrong.
+The comparison masks both sides, which is also the operator's real contract — the rows kept and
+their ranks must agree, not the intermediate column.
+
+Keep it in proportion: Batcher already led this shape by 10-20x over DuckDB and 2.5-10x over
+Polars, so this makes a win larger rather than closing a gap.
+
+### The measured census: 96 queries, four suites, ranked by what they actually cost
+
+The inventory says almost nothing is missing, so the bottlenecks have to be found by
+measurement. Every suite that runs in reasonable time was run on one 96-core node against
+DuckDB's **native store** (the harder of the two bars) with a two-engine lineup: H2O `groupby`
+(10), H2O `join` (5), ClickBench (43) and TPC-H sf1 (22).
+
+**Batcher wins 66 of the 80 queries** where a ratio is meaningful. What follows is the other
+fourteen, and the ordering is the point.
+
+**Rank by ratio and you optimize the wrong thing.** The three worst ratios in the whole census
+are `cb-q19` (2.64x), `h2o-gb-q2` (1.98x) and `h2o-gb-q4` (1.98x) — worth **1.2 ms, 18.3 ms and
+4.0 ms**. Ranked by the time actually lost:
+
+| Query | Batcher | DuckDB | Ratio | **Lost** | Shape |
+|---|---|---|---|---|---|
+| `h2o-join-q5` | 378.5 ms | 271.8 ms | 1.39x | **+106.7 ms** | `x JOIN big USING (id3)`, 1e7 x 1e7, `SELECT x.*` + 5 cols |
+| `h2o-join-q4` | 214.7 ms | 114.9 ms | 1.87x | **+99.8 ms** | `x JOIN medium USING (id5)`, `SELECT x.*` + 4 cols |
+| `h2o-gb-q8` | 115.0 ms | 69.2 ms | 1.66x | +45.8 ms | `row_number() OVER (PARTITION BY id6 ORDER BY v3 DESC) <= 2` |
+| `h2o-gb-q7` | 75.2 ms | 42.1 ms | 1.79x | +33.1 ms | `max(v1)-min(v2) GROUP BY id3` (string key) |
+| `h2o-gb-q3` | 72.5 ms | 45.5 ms | 1.59x | +27.0 ms | `sum,avg GROUP BY id3` (string key) |
+| `h2o-gb-q2` | 37.1 ms | 18.8 ms | 1.98x | +18.3 ms | `GROUP BY id1, id2` (two string keys) |
+| `h2o-gb-q9` | 40.4 ms | 27.4 ms | 1.47x | +13.0 ms | `corr GROUP BY id2, id3` (string keys) |
+| `cb-q32` | 31.1 ms | 21.9 ms | 1.42x | +9.2 ms | `GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10` |
+| `tpch-q13` | 47.4 ms | 41.1 ms | 1.15x | +6.3 ms | customer-order count distribution |
+| `h2o-gb-q4` | 8.1 ms | 4.1 ms | 1.98x | +4.0 ms | `avg x3 GROUP BY id4` (100 groups) |
+| `tpch-q5` | 31.2 ms | 27.3 ms | 1.15x | +3.9 ms | six-way join |
+| `tpch-q6` | 6.3 ms | 4.5 ms | 1.38x | +1.8 ms | filter + `sum` over `lineitem` |
+| `cb-q25` | 3.4 ms | 2.2 ms | 1.50x | +1.2 ms | `ORDER BY <string> LIMIT 10` |
+| `cb-q19` | 2.0 ms | 0.8 ms | 2.64x | +1.2 ms | `WHERE UserID = <literal>` |
+
+Read that way the census says something the per-suite geomeans do not: **two H2O join queries are
+the largest single-node losses in the repository, at about 100 ms each, and together they cost
+more than the other twelve rows combined.**
+
+#### The q2/q4 pair, instrumented — and it is not the join
+
+`h2o-join-q2` (`x JOIN medium USING (id2)`) is a **win** at 0.74x while `h2o-join-q4`
+(`x JOIN medium USING (id5)`) is a 1.87x loss, on the same two tables with nearly the same
+projection. The pair is a free controlled experiment, so it was run: separate the *join* from
+the *materialization* by asking each query for a `count` as well as for its rows. The H2O join
+schema matters here — `id1`, `id2`, `id3` are `int32` and `id4`, `id5`, `id6` are `string`.
+
+| | count only | `SELECT x.*` | materialization | DuckDB count |
+|---|---|---|---|---|
+| `x JOIN medium USING (id2)` — int32 key | 22.0 ms | 93.8 ms | **+71.8 ms** | 3.6 ms |
+| `x JOIN medium USING (id5)` — string key | 32.3 ms | 195.4 ms | **+163.1 ms** | 10.6 ms |
+| `x JOIN big USING (id3)` — int32, 1e7 x 1e7 | 78.1 ms | 390.5 ms | **+312.4 ms** | 100.0 ms |
+
+Two things fall out, and the first is the largest single finding in this census.
+
+**1. Three quarters of these queries is the output gather, not the join.** Materialization is
+77%, 83% and 80% of the three totals. On the big-by-big join Batcher's *join* is **faster than
+DuckDB's** (78.1 ms against 100.0 ms) and the query still loses by 107 ms, because 312 ms of it
+is gathering nine million rows of a wide, string-bearing result through join indices. This is the
+same ~2.5 GB/s permuted read backlog entry 13 measures on the sort, arriving through a different
+operator — and it unifies three separate rows of the table above (`h2o-join-q4`, `h2o-join-q5`,
+`cb-q32`) with the sort finding under **one root cause**. Together those are worth more than
+every other row of the census combined, which makes **selection vectors / deferred payload
+materialization** (RFC proposal 2) the highest-value structural item on the board by a wide
+margin, ahead of the string-key work it was previously ranked behind.
+
+**2. The small-build-side row was measuring the optimizer, not the join — corrected.** The first
+draft of this entry read the 22.0 ms against DuckDB's 3.6 ms as a join-kernel gap and proposed
+building DuckDB's `perfect_hash_join_executor.cpp`. Both halves were wrong, and the correction is
+the more interesting finding.
+
+`crates/bc-runtime/src/join/dense.rs` **is** that executor — "a perfect hash for a small-range
+integer build key", the join-side counterpart of the dense direct map `agg::group::assign` uses.
+It was there the whole time, so the premise was false; a grep would have settled it and the
+measurement was trusted instead.
+
+And the 22.0 ms was not the join. Varying only *which column the aggregate reads*, on the same
+join:
+
+| `SELECT count(...) FROM x JOIN medium USING (id2)` | | |
+|---|---|---|
+| `count(v2)` — a right-side column, so nothing can be pushed | **8.9 ms** | plain join |
+| `count(id2)` — the join key, so `eager_aggregation` pushes | 21.1 ms | **2.4x slower** |
+| `count(v1)` — a left-side column, likewise | 23.2 ms | **2.6x slower** |
+
+`kyber/rules/agg_pushdown.py::eager_aggregation` pre-aggregates a join side to shrink its input,
+gated on `_MIN_PREAGG_REDUCTION = 8.0` — a **row-reduction ratio**. Here the ratio is ~1000x
+(10 M rows to 10,000 groups) so it fires with room to spare, and it is 2.4-2.6x slower than not
+firing.
+
+The gate is measuring the right quantity and comparing it against nothing. A 1000x reduction
+still costs a **full 10 M-row hash aggregate**, and what it buys back is a *broadcast probe
+against a 10,000-row build side*, which is almost free. No reduction ratio, however large, can
+justify the push when the join it replaces costs nothing — the missing term is what the join
+would have cost. The rule's own comment anticipates the shape of this ("the cost model cannot
+catch it — so the guard lives here, on the reduction the rewrite must actually achieve") and then
+picks the one quantity that cannot distinguish a saved shuffle from a saved broadcast.
+
+**What remains true about the join after the correction is much smaller**: `sum(v2)` over the
+same join is 8.8-13.3 ms against DuckDB's 4.7 ms. A ~2x on a small-build broadcast, not a 6x, and
+not the kernel.
+
+**Do not read finding 1 as "the join is slow".** It is not; it is the materialization, and the
+same materialization is behind the sort rows, the `cb-q32` row, and `op-filter-project`'s
+sequential-write cousin. Optimizing the join kernels would move none of it.
+
+Everything below the join rows falls into three buckets already named elsewhere, which is a
+useful result in itself — the census found **no new engine-level gap**:
+
+* **String group keys** (`q2`, `q3`, `q7`, `q9`, +91.4 ms together) — ceiling #2, the largest
+  open item, and the reason the H2O `groupby` geomean is above 1.
+* **Permuted materialization** (`h2o-join-q4/q5`, `cb-q32`) — item 11's backlog entry 13.
+* **Per-query fixed cost** (`h2o-gb-q4`, `cb-q19`, `cb-q07`, `tpch-q6`) — ceiling 8's warm gap.
+  These produce the largest *ratios* and the smallest *losses*, because a 1-4 ms constant is
+  most of a 2-8 ms query. `cb-q00` is 0.1 ms against DuckDB's 0.8 ms on the same dataset, so the
+  constant is not uniform and not a floor; it is work proportional to the plan, not the data.
+
+## 13. The state `mode` and `top_k` were carrying — **landed, 31x and 287x** (2026-08-18)
+
+Found by measuring the aggregate 12d had just finished proving already existed. `approx_top_k`
+was built, correct, wired end to end — and 22.9x *slower* than DuckDB on the shape it is for,
+holding 854 MB to return three values. Being present is not the same as being good, and this
+document had spent four entries checking presence.
+
+The cause was a shared state, not an algorithm. `mode` and `top_k` were listed alongside
+`entropy`, `mad` and `quantile_disc` as "the value-list family: they read a group's whole value
+list, so they share `Median`'s state and differ only in `finalize`". True of the other three.
+False of these two, which never read the list -- they only ever ask how *often* each value
+occurs. So the partial retained every value of every group and the counting happened at
+finalize, over ten million rows, to return three.
+
+The fix is `bc-runtime`'s `agg::counted`: per group, the distinct values and their counts, as
+two parallel `List` state columns. `O(distinct)` instead of `O(rows)`, still exact, and still
+mergeable because counts add -- so `combine` re-groups the pairs and sums, and the parallel,
+spilling and distributed paths inherit it with no second implementation. No IR or wire change:
+same `AggFunc`, same tags, only the state behind them.
+
+10M rows, one group, 50 distinct values, both builds `--release`, best of 3, all three engines
+agreeing on the answer:
+
+| | time | peak RSS |
+|---|---|---|
+| `top_k(3)` before | 547.6 ms | +687 MB |
+| **`top_k(3)` after** | **17.5 ms** | **+224 MB** |
+| DuckDB `approx_top_k(v, 3)` | 705.3 ms | — |
+| `mode()` before | 3,988.3 ms | +20 MB |
+| **`mode()` after** | **13.9 ms** | **+4 MB** |
+| DuckDB `mode(v)` | 109.4 ms | — |
+
+**31x and 287x** against the previous state; 40x and 7.9x against DuckDB. Peak RSS falls 3.1x
+rather than to nothing because `partial` still row-encodes the batch it is handed: the state is
+`O(distinct)`, the transient encoding is still `O(batch rows)`.
+
+Two divergences from DuckDB surfaced while testing, both **pre-existing** and both verified
+identical on a build without this change, so neither is a regression this introduced:
+
+* `mode` over NaN. Batcher folds every NaN into one value and answers `nan`; DuckDB answers
+  `2.5` on `[nan, nan, nan, 2.5, 2.5]` -- while its *own* `GROUP BY` on that column reports
+  `(nan, 3), (2.5, 2)`. DuckDB contradicts itself here; Batcher agrees with its own grouping,
+  which is the property worth keeping. Pinned in `test_diff_agg_counted_state.py` including
+  DuckDB's contradicting answer, so the test fails loudly if DuckDB ever fixes it.
+* `top_k` over an all-null group yields `[]` where DuckDB yields NULL. Recorded, not hidden.
+
+**The lesson for this document.** Entries 12d, 12e and 10n each ended "already built, do not
+re-implement", and that conclusion was right every time. It was also incomplete: none of them
+asked whether the thing that existed was any good. A census that checks presence finds false
+gaps and stops; the one bottleneck worth 287x was inside a feature already marked done. Measure
+the capabilities you rule out, not just the ones you rule in.
+
+## 14. Item 0a re-measured, and it is the wrong lever — the gap is the string *representation* (2026-08-18)
+
+Entry 13 ended with "measure the capabilities you rule out, not just the ones you rule in."
+Applying that to this document's own top item retires it.
+
+**0a said**: deferred payload materialization (selection vectors) is the highest-value
+structural item, worth 77-83% of the two largest single-node losses (`h2o-join-q4/q5`), more
+than the other thirteen census rows combined. Re-measured at `HEAD` on the same shapes and the
+same bar the census used (DuckDB's **native store**, 1e7 x 1e7, best of 3):
+
+| | batcher | duckdb | ratio |
+|---|---|---|---|
+| `x JOIN big USING (id3)`, full projection | 369.6 ms | 204.8 ms | 1.80x |
+| ...`count(*)` only, so the join without the gather | 87.9 ms | 98.5 ms | **0.89x** |
+| `x JOIN medium USING (id5)`, full projection | 231.7 ms | 74.2 ms | 3.12x |
+| ...`count(*)` only | 101.3 ms | 23.4 ms | **4.34x** |
+
+The census's structural claim survives on q5 and only q5: the join beats DuckDB, the query
+loses by 165 ms, and 76% of Batcher's time is the gather. **But three measurements say the
+proposed fix cannot collect it.**
+
+**1. Deferring cannot help a query that returns every row.** `SELECT x.*, ...` over an inner
+join emits all nine million rows. A selection vector defers materialization; it does not remove
+it. It pays where a *downstream* operator discards rows — `cb-q32`'s `LIMIT 10`, a sort's
+top-k — and those shapes are worth single-digit milliseconds each in the census. The two rows
+that made 0a the top item are exactly the two it cannot help.
+
+**2. The gather kernel is already 15x faster than arrow's.** Gathering the ten output columns
+of q5: `bc_runtime::gather` ~282 ms against `pyarrow.compute.take` at 4,254 ms on the identical
+indices. There is no ordinary optimization left in it.
+
+**3. The gap is concentrated in strings, and by a factor.** Same join, **same number of output
+columns**, varying only their type — so nothing is subtracted and no assumption about what
+`count(*)` skips is needed:
+
+| 3 output columns | batcher | duckdb | ratio |
+|---|---|---|---|
+| numeric (`int32`) | 105.8 ms | 101.1 ms | 1.05x |
+| **string** | **260.3 ms** | **145.1 ms** | **1.79x** |
+| **string premium over numeric** | **+154.5 ms** | **+44.0 ms** | **3.51x** |
+
+Numeric materialization is at **parity**. The whole gap is the string columns, whose mean length
+is **six characters**.
+
+*A correction to this entry's first draft.* It reported 4.21x, obtained by subtracting each
+engine's `count(*)` time to isolate materialization. That subtraction assumes the join costs the
+same with and without a projection, which it does not — DuckDB's `count(*)` skips fetching
+payload columns entirely — and it inflated the number. The controlled form above needs no
+subtraction and gives 3.51x. The direction was right and the magnitude was not; the method is
+the part worth copying.
+
+### Why six characters is the whole answer
+
+DuckDB's `string_t` is a 16-byte struct with the first 12 bytes of the string stored *inline*.
+For a column averaging six characters, every value is inline, so DuckDB's gather is a
+**fixed-width 16-byte copy** — no character buffer, no offset prefix-sum, no second read.
+Batcher's `Utf8` gather copies characters, which is a scattered read of the source values plus
+a dependent prefix-sum over the offsets, and that is what the 4.21x is.
+
+Arrow's `Utf8View` is the same layout and the same 12-byte inline rule. The floor is measurable
+even though pyarrow 19 ships no `take` kernel for it: on the same 9 M indices, `take` on `Utf8`
+is 1,756 ms while `take` on an 8-byte fixed-width column is 130 ms. A 16-byte view gather is
+two of those, and it is the kernel `gather::take_fixed_width_parallel` already implements.
+
+### The string length is the proof, and it says where the fix pays
+
+The same premium measured on a *different* string column settles the mechanism. TPC-H's
+`l_comment` averages **26.5** characters, past the 12-byte inline window, and there the gap
+halves — a sort over an identical random permutation, varying only the payload type:
+
+| payload | batcher | duckdb | premium |
+|---|---|---|---|
+| `l_orderkey` (`int64`) | 32.3 ms | 31.6 ms | -- |
+| `l_comment` (26.5 chars) | 129.9 ms | 90.4 ms | +97.6 ms vs +58.8 ms = **1.66x** |
+
+**6-character strings: 3.51x. 26.5-character strings: 1.66x.** That length dependence is the
+inline prefix and nothing else — past 12 bytes DuckDB has to copy characters too, and most of
+its advantage disappears. So `Utf8View` is worth roughly 3.5x on short string columns (keys,
+codes, identifiers, categoricals — the columns joins and group-bys are actually built on) and
+roughly 1.7x on prose. Size the work by that, not by the headline.
+
+### A hypothesis this measurement killed, recorded so nobody rebuilds it
+
+The obvious cheaper fix is a **cache-conscious partitioned gather**: radix-partition the indices
+by source region so each pass's reads stay inside cache, which is what Velox and DuckDB do for
+random access. It does not apply here, because **Batcher's gather is already almost
+locality-insensitive**:
+
+| gather of a 159 MB string column, 6 M rows | pyarrow | batcher | duckdb |
+|---|---|---|---|
+| random source order | 968.2 ms | 129.9 ms | 90.4 ms |
+| sorted / in-order source | 172.0 ms | 109.6 ms | 40.6 ms |
+| **penalty for random access** | **5.63x** | **1.19x** | **2.23x** |
+
+pyarrow pays 5.63x for scattered reads and a 64-bucket partitioning pass recovers 3.41x of it.
+Batcher pays **1.19x**, so the entire prize is ~20 ms of a 130 ms gather and a partitioning pass
+would spend most of it. The parallel chunked gather already solved this problem. What is left is
+not locality, it is the per-value work of a variable-length layout — which is the representation,
+which is `Utf8View`.
+
+### What this changes on the board
+
+**`StringView` (arrow `Utf8View`) replaces deferred materialization as the top structural
+item.** `CLAUDE.md` already names "no `StringView`" as one of the four specific gaps against
+DuckDB single-node; this measurement is what it costs, on the queries that cost the most.
+
+Deferred materialization is **not** retired, it is **re-ranked**: it is the right mechanism for
+`cb-q32` and the sort-plus-limit shapes, which are worth a few milliseconds each, not the
+~165 ms rows it was promoted on.
+
+And q4 needs a second thing besides: its `count(*)` alone loses 4.34x, so a string *join key*
+is slow independently of the output gather. That is the string-key work already on this list,
+and this is the first measurement that separates it cleanly from the gather it was tangled with.
+
+**Scope, stated honestly.** `Utf8View` is not a contained change: it is a new physical type
+through `bc-arrow`, every `bc-expr` string kernel, the row encoder, the FFI boundary, and the
+IR's type vocabulary, with a planner decision about when to produce it (the same shape as the
+dictionary item 6, which was built, measured and reverted for want of exactly that decision).
+It should be started as its own piece of work with that precedent in view, not bolted onto a
+gather patch.
+
+## 15. The operator suite, re-run at HEAD and ranked by time lost (2026-08-18)
+
+`python benchmarks/run.py --benchmark operators`, one 96-core node, TPC-H sf1, five engines,
+**every correctness check passed**. Batcher beats Polars, PyArrow and Daft on all 21 cases —
+often by one to two orders of magnitude — so the only lineup worth tabulating is DuckDB.
+
+Fourteen of 21 are wins. Ranked by **time lost** rather than by ratio, which is the ordering
+entry 12 argued for and this table exists to keep honest:
+
+| case | batcher | duckdb | ratio | **lost** |
+|---|---|---|---|---|
+| `op-sort-string` | 162.5 ms | 140.5 ms | 1.16x | **+22.0 ms** |
+| `op-sort-multikey-narrow` | 50.8 ms | 36.5 ms | 1.39x | **+14.3 ms** |
+| `op-sort-multikey-wide` | 67.1 ms | 55.6 ms | 1.21x | +11.5 ms |
+| `op-sort-string-lowcard` | 45.7 ms | 34.4 ms | 1.33x | +11.3 ms |
+| `op-sort-string-limit` | 9.6 ms | 7.0 ms | 1.37x | +2.6 ms |
+| `op-distinct-high-card` | 20.0 ms | 17.6 ms | 1.13x | +2.4 ms |
+| `op-groupby-sum` | 5.5 ms | 3.2 ms | 1.73x | +2.3 ms |
+| `op-filter-project` | 10.3 ms | 8.1 ms | 1.28x | +2.2 ms |
+| `op-groupby-2key` | 5.7 ms | 5.4 ms | 1.07x | +0.3 ms |
+
+**Sorting is four of the top five and about 59 ms of the roughly 70 ms lost in total**, and
+three of those four sort a string. Everything that is not a sort costs under 3 ms.
+
+Two things follow, and the second is the one that matters.
+
+**The window operators have become a clear win** — `op-window-runsum` 0.20x, `op-window-lag`
+0.37x, `op-window-rank` 0.41x against DuckDB, with Daft OOM-killed on all three (it needs
+~22 GB for an ordered 6 M-row window and exceeds 30 GB on `lag`). That was a loss when this
+document started tracking it.
+
+**The remaining single-node deficit is one operator and one data type.** Entry 14 measured the
+string *payload gather* at 3.51x on short strings; this table adds the other half, the string
+*key ordering*, which `op-sort-string` isolates at 1.16x on a 26.5-character key. They are
+separate paths (`stable_sort_indices_str` and the string range-partitioner versus
+`gather::take_column`) and only the second is addressed by `Utf8View`. The multi-key rows are a
+third, unrelated thing: entry 11a's packed radix sort already landed there and they are still
+1.21-1.39x, so that path has something left in it that the packing did not reach.
+
+## 16. The distributed path, measured — and one open question about the object-store claim (2026-08-19)
+
+Everything in entries 12-15 measures the single-node engine. The mandate names streaming,
+batch, single-node **and distributed**, and `CLAUDE.md` says CI installs no Ray, so the
+distributed path is the one nothing routinely runs. This is what it does at `HEAD`, on a
+**single-node local Ray cluster (4 CPUs)** at TPC-H sf1 with 8 partitions
+(`benchmarks/run.py --benchmark distributed`, `RAY_ADDRESS=local`).
+
+**Correctness first, and it holds:** *"Distributed results match single-node on every query."*
+The mergeable algebra does what it claims. What follows is only about time.
+
+| query | single-node | distributed | |
+|---|---|---|---|
+| `groupby-agg` | 4.8 ms | 635.0 ms | 132x slower |
+| `groupby-2key` | 5.3 ms | 669.6 ms | 126x slower |
+| `join+groupby` | 34.4 ms | 11,066.3 ms | **322x slower** |
+| `distinct` | 6.0 ms | 493.8 ms | 82x slower |
+
+**Distributing an sf1 query is not supposed to pay** — the adaptive loop is gated off below 20 M
+rows precisely because of this, and no one should read these ratios as a defect on their own.
+Two things underneath them are worth an owner.
+
+### The group-by warms up and the join never does
+
+Repeating each query four times in one session, with the session fleet on (the default):
+
+```
+group_by       run1=11063ms  run2= 721ms  run3= 661ms  run4= 643ms
+join+group_by  run1=11571ms  run2=11035ms run3=11267ms run4=24196ms
+```
+
+The group-by pays a large first call and then settles at ~650 ms. The join pays ~11 s **every
+run**. `ShuffleFleet.spawn` was traced through all six runs and fired **zero** times, so neither
+number is fleet spawn: the first call is Ray cluster init, and the join's 11 s is the query.
+
+It is also flat in partition count — 11.2 s, 10.9 s, 11.8 s, 11.4 s at 2, 4, 8 and 16 partitions
+— so it is not per-partition work, and it grows with both row count and column width
+(a 2-column synthetic join of the same 6 M x 1.5 M shape costs 3.8 s against the 16-column
+`lineitem`'s 11 s). That points at bytes moved, which is the next section.
+
+**Caveat that limits how far this can be read.** These inputs are driver-resident Arrow tables,
+so distributing them means shipping ~850 MB out to the workers before any shuffle. A real
+distributed job scans into the workers and never pays that. The measurement is honest about
+what it is: the cost of distributing an in-memory table, not of a cluster-native scan.
+
+### The transport numbers, and the claim they qualify
+
+`benchmarks/run.py --benchmark shuffle`, 8 partitions x 64 batches = 128 MiB, same box:
+
+| transport | | |
+|---|---|---|
+| Ray object store | 108.6 ms | 1,178.4 MiB/s |
+| Carbonite Flight, **network path** (`locality=0.00`) | 331.8 ms | **385.8 MiB/s** |
+| Carbonite **co-located** (`DIRECT_MEMORY`, `locality=1.00`) | 6.4 ms | **19,890.9 MiB/s** |
+
+`competitive_architecture.md` states that bypassing the Ray object store "is the single biggest
+reason Batcher beats Ray Data 50-450x". The co-located row supports that emphatically — 16.9x
+Ray's object store. The network row does not: on same-node loopback it is **0.33x**, three times
+*slower* than the thing it bypasses. The harness labels that row "same-node loopback" itself, and
+loopback is not Flight's design point, so this is not a refutation of the claim.
+
+**It is an open question about which path the operators actually take.** The 51x gap between
+those two rows is entirely a locality decision, and a single-node cluster is the case where
+locality should always win. A distributed join on that same cluster costs ~11 s for roughly
+850 MB, which is the arithmetic of the 386 MiB/s row and not of the 19.9 GiB/s one. Either the
+operators are not reaching the co-located path where the microbenchmark can, or the join's time
+is going somewhere else entirely. **Nothing here settles which**, and the next person on this
+should settle it before optimizing anything: instrument which transfer mode the join's shuffle
+actually uses (`carbonite/transfer/server.py` already counts bytes served over the same-node
+fast paths), on a cluster-native scan rather than driver-resident tables.
+
+Recorded rather than fixed, deliberately. `CLAUDE.md` requires a recorded cluster run for any
+`dist/` change, this box is a 4-CPU single node, and a locality fix validated only here would be
+validated on the one topology where locality is trivially true.
+
+## 17. The string-keyed join was serial — **landed, up to 22.4x** (2026-08-19)
+
+Found by chasing the one number entries 14-16 kept stepping over. Entry 14 measured
+`h2o-join-q4`'s `count(*)` at 4.34x DuckDB and set it aside as "the string-key work already on
+this list"; nobody had asked *why*. Varying only the key type on an otherwise identical join
+answered it immediately:
+
+| `count(*)` only, no output gather | batcher | duckdb | ratio |
+|---|---|---|---|
+| `x JOIN big USING (id3)` — int32, 1e7 x 1e7 | 95.2 ms | 101.0 ms | **0.94x, a win** |
+| `x JOIN big USING (id6)` — **string**, same shape | **4,999.4 ms** | 116.5 ms | **42.91x** |
+
+Same rows, same cardinality, same result — 52x more time for a string key than an integer one.
+That is not a comparison cost, and the scaling curve said so before any code was read: Batcher
+spent a **flat ~650 ns per row** from 250 k to 10 M rows while DuckDB's fell from 127 to 15. Flat
+per-row cost at every scale is what a serial loop looks like. Confirmed directly — 96 cores,
+4 M rows, `cpu_time / wall_time`:
+
+| key | wall | CPU | parallelism |
+|---|---|---|---|
+| `int64` | 38.6 ms | 968 ms | 25.1x |
+| `Utf8` | 2,234.9 ms | 4,692 ms | **2.10x** |
+
+**The cause is a trait bound, not a decision.** `radix_join_scalar` — the cache-radix join both
+integer fast paths use — is generic over `O: Copy`, because the partition pass carries the key
+inline beside the row index. A string is not such a value, so a string key fell to the flat
+build-and-probe path, which is serial. Nothing in the code says "strings run on one core"; it
+follows from a bound, which is exactly why it survived. `ops::byte_sort` records the identical
+failure for sorts — "`sample_sort` reads the same type list, so the sort then ran on **one core**
+whatever the machine" — so this is the second instance of one pattern: **a type list or trait
+bound that silently withholds the parallel path from byte keys.** Worth grepping for a third.
+
+**The fix is not a second join algorithm.** A byte key of <= 15 bytes packs losslessly into one
+`u128` (length in the top byte, value bytes below), which *is* `Copy`, so it reaches the same
+radix join unchanged. The packing is injective, so "packs equal" and "bytes equal" are the same
+predicate and the matches are identical by construction. Longer keys keep the flat path. Fifteen
+bytes covers what join keys are: ids, codes, SKUs, ISO dates, categoricals.
+
+| rows per side | before | after | duckdb | before | after |
+|---|---|---|---|---|---|
+| 250,000 | 117.3 ms | **22.3 ms** | 23.4 ms | 3.69x | **0.96x** |
+| 1,000,000 | 633.1 ms | **46.1 ms** | 53.9 ms | 7.12x | **0.86x** |
+| 4,000,000 | 2,617.3 ms | **124.2 ms** | 59.7 ms | 29.27x | 2.08x |
+| 10,000,000 | 6,835.6 ms | **304.8 ms** | 129.7 ms | 46.74x | 2.35x |
+
+**Up to 22.4x**, two scales from loss to win, parallelism 2.10x -> 19.38x, and the integer
+control unmoved (38.6 -> 39.1 ms). The H2O case that started it: 4,999.4 ms -> **284.8 ms**,
+42.91x -> **2.50x**.
+
+`x JOIN medium USING (id5)` barely moves and should not — its build side is 10 k rows, below
+`RADIX_MIN_BUILD_ROWS`, so the flat path stays and is right for a build table that fits in cache.
+
+### What this says about the entries before it
+
+Entries 14 and 15 concluded the remaining single-node deficit was "one operator and one data
+type", with `StringView` as the top item. That is still true of the *gather*, and this changes
+none of those measurements. But the largest string number in this document was never the gather:
+it was a join that was accidentally serial, worth 42.91x where the gather is worth 3.51x, and it
+sat inside a row (`h2o-join-q4`) that three separate entries had already looked at.
+
+Both times the lesson repeats: **the census ranked capabilities by whether they existed, then by
+ratio, and the biggest wins were inside things already marked done.** Entry 13 found 287x inside
+a "built" aggregate; this found 42.91x inside a "built" join. Neither needed a new feature.
+
+## 18. DuckDB's sort key, read rather than measured — and three hypotheses it killed (2026-08-19)
+
+Every entry above measures competitors as black boxes. This one reads one, because entry 17's
+win came from a *mechanism* (a trait bound withholding parallelism) that no timing could have
+named. The remaining single-node deficit is sorting (entry 15: four of the top five rows,
+~59 ms of ~70 ms), so the thing to read was DuckDB's sort.
+
+### What DuckDB actually does
+
+`src/common/sort/sort.cpp` lowers the whole `ORDER BY` list into **one** `create_sort_key`
+expression, and `src/function/scalar/create_sort_key.cpp:52-67` decides its physical type:
+
+```cpp
+bool all_constant = true;
+idx_t constant_size = 0;
+for (idx_t i = 0; i < arguments.size(); i += 2) {
+    auto physical_type = arguments[i]->GetReturnType().InternalType();
+    if (!TypeIsConstantSize(physical_type)) { all_constant = false; }
+    else { constant_size += GetTypeIdSize(physical_type) + 1; }  // +1 validity byte
+}
+if (all_constant && constant_size <= sizeof(int64_t)) {
+    function.SetReturnType(LogicalType::BIGINT);   // else: BLOB
+}
+```
+
+A single `BIGINT` normalized key when every key column is fixed-width and their **declared**
+widths plus one validity byte each fit in eight bytes; otherwise a `BLOB` and a comparison sort.
+
+**Batcher's rule is strictly stronger, and there is nothing here to adopt.**
+`radix_sort::packed_multi_sort_indices` (entry 11a) packs from the keys' *measured value ranges*
+rather than their declared widths. The benchmark case is the proof:
+`ORDER BY l_shipdate, l_suppkey` is `4+1 + 4+1 = 10` bytes by DuckDB's rule, so DuckDB takes the
+BLOB path; Batcher measures ~2,500 days and ~10,000 suppliers, packs 26 bits into one `u64`, and
+counting-sorts it.
+
+### And yet Batcher loses that case 2.06x, so three hypotheses were tested and all three failed
+
+`ORDER BY l_shipdate, l_suppkey` over 6 M rows, varying only the projection:
+
+| returned | batcher | duckdb | ratio |
+|---|---|---|---|
+| 1 narrow column | 54.1 ms | 26.3 ms | **2.06x** |
+| both keys | 53.6 ms | 31.1 ms | 1.72x |
+| both keys + 2 more | 83.8 ms | 65.7 ms | 1.28x |
+| *delta for the two added columns* | **+30.2 ms** | +34.5 ms | — |
+
+1. **Not the key encoding.** Batcher takes the better of the two paths, as above.
+2. **Not the payload gather.** Adding two columns costs Batcher **less** than DuckDB (+30.2 ms
+   against +34.5 ms). The gather is a Batcher strength here, and the ratio *improves* as the
+   projection widens because the fixed deficit is amortized.
+3. **Not parallelism** — which is what entry 17 predicted, and it was wrong. Entry 17 closed by
+   naming these multi-key rows as the likely third instance of "a type list or bound that
+   silently withholds the parallel path". Measured, `cpu_time / wall_time` on 96 cores:
+
+   | sort | wall | cpu | parallelism |
+   |---|---|---|---|
+   | 1 key, `date32` | 47.3 ms | 782 ms | 16.55x |
+   | 1 key, `Utf8` | 169.2 ms | 4,394 ms | 25.97x |
+   | **2 keys, the 2.06x case** | **51.1 ms** | **1,304 ms** | **25.49x** |
+   | 2 keys, `(int32, int64)` | 45.3 ms | 1,686 ms | 37.20x |
+
+   Every shape is properly parallel. **The prediction is retired; there is no third instance in
+   the sort.**
+
+### What is left, stated as what it is
+
+The entire gap is a fixed ~28 ms of *work*: Batcher spends 1,304 ms of CPU to finish in 51 ms
+where DuckDB finishes in 26 ms. That is not a missing technique, a wrong path, or a serial
+loop — it is CPU efficiency, and it is the cost `CLAUDE.md` already names when it says Batcher
+"buys several of its wall-clock wins with 1.4-4.4x more CPU". An eight-pass LSD radix over 6 M
+`u64` keys moves ~384 MB and does 48 M scattered writes; DuckDB's comparison sort over 10-byte
+keys stays in cache within each block and merges. Below some row count the radix's guaranteed
+`O(n)` stops paying for its memory traffic, and 6 M rows on this machine is evidently below it.
+
+**So the next move on multi-key sorts is a crossover, not a new algorithm**: measure where the
+packed radix loses to the row-encoded comparison sort and gate on it, exactly as
+`ops::byte_sort::radix_sort_live` already does for byte keys (it declines above 2^18 rows for
+this very reason, and `report_the_byte_radix_crossover` records the measurement). The packed
+multi-key path has no such ceiling and should.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -1602,6 +2641,112 @@ implements it, so the next reader can settle it with one grep instead of one day
 11. Post-shuffle partition coalescing from the sizes just written, not the previous run's
     (item 10d).
 12. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+13. **The sort's gather, which is now what is left on this operator (item 11, measured
+    2026-08-18).** With the two fixes in item 11 landed, the operator suite's ordering rows sit
+    at 1.06x-1.29x of DuckDB and the residue is no longer the comparison. Decomposed on 6 M rows
+    with a `float64` payload: `ORDER BY <int64>` returning two columns is **37.6 ms** where the
+    same query returning *one* column is the same time, so the cost is not the output width —
+    it is 96 MiB of **random-access** gather at about 2.5 GB/s, against the 11 GB/s the same two
+    columns copy at with no permutation. DuckDB answers the harder string version of that query
+    in 30.4 ms.
+
+    The mechanism is known and is not a tuning question: DuckDB sorts a **row-major payload**
+    (`TupleDataCollection`), so its final scan is sequential, where Batcher sorts a permutation
+    and then gathers every column through it. That is what the streaming-executor RFC's
+    **selection vectors** proposal is for, which makes that proposal the next structural item on
+    this operator rather than a leftover.
+
+    Do not read this as "the sort is slow". It is the *permuted* materialization that is.
+
+    **And do not fold `op-filter-project` (2.00x) into the same story**, which an earlier draft of
+    this entry did. A filter's compaction is a *sequential* write, not a permuted read, and it
+    measures accordingly: on 6 M rows, adding one output column to a filter costs 5.2 ms to read
+    48 MiB and write 25 MiB, about 14 GB/s. There is no gather cliff there to find. Whatever that
+    row is, it is not this.
+14. **A measured anomaly on this operator that is *not* yet diagnosed: a temporal key sorts
+    ~1.5x slower than the identical integer key.** 6 M rows, seven distinct values, same
+    `float64` payload, both taking the parallel sample-sort after item 11c:
+
+    | leading key | time |
+    |---|---|
+    | `Int64` | 31.1 ms |
+    | `Int32` (normalized to `Int64` at the FFI boundary, so the same path) | 36.8 ms |
+    | `Date32` | 47.0 ms |
+    | `Date64` | 44.8 ms |
+    | `Timestamp(us)` | 40.0 ms |
+
+    **Two of the three candidate causes are now eliminated by measurement, so the next reader
+    starts from a narrower question than this entry originally posed.**
+
+    *Not the widening cast.* `arrow::compute::cast` allocates even when the widths already match,
+    so the obvious suspect was the `8 x rows` buffer a `Timestamp` key builds on the way into a
+    routing that only reads it. A zero-copy reinterpretation was built (`ScalarBuffer` clone plus
+    the source's null buffer, pinned array-for-array against the cast it replaced) and measured
+    **1.0x**. It was reverted: it removes a real allocation, and the allocation is not the cost.
+    The table above already hinted at this and it was not read carefully enough — `Date64` and
+    `Timestamp` are `i64`-backed, so their cast is the cheap one, and they cost what `Date32`
+    costs.
+
+    *Not the output gather.* Sorting by a `Timestamp` key while projecting an `Int64` **mirror**
+    of the same values, so no temporal column reaches the output, still reads **47.4 ms** against
+    **37.6 ms** for the same query sorted by the mirror itself.
+
+    *And not a missing parallel path*, which item 11c would have made the natural guess: below
+    400,000 rows the two types are at parity (6.5 ms against 7.4 ms) and both show the ns/row
+    drop across `PARALLEL_SORT_MIN_ROWS`. The ratio appears between 400,000 and 1.5 M rows and
+    holds at 1.38-1.44 above it.
+
+    So it is inside the sort phase, it scales with the input, and it is neither the widening nor
+    the gather. That is where instrumentation should start; black-box probing has taken it as far
+    as it goes.
+
+    **And check the data before believing a number here.** A first run of this table read
+    `Date64` at **5.3 ms**, five times faster than `Int64`, which is not a plausible time for a
+    6 M-row sort. The cause was the test data: `Date64` is milliseconds that the Arrow spec
+    requires to be a whole number of days, the values used were raw day *numbers*, and every one
+    of them therefore fell inside 1970-01-01. The sort was correct, the input was degenerate, and
+    the identity short-circuit fired legitimately. The check written to catch exactly that —
+    comparing against pyarrow's own sort — **passed**, because it compared the rendered dates,
+    which were all equal. Day-aligning the values put the row back at 44.8 ms.
+
+**Re-ranked 2026-08-18 by the census in item 12, which measured 80 queries rather than reasoning
+from the code.** Two items move to the top and one new one appears:
+
+0a. **~~Deferred payload materialization (selection vectors), RFC proposal 2.~~ Superseded as
+    the top item by `StringView` — see entry 14, which re-measured this at `HEAD`.** Deferring
+    cannot collect the two rows it was promoted on: `h2o-join-q4/q5` return every joined row, so
+    the materialization is required rather than deferrable, and the gather kernel is already 15x
+    faster than arrow's `take`. The measured gap is the string *representation* — 4.21x on string
+    columns against 1.0x on numeric ones, over values averaging six characters, which fit inside
+    DuckDB's inline `string_t` and inside arrow's `Utf8View`. Selection vectors remain the right
+    mechanism for the shapes with a discarding operator downstream (`cb-q32`'s `LIMIT`, sort
+    top-k), which the census prices at single-digit milliseconds each.
+
+0a'. **`StringView` (arrow `Utf8View`) — the new top structural item.** Entry 14 has the
+    measurement and the scope. It is a physical type through `bc-arrow`, the `bc-expr` string
+    kernels, the row encoder and the FFI boundary, plus a planner decision about when to produce
+    it — the same shape as the dictionary item 6, which was built and reverted for want of that
+    decision. Worth roughly parity-to-a-win on the two largest single-node losses.
+
+0b. ~~**Give `eager_aggregation` a cost term, not just a ratio.**~~ **Landed** as
+    `_global_aggregate_gains_nothing` (`kyber/rules/agg_pushdown.py`), wired into all three
+    pushdown rules. **2.29x / 2.23x / 2.14x** on the measured shapes
+    (`count(id2)` 19.6 -> 8.6 ms, `sum(v1)` 20.3 -> 9.1 ms, `min(v1)` 21.0 -> 9.8 ms), with the
+    two controls flat (0.94x on the aggregate that could not be pushed, 0.98x on the grouped
+    form). The gate is `join_rows > source_rows` for an **ungrouped** outer aggregate only —
+    "does the join amplify?", which is the condition eager aggregation always actually needed.
+    Pinned by `test_a_global_aggregate_over_a_non_amplifying_join_does_not_push`, its amplifying
+    twin, and a third test asserting the grouped path is untouched, so the veto cannot silently
+    become "never push". The original entry read below.
+
+    **Give `eager_aggregation` a cost term, not just a ratio.**
+    `kyber/rules/agg_pushdown.py` gates the push on `_MIN_PREAGG_REDUCTION = 8.0`, a row-reduction
+    ratio with no term for what the join would have cost. On a broadcast join against a
+    10,000-row build side it fires on a ~1000x reduction and is **2.4-2.6x slower** than not
+    firing (21.1 ms and 23.2 ms against 8.9 ms for the same query whose aggregate reads a
+    right-side column and therefore cannot be pushed). The push pays a full 10 M-row hash
+    aggregate to save a probe that was nearly free. Cheap to scope, and it is a *regression* the
+    rule introduces rather than a missing capability. See item 12.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the

@@ -13,6 +13,7 @@ from __future__ import annotations
 from batcher.dist.fleet._fleet import (
     ShuffleFleet,
     acquire_fleet,
+    borrows_session_fleet,
     current_fleet,
     release_fleet,
     release_session_fleet,
@@ -30,6 +31,7 @@ __all__ = [
     "FlightMaterializedSource",
     "ShuffleFleet",
     "acquire_fleet",
+    "borrows_session_fleet",
     "current_fleet",
     "evict_plan",
     "fleet_actors_for_eviction",

@@ -110,7 +110,7 @@ async def _gather_batches(
         async with sem:
             if budget is not None:
                 return await _resilient_batch(call, batch, op, budget)
-            return _coerce_udf_result(await _call_resilient(call, batch, op))
+            return _coerce_udf_result(await _call_resilient(call, batch, op), batch.schema)
 
     # `gather` preserves the order of its arguments in its results regardless of completion
     # order, so the output stays aligned to the input batches.
@@ -139,7 +139,7 @@ async def _resilient_batch(
     awaited concurrently.
     """
     try:
-        return _coerce_udf_result(await _call_resilient(call, batch, op))
+        return _coerce_udf_result(await _call_resilient(call, batch, op), batch.schema)
     except Exception as exc:
         if batch.num_rows <= 1:
             # The same atomic claim the synchronous path uses. The budget is shared per

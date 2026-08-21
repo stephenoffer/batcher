@@ -181,6 +181,17 @@ def spill_collect(
         above.append(node)
         node = node.input
     if above:
+        # A peeled `Limit` is order-sensitive, and only `Sort` gives the breaker below it a
+        # defined output order. `Distinct`, `Aggregate`, `Join` and `Window` all emit in
+        # hash/partition order out-of-core, while the in-memory path emits in input order —
+        # so re-applying `LIMIT k` here keeps a *different k rows* than `collect()` does,
+        # which is a wrong answer rather than a slower one. `bc_ir::RelOp::Distinct` states
+        # the contract this breaks: "the rows kept are the first k in input order", chosen
+        # precisely so one node and many agree. Decline instead, and let the in-memory path
+        # answer; the shapes are pinned in `NON_SPILLING_SHAPES`
+        # (tests/integration/test_spill_route_is_taken.py).
+        if not isinstance(node, Sort) and any(isinstance(n, Limit) for n in above):
+            return None
         inner = spill_collect(node, sources, num_partitions)
         if inner is None:
             return None

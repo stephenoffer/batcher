@@ -498,3 +498,60 @@ def test_a_score_restores_the_full_binary_set() -> None:
     ds = bt.from_pydict({"y": [1, 0, 1, 0], "p": [1, 0, 0, 1], "s": [0.9, 0.1, 0.4, 0.6]})
     report = evaluate(ds, "y", y_pred="p", y_score="s", task="binary")
     assert set(report) == set(METRIC_SETS["binary"])
+
+
+# --- tied scores ---------------------------------------------------------------------
+#
+# The `binary` fixture draws continuous scores, so every score above is distinct and the
+# ranking metrics were only ever checked where ties cannot happen. Ties are not exotic:
+# a clipped probability, a rounded score, a shallow tree and a calibrated output all
+# produce them, and `average_precision` counted the positives per tie *group* against the
+# rows per *row*, which is not a precision — on five distinct scores it returned values
+# above 1.
+
+
+@pytest.fixture
+def tied() -> tuple[np.ndarray, np.ndarray, bt.Dataset]:
+    """A binary problem whose scores are quantized to five levels, so ties are everywhere."""
+    rng = np.random.default_rng(3)
+    labels = (rng.random(400) > 0.55).astype(int)
+    score = np.round(np.clip(labels * 0.3 + rng.random(400) * 0.9, 0, 1) * 4) / 4
+    ds = bt.from_pydict({"y": labels.tolist(), "s": score.tolist()})
+    return labels, score, ds
+
+
+def test_tied_scores_really_are_tied(tied) -> None:
+    """Guards the fixture itself: this test file's point is lost if the scores are distinct."""
+    _, score, _ = tied
+    assert len(set(score.tolist())) == 5
+
+
+def test_average_precision_matches_sklearn_under_ties(tied) -> None:
+    labels, score, ds = tied
+    got = average_precision(ds, "y", "s")
+    assert got == pytest.approx(skm.average_precision_score(labels, score), abs=1e-9)
+
+
+def test_average_precision_stays_within_its_range_under_ties(tied) -> None:
+    """The regression proper: this returned 1.35-1.59 when every row was its own denominator."""
+    _, _, ds = tied
+    assert 0.0 <= average_precision(ds, "y", "s") <= 1.0
+
+
+def test_average_precision_of_a_single_tie_group_is_the_prevalence() -> None:
+    """With one score for every row there is no ranking left, so AP is the positive rate."""
+    ds = bt.from_pydict({"y": [0, 1, 0, 1, 1, 0], "s": [0.5] * 6})
+    assert average_precision(ds, "y", "s") == pytest.approx(0.5, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("builder", "oracle"),
+    [
+        (roc_auc, lambda y, s: skm.roc_auc_score(y, s)),
+        (average_precision, lambda y, s: skm.average_precision_score(y, s)),
+        (gini_coefficient, lambda y, s: 2 * skm.roc_auc_score(y, s) - 1),
+    ],
+)
+def test_ranking_metrics_match_sklearn_under_ties(tied, builder, oracle) -> None:
+    labels, score, ds = tied
+    assert builder(ds, "y", "s") == pytest.approx(oracle(labels, score), abs=1e-9)

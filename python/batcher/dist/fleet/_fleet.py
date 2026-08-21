@@ -35,6 +35,7 @@ from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query
 __all__ = [
     "ShuffleFleet",
     "acquire_fleet",
+    "borrows_session_fleet",
     "current_fleet",
     "release_fleet",
     "release_session_fleet",
@@ -55,6 +56,19 @@ _FLEET: contextvars.ContextVar[ShuffleFleet | None] = contextvars.ContextVar(
 # kinds mean opposite things for resizing: see `_session_fleet_resizable`. Guarded by
 # `_SESSION_LOCK`, like `_SESSION_LEASES` itself.
 _SESSION_QUERY_LEASES = 0
+
+#: Whether the *current* query's `session_fleet_lease` has taken its hold on the fleet yet.
+#:
+#: Tri-state, and all three states are distinct: `None` means no query lease is in scope at
+#: all (a bare `acquire_fleet`, which owns its own lease and must not take a second one),
+#: `False` means a query lease is open and has not yet taken its hold, `True` means it has.
+#:
+#: A ContextVar rather than a counter because the hold belongs to one query: `acquire_fleet`
+#: promotes the lease of the query that called it, and a concurrent pipeline's lease is
+#: unaffected.
+_QUERY_HOLD: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "batcher_session_query_hold", default=None
+)
 
 
 def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
@@ -441,6 +455,12 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
             with contextlib.suppress(Exception):
                 _regrant_fleet(_SESSION, credits, cfg_json)
         _SESSION_LEASES += 1
+        # The query lease takes its hold here, on the first acquire, rather than on entry —
+        # see `session_fleet_lease` for why holding it from entry deadlocks a query whose
+        # operators are tasks rather than fleet actors.
+        if _QUERY_HOLD.get() is False:
+            _QUERY_HOLD.set(True)
+            _SESSION_LEASES += 1
         return _SESSION
 
 
@@ -478,22 +498,36 @@ def session_fleet_lease():
     fleet resize it is held *across*: a query that finds the cached fleet too narrow has to
     be able to respawn it on its first acquire, and this lease is its own. See
     `_session_fleet_resizable`.
+
+    **It takes hold on the query's first `acquire_fleet`, not on entry**, and that
+    distinction is the difference between a warm fleet and a deadlock. A warm fleet is a
+    *placement-group reservation of the whole cluster* — measured here as four
+    `_FlightWorker`s holding 24 cores each on a 96-core box — and a query that never shuffles
+    still ran under this lease. So a broadcast join, whose probe is Ray *tasks* rather than
+    fleet actors, cancelled the idle timer on entry and then waited forever for cores that
+    only the timer it had just cancelled could free. Nothing errored: `ray.wait` inside
+    `gather_with_backups`, `{'CPU': 24.0}: 8+ pending` against `96.0/96.0`, indefinitely.
+
+    Deferring the hold costs nothing the docstring above promises. The purpose is to keep
+    the fleet alive *between* a staged query's operators, and a query with no first operator
+    on the fleet has no gap to protect; once one acquires, the hold is taken and every later
+    gap is covered exactly as before.
     """
-    global _SESSION_LEASES, _SESSION_QUERY_LEASES, _SESSION_TIMER
+    global _SESSION_QUERY_LEASES
 
     with _SESSION_LOCK:
-        if _SESSION_TIMER is not None:
-            _SESSION_TIMER.cancel()
-            _SESSION_TIMER = None
-        _SESSION_LEASES += 1
         _SESSION_QUERY_LEASES += 1
+    held = _QUERY_HOLD.set(False)
     try:
         with query_shuffle_scope():  # the fence, and the one place a query is counted
             yield
     finally:
+        promoted = _QUERY_HOLD.get() is True
+        _QUERY_HOLD.reset(held)
         with _SESSION_LOCK:
             _SESSION_QUERY_LEASES = max(0, _SESSION_QUERY_LEASES - 1)
-        release_session_lease()
+        if promoted:
+            release_session_lease()
 
 
 def release_session_fleet() -> None:
@@ -549,6 +583,25 @@ def acquire_fleet(workers: int, credits: int, cfg_json: str):
 
     actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json)
     return actors, pg, addrs, workers, True
+
+
+def borrows_session_fleet() -> bool:
+    """Whether the next `acquire_fleet` will take a lease on the warm **session** fleet.
+
+    Must be asked *before* the acquire. `acquire_fleet` has three branches — borrow the
+    adaptive loop's query fleet, borrow the session fleet, spawn a transient one — and only the
+    middle one takes a lease that has to be handed back. `current_fleet()` separates the first
+    from the other two, but only until the acquire installs one; asking afterwards is how a
+    lease meant for one path gets released on another.
+
+    A stage that *publishes* its output cannot hand the lease back in its own `finally` (that
+    would arm the idle timer against an intermediate nothing has read yet), so it passes this
+    to its `FlightMaterializedSource`, which returns it at `cleanup()`.
+
+    Returns:
+        True when this call site would be the one to take the session lease.
+    """
+    return current_fleet() is None
 
 
 def release_fleet(actors, pg, owns: bool) -> None:

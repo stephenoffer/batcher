@@ -80,6 +80,25 @@ pub struct ShuffleExchange {
     _handle: ServerHandle,
 }
 
+/// `host:port` as a dialable URI authority, bracketing an IPv6 literal.
+///
+/// `SocketAddr`'s own `Display` does this; a *host* string does not, and the advertised
+/// address is built from one. Without the brackets an IPv6-only cluster advertises
+/// `fd00::1:50051`, which is not an authority at all — the last group is indistinguishable
+/// from the port — so every cross-node fetch fails at URI parsing rather than at connect,
+/// on the deployments (IPv6-only Kubernetes, several on-prem fabrics) that have no IPv4
+/// address to fall back to.
+///
+/// Recognized by the presence of a colon, which no IPv4 address or DNS name contains, and
+/// skipped when the caller already bracketed.
+pub(crate) fn advertised_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 impl ShuffleExchange {
     /// Start a shuffle exchange on an ephemeral loopback port and begin serving.
     ///
@@ -146,7 +165,7 @@ impl ShuffleExchange {
         let server = FlightServer::with_store_token_tls(store.clone(), token, tls);
         let (addr, handle) = server.serve_on(bind).await?;
         let advertised = match advertise_host {
-            Some(host) if !host.is_empty() => format!("{host}:{}", addr.port()),
+            Some(host) if !host.is_empty() => advertised_authority(host, addr.port()),
             _ => addr.to_string(),
         };
         Ok(Self {
@@ -774,6 +793,44 @@ fn is_connection_error(err: &TransportError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ipv6_advertise_host_is_bracketed() {
+        // `fd00::1:50051` is not an authority: the last group is indistinguishable from the
+        // port, so every cross-node fetch on an IPv6-only cluster failed at URI parsing.
+        assert_eq!(advertised_authority("fd00::1", 50051), "[fd00::1]:50051");
+        assert_eq!(advertised_authority("::1", 7), "[::1]:7");
+    }
+
+    #[test]
+    fn an_ipv4_host_or_a_name_is_left_alone() {
+        assert_eq!(advertised_authority("10.0.0.4", 50051), "10.0.0.4:50051");
+        assert_eq!(
+            advertised_authority("worker-3.svc", 50051),
+            "worker-3.svc:50051"
+        );
+    }
+
+    #[test]
+    fn an_already_bracketed_host_is_not_bracketed_twice() {
+        assert_eq!(advertised_authority("[fd00::1]", 50051), "[fd00::1]:50051");
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_bind_advertises_a_dialable_authority() {
+        // The whole point: what `bind_tls` produces has to survive being parsed as a URI.
+        let Ok(exchange) = ShuffleExchange::bind_advertised("[::1]:0", Some("::1")).await else {
+            return; // a host with IPv6 disabled cannot run this; the unit cases still do
+        };
+        let advertised = exchange.advertised_addr();
+        assert!(advertised.starts_with("[::1]:"), "got {advertised}");
+        // Parsing it back as a socket address is the same property the URI parser needs:
+        // an unbracketed IPv6 literal cannot be split into host and port by either.
+        assert!(
+            advertised.parse::<SocketAddr>().is_ok(),
+            "advertised address must parse as a host:port authority: {advertised}"
+        );
+    }
 
     #[test]
     fn classify_separates_retryable_from_fatal() {

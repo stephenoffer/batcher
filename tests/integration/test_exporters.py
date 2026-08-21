@@ -53,17 +53,19 @@ def test_to_pandas_roundtrip():
 
 @pytest.mark.integration
 def test_missing_framework_raises_backend_error(monkeypatch):
-    # Simulate the framework being absent: to_pandas must raise the typed error.
-    import builtins
+    """With pandas genuinely unimportable, `to_pandas` raises the typed error.
 
-    real_import = builtins.__import__
+    The absence is simulated by poisoning the `sys.modules` entry, which is what makes
+    *every* spelling of the import fail. Patching `builtins.__import__` does not: the guard
+    goes through `importlib.import_module`, which returns a module already in `sys.modules`
+    without consulting `__import__` at all. So once any earlier test in the process had
+    imported pandas, that simulation left the guard seeing pandas as present, and the run
+    failed deep inside pyarrow's pandas bridge instead — a pass or fail decided by test
+    order rather than by the behavior under test.
+    """
+    import sys
 
-    def _no_pandas(name, *args, **kwargs):
-        if name == "pandas":
-            raise ImportError("no pandas")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _no_pandas)
+    monkeypatch.setitem(sys.modules, "pandas", None)
     ds = bt.from_pydict({"a": [1]})
     with pytest.raises(BackendError, match="\\[pandas\\]"):
         ds.to_pandas()

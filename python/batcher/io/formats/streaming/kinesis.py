@@ -330,12 +330,26 @@ class KinesisSource(BrokerSource):
         if not shards:
             return []
         responses = self._get_records(shards)
+        budget = self._poll_budget()
+        # Rotated so the shard that leads the sweep — and therefore the one guaranteed to be
+        # read when the budget runs out — is a different one each poll. Without it a wide
+        # stream starves its trailing shards, and under a per-partition watermark a starved
+        # shard holds the whole stream's frontier back exactly as a stalled one would.
+        pairs = budget.order(list(zip(shards, responses, strict=True)))
         messages: list[BrokerMessage] = []
-        for (shard_number, shard_id), resp in zip(shards, responses, strict=True):
+        for (shard_number, shard_id), resp in pairs:
             if resp is None:
                 continue  # throttled or expired: retried on the next poll
+            if budget.spent:
+                # The shard's iterator is deliberately *not* advanced, so this response is
+                # simply dropped and the same records are fetched again next epoch. Costing
+                # a re-fetch is the price of never building a batch past `poll_bytes`, which
+                # a `binary` column's 32-bit offsets make a hard limit rather than a target.
+                break
             self._advance(shard_id, resp)
-            messages.extend(self._decode(shard_number, resp))
+            decoded = self._decode(shard_number, resp)
+            budget.spend(sum(len(m.value or b"") for m in decoded))
+            messages.extend(decoded)
         return messages
 
     def _get_records(self, shards: list[tuple[int, str]]) -> list[dict | None]:

@@ -86,8 +86,13 @@ def test_sample_utilization_no_counter_backend_is_none():
 
 
 def test_utilization_registry_covers_counter_backends():
-    # NVIDIA/AMD/Intel have a counter (a registry probe); MPS/TPU/CPU do not.
-    assert set(_UTILIZATION) == {"cuda", "rocm", "xpu"}
+    # Every accelerator whose vendor exposes a busy counter needs a probe here, because the
+    # actors-per-device loop steers by this reading and does nothing at all without one — a
+    # backend missing from the registry silently never reaches the 80% packing target.
+    # NVIDIA and AMD have SMI libraries; Intel XPU, Intel Gaudi and Huawei Ascend report
+    # through their torch namespace. MPS, Cloud TPU and Trainium expose no stable per-process
+    # counter, and are absent on purpose rather than by omission.
+    assert set(_UTILIZATION) == {"cuda", "rocm", "xpu", "hpu", "npu"}
 
 
 def test_xpu_utilization_degrades_to_none_without_intel_gpu():

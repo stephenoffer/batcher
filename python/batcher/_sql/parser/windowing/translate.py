@@ -249,7 +249,7 @@ _UNORDERED_RANK_CONSTANTS = {
 }
 
 
-def _unordered_ranking(ds: Dataset, projections) -> tuple[Dataset, set[str]]:
+def _unordered_ranking(tr, ds: Dataset, taken: set[str], projections) -> tuple[Dataset, set[str]]:
     """Compute the ranking windows that need no ORDER BY, which `ds.window` cannot take.
 
     The window operator requires an ordering for every ranking function, so the translator
@@ -281,16 +281,50 @@ def _unordered_ranking(ds: Dataset, projections) -> tuple[Dataset, set[str]]:
         name = type(win.this).__name__.lower()
         alias = _alias_of(p)
         constant = _UNORDERED_RANK_CONSTANTS.get(name)
+        if constant is None and not (name == "rownumber" and not _window_partition(win)):
+            continue
+        # The output name a SQL window carries is a *select-list* alias, so it may repeat
+        # a source column's name (`SELECT g, sum(i) OVER (...) AS s` over a table that
+        # already has an `s`). The relational operator underneath cannot: its output is
+        # appended to the input's columns, so it refuses a collision. Compute into a
+        # hidden name and record it, so the projection can read it back under the alias
+        # the user wrote. Without this every such query failed outright.
+        out = window_output_name(tr, taken, alias)
         if constant is not None:
-            ds = ds.with_columns(**{alias: lit(constant)})
-            handled.add(alias)
-        elif name == "rownumber" and not _window_partition(win):
-            ds = ds.with_row_index(alias, offset=1)
-            handled.add(alias)
+            ds = ds.with_columns(**{out: lit(constant)})
+        else:
+            ds = ds.with_row_index(out, offset=1)
+        handled.add(alias)
     return ds, handled
 
 
-def _window(ds: Dataset, projections) -> Dataset:
+def window_output_name(tr, taken: set[str], alias: str) -> str:
+    """The physical column a window item is materialized as, recording any rename.
+
+    A select-list alias may legitimately shadow a source column; a relational window
+    output may not, because it is appended to the input relation. When the two clash the
+    window is computed under a `__bc_wout<n>` name and `tr._win_physical` remembers the
+    mapping, which `_projection_map` (and a QUALIFY predicate) consult to read it back.
+
+    Args:
+        tr: The translator, for its rename map and counter.
+        taken: Names already claimed by the input relation or an earlier window item.
+        alias: The select-list alias this window item is written under.
+
+    Returns:
+        The column name to materialize the window under.
+    """
+    if alias not in taken:
+        taken.add(alias)
+        return alias
+    out = f"__bc_wout{tr._win_out_n}"
+    tr._win_out_n += 1
+    tr._win_physical[alias] = out
+    taken.add(out)
+    return out
+
+
+def _window(tr, ds: Dataset, projections) -> Dataset:
     """Apply window functions from the SELECT list, appending output columns.
 
     Window items are grouped by their (partition_by, order_by, frame) spec; each
@@ -298,7 +332,11 @@ def _window(ds: Dataset, projections) -> Dataset:
     single frame, so functions with different frames go to different calls).
     """
 
-    ds, handled = _unordered_ranking(ds, projections)
+    taken = set(ds.columns)
+    # Scoped to this call: a subquery translated earlier may have recorded an alias of
+    # the same name, and reading its hidden column here would answer with the wrong one.
+    tr._win_physical.clear()
+    ds, handled = _unordered_ranking(tr, ds, taken, projections)
 
     # Group window items by their (partition, order, frame) spec, preserving order.
     groups: list[tuple[tuple, tuple, tuple | None, dict]] = []
@@ -313,14 +351,15 @@ def _window(ds: Dataset, projections) -> Dataset:
         order = _window_order(win)
         func = _window_func(win, order)
         frame = _resolve_frame(win)
+        out = window_output_name(tr, taken, alias)
 
         key = (part, order, frame)
         for gpart, gorder, gframe, funcs in groups:
             if (gpart, gorder, gframe) == key:
-                funcs[alias] = func
+                funcs[out] = func
                 break
         else:
-            groups.append((part, order, frame, {alias: func}))
+            groups.append((part, order, frame, {out: func}))
 
     for part, order, frame, funcs in groups:
         ds = ds.window(
@@ -330,6 +369,83 @@ def _window(ds: Dataset, projections) -> Dataset:
             frame=frame,
         )
     return ds
+
+
+def _is_boolean_column(tr, node) -> bool:
+    """True when `node` is a column the plan says is boolean."""
+    import pyarrow as pa
+
+    t = tr.column_type(node)
+    return t is not None and pa.types.is_boolean(t)
+
+
+def _reshaped_window_argument(tr, item, fn, arg):
+    """Rewrite a window aggregate's argument into a type the operator's kernels read.
+
+    Two shapes SQL admits and the window kernels do not, both of which the *grouped* form
+    of the same aggregate already answers (`grouping._numeric_reduction`) — so the windowed
+    spelling failed on a query the `GROUP BY` one does:
+
+    * ``sum(flag) OVER (…)`` over a boolean: SQL sums the TRUEs.
+    * ``avg(ts) OVER (…)`` over a DATE or TIMESTAMP: the mean *instant*, which DuckDB
+      returns as a TIMESTAMP. The mean is taken over the microsecond count, so the output
+      has to be rebuilt into a timestamp — recorded in `tr._win_rewrap`, which the
+      projection applies when it reads the window column back.
+
+    Args:
+        tr: The translator, for the in-scope column types and the rewrap map.
+        item: The projection this window belongs to, for its output alias.
+        fn: The aggregate node.
+        arg: Its argument node.
+
+    Returns:
+        The replacement argument node, or None to leave the argument alone.
+    """
+    import pyarrow as pa
+
+    from batcher.plan.functions.temporal import from_epoch
+
+    name = type(fn).__name__.lower()
+    if name not in ("sum", "avg") or not isinstance(arg, exp.Column):
+        return None
+    dtype = tr.column_type(arg)
+    if dtype is None:
+        return None
+    if pa.types.is_boolean(dtype):
+        return exp.cast(arg.copy(), "BIGINT")
+    if name == "avg" and (pa.types.is_date(dtype) or pa.types.is_timestamp(dtype)):
+        tr._win_rewrap[_alias_of(item)] = lambda value: from_epoch(value.cast("int64"), "us")
+        return exp.cast(exp.cast(arg.copy(), "TIMESTAMP"), "BIGINT")
+    return None
+
+
+def _any_value_func(fn, order):
+    """Refuse `any_value(x) OVER (…)`, naming what it means and what to write instead.
+
+    DuckDB implements the windowed `any_value` as *the first non-null value in the frame*,
+    which is neither of the fills the runtime has: a forward fill is the **last** non-null
+    at or before the row, not the first, so answering with one returns a different column
+    on any partition holding more than one distinct value. DuckDB documents the chosen row
+    as unspecified besides, so there is nothing to conform to.
+
+    This is a refusal rather than a wrong answer on purpose; it exists as its own branch
+    because sqlglot parks `any_value(x)` under an `IgnoreNulls` wrapper, so the message
+    used to name an ``IGNORE NULLS`` clause the query never contained.
+
+    Args:
+        fn: The `AnyValue` node.
+        order: The window's ORDER BY, or an empty tuple.
+
+    Raises:
+        NotImplementedError: Always.
+    """
+    del fn, order
+    raise NotImplementedError(
+        "any_value(x) OVER (…) is not supported: DuckDB answers it with the first "
+        "non-null value in the frame, which is not one of the runtime's window "
+        "primitives, and the row it names is documented as unspecified. Use "
+        "first_value(x) / min(x) / max(x) OVER (…), whose answers are defined"
+    )
 
 
 def _ignore_nulls_func(win, fn, order):
@@ -466,6 +582,14 @@ def hoist_window_args(tr, ds: Dataset, projections) -> Dataset:
                 fn = fn.this
             if type(fn).__name__.lower() in _VALUE_ARG_FUNCS:
                 arg = fn.this
+                # `sum(flag) OVER (…)` over a boolean column: SQL sums the TRUEs, the
+                # window kernels take numbers. Widening it here is the same rule the
+                # GROUP BY path applies (`grouping._numeric_reduction`); without it the
+                # windowed spelling failed on a query the grouped one answers.
+                reshaped = _reshaped_window_argument(tr, p, fn, arg)
+                if reshaped is not None:
+                    arg = reshaped
+                    fn.set("this", arg)
                 # `count(*)`/`count()` has no value argument, and a plain column is
                 # already what the window operator wants.
                 if arg is not None and not isinstance(arg, (exp.Column, exp.Star)):
@@ -491,8 +615,15 @@ def _window_func(win, order):
     """Map a window function node to a `ds.window` functions-value."""
     fn = win.this
     if type(fn).__name__.lower() == "ignorenulls":
+        # sqlglot parks `any_value(x)` under `IgnoreNulls` even with no such clause
+        # written, so the IGNORE-NULLS handler answered a plain `any_value(x) OVER (…)`
+        # with an error naming a clause the query never used.
+        if type(fn.this).__name__.lower() == "anyvalue":
+            return _any_value_func(fn.this, order)
         return _ignore_nulls_func(win, fn.this, order)
     name = type(fn).__name__.lower()
+    if name == "anyvalue":
+        return _any_value_func(fn, order)
 
     # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
     # a fraction; the runtime supports all of these.

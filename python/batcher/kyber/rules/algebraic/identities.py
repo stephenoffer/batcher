@@ -73,6 +73,8 @@ def push_distinct_into_union(node: Distinct, ctx: OptimizerContext) -> LogicalPl
     new_inputs = []
     changed = False
     for branch in inner.inputs:
+        # Deliberately *without* `node.limit`: the outer dedup's row cap is a property of the
+        # concatenation, and applying it per branch would discard rows the union still needs.
         early = Distinct(branch, node.keys, node.order)
         if not isinstance(branch, Distinct | Aggregate) and _dedup_shrinks(ctx, branch, early):
             new_inputs.append(early)
@@ -81,7 +83,12 @@ def push_distinct_into_union(node: Distinct, ctx: OptimizerContext) -> LogicalPl
             new_inputs.append(branch)
     if not changed:
         return None
-    return Distinct(Union(tuple(new_inputs), distinct=False), node.keys, node.order)
+    # `replace`, so the *outer* dedup keeps every field it had. The positional rebuild dropped
+    # `limit`, and `fuse_limit_into_distinct` is in this same phase -- so a `DISTINCT ... LIMIT`
+    # over a `UNION ALL` could have its cap fused in and then silently discarded here within one
+    # fixpoint. The result stayed correct (that rule leaves the `Limit` node above), but the
+    # early exit it exists to enable was gone, which is exactly the kind of loss no test sees.
+    return dataclasses.replace(node, input=Union(tuple(new_inputs), distinct=False))
 
 
 def _dedup_shrinks(ctx: OptimizerContext, branch: LogicalPlan, deduped_branch: Distinct) -> bool:
@@ -183,7 +190,7 @@ def eliminate_sort_before_aggregate(node: Aggregate, _ctx: OptimizerContext) -> 
     rewritten = _sort_under_order_indifferent(node.input)
     if rewritten is None:
         return None
-    return Aggregate(rewritten, node.group_keys, node.aggregates)
+    return dataclasses.replace(node, input=rewritten)
 
 
 @rule(name="constant_propagation", phase=Phase.NORMALIZE, matches=(Filter,))

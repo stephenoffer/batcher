@@ -263,13 +263,73 @@ class LocalRunner:
         snap = getattr(self._processor, "snapshot_state", None)
         return snap() if snap is not None else None
 
+    def snapshot_delta(self) -> pa.RecordBatch | None:
+        """Take this epoch's changelog entry, when the processor offers one.
+
+        Forwarded rather than assumed, and only forwarded at all for a processor that
+        defines it: a delta chain cannot express a *removal*, so a processor that evicts
+        (the windowed aggregate, keyed state with expiry) must keep whole snapshots or
+        recovery would resurrect what it evicted. The engine reads this off the runner, so
+        without the forward the incremental path was simply never reached — which is a
+        silent loss of the optimization rather than a wrong answer, and therefore worth a
+        test that asserts a delta is actually written.
+        """
+        delta = getattr(self._processor, "snapshot_delta", None)
+        return delta() if delta is not None else None
+
+    def snapshot_state_parts(self) -> Any:
+        """The processor's whole state as a stream of parts, when it can hold state on disk.
+
+        Forwarded only for a processor that defines it. `snapshot_state` reports the
+        *resident* state, which is the whole story until a fold spills and a silent loss of
+        the rest afterwards — so a spillable processor offers this instead and the engine
+        prefers it.
+        """
+        parts = getattr(self._processor, "snapshot_state_parts", None)
+        return None if parts is None else parts()
+
     def restore_state(self, state: pa.RecordBatch) -> None:
         restore = getattr(self._processor, "restore_state", None)
         if restore is not None:
             restore(state)
 
+    def restore_state_parts(self, parts: list[pa.RecordBatch]) -> None:
+        """Rebuild the processor's state from a multi-part snapshot."""
+        restore = getattr(self._processor, "restore_state_parts", None)
+        if restore is not None:
+            restore(parts)
+            return
+        # A processor that never spills was never given more than one part.
+        self.restore_state(parts[0])
+
+    def restore_state_chain(self, states: list[pa.RecordBatch]) -> None:
+        """Rebuild the processor's state from a base snapshot plus the deltas after it."""
+        chain = getattr(self._processor, "restore_state_chain", None)
+        if chain is not None:
+            chain(states)
+            return
+        # A processor that cannot combine partials should never have been given a chain —
+        # only one that offers `snapshot_delta` gets deltas written for it. Restoring the
+        # base alone is the safe reading if that ever stops holding: it under-counts, which
+        # a re-read of the uncommitted epoch partly repairs, where applying partials to a
+        # processor that cannot merge them would corrupt the state outright.
+        self.restore_state(states[0])
+
     def has_state(self) -> bool:
         return getattr(self._processor, "snapshot_state", None) is not None
+
+    def close(self) -> None:
+        """Release whatever the processor is holding open. Idempotent.
+
+        A spilling fold owns a scratch directory, which is the same lifetime problem the
+        sink and the checkpoint store already have here: a driver that starts and stops
+        queries — a scheduler, a notebook, a test suite — otherwise leaves one directory of
+        spilled state behind per query, and the only symptom is scratch that slowly fills a
+        disk.
+        """
+        close = getattr(self._processor, "close", None)
+        if close is not None:
+            close()
 
 
 class DriverRunner:

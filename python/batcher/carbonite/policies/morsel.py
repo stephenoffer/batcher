@@ -91,11 +91,20 @@ def row_floor(byte_target: int, width: float) -> int:
     return max(1, min(MIN_MORSEL_ROWS, int(byte_target / width)))
 
 
-def _cap_for_width(config: Config, width: float | None) -> int | None:
-    """Row cap keeping `width`-byte rows inside the byte budget, or `None` if not binding."""
+def _cap_for_width(
+    config: Config, width: float | None, byte_target: int | None = None
+) -> int | None:
+    """Row cap keeping `width`-byte rows inside the byte budget, or `None` if not binding.
+
+    `byte_target` defaults to the configured per-morsel byte target. A caller that has already
+    tightened that budget — `morsel_target` under a configured memory envelope — passes the
+    tightened figure, so the row count is cut against the budget that will actually be
+    enforced rather than the one the config asked for.
+    """
     if width is None or width <= 0:
         return None
-    byte_target = config.execution.morsel_bytes
+    if byte_target is None:
+        byte_target = config.execution.morsel_bytes
     cap = int(byte_target / width)
     if cap >= config.execution.morsel_rows:
         return None  # the width is no wider than assumed — nothing to tighten
@@ -103,7 +112,10 @@ def _cap_for_width(config: Config, width: float | None) -> int | None:
 
 
 def learned_row_cap(
-    config: Config, model: LearnedMemoryModel | None, families: Iterable[str] | None = None
+    config: Config,
+    model: LearnedMemoryModel | None,
+    families: Iterable[str] | None = None,
+    byte_target: int | None = None,
 ) -> int | None:
     """Row cap that keeps a morsel's *measured* byte working set within the budget.
 
@@ -116,6 +128,8 @@ def learned_row_cap(
         config: The active config, for the byte and row targets.
         model: The learned memory model, or `None` on a cold store.
         families: The plan's operator kinds, or `None` for the global widest.
+        byte_target: The per-morsel byte budget to fit inside; the configured target when
+            omitted. See `_cap_for_width`.
 
     Returns:
         The row cap, or `None` when nothing is learned yet or the learned width is no wider
@@ -124,10 +138,10 @@ def learned_row_cap(
     """
     if model is None:
         return None
-    return _cap_for_width(config, model.max_bytes_per_row(families))
+    return _cap_for_width(config, model.max_bytes_per_row(families), byte_target)
 
 
-def planned_row_cap(config: Config, plan: object) -> int | None:
+def planned_row_cap(config: Config, plan: object, byte_target: int | None = None) -> int | None:
     """Row cap from the width the plan's **schema** implies.
 
     The companion to `learned_row_cap`, and the one that exists on the *first* run. A
@@ -164,12 +178,53 @@ def planned_row_cap(config: Config, plan: object) -> int | None:
         arrow = getattr(resolved, "arrow", None)
         if arrow is not None:
             widest = max(widest, schema_row_bytes(arrow))
-    return _cap_for_width(config, widest) if widest > 0.0 else None
+    return _cap_for_width(config, widest, byte_target) if widest > 0.0 else None
 
 
-def _planned(config: Config, plan: object | None) -> int | None:
+def _planned(config: Config, plan: object | None, byte_target: int | None = None) -> int | None:
     """`planned_row_cap` for an optional plan — `None` when the caller supplied none."""
-    return planned_row_cap(config, plan) if plan is not None else None
+    return planned_row_cap(config, plan, byte_target) if plan is not None else None
+
+
+def _envelope_byte_cap(config: Config, plan: object | None) -> int | None:
+    """Per-morsel byte budget implied by an **explicitly configured** memory envelope.
+
+    `max_memory_bytes` is an instruction rather than a reading (`pressure.budget_bytes` says
+    so), and admission bills a streaming pipeline one morsel per operator. So a small
+    configured envelope and a default 16,384-row morsel are two settings that contradict each
+    other, and the engine used to resolve the contradiction by *refusing the query*: a
+    `UNION ALL` over 20,000 rows under a 1 MiB envelope was declined as "does not fit the
+    memory envelope and has no out-of-core path" — for a pipeline that holds one morsel at a
+    time and needs no spill path at all. Two operators x 16,384 rows x 52 bytes is 1.7 MB
+    against a 1 MiB envelope, and every one of those rows was a row the engine chose to batch.
+
+    The morsel is the knob that resolves it. A morsel only *batches* data — it never changes
+    the result — so cutting it to fit is always available, and it is strictly better than
+    declining. The budget is divided by the plan's node count because admission charges each
+    node that holds a morsel and this layer must not import Kyber to learn which ones do:
+    counting every node over-divides, which is the safe direction (a smaller morsel), and
+    reads only the neutral `plan` layer.
+
+    Returns `None` — changing nothing — whenever `max_memory_bytes` is unset, which is the
+    default and the auto-sensed case. An envelope large enough that the quotient exceeds the
+    configured `morsel_bytes` also changes nothing, since `morsel_target` takes the smaller.
+
+    Args:
+        config: The active config.
+        plan: The logical plan about to run, or `None`.
+
+    Returns:
+        The per-morsel byte cap, or `None` to leave the configured target alone.
+    """
+    budget = config.memory.max_memory_bytes
+    if budget is None or budget <= 0 or plan is None:
+        return None
+    from batcher.plan.visitor import walk
+
+    nodes = sum(1 for _ in walk(plan))
+    if nodes <= 0:
+        return None
+    return max(MIN_MORSEL_BYTES, int(budget / nodes))
 
 
 def morsel_target(
@@ -199,6 +254,12 @@ def morsel_target(
     ex = config.execution
     factor = PRESSURE_FACTORS.get(level, 1.0)
     nbytes = int(ex.morsel_bytes * factor)
+    # A configured memory envelope is an instruction, and the morsel is the knob that honours
+    # it for a streaming pipeline. Applied before the width caps below so they cut the row
+    # count against the budget that will actually be enforced.
+    envelope = _envelope_byte_cap(config, plan)
+    if envelope is not None:
+        nbytes = min(nbytes, envelope)
     # Pressure shrinks the row target but never past the cache-efficient batch: that floor
     # is about per-batch overhead, which pressure does not change.
     rows = max(MIN_MORSEL_ROWS, int(ex.morsel_rows * factor))
@@ -217,7 +278,10 @@ def morsel_target(
     # over-tight one costs some throughput while an over-loose one costs the process.
     caps = [
         c
-        for c in (learned_row_cap(config, model, families), _planned(config, plan))
+        for c in (
+            learned_row_cap(config, model, families, nbytes),
+            _planned(config, plan, nbytes),
+        )
         if c is not None
     ]
     cap = min(caps) if caps else None
@@ -226,7 +290,7 @@ def morsel_target(
     # wider than the whole budget — rather than being overridden by it.
     if cap is not None:
         rows = min(rows, cap)
-    # Keep the configured target (fast path) only when neither lever moved anything.
-    if factor >= 1.0 and rows >= ex.morsel_rows:
+    # Keep the configured target (fast path) only when no lever moved anything.
+    if factor >= 1.0 and rows >= ex.morsel_rows and nbytes >= ex.morsel_bytes:
         return None
     return max(1, rows), max(MIN_MORSEL_BYTES, nbytes)

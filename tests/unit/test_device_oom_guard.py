@@ -292,3 +292,63 @@ class TestPackingRespectsCoTenants:
             "batcher._internal.hardware.devices.device_free_bytes", lambda: 80 * _GIB
         )
         assert gpu.max_actors_per_gpu(4.0, 20.0, inference_multiplier=1.0, headroom=0.0) == 5
+
+
+# --- The device tier does not raise a RuntimeError ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # RMM, the allocator every cuDF kernel runs on, raises this.
+        "std::bad_alloc: out_of_memory: CUDA error at: rmm/mr/device/cuda_memory_resource.hpp",
+        "RMM failure at: pool_memory_resource.hpp: Maximum pool size exceeded",
+        "HIP error: hipErrorOutOfMemory",
+    ],
+)
+def test_a_device_allocators_memory_error_is_a_device_oom(message):
+    # `MemoryError` is not a `RuntimeError`, so the whole GPU relational path missed the
+    # halving retry and failed a query a smaller batch would have completed.
+    exc = MemoryError(message)
+    assert is_device_oom(exc) is True
+    assert classify_oom(exc).should_shrink is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Unable to allocate 1.2 GiB for an array with shape (160000000,) and data type int64",
+        "",
+    ],
+)
+def test_a_host_memory_error_is_not_a_device_oom(message):
+    # The two want opposite responses: halving a batch relieves the device and does nothing
+    # for the host, so treating a host exhaustion as a device one retries into the same wall.
+    assert is_device_oom(MemoryError(message)) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # `npu` is inside `input`, and `hip` is inside `relationship`. A short vendor prefix
+        # is exactly the marker that looks harmless and then fires on an ordinary word — and
+        # the two failures want opposite responses, so a false positive retries into the wall.
+        "Unable to allocate output buffer for input column 3",
+        "cannot build the relationship index: out of space",
+        "input too large",
+    ],
+)
+def test_a_vendor_prefix_does_not_fire_on_an_ordinary_word(message):
+    assert is_device_oom(MemoryError(message)) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "NPU out of memory. Tried to allocate 2.00 GiB",
+        "synapse allocator: failed to allocate on device 0",
+        "HIP error: hipErrorOutOfMemory",
+    ],
+)
+def test_the_other_vendors_still_report_their_own_exhaustion(message):
+    assert is_device_oom(MemoryError(message)) is True

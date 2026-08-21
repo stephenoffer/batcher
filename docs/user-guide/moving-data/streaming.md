@@ -188,9 +188,8 @@ Sinks available on the write namespace:
   `truncate=False` or an explicit width.
 - {py:meth}`ds.write.memory(name, trigger=...) <batcher.api.io_namespace.writer.Writer.memory>` builds an in-memory table you read back with
   {py:func}`bt.read_memory(name) <batcher.read_memory>`.
-- {py:meth}`ds.write.for_each_batch(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each_batch>` calls `fn(table, batch_id)` on each
-  micro-batch. The whole Arrow table is passed, never a row, so this is the hook for
-  custom upserts (`MERGE`/SCD), multi-sink fan-out, or any per-batch commit logic.
+- `ds.write(table, "dbapi", uri=..., mode="upsert", key_columns=..., trigger=...)` maintains a **database table**: one transaction per micro-batch, and the upsert makes a replayed batch a no-op, so it is exactly-once with no transaction log. The operational stores (`mongo`, `dynamodb`, `cassandra`, `redis`, `elasticsearch`, `hbase`) work the same way. See {doc}`Writing to a database </integrations/databases/writing>`.
+- {py:meth}`ds.write.for_each_batch(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each_batch>` calls `fn(table, batch_id)` on each micro-batch. The whole Arrow table is passed, never a row: the hook for a multi-statement commit, an SCD, or multi-sink fan-out.
 - {py:meth}`ds.write.noop(trigger=...) <batcher.api.io_namespace.writer.Writer.noop>` runs the pipeline and discards
   its output. The benchmark sink: measuring through a real sink measures the sink too. Rows
   are still counted, so `recent_progress` reports what the query processed.

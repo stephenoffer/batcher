@@ -104,11 +104,21 @@ def test_the_engine_pool_reports_the_documented_shape() -> None:
         "denied",
         "spill_requests",
         "utilization",
+        # The data plane's own pressure line and the level it implies. Without them a reader
+        # could see `used` and had to assume where the line between "filling its envelope"
+        # and "idle while the box is full elsewhere" sat — opposite problems with opposite
+        # fixes, and the pool is the only thing that knows which side it is on.
+        "soft_limit_bytes",
+        "pressure",
     }
     assert stats["limit_bytes"] > 0
     # RAII reservations, so the pool drains between queries; the *peak* is what survives.
     assert stats["used_bytes"] == 0
     assert 0.0 <= stats["utilization"] <= 1.0
+    assert 0 < stats["soft_limit_bytes"] <= stats["limit_bytes"]
+    # Drained, so the level has to be the quiet one. A pool that reported pressure while
+    # holding nothing would make every idle process look like one about to spill.
+    assert stats["pressure"] == "NOMINAL"
 
 
 @_needs_reader

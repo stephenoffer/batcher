@@ -459,7 +459,7 @@ def warn_once_if_allocation_is_wider_than_ray() -> None:
     except Exception as exc:
         note_suppressed("dist", "compare the Ray cluster against the allocation", exc)
         return
-    if ray_nodes >= len(job.nodes):
+    if ray_nodes >= job.node_count:
         return
     _ALLOCATION_WARNED = True
     get_logger("dist").warning(
@@ -467,7 +467,7 @@ def warn_once_if_allocation_is_wider_than_ray() -> None:
         "the allocation. Start Ray across the allocation (`ray start --head` on one node, "
         "`ray start --address` on the rest) and point %s at it.",
         job.kind,
-        len(job.nodes),
+        job.node_count,
         ray_nodes,
         "RAY_ADDRESS",
     )

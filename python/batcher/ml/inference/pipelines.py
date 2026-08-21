@@ -225,10 +225,18 @@ def transformers_pipeline_encoder(
     model=model)`` once per worker (the load-once GPU-inference pattern) and runs it
     over each batch's `column`, appending the pipeline's primary output per row as
     `output_column`. For a classification pipeline that is the predicted ``label``;
-    for text generation the ``generated_text``; otherwise the raw scalar output. On a
-    GPU worker the model is placed on the device and auto-cast to BF16/FP16 where the
-    hardware benefits (see `_pipeline_accel_kwargs`). Needs ``transformers``
+    for text generation the ``generated_text``; for speech recognition the ``text``;
+    otherwise the raw scalar output. On a GPU worker the model is placed on the device
+    and auto-cast to BF16/FP16 where the hardware benefits (see
+    `_pipeline_accel_kwargs`). Needs ``transformers``
     (``batcher-engine[transformers]``).
+
+    `column` is not restricted to text. Its Arrow type decides what the pipeline is fed
+    (`_pipeline_inputs`): a string or binary column passes through as objects — text,
+    paths, URLs, or encoded bytes the pipeline decodes itself — and a numeric list or
+    tensor column becomes one NumPy array per row, which is what an audio, image, or
+    video model wants. That is what makes a decoded waveform column feed an ASR model
+    directly, with the decode and the resample staying in the data plane.
 
     An explicit `device` (``"cuda"``, ``"cpu"``, ``"mps"``) or `dtype` (``"float16"``,
     ``"bfloat16"``) overrides the zero-config accelerator placement; leaving both unset keeps
@@ -276,7 +284,7 @@ def transformers_pipeline_encoder(
             # as one GPU batch (`batch_size=num_rows`) so the forward pass is actually
             # batched; the map_batches `batch_size` already bounds `num_rows`, and the
             # actor-pool OOM-halving is the safety net if a batch is too large for VRAM.
-            inputs = batch.column(column).to_pylist()
+            inputs = _pipeline_inputs(batch.column(column))
             results = self._pipe(inputs, batch_size=max(1, len(inputs)))
             out_col = pa.array([_primary_output(r) for r in results])
             if output_column in batch.schema.names:
@@ -287,6 +295,43 @@ def transformers_pipeline_encoder(
     return _PipelineModel
 
 
+def _pipeline_inputs(column: pa.Array) -> list:
+    """One batch column as the inputs a ``transformers`` pipeline accepts.
+
+    A pipeline is polymorphic in its input and the column type is what says which shape this
+    is, so the conversion is chosen from the schema rather than from the task name:
+
+    * **string** and **binary** columns pass through as Python objects. That covers text, and
+      it covers the file paths, URLs and raw encoded bytes that the image and audio pipelines
+      accept and decode themselves.
+    * a **numeric list / fixed-size-list / tensor** column becomes one NumPy array per row.
+      That is a decoded waveform or a decoded image tensor, and it is the case that used to be
+      broken: ``to_pylist()`` on a ``list<float>`` waveform hands the feature extractor a
+      Python list of floats per row, which it rejects — so an ASR or audio-classification
+      model over the decode path this project documents could not run through `ds.ml.infer`
+      at all. Delegating to the one converter (`interop.arrays`) also means a
+      `FixedShapeTensor` image column restores to its full ``(H, W, C)`` shape rather than
+      arriving flat.
+    """
+    import pyarrow as pa
+
+    dtype = column.type
+    if (
+        pa.types.is_string(dtype)
+        or pa.types.is_large_string(dtype)
+        or pa.types.is_binary(dtype)
+        or pa.types.is_large_binary(dtype)
+        or pa.types.is_fixed_size_binary(dtype)
+    ):
+        return column.to_pylist()
+    from batcher.ml.converters import _column_to_numpy
+
+    matrix = _column_to_numpy(column)
+    if getattr(matrix, "dtype", None) is not None and matrix.dtype == object:
+        return column.to_pylist()  # a nested/ragged column with no array form; let HF judge
+    return list(matrix)
+
+
 def _primary_output(result: Any) -> Any:
     """The single salient value of one pipeline result row (label / text / scalar).
 
@@ -295,6 +340,12 @@ def _primary_output(result: Any) -> Any:
     — every entity a token-classification/NER pipeline found, or every candidate label —
     and each element's salient value is kept as a list, rather than silently discarding all
     but the first (the old ``result[0]``, which dropped every NER entity after the first).
+
+    ``text`` is in the key list because it is what every **speech** pipeline calls its
+    output (``automatic-speech-recognition`` returns ``{"text": ..., "chunks": [...]}``).
+    Without it the whole dict fell through as the "scalar", so a transcription landed as a
+    struct column carrying the timing chunks beside the words — a column nothing downstream
+    reads as a transcript.
     """
     if isinstance(result, list):
         if not result:
@@ -303,7 +354,14 @@ def _primary_output(result: Any) -> Any:
             return [_primary_output(item) for item in result]
         result = result[0]
     if isinstance(result, dict):
-        for key in ("label", "generated_text", "summary_text", "translation_text", "answer"):
+        for key in (
+            "label",
+            "generated_text",
+            "summary_text",
+            "translation_text",
+            "answer",
+            "text",
+        ):
             if key in result:
                 return result[key]
     return result

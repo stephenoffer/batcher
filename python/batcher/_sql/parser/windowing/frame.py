@@ -31,6 +31,7 @@ _WINDOW_AGGS: dict[str, str] = {
     "stddev": "stddev",
     "stddevsamp": "stddev",
     "variance": "var",
+    "median": "median",
 }
 
 

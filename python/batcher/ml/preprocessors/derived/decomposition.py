@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg
 from batcher.plan.expr_ir.constructors import col, lit
 
@@ -24,6 +25,27 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["PCA", "TruncatedSVD"]
+
+
+def _empty_fit(what: str, column: str) -> PlanError:
+    """The error raised when a fitted column carries no value to decompose.
+
+    A decomposition learns its directions from second moments, so a column that is empty or
+    entirely null contributes no variance and leaves the covariance undefined. Reaching
+    ``float(None)`` instead surfaced a bare ``TypeError`` from three frames down that named
+    neither the preprocessor nor the column.
+
+    Args:
+        what: The preprocessor's class name.
+        column: The column with nothing to learn from.
+
+    Returns:
+        A `PlanError` naming the column and the way out.
+    """
+    return PlanError(
+        f"{what}: column {column!r} has no non-null values, so there is no variance to "
+        "decompose. Drop the column, or fill it first with SimpleImputer."
+    )
 
 
 class PCA(Preprocessor):
@@ -122,7 +144,12 @@ class PCA(Preprocessor):
         from batcher.plan.functions.aggregate import mean as mean_
 
         means = ds.agg(**{name: mean_(col(name)) for name in self.columns}).collect()
-        self.mean_ = [float(means.column(name)[0].as_py()) for name in self.columns]
+        self.mean_ = []
+        for name in self.columns:
+            centre = means.column(name)[0].as_py()
+            if centre is None:
+                raise _empty_fit("PCA", name)
+            self.mean_.append(float(centre))
         covariance = covariance_matrix(ds, self.columns).to_pydict()
         matrix = np.array([covariance[name] for name in self.columns], dtype=float).T
         values, vectors = np.linalg.eigh(matrix)
@@ -268,8 +295,16 @@ class TruncatedSVD(Preprocessor):
         gram = np.zeros((d, d))
         for i in range(d):
             for j in range(i, d):
-                value = float(gram_row.column(f"g{i}_{j}")[0].as_py())
-                gram[i, j] = gram[j, i] = value
+                value = gram_row.column(f"g{i}_{j}")[0].as_py()
+                if value is None:
+                    if i == j:
+                        raise _empty_fit("TruncatedSVD", names[i])
+                    raise PlanError(
+                        f"TruncatedSVD: columns {names[i]!r} and {names[j]!r} share no row "
+                        "where both are non-null, so their gram entry is undefined. Fill "
+                        "them first with SimpleImputer, or fit on the complete rows only."
+                    )
+                gram[i, j] = gram[j, i] = float(value)
         values, vectors = np.linalg.eigh(gram)
         order = np.argsort(values)[::-1]
         vectors = vectors[:, order]

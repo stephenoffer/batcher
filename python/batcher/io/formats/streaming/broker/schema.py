@@ -19,11 +19,50 @@ from batcher.io.formats.sql._common import connection_fingerprint
 __all__ = [
     "HEADERS_TYPE",
     "BrokerMessage",
+    "as_header_pairs",
     "broker_schema",
     "normalize_starting_position",
     "opaque_offset",
     "redact_broker_options",
 ]
+
+
+def as_header_pairs(properties: Any) -> list[tuple[str, bytes | None]] | None:
+    """One broker's per-message metadata as the ``[(name, bytes)]`` the schema holds.
+
+    Kafka calls them headers, Pulsar calls them *properties*, Pub/Sub calls them
+    *attributes* and Event Hubs calls them *properties* again — and all four are the same
+    idea: a small string-keyed map riding with the payload, carrying a trace id, a schema
+    reference, a routing hint or a tenant. Only Kafka's ever reached the `headers` column,
+    so ``include_headers=True`` on the other three produced a column of nulls: the option
+    was accepted, the work was done, and nothing said the data was not there.
+
+    The value is normalized to bytes, because that is what the column's type is and because
+    the four clients disagree — Pulsar and Pub/Sub hand back `str`, Event Hubs hands back
+    whatever was published. A key that is bytes is decoded, since the column's key is
+    `string`.
+
+    Args:
+        properties: The client's metadata mapping, or None/empty when there is none.
+
+    Returns:
+        The pairs, or None when the message carried no metadata — the same null-versus-empty
+        distinction Kafka's headers already draw, so "this message had none" stays
+        distinguishable from "this broker does not carry them".
+    """
+    if not properties:
+        return None
+    pairs: list[tuple[str, bytes | None]] = []
+    for name, value in dict(properties).items():
+        key = name.decode("utf-8", "replace") if isinstance(name, bytes) else str(name)
+        if value is None or isinstance(value, bytes):
+            payload = value
+        elif isinstance(value, str):
+            payload = value.encode("utf-8")
+        else:
+            payload = str(value).encode("utf-8")
+        pairs.append((key, payload))
+    return pairs
 
 
 def opaque_offset(position: str) -> int:
@@ -186,7 +225,12 @@ _BROKER_SCHEMA = pa.schema(_BROKER_FIELDS)
 _BROKER_SCHEMA_WITH_HEADERS = pa.schema([*_BROKER_FIELDS, pa.field("headers", HEADERS_TYPE)])
 
 
-def broker_schema(include_headers: bool = False) -> pa.Schema:
+def broker_schema(
+    include_headers: bool = False,
+    *,
+    value_type: pa.DataType | None = None,
+    key_type: pa.DataType | None = None,
+) -> pa.Schema:
     """The broker message schema shared by every broker source.
 
     `include_headers` adds the `headers` column, off by default and opt-in for the reason
@@ -195,13 +239,29 @@ def broker_schema(include_headers: bool = False) -> pa.Schema:
     poll. A stream that does want them — for a trace id, a schema-registry id, a routing
     hint — could not reach them at all before.
 
+    `value_type` / `key_type` retype the payload columns when the source was given a wire
+    format (``value_format="avro"``, …). The retype has to happen *here* rather than after
+    the batch is built, because this schema is what `Dataset.schema` answers from and what
+    the optimizer plans against: a source that decodes to a struct but advertises `binary`
+    type-checks every downstream expression against the wrong type and only fails once rows
+    arrive.
+
     Args:
         include_headers: Whether to add the `headers` column.
+        value_type: The decoded type of the `value` column, or None for raw bytes.
+        key_type: The decoded type of the `key` column, or None for raw bytes.
 
     Returns:
-        The shared, immutable schema for that choice.
+        The schema for that choice. The undecoded cases return the *shared* immutable
+        instance, so the common path allocates nothing per poll.
     """
-    return _BROKER_SCHEMA_WITH_HEADERS if include_headers else _BROKER_SCHEMA
+    if value_type is None and key_type is None:
+        return _BROKER_SCHEMA_WITH_HEADERS if include_headers else _BROKER_SCHEMA
+    base = _BROKER_SCHEMA_WITH_HEADERS if include_headers else _BROKER_SCHEMA
+    retyped = {"value": value_type, "key": key_type}
+    return pa.schema(
+        [pa.field(f.name, retyped[f.name]) if retyped.get(f.name) is not None else f for f in base]
+    )
 
 
 @dataclass(frozen=True, slots=True)

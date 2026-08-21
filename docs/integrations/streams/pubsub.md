@@ -55,8 +55,18 @@ Rows arrive in the fixed broker schema (`key`, `value`, `partition`, `offset`, `
 That `offset` is stable per message and useful for de-duplication, but it is not ordered and
 it is not a position you can seek to.
 
-Message *attributes* are not surfaced. If your producers put routing metadata in attributes
-rather than the body, Batcher will not show it to you.
+Message *attributes* are Pub/Sub's spelling of Kafka's headers, and `include_headers=True`
+adds them as a `headers` column of `array<struct<key:string,value:binary>>` — the same type
+and the same option every broker here uses:
+
+```python
+# docs: skip
+events = bt.read.pubsub("projects/p/subscriptions/s", include_headers=True)
+routed = events.with_columns(tenant=bt.col("headers").list.get(0).struct.field("value"))
+```
+
+It is off by default because the nested column costs on every message of every poll, and a
+message that carried no attributes reads as `null` rather than as an empty list.
 
 ## Decoding the payload
 

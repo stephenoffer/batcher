@@ -300,9 +300,9 @@ class Expr:
 
         The operation is **type-preserving for integers**: Int64 ``//`` Int64 stays
         Int64 and is computed exactly, including above 2^53 where routing through
-        Float64 would silently lose precision. A zero divisor yields NULL (matching
-        DuckDB and Polars) rather than ``inf``/``nan``. Float operands give the IEEE
-        ``floor(a / b)``."""
+        Float64 would silently lose precision. A zero divisor yields NULL on **both**
+        arms, matching DuckDB's ``//`` (``1.0 // 0.0`` is NULL there, not ``inf``);
+        otherwise a float pair gives ``floor(a / b)``."""
         return Binary("floor_div", self, _wrap(other))
 
     def __rfloordiv__(self, other: IntoExpr) -> Expr:
@@ -3999,6 +3999,45 @@ class Expr:
                 {'x': [3, 1, 4, 1, 5], 'cm': [3, 3, 4, 4, 5]}
         """
         return self._running("max", partition_by, order_by)
+
+    def cum_prod(
+        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
+    ) -> WindowExpr:
+        """Cumulative (running) product up to the current row — Polars ``cum_prod``.
+
+        Completes the running family beside :meth:`cum_sum`, :meth:`cum_min`,
+        :meth:`cum_max` and :meth:`cum_count`. Nulls are skipped rather than
+        propagated, so a null leaves the running product unchanged, which is what the
+        other members of the family do and what SQL's ``product`` aggregate does.
+
+        The result is ``Float64`` even for an integer input, because a running product
+        overflows an ``Int64`` far sooner than a running sum and silently wrapping is
+        the wrong answer to give a compounding factor.
+
+        Args:
+            partition_by: Restart the running value per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A window expression carrying the running product.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [2.0, 3.0, 4.0]})
+                >>> ds.with_columns(cp=bt.col("x").cum_prod()).to_pydict()
+                {'x': [2.0, 3.0, 4.0], 'cp': [2.0, 6.0, 24.0]}
+
+                >>> rates = bt.from_pydict(
+                ...     {"fund": ["a", "a", "b", "b"], "r": [1.1, 1.2, 2.0, 0.5]}
+                ... )
+                >>> rates.with_columns(
+                ...     growth=bt.col("r").cum_prod(partition_by="fund", order_by="r")
+                ... ).to_pydict()["growth"]
+                [1.1, 1.32, 1.0, 0.5]
+        """
+        return self._running("product", partition_by, order_by)
 
     def cum_count(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()

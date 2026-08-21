@@ -205,6 +205,8 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.hypot(a, b) <batcher.hypot>` | Euclidean norm `sqrt(a² + b²)` |
 | {py:func}`bt.great_circle_distance(lat1, lon1, lat2, lon2, unit="km") <batcher.great_circle_distance>` | haversine distance between two lat/lon points, in `km`/`m`/`mi`/`nm` |
 | {py:func}`bt.width_bucket(value, low, high, count) <batcher.width_bucket>` | histogram bucket index over `[low, high]` |
+| {py:func}`bt.partition_years(ts) <batcher.partition_years>` / {py:func}`bt.partition_months(ts) <batcher.partition_months>` / {py:func}`bt.partition_days(ts) <batcher.partition_days>` / {py:func}`bt.partition_hours(ts) <batcher.partition_hours>` | Iceberg time partition transforms, counted from the epoch |
+| {py:func}`bt.partition_truncate(value, width) <batcher.partition_truncate>` | Iceberg `truncate` transform: round a number down to a multiple of `width` |
 | {py:func}`bt.struct(**fields) <batcher.struct>` / {py:func}`bt.named_struct(name, value, ...) <batcher.named_struct>` | build a struct column |
 | {py:func}`bt.sequence(start, stop, step=1) <batcher.sequence>` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
 | {py:func}`bt.element() <batcher.element>` | the current element inside `list.transform` / `list.filter` (Polars) |

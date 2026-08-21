@@ -178,10 +178,36 @@ resource you defined yourself on an on-prem cluster (`resources={"fpga_slot": 1}
 Do not pass `num_gpus` for these: a TPU or Trainium node advertises no `GPU` resource, so
 the task would wait for a GPU that never appears rather than failing.
 
-On the model side, `batcher.ml.gpu.detect_backend()` already resolves `cuda` / `rocm` /
-`xpu` (Intel) / `mps` (Apple) / `tpu`, and `torch_device()` maps them to the right torch
-device string (a TPU becomes `xla`). What `resources=` adds is the *placement* half. It
-gets the task onto the node that has the device.
+On the model side, `batcher.ml.gpu.detect_backend()` resolves `cuda`, `rocm`, `xpu` (Intel),
+`mps` (Apple), `tpu`, `neuron` (Trainium/Inferentia), `hpu` (Gaudi) and `npu` (Ascend), and
+`torch_device()` maps each to the right torch device string (a TPU or Trainium becomes `xla`,
+Gaudi `hpu`, Ascend `npu`). What `resources=` adds is the *placement* half. It gets the task
+onto the node that has the device.
+
+### What each accelerator reports
+
+Placement gets a task onto a device; the adaptive loops need to *read* it. Both loops are
+no-ops on a reading they cannot take, and silently so: with no utilization the packing target
+never applies, and with no memory reading the batch-size climb has no ceiling. This is what
+each backend reports:
+
+| Backend | Utilization | Device memory | Fragmentation and per-process cap | Cache release |
+|---|---|---|---|---|
+| `cuda`, `rocm` | NVML / ROCm SMI | NVML, then torch | yes | yes |
+| `xpu` (Intel) | torch counter | torch | yes | yes |
+| `hpu` (Gaudi) | torch counter | torch | yes | yes |
+| `npu` (Ascend) | torch counter | torch | yes | yes |
+| `mps` (Apple) | none reported | torch (unified budget) | yes | yes |
+| `tpu`, `neuron` | none reported | none (XLA has no caching allocator) | no | graph step |
+
+Apple, Cloud TPU and Trainium expose no stable per-process utilization counter. They are
+absent from the table's first column on purpose rather than by omission: a fabricated number
+would be worse than the no-op, because the packing loop would then repack a fleet from it. A
+stage on one of those keeps the `concurrency` you declared.
+
+`tpu` and `neuron` run through XLA, which has no caching allocator to read a fragmentation
+ratio from, no per-process cap to set, and releases memory by stepping its execution graph
+rather than by emptying a cache.
 
 ## Keeping GPUs fed
 
@@ -195,6 +221,63 @@ A GPU sits idle while it waits for data. To avoid that:
   batches amortize per-call overhead.
 - Raise `concurrency` (and use fractional `num_gpus`) until the devices are fully
   utilized.
+
+### The engine does this for you across runs
+
+Leave `concurrency` unset and the packing is measured rather than guessed. Each run records
+the utilization its actors sustained and the peak device memory they used; the next run of the
+same pipeline sizes `num_gpus` so the device lands at **80% utilization**, bounded by what that
+measured peak says memory allows.
+
+Both halves matter and they pull in opposite directions. Packing to utilization alone walks a
+fleet into an out-of-memory; packing to memory alone leaves a cheap model at one actor per
+device with most of the card idle. The loop takes the smaller of the two, so it converges to
+the densest packing that fits.
+
+It settles rather than chases. A device at or above 80% is treated as fed and the density is
+held, because every change rebuilds the pool — a model reload on every device — and a measured
+step past a fed device came out both slower and less evenly spread than the density it left
+(2,602 img/s at 77/94/95/75% against 2,787 at 95/93/94/93%). A stage that lands exactly on the
+target computes the same density again and stays there.
+
+Nothing is measured on the very first run, so it starts from what you declared and improves
+from the second.
+
+### Adding devices adds throughput
+
+The actor pool is sized from the cluster's devices: `total_devices / num_gpus` actors, so
+doubling the fleet doubles the pool. That holds for a named accelerator too — a stage asking
+`resources={"TPU": 4}` opens `cluster_TPU / 4` actors.
+
+The thing that used to break it was the input's shape. A partition count is sized from *data*,
+and a 2.4 GB corpus takes the four-partition floor whatever the cluster looks like; sizing the
+pool by devices and then clamping it to partitions let the data decide how many accelerators
+were allowed to work. Both execution paths now raise the parallelism to match the devices
+instead: the batch path shards to one partition per actor, and the streaming path does not
+clamp its consumers at all, since a consumer is fed by the Flight hand-off rather than by a
+partition.
+
+An explicit `concurrency` is always honored as written. The sizing above applies only when you
+leave it to the engine.
+
+### Reading the pool's own report
+
+{py:class}`InferencePool <batcher.ml.InferencePool>`, which backs
+{py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` and the actor-pool paths,
+publishes a per-batch event carrying the model's latency and `blocked_ms`, the time the
+consumer spent waiting on the pool. That second number is the one that tells you which
+problem you have, because a saturated pool and a starved one look identical in rows per
+second and want opposite fixes:
+
+| `blocked_ms` | What it means | What to change |
+|---|---|---|
+| Large, close to the batch latency | The pool is the bottleneck; the source keeps up. | More workers, a larger batch, or a smaller model. |
+| Near zero | The pool is starved; it finishes before the next batch arrives. | Speed up the source, or widen the read and decode stages. |
+
+The pool reads its source **ahead** on a background thread, so the read and the forward pass
+overlap instead of taking turns. The depth is two batches by default, which bounds the extra
+resident memory to two batches; `prefetch=` raises it for a slow source and `prefetch=0`
+restores the inline pull.
 
 ## See also
 

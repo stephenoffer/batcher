@@ -27,7 +27,12 @@ from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.profile import StageRecorder, logical_op_ids, stage_kind
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import total_logical_bytes
-from batcher.plan.visitor import children, scanned_source_ids, with_children
+from batcher.plan.visitor import (
+    children,
+    reparent_unvalidated,
+    scanned_source_ids,
+    with_children,
+)
 
 __all__ = [
     "build_udf_callable",
@@ -49,12 +54,12 @@ def prebuild_factories(node: LogicalPlan) -> LogicalPlan:
     callable and is left as is; `build_udf_callable` is idempotent on a built instance.
     """
     if isinstance(node, MapBatches):
-        return dataclasses.replace(
+        return reparent_unvalidated(
             node, fn=build_udf_callable(node.fn), input=prebuild_factories(node.input)
         )
     child = getattr(node, "input", None)
     if child is not None:
-        return dataclasses.replace(node, input=prebuild_factories(child))
+        return reparent_unvalidated(node, input=prebuild_factories(child))
     return node
 
 

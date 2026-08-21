@@ -16,9 +16,11 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "DATABASE_SINKS",
     "MODE_AWARE_SINKS",
     "SAVE_MODES",
     "derive_partition_columns",
+    "dml_write_modes",
     "normalize_partition_by",
     "normalize_save_mode",
     "one_or_many",
@@ -37,7 +39,44 @@ __all__ = [
 # quietly appended instead. A save mode that silently does the opposite of what it says is
 # a data-corruption bug, not a missing feature.
 SAVE_MODES = ("overwrite", "overwrite_partitions", "error", "ignore", "append")
-MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi", "snowflake"})
+MODE_AWARE_SINKS = frozenset(
+    {
+        "delta",
+        "iceberg",
+        "hudi",
+        "snowflake",
+        "adbc",
+        "dbapi",
+        "mongo",
+        "dynamodb",
+        "cassandra",
+        "redis",
+        "elasticsearch",
+        "hbase",
+    }
+)
+
+#: Sinks whose destination is a database table rather than a path in a filesystem.
+#:
+#: Two of `Writer.__call__`'s steps are filesystem operations dressed as mode handling: the
+#: ``error``/``ignore`` gate asks whether the destination *path* exists, and the overwrite
+#: cleanup deletes stale files under it. Neither means anything for a table name, and the
+#: first was actively wrong — ``mode="error"`` against a table that already held rows asked
+#: the local filesystem whether a file called ``orders`` existed, got False, and wrote
+#: anyway. The gate that exists to refuse an overwrite silently permitted one.
+DATABASE_SINKS = frozenset(
+    {
+        "adbc",
+        "dbapi",
+        "mongo",
+        "snowflake",
+        "dynamodb",
+        "cassandra",
+        "redis",
+        "elasticsearch",
+        "hbase",
+    }
+)
 
 #: The spellings other engines use for the same four modes. `errorifexists` is the one
 #: that matters most: it is what Spark's own documentation calls the mode, so a ported job
@@ -256,3 +295,42 @@ def reject_row_index(opts: dict[str, Any]) -> None:
             "Drop index=, or add the numbering as a real column before writing so it is "
             "written like every other column."
         )
+
+
+def dml_write_modes(fmt: str | None) -> tuple[str, ...]:
+    """The row-level DML verbs `fmt`'s sink accepts as its `mode`, or empty for none.
+
+    A save mode says what to do with the *table* — replace it, add to it, refuse. A
+    database table is also maintained one row at a time, and ``upsert`` / ``update`` /
+    ``delete`` are not save modes in any sense: they name what happens to the rows the
+    write's keys match, and leave every other row alone. Spark has no spelling for them at
+    all, which is why a JDBC upsert is written by hand there.
+
+    A sink that implements them declares them in a ``dml_modes`` class attribute, the same
+    way one declares its keyword vocabulary in ``write_spec``. `Writer.__call__` then passes
+    such a mode through verbatim rather than running it past `normalize_save_mode`, which
+    would reject it as a misspelled save mode.
+
+    Args:
+        fmt: The sink format name, or None when the format is still being detected from
+            the path — in which case there is no sink to ask and no DML mode to honor.
+
+    Returns:
+        The accepted DML modes, or an empty tuple.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.api.io_namespace._write_opts import dml_write_modes
+            >>> "upsert" in dml_write_modes("dbapi")
+            True
+            >>> dml_write_modes("parquet")
+            ()
+    """
+    if not fmt:
+        return ()
+    from batcher.io.formats import SINKS
+
+    sink_cls = SINKS.get(fmt) if fmt in SINKS else None
+    modes = getattr(sink_cls, "dml_modes", ())
+    return tuple(modes) if isinstance(modes, tuple | list) else ()

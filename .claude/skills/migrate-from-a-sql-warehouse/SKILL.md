@@ -63,7 +63,8 @@ The partitioning options are modeled on Spark's JDBC reader, so this table is ne
 | `numPartitions=8` | `num_partitions=8` | how many parallel queries to issue |
 | `fetchsize=10000` | `batch_size=…` | DB-API path only; ADBC/ConnectorX stream Arrow |
 | `pushDownPredicate=true` | *(always on)* | Kyber pushes filter and projection into the SQL |
-| `.write.jdbc(url, table, mode)` | `ds.write.sql(table, uri=..., mode=...)` | `"create"`, `"append"`, `"replace"`, `"create_append"` |
+| `.write.jdbc(url, table, mode)` | `ds.write.sql(table, uri=..., mode=...)` | `"append"` (default) or `"overwrite"` |
+| `foreachPartition` + a hand-written `MERGE` | `ds.write.sql(table, uri=..., mode="upsert", key_columns=...)` | Spark has no save mode for this; Batcher does |
 
 ## Partitioning: bounds cut, they do not filter
 
@@ -177,8 +178,13 @@ so `batch_size` is the throughput knob that matters here.
    `df = df[df.amount > 100]` lines; write them as `.filter(...)` so they push into the
    SQL. Confirm with `print(ds.explain())`.
 7. **Port the sink.** `.write.jdbc(url, table, mode)` becomes
-   `ds.write.sql(table, uri=..., mode=...)`, which ingests Arrow in bulk rather than row by
-   row.
+   `ds.write.sql(table, uri=..., mode=...)`. A plain append goes through ADBC and ingests
+   Arrow in bulk; MySQL, Oracle and SQL Server, which have no ADBC driver, go through the
+   scheme's PEP 249 driver, so a `jdbc:mysql:` sink ports without changing anything but the
+   URL. If the Spark job wrote to a staging table and then ran a `MERGE` — or looped
+   `foreachPartition` over a hand-written upsert, which is what Spark forces — collapse
+   both into `mode="upsert", key_columns=[...]`, and pass `key_columns=` on the write that
+   creates the table so it has the key the upsert conflicts on.
 8. **Verify the ported extract returns the same rows.** Run the original extract and the
    ported one against the same database and compare **order-independently** — a SQL result
    has no order without an `ORDER BY`, and this is where ports quietly differ:

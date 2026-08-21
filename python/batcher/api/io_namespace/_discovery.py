@@ -156,6 +156,24 @@ def namespace_dir(obj: object) -> list[str]:
     return sorted(set(object.__dir__(obj)) | set(method_names(type(obj))))
 
 
+@functools.cache
+def _unknown_format_attribute() -> type[Exception]:
+    """The exception class a missed namespace attribute raises: a `FormatError` *and* an
+    `AttributeError`.
+
+    Built here rather than declared in the error hierarchy because it exists for one call
+    site and for a Python-protocol reason, not as a category a user should ever name: code
+    catches `FormatError`, and `hasattr` needs the `AttributeError`. Cached so the class is
+    created once and `except` identity is stable across calls.
+    """
+    from batcher._internal.errors import FormatError
+
+    class UnknownFormatAttribute(FormatError, AttributeError):
+        """A format name the namespace does not have."""
+
+    return UnknownFormatAttribute
+
+
 def unknown_attribute(obj: object, label: str, name: str) -> BatcherError | AttributeError:
     """Build the error for an attribute the namespace does not have.
 
@@ -164,6 +182,13 @@ def unknown_attribute(obj: object, label: str, name: str) -> BatcherError | Attr
     ``__getstate__``, and ``_ipython_canary_method_should_not_exist_`` and expect a miss
     to be an `AttributeError`. Answering one of those probes with a `FormatError` would
     break `deepcopy` on a namespace that has nothing to deep-copy.
+
+    The same argument applies to a *public* name, and used to stop at the underscore: a
+    `FormatError` that was not also an `AttributeError` made ``hasattr(bt.read, "ndjson")``
+    **raise** rather than answer False, and took ``getattr(bt.read, name, default)`` with
+    it. Both are how ordinary code asks whether a format is supported. So the returned
+    error subclasses both: `except FormatError` still catches it, the did-you-mean message
+    is unchanged, and the attribute protocol behaves.
 
     Args:
         obj: The namespace instance the lookup missed on.
@@ -176,10 +201,10 @@ def unknown_attribute(obj: object, label: str, name: str) -> BatcherError | Attr
     """
     if name.startswith("_"):
         return AttributeError(f"{type(obj).__name__!r} object has no attribute {name!r}")
-    from batcher._internal.errors import FormatError, unknown_value
+    from batcher._internal.errors import unknown_value
 
     return unknown_value(
-        FormatError,
+        _unknown_format_attribute(),
         "format",
         name,
         method_names(type(obj)),

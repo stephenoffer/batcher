@@ -115,6 +115,18 @@ def execute_adaptive(
                 attempt + 1,
                 max_attempts,
             )
+    # `last` is set by the loop above, which config validation guarantees runs at least once
+    # (`distributed.fleet_max_attempts >= 1`). A config built past that validation would
+    # otherwise reach `raise None`, which is a `TypeError` about `NoneType` in place of the
+    # real problem — and, worse, would silently never run the query at all.
+    if last is None:
+        from batcher._internal.errors import ConfigError
+
+        raise ConfigError(
+            f"distributed.fleet_max_attempts must be at least 1, but is {max_attempts}, "
+            f"so the staged query was never attempted.",
+            hint="Set distributed.fleet_max_attempts to 1 or more.",
+        )
     raise last  # exhausted retries — surface the last worker-loss error
 
 
@@ -311,20 +323,38 @@ def _execute_adaptive(
         decisions.extend(decs)
         return AdaptiveResult(_as_table(result, plan), decisions, stages + 1)
     finally:
-        # The final result is a fully in-memory table, independent of the on-disk
-        # intermediates, so they can be removed now (best-effort).
+        # Every release below is isolated, because they are ordered by dependency and the
+        # expensive ones are last. An intermediate's `cleanup` reaches a Ray actor or a
+        # filesystem, so it can fail for reasons that have nothing to do with the query —
+        # and one raising here used to skip every remaining intermediate, the fleet
+        # teardown, and the session lease. That leaks a whole placement group and its
+        # worker actors for the life of the session, on a path whose only job is to give
+        # resources back. "Best-effort" has to mean per release, not per block.
         for m in intermediates:
-            m.cleanup()
+            _release("drop a staged intermediate", m.cleanup)
         # Free the query-lifetime fleet once, after every intermediate that borrowed
         # it has been read (the final stage already collected its result to a table).
         if fleet is not None:
             from batcher.dist.fleet import reset_fleet
 
-            reset_fleet(fleet_token)
-            fleet.cleanup()
+            _release("unbind the query fleet", reset_fleet, fleet_token)
+            _release("tear down the query fleet", fleet.cleanup)
         # Drop the query-scoped session-fleet lease last: every intermediate that read
         # from the warm fleet is gone, so it may now go idle (and time out) safely.
-        stack.close()
+        _release("drop the session-fleet lease", stack.close)
+
+
+def _release(what: str, release, *args) -> None:
+    """Run one resource release, logging rather than raising.
+
+    A release that raises inside a `finally` both replaces whatever the query was already
+    raising and skips every release queued behind it, which is the opposite of what a
+    teardown path is for.
+    """
+    try:
+        release(*args)
+    except Exception as exc:  # pragma: no cover - a teardown must not mask the real error
+        note_suppressed("api", what, exc)
 
 
 def _run_stage(
@@ -447,12 +477,24 @@ def _worth_staging(srcs: list[Source], hub):
     Best-effort. If the estimate cannot be built or read, the breaker qualifies, which is
     the pre-existing behavior and never loses a measurement the loop would have taken.
     """
+    from batcher.api.adaptive.gating import build_estimator
     from batcher.plan.stats import Provenance
 
-    def accept(node: LogicalPlan) -> bool:
-        try:
-            from batcher.api.adaptive.gating import build_estimator
+    # Built **once per stage**, not once per candidate breaker. `build_estimator` re-reads the
+    # learned bundle and re-collects every source's statistics, and it carries the memo that
+    # makes estimating a plan cheap — so constructing one inside the predicate paid both costs
+    # per node walked and then threw the memo away, on a walk that visits every breaker of the
+    # plan on every iteration of the stage loop.
+    try:
+        estimator = build_estimator(srcs, hub)
+    except Exception as exc:  # pragma: no cover - an estimate must never break staging
+        note_suppressed("api", "build the estimator for staging", exc)
+        estimator = None
 
+    def accept(node: LogicalPlan) -> bool:
+        if estimator is None:
+            return True
+        try:
             # `Provenance` is ordered strongest-trust *first* (EXACT=0 … DEFAULT=4), so the
             # test for "less than exact" is `> EXACT`. Comparing `>= DEFAULT` instead — as
             # this did — accepted only the pure Selinger guess and rejected HISTOGRAM,
@@ -461,7 +503,7 @@ def _worth_staging(srcs: list[Source], hub):
             # aggregate chose its build side from that estimate rather than from the
             # measured size, and adaptive re-optimization got quietly *weaker* the more the
             # learning loop knew.
-            return build_estimator(srcs, hub).estimate(node).provenance > Provenance.EXACT
+            return estimator.estimate(node).provenance > Provenance.EXACT
         except Exception as exc:  # pragma: no cover - an estimate must never break staging
             note_suppressed("api", "read breaker provenance for staging", exc)
             return True

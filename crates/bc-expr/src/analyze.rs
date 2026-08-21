@@ -145,6 +145,10 @@ impl Expr {
             // input must be a column that is already UTF-8: evaluation casts a
             // `Binary` input to `Utf8`, and *that* rejects an invalid byte sequence
             // one row at a time.
+            // The per-row-parameter form runs the same kernels, but a parameter is data
+            // rather than a plan constant — a malformed regex or a negative length is not
+            // knowable here — so it is never treated as an infallible predicate.
+            Expr::StrDyn { .. } | Expr::ListGetDyn { .. } => false,
             Expr::Str { func, input, .. } => {
                 matches!(
                     func,
@@ -276,6 +280,12 @@ impl Expr {
             // of magnitude past that. Both are "run me last" and the exact number
             // only has to preserve that ordering.
             Expr::Str { input, .. } => 40u32.saturating_add(input.eval_cost()),
+            // A per-row parameter means one kernel call per distinct parameter tuple, so
+            // it is at least as expensive as the constant form and usually more.
+            Expr::StrDyn { input, .. } => 80u32.saturating_add(input.eval_cost()),
+            Expr::ListGetDyn { input, index } => 1u32
+                .saturating_add(input.eval_cost())
+                .saturating_add(index.eval_cost()),
             Expr::Image { .. }
             | Expr::ImageCrop { .. }
             | Expr::Audio { .. }
@@ -325,6 +335,28 @@ impl Expr {
             // Leaves.
             Expr::Col { .. } | Expr::Lit { .. } => {}
 
+            // The parameters of the dynamic form are expressions too, so it cannot ride
+            // the single-child list: a column read only by a `pattern`/`length` would be
+            // invisible to projection pruning, which would then prune it away.
+            Expr::StrDyn {
+                input,
+                pattern,
+                replacement,
+                start,
+                length,
+                ..
+            } => {
+                visit(input);
+                for p in [pattern, replacement, start, length].into_iter().flatten() {
+                    visit(p);
+                }
+            }
+            Expr::Str { input, .. } => visit(input),
+            Expr::ListGetDyn { input, index } => {
+                visit(input);
+                visit(index);
+            }
+
             // `frame_at`'s timestamp is an expression too, and optional — so `Video`
             // cannot ride the single-child list without its bound going unvisited.
             Expr::Video { input, second, .. } => {
@@ -358,7 +390,6 @@ impl Expr {
             | Expr::IsNotNull { input }
             | Expr::IsNan { input }
             | Expr::IsInf { input }
-            | Expr::Str { input, .. }
             | Expr::Date { input, .. }
             | Expr::Image { input, .. }
             | Expr::Audio { input, .. }

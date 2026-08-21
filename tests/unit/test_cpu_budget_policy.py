@@ -85,7 +85,9 @@ def test_the_manager_leaves_a_quiet_machine_alone(monkeypatch):
     # and reship an engine config for no reason.
     from batcher.carbonite import manager as mgr
 
-    monkeypatch.setattr(mgr, "effective_core_budget", lambda: mgr.available_cpu_count())
+    # `reduced_core_budget` is the seam: `None` *is* "the permitted count stands", so a quiet
+    # machine is expressed by returning it rather than by making two readings agree.
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: None)
     assert mgr.ResourceManager().recommend_parallelism() is None
 
 
@@ -94,8 +96,7 @@ def test_the_manager_passes_a_reduced_budget_to_the_engine(monkeypatch):
     # engine sizes its rayon pool from. A policy nobody consults changes nothing.
     from batcher.carbonite import manager as mgr
 
-    monkeypatch.setattr(mgr, "effective_core_budget", lambda: 3)
-    monkeypatch.setattr(mgr, "available_cpu_count", lambda: 16)
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 3)
     manager = mgr.ResourceManager()
     assert manager.recommend_parallelism() == 3
     recommended = manager.recommended_config()
@@ -123,8 +124,7 @@ def test_a_parallelism_only_recommendation_preserves_the_morsel_target(monkeypat
     # configured, not reset it to a default the engine would then run with.
     from batcher.carbonite import manager as mgr
 
-    monkeypatch.setattr(mgr, "effective_core_budget", lambda: 3)
-    monkeypatch.setattr(mgr, "available_cpu_count", lambda: 16)
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 3)
     manager = mgr.ResourceManager()
     monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None, plan=None: None)
 
@@ -141,8 +141,7 @@ def test_both_levers_apply_together(monkeypatch):
     # tighter morsel *and* the narrower fan-out.
     from batcher.carbonite import manager as mgr
 
-    monkeypatch.setattr(mgr, "effective_core_budget", lambda: 4)
-    monkeypatch.setattr(mgr, "available_cpu_count", lambda: 32)
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: 4)
     manager = mgr.ResourceManager()
     monkeypatch.setattr(
         manager, "recommend_morsel_target", lambda families=None, plan=None: (2048, 65536)
@@ -160,7 +159,7 @@ def test_an_unpressured_uncontended_machine_still_gets_no_config(monkeypatch):
     # built and no engine config is reshipped.
     from batcher.carbonite import manager as mgr
 
-    monkeypatch.setattr(mgr, "effective_core_budget", lambda: mgr.available_cpu_count())
+    monkeypatch.setattr(mgr, "reduced_core_budget", lambda: None)
     manager = mgr.ResourceManager()
     monkeypatch.setattr(manager, "recommend_morsel_target", lambda families=None, plan=None: None)
     assert manager.recommended_config() is None

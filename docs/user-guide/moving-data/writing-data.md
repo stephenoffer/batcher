@@ -68,9 +68,20 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.gff(path)` | GFF3 annotations, all nine columns | nothing extra |
 | `write.lance(path)` | A Lance dataset (columnar ML format) | `[lance]` |
 | `write.msgpack(path)` | MessagePack files | `[msgpack]` |
-| `write.sql(table, driver=..., db_kwargs=...)` | A database table via ADBC/FlightSQL | driver + reachable DB |
+| `write.sql(table, uri=..., mode=...)` | A SQL table: append, or upsert/update/delete by key | a driver + reachable DB |
 | `write.snowflake(table, connection_kwargs=...)` | A Snowflake table | Snowflake account |
-| `write.mongo(collection, ...)` | A MongoDB collection | a running MongoDB |
+| `write.mongo(collection, uri=..., mode=...)` | A MongoDB collection | a running MongoDB |
+| `write.dynamodb(table, region_name=...)` | A DynamoDB table via `BatchWriteItem` | AWS DynamoDB |
+| `write.cassandra(table, contact_points=..., keyspace=...)` | A Cassandra / Scylla table | a running Cassandra |
+| `write.redis(key_prefix, host=...)` | A Redis keyspace, one hash or string per key | a running Redis |
+| `write.elasticsearch(index, hosts=...)` | An Elasticsearch index via `_bulk` | a running Elasticsearch |
+| `write.hbase(table, host=...)` | An HBase table via happybase batches | an HBase Thrift server |
+
+The database sinks take a `mode` that is not a save mode. `append` and `overwrite` load a
+table; `upsert`, `update` and `delete` *maintain* one, changing only the rows whose keys
+match and leaving every other row alone. See
+{doc}`Writing to a database </integrations/databases/writing>` for what each mode does, which
+backend serves it, and the transaction it runs in.
 
 ORC stores timestamps as nanoseconds and nothing else, which bounds the instants it can
 hold to roughly 1677-09-21 through 2262-04-11. Writing a timestamp outside that range

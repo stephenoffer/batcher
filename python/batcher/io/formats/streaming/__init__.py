@@ -7,6 +7,10 @@ itself into the ``SOURCES`` registry as a side effect (``"kafka"``,
 coordinates at batch granularity; the incremental file source replicates
 Databricks Auto Loader (``cloudFiles``). Each broker's client dependency is an
 optional extra, deferred until construction.
+
+`codecs` turns those raw payload bytes into typed columns — Avro, JSON, Protobuf, text —
+including Confluent Schema Registry framing, so a stream's real schema is known to the
+plan rather than hidden inside a `map_batches`.
 """
 
 from __future__ import annotations
@@ -17,6 +21,12 @@ from batcher.io.formats.streaming.broker import (
     BrokerSource,
     BrokerSplit,
     broker_schema,
+)
+from batcher.io.formats.streaming.codecs import (
+    CODECS,
+    PayloadCodec,
+    SchemaRegistry,
+    resolve_codec,
 )
 from batcher.io.formats.streaming.dev import (
     RateMicroBatchSource,
@@ -41,6 +51,7 @@ from batcher.io.formats.streaming.sinks import (
 )
 
 __all__ = [
+    "CODECS",
     "STREAM_SINKS",
     "BrokerMessage",
     "BrokerSource",
@@ -54,13 +65,16 @@ __all__ = [
     "KafkaStreamSink",
     "KinesisSource",
     "NoopStreamSink",
+    "PayloadCodec",
     "PubSubSource",
     "PulsarSource",
     "RateMicroBatchSource",
     "RateSource",
+    "SchemaRegistry",
     "SocketSource",
     "StreamSink",
     "TransactionalStreamSink",
     "broker_schema",
     "memory_table",
+    "resolve_codec",
 ]

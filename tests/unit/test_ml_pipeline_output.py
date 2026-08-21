@@ -50,3 +50,67 @@ def test_converters_warn_when_dropping_non_numeric_columns():
         warnings.simplefilter("always")
         list(to_torch_iterable([batch]))
     assert any("non-numeric" in str(w.message) and "label" in str(w.message) for w in caught)
+
+
+def test_speech_recognition_reduces_to_the_transcript():
+    # An ASR pipeline returns {"text": ..., "chunks": [...]}. Without `text` in the key list
+    # the whole dict fell through as the "scalar", so a transcription landed as a struct
+    # column carrying the timing chunks beside the words.
+    result = {"text": " the quick brown fox", "chunks": [{"timestamp": (0.0, 1.0)}]}
+    assert _primary_output(result) == " the quick brown fox"
+
+
+def test_a_label_still_wins_over_text_when_a_pipeline_reports_both():
+    assert _primary_output({"label": "POSITIVE", "text": "raw input echoed back"}) == "POSITIVE"
+
+
+class TestPipelineInputs:
+    """What a batch column becomes on the way into a `transformers` pipeline.
+
+    A pipeline is polymorphic in its input, so the *column type* is what decides the shape.
+    """
+
+    @staticmethod
+    def _inputs(array):
+        from batcher.ml.inference.pipelines import _pipeline_inputs
+
+        return _pipeline_inputs(array)
+
+    def test_a_text_column_passes_through_as_strings(self):
+        import pyarrow as pa
+
+        assert self._inputs(pa.array(["a", "b"])) == ["a", "b"]
+
+    def test_a_binary_column_passes_through_as_bytes(self):
+        # Encoded audio/image bytes: the pipeline decodes them itself.
+        import pyarrow as pa
+
+        assert self._inputs(pa.array([b"\x00\x01"], type=pa.binary())) == [b"\x00\x01"]
+
+    def test_a_waveform_column_becomes_one_numpy_array_per_row(self):
+        # The case that was broken: `to_pylist()` hands a feature extractor a Python list of
+        # floats per row, which it rejects — so an ASR model over the documented decode path
+        # could not run through ds.ml.infer at all.
+        import numpy as np
+        import pyarrow as pa
+
+        rows = self._inputs(pa.array([[0.1, 0.2], [0.3, 0.4]], type=pa.list_(pa.float32())))
+        assert len(rows) == 2
+        assert isinstance(rows[0], np.ndarray)
+        assert rows[0].dtype == np.dtype("float32")
+
+    def test_a_tensor_column_keeps_its_shape(self):
+        import numpy as np
+        import pyarrow as pa
+
+        from batcher.io.formats.ml.tensor import to_tensor_column
+
+        column = to_tensor_column(np.zeros((2, 4, 4, 3), dtype="uint8"))
+        rows = self._inputs(pa.chunked_array([column]).combine_chunks())
+        assert rows[0].shape == (4, 4, 3)
+
+    def test_a_column_with_no_array_form_falls_back_to_python_objects(self):
+        import pyarrow as pa
+
+        struct = pa.array([{"a": 1}], type=pa.struct([("a", pa.int64())]))
+        assert self._inputs(struct) == [{"a": 1}]

@@ -14,6 +14,8 @@ a fabricated figure.
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
+
 __all__ = [
     "cluster_accelerator_type",
     "cluster_gpu_memory_bytes",
@@ -88,7 +90,8 @@ def _learned_hub():
         from batcher.core.runtime import default_hub
 
         return default_hub()
-    except Exception:
+    except Exception as exc:
+        note_suppressed("dist", "resolve the learning hub", exc)
         return None
 
 

@@ -9,9 +9,11 @@ The four questions, one module each:
 * `provider` — which GPU cloud this is, from environment markers only. A neocloud is not AWS
   with a different logo: the instance names, the scratch mount, the object-store endpoint, and
   the preemption signal all differ, and the defaults that are right on one are wrong on the next.
-* `scheduler` — what launched this process: Slurm, Kubernetes, Ray, or nothing. A Slurm
-  allocation already knows its node list and its per-node device count, and reading them beats
-  discovering the same shape by probing.
+* `scheduler` — what launched this process: a batch scheduler (Slurm, PBS, LSF, Grid Engine,
+  Flux, HTCondor), a container orchestrator (Kubernetes, Nomad, YARN, Databricks), a managed
+  job service (AWS Batch, SageMaker, Vertex AI, Azure ML, SkyPilot), Ray, or nothing. Each one
+  already knows its node list, its per-node device count and its core grant, and reading them
+  beats discovering the same shape by probing.
 * `scratch` — the node-local fast filesystem. Container roots are small overlays; the terabytes
   of NVMe a GPU node ships with are mounted somewhere else under a name that varies by provider,
   and a spill that defaults to `/tmp` finds the overlay.
@@ -28,6 +30,7 @@ A neutral utility: any layer may import `_internal`.
 from __future__ import annotations
 
 from batcher._internal.site.container import (
+    address_space_limit_bytes,
     container_findings,
     in_container,
     memlock_limit_bytes,
@@ -50,14 +53,20 @@ from batcher._internal.site.provider import (
     site_summary,
 )
 from batcher._internal.site.scheduler import (
+    LauncherRanks,
     SchedulerJob,
+    allocated_cpus,
     expand_nodelist,
+    launcher_ranks,
     scheduler_job,
     scheduler_kind,
+    scheduler_memory_bytes,
+    visible_device_count,
 )
 from batcher._internal.site.scratch import (
     SCRATCH_CANDIDATES,
     ScratchVolume,
+    job_scratch_volume,
     local_scratch_root,
     reset_scratch_probe,
     scratch_volumes,
@@ -67,13 +76,18 @@ from batcher._internal.site.scratch import (
 __all__ = [
     "PROVIDERS",
     "SCRATCH_CANDIDATES",
+    "LauncherRanks",
     "SchedulerJob",
     "ScratchVolume",
     "SiteProfile",
+    "address_space_limit_bytes",
+    "allocated_cpus",
     "container_findings",
     "detect_provider",
     "expand_nodelist",
     "in_container",
+    "job_scratch_volume",
+    "launcher_ranks",
     "local_scratch_root",
     "memlock_limit_bytes",
     "model_cache_root",
@@ -83,6 +97,7 @@ __all__ = [
     "reset_scratch_probe",
     "scheduler_job",
     "scheduler_kind",
+    "scheduler_memory_bytes",
     "scratch_volumes",
     "shm_bytes",
     "shm_root",
@@ -91,4 +106,5 @@ __all__ = [
     "spill_scratch_dir",
     "usable_shm",
     "use_node_local_model_cache",
+    "visible_device_count",
 ]

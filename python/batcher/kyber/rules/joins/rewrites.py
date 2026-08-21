@@ -310,7 +310,10 @@ def join_to_semijoin(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | No
         new_output,
         join.strategy,
     )
-    return Distinct(Project(semi, proj.items))
+    # `replace` so the dedup keeps its own fields. `keys`/`order` are already known empty (the
+    # guard above bails on a keyed dedup), but `limit` is not -- a keyless `Distinct` may carry
+    # a fused cap, and rebuilding positionally dropped it along with the early exit it enables.
+    return dataclasses.replace(node, input=Project(semi, proj.items))
 
 
 # Comparisons and arithmetic propagate a null operand to a null result; boolean

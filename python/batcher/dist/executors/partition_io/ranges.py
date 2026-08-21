@@ -16,6 +16,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from batcher._internal.native import engine
+from batcher.dist.sort_boundaries import grid_kind_of
 
 __all__ = [
     "SAMPLE_PROBS",
@@ -110,10 +111,14 @@ def range_partitionable(dtype: pa.DataType) -> bool:
     """Whether a leading key of `dtype` can be range-partitioned into ordered buckets.
 
     The answer is the intersection of what [`sample_key_grid`] can summarize (a numeric KLL
-    sketch or a lexical string grid) and what `bucketize`'s Rust range partitioner will route
-    (`RuntimeError::NonNumericRangeKey` otherwise). Anything else — Boolean, List, Struct,
-    Binary — has to stay on the materializing operator, which costs memory and never
-    correctness.
+    sketch, or a lexical grid over a text or binary key) and what `bucketize`'s Rust range
+    partitioner will route (`RuntimeError::NonNumericRangeKey` otherwise). Anything else —
+    Boolean, List, Struct — has to stay on the materializing operator, which costs memory and
+    never correctness.
+
+    Binary was in the "anything else" list until the byte-key sort landed, and it is the entry
+    that cost the most: a fixed-width key over a wide payload is the canonical large-sort
+    shape, and refusing it here meant the whole relation had to fit one node.
 
     It is a function rather than a `frozenset` beside each caller for the reason this module
     exists: every `supports_spilling_*` predicate is answering the same question about the
@@ -135,22 +140,25 @@ def range_partitionable(dtype: pa.DataType) -> bool:
             >>> from batcher.dist.executors.partition_io import range_partitionable
             >>> range_partitionable(pa.int64()), range_partitionable(pa.bool_())
             (True, False)
+            >>> range_partitionable(pa.binary()), range_partitionable(pa.binary(10))
+            (True, True)
     """
     return (
         pa.types.is_integer(dtype)
         or pa.types.is_floating(dtype)
-        or pa.types.is_string(dtype)
-        or pa.types.is_large_string(dtype)
+        or grid_kind_of(dtype) != "numeric"
     )
 
 
 def sample_key_grid(
     batches: list[pa.RecordBatch], key_name: str, probs: list[float]
-) -> list[float] | list[str]:
+) -> list[float] | list[str] | list[bytes]:
     """Sample the leading sort key's distribution at `probs` — one grid, whatever its type.
 
-    A numeric or temporal key is summarized by the mergeable KLL sketch; a **string** key
-    has no numeric sketch, so it is sampled lexically instead. Every sort path samples
+    A numeric or temporal key is summarized by the mergeable KLL sketch; a **text or binary**
+    key has no numeric sketch, so it is sampled lexically instead — one sampler each, because
+    a boundary crosses the FFI as `str` in one case and `bytes` in the other, and one routing
+    underneath. Every sort path samples
     through this one function for the reason this module exists: when the out-of-core sort
     re-derived the *bucketing* in NumPy it put the null bucket at the wrong end and silently
     returned unsorted data, and three separate copies of the *sampling* is the same shape of
@@ -171,9 +179,11 @@ def sample_key_grid(
     index = batches[0].schema.get_field_index(key_name)
     if index < 0:
         return []
-    dtype = batches[0].schema.field(index).type
-    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+    kind = grid_kind_of(batches[0].schema.field(index).type)
+    if kind == "text":
         return nat.column_string_quantiles(key_name, list(batches), list(probs))
+    if kind == "binary":
+        return nat.column_binary_quantiles(key_name, list(batches), list(probs))
     return nat.column_quantiles([key_name], list(batches), list(probs)).get(key_name, [])
 
 
@@ -197,19 +207,20 @@ def merge_boundaries(
     70K-row split contribute 65,536 and 70,000 samples — the smaller split dominating
     outright.
 
-    A **string** key's grid is merged lexicographically instead, which is the same
+    A **text or binary** key's grid is merged lexicographically instead, which is the same
     construction over a different order: the weighted union of the samples is sorted and cut
-    at evenly spaced positions of cumulative weight. The grids say which they are — a float
-    grid holds floats and a string grid holds strings — so no caller has to pass a flag that
-    could drift from the data it describes.
+    at evenly spaced positions of cumulative weight. `bytes` and `str` both order that way in
+    Python and both order that way in the Rust router, so the two share this merge. The grids
+    say which they are — a float grid holds floats, a lexical one holds `str` or `bytes` — so
+    no caller has to pass a flag that could drift from the data it describes.
     """
     import numpy as np
 
     kept = [(grid, n) for grid, n in grids if grid and n]
     if not kept:
         return []
-    if isinstance(kept[0][0][0], str):
-        return _merge_string_boundaries(kept, workers)
+    if isinstance(kept[0][0][0], (str, bytes, bytearray)):
+        return _merge_lexical_boundaries(kept, workers)
     qs = np.linspace(0, 1, workers + 1)[1:-1]
     if len(qs) == 0:
         return []
@@ -239,7 +250,7 @@ def _weighted_quantile(values, weights, qs):
     return np.interp(qs, (cumulative - 0.5 * ordered_w) / total, ordered)
 
 
-def _merge_string_boundaries(grids: list[tuple[list[str], int]], workers: int) -> list[str]:
+def _merge_lexical_boundaries(grids: list[tuple[list, int]], workers: int) -> list:
     """The lexical counterpart of the numeric merge: sort the weighted union of every
     worker's sample and cut it at `workers-1` evenly spaced positions of cumulative weight.
 
@@ -258,7 +269,7 @@ def _merge_string_boundaries(grids: list[tuple[list[str], int]], workers: int) -
     if not pooled:
         return []
     total = sum(weight for _, weight in pooled)
-    cuts: list[str] = []
+    cuts: list = []
     index, below = 0, 0.0  # weight of every sample strictly before `index`
     for step in range(1, workers):
         target = step / workers * total
@@ -296,21 +307,20 @@ def bucketize(
         return [[] for _ in range(n_buckets)]
     nat = engine()
     key_index = batches[0].schema.get_field_index(key_name)
-    # A string key routes by byte-lexical comparison and a numeric one by `f64`. The KEY
-    # COLUMN decides, not the boundary list: a split whose key is entirely null samples an
+    # A text or binary key routes by byte-lexical comparison and a numeric one by `f64`. The
+    # KEY COLUMN decides, not the boundary list: a split whose key is entirely null samples an
     # empty grid, and an empty list of boundaries cannot say which partitioner it belongs
-    # to. Routing a string key through the numeric one would order "12" before "9" and
+    # to. Routing a text key through the numeric one would order "12" before "9" and
     # disagree with the single-node sort — the reason the dispatcher used to refuse the
     # shape outright.
-    if pa.types.is_string(batches[0].schema.field(key_index).type) or pa.types.is_large_string(
-        batches[0].schema.field(key_index).type
-    ):
-        return nat.range_partition_batches_str(
-            list(batches), key_index, list(boundaries), n_buckets, nulls_first, descending
-        )
-    return nat.range_partition_batches(
-        list(batches), key_index, list(boundaries), n_buckets, nulls_first, descending
-    )
+    kind = grid_kind_of(batches[0].schema.field(key_index).type)
+    if kind == "text":
+        router = nat.range_partition_batches_str
+    elif kind == "binary":
+        router = nat.range_partition_batches_binary
+    else:
+        router = nat.range_partition_batches
+    return router(list(batches), key_index, list(boundaries), n_buckets, nulls_first, descending)
 
 
 # A hot value is worth splitting once its bucket carries this many times the mean. Below
@@ -332,8 +342,13 @@ def hot_key_share(grids) -> tuple[float, float] | None:
     A value holding share `f` occupies `f` of the sampled positions in expectation, which is
     exactly what the caller needs to size the split.
 
-    Numeric keys only. A string key has no cheap successor to isolate it with (see
-    [`isolate_hot_value`]), so a skewed string sort keeps the unsplit bucket.
+    Every key family, because every one of them has a successor to isolate the hot value
+    against — see [`isolate_hot_value`]. This used to say "numeric keys only. A text or binary
+    key has no cheap successor", and that was simply wrong: a byte key's immediate successor is
+    the value with a `\x00` appended, which is *exact* where the float path's `nextafter` is
+    merely the nearest representable. Declining meant a skewed `ORDER BY` over a string or
+    binary key stopped scaling with the cluster — the failure this whole mechanism exists to
+    prevent, on the key types most likely to be skewed.
 
     Args:
         grids: The `(sampled_values, row_count)` pairs the samplers returned.
@@ -344,8 +359,10 @@ def hot_key_share(grids) -> tuple[float, float] | None:
     import numpy as np
 
     kept = [(g, n) for g, n in grids if g and n]
-    if not kept or isinstance(kept[0][0][0], str):
+    if not kept:
         return None
+    if isinstance(kept[0][0][0], (str, bytes, bytearray)):
+        return _lexical_hot_share(kept)
     values = np.concatenate([np.asarray(g, dtype=float) for g, _ in kept])
     weights = np.concatenate([np.full(len(g), n / len(g), float) for g, n in kept])
     finite = np.isfinite(values)
@@ -361,29 +378,67 @@ def hot_key_share(grids) -> tuple[float, float] | None:
     return float(uniq[i]), float(mass[i] / total)
 
 
-def isolate_hot_value(boundaries: list[float], hot: float) -> tuple[list[float], int]:
+def _lexical_hot_share(kept: list[tuple[list, int]]) -> tuple[object, float] | None:
+    """[`hot_key_share`] for a `str`/`bytes` grid: the heaviest sampled value and its share.
+
+    The same weighting the numeric path uses — each of a worker's samples stands for an equal
+    share of that worker's rows — counted with a dict rather than `np.unique`, because these
+    values are not numbers and casting them to any would destroy the ordering the grid exists
+    to describe. `None` when nothing repeats, which is the sampler saying it saw no dominant
+    value.
+    """
+    mass: dict[object, float] = {}
+    for grid, n in kept:
+        per_sample = n / len(grid)
+        for value in grid:
+            key = bytes(value) if isinstance(value, bytearray) else value
+            mass[key] = mass.get(key, 0.0) + per_sample
+    total = sum(mass.values())
+    if total <= 0:
+        return None
+    hot = max(mass, key=lambda k: mass[k])
+    return hot, mass[hot] / total
+
+
+def isolate_hot_value(boundaries: list, hot) -> tuple[list, int]:
     """Add the two boundaries that put `hot` in a bucket of its own, and say which bucket.
 
     `bucketize` sends a key to `#{b in boundaries : b <= key}`, so a bucket spans
     `[B[i-1], B[i])`. Giving `hot` a bucket containing nothing else therefore needs `hot`
-    itself as a boundary and the *next representable value above it* as the one after —
-    `nextafter` rather than `hot + 1`, so it is correct for a float key and still correct
-    for an integer one, where every other key is at least a whole unit away and so lands
-    beyond it.
+    itself as a boundary and the **immediate successor** of `hot` as the one after.
+
+    What that successor is depends on the key family, and both are exact:
+
+    * **Numeric** — `nextafter(hot, inf)`, the next representable double. `hot + 1` would be
+      wrong for a float; `nextafter` is also still correct for an integer key, where every
+      other key is at least a whole unit away and so lands beyond it.
+    * **Text and binary** — `hot` with a `\x00` appended. Nothing sorts between them: a value
+      above `hot` either has `hot` as a proper prefix, in which case its next byte is at least
+      `\x00` so it is at or above `hot + \x00`, or it differs inside `hot`'s own bytes, in
+      which case it is above both. This is not an approximation of a successor the way
+      `nextafter` is a nearest-representable one — it *is* the successor, exactly.
 
     Args:
         boundaries: The merged, ascending, deduplicated boundaries.
-        hot: The value to isolate.
+        hot: The value to isolate, of the same family as `boundaries`.
 
     Returns:
         `(boundaries, hot_bucket)` — the new boundary list and the index of the bucket that
         now holds exactly `hot`.
     """
-    import numpy as np
+    if isinstance(hot, (bytes, bytearray)):
+        hot = bytes(hot)
+        above = hot + b"\x00"
+    elif isinstance(hot, str):
+        above = hot + "\x00"
+    else:
+        import numpy as np
 
-    above = float(np.nextafter(hot, np.inf))
-    widened = sorted({*(float(b) for b in boundaries), float(hot), above})
-    return widened, widened.index(float(hot)) + 1
+        hot = float(hot)
+        above = float(np.nextafter(hot, np.inf))
+        boundaries = [float(b) for b in boundaries]
+    widened = sorted({*boundaries, hot, above})
+    return widened, widened.index(hot) + 1
 
 
 def hot_sub_bucket(mapper_id: int, n_mappers: int, subs: int, descending: bool) -> int:
@@ -498,7 +553,11 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
     # exactly the kind of wrongness a key or multiset assertion cannot see. Skew tolerance
     # is a balance optimization and correctness outranks it, so a NaN-bearing key keeps the
     # unsplit partition.
-    if not all(math.isfinite(b) for b in boundaries):
+    # `math.isfinite` is a question about numbers, and a lexical boundary is not one — asking
+    # it of `bytes` raises. A byte or text key has no NaN to be unordered by, so it needs no
+    # guard here; `sorted` over such boundaries is a total order by construction.
+    numeric = bool(boundaries) and not isinstance(boundaries[0], (str, bytes, bytearray))
+    if numeric and not all(math.isfinite(b) for b in boundaries):
         return None
     value, share = hot
     widened, hot_bucket = isolate_hot_value(list(boundaries), value)
