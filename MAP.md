@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1387 Python modules across 208 packages and 272 Rust files across 15 crates.
+Covering 1387 Python modules across 208 packages and 273 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -1082,7 +1082,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 278 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 612 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 575 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1093,7 +1093,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `properties.py` | 281 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 251 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 238 | The Kyber rule abstraction — one small, pure unit of optimization. |
-| `signature.py` | 204 | Structural plan signatures. |
+| `signature.py` | 215 | Structural plan signatures. |
 | `spill_rates.py` | 203 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 76 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 350 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
@@ -2840,7 +2840,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort.rs` | 607 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
-| `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
+| `ops/reshape.rs` | 546 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 745 | Single-node parallel full sort by **sample-sort**. |
 | `par.rs` | 3357 | The multi-core executor. |
@@ -2915,9 +2915,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 412 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 685 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1303 | Window functions — partition, order, and append one column per function. |
+| `window/mod.rs` | 1559 | Window functions — partition, order, and append one column per function. |
 | `window/parallel.rs` | 290 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 342 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
+| `window/running_par.rs` | 163 | Parallel prefix scan for *running* (frameless, ordered) window aggregates. |
 | `window/series.rs` | 311 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
 | `window/topk.rs` | 178 | `row_number() OVER (PARTITION BY … ORDER BY …) <= k` without ordering the partitions. |
 
