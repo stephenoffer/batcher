@@ -2291,12 +2291,12 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 156 | Shared accessor-generation helper for the namespace families. |
+| `_bind.py` | 171 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 481 | The curated per-accessor docstrings, keyed by accessor name. |
 | `collections.py` | 1721 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4268 | The `.str` accessor namespace. |
-| `temporal.py` | 1323 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `temporal.py` | 1226 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 

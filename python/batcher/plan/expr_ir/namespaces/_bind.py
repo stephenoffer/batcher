@@ -95,7 +95,15 @@ def _section(doc: str, name: str) -> str:
     return "\n".join(lines[start:end]).rstrip()
 
 
-def _alias_doc(target_doc: str, summary: str, data: str, expr: str, out: str, note: str) -> str:
+def _alias_doc(
+    target_doc: str,
+    summary: str,
+    data: str,
+    expr: str,
+    out: str,
+    note: str,
+    preamble: tuple[str, ...],
+) -> str:
     """Build an alias's docstring from its own example and the target's typed sections.
 
     An alias computes exactly what the method it forwards to computes, so its ``Args:``
@@ -113,9 +121,10 @@ def _alias_doc(target_doc: str, summary: str, data: str, expr: str, out: str, no
         block = _section(doc, name)
         if block:
             parts.append(block)
+    setup = "".join(f"        >>> {line}\n" for line in ("import batcher as bt", *preamble))
     parts.append(
         "Examples:\n    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
+        f"{setup}"
         f"        >>> ds = bt.from_pydict({data})\n"
         f"        >>> ds.select(r={expr}).to_pydict()\n"
         f"        {out}"
@@ -123,7 +132,9 @@ def _alias_doc(target_doc: str, summary: str, data: str, expr: str, out: str, no
     return "\n\n".join(parts)
 
 
-def _bind_aliases(ns: type, table: dict[str, tuple[str, ...]]) -> None:
+def _bind_aliases(
+    ns: type, table: dict[str, tuple[str, ...]], preamble: tuple[str, ...] = ()
+) -> None:
     """Generate one delegating alias per `table` row and attach it to `ns`.
 
     An alias is a second spelling of a method the namespace already has — the Polars or
@@ -137,6 +148,10 @@ def _bind_aliases(ns: type, table: dict[str, tuple[str, ...]]) -> None:
     it). The function is rebuilt in `ns`'s module namespace for the same reason
     `_bind_accessors` does it — so ``doctest`` and Sphinx autodoc find the generated
     examples exactly as if they had been written there by hand.
+
+    `preamble` carries the extra ``>>>`` import lines a whole family's examples need
+    (``import datetime as dt`` for ``.dt``), supplied once here rather than repeated in
+    every row, the same way `_bind_accessors` takes one family-wide `returns`.
     """
     ns_globals = sys.modules[ns.__module__].__dict__
     for alias, spec in table.items():
@@ -152,5 +167,5 @@ def _bind_aliases(ns: type, table: dict[str, tuple[str, ...]]) -> None:
         bound.__qualname__ = f"{ns.__name__}.{alias}"
         bound.__module__ = ns.__module__
         bound.__signature__ = inspect.signature(tgt)  # type: ignore[attr-defined]
-        bound.__doc__ = _alias_doc(tgt.__doc__ or "", summary, data, expr, out, note)
+        bound.__doc__ = _alias_doc(tgt.__doc__ or "", summary, data, expr, out, note, preamble)
         setattr(ns, alias, bound)
