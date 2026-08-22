@@ -3371,6 +3371,38 @@ mod tests {
         Vec<Option<i64>>,
     );
 
+    /// `[Left "v" -> "lv", Right "v" -> "rv"]` — the value-only join output.
+    fn out_vv() -> Vec<bc_ir::JoinOutputCol> {
+        cols(&[("l", "v", "lv"), ("r", "v", "rv")])
+    }
+
+    /// `[Left "k" -> "k", Left "v" -> "lv", Right "v" -> "rv"]` — the join key carried
+    /// through once, under its own name.
+    fn out_kvv() -> Vec<bc_ir::JoinOutputCol> {
+        cols(&[("l", "k", "k"), ("l", "v", "lv"), ("r", "v", "rv")])
+    }
+
+    /// `[Left "k" -> "lk", Left "v" -> "lv", Right "v" -> "rv"]` — the left key aliased so
+    /// an outer join's null-extended rows are distinguishable from a real key.
+    fn out_lkvv() -> Vec<bc_ir::JoinOutputCol> {
+        cols(&[("l", "k", "lk"), ("l", "v", "lv"), ("r", "v", "rv")])
+    }
+
+    /// Build a join output list from `(side, name, alias)` triples; `side` is "l" or "r".
+    fn cols(spec: &[(&str, &str, &str)]) -> Vec<bc_ir::JoinOutputCol> {
+        spec.iter()
+            .map(|(side, name, alias)| bc_ir::JoinOutputCol {
+                side: if *side == "l" {
+                    bc_ir::JoinSide::Left
+                } else {
+                    bc_ir::JoinSide::Right
+                },
+                name: (*name).into(),
+                alias: (*alias).into(),
+            })
+            .collect()
+    }
+
     fn batch(keys: &[i64], vals: &[i64]) -> RecordBatch {
         RecordBatch::try_from_iter(vec![
             ("k", Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef),
@@ -3408,18 +3440,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: bc_ir::JoinType::Inner,
-            output: vec![
-                bc_ir::JoinOutputCol {
-                    side: bc_ir::JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                bc_ir::JoinOutputCol {
-                    side: bc_ir::JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_vv(),
             strategy: bc_ir::JoinStrategy::Hash,
         };
         let sources = vec![
@@ -3610,7 +3631,7 @@ mod tests {
     #[test]
     fn fused_join_top_n_keeps_child_op_ids_aligned() {
         use bc_expr::Expr;
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType, SortKey};
+        use bc_ir::{JoinStrategy, JoinType, SortKey};
 
         // Sort{limit=2}( HashJoin.Inner.Hash( Scan0, Scan1 ) ), ORDER BY the left key.
         let plan = RelOp::Sort {
@@ -3620,18 +3641,7 @@ mod tests {
                 left_keys: vec!["k".into()],
                 right_keys: vec!["k".into()],
                 join_type: JoinType::Inner,
-                output: vec![
-                    JoinOutputCol {
-                        side: JoinSide::Left,
-                        name: "v".into(),
-                        alias: "lv".into(),
-                    },
-                    JoinOutputCol {
-                        side: JoinSide::Right,
-                        name: "v".into(),
-                        alias: "rv".into(),
-                    },
-                ],
+                output: out_vv(),
                 strategy: JoinStrategy::Hash,
             }),
             keys: vec![SortKey {
@@ -3755,18 +3765,7 @@ mod tests {
                 left_keys: vec!["k".into()],
                 right_keys: vec!["k".into()],
                 join_type: bc_ir::JoinType::Inner,
-                output: vec![
-                    bc_ir::JoinOutputCol {
-                        side: bc_ir::JoinSide::Left,
-                        name: "v".into(),
-                        alias: "lv".into(),
-                    },
-                    bc_ir::JoinOutputCol {
-                        side: bc_ir::JoinSide::Right,
-                        name: "v".into(),
-                        alias: "rv".into(),
-                    },
-                ],
+                output: out_vv(),
                 strategy: bc_ir::JoinStrategy::Hash,
             };
             let probe: Vec<i64> = (0..2_000).map(|i| i % 500).collect();
@@ -5504,7 +5503,7 @@ mod tests {
 
     #[test]
     fn parallel_matches_sequential_join() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        use bc_ir::{JoinStrategy, JoinType};
 
         let plan = RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -5512,23 +5511,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: JoinType::Inner,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "k".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_kvv(),
             strategy: JoinStrategy::Hash,
         };
         let left = vec![batch(&[1, 2, 3, 2], &[10, 20, 30, 40])];
@@ -5545,8 +5528,6 @@ mod tests {
     /// buckets.
     #[test]
     fn parallel_matches_sequential_asof_join() {
-        use bc_ir::{JoinOutputCol, JoinSide};
-
         let plan = RelOp::AsofJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
             right: Box::new(RelOp::Scan { source_id: 1 }),
@@ -5557,23 +5538,7 @@ mod tests {
             direction: bc_ir::AsofDirection::Backward,
             tolerance: None,
             allow_exact_matches: true,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "k".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_kvv(),
         };
         let left = vec![batch(&[1, 1, 2, 3], &[10, 25, 40, 5])];
         let right = vec![batch(&[1, 1, 2], &[5, 20, 30])];
@@ -5599,8 +5564,6 @@ mod tests {
     /// partition size rather than by everything trivially exceeding it.
     #[test]
     fn spilling_asof_join_with_skewed_by_groups_matches_in_memory() {
-        use bc_ir::{JoinOutputCol, JoinSide};
-
         let plan = RelOp::AsofJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
             right: Box::new(RelOp::Scan { source_id: 1 }),
@@ -5611,23 +5574,7 @@ mod tests {
             direction: bc_ir::AsofDirection::Backward,
             tolerance: None,
             allow_exact_matches: true,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "k".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_kvv(),
         };
 
         // One hot `by` group carrying the bulk of both sides, plus cold ones.
@@ -5675,8 +5622,6 @@ mod tests {
 
     #[test]
     fn spilling_asof_join_matches_in_memory() {
-        use bc_ir::{JoinOutputCol, JoinSide};
-
         let plan = RelOp::AsofJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
             right: Box::new(RelOp::Scan { source_id: 1 }),
@@ -5687,23 +5632,7 @@ mod tests {
             direction: bc_ir::AsofDirection::Backward,
             tolerance: None,
             allow_exact_matches: true,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "k".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_kvv(),
         };
         // Several `by` groups so partitioning spreads them across buckets.
         let left = vec![batch(&[1, 1, 2, 3, 4, 5], &[10, 25, 40, 5, 7, 9])];
@@ -5990,7 +5919,7 @@ mod tests {
     /// unmatched-row emission is the subtle part.
     #[test]
     fn spilling_join_matches_sequential() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        use bc_ir::{JoinStrategy, JoinType};
 
         let join_plan = |jt: JoinType| RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -5998,23 +5927,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: jt,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "lk".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_lkvv(),
             strategy: JoinStrategy::Hash,
         };
         // Keys overlap partially so inner/left/right/full/semi/anti all differ.
@@ -6064,7 +5977,7 @@ mod tests {
     /// separate the hot key and the depth limit is reached.
     #[test]
     fn spilling_join_with_skewed_buckets_matches_sequential() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        use bc_ir::{JoinStrategy, JoinType};
 
         let join_plan = |jt: JoinType| RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -6072,23 +5985,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: jt,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "lk".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_lkvv(),
             strategy: JoinStrategy::Hash,
         };
 
@@ -6292,7 +6189,7 @@ mod tests {
     /// strategy (= the oracle) for every join type — it only changes data movement.
     #[test]
     fn broadcast_join_matches_oracle() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        use bc_ir::{JoinStrategy, JoinType};
 
         let join_plan = |jt: JoinType, strategy: JoinStrategy| RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -6300,23 +6197,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: jt,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "lk".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_lkvv(),
             strategy,
         };
         // Large-ish left (the probe side), small right (the broadcast side), with
@@ -6420,7 +6301,7 @@ mod tests {
     /// (so it exercises the per-bucket sort-merge after the hash shuffle).
     #[test]
     fn sort_merge_join_matches_oracle() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        use bc_ir::{JoinStrategy, JoinType};
 
         let join_plan = |jt: JoinType, strategy: JoinStrategy| RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -6428,23 +6309,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: jt,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "k".into(),
-                    alias: "lk".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_lkvv(),
             strategy,
         };
         // Duplicate keys on both sides exercise the equal-key cross product.
@@ -6496,7 +6361,7 @@ mod tests {
     /// which `skewed_string_join_takes_the_shared_build_path` below pins.
     #[test]
     fn skewed_join_takes_the_shared_build_path_and_matches_the_oracle() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinType};
+        use bc_ir::JoinType;
 
         // Left: ~80k rows of the hot key (1) with unique values, plus a little cold
         // data. Right: a one-row-per-key dimension.
@@ -6513,18 +6378,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: JoinType::Inner,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_vv(),
             strategy: bc_ir::JoinStrategy::Hash,
         };
 
@@ -6566,7 +6420,7 @@ mod tests {
     #[test]
     fn skewed_string_join_takes_the_shared_build_path() {
         use arrow::array::StringArray;
-        use bc_ir::{JoinOutputCol, JoinSide, JoinType};
+        use bc_ir::JoinType;
 
         fn str_batch(keys: &[&str], vals: &[i64]) -> RecordBatch {
             RecordBatch::try_from_iter(vec![
@@ -6589,18 +6443,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: JoinType::Inner,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_vv(),
             strategy: bc_ir::JoinStrategy::Hash,
         };
 
@@ -6632,7 +6475,7 @@ mod tests {
     /// flip-to-left path and matches the sequential oracle.
     #[test]
     fn skewed_right_join_matches_oracle_and_salts() {
-        use bc_ir::{JoinOutputCol, JoinSide, JoinType};
+        use bc_ir::JoinType;
 
         // Right side is the hot/driving side; left is a one-row-per-key dimension.
         let hot = SKEW_MIN_BUCKET_ROWS + 5_000;
@@ -6648,18 +6491,7 @@ mod tests {
             left_keys: vec!["k".into()],
             right_keys: vec!["k".into()],
             join_type: JoinType::Right,
-            output: vec![
-                JoinOutputCol {
-                    side: JoinSide::Left,
-                    name: "v".into(),
-                    alias: "lv".into(),
-                },
-                JoinOutputCol {
-                    side: JoinSide::Right,
-                    name: "v".into(),
-                    alias: "rv".into(),
-                },
-            ],
+            output: out_vv(),
             strategy: bc_ir::JoinStrategy::Hash,
         };
 
