@@ -17,9 +17,18 @@ of eight.
 Against DuckDB on the **same zero-copy Arrow** — the bar `methodology.md` designates the
 like-for-like execution comparison — **every suite that can run it is a win**: JSON 0.039x
 (5/5), ClickBench 0.072x (43/43), H2O `groupby` 0.089x (10/10), H2O `join` 0.244x (5/5), TPC-H
-0.256x (22/22), operators 0.362x (15/19). TPC-DS and JOB have no figure on that bar because
-DuckDB over registered Arrow views has no storage statistics to order a many-way join with and
-is SIGKILLed on TPC-DS q64 — see `engines/lineup.py`.
+0.256x (22/22), operators 0.362x (15/19). TPC-DS still has no figure on that bar — DuckDB
+over registered Arrow views is SIGKILLed on q64 (see `engines/lineup.py`).
+
+**JOB now has one, and it is the weakest bar in this paragraph.** All 113 queries run on a
+three-engine lineup: **0.404x, winning 106 of 109** against the same Arrow, against 1.221x on
+the same run versus the native store. Read it with the reservation this sentence used to state
+as a reason for having no figure at all: JOB exists to measure *join ordering*, and DuckDB over
+registered Arrow has no storage statistics to order a many-way join with — so part of that 0.404
+is a planner deprived of its inputs rather than an executor beaten on even terms. What it does
+establish is the direction of the residual: on identical input Batcher is not losing JOB, and
+the 1.221x is against DuckDB's storage engine. (The two-engine lineup this scorecard prefers
+reads JOB at 1.308x; the lineup is part of the measurement, as the 2026-08-16 note says.)
 
 Two rows below move, and neither claim in them is retired:
 

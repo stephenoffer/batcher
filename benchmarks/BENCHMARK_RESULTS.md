@@ -1,5 +1,26 @@
 # Batcher CPU benchmark results
 
+## JOB has a like-for-like figure for the first time: 0.404x, 106 of 109 — and it is the weakest bar in the set (2026-08-22)
+
+`docs/architecture/internals/competitive_architecture.md`.
+
+The scorecard recorded that JOB "has no figure" against `duckdb_arrow`. It runs: all 113
+queries, three-engine lineup (`batcher,duckdb,duckdb_arrow`), **0.404x winning 106 of 109**
+against the same zero-copy Arrow, and **1.221x** against DuckDB's native store on the same run.
+
+**The reservation the scorecard gave for having no figure is still true and now travels with the
+number.** JOB exists to measure join *ordering*, and DuckDB over registered Arrow has no storage
+statistics to order a many-way join with — so part of 0.404x is a planner deprived of its inputs,
+not an executor beaten on even terms. What it does settle is the direction of the residual: on
+identical input Batcher is not losing JOB, and the 1.221x is against the storage engine. Six of
+the worst offenders read the same way — q33a 4.40x, q27a 4.32x, q13a 3.66x against the native
+store, while a probe registering the same Arrow into DuckDB reads q13a at **0.23x** and q33a at
+0.31x.
+
+State the lineup with the figure: the two-engine run this session read JOB at 1.308x and the
+three-engine one at 1.221x, which is the same effect the 2026-08-16 note records for H2O `join`
+(1.83x on four engines against 0.93x on two).
+
 ## Three grouping levels of one `ROLLUP` shared a single learned entry — and the cardinality loop still cannot be fixed, for a different reason than the one on record (2026-08-21)
 
 `python/batcher/kyber/signature.py`; `python/batcher/kyber/learning.py` (measured, not changed).
