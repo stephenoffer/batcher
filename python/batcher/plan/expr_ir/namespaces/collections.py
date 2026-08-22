@@ -248,20 +248,28 @@ class _JsonNamespace:
 
         Source order, not sorted order, so the keys line up with the document as written.
 
+        Note the two different empty answers, which follow DuckDB's ``json_keys``. A value
+        that *is* reachable but has no keys of its own — an array, a scalar, a JSON
+        ``null`` — answers the **empty list**, the same as ``{}`` does. Null is reserved for
+        the cases where there is no value to inspect at all: the path is absent, the
+        document does not parse, or the input row is itself null.
+
         Args:
             path: A JSONPath to the object; the document root by default.
 
         Returns:
-            A new List<Utf8> expression, or a null list if the path is absent or the
-            value there is not an object.
+            A new List<Utf8> expression: the key names, an empty list for a reachable
+            non-object, or null when the path is absent or the document does not parse.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"j": ['{"z": 1, "a": 2}', "[]"]})
+                >>> ds = bt.from_pydict({"j": ['{"z": 1, "a": 2}', "[]", "nope"]})
                 >>> ds.select(r=bt.col("j").json.keys()).to_pydict()
-                {'r': [['z', 'a'], None]}
+                {'r': [['z', 'a'], [], None]}
+                >>> ds.select(r=bt.col("j").json.keys("$.absent")).to_pydict()
+                {'r': [None, None, None]}
         """
         return StrFunc("json_object_keys", self._e, pattern=path)
 

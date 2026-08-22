@@ -88,16 +88,21 @@ class StorageMeta(MetaBase):
         return storage.has_exact_row_count(self.source_stats())
 
     def total_bytes(self) -> int | None:
-        """The total on-disk size of the sources, in bytes, or ``None`` if any cannot say.
+        """The total size of the sources, in bytes, or ``None`` if any cannot say.
+
+        A file source reports its *stored* (compressed) size. An in-memory relation reports
+        the retained size of its resident Arrow buffers, which it alone knows for free —
+        without it every consumer sizing from this figure falls back to a coarse
+        ``rows x type-width`` guess that under-sizes wide string columns badly.
 
         Returns:
-            The compressed byte size across every source, or ``None``.
+            The byte size across every source, or ``None``.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> bt.from_pydict({"x": [1]}).meta.storage.total_bytes() is None
+                >>> bt.from_pydict({"x": [1]}).meta.storage.total_bytes() > 0
                 True
         """
         return storage.total_bytes(self.source_stats())
@@ -122,19 +127,20 @@ class StorageMeta(MetaBase):
         return storage.row_group_count(self.source_stats())
 
     def bytes_per_row(self) -> float | None:
-        """The average on-disk bytes per row, or ``None`` when either total is unknown.
+        """The average stored bytes per row, or ``None`` when either total is unknown.
 
-        *Compressed* width, so it is the number that predicts scan time.
-        ``ds.meta.approx.row_bytes()`` estimates the in-memory width instead, which is wider.
+        For a file source this is *compressed* width, so it is the number that predicts scan
+        time. ``ds.meta.approx.row_bytes()`` is the different question — a type-derived
+        estimate of the *materialized* Arrow width, which stays type-derived on purpose.
 
         Returns:
-            The average compressed bytes per row, or ``None``.
+            The average stored bytes per row, or ``None``.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> bt.from_pydict({"x": [1]}).meta.storage.bytes_per_row() is None
+                >>> bt.from_pydict({"x": [1]}).meta.storage.bytes_per_row() > 0
                 True
         """
         return storage.bytes_per_row(self.source_stats())

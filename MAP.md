@@ -274,7 +274,7 @@ The `ds.meta` accessor tree (façade) — answer from metadata, execute only whe
 | `pair.py` | 163 | The `ds.meta.against(other)` accessor — what two relations' footers say about their join. |
 | `prove.py` | 104 | Prove a constraint from metadata — a data contract that holds should cost nothing. |
 | `schema.py` | 364 | The `ds.meta.schema` accessor — questions about types, which never touch data at all. |
-| `storage.py` | 237 | The `ds.meta.storage` accessor — what a scan *would* read, without reading it. |
+| `storage.py` | 243 | The `ds.meta.storage` accessor — what a scan *would* read, without reading it. |
 
 ### `batcher/api/io_namespace/` — 5 · conductor
 
@@ -2293,7 +2293,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 82 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 481 | The curated per-accessor docstrings, keyed by accessor name. |
-| `collections.py` | 1713 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1721 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4406 | The `.str` accessor namespace. |
 | `temporal.py` | 1323 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
