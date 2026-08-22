@@ -7,11 +7,9 @@ sub-second queries to PB-scale, batch and streaming, single-node and distributed
 The moat is **stage-boundary re-optimization on *measured* cardinalities** (`api/adaptive/`)
 plus a **sketch-backed cross-query learned-stats and bandit loop** (`kyber/learning.py`,
 `kyber/learned_tuning/`). **This is aspirational, not a description of today** — it is not
-finer-grained than Spark AQE, and it only engages on a query that *has a join* and whose
-scan input clears a **per-stage** floor — 5M rows or ~320 MB multiplied by the number of
-pipeline breakers the loop would cut at (`api/adaptive/gating.py`). A two-breaker plan
-qualifies at 10M rows, a six-breaker one needs 30M. The flat "off below 20M rows" this
-replaced is retired; do not restore it.
+finer-grained than Spark AQE, and it engages only on a *joined* query clearing a **per-stage**
+floor — 5M rows or ~320 MB per breaker it would cut at (`api/adaptive/gating.py`), so ~10M for
+the simplest shape. The flat "off below 20M rows" is retired; don't restore it.
 `docs/architecture/internals/competitive_architecture.md` is the code-checked scorecard;
 **read it before making a competitive claim, and never restore a claim it retires.** It does
 not currently always win, and the gaps are specific rather than vague: it loses to DuckDB
