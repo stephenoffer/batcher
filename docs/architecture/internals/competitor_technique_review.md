@@ -2290,8 +2290,9 @@ The mergeable algebra does what it claims. What follows is only about time.
 | `join+groupby` | 34.4 ms | 11,066.3 ms | **322x slower** |
 | `distinct` | 6.0 ms | 493.8 ms | 82x slower |
 
-**Distributing an sf1 query is not supposed to pay** — the adaptive loop is gated off below 20 M
-rows precisely because of this, and no one should read these ratios as a defect on their own.
+**Distributing an sf1 query is not supposed to pay** — the adaptive loop's per-cut size floor
+(5M rows, or roughly 320 MB, per pipeline breaker) keeps it away from queries this small
+precisely because of this, and no one should read these ratios as a defect on their own.
 Two things underneath them are worth an owner.
 
 ### The group-by warms up and the join never does

@@ -166,7 +166,7 @@ Re-optimization happens *between* stages, never mid-operator. A stage runs to co
 
 Only the seven breaker types segment. A badly mis-estimated selective filter is measured only when it feeds a breaker, which for a pure `scan -> filter -> collect` is never.
 
-Granularity has a floor, because staging materializes. A plan with many small breakers pays the control-plane round-trip at each one, which is why the accuracy early-exit exists and why the structural heuristic won't turn adaptivity on below 20M input rows. The distributed-staging and learned-history paths ignore that floor, since one is a correctness requirement and the other has measured evidence for the shape.
+Granularity has a floor, because staging materializes. A plan with many small breakers pays the control-plane round-trip at each one, which is why the accuracy early-exit exists and why the structural heuristic won't turn adaptivity on below the per-cut floor described above. The distributed-staging and learned-history paths ignore that floor, since one is a correctness requirement and the other has measured evidence for the shape.
 
 A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber optimize is skipped for a UDF plan and each stage is optimized on its own instead.
 
