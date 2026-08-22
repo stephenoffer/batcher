@@ -1,5 +1,109 @@
 # Batcher CPU benchmark results
 
+## Three grouping levels of one `ROLLUP` shared a single learned entry — and the cardinality loop still cannot be fixed, for a different reason than the one on record (2026-08-21)
+
+`python/batcher/kyber/signature.py`; `python/batcher/kyber/learning.py` (measured, not changed).
+
+The 2026-08-16 entry below records that the cross-query cardinality loop writes a measured row
+count to a key nothing reads, that the one-line fix is to file it against the aggregate instead
+of the `Project` above it, and that doing so **regresses the suites** because "every threshold
+downstream was calibrated while this input was ~10x low". This is that claim re-measured, and
+a defect found underneath it that had to be fixed before the question could be asked cleanly.
+
+### What was actually in the way
+
+`plan_signature`'s `Aggregate` token carried the group keys' **aliases** and not their
+expressions. `api.multi_group` builds every level of a `ROLLUP`/`CUBE`/`GROUPING SETS` with the
+*same* output aliases, marking the inactive keys `nullif(col, col)` — so the levels differ only
+in expressions the signature never looked at:
+
+```
+level 0: keys=[a=Col,    b=Col,    c=Col   ]  sig=0c8a7ebf87612584
+level 1: keys=[a=Col,    b=Col,    c=NullIf]  sig=0c8a7ebf87612584
+level 2: keys=[a=Col,    b=NullIf, c=NullIf]  sig=0c8a7ebf87612584
+level 3: (grand total)                        sig=5962611669333f15
+```
+
+**Three aggregates whose group counts differ by orders of magnitude, sharing one learned row
+count and one correction factor** — and the correction factor *is* read today, because
+`Aggregate` is in `StatsEstimator._CORRECTABLE`. Every `ROLLUP`/`CUBE`/`GROUPING SETS` query in
+TPC-DS is an instance; nine of the ninety-nine are.
+
+This is the same collision `signature.py` already describes for `Scan` ("`["scan"]` for every
+relation in the process") and fixes for `Distinct` ("the dedup key is part of the shape") and
+`MapBatches` (the UDF's identity). The `Aggregate` arm had it and nobody had looked. The group
+keys' normalized expressions are now part of the token, and the four levels take four keys.
+
+**It is neutral at suite level and is kept on its own terms.** TPC-DS over three paired runs
+before it: 0.971 / 0.967 / 0.957 (41.7 wins); after: 0.963 / 0.945 / 0.961 (42.7 wins). That is
+inside the ±5 % this box gives a suite run, which is the honest reading — what recommends it is
+that a shared entry between two operators with different cardinalities is wrong whatever it
+measures, exactly as the three arms above it already argue.
+
+### The loop still cannot be fixed, and the recorded reason is not the reason
+
+With the collision gone, filing the count against the aggregate — peeling `Project`/`Sort`,
+never `Limit` — was measured again, three paired runs, alternating arms, same binary:
+
+| | run 1 | run 2 | run 3 | mean | wins |
+|---|---:|---:|---:|---:|---:|
+| peel off (today) | 0.963 | 0.945 | 0.961 | **0.956** | 42.7 |
+| peel on | 0.977 | 0.983 | 0.989 | 0.983 | 40.3 |
+
+All three pairs agree in sign: **~2.7 % worse and two wins fewer.** So the conclusion of the
+2026-08-16 entry stands and the fix stays out — but two things it says do not survive:
+
+- **The per-query numbers are gone.** `q98 0.81 -> 3.09` does not reproduce; q98 reads 1.066 in
+  a fresh-session A/B and *better* (0.822) in an interleaved one. Neither does `TPC-DS
+  0.965 -> 0.988` — the same comparison now reads 0.956 -> 0.983.
+- **The measurement regime decides the sign, which is why the old numbers are not recoverable.**
+  Interleaving all 98 queries five times and taking medians reads the peel as a **win**
+  (geomean 0.973). Running each query best-of-5 in its own fresh session reads it as ±1-6 % with
+  no sign. Only the benchmark's own regime — one process, every query in order — reads it as a
+  consistent loss, and it is the one that matters because it is the one the suite reports. An
+  A/B of this loop is an A/B of accumulated session state, so the regime is part of the result
+  and has to be stated with it.
+
+What is still unproven is *where* the 2.7 % goes. `_prefers_materializing_aggregate` is the
+suspect the earlier note names; forcing it to decline removes only part of the difference on the
+queries that move most (q98 1.066 -> 1.038, q46 1.024 -> 0.988, q90 1.041 -> 1.007), so it is a
+contributor and not the whole of it. The strict xfail in `tests/unit/test_learned_rows_scope.py`
+carries these numbers now instead of the old ones.
+
+### Also measured here, and not a defect
+
+`push_is_not_null_from_join_key` looked like a clear one: on TPC-DS q96 it plants a filter that
+keeps 95.5 % of 2.88 M rows, materializes 85 MB, and is redundant with the inner equi-join above
+it that rejects null keys anyway. Neutering the rule and alternating arms makes **every** query
+tested slower — q96 1.089, and q54/q85/q37/q88/q82/q47 all 1.002-1.015. It pays for itself; left
+alone.
+
+And the learned store does **not** persist across processes: the default backend is
+`InProcessBackend`, so every benchmark run starts cold and "learned across runs" means across
+queries within one process unless a persistent backend is configured. Worth knowing before
+designing an A/B around it — it is why the runs above are not contaminated by each other.
+
+### A red `tests/differential` run on this box, which is neither new nor Batcher's
+
+A whole-directory `pytest tests/differential` ends **3 failed, 12,523 passed** — always the same
+three, all `test_diff_str_compress.py[zstd]`, and all passing when the file is run alone (34
+passed). The assertion never runs:
+
+```
+ImportError: zstd C API versions mismatch; Python bindings were not compiled/linked against
+expected zstd version (10507 returned by the lib, 10506 hardcoded in the cext)
+```
+
+So `zstandard`'s C extension finds libzstd 1.5.7 already resolved in the process where it was
+built against 1.5.6, and `pytest.importorskip` reports that as a failure rather than a skip.
+**Verified pre-existing**: the same directory run against an engine and a `signature.py` from
+`HEAD` gives the byte-identical result — 3 failed, 12,523 passed, the same three names. It is
+not Batcher's frames and not this change; importing `batcher`, compressing with it, and then
+importing `zstandard` in a fresh process all succeed, as does each of `pyarrow`, `deltalake`,
+`ray`, `pyiceberg` and `torch` in turn. Something later in the session pulls the newer library
+in. Recorded so the next person does not spend the run bisecting their own change, and so the
+number to compare a suite against is 12,523/3 rather than clean.
+
 ## One partition more than there are workers costs a whole extra round — h2o-groupby 1.125x -> 1.028x, and a single string key was still encoding every row serially to find its bucket (2026-08-21)
 
 `crates/bc-interp/src/agg_par.rs`, `crates/bc-runtime/src/agg/group/combine.rs`,
