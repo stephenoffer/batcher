@@ -1082,7 +1082,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 278 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 575 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 607 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -2293,7 +2293,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 |---|---|---|
 | `_bind.py` | 171 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 481 | The curated per-accessor docstrings, keyed by accessor name. |
-| `collections.py` | 1721 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1646 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4268 | The `.str` accessor namespace. |
 | `temporal.py` | 1226 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |

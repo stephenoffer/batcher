@@ -27,7 +27,7 @@ from batcher.plan.expr_ir.func_nodes import (
     StrFunc,
     StructField,
 )
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
 from batcher.plan.expr_ir.nodes import ListJoin
 
 
@@ -987,22 +987,6 @@ class _ListNamespace:
 
     # --- embedding / vector helpers -------------------------------------------------
 
-    def magnitude(self) -> ListFunc:
-        """Euclidean length of the vector — the ``l2_norm`` spelling used in ML code.
-
-        Returns:
-            A Float64 expression of the vector magnitude.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"v": [[3.0, 4.0]]})
-                >>> ds.select(r=bt.col("v").list.magnitude()).to_pydict()
-                {'r': [5.0]}
-        """
-        return self.l2_norm()
-
     def is_unit_norm(self, tolerance: float = 1e-6) -> Expr:
         """True where the vector's magnitude is 1 within `tolerance`.
 
@@ -1026,25 +1010,6 @@ class _ListNamespace:
         """
 
         return (self.l2_norm() - Lit(1.0)).abs() < Lit(tolerance)
-
-    def euclidean_distance(self, other: Any) -> ListBinary:
-        """Straight-line distance between two vectors — the ``l2_distance`` spelling.
-
-        Args:
-            other: The other vector column (or an ``array(...)`` literal).
-
-        Returns:
-            A Float64 expression of the Euclidean distance.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]})
-                >>> ds.select(r=bt.col("a").list.euclidean_distance(bt.col("b"))).to_pydict()
-                {'r': [5.0]}
-        """
-        return self.l2_distance(other)
 
     def angular_distance(self, other: Any) -> Expr:
         """Normalized angle between two vectors, in ``[0, 1]`` — ``acos(cosine) / pi``.
@@ -1070,25 +1035,6 @@ class _ListNamespace:
         import math
 
         return self.cosine_similarity(other).acos() / Lit(math.pi)
-
-    def dim(self) -> ListFunc:
-        """Number of components in the vector — the embedding dimension.
-
-        The named spelling of ``len`` for embedding columns; asserting it is uniform is
-        the first check when two models' outputs get mixed in one table.
-
-        Returns:
-            An Int64 expression of the vector dimension.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"v": [[3.0, 4.0]]})
-                >>> ds.select(r=bt.col("v").list.dim()).to_pydict()
-                {'r': [2]}
-        """
-        return self.len()
 
     def is_zero_vector(self) -> Expr:
         """True where every component is zero — the failed-embedding check.
@@ -1128,95 +1074,6 @@ class _ListNamespace:
                 {'r': [25.0]}
         """
         return self.dot(self._e)
-
-    def mean_pool(self) -> ListFunc:
-        """Average of the components — mean pooling over a token-embedding sequence.
-
-        Returns:
-            A Float64 expression of the mean component.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"v": [[1.0, 3.0]]})
-                >>> ds.select(r=bt.col("v").list.mean_pool()).to_pydict()
-                {'r': [2.0]}
-        """
-        return self.mean()
-
-    def max_pool(self) -> ListFunc:
-        """Largest component — max pooling over a token-embedding sequence.
-
-        Returns:
-            An expression of the maximum component.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"v": [[1.0, 3.0]]})
-                >>> ds.select(r=bt.col("v").list.max_pool()).to_pydict()
-                {'r': [3.0]}
-        """
-        return self.max()
-
-    def set_union(self, other: Any) -> ListSet:
-        """Set union of the two lists — the Polars ``set_union`` spelling of :meth:`union`.
-
-        Args:
-            other: The other list column (or an ``array(...)`` literal).
-
-        Returns:
-            A new List expression of the combined distinct elements.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
-                >>> ds.select(bt.col("a").list.set_union(bt.col("b")).alias("r")).to_pydict()
-                {'r': [[1, 2, 3]]}
-        """
-        return self.union(other)
-
-    def set_intersection(self, other: Any) -> ListSet:
-        """Set intersection — the Polars ``set_intersection`` spelling of :meth:`intersect`.
-
-        Args:
-            other: The other list column (or an ``array(...)`` literal).
-
-        Returns:
-            A new List expression of the elements present in both lists.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
-                >>> ds.select(bt.col("a").list.set_intersection(bt.col("b")).alias("r")).to_pydict()
-                {'r': [[2, 3]]}
-        """
-        return self.intersect(other)
-
-    def set_difference(self, other: Any) -> ListSet:
-        """Set difference — the Polars ``set_difference`` spelling of :meth:`difference`.
-
-        Args:
-            other: The other list column (or an ``array(...)`` literal).
-
-        Returns:
-            A new List expression of the elements in this list but not ``other``.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
-                >>> ds.select(bt.col("a").list.set_difference(bt.col("b")).alias("r")).to_pydict()
-                {'r': [[1]]}
-        """
-        return self.difference(other)
 
     def transform(self, func: Any) -> ListTransform:
         """Apply ``func`` to every element, preserving list lengths (→ List).
@@ -1719,3 +1576,71 @@ _bind_accessors(
     _list_reduction_doc,
     "A new :class:`~batcher.Expr` carrying the per-row reduction.",
 )
+
+
+# The vector/set compat spellings for `.list` -- a second name for a method this
+# namespace already has, kept because ML code says `l2_norm` and Polars says
+# `set_union`. Rows are (target, summary, example data, example expression, expected
+# output[, extra note]); the signature and the `Args:`/`Returns:` come from the target.
+_LIST_ALIASES: dict[str, tuple[str, ...]] = {
+    "magnitude": (
+        "l2_norm",
+        "Euclidean length of the vector — the ``l2_norm`` spelling used in ML code.",
+        '{"v": [[3.0, 4.0]]}',
+        'bt.col("v").list.magnitude()',
+        "{'r': [5.0]}",
+    ),
+    "euclidean_distance": (
+        "l2_distance",
+        "Straight-line distance between two vectors — the ``l2_distance`` spelling.",
+        '{"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]}',
+        'bt.col("a").list.euclidean_distance(bt.col("b"))',
+        "{'r': [5.0]}",
+    ),
+    "dim": (
+        "len",
+        "Number of components in the vector — the embedding dimension.",
+        '{"v": [[3.0, 4.0]]}',
+        'bt.col("v").list.dim()',
+        "{'r': [2]}",
+        "The named spelling of ``len`` for embedding columns; asserting it is uniform is\n"
+        "the first check when two models' outputs get mixed in one table.",
+    ),
+    "mean_pool": (
+        "mean",
+        "Average of the components — mean pooling over a token-embedding sequence.",
+        '{"v": [[1.0, 3.0]]}',
+        'bt.col("v").list.mean_pool()',
+        "{'r': [2.0]}",
+    ),
+    "max_pool": (
+        "max",
+        "Largest component — max pooling over a token-embedding sequence.",
+        '{"v": [[1.0, 3.0]]}',
+        'bt.col("v").list.max_pool()',
+        "{'r': [3.0]}",
+    ),
+    "set_union": (
+        "union",
+        "Set union of the two lists — the Polars ``set_union`` spelling of :meth:`union`.",
+        '{"a": [[1, 2]], "b": [[2, 3]]}',
+        'bt.col("a").list.set_union(bt.col("b"))',
+        "{'r': [[1, 2, 3]]}",
+    ),
+    "set_intersection": (
+        "intersect",
+        "Set intersection — the Polars ``set_intersection`` spelling of :meth:`intersect`.",
+        '{"a": [[1, 2, 3]], "b": [[2, 3, 4]]}',
+        'bt.col("a").list.set_intersection(bt.col("b"))',
+        "{'r': [[2, 3]]}",
+    ),
+    "set_difference": (
+        "difference",
+        "Set difference — the Polars ``set_difference`` spelling of :meth:`difference`.",
+        '{"a": [[1, 2, 3]], "b": [[2, 3, 4]]}',
+        'bt.col("a").list.set_difference(bt.col("b"))',
+        "{'r': [[1]]}",
+    ),
+}
+
+_bind_aliases(_ListNamespace, _LIST_ALIASES)
