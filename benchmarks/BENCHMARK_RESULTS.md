@@ -143,8 +143,10 @@ because the reasoning behind it is the obvious one and will be had again.
   cheaper than its metadata-only `count` (131.8), which is what a fixed S3 floor with no pruning
   looks like. What separates the two is bytes per second once the read starts: Batcher's `filter`
   costs 185 ms over its own `count` floor to read one 67 MB column (~360 MB/s), and the ratio
-  holds at 16 columns (`sumwide` 917 vs `filter` 293, against DuckDB's 464 vs 129). The place to
-  look is `bc-io`'s request concurrency, not the zone maps.
+  holds at 16 columns (`sumwide` 917 vs `filter` 293, against DuckDB's 464 vs 129).
+  **Where it is not:** see the entry below, which reproduced this off the network and found the
+  concurrency is already there. This bullet's closing guess — "look at `bc-io`'s request
+  concurrency" — is retracted there.
 - **Three distributed tests deadlock on this single-node box, at `HEAD` as well as with this
   change.** `test_distributed_global_window_matches_single_node[flight]` and the distributed sort in
   `test_shuffle_replication` hang with `ray status` showing `96.0/96.0 CPU (96.0 used of 96.0
@@ -152,6 +154,78 @@ because the reasoning behind it is the obvious one and will be had again.
   a fan-out wider than the cluster and waits for an autoscaler that has nowhere to grow. Verified
   pre-existing by rebuilding the engine from `HEAD` and reproducing all four failures; recorded
   here rather than fixed because it is a `dist/` sizing question, not a shuffle one.
+
+## The scan suite's gap is the Parquet decoder's CPU, not its concurrency — reproduced off the network, where the guess in the entry above dies (2026-08-21)
+
+`crates/bc-io/src/lib.rs` (read, unchanged), `python/batcher/io/formats/structured/parquet/`.
+
+The entry above measured `scan` at 1.458x over S3 and closed with "the place to look is `bc-io`'s
+request concurrency". **That is wrong, and this is the measurement that says so.** Recorded rather
+than deleted because it is the obvious guess and the next person will make it too.
+
+### The bench, rebuilt locally so the network is not a variable
+
+Eight snappy Parquet files, 16 uniformly-random `int64` columns, 8,388,608 rows, 64 row groups —
+the `scan-ideal` layout without S3. Every gap reproduces, so none of it is the object store:
+
+| shape | batcher | duckdb | |
+|---|---:|---:|---:|
+| `count` (footer only) | 3.7 ms | 3.9 | 0.93x |
+| `filter` `count(*) WHERE column0 < k` | 21.5 | 9.3 | 2.31x |
+| `filter_agg` | 36.1 | 16.9 | 2.13x |
+| `sum1` | 27.6 | 10.3 | 2.68x |
+| `sumwide` (16 columns) | 317.8 | 278.6 | 1.14x |
+| `groupby` | 52.2 | 58.1 | 0.90x |
+
+### Four things it is not
+
+- **Not row-group concurrency.** `BATCHER_PARQUET_RG_CONCURRENCY` at 16 / 32 / 64 / 128 reads
+  23.2 / 23.3 / 22.8 / 23.1 ms. Flat.
+- **Not the file fan-out.** The same eight files' `column0`, read through the native reader on
+  eight Python threads, take **11.4 ms at 34.6 cores busy** — and `read_parquet_many`'s single
+  batched call takes 11.3 ms at 33.5. The concurrency is there and reachable; the query just does
+  not convert it into wall time.
+- **Not the Arrow re-filter.** `_read_one` re-applies the pushed predicate through
+  `pa.Table.filter(Expression)`, which looks like a duplicate of the reader's own `RowFilter` and
+  profiles at 37 % of a `cProfile` run. Timed directly it is **0.13 ms** — `cProfile`'s `cumtime`
+  on a recursive Acero call is not a measurement. The predicate itself narrows 8.39 M rows to
+  84,215 inside the decode, exactly as intended.
+- **Not the row filter being a mistake.** `BATCHER_PARQUET_ROW_FILTER=0` makes `filter` *worse*,
+  22.0 -> 31.1 ms. Leave it on.
+
+### What it is
+
+Wall and CPU, same query, same corpus, 20 runs:
+
+| | wall | CPU | cores busy |
+|---|---:|---:|---:|
+| batcher | 22.80 ms | 399.4 ms | 17.5 |
+| duckdb | 8.07 | 230.4 | 28.5 |
+
+**1.7x the CPU to decode the same 69 MB** — 5.8 ns/byte against 3.3. The profile puts the top
+symbol at `parquet::encodings::rle::RleDecoder::get_batch_with_dict` with
+`bit_pack::unpack32` behind it: the corpus is `RLE_DICTIONARY` encoded (PyArrow's default, with a
+`PLAIN` fallback once the dictionary outgrows its page), so every value costs an RLE index decode
+and a random gather out of a 131,072-entry dictionary. That is `arrow-rs`'s decoder against
+DuckDB's own, and it is the larger half of the gap.
+
+The rest is fixed cost around the read. Timing `collect()` against when the first and last native
+read start and finish:
+
+```
+total 18.68 ms  =  pre 2.39  +  reads 11.94  +  post 4.35
+```
+
+~6 ms on either side of the read, for a query that returns one row — split planning and footer
+work before, and after it the engine plus a Python pass over the **64 tiny batches** the filtered
+read returns (one row group each, ~1,300 rows apiece, because a 1 %-selective `RowFilter` shrinks
+every row group's output but the reader still emits one batch per group).
+
+So the honest ceiling on the control-plane half is about 4 ms of an 18.7 ms query, which would
+leave ~13 ms against DuckDB's 8. **Closing `scan` means the decoder**, and that is a `arrow-rs`
+question or a hand-written reader, not a tuning one. Coalescing the filtered reader's output up to
+`batch_size` before it crosses the FFI is the cheap piece of it and is worth doing on its own
+merits; it was not attempted here.
 
 ## The non-reducing group-by spends 70% of itself moving rows, the textbook fix for that made it 2.7x worse, and the fix that worked was removing a second pass (2026-08-20)
 
