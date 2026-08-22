@@ -826,7 +826,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `json.py` | 157 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 575 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 83 | SQL → `.map` accessor dispatch. |
-| `scalar.py` | 539 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `scalar.py` | 534 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 285 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 222 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 570 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
@@ -874,7 +874,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `frame.py` | 200 | Resolving a SQL window spec into the engine's frame, partition and order triple. |
-| `translate.py` | 709 | Window-function handling for the SQL translator. |
+| `translate.py` | 701 | Window-function handling for the SQL translator. |
 
 ### `batcher/dist/` — 4 · backend
 
