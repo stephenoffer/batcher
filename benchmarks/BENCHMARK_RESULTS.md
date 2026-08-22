@@ -1,5 +1,158 @@
 # Batcher CPU benchmark results
 
+## One partition more than there are workers costs a whole extra round — h2o-groupby 1.125x -> 1.028x, and a single string key was still encoding every row serially to find its bucket (2026-08-21)
+
+`crates/bc-interp/src/agg_par.rs`, `crates/bc-runtime/src/agg/group/combine.rs`,
+`crates/bc-runtime/src/shuffle.rs`.
+
+`h2o-groupby` was the one in-memory suite Batcher lost outright. Two independent defects, both
+in the *shape* of the parallel aggregate rather than in any kernel it runs.
+
+### 1. The radix width rounded up to a power of two, and the cost is a cliff
+
+The partition path (a `GROUP BY` whose key does not reduce) splits the relation `parts` ways and
+aggregates each part once, fanning out **one task per partition**. Its critical path is therefore
+`ceil(parts / workers)` buckets however small the last round is — so a width one over the pool
+starts a whole second round for two buckets' worth of work.
+
+`radix_width` rounded its answer up to a power of two, which walked straight off that cliff: the
+pool this box gives a 10 M-row aggregate is **61**, and 61 rounds to **64**.
+
+Measured by alternating the arms round by round inside one process, so neither arm inherits the
+other's cache state (`BATCHER_AGG_PARTS` pinning the width; H2O `groupby` at its own 1e7-row
+tier, median of nine, milliseconds):
+
+| partitions | 48 | 56 | **61** | 62 | 64 | 72 |
+|---|---:|---:|---:|---:|---:|---:|
+| q3 `sum, avg BY id3` | 51.1 | 48.1 | **46.4** | 62.0 | 61.2 | 56.1 |
+| q5 `three sums BY id6` | 33.2 | 33.3 | **32.8** | 40.6 | 39.7 | 39.6 |
+| q7 `max-min BY id3` | 50.5 | 49.2 | **49.5** | 63.1 | 62.2 | 57.1 |
+
+Every width at or below the pool is flat and 62 is 20-25 % worse than 61, which is the whole
+finding: **nothing about powers of two is involved.** 64 is merely where the rounding landed. An
+earlier reading of this table blamed the power of two and would have been wrong — 32 sits on the
+smooth part of the curve, and 63/65 are as slow as 64.
+
+The width is now rounded up to a multiple of the worker count, which is the property that makes
+`ceil(parts / workers)` exact: every worker takes the same number of buckets. `bucket_of` has
+handled a non-power-of-two count since it was written (Lemire multiply-shift over the hash's high
+bits instead of a mask over its low ones), so the rounding bought nothing that had to be paid for.
+
+The regroup inside `agg::combine` had the identical rule and now has the identical fix.
+Alternating that one on its own moves the shapes it serves: q10 (`GROUP BY id1..id6`, near-unique
+over 10 M rows) **200.9 -> 189.5 ms**, q2 34.5 -> 34.0, q9 43.4 -> 42.8, q4 8.4 -> 8.3.
+
+### 2. A single string key could not reach the raw hash, so every shuffle encoded it serially
+
+`bucket_of_rows` had two fast paths — all-`Int64` at any column count, and a *two-or-more*-column
+mix of `Int64`/string/binary — and the `RowConverter` for everything else. A **single** `Utf8` key
+therefore missed both, which is the commonest high-cardinality group/join/DISTINCT key there is.
+`RowConverter::convert_columns` encodes every row into arrow's byte format in one **serial** pass
+before the parallel hash can start; on `GROUP BY id3` (a 12-byte string key over 10 M rows) it
+profiled at **7.5 %** of the whole query — `variable::encode_one` 3.1 %, `variable::encode` 1.5 %,
+`str::from_utf8` 1.9 %, `row_lengths` 1.0 % — to compute a hash the raw path takes from the value
+buffer with no intermediate at all.
+
+There is now one `KeyHash` for the module and the raw fold is the rule rather than the exception:
+every integer and temporal type (widened to the `i64` it would have been had it crossed the FFI
+boundary, so an `Int32` key and an `Int64` key of the same value hash the same), `Float64` over its
+canonical bits, and the byte types. The `RowConverter` remains for what only it models — list,
+struct, decimal, dictionary, boolean. Measured on q3 in isolation, 71.8 / 71.1 ms before against
+66.8 / 67.4 after.
+
+**It also removes a real disagreement.** `salted_partition_by_keys` — the skew-aware shuffle —
+derived its own key hash from the `RowConverter`, while `bucket_of_rows` hashed a single `Int64`
+key raw. Two mappers of one join side that took different branches (one given hot keys, one not)
+would route equal keys to different reducers. Both now build the same `KeyHash`.
+
+**The routing changed for single byte keys and for `Float64`, deliberately.** Two golden vectors in
+`shuffle_hash_golden.rs` are re-baselined and say so; the co-location assertions they carry (all
+nulls together, `-0.0` with `0.0`, every NaN together) are unchanged and still pass. A mixed-version
+cluster would disagree about these keys, which is the announced break that file asks for.
+
+### Suites
+
+Every in-memory suite re-run on the 96-core / 184 GiB box, release build. `b/duckdb` is against
+DuckDB's native compressed store; `b/duckdb_arrow` is the like-for-like bar — the same zero-copy
+Arrow Batcher executes over.
+
+| suite | n | before | after | vs `duckdb_arrow` | |
+|---|---:|---:|---:|---:|---|
+| **h2o-groupby** | 10 | **1.125** | **1.028** | 0.083 | loss, and no longer the outlier |
+| TPC-H sf1 | 22 | 0.774 | 0.736 | 0.254 | win |
+| ClickBench | 43 | 0.625 | 0.597 | 0.074 | win |
+| operators | 21 | 0.683 | 0.662 | 0.385 | win |
+| h2o-join | 5 | 0.796 | 0.818 | 0.204 | win |
+| JSON | 5 | 0.262 | 0.249 | 0.035 | win |
+| TPC-DS sf1 | 98 | 0.995 | 0.962 | — | parity |
+| JOB | 109 | 1.488 (recorded) | 1.308 | — | loss |
+
+**Read the per-query movement, not the suite geomeans.** `h2o-groupby` moved because two queries
+did, by far more than this box's spread: q3 **69.0 -> 50.5 ms** (1.57x -> 1.16x) and q7
+**71.7 -> 46.6** (1.69x -> 1.15x), with q5 41.7 -> 36.1 and q10 215.4 -> 189.7. Everything else in
+the table is inside the noise band and should be read as unchanged: `op-filter-project` — a filter
+and a multiply, touching none of this code — read 1.24x, 1.53x, 1.43x and 1.40x across four runs of
+two binaries, so ±25 % on a small operator case and ±4 % at suite level is what this box gives.
+
+Two measurement traps worth keeping. A **four-engine lineup distorts `h2o-join`**: with
+`duckdb_arrow` added it read 1.440x, and the same binary re-run at three engines read 0.818x — the
+suite's own note about ~18 GiB resident at scale 1 is the reason, and the three-engine figure is the
+one in the table. And a probe that **read its fixture from a feather file** made every h2o query
+20-40 % slower than the same data built in memory, because `read_table` returns 153 chunks per
+column where the generator returns one; `combine_chunks()` on the way in is the fix, and an A/B run
+without it measured the chunking, not the change.
+
+### Measured and thrown away
+
+Four changes were built, measured against the shape they targeted, and reverted. Each is recorded
+because the reasoning behind it is the obvious one and will be had again.
+
+- **One shard per worker in the join build** (`join::build::shard_count`, plus the dense fill's part
+  count), by the same second-round argument as the aggregate's radix width, with `shard_of`
+  multiplying instead of masking. It is **worse**: alternating the arms over a 10 M x 10 M
+  composite-key join and a 10 M x 10 k one, 1040.7 vs 1027.4 ms and 25.1 vs 24.0. The build is not
+  the join's critical path, and the mask is genuinely cheaper in a probe loop that runs per row.
+- **Ranking a composite byte key through a packed `u64`** instead of `AHashMap<&[u8], _>`, so the
+  probe compares a register rather than `memcmp`-ing a slice. The profile says that map is 16 % of
+  h2o q2 and the change moves nothing: 35.2 vs 35.4 ms. The cost is reaching the value buffer, not
+  hashing it.
+- **One partial per worker instead of partitioning** on the high-cardinality shapes. 1.7-1.9x worse
+  on q3/q5 and identical on q2/q9 — so the routing rule `REDUCTION_CEILING` implements is right,
+  which is worth knowing because the whole partition path rests on it.
+- **Chunk counts other than one per worker** (96/32/16/8 over the same shapes): flat.
+
+### What is left, with the evidence for it
+
+- **h2o-groupby's remaining loss is DuckDB's storage engine, not its executor.** Against the same
+  Arrow the suite is **0.083x** — 12x faster on every one of the ten. q2 (two 5-byte string keys,
+  10 k groups) and q4 (100 integer groups, three `AVG`s) are the worst at 1.94x and 1.89x, and both
+  read columns DuckDB holds dictionary-encoded and bit-packed.
+- **TPC-DS wins 41 of 98.** Its worst are q5 6.37x and q77 5.27x, both `ROLLUP` over three sales
+  channels — the union-of-levels design `api/multi_group.py` documents, where each level re-reads
+  and re-aggregates the shared input. A grouping-sets aggregate that keeps one state per set is
+  still the fix and is still unbuilt.
+- **The estimator is not the JOB gap.** The 2026-08-07 entry below measured that: seeding the
+  missing distinct counts made JOB 33 % *slower*, so the defect is in the join-order search, not the
+  statistics feeding it.
+- **`scan` is a read-throughput gap, not a pruning one.** The `scan-ideal` layout (8 x ~132 MiB
+  parquet on S3, 8,388,608 rows) reads **1.458x**, 2 of 9: `filter_agg` 3.02x, `filter` 2.27x,
+  `sumwide` 1.97x, against wins on `count` (0.82x) and `minmax` (0.86x), which are footer-only.
+  The suite's header says a predicate here rewards row-group skipping, but the corpus is 16
+  *uniformly random* `int64` columns over `[0, 2^63)`, so every row group's min is near 0 and its
+  max near `2^63` and **no engine can prune anything** — DuckDB's own `filter` (129.1 ms) is
+  cheaper than its metadata-only `count` (131.8), which is what a fixed S3 floor with no pruning
+  looks like. What separates the two is bytes per second once the read starts: Batcher's `filter`
+  costs 185 ms over its own `count` floor to read one 67 MB column (~360 MB/s), and the ratio
+  holds at 16 columns (`sumwide` 917 vs `filter` 293, against DuckDB's 464 vs 129). The place to
+  look is `bc-io`'s request concurrency, not the zone maps.
+- **Three distributed tests deadlock on this single-node box, at `HEAD` as well as with this
+  change.** `test_distributed_global_window_matches_single_node[flight]` and the distributed sort in
+  `test_shuffle_replication` hang with `ray status` showing `96.0/96.0 CPU (96.0 used of 96.0
+  reserved in placement groups)` against `Pending Demands: {'CPU': 12.0}: 16+` — the query asks for
+  a fan-out wider than the cluster and waits for an autoscaler that has nowhere to grow. Verified
+  pre-existing by rebuilding the engine from `HEAD` and reproducing all four failures; recorded
+  here rather than fixed because it is a `dist/` sizing question, not a shuffle one.
+
 ## The non-reducing group-by spends 70% of itself moving rows, the textbook fix for that made it 2.7x worse, and the fix that worked was removing a second pass (2026-08-20)
 
 `crates/bc-interp/src/ops/repartition.rs`, `crates/bc-interp/src/agg_par.rs`.

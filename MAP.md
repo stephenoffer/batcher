@@ -2820,7 +2820,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg_par.rs` | 505 | The high-cardinality parallel aggregate: partition first, aggregate once. |
+| `agg_par.rs` | 530 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 589 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 136 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
@@ -2876,7 +2876,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 642 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1616 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 562 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 569 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
@@ -2907,7 +2907,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `keys.rs` | 372 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 33 | `bc-runtime` — the engine's runtime library. |
 | `measure.rs` | 111 | Reading an ordered key as a number, so two of them can be *subtracted*. |
-| `shuffle.rs` | 1186 | Hash repartitioning — the shuffle primitive. |
+| `shuffle.rs` | 1167 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window/agg/median_state.rs` | 80 | The running median's two-heap, kept apart from the aggregates that use it. |
 | `window/agg/mod.rs` | 752 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |

@@ -83,10 +83,28 @@ fn golden_mixed_int_and_string_key() {
     assert_eq!(buckets(&keys, 3, 7), vec![2, 6, 4]);
 }
 
-/// A nullable key falls out of the fast paths onto the `RowConverter`, so this pins a
-/// different hasher call site than the tests above.
+/// A **single** byte-typed key — the commonest high-cardinality shuffle there is
+/// (`GROUP BY id3`, a join on a natural key). Re-baselined 2026-08-21: this shape used to
+/// fall back to the `RowConverter`, whose `convert_columns` encodes every row in one serial
+/// pass; it now folds the value bytes raw like every other supported type. The routing
+/// therefore changed, deliberately — see `KeyHash` in `shuffle.rs`.
 #[test]
-fn golden_nullable_key_uses_the_row_converter() {
+fn golden_single_string_key() {
+    let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+        "alpha", "beta", "gamma", "alpha",
+    ]))];
+    let got = buckets(&keys, 4, 8);
+    assert_eq!(got[0], got[3], "equal keys must co-locate");
+    assert_eq!(got, vec![4, 1, 2, 4]);
+    assert_eq!(buckets(&keys, 4, 7), vec![3, 6, 6, 3]);
+}
+
+/// A nullable key routes its nulls to the fixed null bucket and its non-null rows through the
+/// raw fold, so a nullable key and a null-free key of the same type agree on every non-null
+/// value. Re-baselined 2026-08-21 with `golden_single_string_key` above: a nullable byte key
+/// used to be the `RowConverter`'s job.
+#[test]
+fn golden_nullable_key_routes_nulls_together() {
     let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
         Some("a"),
         None,
@@ -94,7 +112,7 @@ fn golden_nullable_key_uses_the_row_converter() {
         None,
     ]))];
     let got = buckets(&keys, 4, 8);
-    assert_eq!(got, vec![6, 6, 1, 6]);
+    assert_eq!(got, vec![1, 7, 5, 7]);
     // Whatever bucket nulls take, every null must take the *same* one, or two rows that
     // compare equal to the group assigner would be finalized on different reducers.
     assert_eq!(got[1], got[3], "all nulls must co-locate");
@@ -120,7 +138,10 @@ fn golden_float_key_canonicalizes_before_hashing() {
         );
         assert_eq!(got[2], got[3], "every NaN must co-locate ({parts} parts)");
     }
-    assert_eq!(buckets(&keys, 5, 8), vec![7, 7, 2, 2, 0]);
+    // Re-baselined 2026-08-21: `Float64` folds its canonical bits raw rather than through
+    // the `RowConverter`. The co-location assertions above are the contract; these numbers
+    // are the routing that implements it.
+    assert_eq!(buckets(&keys, 5, 8), vec![7, 7, 0, 0, 0]);
 }
 
 /// Equal keys must map to one bucket regardless of where they sit in the batch, which is
