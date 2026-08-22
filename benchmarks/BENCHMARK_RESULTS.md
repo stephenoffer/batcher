@@ -222,10 +222,31 @@ read returns (one row group each, ~1,300 rows apiece, because a 1 %-selective `R
 every row group's output but the reader still emits one batch per group).
 
 So the honest ceiling on the control-plane half is about 4 ms of an 18.7 ms query, which would
-leave ~13 ms against DuckDB's 8. **Closing `scan` means the decoder**, and that is a `arrow-rs`
-question or a hand-written reader, not a tuning one. Coalescing the filtered reader's output up to
-`batch_size` before it crosses the FFI is the cheap piece of it and is worth doing on its own
-merits; it was not attempted here.
+leave ~13 ms against DuckDB's 8. **Closing `scan` means the decoder**, and that is an `arrow-rs`
+question or a hand-written reader, not a tuning one.
+
+### The one piece of it that was cheap: coalescing the reader's output
+
+`coalesce_batches` merges consecutive batches up to the `batch_size` the caller asked for, so the
+selective read above hands back **one batch of 10,455 rows per file instead of eight of ~1,300**.
+A read already at the target copies nothing — a run stops before it would exceed `batch_size`, so
+a full-size batch forms a run of one and passes through by `Arc`, and the partial batch ending each
+row group never merges with the next group's full one. Verified: the unfiltered read of the same
+file still returns 16 batches of exactly 65,536.
+
+Alternating the arms round by round in one process (median of nine, local corpus):
+
+| shape | coalesced | as before | |
+|---|---:|---:|---:|
+| `filter` | **21.42 ms** | 23.50 | 0.912 |
+| `filter_agg` | **28.70** | 30.37 | 0.945 |
+| `sum1` | **30.18** | 31.78 | 0.950 |
+| `sumwide` | 270.06 | 272.38 | 0.991 |
+
+**Do not look for this in the suite.** Re-running `scan-ideal` over S3 reads 1.455x against 1.458x
+before it, and the same run moves `scan-count` from 107.8 to 90.4 ms and DuckDB's from 131.8 to
+146.1 — the object store's spread is several times the effect. The local A/B is the measurement;
+the suite is the reason it is not the fix.
 
 ## The non-reducing group-by spends 70% of itself moving rows, the textbook fix for that made it 2.7x worse, and the fix that worked was removing a second pass (2026-08-20)
 

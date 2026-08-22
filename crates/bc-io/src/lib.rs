@@ -687,12 +687,66 @@ async fn read_parquet_async(
         })
         .try_collect()
         .await?;
-    let mut batches: Vec<RecordBatch> = per_rg_batches.into_iter().flatten().collect();
+    let flat: Vec<RecordBatch> = per_rg_batches.into_iter().flatten().collect();
+    let mut batches = coalesce_batches(flat, batch_size)?;
     // Match PyArrow: return columns in the requested projection order, not file order.
     if let Some(cols) = columns {
         reorder_to_projection(&mut batches, cols);
     }
     Ok(batches)
+}
+
+/// Merge consecutive batches up to `batch_size` rows, preserving row order.
+///
+/// The decoder emits at least one batch per row group, so a *selective* read fragments: a
+/// `RowFilter` keeping 1 % of a 131,072-row group leaves ~1,300 rows, and a 64-row-group read
+/// hands the caller 64 batches averaging 1,300 rows where it asked for 65,536. Every one of them
+/// then crosses the FFI as its own `RecordBatch`, is conformed to the source schema by a Python
+/// loop, and becomes its own morsel downstream — per-batch cost paid 64 times for one batch's
+/// worth of rows.
+///
+/// **A read that is already at the target copies nothing.** A run stops before it would exceed
+/// `batch_size`, so a full-size batch forms a run of one and is passed through by `Arc`; the
+/// partial batch that ends each row group likewise never merges with the next group's full one.
+/// Only the fragmented case concatenates, and there the copy is bounded by the rows that
+/// survived the filter.
+///
+/// Order is the decoder's order, which is row-group order — the property the `seq == par` oracle
+/// and PyArrow parity both rest on — and concatenation preserves it. Empty batches ride along in
+/// their run rather than being dropped, so a read that matched nothing still returns one batch
+/// carrying the schema instead of an empty list.
+fn coalesce_batches(
+    batches: Vec<RecordBatch>,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, IoError> {
+    if batches.len() < 2 {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let mut out: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    let mut run: Vec<RecordBatch> = Vec::new();
+    let mut rows = 0usize;
+    let flush = |run: &mut Vec<RecordBatch>, out: &mut Vec<RecordBatch>| -> Result<(), IoError> {
+        match run.len() {
+            0 => {}
+            1 => out.push(run.pop().expect("len 1")),
+            _ => {
+                out.push(arrow::compute::concat_batches(&schema, run.iter())?);
+                run.clear();
+            }
+        }
+        Ok(())
+    };
+    for b in batches {
+        if !run.is_empty() && rows + b.num_rows() > batch_size {
+            flush(&mut run, &mut out)?;
+            rows = 0;
+        }
+        rows += b.num_rows();
+        run.push(b);
+    }
+    flush(&mut run, &mut out)?;
+    Ok(out)
 }
 
 /// Reorder each batch's columns to the requested projection order (PyArrow parity).
