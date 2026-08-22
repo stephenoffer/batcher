@@ -16,7 +16,7 @@ from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attri
 from batcher.plan.expr_ir.constructors import lit, nullif
 from batcher.plan.expr_ir.core import AggExpr, Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
-from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
+from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
 from batcher.plan.expr_ir.nodes import ListJoin
 
 # Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
@@ -564,54 +564,6 @@ class _StrNamespace:
 
     # --- Polars/pandas-compatible spellings (delegate to the SQL-named methods) -----
 
-    def to_lowercase(self) -> StrFunc:
-        """Lowercase the string — the Polars ``to_lowercase`` spelling of :meth:`lower`.
-
-        Returns:
-            A new Utf8 expression with every letter lowercased.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["Hello"]})
-                >>> ds.select(r=bt.col("s").str.to_lowercase()).to_pydict()
-                {'r': ['hello']}
-        """
-        return self.lower()
-
-    def to_uppercase(self) -> StrFunc:
-        """Uppercase the string — the Polars ``to_uppercase`` spelling of :meth:`upper`.
-
-        Returns:
-            A new Utf8 expression with every letter uppercased.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["Hello"]})
-                >>> ds.select(r=bt.col("s").str.to_uppercase()).to_pydict()
-                {'r': ['HELLO']}
-        """
-        return self.upper()
-
-    def to_titlecase(self) -> StrFunc:
-        """Title-case the string — the Polars ``to_titlecase`` spelling of :meth:`initcap`.
-
-        Returns:
-            A new Utf8 expression with the first letter of each word uppercased.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello world"]})
-                >>> ds.select(r=bt.col("s").str.to_titlecase()).to_pydict()
-                {'r': ['Hello World']}
-        """
-        return self.initcap()
-
     def pad_start(self, width: int, fill: str = " ") -> StrFunc:
         """Left-pad to ``width`` — the Polars ``pad_start`` spelling of :meth:`lpad`.
 
@@ -651,178 +603,6 @@ class _StrNamespace:
                 {'r': ['ab***']}
         """
         return self.rpad(require_int(width, func="str.pad_end", arg="width"), fill)
-
-    def count_matches(self, pattern: str) -> StrFunc:
-        """Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.
-
-        Args:
-            pattern: The regular expression to count.
-
-        Returns:
-            An Int64 expression of the number of matches per row.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1b2c3"]})
-                >>> ds.select(r=bt.col("s").str.count_matches("[0-9]")).to_pydict()
-                {'r': [3]}
-        """
-        return self.regexp_count(pattern)
-
-    def extract(self, pattern: str, group: int = 1) -> StrFunc:
-        """Extract a regex capture group — Polars' ``extract`` (see :meth:`regexp_extract`).
-
-        Args:
-            pattern: The regular expression with capture groups.
-            group: The 1-based capture group to return (``0`` is the whole match).
-
-        Returns:
-            A Utf8 expression of the captured text, or null if no match.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1"]})
-                >>> ds.select(r=bt.col("s").str.extract(r"([a-z])([0-9])", 2)).to_pydict()
-                {'r': ['1']}
-        """
-        return self.regexp_extract(pattern, group)
-
-    def extract_all(self, pattern: str) -> StrFunc:
-        """All regex matches as a list — Polars' ``extract_all`` (see :meth:`regexp_extract_all`).
-
-        Args:
-            pattern: The regular expression to find all matches of.
-
-        Returns:
-            A ``List<Utf8>`` expression of every match per row.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1b2"]})
-                >>> ds.select(r=bt.col("s").str.extract_all("[0-9]")).to_pydict()
-                {'r': [['1', '2']]}
-        """
-        return self.regexp_extract_all(pattern)
-
-    def replace_all(self, pattern: str, value: str) -> StrFunc:
-        """Replace every regex match — Polars' ``replace_all`` (see :meth:`regexp_replace_all`).
-
-        Args:
-            pattern: The regular expression to replace.
-            value: The replacement text.
-
-        Returns:
-            A Utf8 expression with every match replaced.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a1b2"]})
-                >>> ds.select(r=bt.col("s").str.replace_all("[0-9]", "#")).to_pydict()
-                {'r': ['a#b#']}
-        """
-        return self.regexp_replace_all(pattern, value)
-
-    def len_chars(self) -> StrFunc:
-        """Character length — the Polars ``len_chars`` spelling of :meth:`len`.
-
-        Returns:
-            An Int64 expression of the number of characters per row.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["café"]})
-                >>> ds.select(r=bt.col("s").str.len_chars()).to_pydict()
-                {'r': [4]}
-        """
-        return self.len()
-
-    def len_bytes(self) -> StrFunc:
-        """UTF-8 byte length — the Polars ``len_bytes`` spelling of :meth:`octet_length`.
-
-        Returns:
-            An Int64 expression of the number of UTF-8 bytes per row.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["café"]})
-                >>> ds.select(r=bt.col("s").str.len_bytes()).to_pydict()
-                {'r': [5]}
-        """
-        return self.octet_length()
-
-    def strip_chars(self, chars: str | None = None) -> StrFunc:
-        """Trim from both ends — the Polars ``strip_chars`` spelling of :meth:`trim`.
-
-        Note the divergence from Polars: with ``chars=None`` this strips the ASCII **space**
-        only, following SQL ``TRIM`` (and DuckDB), not the whole whitespace class. Tabs and
-        newlines survive. Pass them explicitly — ``strip_chars(" \\t\\n")`` — when the input
-        may carry them, which scraped and CSV text usually does.
-
-        Args:
-            chars: The characters to strip; the ASCII space when ``None``.
-
-        Returns:
-            A Utf8 expression with the leading and trailing characters removed.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  ab  "]})
-                >>> ds.select(r=bt.col("s").str.strip_chars()).to_pydict()
-                {'r': ['ab']}
-        """
-        return self.trim(chars)
-
-    def strip_chars_start(self, chars: str | None = None) -> StrFunc:
-        """Trim from the left — the Polars ``strip_chars_start`` spelling of :meth:`lstrip`.
-
-        Args:
-            chars: The characters to strip; the ASCII space when ``None``.
-
-        Returns:
-            A Utf8 expression with the leading characters removed.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  ab  "]})
-                >>> ds.select(r=bt.col("s").str.strip_chars_start()).to_pydict()
-                {'r': ['ab  ']}
-        """
-        return self.lstrip(chars)
-
-    def strip_chars_end(self, chars: str | None = None) -> StrFunc:
-        """Trim from the right — the Polars ``strip_chars_end`` spelling of :meth:`rstrip`.
-
-        Args:
-            chars: The characters to strip; the ASCII space when ``None``.
-
-        Returns:
-            A Utf8 expression with the trailing characters removed.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  ab  "]})
-                >>> ds.select(r=bt.col("s").str.strip_chars_end()).to_pydict()
-                {'r': ['  ab']}
-        """
-        return self.rstrip(chars)
 
     def head(self, n: int) -> StrFunc:
         """First ``n`` characters — the Polars ``str.head`` spelling of :meth:`left`.
@@ -2621,66 +2401,6 @@ class _StrNamespace:
 
     # --- pandas-compatible string spellings -----------------------------------------
 
-    def strip(self, chars: str | None = None) -> StrFunc:
-        """Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.
-
-        Unlike Python's ``str.strip()``, the no-argument form removes the ASCII **space**
-        only, following SQL ``TRIM``. Pass ``strip(" \\t\\n")`` to also drop tabs and newlines.
-
-        Args:
-            chars: The characters to strip; the ASCII space when ``None``.
-
-        Returns:
-            A Utf8 expression with leading and trailing characters removed.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["  ab  "]})
-                >>> ds.select(r=bt.col("s").str.strip()).to_pydict()
-                {'r': ['ab']}
-        """
-        return self.trim(chars)
-
-    def startswith(self, pattern: str) -> StrFunc:
-        """True where the string starts with `pattern` — the pandas ``str.startswith``.
-
-        Args:
-            pattern: The literal prefix to test for.
-
-        Returns:
-            A Boolean expression.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abc", "xbc"]})
-                >>> ds.select(r=bt.col("s").str.startswith("a")).to_pydict()
-                {'r': [True, False]}
-        """
-        return self.starts_with(pattern)
-
-    def endswith(self, pattern: str) -> StrFunc:
-        """True where the string ends with `pattern` — the pandas ``str.endswith``.
-
-        Args:
-            pattern: The literal suffix to test for.
-
-        Returns:
-            A Boolean expression.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abc", "abx"]})
-                >>> ds.select(r=bt.col("s").str.endswith("c")).to_pydict()
-                {'r': [True, False]}
-        """
-        return self.ends_with(pattern)
-
     def match(self, pattern: str) -> StrFunc:
         """True where `pattern` matches at the **start** of the string — pandas ``str.match``.
 
@@ -2711,22 +2431,6 @@ class _StrNamespace:
                 {'r': [True, False, True]}
         """
         return self.regexp_matches(f"^(?:{pattern})")
-
-    def title(self) -> StrFunc:
-        """Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.
-
-        Returns:
-            A Utf8 expression with each word's first letter uppercased.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello world"]})
-                >>> ds.select(r=bt.col("s").str.title()).to_pydict()
-                {'r': ['Hello World']}
-        """
-        return self.initcap()
 
     def removeprefix(self, prefix: str) -> StrFunc:
         """Drop `prefix` from the start if present, else leave the string unchanged.
@@ -3107,22 +2811,6 @@ class _StrNamespace:
         """
 
         return ListJoin(AggExpr("list_agg", self._e), delimiter)
-
-    def escape_regex(self) -> StrFunc:
-        """Escape the regex metacharacters, spelled as Polars ``str.escape_regex``.
-
-        Returns:
-            A new Utf8 expression, safe to embed in a pattern as a literal.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["a.b"]})
-                >>> ds.select(r=bt.col("s").str.escape_regex()).to_pydict()
-                {'r': ['a\\\\.b']}
-        """
-        return self.regexp_escape()
 
     def regexp_escape(self) -> StrFunc:
         """Escape the regex metacharacters in the value (→ Utf8).
@@ -4370,6 +4058,65 @@ class _StrNamespace:
         """
         return StrFunc("translate", self._e, pattern=from_chars, replacement=to_chars)
 
+    def extract(self, pattern: str, group: int = 1) -> StrFunc:
+        """Extract a regex capture group — Polars' ``extract`` (see :meth:`regexp_extract`).
+
+        Args:
+            pattern: The regular expression with capture groups.
+            group: The 1-based capture group to return (``0`` is the whole match).
+
+        Returns:
+            A Utf8 expression of the captured text, or null if no match.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1"]})
+                >>> ds.select(r=bt.col("s").str.extract(r"([a-z])([0-9])", 2)).to_pydict()
+                {'r': ['1']}
+        """
+        return self.regexp_extract(pattern, group)
+
+    def extract_all(self, pattern: str) -> StrFunc:
+        """All regex matches as a list — Polars' ``extract_all`` (see :meth:`regexp_extract_all`).
+
+        Args:
+            pattern: The regular expression to find all matches of.
+
+        Returns:
+            A ``List<Utf8>`` expression of every match per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> ds.select(r=bt.col("s").str.extract_all("[0-9]")).to_pydict()
+                {'r': [['1', '2']]}
+        """
+        return self.regexp_extract_all(pattern)
+
+    def replace_all(self, pattern: str, value: str) -> StrFunc:
+        """Replace every regex match — Polars' ``replace_all`` (see :meth:`regexp_replace_all`).
+
+        Args:
+            pattern: The regular expression to replace.
+            value: The replacement text.
+
+        Returns:
+            A Utf8 expression with every match replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> ds.select(r=bt.col("s").str.replace_all("[0-9]", "#")).to_pydict()
+                {'r': ['a#b#']}
+        """
+        return self.regexp_replace_all(pattern, value)
+
 
 # Parameterless string→string transforms: accessor name → engine `StrFunc` tag.
 # (`trim`/`lstrip`/`rstrip` are explicit methods — they take an optional char set.)
@@ -4404,3 +4151,118 @@ _bind_accessors(
     _str_transform_doc,
     "A new string :class:`~batcher.Expr` with the transform applied.",
 )
+
+
+# The Polars/pandas compat vocabulary for `.str`: a second spelling of a method this
+# namespace already has, kept so a migrated script runs unchanged. Each row is
+# (target, summary, example data, example expression, expected output[, extra note]);
+# the `Args:`/`Returns:` sections and the signature come from the target, so an alias
+# cannot drift from the method it forwards to. See `_bind_aliases`.
+_STR_ALIASES: dict[str, tuple[str, ...]] = {
+    "to_lowercase": (
+        "lower",
+        "Lowercase the string — the Polars ``to_lowercase`` spelling of :meth:`lower`.",
+        '{"s": ["Hello"]}',
+        'bt.col("s").str.to_lowercase()',
+        "{'r': ['hello']}",
+    ),
+    "to_uppercase": (
+        "upper",
+        "Uppercase the string — the Polars ``to_uppercase`` spelling of :meth:`upper`.",
+        '{"s": ["Hello"]}',
+        'bt.col("s").str.to_uppercase()',
+        "{'r': ['HELLO']}",
+    ),
+    "to_titlecase": (
+        "initcap",
+        "Title-case the string — the Polars ``to_titlecase`` spelling of :meth:`initcap`.",
+        '{"s": ["hello world"]}',
+        'bt.col("s").str.to_titlecase()',
+        "{'r': ['Hello World']}",
+    ),
+    "count_matches": (
+        "regexp_count",
+        "Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.",
+        '{"s": ["a1b2c3"]}',
+        'bt.col("s").str.count_matches("[0-9]")',
+        "{'r': [3]}",
+    ),
+    "len_chars": (
+        "len",
+        "Character length — the Polars ``len_chars`` spelling of :meth:`len`.",
+        '{"s": ["café"]}',
+        'bt.col("s").str.len_chars()',
+        "{'r': [4]}",
+    ),
+    "len_bytes": (
+        "octet_length",
+        "UTF-8 byte length — the Polars ``len_bytes`` spelling of :meth:`octet_length`.",
+        '{"s": ["café"]}',
+        'bt.col("s").str.len_bytes()',
+        "{'r': [5]}",
+    ),
+    "strip_chars": (
+        "trim",
+        "Trim from both ends — the Polars ``strip_chars`` spelling of :meth:`trim`.",
+        '{"s": ["  ab  "]}',
+        'bt.col("s").str.strip_chars()',
+        "{'r': ['ab']}",
+        "Note the divergence from Polars: with ``chars=None`` this strips the ASCII **space**\n"
+        "only, following SQL ``TRIM`` (and DuckDB), not the whole whitespace class. Tabs and\n"
+        'newlines survive. Pass them explicitly — ``strip_chars(" \\t\\n")`` — when the input\n'
+        "may carry them, which scraped and CSV text usually does.",
+    ),
+    "strip_chars_start": (
+        "lstrip",
+        "Trim from the left — the Polars ``strip_chars_start`` spelling of :meth:`lstrip`.",
+        '{"s": ["  ab  "]}',
+        'bt.col("s").str.strip_chars_start()',
+        "{'r': ['ab  ']}",
+    ),
+    "strip_chars_end": (
+        "rstrip",
+        "Trim from the right — the Polars ``strip_chars_end`` spelling of :meth:`rstrip`.",
+        '{"s": ["  ab  "]}',
+        'bt.col("s").str.strip_chars_end()',
+        "{'r': ['  ab']}",
+    ),
+    "strip": (
+        "trim",
+        "Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.",
+        '{"s": ["  ab  "]}',
+        'bt.col("s").str.strip()',
+        "{'r': ['ab']}",
+        "Unlike Python's ``str.strip()``, the no-argument form removes the ASCII **space**\n"
+        'only, following SQL ``TRIM``. Pass ``strip(" \\t\\n")`` to also drop tabs and newlines.',
+    ),
+    "startswith": (
+        "starts_with",
+        "True where the string starts with `pattern` — the pandas ``str.startswith``.",
+        '{"s": ["abc", "xbc"]}',
+        'bt.col("s").str.startswith("a")',
+        "{'r': [True, False]}",
+    ),
+    "endswith": (
+        "ends_with",
+        "True where the string ends with `pattern` — the pandas ``str.endswith``.",
+        '{"s": ["abc", "abx"]}',
+        'bt.col("s").str.endswith("c")',
+        "{'r': [True, False]}",
+    ),
+    "title": (
+        "initcap",
+        "Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.",
+        '{"s": ["hello world"]}',
+        'bt.col("s").str.title()',
+        "{'r': ['Hello World']}",
+    ),
+    "escape_regex": (
+        "regexp_escape",
+        "Escape the regex metacharacters, spelled as Polars ``str.escape_regex``.",
+        '{"s": ["a.b"]}',
+        'bt.col("s").str.escape_regex()',
+        "{'r': ['a\\\\.b']}",
+    ),
+}
+
+_bind_aliases(_StrNamespace, _STR_ALIASES)

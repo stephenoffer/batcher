@@ -80,3 +80,77 @@ def _bind_accessors(
         ret = returns(name) if callable(returns) else returns
         bound.__doc__ = _with_returns(_DESCRIPTIONS.get(name, doc(name)), ret)
         setattr(ns, name, bound)
+
+
+def _section(doc: str, name: str) -> str:
+    """Pull one ``Name:`` section out of a cleaned docstring, or ``""`` if absent."""
+    lines = doc.split("\n")
+    try:
+        start = lines.index(f"{name}:")
+    except ValueError:
+        return ""
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith(" ")):
+        end += 1
+    return "\n".join(lines[start:end]).rstrip()
+
+
+def _alias_doc(target_doc: str, summary: str, data: str, expr: str, out: str, note: str) -> str:
+    """Build an alias's docstring from its own example and the target's typed sections.
+
+    An alias computes exactly what the method it forwards to computes, so its ``Args:``
+    and ``Returns:`` are the target's *by construction* — restating them by hand is how
+    the two drift into disagreeing about the same parameter. The example is the one part
+    that is genuinely the alias's own (``len_chars`` on ``"café"`` answers 4 where
+    ``len_bytes`` answers 5, and that contrast is the point of documenting both), so it
+    is carried per alias rather than derived.
+    """
+    doc = inspect.cleandoc(target_doc or "")
+    parts = [summary]
+    if note:
+        parts.append(note)
+    for name in ("Args", "Returns"):
+        block = _section(doc, name)
+        if block:
+            parts.append(block)
+    parts.append(
+        "Examples:\n    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        f"        >>> ds = bt.from_pydict({data})\n"
+        f"        >>> ds.select(r={expr}).to_pydict()\n"
+        f"        {out}"
+    )
+    return "\n\n".join(parts)
+
+
+def _bind_aliases(ns: type, table: dict[str, tuple[str, ...]]) -> None:
+    """Generate one delegating alias per `table` row and attach it to `ns`.
+
+    An alias is a second spelling of a method the namespace already has — the Polars or
+    pandas name for the same operation, kept so a migrated script runs unchanged. Written
+    out, each costs about fifteen lines of which two are the delegation and the rest is a
+    docstring the gate mandates and whose typed sections are the target's verbatim.
+
+    Written as a table they are what they actually are: a compat vocabulary, enumerable in
+    one place, where adding a spelling is one row and no signature can drift from the
+    method it forwards to (the alias *takes* the target's signature rather than repeating
+    it). The function is rebuilt in `ns`'s module namespace for the same reason
+    `_bind_accessors` does it — so ``doctest`` and Sphinx autodoc find the generated
+    examples exactly as if they had been written there by hand.
+    """
+    ns_globals = sys.modules[ns.__module__].__dict__
+    for alias, spec in table.items():
+        target, summary, data, expr, out = spec[:5]
+        note = spec[5] if len(spec) > 5 else ""
+        tgt = getattr(ns, target)
+
+        def forward(self: Any, *args: Any, _t: str = target, **kwargs: Any) -> Expr:
+            return getattr(self, _t)(*args, **kwargs)
+
+        bound = types.FunctionType(forward.__code__, ns_globals, alias, forward.__defaults__)
+        bound.__kwdefaults__ = {"_t": target}
+        bound.__qualname__ = f"{ns.__name__}.{alias}"
+        bound.__module__ = ns.__module__
+        bound.__signature__ = inspect.signature(tgt)  # type: ignore[attr-defined]
+        bound.__doc__ = _alias_doc(tgt.__doc__ or "", summary, data, expr, out, note)
+        setattr(ns, alias, bound)
