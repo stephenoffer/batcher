@@ -347,11 +347,16 @@ def python_code_lines(text: str) -> int:
     on every public name, with typed `Args:`/`Returns:` sections and a runnable `.. doctest::`
     example — and then this gate charged the file for having them.
 
-    The result was not close. Measured across the six largest allowlisted modules:
-    `api/dataset/frame.py` is 5,720 lines of which **623 are code and 3,863 are docstrings**;
-    `plan/expr_ir/core.py` is 5,172 lines of which **316 are code**. Both carry an allowlist
-    entry apologising for a size that is almost entirely the other gate's requirement. Several
-    of the 43 exemptions exist for that reason and no other.
+    The result was not close. Measured across the largest allowlisted modules:
+    `expr_ir/namespaces/strings.py` is 4,406 lines of which **832 are code and 3,574 are
+    docstrings** (81% docstring); `api/dataset/frame.py` is 6,362 lines of which **2,077 are
+    code and 4,285 are docstrings**; `plan/expr_ir/core.py` is 6,052 of which **1,944 are
+    code**. Each carried an allowlist entry apologising for a size that is largely the other
+    gate's requirement. Several of the 42 exemptions existed for that reason and no other.
+
+    Re-measure before citing these figures rather than trusting the numbers above: they are a
+    snapshot, the files grow, and an earlier revision of this docstring carried a code count
+    that did not even agree with the total and docstring count printed beside it.
 
     What the limit is for is the code you have to hold in your head to change the file safely.
     A docstring is the thing that makes that *easier*. Comments stay counted: they interleave
