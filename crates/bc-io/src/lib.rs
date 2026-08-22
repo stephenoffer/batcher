@@ -798,6 +798,76 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
+    /// One `Int64` batch holding `values`, on the shared one-column schema below.
+    fn i64_batch(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    /// A fragmented read merges into whole batches and keeps every row in its original
+    /// position — the property the row-group order of a Parquet read rests on.
+    #[test]
+    fn coalescing_merges_short_batches_and_preserves_order() {
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|g: i64| i64_batch(&[g * 10, g * 10 + 1, g * 10 + 2]))
+            .collect();
+        let out = coalesce_batches(batches, 10).unwrap();
+        // 10 rows per run: three 3-row batches fit, the fourth would make 12.
+        assert_eq!(
+            out.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![9, 9, 6]
+        );
+        let flat: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let want: Vec<i64> = (0..8)
+            .flat_map(|g: i64| [g * 10, g * 10 + 1, g * 10 + 2])
+            .collect();
+        assert_eq!(flat, want, "coalescing must not reorder rows");
+    }
+
+    /// A read already at the target copies nothing: every batch forms a run of one and comes
+    /// back untouched. This is what keeps the change free on the unfiltered path, where the
+    /// decoder already emits `batch_size` rows at a time.
+    #[test]
+    fn coalescing_passes_full_batches_through_untouched() {
+        let batches: Vec<RecordBatch> = (0..4).map(|_| i64_batch(&[1, 2, 3, 4])).collect();
+        let ptrs: Vec<*const u8> = batches
+            .iter()
+            .map(|b| b.column(0).to_data().buffers()[0].as_ptr())
+            .collect();
+        let out = coalesce_batches(batches, 4).unwrap();
+        assert_eq!(out.len(), 4, "no batch should have been merged");
+        let after: Vec<*const u8> = out
+            .iter()
+            .map(|b| b.column(0).to_data().buffers()[0].as_ptr())
+            .collect();
+        assert_eq!(
+            ptrs, after,
+            "a full-size batch must pass through by pointer"
+        );
+    }
+
+    /// A read that matched nothing still carries its schema: the empty batches ride along in
+    /// their run rather than being dropped, so the caller never gets an empty `Vec` where the
+    /// decoder produced typed (if empty) output.
+    #[test]
+    fn coalescing_keeps_an_all_empty_read_addressable() {
+        let batches: Vec<RecordBatch> = (0..5).map(|_| i64_batch(&[])).collect();
+        let out = coalesce_batches(batches, 1024).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 0);
+        assert_eq!(out[0].schema().field(0).name(), "a");
+    }
+
     use super::*;
 
     fn write_parquet(path: &std::path::Path, batches: &[RecordBatch], rows_per_group: usize) {
