@@ -6,9 +6,10 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, Int64Array, RecordBatch, Scalar,
 };
+use arrow::buffer::BooleanBuffer;
 use arrow::compute::cast;
 use arrow::compute::kernels::{boolean, cmp, numeric};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Float32Type, Float64Type};
 use bc_arrow::canon_float_array;
 
 use crate::eval::coerce::{
@@ -185,6 +186,15 @@ pub(crate) fn try_scalar_binary(
         }
     };
 
+    // A float column against a float scalar answers in **one IEEE pass**, with no
+    // canonicalizing rewrite of the column at all — see `float_scalar_cmp`. Declines (and
+    // falls through to the canonicalize-then-compare path below) for anything it cannot
+    // answer exactly, so the two are interchangeable.
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        if let Some(out) = float_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
+            return Ok(Some(out));
+        }
+    }
     // Canonicalize both float operands for the comparison arms, exactly as the array path
     // does — this path must be bit-identical to it (see `canon_floats_for_cmp`). Arithmetic
     // is untouched: `-0.0 + x` and NaN propagation stay IEEE.
@@ -222,6 +232,110 @@ pub(crate) fn try_scalar_binary(
         _ => unreachable!("filtered to arith/cmp above"),
     };
     Ok(Some(out))
+}
+
+/// `<float column> <cmp> <float scalar>` in one IEEE pass — no canonicalized copy of the
+/// column, and no `total_cmp`.
+///
+/// The engine's float identity folds `-0.0` into `0.0` and all NaNs into one value
+/// (`bc_arrow::float_ident`), and every other float comparison here obtains it by rewriting
+/// **both operands** and handing them to arrow's `cmp`, which ranks floats by `total_cmp`.
+/// That is two full passes over the column — one to look for a `-0.0` or a NaN, plus a
+/// second, scalar one to compare — and on a 60 M-row predicate the first alone profiled at
+/// 10.9 % of the query while the comparison kernel took another 39 %.
+///
+/// Neither pass is necessary against a scalar, because the identity is already *implied* by
+/// the right IEEE predicate. Two observations do it:
+///
+/// * **IEEE already folds the zeros.** `-0.0 == 0.0` is true and `-0.0 < x` iff `0.0 < x`
+///   for every `x`, so a canonicalizing pass changes no comparison's answer. Only
+///   `total_cmp` — which orders the two zeros apart, and which nothing here needs — made it
+///   look necessary.
+/// * **NaN is the only real difference, and it is a predicate choice.** Canonicalizing sends
+///   every NaN to `+qNaN`, which `total_cmp` ranks above `+inf`, so against a non-NaN literal
+///   a NaN row answers *false* to `<` and `<=` and *true* to `>` and `>=`. IEEE agrees on the
+///   first pair (a NaN comparison is false) and disagrees on the second — which is exactly
+///   what the **negated** form fixes: `!(v <= lit)` is true for a NaN and equals `v > lit`
+///   for everything else. That is one unordered-or-greater compare, which is a single
+///   instruction on every SIMD target, rather than a branch.
+///
+/// `Eq`/`Ne` need no adjustment: with a non-NaN literal, `canon(v) == canon(lit)` under
+/// `total_cmp` holds exactly when `v == lit` under IEEE, NaN answering false to both.
+///
+/// # Declines
+///
+/// * A **NaN literal**. It is the one value whose canonical form changes the answer —
+///   `canon(NaN) == canon(NaN)` is *true*, where IEEE `NaN == NaN` is false — so it keeps
+///   the canonicalizing path rather than being special-cased here.
+/// * A null literal, a non-float column, or a column and literal of different float widths.
+///   All are the array path's to coerce; this fires only where the two already agree.
+///
+/// Nulls are carried through unchanged: the output is null exactly where the input is,
+/// which is what `arrow_ord::cmp` produces for a null-free scalar operand.
+fn float_scalar_cmp(
+    op: BinaryOp,
+    arr: &ArrayRef,
+    lit_arr: &ArrayRef,
+    lit_on_right: bool,
+) -> Option<ArrayRef> {
+    if arr.data_type() != lit_arr.data_type() || lit_arr.is_null(0) {
+        return None;
+    }
+    // A literal on the *left* is the mirrored predicate on the right: `24 > x` is `x < 24`.
+    // Mirroring the operator is exact for every arm, including the NaN ones, because it is
+    // the same total order read in the other direction.
+    let op = if lit_on_right { op } else { mirror_cmp(op) };
+    let values = match arr.data_type() {
+        DataType::Float64 => {
+            let lit = lit_arr.as_primitive::<Float64Type>().value(0);
+            if lit.is_nan() {
+                return None;
+            }
+            float_cmp_bits(arr.as_primitive::<Float64Type>().values(), lit, op)
+        }
+        DataType::Float32 => {
+            let lit = lit_arr.as_primitive::<Float32Type>().value(0);
+            if lit.is_nan() {
+                return None;
+            }
+            float_cmp_bits(arr.as_primitive::<Float32Type>().values(), lit, op)
+        }
+        _ => return None,
+    };
+    Some(Arc::new(BooleanArray::new(values, arr.nulls().cloned())))
+}
+
+/// The comparison read from the other side — `a < b` is `b > a`, and so on.
+fn mirror_cmp(op: BinaryOp) -> BinaryOp {
+    use BinaryOp::*;
+    match op {
+        Lt => Gt,
+        Le => Ge,
+        Gt => Lt,
+        Ge => Le,
+        other => other, // Eq / Ne are symmetric
+    }
+}
+
+/// One IEEE comparison per value, packed 64 bits at a time. See [`float_scalar_cmp`] for why
+/// `Gt`/`Ge` are written as negations — that is the whole of the NaN handling.
+// `!(a <= b)` on a partially ordered type is exactly what this needs, and it is what the
+// lint exists to question: the negation is the NaN handling, not a lazy spelling of `>`.
+// `partial_cmp` — the lint's suggestion — would reintroduce the branch on `None` that the
+// unordered-or-greater compare replaces with one instruction.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn float_cmp_bits<T: PartialOrd + Copy>(values: &[T], lit: T, op: BinaryOp) -> BooleanBuffer {
+    use BinaryOp::*;
+    let n = values.len();
+    match op {
+        Lt => BooleanBuffer::collect_bool(n, |i| values[i] < lit),
+        Le => BooleanBuffer::collect_bool(n, |i| values[i] <= lit),
+        Gt => BooleanBuffer::collect_bool(n, |i| !(values[i] <= lit)),
+        Ge => BooleanBuffer::collect_bool(n, |i| !(values[i] < lit)),
+        Eq => BooleanBuffer::collect_bool(n, |i| values[i] == lit),
+        Ne => BooleanBuffer::collect_bool(n, |i| !(values[i] == lit)),
+        _ => unreachable!("float_scalar_cmp filters to the comparison arms"),
+    }
 }
 
 pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
@@ -1654,5 +1768,123 @@ mod floor_div_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod float_scalar_cmp_tests {
+    use super::*;
+    use arrow::array::{Float32Array, Float64Array};
+
+    /// The awkward bit patterns: the two zeros, both NaN signs, a second NaN payload, and
+    /// the infinities. These are the only values on which the fused predicate and the
+    /// canonicalize-then-`total_cmp` path could possibly disagree.
+    fn awkward() -> Vec<Option<f64>> {
+        vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(-f64::NAN),
+            Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Some(f64::from_bits(0xfff8_0000_0000_0001)),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1.5),
+            Some(-1.5),
+            None,
+        ]
+    }
+
+    /// What the fused path replaces: canonicalize both sides, then arrow's `cmp`. Kept here
+    /// as the oracle so the test compares against the *behaviour*, not against a
+    /// re-derivation of it.
+    fn canon_oracle(op: BinaryOp, col: &ArrayRef, lit: &ArrayRef, lit_on_right: bool) -> ArrayRef {
+        let (c, l) = (canon_float_array(col), canon_float_array(lit));
+        let scalar = Scalar::new(l);
+        let cdyn: &dyn Array = c.as_ref();
+        let cd: &dyn Datum = &cdyn;
+        let sd: &dyn Datum = &scalar;
+        let (lhs, rhs) = if lit_on_right { (cd, sd) } else { (sd, cd) };
+        match op {
+            BinaryOp::Eq => Arc::new(cmp::eq(lhs, rhs).unwrap()),
+            BinaryOp::Ne => Arc::new(cmp::neq(lhs, rhs).unwrap()),
+            BinaryOp::Lt => Arc::new(cmp::lt(lhs, rhs).unwrap()),
+            BinaryOp::Le => Arc::new(cmp::lt_eq(lhs, rhs).unwrap()),
+            BinaryOp::Gt => Arc::new(cmp::gt(lhs, rhs).unwrap()),
+            BinaryOp::Ge => Arc::new(cmp::gt_eq(lhs, rhs).unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The contract: wherever the fused path answers, it answers **exactly** what
+    /// canonicalize-then-compare answers — same values, same nulls — over every awkward bit
+    /// pattern, every comparison, both operand orders, and both float widths.
+    #[test]
+    fn fused_predicate_equals_canonicalize_then_compare() {
+        let ops = [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ];
+        let col64: ArrayRef = Arc::new(Float64Array::from(awkward()));
+        let col32: ArrayRef = Arc::new(Float32Array::from(
+            awkward()
+                .into_iter()
+                .map(|v| v.map(|v| v as f32))
+                .collect::<Vec<_>>(),
+        ));
+        // Every literal a query can compare against, NaN excluded (the fused path declines
+        // it, which the next test pins).
+        let lits64: Vec<f64> = vec![0.0, -0.0, 1.5, -1.5, f64::INFINITY, f64::NEG_INFINITY];
+        for (col, is32) in [(&col64, false), (&col32, true)] {
+            for &lv in &lits64 {
+                let lit: ArrayRef = if is32 {
+                    Arc::new(Float32Array::from(vec![lv as f32]))
+                } else {
+                    Arc::new(Float64Array::from(vec![lv]))
+                };
+                for op in ops {
+                    for lit_on_right in [true, false] {
+                        let fused = float_scalar_cmp(op, col, &lit, lit_on_right)
+                            .expect("a float column against a non-NaN float literal");
+                        let oracle = canon_oracle(op, col, &lit, lit_on_right);
+                        assert_eq!(
+                            fused.as_ref(),
+                            oracle.as_ref(),
+                            "op={op:?} lit={lv} lit_on_right={lit_on_right} f32={is32}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A NaN literal is the one value the fused predicate cannot express — `canon(NaN) ==
+    /// canon(NaN)` is true where IEEE says false — so it must decline and leave the
+    /// canonicalizing path to answer.
+    #[test]
+    fn a_nan_literal_declines() {
+        let col: ArrayRef = Arc::new(Float64Array::from(awkward()));
+        let lit: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        for op in [BinaryOp::Eq, BinaryOp::Lt, BinaryOp::Ge] {
+            assert!(float_scalar_cmp(op, &col, &lit, true).is_none());
+        }
+    }
+
+    /// It also declines what it is not for: a non-float column, a null literal, and a
+    /// column/literal pair of different widths (the array path's coercion owns those).
+    #[test]
+    fn declines_what_it_does_not_own() {
+        let f64col: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let intcol: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+        let f64lit: ArrayRef = Arc::new(Float64Array::from(vec![1.0]));
+        let f32lit: ArrayRef = Arc::new(Float32Array::from(vec![1.0f32]));
+        let nulllit: ArrayRef = Arc::new(Float64Array::from(vec![None::<f64>]));
+        assert!(float_scalar_cmp(BinaryOp::Lt, &intcol, &f64lit, true).is_none());
+        assert!(float_scalar_cmp(BinaryOp::Lt, &f64col, &f32lit, true).is_none());
+        assert!(float_scalar_cmp(BinaryOp::Lt, &f64col, &nulllit, true).is_none());
     }
 }

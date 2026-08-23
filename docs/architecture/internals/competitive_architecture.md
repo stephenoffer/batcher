@@ -17,9 +17,18 @@ of eight.
 Against DuckDB on the **same zero-copy Arrow** — the bar `methodology.md` designates the
 like-for-like execution comparison — **every suite that can run it is a win**: JSON 0.039x
 (5/5), ClickBench 0.072x (43/43), H2O `groupby` 0.089x (10/10), H2O `join` 0.244x (5/5), TPC-H
-0.256x (22/22), operators 0.362x (15/19). TPC-DS and JOB have no figure on that bar because
-DuckDB over registered Arrow views has no storage statistics to order a many-way join with and
-is SIGKILLed on TPC-DS q64 — see `engines/lineup.py`.
+0.256x (22/22), operators 0.362x (15/19). TPC-DS still has no figure on that bar — DuckDB
+over registered Arrow views is SIGKILLed on q64 (see `engines/lineup.py`).
+
+**JOB now has one, and it is the weakest bar in this paragraph.** All 113 queries run on a
+three-engine lineup: **0.404x, winning 106 of 109** against the same Arrow, against 1.221x on
+the same run versus the native store. Read it with the reservation this sentence used to state
+as a reason for having no figure at all: JOB exists to measure *join ordering*, and DuckDB over
+registered Arrow has no storage statistics to order a many-way join with — so part of that 0.404
+is a planner deprived of its inputs rather than an executor beaten on even terms. What it does
+establish is the direction of the residual: on identical input Batcher is not losing JOB, and
+the 1.221x is against DuckDB's storage engine. (The two-engine lineup this scorecard prefers
+reads JOB at 1.308x; the lineup is part of the measurement, as the 2026-08-16 note says.)
 
 Two rows below move, and neither claim in them is retired:
 
@@ -51,10 +60,29 @@ is confirmed:
 
 * **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
 * **Single-node ≥100M rows (vs DuckDB): L** — still L, and the boundary is now located rather
-  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is **1.27x**, a loss, where sf1 is 0.78x.
+  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is a loss, where sf1 is 0.78x.
   Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
   q13 12.7x, q18 12.5x, q9 11.2x), and those four carry the highest-cardinality group-bys and
   the largest intermediates in the benchmark.
+
+  **The sf10 figure is 1.07x, not the 1.27x recorded here** (2026-08-23): six runs across two
+  passes read 1.227 / 1.225 → 1.118 / 1.115 → 1.066 / 1.078, with 8-10 of 22 won. What moved is
+  in `benchmarks/BENCHMARK_RESULTS.md`; q18, q20, q21, q7, q3 and q9 carry most of it. Read the
+  row as *still a loss, and a much smaller one*.
+
+  **TPC-DS sf1 moved with it, and further: 0.970 → 0.918**, 43 of 99 won, and the Join Order
+  Benchmark 1.265 → **1.185** (40 of 109). Two thirds of what remains at sf10 is three queries
+  — q9, q21, q13 — and they profile as one thing each: a high-cardinality grouped aggregate and
+  a join-output gather.
+
+  **How much of the residual is storage rather than execution is now answerable**, and the
+  answer is: nearly all of it. Against `duckdb_arrow` — DuckDB executing the same zero-copy
+  Arrow — the same sf10 run is **0.297x, and the only query Batcher loses is q13** (1.84x).
+  JOB reads the same way: 1.185x against the native store and **0.383x against the same Arrow**,
+  106 of 109.
+  So the sf10 gap against the native store is DuckDB decompressing a dictionary/RLE column
+  where Batcher reads full Arrow, which is invariant #3 and not a kernel deficit. State the
+  row with both numbers or it reads as an execution loss it is not.
 * **The Join Order Benchmark now completes.** This document's ceiling on it was recorded when
   two runs were OOM-killed; all 113 queries now run with none killed (geomean 1.37x, 31
   wins), and `job-q7c` — the query that took the process down — is a **win** at 291 ms against

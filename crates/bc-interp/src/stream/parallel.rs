@@ -548,10 +548,15 @@ fn run_with_cache(
             _ => fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel),
         };
     };
-    let driving_rows: usize = sources
-        .get(driving)
-        .map(|b| b.iter().map(|x| x.num_rows()).sum())
-        .unwrap_or(0);
+    let driving_rows: usize = driving
+        .iter()
+        .map(|&d| {
+            sources
+                .get(d)
+                .map(|b| b.iter().map(|x| x.num_rows()).sum::<usize>())
+                .unwrap_or(0)
+        })
+        .sum();
     // `nothing_to_parallelize` joins the two existing reasons not to cut the source up: a plan
     // that computes nothing per row gains nothing from being sharded, however many rows it has.
     // Without it the width cap alone would leave the worst of both — ~96 shards of an identity
@@ -567,9 +572,28 @@ fn run_with_cache(
     // Capped so no shard is under a morsel (see `effective_shard_count`) — else a medium
     // relation's sub-morsel shards run the parallel path slower than sequential.
     let shard_workers = effective_shard_count(workers, driving_rows);
-    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = shard(&sources[driving], shard_workers)
-        .into_iter()
-        .map(|sh| swap(sources, driving, sh))
+    // Each driving source cut the same number of ways, then worker `k` gets shard `k` of every
+    // one of them at once. With a single driving source this is exactly what it always was;
+    // with a `UNION ALL` spine it is what makes the union's *output* the thing being
+    // partitioned. `shard` yields fewer pieces than asked for when a relation is smaller than
+    // the split, so short lists are padded with empty shards rather than silently shortening
+    // the worker count for every other source.
+    let per_source: Vec<Vec<Vec<RecordBatch>>> = driving
+        .iter()
+        .map(|&d| {
+            let mut sh = shard(&sources[d], shard_workers);
+            sh.resize_with(shard_workers, Vec::new);
+            sh
+        })
+        .collect();
+    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = (0..shard_workers)
+        .map(|k| {
+            let mut view = sources.to_vec();
+            for (slot, &d) in per_source.iter().zip(&driving) {
+                view[d] = slot[k].clone();
+            }
+            view
+        })
         .collect();
 
     // (3)+(4) One streaming pipeline per shard; combine at the root.
@@ -945,17 +969,6 @@ fn fallback_with(
     Ok(strip_empties(out))
 }
 
-/// `sources` with `idx` replaced by `shard` — what one worker's pipeline scans.
-fn swap(
-    sources: &[Vec<RecordBatch>],
-    idx: usize,
-    shard: Vec<RecordBatch>,
-) -> Vec<Vec<RecordBatch>> {
-    let mut out = sources.to_vec();
-    out[idx] = shard;
-    out
-}
-
 /// Shards to split the driving relation into: `workers`, capped so no shard is under a morsel.
 ///
 /// Splitting a medium relation across every core gives sub-morsel shards whose per-shard
@@ -1001,7 +1014,31 @@ fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
     out
 }
 
-/// The source id to shard, or `None` when this plan must not be sharded.
+/// Every source the shardable spine drives, or `None` when one of them cannot be reached.
+///
+/// One entry for a plain spine; one **per branch** under a `UNION ALL`, which is the whole
+/// reason this exists beside [`leftmost_scan`]. A branch that dead-ends without a scan — an
+/// already-materialized subtree, most often — makes the union unshardable rather than
+/// partially so: sharding the other branch alone would replay the materialized one in every
+/// worker and duplicate its rows.
+fn driving_scans(plan: &RelOp, mats: Option<&MatCache>) -> Option<Vec<usize>> {
+    if is_materialized(plan, mats) {
+        return None;
+    }
+    match plan {
+        RelOp::Scan { source_id } => Some(vec![*source_id]),
+        RelOp::Union { inputs, .. } => {
+            let mut out = Vec::with_capacity(inputs.len());
+            for branch in inputs {
+                out.extend(driving_scans(branch, mats)?);
+            }
+            Some(out)
+        }
+        other => driving_scans(other.children().first()?, mats),
+    }
+}
+
+/// The source ids to shard, or `None` when this plan must not be sharded.
 ///
 /// Two conditions, and both were learned the hard way — each one is a wrong answer, silently, if
 /// it is skipped:
@@ -1018,7 +1055,11 @@ fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
 ///
 /// Anything else falls back to the sequential streaming path — still bounded-memory, just
 /// single-threaded. Declining is always safe; guessing is not.
-fn shardable_source(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>) -> Option<usize> {
+fn shardable_source(
+    plan: &RelOp,
+    cache: &BuildCache,
+    mats: Option<&MatCache>,
+) -> Option<Vec<usize>> {
     // An `Aggregate` is a breaker, and a breaker that sees only a shard computes the wrong
     // answer — *unless* it is the root, where each worker's `Partial` is combined rather than
     // finalized. So the root aggregate is allowed and checked through to its input; an aggregate
@@ -1037,10 +1078,16 @@ fn shardable_source(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>) -
     if !spine_is_shardable(spine, cache, mats) {
         return None;
     }
-    let driving = leftmost_scan(spine, mats)?;
+    let driving = driving_scans(spine, mats)?;
     let mut counts: HashMap<usize, usize> = HashMap::new();
     count_scans(plan, &mut counts);
-    (counts.get(&driving) == Some(&1)).then_some(driving)
+    // Every driving source read exactly once in the whole plan — condition 2 above, now asked
+    // of each of them. A union whose branches scan the *same* source is refused by the same
+    // test: that source's count is 2, so slicing it for one branch would slice it for both.
+    if driving.iter().any(|d| counts.get(d) != Some(&1)) {
+        return None;
+    }
+    Some(driving)
 }
 
 /// Whether every operator from here down to the driving scan is morsel-independent.
@@ -1081,6 +1128,27 @@ fn spine_is_shardable(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>)
                 .is_some_and(|b| b.has_morsel_probe());
             probe_driven && spine_is_shardable(left, cache, mats)
         }
+        // A `UNION ALL` is a concatenation, not a breaker: its output rows are its branches'
+        // rows unchanged, so worker `k` taking shard `k` of *every* branch partitions the
+        // union's output exactly as one scan's shards partition a scan's. What changes is the
+        // interleaving — `A₀B₀A₁B₁…` where the unsharded union emits `A₀A₁…B₀B₁…` — and no
+        // consumer on a shardable spine can see it: `Sort`, `Limit` and `RowId` are refused
+        // above, and the root `Aggregate`/`Distinct` merge their shards' partials.
+        //
+        // Listing it as a breaker cost the whole spine above it. `shardable_source` shards one
+        // driving scan, so a union — two driving scans — refused, and the join, gather and fold
+        // above it all ran through a single pipeline. Measured on TPC-DS sf1, the *same*
+        // 15-row-build join over `store_sales`: **7.5 ms at 10.8x parallelism** with a plain
+        // scan on the probe side against **35.1 ms at 3.2x** with a two-branch `UNION ALL`.
+        // TPC-DS reaches this shape in q5, q77 and q80 — the sales/returns union — and in a
+        // dozen more.
+        //
+        // A **distinct** union is a genuine breaker (dedup per shard leaves duplicates across
+        // shards) and keeps the refusal.
+        RelOp::Union {
+            inputs,
+            distinct: false,
+        } => inputs.iter().all(|i| spine_is_shardable(i, cache, mats)),
         _ => false,
     }
 }
@@ -1229,6 +1297,31 @@ fn is_spine_breaker(plan: &RelOp) -> bool {
     )
 }
 
+/// [`is_spine_breaker`], as `materialize_spine_breakers` needs to ask it: with the one case
+/// where sharding will take the node over instead.
+///
+/// A `UNION ALL` whose branches are **all shardable** must not be materialized here, because
+/// `spine_is_shardable` now runs sharding straight through it — and a materialized union is a
+/// leaf, so `driving_scans` would find no scan to slice and the plan would fall back to one
+/// core. The two decisions have to agree, and this is where they are made to.
+///
+/// A `UNION ALL` whose branches are **not** shardable keeps the old treatment, and that half
+/// matters just as much. `api.multi_group` lowers `ROLLUP`/`CUBE`/`GROUPING SETS` to a union of
+/// one `Aggregate` per level, and an aggregate branch is not shardable — so such a union is
+/// never sharded, and materializing it here is the only thing that runs its levels across
+/// cores at all. Excluding every union unconditionally took TPC-DS q67 (a nine-level `ROLLUP`)
+/// from **232 ms to 2,447 ms**: neither materialized nor sharded, it ran serially.
+fn materializable_spine_breaker(plan: &RelOp, cache: &BuildCache) -> bool {
+    if let RelOp::Union {
+        inputs,
+        distinct: false,
+    } = plan
+    {
+        return !inputs.iter().all(|i| spine_is_shardable(i, cache, None));
+    }
+    is_spine_breaker(plan)
+}
+
 /// Evaluate the first breaker on the probe spine, in parallel, over the **unsharded** sources.
 ///
 /// This is the counterpart to `prebuild_joins` for the other thing that used to serialize a whole
@@ -1263,7 +1356,7 @@ fn materialize_spine_breakers(
         return Ok(mats);
     };
     loop {
-        if is_spine_breaker(node) {
+        if materializable_spine_breaker(node, cache) {
             // The builds are handed down (`collect_builds` descends the probe spine, so the cache
             // already covers every join under here); the mats are not, because this subtree owns
             // whatever lies below it.

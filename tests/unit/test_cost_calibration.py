@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.config import active_config
-from batcher.kyber.calibration import _RECALIBRATE_AFTER, calibrate
+from batcher.kyber.calibration import _JOIN_FIT_MIN_ROWS, _RECALIBRATE_AFTER, calibrate
 from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
 from batcher.plan.feedback import OperatorFeedback
@@ -329,3 +329,100 @@ def test_the_anchor_settles_as_history_accumulates():
     tail = fits[-4:]
     spread = (max(tail) - min(tail)) / max(tail)
     assert spread < 0.05, f"the fit is still walking as history grows: {fits}"
+
+
+def _record_join(
+    hub: MetadataHub, n: int, *, build: int, probe: int, t_ms: float, start: int = 0
+) -> None:
+    """Record `n` hash-join samples with an explicit build and probe cardinality."""
+    for i in range(n):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId((start + i) % 4),
+                kind="hash_join",
+                n_actual=probe,
+                t_op_ms=t_ms,
+                m_peak_bytes=build * 8,
+                selectivity=1.0,
+                batch_size=16384,
+                backend="interp",
+                n_input=probe,
+                n_build=build,
+            )
+        )
+
+
+def test_the_join_pair_is_fitted_from_the_join_family_together():
+    """Both join coefficients come from one regression over `hash_join`, not two families.
+
+    The build-side rule chooses an orientation by comparing
+    `hash_build_row x build + hash_probe_row x probe x cache` against the same expression
+    with the sides exchanged, so the decision is a pure function of the two coefficients'
+    **ratio**. Fitting `hash_build_row` from `aggregate` and `hash_probe_row` from
+    `hash_join` left that ratio measuring nothing.
+
+    Here the joins are twice as expensive per *build* row as the shipped 2:1 says, and the
+    two shapes differ enough to separate the terms. The fit must move both, and must not
+    take `hash_build_row` from the aggregate recorded beside them.
+    """
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    hub = _hub()
+    _record(hub, "scan", n, rows=1_000_000, t_ms=1.0)
+    # An aggregate whose per-row cost is wildly different from the joins', so a
+    # `hash_build_row` taken from *it* would be visibly wrong.
+    _record(hub, "aggregate", n, rows=1_000_000, t_ms=100.0)
+    # Two join shapes: build-heavy and probe-heavy, both well above the work floor.
+    _record_join(hub, n, build=4_000_000, probe=1_000_000, t_ms=9.0)
+    _record_join(hub, n, build=1_000_000, probe=4_000_000, t_ms=6.0, start=1)
+    coeffs = calibrate(hub, cfg)
+    # `t = a*build + b*probe` over those two shapes solves at a = 2b exactly, so the fitted
+    # ratio must sit at or above the shipped 2:1 rather than at the aggregate's scale.
+    assert coeffs.hash_build_row / coeffs.hash_probe_row >= 2.0
+
+
+def test_a_join_below_the_work_floor_cannot_move_the_fit():
+    """A dimension join's time is its launch, not its rows, and a regression cannot tell.
+
+    `nation` at 25 rows and `region` at 5 are most of the joins an analytical plan issues,
+    and one measured sample of that shape asks for a per-row cost twenty times anything
+    physical. A median ignores such an outlier; a least squares does not, so these are
+    excluded by row count before the fit sees them.
+    """
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    defaults = cfg.optimizer.cost_coeffs
+    hub = _hub()
+    _record(hub, "scan", n, rows=1_000_000, t_ms=1.0)
+    tiny = _JOIN_FIT_MIN_ROWS // 4
+    _record_join(hub, n * 4, build=tiny, probe=tiny, t_ms=1.5)
+    coeffs = calibrate(hub, cfg)
+    # Nothing cleared the floor, so the two-term fit declined and the ratio is the shipped one.
+    assert coeffs.hash_build_row / coeffs.hash_probe_row == pytest.approx(
+        defaults.hash_build_row / defaults.hash_probe_row
+    )
+
+
+def test_the_build_probe_ratio_never_falls_below_the_shipped_one():
+    """The floor that stops a mis-fit from telling the planner to hash the larger relation.
+
+    Fused-join wall time carries the scan and filter that feed the probe, so the residual
+    the regression minimizes is not a function of the two row counts alone and can fit a
+    build cheaper than a probe. Physically it cannot be: an insert hashes the key and walks
+    to its slot exactly as a probe does, and then writes. Measured on TPC-H sf10, an
+    inverted ratio put q9's `orders` join on a 15,000,000-row build instead of a
+    3,419,275-row one and doubled the query.
+
+    These samples say a probe costs far more per row than a build — the inversion — and the
+    served coefficients must still come back at the shipped ratio or above.
+    """
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    defaults = cfg.optimizer.cost_coeffs
+    hub = _hub()
+    _record(hub, "scan", n, rows=1_000_000, t_ms=1.0)
+    _record_join(hub, n, build=4_000_000, probe=1_000_000, t_ms=2.0)
+    _record_join(hub, n, build=1_000_000, probe=4_000_000, t_ms=8.0, start=1)
+    coeffs = calibrate(hub, cfg)
+    floor = defaults.hash_build_row / defaults.hash_probe_row
+    assert coeffs.hash_build_row / coeffs.hash_probe_row >= floor - 1e-9

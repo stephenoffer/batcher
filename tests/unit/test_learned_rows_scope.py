@@ -128,28 +128,31 @@ def test_a_real_cardinality_shift_still_invalidates():
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "KNOWN DEFECT, deliberately not fixed here — see BENCHMARK_RESULTS.md, "
-        "'the cardinality loop is writing to a key nothing reads'. Filing the count "
-        "against the aggregate is a one-line change and it REGRESSES the suites, because "
-        "every threshold downstream was calibrated while this input was ~10x low: "
-        "TPC-DS 0.965 -> 0.988, h2o-groupby 1.151 -> 1.180, TPC-DS q98 0.81 -> 3.09. The "
-        "fix has to land with that recalibration, not before it. Strict, so this fails "
-        "loudly the moment someone does land it."
+        "KNOWN DEFECT, deliberately not fixed here — see BENCHMARK_RESULTS.md, 'the "
+        "cardinality loop is still writing to a key nothing reads, and the reason it cannot "
+        "be fixed is not the one on record'. Peeling the row-preserving wrappers so the count "
+        "lands on the aggregate is a one-line change and it REGRESSES TPC-DS: 0.956 -> 0.983 "
+        "geomean and 42.7 -> 40.3 wins, over three paired runs that agree in sign. The "
+        "per-query numbers the earlier note gave (q98 0.81 -> 3.09) do NOT reproduce; what "
+        "does is a consistent ~2.7% suite loss. Strict, so this fails loudly the moment "
+        "someone lands the peel."
     ),
 )
 def test_a_projections_measurement_is_filed_against_the_aggregate_beneath_it():
     """A grouped aggregate's measured group count should reach the estimator that asks for it.
 
     The root of every ``SELECT <cols> ... GROUP BY ...`` is the projection the select list
-    builds, so the count is filed under a `Project`'s signature — and `Project` is excluded
-    from `StatsEstimator._CORRECTABLE` on purpose, because a row-preserving operator has no
-    cardinality of its own to learn. The measurement therefore goes to a key with no reader:
-    written on every run, read on none, and the estimator falls back to `combine_ndv`'s
+    builds, so the count used to be filed under a `Project`'s signature — and `Project` is
+    excluded from `StatsEstimator._CORRECTABLE` on purpose, because a row-preserving operator
+    has no cardinality of its own to learn. The measurement therefore went to a key with no
+    reader: written on every run, read on none, and the estimator fell back to `combine_ndv`'s
     damped product for ever. Instrumented over three rounds of three h2o group-bys,
     `_estimate_aggregate` looked for a learned row count nine times and found it zero times.
 
-    Pinned on the *signature* rather than on a timing, because what this costs is a routing
-    decision (`_prefers_materializing_aggregate`) and never a wrong answer.
+    Peeling the row-preserving wrappers off the root before filing would land the count on the
+    node whose cardinality it is. Pinned on the *signature* rather than on a timing, because
+    what it buys is an estimate and never a different answer — and because the cost of landing
+    it is a suite regression rather than a wrong result.
     """
     from batcher.kyber import learning
     from batcher.kyber.learning import load_learned_stats
@@ -201,4 +204,26 @@ def test_a_limit_is_never_peeled_when_filing_a_measurement():
     learned = load_learned_stats(hub)
     assert plan_signature(aggregate) not in learned, (
         "a LIMIT's row count was attributed to the aggregate underneath it"
+    )
+
+
+def test_multi_level_group_by_levels_do_not_share_one_signature() -> None:
+    """`ROLLUP(a, b, c)`'s levels each get their own learned entry.
+
+    `api.multi_group` builds every level with the *same* output aliases and marks the inactive
+    keys `nullif(col, col)`, so a signature keyed on the aliases alone gave the (a,b,c), (a,b)
+    and (a) levels one key — three aggregates whose group counts differ by orders of magnitude,
+    sharing one learned row count and one correction factor. Every `ROLLUP`/`CUBE`/`GROUPING
+    SETS` query in TPC-DS is an instance, which is why the group keys' *expressions* are part
+    of the `Aggregate` token and not just their names.
+    """
+    from batcher.plan.logical import Union
+    from batcher.plan.visitor import walk
+
+    t = pa.table({"a": ["x", "y"] * 50, "b": [1, 2] * 50, "c": [3, 4] * 50, "v": list(range(100))})
+    plan = bt.from_arrow(t).rollup("a", "b", "c").agg(s=bt.col("v").sum())._plan
+    union = next(n for n in walk(plan) if isinstance(n, Union))
+    sigs = [plan_signature(level) for level in union.inputs]
+    assert len(set(sigs)) == len(sigs), (
+        f"{len(sigs)} grouping levels collapsed to {len(set(sigs))} learned entries"
     )

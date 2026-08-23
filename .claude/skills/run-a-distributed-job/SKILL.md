@@ -62,8 +62,9 @@ note the latter defaults to `False`, not `"auto"`.
 forces a `ray.init()`), **and** the cluster reports more than one node, **and** the estimated
 input clears `distribute_min_rows` — or a GPU-bearing `map_batches` forces it. On a workspace
 where nothing has attached yet, `"auto"` silently runs in-process; use `distributed=True` when
-you mean it. (Unrelated 20M number: the *adaptive re-optimization* gate in `api/adaptive.py` is
-off below 20M input rows. That is not the distribution threshold.)
+you mean it. (Unrelated size gate: the *adaptive re-optimization* floor in
+`api/adaptive/gating.py` is 5M rows or ~320 MB per pipeline breaker the loop would cut at.
+That is not the distribution threshold.)
 
 ## The invariant: distributed == single-node
 

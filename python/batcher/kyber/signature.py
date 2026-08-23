@@ -109,9 +109,20 @@ def _struct(node: LogicalPlan):
     if isinstance(node, Project):
         return ["project", [i.alias for i in node.items], plan_signature(node.input)]
     if isinstance(node, Aggregate):
+        # The group keys' **expressions**, not just their output names. What an aggregate has
+        # to learn is how many groups it emits, and that is decided by what it groups on — so
+        # two aggregates that publish the same column names over different expressions must
+        # not share an entry. This is the same collision the `Scan` arm above describes and
+        # the `Distinct` and `MapBatches` arms below fix for themselves, and a multi-level
+        # `GROUP BY` is the shape that walks into it every time: `api.multi_group` builds each
+        # level with the *same* aliases and marks the inactive keys `nullif(col, col)`, so
+        # `ROLLUP(a, b, c)` gave its (a,b,c), (a,b) and (a) levels **one** signature — three
+        # levels whose group counts differ by orders of magnitude, feeding one learned entry
+        # and one correction factor. Every `ROLLUP`/`CUBE`/`GROUPING SETS` query in TPC-DS is
+        # an instance.
         return [
             "agg",
-            [k.alias for k in node.group_keys],
+            [(k.alias, _norm(k.expr.to_ir())) for k in node.group_keys],
             [(s.alias, s.agg.func) for s in node.aggregates],
             plan_signature(node.input),
         ]

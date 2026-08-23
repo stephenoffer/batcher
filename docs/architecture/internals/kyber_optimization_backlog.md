@@ -699,8 +699,8 @@ t-digest. Kyber consumes bloom, HLL-derived NDV, KLL-derived quantiles, and an M
 ### G. The adaptive loop (12)
 
 The scorecard is explicit that this loop is stage-boundary adaptation, the same granularity as
-Spark AQE, and off below 20M input rows. These proposals are what would make the finer claim
-true.
+Spark AQE, and off below a per-cut size floor (5M rows, or roughly 320 MB, for each pipeline
+breaker it would cut at). These proposals are what would make the finer claim true.
 
 | # | Proposal | Metadata | Home |
 |---|---|---|---|

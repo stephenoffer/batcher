@@ -483,10 +483,17 @@ const MIN_ROWS_PER_RADIX_PARTITION: usize = 256;
 /// meaningful on a single-core one.
 pub(crate) fn radix_partitions(estimated_groups: usize) -> usize {
     let per_core = rayon::current_num_threads().clamp(2, 512);
-    estimated_groups
+    let want = estimated_groups
         .div_ceil(GROUPS_PER_RADIX_PARTITION)
-        .clamp(per_core, RADIX_PARTITIONS_MAX)
-        .next_power_of_two()
+        .clamp(per_core, RADIX_PARTITIONS_MAX);
+    // A multiple of the worker count, not a power of two — the same second-round argument
+    // `bc_interp::agg_par::radix_width` measures, on the regroup this width belongs to. A
+    // partition count one over the pool costs a whole extra round; the old rounding put a
+    // 61-worker pool on 64 partitions. Alternating the arms over the H2O `groupby` shapes
+    // this path serves (median of nine): q10 (`GROUP BY id1..id6`, 10 M near-unique rows)
+    // 200.9 -> **189.5 ms**, q2 34.5 -> 34.0, q9 43.4 -> 42.8, q4 8.4 -> 8.3.
+    want.div_ceil(per_core)
+        .saturating_mul(per_core)
         .min(RADIX_PARTITIONS_MAX)
 }
 

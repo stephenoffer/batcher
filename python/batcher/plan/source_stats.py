@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+import uuid
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -42,6 +43,16 @@ __all__ = [
 _SERIALS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _NEXT_SERIAL = itertools.count(1)
 _SERIAL_LOCK = threading.Lock()
+
+# Scopes every per-instance serial to *this* process.
+#
+# A serial is a small counter that starts at 1 in every process, so `obj:1` names a different
+# relation in each of them. That is harmless while the `MetadataHub` is the default in-process
+# backend and wrong the moment it is a shared Redis or object store: two workers' first
+# in-memory relation would read back each other's distinct counts and quantile grids. The
+# nonce is what makes "no cross-run identity" a property of the key rather than an assumption
+# about the backend — a process-local key that *cannot* be resolved by anyone else.
+_PROCESS_NONCE = uuid.uuid4().hex[:12]
 
 
 def _instance_serial(source: object) -> int:
@@ -108,6 +119,14 @@ def stable_source_key(source: object) -> str:
     relations is left to the confidence gate in `kyber.measured_selectivity` — a bounded,
     process-local exposure, against a durable and cross-run one for real tables.
 
+    Substituting the per-instance serial `source_stats_key` uses was tried here and reverted.
+    It does separate two in-memory relations, and `tests/unit/test_metadata_driven_estimates.py`
+    is where the cost shows: a serial is per *object*, so the same relation rebuilt — or the
+    same table at another size, which is precisely what the generalization above is for — is a
+    different key and learns nothing from its predecessor. The exchange is only worth making
+    with a measurement behind it, and the session that tried it found the TPC-H instability it
+    was aimed at came from `kyber.calibration` instead.
+
     Args:
         source: A bound input source.
 
@@ -130,10 +149,12 @@ def source_stats_key(source: object) -> str | None:
       - A source with a **data-stable** identity (a file path, a table URI) is keyed by it,
         so what one run measures the next run reads back.
       - A source whose identity is only *shape*-based — in-memory batches, keyed by schema
-        and row count — is keyed by a **per-instance serial** instead. Its `identity()` is
-        documented to collide across different relations of the same shape, and keying
-        statistics on it would re-create the very collision this exists to prevent. Such
-        data has no cross-run life anyway, so a process-local key loses nothing.
+        and row count — is keyed by a **per-instance serial**, scoped to this process by
+        `_PROCESS_NONCE`. Its `identity()` is documented to collide across different
+        relations of the same shape, and keying statistics on it would re-create the very
+        collision this exists to prevent. Such data has no cross-run life anyway, so a
+        process-local key loses nothing — and the nonce is what makes it genuinely
+        process-local rather than a bare counter every process restarts at 1.
 
         The serial is not `id()`, and that distinction is the whole of `_instance_serial`.
         CPython reuses an address the moment an object is freed, and a transient frame is
@@ -162,7 +183,7 @@ def source_stats_key(source: object) -> str | None:
     if derivation:
         return f"{prefix}derived:{derivation}"
     if not getattr(source, "stable_stats_identity", True):
-        return f"{prefix}obj:{_instance_serial(source)}"
+        return f"{prefix}obj:{_PROCESS_NONCE}:{_instance_serial(source)}"
     try:
         return f"{prefix}id:{identity()}"
     except Exception:  # pragma: no cover - a source that cannot key itself

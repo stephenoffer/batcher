@@ -455,11 +455,6 @@ def _arg_nodes(node) -> list:
     return [a for a in args if a is not None]
 
 
-def _scalar_args(tr, node) -> list[Expr]:
-    """All argument sub-expressions of a variadic node (`this` + `expressions`)."""
-    return [tr._scalar(a) for a in _arg_nodes(node)]
-
-
 def _concat(tr, node) -> Expr:
     """`concat(a, b, …)` / `concat_ws(sep, a, b, …)` → chained `||`.
 

@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from batcher.io.source import InMemorySource
 from batcher.kyber import plan_cache
+from batcher.plan import source_stats
 from batcher.plan.source_stats import source_stats_key
 
 
@@ -47,6 +48,20 @@ def test_different_derivations_key_differently():
 def test_an_ordinary_in_memory_source_still_keys_per_instance():
     """Unchanged for everything else: shape-based identity collides, so it keys per object."""
     assert source_stats_key(_src()) != source_stats_key(_src())
+
+
+def test_a_per_instance_key_is_scoped_to_this_process():
+    """A serial alone names a *different* relation in every process that issues it.
+
+    Harmless while the `MetadataHub` is the default in-process backend, and a real leak the
+    moment it is a shared Redis or object store: two workers' first in-memory relation both
+    key as `obj:1` and read back each other's distinct counts, most-common values and
+    quantile grids. The process nonce is what makes "this relation has no cross-run
+    identity" a property of the key rather than an assumption about the backend.
+    """
+    key = source_stats_key(_src())
+    assert key is not None
+    assert key.startswith(f"obj:{source_stats._PROCESS_NONCE}:")
 
 
 def test_a_derived_source_is_not_pinned_by_the_cache():

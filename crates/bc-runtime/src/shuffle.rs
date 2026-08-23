@@ -132,37 +132,10 @@ pub fn bucket_of_rows_salted(
     // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
     let canon = crate::keys::canonicalize_float_keys(keys);
     let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
-    if let Some(part) = partition_int_key(keys, num_partitions, salt) {
-        return Ok(part);
-    }
-    // Mixed Int64 / string / binary key (null-free): hash each row's raw column values
-    // directly, in parallel, instead of arrow's `RowConverter` — whose `convert_columns`
-    // encodes every row into its byte format in one *serial* pass (the parallel hash after it
-    // can't hide that). That serial encode is the whole cost of a `COUNT(DISTINCT id) GROUP BY
-    // flag` partition (a `(flag, orderkey)` shuffle over 60M rows ran at ~14% CPU / ~1s).
-    // Equal non-null rows hash identically, so they co-partition — all a shuffle/DISTINCT
-    // needs. Null-free only: a null slot's arbitrary raw bytes could split two equal
-    // null-bearing rows across buckets (fine for a join, where null keys never match, but not
-    // for a DISTINCT, where nulls compare equal); a nullable key keeps the `RowConverter`.
-    if let Some(part) = partition_mixed_key(keys, num_partitions, salt) {
-        return Ok(part);
-    }
-    let fields: Vec<SortField> = keys
-        .iter()
-        .map(|a| SortField::new(a.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let encoded = converter.convert_columns(keys)?;
-    Ok(if rows >= PAR_HASH_MIN_ROWS {
-        (0..rows)
-            .into_par_iter()
-            .map(|i| bucket_of_salted(SEED.hash_one(encoded.row(i)), num_partitions, salt))
-            .collect()
-    } else {
-        (0..rows)
-            .map(|i| bucket_of_salted(SEED.hash_one(encoded.row(i)), num_partitions, salt))
-            .collect()
-    })
+    let hasher = KeyHash::build(keys)?;
+    Ok(map_rows(rows, |i| {
+        bucket_of_salted(hasher.hash(i), num_partitions, salt)
+    }))
 }
 
 /// Compute a per-row bucket id across every core on a large input.
@@ -916,8 +889,12 @@ pub fn salted_partition_by_keys(
     let key_col = batch.column(key_indices[0]).clone();
     let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(&key_col));
     let key_col = canon.map_or(key_col, |mut c| c.remove(0));
-    let converter = RowConverter::new(vec![SortField::new(key_col.data_type().clone())])?;
-    let rows = converter.convert_columns(std::slice::from_ref(&key_col))?;
+    // The SAME hasher the unsalted shuffle uses. It used to be a `RowConverter` encode
+    // computed here, which disagreed with `bucket_of_rows`' raw fold for every key type that
+    // has one: a cold row's bucket then depended on whether its mapper had been given hot
+    // keys, so two mappers of one join side could route equal keys to different reducers.
+    // See [`KeyHash`].
+    let hasher = KeyHash::build(std::slice::from_ref(&key_col))?;
     // Hot membership is tested on the string rendering, matching how hot keys were
     // detected. Cast failures → treat as cold (no salting), still correct.
     let key_str = cast(&key_col, &DataType::Utf8).ok();
@@ -935,7 +912,7 @@ pub fn salted_partition_by_keys(
     // each DISTINCT salt bucket exactly once — see the `replicate` branch.
     let mut seen = vec![false; num_partitions];
     for i in 0..n {
-        let kh = SEED.hash_one(rows.row(i));
+        let kh = hasher.hash(i);
         let is_hot = key_str
             .map(|s| s.is_valid(i) && hot_keys.contains(s.value(i)))
             .unwrap_or(false);
@@ -1006,148 +983,230 @@ fn bucket_of_salted(hash: u64, num_partitions: usize, salt: u64) -> u32 {
     bucket_of(h, num_partitions)
 }
 
-/// Per-row bucket ids for an all-`Int64` key, hashing native values directly (no row encoding).
-/// `None` unless every key column is `Int64` (narrow ints are normalized to `Int64` upstream, so
-/// this covers the common single- and composite-integer shuffle shapes).
+/// The **one** per-row key hash every hash-partitioner in this module computes.
 ///
-/// Nulls are handled in-path, not bailed on. Arrow leaves the value under a null slot undefined
-/// (parquet's `pad_nulls` leaves whatever was in the buffer), so a null row must NOT be hashed by
-/// its raw value: it would scatter otherwise-identical NULL keys across every bucket (wrong for an
-/// aggregate/DISTINCT shuffle, where SQL says all NULLs are one group). Instead every null row
-/// hashes to the fixed `keys::NULL_HASH` bucket. Crucially, this keeps a *nullable* key on the raw
-/// path rather than falling back to the `RowConverter`: if it fell back while a null-free key of
-/// the same type hashed raw, the two hashes would disagree on equal *non-null* keys and split them
-/// across buckets — silently dropping inner-join matches (both join sides must take one path).
-fn partition_int_key(keys: &[ArrayRef], num_partitions: usize, salt: u64) -> Option<Vec<u32>> {
-    use arrow::array::Int64Array;
-    if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
-        return None;
-    }
-    // Nulls are handled here, NOT bailed on: a null row hashes to the fixed `keys::NULL_HASH`
-    // bucket (co-locating every null, so a DISTINCT/aggregate sees one NULL group), and a
-    // non-null row hashes its raw value. This is what keeps BOTH sides of a join on the raw
-    // path: if a nullable key fell back to the `RowConverter` while the other (null-free) side
-    // took this raw hash, the two hashes would disagree on equal *non-null* keys, splitting them
-    // across buckets and silently dropping inner-join matches. Same-typed keys therefore always
-    // take one identical path regardless of null presence.
-    let null_bucket = bucket_of_salted(crate::keys::NULL_HASH, num_partitions, salt);
-    // Single Int64 key — hash the raw value directly.
-    if keys.len() == 1 {
-        let arr = keys[0].as_any().downcast_ref::<Int64Array>()?;
-        let vals = arr.values();
-        let hash1 = |i: usize| -> u32 {
-            if arr.is_null(i) {
-                null_bucket
-            } else {
-                bucket_of_salted(SEED.hash_one(vals[i]), num_partitions, salt)
-            }
-        };
-        let n = vals.len();
-        return Some(if n >= PAR_HASH_MIN_ROWS {
-            (0..n).into_par_iter().map(hash1).collect()
-        } else {
-            (0..n).map(hash1).collect()
-        });
-    }
-    // Composite Int64 key (e.g. a `(part, supplier)` join / group shuffle). Fold each
-    // column's raw value into one hasher per row — skips the `RowConverter` encode the
-    // general path runs. A row with a null in ANY key column routes to the null bucket (equal
-    // null-bearing rows still co-locate; they are compared within the bucket by the assigner),
-    // so co-partitioning holds for null-free and nullable keys alike.
-    let cols: Vec<&Int64Array> = keys
-        .iter()
-        .map(|k| k.as_any().downcast_ref::<Int64Array>().unwrap())
-        .collect();
-    let n = cols[0].len();
-    let hashn = |i: usize| -> u32 {
-        use std::hash::{BuildHasher, Hasher};
-        if cols.iter().any(|c| c.is_null(i)) {
-            return null_bucket;
-        }
-        let mut h = SEED.build_hasher();
-        for c in &cols {
-            h.write_i64(c.values()[i]);
-        }
-        bucket_of_salted(h.finish(), num_partitions, salt)
-    };
-    Some(if n >= PAR_HASH_MIN_ROWS {
-        (0..n).into_par_iter().map(hashn).collect()
-    } else {
-        (0..n).map(hashn).collect()
-    })
+/// Which reducer owns a key is a cluster-wide contract, so the answer has to come from one
+/// place: [`bucket_of_rows_salted`] (the plain shuffle) and [`salted_partition_by_keys`] (the
+/// skew-aware one) previously derived it separately, and they *disagreed* — the plain path
+/// hashed a single `Int64` key's raw value while the salted path hashed the same key's arrow
+/// row encoding. Two mappers that took different branches would then route equal keys to
+/// different reducers, which is the silent split-group / dropped-join-match failure this
+/// module exists to prevent. There is now one hasher and both build it.
+///
+/// Two shapes, chosen by key type:
+///
+/// * [`KeyHash::Raw`] folds each column's **native value** into the hasher — no intermediate
+///   encoding, and parallel across rows. Nulls do not reach the fold: a row with a null in any
+///   key column takes [`crate::keys::NULL_HASH`], so every null co-locates (SQL groups all
+///   NULLs together) and a *nullable* key never routes differently from a null-free key of the
+///   same type.
+/// * [`KeyHash::Rows`] is the fallback for a type the raw fold does not model (list, struct,
+///   decimal, dictionary, boolean). Arrow's `RowConverter::convert_columns` encodes every row
+///   in one **serial** pass before any hashing can start, which is why it is the exception and
+///   not the rule. It used to be the rule for every key that was not all-`Int64`: a single
+///   `Utf8` group key — the commonest high-cardinality key there is — paid that serial encode
+///   on every shuffle, 7.5 % of H2O `groupby` q3 before this.
+///
+/// Widening is deliberate. Every integer and temporal type folds as the `i64` it would have
+/// been had it crossed the FFI boundary (which normalizes narrow ints to `Int64`), so an
+/// `Int32` key and an `Int64` key of the same value hash **the same**. That is the property
+/// that lets two sides of a join whose key types differ in width still co-partition.
+enum KeyHash<'a> {
+    Raw {
+        cols: Vec<RawKey<'a>>,
+        /// Only the key columns that actually carry a null; empty is the common case and
+        /// skips the per-row null test entirely.
+        nullable: Vec<&'a ArrayRef>,
+    },
+    Rows(arrow::row::Rows),
 }
 
 /// One key column, downcast once, exposing a per-row raw value to the hasher.
-enum MixedCol<'a> {
-    Int(&'a [i64]),
+enum RawKey<'a> {
+    /// Any signed/unsigned integer or temporal column, widened to `i64` on read.
+    Int(IntCol<'a>),
+    /// A `Float64` column whose `-0.0`/NaN have already been folded by
+    /// `keys::canonicalize_float_keys`; hashed by its bits so it cannot disagree with the
+    /// integer path about what "the same value" means.
+    F64(&'a [f64]),
     Str32(&'a GenericStringArray<i32>),
     Str64(&'a GenericStringArray<i64>),
     Bin32(&'a GenericBinaryArray<i32>),
     Bin64(&'a GenericBinaryArray<i64>),
 }
 
-impl MixedCol<'_> {
+/// An integer/temporal key column's values at their native width.
+///
+/// Kept as a native slice rather than cast to a new `Int64Array` because the cast would
+/// allocate and copy the whole key column on every shuffle; widening one value on read is
+/// free next to the hash itself.
+enum IntCol<'a> {
+    I8(&'a [i8]),
+    I16(&'a [i16]),
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+    U32(&'a [u32]),
+    U64(&'a [u64]),
+}
+
+impl IntCol<'_> {
     #[inline]
     fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
         match self {
-            MixedCol::Int(v) => h.write_i64(v[i]),
-            MixedCol::Str32(a) => h.write(a.value(i).as_bytes()),
-            MixedCol::Str64(a) => h.write(a.value(i).as_bytes()),
-            MixedCol::Bin32(a) => h.write(a.value(i)),
-            MixedCol::Bin64(a) => h.write(a.value(i)),
+            IntCol::I8(v) => h.write_i64(i64::from(v[i])),
+            IntCol::I16(v) => h.write_i64(i64::from(v[i])),
+            IntCol::I32(v) => h.write_i64(i64::from(v[i])),
+            IntCol::I64(v) => h.write_i64(v[i]),
+            IntCol::U8(v) => h.write_i64(i64::from(v[i])),
+            IntCol::U16(v) => h.write_i64(i64::from(v[i])),
+            IntCol::U32(v) => h.write_i64(i64::from(v[i])),
+            // The one width that cannot widen to `i64`; hashed as itself, which agrees with
+            // `write_i64` for every value an `Int64` key could also hold.
+            IntCol::U64(v) => h.write_u64(v[i]),
         }
     }
 }
 
-/// Partition a null-free composite key of `Int64` / string / binary columns by hashing each
-/// row's raw values directly — the parallel alternative to the `RowConverter` path, whose
-/// per-row byte encode runs serially. Returns `None` (caller keeps `RowConverter`) for an
-/// empty key, any nullable column, or any unsupported type.
-///
-/// Equal non-null rows fold the same bytes into the hasher in the same order, so they land in
-/// the same bucket — the co-partitioning invariant a shuffle/DISTINCT needs. Gated null-free
-/// because a null slot's arbitrary raw value could split two equal null-bearing rows across
-/// buckets, which a DISTINCT (nulls compare equal) must not do.
-fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize, salt: u64) -> Option<Vec<u32>> {
-    if keys.len() < 2 {
-        return None;
+impl RawKey<'_> {
+    #[inline]
+    fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
+        match self {
+            RawKey::Int(c) => c.write(h, i),
+            RawKey::F64(v) => h.write_u64(v[i].to_bits()),
+            RawKey::Str32(a) => h.write(a.value(i).as_bytes()),
+            RawKey::Str64(a) => h.write(a.value(i).as_bytes()),
+            RawKey::Bin32(a) => h.write(a.value(i)),
+            RawKey::Bin64(a) => h.write(a.value(i)),
+        }
     }
-    let cols: Vec<MixedCol> = keys
-        .iter()
-        .map(|k| match k.data_type() {
-            DataType::Int64 => Some(MixedCol::Int(
-                k.as_primitive::<arrow::datatypes::Int64Type>().values(),
-            )),
-            DataType::Utf8 => Some(MixedCol::Str32(k.as_string::<i32>())),
-            DataType::LargeUtf8 => Some(MixedCol::Str64(k.as_string::<i64>())),
-            DataType::Binary => Some(MixedCol::Bin32(k.as_binary::<i32>())),
-            DataType::LargeBinary => Some(MixedCol::Bin64(k.as_binary::<i64>())),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    let n = keys[0].len();
-    // Nulls route to the fixed null bucket (co-locating equal null-bearing rows) and non-null
-    // rows hash raw — the same null-awareness `partition_int_key` has, so a nullable key never
-    // falls back to the `RowConverter` while a null-free key of the same shape hashes raw, which
-    // would split equal non-null keys across buckets and drop inner-join matches.
-    let null_bucket = bucket_of_salted(crate::keys::NULL_HASH, num_partitions, salt);
-    let any_null = keys.iter().any(|k| k.null_count() != 0);
-    let hashn = |i: usize| -> u32 {
-        use std::hash::{BuildHasher, Hasher};
-        if any_null && keys.iter().any(|k| k.is_null(i)) {
-            return null_bucket;
-        }
-        let mut h = SEED.build_hasher();
-        for c in &cols {
-            c.write(&mut h, i);
-        }
-        bucket_of_salted(h.finish(), num_partitions, salt)
+}
+
+/// The native slice behind an integer or temporal key column, or `None` for any other type.
+///
+/// Temporal columns hash as their underlying integer: a `Date32` is its day count and a
+/// `Timestamp` its tick count, which is the same number `temporal_to_i64` hands the range
+/// partitioner. Two columns of the same temporal type therefore agree, which is all a
+/// co-partition needs.
+fn int_col(a: &ArrayRef) -> Option<IntCol<'_>> {
+    use arrow::datatypes::{
+        Date32Type, Date64Type, DurationMicrosecondType, DurationMillisecondType,
+        DurationNanosecondType, DurationSecondType, Int16Type, Int32Type, Int64Type, Int8Type,
+        Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+        TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
-    Some(if n >= PAR_HASH_MIN_ROWS {
-        (0..n).into_par_iter().map(hashn).collect()
-    } else {
-        (0..n).map(hashn).collect()
+    Some(match a.data_type() {
+        DataType::Int8 => IntCol::I8(a.as_primitive::<Int8Type>().values()),
+        DataType::Int16 => IntCol::I16(a.as_primitive::<Int16Type>().values()),
+        DataType::Int32 => IntCol::I32(a.as_primitive::<Int32Type>().values()),
+        DataType::Int64 => IntCol::I64(a.as_primitive::<Int64Type>().values()),
+        DataType::UInt8 => IntCol::U8(a.as_primitive::<UInt8Type>().values()),
+        DataType::UInt16 => IntCol::U16(a.as_primitive::<UInt16Type>().values()),
+        DataType::UInt32 => IntCol::U32(a.as_primitive::<UInt32Type>().values()),
+        DataType::UInt64 => IntCol::U64(a.as_primitive::<UInt64Type>().values()),
+        DataType::Date32 => IntCol::I32(a.as_primitive::<Date32Type>().values()),
+        DataType::Date64 => IntCol::I64(a.as_primitive::<Date64Type>().values()),
+        DataType::Time32(TimeUnit::Second) => {
+            IntCol::I32(a.as_primitive::<Time32SecondType>().values())
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            IntCol::I32(a.as_primitive::<Time32MillisecondType>().values())
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            IntCol::I64(a.as_primitive::<Time64MicrosecondType>().values())
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            IntCol::I64(a.as_primitive::<Time64NanosecondType>().values())
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            IntCol::I64(a.as_primitive::<TimestampSecondType>().values())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            IntCol::I64(a.as_primitive::<TimestampMillisecondType>().values())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            IntCol::I64(a.as_primitive::<TimestampMicrosecondType>().values())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            IntCol::I64(a.as_primitive::<TimestampNanosecondType>().values())
+        }
+        DataType::Duration(TimeUnit::Second) => {
+            IntCol::I64(a.as_primitive::<DurationSecondType>().values())
+        }
+        DataType::Duration(TimeUnit::Millisecond) => {
+            IntCol::I64(a.as_primitive::<DurationMillisecondType>().values())
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            IntCol::I64(a.as_primitive::<DurationMicrosecondType>().values())
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            IntCol::I64(a.as_primitive::<DurationNanosecondType>().values())
+        }
+        _ => return None,
     })
+}
+
+/// One key column as a raw fold, or `None` for a type only the row encoding models.
+fn raw_key(a: &ArrayRef) -> Option<RawKey<'_>> {
+    if let Some(c) = int_col(a) {
+        return Some(RawKey::Int(c));
+    }
+    Some(match a.data_type() {
+        DataType::Float64 => {
+            RawKey::F64(a.as_primitive::<arrow::datatypes::Float64Type>().values())
+        }
+        DataType::Utf8 => RawKey::Str32(a.as_string::<i32>()),
+        DataType::LargeUtf8 => RawKey::Str64(a.as_string::<i64>()),
+        DataType::Binary => RawKey::Bin32(a.as_binary::<i32>()),
+        DataType::LargeBinary => RawKey::Bin64(a.as_binary::<i64>()),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+impl KeyHash<'_> {
+    /// Whether the raw fold applies to these keys — what the tests below assert when they
+    /// mean "this shape must not fall back to the `RowConverter`".
+    fn is_raw(keys: &[ArrayRef]) -> bool {
+        matches!(KeyHash::build(keys), Ok(KeyHash::Raw { .. }))
+    }
+}
+
+impl<'a> KeyHash<'a> {
+    /// Build the hasher for `keys`, which must already have had its float columns
+    /// canonicalized (`crate::keys::canonicalize_float_keys`).
+    fn build(keys: &'a [ArrayRef]) -> Result<Self, RuntimeError> {
+        if let Some(cols) = keys.iter().map(raw_key).collect::<Option<Vec<_>>>() {
+            let nullable = keys.iter().filter(|k| k.null_count() != 0).collect();
+            return Ok(KeyHash::Raw { cols, nullable });
+        }
+        let fields: Vec<SortField> = keys
+            .iter()
+            .map(|a| SortField::new(a.data_type().clone()))
+            .collect();
+        let converter = RowConverter::new(fields)?;
+        Ok(KeyHash::Rows(converter.convert_columns(keys)?))
+    }
+
+    #[inline]
+    fn hash(&self, i: usize) -> u64 {
+        match self {
+            KeyHash::Raw { cols, nullable } => {
+                if !nullable.is_empty() && nullable.iter().any(|k| k.is_null(i)) {
+                    return crate::keys::NULL_HASH;
+                }
+                let mut h = SEED.build_hasher();
+                for c in cols {
+                    c.write(&mut h, i);
+                }
+                use std::hash::Hasher;
+                h.finish()
+            }
+            KeyHash::Rows(rows) => SEED.hash_one(rows.row(i)),
+        }
+    }
 }
 
 /// Map a key hash to a bucket in `[0, num_partitions)` **without a division**: a bit mask when
@@ -1611,7 +1670,8 @@ mod tests {
         let key = Arc::new(Int64Array::from(vec![10, 20, 10, 20, 11, 20])) as ArrayRef;
         let keys = vec![flag, key];
         // Fast path must fire (null-free, 2 cols of int+str).
-        let fast = partition_mixed_key(&keys, 8, 0).expect("mixed fast path should apply");
+        assert!(KeyHash::is_raw(&keys), "mixed raw fold should apply");
+        let fast = bucket_of_rows(&keys, 6, 8).unwrap();
         assert_eq!(fast.len(), 6);
         // Rows 0 and 2 are ("A",10) — identical → same bucket. Rows 1,3,5 are ("N"/"R",20):
         // 1 and 3 are ("N",20) identical; 5 is ("R",20) distinct.
@@ -1639,7 +1699,9 @@ mod tests {
         use arrow::array::StringArray;
         let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A"), None])) as ArrayRef;
         let key = Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])) as ArrayRef;
-        let part = partition_mixed_key(&[flag, key], 8, 0).expect("null-aware fast path applies");
+        let cols = [flag, key];
+        assert!(KeyHash::is_raw(&cols), "null-aware raw fold applies");
+        let part = bucket_of_rows(&cols, 4, 8).unwrap();
         assert_eq!(part.len(), 4);
         // Rows 0 and 2 are ("A",1) → same bucket. Rows 1 and 3 are (null,null) → the null bucket.
         assert_eq!(part[0], part[2], "equal (A,1) rows co-partition");

@@ -517,6 +517,86 @@ fn a_limit_over_a_union_all_matches_the_oracle_in_order() {
     assert_ordered(&json, &[facts()]);
 }
 
+/// The shape the union spine is sharded *through*: an aggregate over a join whose probe side is
+/// a `UNION ALL` of two different sources.
+///
+/// `spine_is_shardable` admits a `UNION ALL`, so every worker takes shard `k` of **both**
+/// branches at once and the join, gather and fold above run per shard. That is the whole point —
+/// before it, one union anywhere on the probe spine pinned the query to a single core (TPC-DS
+/// sf1, the same 15-row-build join over `store_sales`: 7.5 ms at 10.8x parallelism on a plain
+/// scan against 35.1 ms at 3.2x with a two-branch union) — and it is also where sharding can go
+/// wrong in a way a smaller plan cannot show: a shard that drew from one branch but not the
+/// other would drop or duplicate rows, and a per-shard finalize would answer for a shard.
+///
+/// Multiset rather than ordered, because sharding a union interleaves the branches
+/// (`A₀B₀A₁B₁…` against the unsharded `A₀A₁…B₀B₁…`) — a licence the aggregate above makes
+/// unobservable and which `spine_is_shardable` refuses to anything that could observe it.
+#[test]
+fn an_aggregate_over_a_join_whose_probe_is_a_union_matches_the_oracle() {
+    let branch = |src: usize| {
+        format!(
+            r#"{{"op":"project","input":{{"op":"scan","source_id":{src}}},
+                 "exprs":[{{"expr":{},"alias":"k"}}]}}"#,
+            col("k")
+        )
+    };
+    let (left, right) = (branch(0), branch(1));
+    let union = format!(r#"{{"op":"union","inputs":[{left},{right}],"distinct":false}}"#);
+    let join = format!(
+        r#"{{"op":"hash_join","left":{union},"right":{{"op":"scan","source_id":2}},
+             "left_keys":["k"],"right_keys":["k"],"join_type":"inner",
+             "output":[{{"side":"left","name":"k","alias":"k"}},
+                       {{"side":"right","name":"d","alias":"d"}}],"strategy":"hash"}}"#
+    );
+    let json = format!(
+        r#"{{"op":"aggregate","input":{join},"group_keys":[{{"expr":{},"alias":"k"}}],
+             "aggregates":[{{"func":"sum","input":{},"alias":"t"}}]}}"#,
+        col("k"),
+        col("d")
+    );
+    // Source 1 is a *second* fact relation so both branches are large enough to shard, and
+    // source 2 is the small dimension the join builds over.
+    assert_multiset(&json, &[facts(), facts(), dim()]);
+}
+
+/// The other half of the same decision: a `UNION ALL` whose branches are **not** shardable must
+/// still be materialized across cores rather than left to run serially.
+///
+/// `api.multi_group` lowers `ROLLUP`/`CUBE`/`GROUPING SETS` to exactly this — a union of one
+/// `Aggregate` per level — and excluding every union from `materialize_spine_breakers` took
+/// TPC-DS q67 from 232 ms to 2,447 ms. This is that shape as a correctness assertion; the
+/// timing lives in `benchmarks/BENCHMARK_RESULTS.md`.
+#[test]
+fn a_union_of_aggregates_under_a_pipeline_matches_the_oracle() {
+    let level = |key: &str| {
+        format!(
+            r#"{{"op":"aggregate","input":{SCAN},"group_keys":[{{"expr":{},"alias":"g"}}],
+                 "aggregates":[{{"func":"sum","input":{},"alias":"t"}}]}}"#,
+            col(key),
+            col("v")
+        )
+    };
+    let (a, b) = (level("k"), level("s"));
+    // `s` is a string key and `k` an integer one, so the two levels are not union-compatible
+    // as written; project both to a common shape first.
+    let cast = |inner: String| {
+        format!(
+            r#"{{"op":"project","input":{inner},"exprs":[{{"expr":{},"alias":"t"}}]}}"#,
+            col("t")
+        )
+    };
+    let union = format!(
+        r#"{{"op":"union","inputs":[{},{}],"distinct":false}}"#,
+        cast(a),
+        cast(b)
+    );
+    let json = format!(
+        r#"{{"op":"project","input":{union},"exprs":[{{"expr":{},"alias":"t"}}]}}"#,
+        col("t")
+    );
+    assert_multiset(&json, &[facts()]);
+}
+
 /// `UNION DISTINCT` composes the streamed concat with the streamed dedup. Its group order is a
 /// hash aggregate's and so unspecified, which is what the multiset comparison is for here.
 #[test]

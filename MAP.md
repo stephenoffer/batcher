@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1387 Python modules across 208 packages and 272 Rust files across 15 crates.
+Covering 1387 Python modules across 208 packages and 273 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -274,7 +274,7 @@ The `ds.meta` accessor tree (façade) — answer from metadata, execute only whe
 | `pair.py` | 163 | The `ds.meta.against(other)` accessor — what two relations' footers say about their join. |
 | `prove.py` | 104 | Prove a constraint from metadata — a data contract that holds should cost nothing. |
 | `schema.py` | 364 | The `ds.meta.schema` accessor — questions about types, which never touch data at all. |
-| `storage.py` | 237 | The `ds.meta.storage` accessor — what a scan *would* read, without reading it. |
+| `storage.py` | 243 | The `ds.meta.storage` accessor — what a scan *would* read, without reading it. |
 
 ### `batcher/api/io_namespace/` — 5 · conductor
 
@@ -826,7 +826,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `json.py` | 157 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 575 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 83 | SQL → `.map` accessor dispatch. |
-| `scalar.py` | 539 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `scalar.py` | 534 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 285 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 222 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 570 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
@@ -874,7 +874,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `frame.py` | 200 | Resolving a SQL window spec into the engine's frame, partition and order triple. |
-| `translate.py` | 709 | Window-function handling for the SQL translator. |
+| `translate.py` | 701 | Window-function handling for the SQL translator. |
 
 ### `batcher/dist/` — 4 · backend
 
@@ -1076,7 +1076,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | module | lines | what it is |
 |---|---|---|
 | `annotate.py` | 546 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
-| `calibration.py` | 493 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
+| `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `common_subplan.py` | 278 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
@@ -1093,7 +1093,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `properties.py` | 281 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 251 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 238 | The Kyber rule abstraction — one small, pure unit of optimization. |
-| `signature.py` | 204 | Structural plan signatures. |
+| `signature.py` | 215 | Structural plan signatures. |
 | `spill_rates.py` | 203 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 76 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 350 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
@@ -1186,7 +1186,7 @@ Kyber rule modules.
 | `ordering.py` | 108 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 820 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 583 | Predicate pushdown — evaluate filters as early as possible. |
-| `selection.py` | 484 | SELECTION-phase rules — cost-based physical algorithm choice. |
+| `selection.py` | 511 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 488 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
@@ -1721,7 +1721,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 247 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
-| `filesystem.py` | 606 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
+| `filesystem.py` | 658 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 367 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
@@ -2232,7 +2232,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `ir_tags.py` | 278 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 149 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 291 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 312 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 525 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 346 | Shared traversal for `LogicalPlan` trees. |
 
@@ -2291,12 +2291,12 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 82 | Shared accessor-generation helper for the namespace families. |
+| `_bind.py` | 171 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 481 | The curated per-accessor docstrings, keyed by accessor name. |
-| `collections.py` | 1713 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 1646 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4406 | The `.str` accessor namespace. |
-| `temporal.py` | 1323 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `strings.py` | 4268 | The `.str` accessor namespace. |
+| `temporal.py` | 1226 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
@@ -2457,7 +2457,7 @@ String free functions, in two halves: building text and reading structure out of
 | `join.py` | 539 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 648 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 385 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 410 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 380 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
@@ -2820,7 +2820,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg_par.rs` | 505 | The high-cardinality parallel aggregate: partition first, aggregate once. |
+| `agg_par.rs` | 530 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 589 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 136 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
@@ -2840,7 +2840,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort.rs` | 607 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
-| `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
+| `ops/reshape.rs` | 546 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 745 | Single-node parallel full sort by **sample-sort**. |
 | `par.rs` | 3357 | The multi-core executor. |
@@ -2852,7 +2852,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/folds.rs` | 611 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 696 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1366 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1459 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -2876,7 +2876,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 642 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1616 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 562 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 569 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
@@ -2891,11 +2891,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `byte_key.rs` | 214 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 253 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
-| `gather/mod.rs` | 636 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
+| `gather/mod.rs` | 711 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
-| `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
+| `join/key_filter.rs` | 301 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1966 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 299 | The band join: two inequalities that bound **one** right key from both sides. |
@@ -2907,7 +2907,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `keys.rs` | 372 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 33 | `bc-runtime` — the engine's runtime library. |
 | `measure.rs` | 111 | Reading an ordered key as a number, so two of them can be *subtracted*. |
-| `shuffle.rs` | 1186 | Hash repartitioning — the shuffle primitive. |
+| `shuffle.rs` | 1167 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window/agg/median_state.rs` | 80 | The running median's two-heap, kept apart from the aggregates that use it. |
 | `window/agg/mod.rs` | 752 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
@@ -2915,9 +2915,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 412 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 685 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1303 | Window functions — partition, order, and append one column per function. |
+| `window/mod.rs` | 1559 | Window functions — partition, order, and append one column per function. |
 | `window/parallel.rs` | 290 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 342 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
+| `window/running_par.rs` | 163 | Parallel prefix scan for *running* (frameless, ordered) window aggregates. |
 | `window/series.rs` | 311 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
 | `window/topk.rs` | 178 | `row_number() OVER (PARTITION BY … ORDER BY …) <= k` without ordering the partitions. |
 
@@ -2960,7 +2961,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 485 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 105 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 645 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 759 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 512 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
@@ -3122,7 +3123,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 567 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 737 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 791 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |

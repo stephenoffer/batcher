@@ -687,12 +687,66 @@ async fn read_parquet_async(
         })
         .try_collect()
         .await?;
-    let mut batches: Vec<RecordBatch> = per_rg_batches.into_iter().flatten().collect();
+    let flat: Vec<RecordBatch> = per_rg_batches.into_iter().flatten().collect();
+    let mut batches = coalesce_batches(flat, batch_size)?;
     // Match PyArrow: return columns in the requested projection order, not file order.
     if let Some(cols) = columns {
         reorder_to_projection(&mut batches, cols);
     }
     Ok(batches)
+}
+
+/// Merge consecutive batches up to `batch_size` rows, preserving row order.
+///
+/// The decoder emits at least one batch per row group, so a *selective* read fragments: a
+/// `RowFilter` keeping 1 % of a 131,072-row group leaves ~1,300 rows, and a 64-row-group read
+/// hands the caller 64 batches averaging 1,300 rows where it asked for 65,536. Every one of them
+/// then crosses the FFI as its own `RecordBatch`, is conformed to the source schema by a Python
+/// loop, and becomes its own morsel downstream — per-batch cost paid 64 times for one batch's
+/// worth of rows.
+///
+/// **A read that is already at the target copies nothing.** A run stops before it would exceed
+/// `batch_size`, so a full-size batch forms a run of one and is passed through by `Arc`; the
+/// partial batch that ends each row group likewise never merges with the next group's full one.
+/// Only the fragmented case concatenates, and there the copy is bounded by the rows that
+/// survived the filter.
+///
+/// Order is the decoder's order, which is row-group order — the property the `seq == par` oracle
+/// and PyArrow parity both rest on — and concatenation preserves it. Empty batches ride along in
+/// their run rather than being dropped, so a read that matched nothing still returns one batch
+/// carrying the schema instead of an empty list.
+fn coalesce_batches(
+    batches: Vec<RecordBatch>,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, IoError> {
+    if batches.len() < 2 {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let mut out: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    let mut run: Vec<RecordBatch> = Vec::new();
+    let mut rows = 0usize;
+    let flush = |run: &mut Vec<RecordBatch>, out: &mut Vec<RecordBatch>| -> Result<(), IoError> {
+        match run.len() {
+            0 => {}
+            1 => out.push(run.pop().expect("len 1")),
+            _ => {
+                out.push(arrow::compute::concat_batches(&schema, run.iter())?);
+                run.clear();
+            }
+        }
+        Ok(())
+    };
+    for b in batches {
+        if !run.is_empty() && rows + b.num_rows() > batch_size {
+            flush(&mut run, &mut out)?;
+            rows = 0;
+        }
+        rows += b.num_rows();
+        run.push(b);
+    }
+    flush(&mut run, &mut out)?;
+    Ok(out)
 }
 
 /// Reorder each batch's columns to the requested projection order (PyArrow parity).
@@ -743,6 +797,76 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
+
+    /// One `Int64` batch holding `values`, on the shared one-column schema below.
+    fn i64_batch(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    /// A fragmented read merges into whole batches and keeps every row in its original
+    /// position — the property the row-group order of a Parquet read rests on.
+    #[test]
+    fn coalescing_merges_short_batches_and_preserves_order() {
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|g: i64| i64_batch(&[g * 10, g * 10 + 1, g * 10 + 2]))
+            .collect();
+        let out = coalesce_batches(batches, 10).unwrap();
+        // 10 rows per run: three 3-row batches fit, the fourth would make 12.
+        assert_eq!(
+            out.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![9, 9, 6]
+        );
+        let flat: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let want: Vec<i64> = (0..8)
+            .flat_map(|g: i64| [g * 10, g * 10 + 1, g * 10 + 2])
+            .collect();
+        assert_eq!(flat, want, "coalescing must not reorder rows");
+    }
+
+    /// A read already at the target copies nothing: every batch forms a run of one and comes
+    /// back untouched. This is what keeps the change free on the unfiltered path, where the
+    /// decoder already emits `batch_size` rows at a time.
+    #[test]
+    fn coalescing_passes_full_batches_through_untouched() {
+        let batches: Vec<RecordBatch> = (0..4).map(|_| i64_batch(&[1, 2, 3, 4])).collect();
+        let ptrs: Vec<*const u8> = batches
+            .iter()
+            .map(|b| b.column(0).to_data().buffers()[0].as_ptr())
+            .collect();
+        let out = coalesce_batches(batches, 4).unwrap();
+        assert_eq!(out.len(), 4, "no batch should have been merged");
+        let after: Vec<*const u8> = out
+            .iter()
+            .map(|b| b.column(0).to_data().buffers()[0].as_ptr())
+            .collect();
+        assert_eq!(
+            ptrs, after,
+            "a full-size batch must pass through by pointer"
+        );
+    }
+
+    /// A read that matched nothing still carries its schema: the empty batches ride along in
+    /// their run rather than being dropped, so the caller never gets an empty `Vec` where the
+    /// decoder produced typed (if empty) output.
+    #[test]
+    fn coalescing_keeps_an_all_empty_read_addressable() {
+        let batches: Vec<RecordBatch> = (0..5).map(|_| i64_batch(&[])).collect();
+        let out = coalesce_batches(batches, 1024).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 0);
+        assert_eq!(out[0].schema().field(0).name(), "a");
+    }
 
     use super::*;
 

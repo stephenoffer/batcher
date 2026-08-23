@@ -128,9 +128,12 @@ out = ds.collect(adaptive=True)     # "auto" (default) | True | False
 ```
 
 Under `adaptive="auto"` it engages only when a join has a breaker-produced operand whose
-size is merely *guessed* **and** total input rows clear an internal 20,000,000-row gate
-(`_ADAPTIVE_MIN_INPUT_ROWS` in `python/batcher/api/adaptive.py` — a private constant, not
-a config field; it is not settable, so do not look for a knob). Below that, one-shot
+size is merely *guessed* **and** the scan input clears a **per-stage** size floor: 5M rows
+or ~320 MB for each pipeline breaker the loop would cut at, whichever the shape suits
+(`_ADAPTIVE_MIN_ROWS_PER_STAGE` / `_ADAPTIVE_MIN_BYTES_PER_STAGE` in
+`python/batcher/api/adaptive/gating.py` — private constants, not config fields; they are
+not settable, so do not look for a knob). So a two-breaker plan qualifies at 10M rows and a
+six-breaker one at 30M; the flat 20M gate this replaced is retired. Below that, one-shot
 planning is already fast and re-planning is pure overhead (~20–40 ms of control plane per
 stage). `adaptive=True` bypasses the gate entirely — the right thing to try on a
 mid-sized query with badly mis-estimated joins. The related tunable that *is* real is

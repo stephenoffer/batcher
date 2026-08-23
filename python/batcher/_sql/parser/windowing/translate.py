@@ -371,14 +371,6 @@ def _window(tr, ds: Dataset, projections) -> Dataset:
     return ds
 
 
-def _is_boolean_column(tr, node) -> bool:
-    """True when `node` is a column the plan says is boolean."""
-    import pyarrow as pa
-
-    t = tr.column_type(node)
-    return t is not None and pa.types.is_boolean(t)
-
-
 def _reshaped_window_argument(tr, item, fn, arg):
     """Rewrite a window aggregate's argument into a type the operator's kernels read.
 

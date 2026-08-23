@@ -72,8 +72,14 @@ last commit alone.
 | Polars    | single-backend, single-node         | mergeable algebra → distributed; adaptive |
 
 Note what the middle row does **not** say. Batcher does not re-plan at a finer grain
-than AQE, and the within-query loop is off below a size floor
-(`api/adaptive/gating.py`), so on most queries it does not run at all. Claim the two
+than AQE, and the within-query loop is off below a size floor, so on most queries it does
+not run at all. That floor is charged **per stage**, not per query, because a cut is what
+staging costs: `_ADAPTIVE_MIN_ROWS_PER_STAGE` (5M) or `_ADAPTIVE_MIN_BYTES_PER_STAGE`
+(~320 MB), OR'd, times the pipeline breakers the loop would cut at
+(`api/adaptive/gating.py`). So a two-breaker plan qualifies at 10M rows, a four-breaker one
+at 20M, a six-breaker one at 30M. A plan with **no join** never qualifies at any size, which
+gates more queries than the size floor does. The flat 20,000,000-row gate this replaced, and
+the `_ADAPTIVE_MIN_INPUT_ROWS` constant that held it, are both gone. Claim the two
 things that are true — single-node availability, and cross-run learning — and nothing
 past them.
 

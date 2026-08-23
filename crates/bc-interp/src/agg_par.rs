@@ -160,10 +160,35 @@ pub(crate) fn radix_width(estimated_groups: usize, threads: usize) -> usize {
             return w.max(1);
         }
     }
-    estimated_groups
+    let threads = threads.max(1);
+    let want = estimated_groups
         .div_ceil(GROUPS_PER_PARTITION)
-        .clamp(threads.max(1), MAX_PARTITIONS)
-        .next_power_of_two()
+        .clamp(threads, MAX_PARTITIONS);
+    // Round **up to a multiple of the worker count**, not up to a power of two.
+    //
+    // The split fans out one task per partition, so its critical path is
+    // `ceil(parts / workers)` buckets however small the last round is — and going a single
+    // partition over the pool starts a whole second round. That is a cliff, not a slope, and
+    // the old rule walked straight off it: it rounded a wanted width of 61 (the pool this box
+    // gives a 10 M-row aggregate) up to 64.
+    //
+    // Measured by alternating the arms round by round in one process, so no arm can inherit
+    // the other's cache state — H2O `groupby` at its 1e7-row tier, median of nine
+    // (milliseconds, `BATCHER_AGG_PARTS` pinning the width):
+    //
+    // | partitions | 48 | 56 | **61** | 62 | 64 | 72 |
+    // |---|---:|---:|---:|---:|---:|---:|
+    // | q3 `sum,avg BY id3` | 51.1 | 48.1 | **46.4** | 62.0 | 61.2 | 56.1 |
+    // | q5 `three sums BY id6` | 33.2 | 33.3 | **32.8** | 40.6 | 39.7 | 39.6 |
+    // | q7 `max-min BY id3` | 50.5 | 49.2 | **49.5** | 63.1 | 62.2 | 57.1 |
+    //
+    // Every width at or below the pool is flat; 62 is 20-25 % worse than 61. Nothing about
+    // powers of two is involved — 64 is merely where the old rounding happened to land.
+    // `bucket_of` has always handled a non-power-of-two count (Lemire multiply-shift over the
+    // hash's high bits instead of a mask over its low ones), so the rounding bought nothing
+    // that had to be paid for.
+    want.div_ceil(threads)
+        .saturating_mul(threads)
         .min(MAX_PARTITIONS)
 }
 
@@ -578,7 +603,12 @@ mod tests {
             );
             for groups in [1usize, 10_000, 1_000_000, 100_000_000] {
                 let w = radix_width(groups, threads);
-                assert!(w.is_power_of_two(), "width {w} is not a power of two");
+                // Every worker takes the same number of buckets, so the split has no
+                // straggler round — the property that replaced "round to a power of two".
+                assert!(
+                    w % threads == 0 || w == MAX_PARTITIONS,
+                    "width {w} is not a multiple of {threads} workers"
+                );
                 assert!((threads..=MAX_PARTITIONS).contains(&w) || w >= threads);
             }
         }
