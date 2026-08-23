@@ -28,6 +28,7 @@ from batcher.plan.logical.relational import (
     Projection,
     Sample,
     Scan,
+    Union,
 )
 from batcher.plan.logical.reshape import Unnest, Unpivot
 from batcher.plan.schema import placeholder_schema
@@ -130,6 +131,30 @@ def constant_column_value(plan: LogicalPlan, column: str) -> object:
                 child = plan.left if o.side == "left" else plan.right
                 return constant_column_value(child, o.name)
         return _NOT_CONSTANT
+    # A union's output rows are its branches' rows unchanged, so the column is constant
+    # exactly when **every** branch proves the *same* constant. Branches are validated to
+    # carry identical column names (`Union.__post_init__`), so each is traced by name.
+    #
+    # This arm is what makes the comma-join pseudo-key recognizable over a `UNION ALL`, and
+    # its absence was expensive rather than merely incomplete. Projection pushdown moves the
+    # synthetic `__cross_key = lit(1)` *into* each branch, so above the union the column is a
+    # bare `Col` with no `Project` to prove it — `is_cartesian_key_pair` then read the pseudo
+    # -edge as a genuine join key, `drop_redundant_cross_key` could not fire, and the join
+    # ran on the composite `(__cross_key, real_key)`. That costs twice: it is a two-column
+    # key, so the join takes `I64x2Keys` instead of `I64Keys` and forfeits the dense direct
+    # map, and the constant column is materialized for every probe row. Measured on TPC-DS
+    # sf1, the same 15-row-build join over `store_sales`: **5.7 ms** with a plain scan on the
+    # probe side against **48.5 ms** with a two-branch `UNION ALL` — 8.5x, for a key that
+    # matches every row.
+    if isinstance(plan, Union):
+        values = [constant_column_value(branch, column) for branch in plan.inputs]
+        first = values[0]
+        if first is _NOT_CONSTANT:
+            return _NOT_CONSTANT
+        for other in values[1:]:
+            if other is _NOT_CONSTANT or other != first:
+                return _NOT_CONSTANT
+        return first
     return _NOT_CONSTANT
 
 

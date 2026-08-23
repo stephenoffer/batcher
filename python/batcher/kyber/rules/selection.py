@@ -303,11 +303,9 @@ def _rewrite(
         # Build-side swap is only valid for inner joins (associative/commutative).
         # Compare the cost of this orientation against the swapped one; children are
         # identical between them, so the per-join `op_cost` is the deciding term.
-        # (A left/right join's `A LEFT JOIN B == B RIGHT JOIN A` rename was tried to
-        # build the smaller *preserved* side, but it regressed: building the small side
-        # forces probing the large one, and the scattered probe lookups cost more than
-        # the larger but cache-friendlier build. The current cost model's build:probe
-        # ratio mis-ranks that, so the rename is withheld until the model is calibrated.)
+        # An outer join is deliberately NOT given the same treatment through its own
+        # equivalence, `A LEFT JOIN B == B RIGHT JOIN A`, which would move the hash table to
+        # the other input exactly as the swap does. See the note on the non-inner arm below.
         cost_delta = 0.0
         swap = False
         broadcast = False
@@ -345,6 +343,35 @@ def _rewrite(
         else:
             # Non-inner joins are not commutative — the build is always the right input.
             # Broadcast it when it is small enough to replicate (the engine probes left).
+            #
+            # The `A LEFT JOIN B == B RIGHT JOIN A` rename would give an outer join the same
+            # choice of build side the inner arm has, and on the join alone it is a large win:
+            # `customer LEFT JOIN orders` at TPC-H sf10 hashes the 15,000,000-row `orders` and
+            # runs 225.9 ms, where the renamed `orders RIGHT JOIN customer` hashes the
+            # 1,500,000-row `customer` and runs **58.8 ms**.
+            #
+            # It is still not taken, and the reason on record — "the scattered probe lookups
+            # cost more than the larger but cache-friendlier build", blamed on an uncalibrated
+            # build:probe ratio — is not the reason. That ratio is calibrated now
+            # (`kyber.calibration._fit_join_terms`) and the small build is faster either way.
+            # What the rename actually costs is the **order of the join's output**: the runtime
+            # probes its left input and emits in probe order, so the join as written comes out
+            # clustered by `c_custkey`, and q13's next operator is `GROUP BY c_custkey`, which
+            # on clustered input takes `agg::group::runs`' sorted-key short-circuit for almost
+            # nothing. Renamed, that group-by sees 15 M rows in `orders` order, falls to the
+            # partition path and gathers the whole wide relation:
+            #
+            #   | | join | + GROUP BY c_custkey | q13 end to end |
+            #   |---|---:|---:|---:|
+            #   | as written | 225.9 ms | 305 ms (group-by ~26 ms) | **357 ms** |
+            #   | renamed    |  58.8 ms | 741 ms (group-by ~628 ms) | 725 ms |
+            #
+            # 167 ms off the join for 600 ms onto the aggregate. `op_cost` prices neither: an
+            # output's sortedness is not one of its terms, so the rewrite cannot be decided on
+            # cost until interesting-orders exists in the cost model. That is a design
+            # addition, not a threshold. Recorded with the numbers so the next attempt starts
+            # from the mechanism rather than from the join microbenchmark, which says
+            # "obviously yes".
             broadcast = right_bytes <= max_bytes
         # After any swap, the right input is the build side — and a swap moves the
         # *original left* there. `min(l, r)` only coincides with that when the swap was

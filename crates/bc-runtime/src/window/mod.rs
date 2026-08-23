@@ -29,6 +29,7 @@ mod coerce;
 mod fill;
 mod parallel;
 mod partition_agg;
+mod running_par;
 mod series;
 mod topk;
 
@@ -346,12 +347,24 @@ pub(crate) fn window_serial(
     // index, and it parallelizes the grouping. The result is identical (the order within
     // a partition never affects a whole-partition aggregate).
     if order_keys.is_empty()
-        && !partition_keys.is_empty()
         && funcs
             .iter()
             .all(|c| c.frame.is_none() && c.func.is_aggregate())
     {
-        let (group_ids, num_groups, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
+        // With NO partition keys this is `SUM(x) OVER ()` -- one group over every row -- and the
+        // group assignment is therefore known without looking at the data: every row is group 0.
+        // Saying so skips both O(rows) serial passes the general path spends to rediscover it
+        // (an 8M-entry `Vec<usize>` partition list, then a scattered write of a group id per
+        // row); `vec![0u32; n]` is a zeroed allocation the kernel hands over a page at a time.
+        // The reduce-and-broadcast below is unchanged, and with one group it is exactly the
+        // whole-column aggregate this shape asks for.
+        let (group_ids, num_groups) = match partition_keys.is_empty() {
+            true => (vec![0u32; num_rows], 1usize),
+            false => {
+                let (g, n, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
+                (g, n)
+            }
+        };
         return funcs
             .iter()
             .map(|call| {
@@ -769,17 +782,33 @@ fn f64_ordered(x: f64) -> u64 {
 /// other type or a column with nulls (the general row-encoded path handles those). `value(i)`
 /// is used (not the raw buffer) so a sliced array's offset is honored.
 fn pack_ordered_u64(a: &ArrayRef) -> Option<Vec<u64>> {
+    use rayon::prelude::*;
     if a.null_count() != 0 {
         return None;
     }
+    // Packed **across cores**. This is one of four O(rows) passes that surround the parallel
+    // sort in `try_ordered_partitions_packed`; on a global window they were all serial, and
+    // Amdahl's law -- not the sort -- is what held `rank()/row_number() OVER (ORDER BY x)` to
+    // ~2-3x however many cores it was given. Rayon's indexed `collect` preserves order, so the
+    // packed vector is element-for-element what the serial map produced.
     match a.data_type() {
         DataType::Int64 => {
             let v = a.as_primitive::<Int64Type>();
-            Some((0..v.len()).map(|i| i64_ordered(v.value(i))).collect())
+            Some(
+                (0..v.len())
+                    .into_par_iter()
+                    .map(|i| i64_ordered(v.value(i)))
+                    .collect(),
+            )
         }
         DataType::Float64 => {
             let v = a.as_primitive::<Float64Type>();
-            Some((0..v.len()).map(|i| f64_ordered(v.value(i))).collect())
+            Some(
+                (0..v.len())
+                    .into_par_iter()
+                    .map(|i| f64_ordered(v.value(i)))
+                    .collect(),
+            )
         }
         _ => None,
     }
@@ -815,16 +844,30 @@ fn try_ordered_partitions_packed(
     // DESC: invert the order-preserving key so an ascending unsigned sort yields descending.
     // (`nulls_first` is irrelevant — this path requires non-null keys.)
     if opts.descending {
-        for x in &mut ord {
-            *x = !*x;
-        }
+        use rayon::prelude::*;
+        ord.par_iter_mut().for_each(|x| *x = !*x);
     }
     // Sort (partition, order, original-index) tuples. The derived tuple `Ord` sorts by
     // partition, then order, then index; the index makes it a total order, so the unstable
     // sort is deterministic. `par_sort` is kept even though this runs per hash bucket inside
     // `window_parallel`: buckets finish unevenly, so rayon work-stealing puts the freed cores
     // onto the still-running buckets' sorts — measurably faster than a serial per-bucket sort.
+    use rayon::prelude::*;
+    // No PARTITION BY is one global partition, so the constant partition component sorts
+    // nothing and only widens the tuple. Dropping it sorts `(order, index)` -- 12 bytes a row
+    // instead of 20, which is 64 MB less to move at 8M rows -- and skips the run-splitting scan
+    // below entirely, because there is exactly one run by construction.
+    if part.is_none() {
+        let mut keyed: Vec<(u64, u32)> = (0..num_rows)
+            .into_par_iter()
+            .map(|i| (ord[i], i as u32))
+            .collect();
+        keyed.par_sort_unstable();
+        let single: Vec<usize> = keyed.par_iter().map(|&(_, i)| i as usize).collect();
+        return Some(vec![single]);
+    }
     let mut keyed: Vec<(u64, u64, u32)> = (0..num_rows)
+        .into_par_iter()
         .map(|i| (part.as_ref().map_or(0, |p| p[i]), ord[i], i as u32))
         .collect();
     keyed.par_sort_unstable();
@@ -863,13 +906,26 @@ use bc_arrow::row_sort::row_prefix;
 
 /// `row_number`: 1..n in order, unique per row. Scattered to original positions.
 fn row_number(ordered: &[Vec<usize>], num_rows: usize) -> ArrayRef {
-    let mut out = vec![0i64; num_rows];
+    use rayon::prelude::*;
+    // `ROW_NUMBER` is pure position, so every row is independent -- the only obstacle to
+    // computing it across cores is that the writes are scattered (`part` is a sort permutation,
+    // so consecutive positions land anywhere in `out`). `AtomicI64` has the same layout and
+    // cost as `i64` for a relaxed store on every architecture the engine targets, and it makes
+    // the disjoint scatter expressible without `unsafe`: each position is written exactly once,
+    // by exactly one thread, so there is no contention and no ordering to establish.
+    let out: Vec<std::sync::atomic::AtomicI64> = (0..num_rows)
+        .map(|_| std::sync::atomic::AtomicI64::new(0))
+        .collect();
     for part in ordered {
-        for (rank0, &row) in part.iter().enumerate() {
-            out[row] = rank0 as i64 + 1;
-        }
+        part.par_iter().enumerate().for_each(|(rank0, &row)| {
+            out[row].store(rank0 as i64 + 1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
-    Arc::new(Int64Array::from(out))
+    Arc::new(Int64Array::from(
+        out.into_iter()
+            .map(|a| a.into_inner())
+            .collect::<Vec<i64>>(),
+    ))
 }
 
 /// `rank` (gaps, ties share min) or `dense_rank` (no gaps, ties share). Ties are
@@ -886,7 +942,59 @@ fn rank(
         });
     };
     let mut out = vec![0i64; num_rows];
+    let threads = rayon::current_num_threads().max(1);
     for part in ordered {
+        // Both forms are recoverable from position plus peer-group structure, so a big
+        // partition splits across cores exactly (integer counting -- no re-association question
+        // of the kind float SUM raises; see `running_par`).
+        //
+        // `rank` is *purely* positional: a row's rank is the 1-based index at which its peer
+        // group starts, so a chunk beginning on a peer boundary needs nothing from the chunks
+        // before it. `dense_rank` counts distinct groups, which is a prefix sum, so it carries
+        // one integer between chunks -- which is what `running_par::scan` threads for us.
+        if running_par::worth_splitting(part.len(), threads) {
+            // One comparison per position, done once and in parallel. Both the chunk placement
+            // and the fold below read the answer instead of recomputing it -- the serial walk
+            // this replaces avoided the same redundancy by carrying `prev` across iterations.
+            let starts = running_par::peer_group_starts(part, |a, b| rows_equal(rows, a, b));
+            let boundary = running_par::boundary_from_starts(&starts);
+            let chunks = running_par::peer_chunks(part.len(), threads, &boundary);
+            let vals = if dense {
+                running_par::scan(
+                    part.len(),
+                    &chunks,
+                    0i64,
+                    |acc, pos| {
+                        Ok(acc
+                            + i64::from(pos == 0 || rows.row(part[pos]) != rows.row(part[pos - 1])))
+                    },
+                    |a, b| a + b,
+                    Ok,
+                    &boundary,
+                )?
+            } else {
+                // Carry the group's start position rather than a count: at a boundary the whole
+                // group takes `group_start + 1`, and `scan` fills the group with it.
+                running_par::scan(
+                    part.len(),
+                    &chunks,
+                    0i64,
+                    |acc, pos| {
+                        Ok(match starts[pos] {
+                            true => pos as i64 + 1,
+                            false => acc,
+                        })
+                    },
+                    |a, b| if b == 0 { a } else { b },
+                    Ok,
+                    &boundary,
+                )?
+            };
+            for (pos, v) in vals.into_iter().enumerate() {
+                out[part[pos]] = v;
+            }
+            continue;
+        }
         let mut current = 0i64; // last assigned rank
                                 // Carry the previous position's encoded row. Comparing `part[pos - 1]` against `row`
                                 // is two random reads of the encoded buffer per position, and the first was already
@@ -1044,7 +1152,28 @@ fn running_aggregate(
         let nulls = values.logical_nulls();
         let is_valid = |i: usize| nulls.as_ref().is_none_or(|n| n.is_valid(i));
         let mut out = vec![0i64; num_rows];
+        let threads = rayon::current_num_threads().max(1);
         for part in ordered {
+            // Counting is exact under re-association, so a big partition splits across cores.
+            if running_par::worth_splitting(part.len(), threads) {
+                let starts =
+                    running_par::peer_group_starts(part, |a, b| rows_equal(order_rows, a, b));
+                let boundary = running_par::boundary_from_starts(&starts);
+                let chunks = running_par::peer_chunks(part.len(), threads, &boundary);
+                let vals = running_par::scan(
+                    part.len(),
+                    &chunks,
+                    0i64,
+                    |acc, pos| Ok(acc + i64::from(is_valid(part[pos]))),
+                    |a, b| a + b,
+                    Ok,
+                    &boundary,
+                )?;
+                for (pos, v) in vals.into_iter().enumerate() {
+                    out[part[pos]] = v;
+                }
+                continue;
+            }
             let (mut acc, mut gs) = (0i64, 0usize);
             for pos in 0..part.len() {
                 if is_valid(part[pos]) {
@@ -1114,6 +1243,7 @@ fn running_numeric_i64(
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     let arr = values.as_primitive::<Int64Type>();
+    let threads = rayon::current_num_threads().max(1);
     if func == WindowFn::Avg {
         let mut out: Vec<Option<f64>> = vec![None; num_rows];
         for part in ordered {
@@ -1122,6 +1252,32 @@ fn running_numeric_i64(
             // bit in an f64 accumulator (avg came back `…496.0` instead of `…497.0`). The
             // exact i128 sum divided once at the peer boundary matches the interpreter and
             // DuckDB; i128 can't overflow for any realistic i64 column (~2^64 rows).
+            // The i128 sum and the count are both exact under re-association, so a large
+            // partition splits across cores and still divides the identical pair.
+            if running_par::worth_splitting(part.len(), threads) {
+                let starts =
+                    running_par::peer_group_starts(part, |a, b| rows_equal(order_rows, a, b));
+                let boundary = running_par::boundary_from_starts(&starts);
+                let chunks = running_par::peer_chunks(part.len(), threads, &boundary);
+                let vals = running_par::scan(
+                    part.len(),
+                    &chunks,
+                    (0i128, 0i64),
+                    |(s, c), pos| {
+                        Ok(match arr.is_valid(part[pos]) {
+                            true => (s + arr.value(part[pos]) as i128, c + 1),
+                            false => (s, c),
+                        })
+                    },
+                    |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2),
+                    |(s, c)| Ok((c > 0).then(|| s as f64 / c as f64)),
+                    &boundary,
+                )?;
+                for (pos, v) in vals.into_iter().enumerate() {
+                    out[part[pos]] = v;
+                }
+                continue;
+            }
             let (mut sum, mut cnt, mut gs) = (0i128, 0i64, 0usize);
             for pos in 0..part.len() {
                 if arr.is_valid(part[pos]) {
@@ -1141,6 +1297,57 @@ fn running_numeric_i64(
     }
     let mut out: Vec<Option<i64>> = vec![None; num_rows];
     for part in ordered {
+        // Integer `+`, `min` and `max` are all exact and associative, so a large partition
+        // splits across cores. SUM accumulates in i128 so that a *chunk's own* total cannot
+        // overflow where no running value does (a chunk total is a difference of two prefixes,
+        // which can leave i64 range even when every prefix is inside it); `emit` then applies
+        // the same i64 range check the serial walk's `checked_add` applies, so the two error
+        // on exactly the same inputs.
+        if running_par::worth_splitting(part.len(), threads) {
+            let starts = running_par::peer_group_starts(part, |a, b| rows_equal(order_rows, a, b));
+            let boundary = running_par::boundary_from_starts(&starts);
+            let chunks = running_par::peer_chunks(part.len(), threads, &boundary);
+            let vals = running_par::scan(
+                part.len(),
+                &chunks,
+                None::<i128>,
+                |acc, pos| {
+                    Ok(match (arr.is_valid(part[pos]), acc) {
+                        (false, a) => a,
+                        (true, None) => Some(arr.value(part[pos]) as i128),
+                        (true, Some(a)) => {
+                            let v = arr.value(part[pos]) as i128;
+                            Some(match func {
+                                WindowFn::Sum => a + v,
+                                WindowFn::Min => a.min(v),
+                                WindowFn::Max => a.max(v),
+                                _ => a,
+                            })
+                        }
+                    })
+                },
+                |a, b| match (a, b) {
+                    (None, x) | (x, None) => x,
+                    (Some(x), Some(y)) => Some(match func {
+                        WindowFn::Sum => x + y,
+                        WindowFn::Min => x.min(y),
+                        WindowFn::Max => x.max(y),
+                        _ => x,
+                    }),
+                },
+                |acc| match acc {
+                    None => Ok(None),
+                    Some(a) => i64::try_from(a)
+                        .map(Some)
+                        .map_err(|_| RuntimeError::SumOverflow),
+                },
+                &boundary,
+            )?;
+            for (pos, v) in vals.into_iter().enumerate() {
+                out[part[pos]] = v;
+            }
+            continue;
+        }
         let (mut acc, mut gs): (Option<i64>, usize) = (None, 0);
         for pos in 0..part.len() {
             let row = part[pos];
@@ -1178,7 +1385,56 @@ fn running_numeric_f64(
     let arr = values.as_primitive::<Float64Type>();
     let is_avg = func == WindowFn::Avg;
     let mut out: Vec<Option<f64>> = vec![None; num_rows];
+    let threads = rayon::current_num_threads().max(1);
+    // MIN/MAX only. Float `+` is not associative, so splitting a running SUM/AVG would change
+    // its low bits and put this path out of step with the sequential oracle it must match
+    // bit-for-bit; MIN/MAX select an input value under a total order, which re-associates
+    // exactly. See the module comment on `running_par`.
+    let splittable = matches!(func, WindowFn::Min | WindowFn::Max);
     for part in ordered {
+        if splittable && running_par::worth_splitting(part.len(), threads) {
+            let starts = running_par::peer_group_starts(part, |a, b| rows_equal(order_rows, a, b));
+            let boundary = running_par::boundary_from_starts(&starts);
+            let chunks = running_par::peer_chunks(part.len(), threads, &boundary);
+            let pick = |a: f64, b: f64| match func {
+                WindowFn::Min => {
+                    if crate::keys::float_total_cmp(b, a).is_lt() {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                _ => {
+                    if crate::keys::float_total_cmp(b, a).is_gt() {
+                        b
+                    } else {
+                        a
+                    }
+                }
+            };
+            let vals = running_par::scan(
+                part.len(),
+                &chunks,
+                None::<f64>,
+                |acc, pos| {
+                    Ok(match (arr.is_valid(part[pos]), acc) {
+                        (false, a) => a,
+                        (true, None) => Some(arr.value(part[pos])),
+                        (true, Some(a)) => Some(pick(a, arr.value(part[pos]))),
+                    })
+                },
+                |a, b| match (a, b) {
+                    (None, x) | (x, None) => x,
+                    (Some(x), Some(y)) => Some(pick(x, y)),
+                },
+                Ok,
+                &boundary,
+            )?;
+            for (pos, v) in vals.into_iter().enumerate() {
+                out[part[pos]] = v;
+            }
+            continue;
+        }
         let (mut acc, mut cnt, mut gs): (Option<f64>, i64, usize) = (None, 0, 0);
         for pos in 0..part.len() {
             let row = part[pos];

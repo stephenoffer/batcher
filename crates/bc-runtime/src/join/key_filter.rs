@@ -28,6 +28,23 @@
 //! nothing" — rather than guessing. The one thing this module deliberately does **not** do is
 //! approximate: see [`MAX_DISTINCT_KEYS`] for the measurement that ruled a bloom out.
 //!
+//! ## Two exact representations, chosen by the key's *span*
+//!
+//! A surrogate join key is dense by construction — `p_partkey`, `o_orderkey`, `s_suppkey` are
+//! runs of integers — so its membership set is better held as a **bitmap over `[lo, hi]`** than
+//! as a hash set: smaller, built with no hashing, and probed with one load and a shift instead
+//! of a hash and a chain walk. [`KeySet`] holds whichever is smaller, and both are exact, so
+//! which one a build side gets is invisible in the result.
+//!
+//! That choice is not a micro-optimization — it is what lets the digest serve the shape it was
+//! written for. [`MAX_DISTINCT_KEYS`] bounds the *hash set*, and it has to, because a hash set
+//! of a million keys is a megabyte of random-access probe target. A bitmap has no such problem,
+//! so a dense key is admitted on its span alone. The cliff that removed was measurable and
+//! sharp: TPC-H sf10 `lineitem ⋈ part` with the build side narrowed to N distinct part keys ran
+//! at 36.6 ms for N = 62,500 and **74.7 ms** for N = 66,666, the two sides of a cap that had
+//! nothing to do with the data. `p_name LIKE '%green%'` — TPC-H q9's own filter — keeps 108,782
+//! parts and landed on the wrong side of it.
+//!
 //! Null keys need no special case beyond dropping them: `NULL = NULL` is NULL, not TRUE, so a
 //! null-keyed probe row never matches. It is therefore correct to mark it `false` — but only
 //! for a join whose probe side is *reducible* at all. That is the caller's decision (an anti or
@@ -36,6 +53,7 @@
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use arrow::buffer::BooleanBuffer;
+use arrow::compute::kernels::aggregate::{max as arrow_max, min as arrow_min};
 use arrow::datatypes::{DataType, Int64Type};
 use hashbrown::HashSet;
 
@@ -69,6 +87,51 @@ const MAX_DISTINCT_KEYS: usize = 1 << 16;
 /// selective — worth the scan.
 const MAX_BUILD_ROWS: usize = 1 << 22;
 
+/// Bits of key span a dense bitmap may cover per non-null build row.
+///
+/// The bitmap costs `span / 8` bytes; the hash set it replaces costs ~10.3 bytes per key
+/// (hashbrown holds an `i64` plus a control byte at a 7/8 load factor). So the bitmap is the
+/// *smaller* structure whenever `span < 82 * rows`, and 64 is that crossover rounded down to a
+/// shift. Sizing the choice by which representation is smaller — rather than by a tuned
+/// constant — is what keeps this honest at every scale: a key so sparse that the bitmap would be
+/// the bigger object is exactly the key the hash set should hold.
+const DENSE_SPAN_PER_ROW: u128 = 64;
+
+/// The smallest span always allowed a bitmap, so a handful of build rows a few thousand apart
+/// are not pushed onto the hash set to save a few hundred bytes.
+const MIN_DENSE_SPAN: u128 = 1 << 13;
+
+/// Absolute ceiling on a bitmap's span — 256 Mi keys, a 32 MiB map.
+///
+/// [`DENSE_SPAN_PER_ROW`] alone is a *relative* bound, and a relative bound on a 4M-row build
+/// side (the [`MAX_BUILD_ROWS`] limit) would permit a 32 GiB allocation. This is the guard that
+/// makes the memory a stated number rather than a consequence.
+const MAX_DENSE_SPAN: u128 = 1 << 28;
+
+/// How a [`KeyFilter`] holds its build keys. Both arms are **exact** — no false positives and
+/// no false negatives — so the arm a build side lands on changes speed and memory, never rows.
+enum KeySet {
+    /// A bitmap over `[lo, hi]`: key `k` is present iff bit `k - lo` is set. The representation
+    /// a surrogate key gets, and the one that made the digest worth extending past
+    /// [`MAX_DISTINCT_KEYS`] — see the module note.
+    Dense(Vec<u64>),
+    /// The literal key set, for a span too sparse to bitmap. Bounded by [`MAX_DISTINCT_KEYS`].
+    Sparse(HashSet<i64, ahash::RandomState>),
+}
+
+impl KeySet {
+    /// Whether `offset` (already known to be within `[0, span)`) is a member.
+    #[inline]
+    fn contains(&self, key: i64, offset: usize) -> bool {
+        match self {
+            // `offset < span` is guaranteed by the caller's `[lo, hi]` guard, and the bitmap
+            // covers `span` bits, so the word index is in bounds.
+            KeySet::Dense(bits) => (bits[offset >> 6] >> (offset & 63)) & 1 == 1,
+            KeySet::Sparse(set) => set.contains(&key),
+        }
+    }
+}
+
 /// The build side's key set, as a membership test over `Int64` probe keys.
 ///
 /// Restricted to a single `Int64` key column — the analytical join shape once the FFI boundary
@@ -84,7 +147,10 @@ pub struct KeyFilter {
     /// The build side's keys, exactly. Not a sketch: an approximate membership test would let
     /// through rows the exact set rejects, and at these sizes the exact set is both smaller and
     /// faster than the bloom that would approximate it (see [`MAX_DISTINCT_KEYS`]).
-    keys: HashSet<i64, ahash::RandomState>,
+    keys: KeySet,
+    /// Distinct non-null build keys held. Counted during the digest, because neither
+    /// representation can answer it afterwards in constant time.
+    distinct: usize,
 }
 
 impl KeyFilter {
@@ -100,26 +166,75 @@ impl KeyFilter {
             return None;
         }
         let a = keys.as_primitive::<Int64Type>();
+        // The extremes come from arrow's own null-skipping SIMD reduction rather than the
+        // digest loop, because they decide *which* digest to run — and because a build side
+        // that turns out to be sparse should not have paid for a hash-set insert per row on
+        // the way to finding that out. `None` here is an empty or all-null key column.
+        let (lo, hi) = match (arrow_min(a), arrow_max(a)) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => return None,
+        };
+        // `i128` because `hi - lo` overflows `i64` on the extremes, and a span that wide is
+        // refused rather than wrapped into a small one.
+        let span = (hi as i128 - lo as i128 + 1) as u128;
+        let rows = a.len() - a.null_count();
+        if span <= dense_span_budget(rows) {
+            return Some(Self::dense(a, lo, hi, span));
+        }
+        Self::sparse(a, lo, hi)
+    }
+
+    /// The bitmap digest: one bit per key in `[lo, hi]`, set from the build side in one pass.
+    fn dense(a: &arrow::array::Int64Array, lo: i64, hi: i64, span: u128) -> Self {
+        let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        let mut distinct = 0usize;
+        let mut set = |v: i64| {
+            // In range by construction: `lo <= v <= hi` for every non-null build key.
+            let offset = (v as i128 - lo as i128) as usize;
+            let word = &mut bits[offset >> 6];
+            let mask = 1u64 << (offset & 63);
+            distinct += usize::from(*word & mask == 0);
+            *word |= mask;
+        };
+        match a.nulls() {
+            // The null-free case reads the values buffer straight through — no per-row validity
+            // branch, which is the shape a foreign-key column actually has.
+            None => a.values().iter().copied().for_each(&mut set),
+            Some(nulls) => {
+                for i in nulls.valid_indices() {
+                    set(a.value(i));
+                }
+            }
+        }
+        Self {
+            lo,
+            hi,
+            keys: KeySet::Dense(bits),
+            distinct,
+        }
+    }
+
+    /// The hash-set digest, for a span too sparse to bitmap. Bounded by [`MAX_DISTINCT_KEYS`].
+    fn sparse(a: &arrow::array::Int64Array, lo: i64, hi: i64) -> Option<Self> {
         let mut set: HashSet<i64, ahash::RandomState> = HashSet::default();
-        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
         for i in 0..a.len() {
             if a.is_null(i) {
                 continue; // a null key matches nothing; it is not part of the set
             }
-            let v = a.value(i);
-            lo = lo.min(v);
-            hi = hi.max(v);
-            set.insert(v);
+            set.insert(a.value(i));
             if set.len() > MAX_DISTINCT_KEYS {
                 // Give up here rather than at the end: this is what keeps the digest's cost
                 // proportional to how useful it can be, instead of to the build side's size.
                 return None;
             }
         }
-        if lo > hi {
-            return None; // no non-null keys at all
-        }
-        Some(Self { lo, hi, keys: set })
+        let distinct = set.len();
+        Some(Self {
+            lo,
+            hi,
+            keys: KeySet::Sparse(set),
+            distinct,
+        })
     }
 
     /// Whether a probe key matches a build key.
@@ -128,7 +243,13 @@ impl KeyFilter {
     /// `[lo, hi]` guard short-circuiting a lookup whose answer would have been `false` anyway.
     #[inline]
     fn may_match(&self, key: i64) -> bool {
-        key >= self.lo && key <= self.hi && self.keys.contains(&key)
+        // The `[lo, hi]` guard runs first for both representations: it rejects an out-of-range
+        // key with two predictable compares, and it is what makes the bitmap offset in bounds.
+        if key < self.lo || key > self.hi {
+            return false;
+        }
+        let offset = (key as i128 - self.lo as i128) as usize;
+        self.keys.contains(key, offset)
     }
 
     /// A mask over `probe`: `true` where the key may match, `false` where it provably cannot.
@@ -157,13 +278,25 @@ impl KeyFilter {
 
     /// Distinct build keys held — the ceiling on how many probe keys can survive the filter.
     pub fn distinct_keys(&self) -> usize {
-        self.keys.len()
+        self.distinct
     }
 
     /// The build keys' `[min, max]`.
     pub fn bounds(&self) -> (i64, i64) {
         (self.lo, self.hi)
     }
+}
+
+/// The widest span a bitmap may cover for a build side of `rows` non-null keys.
+///
+/// Both bounds are load-bearing and they answer different questions.
+/// [`DENSE_SPAN_PER_ROW`] asks "is the bitmap the smaller of the two exact representations?",
+/// which is what makes the choice self-justifying rather than tuned. [`MAX_DENSE_SPAN`] asks
+/// "is it an amount of memory worth naming?", which the relative bound alone cannot: at
+/// [`MAX_BUILD_ROWS`] the ratio would admit 32 GiB. [`MIN_DENSE_SPAN`] keeps a small, slightly
+/// gappy build side on the cheaper structure instead of refusing it over a few hundred bytes.
+fn dense_span_budget(rows: usize) -> u128 {
+    ((rows as u128).saturating_mul(DENSE_SPAN_PER_ROW)).clamp(MIN_DENSE_SPAN, MAX_DENSE_SPAN)
 }
 
 #[cfg(test)]
@@ -259,13 +392,75 @@ mod tests {
         assert!(f.mask(&probe).is_none());
     }
 
-    /// Past the distinct-key cap the build side is abandoned rather than approximated — this
-    /// is the guard that stopped TPC-H q4 paying 236 ms for a filter that removed nothing.
+    /// Past the distinct-key cap a **sparse** build side is abandoned rather than approximated
+    /// — this is the guard that stopped TPC-H q4 paying 236 ms for a filter that removed
+    /// nothing. The keys are spread far enough apart that the bitmap cannot take them, which is
+    /// what makes this a test of the cap rather than of the span budget.
     #[test]
-    fn a_high_cardinality_build_side_is_abandoned() {
+    fn a_high_cardinality_sparse_build_side_is_abandoned() {
         let n = MAX_DISTINCT_KEYS + 1;
-        let keys: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64)).collect();
+        let stride = (DENSE_SPAN_PER_ROW as i64) * 4;
+        let keys: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64 * stride)).collect();
         assert!(filter_of(keys).is_none());
+    }
+
+    /// The same cardinality, *densely* packed, is digested — the cliff this module's second
+    /// representation exists to remove. A contiguous surrogate key is the shape a real join
+    /// has, and it used to be refused for the sole reason that it had more than
+    /// [`MAX_DISTINCT_KEYS`] of them.
+    #[test]
+    fn a_high_cardinality_dense_build_side_is_digested() {
+        let n = MAX_DISTINCT_KEYS * 4 + 1;
+        let keys: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64)).collect();
+        let f = filter_of(keys).expect("a dense key must digest past the sparse cap");
+        assert_eq!(f.distinct_keys(), n);
+        assert_eq!(
+            mask_of(
+                &f,
+                vec![Some(0), Some(n as i64 - 1), Some(n as i64), Some(-1)]
+            ),
+            vec![true, true, false, false]
+        );
+    }
+
+    /// Both representations answer identically over the same key set, including the in-range
+    /// gaps that are the only place an approximate filter would differ. This is the property
+    /// that makes the choice of representation invisible in the result.
+    #[test]
+    fn the_two_representations_agree_exactly() {
+        // Same keys, two spans: one inside the bitmap budget, one far outside it.
+        let members: Vec<i64> = (0..2_000).map(|i| i * 3).collect();
+        let dense = filter_of(members.iter().map(|&k| Some(k)).collect()).expect("dense");
+        let sparse_keys: Vec<i64> = members
+            .iter()
+            .map(|&k| k * (DENSE_SPAN_PER_ROW as i64) * 8)
+            .collect();
+        let sparse = filter_of(sparse_keys.iter().map(|&k| Some(k)).collect()).expect("sparse");
+        assert!(matches!(dense.keys, KeySet::Dense(_)));
+        assert!(matches!(sparse.keys, KeySet::Sparse(_)));
+        assert_eq!(dense.distinct_keys(), sparse.distinct_keys());
+        // Probe every key and every gap between them, on each filter's own scale.
+        let probe_d: Vec<Option<i64>> = (0..6_000).map(Some).collect();
+        let probe_s: Vec<Option<i64>> = probe_d
+            .iter()
+            .map(|k| k.map(|k| k * (DENSE_SPAN_PER_ROW as i64) * 8))
+            .collect();
+        assert_eq!(mask_of(&dense, probe_d), mask_of(&sparse, probe_s));
+    }
+
+    /// A span wide enough to blow the absolute memory ceiling is refused a bitmap even though
+    /// the per-row ratio would allow it, and falls back to the exact set.
+    #[test]
+    fn the_absolute_span_ceiling_bounds_the_bitmap() {
+        let rows = 1_000_000usize;
+        assert!(dense_span_budget(rows) <= MAX_DENSE_SPAN);
+        // Two keys astride the whole i64 range must not wrap into a small span.
+        let f = filter_of(vec![Some(i64::MIN), Some(i64::MAX)]).expect("digestible");
+        assert!(matches!(f.keys, KeySet::Sparse(_)));
+        assert_eq!(
+            mask_of(&f, vec![Some(i64::MIN), Some(0), Some(i64::MAX)]),
+            vec![true, false, true]
+        );
     }
 
     /// A build side that is *large* but low-cardinality is still digested: it is exactly the

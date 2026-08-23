@@ -1,5 +1,467 @@
 # Batcher CPU benchmark results
 
+## A comma join's pseudo-key, a union that pinned its query to one core, and a UTF-8 check on bytes that were already valid — TPC-DS 0.970x -> 0.918x, and four more kernels at parity (2026-08-23)
+
+`python/batcher/plan/logical/transforms.py`; `crates/bc-interp/src/stream/parallel.rs`;
+`crates/bc-runtime/src/gather/mod.rs`.
+
+A second pass, aimed at the queries the entry below left losing. It went after TPC-DS rather
+than TPC-H because that is where the *ratios* were worst — 3x to 6x, which is the size that
+means a defect rather than DuckDB's compressed store.
+
+| suite | before | after |
+|---|---:|---:|
+| TPC-DS sf1 (99) | 0.970 | **0.918 / 0.920** |
+| TPC-H sf10 (22) | 1.118 / 1.115 | **1.066 / 1.078** |
+| TPC-H sf1 (22) | 0.759 | 0.746 |
+| ClickBench (43) | 0.614 | 0.603 |
+| operator mix | 0.763 | 0.740 |
+| JOB (113) | 1.265 | **1.185**, 40 of 109 |
+| JSON | — | 0.262, 5 of 5 |
+
+TPC-DS is **−238 ms across the 99**, TPC-H sf10 −55 ms across the 22. The kernel board is the
+clearer statement: of the twelve shapes tracked in `benchmarks/run.py --benchmark operators`
+plus the sf10 micro-set, `join-small-build` went 2.78x → **1.00x**, `gb-lowcard` 1.18x →
+0.97x, `gb-med` 0.78x → 0.65x, `gb-str-med` 1.01x → 0.89x and `join-big-build` 1.03x → 0.97x.
+Four remain: `gb-high` 2.61x, `join-2key` 2.53x, `filter-sum` 2.52x, `sort-1int` 2.43x.
+
+### 1. A comma join's `__cross_key` survived a `UNION ALL`, so the join ran on a composite key
+
+`constant_column_value` proves a column holds one literal in every output row, and
+`is_cartesian_key_pair` uses it to tell a comma/cross join's synthetic `__cross_key` from a
+real equi-key. It walked `Project`, the row-preserving operators and inner/semi/anti `Join` —
+but **not `Union`**, and projection pushdown moves `__cross_key = lit(1)` *into* each branch,
+so above a union the column is a bare `Col` with no `Project` left to prove it.
+
+`drop_redundant_cross_key` therefore could not fire, and the join kept
+`(__cross_key, date_sk) = (__cross_key, d_date_sk)`. That costs twice over: two `Int64` key
+columns route to `I64x2Keys` instead of `I64Keys`, forfeiting the dense direct map, and the
+constant column is materialized for every probe row. Measured at TPC-DS sf1 on the *same*
+15-row-build join over `store_sales`:
+
+| probe side | ms |
+|---|---:|
+| a plain scan | 5.7 |
+| a two-branch `UNION ALL` | **48.5** |
+
+A union's output rows are its branches' rows unchanged, so the column is constant exactly when
+every branch proves the *same* constant. Adding that arm took the union form to 32.1 ms.
+TPC-DS is written in comma-join syntax throughout and its sales/returns unions are everywhere.
+
+### 2. …and the remaining 32 ms was the union pinning the query to one core
+
+`spine_is_shardable` listed `Union` among the breakers it refuses, on the reasoning that a
+breaker handed one shard answers for one shard. That is right for `UNION DISTINCT` and wrong
+for `UNION ALL`, which is a **concatenation**: worker `k` taking shard `k` of every branch
+partitions the union's output exactly as one scan's shards partition a scan's. What changes is
+the interleaving, and nothing on a shardable spine can observe it — `Sort`, `Limit` and `RowId`
+are refused above, and the root `Aggregate`/`Distinct` merge their shards' partials.
+
+The refusal cost the *whole spine above it*, because `shardable_source` shards one driving scan
+and a union has several. Same join, same data:
+
+| probe side | ms | parallelism |
+|---|---:|---:|
+| a plain scan | 6.6 | 10.0x |
+| a `UNION ALL`, before | 35.1 | 3.2x |
+| a `UNION ALL`, after | **9.1** | 8.3x |
+
+Three pieces make it work, and the second is the one that bit: `spine_is_shardable` admits a
+`UNION ALL` whose branches are all shardable; `driving_scans` returns **every** driving source
+(refusing the union outright if any branch dead-ends, since sharding one branch and replaying a
+materialized other would duplicate rows); and the shard builder cuts each of them the same
+number of ways so worker `k` sees shard `k` of all.
+
+**`is_spine_breaker` had to keep saying yes for the other kind of union.** Excluding every
+`UNION ALL` from `materialize_spine_breakers` too — so the two decisions would agree — took
+TPC-DS **q67 from 232 ms to 2,447 ms**: `api.multi_group` lowers `ROLLUP`/`CUBE`/`GROUPING
+SETS` to a union of one `Aggregate` per level, an aggregate branch is not shardable, so that
+union was suddenly neither materialized (which is what ran its levels across cores) nor
+sharded. `materializable_spine_breaker` asks the shardability question there too, and the two
+now agree by construction rather than by coincidence.
+
+TPC-DS q5 140.1 → 67.7 ms, q54 58.2 → 21.6, q50 30.7 → 16.0, q76 29.2 → 18.7, q71 29.9 → 20.3.
+
+### 3. Every gathered string column was re-validated as UTF-8
+
+`GenericByteArray::try_new` runs `std::str::from_utf8` over the whole gathered buffer. Every
+byte gather in `bc_runtime::gather` copies **whole values** out of an already-validated array
+of the same type, so it re-derives a property the input had, at a price: on TPC-DS q57 — a
+query whose cost *is* a string gather — `try_new` (6.3 %) plus `core::str::from_utf8` (4.7 %)
+came to **11 % of the query**. Every `GROUP BY`, join and sort over a string column paid it.
+
+The four constructions now go through one `assembled` helper on `new_unchecked`, with the
+contract stated once. The offsets are still checked — `OffsetBuffer::new` verifies monotonicity,
+a pass over `n` integers rather than over the bytes — so the only property taken on trust is
+the one that is true by construction and expensive to confirm.
+`a_gathered_string_column_is_still_valid_utf8` reads every value back through `str` over 1-, 2-,
+3- and 4-byte code points, four index shapes and the concat path.
+
+TPC-DS q83 86.1 → 20.4 ms, q57 110.5 → 76.2, q77 79.2 → 54.7, q59 64.3 → 48.6.
+
+### 4. A gather whose indices are a contiguous run is a slice
+
+A hash join's **probe-side** index array is `0, 1, 2, …` whenever each probe row matches
+exactly once — every join to a dimension on a foreign key. TPC-H q9 has four joins and three
+are that shape. `contiguous_run` detects it and returns `col.slice(start, len)`.
+
+It is rejected in **O(1)** almost always (`last - first == len - 1` fails immediately for a
+scattered index), so a gather that is not a run pays a few comparisons. And it declines a run
+of **under half the column**: a slice keeps the whole parent buffer alive, so selecting a
+thousand contiguous rows out of sixty million would retain 480 MB — a gather that turns a
+bounded copy into an unbounded hold, which is the opposite of what the operators above it are
+budgeted for.
+
+### Measured again, and still not acted on: there is no right pool width
+
+The entry below records 46 threads beating the auto-selected 61 on three suites of four. With
+the four changes above in, the same sweep over the worst TPC-DS queries says the opposite as
+often as it agrees:
+
+| width | q5 | q77 | q47 | q78 | q22 | q67 |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 67.1 | **48.7** | **126.7** | 225.0 | 325.4 | 379.2 |
+| 46 | 67.8 | 70.8 | 143.6 | 220.2 | 184.3 | 218.8 |
+| 61 (auto) | 77.3 | 70.9 | 131.0 | **210.7** | **183.2** | **225.4** |
+
+q77 wants 16 and q22 wants 61, by 1.8x in each direction. A single constant cannot serve both,
+which is what the previous entry concluded from four suites and this confirms query by query.
+The fix is a width chosen per *operator*, and `pool_for`'s width-keyed pool cache plus
+`current_num_threads()`-driven shuffle bucketing both stand in the way.
+
+### What is left, and why
+
+TPC-H sf10's remaining gap is **q9 (+262 ms), q21 (+230), q13 (+188)** — 68 % of it. All three
+profile the same way: q21 is **46 % grouped aggregation** (`agg::partial`, `combine::gather`,
+`int_group_ids`) and q9 is **38 % gather** (`take_primitive_parallel` plus its memmove). The
+two remaining kernels behind them, `gb-high` (2.61x) and `join-2key` (2.53x), are the
+high-cardinality group-by's partition pass and the composite-key join's un-dense-mappable
+probe. Neither is a threshold; both are algorithm work.
+
+`filter-sum` (2.52x) is not: 60 M rows over two `Float64`/`Int64` columns is 960 MB, and at
+18.4 ms Batcher is reading it at 52 GB/s where DuckDB reads a delta-compressed `l_shipdate` and
+a zone map. That one is invariant #3, and it should be quoted as such rather than as a kernel
+gap — `duckdb_arrow`, which reads the same Arrow, takes 98 ms.
+
+## Four ceilings: a join's key filter, its cost model's build:probe ratio, a float compare, and eight pyarrow IO threads — TPC-H sf10 1.226x -> 1.117x, S3 image ingest 2.4x (2026-08-22)
+
+`crates/bc-runtime/src/join/key_filter.rs`; `python/batcher/kyber/calibration.py`;
+`crates/bc-expr/src/eval/binary.rs`; `python/batcher/io/filesystem.py`;
+`python/batcher/plan/source_stats.py`.
+
+Four separate findings. The first three were reached by profiling the sf10 board rather than
+the sf1 one — at sf1 every query is a few milliseconds of fixed cost and the kernels do not
+show. The fourth came from the `images` suite, and is the largest single number here.
+
+**TPC-H sf10, `b/duckdb` geomean, two runs before and two after on the final tree:**
+1.227 / 1.225 → **1.118 / 1.115**. Wins 5-6 of 22 → 7-8. Against `duckdb_arrow` — the same
+zero-copy Arrow, which is the like-for-like execution bar — 0.331 → 0.297, and the *only*
+query Batcher still loses on identical input is q13 (1.84x). Everything else in the sf10 gap
+is DuckDB's compressed native store, which the Arrow-only contract has no answer to; say so
+rather than implying the executor is behind.
+
+Per query (batcher ms, best of the two after-runs):
+
+| q | before | after | | q | before | after |
+|---|---:|---:|---|---|---:|---:|
+| q18 | 372.4 | **243.0** (-34.7%) | | q9 | 550.9 | **466.7** (-15.3%) |
+| q20 | 110.9 | **81.5** (-26.5%) | | q5 | 222.3 | 188.5 (-15.2%) |
+| q21 | 661.1 | **526.9** (-20.3%) | | q8 | 117.8 | 105.6 (-10.4%) |
+| q7 | 140.1 | **112.0** (-20.1%) | | q17 | 70.8 | 65.1 (-8.1%) |
+| q3 | 142.5 | **116.4** (-18.3%) | | q13 | 345.1 | 320.4 (-7.2%) |
+| q19 | 88.7 | **74.3** (-16.2%) | | q4 | 122.1 | 114.4 (-6.3%) |
+
+**Nothing regressed.** The two queries that moved the wrong way are q12 (+3.7 %) and q2
+(+2.0 %), both inside this box's run-to-run band; every other query is flat or faster.
+
+The rest of the sweep, same tree, for the record — every suite run and every correctness gate
+green except the two failures named at the end: TPC-H sf1 **0.759** (18 of 22),
+TPC-DS sf1 **0.970** (39 of 99), ClickBench **0.614** (31 of 43) and **0.076** against
+`duckdb_arrow` (43 of 43), the operator mix **0.763**, JSON **0.01-0.43x**, JOB **1.265**
+(37 of 109) and **0.397** against `duckdb_arrow` (106 of 109), H2O `join` 5 cases (four wins,
+q5 1.61x), H2O `groupby` 10 cases (five wins). CloudSort is **9x-25x** ahead of DuckDB on the
+Sort Benchmark record shape and the geospatial suite **1.3x-13x** ahead of DuckDB spatial, both
+on identical Arrow.
+
+**A measurement caveat that cost an hour here.** TPC-H sf1 reads 0.719 before and 0.759 after,
+which looks like a regression and is not: Batcher's *absolute* sf1 times are flat to within
+3 % across every run, and what moved is DuckDB (q9 62.5 → 54.3 ms, q13 50.9 → 42.1, q18
+38.6 → 32.9) on a box that got quieter between the two. At sf1 every query is a few
+milliseconds and the comparator's own variance is the whole signal. Read sf1 as absolute ms or
+not at all; the ratios there are noise.
+
+### 1. A join's key filter was refused for having 65,537 distinct keys, and the cliff was sheer
+
+`bc_runtime::join::KeyFilter` digests a build side's key set so the probe pipeline can drop
+non-matching rows **at the scan**, before every predicate and copy above it. It refused any
+build side past `MAX_DISTINCT_KEYS` (65,536), because the digest was a `HashSet<i64>` and a
+hash set of a million keys is a megabyte of random-access probe target.
+
+The refusal is a step function, and stepping across it is expensive. TPC-H sf10
+`lineitem ⋈ part` with the build narrowed to N distinct part keys, everything else identical:
+
+| distinct build keys | 20,000 | 40,000 | 62,500 | **66,666** | 100,000 | 200,000 |
+|---|---:|---:|---:|---:|---:|---:|
+| before | 29.3 | 33.1 | 36.6 | **74.7** | 77.7 | 84.5 |
+| after | 30.1 | 25.3 | 27.8 | **28.4** | 31.3 | 37.5 |
+
+`p_name LIKE '%green%'` — q9's own filter — keeps 108,782 parts and landed on the wrong side
+of it, at 2.5x.
+
+The fix is a second **exact** representation chosen by the key's *span*: a bitmap over
+`[lo, hi]`, one bit per key. A surrogate join key is dense by construction, so for
+`p_partkey`/`o_orderkey`/`s_suppkey` the bitmap is both the smaller structure and the cheaper
+one — no hashing on either side, one load and a shift to probe. The choice is self-justifying
+rather than tuned: the bitmap is taken exactly when it is smaller than the hash set would be
+(`span < 64 x rows`, the crossover of `span/8` against hashbrown's ~10.3 bytes per key),
+under an absolute 32 MiB ceiling so the memory is a stated number. Both arms are exact, so
+which one a build side gets is invisible in the result — pinned by
+`the_two_representations_agree_exactly`, which probes every key and every gap between them on
+both.
+
+Note what did **not** need to change: the downside guard. `stream::runtime_filter`'s `Gauge`
+already switches off a filter that is not removing rows, and `apply` already declines the copy
+per morsel. Those are what made it safe to admit far more build sides; the distinct-key cap
+was guarding a cost the runtime already bounds.
+
+### 2. The build-side rule turns on a ratio between two coefficients fitted from different families
+
+The headline symptom was that **TPC-H sf10 q9 took 573 ms alone and 1,215 ms if q5 or q8 had
+run first in the same process**, with a byte-identical binary and the same data. Running the
+suite twice put q9 anywhere between 490 ms and 1,215 ms depending on nothing the query could
+see, which is also why an A/B of anything else on this suite was unreadable.
+
+The plan changes, and in one place: `hash_join(left≈3,419,275, right≈15,000,000)` reads
+`swap build→left` alone and `keep` after q5 — it hashes the **15 M-row `orders`** instead of
+the 3.4 M-row intermediate. `selection.py` chooses that orientation by comparing
+`hash_build_row x build + hash_probe_row x probe x cache_factor` against the same expression
+with the sides exchanged. The two sides swap which coefficient multiplies which relation, so
+the decision is a pure function of the **ratio** of the two coefficients.
+
+That ratio was fitted from two unrelated operator families. `calibration._KIND_COEFF` mapped
+`aggregate → hash_build_row` and `hash_join → hash_probe_row`, and the join's single-term fit
+divides the whole operator's wall time — build *and* probe — by the probe rows alone, so
+`hash_probe_row` silently absorbs the build. Measured: q5 takes it from 1.0 to 3.36 while
+`hash_build_row` sits at its 2.0 default, and the ratio goes 2.0 → 0.60.
+
+The note that stood above `_KIND_COEFF` argued this was harmless *because* it is uniform —
+"join-order and build-side choices, which compare joins with joins, are largely unaffected".
+It is exactly backwards, and it is the only claim in that comment the measurement contradicts.
+
+Three changes, in the order they were needed:
+
+- **`_fit_join_terms` fits both coefficients from one regression over the join family**, using
+  the `n_build` and `n_input` `ExecMetrics` already records. Solved in *relative* form (every
+  equation divided by its own measured time) for the same reason `_anchor` takes a median
+  rather than a ratio of sums: an absolute least squares is weighted by `work²` and is decided
+  by the largest joins in the history. Declines when the two bases are too collinear to
+  separate.
+- **`_JOIN_FIT_MIN_ROWS` (131,072) excludes a join whose time is its launch.** `nation` at 25
+  rows and `region` at 5 are most of the joins an analytical plan issues; one such sample read
+  `build=624, probe=624, t=1.44 ms`, which as a per-row equation asks for costs twenty times
+  anything physical. A median ignores that; a regression does not. This is the one respect in
+  which the two-term form is *more* fragile than what it replaces, so it is guarded explicitly.
+- **`_hold_build_above_probe` floors the ratio at the shipped 2:1.** Calibration may scale the
+  join family freely — that is what puts a join beside a scan on one axis — but it may not
+  compress the ratio, because nothing in the measurements identifies it downward: `t_op_ms` for
+  a **fused** join is a pipeline segment's time, the scan and filter feeding the probe pulled
+  through it, so the residual the regression minimizes is not a function of the two row counts
+  it regresses on. The floor is one-sided; where the data supports a dearer build the fit takes
+  it, and 4x-6x is what this workload actually produces. It has to be applied to what is
+  *served*, not only inside the fit: `_settled` smooths each field independently and reopened
+  an inversion the fit had just closed, at 0.94.
+
+q9 after the fix, through the harness, same prefixes: **532 / 486 / 520 / 533 ms** after
+nothing, q5, q8 and q18 — the spread is the box, not the prefix.
+
+### 3. A float comparison paid a canonicalizing pass and `total_cmp`, and needed neither
+
+Every float comparison rewrote **both operands** through `bc_arrow::canon_float_array` — a
+full scan looking for a `-0.0` or a NaN — and then compared with arrow's `cmp`, which ranks
+floats by `total_cmp`. On a 60 M-row two-predicate filter the canonicalizing scan alone
+profiled at **10.9 %** and the comparison kernel at **39 %**.
+
+Against a scalar neither is necessary, and the reason is a predicate choice rather than an
+optimization. IEEE already folds the two zeros (`-0.0 == 0.0`, and both sit on the same side
+of every other value), so canonicalization changes no comparison's answer; only `total_cmp`,
+which orders them apart and which nothing here needs, made it look required. NaN is the whole
+of the real difference: canonicalizing sends every NaN to `+qNaN`, which ranks above `+inf`,
+so against a non-NaN literal a NaN row answers *false* to `<`/`<=` and *true* to `>`/`>=`.
+IEEE agrees on the first pair and disagrees on the second — which the **negated** form fixes,
+because `!(v <= lit)` is true for a NaN and equals `v > lit` for everything else. That is one
+unordered-or-greater compare, a single instruction on every SIMD target.
+
+`fused_predicate_equals_canonicalize_then_compare` holds it to the path it replaces over both
+zeros, both NaN signs, a second NaN payload, both infinities and a null, for all six
+comparisons, both operand orders and both float widths. A **NaN literal** is the one value it
+declines (`canon(NaN) == canon(NaN)` is true where IEEE says false) and keeps the old path.
+The Cranelift tier is unaffected: `emit::canon_total_order_key` reproduces canonicalize-then-
+`total_cmp` exactly, and the new path is proven equal to that, so invariant #6 still holds.
+
+`canon_float_array` disappears from the profile of a float predicate. It is not visible in
+q6's wall time, which is dominated by the date comparisons and by the short-circuit filter's
+compaction gathers (24 % in `take_native`) — a separate, unaddressed cost recorded below.
+
+### 4. Every remote read in the engine queued behind eight pyarrow threads
+
+`python/batcher/io/filesystem.py`.
+
+The `images` suite reads 1,000 JPEGs from S3. Batcher took **1,467 ms** where Daft's native
+object-store client took 694, and `img-decode`/`img-resize` took the *same* time as
+`img-list` — decode was free and the read was everything. On the identical corpus held
+locally (`benchmarks/scenarios/image_decode.py`) Batcher is **1.98x faster than Daft** and
+16.85x faster than Ray Data, so it was not the decoder.
+
+`io._concurrent.read_each_file` fans 64 blob reads across a `ThreadPoolExecutor`, and every
+one of them then queues inside `S3FileSystem.open_input_file` behind **pyarrow's global IO
+thread pool, which defaults to 8**. The engine's own concurrency knob could not see it:
+raising `BATCHER_FOOTER_CONCURRENCY` from 64 to 1024 moved the read by under 5 %, because the
+requests were never the bound. Nor was the network — a raw `pyarrow.fs` probe over the same
+1,000 objects read 1,460 ms at 32, 128 *and* 256 Python threads, flat, which is the shape of
+a queue rather than a link.
+
+| pyarrow IO threads | 8 (default) | 64 | 256 |
+|---|---:|---:|---:|
+| 1,000 S3 JPEGs, `read.images(...).collect()` | 1,467 ms | **603 ms** | 596 ms |
+
+Lifted to 64 — the width `read_each_file` already fans out to, so it is the engine's own
+number rather than a tuned one — on **first remote filesystem resolution**, only ever
+upwards, and never over an explicit `ARROW_IO_THREADS`. A local-only session is untouched;
+the pool is process-global and shared with everything else in the interpreter, which is why
+it is not raised at import.
+
+The `images` suite, 1,000 images from S3, before → after:
+
+| case | batcher before | batcher after | daft | b/daft after |
+|---|---:|---:|---:|---:|
+| `img-list` | 1546 | **625** | 669 | 0.93x |
+| `img-decode` | 1509 | **660** | 672 | 0.98x |
+| `img-resize` | 1583 | **671** | 681 | 0.99x |
+
+From losing decode and resize by 2.2x and 2.5x to winning all three.
+
+### Also run: the scan suite, where the many-small-files layout is no longer the weak one
+
+Three parquet layouts at scale 1 from S3, `b/duckdb`:
+
+| shape | many_small (1,024 files) | ideal (8 files) | one_big (1 file) |
+|---|---:|---:|---:|
+| count / minmax | **0.11x / 0.12x** | 0.73x / 0.64x | 0.48x / 0.39x |
+| sum1 | **0.47x** | 1.56x | 1.51x |
+| sumwide (16 cols) | 1.36x | 2.15x | 2.04x |
+| filter / filter_agg | **0.60x / 0.63x** | 2.38x / 2.53x | 2.50x / 2.52x |
+| groupby / distinct / topn | **0.42x / 0.63x / 0.55x** | 1.22x / 1.30x / 1.94x | 1.79x / 1.40x / 1.45x |
+
+Batcher wins **8 of 9** on the many-small corpus the README calls its largest gap, and loses
+6 and 7 of 9 on the two few-large-file layouts. The gap has moved: it is no longer file
+handling, it is the Parquet **decoder's CPU** on a wide or filtered read, which is what the
+2026-08-21 entry below concluded off the network and is untouched by this session.
+
+### Measured and not acted on: the operator pool is 61 threads and three suites of four want 46
+
+`crossbeam_epoch::pin` + `try_advance` + `steal` are **22.9 % of TPC-DS q5** — idle rayon
+workers spinning, not work. `auto_width` resolves to `operator_cores()` = 61 here (46 physical
++ a third of the SMT siblings), bounded by the *widest leaf's* morsel count, so a query that
+touches one 2.9 M-row table runs every one of its small operators 61 ways.
+
+Pinning the width to 46 (`BATCHER_EXECUTION_PARALLELISM`), alternating arms, `b/duckdb`
+geomean:
+
+| suite | 61 (auto) | 46 |
+|---|---:|---:|
+| TPC-DS sf1 (99) | 0.971 / 0.974 | **0.952 / 0.944** |
+| ClickBench (43) | 0.638 | **0.619** |
+| operators (21) | 0.673 | **0.658** |
+| TPC-H sf10 (22) | **1.136 / 1.159** | 1.213 / 1.137 |
+
+163 queries prefer the narrower pool by 2-3 %, 22 prefer the wider one — and the 22 are at the
+scale where Batcher already loses by the most, which is the wrong place to spend a trade. The
+split is not noise, it is the shape of the answer: narrow wins where per-operator work is
+small and wide wins where it is large, so **there is no single right constant** and the
+existing one is a defensible middle. The real fix is a width chosen per *operator* rather than
+per query, which `pool_for`'s width-keyed pool cache and `current_num_threads()`-driven shuffle
+bucketing both stand in the way of. Left alone, with the numbers, rather than moved on one
+suite's evidence.
+
+### Measured and not acted on: the outer-join rename is 3.8x on the join and 2x worse on the query
+
+`kyber/rules/selection.py` records that `A LEFT JOIN B == B RIGHT JOIN A` "was tried but
+regressed", and blames the cost model's build:probe ratio — the ratio fixed above. So it was
+tried again. TPC-H sf10, the same relation in four spellings:
+
+| spelling | ms |
+|---|---:|
+| `customer LEFT JOIN orders` (as written; hashes the 15 M side) | 225.9 |
+| `orders RIGHT JOIN customer` (renamed; hashes the 1.5 M side) | **58.8** |
+| `customer INNER JOIN orders` (the inner arm already swaps) | 19.7 |
+
+**The recorded reason is not the reason.** The small build is 3.8x faster, calibrated ratio or
+not. What the rename costs is the **order of the join's output**: the runtime probes its left
+input and emits in probe order, so the join as written comes out clustered by `c_custkey` — and
+q13's next operator is `GROUP BY c_custkey`, which on clustered input takes
+`agg::group::runs`' sorted-key short-circuit and costs almost nothing. Renamed, the same
+group-by sees 15 M rows in `orders` order, falls to the partition path, and gathers the whole
+wide relation.
+
+| | join | + `GROUP BY c_custkey` | q13 end to end (harness) |
+|---|---:|---:|---:|
+| as written | 225.9 ms | 305 ms (group-by ~26 ms) | **357 ms** |
+| renamed | **58.8 ms** | 741 ms (group-by ~628 ms) | 725 ms |
+
+167 ms off the join for 600 ms onto the aggregate, and `op_cost` prices neither, because an
+output's *sortedness* is not one of its terms. Reverted; the comment at the decision site now
+carries the mechanism and the numbers, so the next attempt starts from those rather than from
+the join microbenchmark, which says "obviously yes". Taking it needs interesting-orders in the
+cost model, which is a design addition rather than a threshold — and it is the same missing
+term that would let q13 close its 1.84x, the only sf10 query Batcher loses on identical input.
+
+### Also observed, not this session's work
+
+- **TPC-DS sf1 completes at 0.977 geomean, 42 wins of 99**, two engines. With **four**
+  (`batcher,duckdb,duckdb_arrow,polars`) it was **OOM-killed at 143 GB RSS** around q64 on a
+  184 GB box; q64 alone runs in 2.7 ms. That is a property of holding four engines' materialized
+  state for 99 queries in one process, not of any query — but it is why the recorded TPC-DS
+  numbers here are a two-engine run.
+- **`tpcds-q67` still fails the correctness gate**, `column 'rk'` off by one. Already diagnosed
+  in this file (2026-08-08): `sources/tables.py::_normalize_types` casts TPC-DS's `DECIMAL(7,2)`
+  to float64, `rank()` turns the resulting last-bit reassociation difference into a different
+  integer, and against the source decimal types all 100 rows match exactly. Not re-diagnosed.
+- **`tests/integration` is red at `HEAD`: 16 tests across 8 files**, every one of them on the
+  Ray/distributed or streaming-inference path — which is exactly what the contract says CI
+  cannot see, because CI installs no Ray. Run a file per process, the other 224 files pass.
+
+  | file | failures |
+  |---|---:|
+  | `test_row_callback_distributed.py` | 4 |
+  | `test_distributed_scheduling.py`, `test_stream_inference.py` | 3 each |
+  | `test_distributed_sample_and_range_join.py` | 2 |
+  | `test_distributed_feedback.py`, `test_distributed_no_materialize.py`, `test_ml_distributed.py`, `test_shuffle_replication.py` | 1 each |
+
+  The most informative one is
+  `test_distributed_shuffle_join_records_feedback_and_matches_single_node`: it asserts the
+  co-partitioned reduce records 32 build rows and gets **64** — the count a *broadcast* probe
+  produces, where every task sees all 32, which is precisely what the test's own comment says
+  it exists to rule out. So the shuffle reducer it claims to cover is not what runs, despite
+  its `broadcast_max_bytes=1`. That is a coverage hole in the distributed join, not a timing
+  wobble.
+
+  **Proven pre-existing rather than assumed**: `git archive HEAD crates` built in a scratch
+  directory with `cargo build --release -p bc-py`, dropped into a `git archive HEAD python
+  tests` sandbox, reproduces all 16 identically. None is reachable from this session's changes
+  anyway — the key filter is gated at 16 M source rows where these fixtures hold thousands,
+  and the float predicate cannot fire on an `Int64` join key — but the isolated build is what
+  settles it rather than that argument.
+
+  A third thing to know before running these: batching several Ray-using files into one
+  pytest process under `RAY_ADDRESS=local` fails 7 of them with `ray.init twice`, and all 7
+  pass one-file-per-process. Run `tests/integration` a file at a time or the failure list is
+  about the harness.
+
+- **`tpch-q6` FAILS the gate on Daft's answer, at both scales** — sf1 `revenue`
+  123,141,078 (DuckDB, and Batcher) against 75,207,768 (Daft), sf10 1,230,113,636 against
+  752,448,391. Daft's engine, not Batcher's; the harness names the culprit correctly, and it
+  is the only correctness failure in the whole sweep besides the known q67.
+
 ## JOB has a like-for-like figure for the first time: 0.404x, 106 of 109 — and it is the weakest bar in the set (2026-08-22)
 
 `docs/architecture/internals/competitive_architecture.md`.

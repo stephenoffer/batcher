@@ -60,10 +60,29 @@ is confirmed:
 
 * **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
 * **Single-node ≥100M rows (vs DuckDB): L** — still L, and the boundary is now located rather
-  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is **1.27x**, a loss, where sf1 is 0.78x.
+  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is a loss, where sf1 is 0.78x.
   Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
   q13 12.7x, q18 12.5x, q9 11.2x), and those four carry the highest-cardinality group-bys and
   the largest intermediates in the benchmark.
+
+  **The sf10 figure is 1.07x, not the 1.27x recorded here** (2026-08-23): six runs across two
+  passes read 1.227 / 1.225 → 1.118 / 1.115 → 1.066 / 1.078, with 8-10 of 22 won. What moved is
+  in `benchmarks/BENCHMARK_RESULTS.md`; q18, q20, q21, q7, q3 and q9 carry most of it. Read the
+  row as *still a loss, and a much smaller one*.
+
+  **TPC-DS sf1 moved with it, and further: 0.970 → 0.918**, 43 of 99 won, and the Join Order
+  Benchmark 1.265 → **1.185** (40 of 109). Two thirds of what remains at sf10 is three queries
+  — q9, q21, q13 — and they profile as one thing each: a high-cardinality grouped aggregate and
+  a join-output gather.
+
+  **How much of the residual is storage rather than execution is now answerable**, and the
+  answer is: nearly all of it. Against `duckdb_arrow` — DuckDB executing the same zero-copy
+  Arrow — the same sf10 run is **0.297x, and the only query Batcher loses is q13** (1.84x).
+  JOB reads the same way: 1.185x against the native store and **0.383x against the same Arrow**,
+  106 of 109.
+  So the sf10 gap against the native store is DuckDB decompressing a dictionary/RLE column
+  where Batcher reads full Arrow, which is invariant #3 and not a kernel deficit. State the
+  row with both numbers or it reads as an execution loss it is not.
 * **The Join Order Benchmark now completes.** This document's ceiling on it was recorded when
   two runs were OOM-killed; all 113 queries now run with none killed (geomean 1.37x, 31
   wins), and `job-q7c` — the query that took the process down — is a **win** at 291 ms against

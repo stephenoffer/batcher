@@ -78,22 +78,29 @@ def live_coefficients(hub: MetadataHub | None) -> CostCoefficients | None:
 # signal); `hash_probe_row` from `hash_join`. The remaining coefficients (`output_row`,
 # `map_row`, `bytes_per_row`) have no clean single-family signal and keep their defaults.
 #
-# **The join's basis is its probe side alone, and the fit absorbs its build time anyway.**
-# `_samples` prefers `n_input`, which `ExecMetrics` narrowed to the probe rows when it gained
-# a separate `rows_build` (so that a join's `selectivity` means fan-out rather than nothing).
-# The numerator is still `t_op_ms`, the whole operator's wall time — build *and* probe — so
-# the fitted `hash_probe_row` is that whole time spread over probe rows, and
-# `cost.model._join_cost` then charges `hash_build_row x build_rows` on top of it. A
-# calibrated join is therefore priced above what it was measured to take, by its build term.
+# **A join fits BOTH of its coefficients, together, from the join family** — see
+# [`_fit_join_terms`]. This entry is the single-term fallback for when that regression is not
+# identifiable, and the reason the two-term form had to replace it is worth stating, because
+# the note that stood here argued the opposite.
 #
-# This is stated rather than corrected because correcting it is a cost-model retune, not a
-# bug fix: the honest form is a two-coefficient regression over `(build_rows, probe_rows)`
-# against `t_op_ms`, which changes how every join ranks against every non-join and has to be
-# measured (`python benchmarks/run.py`) rather than reasoned about. What bounds the damage
-# meanwhile is that it is *uniform* — every join is over-charged by the same term — so
-# join-order and build-side choices, which compare joins with joins, are largely unaffected;
-# what moves is a join weighed against an aggregate or a sort. `shrink` and `clamp_factor`
-# bound how far the fit can travel from the shipped default in any case.
+# The single-term fit divides the whole operator's wall time — build *and* probe — by the
+# probe rows alone, so `hash_probe_row` silently absorbs the build. That was recorded as
+# harmless on the grounds that it is *uniform*: "every join is over-charged by the same term
+# — so join-order and build-side choices, which compare joins with joins, are largely
+# unaffected". **That is exactly backwards.** The build-side rule compares the two
+# orientations of *one* join, and the two orientations swap which coefficient multiplies
+# which side: it keeps the current build iff
+# `hash_build_row x build + hash_probe_row x probe x cache` is smaller the other way round.
+# The decision is a pure function of the **ratio** of the two coefficients — and the ratio was
+# the one thing nothing fitted, because `hash_build_row` came from the `aggregate` family and
+# `hash_probe_row` from `hash_join`. Two unrelated families, one ratio, and a decision that
+# turns on it.
+#
+# Measured on TPC-H sf10 in one session: running q5 before q9 refits `hash_probe_row` from 1.0
+# to 3.36 while `hash_build_row` stays at its 2.0 default, taking the ratio from 2.0 to 0.60.
+# q9's `orders` join then prices building the **15,000,000-row** side below the 3,419,275-row
+# one and takes it: **q9 goes from 555 ms to ~1,200 ms**, and q8 before it does the same. The
+# plan is otherwise identical; only that one orientation flips.
 _KIND_COEFF: dict[str, str] = {
     "scan": "scan_row",
     "filter": "filter_row",
@@ -223,6 +230,11 @@ def calibrate(
     # would hand each the other's measurements.
     if cached is not None and cached[1] == fingerprint:
         coeffs = _settled(cached[2], coeffs)
+    # After the blend, not only inside the fit: `_settled` smooths every field independently,
+    # so it can re-open an inversion the fit had just closed. Measured — the fit clamped to
+    # `build == probe` and the blend against the previous fit's higher `probe` reopened it at
+    # 0.94. The invariant has to hold on what is *cached and served*.
+    coeffs = _hold_build_above_probe(coeffs)
     _CALIB_CACHE[hub] = (version, fingerprint, coeffs)
     return coeffs
 
@@ -346,11 +358,210 @@ def _calibrate(
         measured = median(per_row)
         updates[coeff] = clamp_factor(shrink(measured, c0, len(per_row), prior_strength), c0, clamp)
 
+    # Both join coefficients, from one regression over the join family — the fit that makes
+    # their *ratio* measured rather than an accident of which families happened to run. It
+    # overwrites whatever the single-term loop above put in `hash_probe_row` (and whatever the
+    # `aggregate` family put in `hash_build_row`), and declines when the two sides are too
+    # collinear to separate, in which case those single-term fits stand exactly as before.
+    joint = _fit_join_terms(
+        _join_samples(by_kind.get("hash_join", [])), defaults, k, min_samples, prior_strength, clamp
+    )
+    if joint:
+        updates.update(joint)
+
     speedup = _measured_jit_speedup(by_kind, defaults, cfg)
     if speedup is not None:
         updates["jit_speedup"] = speedup
 
     return dataclasses.replace(defaults, **updates) if updates else defaults
+
+
+def _hold_build_above_probe(coeffs: CostCoefficients) -> CostCoefficients:
+    """Keep the build:probe ratio at or above the shipped one, whatever the fits produced.
+
+    Calibration may scale the join family up or down — that is what it is for, and it is
+    what puts a join beside a scan or a sort on one axis. What it may **not** do is compress
+    the two coefficients' *ratio* below the shipped `hash_build_row / hash_probe_row`, which
+    is a statement about the hardware rather than about a workload: inserting a row into a
+    hash table does everything probing it does — hash the key, walk to its slot — and then
+    writes, may chain, and may grow the table. The shipped 2:1 is that fact, and it is
+    confirmed by this engine's own measurements (TPC-H sf10, `lineitem`-shaped probes: a
+    15,000,000-row build costs ~5.3e-5 ms/row against ~2.2e-5 ms/probe row, a ratio of 2.4).
+    The floor is one-sided: a workload whose builds really are dearer than that is free to
+    fit a higher ratio, and does — 4x to 6x is typical here.
+
+    Nothing in the measurements can identify the ratio downward, which is why the floor is
+    not merely prudent. `t_op_ms` for a **fused** join is a pipeline segment's time — the
+    scan and filter feeding the probe are pulled through it — so the residual the regression
+    minimizes is not a function of the two row counts it regresses on. The scale survives
+    that (it is one number over the family); the ratio does not.
+
+    The fits can nonetheless produce an inversion, and when they do the consequence is not a
+    mildly wrong cost, it is a wrong *plan*: the build-side rule keeps the current
+    orientation iff `build_row x build + probe_row x probe x cache` is smaller than the same
+    expression with the two sides exchanged, so a ratio below one tells it to hash the larger
+    relation. Measured on TPC-H sf10, that put q9's `orders` join on a 15,000,000-row build
+    instead of a 3,419,275-row one and doubled the query.
+
+    Two things can invert it. The single-term path fits the two coefficients from *different*
+    families (`aggregate` and `hash_join`), so nothing relates them. And the two-term
+    regression, which does relate them, reads `t_op_ms` for a **fused** join — a pipeline
+    segment whose scan and filter time is attributed to the join that pulls it — so its
+    residual is not purely a function of the two row counts it regresses on. Clamping here
+    costs nothing when the data is well behaved (the fit routinely lands at 3-10x, well above
+    the floor) and removes the failure mode when it is not.
+
+    Args:
+        coeffs: The coefficients about to be served.
+
+    Returns:
+        `coeffs` unchanged, or with `hash_build_row` raised to `hash_probe_row`.
+    """
+    shipped = CostCoefficients()
+    if shipped.hash_probe_row <= 0.0:
+        return coeffs
+    floor_ratio = shipped.hash_build_row / shipped.hash_probe_row
+    build = getattr(coeffs, "hash_build_row", 0.0)
+    probe = getattr(coeffs, "hash_probe_row", 0.0)
+    if build > 0.0 and probe > 0.0 and build < probe * floor_ratio:
+        return dataclasses.replace(coeffs, hash_build_row=probe * floor_ratio)
+    return coeffs
+
+
+def _join_samples(rows: list[dict]) -> list[tuple[float, float, float]]:
+    """Usable `(build_rows, probe_rows, work_units)` triples from the `hash_join` family.
+
+    Separate from [`_samples`] because the join is the one family whose cost has **two**
+    row bases, and the pair is what [`_fit_join_terms`] needs. `n_build` is the build side's
+    rows as `ExecMetrics` measured them and `n_input` is the probe side's; a row missing
+    either — an older record, or a join that reported no build — is dropped rather than
+    guessed at, since a guessed basis is what the two-term fit exists to stop relying on.
+
+    `work_units` is `t_op_ms / expr_factor`: the operator's time with the cost of the
+    expressions it evaluated divided out, exactly as [`_samples`] does, so the coefficient
+    measures the engine's per-row overhead rather than the workload's expressions.
+    """
+    out: list[tuple[float, float, float]] = []
+    for r in rows:
+        build = float(r.get("n_build") or r.get("rows_build") or 0.0)
+        probe = float(r.get("n_input") or r.get("rows_in") or 0.0)
+        t = float(r.get("t_op_ms", 0.0))
+        factor = float(r.get("expr_factor") or 1.0)
+        usable = build > 0.0 and probe > 0.0 and t > 0.0 and factor > 0.0
+        if usable and build + probe >= _JOIN_FIT_MIN_ROWS:
+            out.append((build, probe, t / factor))
+    return out
+
+
+# Rows a join must touch before its time is mostly *per-row* work rather than fixed cost.
+#
+# Every operator pays a launch: a rayon fan-out, a pool acquisition, a metrics record. On the
+# dimension joins an analytical plan is full of — TPC-H's `nation` at 25 rows, `region` at 5 —
+# that launch **is** the measurement. One such sample read `build=624, probe=624,
+# t=1.44 ms`, which as a per-row equation asks for a build plus a probe cost twenty times
+# anything physical, and a least squares has no way to disbelieve it. The single-term fits
+# above survive these because a median ignores an outlier; a regression does not, and that is
+# the one respect in which the two-term form is more fragile than what it replaces.
+#
+# The floor is where per-row work is an order of magnitude above the launch: at ~2.4e-5 ms
+# per probe row (measured on this engine), 131,072 rows is ~3 ms of work against a launch
+# well under one. Below it a join tells us about scheduling, not about hashing.
+_JOIN_FIT_MIN_ROWS = 1 << 17
+
+
+# How far from collinear the two join bases must be before the pair can be separated.
+#
+# The regression solves for `(build, probe)` per-row costs from samples of
+# `a x build + b x probe = t`. If every sample has the same build:probe ratio the two columns
+# are proportional and *any* `(a, b)` on a line through them fits equally well — the system is
+# singular and the answer is noise. The determinant of the normal equations, divided by the
+# product of the diagonals, is `1 - r^2` for the correlation `r` between the two columns; this
+# is the floor it must clear. 0.02 admits a fit only once the workload has shown joins with
+# genuinely different shapes, which is exactly when the ratio is knowable.
+_JOIN_FIT_MIN_CONDITION = 0.02
+
+
+def _fit_join_terms(
+    samples: list[tuple[float, float, float]],
+    defaults: CostCoefficients,
+    anchor: float,
+    min_samples: int,
+    prior_strength: float,
+    clamp: float,
+) -> dict[str, float]:
+    """Fit `hash_build_row` and `hash_probe_row` together from the join family.
+
+    The cost model prices a hash join as `hash_build_row x build_rows + hash_probe_row x
+    probe_rows x cache_factor + ...`, and the build-side rule chooses an orientation by
+    comparing that expression with its two sides exchanged. So the decision depends on the
+    two coefficients' **ratio**, and a ratio between two independently-fitted families is not
+    an estimate of anything (see the note above `_KIND_COEFF` for the 2.2x this cost on
+    TPC-H q9).
+
+    Fitting them from one regression over the same measurements makes the ratio measured.
+    Each sample contributes `a x build + b x probe = work`, and the system is solved in
+    **relative** form — every equation divided by its own `work`, so it reads
+    `a x (build/work) + b x (probe/work) = 1`. That is deliberate and mirrors why
+    [`_anchor`] takes a median rather than a ratio of sums: an absolute least squares is
+    weighted by `work^2` and is therefore decided by the largest joins in the history,
+    whose times are also the most variable. In relative form every join counts once.
+
+    `cache_factor` is **not** in the fit. The model multiplies the probe term by it, so the
+    fitted `hash_probe_row` absorbs the typical cache residency of the joins observed. That
+    is a bias shared by both orientations of every join, which is what the ratio needs; a
+    fit that modelled it would need the build side's bytes, which `op_stats` records only as
+    a peak.
+
+    Returns an empty mapping — leaving the single-term fits in place — when there is not
+    enough evidence, when the two bases are too collinear to separate
+    ([`_JOIN_FIT_MIN_CONDITION`]), or when either fitted cost comes out non-positive, which
+    is the arithmetic saying the data does not support a two-term model.
+
+    Args:
+        samples: `(build_rows, probe_rows, work_units)` from [`_join_samples`].
+        defaults: The shipped coefficients, used as the shrinkage prior and clamp centre.
+        anchor: Work units per millisecond, from [`_anchor`], so the fit lands on the same
+            scale as an unfitted family's default.
+        min_samples: Sample floor, shared with the single-term fits.
+        prior_strength: Pseudo-samples the shipped default is worth, shared likewise.
+        clamp: Maximum multiplicative distance a fit may travel from its default.
+
+    Returns:
+        `{"hash_build_row": ..., "hash_probe_row": ...}`, or `{}` to decline.
+    """
+    if len(samples) < min_samples or anchor <= 0.0:
+        return {}
+    build_prior = getattr(defaults, "hash_build_row", 0.0)
+    probe_prior = getattr(defaults, "hash_probe_row", 0.0)
+    if build_prior <= 0.0 or probe_prior <= 0.0:
+        return {}
+    suu = suv = svv = su = sv = 0.0
+    for build, probe, work in samples:
+        units = anchor * work  # the same units the default coefficients are expressed in
+        if units <= 0.0:
+            continue
+        u, v = build / units, probe / units
+        suu += u * u
+        suv += u * v
+        svv += v * v
+        su += u
+        sv += v
+    det = suu * svv - suv * suv
+    if det <= 0.0 or suu <= 0.0 or svv <= 0.0 or det < _JOIN_FIT_MIN_CONDITION * suu * svv:
+        return {}
+    a = (svv * su - suv * sv) / det
+    b = (suu * sv - suv * su) / det
+    if not (a > 0.0 and b > 0.0) or not (math.isfinite(a) and math.isfinite(b)):
+        return {}
+    n = len(samples)
+    return {
+        "hash_build_row": clamp_factor(
+            shrink(a, build_prior, n, prior_strength), build_prior, clamp
+        ),
+        "hash_probe_row": clamp_factor(
+            shrink(b, probe_prior, n, prior_strength), probe_prior, clamp
+        ),
+    }
 
 
 def _anchor(

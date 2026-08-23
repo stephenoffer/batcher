@@ -392,20 +392,51 @@ pub(crate) fn sample_n_batches(
 
     // Max-heap of the n smallest `(hash, row, batch, row_idx)` seen so far: the heap
     // top is the largest kept entry, evicted when a smaller one arrives.
-    let mut heap: BinaryHeap<(u64, OwnedRow, usize, usize)> = BinaryHeap::with_capacity(n + 1);
-    for (bi, b) in batches.iter().enumerate() {
-        let rows = converter.convert_columns(b.columns())?;
-        for ri in 0..b.num_rows() {
-            let r = rows.row(ri);
-            let entry = (fnv1a_seeded(r.as_ref(), seed), r.owned(), bi, ri);
-            if heap.len() < n {
-                heap.push(entry);
-            } else if entry < *heap.peek().expect("heap is full") {
-                heap.pop();
-                heap.push(entry);
+    //
+    // Built **across cores**, not in one pass. The encode + hash of every row is the whole
+    // cost here (a size-`n` heap absorbs only the survivors), and running it serially left a
+    // fixed-count `sample(n=...)` flat at 1.26x from 1 to 32 threads while every other
+    // breaker scaled — the one operator whose own doc-comment states the property that makes
+    // it splittable and then did not use it.
+    //
+    // Each chunk of batches keeps its OWN n-smallest and the chunk results are merged, which
+    // is exactly the merge the distributed path already performs across partitions ("each
+    // partition's n-smallest, then the global n-smallest"). It is identical to the serial
+    // result, not merely equivalent: the heap orders whole `(hash, row, batch, row_idx)`
+    // tuples, `(batch, row_idx)` is unique, so the order is *total* — and the n smallest of
+    // the union of per-chunk n-smallest sets are the n smallest overall, because a globally
+    // surviving row is also among its own chunk's n smallest. Peak memory is `threads x n`
+    // rather than `batches x n`, so chunking (not one heap per batch) is what keeps it bounded.
+    let p = rayon::current_num_threads().max(1);
+    let mut heap: BinaryHeap<(u64, OwnedRow, usize, usize)> = if p > 1 && batches.len() > 1 {
+        use rayon::prelude::*;
+        let per_chunk = batches.len().div_ceil(p);
+        let partials: Vec<BinaryHeap<(u64, OwnedRow, usize, usize)>> = batches
+            .par_chunks(per_chunk)
+            .enumerate()
+            .map(|(ci, chunk)| -> Result<_, InterpError> {
+                let mut h = BinaryHeap::with_capacity(n + 1);
+                for (k, b) in chunk.iter().enumerate() {
+                    sample_n_push_batch(&converter, &mut h, b, ci * per_chunk + k, n, seed)?;
+                }
+                Ok(h)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut merged = BinaryHeap::with_capacity(n + 1);
+        for part in partials {
+            for entry in part {
+                sample_n_push(&mut merged, entry, n);
             }
         }
-    }
+        merged
+    } else {
+        let mut h = BinaryHeap::with_capacity(n + 1);
+        for (bi, b) in batches.iter().enumerate() {
+            sample_n_push_batch(&converter, &mut h, b, bi, n, seed)?;
+        }
+        h
+    };
+    let heap = std::mem::take(&mut heap);
 
     // Gather the kept row indices per batch (sorted, so each output batch keeps the
     // input's relative row order).
@@ -428,6 +459,69 @@ pub(crate) fn sample_n_batches(
         out.push(RecordBatch::try_new(b.schema(), cols)?);
     }
     Ok(out)
+}
+
+/// Encode one batch's rows and offer each to `heap`, keeping the `n` smallest.
+///
+/// Split out so the serial and the chunk-parallel arms of `sample_n_batches` share one
+/// statement of the encode + hash + admit step: two spellings of it could disagree about a
+/// tie and silently return different samples on different thread counts.
+fn sample_n_push_batch(
+    converter: &RowConverter,
+    heap: &mut BinaryHeap<(u64, OwnedRow, usize, usize)>,
+    batch: &RecordBatch,
+    bi: usize,
+    n: usize,
+    seed: u64,
+) -> Result<(), InterpError> {
+    let rows = converter.convert_columns(batch.columns())?;
+    for ri in 0..batch.num_rows() {
+        let r = rows.row(ri);
+        let hash = fnv1a_seeded(r.as_ref(), seed);
+        // Own the row ONLY once it is known to beat the heap top. `r.owned()` copies the row
+        // encoding onto the heap, and doing that per input row (as this loop did when the
+        // entry was built before the comparison) is one allocation per row of the whole
+        // relation to keep `n` of them -- 8 M allocations for a `sample(n=1000)`. Serially
+        // that is merely wasteful; across threads it is the operator, because every one of
+        // those allocations contends on the same allocator, which is why the first parallel
+        // cut of this function ran *slower* the more cores it was given (0.63x at 32 threads).
+        //
+        // `Row`'s `Ord` is `self.data.cmp(other.data)` and both `Row` and `OwnedRow` expose
+        // those bytes via `AsRef<[u8]>`, so comparing the borrowed row's bytes against the
+        // stored top's bytes is the same comparison the `(u64, OwnedRow, usize, usize)` tuple
+        // would make -- the admission decision is unchanged, only the allocation is deferred.
+        if heap.len() < n {
+            heap.push((hash, r.owned(), bi, ri));
+            continue;
+        }
+        let top = heap.peek().expect("heap is full");
+        let beats_top = hash
+            .cmp(&top.0)
+            .then_with(|| r.as_ref().cmp(top.1.as_ref()))
+            .then_with(|| bi.cmp(&top.2))
+            .then_with(|| ri.cmp(&top.3))
+            .is_lt();
+        if beats_top {
+            heap.pop();
+            heap.push((hash, r.owned(), bi, ri));
+        }
+    }
+    Ok(())
+}
+
+/// Admit one already-owned entry to a bounded max-heap of the `n` smallest entries seen.
+/// Used only to merge the per-chunk heaps, where every entry is owned already.
+fn sample_n_push(
+    heap: &mut BinaryHeap<(u64, OwnedRow, usize, usize)>,
+    entry: (u64, OwnedRow, usize, usize),
+    n: usize,
+) {
+    if heap.len() < n {
+        heap.push(entry);
+    } else if entry < *heap.peek().expect("heap is full") {
+        heap.pop();
+        heap.push(entry);
+    }
 }
 
 /// A fixed, version-stable per-row hash: FNV-1a over `bytes` (seeded), then a

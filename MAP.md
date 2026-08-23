@@ -1076,7 +1076,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | module | lines | what it is |
 |---|---|---|
 | `annotate.py` | 546 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
-| `calibration.py` | 493 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
+| `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `common_subplan.py` | 278 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
@@ -1186,7 +1186,7 @@ Kyber rule modules.
 | `ordering.py` | 108 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 820 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 583 | Predicate pushdown — evaluate filters as early as possible. |
-| `selection.py` | 484 | SELECTION-phase rules — cost-based physical algorithm choice. |
+| `selection.py` | 511 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 488 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
@@ -1721,7 +1721,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 247 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
-| `filesystem.py` | 606 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
+| `filesystem.py` | 658 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 367 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
@@ -2232,7 +2232,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `ir_tags.py` | 278 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 149 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 291 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 312 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 525 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 346 | Shared traversal for `LogicalPlan` trees. |
 
@@ -2457,7 +2457,7 @@ String free functions, in two halves: building text and reading structure out of
 | `join.py` | 539 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 648 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 385 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 410 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 380 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
@@ -2852,7 +2852,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/folds.rs` | 611 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 696 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1366 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1459 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -2891,11 +2891,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `byte_key.rs` | 214 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 253 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
-| `gather/mod.rs` | 636 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
+| `gather/mod.rs` | 711 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
-| `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
+| `join/key_filter.rs` | 301 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 1966 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 299 | The band join: two inequalities that bound **one** right key from both sides. |
@@ -2961,7 +2961,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 485 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 105 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 645 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 759 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 512 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |

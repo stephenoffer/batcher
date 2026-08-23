@@ -225,17 +225,98 @@ fn concat_bytes<T: ByteArrayType>(arrays: &[&dyn Array]) -> Option<GenericByteAr
         )
     });
 
-    Some(GenericByteArray::<T>::new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        values.into(),
-        nulls,
-    ))
+    // SAFETY: `offsets` is a running total of whole-value lengths copied out of valid
+    // `GenericByteArray<T>` sources — see `assembled`.
+    Some(unsafe { assembled::<T>(offsets, values, nulls) })
+}
+
+/// Assemble a gathered byte array from parts this module built, **without re-validating its
+/// UTF-8**.
+///
+/// Every byte construction here copies *whole values* out of an already-validated
+/// `GenericByteArray<T>` of the same type, so for the `Utf8` types the bytes between any two
+/// offsets are exactly the bytes of a value that was valid UTF-8 when it arrived. `try_new`
+/// re-derives that with `std::str::from_utf8` over the whole gathered buffer, and it is not
+/// free: on TPC-DS q57 — a query whose cost *is* a string gather — `GenericByteArray::try_new`
+/// (6.3 %) plus `core::str::from_utf8` (4.7 %) came to **11 % of the query**, and every
+/// `GROUP BY`, join and sort over a string column pays the same toll.
+///
+/// The offsets are still checked: `OffsetBuffer::new` verifies they are monotonic, which is a
+/// pass over `n` integers rather than over the bytes. So the only property taken on trust is
+/// the one that is true by construction and expensive to confirm.
+///
+/// # Safety
+///
+/// `values` must hold, between each consecutive pair of `offsets`, the bytes of a whole value
+/// copied from a valid `GenericByteArray<T>` — which is what makes them valid UTF-8 when `T`
+/// is a string type — and the last offset must equal `values.len()`. Every caller below builds
+/// exactly that; nothing outside this module may call it.
+unsafe fn assembled<T: ByteArrayType>(
+    offsets: Vec<T::Offset>,
+    values: impl Into<arrow::buffer::Buffer>,
+    nulls: Option<NullBuffer>,
+) -> GenericByteArray<T> {
+    // SAFETY: the caller's contract, plus `OffsetBuffer::new`'s own monotonicity check.
+    unsafe {
+        GenericByteArray::<T>::new_unchecked(
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            values.into(),
+            nulls,
+        )
+    }
+}
+
+/// The start of `indices` when it is a **contiguous ascending run** `s, s+1, …, s+len-1` that
+/// lies inside a `len`-row column, else `None`.
+///
+/// Such a gather is a *slice*, not a scatter, and the shape is not exotic — it is what a hash
+/// join's **probe-side** index array is whenever each probe row matches exactly once, which is
+/// every join to a dimension on a foreign key. TPC-H q9 has four joins and three of them are
+/// that shape: after `lineitem ⋈ part` narrows the fact table, the joins to `orders`,
+/// `supplier ⋈ nation` and `partsupp` each emit their 3.26 M probe rows in order, so the probe
+/// columns' index array is exactly `0..3,261,613` and gathering them row by row copies a column
+/// onto itself the slow way.
+///
+/// The check is cheap enough to run unconditionally because it is **rejected in O(1)** almost
+/// always: `last - first == len - 1` fails immediately for a scattered index, and only an index
+/// that already looks like a run pays the linear confirmation. The confirmation is a plain
+/// ascending-slice scan, which vectorizes; a gather is a dependent load per row, which does not.
+fn contiguous_run(indices: &UInt32Array, col_rows: usize) -> Option<usize> {
+    let idx = indices.values();
+    let (&first, &last) = (idx.first()?, idx.last()?);
+    // Also covers `len > col_rows`, which cannot be a run inside the column.
+    if (last as u64).checked_sub(first as u64)? != idx.len() as u64 - 1 {
+        return None;
+    }
+    let start = first as usize;
+    if start + idx.len() > col_rows {
+        return None;
+    }
+    // A slice keeps the **whole** parent buffer alive, so it is only free when the run is most
+    // of the column. Selecting a thousand contiguous rows out of sixty million and handing back
+    // a slice would retain the 480 MB behind them for as long as the result lives — a gather
+    // that turns a bounded copy into an unbounded hold, which is the opposite of what the
+    // operators above it are budgeted for. Half is the line: at or above it the copy would cost
+    // more than the retention, below it the copy is the cheaper of the two.
+    if idx.len() * 2 < col_rows {
+        return None;
+    }
+    // The bounds agree; confirm every step is +1 (an index that merely starts and ends right
+    // — `0, 5, 2, 3` — is not a run).
+    idx.windows(2).all(|w| w[1] == w[0] + 1).then_some(start)
 }
 
 /// Gather `col`'s rows at `indices`, matching `arrow::compute::take` exactly.
 pub fn take_column(col: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef, RuntimeError> {
     // A null index means a null output row; the length/copy loops below assume a value.
     if indices.null_count() == 0 {
+        // A contiguous run is a slice — zero copy, and identical rows in identical order. Every
+        // consumer reads the result through `Array`, so a slice is indistinguishable from the
+        // fresh buffer a gather would have built (the same licence `agg::group::group_columns`
+        // takes for its identity permutation).
+        if let Some(start) = contiguous_run(indices, col.len()) {
+            return Ok(col.slice(start, indices.len()));
+        }
         // The single-pass byte fill, for the four variable-length byte types that share a
         // layout. It declines when the gathered bytes would not fit the offset width, and that
         // decline must fall to `take_chunked` rather than to arrow: arrow's builder `.expect()`s
@@ -387,11 +468,9 @@ fn gather_bytes_of<T: ByteArrayType>(
                 .map(|(&p, &r)| arrs[p as usize].is_valid(r as usize)),
         )
     });
-    Some(GenericByteArray::<T>::new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        values.into(),
-        nulls,
-    ))
+    // SAFETY: `offsets` is a running total of whole-value lengths copied out of valid
+    // `GenericByteArray<T>` sources — see `assembled`.
+    Some(unsafe { assembled::<T>(offsets, values, nulls) })
 }
 
 /// How far ahead [`take_bytes`] prefetches the *offset* pair for an upcoming row.
@@ -508,11 +587,9 @@ fn take_bytes_serial<T: ByteArrayType>(
         .nulls()
         .map(|src| NullBuffer::from_iter(idx.iter().map(|&i| src.is_valid(i as usize))));
 
-    Some(GenericByteArray::<T>::new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        values.into(),
-        nulls,
-    ))
+    // SAFETY: `offsets` is a running total of whole-value lengths copied out of valid
+    // `GenericByteArray<T>` sources — see `assembled`.
+    Some(unsafe { assembled::<T>(offsets, values, nulls) })
 }
 
 /// [`take_bytes`] across cores, for a gather large enough to pay for the extra pass.
@@ -627,15 +704,122 @@ fn take_bytes_parallel<T: ByteArrayType>(
         .nulls()
         .map(|src| NullBuffer::from_iter(idx.iter().map(|&i| src.is_valid(i as usize))));
 
-    Some(GenericByteArray::<T>::new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        values.into(),
-        nulls,
-    ))
+    // SAFETY: `offsets` is a running total of whole-value lengths copied out of valid
+    // `GenericByteArray<T>` sources — see `assembled`.
+    Some(unsafe { assembled::<T>(offsets, values, nulls) })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The one property `assembled` takes on trust: a gathered string column is still valid
+    /// UTF-8. Multi-byte values are what make this a real assertion rather than a tautology —
+    /// an off-by-one in an offset would split a code point, which is exactly what the skipped
+    /// `from_utf8` would have caught. Every value is read back through `str`, so a broken
+    /// boundary surfaces here rather than in a caller.
+    #[test]
+    fn a_gathered_string_column_is_still_valid_utf8() {
+        use arrow::array::StringArray;
+        // 1-, 2-, 3- and 4-byte code points, an empty string, and nulls.
+        let vals: Vec<Option<&str>> = vec![
+            Some("a"),
+            Some("é"),
+            Some("€"),
+            Some("𝄞"),
+            Some(""),
+            None,
+            Some("naïve café 日本語 🎉"),
+            Some("z"),
+        ];
+        let col: ArrayRef = Arc::new(StringArray::from(vals.clone()));
+        // Scattered, reversed, repeated and contiguous index shapes, so every construction
+        // path in this module is reached.
+        let cases: Vec<Vec<u32>> = vec![
+            vec![6, 3, 2, 1, 6, 0, 5, 4],
+            (0..8).rev().collect(),
+            vec![6, 6, 6, 6],
+            (0..8).collect(),
+        ];
+        for idx in cases {
+            let ind = UInt32Array::from(idx.clone());
+            let got = take_column(col.as_ref(), &ind).expect("gather");
+            let want = take(col.as_ref(), &ind, None).expect("arrow take");
+            assert_eq!(got.as_ref(), want.as_ref(), "indices {idx:?}");
+            // Read every surviving value back as `str` — the check `new_unchecked` skipped.
+            let s = got.as_any().downcast_ref::<StringArray>().expect("utf8");
+            for (k, &i) in idx.iter().enumerate() {
+                assert_eq!(s.is_null(k), vals[i as usize].is_none());
+                if !s.is_null(k) {
+                    assert_eq!(s.value(k), vals[i as usize].unwrap());
+                }
+            }
+        }
+        // The concatenation path assembles the same way.
+        let joined = concat_columns(&[col.as_ref(), col.as_ref()]).expect("concat");
+        let s = joined.as_any().downcast_ref::<StringArray>().expect("utf8");
+        assert_eq!(s.len(), 16);
+        assert_eq!(s.value(6), "naïve café 日本語 🎉");
+        assert_eq!(s.value(14), "naïve café 日本語 🎉");
+    }
+
+    /// A contiguous index run must gather exactly what a scatter would — same rows, same order,
+    /// same nulls — because the fast path returns a *slice* of the source instead of a copy.
+    /// The cases that matter are the ones where "looks like a run" and "is a run" differ.
+    #[test]
+    fn a_contiguous_run_gathers_what_a_scatter_would() {
+        use arrow::array::Int64Array;
+        let col: ArrayRef = Arc::new(Int64Array::from(
+            (0..64i64)
+                .map(|i| (i % 7 != 0).then_some(i * 3))
+                .collect::<Vec<_>>(),
+        ));
+        let cases: Vec<Vec<u32>> = vec![
+            (0..64).collect(),       // the identity — the whole column
+            (10..42).collect(),      // an interior run, half the column (sliced)
+            (10..20).collect(),      // an interior run too small to slice (copied)
+            vec![63],                // one row at the end
+            vec![0],                 // one row at the start
+            vec![0, 5, 2, 3],        // starts and ends right, is NOT a run
+            vec![5, 4, 3, 2, 1, 0],  // descending
+            vec![3, 3, 4, 5],        // a repeat
+            (0..64).rev().collect(), // fully reversed
+        ];
+        for idx in cases {
+            let ind = UInt32Array::from(idx.clone());
+            let got = take_column(col.as_ref(), &ind).expect("gather");
+            let want = take(col.as_ref(), &ind, None).expect("arrow take");
+            assert_eq!(got.as_ref(), want.as_ref(), "indices {idx:?}");
+        }
+    }
+
+    /// The detector must refuse a run that leaves the column's rows, and a **sliced** column is
+    /// where that is easy to get wrong: `8..24` is a perfectly good run inside the buffer behind
+    /// a 16-row slice, and slicing on it would silently hand back rows the caller never asked
+    /// for. Asked of the detector directly, because arrow's `take` *panics* on an out-of-range
+    /// index rather than erroring, so there is no oracle to compare against here.
+    #[test]
+    fn the_run_detector_refuses_what_it_cannot_slice() {
+        use arrow::array::Int64Array;
+        let full = Int64Array::from((0..64i64).collect::<Vec<_>>());
+        let sliced = full.slice(8, 16); // 16 rows visible
+        let past_end = UInt32Array::from((8u32..24).collect::<Vec<_>>());
+        assert_eq!(contiguous_run(&past_end, sliced.len()), None);
+        // A run of under half the column is copied rather than sliced, so it cannot retain the
+        // whole parent buffer behind a handful of rows.
+        let sliver = UInt32Array::from((0u32..4).collect::<Vec<_>>());
+        assert_eq!(contiguous_run(&sliver, sliced.len()), None);
+        // A run that fits is still a run, and gathers what a scatter would.
+        let fits = UInt32Array::from((0u32..16).collect::<Vec<_>>());
+        assert_eq!(contiguous_run(&fits, sliced.len()), Some(0));
+        let arr: ArrayRef = Arc::new(sliced);
+        let got = take_column(arr.as_ref(), &fits).expect("gather");
+        let want = take(arr.as_ref(), &fits, None).expect("arrow take");
+        assert_eq!(got.as_ref(), want.as_ref());
+        // An empty index is not a run (there is nothing to slice), and must still gather.
+        let empty = UInt32Array::from(Vec::<u32>::new());
+        assert_eq!(contiguous_run(&empty, arr.len()), None);
+        assert_eq!(take_column(arr.as_ref(), &empty).expect("gather").len(), 0);
+    }
     use arrow::array::{
         BinaryArray, Decimal128Array, DictionaryArray, Float64Array, Int64Array, LargeBinaryArray,
         LargeStringArray, StringArray, TimestampMicrosecondArray,
