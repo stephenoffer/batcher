@@ -828,7 +828,22 @@ struct JoinTable {
     /// Result-invariant: a length-1 chain emits the same single `(i, r)` pair either way.
     unique: bool,
     state: ahash::RandomState,
-    bloom: Option<BloomFilter>,
+    /// The probe-side bloom, **one filter per head shard** — empty when there is none.
+    ///
+    /// Sharding the bloom the way the heads are sharded is what makes the parallel build's
+    /// bloom free. A shard's keys are exactly the keys whose [`build::shard_of`] is that
+    /// shard, so a shard filter answers for its own keys and no other, and a probe reaches it
+    /// through the shard index it already computes for the head lookup. Nothing is merged.
+    ///
+    /// The merge it replaces was the single largest cost in a large build. Each of the 64
+    /// shards allocated and zeroed a filter sized for the **whole** build side and the union
+    /// was then folded serially, one full-size bit-OR per shard: at TPC-H sf10 q9's 3.26M-row
+    /// build that is 64 x 3.9 MB allocated and 250 MB of serial OR, measured at **34.3 ms
+    /// against a 31.3 ms parallel insert** — the bloom cost more to combine than the hash
+    /// table cost to build, twice per query. Per-shard filters are `1/shards` the size each,
+    /// so the total bits, the bits-per-key ratio, and therefore the false-positive rate are
+    /// what they always were.
+    bloom: Vec<BloomFilter>,
     /// Runtime verdict on whether the probe-side bloom is *earning* its lookup.
     ///
     /// The bloom's value is its **rejection rate**, which no planner-side row count can
@@ -919,17 +934,21 @@ impl JoinTable {
                     next: build::stitch_chain(d.links, right_rows, d.unique),
                     unique: d.unique,
                     state,
-                    bloom: None,
+                    bloom: Vec::new(),
                     bloom_trial: BloomTrial::default(),
                 };
             }
         }
 
-        let bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
         let shards = build::shard_count(right_rows);
         if shards > 1 {
+            // Sized per shard, from that shard's expected share of the keys, so the shards
+            // together hold the same bits-per-key the one merged filter held.
+            let per_shard = use_bloom.then(|| {
+                BloomFilter::with_params((right_rows / shards).max(1) as u64, bloom_fp_rate)
+            });
             let (heads, next, bloom, unique) =
-                build::build_sharded(keys, &state, right_rows, right_null, shards, bloom);
+                build::build_sharded(keys, &state, right_rows, right_null, shards, per_shard);
             return Self {
                 heads,
                 dense: None,
@@ -943,7 +962,8 @@ impl JoinTable {
 
         let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
         let mut next: Vec<u32> = vec![u32::MAX; right_rows];
-        let mut bloom = bloom;
+        let mut bloom =
+            use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
         // Set on the first repeated key — the serial mirror of `build_sharded`'s chain check.
         let mut unique = true;
         for (i, &is_null) in right_null.iter().enumerate() {
@@ -977,9 +997,29 @@ impl JoinTable {
             next,
             unique,
             state,
-            bloom,
+            // One shard, so one filter — the same shard-indexed shape the parallel build
+            // produces, with `shard_of` collapsing to 0.
+            bloom: bloom.into_iter().collect(),
             bloom_trial: BloomTrial::default(),
         }
+    }
+
+    /// Heap bytes this table holds, for a caller budgeting the build sides it keeps resident.
+    ///
+    /// The relation a join broadcasts is only half of what stays live: the table over it —
+    /// head slots, the chain array, and the probe filter — is roughly nine bytes per build row
+    /// again, and a caller checking only the relation under-reads its own envelope by that
+    /// much on every join it prepares.
+    fn heap_bytes(&self) -> usize {
+        let heads: usize = self
+            .heads
+            .iter()
+            .map(|h| h.capacity() * (std::mem::size_of::<u32>() + 1))
+            .sum();
+        let dense = self.dense.as_ref().map_or(0, dense::DenseHeads::heap_bytes);
+        let next = self.next.capacity() * std::mem::size_of::<u32>();
+        let bloom: usize = self.bloom.iter().map(|b| (b.num_bits() / 8) as usize).sum();
+        heads + dense + next + bloom
     }
 
     /// The chain head for probe (left) row `l` — `None` for a null key, a bloom miss,
@@ -993,7 +1033,7 @@ impl JoinTable {
         keys: &K,
         l: usize,
         is_null: bool,
-        bloom: Option<&BloomFilter>,
+        bloom: Option<&[BloomFilter]>,
         rejected: &mut u64,
     ) -> Option<u32> {
         if is_null {
@@ -1008,16 +1048,19 @@ impl JoinTable {
             return d.head(left[l]);
         }
         let hash = keys.hash_left(&self.state, l);
+        // The build put this key in exactly one shard, chosen from its hash — so the probe
+        // finds it there without any coordination. One shard (the small-build case) reduces to
+        // the flat lookup this always was. The shard index serves the bloom too: that shard's
+        // filter holds exactly that shard's keys, so consulting it is the same question the
+        // merged filter answered.
+        let shard = build::shard_of(hash, self.heads.len());
         // A bloom miss is definitive (no false negatives): the key is not on the build
         // side, so the chain is provably empty — skip the hash-table lookup.
-        if bloom.is_some_and(|b| !b.contains_hash(hash)) {
+        if bloom.is_some_and(|b| !b[shard].contains_hash(hash)) {
             *rejected += 1;
             return None;
         }
-        // The build put this key in exactly one shard, chosen from its hash — so the probe
-        // finds it there without any coordination. One shard (the small-build case) reduces to
-        // the flat lookup this always was.
-        self.heads[build::shard_of(hash, self.heads.len())]
+        self.heads[shard]
             .find(hash, |&h| keys.right_eq_left(h as usize, l))
             .copied()
     }
@@ -1041,10 +1084,8 @@ impl JoinTable {
         let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
         // Decide once per range whether to consult the bloom, then tally what it rejected so
         // the next range can re-decide. `None` here is exactly the "no bloom" path.
-        let bloom = self
-            .bloom
-            .as_ref()
-            .filter(|_| self.bloom_trial.worth_consulting());
+        let bloom = Some(self.bloom.as_slice())
+            .filter(|b| !b.is_empty() && self.bloom_trial.worth_consulting());
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {
@@ -1135,10 +1176,8 @@ impl JoinTable {
         matched: &[std::sync::atomic::AtomicBool],
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        let bloom = self
-            .bloom
-            .as_ref()
-            .filter(|_| self.bloom_trial.worth_consulting());
+        let bloom = Some(self.bloom.as_slice())
+            .filter(|b| !b.is_empty() && self.bloom_trial.worth_consulting());
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {
@@ -2851,6 +2890,66 @@ mod tests {
                 sorted_pairs(&with),
                 sorted_pairs(&without),
                 "bloom-on disagrees with bloom-off for {jt:?}"
+            );
+        }
+    }
+
+    /// The **sharded** build's per-shard blooms must answer exactly what one merged filter
+    /// answered: every key present is found, and nothing else changes.
+    ///
+    /// Every other bloom test here builds a handful of rows, so `shard_count` is 1 and the
+    /// filter is flat — which is precisely the path that cannot show a shard-indexing mistake.
+    /// A bloom consulted for the wrong shard is a **false negative**, the one error a bloom may
+    /// never make: the row silently drops out of the join and the result is short, not slow. So
+    /// this builds past both `build::PARALLEL_BUILD_MIN_ROWS` (to get several shards) and
+    /// [`BLOOM_MIN_BUILD_ROWS`] (to get a bloom at all), and holds the join to the bloom-off
+    /// oracle over a probe side that is half present keys and half absent ones.
+    #[test]
+    fn the_sharded_build_blooms_agree_with_no_bloom_at_all() {
+        let build_rows = (BLOOM_MIN_BUILD_ROWS.max(build::PARALLEL_BUILD_MIN_ROWS) * 2) as i64;
+        assert!(
+            build::shard_count(build_rows as usize) > 1,
+            "test needs several shards"
+        );
+        // Keys spread over a range far wider than the row count, so `DenseHeads` declines and
+        // the hashed (and therefore bloom-bearing) path is the one under test.
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+            (0..build_rows).map(|i| i * 977).collect::<Vec<_>>(),
+        ))];
+        // Alternating hit/miss, so a shard whose filter was consulted wrongly loses real rows.
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+            (0..build_rows)
+                .map(|i| if i % 2 == 0 { i * 977 } else { i * 977 + 1 })
+                .collect::<Vec<_>>(),
+        ))];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let with = hash_join_indices_impl(
+                &left,
+                &right,
+                jt,
+                true,
+                BLOOM_FP_RATE,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
+            let without = hash_join_indices_impl(
+                &left,
+                &right,
+                jt,
+                false,
+                BLOOM_FP_RATE,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
+            assert_eq!(
+                sorted_pairs(&with),
+                sorted_pairs(&without),
+                "the sharded per-shard blooms disagree with no bloom for {jt:?}"
             );
         }
     }

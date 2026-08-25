@@ -644,7 +644,19 @@ pub(crate) fn broadcast_join_streaming(
     let tuning = bc_arrow::RuntimeTuning::default();
     let build_key_cols = ops::columns_by_name(build, build_keys)?;
     let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-    let Some(table) = join::BroadcastProbe::new(
+    // `over_any_build`, not `new`: the row ceiling `new` applies compares a flat probe against
+    // the *partitioned radix* join, and that is not the comparison this caller is making. Kyber
+    // has already chosen `Broadcast`, so the only alternative here is [`broadcast_join`] — which
+    // builds **the same single flat table over the same build side** and probes it in row-range
+    // chunks. Declining therefore buys no cache locality whatsoever; all it buys is the
+    // `ops::materialize` the caller falls back to, a serial concatenation of the *probe* side,
+    // which is the largest relation in the query.
+    //
+    // Measured on TPC-H sf10 `lineitem ⋈ orders` (60M probe, 15M build, 8% over the ceiling):
+    // see `benchmarks/BENCHMARK_RESULTS.md`. This is the same argument `over_any_build`'s own
+    // docstring makes for the fused-aggregate path, applied to the caller that pays the larger
+    // copy.
+    let Some(table) = join::BroadcastProbe::over_any_build(
         &build_key_cols,
         ops::map_join_type(join_type),
         probe_rows,

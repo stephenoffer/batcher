@@ -83,7 +83,11 @@ impl BuildCache {
     }
 
     fn insert(&mut self, key: usize, build: Arc<JoinBuild>) {
-        self.bytes += build.side.get_array_memory_size() as u64;
+        // The probe table counts too. It is ~9 bytes per build row on top of the relation, and
+        // since a large build side now gets one (see [`Admission`]) leaving it out understates
+        // what this cache holds by roughly half on exactly the joins the envelope is about.
+        self.bytes += build.side.get_array_memory_size() as u64
+            + build.probe.as_ref().map_or(0, |p| p.heap_bytes()) as u64;
         self.joins.insert(key, build);
     }
 
@@ -229,21 +233,6 @@ fn driving_rows(plan: &RelOp, sources: &[Vec<RecordBatch>]) -> usize {
         .unwrap_or(0)
 }
 
-/// How far past its cache-sized ceiling a build may go and still be worth probing flat when the
-/// *probe* is the smaller side. ~16.8M rows is a ~270 MB table: past that, building it flat is a
-/// pathology on its own terms rather than a cache trade — TPC-H sf10 q18 builds 60M rows (~1 GB)
-/// and admitting it cost 378 -> 559 ms.
-const SMALL_PROBE_BUILD_CAP: usize = 8;
-
-/// How much larger the probe must be than the build before a flat probe past cache pays.
-///
-/// The flat probe pays about one cache miss per probe row; what it buys is the probe spine
-/// running on every core instead of one. So it wins at the *extremes* of the size ratio and
-/// loses in the middle, where the radix path's partition pass is cheap against both sides. Six
-/// is fitted to the measurements below rather than derived, and the band it sits in is narrow:
-/// TPC-H sf10 q9 wins at 7.5x and q21 loses at 4.0x.
-const PROBE_DOMINANCE: usize = 6;
-
 /// Whether a build above the ceiling may still take a per-morsel probe.
 ///
 /// Declining is not free: a spine join with no per-morsel probe makes the whole probe spine
@@ -253,25 +242,30 @@ const PROBE_DOMINANCE: usize = 6;
 /// sf10 against DuckDB's 30-57, and the whole reason Batcher won sf1 and lost sf10 on every
 /// multi-way join.
 ///
-/// The conditions are **fitted to measurement, not derived**, and are stated that way on
-/// purpose. Each has a mechanism, and each was measured in-process with the arms alternating by
-/// round (seven rounds, best of two, TPC-H sf10):
+/// Two conditions remain, and both are structural rather than fitted:
 ///
 /// * **`Semi` / `Anti` are never admitted.** Their build is the side being *tested against*
-///   rather than the side being emitted, and a flat table over it is the whole cost of the
-///   join. q4 builds 37.9M rows for a `Semi` and q22 15M for an `Anti`: admitting them cost
-///   **146 -> 305 ms** and **43 -> 214 ms**. q13's `Left` join over a near-identical 14.8M-row
-///   build and the same 1.5M probe *gains* 515 -> 309, which is what rules out build size as
-///   the explanation.
-/// * **A probe that dominates the build** ([`PROBE_DOMINANCE`]) — the misses are bounded by the
-///   build while the serial time saved scales with the probe. q5 probes 60M against 2.28M
-///   (26x): **350 -> 177 ms**. q9, at 7.5x: **541 -> 449**.
-/// * **A probe smaller than the build**, up to [`SMALL_PROBE_BUILD_CAP`] — total misses are
-///   bounded by the small probe. q13 probes 1.5M against 14.8M: **515 -> 309 ms**.
-/// * **Never where the plan could hand off instead.** One hash join and a probe bigger than the
-///   build is the case `unshardable_join_reason` gives to the materializing executor, which
-///   spreads the probe across every core *and* keeps the cache-resident radix join. Pinned by
+///   rather than the side being emitted, so a flat table over it is the whole cost of the join
+///   — there is no output gather for it to amortize against. q4 builds 37.9M rows for a `Semi`
+///   and q22 15M for an `Anti`.
+/// * **Never where the plan could hand off instead.** One hash join and a probe bigger than
+///   the build is the case `unshardable_join_reason` gives to the materializing executor,
+///   which spreads the probe across every core *and* keeps the cache-resident radix join.
+///   Pinned by
 ///   `stream_oracle::a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks`.
+///
+/// **A size ratio used to stand here as well, and it was measuring something else.** Two
+/// fitted constants admitted a large build only when the probe dominated it by 6x or when the
+/// probe was the smaller side — because past those bands a flat build measured slower than the
+/// sequential spine it replaced. What made it slower was not the probe's cache misses: it was
+/// the *build*, whose probe-side bloom allocated one full-size filter per shard and folded the
+/// 64 of them together in a serial bit-OR. At sf10 q9's 3.26M-row build that merge alone was
+/// **34.3 ms, more than the 31.3 ms parallel hash insert beside it**, and it was charged twice
+/// per query. `JoinTable::bloom` now shards the filter the way the heads are sharded and merges
+/// nothing, and with that cost gone the ratio bands invert: admitting every non-semi build took
+/// TPC-H sf10 **q9 468 -> 248 ms** and the suite geomean against DuckDB **1.044 -> 0.993**, with
+/// q4 (`Semi`, still refused) and q13 unmoved. The constants are gone rather than re-fitted —
+/// what they were compensating for is fixed at its source.
 ///
 /// Below the ceiling this admits everything, exactly as before.
 #[derive(Clone, Copy)]
@@ -291,13 +285,7 @@ impl Admission {
         if matches!(join_type, JoinType::Semi | JoinType::Anti) {
             return false;
         }
-        if self.can_hand_off && self.driving > build_rows {
-            return false;
-        }
-        let probe_dominates = self.driving >= build_rows.saturating_mul(PROBE_DOMINANCE);
-        let small_probe = self.driving < build_rows
-            && build_rows <= ceiling.saturating_mul(SMALL_PROBE_BUILD_CAP);
-        probe_dominates || small_probe
+        !(self.can_hand_off && self.driving > build_rows)
     }
 }
 

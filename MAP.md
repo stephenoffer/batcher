@@ -2820,11 +2820,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg_par.rs` | 530 | The high-cardinality parallel aggregate: partition first, aggregate once. |
+| `agg_par.rs` | 701 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 589 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 136 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
-| `join_par/mod.rs` | 764 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/mod.rs` | 776 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `lib.rs` | 713 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 374 | Per-operator execution metrics — the measure half of the adaptive loop. |
@@ -2843,11 +2843,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/reshape.rs` | 546 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 745 | Single-node parallel full sort by **sample-sort**. |
-| `par.rs` | 3357 | The multi-core executor. |
+| `par.rs` | 3396 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 617 | The breakers: operators that must see all of their input before they can emit any output. |
-| `stream/builds.rs` | 359 | Preparing a hash join's build side once, for every worker that will probe it. |
+| `stream/builds.rs` | 347 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 611 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
@@ -2893,17 +2893,17 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/fixed.rs` | 253 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 711 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
-| `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
+| `join/dense.rs` | 357 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_filter.rs` | 301 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 1966 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2005 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 299 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 537 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
 | `join/range/mod.rs` | 701 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/sort_merge.rs` | 206 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
-| `join/stream.rs` | 349 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
+| `join/stream.rs` | 358 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 372 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 33 | `bc-runtime` — the engine's runtime library. |
 | `measure.rs` | 111 | Reading an ordered key as a number, so two of them can be *subtracted*. |
@@ -3072,7 +3072,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `bloom.rs` | 191 | Bloom filter — approximate set membership for runtime join filters. |
+| `bloom.rs` | 205 | Bloom filter — approximate set membership for runtime join filters. |
 | `countmin.rs` | 194 | Count-Min — frequency (heavy-hitter) estimation. |
 | `ddsketch.rs` | 423 | DDSketch — relative-error quantile sketch (Masson, Rim, Lee). |
 | `frequent.rs` | 234 | Misra-Gries — frequent-items (heavy-hitter *key*) enumeration. |

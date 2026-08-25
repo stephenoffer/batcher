@@ -902,6 +902,45 @@ fn exec(
             // once. When grouping does reduce, the sample's partials are the first slice of
             // the work below, and are reused rather than recomputed.
             let partition_keys = agg_par::partitionable(group_keys, &parts);
+            // The partition this relation already has, if its key arrives ordered: runs of
+            // morsels whose key ranges do not overlap are key-disjoint exactly as hash buckets
+            // are, and cost nothing to form. Tried before the sample because it makes the
+            // sample's question moot — the reduction ratio decides between *gathering* the
+            // relation and pre-aggregating it, and this path does neither.
+            if let Some(keys) = partition_keys.as_deref() {
+                let workers = rayon::current_num_threads().max(1);
+                // The cut points first, the pool second. Asking the pool is not a free
+                // question — `try_reserve_cooperative` can make *other* operators spill to
+                // honour the reservation — so it must only be asked when the answer can change
+                // what this operator does. Asked unconditionally it cost TPC-H sf10 q18, whose
+                // key yields too few runs to take this path at all, **234 -> 508 ms**.
+                //
+                // The reservation is against ~1x the input rather than the partition path's 2x:
+                // this holds the per-run partials and no gathered copy of the relation. It is
+                // still *unbounded* in the sense that matters — it does not spill — so under
+                // real pressure the reducing path, which does, has to win.
+                let runs = agg_par::key_disjoint_runs(&parts, keys, workers).filter(|_| {
+                    matches!(admit(opts, op_id, in_bytes as usize), Admit::InMemory(_))
+                });
+                if let Some(runs) = runs {
+                    let out = agg_par::disjoint_run_aggregate(
+                        &parts, &runs, group_keys, aggregates, &agg_jit, &funcs,
+                    )?;
+                    push_breaker(
+                        m,
+                        op_id,
+                        "aggregate",
+                        rows_in,
+                        0,
+                        in_bytes,
+                        &out,
+                        t0,
+                        false,
+                        "par-agg-disjoint-runs",
+                    );
+                    return Ok(out);
+                }
+            }
             let (partials, est_groups) = match agg_par::decide(
                 &parts,
                 group_keys,

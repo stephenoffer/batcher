@@ -1,5 +1,210 @@
 # Batcher CPU benchmark results
 
+## A bloom that cost more to merge than its hash table cost to build, the admission rule fitted to that cost, and a partition the data already had — TPC-H sf10 1.087x -> 0.963x (2026-08-25)
+
+`crates/bc-runtime/src/join/{mod.rs,build.rs,stream.rs}`; `crates/bc-sketches/src/bloom.rs`;
+`crates/bc-interp/src/{agg_par.rs,par.rs,stream/builds.rs}`.
+
+Two findings, reached the same way: measure **CPU time beside wall time** and ask which one is
+short. On TPC-H sf10 the answer was neither what the ratios suggested nor what the previous
+entry's kernel board predicted.
+
+| q | batcher wall / cpu / cores | duckdb wall / cpu / cores |
+|---|---|---|
+| q9 | 537 ms / 7.8 s / **14.5** | 175 ms / 10.1 s / **57.7** |
+| q7 | 130 ms / 2.4 s / 18.6 | 57 ms / 2.2 s / 38.9 |
+| q3 | 103 ms / 2.2 s / 21.5 | 83 ms / 2.6 s / 31.7 |
+
+Batcher used **less CPU than DuckDB** on all three and took two to three times as long. Nothing
+on the kernel board explains that; a query running on 14 of 61 workers does.
+
+### 1. The probe bloom allocated 64 full-size filters and merged them serially
+
+`build::build_sharded` splits a hash build across 64 shards. Each shard was handed
+`BloomFilter::new(b.num_bits(), b.num_hashes())` — a filter sized for the **whole** build side —
+and the union was folded afterwards on the calling thread, one full-size `merge` per shard.
+
+At sf10 q9's 3.26M-row build that is 64 x 3.9 MB allocated and zeroed, then 250 MB of serial
+bit-OR. Instrumented, with the query at 334 ms total:
+
+| phase | ms |
+|---|---:|
+| `radix::partition_side` | 3.1 |
+| the parallel insert, 64 shards | 31.3 |
+| **the bloom merge** | **34.3** |
+| `stitch_chain` | 3.1 |
+
+The bloom cost more to combine than the hash table cost to build, and q9 pays it twice.
+
+`JoinTable::bloom` is now **one filter per head shard**. A shard's keys are exactly the keys
+whose `build::shard_of` is that shard, so a shard filter answers for its own keys and no other,
+and `head_for` reaches it through the shard index it already computes for the head lookup.
+Nothing is merged, each filter is `1/shards` the size, and the total bits — and therefore the
+false-positive rate — are unchanged.
+
+`join::tests::the_sharded_build_blooms_agree_with_no_bloom_at_all` pins it, and it had to be a
+*new* test: every existing bloom test in that file builds a handful of rows, so `shard_count`
+is 1 for all of them and none could see a shard-indexing mistake. That mistake is a **false
+negative** — the probe row leaves the join silently, and the result is short rather than slow —
+which is the one error a bloom may never make.
+
+### 2. …and the admission rule was fitted to that cost, so removing it inverted the rule
+
+`stream::builds::Admission` decides whether a build side past
+`RADIX_MIN_BUILD_ROWS_BROADCAST` may have a shared probe table. Two constants
+(`PROBE_DOMINANCE`, `SMALL_PROBE_BUILD_CAP`) admitted one only where the probe dominated the
+build 6x, or where the probe was the smaller side, because outside those bands a flat build
+measured *slower* than what it replaced.
+
+What it replaced is the part worth naming. A spine join with no per-morsel probe makes the whole
+probe spine un-shardable (`parallel::spine_is_shardable`), and a plan with more than one join
+cannot hand off to the materializing executor either — so on a multi-join plan the ceiling was
+not choosing between two parallel joins, it was choosing **the sequential streaming pipeline**.
+A call-tree trace of q9 shows 204 ms of its 443 ms inside the root `Aggregate` after every child
+returned, on one core, with a second 171 ms region below it.
+
+With the merge gone the bands invert: admitting every non-semi build took q9 from 468 to 248 ms
+and the sf10 geomean from 1.044 to 0.993 in the same process. Both constants are deleted rather than re-fitted —
+what they were compensating for is fixed at its source. `Semi`/`Anti` keep their refusal (their
+build is the side being *tested against*, so a flat table over it is the whole cost of the join,
+with no output gather to amortize against), as does the case that can hand off instead.
+
+### 3. Two consequences of admitting large builds, both paid
+
+**The bloom's `%` became a mask.** `BloomFilter::positions` reduced each of `num_hashes`
+candidate indices with `% num_bits` — a 64-bit hardware division, seven of them per key added
+*and* per key tested. `new` now rounds the bit count up to a power of two. The rounding costs at
+most 2x the bits, which only lowers the false-positive rate; `from_bytes` refuses a
+non-power-of-two blob, because the mask is what it assumes and folding indices into the low bits
+would give a filter that reports `false` for keys it holds.
+
+**The build cache now counts the probe table.** `BuildCache::insert` measured
+`side.get_array_memory_size()` and nothing else. The table over that relation — head slots,
+chain array, filter — is roughly nine bytes per build row again, and since a large build side
+now gets one, leaving it out understated what the cache holds by about half on exactly the joins
+the envelope exists for. `JoinTable::heap_bytes` reports it and `insert` adds it in.
+
+### 4. The high-cardinality group-by was not slow; it was blind to the order it was given
+
+The `gb-high` kernel the previous entry left at 2.61x is not an aggregation gap. Grouping 60M
+rows into 15M on an `Int64` key, `min`/`max`, same data in both orders:
+
+| key | batcher | duckdb | |
+|---|---:|---:|---|
+| **sorted** | 230.1 ms | 105.0 ms | 2.19x behind |
+| **shuffled** | 223.5 ms | 236.4 ms | 0.95x ahead |
+
+Batcher is within 3% of itself either way. DuckDB is 2.25x faster on the sorted one, and that
+difference *is* the gap. The cost is visible directly: of the 230 ms, `ops::partition_morsels` —
+the gather of every row of every column into hash buckets — is **150 ms**, and the aggregation it
+exists to enable is 70 ms.
+
+That gather buys key-disjoint pieces. An ordered relation already has them:
+`agg_par::key_disjoint_runs` reads each morsel's key bounds and cuts a run wherever one morsel's
+largest key is strictly below the next morsel's smallest. Each run then holds every row for the
+keys inside it and no row for any other — the identical argument `partitioned_aggregate` makes
+about its buckets — so each run's partial is final and the runs finalize independently. Applying
+the partition copies nothing.
+
+**230.1 ms -> 94 ms, and 0.78x against DuckDB** — from losing by 2.19x to winning.
+
+Three things this is careful about, and one it got wrong first:
+
+* **Separation is established, never assumed.** The bounds are read off the data, so an input
+  that merely *claims* an order — a lakehouse `sorted_by` nothing enforces on write — cannot
+  make it fire. A wrong cut is not slow, it splits one group across two runs and emits it twice.
+* **The cut rate is sampled before the relation is scanned.** Reading every morsel's bounds
+  costs ~6 ms on a 60M-row key and the answer is usually no: an interleaved relation has a legal
+  cut at well under 1% of its boundaries where an ordered one has one at most of them, and those
+  rates are orders of magnitude apart. Sampling only decides whether to *look*; the cuts the
+  runs are built from are always read off the data.
+* **The pool is asked last.** `try_reserve_cooperative` can make *other* operators spill to
+  honour a reservation, so it must only be asked when the answer can change what this operator
+  does. Asked before the cut points instead of after, it cost q18 — whose key yields too few
+  runs to take the path at all — **234 -> 508 ms**.
+
+**This is not a TPC-H win, and should not be quoted as one.** `lineitem` as the suite loads it
+is *not* ordered: ten parquet files read in parallel interleave, a 122-boundary sample of
+`lineitem` finds at most one legal cut, and the path correctly declines on every TPC-H query. An A/B with the
+path forced off measures q18 at 233.6 ms against 240.8 ms with it on — parity, which is what
+"declines cheaply" should look like. The shapes it does serve are a lakehouse table with a real
+sort key, a time-ordered ingest, and any aggregate over already-sorted output.
+
+### The board
+
+**Measured as an A/B against `HEAD` itself**, built in a separate worktree, two engines on both
+arms, alternating by suite — not against the figures recorded in the entries above. Those were
+taken on other days and two of them are stale by more than this change is worth: the operator
+mix reads 0.740 there and 0.690 on `HEAD` today, H2O groupby 1.171 there and 1.006 today.
+Comparing against them would have credited this change with both.
+
+| suite | HEAD | after | batcher total |
+|---|---:|---:|---|
+| **TPC-H sf10 (22)** | 1.087 | **0.963** | 2938 -> **2323 ms** |
+| TPC-H sf1 (22) | 0.782 | 0.742 | 460 -> 423 ms |
+| TPC-DS sf1 (99) | 0.945 | 0.947 | 3408 -> **3256 ms** |
+| ClickBench (43) | 0.630 | 0.620 | 324 -> 327 ms |
+| operator mix (21) | 0.690 | 0.678 | 635 -> 643 ms |
+| H2O join (5) | 0.697 | 0.695 | 555 -> **476 ms** |
+| H2O groupby (10) | 1.006 | 1.025 | 561 -> 576 ms |
+| **JOB (113, real IMDb)** | 1.265 | **1.112** | 9445 -> **8131 ms**, 34 -> 44 wins |
+
+TPC-H sf10 is where it lands, and it lands there per query rather than as a geomean artifact:
+
+| q | HEAD | after | | q | HEAD | after |
+|---|---:|---:|---|---|---:|---:|
+| q9 | 456 | **233** | | q3 | 116 | **87** |
+| q13 | 325 | **174** | | q4 | 117 | 96 |
+| q5 | 189 | **122** | | q10 | 158 | 139 |
+| q21 | 532 | 468 | | q8 | 103 | 94 |
+
+**JOB is the largest absolute move, and it is the bar this repo has called its weakest.** All
+113 queries over the real 2014 IMDb snapshot, every one a 3-to-16-way join — which is exactly
+the shape the admission rule was collapsing onto one core. Batcher's total drops below DuckDB's
+(8131 ms against 8885) while the geomean stays above 1: it wins the large queries (q17f
+298 -> 75 ms, q10c 185 -> 46, q8d 188 -> 69, q30a 172 -> 106) and still loses many small ones,
+so the two summary statistics disagree and both are worth quoting.
+
+**Per-query JOB deltas are not trustworthy; the suite total is.** A full run shows q25a at
+83.7 -> 264.5 ms, which looks like a 3x regression and is not one: run on its own the whole q25
+family is *faster* on the new build (q25a 135.5 -> 72.7, q25b 95.3 -> 63.5, q25c 109.5 -> 82.7),
+and q17c and q17f simply swap places between runs. 113 queries share one process, one
+learned-stats hub and one memory pool, so a query's time depends on what ran before it.
+
+TPC-DS moves 152 ms on the same shapes (q78 218 -> 162, q97 69 -> 57, q29 43 -> 32, q5 87 -> 75)
+while its geomean does not, because the queries that gained are the large ones. H2O join gains
+79 ms, all of it q5 (307 -> 205), the one question whose build side is large enough to have been
+refused a shared probe table. **Everything else is flat**, including H2O groupby at +15 ms and
+the operator mix at +8 ms — both inside the run-to-run band, and both stated rather than
+rounded away.
+
+**A three-engine sf10 run reads differently, and the reason is worth knowing.** With Polars in
+the lineup holding a second copy of the sf10 tables, q18 measures ~486 ms instead of ~235 ms:
+the shared memory pool admits its aggregate to spill rather than run in memory. That is the
+envelope working as designed — bounded beats fast — but it moves the suite geomean by ~0.07, so
+a three-engine sf10 number is noisier than it looks. The A/B above is two engines on both arms
+for exactly that reason.
+
+
+### The one failure, and it is not this change's
+
+`tpcds-q67` fails its correctness gate, and did so before any of this — reproduced on a `HEAD`
+build in a separate worktree, failing identically and just as intermittently. It is characterized
+rather than fixed.
+
+Batcher's group sums are **bit-identical across five runs**, so the engine is deterministic. But
+58,687 of its 505,132 sums differ from DuckDB's in their last bits — reassociation, which
+`python-control-plane.md` states is permitted and which no partition-count-free implementation
+can avoid. That changes which sums *tie*: 50,447 ties within `i_category` against DuckDB's
+49,469. `rank() OVER (PARTITION BY i_category ORDER BY sumsales DESC)` then turns a 1-ULP
+difference into an integer one, and the comparison reports an `rk` column differing by 1 to 3.
+
+DuckDB's own `sumsales` is not stable either — only 18 of its 100 output sums are bit-identical
+between `threads=1` and `threads=92`; its *ranks* happen to be stable across those runs, which is
+luck rather than a property. No engine can make `rank()` over a float sum agree with another
+engine's arithmetic, so this is a divergence to record, not a defect to chase. The gate is
+untouched.
+
 ## A comma join's pseudo-key, a union that pinned its query to one core, and a UTF-8 check on bytes that were already valid — TPC-DS 0.970x -> 0.918x, and four more kernels at parity (2026-08-23)
 
 `python/batcher/plan/logical/transforms.py`; `crates/bc-interp/src/stream/parallel.rs`;

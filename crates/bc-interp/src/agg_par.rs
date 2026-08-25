@@ -425,6 +425,177 @@ pub(crate) fn partials(
         .collect()
 }
 
+/// Contiguous runs of morsels whose first key column's value ranges do not overlap.
+///
+/// This is the partition the relation already has, for free. `partitioned_aggregate` pays
+/// [`ops::partition_morsels`] — a gather of every row of every column into hash buckets — to
+/// obtain key-disjoint pieces. When the key arrives **ordered**, the pieces are already there:
+/// morsel `i`'s largest key is below morsel `i + 1`'s smallest, so a cut between them separates
+/// the key space exactly as a hash bucket does, and applying it copies nothing at all.
+///
+/// That is the shape of every `GROUP BY` on a clustered key — TPC-H's `l_orderkey`, a lakehouse
+/// table's declared sort key, a time-ordered ingest — and it is where the gather hurts most,
+/// because a key that barely reduces is precisely the one whose gather moves the whole relation.
+/// Measured on 60M rows grouping to 15M on a sorted `Int64` key, `min`/`max` aggregates:
+///
+/// | phase | ms |
+/// |---|---:|
+/// | `partition_morsels` (the gather) | 150 |
+/// | the aggregation itself | 70 |
+///
+/// **Separation is established, never assumed.** The bounds are read off the data with arrow's
+/// `min`/`max`, so an input that merely *claims* an order — a lakehouse `sorted_by` nothing
+/// enforces on write — cannot make this fire. Getting it wrong would not be slow, it would split
+/// one group across two runs and emit it twice, which is why the test is on values rather than
+/// on metadata.
+///
+/// Why the **first** key column alone decides: if run A's first-column maximum is strictly below
+/// run B's first-column minimum, then no composite key can appear in both, whatever the later
+/// columns hold. A tighter test would admit more inputs; this one is sufficient and needs one
+/// column's bounds.
+///
+/// Declines a null-bearing key (`min`/`max` skip nulls, so a null key could sit in two runs and
+/// become two groups) and anything but `Int64` — the analytical key shape after the FFI boundary
+/// widens narrow integers, and the one whose ordering is unambiguous. Returns `None` when fewer
+/// than [`MIN_DISJOINT_RUNS_PER_THREAD`] runs per worker can be cut, which is the low-cardinality
+/// case: one group then spans many morsels, no cut is legal, and the existing paths are right.
+pub(crate) fn key_disjoint_runs(
+    morsels: &[RecordBatch],
+    keys: &[String],
+    workers: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Int64Type};
+
+    let key = keys.first()?;
+    if morsels.len() < 2 {
+        return None;
+    }
+    // One morsel's key bounds, or `None` for a shape this cannot reason about.
+    let bounds_of = |b: &RecordBatch| -> Option<(i64, i64)> {
+        let col = b.column_by_name(key)?;
+        if col.data_type() != &DataType::Int64 || col.null_count() > 0 || col.is_empty() {
+            return None;
+        }
+        let a = col.as_primitive::<Int64Type>();
+        Some((
+            arrow::compute::kernels::aggregate::min(a)?,
+            arrow::compute::kernels::aggregate::max(a)?,
+        ))
+    };
+
+    // Aim for two runs per worker and accept one, so the overshoot below has somewhere to go.
+    let total: usize = morsels.iter().map(|b| b.num_rows()).sum();
+    let target = total
+        .div_ceil(workers.max(1).saturating_mul(MIN_DISJOINT_RUNS_PER_THREAD))
+        .max(1);
+
+    // **Estimate the cut rate before scanning.** Reading every morsel's bounds costs a pass
+    // over the key column — 6 ms on TPC-H sf10's 60M-row `l_orderkey` — and the answer is
+    // usually no. A relation whose morsels arrive interleaved (ten parquet files read in
+    // parallel, say) has a legal cut at well under 1% of its boundaries, where an ordered one
+    // has a cut wherever a group happens not to straddle a morsel edge — for a key with a few
+    // rows per group, most of them. Those two rates are orders of magnitude apart, so a sample
+    // of boundaries separates them without touching the rest of the relation.
+    //
+    // Sampling is sound here because it only decides whether to *look*: the cut points the runs
+    // are actually built from are read off the data in the scan below, never estimated.
+    let __t = std::time::Instant::now();
+    let boundaries = morsels.len() - 1;
+    // `min` then `max`, never `clamp`: with fewer morsels than the sample wants, `clamp`'s
+    // bounds cross and it panics.
+    let samples = workers.saturating_mul(2).max(8).min(boundaries).max(1);
+    let mut hits = 0usize;
+    for s in 0..samples {
+        let i = s.saturating_mul(boundaries) / samples;
+        if bounds_of(&morsels[i])?.1 < bounds_of(&morsels[i + 1])?.0 {
+            hits += 1;
+        }
+    }
+    // Extrapolate to the whole relation and require comfortably more cuts than runs wanted —
+    // a cut only helps where it falls near a target boundary, so parity would not be enough.
+    if hits.saturating_mul(boundaries) < workers.saturating_mul(2).saturating_mul(samples) {
+        return None;
+    }
+
+    let bounds: Vec<(i64, i64)> = morsels.par_iter().map(bounds_of).collect::<Option<_>>()?;
+
+    // Close a run at the first *legal* cut past its share of the rows: legal means the run's
+    // largest key is strictly below the next morsel's smallest, so no group straddles the cut.
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut start, mut rows, mut hi) = (0usize, 0usize, i64::MIN);
+    for i in 0..morsels.len() {
+        rows += morsels[i].num_rows();
+        hi = hi.max(bounds[i].1);
+        let cuttable = i + 1 < morsels.len() && hi < bounds[i + 1].0;
+        if cuttable && rows >= target {
+            runs.push(start..i + 1);
+            (start, rows, hi) = (i + 1, 0, i64::MIN);
+        }
+    }
+    runs.push(start..morsels.len());
+    if std::env::var("BATCHER_DEBUG_AGGSPLIT").is_ok() {
+        eprintln!(
+            "AGGRUNS morsels={} runs={} workers={} target={target} scan={:?}",
+            morsels.len(),
+            runs.len(),
+            workers,
+            __t.elapsed()
+        );
+    }
+    (runs.len() >= workers.max(1).max(2)).then_some(runs)
+}
+
+/// Runs *aimed for* per worker — the cut points are then accepted wherever the key allows one,
+/// and the path is taken when at least one run per worker came out.
+///
+/// Aiming at one per worker and demanding one per worker cannot both be met: a run closes at the
+/// first legal cut *past* its share of the rows, so it always overshoots slightly and the count
+/// lands just under the worker count. Aiming at two and accepting one leaves that slack, and
+/// gives rayon something to steal with when the cuts fall unevenly.
+///
+/// The one-per-worker floor is also what keeps this off the low-cardinality group-by: there a
+/// group spans many morsels, almost no cut between them is legal, and the handful of runs that
+/// come out would run the aggregate on a handful of cores.
+const MIN_DISJOINT_RUNS_PER_THREAD: usize = 2;
+
+/// Aggregate each key-disjoint run of morsels independently, and concatenate.
+///
+/// Each run holds every row for the keys inside it and no row for any other, so its partial is
+/// already final — the identical argument [`partitioned_aggregate`] makes about its hash
+/// buckets, reached without the gather. A run of one morsel is aggregated directly; a longer one
+/// aggregates each morsel and merges with `combine`, which is cheap here because it is a merge
+/// *within* a run (a few morsels' worth of groups, cache-resident) rather than across the whole
+/// relation.
+pub(crate) fn disjoint_run_aggregate(
+    morsels: &[RecordBatch],
+    runs: &[std::ops::Range<usize>],
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    jit: &AggJit,
+    funcs: &[agg::AggFunc],
+) -> Result<Vec<RecordBatch>, InterpError> {
+    runs.par_iter()
+        .map(|run| {
+            let partial = match &morsels[run.clone()] {
+                [] => return Ok(None),
+                [only] => ops::eval_partial_jit(only, group_keys, aggregates, jit)?,
+                many => {
+                    let parts: Vec<agg::Partial> = many
+                        .iter()
+                        .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, jit))
+                        .collect::<Result<_, _>>()?;
+                    agg::combine(&parts, funcs)?
+                }
+            };
+            let agg_columns = agg::finalize(funcs, &partial)?;
+            ops::build_agg_batch(group_keys, aggregates, &partial.group_columns, &agg_columns)
+                .map(Some)
+        })
+        .filter_map(|r| r.transpose())
+        .collect()
+}
+
 /// Peak bytes the partition path holds: the gathered, partitioned relation (~1× the input)
 /// **plus** the source morsels it was gathered from, which stay live until the gather
 /// completes — so the true working set is ~2× the input, not 1×. The caller admits this
@@ -531,6 +702,96 @@ pub(crate) fn partitioned_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A morsel of `rows` consecutive keys starting at `from`, each repeated `per` times.
+    fn keyed(from: i64, rows: usize, per: i64) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let k: Vec<i64> = (0..rows as i64).map(|i| from + i / per).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(k))]).expect("batch")
+    }
+
+    /// The runs this cuts must be **key-disjoint**, because that is the entire licence for
+    /// finalizing each one on its own: a key appearing in two runs is emitted as two groups,
+    /// silently. So the property is checked directly on the cut points rather than inferred
+    /// from the ordering they were derived from.
+    #[test]
+    fn every_cut_separates_the_key_space() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+        // 400 morsels of 1,000 rows, four rows per key: most morsel edges fall inside a group,
+        // so the cuts have to be *found* rather than taken at every boundary.
+        let per = 4i64;
+        let morsels: Vec<RecordBatch> = (0..400)
+            .map(|m| keyed(m as i64 * 1_000 / per, 1_000, per))
+            .collect();
+        let keys = vec!["k".to_string()];
+        let runs = key_disjoint_runs(&morsels, &keys, 8).expect("an ordered key yields runs");
+        assert!(
+            runs.len() >= 8,
+            "wanted at least one run per worker, got {}",
+            runs.len()
+        );
+        // The runs tile the morsels exactly, and no key spans two of them.
+        assert_eq!(runs[0].start, 0);
+        assert_eq!(runs[runs.len() - 1].end, morsels.len());
+        let mut last_max: Option<i64> = None;
+        for run in &runs {
+            let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+            for b in &morsels[run.clone()] {
+                let a = b.column(0).as_primitive::<Int64Type>();
+                for i in 0..a.len() {
+                    lo = lo.min(a.value(i));
+                    hi = hi.max(a.value(i));
+                }
+            }
+            if let Some(prev) = last_max {
+                assert!(
+                    prev < lo,
+                    "run starting at {lo} overlaps the previous run ending at {prev}"
+                );
+            }
+            last_max = Some(hi);
+        }
+    }
+
+    /// A key whose morsels interleave has no legal cut, and must be refused rather than cut
+    /// somewhere that splits a group. This is the shape of a relation read from several files
+    /// in parallel, which is what TPC-H's `lineitem` arrives as.
+    #[test]
+    fn an_interleaved_key_yields_no_runs() {
+        // Every morsel spans the whole key range, so no boundary separates anything.
+        let morsels: Vec<RecordBatch> = (0..400).map(|_| keyed(0, 1_000, 1)).collect();
+        assert!(key_disjoint_runs(&morsels, &["k".to_string()], 8).is_none());
+    }
+
+    /// A null in the key is refused: `min`/`max` skip nulls, so a null-keyed row could sit in
+    /// two runs and be emitted as two groups.
+    #[test]
+    fn a_null_key_is_refused() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let morsels: Vec<RecordBatch> = (0..400)
+            .map(|m| {
+                let k: Vec<Option<i64>> = (0..1_000i64)
+                    .map(|i| {
+                        if i == 7 {
+                            None
+                        } else {
+                            Some(m as i64 * 1_000 + i)
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(k))])
+                    .expect("batch")
+            })
+            .collect();
+        assert!(key_disjoint_runs(&morsels, &["k".to_string()], 8).is_none());
+    }
 
     /// Rows a morsel of `m` rows draws from a domain of `d` distinct keys yields, per the
     /// coupon-collector curve [`estimated_groups`] inverts. The oracle for the tests below.

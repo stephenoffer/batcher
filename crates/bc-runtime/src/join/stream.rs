@@ -247,6 +247,15 @@ impl BroadcastProbe {
         })
     }
 
+    /// Heap bytes the built table holds — head slots, chain array and probe filter.
+    ///
+    /// A caller that keeps several of these resident (the streaming executor prepares one per
+    /// join before it runs anything) needs this to budget them; the build *relation* it
+    /// already measures is only about half of what a large join holds.
+    pub fn heap_bytes(&self) -> usize {
+        self.table.heap_bytes()
+    }
+
     /// Whether `probe_keys` present the same key shape the table was built for.
     ///
     /// Every morsel of a relation shares one schema, so the caller checks this once against
