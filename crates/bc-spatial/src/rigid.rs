@@ -22,6 +22,7 @@ pub struct Pose {
 
 impl Pose {
     /// The pose with the given translation and rotation.
+    #[must_use]
     pub const fn new(translation: Vec3, rotation: Quat) -> Self {
         Self {
             translation,
@@ -36,6 +37,7 @@ impl Pose {
     ///
     /// Rotation is applied before translation. The other order is a different transform
     /// and gets a different, wrong answer for every point off the origin.
+    #[must_use]
     pub fn transform(self, point: Vec3) -> Option<Vec3> {
         Some(self.rotation.rotate(point)? + self.translation)
     }
@@ -45,11 +47,13 @@ impl Pose {
     /// The inverse of `transform`, and worth having directly: composing it out of
     /// `inverse` and `transform` costs an extra rotation and gets the subtract-then-
     /// rotate order wrong about half the time it is written by hand.
+    #[must_use]
     pub fn inverse_transform(self, point: Vec3) -> Option<Vec3> {
         self.rotation.inverse_rotate(point - self.translation)
     }
 
     /// The pose that undoes this one.
+    #[must_use]
     pub fn inverse(self) -> Option<Self> {
         let inv = self.rotation.inverse()?;
         Some(Self::new(inv.rotate(self.translation)?.scale(-1.0), inv))
@@ -59,6 +63,7 @@ impl Pose {
     ///
     /// Composes the way the frame names read: `world_from_ego.compose(ego_from_lidar)`
     /// is `world_from_lidar`.
+    #[must_use]
     pub fn compose(self, other: Self) -> Option<Self> {
         Some(Self::new(
             self.rotation.rotate(other.translation)? + self.translation,

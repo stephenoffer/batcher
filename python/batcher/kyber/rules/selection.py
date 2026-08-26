@@ -188,7 +188,22 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
     smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
-    smb = ctx.hardware.memory_bytes / _SORT_MERGE_MEMORY_SHARE
+    # Both sort-merge floors are per-*task* quantities compared against whole-relation
+    # estimates, so on a cluster they have to be scaled by the fan-out the join will actually
+    # be cut into. A co-partition shuffle hashes one bucket per reducer, so a reducer's build
+    # is `build_bytes / workers` — but the guard reads the *whole* build against *one node's*
+    # memory. On a sixteen-worker cluster that declares a build sixteen times larger than it
+    # is, and steers a join whose real per-reducer hash table fits comfortably into the
+    # bounded-memory merge instead: the same 7x penalty `_SORT_MERGE_MEMORY_SHARE` was
+    # written to prevent, arrived at from the other direction.
+    #
+    # This is the same correction `_broadcast_max_bytes` already applies to the other
+    # threshold on this rule, and for the same reason — a threshold sized to one machine is
+    # not the threshold for a cluster. It cannot mis-steer a broadcast join, which decides
+    # above this and never reaches the sort-merge branch.
+    fanout = max(1, ctx.hardware.worker_count)
+    smr *= fanout
+    smb = ctx.hardware.memory_bytes * fanout / _SORT_MERGE_MEMORY_SHARE
     plan, decisions = adaptive_build_side(
         plan,
         ctx.estimator,

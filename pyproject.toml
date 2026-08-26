@@ -54,8 +54,13 @@ ray = ["ray[default]>=2.9"]
 # Optional fallback backends + benchmark oracles (NOT part of the core engine).
 polars = ["polars>=1.0"]
 duckdb = ["duckdb>=1.0"]
-# Pluggable MetadataHub backends.
+# Pluggable MetadataHub backends, and the shared result-cache backends behind the same
+# two drivers: `redis` covers both the cluster-shared statistics store and the shared
+# result cache, `rocksdb` covers the embedded ones. `rocksdict` rather than `python-rocksdb`
+# because it ships prebuilt wheels for every platform the engine targets, where the latter
+# needs a local RocksDB toolchain to install at all.
 redis = ["redis>=5"]
+rocksdb = ["rocksdict>=0.3"]
 # One extra that covers every object store the filesystem façade routes to fsspec: S3,
 # GCS, Azure (`adlfs` — `az://`, and the fallback for `abfs://` when pyarrow is built
 # without its native Azure backend), and HTTP(S) presigned URLs (`aiohttp`). Without adlfs
@@ -224,7 +229,7 @@ docs = [
     "sphinx-copybutton>=0.5",
 ]
 all = [
-    "batcher-engine[ray,polars,duckdb,redis,cloud,torch,tensorflow]",
+    "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow]",
     "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
     "batcher-engine[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
 ]

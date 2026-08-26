@@ -56,14 +56,31 @@ def _window(inp, *, partition=(), order=("a",), func="row_number", alias="r", fi
 
 
 def test_transpose_orders_independent_windows_by_spec(scan, ctx):
-    """Two independent windows are swapped into canonical spec order."""
+    """Two independent windows are swapped into canonical spec order, under a `Project`.
+
+    The projection is the correction, not decoration. `Window.available_columns()` is
+    `input.available_columns() + [aliases]`, so whichever node ends up outermost contributes
+    its aliases last — and swapping the nodes therefore transposes the *output columns* too.
+    The rule's own docstring recorded the gap without seeing it: the aliases must be disjoint
+    "so the column **set** above the pair is unchanged either way", and a set is not an order.
+    `with_columns(a=rank().over(...), b=sum().over(...))` came back as `g, v, b, a`.
+
+    So this asserts both halves: the swap happened (which is what lets
+    `collapse_adjacent_windows` merge equal specs), and the columns above the pair are exactly
+    what they were (which is what makes the rule semantics-preserving).
+    """
     inner = _window(scan, partition=("g",), alias="r1")
     outer = _window(inner, partition=(), alias="r2")
+    before = outer.available_columns()
+
     out = transpose_adjacent_windows(outer, ctx)
     assert out is not None
-    # The partition-free spec sorts first, so it must end up innermost.
-    assert isinstance(out, Window) and out.functions[0].alias == "r1"
-    assert isinstance(out.input, Window) and out.input.functions[0].alias == "r2"
+    assert out.available_columns() == before, "the rewrite transposed the output columns"
+
+    # The partition-free spec sorts first, so it must end up innermost, beneath the `Project`.
+    swapped = out.input
+    assert isinstance(swapped, Window) and swapped.functions[0].alias == "r1"
+    assert isinstance(swapped.input, Window) and swapped.input.functions[0].alias == "r2"
 
 
 def test_transpose_is_a_fixpoint_in_canonical_order(scan, ctx):

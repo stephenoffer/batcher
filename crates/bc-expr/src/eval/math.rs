@@ -164,7 +164,7 @@ fn round_i64(x: i64, digits: i64) -> i64 {
     // 10^19 already exceeds i64::MAX, so every wider step rounds to 0; clamp the
     // exponent rather than overflow the i128 power itself.
     let f = 10i128.pow((-digits).min(19) as u32);
-    let v = x as i128;
+    let v = i128::from(x);
     let half = f / 2;
     // Rust's `/` truncates toward zero, so biasing by ±half gives half-away-from-zero.
     let q = if v >= 0 {
@@ -293,7 +293,7 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
 /// on an integer, and DuckDB returns BIGINT for both); `floor`/`ceil`/`sqrt` yield
 /// Float64, promoting integer inputs, as DuckDB does.
 pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use MathFunc::*;
+    use MathFunc::{Abs, BitCount, Factorial, Round};
     // `bit_count`/`factorial` are integer functions: their result is defined by the
     // two's-complement i64 bits, not an f64 approximation. Routing them through f64
     // (a) mistyped the schema as `double` and (b) gave wrong answers above 2^53 —
@@ -316,7 +316,7 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // above 2^53 — `round(2^53+1)` came back as `2^53`. `floor`/`ceil`/`sqrt` really
         // do yield double in DuckDB, so the promotion below stays right for them.
         (Round, DataType::Int64) => Ok(Arc::clone(arr)),
-        (_, DataType::Int64) | (_, DataType::Decimal128(..)) | (_, DataType::Decimal256(..)) => {
+        (_, DataType::Int64 | DataType::Decimal128(..) | DataType::Decimal256(..)) => {
             // Promote to Float64 and apply the float function.
             //
             // **Decimal is here deliberately, and it is a trade.** Arithmetic, comparison,
@@ -404,7 +404,11 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
 /// One unary math op on a scalar `f64` (shared by both null paths of `eval_math`).
 #[inline]
 fn apply_unary(func: MathFunc, v: f64) -> f64 {
-    use MathFunc::*;
+    use MathFunc::{
+        Abs, Acos, Acosh, Asin, Asinh, Atan, Atanh, BitCount, Cbrt, Ceil, Cos, Cosh, Cot, Csc,
+        Degrees, Even, Exp, Factorial, Floor, Gamma, Lgamma, Ln, Log10, Log2, Radians, Rint, Round,
+        Sec, Sign, Sin, Sinh, Sqrt, Tan, Tanh, Trunc,
+    };
     match func {
         Abs => v.abs(),
         Round => v.round(),
@@ -489,7 +493,7 @@ fn round_ties_even(v: f64) -> f64 {
 /// spans `n ≤ 33`; the engine has no 128-bit output type, so the exact-or-error contract
 /// stops one step earlier — a documented, safe difference.)
 fn eval_int_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use MathFunc::*;
+    use MathFunc::{BitCount, Factorial};
     let i = cast(arr, &DataType::Int64)?;
     let a = i.as_primitive::<Int64Type>();
     let out: Int64Array = match func {

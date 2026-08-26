@@ -20,7 +20,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_tables_equal
 from batcher import col
 from batcher._internal.errors import PlanError
 
@@ -158,3 +158,67 @@ def test_an_aggregate_expression_in_a_select_is_the_whole_frame_aggregation():
     ds = bt.from_pydict({"g": ["a", "b"], "x": [1.0, 3.0]})
     assert ds.select(r=col("x").sum() / col("x").sum()).to_pydict() == {"r": [1.0]}
     assert ds.select(r=col("x").sum()).to_pydict() == {"r": [4.0]}
+
+
+#: A group's ``(x, y)`` pairs, and what makes the least-squares fit degenerate there. Each
+#: case is a shape the family used to answer differently from DuckDB — and, worse, from
+#: itself: `regr_r2` said NULL for a flat ``y`` where the standard says the fit is perfect,
+#: and `regr_intercept` said NaN for a flat ``x`` where `regr_r2` on the very same input
+#: said NULL.
+_DEGENERATE_FITS = [
+    pytest.param([1.0, 1.0, 1.0], [2.0, 4.0, 7.0], id="x-flat"),
+    pytest.param([1.0, 2.0, 3.0], [5.0, 5.0, 5.0], id="y-flat"),
+    pytest.param([1.0, 1.0], [5.0, 5.0], id="both-flat"),
+    pytest.param([1.0], [2.0], id="one-pair"),
+    pytest.param([], [], id="no-rows"),
+    pytest.param([None, 2.0], [4.0, 8.0], id="one-pair-after-null-drop"),
+]
+
+
+@pytest.mark.parametrize(("xs", "ys"), _DEGENERATE_FITS)
+@pytest.mark.parametrize("fn", ["regr_slope", "regr_intercept", "regr_r2"])
+def test_a_degenerate_fit_answers_what_duckdb_answers(duck, fn, xs, ys):
+    """NaN and NULL are different answers, and which one is right is per-function.
+
+    DuckDB gives `regr_slope` NaN and `regr_intercept` NULL on the same flat ``x`` — they
+    are not two spellings of one rule, so neither can be derived from the other. Asserting
+    the *pair* is the point: a change that unified them would pass a test on either alone.
+    """
+    tbl = pa.table({"x": pa.array(xs, pa.float64()), "y": pa.array(ys, pa.float64())})
+    duck.register("t", tbl)
+    sql = f"SELECT {fn}(y, x) AS v FROM t"
+    expected = duck.execute(sql).fetch_arrow_table().to_pydict()["v"][0]
+    actual = bt.sql(sql, t=bt.from_arrow(tbl)).to_pydict()["v"][0]
+    if expected is None or actual is None:
+        assert expected is actual, f"{fn}: NULL on one side only"
+    elif math.isnan(expected) or math.isnan(actual):
+        assert math.isnan(expected) and math.isnan(actual), f"{fn}: NaN on one side only"
+    else:
+        assert math.isclose(expected, actual, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_a_degenerate_fit_is_partition_independent():
+    """The degenerate branches are `CASE`s over aggregates, so they must still merge.
+
+    A conditional in the projection is evaluated *after* combine, on the merged state; a
+    version that folded it into the partial would give a different answer per partition
+    count, which is the failure mode invariant #7 exists to stop.
+    """
+    tbl = pa.table(
+        {
+            "g": ["flat-x", "flat-x", "flat-y", "flat-y", "fit", "fit", "fit"],
+            "x": [1.0, 1.0, 1.0, 2.0, 1.0, 2.0, 3.0],
+            "y": [2.0, 5.0, 4.0, 4.0, 2.0, 4.0, 6.0],
+        }
+    )
+
+    def query(ds):
+        return ds.group_by("g").agg(
+            r2=bt.regr_r2(col("y"), col("x")),
+            b=bt.regr_intercept(col("y"), col("x")),
+        )
+
+    single = bt.from_arrow(tbl)
+    assert_tables_equal(
+        query(single).collect(distributed=True, num_workers=3), query(single).collect()
+    )

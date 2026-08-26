@@ -71,13 +71,17 @@ class Optimizer:
         # all but one of its eight lookups, and re-inverted the whole rule set each time.
         # An explicit `rules` list (tests, a caller driving a subset) still partitions here,
         # because it has no registry to memoize against and is not on the per-query path.
+        # The cleanup round's rules come from the registry for the same list-identity reason
+        # the phase partition does — see `_run_cleanup`.
         if rules is None:
             self._by_phase: dict[Phase, list[Rule]] = DEFAULT_REGISTRY.by_phase()
+            self._cleanup: list[Rule] = DEFAULT_REGISTRY.recanonicalize_rules()
         else:
             by_phase: dict[Phase, list[Rule]] = {p: [] for p in Phase}
             for r in rules:
                 by_phase[r.phase].append(r)
             self._by_phase = by_phase
+            self._cleanup = [r for r in rules if r.recanonicalize]
 
     def _context(self) -> OptimizerContext:
         learned = load_learned_stats(self._hub) if self._hub is not None else {}
@@ -135,6 +139,8 @@ class Optimizer:
         The IR is `None` only when *no* phase changed the plan (every phase was a
         no-op), in which case the caller lowers once with `plan.to_ir()`. Otherwise
         the last phase that changed the plan already built the final plan's IR.
+
+        A **canonicalization round** runs after FUSION — see `_run_cleanup`.
         """
         plan = logical
         last_ir: dict | None = None
@@ -151,7 +157,81 @@ class Optimizer:
             if ir is not None:  # a no-op phase leaves the plan (and its IR) unchanged
                 last_ir = ir
                 present = _present(plan)  # refresh once for the next phase
+            if phase is Phase.FUSION:
+                plan, ir, present = self._run_cleanup(plan, ctx, fixpoint, present)
+                if ir is not None:
+                    last_ir = ir
         return plan, last_ir
+
+    def _run_cleanup(
+        self,
+        plan: LogicalPlan,
+        ctx: OptimizerContext,
+        fixpoint: int,
+        present: frozenset[type],
+    ) -> tuple[LogicalPlan, dict | None, frozenset[type]]:
+        """Re-run the canonicalization rules once the plan's shape has settled.
+
+        The phase list is a **single forward pass**, so every rule sees the plan exactly as it
+        stands when its own phase runs — and the phases after it put back the shapes a
+        canonicalizer exists to collapse. Projection pushdown stacks `Project` on `Project`;
+        join reordering re-parents subtrees so operators that were separated become adjacent;
+        fusion re-parents them again. `merge_projections` (NORMALIZE) and
+        `merge_adjacent_filters` (PUSHDOWN) have long since run by then, nothing runs them
+        again, and the redundant operator ships to the engine.
+
+        Measured over the 99 TPC-DS queries: **46 of them optimized to a plan a second
+        `optimize_logical` would still shrink**. This round takes the total plan size from
+        4,561 operator nodes to 4,491 and the non-idempotent count from 46 to 21, while
+        making planning *faster* — 57.9 ms/query to 54.9 — because every phase after a
+        smaller plan has less to walk.
+
+        **Do not read those plan-size figures as a throughput claim.** An interleaved A/B on
+        execution (12 TPC-DS queries, 7 alternating rounds, minimum of each) reads **-1.5%
+        end to end**, with per-query noise of ±5% on a shared box — so the honest statement is
+        that the round is free and slightly positive, not that it is a speed-up. A
+        *sequential* A/B on the same queries read -5.4% with one query at -21%; that was
+        page-cache ordering bias and did not survive interleaving. The reason to keep the
+        round is the plan being *canonical*, which the numbers above do establish: the
+        adaptive executor re-optimizes each stage subtree mid-query
+        (`api/adaptive/`), and a plan that still shrinks under a second pass makes that
+        re-optimization change the plan shape for reasons that have nothing to do with the
+        measured cardinalities it is supposed to be reacting to.
+
+        **Why here, and not one phase earlier or later.** Three placements were measured.
+        After JOIN_REORDER only: 4,521 nodes, because FUSION then re-creates adjacency the
+        round has already passed. After FUSION (this one): 4,491. Both: also 4,491, so the
+        earlier round earns nothing once this one exists. And it must not move *later*:
+        SELECTION's `split_expensive_filter` deliberately emits `Filter(Filter(...))` so an
+        expensive predicate sees only the survivors of a cheap one, and
+        `merge_adjacent_filters` would fuse it straight back — the ping-pong that rule's
+        module docstring says its phase placement exists to prevent. After FUSION and before
+        SELECTION is the one point where the plan's shape has settled and no cost-based
+        decision has yet been written into it.
+
+        **Why a declared subset and not a re-run of the rewrite phases.** Re-running
+        NORMALIZE + REWRITE + PUSHDOWN wholesale is both slower *and worse*: on the same 99
+        queries it cost **+18.6%** planning time and removed **41** nodes, against **-5%**
+        and **70** here. Worse because those phases also hold rules that legitimately *grow*
+        a plan, and re-running them partially undoes the first pass. Only a *contracting*
+        rule is safe to run twice, which is what `Rule.recanonicalize` declares — on the rule
+        itself, so the set cannot rot the way a name list in this module would.
+
+        Args:
+            plan: The plan as FUSION left it.
+            ctx: The optimizer context every phase shares.
+            fixpoint: The iteration bound, from `_fixpoint_bound`.
+            present: The plan's node-type set, for the rule pattern index.
+
+        Returns:
+            The canonicalized plan, the IR this round computed (`None` when it changed
+            nothing, meaning the caller keeps the IR it already had), and the refreshed
+            node-type set.
+        """
+        if not self._cleanup:
+            return plan, None, present
+        plan, ir = _run_phase(plan, self._cleanup, ctx, fixpoint, present)
+        return plan, ir, _present(plan) if ir is not None else present
 
     def optimize(self, logical: LogicalPlan) -> PhysicalPlan:
         return self.optimize_traced(logical)[0]

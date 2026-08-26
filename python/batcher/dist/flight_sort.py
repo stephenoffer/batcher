@@ -32,7 +32,7 @@ from batcher.dist.executors.partition_io import (
     partition_descriptors,
     plan_hot_split,
     sample_probs,
-    source_pushdown,
+    stage_pushdown,
 )
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
@@ -55,7 +55,7 @@ from batcher.dist.sort_boundaries import (
     sort_shape_key,
 )
 from batcher.io.source import Source
-from batcher.plan.ir_specs import sort_keys_ir, task_scan_ir
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Sort
 
 __all__ = ["execute_sort_flight", "execute_topn_flight"]
@@ -75,16 +75,14 @@ def _phase(name: str, seconds: float, **fields: object) -> None:
     log_kv(_log, logging.DEBUG, "sort phase", phase=name, seconds=round(seconds, 3), **fields)
 
 
-def _sort_ir(keys, limit, input_ir):
-    """The sort IR over `input_ir` carrying `keys` and `limit` (None = no limit)."""
-    return json.dumps(
-        {
-            "op": "sort",
-            "input": input_ir,
-            "keys": sort_keys_ir(keys),
-            "limit": limit,
-        }
-    )
+def _sort_ir(sort: Sort, input_ir: dict) -> str:
+    """`sort`'s own shape over `input_ir`.
+
+    Through `Sort.shape_ir()` rather than a hand-listed field set, so a field added to the
+    operator crosses the cluster instead of being dropped on this path with every
+    single-node test green — the way `Join` once lost `strategy`.
+    """
+    return json.dumps({**sort.shape_ir(), "input": input_ir})
 
 
 def execute_topn_flight(
@@ -116,9 +114,9 @@ def execute_topn_flight(
     cfg_json = engine_config_json()
     map_plan, sid = _relabel_single_source(sort.input)
     # Per-worker plan: read the split (scan 0) → map prefix → local top-N heap.
-    local_ir = _sort_ir(sort.keys, sort.limit, map_plan.to_ir())
+    local_ir = _sort_ir(sort, map_plan.to_ir())
     # Driver merge plan: top-N over the concatenated per-worker top-Ns (scan 0).
-    merge_ir = _sort_ir(sort.keys, sort.limit, task_scan_ir())
+    merge_ir = _sort_ir(sort, task_scan_ir())
 
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
     try:
@@ -131,7 +129,8 @@ def execute_topn_flight(
         # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
         # source's original index: a staged plan whose input is an intermediate (source id >
         # 0) missed the lookup and silently read every column.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Asked of the whole stage (`above` over the sort), keyed by the source's own id.
+        projection, predicate = stage_pushdown(above, sort, sid)
         # Contiguous, source-ordered partitions. A top-N keeps only `k` of the rows it
         # orders, so which of several rows tied at the `k`-th place survives is decided by
         # input order — and the load-balanced split pick hands one partition non-adjacent
@@ -246,7 +245,8 @@ def execute_sort_flight(
         # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
         # source's original index: a staged plan whose input is an intermediate (source id >
         # 0) missed the lookup and silently read every column.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Asked of the whole stage (`above` over the sort), keyed by the source's own id.
+        projection, predicate = stage_pushdown(above, sort, sid)
         # More map partitions than workers where the source has splits to fill them, so a
         # straggler holds a fraction of a node's share rather than all of it (see
         # `map_partitions`). `len(parts)` is the source count from here on — for the sample

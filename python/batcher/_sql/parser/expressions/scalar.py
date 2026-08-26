@@ -43,6 +43,7 @@ from batcher._sql.parser.expressions.lowering import (
     str_call,
     typed_null,
 )
+from batcher._sql.parser.expressions.lowering.families import family_function
 from batcher._sql.parser.expressions.temporal import _date_diff
 from batcher.plan.expr_ir import (
     Array,
@@ -309,10 +310,20 @@ def _scalar(tr, node) -> Expr:
         named = anonymous_scalar(tr, node)
         if named is not None:
             return named
+        # Last, and it has to be last: the derived dispatch reaches the whole public
+        # function library by name, so running it any earlier would let a Python function
+        # shadow a curated SQL mapping of the same name — which it did, taking
+        # `partition_truncate` away from `anonymous_scalar`'s own entry for it.
+        library = family_function(tr, node)
+        if library is not None:
+            return library
         raise NotImplementedError(
             f"unknown function {node.name!r}: it is not a supported SQL function and "
             f"is not registered (use bt.register_function to call a Python function)"
         )
+    typed = family_function(tr, node)
+    if typed is not None:
+        return typed
     raise NotImplementedError(f"unsupported SQL expression: {type(node).__name__}")
 
 

@@ -290,9 +290,8 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
                 "aws_virtual_hosted_style_request",
                 &["AWS_VIRTUAL_HOSTED_STYLE_REQUEST"],
             );
-            allow_http = std::env::var("AWS_ALLOW_HTTP")
-                .map(|v| is_truthy(&v))
-                .unwrap_or_else(|_| {
+            allow_http = std::env::var("AWS_ALLOW_HTTP").map_or_else(
+                |_| {
                     // An `http://` endpoint from the environment implies plain HTTP, the same
                     // way one written into the query string already does. Without this the
                     // asymmetry bites exactly the deployment the endpoint variable exists for:
@@ -308,7 +307,9 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
                         .or_else(|_| std::env::var("AWS_ENDPOINT"))
                         .map(|e| e.trim_start().to_ascii_lowercase().starts_with("http://"))
                         .unwrap_or(false)
-                });
+                },
+                |v| is_truthy(&v),
+            );
         }
         "gs" | "gcs" => {
             env_opt(

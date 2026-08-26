@@ -19,6 +19,7 @@ from typing import IO, Any, ClassVar
 
 import pyarrow as pa
 
+from batcher._internal.errors import ColumnNotFoundError
 from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
 from batcher.io._backend import _scheme
 from batcher.io.base._hive import (
@@ -547,6 +548,16 @@ class FileSink(ABC):
         if not partition_by:
             fs.mkdirs(path, exist_ok=True)
             return self._write_parts(table, path, file_index, resume, max_rows_per_file)
+
+        # Validated here, before `_hive_partition` sorts by the key columns. Without it
+        # the miss surfaced from Arrow's sort kernel as a bare `ArrowInvalid` reading
+        # "No match for FieldRef.Name(zz) in ..." followed by a dump of the table's
+        # schema *and its data* into the exception message -- untyped, unreadable, and a
+        # way for row values to reach a log. `ColumnNotFoundError` is what every other
+        # unknown-column miss in the engine raises, and it names the near-miss.
+        missing = [c for c in partition_by if c not in table.column_names]
+        if missing:
+            raise ColumnNotFoundError.of(missing[0], table.column_names)
 
         parts = list(self._hive_partition(table, partition_by))
         warn_high_cardinality_partitioning(len(parts), partition_by, path)

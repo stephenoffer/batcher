@@ -130,17 +130,16 @@ fn ranks_of<A: ByteKeys + Sync>(
                     continue;
                 }
                 let value = arr.key(i);
-                let id = match ids.get(value) {
-                    Some(&id) => id,
-                    None => {
-                        if distinct.len() >= MAX_RANK_DISTINCT {
-                            return None; // too many distinct values for ranking to pay
-                        }
-                        let id = distinct.len() as u32;
-                        distinct.push(value);
-                        ids.insert(value, id);
-                        id
+                let id = if let Some(&id) = ids.get(value) {
+                    id
+                } else {
+                    if distinct.len() >= MAX_RANK_DISTINCT {
+                        return None; // too many distinct values for ranking to pay
                     }
+                    let id = distinct.len() as u32;
+                    distinct.push(value);
+                    ids.insert(value, id);
+                    id
                 };
                 codes.push(id);
             }

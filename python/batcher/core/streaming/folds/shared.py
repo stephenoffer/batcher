@@ -15,9 +15,15 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.io.source import Source, iter_source
-from batcher.plan.logical import Aggregate
+from batcher.plan.logical import Aggregate, rebuild_over_scan
+from batcher.plan.types import one_batch
 
-__all__ = ["check_agg_state_bounded", "empty_global_aggregate", "streaming_state_budget"]
+__all__ = [
+    "StreamingTail",
+    "check_agg_state_bounded",
+    "empty_global_aggregate",
+    "streaming_state_budget",
+]
 
 
 def empty_global_aggregate(agg: Aggregate, schema: pa.Schema) -> pa.RecordBatch | None:
@@ -118,3 +124,48 @@ def check_agg_state_bounded(
         from batcher._internal.errors import ResourceError
 
         raise ResourceError(f"{label} state reached {size} bytes (cap {cap}): {cause}.")
+
+
+class StreamingTail:
+    """The row-wise operators above a streaming fold, re-applied to each emitted result.
+
+    A running fold computes the aggregate; anything the query asked for *above* it — a
+    projection, a HAVING filter, the arithmetic an expression over aggregates lowers to —
+    is row-wise over the aggregated rows, so applying it to the fold's snapshot gives
+    exactly what the batch plan computes over the whole input.
+
+    Before this, those shapes were refused from a streaming sink altogether: `sum(x) /
+    count()`, `max(v) - min(v)`, `group_by(...).agg(...).select(...)` and a HAVING filter
+    all lower to a `Project`/`Filter` *over* the `Aggregate`, and the processor router only
+    recognized a bare top-level fold. Batch ran every one of them.
+
+    The tail is executed through the same `execute_plan` call the fold uses for its input
+    pipeline, so it is the engine — not the control plane — that evaluates the expressions,
+    and the plan is built and serialized once rather than per micro-batch.
+    """
+
+    __slots__ = ("_cfg", "_ir", "_nodes")
+
+    def __init__(self, nodes: tuple) -> None:
+        """Hold the tail `nodes` (outermost first) to apply to each fold result."""
+        self._nodes = tuple(nodes)
+        # Built on first use: the tail's scan is typed by the *fold's output* schema, which
+        # is not known until a result exists.
+        self._ir: str | None = None
+        self._cfg = active_config().engine_config_json()
+
+    def apply(self, result: pa.RecordBatch) -> pa.RecordBatch | None:
+        """Run the tail over one fold result; None when it leaves no rows.
+
+        Args:
+            result: The fold's current snapshot.
+
+        Returns:
+            The transformed snapshot, or None when the tail filtered every row away.
+        """
+        if not self._nodes:
+            return result
+        if self._ir is None:
+            self._ir = json.dumps(rebuild_over_scan(self._nodes, result.schema).to_ir())
+        out = engine().execute_plan(self._ir, [[result]], self._cfg)
+        return one_batch([b for b in out if b.num_rows])

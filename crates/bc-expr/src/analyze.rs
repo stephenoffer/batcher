@@ -168,6 +168,11 @@ impl Expr {
             // existed.
             Expr::Cast { .. }
             | Expr::Case { .. }
+            // `MakeMap` raises on a row's *values* — a null key, a duplicate key, or key
+            // and value lists of different lengths — so it is fallible in the strongest
+            // sense this predicate cares about: whether reordering a conjunct ahead of it
+            // could stop an error that should be raised.
+            | Expr::MakeMap { .. }
             | Expr::Date { .. }
             // A geo function raises on a *caller* error (a negative radius, an
             // unsupported EPSG code) rather than on a row's value, so it would qualify
@@ -447,6 +452,13 @@ impl Expr {
             Expr::Spatial { args, .. } => args.iter().for_each(visit),
             Expr::MakeTemporal { args, .. } => args.iter().for_each(visit),
             Expr::MakeStruct { fields } => fields.iter().for_each(|f| visit(&f.value)),
+            // Both operands are read, so a column referenced only by the value list must
+            // not be pruned away — the failure mode here is a missing column at execution,
+            // not a wrong answer.
+            Expr::MakeMap { keys, values } => {
+                visit(keys);
+                visit(values);
+            }
             Expr::Case {
                 branches,
                 otherwise,

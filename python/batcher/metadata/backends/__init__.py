@@ -1,9 +1,10 @@
 """MetadataHub persistence backends.
 
 `InProcessBackend` (tests / single-process) and `SQLiteBackend` (local durable
-default) are built in; `ObjectStorageBackend` / `RedisBackend` share statistics
-across a cluster, and `LayeredBackend` caches one of those behind a local dict — all
-behind the same `MetadataBackend` protocol, so the Hub never changes.
+default) are built in; `RocksDBBackend` is the embedded alternative for a write-heavy
+single-node loop, `ObjectStorageBackend` / `RedisBackend` share statistics across a
+cluster, and `LayeredBackend` caches one of those behind a local dict — all behind the
+same `MetadataBackend` protocol, so the Hub never changes.
 """
 
 from __future__ import annotations

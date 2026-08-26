@@ -10,13 +10,21 @@ for unstructured multimodal ingest — against the engines Batcher claims to bea
 
 | Tier            | Engines                                              |
 |-----------------|------------------------------------------------------|
-| **Single-node** | batcher, duckdb, `duckdb_arrow`, polars, pyarrow, **pyspark** (opt-in) |
-| **Multi-node**  | batcher (distributed), daft, **pyspark** (opt-in) |
+| **Single-node** | batcher, duckdb, polars, pyarrow, daft — plus `duckdb_arrow` and **pyspark**, both opt-in |
+| **Multi-node**  | batcher (distributed), daft — plus **pyspark**, opt-in |
 
 `duckdb` runs on its compressed *native* store (DuckDB at its best); `duckdb_arrow` runs the
 same query on the *same zero-copy Arrow* Batcher consumes — the like-for-like execution bar.
-Reporting both separates DuckDB's storage engine from its execution engine (see
-`TPCH_FINDINGS.md`).
+The two separate DuckDB's storage engine from its execution engine, and **a ratio is
+meaningless without saying which bar it is against**: on h2o-groupby the same Batcher on the
+same queries reads 1.042x against native DuckDB and 0.03-0.15x against DuckDB-on-Arrow,
+because the first comparison is against dictionary-encoded storage Batcher has no equivalent
+for. Always name the bar. See `TPCH_FINDINGS.md`.
+
+`duckdb_arrow` is **not** in the default lineup — it must be requested with
+`--engines batcher,duckdb,duckdb_arrow`. It was tried as a default and TPC-DS could not
+finish: over registered Arrow views DuckDB has no storage statistics to order a many-way
+join with, and it was SIGKILLed on q64. `engines/lineup.py` records the detail.
 
 Correctness is checked before any timing is trusted: a query is only timed once its
 result matches the reference engine, so a fast wrong answer can never be reported as
@@ -55,6 +63,23 @@ export BENCH_CLICKBENCH_PARTS=10                        # read 10 hits partition
 export BENCH_SCAN_BASE=s3://my-mirror                   # scan corpus bucket root
 export BENCH_S3_REGION=us-east-1                        # for S3 sources
 ```
+
+### What TPC-H actually measures, per engine
+
+Worth knowing before quoting a TPC-H ratio: **the suite does not run one surface for
+Batcher.** Ray Data has no SQL, so `suites/standard/tpch_ray/` gives it a hand-written
+`ray.data.Dataset` pipeline for all 22 queries. Polars runs native lazy-DataFrame pipelines
+(`tpch_polars/`), the way Polars' own published TPC-H benchmark does, because its SQL parser
+folds `0.06 + 0.01` to the double below `0.07` and returns a wrong q6. And Batcher runs
+`tpch_dataframe.py` pipelines on the **8 queries that have one** (q1, q3, q5, q6, q10, q12,
+q14, q19) and `bt.sql()` on the other 14. DuckDB and Spark run the SQL string throughout.
+
+So a TPC-H geomean for Batcher averages two front-ends. That is worth stating and is not a
+validity problem: the planned operator sequences were diffed at sf1-proportional
+cardinalities and are **identical** for q1, q3, q5 and q6 — including q5's six-table join, so
+Kyber derives the same join tree from the flat `FROM a,b,c,d,e,f WHERE ...` that the pipeline
+hard-codes — and for q10, q12, q14 and q19 they differ only in where one or two `project` and
+scan-pushdown nodes land. The hand-written plans are not out-planning the SQL front-end.
 
 ### Standard benchmarks deliberately not wired up
 
@@ -314,30 +339,44 @@ engine adapter already has a `read_parquet`.
 
 ```
 benchmarks/
-  harness.py     correctness check + best-of-N timing (the measurement core)
+  harness/       correctness check + best-of-N timing (the measurement core)
+    compare.py   canonicalize, reconcile types, compare row multisets, time what agreed
+    order.py     the half a multiset comparison cannot see: did the ORDER BY happen?
+    report.py    the aligned table, per-case subprocess isolation, the `n/c` rule
   registry.py    the benchmark registry, the suite(...) decorator, and sql_case
+  envinfo.py     refuse a debug build or a contended box; the machine fingerprint
+  signature.py   a bounded result fingerprint, for checking every request in a loop
   sources/       established public parquet sources; job.py fetches the IMDb database
   datagen/       the two datasets with no public corpus: h2o_tables.py  json_events.py
   context.py     loads a benchmark's tables once, serves every engine
   engines/       one adapter per engine, behind a common contract
-    base.py  lineup.py  batcher.py  duckdb.py  polars.py  pyarrow.py
-    spark.py  daft.py  ray.py
-  suites/
+    base.py  lineup.py  batcher.py  duckdb.py  duckdb_arrow.py  polars.py
+    pyarrow.py  spark.py  daft.py  ray.py
+  suites/        the registered, correctness-gated cases run through run.py
     standard/    SQL-first: tpch.py (22)  clickbench.py (43)  tpcds.py (99)  job.py (113)
                  — the latter two split vendored .sql files written by
-                 tools/vendor_{tpcds,job}_queries.py
+                 tools/vendor_{tpcds,job}_queries.py; tpch_{dataframe,polars,ray}/ carry
+                 the native pipelines for the engines that do not run the SQL
     h2o/         H2O.ai db-benchmark: groupby.py (10)  join.py (5)
     operators/   dataframe-API operator-mix; where PyArrow also competes natively
     scan/        one table x three parquet file layouts; isolates scan planning
     semistructured/ JSON parsing + typed path extraction
     multimodal/  unstructured ingest: images.py (list/decode/resize) vs Daft
-  cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video)
   run.py         the CLI: select engines, load data, run, report
   internals/     benchmarks of Batcher's own subsystems, with their own reporting
     distributed.py             single-node == many-partition equivalence + timing
     optimizer_bench.py         Kyber planning latency as the rule set grows
     metadata_bench.py          metadata-answered queries vs the O(rows) computation
     shuffle_vs_object_store.py Arrow Flight shuffle vs the Ray object store
+  scenarios/     standalone workload benchmarks, run directly rather than through run.py
+    claims/      does a claim the project makes survive measurement? cost, learning
+                 curve, scheduler equivalence, cold start
+    formats/ genomics/ robotics/ streaming/ training/
+  cluster/       distributed + GPU multimodal benchmarks (inference/LLM/audio/video)
+  gpu_backend/   the device tier: kernels, multi-GPU, energy, the public gpu path
+  concurrency/   many clients against one engine: QPS, latency percentiles, wrong
+                 answers that only appear under concurrency
+  iso/           one process per (engine, query) — no cross-query state at all
 ```
 
 ### Adding a benchmark
@@ -470,22 +509,50 @@ answer and a multiset comparison cannot see a sort bug.
 `bench-h2o-groupby`, `bench-h2o-join`, `bench-ops`, `bench-scan`, `bench-images`,
 `bench-multi`, `bench-all`, `bench-list`, `bench-dist`, `bench-aux <which>`.
 
-The harness (`harness.py`):
+The harness (`harness/`):
 
 1. **Verifies correctness first.** Every engine's output is compared to a reference
    as a sorted row multiset (row and column order normalized away), tolerant of float
-   rounding and of DuckDB's `Decimal` sums vs. float. A mismatch marks the row
-   `FAILED` and prints a diff; it does not abort the suite.
-2. **Times best-of-N** wall-clock in milliseconds after one warm-up. An engine that
-   cannot express a query is marked `n/a` (`PARTIAL` overall); one that errors records
-   the error rather than crashing the run.
-3. **Reports an aligned table** whose columns adapt to the selected lineup:
-   `query | <engine>_ms ... | b/<engine> ratios | status`.
+   rounding and of DuckDB's `Decimal` sums vs. float. The reference is never Batcher
+   while any independent engine is present (`harness/compare.py::_ORACLE_PREFERENCE`) —
+   a comparator's bug reported as Batcher's has actually happened here.
+2. **Checks the order separately.** The multiset comparison sorts both sides, so it cannot
+   tell a sorted result from an unsorted one; a case carrying an outermost `ORDER BY` is
+   additionally checked for monotonicity in its own order, per engine (`harness/order.py`).
+3. **Times best-of-N** wall-clock in milliseconds. Each engine is executed once for the
+   correctness check and once as `bench()`'s warm-up, so a timed run is the third — the
+   fixed cost of a *cold* process is deliberately not visible here, and
+   `scenarios/claims/cold_start.py` measures it instead. An engine that cannot express a
+   query is `n/a` (`PARTIAL` overall); one that errors records the error.
+4. **Reports an aligned table** whose columns adapt to the lineup:
+   `query | <engine>_ms ... | b/<engine> ratios | status`. A failed engine is still timed —
+   how fast a wrong answer was is diagnostic — but its **ratio is withheld and printed
+   `n/c`**, because a ratio is a claim about which engine is faster and a number parts
+   company with its status column the moment either is copied elsewhere.
 
 ## Reading the numbers
 
-`b/<engine>` is `batcher_ms / engine_ms` (lower means Batcher is faster). Timings vary
-run to run; treat them as order-of-magnitude. The status column is the gate: only `OK`
+The suite prints a **geomean of `b/<engine>` beneath every table**, together with the
+number of cases it is a mean *of* and the exclusions by status — because a geomean over an
+unstated denominator is not comparable to another one, and until recently the harness
+computed no geomean at all: every published figure was worked out by hand from the printed
+rows, with no record of which `FAILED`, `PARTIAL` or `DIVERGENT` rows were included.
+
+**Do not quote a geomean to three decimals from a single run.** The operator mix has been
+measured at a **4.1% spread** across three runs on one box (0.619 / 0.598 / 0.594), with
+five of its 21 cases varying more than 20% and one by 1.78x. At that spread, two figures
+agreeing to 0.001 is a coincidence and not corroboration — a claim of exactly that form was
+published and has been withdrawn. Run `--repeat N`, which re-runs the whole selection and
+reports min / median / max and the spread, then quote the median to a precision the spread
+supports.
+
+`b/<engine>` is `batcher_ms / engine_ms` — **lower means Batcher is faster**, and every
+table `run.py` prints uses this direction. Two standalone scripts print the reciprocal
+(`scenarios/strength_bench.py` reports `<engine>/batcher` and `cluster/vs_ray_daft.py`
+reports `vs_ray = ray_ms / batcher_ms`), where **higher** means Batcher is faster; both say
+so in their headers. Check the direction before transcribing a number — inverting one turns
+a loss into a win rather than merely blurring it. `n/c` means the row failed the correctness
+gate and the ratio was withheld. Timings vary run to run; treat them as order-of-magnitude. The status column is the gate: only `OK`
 rows have been verified to match the reference engine. `PARTIAL` means some engine in the
 lineup could not express that query, while the ones that did still agreed.
 

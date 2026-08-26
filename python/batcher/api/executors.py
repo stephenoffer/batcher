@@ -17,6 +17,7 @@ chain.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -29,6 +30,9 @@ from batcher.api.terminal._metadata import collect_source_metadata
 from batcher.core import ExecutionContext, Executor
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+
+if TYPE_CHECKING:
+    from batcher.carbonite.cache_shared import SharedResultCache
 
 __all__ = ["DistributedExecutor", "LocalNativeExecutor", "UdfExecutor", "select"]
 
@@ -216,34 +220,107 @@ def _cached_or_run(
     """Serve `plan`'s result from the process result cache, else compute it via `run`
     and store it — the shared `Dataset.cache()` path for the relational executors.
 
-    A no-op wrapper around `run()` unless `ctx.cache`. Only relational results are
-    cached (the UDF path is opaque to Kyber and may be non-deterministic, so it never
-    routes here); the key is shared across the single-node and distributed paths
-    (mergeable algebra makes their results identical), so a result cached one way is
-    served the other. An oversized result is simply not cached (the store's size guard).
+    A no-op wrapper around `run()` unless `ctx.cache` names a storage level. Only
+    relational results are cached (the UDF path is opaque to Kyber and may be
+    non-deterministic, so it never routes here); the key is shared across the single-node
+    and distributed paths (mergeable algebra makes their results identical), so a result
+    cached one way is served the other. An oversized result is not held in memory, and is
+    written to the disk tier instead when the level allows it (the store's size guard).
+
+    Three lookups, cheapest first: the process cache, then the shared store if one is
+    configured *and* this query may be shared, then execution. A shared hit is written
+    into the process cache on the way through, so the second read in this process does
+    not pay the round trip again.
     """
-    if not ctx.cache:
+    if ctx.cache is None:
         return run()
     import time
 
     from batcher import carbonite
 
     cache = carbonite.result_cache()
-    key = _result_cache_key(plan, sources)
+    key = result_cache_key(plan, sources)
     hit = cache.get(key)
     if hit is not None:
         return hit
+
+    shared, shared_key = _shared_lookup(plan, sources)
+    if shared is not None and shared_key is not None:
+        remote = shared.get(shared_key)
+        if remote is not None:
+            # Promote into the process cache. `cost` is unknown here — what was measured
+            # was another process's run — so it enters at zero, which ranks it as the
+            # cheap entry it *is* to re-obtain: a read-back, not a recompute.
+            cache.put(key, remote, keepalive=tuple(sources), cost=0.0, level=ctx.cache)
+            return remote
+
     started = time.perf_counter()
     table = run()
     cost = time.perf_counter() - started
     # Pin the source objects as the entry's keep-alive: the key uses their object
     # identity, so holding them alive makes a collision with a reused id impossible.
     # `cost` (recompute seconds) lets eviction keep expensive results over cheap ones.
-    cache.put(key, table, keepalive=tuple(sources), cost=cost)
+    cache.put(key, table, keepalive=tuple(sources), cost=cost, level=ctx.cache)
+    if shared is not None and shared_key is not None:
+        shared.put(shared_key, table)
     return table
 
 
-def _result_cache_key(plan: LogicalPlan, sources: list[Source]) -> str:
+def _shared_lookup(
+    plan: LogicalPlan, sources: list[Source]
+) -> tuple[SharedResultCache | None, str | None]:
+    """The shared result cache and this query's key in it, or `(None, None)`.
+
+    Two things have to be true before a result may leave the process, and they fail for
+    different reasons: a store must be configured and reachable, and *this* query must be
+    keyable by content. The second is the one that matters — see
+    `carbonite.cache_shared.base` — and it declines for anything reading in-memory data or
+    a source that cannot state which version of itself was read.
+
+    Args:
+        plan: The plan about to run.
+        sources: Its bound sources, in scan order.
+
+    Returns:
+        The shared cache and the key to use, or `(None, None)` when the result must stay
+        in this process.
+    """
+    from batcher.carbonite.cache_shared import shareable_key, shared_cache
+    from batcher.kyber.signature import plan_signature
+
+    store = shared_cache()
+    if store is None:
+        return None, None
+    return store, shareable_key(plan_signature(plan), list(sources), _cache_scope())
+
+
+def cached_result(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None:
+    """The cached result for `plan` over `sources`, or `None` if nothing is cached.
+
+    A read-only probe of the process result cache for callers that are not the executor:
+    a `count()` or an `is_empty()` on a dataset whose result is already cached should read
+    the answer off the stored table rather than issuing a fresh `COUNT(*)` over the source.
+    That is the whole point of having cached it — those two are the terminals a caching
+    user calls *most*, and answering them from the source made a warm cache invisible on
+    exactly the queries it should have been fastest on.
+
+    Counts as a hit or a miss, because it is one. A probe that did not would make the
+    cache's own hit rate understate its value by however much of the workload asks a
+    question about a result rather than for the result itself.
+
+    Args:
+        plan: The plan whose result is wanted.
+        sources: Its bound sources, in scan order.
+
+    Returns:
+        The cached table, or `None` on a miss.
+    """
+    from batcher import carbonite
+
+    return carbonite.result_cache().get(result_cache_key(plan, sources))
+
+
+def result_cache_key(plan: LogicalPlan, sources: list[Source]) -> str:
     """A correctness-safe result-cache key: plan signature, inputs, tenant, and viewer.
 
     Object identity (`id`) distinguishes inputs that share a shape — `Source.identity()`

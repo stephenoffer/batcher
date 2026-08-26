@@ -26,17 +26,23 @@ def planar_measurement_answers_in_coordinate_units() -> None:
         }
     )
     print("--- area, length and perimeter measure three different things ---")
-    print(
-        shapes.select(
-            kind=bt.st_geometry_type(col("g")),
-            # Holes are subtracted; a non-areal geometry has zero area, not null.
-            area=bt.st_area(col("g")),
-            # Chains only. A polygon reports zero, matching PostGIS.
-            length=bt.st_length(col("g")),
-            # Polygon boundaries only, holes included.
-            perimeter=bt.st_perimeter(col("g")),
-        ).to_pydict()
-    )
+    measured = shapes.select(
+        kind=bt.st_geometry_type(col("g")),
+        # Holes are subtracted; a non-areal geometry has zero area, not null.
+        area=bt.st_area(col("g")),
+        # Chains only. A polygon reports zero, matching PostGIS.
+        length=bt.st_length(col("g")),
+        # Polygon boundaries only, holes included.
+        perimeter=bt.st_perimeter(col("g")),
+    ).to_pydict()
+    print(measured)
+    # Each comment above is a claim, so check it rather than trusting the printout.
+    assert measured["area"][0] == 16.0, "a 4x4 square"
+    assert measured["area"][1] == 96.0, "10x10 less a 2x2 hole — the hole IS subtracted"
+    assert measured["length"][:2] == [0.0, 0.0], "a polygon has zero length, as in PostGIS"
+    assert measured["length"][2] == 5.0, "the 3-4-5 chain"
+    assert measured["perimeter"][1] == 48.0, "40 of shell plus 8 of hole — holes ARE included"
+    assert measured["perimeter"][2] == 0.0 and measured["area"][3] == 0.0, "zero, never null"
 
     pairs = bt.from_pydict(
         {
@@ -45,15 +51,20 @@ def planar_measurement_answers_in_coordinate_units() -> None:
         }
     )
     print("--- the distance family ---")
-    print(
-        pairs.select(
-            nearest=bt.st_distance(col("a"), col("b")),
-            furthest=bt.st_max_distance(col("a"), col("b")),
-            # How far apart two shapes are at their worst-matching point: the standard
-            # measure of "are these the same shape".
-            hausdorff=bt.st_hausdorff_distance(col("a"), col("b")),
-        ).to_pydict()
-    )
+    distances = pairs.select(
+        nearest=bt.st_distance(col("a"), col("b")),
+        furthest=bt.st_max_distance(col("a"), col("b")),
+        # How far apart two shapes are at their worst-matching point: the standard
+        # measure of "are these the same shape".
+        hausdorff=bt.st_hausdorff_distance(col("a"), col("b")),
+    ).to_pydict()
+    print(distances)
+    assert distances["nearest"] == [2.0, 1.0]
+    # The three are genuinely different measures: for two parallel lines one unit apart,
+    # nearest and Hausdorff agree at 1 while the furthest corner-to-corner span is ~10.
+    assert distances["hausdorff"][1] == 1.0 and distances["furthest"][1] > 10.0
+    for near, far in zip(distances["nearest"], distances["furthest"], strict=True):
+        assert near <= far
 
     bearings = bt.from_pydict(
         {
@@ -62,7 +73,11 @@ def planar_measurement_answers_in_coordinate_units() -> None:
         }
     )
     print("--- azimuth: radians clockwise from north ---")
-    print(bearings.select(rad=bt.st_azimuth(col("from"), col("to")).round(4)).to_pydict())
+    azimuths = bearings.select(rad=bt.st_azimuth(col("from"), col("to")).round(4)).to_pydict()
+    print(azimuths)
+    # North, east, south, west — clockwise from north, so east is pi/2 and not -pi/2. A
+    # counter-clockwise or from-east convention would print equally plausible numbers.
+    assert azimuths["rad"] == [0.0, 1.5708, 3.1416, 4.7124]
 
 
 def geodesic_measurement_answers_in_metres() -> None:
@@ -74,16 +89,22 @@ def geodesic_measurement_answers_in_metres() -> None:
         }
     )
     print("--- planar degrees versus spherical and ellipsoidal metres ---")
-    print(
-        legs.select(
-            "leg",
-            degrees=bt.st_distance(col("a"), col("b")).round(2),
-            # Haversine: about 0.5% accurate, cheap, no failure mode.
-            sphere_km=(bt.st_distance_sphere(col("a"), col("b")) / 1000).round(1),
-            # Vincenty on WGS 84: sub-millimetre, iterative, an order slower.
-            spheroid_km=(bt.st_distance_spheroid(col("a"), col("b")) / 1000).round(1),
-        ).to_pydict()
-    )
+    legs_out = legs.select(
+        "leg",
+        degrees=bt.st_distance(col("a"), col("b")).round(2),
+        # Haversine: about 0.5% accurate, cheap, no failure mode.
+        sphere_km=(bt.st_distance_sphere(col("a"), col("b")) / 1000).round(1),
+        # Vincenty on WGS 84: sub-millimetre, iterative, an order slower.
+        spheroid_km=(bt.st_distance_spheroid(col("a"), col("b")) / 1000).round(1),
+    ).to_pydict()
+    print(legs_out)
+    # SF to London is ~8,600 km and London to Paris ~344 km; the whole point of the section
+    # is that the planar number is in degrees and means nothing as a distance.
+    assert 8500 < legs_out["sphere_km"][0] < 8700
+    assert 340 < legs_out["spheroid_km"][1] < 350
+    # Haversine and Vincenty must agree to within haversine's stated ~0.5%.
+    for sphere, spheroid in zip(legs_out["sphere_km"], legs_out["spheroid_km"], strict=True):
+        assert abs(sphere - spheroid) / spheroid < 0.005
 
     cells = bt.from_pydict(
         {
@@ -95,18 +116,25 @@ def geodesic_measurement_answers_in_metres() -> None:
         }
     )
     print("--- one degree of ground is not one degree of area ---")
-    print(
-        cells.select(
-            "where",
-            square_degrees=bt.st_area(col("g")),
-            square_km=(bt.st_area_spheroid(col("g")) / 1e6).round(0),
-            perimeter_km=(bt.st_perimeter_spheroid(col("g")) / 1000).round(0),
-        ).to_pydict()
-    )
+    cells_out = cells.select(
+        "where",
+        square_degrees=bt.st_area(col("g")),
+        square_km=(bt.st_area_spheroid(col("g")) / 1e6).round(0),
+        perimeter_km=(bt.st_perimeter_spheroid(col("g")) / 1000).round(0),
+    ).to_pydict()
+    print(cells_out)
+    # The section's entire claim: identical in degrees, and about half the ground area at
+    # 60 north, because a degree of longitude shrinks with cos(latitude) and cos(60) = 0.5.
+    assert cells_out["square_degrees"] == [1.0, 1.0]
+    ratio = cells_out["square_km"][1] / cells_out["square_km"][0]
+    assert 0.45 < ratio < 0.55, f"expected roughly cos(60)=0.5, measured {ratio:.3f}"
 
     routes = bt.from_pydict({"g": ["LINESTRING(0 0, 1 0, 1 1)"]})
     print("--- geodesic chain length ---")
-    print(routes.select(km=(bt.st_length_spheroid(col("g")) / 1000).round(1)).to_pydict())
+    chain = routes.select(km=(bt.st_length_spheroid(col("g")) / 1000).round(1)).to_pydict()
+    print(chain)
+    # Two one-degree legs at the equator, each ~111.2 km.
+    assert 220 < chain["km"][0] < 225
 
 
 def project_once_then_measure_in_metres() -> None:
@@ -237,30 +265,47 @@ def positions_along_a_route() -> None:
     """Linear referencing: the vocabulary route and network data is described in."""
     road = bt.from_pydict({"g": ["LINESTRING(0 0, 10 0, 10 10)"], "fix": ["POINT(4 7)"]})
     print("--- interpolate and locate are exact inverses ---")
-    print(
-        road.select(
-            halfway=bt.st_as_text(bt.st_line_interpolate_point(col("g"), 0.5)),
-            where=bt.st_line_locate_point(col("g"), col("fix")).round(4),
-            stretch=bt.st_as_text(bt.st_line_substring(col("g"), 0.25, 0.75)),
-        ).to_pydict()
-    )
+    linear = road.select(
+        halfway=bt.st_as_text(bt.st_line_interpolate_point(col("g"), 0.5)),
+        where=bt.st_line_locate_point(col("g"), col("fix")).round(4),
+        stretch=bt.st_as_text(bt.st_line_substring(col("g"), 0.25, 0.75)),
+    ).to_pydict()
+    print(linear)
+    # The road is 20 units long, so the midpoint is exactly the corner at (10 0).
+    assert linear["halfway"] == ["POINT(10 0)"]
+    assert linear["stretch"] == ["LINESTRING(5 0, 10 0, 10 5)"]
+    # "Exact inverses" is a claim, so round-trip it: interpolating at the fraction `locate`
+    # returned must land back on the point `locate` was given.
+    back = road.select(
+        at=bt.st_as_text(bt.st_line_interpolate_point(col("g"), linear["where"][0]))
+    ).to_pydict()["at"]
+    assert back == ["POINT(10 7)"], f"locate/interpolate are not inverses: {back}"
 
     print("--- snapping a fix to the road, and drawing the gap ---")
-    print(
-        road.select(
-            snapped=bt.st_as_text(bt.st_closest_point(col("g"), col("fix"))),
-            gap=bt.st_as_text(bt.st_shortest_line(col("g"), col("fix"))),
-        ).to_pydict()
-    )
+    snapping = road.select(
+        snapped=bt.st_as_text(bt.st_closest_point(col("g"), col("fix"))),
+        gap=bt.st_as_text(bt.st_shortest_line(col("g"), col("fix"))),
+    ).to_pydict()
+    print(snapping)
+    # The fix at (4 7) snaps sideways onto the vertical leg, and the gap runs from the
+    # snapped point back to the fix — so the two answers must agree on where the road is.
+    assert snapping["snapped"] == ["POINT(10 7)"]
+    assert snapping["gap"] == ["LINESTRING(10 7, 4 7)"]
 
     origin = bt.from_pydict({"g": ["POINT(0 0)"]})
     print("--- travel a geodesic distance along a bearing ---")
-    print(
-        origin.select(
-            north_111km=bt.st_as_text(bt.st_project(col("g"), 111195.0, 0.0)),
-            east_111km=bt.st_as_text(bt.st_project(col("g"), 111195.0, 90.0)),
-        ).to_pydict()
-    )
+    travelled = origin.select(
+        north_111km=bt.st_as_text(bt.st_project(col("g"), 111195.0, 0.0)),
+        east_111km=bt.st_as_text(bt.st_project(col("g"), 111195.0, 90.0)),
+    ).to_pydict()
+    print(travelled)
+    # 111,195 m is one degree of great circle, so from the origin each bearing moves almost
+    # exactly one degree along its own axis and essentially none along the other. A bearing
+    # measured from the wrong reference would swap these two.
+    north = travelled["north_111km"][0].removeprefix("POINT(").removesuffix(")").split()
+    east = travelled["east_111km"][0].removeprefix("POINT(").removesuffix(")").split()
+    assert abs(float(north[0])) < 1e-6 and abs(float(north[1]) - 1.0) < 1e-5
+    assert abs(float(east[0]) - 1.0) < 1e-5 and abs(float(east[1])) < 1e-6
 
 
 def main() -> None:

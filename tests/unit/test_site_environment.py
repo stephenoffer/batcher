@@ -340,7 +340,7 @@ def test_no_local_volume_leaves_the_spill_paths_on_a_tempdir(monkeypatch, tmp_pa
     from batcher.dist.flight_worker import _reduce_work_dir
 
     made = _reduce_work_dir("probe_", None)
-    assert made.startswith(tempfile.gettempdir()) or made.startswith(str(tmp_path))
+    assert made.startswith((tempfile.gettempdir(), str(tmp_path)))
 
 
 def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monkeypatch, tmp_path):

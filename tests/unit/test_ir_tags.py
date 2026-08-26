@@ -79,6 +79,7 @@ EXPR_GOLDEN = {
     "LIST_TRANSFORM": "list_transform",
     "LIST_ZIP": "list_zip",
     "LIT": "lit",
+    "MAKE_MAP": "make_map",
     "MAKE_STRUCT": "make_struct",
     "MAKE_TEMPORAL": "make_temporal",
     "MAP": "map",

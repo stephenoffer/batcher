@@ -53,9 +53,7 @@ def test_generate_names_the_output_column():
 
 def test_generate_builds_prompts_from_a_template():
     ds = bt.from_pydict({"name": ["ada"], "topic": ["math"]})
-    out = ds.ml.generate(
-        lambda: lambda ps: list(ps), prompt_column="name", template="{name} likes {topic}"
-    )
+    out = ds.ml.generate(lambda: list, prompt_column="name", template="{name} likes {topic}")
     assert out.to_pydict()["response"] == ["ada likes math"]
 
 
@@ -77,9 +75,7 @@ def test_generate_appends_token_usage_columns():
             self.last_usage = [(3, 4)] * len(prompts)
             return ["ok"] * len(prompts)
 
-    out = bt.from_pydict({"q": ["a", "b"]}).ml.generate(
-        lambda: _Engine(), prompt_column="q", usage=True
-    )
+    out = bt.from_pydict({"q": ["a", "b"]}).ml.generate(_Engine, prompt_column="q", usage=True)
     assert out.to_pydict() == {
         "q": ["a", "b"],
         "response": ["ok", "ok"],
@@ -99,9 +95,7 @@ def test_generate_builds_the_engine_once_not_once_per_batch():
         def __call__(self, prompts):
             return ["r"] * len(prompts)
 
-    bt.from_pydict({"q": list("abcdefgh")}).ml.generate(
-        lambda: _Engine(), prompt_column="q"
-    ).to_pydict()
+    bt.from_pydict({"q": list("abcdefgh")}).ml.generate(_Engine, prompt_column="q").to_pydict()
     assert len(builds) == 1
 
 
@@ -138,7 +132,7 @@ def test_streaming_builds_the_engine_once_for_the_whole_query():
         def __call__(self, prompts):
             return ["r"] * len(prompts)
 
-    plan = bt.from_pydict({"q": ["a", "b"]}).ml.generate(lambda: _Engine(), prompt_column="q")._plan
+    plan = bt.from_pydict({"q": ["a", "b"]}).ml.generate(_Engine, prompt_column="q")._plan
     prebuild_factories(plan)
     assert len(builds) == 1
 

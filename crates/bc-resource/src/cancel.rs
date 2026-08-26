@@ -146,6 +146,7 @@ pub fn unregister(query_id: &str) {
 /// Args are the id and the token `register` returned for it.
 ///
 /// Returns whether an entry was removed.
+#[must_use]
 pub fn unregister_token(query_id: &str, token: &CancelToken) -> bool {
     let mut map = locked();
     match map.get(query_id) {
@@ -162,6 +163,7 @@ pub fn unregister_token(query_id: &str, token: &CancelToken) -> bool {
 /// Returns whether a query with that id was registered. `false` means it already finished
 /// or never started, which is information for the caller and not an error — the race
 /// between a cancel and a completion has no correct loser.
+#[must_use]
 pub fn cancel(query_id: &str) -> bool {
     match locked().get(query_id) {
         Some(token) => {
@@ -188,6 +190,7 @@ pub fn running() -> Vec<String> {
 ///
 /// Returns how many were cancelled, so a shutdown path can say whether it interrupted
 /// anything rather than guessing.
+#[must_use]
 pub fn cancel_all() -> usize {
     let map = locked();
     for token in map.values() {

@@ -370,6 +370,10 @@ impl Expr {
             Expr::ListTransform { input, func } => eval_list_transform(&input.eval(batch)?, func),
             Expr::ListFilter { input, pred } => eval_list_filter(&input.eval(batch)?, pred),
             Expr::MakeStruct { fields } => eval_make_struct(fields, batch),
+            Expr::MakeMap { keys, values } => crate::eval::map_ops::make_map::eval_make_map(
+                &keys.eval(batch)?,
+                &values.eval(batch)?,
+            ),
             Expr::ListJoin { input, separator } => eval_list_join(&input.eval(batch)?, separator),
             Expr::Math { func, input } => {
                 let arr = input.eval(batch)?;
@@ -493,16 +497,34 @@ impl Expr {
                 let list = list.as_list::<i32>();
                 rebuild_list(list, |s, e| {
                     // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
-                    // otherwise overflows the `+` before the `.min(e)` clamp — panicking
-                    // in debug and wrapping to a giant `usize` (capacity overflow) in
-                    // release. `list.slice(3, i64::MAX)` must clamp to the list end.
-                    let begin = (s as i64).saturating_add((*offset).max(0)).min(e as i64) as usize;
-                    let end = match length {
-                        Some(l) => {
-                            (begin as i64).saturating_add((*l).max(0)).min(e as i64) as usize
-                        }
-                        None => e,
+                    // otherwise overflows the `+` before the clamp — panicking in debug
+                    // and wrapping to a giant `usize` (capacity overflow) in release.
+                    // `list.slice(3, i64::MAX)` must clamp to the list end.
+                    let len = (e - s) as i64;
+                    // A negative offset counts back from the end of *this row's* list,
+                    // matching `str.slice` and the Polars spelling this method mirrors.
+                    // It is resolved *before* the clamp, which is what makes an offset
+                    // reaching past the front yield an empty window rather than the
+                    // list's head: `slice(-10, 2)` on six elements is empty, exactly as
+                    // Python's `l[-10:-8]` is. Clamping the offset to zero first (the
+                    // previous `(*offset).max(0)`) silently returned the wrong end of
+                    // the list for every negative offset — so `slice(-1)` returned the
+                    // whole list, and the `.list.tail` guidance, which points straight
+                    // at `slice(-n, n)`, was wrong for every input.
+                    let start_rel = if *offset < 0 {
+                        len.saturating_add(*offset)
+                    } else {
+                        *offset
                     };
+                    let end_rel = match length {
+                        Some(l) => start_rel.saturating_add((*l).max(0)),
+                        None => len,
+                    };
+                    // Clamped independently, so `end_rel < start_rel` (a window that
+                    // ends before it begins) collapses to an empty range rather than
+                    // underflowing the `usize` cast.
+                    let begin = s + start_rel.clamp(0, len) as usize;
+                    let end = s + end_rel.clamp(0, len) as usize;
                     (begin..end).map(|k| k as u32).collect()
                 })
             }

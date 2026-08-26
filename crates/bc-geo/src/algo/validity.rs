@@ -16,6 +16,7 @@ use crate::types::{is_closed, Coord, Geometry, LineString, Polygon};
 use crate::Geom;
 
 /// True when the chain's first and last positions coincide.
+#[must_use]
 pub fn line_is_closed(g: &Geometry) -> bool {
     match g {
         Geometry::LineString(l) => l.len() >= 2 && is_closed(l),
@@ -29,6 +30,7 @@ pub fn line_is_closed(g: &Geometry) -> bool {
 }
 
 /// True when the chain is closed and does not cross itself — an OGC linear ring.
+#[must_use]
 pub fn is_ring(g: &Geometry) -> bool {
     match g {
         Geometry::LineString(l) => l.len() >= 4 && is_closed(l) && !self_intersects(l),
@@ -318,6 +320,7 @@ fn polygons_overlap(a: &Polygon, b: &Polygon) -> bool {
 }
 
 /// True when the geometry satisfies OGC validity.
+#[must_use]
 pub fn is_valid(g: &Geom) -> bool {
     validity_reason(g).is_none()
 }

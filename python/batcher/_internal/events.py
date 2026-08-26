@@ -306,11 +306,27 @@ class Event:
 #: A sink: called with each `Event`. Must not raise; if it does, it is skipped.
 Subscriber = Callable[[Event], None]
 
+#: Consecutive failures a sink is allowed before it is detached.
+#:
+#: A sink that raises is skipped for that emit and kept — which is right for a transient
+#: failure and wrong for a permanent one. A sink whose stream has been closed raises on
+#: *every* event, and progress is published per morsel, so a single broken sink turned a
+#: query into one DEBUG record per batch: unbounded log noise on the hot path, attributed
+#: to a subsystem that has nothing to do with the failure, and a `publish` that stays
+#: expensive forever because the failing sink is still in the tuple. Three strikes keeps a
+#: sink that blips and removes one that is gone.
+MAX_SINK_FAILURES = 3
+
 # Swapped wholesale under `_lock` rather than mutated, so `publish` can read it without
 # taking the lock at all — the reader sees either the old tuple or the new one, never a
 # half-mutated list. This is what keeps per-batch progress publishing lock-free.
 _subscribers: tuple[Subscriber, ...] = ()
 _lock = threading.Lock()
+
+# Consecutive-failure counts, keyed by the sink's identity. An entry exists only while the
+# sink is both subscribed and currently failing, so this cannot grow without bound and an
+# id cannot be reused: `_subscribers` holds a reference for as long as a count is kept.
+_failures: dict[int, int] = {}
 
 # Re-entrancy guard, per thread. Publishing can re-enter itself: a sink raises, `publish`
 # logs that at DEBUG, the logging bridge turns the record into a LOG event, and that event
@@ -357,6 +373,7 @@ def subscribe(sink: Subscriber) -> Callable[[], None]:
         global _subscribers
         with _lock:
             _subscribers = tuple(s for s in _subscribers if s is not sink)
+            _failures.pop(id(sink), None)
 
     return _unsubscribe
 
@@ -442,19 +459,54 @@ def publish(kind: str, *, query_id: str = "", name: str = "", **fields: Any) -> 
         for sink in sinks:
             try:
                 sink(event)
-            except Exception:  # pragma: no cover - a sink must never fail a query
-                _report_sink_failure()
+            except Exception as exc:  # pragma: no cover - a sink must never fail a query
+                _report_sink_failure(sink, exc)
+            else:
+                if _failures:
+                    _failures.pop(id(sink), None)
     finally:
         _publishing.active = False
 
 
-def _report_sink_failure() -> None:
-    """Log a sink exception at DEBUG, without recursing back onto the bus.
+def _report_sink_failure(sink: Subscriber, exc: BaseException) -> None:
+    """Log a sink exception and detach the sink once it has failed `MAX_SINK_FAILURES` times.
 
     Imported lazily and called only on the failure path: `logging` bridges records *onto*
     the bus, so doing this eagerly at module scope would make the two modules mutually
     importable at load time for no benefit.
-    """
-    from batcher._internal.logging import get_logger
 
-    get_logger("observe").debug("event sink raised; skipped", exc_info=True)
+    The detach is the point. A permanently broken sink — a reporter whose stream was closed,
+    a dashboard whose socket is gone — raises on every event, and progress is published per
+    morsel; keeping it produced one DEBUG record per batch forever and left `publish`
+    paying for a sink that can never succeed. The record on the way out is a WARNING,
+    because losing a whole observability surface mid-run is worth knowing about, and it is
+    emitted exactly once.
+
+    Args:
+        sink: The sink that raised.
+        exc: The exception it raised.
+    """
+    from batcher._internal.logging import get_logger, log_kv
+
+    logger = get_logger("observe")
+    key = id(sink)
+    count = _failures.get(key, 0) + 1
+    _failures[key] = count
+    if count < MAX_SINK_FAILURES:
+        logger.debug("event sink raised; skipped", exc_info=True)
+        return
+    global _subscribers
+    with _lock:
+        _subscribers = tuple(s for s in _subscribers if s is not sink)
+        _failures.pop(key, None)
+    import logging as _logging
+
+    log_kv(
+        logger,
+        _logging.WARNING,
+        "event sink detached after repeated failures",
+        sink=type(sink).__name__,
+        failures=count,
+        error=type(exc).__name__,
+        detail=str(exc),
+    )

@@ -235,11 +235,13 @@ impl Default for QueryStopwatch {
 
 impl QueryStopwatch {
     /// Capture the wall clock and every OS counter now.
+    #[must_use]
     pub fn start() -> Self {
         Self(Stopwatch::start())
     }
 
     /// The deltas since [`start`](Self::start).
+    #[must_use]
     pub fn finish(self) -> QueryMetrics {
         let wall_ns = self.0.elapsed_ns();
         let (cpu_ns, peak_rss_bytes, hw) = self.0.measure();
@@ -272,6 +274,7 @@ impl ExecMetrics {
     }
 
     /// Attach the whole-execution measurement, consuming the stopwatch that took it.
+    #[must_use]
     pub fn with_query(mut self, sw: QueryStopwatch) -> Self {
         self.query = sw.finish();
         self
@@ -280,6 +283,7 @@ impl ExecMetrics {
     /// Serialize to the JSON document the FFI returns to the control plane.
     /// Infallible in practice (the struct is plain data); a serialization error
     /// degrades to an empty-metrics document rather than failing the query.
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{\"ops\":[]}".to_string())
     }

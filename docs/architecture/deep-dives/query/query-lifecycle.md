@@ -149,9 +149,12 @@ print(q.sort("g").to_pydict())
 
 :::{dropdown} The plan side of that output
 ```text
-aggregate                       est≈1 (default)
-  filter                        est≈1 (default)
-    scan                        est≈4 (exact)
+query plan (planned)                             3 operators
+────────────────────────────────────────────────────────────
+OPERATOR                      ESTIMATE  NOTES
+aggregate  [by k · sum]          est≈1  (default)
+└─ filter  [v > 10]              est≈1  (default)
+   └─ scan  [source 0]           est≈4  (exact)  pushed[v > 10]
 ```
 
 `est≈4 (exact)` on the scan is the metadata layer: the row count of an in-memory relation is

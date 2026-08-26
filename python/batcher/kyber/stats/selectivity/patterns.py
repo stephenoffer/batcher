@@ -242,6 +242,10 @@ _VALUE_MATCHERS: dict[str, Callable[[str, str], bool]] = {
     "contains": lambda value, needle: needle in value,
     "starts_with": lambda value, prefix: value.startswith(prefix),
     "ends_with": lambda value, suffix: value.endswith(suffix),
+    # The lambda defers the name lookup: this dict is built at module-execution time and
+    # `_like_matches` is defined below it, so a bare reference raises `NameError` on import.
+    # See the same note in `io/formats/streaming/codecs/base.py`; an autofix has made this
+    # exact substitution once already.
     "like": lambda value, pattern: _like_matches(value, pattern),
     "ilike": lambda value, pattern: _like_matches(value.lower(), pattern.lower()),
 }

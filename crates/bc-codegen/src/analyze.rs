@@ -341,6 +341,7 @@ pub(crate) fn analyze(
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
         Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
         Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),
+        Expr::MakeMap { .. } => Err(CodegenError::Unsupported("map construction".into())),
         Expr::ListJoin { .. } => Err(CodegenError::Unsupported("list join".into())),
         Expr::Math { func, input } => {
             use bc_expr::MathFunc::*;

@@ -28,7 +28,7 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import Window
 
 
@@ -70,16 +70,15 @@ def stream_spilling_window(
     pk_indices = [cols.index(k.name) for k in window.partition_keys]
     map_plan, sid = _relabel_single_source(window.input)
     map_ir = json.dumps(map_plan.to_ir())
-    # The reduce runs the window over its bucket as a single in-memory source 0. `to_ir()`
-    # **memoizes per node and hands back the plan's own dict**, so re-rooting it in place
-    # does not build a second plan — it edits the caller's, permanently. Streaming a window
-    # once and then touching the same `Dataset` again therefore ran a plan whose window had
-    # lost whatever produced its input: `ds.with_columns(x=...).window(..., functions on x)`
-    # came back as `window ← scan`, and the next `collect()` either returned the wrong rows
-    # or raised `unknown column: x`. Copy before rewriting.
-    win_ir = dict(window.to_ir())
-    win_ir["input"] = task_scan_ir()
-    win_json = json.dumps(win_ir)
+    # The reduce runs the window over its bucket as a single in-memory source 0.
+    # `unary_task_ir` builds that from `Window.shape_ir()`. Never by re-rooting `to_ir()`'s
+    # result in place: it **memoizes per node and hands back the plan's own dict**, so doing
+    # so does not build a second plan — it edits the caller's, permanently. Streaming a
+    # window once and then touching the same `Dataset` again then ran a plan whose window
+    # had lost whatever produced its input: `ds.with_columns(x=...).window(..., functions on
+    # x)` came back as `window <- scan`, and the next `collect()` either returned the wrong
+    # rows or raised `unknown column: x`.
+    win_json = json.dumps(unary_task_ir(window))
     n_buckets = _fd_safe(num_partitions)
     source = sources[sid]
 

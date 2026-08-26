@@ -77,6 +77,17 @@ def _runnable_blocks(text: str, *, opt_in: bool) -> list[str]:
     return blocks
 
 
+def test_doc_pages_exist() -> None:
+    """The docs tree is non-empty.
+
+    `test_doc_examples` is parametrized over `_doc_files()`, so an empty result collects
+    **zero** tests rather than failing one: every executed code block under `docs/` would
+    stop being executed and the run would still print green. This assertion is the one
+    thing in the file that a moved directory cannot satisfy vacuously.
+    """
+    assert _doc_files(), f"no markdown pages found under {DOCS_ROOT}"
+
+
 @pytest.mark.docs
 @pytest.mark.integration
 @pytest.mark.parametrize("path", _doc_files(), ids=lambda p: str(p.relative_to(DOCS_ROOT)))

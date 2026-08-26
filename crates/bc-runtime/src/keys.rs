@@ -56,19 +56,20 @@ pub(crate) const SHUFFLE_HASHER: bc_arrow::PortableBuildHasher =
     bc_arrow::PortableBuildHasher::with_seed(0x5348_5546_464C_4530);
 
 /// Whether a data type has a floating-point leaf that needs canonicalizing — a top-level
-/// float, or a float nested inside a list/struct key. Dictionary and top-level narrow
-/// floats are decoded/widened at the FFI boundary, so only these shapes reach the engine.
+/// float, a float nested inside a list/struct key, or a float behind a dictionary encoding.
 ///
-/// **That boundary decode is load-bearing here, and it is scheduled to be removed.** The
-/// `_ => false` arm below catches `Dictionary(_, Float64)`, so if a float dictionary ever
-/// reaches this as a key it is *not* canonicalized: `-0.0` and `0.0` keep distinct codes,
-/// one `GROUP BY` group splits in two, and a join drops matches — the silent wrong answer
-/// this module exists to prevent. `decode_dict_keys` covers the join paths by running first,
-/// but `agg::group::combine` calls `canonicalize_float_keys` directly. Anyone implementing
-/// `rfc-streaming-executor.md` Proposal 3 must either recurse this into `Dictionary` (and
-/// teach `canon_array` to rebuild one) or decode before canonicalizing.
-/// `a_float_dictionary_follows_the_engines_float_identity` in
-/// `bc-interp/tests/dictionary_operators.rs` is the tripwire.
+/// **The `Dictionary` arm is not symmetry with the others; it closes a silent wrong answer.**
+/// A dictionary's identity is its *codes*, and codes are not float identity: `-0.0` and `0.0`
+/// are two entries, every NaN bit pattern is its own entry, and nothing forbids a dictionary
+/// that simply spells one value twice. A float dictionary reaching this as a key without the
+/// arm therefore splits one `GROUP BY` group in two and drops join matches — exactly what this
+/// module exists to prevent. It used to be out of reach only because the FFI boundary decoded
+/// dictionaries on the way in and `Expr::eval` decoded again at a `Col` leaf; both of those are
+/// performance decisions that `rfc-streaming-executor.md` Proposal 3 would reverse, and neither
+/// is a place a correctness invariant should be resting.
+/// [`canon_array`] answers the arm by decoding, since a canonical *value* under a duplicated
+/// code is still two groups. `a_float_dictionary_follows_the_engines_float_identity` in
+/// `bc-interp/tests/dictionary_operators.rs` pins it.
 fn contains_float(dt: &DataType) -> bool {
     match dt {
         DataType::Float32 | DataType::Float64 => true,
@@ -76,6 +77,7 @@ fn contains_float(dt: &DataType) -> bool {
             contains_float(f.data_type())
         }
         DataType::Struct(fields) => fields.iter().any(|f| contains_float(f.data_type())),
+        DataType::Dictionary(_, value) => contains_float(value),
         _ => false,
     }
 }
@@ -147,6 +149,21 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
                 child,
                 l.nulls().cloned(),
             )) as ArrayRef)
+        }
+        // A float behind a dictionary is canonicalized by **decoding** it, not by rewriting
+        // its values in place. Folding the values alone would leave `-0.0` and `0.0` as two
+        // codes that now both spell `0.0`, and every path that reaches here hashes or encodes
+        // the codes — so the group would still split. Decoding is what `decode_dict_keys` does
+        // for the same class of bug on strings, and for the same reason: two dictionaries built
+        // independently assign different codes to one value, so codes only compare against a
+        // shared dictionary. Unconditional on a float dictionary (not gated on a `-0.0`/NaN
+        // being present), because a dictionary may spell one ordinary value under two codes.
+        DataType::Dictionary(_, value) if contains_float(value) => {
+            // A cast to the dictionary's own value type cannot fail on well-formed input;
+            // declining on an error leaves the caller with the array it already had rather
+            // than turning a decode into a query failure.
+            let decoded = arrow::compute::cast(arr, value).ok()?;
+            Some(canon_array(&decoded).unwrap_or(decoded))
         }
         DataType::Struct(fields) => {
             let s = arr.as_any().downcast_ref::<StructArray>()?;
@@ -327,21 +344,23 @@ pub(crate) fn u64_order_keys(arr: &ArrayRef, descending: bool) -> Option<Vec<u64
     }
 
     let keys: Option<Vec<u64>> = match arr.data_type() {
-        DataType::Int8 => prim!(Int8Type, |v: i8| signed(v as i64)),
-        DataType::Int16 => prim!(Int16Type, |v: i16| signed(v as i64)),
-        DataType::Int32 => prim!(Int32Type, |v: i32| signed(v as i64)),
+        DataType::Int8 => prim!(Int8Type, |v: i8| signed(i64::from(v))),
+        DataType::Int16 => prim!(Int16Type, |v: i16| signed(i64::from(v))),
+        DataType::Int32 => prim!(Int32Type, |v: i32| signed(i64::from(v))),
         DataType::Int64 => prim!(Int64Type, signed),
-        DataType::UInt8 => prim!(UInt8Type, |v: u8| v as u64),
-        DataType::UInt16 => prim!(UInt16Type, |v: u16| v as u64),
-        DataType::UInt32 => prim!(UInt32Type, |v: u32| v as u64),
+        DataType::UInt8 => prim!(UInt8Type, |v: u8| u64::from(v)),
+        DataType::UInt16 => prim!(UInt16Type, |v: u16| u64::from(v)),
+        DataType::UInt32 => prim!(UInt32Type, |v: u32| u64::from(v)),
         DataType::UInt64 => prim!(UInt64Type, |v: u64| v),
-        DataType::Float32 => prim!(Float32Type, |v: f32| float((v as f64).to_bits())),
+        DataType::Float32 => prim!(Float32Type, |v: f32| float(f64::from(v).to_bits())),
         DataType::Float64 => prim!(Float64Type, |v: f64| float(v.to_bits())),
-        DataType::Date32 => prim!(Date32Type, |v: i32| signed(v as i64)),
+        DataType::Date32 => prim!(Date32Type, |v: i32| signed(i64::from(v))),
         DataType::Date64 => prim!(Date64Type, signed),
-        DataType::Time32(TimeUnit::Second) => prim!(Time32SecondType, |v: i32| signed(v as i64)),
+        DataType::Time32(TimeUnit::Second) => {
+            prim!(Time32SecondType, |v: i32| signed(i64::from(v)))
+        }
         DataType::Time32(TimeUnit::Millisecond) => {
-            prim!(Time32MillisecondType, |v: i32| signed(v as i64))
+            prim!(Time32MillisecondType, |v: i32| signed(i64::from(v)))
         }
         DataType::Time64(TimeUnit::Microsecond) => prim!(Time64MicrosecondType, signed),
         DataType::Time64(TimeUnit::Nanosecond) => prim!(Time64NanosecondType, signed),
@@ -401,6 +420,58 @@ mod tests {
         assert_eq!(f.value(0).to_bits(), f.value(1).to_bits());
         assert!(f.is_null(2));
         assert_eq!(f.value(3), 2.5);
+    }
+
+    /// A float **dictionary** key must group by the engine's float identity, not by the
+    /// dictionary's codes.
+    ///
+    /// The adversarial shape is the one a real encoder produces: `-0.0` and `0.0` get
+    /// separate entries, each NaN bit pattern gets its own, and an ordinary value can be
+    /// spelled twice. Grouping on codes reports one group per *entry*; the oracle — the same
+    /// column decoded — reports one per value. Before `contains_float` recursed into
+    /// `Dictionary`, this column reached the assigner uncanonicalized and split every one of
+    /// those groups. See the note on `contains_float`.
+    #[test]
+    fn canonicalize_folds_float_dictionary_to_value_identity() {
+        use arrow::array::{DictionaryArray, Int32Array};
+        use arrow::datatypes::Int32Type;
+
+        // Entries 0 and 1 are two spellings of zero; 2 and 3 two NaN patterns; 4 and 5 the
+        // same ordinary value under two codes. Six entries, three values.
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            1.5,
+            1.5,
+        ]));
+        let codes = Int32Array::from(vec![0, 1, 2, 3, 4, 5]);
+        let dict: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(codes, Arc::clone(&values)).expect("dictionary"),
+        );
+
+        let canon = canonicalize_float_keys(std::slice::from_ref(&dict))
+            .expect("a float dictionary has a float leaf");
+        let (_, groups, _) =
+            crate::agg::assign_groups(&canon, 6).expect("assign over a canonicalized key");
+
+        // The decoded oracle: {0.0, NaN, 1.5}.
+        let (_, oracle, _) = crate::agg::assign_groups(
+            std::slice::from_ref(
+                &canonicalize_float_keys(std::slice::from_ref(&values)).expect("float leaf")[0],
+            ),
+            6,
+        )
+        .expect("assign over the decoded key");
+        assert_eq!(
+            groups, oracle,
+            "dictionary must group as its decoded values do"
+        );
+        assert_eq!(
+            groups, 3,
+            "two zeros, two NaNs and a duplicated 1.5 are three groups"
+        );
     }
 
     #[test]

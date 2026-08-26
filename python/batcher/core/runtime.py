@@ -131,6 +131,11 @@ def query_scope() -> Iterator[str]:
         yield active
         return
 
+    # Random, never sequential or caller-supplied. The engine's cleanup removes whatever is
+    # registered under the id (`bc_py::unregister_query`), so an id that could be live twice
+    # would let one query's exit silently deregister another's — leaving it uncancellable.
+    # Sixteen hex digits of uuid4 is what makes that unreachable; changing this scheme means
+    # threading the token through and using `unregister_token` on the Rust side.
     query_id = f"q-{uuid.uuid4().hex[:16]}"
     native = engine()
     # Registered here rather than inside `execute_plan`, so the id exists from the moment the

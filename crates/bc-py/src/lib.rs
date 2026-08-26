@@ -349,6 +349,12 @@ fn register_query(query_id: &str) {
 }
 
 /// Close the registration for `query_id`. Idempotent.
+///
+/// The unconditional `unregister`. `bc_resource::cancel::unregister_token` exists because that
+/// is unsafe when an id can be *reused* — one query's cleanup deregisters another's, leaving it
+/// uncancellable. Safe here only by a property of the caller: `core.runtime.query_scope` mints
+/// `q-<16 hex of uuid4>` per terminal op and a re-entrant scope reuses the active id, so an id
+/// is never live twice. **Change that and the token must be threaded through instead.**
 #[pyfunction]
 fn unregister_query(query_id: &str) {
     bc_resource::cancel::unregister(query_id);

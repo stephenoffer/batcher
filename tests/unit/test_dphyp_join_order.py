@@ -54,7 +54,7 @@ def _build_inputs(n: int, rng: random.Random):
         leaves.append(Scan(i, SchemaRef(pa.schema([pa.field(c, pa.int64()) for c in cols]))))
         stats.append(SourceStatistics(row_count=rng.randint(10, 200_000)))
 
-    first_col = sorted(incident[0])[0]
+    first_col = min(incident[0])
     required = [(first_col, (0, first_col))]
     est = StatsEstimator([None] * n, learned={"__column_ndv__": ndv}, source_stats=stats)
     ctx = OptimizerContext(config=active_config(), sources=[None] * n, hub=None, estimator=est)

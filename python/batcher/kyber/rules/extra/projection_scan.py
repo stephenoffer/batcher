@@ -242,7 +242,14 @@ def fold_nested_sample_same_seed(node: Sample, _ctx: OptimizerContext) -> Logica
 # --- projection/expression cleanups the merge/fold rules decline -------------
 
 
-@rule(name="merge_projection_renames", phase=Phase.NORMALIZE, matches=(Project,))
+@rule(
+    name="merge_projection_renames",
+    phase=Phase.NORMALIZE,
+    matches=(Project,),
+    # The rename half of the same story `merge_projections` records; 13 of the 99 TPC-DS
+    # queries, 13 nodes. See `Rule.recanonicalize`.
+    recanonicalize=True,
+)
 def merge_projection_renames(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Project(Project(x))` → one `Project(x)` even when a *renamed* inner column is
     referenced by the outer projection more than once.

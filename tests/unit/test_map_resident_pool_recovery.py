@@ -136,7 +136,7 @@ def test_a_repacked_pool_replaces_the_old_one_instead_of_growing_past_it(monkeyp
     object.__setattr__(node, "fn", _Fn())
     object.__setattr__(node, "input", None)
     monkeypatch.setattr(mapmod, "_new_map_actor", lambda plan0, opts: f"actor@{opts['num_gpus']}")
-    monkeypatch.setattr(mapmod, "_healthy_actors", lambda pool: list(pool))
+    monkeypatch.setattr(mapmod, "_healthy_actors", list)
 
     registry: dict = {}
     whole = mapmod._resident_pool_for(node, {"num_gpus": 1.0}, 4, registry)

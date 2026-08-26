@@ -27,12 +27,22 @@ from batcher.carbonite.cache import (
     reset_result_cache,
     result_cache,
 )
+from batcher.carbonite.cache_shared import (
+    SharedResultCache,
+    current_shared_cache,
+    reset_shared_cache,
+    shared_cache,
+)
 from batcher.carbonite.manager import ResourceManager
 
 __all__ = [
     "CacheStore",
     "ResourceManager",
+    "SharedResultCache",
     "current_result_cache",
+    "current_shared_cache",
     "reset_result_cache",
+    "reset_shared_cache",
     "result_cache",
+    "shared_cache",
 ]

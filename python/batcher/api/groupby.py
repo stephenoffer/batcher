@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset.compat.guidance import groupby_attribute_error
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
@@ -182,8 +183,9 @@ class GroupBy:
 
         Args:
             *aggs: Bare single-column aggregates (``col(name).<agg>()``) that keep
-                ``name`` as the output column, or a single pandas-style
-                ``{column: reducer}`` / ``{column: [reducers]}`` dict.
+                ``name`` as the output column, aggregates named by ``.alias(...)``, or a
+                single pandas-style ``{column: reducer}`` / ``{column: [reducers]}``
+                dict. A list of aggregates is accepted in place of separate arguments.
             **named: Output column name to an aggregate, or an expression over aggregates.
 
         Returns:
@@ -195,6 +197,7 @@ class GroupBy:
         """
         if len(aggs) == 1 and isinstance(aggs[0], dict):
             return self.agg(**{**self._spec_to_aggs(aggs[0]), **named})
+        aggs = flatten_varargs(aggs)
         resolved = {**self._named_aggs(aggs), **named}
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
@@ -910,20 +913,31 @@ class GroupBy:
         """Resolve bare positional aggregates to an ordered {source_column: agg} map."""
         out: dict[str, AggExpr] = {}
         for a in aggs:
-            if isinstance(a, AggExpr) and isinstance(a.input, Col):
-                if a.input.name in out:
-                    raise PlanError(
-                        f"agg() got two positional aggregates over column {a.input.name!r}, "
-                        "which would both be named after it; give one a keyword name, "
-                        "e.g. agg(total=col('x').sum(), avg=col('x').mean())"
-                    )
-                out[a.input.name] = a
-            else:
+            # An explicit `.alias(...)` names the output directly, which is what lets a
+            # positional `count()` (no input column to be named after) and two aggregates
+            # over one column both be spelled positionally, as Polars spells them.
+            name = a.name if isinstance(a, AggExpr) else None
+            if name is None and isinstance(a, AggExpr) and isinstance(a.input, Col):
+                name = a.input.name
+            if name is None:
                 raise PlanError(
                     "a positional agg() argument must be a single-column aggregate that "
                     "names its output, e.g. col('x').sum(); for a custom name or a "
-                    "count()/multi-column aggregate use a keyword (agg(total=...))"
+                    "count()/multi-column aggregate use .alias('name') or a keyword "
+                    "(agg(total=...))"
                 )
+            if name in out:
+                if a.name is None:
+                    raise PlanError(
+                        f"agg() got two positional aggregates over column {name!r}, which "
+                        "would both be named after it; give one a name, e.g. "
+                        "agg(col('x').sum().alias('total'), col('x').mean().alias('avg'))"
+                    )
+                raise PlanError(
+                    f"agg() got two positional aggregates aliased {name!r}; each "
+                    ".alias(...) must name a distinct output column"
+                )
+            out[name] = a
         return out
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:

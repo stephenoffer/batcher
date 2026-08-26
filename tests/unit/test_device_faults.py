@@ -375,7 +375,7 @@ def test_the_two_lists_stay_separate_in_the_fleet_record(monkeypatch):
 
     monkeypatch.setattr("batcher.carbonite.accel.assess_fleet", lambda: ())
     monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ())
-    monkeypatch.setattr("batcher.carbonite.accel.device_affinity_summary", lambda: {})
+    monkeypatch.setattr("batcher.carbonite.accel.device_affinity_summary", dict)
     monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: ())
     monkeypatch.setattr(
         "batcher._internal.hardware.faults.xid_application_faults",

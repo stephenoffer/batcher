@@ -367,8 +367,8 @@ def test_every_rendering_switch_has_a_pane(html):
 def _defined_globals(source: str) -> set[str]:
     """Top-level names a file introduces. Deliberately generous — this hunts typos."""
     names: set[str] = set()
-    names |= set(re.findall(r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", source, re.M))
-    names |= set(re.findall(r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)", source, re.M))
+    names |= set(re.findall(r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", source, re.MULTILINE))
+    names |= set(re.findall(r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)", source, re.MULTILINE))
     # Locals too: this check is about *calls to things that exist nowhere*, so a helper
     # defined inside a closure still counts as defined.
     names |= set(re.findall(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", source))
@@ -446,7 +446,7 @@ def test_no_script_imports_the_compiled_engine_directly(bundle):
     """The browser can only see the JSON API. A fetch to anything else is a mistake."""
     for name, source in bundle.items():
         for url in re.findall(r"""fetch\(\s*[`'"]([^`'"$]*)""", source):
-            assert url.startswith("/api") or url.startswith("/metrics"), (
+            assert url.startswith(("/api", "/metrics")), (
                 f"{name} fetches {url!r}, which is not part of the read-only API"
             )
 
@@ -464,8 +464,8 @@ def test_no_raw_colour_outside_the_token_block():
     body = css.split("/* ═══════════════ base ═══════════════ */", 1)[-1]
     # Print is the one exempt context: paper has no theme to follow, and the print rules
     # deliberately force black on white rather than rendering a dark surface as ink.
-    body = re.sub(r"@media print\s*\{.*?\n\}", "", body, flags=re.S)
-    literals = [m for m in re.findall(r"#[0-9a-fA-F]{3,8}\b", body) if m not in {"#fff"}]
+    body = re.sub(r"@media print\s*\{.*?\n\}", "", body, flags=re.DOTALL)
+    literals = [m for m in re.findall(r"#[0-9a-fA-F]{3,8}\b", body) if m != "#fff"]
     assert not literals, f"raw colours below the token block: {sorted(set(literals))}"
 
 

@@ -96,14 +96,13 @@ fn tally<'a>(
         }
         let g = group_of(i);
         let key = rows.row(i);
-        match maps[g].get(&key) {
-            Some(&slot) => counts[slot] += weight(i),
-            None => {
-                maps[g].insert(key, keep.len());
-                keep.push(i as u32);
-                counts.push(weight(i));
-                elem_groups.push(g as i64);
-            }
+        if let Some(&slot) = maps[g].get(&key) {
+            counts[slot] += weight(i)
+        } else {
+            maps[g].insert(key, keep.len());
+            keep.push(i as u32);
+            counts.push(weight(i));
+            elem_groups.push(g as i64);
         }
     }
     (keep, counts, elem_groups)

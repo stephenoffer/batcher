@@ -256,14 +256,40 @@ def test_the_unoffsettable_functions_are_refused():
             rank_limit=None,
         )
     )
-    # Two order keys: there is no single column to range-partition on.
+    # Two order keys ARE accepted: only the LEADING one has to be a plain column, because it
+    # is the only one the range partitioner reads values from. This asserted the opposite,
+    # on the ground that "there is no single column to range-partition on" — but there is,
+    # and all three drivers already cut on `order_keys[0]` alone.
+    #
+    # The bucket argument survives the extra keys: a peer group under a multi-key `ORDER BY`
+    # is a set of rows equal on *every* key, so it sits inside the set of rows equal on the
+    # leading key, which the partitioner puts in one bucket. No peer group straddles a cut,
+    # and an earlier bucket's rows have a strictly smaller leading key so the buckets stay
+    # ordered. Refusing was not conservative: a global window is not a `_split_at`
+    # pass-through, so nothing carried it up and `ORDER BY a, b` **raised** `PlanError` on
+    # distributed data instead of falling back to the materializing kernel.
+    # `tests/differential/test_diff_global_window_split_folds.py` holds the split result equal
+    # to the single-node one for ten functions, `rank` and `dense_rank` among them — the two
+    # that would expose a broken peer group.
     from batcher.plan.logical.aggregate import SortKeySpec
 
-    assert not supports_ordered_bucket_offsets(
+    assert supports_ordered_bucket_offsets(
         Window(
             input=win.input,
             partition_keys=(),
             order_keys=(*win.order_keys, SortKeySpec(Col("v"))),
+            functions=win.functions,
+            rank_limit=None,
+        )
+    )
+    # The relaxation is to the TRAILING keys only. A computed *leading* key has no column for
+    # the partitioner to read, so it is still refused — the control that keeps the assertion
+    # above from being satisfied by a uniformly permissive predicate.
+    assert not supports_ordered_bucket_offsets(
+        Window(
+            input=win.input,
+            partition_keys=(),
+            order_keys=(SortKeySpec(Col("t") + Col("v")), *win.order_keys),
             functions=win.functions,
             rank_limit=None,
         )

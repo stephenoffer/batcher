@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from batcher._internal.hardware import hardware_profile
+from batcher._internal.humanize import byte_size
 from batcher._internal.mathx import safe_div
 from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
@@ -180,6 +181,19 @@ class OpProfile:
     est_rows: float = float("nan")
     provenance: str = ""
     algorithm: str = ""
+    #: What *this* operator does, in its own terms: the join type and keys, the group keys
+    #: and aggregates, the sort keys, the filter predicate. Already rendered.
+    #:
+    #: The single most useful thing on a plan line after the operator's type, and it was
+    #: missing from `explain()` entirely — "hash_join" alone has never told anyone which
+    #: join it was, and a plan with four of them printed four identical lines. Every
+    #: comparable engine prints it (Postgres's ``Hash Cond:``, Spark's ``[id#3 = id#7]``,
+    #: DuckDB's key list), and the dashboard already showed it.
+    #:
+    #: Carried as finished text for the same reason `pushed` is: rendering an IR node lives
+    #: in `observe`, which this layer may not import, so the caller that has both
+    #: (`api.terminal.profile`) does the rendering and passes the result down.
+    detail: str = ""
     #: What the plan handed to this scan's *source* to apply for itself — the pushed filter
     #: and the column projection, already rendered. Empty for every operator that is not a
     #: scan, and for a scan the plan pushed nothing to.
@@ -278,6 +292,7 @@ class OpProfile:
             "est_rows": None if math.isnan(self.est_rows) else self.est_rows,
             "provenance": self.provenance,
             "algorithm": self.algorithm,
+            "detail": self.detail,
             "pushed": self.pushed,
             "measured": self.measured,
             "rows_in": self.rows_in,
@@ -441,7 +456,16 @@ class QueryProfile:
         b = self.bottleneck
         if b is None:
             return "no operators measured"
-        share = (b.elapsed_ms / self.total_ms * 100.0) if self.total_ms else 0.0
+        # Share of *measured operator time*, not of `total_ms`. `total_ms` is the whole
+        # terminal operation — planning, optimization, admission, the FFI crossing and
+        # result assembly included — and the operators cover only the engine call inside
+        # it. Against that denominator the dominant operator of a short query reported "2%
+        # of wall time", which reads as "nothing here is the bottleneck" for the operator
+        # that owned two thirds of the engine's work. The unaccounted remainder is a real
+        # and often larger cost, and `render` now reports it on its own line rather than
+        # by deflating every operator's share until none of them looks like the answer.
+        ops_ms = sum(o.elapsed_ms for o in self.ops if o.measured)
+        share = (b.elapsed_ms / ops_ms * 100.0) if ops_ms else 0.0
         # Classify by the *measured* per-core CPU busy fraction when it was recorded: a low
         # fraction is I/O- or launch-bound whatever the operator kind (a cached scan is not
         # I/O-bound; a stalled join can be memory-bound). Fall back to the kind heuristic when
@@ -459,84 +483,27 @@ class QueryProfile:
         else:
             kind = "I/O-bound (read dominates)" if b.kind == "scan" else f"compute-bound ({b.kind})"
         spill = f" — SPILLED {human_bytes(self.total_spill_bytes)} to disk" if self.spilled else ""
-        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% of wall time — {kind}{spill}"
+        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% of operator time — {kind}{spill}"
 
     def render(self, *, analyze: bool | None = None) -> str:
-        """Render the plan as an indented tree.
+        """Render the plan as an operator tree with its summary sections.
 
-        `analyze=True` shows the measured columns (actual rows, time, memory, spill);
-        `analyze=False` shows the planned estimate only. Defaults to whichever the
-        profile carries (`measured`).
+        `analyze=True` shows the measured columns (actual rows, estimate miss, time,
+        share, spill); `analyze=False` shows the planned estimate only. Defaults to
+        whichever the profile carries (`measured`).
+
+        Args:
+            analyze: Force the measured or planned form; `None` follows `measured`.
+
+        Returns:
+            The rendered profile, in plain text.
         """
-        show = self.measured if analyze is None else analyze
-        lines = [self._render_op(o, show) for o in self.ops]
-        if show:
-            lines.append("")
-            lines.append(f"total: {self.total_ms:.2f} ms, {self.rows:,} rows out")
-            lines.append(self.bottleneck_summary())
-            util = self.utilization_summary()
-            if util:
-                lines.append(util)
-            # Only on a single-node run. On a distributed one the profile is assembled on the
-            # driver while the work happened on the workers, so naming the driver's machine
-            # here would attribute every timing above it to hardware that ran none of it —
-            # and a head node is routinely a different shape from the fleet. The workers'
-            # own section below is where their facts belong.
-            if not self.distributed:
-                lines.append(f"machine: {self.machine}")
-        if self.decisions:
-            lines.append("")
-            lines.append("decisions:")
-            lines.extend(f"  - [{d.subsystem}/{d.category}] {d.summary}" for d in self.decisions)
-        if show and self.worker_ops:
-            lines.append("")
-            lines.append("distributed map sub-plan (summed across workers):")
-            for o in self.worker_ops:
-                lines.append("  " + self._render_op(o, analyze=True).lstrip())
-        if show and self.adaptive_stages:
-            lines.append("")
-            lines.append("adaptive re-optimization:")
-            for s in self.adaptive_stages:
-                lines.append(
-                    f"  - {s.get('kind', '?')} (op {s.get('op_id', '?')}): "
-                    f"est≈{s.get('est_rows', 0):,.0f} actual={s.get('actual_rows', 0):,} "
-                    f"→ {s.get('action', '')}"
-                )
-        return "\n".join(lines)
+        from batcher.plan.profile.render import render_profile
+
+        return render_profile(self, analyze=analyze)
 
     def __str__(self) -> str:
         return self.render()
-
-    def _render_op(self, o: OpProfile, analyze: bool) -> str:
-        label = f"{'  ' * o.depth}{o.kind}"
-        est = "est≈?" if math.isnan(o.est_rows) else f"est≈{o.est_rows:,.0f}"
-        prov = f" ({o.provenance})" if o.provenance else ""
-        algo = f" [{o.algorithm}]" if o.algorithm else ""
-        # What the source was asked to do itself. Every other engine's EXPLAIN says this
-        # (Spark's `PushedFilters:`, DuckDB's `Filters:`), and without it a reader has no
-        # way to tell a pushed-down filter from one the engine is applying over a full
-        # scan — the two plans print identically while differing by the whole table.
-        pushed = f" pushed[{o.pushed}]" if o.pushed else ""
-        if not analyze or not o.measured:
-            return f"{label:<32}{est}{prov}{algo}{pushed}"
-        share = (o.elapsed_ms / self.total_ms * 100.0) if self.total_ms else 0.0
-        err = "" if math.isnan(o.est_error) else f" ({o.est_error:.1f}x)"
-        # Show the measured spill *volume* when known, not just the fact of spilling — the
-        # magnitude is what tells a 1 GB spill from a 100 GB one at a glance.
-        if o.spilled:
-            spill = f" [spill {human_bytes(o.spill_bytes)}]" if o.spill_bytes else " [spill]"
-        else:
-            spill = ""
-        rss = f"  rss+{human_bytes(o.peak_rss_bytes)}" if o.peak_rss_bytes else ""
-        # Per-core CPU busy fraction: a low value flags an I/O- or launch-bound op (a scan,
-        # a GPU dispatch) that packs several per core; near 1.0 flags a CPU-bound one.
-        cpu = f"  cpu={o.cpu_util * 100:.0f}%" if o.cpu_util > 0 else ""
-        return (
-            f"{label:<32}{est} actual={o.rows_out:,}{err}"
-            f"  {o.elapsed_ms:.1f}ms ({share:.0f}%){cpu}"
-            f"  out={human_bytes(o.result_bytes)}{rss}  {o.backend}{spill}"
-            f"{_hardware_flags(o)}{pushed}"
-        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -562,39 +529,19 @@ class QueryProfile:
         }
 
 
-def _hardware_flags(o: OpProfile) -> str:
-    """The hardware conditions worth flagging on an operator's plan line, or `""`.
-
-    Only conditions that change what a reader should *do* appear here, and only when they are
-    actually present. A plan line is already dense, and a row of always-on counters would push
-    the fields people read every time off the right edge to make room for numbers that are
-    usually zero. Disk reads are the exception to "only when abnormal": knowing a scan reached
-    the device rather than the page cache is the difference between a timing worth trusting
-    and one that measured a warm cache.
-    """
-    parts = []
-    if o.paging:
-        # First, because it invalidates the reading of everything else on the line: an operator
-        # taking disk-backed faults is waiting on storage for its own memory, and its time and
-        # utilization describe that rather than its work.
-        parts.append(f"PAGING({o.major_faults:,} major faults)")
-    if o.contended:
-        parts.append(f"contended({o.preemption_rate:,.0f} preempt/core-s)")
-    if o.io_read_bytes:
-        parts.append(f"disk-read={human_bytes(o.io_read_bytes)}")
-    if o.io_write_bytes:
-        parts.append(f"disk-write={human_bytes(o.io_write_bytes)}")
-    return ("  " + " ".join(parts)) if parts else ""
-
-
 def human_bytes(n: int) -> str:
-    """Compact human-readable byte size (e.g. ``512KB``, ``3.4MB``)."""
-    if n < 1024:
-        return f"{n}B"
-    units = ("KB", "MB", "GB", "TB")
-    size = float(n)
-    for unit in units:
-        size /= 1024.0
-        if size < 1024.0 or unit == units[-1]:
-            return f"{size:.0f}{unit}" if size >= 10 else f"{size:.1f}{unit}"
-    return f"{n}B"
+    """Compact human-readable byte size (e.g. ``1.5 KiB``, ``3.4 MiB``).
+
+    Delegates to `_internal.humanize.byte_size`, which is also what the web dashboard's
+    ``UI.bytes`` renders, so the same spill volume reads identically in a terminal and in
+    the browser. It did not before: this function divided by 1024 and labelled the result
+    ``KB``, so every byte size in ``explain(analyze=True)`` was overstated by 2.4% per
+    power of the unit and by 10% at the terabyte rung.
+
+    Args:
+        n: A byte count.
+
+    Returns:
+        The size with its binary unit, or an em dash when `n` is zero.
+    """
+    return byte_size(n)

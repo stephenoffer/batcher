@@ -24,8 +24,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from batcher.ml.llm.channels import finish_reason_sink, usage_sink
-from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
+from batcher.ml.llm.engines.base import (
+    Engine,
+    EngineFactory,
+    batched_engine,
+    unpack_request,
+)
 from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
 
 __all__ = ["bedrock_engine", "gemini_engine"]
@@ -171,7 +175,7 @@ def bedrock_engine(
             )
 
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
-        engine = _batched_engine(call_one, pool, concurrency)
+        engine = batched_engine(call_one, pool, concurrency)
         engine.close = lambda: pool.shutdown(wait=False)
         return engine
 
@@ -294,7 +298,7 @@ def gemini_engine(
             )
 
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
-        engine = _batched_engine(call_one, pool, concurrency)
+        engine = batched_engine(call_one, pool, concurrency)
         engine.close = lambda: pool.shutdown(wait=False)
         return engine
 
@@ -312,28 +316,6 @@ class _Reply:
         self.text = text
         self.usage = usage
         self.finish_reason = finish_reason
-
-
-def _batched_engine(call_one: Any, pool: Any, concurrency: int) -> Engine:
-    """The batch loop both engines share: overlap the requests, then report every signal.
-
-    ``Executor.map`` preserves input order regardless of completion order, so the returned
-    strings stay aligned with the rows that produced them — the property everything columnar
-    downstream depends on.
-    """
-
-    def engine(prompts: list) -> list[str]:
-        if concurrency <= 1 or len(prompts) <= 1:
-            replies = [call_one(p) for p in prompts]
-        else:
-            replies = list(pool.map(call_one, prompts))
-        usage = [r.usage for r in replies]
-        usage_sink().report(usage)
-        finish_reason_sink().report([r.finish_reason for r in replies])
-        engine.last_usage = usage  # the documented legacy channel
-        return [r.text for r in replies]
-
-    return engine
 
 
 def _limiter_view(body: dict, prompt: str) -> dict:

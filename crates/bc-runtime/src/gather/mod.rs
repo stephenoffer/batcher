@@ -285,7 +285,7 @@ fn contiguous_run(indices: &UInt32Array, col_rows: usize) -> Option<usize> {
     let idx = indices.values();
     let (&first, &last) = (idx.first()?, idx.last()?);
     // Also covers `len > col_rows`, which cannot be a run inside the column.
-    if (last as u64).checked_sub(first as u64)? != idx.len() as u64 - 1 {
+    if u64::from(last).checked_sub(u64::from(first))? != idx.len() as u64 - 1 {
         return None;
     }
     let start = first as usize;

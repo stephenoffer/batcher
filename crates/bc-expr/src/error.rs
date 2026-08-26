@@ -9,6 +9,15 @@ pub enum ExprError {
     #[error("unknown column: {0}")]
     UnknownColumn(String),
 
+    /// A struct field the struct does not have. Distinct from `UnknownColumn` for the
+    /// same reason `ExpectedType` is distinct from `ExpectedString`: the noun was wrong.
+    /// `col("s").struct.field("zz")` reported "unknown column: zz" when `zz` is a *field*
+    /// of `s`, sending the reader to hunt for a top-level column that was never the
+    /// problem. Naming the fields the struct does have is what makes it actionable, the
+    /// same reason the control plane's `ColumnNotFoundError` carries `available`.
+    #[error("struct has no field `{field}`; its fields are: {available}")]
+    UnknownField { field: String, available: String },
+
     #[error("operator `{op}` expected a boolean argument, got {got}")]
     ExpectedBoolean { op: String, got: String },
 

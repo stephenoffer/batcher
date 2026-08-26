@@ -29,6 +29,7 @@ pub struct ShuffleTicket {
 
 impl ShuffleTicket {
     /// Construct a ticket from its components.
+    #[must_use]
     pub fn new(
         plan_id: u64,
         stage_id: u32,
@@ -48,6 +49,7 @@ impl ShuffleTicket {
     /// Render the ticket as its canonical string form. (Mirrors the `Display`
     /// impl; provided as a named method per the shuffle-ticket API contract.)
     #[allow(clippy::inherent_to_string_shadow_display)]
+    #[must_use]
     pub fn to_string(&self) -> String {
         format!(
             "{}/{}/{}/{}/{}",

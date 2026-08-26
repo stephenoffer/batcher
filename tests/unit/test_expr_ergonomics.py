@@ -256,7 +256,7 @@ def test_cast_still_rejects_an_unknown_dtype_with_a_hint():
         (lambda: col("l").list.get(2), "col('l').list.get(2)"),
         (lambda: col("l").list.slice(1, 2), "col('l').list.slice(1, 2)"),
         (lambda: col("v").struct.field("a"), "col('v').struct.field('a')"),
-        (lambda: col("t").dt.truncate("1d"), "col('t').dt.truncate('1d')"),
+        (lambda: col("t").dt.truncate("day"), "col('t').dt.truncate('day')"),
         (lambda: col("m").map.get("k"), "col('m').map.get('k')"),
         (lambda: col("a").list.dot(col("b")), "col('a').list.dot(col('b'))"),
         (lambda: col("a").list.union(col("b")), "col('a').list.union(col('b'))"),
@@ -264,6 +264,24 @@ def test_cast_still_rejects_an_unknown_dtype_with_a_hint():
 )
 def test_repr_reads_like_the_code_that_built_it(build, expected):
     assert repr(build()) == expected
+
+
+def test_a_truncation_unit_alias_is_canonicalized_on_the_node():
+    """`truncate('1d')` records `'day'`, and that is deliberate rather than cosmetic.
+
+    The unit is normalized where the expression is built, not where it is lowered, because
+    Kyber reasons over `DateTrunc.unit` by *name*: `temporal_extra._nested_trunc` gates on
+    membership of `_TRUNC_ORDER` and `_collapse_same_unit` compares two units for equality.
+    A node holding the raw `'1d'` would fall out of that set, so the nested-truncate
+    collapse would silently stop firing for every aliased spelling -- a rule that quietly
+    does nothing, which is worse than one that errors.
+
+    So the repr reads like *equivalent* code rather than the exact characters typed. The
+    parametrized repr case above uses the canonical spelling for that reason.
+    """
+    assert repr(col("t").dt.truncate("1d")) == "col('t').dt.truncate('day')"
+    assert repr(col("t").dt.truncate("mo")) == "col('t').dt.truncate('month')"
+    assert repr(col("t").dt.floor("1h")) == "col('t').dt.truncate('hour')"
 
 
 def test_two_column_list_nodes_repr_without_raising():

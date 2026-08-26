@@ -59,15 +59,34 @@ a serialized protocol.
 - The distributed executor (`dist/`) composes the *same* mergeable primitives
   (`partial_aggregate` / `partition_batches` / `combine_finalize`) the single-node
   path uses. Distributed is a scheduling concern, not a second semantics.
-- **A result MUST be identical whether produced on one node or many — with one stated
-  exception.** The multiset of rows, every column name, and every column *type* are exact.
-  Floating-point reductions are identical *up to reassociation*: `combine` is associative in
+- **A result MUST be identical whether produced on one node or many — with two stated
+  exceptions.** The multiset of rows, every column name, and every column *type* are exact.
+  Both exceptions are places where the *query itself* does not determine an answer, so neither
+  is a licence to differ anywhere else.
+
+  **Floating-point reductions are identical up to reassociation.** `combine` is associative in
   exact arithmetic, IEEE addition is not, and partition count changes the summation order.
   `bc-runtime`'s Neumaier compensation and Chan's parallel Welford formula bound that error to
   near the last bits; they do not remove it, and nothing can while the partition count is free.
   Write the claim this way. Stating it as bit-identity was worse than useless: it is not what
   the code does, `assert_same` tolerates float rounding so nothing ever checked it, and an
   invariant nobody can fail is one nobody reads.
+
+  **A window function that must break a tie its `ORDER BY` leaves open may break it
+  differently.** `row_number()` assigns 1..n within a partition; when several rows share the
+  ordering key, which of them gets which number is undefined in SQL, and the two paths resolve
+  it by different physical orders — single-node by arrival within the partition, distributed by
+  arrival through the shuffle. Verified on a partitioned `row_number` where every row was in a
+  tied group: the partitions, their sizes, and the rank set 1..n per partition were identical
+  on both sides, and only the assignment of a rank to a *tied* row differed. `rank` and
+  `dense_rank` are unaffected — they give peers the same value by definition.
+
+  This one is worth reading as a *bound* rather than a licence, because the engine already
+  refuses the same freedom elsewhere: `bc_interp::ops::reshape::sample_n_batches` breaks its
+  hash ties by row *content* precisely so a fixed-count `sample` does not depend on how the
+  input was split. Making `row_number` deterministic the same way is a decision available to
+  anyone who wants it — a content tiebreak, paid per tie — not a limit of the architecture. A
+  divergence that is **not** of these two kinds is a defect, however plausible its rows look.
 
 ## Streaming and batch
 

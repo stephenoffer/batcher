@@ -18,7 +18,14 @@ __all__ = ["BACKEND_NAMES", "default_sqlite_uri", "make_backend"]
 
 #: Every name `make_backend` accepts. The one source of truth for the set, so the
 #: "unknown backend" error can never offer a name the factory does not build.
-BACKEND_NAMES: tuple[str, ...] = ("in_process", "sqlite", "object_storage", "redis", "layered")
+BACKEND_NAMES: tuple[str, ...] = (
+    "in_process",
+    "sqlite",
+    "rocksdb",
+    "object_storage",
+    "redis",
+    "layered",
+)
 
 
 def default_sqlite_uri() -> str:
@@ -58,8 +65,9 @@ def make_backend(name: str, uri: str | None = None) -> MetadataBackend:
 
     Args:
         name: One of `BACKEND_NAMES`.
-        uri: Where the backend stores its data. Required by ``object_storage`` and
-            ``redis``; optional for ``sqlite``, which defaults to a per-user file.
+        uri: Where the backend stores its data. Required by ``object_storage``,
+            ``redis``, and ``rocksdb``; optional for ``sqlite``, which defaults to a
+            per-user file.
 
     Returns:
         A `MetadataBackend` ready to hand to a `MetadataHub`.
@@ -74,6 +82,10 @@ def make_backend(name: str, uri: str | None = None) -> MetadataBackend:
         # No URI → a persistent per-user file (not an ephemeral `:memory:` store, which
         # would silently defeat the point of choosing the durable backend).
         return SQLiteBackend(uri if uri is not None else default_sqlite_uri())
+    if name == "rocksdb":
+        from batcher.metadata.backends.rocksdb import RocksDBBackend
+
+        return RocksDBBackend(uri)
     if name == "object_storage":
         from batcher.metadata.backends.object_storage import ObjectStorageBackend
 

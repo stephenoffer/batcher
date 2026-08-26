@@ -174,9 +174,12 @@ The `project` is the columns the analyst may select, read through their masks; t
 estimate drops from 4 rows to 2 because the row policy is a predicate like any other:
 
 ```text
-project                         est≈2 (learned)
-  filter                        est≈2 (learned)
-    scan                        est≈4 (exact)
+query plan (planned)                          3 operators
+─────────────────────────────────────────────────────────
+OPERATOR                   ESTIMATE  NOTES
+project                       est≈2  (learned)
+└─ filter  [region = eu]      est≈2  (learned)
+   └─ scan  [source 0]        est≈4  (exact)  pushed[region = eu]
 
 decisions:
   - [core/io] source read at 0 MB/s (learned) — ~0.0s to read

@@ -238,7 +238,9 @@ fn explode_fixed_size_list(
 /// at `Int64`, any float wins (→ `Float64`, as DuckDB/Polars promote int∪float), so the
 /// stacked `value` column matches the type the planner advertised in the output schema.
 fn promote_value_columns(arrays: &[ArrayRef]) -> Option<DataType> {
-    use DataType::*;
+    use DataType::{
+        Float16, Float32, Float64, Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
+    };
     let is_float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
     let is_int = |t: &DataType| {
         matches!(
@@ -317,7 +319,7 @@ pub(crate) fn unpivot_batch(
         .map(|name| lookup(name).cloned())
         .collect::<Result<_, _>>()?;
     if let Some(target) = promote_value_columns(&value_arrays) {
-        for a in value_arrays.iter_mut() {
+        for a in &mut value_arrays {
             if a.data_type() != &target {
                 *a = arrow::compute::cast(a, &target)?;
             }
@@ -532,7 +534,7 @@ fn sample_n_push(
 fn fnv1a_seeded(bytes: &[u8], seed: u64) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed;
     for &b in bytes {
-        hash ^= b as u64;
+        hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     // splitmix64 finalizer (strong avalanche).

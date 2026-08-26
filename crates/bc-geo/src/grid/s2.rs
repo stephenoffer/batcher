@@ -163,6 +163,7 @@ pub fn cell_id(lon: f64, lat: f64, level: u32) -> GeoResult<u64> {
 }
 
 /// The level a cell id encodes, or `None` when the id is not a valid cell.
+#[must_use]
 pub fn level_of(id: u64) -> Option<u32> {
     if id == 0 || (id >> 61) > 5 {
         return None;
@@ -174,6 +175,7 @@ pub fn level_of(id: u64) -> Option<u32> {
 }
 
 /// The ancestor of `id` at `level`, or `None` when `level` is finer than `id`'s own.
+#[must_use]
 pub fn parent(id: u64, level: u32) -> Option<u64> {
     let own = level_of(id)?;
     if level > own {
@@ -184,6 +186,7 @@ pub fn parent(id: u64, level: u32) -> Option<u64> {
 }
 
 /// The four children of a cell, or `None` at the finest level.
+#[must_use]
 pub fn children(id: u64) -> Option<[u64; 4]> {
     let level = level_of(id)?;
     if level >= MAX_LEVEL {
@@ -200,6 +203,7 @@ pub fn children(id: u64) -> Option<[u64; 4]> {
 /// This is the property that makes S2 usable without a spatial index: every descendant
 /// of a cell, at every level, has an id inside this range, so `id BETWEEN lo AND hi` is
 /// an exact region filter over an ordinary sorted `Int64` column.
+#[must_use]
 pub fn range(id: u64) -> Option<(u64, u64)> {
     level_of(id)?;
     let lsb = id & id.wrapping_neg();

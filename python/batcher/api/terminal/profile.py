@@ -173,12 +173,46 @@ def _elide(text: str) -> str:
     return text[: _PUSHED_MAX_CHARS - 1].rstrip() + "…"
 
 
+def detail_labels(ir: dict | None) -> dict[int, str]:
+    """Per `op_id`, what that operator does in its own terms, for `explain()`.
+
+    The join type and keys, the group keys and aggregates, the sort keys, the filter
+    predicate. `explain()` printed none of it, so a plan with four joins printed four
+    identical `hash_join` lines and the reader had no way to tell which was which — the
+    first question anyone asks of a join tree. Every comparable engine prints it
+    (Postgres's ``Hash Cond:``, Spark's ``[id#3 = id#7]``, DuckDB's key list).
+
+    Reuses `observe.dag.describe`, which is the same function the web dashboard labels its
+    plan nodes with, rather than growing a second describer: two of them would drift within
+    a release and show the same operator two ways, which is the failure that makes a reader
+    stop trusting both.
+
+    Args:
+        ir: The optimized plan IR, walked in the pre-order that assigns `op_id`.
+
+    Returns:
+        A mapping from `op_id` to its label; operators with nothing worth naming are absent.
+    """
+    if not ir:
+        return {}
+    from batcher.observe.dag.describe import describe
+    from batcher.plan.profile import walk_ir
+
+    labels: dict[int, str] = {}
+    for op_id, (_depth, node) in enumerate(walk_ir(ir)):
+        text = describe(str(node.get("op", "")), node)
+        if text:
+            labels[op_id] = _elide(text)
+    return labels
+
+
 def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
     prof.physical_ops = opt.ops
     prof.source_pushdown = pushdown_labels(opt)
+    prof.node_details = detail_labels(opt.ir)
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -478,7 +512,7 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
         plan, sources=sources, hub=hub, source_stats=source_stats
     )
     return QueryProfile(
-        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt)),
+        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir)),
         decisions=(
             *build_side_decisions(decisions),
             *_io_throughput_decisions(sources, hub),

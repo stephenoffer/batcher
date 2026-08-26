@@ -15,6 +15,14 @@ from __future__ import annotations
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.aggregate import _as_column
 
+__all__ = [
+    "geometric_std",
+    "index_of_dispersion",
+    "relative_range",
+    "signal_to_noise",
+    "studentized_range",
+]
+
 
 def index_of_dispersion(column: str | Expr) -> Expr:
     """The variance-to-mean ratio (Fano factor) — ``var / mean``.

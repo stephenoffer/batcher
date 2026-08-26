@@ -288,7 +288,7 @@ def query_label(plan: object) -> str:
 
 
 def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException) -> None:
-    """Close a failed query out on the event bus, recording the exception's message.
+    """Close a failed query out on the event bus and in the trace, recording the exception.
 
     Args:
         query_id: The id `start_query_report` returned, or None if none was announced.
@@ -296,6 +296,7 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
         exc: The exception that ended the query.
     """
     from batcher._internal import events
+    from batcher.api.terminal.otel import emit_failure_span
 
     if not query_id:
         return
@@ -308,6 +309,11 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
         error=f"{type(exc).__name__}: {exc}",
         profile=None,
     )
+    # A failed query used to reach the bus and nothing else: `emit_query_spans` runs off a
+    # profile, and a query that raised has none. So the one class of run an operator most
+    # wants to find in a trace backend was the only class that was never in it, and a
+    # latency histogram built from these spans silently excluded every timeout.
+    emit_failure_span(query_id, total_ms, exc)
 
 
 def report_stream(batches: Iterator[Any], *, label: str, signature: str = "") -> Iterator[Any]:

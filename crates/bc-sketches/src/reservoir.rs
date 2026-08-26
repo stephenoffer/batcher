@@ -120,6 +120,7 @@ impl<T: Clone> ReservoirSample<T> {
     /// PRNG seed for reproducibility.
     ///
     /// A `capacity` of 0 yields a reservoir that always stays empty.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self::with_seed(capacity, RESERVOIR_SEED)
     }
@@ -133,6 +134,7 @@ impl<T: Clone> ReservoirSample<T> {
     /// row-group splits) it correlates the partitions' samples. Pass a distinct
     /// seed per partition — a partition index is enough — to decorrelate them
     /// while keeping each partition individually reproducible.
+    #[must_use]
     pub fn with_seed(capacity: usize, seed: u64) -> Self {
         Self {
             capacity,
@@ -202,26 +204,31 @@ impl<T: Clone> ReservoirSample<T> {
     }
 
     /// The current reservoir contents — a uniform sample of everything seen.
+    #[must_use]
     pub fn sample(&self) -> &[T] {
         &self.items
     }
 
     /// Number of items currently held in the reservoir (`min(total_seen, capacity)`).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Whether the reservoir currently holds no items.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Total number of items ever offered via [`add`](ReservoirSample::add).
+    #[must_use]
     pub fn total_seen(&self) -> u64 {
         self.seen
     }
 
     /// Capacity (maximum reservoir size).
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -252,8 +259,8 @@ fn split_slots(out_len: usize, seen: (u64, u64), len: (usize, usize)) -> (usize,
     if total == 0 || out_len == 0 {
         return (0, 0);
     }
-    let (out, total) = (out_len as u128, total as u128);
-    let (wa, wb) = (out * seen.0 as u128, out * seen.1 as u128);
+    let (out, total) = (out_len as u128, u128::from(total));
+    let (wa, wb) = (out * u128::from(seen.0), out * u128::from(seen.1));
 
     let mut ka = (wa / total) as usize;
     let mut kb = (wb / total) as usize;
@@ -593,7 +600,7 @@ mod tests {
 
         let mut bc = b.clone();
         bc.merge(&c);
-        let mut right = a.clone();
+        let mut right = a;
         right.merge(&bc);
 
         let mut lhs: Vec<u64> = left.sample().to_vec();
@@ -709,14 +716,14 @@ mod tests {
         // Each position's count is Binomial(trials, k/n); its sd is sqrt(trials·p·(1-p)).
         let sd = (trials as f64 * (k as f64 / n as f64) * (1.0 - k as f64 / n as f64)).sqrt();
         for (i, &h) in hits.iter().enumerate() {
-            let z = (h as f64 - expected) / sd;
+            let z = (f64::from(h) - expected) / sd;
             assert!(
                 z.abs() < 5.0,
                 "position {i}: {h} hits, expected {expected:.1} (z = {z:.2})"
             );
         }
         // And the mean over all positions must land essentially on the expectation.
-        let mean = hits.iter().map(|&h| h as f64).sum::<f64>() / n as f64;
+        let mean = hits.iter().map(|&h| f64::from(h)).sum::<f64>() / n as f64;
         assert!((mean - expected).abs() < 0.5, "mean {mean} vs {expected}");
     }
 

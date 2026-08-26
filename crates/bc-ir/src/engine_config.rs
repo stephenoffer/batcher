@@ -171,6 +171,7 @@ impl Default for EngineConfig {
 impl EngineConfig {
     /// The performance-threshold knobs as a [`bc_arrow::RuntimeTuning`] the data
     /// plane consumes — the bridge from the wire config to the runtime hot path.
+    #[must_use]
     pub fn runtime_tuning(&self) -> bc_arrow::RuntimeTuning {
         bc_arrow::RuntimeTuning {
             bloom_fp_rate: self.bloom_fp_rate,

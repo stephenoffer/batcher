@@ -22,6 +22,7 @@ from batcher.plan.expr_ir.func_nodes import (
     Strftime,
 )
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
+from batcher.plan.expr_ir.namespaces._temporal_units import trunc_unit
 from batcher.plan.ir_tags import MICROS_PER_DAY
 
 # Offset-string units → (months, days, micros) contribution per unit count. `mo`
@@ -91,8 +92,13 @@ _UNIT_STEP: dict[str, str] = {
 
 
 def _step_offset(unit: str, func: str) -> str:
-    """The `offset_by` step that reaches the next `unit` boundary, or raise."""
-    step = _UNIT_STEP.get(unit.lower())
+    """The `offset_by` step that reaches the next `unit` boundary, or raise.
+
+    Normalizes through `_trunc_unit` first so `ceil`/`round` accept exactly the vocabulary
+    `truncate` does -- they call `truncate` on the same string, so a spelling one of them
+    understood and the other did not would fail halfway through building the expression.
+    """
+    step = _UNIT_STEP.get(trunc_unit(unit, func))
     if step is None:
         raise PlanError(
             f".dt.{func}({unit!r}) is not supported; use one of "
@@ -174,7 +180,11 @@ class _DtNamespace:
         Type-preserving.
 
         Args:
-            unit: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+            unit: One of ``millennium``/``century``/``decade``/``year``/``quarter``/
+                ``month``/``week``/``day``/``hour``/``minute``/``second``/
+                ``millisecond``/``microsecond``. The duration spellings ``offset_by``
+                takes are accepted too (``"1mo"``/``"mo"``, ``"1d"``/``"d"``, ...),
+                where ``mo`` is months and ``m`` is minutes.
 
         Returns:
             A new Timestamp expression floored to ``unit``.
@@ -187,8 +197,11 @@ class _DtNamespace:
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
                 >>> ds.select(bt.col("d").dt.truncate("month").alias("r")).to_pydict()
                 {'r': [datetime.datetime(2024, 2, 1, 0, 0)]}
+
+                >>> ds.select(bt.col("d").dt.truncate("1mo").alias("r")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 1, 0, 0)]}
         """
-        return DateTrunc(self._e, unit)
+        return DateTrunc(self._e, trunc_unit(unit, "truncate"))
 
     def is_leap_year(self) -> DateFunc:
         """Test whether each row's year is a leap year (→ Bool).

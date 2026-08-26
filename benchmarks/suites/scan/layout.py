@@ -54,8 +54,28 @@ def _engine_queries(ctx: Context, layout: str, shape: Shape) -> EngineQueries:
     return queries
 
 
+def _order_terms(sql: str) -> str | None:
+    """The shape's ``ORDER BY`` clause as `Suite.case` wants it, or None when it has none."""
+    lowered = sql.lower()
+    at = lowered.rfind("order by")
+    if at == -1:
+        return None
+    clause = sql[at + len("order by") :]
+    limit = clause.lower().find("limit")
+    return (clause[:limit] if limit != -1 else clause).strip()
+
+
 def _register() -> None:
-    """One family per layout, one case per (shape, layout)."""
+    """One family per layout, one case per (shape, layout).
+
+    ``ordered_by`` is derived from the shape's own SQL rather than left at its default. A
+    `Shape` carries the query it runs, so dropping it here would have been the same mistake
+    TPC-H made: the `topn` shape is ``SELECT column0 FROM t ORDER BY column0 LIMIT 10``, and
+    the correctness gate compares results as row *multisets*, so without the order keys an
+    engine that returned ten arbitrary rows instead of the ten smallest would have passed the
+    check and then been timed on the work it did not do — on the one shape in this suite
+    where ordering is the entire measurement.
+    """
     for layout in SCAN_LAYOUTS:
         family = suite(f"scan-{layout}", dataset="scan")
         for shape in SHAPES:
@@ -63,7 +83,7 @@ def _register() -> None:
             def build(ctx: Context, _layout: str = layout, _shape: Shape = shape) -> EngineQueries:
                 return _engine_queries(ctx, _layout, _shape)
 
-            family.case(f"scan-{shape.name}-{layout}")(build)
+            family.case(f"scan-{shape.name}-{layout}", ordered_by=_order_terms(shape.sql))(build)
 
 
 _register()

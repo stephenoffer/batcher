@@ -27,7 +27,7 @@ pub(super) fn resize<O: OffsetSizeTrait>(
     // buffer per row; an absurd product (e.g. 50_000²) is a multi-gigabyte allocation bomb
     // driven by a query parameter. Cap it at `i32::MAX` — no legitimate thumbnail approaches
     // 2 GiB — computed in `u64` so the multiply itself cannot overflow.
-    if (w as u64) * (h as u64) * 3 > i32::MAX as u64 {
+    if u64::from(w) * u64::from(h) * 3 > i32::MAX as u64 {
         return Err(ExprError::InvalidArgument {
             func: "resize".to_string(),
             reason: format!(
@@ -227,7 +227,7 @@ pub(super) fn letterbox<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("letterbox", "width", args.width)?;
     let h = dim("letterbox", "height", args.height)?;
-    let per_row = super::element_len_guard("letterbox", (w as u64) * (h as u64) * 3, "bytes")?;
+    let per_row = super::element_len_guard("letterbox", u64::from(w) * u64::from(h) * 3, "bytes")?;
     let fill = match args.fill {
         None => 114u8,
         Some(v) => u8::try_from(v).map_err(|_| ExprError::InvalidArgument {
@@ -560,6 +560,8 @@ impl<'a> Bounds<'a> {
             .filter(|&v| v > 0)?;
         // A single row's window is still an allocation driven by the data, so bound it the
         // way the literal form bounds its constant.
-        ((w as u64) * (h as u64) * 3 <= i32::MAX as u64).then_some((x, y, w, h))
+        i32::try_from(u64::from(w) * u64::from(h) * 3)
+            .is_ok()
+            .then_some((x, y, w, h))
     }
 }

@@ -25,6 +25,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
+from batcher.kyber.rules.algebraic.identities import _caps_rows
 from batcher.plan.logical import Distinct, Limit, LogicalPlan, RowId, Union
 from batcher.plan.stats import Provenance
 
@@ -127,13 +128,21 @@ def push_offset_limit_into_union(node: Limit, _ctx: OptimizerContext) -> Logical
 
     Restricted to non-distinct unions (dedup changes counts) with a positive offset; the
     guard against already-capped inputs makes it fire once and then rest at a fixpoint.
+
+    That guard has to look *through* a projection — `_caps_rows`, shared with the offset-0
+    rule it companions — for the reason documented there: `push_limit_through_project` runs
+    in this phase and turns the `Limit(Project(x))` this installs into `Project(Limit(x))`,
+    after which an `isinstance(i, Limit)` test on the immediate input sees a bare `Project`
+    and re-caps a branch that is already capped. Verified at the rule level: with the
+    narrow test, applying this rule, then `push_limit_through_project`, then this rule
+    again, fires a second time on a plan it had already rewritten.
     """
     inner = node.input
     if (
         node.offset > 0
         and isinstance(inner, Union)
         and not inner.distinct
-        and not any(isinstance(i, Limit) for i in inner.inputs)
+        and not any(_caps_rows(i) for i in inner.inputs)
     ):
         cap = node.offset + node.n
         capped = tuple(Limit(i, cap, 0) for i in inner.inputs)

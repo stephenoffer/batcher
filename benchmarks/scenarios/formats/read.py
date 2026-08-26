@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -28,6 +30,10 @@ import pyarrow.orc as paorc
 import pyarrow.parquet as pq
 
 import batcher as bt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 
 def _table(rows: int) -> pa.Table:
@@ -99,6 +105,17 @@ def _engines_for(fmt: str, path: str) -> dict:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description="Format-read benchmark")
     parser.add_argument("--rows", type=int, default=3_000_000)
     parser.add_argument("--runs", type=int, default=3)
@@ -143,7 +160,20 @@ def main() -> int:
             except Exception as exc:
                 times[name] = -1.0
                 print(f"  ({fmt}/{name} error: {str(exc)[:60]})")
-        gate = "OK" if len(counts) == 1 else f"MISMATCH {counts}"
+        # Agreement is necessary and not sufficient: every engine reading **zero** rows
+        # agrees perfectly, and a near-zero read time then reports as a very fast one. A
+        # wrong path, a truncated write or an empty glob all land there, and none of them
+        # raises. So the gate also requires the count to be the number of rows written —
+        # the positive control that makes the agreement mean something.
+        expected = table.num_rows
+        if not counts:
+            gate = "NO DATA"
+        elif len(counts) > 1:
+            gate = f"MISMATCH {counts}"
+        elif counts != {expected}:
+            gate = f"WRONG COUNT {counts.pop():,} != {expected:,}"
+        else:
+            gate = "OK"
         size = os.path.getsize(path) / (1 << 20)
         cells = []
         for e in ("batcher", "duckdb", "polars", "fastavro"):

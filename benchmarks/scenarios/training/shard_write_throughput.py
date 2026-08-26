@@ -25,11 +25,17 @@ from __future__ import annotations
 import argparse
 import contextlib
 import shutil
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 
 class _LatentFilesystem:
@@ -90,6 +96,17 @@ def _time_write(table: pa.Table, rows_per_shard: int, concurrency: int, latency_
 
 def main() -> None:
     """Write the same corpus at several concurrencies and compare, checking each result."""
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=40_000)
     parser.add_argument("--width", type=int, default=16, help="feature vector width")

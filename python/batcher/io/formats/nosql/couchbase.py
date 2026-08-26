@@ -197,7 +197,7 @@ class CouchbaseSource(ScanSource):
         # collection and every prior window's rows came back a second time. The single serial
         # window ``(0, 0)`` still emits no ORDER BY/LIMIT/OFFSET (a plain full scan).
         if limit or offset:
-            effective_limit = limit if limit else _UNBOUNDED_LIMIT
+            effective_limit = limit or _UNBOUNDED_LIMIT
             stmt += f" ORDER BY META(c).id LIMIT {effective_limit} OFFSET {offset}"
         # Resolve the schema before opening this window's cluster: `self.schema()` falls
         # through to `_infer_schema`, which builds a cluster of its own, so leaving it below

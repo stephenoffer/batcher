@@ -77,5 +77,5 @@ def test_a_genuinely_full_cluster_keeps_the_grant(monkeypatch):
 def test_an_unreadable_free_reading_keeps_the_grant(monkeypatch):
     """`free_cpus` is absent wherever the per-node figures could not be read; absent must
     mean nameplate, which is the behaviour before any of this existed."""
-    monkeypatch.setattr(scaling, "node_classes", lambda: [])
+    monkeypatch.setattr(scaling, "node_classes", list)
     assert executor._fill_grant([8.0] * 4) == 8.0

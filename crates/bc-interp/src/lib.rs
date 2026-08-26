@@ -85,27 +85,42 @@ pub(crate) fn count_rows(batches: &[RecordBatch]) -> u64 {
 /// unambiguous because every morsel being measured is alive, so two live dictionaries cannot
 /// share an address. Relations with no dictionary column skip the bookkeeping entirely.
 pub(crate) fn batch_bytes(batches: &[RecordBatch]) -> u64 {
-    let gross: u64 = batches
+    column_bytes(batches.iter().flat_map(RecordBatch::columns))
+}
+
+/// [`batch_bytes`] over loose columns rather than whole batches — the measure itself.
+///
+/// The stateful operators budget against things that are not a `RecordBatch`: a `Partial`'s
+/// group columns and accumulator states, a window's partition keys. Those had each grown their
+/// own `get_array_memory_size` sum, which is the *parent-buffer* measure this function's doc
+/// explains at length is wrong for a morselized relation — so the one place that knew the right
+/// answer was the one place that did not need it. The measure lives here and takes columns; the
+/// batch form is a two-line wrapper over it.
+///
+/// The dictionary de-duplication is per *call*, so a caller that folds batch by batch charges a
+/// shared dictionary once per batch. That is still far tighter than the parent-buffer sum and
+/// errs conservative; a caller that can hand over the whole relation at once gets it exact.
+pub(crate) fn column_bytes<'a>(cols: impl IntoIterator<Item = &'a arrow::array::ArrayRef>) -> u64 {
+    // `to_data` once per column: the dictionary walk needs the same `ArrayData` the gross sum
+    // measured, and building it twice was both the allocation and the risk of the two passes
+    // disagreeing about what they were looking at. The per-column measure itself is
+    // `bc_arrow::slice_bytes`, inlined here for that reason — this function is that measure
+    // plus the cross-column dictionary de-duplication `bc-arrow` deliberately does not do.
+    let datas: Vec<arrow::array::ArrayData> = cols.into_iter().map(|c| c.to_data()).collect();
+    let gross: u64 = datas
         .iter()
-        .flat_map(|b| b.columns().iter())
-        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .map(|d| d.get_slice_memory_size().unwrap_or(0) as u64)
         .sum();
-    // Fast path: no dictionary anywhere in the schema, so nothing can be double-counted and
-    // the walk below would only cost allocations. This is every relation of plain numeric,
-    // string, or nested-non-dictionary columns.
-    if !batches.first().is_some_and(|b| {
-        b.schema()
-            .fields()
-            .iter()
-            .any(|f| has_dictionary(f.data_type()))
-    }) {
+    // Fast path: no dictionary anywhere, so nothing can be double-counted and the walk below
+    // would only cost allocations. This is every relation of plain numeric, string, or
+    // nested-non-dictionary columns.
+    if !datas.iter().any(|d| has_dictionary(d.data_type())) {
         return gross;
     }
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let recounted: u64 = batches
+    let recounted: u64 = datas
         .iter()
-        .flat_map(|b| b.columns().iter())
-        .map(|c| recounted_dictionary_bytes(&c.to_data(), &mut seen))
+        .map(|d| recounted_dictionary_bytes(d, &mut seen))
         .sum();
     gross.saturating_sub(recounted)
 }
@@ -569,9 +584,10 @@ fn exec_seq(
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
-            let deduped = match keys.is_empty() {
-                true => distinct(&batches)?,
-                false => ops::distinct_on_batches(&batches, keys, order)?,
+            let deduped = if keys.is_empty() {
+                distinct(&batches)?
+            } else {
+                ops::distinct_on_batches(&batches, keys, order)?
             };
             // The oracle deliberately dedups everything and *then* truncates, rather than
             // reusing the early-stopping `DistinctPrefix` the fast paths run. Both produce the

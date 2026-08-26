@@ -54,9 +54,9 @@ const INT64_DECIMAL_DIGITS: u8 = 19;
 /// two types is more useful than either.
 fn unify_decimal(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<DataType> {
     let scale = s1.max(s2);
-    let int_digits = (p1 as i16 - s1 as i16).max(p2 as i16 - s2 as i16);
-    let precision = int_digits + scale as i16;
-    if precision <= 0 || precision > DECIMAL128_MAX_PRECISION as i16 {
+    let int_digits = (i16::from(p1) - i16::from(s1)).max(i16::from(p2) - i16::from(s2));
+    let precision = int_digits + i16::from(scale);
+    if precision <= 0 || precision > i16::from(DECIMAL128_MAX_PRECISION) {
         return None;
     }
     Some(DataType::Decimal128(precision as u8, scale))
@@ -66,7 +66,7 @@ fn unify_decimal(p1: u8, s1: i8, p2: u8, s2: i8) -> Option<DataType> {
 /// unsigned integers to `Int64`, but a batch read straight from a file has not been
 /// through it, so accept the whole family).
 fn is_int(t: &DataType) -> bool {
-    use DataType::*;
+    use DataType::{Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8};
     matches!(
         t,
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
@@ -84,8 +84,12 @@ fn is_float(t: &DataType) -> bool {
 /// lossless common type, and callers turn it into a typed error naming both sides. The
 /// one place this deliberately departs from "lossless" is the int/float mix, which meets
 /// at `Float64` as every SQL dialect does.
+#[must_use]
 pub fn common_supertype(a: &DataType, b: &DataType) -> Option<DataType> {
-    use DataType::*;
+    use DataType::{
+        Binary, Boolean, Date32, Date64, Decimal128, Decimal256, Dictionary, Duration, Float64,
+        Int64, LargeBinary, LargeUtf8, Null, Time32, Time64, Timestamp, Utf8,
+    };
     if a == b {
         return Some(a.clone());
     }

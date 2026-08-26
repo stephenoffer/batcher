@@ -409,16 +409,18 @@ def invalidate_source_stats(path: str, fmt: str) -> None:
 
 
 def _cache_key(source: Source, identity: str) -> str | None:
-    """The memo key for `source`: its identity qualified by its content version."""
+    """The memo key for `source`: its identity qualified by its content version.
+
+    A source that cannot version itself keeps the identity-only key here, which is the one
+    place that answer differs from the shared result cache's: this memo lives and dies with
+    the process, so the worst an unversioned entry can do is be stale for one session,
+    where a shared entry would be stale for every later one.
+    """
+    from batcher.plan.source_stats import content_version
+
     if not identity:
         return None
-    version_fn = getattr(source, "stats_version", None)
-    if version_fn is None:
-        return identity
-    try:
-        version = version_fn()
-    except Exception:  # a source that cannot version itself keeps the identity-only key
-        return identity
+    version = content_version(source)
     return identity if version is None else f"{identity}@{version}"
 
 

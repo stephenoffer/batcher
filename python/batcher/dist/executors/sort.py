@@ -28,7 +28,7 @@ from batcher.dist.executors.partition_io import (
     merge_boundaries,
     plan_hot_split,
     sample_probs,
-    source_pushdown,
+    stage_pushdown,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table
 from batcher.dist.executors.ray_runtime import (
@@ -120,7 +120,9 @@ def _distributed_sort(
         # sort already does. The map plan re-checks the filter, so this is I/O only — but
         # this operator reads its input *twice* (sample, then range-partition), so it is the
         # one where the saving is doubled. `map_plan`'s scan was relabeled to source 0.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Asked of the whole stage (`above` over the sort), keyed by the source's own id:
+        # a sort narrows nothing itself, so the projection lives above it. See `stage_pushdown`.
+        projection, predicate = stage_pushdown(above, sort, sid)
         # A sort carrying a `limit` too large for the shuffle-free top-N still *slices*, so
         # it selects among rows tied at the cut and needs the same source-ordered partitions
         # `_distributed_topn` does. An unlimited sort returns every row, so the pick is free
@@ -330,7 +332,9 @@ def _distributed_topn(
         # top-N does. The map plan re-checks the filter, so this is I/O only — but it is
         # per-node I/O, which is the term that has to fall with the fleet for the shape to
         # scale at all. `map_plan`'s scan was relabeled to source 0, so ask about 0.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Asked of the whole stage (`above` over the sort), keyed by the source's own id:
+        # a sort narrows nothing itself, so the projection lives above it. See `stage_pushdown`.
+        projection, predicate = stage_pushdown(above, sort, sid)
         # Contiguous, source-ordered partitions. A top-N keeps only `k` of the rows it
         # orders, so which of several rows tied at the `k`-th place survives is decided by
         # input order — and the load-balanced split pick hands one partition non-adjacent

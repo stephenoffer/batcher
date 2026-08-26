@@ -19,6 +19,7 @@ import pytest
 
 from _harness import (
     assert_same,
+    assert_same_for_query,
     assert_same_ordered,
     assert_tables_equal,
     duck_materialize,
@@ -29,6 +30,7 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 
 __all__ = [
     "assert_same",
+    "assert_same_for_query",
     "assert_same_ordered",
     "assert_tables_equal",
     "duck_materialize",

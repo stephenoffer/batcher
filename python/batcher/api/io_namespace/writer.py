@@ -205,7 +205,7 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
     (single-node == distributed), and is not a slogan: the one shape that slipped through this
     gate silently returned a different answer on a cluster than on one box.
     """
-    from batcher.plan.logical import Distinct, TransformWithState, streaming_fold_target
+    from batcher.plan.logical import Distinct, TransformWithState, split_streaming_tail
 
     if isinstance(plan, TransformWithState):
         # Named rather than folded into "another pipeline breaker": this one *has* a
@@ -219,7 +219,13 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
             "do. Run it with distributed=False rather than have the cluster compute "
             "something else."
         )
-    agg = streaming_fold_target(plan)
+    split = split_streaming_tail(plan)
+    # The row-wise tail above the fold (a projection, a HAVING filter, the arithmetic an
+    # expression over aggregates lowers to) is applied by the driver to the combined result,
+    # exactly as the single-node processor applies it to the fold snapshot. Refusing it here
+    # while single-node accepted it would be a capability gap with no semantic cause -- the
+    # same gap `streaming_fold_target` was introduced to close for `distinct()`.
+    agg = split[1] if split is not None else None
     if agg is None:
         if isinstance(plan, Distinct) and plan.keys:
             # Named rather than folded into "another pipeline breaker", for the same reason

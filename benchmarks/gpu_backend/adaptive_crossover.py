@@ -91,7 +91,7 @@ def main() -> int:
             xo = learned_gpu_min_rows(core.default_hub())
             print(
                 f"n={n // 1_000_000:3d}M  gpu==cpu [{'OK' if _agree(gpu, cpu) else 'MISMATCH'}]  "
-                f"learned_crossover={xo if xo else '(not yet)'}"
+                f"learned_crossover={xo or '(not yet)'}"
             )
 
     xo = learned_gpu_min_rows(core.default_hub())

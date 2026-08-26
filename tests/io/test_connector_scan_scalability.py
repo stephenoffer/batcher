@@ -196,8 +196,7 @@ def _write_ndjson(path: str, rows: int = 5_000) -> pa.Table:
         {"a": i, "b": f"s{i}", "c": float(i) + 0.5, "d": {"x": i, "y": "n"}} for i in range(rows)
     ]
     with open(path, "w") as fh:
-        for r in records:
-            fh.write(json.dumps(r) + "\n")
+        fh.writelines(json.dumps(r) + "\n" for r in records)
     import pyarrow.json as pajson
 
     return pajson.read_json(path)
@@ -256,8 +255,7 @@ def test_json_projection_falls_back_when_the_schema_cannot_parse_a_file(tmp_path
 
     path = str(tmp_path / "w.json")
     with open(path, "w") as fh:
-        for i in range(2_000):
-            fh.write(f'{{"v": {i}}}\n')
+        fh.writelines(f'{{"v": {i}}}\n' for i in range(2_000))
         fh.write('{"v": 1.5}\n')
 
     table = pa.Table.from_batches(JSONSource(path).read(projection=["v"]))

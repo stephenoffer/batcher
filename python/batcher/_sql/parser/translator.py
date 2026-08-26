@@ -309,7 +309,7 @@ class _Translator:
 
         Referenced once ⇒ left lazy, so predicate/projection pushdown still reaches into it.
         """
-        ds = self.statement(cte.this)
+        ds = from_clause.alias_columns(self.statement(cte.this), cte)
         if _table_ref_count(root, cte.alias) > 1:
             return from_arrow(ds.collect())
         return ds
@@ -633,17 +633,29 @@ class _Translator:
         answers None rather than guessing — so a caller must treat None as "unknown", never
         as a type.
 
+        A query with no `FROM` has no bound scope, but a *constant* expression still has a
+        type — `DATE '2024-01-31'` is a Date32 with or without a relation to read it over.
+        Answering None there sent `time_bucket(INTERVAL 1 MONTH, DATE '...')` down the
+        timestamp branch, so an empty scope is an empty schema here rather than a refusal.
+
         Args:
             expr: A built `Expr`.
 
         Returns:
             The Arrow `DataType`, or None.
         """
-        if self._scope_schema is None:
-            return None
+        import pyarrow as pa
+
+        from batcher.plan.schema import SchemaRef
         from batcher.plan.types.infer import infer_type
 
-        return infer_type(expr, self._scope_schema)
+        schema = self._scope_schema or SchemaRef.from_arrow(pa.schema([]))
+        try:
+            return infer_type(expr, schema)
+        except KeyError:
+            # `SchemaRef.field` raises for a column the scope does not carry — a correlated
+            # outer reference, or a name resolved later. "Unknown" is the sound answer.
+            return None
 
     def column_type(self, node) -> Any | None:
         """The Arrow type of `node` when it is a plain column currently in scope.

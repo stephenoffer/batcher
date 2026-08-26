@@ -190,6 +190,16 @@ def test_efficiency_is_none_rather_than_zero_when_undefined() -> None:
     assert stage.rows_per_joule is None, "a stage that emitted nothing has no efficiency figure"
     assert stage.tokens_per_joule is None
     assert EnergyLedger().tokens_per_joule() is None
+    # The negative below needs a positive control, or it passes for the wrong reason: if
+    # `summary()` ever stops spelling the key `tokens_per_joule` — a rename, a nested
+    # section, a different renderer — the absence assertion becomes true by construction and
+    # keeps passing whether or not the empty ledger correctly omits the figure.
+    fed = EnergyLedger()
+    fed.record(StageEnergy("Decode#1", "NVIDIA_H100", 1, 10.0, 0.5, joules=1000.0, tokens=2000))
+    assert "tokens_per_joule" in fed.summary(), (
+        "control for the assertion below: a ledger that HAS an efficiency figure must "
+        "report it under this exact key"
+    )
     assert "tokens_per_joule" not in EnergyLedger().summary()
 
 

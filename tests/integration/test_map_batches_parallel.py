@@ -115,7 +115,7 @@ def test_multiprocessing_lambda_falls_back_and_is_correct():
     t = pa.table({"v": list(range(300))})
     out = (
         bt.from_arrow(t)
-        .map_batches(lambda b: _double(b), batch_size=50, num_workers=4, multiprocessing=True)
+        .map_batches(_double, batch_size=50, num_workers=4, multiprocessing=True)
         .collect()
     )
     assert out.column("v").to_pylist() == [x * 2 for x in range(300)]

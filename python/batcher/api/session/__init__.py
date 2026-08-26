@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from batcher.api.session import accelerators as _accelerators
 from batcher.api.session import admin as _admin
+from batcher.api.session import cache as _cache
 from batcher.api.session import combine as _combine
 from batcher.api.session import frames as _frames
 from batcher.api.session import frameworks as _frameworks
@@ -25,6 +26,7 @@ from batcher.api.session import versions as _versions
 from batcher.api.session._scan import _scan as _scan
 from batcher.api.session.accelerators import *  # noqa: F403
 from batcher.api.session.admin import *  # noqa: F403  (governed by admin.__all__)
+from batcher.api.session.cache import *  # noqa: F403
 from batcher.api.session.combine import *  # noqa: F403
 from batcher.api.session.frames import *  # noqa: F403
 from batcher.api.session.frameworks import *  # noqa: F403
@@ -37,6 +39,7 @@ from batcher.api.session.versions import *  # noqa: F403
 __all__ = [
     *_accelerators.__all__,
     *_admin.__all__,
+    *_cache.__all__,
     *_combine.__all__,
     *_frames.__all__,
     *_frameworks.__all__,

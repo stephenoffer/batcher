@@ -127,16 +127,19 @@ impl CpuTopology {
     ///
     /// A ratio rather than a boolean because 4-way SMT exists (POWER, some SPARC) and a
     /// caller weighing "how much of my logical count is real throughput" needs the factor.
+    #[must_use]
     pub fn smt_width(&self) -> usize {
         self.threads_per_core.max(1)
     }
 
     /// Whether this host runs more than one hardware thread per core.
+    #[must_use]
     pub fn has_smt(&self) -> bool {
         self.threads_per_core > 1
     }
 
     /// Whether this host has more than one usable NUMA node.
+    #[must_use]
     pub fn is_numa(&self) -> bool {
         self.numa_nodes > 1
     }
@@ -146,6 +149,7 @@ impl CpuTopology {
     /// The single place the engine turns "this cache is N bytes" into "so process M rows at a
     /// time". Returns at least 1 so a caller never divides by zero on a pathologically wide
     /// row, and saturates rather than overflowing on a zero width.
+    #[must_use]
     pub fn rows_in(&self, cache_bytes: usize, row_bytes: usize) -> usize {
         let budget = cache_bytes / CACHE_OCCUPANCY_DENOMINATOR * CACHE_OCCUPANCY_NUMERATOR;
         (budget / row_bytes.max(1)).max(1)
@@ -156,6 +160,7 @@ impl CpuTopology {
     /// The morsel-sizing question: a morsel exists to be small enough that the operator
     /// touching it does not evict itself between passes. L2 is the right level — L1 is too
     /// small to amortize per-morsel scheduling, L3 is shared and so not a per-thread budget.
+    #[must_use]
     pub fn l2_resident_rows(&self, row_bytes: usize) -> usize {
         self.rows_in(self.l2_bytes, row_bytes)
     }
@@ -165,6 +170,7 @@ impl CpuTopology {
     /// Compute-bound kernels get the physical core count; the SMT sibling of a saturated core
     /// contributes almost nothing and halves its cache. Memory-bound work should use
     /// [`Self::logical_cores`] instead, which is what hides the stalls SMT exists for.
+    #[must_use]
     pub fn compute_threads(&self) -> usize {
         self.physical_cores.max(1)
     }
@@ -178,6 +184,7 @@ impl CpuTopology {
 ///
 /// Malformed components are skipped rather than failing the whole parse: a partially readable
 /// topology beats none, and the kernel occasionally emits fields this was not written for.
+#[must_use]
 pub fn parse_cpu_list_public(raw: &str) -> Vec<usize> {
     let mut out: Vec<usize> = Vec::new();
     for part in raw.trim().split(',') {
@@ -222,9 +229,9 @@ mod sysfs {
     pub(super) fn parse_cache_size(raw: &str) -> usize {
         let raw = raw.trim();
         let (digits, mult) = match raw.chars().last() {
-            Some('K') | Some('k') => (&raw[..raw.len() - 1], 1 << 10),
-            Some('M') | Some('m') => (&raw[..raw.len() - 1], 1 << 20),
-            Some('G') | Some('g') => (&raw[..raw.len() - 1], 1 << 30),
+            Some('K' | 'k') => (&raw[..raw.len() - 1], 1 << 10),
+            Some('M' | 'm') => (&raw[..raw.len() - 1], 1 << 20),
+            Some('G' | 'g') => (&raw[..raw.len() - 1], 1 << 30),
             _ => (raw, 1),
         };
         digits
@@ -256,6 +263,7 @@ mod sysfs {
 /// `None` means "no restriction known", which callers read as "every CPU is allowed" — the
 /// same answer the engine gave before affinity was consulted at all.
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn affinity_cpus() -> Option<Vec<usize>> {
     // /proc/self/status exposes the mask as a hex bitmap in `Cpus_allowed_list` (a cpulist),
     // which is exactly the format `parse_cpu_list` already reads. Going through /proc rather
@@ -280,6 +288,7 @@ pub fn affinity_cpus() -> Option<Vec<usize>> {
 /// therefore how to split a build side so each node probes its own copy. Empty when NUMA is
 /// not exposed, which callers read as "one node".
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn numa_node_cpus() -> Vec<(usize, Vec<usize>)> {
     let allowed: Option<std::collections::BTreeSet<usize>> =
         affinity_cpus().map(|v| v.into_iter().collect());
@@ -392,9 +401,8 @@ fn cache_sizes() -> (usize, usize, usize, usize) {
         let Some(level) = sysfs::read_usize(&format!("{base}/level")) else {
             continue;
         };
-        let size = sysfs::read_trimmed(&format!("{base}/size"))
-            .map(|s| sysfs::parse_cache_size(&s))
-            .unwrap_or(0);
+        let size =
+            sysfs::read_trimmed(&format!("{base}/size")).map_or(0, |s| sysfs::parse_cache_size(&s));
         // A "Unified" L1 (some ARM cores) is the cache a data working set contends for, so
         // it counts as the d-cache rather than being skipped.
         match level {
@@ -457,7 +465,7 @@ pub fn prefetch_read<T>(addr: *const T) {
         // SAFETY: `_mm_prefetch` is a hint instruction. It never faults, never dereferences
         // architecturally, and has no effect on program state — only on cache residency.
         unsafe {
-            core::arch::x86_64::_mm_prefetch(addr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(addr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
         }
     }
     // AArch64 is not a fallback target here — Graviton, Ampere Altra and Grace are ordinary

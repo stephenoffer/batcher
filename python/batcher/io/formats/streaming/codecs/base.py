@@ -58,6 +58,13 @@ _MODES = ("fail", "permissive")
 CODECS: Registry[Any] = Registry(
     "payload codec",
     doc="integrations/streams/payload-formats",
+    # The lambda is load-bearing, not a redundant wrapper. This `Registry(...)` is built at
+    # module-execution time, above the `def` below, so a bare `_register_builtin_codecs`
+    # reference is evaluated now and raises `NameError` on `import batcher` - which takes the
+    # whole package down, not just this module. The lambda defers the lookup to call time.
+    # A lint autofix has already made exactly this change once. Ruff's `PLW0108` is not an
+    # enabled rule here, so a suppression directive cannot mark the line either - RUF100
+    # rejects a directive for a rule that is off - and this comment is the only defence.
     on_miss=lambda: _register_builtin_codecs(),
 )
 

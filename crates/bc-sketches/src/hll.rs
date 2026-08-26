@@ -24,6 +24,7 @@ pub struct HyperLogLog {
 
 impl HyperLogLog {
     /// Create an empty sketch with `2^precision` registers (precision 4..=18).
+    #[must_use]
     pub fn new(precision: u8) -> Self {
         assert!((4..=18).contains(&precision), "precision must be in 4..=18");
         Self {
@@ -33,6 +34,7 @@ impl HyperLogLog {
     }
 
     /// A sensible default (precision 14 → ~0.81% error, 16 KB).
+    #[must_use]
     pub fn default_precision() -> Self {
         Self::new(14)
     }
@@ -43,7 +45,7 @@ impl HyperLogLog {
 
     /// Add a pre-computed 64-bit hash.
     pub fn add_hash(&mut self, hash: u64) {
-        let p = self.precision as u32;
+        let p = u32::from(self.precision);
         let idx = (hash >> (64 - p)) as usize;
         // Rank = position of the leftmost 1 in the remaining bits (+1).
         let w = hash << p;
@@ -118,18 +120,18 @@ impl HyperLogLog {
         }
 
         match array.data_type() {
-            DT::Int8 => prim!(Int8Array, |v: i8| v as i64),
-            DT::Int16 => prim!(Int16Array, |v: i16| v as i64),
-            DT::Int32 => prim!(Int32Array, |v: i32| v as i64),
+            DT::Int8 => prim!(Int8Array, |v: i8| i64::from(v)),
+            DT::Int16 => prim!(Int16Array, |v: i16| i64::from(v)),
+            DT::Int32 => prim!(Int32Array, |v: i32| i64::from(v)),
             DT::Int64 => prim!(Int64Array, |v: i64| v),
-            DT::UInt8 => prim!(UInt8Array, |v: u8| v as u64),
-            DT::UInt16 => prim!(UInt16Array, |v: u16| v as u64),
-            DT::UInt32 => prim!(UInt32Array, |v: u32| v as u64),
+            DT::UInt8 => prim!(UInt8Array, |v: u8| u64::from(v)),
+            DT::UInt16 => prim!(UInt16Array, |v: u16| u64::from(v)),
+            DT::UInt32 => prim!(UInt32Array, |v: u32| u64::from(v)),
             DT::UInt64 => prim!(UInt64Array, |v: u64| v),
             DT::Float16 => prim!(Float16Array, |v| canon_float_bits(f64::from(v))),
-            DT::Float32 => prim!(Float32Array, |v: f32| canon_float_bits(v as f64)),
+            DT::Float32 => prim!(Float32Array, |v: f32| canon_float_bits(f64::from(v))),
             DT::Float64 => prim!(Float64Array, |v: f64| canon_float_bits(v)),
-            DT::Date32 => prim!(Date32Array, |v: i32| v as i64),
+            DT::Date32 => prim!(Date32Array, |v: i32| i64::from(v)),
             DT::Date64 => prim!(Date64Array, |v: i64| v),
             // The temporal and decimal families below are as primitive as the integers above
             // — one fixed-width value per row — and they were falling through to the
@@ -150,8 +152,10 @@ impl HyperLogLog {
                 prim!(TimestampMicrosecondArray, |v: i64| v)
             }
             DT::Timestamp(TimeUnit::Nanosecond, _) => prim!(TimestampNanosecondArray, |v: i64| v),
-            DT::Time32(TimeUnit::Second) => prim!(Time32SecondArray, |v: i32| v as i64),
-            DT::Time32(TimeUnit::Millisecond) => prim!(Time32MillisecondArray, |v: i32| v as i64),
+            DT::Time32(TimeUnit::Second) => prim!(Time32SecondArray, |v: i32| i64::from(v)),
+            DT::Time32(TimeUnit::Millisecond) => {
+                prim!(Time32MillisecondArray, |v: i32| i64::from(v))
+            }
             DT::Time64(TimeUnit::Microsecond) => prim!(Time64MicrosecondArray, |v: i64| v),
             DT::Time64(TimeUnit::Nanosecond) => prim!(Time64NanosecondArray, |v: i64| v),
             DT::Duration(TimeUnit::Second) => prim!(DurationSecondArray, |v: i64| v),
@@ -246,12 +250,13 @@ impl HyperLogLog {
     /// and blended rather than switched), and `τ` accounts for registers saturated at the
     /// maximum rank (the large-range end). Between them the estimator degrades gracefully
     /// instead of stepping.
+    #[must_use]
     pub fn estimate(&self) -> f64 {
         let m = self.m() as f64;
-        let q = 64 - self.precision as u32; // registers hold ranks 0..=q+1
-                                            // Register multiplicities: `counts[k]` = how many registers hold rank `k`. Ertl's
-                                            // estimator is a function of this histogram alone, which is also a cheaper pass than
-                                            // the float harmonic sum it replaces (integer increments, no FP per register).
+        let q = 64 - u32::from(self.precision); // registers hold ranks 0..=q+1
+                                                // Register multiplicities: `counts[k]` = how many registers hold rank `k`. Ertl's
+                                                // estimator is a function of this histogram alone, which is also a cheaper pass than
+                                                // the float harmonic sum it replaces (integer increments, no FP per register).
         let mut counts = vec![0u32; q as usize + 2];
         for &r in &self.registers {
             counts[r as usize] += 1;
@@ -259,11 +264,11 @@ impl HyperLogLog {
         if counts[0] == self.registers.len() as u32 {
             return 0.0; // every register untouched: the sketch is empty
         }
-        let mut z = m * tau((m - counts[q as usize + 1] as f64) / m);
+        let mut z = m * tau((m - f64::from(counts[q as usize + 1])) / m);
         for k in (1..=q as usize).rev() {
-            z = 0.5 * (z + counts[k] as f64);
+            z = f64::midpoint(z, f64::from(counts[k]));
         }
-        z += m * sigma(counts[0] as f64 / m);
+        z += m * sigma(f64::from(counts[0]) / m);
         if z <= 0.0 || !z.is_finite() {
             // Every register saturated at the maximum rank — unreachable with a 64-bit hash
             // below ~2^58 distinct values, but the estimate is unbounded there rather than
@@ -277,6 +282,7 @@ impl HyperLogLog {
     ///
     /// The register count is implied by `precision` (`2^precision`), so no length
     /// prefix is needed. Suitable for storing as a metadata blob.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.registers.len());
         out.push(self.precision);
@@ -286,6 +292,7 @@ impl HyperLogLog {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on malformed
     /// input (bad precision, or a length that doesn't equal `1 + 2^precision`).
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (&precision, registers) = bytes.split_first()?;
         if !(4..=18).contains(&precision) {
@@ -559,7 +566,7 @@ mod tests {
         bc.merge(&cc);
         left.merge(&bc);
 
-        let mut right = a.clone();
+        let mut right = a;
         right.merge(&b);
         right.merge(&cc);
 
@@ -791,7 +798,7 @@ mod fast_path_tests {
     fn nulls_are_not_distinct_values() {
         let array = TimestampMicrosecondArray::from(
             (0..2_000)
-                .map(|i| if i % 3 == 0 { None } else { Some(i as i64) })
+                .map(|i| if i % 3 == 0 { None } else { Some(i64::from(i)) })
                 .collect::<Vec<_>>(),
         );
         let truth = (0..2_000).filter(|i| i % 3 != 0).count() as u64;

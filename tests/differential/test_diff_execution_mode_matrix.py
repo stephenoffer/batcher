@@ -103,7 +103,22 @@ def _shard_threshold_rows() -> int:
     )
     rows = re.search(r"DEFAULT_MORSEL_ROWS:\s*usize\s*=\s*([\d_]+)", morsel)
     if not mult or not rows:
-        pytest.skip("could not read MIN_ROWS_TO_SHARD from the Rust sources")
+        # `fail`, not `skip`. An unreadable constant is a defect in this coupling, not an
+        # absent dependency — and the coupling exists *because* the Rust side is expected to
+        # change. Every plausible edit breaks these regexes: `= 8 * 8192`, `= shard_floor()`,
+        # or renaming `DEFAULT_MORSEL_ROWS`. A skip would then take the sharding guard out
+        # of the run, and the twelve-case matrix below it would go on re-running the
+        # sequential path forever — green, covering nothing new, which is the exact trap this
+        # function's docstring exists to close. Reached by the one route it did not guard.
+        #
+        # A mid-body skip is also invisible to `tools/lint_skips.py`, which reads module-level
+        # guards by design, so nothing would have reported the loss of coverage either.
+        pytest.fail(
+            "could not read MIN_ROWS_TO_SHARD out of the Rust sources — the regexes in this "
+            "helper have drifted from crates/bc-interp/src/stream/parallel.rs or "
+            "crates/bc-arrow/src/lib.rs. Update them; do not weaken this to a skip, or the "
+            "whole matrix silently stops exercising the sharded path."
+        )
     return int(mult.group(1)) * int(rows.group(1).replace("_", ""))
 
 

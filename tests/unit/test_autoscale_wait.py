@@ -57,7 +57,6 @@ def _run(monkeypatch, cpus_series, *, target, wait=180.0, poll=5.0, stall=90.0, 
     monkeypatch.setattr(
         scaling, "cluster_topology", lambda: {"nodes": 1, "cpus": cpus_series(clock.t), "gpus": 0.0}
     )
-    monkeypatch.setattr(scaling, "_ray_initialized", lambda: True, raising=False)
     base = active_config()
     dc = dataclasses.replace(
         base.distributed,

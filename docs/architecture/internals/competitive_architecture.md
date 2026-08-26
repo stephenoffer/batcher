@@ -1,8 +1,56 @@
 # Competitive architecture: where Batcher wins, where it loses, and what it must build
 
-**Status:** audit, 2026-07-14; partially re-audited 2026-07-29, 2026-08-01, 2026-08-15 and
-2026-08-16. Every claim below was checked against code, not documentation. Where the docs and the code disagreed, the
+**Status:** audit, 2026-07-14; partially re-audited 2026-07-29, 2026-08-01, 2026-08-15,
+2026-08-16 and 2026-08-25. Every claim below was checked against code, not documentation. Where the docs and the code disagreed, the
 code won and the doc is named as wrong.
+
+**What the 2026-08-25 pass changed — TPC-H sf10 is a win, and JOB is the largest move.**
+Measured as an **A/B against the tree itself**: `HEAD` built in a separate worktree, the new
+build in the main one, two engines on both arms (`batcher,duckdb`) and the same 96-core /
+184 GiB node. Against the figures recorded in the passes below rather than a re-run of `HEAD`,
+two rows would have been credited with drift they did not earn — the operator mix reads 0.740
+in the 2026-08-23 entry and **0.690 on `HEAD` today** — so every number in this pass is a
+same-day pair.
+
+| suite | HEAD | after |
+|---|---:|---:|
+| **TPC-H sf10 (22)** | 1.087 | **0.963 — W** |
+| **JOB (113, real IMDb)** | 1.265 | **1.112**, 34 → 44 wins |
+| TPC-H sf1 (22) | 0.782 | **0.742** |
+| TPC-DS sf1 (99) | 0.945 | 0.947 (total 3,408 → **3,256 ms**) |
+| ClickBench (43) | 0.630 | **0.620** |
+| operator mix (21) | 0.690 | **0.678** |
+| H2O `join` (5) | 0.697 | 0.695 (total 555 → **476 ms**) |
+| H2O `groupby` (10) | 1.006 | 1.025 |
+
+**Two rows below change their verdict, and one of them is this document's oldest reservation.**
+
+* **TPC-H sf10 (60M-row `lineitem`) is no longer a loss.** 1.087x → **0.963x**, suite total
+  2,938 → 2,323 ms, carried per query rather than by a geomean: q9 456 → 233 ms, q13 325 → 174,
+  q5 189 → 122, q3 116 → 87, q4 117 → 96, q10 158 → 139. The `≥100M rows` row keeps its **L**
+  on the sf100 evidence — 600M rows still OOMs q3/q4/q5 and that is untested here — but the
+  sentence locating the boundary *at sf10* is retired.
+
+* **JOB moves further than any other suite: 1.265x → 1.112x, and Batcher's total drops below
+  DuckDB's** (8,131 ms against 8,885). The geomean stays above 1 because it wins the large
+  queries and still loses many small ones — q17f 298 → 75 ms, q10c 185 → 46, q8d 188 → 69,
+  q30a 172 → 106 — so quote both or the row reads as a loss it no longer straightforwardly is.
+  This is the suite the design is aimed at, and it is the one that moved most.
+
+**Why they moved, in one line each** (`benchmarks/BENCHMARK_RESULTS.md` carries the
+measurements): a probe-side bloom that allocated one full-size filter per build shard and merged
+them serially — 34.3 ms against the 31.3 ms parallel hash insert beside it — is now sharded the
+way the heads are and merges nothing; the two fitted constants that existed only to compensate
+for that cost are gone, which is what lets a multi-join spine keep every core instead of
+collapsing to one; an ordered group key now uses the key-disjoint partition its own layout
+already provides instead of gathering the relation into hash buckets; and the group-count
+estimator no longer reads a *clustered* key as a thousand-value domain when it holds fifteen
+million.
+
+**Read JOB's per-query deltas as noise and its total as signal.** 113 queries share one process,
+one learned-stats hub and one memory pool, so a query's time depends on what ran before it: a
+full run shows q25a at 83.7 → 264.5 ms, and run on its own the whole q25 family is *faster* on
+the new build (q25a 135.5 → 72.7, q25b 95.3 → 63.5, q25c 109.5 → 82.7).
 
 **What the 2026-08-16 pass changed.** Re-measured every suite on the same 96-core / 184 GiB
 node, each on a **two-engine** lineup (`batcher,duckdb`) so no third engine's resident memory
@@ -59,8 +107,10 @@ day and 1.51x a week before), ClickBench (0.62x, 30 of 43), JSON (0.25x), the op
 is confirmed:
 
 * **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
-* **Single-node ≥100M rows (vs DuckDB): L** — still L, and the boundary is now located rather
-  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is a loss, where sf1 is 0.78x.
+* **Single-node ≥100M rows (vs DuckDB): L** — still L on the sf100 evidence (600M rows, where
+  q3/q4/q5 OOM), but **the sf10 half of this row is retired**: TPC-H at sf10 (60M-row
+  `lineitem`) is a **win** as of 2026-08-25, 0.963x against 1.087x on the same day's `HEAD`.
+  The sentence below recorded it as a loss and is kept for the history of the number.
   Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
   q13 12.7x, q18 12.5x, q9 11.2x), and those four carry the highest-cardinality group-bys and
   the largest intermediates in the benchmark.
@@ -163,7 +213,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 |---|---|---|---|---|---|---|
 | Small-query latency | **= on a repeated shape** (2x faster), **L on a first-seen one** (2.8x slower — 8 ms of optimizer, twice; ceiling 8) | = | **W** | — | **W** | **W** |
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
-| Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5) | **L** on 6 shapes | — | — | **W** | — |
+| Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5 at sf100) — but the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (722 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
 | Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |

@@ -87,7 +87,7 @@ impl NumericKeys {
     /// total order, matching how the order key was sorted and peer-grouped.
     pub(crate) fn shifted_cmp(&self, i: usize, delta: i128, j: usize) -> std::cmp::Ordering {
         match self {
-            NumericKeys::Ints(v) => (v[j] as i128).cmp(&(v[i] as i128).saturating_add(delta)),
+            NumericKeys::Ints(v) => i128::from(v[j]).cmp(&i128::from(v[i]).saturating_add(delta)),
             NumericKeys::Floats(v) => v[j].total_cmp(&(v[i] + delta as f64)),
         }
     }
@@ -101,7 +101,7 @@ impl NumericKeys {
             // `i128` so the subtraction cannot overflow for two extreme timestamps; what
             // survives is a duration, small enough to be exact in `f64`.
             (NumericKeys::Ints(a), NumericKeys::Ints(b)) => {
-                Some((a[i] as i128 - b[j] as i128).unsigned_abs() as f64)
+                Some((i128::from(a[i]) - i128::from(b[j])).unsigned_abs() as f64)
             }
             (NumericKeys::Floats(a), NumericKeys::Floats(b)) => Some((a[i] - b[j]).abs()),
             _ => None,
@@ -172,10 +172,10 @@ mod tests {
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 0]));
         let keys = NumericKeys::read(&arr).unwrap().unwrap();
         // `i64::MAX + a huge delta` still sits above every other value.
-        assert_eq!(keys.shifted_cmp(0, i64::MAX as i128, 2), Ordering::Less);
+        assert_eq!(keys.shifted_cmp(0, i128::from(i64::MAX), 2), Ordering::Less);
         // `i64::MIN - a huge delta` still sits below every other value.
         assert_eq!(
-            keys.shifted_cmp(1, -(i64::MAX as i128), 2),
+            keys.shifted_cmp(1, -i128::from(i64::MAX), 2),
             Ordering::Greater
         );
         // A zero shift is a plain comparison against the row's own value.

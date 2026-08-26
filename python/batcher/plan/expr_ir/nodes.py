@@ -148,6 +148,20 @@ class MakeStruct(IRNode):
 
 
 @expr_node
+class MakeMap(IRNode):
+    """Map construction: pair a list of keys with a list of values into one ``Map`` entry
+    per row (SQL ``map(keys, values)``; Spark ``map_from_arrays``). Built by
+    ``map_from_arrays(keys, values)``.
+
+    The read side — ``.map.keys``/``.map.values``/``.map.entries``/``.map.get`` — has always
+    worked on a ``Map`` column arriving from Arrow; this is what builds one."""
+
+    tag = ExprTag.MAKE_MAP
+    keys: Expr = child()
+    values: Expr = child()
+
+
+@expr_node
 class ListJoin(IRNode):
     """Concatenate a list column's elements (cast to text, nulls skipped) with a
     separator → text. Backs SQL ``string_agg`` over an ``array_agg`` input."""

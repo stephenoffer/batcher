@@ -200,14 +200,14 @@ const C_TERM_PKA: f64 = 3.55;
 /// Net charge of the sequence at a given pH, from the Henderson-Hasselbalch equation.
 fn charge_at(counts: &[(u8, usize)], ph: f64, has_termini: bool) -> f64 {
     let mut charge = 0.0;
-    for &(res, pka) in POSITIVE_PKA.iter() {
+    for &(res, pka) in &POSITIVE_PKA {
         let n = counts
             .iter()
             .find(|(c, _)| *c == res)
             .map_or(0, |&(_, n)| n);
         charge += n as f64 / (1.0 + 10f64.powf(ph - pka));
     }
-    for &(res, pka) in NEGATIVE_PKA.iter() {
+    for &(res, pka) in &NEGATIVE_PKA {
         let n = counts
             .iter()
             .find(|(c, _)| *c == res)

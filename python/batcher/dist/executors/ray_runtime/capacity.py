@@ -163,8 +163,7 @@ def placeable_workers(
     # Nameplate, because this answers what the cluster can host rather than what is free
     # right now — the fan-out is sized before the fleet is placed, and a co-tenant that
     # finishes in the meantime must not have shrunk it.
-    total = sum(workers_per_node(node, demand, nameplate=True) for node in nodes)
-    return total
+    return sum(workers_per_node(node, demand, nameplate=True) for node in nodes)
 
 
 @dataclass(frozen=True, slots=True)

@@ -17,7 +17,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same_for_query
 
 pytestmark = pytest.mark.differential
 
@@ -50,7 +50,9 @@ def _table() -> pa.Table:
 def test_an_identifier_resolves_regardless_of_case(duck, sql):
     table = _table()
     duck.register("t", table)
-    assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))
+    # `SELECT I AS X FROM t ORDER BY X` asks for an order over the distinct values 1/2/3;
+    # the rest of the list does not, and must stay an order-independent comparison.
+    assert_same_for_query(bt.sql(sql, t=table).collect(), duck.sql(sql), sql)
 
 
 def test_the_output_name_is_the_relations_spelling_not_the_querys():

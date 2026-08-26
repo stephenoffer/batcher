@@ -227,6 +227,7 @@ struct Slot {
 impl ConjunctOrder {
     /// Build state for `predicate`, or `None` when it has fewer than two conjuncts and
     /// there is therefore no order to choose.
+    #[must_use]
     pub fn new(predicate: &Expr) -> Option<Self> {
         let width = predicate.and_conjuncts().len();
         (width >= 2).then(|| Self {
@@ -235,12 +236,14 @@ impl ConjunctOrder {
     }
 
     /// How many conjuncts this was built for.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// True when there are no conjuncts. Present because clippy asks for it beside
     /// [`Self::len`]; a `ConjunctOrder` is never actually built empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -489,7 +492,7 @@ mod tests {
         assert_eq!(mask.len(), batch.num_rows());
         let got = filter_record_batch(batch, &mask).expect("filter with short-circuit mask");
         assert_eq!(
-            format!("{:?}", got),
+            format!("{got:?}"),
             format!("{:?}", expected),
             "short-circuit diverged from whole-batch evaluation"
         );
@@ -677,7 +680,7 @@ mod tests {
             Arc::new(values),
         )
         .expect("dictionary");
-        let a: Int64Array = (0..n as i64).collect::<Vec<_>>().into();
+        let a: Int64Array = (0..i64::from(n)).collect::<Vec<_>>().into();
         let dtype = dict.data_type().clone();
         let schema = Schema::new(vec![
             Field::new("a", DataType::Int64, true),
@@ -787,7 +790,7 @@ mod tests {
     fn a_measured_order_promotes_the_selective_conjunct() {
         let n = 8_192;
         // `keep_all` is true for every row; `keep_few` for one row in 512.
-        let a: Int64Array = (0..n as i64).map(Some).collect();
+        let a: Int64Array = (0..i64::from(n)).map(Some).collect();
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).expect("batch");
 

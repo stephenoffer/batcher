@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import batcher as bt
 from batcher import col
 from batcher.kyber.registry import DEFAULT_REGISTRY
@@ -276,3 +278,67 @@ def test_rules_apply_to_project_nodes():
     node = bt.from_pydict({"a": [1]}).select(r=(col("a") > 1) == True)._plan  # noqa: E712
     out = ba.bool_eq_literal(node, None)
     assert isinstance(out, Project) and out.items[0].expr.to_ir()["op"] == "gt"
+
+
+#: Every shape whose rewrite *dropped a boolean operator*, over an operand that is not a
+#: boolean. Each of these is an invalid query -- `and`/`or` are defined on booleans and `i`
+#: is Int64 -- and each one used to be rewritten into a valid one. Four of the six then
+#: returned an Int64 column from a boolean operator, while `col("i") AND col("j")`, the
+#: identical mistake with two different columns, still raised. Whether an invalid query
+#: succeeded depended on which rule happened to match it.
+_INVALID_ON_A_NON_BOOLEAN = [
+    ("and_false", lambda c: c("i") & bt.lit(False)),
+    ("or_true", lambda c: c("i") | bt.lit(True)),
+    ("and_idempotent", lambda c: c("i") & c("i")),
+    ("or_idempotent", lambda c: c("i") | c("i")),
+    ("and_absorption", lambda c: c("i") & (c("i") | c("j"))),
+    ("or_absorption", lambda c: c("i") | (c("i") & c("j"))),
+]
+
+
+@pytest.mark.parametrize(("rule_name", "build"), _INVALID_ON_A_NON_BOOLEAN)
+def test_a_rewrite_never_makes_an_invalid_query_valid(rule_name, build):
+    """A rewrite may not answer a query the engine would refuse.
+
+    The module's contract is that a rule preserves the query's value *and* whether it
+    errors. `_safe` asked only whether the *operand* can raise; the error here comes from
+    the **operator**, so dropping the operator dropped the error with it.
+    """
+    ds = bt.from_pydict({"i": [1, 2], "j": [3, 4]})
+    with pytest.raises(RuntimeError, match="expected a boolean argument"):
+        ds.select(v=build(col)).collect()
+
+
+@pytest.mark.parametrize(
+    ("rule", "predicate", "expect"),
+    [
+        (ba.and_false_annihilator, (col("a") > 0) & bt.lit(False), "lit"),
+        (ba.or_true_annihilator, (col("a") > 0) | bt.lit(True), "lit"),
+        (ba.and_idempotent, (col("a") > 0) & (col("a") > 0), "binary"),
+        (ba.or_idempotent, (col("a") > 0) | (col("a") > 0), "binary"),
+        (ba.and_absorption, (col("a") > 0) & ((col("a") > 0) | (col("x") > 0)), "binary"),
+        (ba.or_absorption, (col("a") > 0) | ((col("a") > 0) & (col("x") > 0)), "binary"),
+    ],
+)
+def test_the_same_rewrite_still_fires_on_a_boolean(rule, predicate, expect):
+    """The guard must not turn the rules off — a fix that fires never is worthless.
+
+    Same six shapes over a *comparison*, which is provably boolean where a bare column's
+    type is unknown here, so every rewrite still applies.
+    """
+    out = rule(_flt(predicate), None)
+    assert out is not None, "the rewrite stopped firing on a boolean operand"
+    assert _pred_ir(out)["e"] == expect
+
+
+def test_a_bare_boolean_column_is_the_price_of_the_guard():
+    """Stated rather than hidden: the rules no longer fire on a bare column.
+
+    A `Col`'s type is not known at this layer, so "provably boolean" excludes it and
+    `flag AND flag` keeps its redundant conjunction even though `f` really is boolean.
+    That is the trade the guard makes, and it is deliberate — answering an invalid query
+    is worse than one un-folded predicate. If the rules ever gain the input schema, this
+    is the test to revisit.
+    """
+    assert ba.and_idempotent(_flt(col("f") & col("f")), None) is None
+    assert ba.and_false_annihilator(_flt(col("f") & bt.lit(False)), None) is None

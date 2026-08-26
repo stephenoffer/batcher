@@ -670,6 +670,7 @@ impl RelOp {
     /// The order is the contract: it is the pre-order the executors and the Python control
     /// plane both number operators by, so `children()` and [`Self::node_count`] agree with
     /// the ids a recursive walk hands out.
+    #[must_use]
     pub fn children(&self) -> Vec<&RelOp> {
         match self {
             RelOp::Scan { .. } => Vec::new(),
@@ -703,6 +704,7 @@ impl RelOp {
     /// depth of a plan that arrives over the wire, but a plan built in Rust — or one
     /// deserialized before this guard existed — has no such bound, and this used to be a
     /// second way to overflow the stack on a deep chain. A `Vec` grows on the heap.
+    #[must_use]
     pub fn node_count(&self) -> u32 {
         let mut count = 0u32;
         let mut stack: Vec<&RelOp> = vec![self];
@@ -720,6 +722,7 @@ impl RelOp {
     /// query holding" has to be asked of the scans rather than of that list. `bc-py`'s
     /// executor-routing guard is the caller that needs it, and it lives here because the
     /// question is about a `RelOp` and nothing else.
+    #[must_use]
     pub fn scanned_source_ids(&self) -> std::collections::HashSet<usize> {
         let mut ids = std::collections::HashSet::new();
         let mut stack: Vec<&RelOp> = vec![self];
@@ -803,6 +806,47 @@ impl RelOp {
                 .into_iter()
                 .any(Expr::contains_media_decode)
             {
+                return true;
+            }
+            stack.extend(node.children());
+        }
+        false
+    }
+
+    /// True if this plan contains an operator that can emit **many rows per input row**.
+    ///
+    /// A *scheduling* signal, like [`Self::contains_media_decode`], and it exists to correct the
+    /// same mistake in the same place. `par::auto_width` caps pool width at the number of
+    /// morsels the *leaves* can yield, on the reasoning that a worker with no morsel to take is
+    /// not free. That reasoning holds only while an operator's output is bounded by its input.
+    ///
+    /// It is not, for these three. `Unnest` turns one row into as many as its list has elements;
+    /// `Unpivot` into one per measure column; a `RangeJoin` emits a band, whose size is a
+    /// product rather than a maximum. A hundred-row table of ten-thousand-element lists is a
+    /// single morsel at the leaf and a million rows immediately after it, so the cap pinned the
+    /// whole downstream — the aggregate, the sort, the join — to **one core**, and the comment
+    /// on `auto_width` claimed that could not happen.
+    ///
+    /// `HashJoin` is deliberately excluded even though a many-to-many equi-join also multiplies.
+    /// Including it would lift the cap for nearly every non-trivial plan, which is the cap
+    /// removed rather than corrected; and a join's own inputs are normally large enough that
+    /// the leaf count already provisions for the output. The three here are the shapes where a
+    /// *tiny* input legitimately becomes a large relation.
+    ///
+    /// The cost of being wrong is bounded and one-sided: a small query carrying an `Unnest` gets
+    /// a wider pool than it needs, paying one thread-spawn (pools are cached per width). The
+    /// cost of the cap being wrong is a large relation on a single core.
+    ///
+    /// Walks a worklist rather than recursing, and short-circuits, for the reasons given on
+    /// [`Self::contains_media_decode`].
+    #[must_use]
+    pub fn multiplies_rows(&self) -> bool {
+        let mut stack: Vec<&RelOp> = vec![self];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node,
+                RelOp::Unnest { .. } | RelOp::Unpivot { .. } | RelOp::RangeJoin { .. }
+            ) {
                 return true;
             }
             stack.extend(node.children());

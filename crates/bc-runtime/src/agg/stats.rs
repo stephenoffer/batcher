@@ -477,9 +477,9 @@ mod tests {
     /// distributed), even split across an uneven chunk boundary at a large offset.
     #[test]
     fn covar_corr_merge_equals_whole() {
-        let x: Vec<f64> = (0..97).map(|i| 1000.0 + (i as f64) * 0.5).collect();
+        let x: Vec<f64> = (0..97).map(|i| 1000.0 + f64::from(i) * 0.5).collect();
         let y: Vec<f64> = (0..97)
-            .map(|i| 1000.0 - (i as f64) * 0.3 + (i % 7) as f64)
+            .map(|i| 1000.0 - f64::from(i) * 0.3 + f64::from(i % 7))
             .collect();
         let g = vec![0u32; x.len()];
         let whole = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
@@ -529,7 +529,7 @@ mod tests {
     /// skewness/kurtosis stable at a large offset and mergeable across chunks.
     #[test]
     fn moments_merge_equals_whole() {
-        let x: Vec<f64> = (0..120).map(|i| 1000.0 + ((i * 7) % 13) as f64).collect();
+        let x: Vec<f64> = (0..120).map(|i| 1000.0 + f64::from((i * 7) % 13)).collect();
         let g = vec![0u32; x.len()];
         let whole = moment_state(&f64s(&x), &g, 1, AggFunc::Skewness).unwrap();
         let bounds = [0usize, 17, 60, 120];
@@ -593,8 +593,8 @@ mod tests {
     /// finite.
     #[test]
     fn corr_survives_moments_whose_product_overflows() {
-        let x: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
-        let y: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
+        let x: Vec<f64> = (1..=5).map(|i| f64::from(i) * 1e120).collect();
+        let y: Vec<f64> = (1..=5).map(|i| f64::from(i) * 1e120).collect();
         let g = vec![0u32; x.len()];
         let st = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
         // The guard the fix exists for: the product really does overflow here.
@@ -633,12 +633,12 @@ mod tests {
         // 1e6 values whose true variance is exactly known, offset far enough that a naive
         // sum drops bits on every addition.
         let n = 200_000;
-        let values: Vec<f64> = (0..n).map(|i| 1e9 + (i % 2) as f64).collect();
+        let values: Vec<f64> = (0..n).map(|i| 1e9 + f64::from(i % 2)).collect();
         let g = vec![0u32; values.len()];
         let st = moment_state(&f64s(&values), &g, 1, AggFunc::Skewness).unwrap();
         let m2 = st[2].as_primitive::<Float64Type>().value(0);
         // Half the values are 1e9 and half 1e9+1, so Σ(x-x̄)² is exactly n/4.
-        let expected = n as f64 / 4.0;
+        let expected = f64::from(n) / 4.0;
         assert!(
             (m2 - expected).abs() / expected < 1e-9,
             "M2 {m2} differs from the exact {expected}"

@@ -604,7 +604,7 @@ fn sample_boundaries_f64(key: &arrow::array::Float64Array, parts: usize) -> Opti
     if sample.len() < parts {
         return None;
     }
-    sample.sort_unstable_by(|a, b| a.total_cmp(b));
+    sample.sort_unstable_by(f64::total_cmp);
     let m = sample.len();
     Some(
         (1..parts)
@@ -1026,7 +1026,7 @@ mod tests {
         let vals: Vec<Option<&str>> = (0..n)
             .map(|i| Some(if i % 2 == 0 { "aaa" } else { "bbb" }))
             .collect();
-        let b = str_batch(vals, (0..n as i64).collect());
+        let b = str_batch(vals, (0..i64::from(n)).collect());
         // Two distinct values only: boundaries collapse is possible, so just assert the
         // result equals the serial oracle whichever path is taken.
         let want = sort_batch(&b, &key(false, false), None).unwrap();
@@ -1279,7 +1279,8 @@ mod tests {
                     Field::new("p", DataType::Int64, false),
                 ]));
                 let sa: ArrayRef = Arc::new(arrow::array::Float64Array::from(vals));
-                let pa: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+                let pa: ArrayRef =
+                    Arc::new(Int64Array::from((0..i64::from(n)).collect::<Vec<_>>()));
                 let b = RecordBatch::try_new(schema, vec![sa, pa]).unwrap();
                 let keys = key(descending, nulls_first);
 
@@ -1472,7 +1473,7 @@ mod tests {
     fn single_distinct_key_is_ranked_rather_than_declined() {
         let n = 1 << 18;
         let vals: Vec<Option<&str>> = (0..n).map(|_| Some("same")).collect();
-        let b = str_batch(vals, (0..n as i64).collect());
+        let b = str_batch(vals, (0..i64::from(n)).collect());
         let ranges = parallel_sort_batch(&b, &key(false, false), None)
             .unwrap()
             .expect("rank routing needs no boundaries");

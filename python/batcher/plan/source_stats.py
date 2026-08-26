@@ -23,15 +23,68 @@ import uuid
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, SortOrder, as_sort_orders
 
 __all__ = [
     "SourceStatistics",
+    "content_version",
+    "declared",
     "source_identity",
     "source_stats_key",
     "stable_source_key",
 ]
+
+
+def declared(source: object, fact: str) -> Any | None:
+    """What `source` says about itself when asked for `fact`, or `None` if it cannot say.
+
+    A source describes itself through optional zero-argument methods — ``row_count``,
+    ``stats_version`` — and every caller of one has to answer the same three questions: is
+    the method there, does calling it raise, and did it return `None`. Answering them at
+    each call site is three chances for one of them to start reading a *raising* source as
+    a zero, which is the failure mode that matters: "I could not ask" and "the answer is
+    nothing" are the same value here and must stay the same *answer*.
+
+    Args:
+        source: A bound input source.
+        fact: The name of the self-describing method to call.
+
+    Returns:
+        Whatever the method returned, or `None` when the source does not implement it,
+        raises, or answers `None`. The caller coerces the type it expects.
+    """
+    method = getattr(source, fact, None)
+    if not callable(method):
+        return None
+    try:
+        return method()
+    except Exception:  # pragma: no cover - a source that cannot answer for itself
+        return None
+
+
+def content_version(source: object) -> str | None:
+    """The token that changes when `source`'s data could have changed, or `None`.
+
+    `source_identity` names *which relation* this is; this names *which version of it*.
+    Together they are what any store outliving a single read has to key on — the source
+    statistics memo, and the shared result cache — because an identity-only key serves a
+    rewritten table's previous contents forever, under the same path, with nothing raised.
+
+    `None` means the source cannot state a version, and every caller must treat that as
+    "do not cache". A source without the method and one whose version call fails are the
+    same answer for the same reason: unversioned is indistinguishable from unchanged, and
+    a caller that guessed would be guessing about correctness.
+
+    Args:
+        source: A bound input source.
+
+    Returns:
+        The version token, or `None` when the source cannot produce one.
+    """
+    version = declared(source, "stats_version")
+    return None if version is None else str(version)
 
 
 # Per-instance serials for shape-keyed sources, and the counter that issues them.

@@ -255,8 +255,8 @@ def test_a_hash_survives_rescaling_and_separates_different_pictures(method: str)
 
     ds = bt.from_pydict({"img": [_encode(scene), _encode(small), _encode(other)]})
     digests = ds.select(h=getattr(bt.col("img").image, method)()).to_pydict()["h"]
-    rescaled = bin((digests[0] ^ digests[1]) & 0xFFFFFFFFFFFFFFFF).count("1")
-    different = bin((digests[0] ^ digests[2]) & 0xFFFFFFFFFFFFFFFF).count("1")
+    rescaled = ((digests[0] ^ digests[1]) & 0xFFFFFFFFFFFFFFFF).bit_count()
+    different = ((digests[0] ^ digests[2]) & 0xFFFFFFFFFFFFFFFF).bit_count()
     assert rescaled <= 8, f"{method} moved {rescaled} bits under a 4x downscale"
     assert different > rescaled, f"{method} put two different pictures {different} bits apart"
 

@@ -1,5 +1,263 @@
 # Batcher CPU benchmark results
 
+## Work above a streaming aggregate reached neither sink, single-node or distributed (2026-08-25)
+
+`python/batcher/plan/logical/transforms.py`; `python/batcher/core/streaming/folds/shared.py`;
+`python/batcher/core/streaming_query/processors.py`;
+`python/batcher/api/io_namespace/writer.py`; `python/batcher/api/streaming/_distributed.py`;
+`python/batcher/dist/streaming/microbatch.py`.
+
+Not a timing change — a capability one, recorded here because it touches `dist/` and the
+gate matrix asks for a cluster run when it does. CI installs no Ray, so a green PR says
+nothing about the distributed half of this.
+
+### What was refused
+
+A streaming write accepted only a *bare* top-level fold. Anything above the aggregate was
+refused with "this plan cannot be streamed to a sink (it has a pipeline breaker other than
+a top-level aggregation)" — a message that reads as a missing operator and was really a
+missing projection. The shapes it covered are not exotic:
+
+| Shape | Lowers to |
+|---|---|
+| `agg(a=col("v").sum() / count())` | `Project` over `Aggregate` |
+| `agg(a=col("v").max() - col("v").min())` | `Project` over `Aggregate` |
+| `agg(a=regr_slope(x, y))`, and the other regression/correlation functions | `Project` over `Aggregate` |
+| `group_by(k).agg(...).select(...)` / `.with_columns(...)` | `Project` over `Aggregate` |
+| `group_by(k).agg(...).filter(...)` (SQL `HAVING`) | `Filter` over `Aggregate` |
+
+Every one runs in batch. The first four are the common case rather than the corner, because
+an expression *over* aggregates is one keyword to the user and two nodes to the engine.
+
+### Why no test saw it
+
+`tests/integration/test_stream_batch_operator_parity.py` is the stream-vs-batch matrix, and
+it drives `iter_batches()` — which has always **materialized** these shapes and returned the
+right answer. The whole matrix stayed green while the sink refused every one of them. A
+capability gap is invisible to a terminal that does not have the gap, which is why the new
+coverage is written against the sink (`tests/integration/test_stream_sink_tail_parity.py`)
+rather than added only to the existing matrix.
+
+### The fix, and why it is one predicate rather than two
+
+`split_streaming_tail` returns `(tail, fold)`: the row-wise operators above the fold, and
+the fold itself. The tail is exactly `is_partition_independent` — the predicate the
+distributed dispatcher already shares with the streaming path — so a node becomes
+streamable above a fold at the same moment it becomes safe to run per partition, and
+there is no second list to drift. `rebuild_over_scan` re-roots the chain on a scan of the
+fold's output, which is the same thing `dist`'s `_apply_above` does above a distributed
+breaker.
+
+`sort` and `limit` are deliberately out: neither is row-wise, and neither has a meaning on
+a *running* result that matches what it means over the whole input.
+
+Both execution paths apply the identical `StreamingTail`: the single-node processor to its
+fold snapshot, and the distributed driver to the combined result in `_publish_aggregate`.
+That was the point of doing them together — accepting the shape single-node while the
+cluster kept refusing it would have been a capability gap with no semantic cause, which is
+the same gap `streaming_fold_target` was introduced to close for `distinct()`.
+
+### Recorded cluster run
+
+Shared Ray cluster on the dev host, `num_workers=2`, four-file incremental Parquet source,
+Delta sink, `Trigger.available_now()`, `output_mode` default. Each shape's sink contents
+compared against the same pipeline collected in batch:
+
+| Shape | Result |
+|---|---|
+| bare aggregate (control, worked before) | MATCH |
+| `agg(sum(v) / count())` | MATCH |
+| `agg(...).select(...)` | MATCH |
+| `agg(...).filter(...)` (HAVING) | MATCH |
+| `agg(...).with_columns(...)` | MATCH |
+
+The four that are not the control raised `PlanError` before this change, so "MATCH" is the
+capability appearing, not a number moving. Single-node parity for the same shapes, in both
+`complete` and `update` output modes, is pinned by the new sink test.
+
+### One shape still refuses, on purpose
+
+`output_mode="append"` on a *windowed* aggregate raises rather than applying the tail. A
+closed window is emitted once and never revised, so there is no later snapshot to correct a
+projection applied to a partial one. The message names `complete`/`update` as the
+alternative instead of leaving the caller to guess.
+
+## A group-count estimate that read 15,000,000 keys as 1,044, and two aggregates that evaluated one expression twice (2026-08-25)
+
+`crates/bc-interp/src/agg_par.rs`; `crates/bc-interp/src/ops/mod.rs`.
+
+### 1. The cost model could not see a clustered key, and it cost the largest aggregate in TPC-H
+
+`agg_par::decide` chooses an aggregate's shape by *measuring*: it partials a sample of morsels
+and reads the reduction they achieved. Reading a **group count** off that sample means inverting
+a coupon-collector curve, and that inversion assumes a morsel's rows are drawn from the key's
+domain uniformly.
+
+A **clustered** key breaks the assumption completely, and TPC-H's `l_orderkey` is the canonical
+one: four rows per key, laid out in key order, so a 4,096-row morsel holds 1,024 distinct keys.
+That is *exactly* what a 1,050-value domain looks like from one morsel, and the estimator
+concluded the whole relation held about a thousand groups. It holds fifteen million.
+
+| key shape | estimated | actual |
+|---|---:|---:|
+| clustered (`l_orderkey`, 4 rows per key) | **1,044** | 15,000,000 |
+| a genuinely small domain | 1,018 | 1,000 |
+| uniformly random, huge domain | 8,380,673 | 15,000,000 |
+
+The under-read is not a rounding error, it is a routing decision: `chunking_pays` compares
+`threads x groups` against the relation, so a thousand groups sends a fifteen-million-group
+aggregate to `chunked_partials`, whose merge then regroups ~59M partial rows — nearly the input
+again. Measured on TPC-H q21's decorrelation group-by, 60M rows to 15M groups over four
+aggregates:
+
+| path | ms |
+|---|---:|
+| what the under-read chose (`chunked_partials`) | 483 |
+| **the partition path the corrected estimate chooses** | **290** |
+
+**What distinguishes the two shapes is already in the sample.** A small domain has every morsel
+holding nearly all of it, so the sample's *union* of distinct keys sits far below the sum of its
+morsels' counts. A clustered key has each morsel covering its own stretch, so the union **is**
+the sum. When the morsels are that disjoint the domain cannot be as small as the inversion says,
+and the count scales with the rows instead — so the sample's own distinct-per-row rate, read
+forward to the relation, is the estimate. One merge of the sample's own partials, which are
+already in hand, answers it.
+
+`a_clustered_key_is_not_read_as_a_tiny_domain` and `a_small_domain_is_still_read_as_small` pin
+both directions, and a third test pins that the correction only ever *raises* an estimate and
+never past one group per row.
+
+It reads a uniformly-random key with a genuinely huge domain **high** — 60M rows over 15M random
+keys estimates ~59M rather than 15M — and that is the accepted trade, stated rather than hidden:
+a sample that has not begun to saturate cannot tell "clustered" from "enormous", and both
+answers fall on the same side of every decision this feeds.
+
+### 2. `min(e)` beside `max(e)` evaluated `e` twice
+
+`eval_partial_with` evaluates each aggregate's input expression independently, so two aggregates
+over one expression build, materialize and discard it twice — per morsel, for every morsel. It
+is an ordinary shape (`min(x), max(x)`; `sum(a*b), avg(a*b)`) and q21 reaches the executor with
+exactly it, the `<>`-EXISTS decorrelation emitting `min(CASE WHEN late THEN suppkey END)` beside
+`max(` the same `)`.
+
+`AggJit` now carries, for each aggregate, the earlier aggregate whose input is the same
+expression; the value array is evaluated once and shared. Matched on the expression's derived
+`Debug` rendering and computed **once per operator**, never per morsel — rendering an expression
+for every morsel would cost more than the evaluation it saves. Two expressions that render
+identically are the same expression, so sharing is sound, and anything the match misses is
+simply evaluated twice as before.
+
+Worth **334 -> 320 ms** on that shape at sf10, and nothing measurable where inputs are bare
+columns (an evaluation there is already an `Arc` clone). `count(*)` shares nothing, and an
+`arg_min`/`arg_max` is excluded: its value array is paired with an ordering key and the two are
+only interchangeable together.
+
+### Where this leaves TPC-H q21
+
+The aggregate is 306 ms of q21's 468, and the three paths now available for it measure 290 ms
+(partition), 315 ms (streaming fold) and 483 ms (the chunked path the bad estimate chose). The
+corrected estimate removes the worst of the three from the table.
+
+**What it does not do is close the query**, and the reason is worth recording so the next attempt
+starts from it rather than from the cost model. Of the partition path's 290 ms, 93 ms is the
+split and 148 ms the per-partition aggregation — against DuckDB's ~75 ms for the whole operator.
+Both remaining costs are in the kernel rather than in the shape, so the next lever is the
+per-partition aggregation itself, not the sharding topology. Key-partitioned sharding inside the
+streaming executor was scoped and measured before being set aside on exactly that ground: with
+the estimate corrected it is worth the difference between 315 ms and 290 ms, which does not
+justify a rewrite of the mergeable-algebra path.
+
+## A cache that only `collect()` could see, an eviction that meant recompute, and a lookup join written a row at a time (2026-08-25)
+
+`python/batcher/carbonite/{cache.py,cache_disk.py,cache_shared/}`;
+`python/batcher/api/{executors.py,terminal/core.py,dataset/frame.py}`;
+`python/batcher/io/lookup/`. Reproduce with `python benchmarks/run.py --benchmark cache`
+(`benchmarks/internals/cache_bench.py`), on this 96-core / 184 GB box, release build.
+
+Three findings, and the third is the one worth reading — it is a bug that measured *fast*
+until the measurement itself was checked.
+
+### 1. Seven of the eight terminals never consulted the result cache
+
+`Dataset.cache()` marks a result; `api.executors._cached_or_run` serves it. Only `_collect`
+ever called that. `to_pydict`, `to_pylist`, `to_pandas`, `to_polars`, `to_arrow`, `count`,
+`is_empty` and `iter_batches` all re-executed the whole plan on a dataset the user had
+explicitly cached — and recorded neither a hit nor a miss doing it, so `cache_stats()`
+showed an idle cache rather than a bypassed one.
+
+The fix threads the storage level through each of them. `count()` and `is_empty()` now
+answer off the cached table (an attribute read), and `iter_batches()` streams it. All three
+*read* a warm cache and never fill a cold one, because filling it means materializing the
+result those three exist to avoid materializing.
+
+| path | before | after |
+|---|---|---|
+| `cache().collect()` warm | 0.1 ms | 0.1 ms |
+| `cache().count()` warm | 34.3 ms (full recompute) | **0.005 ms** |
+
+### 2. Eviction meant recompute, so the cache could not help a working set larger than RAM
+
+The store was memory-only: over budget, an entry was dropped. That is the one shape of
+cache that cannot help the workload that asked for one, since a working set larger than
+`result_cache_max_bytes` evicts every entry before anything reads it again.
+
+Eviction now **demotes** to a disk tier over the existing `TieredSpillStore` (so it inherits
+local-NVMe siting, the codec, and object-store overflow), under a `StorageLevel` the caller
+picks. 4,000,000 rows to 50,000 groups:
+
+| path | ms | vs recompute |
+|---|---|---|
+| cold (uncached) | 19.1 | - |
+| warm, memory tier | 0.1 | **215x** |
+| warm, disk tier | 3.9 | **4.9x** |
+
+4.9x is the number that decides whether the tier earns its disk, and it is the honest one:
+this result compresses to 1.2 MB, so the read-back is nearly free and almost all of the 3.9
+ms is decode. A result that is expensive to *compute* rather than large to store does
+better; one that is cheap to recompute does worse, which is why `MEMORY_ONLY` exists.
+
+### 3. The lookup join was 37x slower than it needed to be, and the first measurement of it was meaningless
+
+`Dataset.lookup_join` enriches each batch by point lookup instead of reading the dimension.
+Its whole claim is that cost scales with the **distinct keys the data contains**. The first
+implementation assembled each batch's columns with a Python comprehension over its rows, so
+the cost scaled with **rows** — the right algorithm in the wrong language. Replacing that
+with `index_in` + `take` moves the Python work to one unit per distinct key:
+
+| 1,000,000 rows, 5,000 distinct keys, 1 column | ms |
+|---|---|
+| row-wise Python assembly | 1051.7 |
+| vectorized (`index_in` + `take`) | **28.1** (37x) |
+
+**The first end-to-end comparison reported 268x slower than a hash join and was an
+artifact.** It timed `count()` on both sides. A count over a row-preserving plan is answered
+from metadata *without executing*, so the hash-join side never ran: a real join was being
+compared against a no-op. Measured with `collect()`, on a 2,000,000-row dimension and a
+2,000,000-row probe over 5,000 distinct keys, one worker:
+
+| path | ms | vs join | keys fetched |
+|---|---|---|---|
+| `join` (reads the dimension) | 70.2 | - | 2,000,000 |
+| `lookup_join`, engine batching | 156.3 | 2.2x | **5,000** |
+| `lookup_join`, `batch_size=512k` | 120.9 | 1.7x | 5,000 |
+| `lookup_join`, `batch_size=16k` | 1059.6 | 15.1x | 5,000 |
+
+Two things to take from it. The store here is **in-process**, so the ratio is the
+mechanism's overhead and not its benefit — the case `lookup_join` exists for is a store a
+hash join cannot read without pulling every row over a network, which this box cannot
+measure. And `batch_size` is a trap: assembly costs one unit per distinct key *per batch*,
+so a batch smaller than the distinct-key count pays for the same keys repeatedly. The
+engine's own batching is fine; an explicitly small one is 7x worse. Both are now in the
+docstring and in `docs/user-guide/analyze/joins.md`.
+
+### What did not move
+
+`python benchmarks/run.py --benchmark operators` runs clean, all correctness checks passing,
+with ratios inside the range this suite has recorded before (`op-groupby-sum` 1.20x,
+`op-join-agg` 0.71x, `op-sort-string` 0.93x, `op-window-runsum` 0.17x). An uncached query
+gains one `is None` test on the `count()` path and nothing else; the demote and promote paths
+run only on eviction and only for a dataset that asked to be cached.
+
 ## A bloom that cost more to merge than its hash table cost to build, the admission rule fitted to that cost, and a partition the data already had — TPC-H sf10 1.087x -> 0.963x (2026-08-25)
 
 `crates/bc-runtime/src/join/{mod.rs,build.rs,stream.rs}`; `crates/bc-sketches/src/bloom.rs`;

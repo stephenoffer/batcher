@@ -645,8 +645,11 @@ class _StrNamespace:
     def slice(self, offset: int, length: int | None = None) -> StrFunc:
         """0-based substring — the Polars ``str.slice`` spelling over :meth:`substr` (1-based).
 
+        A negative ``offset`` counts back from the end, so ``slice(-3, 2)`` takes the
+        third-and-second-to-last characters.
+
         Args:
-            offset: 0-based start index.
+            offset: 0-based start index; negative counts back from the end.
             length: Number of characters; to the end when ``None``.
 
         Returns:
@@ -659,9 +662,19 @@ class _StrNamespace:
                 >>> ds = bt.from_pydict({"s": ["hello"]})
                 >>> ds.select(r=bt.col("s").str.slice(1, 3)).to_pydict()
                 {'r': ['ell']}
+
+                >>> ds.select(r=bt.col("s").str.slice(-3, 2)).to_pydict()
+                {'r': ['ll']}
         """
         offset = require_int(offset, func="str.slice", arg="offset")
-        return self.substr(offset + 1, length)
+        # Only a *non-negative* offset shifts by one to reach `substr`'s 1-based
+        # indexing. A negative offset is already end-relative and means the same
+        # position in both spellings -- `substr` resolves it as `n + offset + 1`,
+        # which is exactly the 0-based `n + offset` this method promises. Adding one
+        # to it moved every negative slice one character towards the end, so
+        # `slice(-3, 2)` on "abcdef" silently returned "ef" instead of "de", and
+        # `slice(-1)` wrapped past the end to return the *whole* string.
+        return self.substr(offset + 1 if offset >= 0 else offset, length)
 
     def ljust(self, width: int, fill: str = " ") -> StrFunc:
         """Left-justify to ``width`` (pad right) — pandas' ``str.ljust`` (see :meth:`rpad`).

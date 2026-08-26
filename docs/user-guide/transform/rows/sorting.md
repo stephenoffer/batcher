@@ -211,6 +211,39 @@ None of this changes the answer, only the time. If the key you have is a string,
 The point is to reach for a fixed-width key when one is genuinely available, rather than to
 reshape data around the sort.
 
+### Data that is already partly in order
+
+The engine looks for stretches of the key that are already ordered, and merges them instead of
+sorting them. You get this without asking, and it is common to have without realizing: a table
+whose files were each written sorted, batches appended in arrival order, a `union` of sorted
+sources, or a re-sort by the column a table is already clustered on.
+
+Detection is cheap enough to be unconditional. It samples along the key rather than scanning it,
+so an input with no order to find pays a few dozen comparisons and then sorts exactly as it
+would have. There is no flag, and nothing to declare: the engine checks the rows in hand rather
+than trusting a claim that they are sorted, so a wrong claim cannot produce a wrong answer.
+
+```python
+import batcher as bt
+
+# Two already-sorted sources, concatenated — the shape a partitioned table has.
+early = bt.from_pydict({"ts": [1, 3, 5, 7], "v": ["a", "b", "c", "d"]})
+late = bt.from_pydict({"ts": [2, 4, 6, 8], "v": ["e", "f", "g", "h"]})
+merged = bt.concat([early, late]).sort("ts")
+print(merged.to_pydict()["v"])
+# ['a', 'e', 'b', 'f', 'c', 'g', 'd', 'h']
+```
+
+Two things bound what this is worth. It applies to fixed-width keys, and the runs have to be
+long: a column that is *nearly* sorted with frequent out-of-order rows has no long stretches to
+merge, and sorts at its usual cost. On six million rows a fully sorted or run-structured key is
+1.1x to 1.3x faster than a random one, and the remainder is the cost of moving the rows into
+their new order, which no ordering trick removes.
+
+Descending data counts as ordered too, and reversing it is free — but only when the descending
+stretch has no repeated keys, because reversing a run holding two equal rows would put the later
+one first and the engine's sort keeps ties in input order.
+
 ### Binary keys
 
 A `binary` column is a first-class sort key and is ordered by the same byte comparison a string

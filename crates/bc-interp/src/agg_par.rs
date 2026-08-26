@@ -248,6 +248,61 @@ pub(crate) fn estimated_groups(
     (seen as usize).clamp(floor.min(total_rows), total_rows)
 }
 
+/// Disjointness above which the sample's morsels are taken to cover *different* keys.
+///
+/// A morsel that shares almost none of its keys with the others is evidence the key is spread
+/// across the relation rather than drawn from a small domain, and the two readings of the same
+/// `(rows, groups)` ratio differ by orders of magnitude. Set high because the correction it
+/// gates is a large one: only a sample whose morsels genuinely barely overlap should take it.
+const SPREAD_MIN: f64 = 0.9;
+
+/// [`estimated_groups`], told **also** how many distinct keys the sample held in total.
+///
+/// The coupon-collector inversion behind `estimated_groups` reads one morsel's ratio as a
+/// property of the key's *domain*, which is right only when a morsel's rows are drawn from that
+/// domain uniformly. A **clustered** key breaks that assumption completely, and TPC-H's
+/// `l_orderkey` is the canonical example: four rows per key laid out in key order, so a
+/// 4,096-row morsel holds 1,024 distinct keys and the inversion concludes the whole relation
+/// holds about **1,050** of them. It holds 15,000,000 — an under-read of four orders of
+/// magnitude, and it is not a rounding problem but a modelling one: "4,096 rows kept 1,024" is
+/// exactly what a 1,050-value domain looks like too.
+///
+/// What separates the two is whether the sampled morsels keep the *same* keys or different
+/// ones. A small domain has every morsel holding nearly all of it, so the sample's union is far
+/// below the sum of its morsels' counts; a clustered key has each morsel covering its own
+/// stretch, so the union *is* the sum. When the morsels are that disjoint the domain cannot be
+/// as small as the inversion says, and the count instead scales with the rows — so the sample's
+/// own distinct-per-row rate, read forward to the whole relation, is the estimate.
+///
+/// It costs the decision it feeds, not a rounding error: at sf10 the under-read routed a
+/// 15M-group aggregate to `chunked_partials`, whose merge then re-grouped ~59M partial rows.
+/// Measured on TPC-H q21's decorrelation group-by — 60M rows to 15M groups, four aggregates —
+/// **483 ms on the path the bad estimate chose against 286 ms on the partition path** the
+/// corrected one chooses.
+///
+/// **It over-reads a uniformly-random key with a genuinely huge domain**, and that is the
+/// accepted trade: 60M rows over 15M random keys estimates ~59M rather than 15M, because a
+/// sample that has not begun to saturate cannot tell "clustered" from "enormous". Both answers
+/// are on the same side of every decision this feeds — the partition path, and a radix width
+/// that is merely wider than it needed to be.
+pub(crate) fn estimated_groups_spread(
+    sample_rows: usize,
+    per_morsel_groups: usize,
+    union_groups: usize,
+    sample_morsels: usize,
+    total_rows: usize,
+) -> usize {
+    let saturating = estimated_groups(sample_rows, per_morsel_groups, sample_morsels, total_rows);
+    if per_morsel_groups == 0 || union_groups == 0 || sample_rows == 0 {
+        return saturating;
+    }
+    if (union_groups as f64) / (per_morsel_groups as f64) < SPREAD_MIN {
+        return saturating;
+    }
+    let linear = (total_rows as f64) * (union_groups as f64) / (sample_rows as f64);
+    saturating.max(linear as usize).min(total_rows)
+}
+
 /// Read a sample's partials and say how wide to partition — or `None` to keep the reducing
 /// path.
 ///
@@ -317,7 +372,20 @@ pub(crate) fn decide(
     let rows_in: usize = morsels[..n].iter().map(|b| b.num_rows()).sum();
     let total_rows: usize = morsels.iter().map(|b| b.num_rows()).sum();
     if let Some(width) = width_from_sample(&sampled, rows_in, n, total_rows) {
-        let groups = groups_from_sample(&sampled, rows_in, n, total_rows);
+        // How many distinct keys the sample held *in total*, which is what tells a clustered
+        // key from a small domain — see [`estimated_groups_spread`]. It is one merge of the
+        // sample's own partials, which are already in hand and small (the sample is a bounded
+        // fraction of the input), and it is only asked for on the non-reducing branch, where
+        // the answer decides between two shapes that differ by hundreds of milliseconds.
+        let funcs = ops::agg_funcs(aggregates);
+        let union = agg::combine(&sampled, &funcs)
+            .map(|p| p.group_columns.first().map_or(0, |c| c.len()))
+            .unwrap_or(0);
+        let per_morsel: usize = sampled
+            .iter()
+            .map(|p| p.group_columns.first().map_or(0, |c| c.len()))
+            .sum();
+        let groups = estimated_groups_spread(rows_in, per_morsel, union, n, total_rows);
         // The sample says a *morsel* does not reduce — but a morsel is 16,384 rows, and a
         // group count well under that reduces enormously over a whole worker's share. Both
         // readings are right and they choose different shapes, so the group count decides
@@ -500,7 +568,6 @@ pub(crate) fn key_disjoint_runs(
     //
     // Sampling is sound here because it only decides whether to *look*: the cut points the runs
     // are actually built from are read off the data in the scan below, never estimated.
-    let __t = std::time::Instant::now();
     let boundaries = morsels.len() - 1;
     // `min` then `max`, never `clamp`: with fewer morsels than the sample wants, `clamp`'s
     // bounds cross and it panics.
@@ -534,15 +601,6 @@ pub(crate) fn key_disjoint_runs(
         }
     }
     runs.push(start..morsels.len());
-    if std::env::var("BATCHER_DEBUG_AGGSPLIT").is_ok() {
-        eprintln!(
-            "AGGRUNS morsels={} runs={} workers={} target={target} scan={:?}",
-            morsels.len(),
-            runs.len(),
-            workers,
-            __t.elapsed()
-        );
-    }
     (runs.len() >= workers.max(1).max(2)).then_some(runs)
 }
 
@@ -797,6 +855,64 @@ mod tests {
     /// coupon-collector curve [`estimated_groups`] inverts. The oracle for the tests below.
     fn distinct_in(rows: f64, domain: f64) -> f64 {
         domain * (1.0 - (-rows / domain).exp())
+    }
+
+    /// A **clustered** key is the one shape the coupon-collector inversion cannot read, and
+    /// getting it wrong is what routes a 15M-group aggregate to the merge-heavy path. Four
+    /// rows per key laid out in key order: every morsel holds 1,024 distinct keys out of 4,096
+    /// rows, exactly as a 1,050-value domain would — and the morsels share no key, which a
+    /// small domain never does.
+    #[test]
+    fn a_clustered_key_is_not_read_as_a_tiny_domain() {
+        let (morsels, per_morsel_rows, per_morsel_groups) = (61usize, 4096usize, 1024usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * per_morsel_groups;
+        let total = 59_986_052usize;
+        // The bare inversion: four orders of magnitude low, and the reason this test exists.
+        assert!(
+            estimated_groups(rows, summed, morsels, total) < 2_000,
+            "the unaided inversion is expected to under-read a clustered key"
+        );
+        // Disjoint morsels (union == sum) say the domain cannot be that small.
+        let spread = estimated_groups_spread(rows, summed, summed, morsels, total);
+        assert!(
+            (14_000_000..=16_000_000).contains(&spread),
+            "a clustered key must read as ~15M groups, got {spread}"
+        );
+    }
+
+    /// …and a genuinely small domain must still read as small. Every morsel holds nearly the
+    /// whole domain, so the sample's union is far below the sum of its morsels' counts and the
+    /// correction stays out of the way.
+    #[test]
+    fn a_small_domain_is_still_read_as_small() {
+        let (morsels, per_morsel_rows, domain) = (61usize, 4096usize, 1000usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * domain; // every morsel sees all of it
+        let spread = estimated_groups_spread(rows, summed, domain, morsels, 59_986_052);
+        assert!(
+            spread < 2_000,
+            "a 1,000-value domain must not be inflated by the spread correction, got {spread}"
+        );
+        assert_eq!(spread, estimated_groups(rows, summed, morsels, 59_986_052));
+    }
+
+    /// The correction only ever raises the estimate, and never past one group per row — both
+    /// properties the decisions downstream rely on.
+    #[test]
+    fn the_spread_correction_only_raises_and_stays_bounded() {
+        let total = 1_000_000usize;
+        for union in [1usize, 10, 1_000, 40_000, 60_000] {
+            let summed = 61 * 1_000;
+            let rows = 61 * 4_096;
+            let base = estimated_groups(rows, summed, 61, total);
+            let spread = estimated_groups_spread(rows, summed, union, 61, total);
+            assert!(
+                spread >= base,
+                "the correction must never lower the estimate"
+            );
+            assert!(spread <= total, "never more groups than rows");
+        }
     }
 
     /// The estimator must recover the group count a uniform key really produces, because

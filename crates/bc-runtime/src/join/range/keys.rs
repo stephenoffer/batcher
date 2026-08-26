@@ -229,7 +229,7 @@ fn rank_packed(mut packed: Vec<u64>) -> (Vec<u32>, Vec<u32>) {
     let unwrap = |slots: Vec<AtomicU32>| -> Vec<u32> {
         slots
             .into_iter()
-            .map(|s| s.into_inner())
+            .map(AtomicU32::into_inner)
             .collect::<Vec<u32>>()
     };
     (unwrap(order_slots), unwrap(rank_slots))
@@ -283,12 +283,12 @@ fn sorted_entries(keys: &[u64], first: u32, last: u32) -> Vec<u32> {
     let mut packed: Vec<u64> = if n >= PARALLEL_MAP_MIN {
         sub.par_iter()
             .enumerate()
-            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .map(|(i, &k)| ((k - lo) << 32) | (u64::from(first) + i as u64))
             .collect()
     } else {
         sub.iter()
             .enumerate()
-            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .map(|(i, &k)| ((k - lo) << 32) | (u64::from(first) + i as u64))
             .collect()
     };
     if n >= PARALLEL_SORT_MIN_ROWS {
@@ -344,9 +344,10 @@ impl AxisKeys {
         rmap: &[u32],
     ) -> (Vec<u32>, Vec<u32>) {
         match self {
-            AxisKeys::Fast(keys) => match packed_keys(keys) {
-                Some(packed) => rank_packed(packed),
-                None => {
+            AxisKeys::Fast(keys) => {
+                if let Some(packed) = packed_keys(keys) {
+                    rank_packed(packed)
+                } else {
                     let mut pairs: Vec<(u64, u32)> = keys.iter().copied().zip(0u32..).collect();
                     sort_u64_pairs(&mut pairs);
                     let mut order = Vec::with_capacity(pairs.len());
@@ -363,7 +364,7 @@ impl AxisKeys {
                     }
                     (order, ranks)
                 }
-            },
+            }
             AxisKeys::Encoded { left, right } => {
                 let mut order: Vec<u32> = (0..n as u32).collect();
                 sort_by_key(&mut order, |e| key(e, nl, left, right, lmap, rmap));

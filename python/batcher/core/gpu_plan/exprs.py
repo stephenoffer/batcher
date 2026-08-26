@@ -403,6 +403,7 @@ DECLINED_EXPRS: dict[str, str] = {
     "list_get_dyn": "not translated (a per-row list index)",
     "list_transform": "not translated",
     "list_zip": "not translated",
+    "make_map": "not translated",
     "make_struct": "not translated",
     "map": "not translated",
     "sequence": "not translated",

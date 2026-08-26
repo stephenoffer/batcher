@@ -50,7 +50,7 @@ def test_scalar_nested(docs):
 def test_scalar_literal_and_expr_args(docs):
     s = bt.Session()
     s.register("docs", docs)
-    s.register_function("addk", lambda a, k: pc.add(a, k))
+    s.register_function("addk", pc.add)
     out = s.sql("SELECT addk(x + 1, 100) AS y FROM docs").collect()
     assert out.to_pydict() == {"y": [111, 121, 131]}
 

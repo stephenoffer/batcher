@@ -209,9 +209,7 @@ fn slurm_expansion_min(raw: &str) -> Option<usize> {
 /// honors no scheduler grant either; see [`scheduler_granted_cores`]. This is the figure to size
 /// thread pools and shard counts from.
 pub fn usable_cores() -> usize {
-    let affinity = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let affinity = std::thread::available_parallelism().map_or(1, |n| n.get());
     [cfs_quota_cores(), scheduler_granted_cores()]
         .into_iter()
         .flatten()
@@ -233,6 +231,7 @@ pub fn usable_cores() -> usize {
 /// worker whose CPU affinity is applied after the process starts, which is the hazard
 /// `ExecOptions::workers` documents. On a host with no SMT it is every usable core, and it
 /// never exceeds what a cgroup quota grants.
+#[must_use]
 pub fn operator_cores() -> usize {
     let usable = usable_cores();
     let smt = crate::CpuTopology::detect().smt_width();
@@ -295,6 +294,7 @@ impl HardwareProfile {
     /// The detected profile with a policy override applied: a non-zero `lanes`/
     /// `unroll` pins that field; `force_scalar` collapses to a single scalar lane so
     /// the JIT never takes the vector path. Lane/unroll counts are clamped to ≥ 1.
+    #[must_use]
     pub fn resolved(over: SimdOverride) -> HardwareProfile {
         let base = *Self::detect();
         if over.force_scalar {
@@ -371,9 +371,7 @@ mod usable_cores_tests {
     /// divergence between the two would size pools differently from the reported hardware.
     #[test]
     fn usable_cores_is_bounded_and_consistent() {
-        let affinity = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let affinity = std::thread::available_parallelism().map_or(1, |n| n.get());
         let usable = usable_cores();
         assert!(usable >= 1, "must never be zero");
         assert!(
@@ -447,9 +445,7 @@ mod slurm_grant_tests {
     /// affinity mask and the cgroup quota already allow.
     #[test]
     fn usable_cores_is_still_bounded_by_the_affinity_mask() {
-        let affinity = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let affinity = std::thread::available_parallelism().map_or(1, |n| n.get());
         assert!(usable_cores() <= affinity.max(1));
         assert!(usable_cores() >= 1);
     }

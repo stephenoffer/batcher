@@ -47,7 +47,7 @@ def test_an_older_extension_missing_the_entry_points_reports_unknown(monkeypatch
     # The case that actually happens: the engine imports fine, but it was built before these
     # functions existed. Looking the attribute up rather than calling it is what makes this a
     # shrug instead of an AttributeError in the middle of a memory-envelope decision.
-    monkeypatch.setattr(detected, "engine_or_none", lambda: _Engine())
+    monkeypatch.setattr(detected, "engine_or_none", _Engine)
     assert detected.engine_hardware() == {}
     assert detected.engine_pinning_order() == ()
     assert allocator.allocator_stats() == {}

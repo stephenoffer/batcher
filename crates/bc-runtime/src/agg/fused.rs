@@ -215,13 +215,13 @@ impl FusedAcc<'_> {
                 // Unchecked by proof, not by omission: `i128` holds `n · 2^63` for every
                 // addressable `n` (`accum::mean_sum_i128`).
                 block_loop!(ids, start, end, |i, g| {
-                    sums[g] += v[i] as i128;
+                    sums[g] += i128::from(v[i]);
                 })
             }
             FusedAcc::MeanSumI64 { v, sums, valid } => {
                 block_loop!(ids, start, end, |i, g| {
                     if v.is_valid(i) {
-                        sums[g] += v.value(i) as i128;
+                        sums[g] += i128::from(v.value(i));
                         valid[g] = true;
                     }
                 })

@@ -248,7 +248,7 @@ fn hash_f64_canon(arr: &ArrayRef, num_rows: usize) -> Vec<u64> {
     (0..num_rows)
         .into_par_iter()
         .map(|i| {
-            if nulls.map(|n| n.is_null(i)).unwrap_or(false) {
+            if nulls.is_some_and(|n| n.is_null(i)) {
                 NULL_HASH
             } else {
                 SEED.hash_one(canon_f64(values[i]))
@@ -268,7 +268,7 @@ where
     (0..num_rows)
         .into_par_iter()
         .map(|i| {
-            if nulls.map(|n| n.is_null(i)).unwrap_or(false) {
+            if nulls.is_some_and(|n| n.is_null(i)) {
                 NULL_HASH
             } else {
                 SEED.hash_one(values[i])

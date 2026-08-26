@@ -30,7 +30,7 @@ import threading
 from collections import defaultdict
 from typing import Any
 
-from batcher.observe.counters._series import as_number
+from batcher.observe.counters._series import as_number, escape_label
 from batcher.plan.ir_tags import Op
 
 __all__ = ["WorkCounters"]
@@ -311,9 +311,11 @@ class WorkCounters:
             out.append(f"# HELP {metric} {help_text}")
             out.append(f"# TYPE {metric} counter")
             for kind, stats in operators.items():
-                out.append(f'{metric}{{kind="{kind}"}} {stats[f"{field}_total"]}')
+                label = escape_label(kind)
+                out.append(f'{metric}{{kind="{label}"}} {stats[f"{field}_total"]}')
         out.append("# HELP batcher_operator_spills_total Operators that engaged their spill path")
         out.append("# TYPE batcher_operator_spills_total counter")
         for kind, stats in operators.items():
-            out.append(f'batcher_operator_spills_total{{kind="{kind}"}} {stats["spills"]}')
+            label = escape_label(kind)
+            out.append(f'batcher_operator_spills_total{{kind="{label}"}} {stats["spills"]}')
         return out

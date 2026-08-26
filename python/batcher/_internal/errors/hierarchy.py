@@ -557,6 +557,7 @@ def unknown_value(
     label: str | None = None,
     hint: str = "",
     doc: str = "",
+    suggestion: str = "",
 ) -> BatcherError:
     """Build the canonical "you named something that does not exist" error.
 
@@ -573,6 +574,12 @@ def unknown_value(
         label: The alternatives' lead-in. Defaults to ``"Available <kind>s"``.
         hint: A next action.
         doc: A documentation path, attached as an exception note.
+        suggestion: A rendered ``Did you mean ...?`` sentence to use instead of the
+            edit-distance guess, for a caller that *knows* the answer. The guess is a
+            fallback for when nobody does: a caller holding a synonym table has a better
+            answer than character distance can reach, and leaving the guess in front of it
+            prints a wrong one first (``'database'`` drew "did you mean 'webdataset'" while
+            the caller knew it was ``'sql'``).
 
     Returns:
         An instance of `error`, ready to raise.
@@ -593,7 +600,7 @@ def unknown_value(
     # message with `unknown_message` here would print each of them twice.
     return error(
         f"Unknown {kind} {name!r}.",
-        suggestion=_suggestion(name, pool) if isinstance(name, str) else "",
+        suggestion=suggestion or (_suggestion(name, pool) if isinstance(name, str) else ""),
         available=pool,
         available_label=label or f"Available {kind}s",
         hint=hint,

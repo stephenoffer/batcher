@@ -44,21 +44,76 @@ __all__ = [
     "supports_ordered_bucket_offsets",
 ]
 
+#: The running *associative folds*: a window function whose value at a row is
+#: ``identity OP x0 OP x1 OP ... OP x_row`` over the non-null inputs, and which is therefore
+#: offset by folding the prior buckets' accumulated value in on the left. Each entry is
+#: ``(identity, pyarrow-compute op, numpy ufunc)``: the identity fills the within-bucket
+#: nulls (a running fold is NULL until its first non-null input, where the correct global
+#: value is exactly the prior accumulation), the compute op folds the prior accumulation into
+#: every row, and the ufunc reduces this bucket's own inputs to the value the *next* bucket
+#: carries. The reduce reads the **input** column, never the running one: the kernel returns a
+#: bucket's rows in arrival order, not sort order, so the running column's last cell is an
+#: arbitrary row's prefix rather than the bucket's total.
+#:
+#: `sum` is the member this table was generalized from — it had the arithmetic written out
+#: inline, and the bitwise and boolean folds the engine computes were declined by
+#: `supports_ordered_bucket_offsets` purely because nobody had written theirs. Declining costs
+#: a *distributed* global window its split: the materializing kernel runs the whole relation
+#: on one node instead. The identity is the only thing that differs between them, so stating
+#: it as data rather than as a branch is what makes adding the sixth cost one line.
+#:
+#: **`product` is deliberately absent**, and is the one running fold the engine computes that
+#: is not here. Reassociation is tolerated for a float reduction — `combine` is associative in
+#: exact arithmetic and IEEE addition is not, so a `sum` differs in its last bits with the
+#: partition count. `product` does not fail in its last bits. Over a few thousand values it
+#: overflows to `inf` and underflows to `0`, and the two orders then disagree on `inf * 0`,
+#: which is `NaN` one way and `0` the other: measured on 4,000 rows, single-node returned
+#: `-0.0` where the seven-bucket split returned `NaN`. The other six folds are exact integer
+#: or boolean arithmetic, so their reassociation is not merely bounded but nil.
+_FOLDS: dict[str, tuple[object, str, str]] = {
+    "sum": (0, "add", "add"),
+    "bit_and": (-1, "bit_wise_and", "bitwise_and"),
+    "bit_or": (0, "bit_wise_or", "bitwise_or"),
+    "bit_xor": (0, "bit_wise_xor", "bitwise_xor"),
+    "bool_and": (True, "and_", "logical_and"),
+    "bool_or": (False, "or_", "logical_or"),
+}
+
 #: Window functions whose global value is recovered from the within-bucket value plus a
 #: constant/element-wise per-bucket offset (so per-bucket compute + offset == single-node).
 #: `avg` qualifies through its running `sum` and `count`, each of which is a constant shift.
-_OFFSETTABLE = frozenset({"row_number", "rank", "dense_rank", "sum", "count", "min", "max", "avg"})
-_NEEDS_COL_INPUT = frozenset({"sum", "count", "min", "max", "avg", "first_value"})
+_OFFSETTABLE = frozenset(
+    {"row_number", "rank", "dense_rank", "count", "min", "max", "avg", *_FOLDS}
+)
+#: Functions whose offset reads the *input* column out of the bucket, so the input must be a
+#: plain column the kernel also emits alongside the running one.
+_NEEDS_COL_INPUT = frozenset({"count", "min", "max", "avg", "first_value", *_FOLDS})
 _UNSET = object()
 
 
 def supports_ordered_bucket_offsets(window: Window) -> bool:
     """Whether `window` is a global window the ordered-bucket-offset algebra covers.
 
-    Requires: no partition keys (global); exactly one plain-column order key (the column the
-    range partitioner cuts on) *of a type that partitioner can cut*; every function
+    Requires: no partition keys (global); a **leading** order key that is a plain column (the
+    column the range partitioner cuts on) *of a type that partitioner can cut*; every function
     offsettable or `first_value`, with no explicit frame; and aggregate/`first_value` inputs
     are plain columns.
+
+    Only the leading key is constrained, and the further keys may be anything. The bucket
+    argument survives them intact: a peer group under a multi-key `ORDER BY` is a set of rows
+    equal on *every* key, so it is contained in a set of rows equal on the leading key, which
+    the range partitioner puts in one bucket — no peer group and no frame straddles a cut. And
+    the buckets stay ordered relative to each other, because a row in an earlier bucket has a
+    strictly smaller leading key and therefore sorts before every row in a later one whatever
+    the trailing keys say. Each bucket is then windowed by its full key list, which is what
+    the reducer already receives (`unary_task_ir(window)` carries every key).
+
+    This said `len(order_keys) != 1` and refused the rest, which was not merely conservative:
+    a global window is not a `_split_at` pass-through, so nothing carried it up and
+    `ORDER BY a, b` **raised** `PlanError` on distributed data rather than declining to a
+    slower path. All three drivers already cut on `order_keys[0]` alone — the sort states the
+    same rule for itself ("only the leading key drives the partitioning, the rest are
+    evaluated by each reducer's local sort").
 
     The type test is the one this predicate was missing while its sort sibling
     (`supports_spilling_sort`) had it, and both guard the same range partitioner. Without it
@@ -81,7 +136,7 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
     """
     if window.rank_limit is not None or window.partition_keys:
         return False
-    if len(window.order_keys) != 1 or not isinstance(window.order_keys[0].expr, Col):
+    if not window.order_keys or not isinstance(window.order_keys[0].expr, Col):
         return False
     if not _single_source_input(window):
         return False
@@ -192,10 +247,12 @@ class OrderedBucketOffsets:
         aliases = [f.alias for f in window.functions]
         self._dense = dict.fromkeys(aliases, 0)
         self._sum: dict[str, float] = dict.fromkeys(aliases, 0)
-        # Whether any prior bucket held a non-null input. `_sum` alone cannot answer that:
-        # a genuine total of 0 and "nothing seen yet" are the same number, and a running
-        # `sum` must stay NULL only in the second case.
-        self._seen = dict.fromkeys(aliases, False)
+        # The prior buckets' accumulation for each running fold (`_FOLDS`), or `_UNSET` when
+        # no prior bucket has held a non-null input. A sentinel rather than the op's identity:
+        # a genuine accumulation *equal to* the identity (a `sum` of 0, a `bit_or` of 0, a
+        # `bool_and` of True) and "nothing seen yet" are the same value, and a running fold
+        # must stay NULL only in the second case.
+        self._fold: dict[str, object] = dict.fromkeys(aliases, _UNSET)
         self._count = dict.fromkeys(aliases, 0)
         self._min: dict[str, object] = dict.fromkeys(aliases)
         self._max: dict[str, object] = dict.fromkeys(aliases)
@@ -224,20 +281,8 @@ class OrderedBucketOffsets:
                 bucket_distinct = pc.max(col).as_py() or 0
                 col = pc.add(col, self._dense[alias])
                 self._dense[alias] += bucket_distinct
-            elif fn.func == "sum":
-                # The kernel's within-bucket running sum is NULL until this bucket's first
-                # non-null input — but if a prior bucket held one, the *global* running sum
-                # at those rows is defined and equals the prior total. Adding to the NULL
-                # (`NULL + prior == NULL`) silently dropped every such row's value, which
-                # only ever showed on a bucket that opens with nulls and is not the first.
-                # Where nothing non-null has been seen at all, NULL is the right answer and
-                # the column is left as it is.
-                if self._seen[alias]:
-                    col = pc.add(pc.fill_null(col, 0), self._sum[alias])
-                s = pc.sum(wt.column(fn.input.name)).as_py()
-                if s is not None:
-                    self._sum[alias] += s
-                    self._seen[alias] = True
+            elif fn.func in _FOLDS:
+                col = self._fold_column(col, wt, fn)
             elif fn.func == "count":
                 col = pc.add(col, self._count[alias])
                 self._count[alias] += pc.count(wt.column(fn.input.name)).as_py()
@@ -259,6 +304,39 @@ class OrderedBucketOffsets:
             wt = wt.select([c for c in wt.column_names if c not in hidden])
         self._prior_rows += n
         return wt
+
+    def _fold_column(self, col, wt, fn):
+        """Offset a running associative fold (`sum`/`product`/bitwise/boolean) by the prior
+        buckets' accumulation.
+
+        The kernel's within-bucket value is NULL until this bucket's first non-null input —
+        but if a prior bucket held one, the *global* fold at those rows is defined and equals
+        the prior accumulation. Folding into the NULL directly (`NULL OP prior == NULL` under
+        every one of these ops) silently dropped every such row's value, which only ever
+        showed on a bucket that opens with nulls and is not the first. Filling with the op's
+        **identity** first is what makes those rows come back as the prior accumulation, and
+        is the one thing that differs between the seven folds.
+
+        The bucket's contribution to the next bucket is a reduce over its **input** column,
+        not the running column's last cell: the kernel hands a bucket's rows back in arrival
+        order rather than sort order, so that cell is some arbitrary row's prefix. Reducing
+        the input is order-independent, which is the property that makes the fold mergeable
+        in the first place.
+        """
+        import numpy as np
+        import pyarrow.compute as pc
+
+        alias = fn.alias
+        identity, op, ufunc = _FOLDS[fn.func]
+        prior = self._fold[alias]
+        if prior is not _UNSET:
+            col = getattr(pc, op)(pc.fill_null(col, identity), pa.scalar(prior, col.type))
+        values = wt.column(fn.input.name).drop_null()
+        if values.length():
+            fold = getattr(np, ufunc)
+            bucket = fold.reduce(values.to_numpy(zero_copy_only=False)).item()
+            self._fold[alias] = bucket if prior is _UNSET else fold(prior, bucket).item()
+        return col
 
     def _extreme(self, col, wt, fn, state, element_wise, pick, reduce_fn):
         """Offset a running `min`/`max` against the prior buckets' running extreme."""

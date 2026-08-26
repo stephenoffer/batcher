@@ -45,7 +45,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
-from batcher.plan.logical import LogicalPlan, MapBatches
+from batcher.plan.logical import LogicalPlan, MapBatches, preserves_source_row_count
 from batcher.plan.visitor import scanned_source_ids
 
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
@@ -776,7 +776,7 @@ def _distributed_map(
     for r in results:
         if r:
             batches.extend(r)
-    _record_source_rows(hub, sources[sid], sum(b.num_rows for b in batches))
+    _record_source_rows(hub, sources[sid], plan, sum(b.num_rows for b in batches))
     if not batches:
         # A pipeline whose filter matched nothing still has a schema, and the single-node
         # path returns it. Returning a *column-less* table here made `distributed ==
@@ -789,8 +789,9 @@ def _distributed_map(
     # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
     # rows carry extra fields) to one union schema, so the gather concatenates instead of
     # failing — the same schema-drift tolerance the single-node path gives.
-    from batcher.io.schema.evolution import reconcile_batches
+    from batcher.io.schema.evolution import note_dropped_columns, reconcile_batches
 
+    note_dropped_columns(batches, context="map_batches (distributed)")
     return pa.Table.from_batches(reconcile_batches(batches))
 
 
@@ -850,13 +851,26 @@ def _engine_config_cache():
     return cfg_for
 
 
-def _record_source_rows(hub, source, rows: int) -> None:
+def _record_source_rows(hub, source, plan: LogicalPlan, rows: int) -> None:
     """Persist a run's measured total rows for `source` so the next run's partition count can
     seed from it when the footer count is unknown. Best-effort; never breaks a query.
+
+    **Only when `plan` emits one row per source row.** What is measured here is the plan's
+    output, and writing that down under the *source's* identity claims it is the source's
+    size — true for a projection or a sort, false for everything that resizes. The executor
+    runs plenty that does: a filtered scan, a per-partition `Limit`, a fixed-count `Sample`,
+    a per-partition `Distinct(limit=k)`. Each recorded a number far below the source's real
+    row count, and `_adaptive_partition_count` seeds the *next* run from it — so a
+    billion-row table that once answered a `distinct().limit(10)` came back sized for forty
+    rows, ran on one worker, and recorded a smaller number again. The dispatcher withholds
+    the hub by hand at six call sites to avoid exactly this; `preserves_source_row_count` is
+    that rule stated once, so a call site that forgets is no longer a silent perf cliff.
 
     Noted rather than suppressed: a failed write is indistinguishable from a source that has
     never run, so the partition count silently keeps falling back to the blunt cluster-fill
     worker count on every future run, forever, with nothing saying why."""
+    if not preserves_source_row_count(plan):
+        return
     try:
         from batcher.dist.adaptive_sizing import record_partition_rows
 

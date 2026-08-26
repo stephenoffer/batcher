@@ -291,9 +291,21 @@ def _null_inactive_refs(node, inactive: dict, typed_null) -> None:
 
     Aggregate arguments are deliberately skipped: `sum(x)` at a level that rolls `x` up
     still sums the underlying rows. Only the *grouped* reference goes to NULL.
+
+    That skip is checked on `node` itself and not only on its children, because the
+    projection loop above hands this function the select item *whole* — and a select item
+    is very often an aggregate. `SELECT s, max(s) ... GROUP BY ROLLUP(s)` arrived here as
+    `MAX(s)`, whose only child is the rolled-up key, so the argument was NULLed and the
+    item became `MAX(NULLIF(MAX(s), MAX(s)))` — a nested aggregate the translator then
+    lowered into an outer aggregate over the inner one's internal alias, failing with
+    ``aggregate 'a' references unknown column(s) ['__agg0']``. Every ROLLUP/CUBE/GROUPING
+    SETS query aggregating over one of its own grouping keys (`sum(i) ... ROLLUP(i)`,
+    `count(s) ... CUBE(s)`) could not run.
     """
     from batcher._sql.parser.expressions.aggregates import is_agg_node
 
+    if is_agg_node(node):
+        return
     for child in list(node.iter_expressions()):
         if is_agg_node(child):
             continue

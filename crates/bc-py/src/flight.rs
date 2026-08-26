@@ -102,7 +102,12 @@ impl ShuffleSpiller {
         }
         // The pool will not cover the growth. Spill the excess and charge what remains.
         let excess = held.saturating_sub(reservation.size());
-        self.exchange.try_spill_at_least(excess);
+        // The freed count is deliberately dropped: `try_spill_at_least` is best-effort and
+        // documents that it returns 0 when the store is busy, so acting on the number would
+        // mean trusting a figure that can be stale by the next line. The resize below
+        // re-reads `retained_bytes()` instead, which is the truth after the attempt whether it
+        // freed everything, something, or nothing.
+        let _freed = self.exchange.try_spill_at_least(excess);
         let _ = reservation.try_resize(self.exchange.retained_bytes());
     }
 }

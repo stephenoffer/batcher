@@ -21,6 +21,7 @@ from batcher.observe.counters import (
     StreamCounters,
     WorkCounters,
     WriteCounters,
+    as_number,
 )
 from batcher.observe.node_metrics import node_conditions
 
@@ -124,17 +125,20 @@ class _Collector:
             elif kind == events.QUERY_START:
                 self.queries_active += 1
             elif kind == events.PROGRESS:
-                self.stream_rows_total += int(fields.get("rows", 0))
-                self.stream_bytes_total += int(fields.get("bytes", 0))
+                # `as_number`, not a bare `int`: the bus is best-effort and a sink that
+                # raises is now detached after three strikes, so a publisher passing `None`
+                # where a number was documented would cost the whole metrics export.
+                self.stream_rows_total += int(as_number(fields.get("rows")))
+                self.stream_bytes_total += int(as_number(fields.get("bytes")))
             elif kind == events.LOG:
                 self._log_counts[str(fields.get("level", "INFO"))] += 1
             elif kind == events.PARTITION:
                 self.partitions_done_total += 1
             elif kind == events.INFER:
                 self.infer_batches_total += 1
-                self.infer_rows_total += int(fields.get("rows", 0))
-                self.infer_latency_ms_total += float(fields.get("latency_ms", 0.0))
-                self.infer_blocked_ms_total += float(fields.get("blocked_ms", 0.0))
+                self.infer_rows_total += int(as_number(fields.get("rows")))
+                self.infer_latency_ms_total += as_number(fields.get("latency_ms"))
+                self.infer_blocked_ms_total += as_number(fields.get("blocked_ms"))
             elif kind == events.SKIPPED:
                 count = int(fields.get("count", 0))
                 self.skipped_total += count

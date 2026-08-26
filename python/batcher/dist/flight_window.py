@@ -30,7 +30,7 @@ import pyarrow as pa
 from batcher.carbonite.resilience import SourcePlacement
 from batcher.dist.adaptive_sizing import row_shuffle_reducer_count
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
-from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.partition_io import partition_descriptors, stage_pushdown
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
@@ -45,7 +45,7 @@ from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_keyed_shuffle_flight", "execute_window_flight"]
@@ -80,6 +80,7 @@ def execute_window_flight(
     map_plan, sid = _relabel_single_source(window.input)
     return _execute_keyed_flight(
         above,
+        operator=window,
         map_plan=map_plan,
         reduce_ir=_scan_rooted_ir(window),
         key_names=[k.name for k in window.partition_keys],
@@ -98,6 +99,7 @@ def execute_window_flight(
 def execute_keyed_shuffle_flight(
     above: list[LogicalPlan],
     *,
+    operator: LogicalPlan,
     map_plan: LogicalPlan,
     reduce_ir: str,
     key_names: list[str],
@@ -138,6 +140,7 @@ def execute_keyed_shuffle_flight(
     """
     return _execute_keyed_flight(
         above,
+        operator=operator,
         map_plan=map_plan,
         reduce_ir=reduce_ir,
         key_names=key_names,
@@ -152,15 +155,21 @@ def execute_keyed_shuffle_flight(
 
 
 def _scan_rooted_ir(node: LogicalPlan) -> str:
-    """`node`'s IR with its input replaced by a scan of source 0 — the reduce-side plan."""
-    ir = node.to_ir()
-    ir["input"] = task_scan_ir()
-    return json.dumps(ir)
+    """`node`'s IR with its input replaced by a scan of source 0 — the reduce-side plan.
+
+    Built from `shape_ir()`, never by editing `to_ir()`'s result: that dict is **memoized on
+    the node**, so writing an `"input"` into it left the plan's own lowered IR reading the
+    window's child as a bare `scan(source 0)` for the rest of the process — a wrong plan for
+    any later `to_ir()` (a re-collect, an adaptive re-optimization, the plan cache's content
+    key). It also skips lowering the child subtree that is about to be discarded.
+    """
+    return json.dumps(unary_task_ir(node))
 
 
 def _execute_keyed_flight(
     above: list[LogicalPlan],
     *,
+    operator: LogicalPlan,
     map_plan: LogicalPlan,
     reduce_ir: str,
     key_names: list[str],
@@ -174,7 +183,11 @@ def _execute_keyed_flight(
     metrics_out=None,
     materialize: bool = True,
 ):
-    """The shared driver: shuffle rows by `key_names`, run `reduce_ir` per bucket."""
+    """The shared driver: shuffle rows by `key_names`, run `reduce_ir` per bucket.
+
+    `operator` is the breaker itself, carried only so the read can be narrowed against the
+    whole stage (`above` over it) rather than against its map prefix — see `stage_pushdown`.
+    """
     import ray
 
     _ensure_ray(workers)
@@ -199,11 +212,13 @@ def _execute_keyed_flight(
     publish = materialize is False and not above
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:
-        # Read only the columns/rows the window's map prefix needs (see flight_aggregate).
-        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
-        # source's original index: a staged plan whose input is an intermediate (source id >
-        # 0) missed the lookup and silently read every column.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Read only the columns/rows this stage needs, asked of the whole stage (`above`
+        # over the breaker) and keyed by the source's own id. The breaker alone is the wrong
+        # question: a window emits its input columns plus its aliases and a keyed shuffle is
+        # pass-through, so both correctly answer "every column" — what narrows the read is the
+        # projection sitting above, which the dispatcher is holding in `above` to re-apply on
+        # the driver. See `stage_pushdown`.
+        projection, predicate = stage_pushdown(above, operator, source_id)
         # More map partitions than workers where the source has splits to fill them, so a
         # straggler holds a fraction of a node's share rather than all of it (see
         # `map_partitions`). `len(parts)` is the source count from here on.

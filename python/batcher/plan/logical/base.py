@@ -136,11 +136,17 @@ def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
     """
     missing = _referenced_columns(expr) - available
     if missing:
+        # The available columns are passed as the structured field and NOT also
+        # inlined into the message. Doing both rendered them twice --
+        # "... available: ['a', 'b'] Available columns: 'a', 'b'" -- and the inlined
+        # copy was the unbounded one: `BatcherError.__str__` truncates the field
+        # ("(+N more)"), where an f-string of `sorted(available)` prints all of them,
+        # so a miss against a wide table buried the actual error under its schema.
         raise ColumnNotFoundError(
-            f"{what} references unknown column(s) {sorted(missing)}; "
-            f"available: {sorted(available)}",
+            f"{what} references unknown column(s) {sorted(missing)}",
             column=sorted(missing)[0],
             available=sorted(available),
+            available_label="Available columns",
         )
 
 

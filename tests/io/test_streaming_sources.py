@@ -320,7 +320,7 @@ def test_broker_backs_off_on_empty_polls(monkeypatch):
     from batcher.io.formats.streaming.broker import BrokerSource
 
     sleeps: list[float] = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(time, "sleep", sleeps.append)
 
     class _EmptyThenData(BrokerSource):
         format_name = "empty_then_data"
@@ -367,7 +367,7 @@ def test_broker_back_off_is_discounted_by_a_poll_that_already_blocked(monkeypatc
     from batcher.io.formats.streaming.broker import BrokerSource
 
     sleeps: list[float] = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(time, "sleep", sleeps.append)
     clock = {"now": 0.0}
     monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
 
@@ -520,7 +520,7 @@ class _FakeEHConsumer:
         ready, self._events = self._events[:max_batch_size], self._events[max_batch_size:]
         if ready:
             self._deliver(ready)
-        return None
+        return
 
     def close(self):
         pass
@@ -657,7 +657,7 @@ def test_pulsar_receive_timeout_is_configurable(monkeypatch):
 
         def receive(self, timeout_millis):
             self.timeouts.append(timeout_millis)
-            raise _Timeout()  # idle topic -> empty poll
+            raise _Timeout  # idle topic -> empty poll
 
     src = pmod.PulsarSource("t", receive_timeout_millis=250)
     assert "receive_timeout_millis" not in src._options
@@ -681,3 +681,23 @@ def test_kafka_deferred_dependency_raises_backend_error():
     except ImportError:
         with pytest.raises(BackendError, match="\\[kafka\\]"):
             src._client()
+
+
+def test_a_missing_path_and_an_empty_one_are_different_failures(tmp_path):
+    """A typo in the path must not read as "your files have not arrived yet".
+
+    Both conditions reach `schema()` through the same raising `expand`, and collapsing
+    them onto one message sends a user whose path is wrong to wait for files that will
+    never land. The empty directory keeps the "yet", because there it is true.
+    """
+    from batcher._internal.errors import IOError as BatcherIOError
+
+    empty = tmp_path / "incoming"
+    empty.mkdir()
+    with pytest.raises(BatcherIOError, match=r"no \.parquet files yet"):
+        IncrementalFileSource(str(empty), "parquet", state_dir=str(tmp_path / "s1")).schema()
+
+    missing = tmp_path / "not-a-directory"
+    with pytest.raises(BatcherIOError, match=r"does not exist") as caught:
+        IncrementalFileSource(str(missing), "parquet", state_dir=str(tmp_path / "s2")).schema()
+    assert "yet" not in str(caught.value)

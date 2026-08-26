@@ -147,10 +147,73 @@ is mid-run — which otherwise blocks the whole `bc-py` surface for as long as t
 ```
 cargo build --release -p bc-py --features pyo3/extension-module   # -> target/release/lib_native.so
 SB=<scratchpad>/sandbox && rm -rf $SB && mkdir -p $SB
-git archive HEAD python tests | tar -x -C $SB                     # committed state, not their WIP
+git archive HEAD python tests pyproject.toml benchmarks .github | tar -x -C $SB
+tar -c crates | tar -x -C $SB                                      # see below: some tests read these
 cp target/release/lib_native.so $SB/python/batcher/_native.abi3.so
 PYTHONPATH=$SB/python python -m pytest $SB/tests/differential -q
 ```
+
+**Stage more than `python tests`, or you get spurious failures with misleading names.** A
+number of tests read repo files *deliberately*, so a constant and its source cannot drift, and
+under `PYTHONPATH` they resolve the repo root as the **sandbox** root — so a directory you did
+not stage is simply absent. Measured by running the sandbox with and without each:
+
+| Also stage | Or else |
+|---|---|
+| `crates/` (the **working tree's**) | `test_diff_execution_mode_matrix::test_the_fixture_actually_shards` raises `FileNotFoundError`. It parses `crates/bc-interp/src/stream/parallel.rs` for `MIN_ROWS_TO_SHARD` rather than hardcoding a number that would let the file quietly stop testing the sharded path. |
+| `benchmarks/` | `test_benchmark_isolation.py` fails to **collect** — `ModuleNotFoundError: No module named 'harness'`. |
+| `pyproject.toml` | `test_python_floor` and `test_optional_guard_is_shared` fail: the declared Python floor and the extras an optional-guard names both live there. |
+| `.github` | `test_python_floor::test_the_release_workflow_builds_on_the_declared_floor` fails. It reads `.github/workflows/release.yml` and cross-checks the pinned `python-version` against the floor. |
+
+`crates/` is the one copied from the working tree rather than `git archive`d, because the
+`.so` you just built came from the working tree and staging HEAD's sources would reintroduce
+exactly the drift the test exists to catch. It is 7.5 MB. The rest are not compiled into the
+`.so`, so HEAD's copies are right and keep the "committed state, not their WIP" property.
+
+Two things about this table are worth more than the entries.
+
+**The failure modes are not equally readable, and the worst one is not the loudest.** A
+`FileNotFoundError` at least names the file it wanted. `ModuleNotFoundError: No module named
+'harness'` inside a file called `test_benchmark_isolation` reads as a broken interpreter or a
+bad `PYTHONPATH`, reports as an *error* rather than a failure, and takes the whole module down
+instead of one test — so the natural first guess is that the recipe is wrong rather than
+incomplete. One or two failures is the worst possible size for any of them: small enough to
+wave through as flake, large enough to cost an hour if you chase it.
+
+**This list is known-incomplete by construction, and is not a specification.** It was assembled
+by two sessions in one afternoon who were each looking for something else, and every entry was
+found by a test failing rather than by anyone enumerating what tests read. `.github` is the
+one to look at before trusting your judgement over a measurement: the test that needs it is
+*about* `pyproject.toml`, names `.github` only inside a path expression, and reads for all the
+world as though the workflow were context — so "that one isn't load-bearing" is the plausible
+guess and it is wrong. It was asserted here, on the strength of a sandbox run whose staged set
+had been read off an `ls` that hides dotfiles, and corrected by someone who ran the arm
+properly.
+
+A partial regeneration — tests that climb above their own directory to reach a repo file:
+
+```
+grep -rlE 'parents\[|\.parent\.parent' tests --include='*.py'
+```
+
+Check what each of the 26 joins onto that root; anything outside `python/` and `tests/` needs
+staging or a skip guard.
+
+**`grep`, not `rg`, and the reason generalises past this recipe.** `rg` in a Claude Code
+session is a *shell function* from the shell snapshot, not a binary on `PATH`. A bare `rg`
+works because the shell resolves it; `... | xargs rg ...` does not, because `xargs` execs
+directly — and it fails to **stderr while exiting 0**, so the pipeline prints an empty list and
+reports success. That is the same defect this paragraph exists to warn about, one layer out:
+the regeneration step would have certified the absence it could not see. Any recipe in
+`.claude/rules/` that pipes into `xargs rg` has it.
+
+**And the grep is a floor, not a proof — one of the four entries proves it.**
+`test_benchmark_isolation` fails in an unstaged sandbox with `ModuleNotFoundError: No module
+named 'harness'`, which is an *import* dependency on `benchmarks/`, not a path read. It happens
+to appear in the scan only because it also computes a path; a version of it that imported and
+nothing more would be invisible, and nothing in the scan's design would say so. The only
+enumeration that needs no judgement is **run the suite in the sandbox and see what breaks**,
+which is how all four of these were found, twice by accident.
 
 Three things make this work and are worth keeping: `bc-py`'s `[lib] name = "_native"` is a
 plain `cdylib`, so the file cargo produces *is* the extension module under a different name;
@@ -178,14 +241,37 @@ Two ways to shoot yourself with the sandbox, both of which happened in one sessi
 
 ### A full suite gets OOM-killed on a busy box; chunk it
 
-The head node has 30 GB and is shared. With three other sessions running suites, a
-whole-directory `pytest tests/differential` was **killed** twice, ~20% in, reporting nothing —
-the same `Killed` you would see from a hang, and easy to misread as your change.
+The head node is shared. With three other sessions running suites, a whole-directory
+`pytest tests/differential` was **killed** twice, ~20% in, reporting nothing — the same
+`Killed` you would see from a hang, and easy to misread as your change.
 
-Run the directory in chunks of ~40 files, one process each. A chunk's peak is its own files,
-so the run survives; and a chunk that *is* killed names itself instead of taking the whole
-result with it. `ls dir/*.py | xargs -n 40` and a loop is the entire fix. The same applies to
-a memory-hungry benchmark: a 10 M-row x 9-column A/B was killed until it was cut to 4 M.
+Run the directory in chunks of ~40 files, one process each. **The reason that survives a
+hardware change is attribution, not headroom**: a chunk that is killed names itself, where a
+whole-directory run takes the entire result down with it and tells you nothing. (This
+paragraph said "the head node has 30 GB" for long enough that at least one session throttled
+itself on the strength of it. It is 184 GB with ~170 available and 96 cores. Measure with
+`free -g` rather than trusting a number in a document — including this one.) The same applies
+to a memory-hungry benchmark: a 10 M-row x 9-column A/B was killed until it was cut to 4 M.
+
+**Write the loop carefully, because the obvious spelling is broken here and fails silently.**
+The shell is **zsh**, which does *not* word-split an unquoted parameter expansion, so this —
+
+```
+ls dir/*.py | xargs -n 40 | while read -r chunk; do python -m pytest $chunk -q; done
+```
+
+— hands pytest **one enormous non-existent filename** per chunk and prints `no tests ran in
+0.14s`, exit 0, once per chunk. Two sessions hit it on the same afternoon; one lost a
+debugging cycle and the other misattributed it to a different bug in its own loop. It is the
+worst-placed instance of that failure in this file, because the recipe is offered as the fix
+for *an OOM that already reported nothing* — so "no tests ran" reads as "the chunking worked".
+
+In zsh use `${=chunk}` to force splitting, or sidestep the shell:
+
+```python
+for i in range(0, len(files), 40):
+    subprocess.run([sys.executable, "-m", "pytest", *files[i : i + 40], "-q"], cwd=root)
+```
 
 ## The pre-commit hook is repo-wide, so someone else's half-done refactor blocks you
 

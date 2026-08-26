@@ -342,6 +342,7 @@ impl Default for FlightServer {
 
 impl FlightServer {
     /// Create a new, empty server.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             store: Arc::new(PartitionStore::default()),
@@ -592,6 +593,7 @@ impl FlightClient {
 
     /// Wrap an already-established [`Channel`] (cheap; channels are clonable and
     /// multiplex over HTTP/2, so one channel backs many `FlightClient`s).
+    #[must_use]
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             inner: arrow_flight::FlightClient::new(channel),
@@ -933,7 +935,7 @@ mod tests {
         // Flow control: the producer never ran more than WINDOW batches ahead.
         let max_inflight = producer.max_inflight(&ticket).await.unwrap();
         assert!(
-            max_inflight >= 1 && max_inflight <= WINDOW as i64,
+            max_inflight >= 1 && max_inflight <= i64::from(WINDOW),
             "in-flight high-water mark {max_inflight} must be within (0, {WINDOW}]",
         );
     }
@@ -1004,7 +1006,7 @@ mod tests {
         // observes 56 in flight against a seeded window of 4 — the producer encoding its
         // whole partition because the consumer said it could.
         assert!(
-            max_inflight <= WINDOW as i64 + 1,
+            max_inflight <= i64::from(WINDOW) + 1,
             "a dishonest consumer widened the producer's window to {max_inflight} (seeded {WINDOW})",
         );
     }
@@ -1119,11 +1121,11 @@ mod tests {
         assert_eq!(seen, N, "a slow consumer must still receive every batch");
         let max_inflight = producer.max_inflight(&ticket).await.unwrap();
         assert!(
-            max_inflight <= WINDOW as i64 + 1,
+            max_inflight <= i64::from(WINDOW) + 1,
             "the producer ran {max_inflight} ahead of a slow consumer (window {WINDOW})",
         );
         assert!(
-            max_inflight >= WINDOW as i64,
+            max_inflight >= i64::from(WINDOW),
             "the producer filled only {max_inflight} of {WINDOW} credits, so it never \
              parked — this test is not exercising the blocking path it exists for"
         );
@@ -1205,7 +1207,7 @@ mod tests {
             }
             let max_inflight = producer.max_inflight(&ticket).await.unwrap();
             assert!(
-                max_inflight >= 1 && max_inflight <= window as i64,
+                max_inflight >= 1 && max_inflight <= i64::from(window),
                 "n={n} window={window}: in-flight high-water {max_inflight} outside (0, {window}]",
             );
         }
@@ -1261,7 +1263,7 @@ mod tests {
         }
         let max_inflight = producer.max_inflight(&ticket).await.unwrap();
         assert!(
-            max_inflight >= 1 && max_inflight <= WINDOW as i64,
+            max_inflight >= 1 && max_inflight <= i64::from(WINDOW),
             "in-flight high-water mark {max_inflight} must stay within (0, {WINDOW}]",
         );
 
@@ -1433,7 +1435,7 @@ mod tests {
         }
         let max_inflight = producer.max_inflight(&ticket).await.unwrap();
         assert!(
-            max_inflight >= 1 && max_inflight <= WINDOW as i64,
+            max_inflight >= 1 && max_inflight <= i64::from(WINDOW),
             "blocking credit fetch must honor window {WINDOW}, got {max_inflight}",
         );
     }

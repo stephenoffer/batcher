@@ -209,6 +209,7 @@ fn split_reference(reference: &str) -> Option<(Arc<dyn SecretBackend>, &str)> {
 }
 
 /// Whether `reference` names a registered secret scheme.
+#[must_use]
 pub fn is_reference(reference: &str) -> bool {
     split_reference(reference).is_some()
 }

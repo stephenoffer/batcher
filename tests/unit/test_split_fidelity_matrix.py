@@ -93,8 +93,7 @@ def _json(tmp_path):
     from batcher.io.formats.semistructured.json import JSONSource
 
     with open(tmp_path / "a.json", "w") as fh:
-        for row in _data().to_pylist():
-            fh.write(f'{{"k": {row["k"]}, "g": "{row["g"]}"}}\n')
+        fh.writelines(f'{{"k": {row["k"]}, "g": "{row["g"]}"}}\n' for row in _data().to_pylist())
     return JSONSource(str(tmp_path))
 
 

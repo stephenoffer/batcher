@@ -9,7 +9,12 @@ not just the first — a wrong answer that only appears at 16-way concurrency is
 failure a QPS number would otherwise hide — and it cannot afford a full multiset
 comparison per request. The fingerprint keeps the row count plus the first and last five
 sorted rows, which catches a truncated, duplicated, reordered-into-wrongness, or silently
-empty result at constant cost.
+empty result while carrying a *bounded* value — bounded in what it stores, not in what it
+costs to compute: `result_signature` materializes every row to a Python tuple and sorts
+them, so it is O(n log n) in Python and grows with the result. The concurrency client takes
+its latency sample *before* calling it, so no request is mis-timed, but the work still
+happens in the request loop and a case with a large result will see lower achievable QPS
+because of it. Keep it to cases whose results are small.
 
 It is deliberately *not* a hash: when it mismatches, the two values print as readable rows,
 so the failure says what went wrong rather than that something did.

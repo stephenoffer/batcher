@@ -85,7 +85,7 @@ The table below lists the operations and performance scripts in path order.
 | `examples/operations/gpu_cloud.py` | Checking a GPU-cloud node before you trust its throughput |
 | `examples/operations/inspecting_a_query.py` | Reading a plan, timing a query, and checking what the engine actually ran |
 | `examples/operations/lineage.py` | Tracing where a column came from |
-| `examples/operations/memory_and_caching.py` | Bounded memory: caching a reused branch and spilling under a tight budget |
+| `examples/operations/memory_and_caching.py` | Bounded memory: caching a reused branch, storage levels, and spilling under a tight budget |
 | `examples/operations/memory_pricing.py` | Memory: what a result costs to hold, and when to hold it |
 | `examples/operations/observability.py` | Watching a query run: verbosity, logging, and execution statistics |
 | `examples/operations/observability_events.py` | Watching a query run: the progress reporter and the activity store |

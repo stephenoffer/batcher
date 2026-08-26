@@ -35,6 +35,7 @@ mod quantile_spill;
 mod radix_sort;
 mod repartition;
 mod reshape;
+mod run_sort;
 mod sample_sort;
 pub(crate) use external_sort::{
     external_merge_sort, external_sort_to_final_store, DEFAULT_RUN_TARGET_BYTES,
@@ -198,6 +199,23 @@ pub(crate) struct AggJit {
     /// backend from the `None`s alone would tag an aggregate over bare columns — which is
     /// most of TPC-H — as having fallen back, when in fact it never had a candidate.
     candidates: usize,
+    /// For aggregate `i`, the earlier aggregate whose input expression is the *same* one —
+    /// so it is evaluated once and shared instead of twice.
+    ///
+    /// `min(e)` and `max(e)` over one expression is an ordinary shape and a costly one when
+    /// `e` is computed: each aggregate's input is evaluated independently over every morsel,
+    /// so a `CASE` feeding both is built, materialized and thrown away twice. TPC-H q21 reaches
+    /// the executor with exactly that pair — the `<>`-EXISTS decorrelation emits
+    /// `min(CASE WHEN late THEN suppkey END)` beside `max(` the same `)` — and over 60M rows
+    /// the duplicate pass measured **+68 ms per conditional aggregate** against a plain one.
+    ///
+    /// Matched on the expression's `Debug` rendering, which is derived and therefore
+    /// structural. That is a *conservative* equality in the direction that matters: two
+    /// expressions rendering identically are the same expression, so sharing their value is
+    /// sound, and anything it fails to match is simply evaluated twice as before. It is
+    /// computed **once per operator** here, never per morsel, because rendering an expression
+    /// for every morsel would cost more than the evaluation it saves.
+    input_alias: Vec<Option<usize>>,
 }
 
 impl AggJit {
@@ -230,12 +248,36 @@ fn is_jit_candidate(expr: &bc_expr::Expr) -> bool {
 /// representative batch. Computed expressions (`GROUP BY a + b`, `SUM(price * qty)`)
 /// get the JIT fast path; bare columns and unsupported expressions stay on the
 /// interpreter (see [`try_compile_computed`]).
+/// Which earlier aggregate shares each aggregate's input expression — see [`AggJit::input_alias`].
+///
+/// An aggregate with no input (`count(*)`) aliases nothing, and neither does one carrying an
+/// `input2` (`arg_min`/`arg_max`): its value array is paired with an ordering key, and the two
+/// are only interchangeable when both match, which is not worth modelling for a shape that does
+/// not repeat in practice.
+fn input_aliases(aggregates: &[AggregateItem]) -> Vec<Option<usize>> {
+    let keys: Vec<Option<String>> = aggregates
+        .iter()
+        .map(|a| match (&a.input, &a.input2) {
+            (Some(e), None) => Some(format!("{e:?}")),
+            _ => None,
+        })
+        .collect();
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let k = k.as_ref()?;
+            (0..i).find(|&j| keys[j].as_ref() == Some(k))
+        })
+        .collect()
+}
+
 pub(crate) fn compile_agg(
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
     sample: &RecordBatch,
 ) -> AggJit {
     AggJit {
+        input_alias: input_aliases(aggregates),
         group: group_keys
             .iter()
             .map(|k| try_compile_computed(&k.expr, sample))
@@ -283,6 +325,7 @@ fn eval_partial_with(
     mut eval_group: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
     mut eval_input: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
     mut eval_input2: impl FnMut(usize, &bc_expr::Expr) -> Result<ArrayRef, InterpError>,
+    input_alias: &[Option<usize>],
 ) -> Result<agg::Partial, InterpError> {
     let group_arrays: Vec<ArrayRef> = group_keys
         .iter()
@@ -290,11 +333,22 @@ fn eval_partial_with(
         .map(|(i, k)| eval_group(i, &k.expr))
         .collect::<Result<_, _>>()?;
     let mut calls = Vec::with_capacity(aggregates.len());
+    // One array per *distinct* input expression, indexed by the aggregate that first evaluated
+    // it. Sharing an `ArrayRef` is sound because an evaluation is a pure function of the batch:
+    // the second aggregate would have produced an identical array.
+    let mut evaluated: Vec<Option<ArrayRef>> = vec![None; aggregates.len()];
     for (i, item) in aggregates.iter().enumerate() {
         let values = match &item.input {
-            Some(expr) => Some(eval_input(i, expr)?),
+            Some(expr) => Some(
+                match input_alias.get(i).copied().flatten() {
+                    Some(j) => evaluated[j].clone(),
+                    None => None,
+                }
+                .map_or_else(|| eval_input(i, expr), Ok)?,
+            ),
             None => None,
         };
+        evaluated[i] = values.clone();
         // The ordering key for arg_min/arg_max (the aggregate's second input).
         let key = match &item.input2 {
             Some(expr) => Some(eval_input2(i, expr)?),
@@ -317,6 +371,7 @@ pub(crate) fn eval_partial(
         |_, e| e.eval(batch).map_err(Into::into),
         |_, e| e.eval(batch).map_err(Into::into),
         |_, e| e.eval(batch).map_err(Into::into),
+        &input_aliases(aggregates),
     )
 }
 
@@ -336,6 +391,7 @@ pub(crate) fn eval_partial_jit(
         |i, e| eval_jit(&jit.group[i], e, batch),
         |i, e| eval_jit(&jit.input[i], e, batch),
         |i, e| eval_jit(&jit.input2[i], e, batch),
+        &jit.input_alias,
     )
 }
 
@@ -1613,6 +1669,85 @@ pub(crate) fn limit(batches: Vec<RecordBatch>, n: usize, offset: usize) -> Vec<R
         }
     }
     out
+}
+
+#[cfg(test)]
+mod input_alias_tests {
+    use super::*;
+    use bc_expr::{BinaryOp, Expr};
+
+    fn agg(func: bc_ir::AggFunc, input: Option<Expr>, input2: Option<Expr>) -> AggregateItem {
+        AggregateItem {
+            func,
+            input,
+            input2,
+            alias: "a".into(),
+            param: None,
+        }
+    }
+
+    fn cmp(l: &str, r: &str) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Col { name: l.into() }),
+            right: Box::new(Expr::Col { name: r.into() }),
+        }
+    }
+
+    /// Two aggregates over the *same* computed expression share one evaluation, and the alias
+    /// points at the earlier of them — the TPC-H q21 shape, `min(e)` beside `max(e)`.
+    #[test]
+    fn identical_inputs_alias_to_the_first() {
+        let e = cmp("recv", "commit");
+        let aggs = [
+            agg(bc_ir::AggFunc::Min, Some(e.clone()), None),
+            agg(bc_ir::AggFunc::Max, Some(e.clone()), None),
+            agg(
+                bc_ir::AggFunc::Min,
+                Some(Expr::Col { name: "x".into() }),
+                None,
+            ),
+            agg(
+                bc_ir::AggFunc::Max,
+                Some(Expr::Col { name: "x".into() }),
+                None,
+            ),
+        ];
+        assert_eq!(
+            input_aliases(&aggs),
+            vec![None, Some(0), None, Some(2)],
+            "each aggregate must alias the first one carrying its expression"
+        );
+    }
+
+    /// Different expressions never alias — sharing one would compute the wrong aggregate.
+    #[test]
+    fn different_inputs_do_not_alias() {
+        let aggs = [
+            agg(bc_ir::AggFunc::Min, Some(cmp("a", "b")), None),
+            agg(bc_ir::AggFunc::Max, Some(cmp("b", "a")), None),
+            agg(
+                bc_ir::AggFunc::Sum,
+                Some(Expr::Col { name: "a".into() }),
+                None,
+            ),
+        ];
+        assert_eq!(input_aliases(&aggs), vec![None, None, None]);
+    }
+
+    /// `count(*)` has no input to share, and an `arg_min`/`arg_max` carries an ordering key its
+    /// value array is only interchangeable *with* — neither participates.
+    #[test]
+    fn inputless_and_keyed_aggregates_never_alias() {
+        let x = Expr::Col { name: "x".into() };
+        let aggs = [
+            agg(bc_ir::AggFunc::CountStar, None, None),
+            agg(bc_ir::AggFunc::CountStar, None, None),
+            agg(bc_ir::AggFunc::Min, Some(x.clone()), Some(x.clone())),
+            agg(bc_ir::AggFunc::Max, Some(x.clone()), Some(x.clone())),
+        ];
+        assert_eq!(input_aliases(&aggs), vec![None, None, None, None]);
+    }
 }
 
 #[cfg(test)]

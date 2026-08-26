@@ -92,7 +92,21 @@ _UNSAFE_HTML = (
 # Zero-width and bidirectional-override codepoints. They render as nothing, so an instruction
 # written with them between the letters reaches the model while a human reviewer sees clean
 # text. There is no legitimate reason for them in a retrieved document.
-_HIDDEN_UNICODE = "[​-‏‪-‮⁠-⁤﻿­]"
+#
+# Spelled as escapes, never as the characters themselves. A class written literally is
+# invisible in the source, in a diff, and in review - which is the same property that makes
+# these codepoints an attack - so any tool that normalizes Unicode on the way past silently
+# empties the detector and nothing looks different. `hidden_unicode_class_covers_exactly_the
+# _documented_codepoints` pins the set.
+_HIDDEN_UNICODE = (
+    "["
+    "\u200b-\u200f"  # ZWSP, ZWNJ, ZWJ, LRM, RLM
+    "\u202a-\u202e"  # LRE, RLE, PDF, LRO, RLO - the bidirectional overrides
+    "\u2060-\u2064"  # word joiner, function application, invisible times/separator/plus
+    "\ufeff"  # zero-width no-break space (BOM)
+    "\u00ad"  # soft hyphen
+    "]"
+)
 
 
 def instruction_override_rate(text: IntoExpr) -> Expr:
@@ -174,7 +188,7 @@ def hidden_unicode_rate(text: IntoExpr) -> Expr:
         .. doctest::
 
             >>> import batcher as bt
-            >>> docs = bt.from_pydict({"body": ["clean text", "hi​dden"]})
+            >>> docs = bt.from_pydict({"body": ["clean text", "hi\u200bdden"]})
             >>> docs.agg(r=bt.hidden_unicode_rate("body")).to_pydict()["r"][0]
             0.5
     """

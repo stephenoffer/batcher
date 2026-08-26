@@ -1,7 +1,12 @@
 """End-to-end column lineage through the public API for the ASOF join.
 
-Lineage is a pure plan analysis (nothing executes), but it must be correct on the plan
-the *public* surface builds. This exercises `Dataset.join_asof(...).lineage()` and asserts
+**There is no second engine to be an oracle for this**, and unlike the rest of this
+directory there cannot be: lineage is a pure plan analysis that nothing executes, so the
+assertion is the attribution itself, read off the plan the *public* surface builds. It is
+here rather than in `tests/unit/` because it goes through `bt.read.parquet(...)` end to end
+rather than constructing a plan by hand, which is what caught the regression below.
+
+This exercises `Dataset.join_asof(...).lineage()` and asserts that
 each output column names exactly the source column it is fed by — the regression being that
 an ASOF join fell through to the opaque catch-all, which attributed a left-derived column
 to the right source and dropped its true left origin.

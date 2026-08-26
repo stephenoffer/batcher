@@ -347,10 +347,18 @@ class Window(LogicalPlan):
                 )
             seen.add(fn.alias)
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the input — see `Sort.shape_ir` for why this seam exists.
+
+        Four distributed paths re-root a window on the bucket its reducer holds (the hash
+        shuffle, the Flight shuffle, and both global-window drivers). Two of them did it by
+        mutating the dict `to_ir()` returns, which is **memoized on the node**: the plan's
+        own lowered IR then carried `{"op": "scan", "source_id": 0}` as the window's input
+        for the rest of the process. Building the shape without an input removes both the
+        mutation and the discarded recursive lowering of the whole child subtree.
+        """
         return {
             "op": Op.WINDOW,
-            "input": self.input.to_ir(),
             "partition_keys": [e.to_ir() for e in self.partition_keys],
             "order_keys": [
                 {
@@ -363,6 +371,9 @@ class Window(LogicalPlan):
             "functions": [fn.to_ir() for fn in self.functions],
             "rank_limit": self.rank_limit,
         }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {**self.shape_ir(), "input": self.input.to_ir()}
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns() + [fn.alias for fn in self.functions]

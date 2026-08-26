@@ -90,7 +90,7 @@ pub fn hex_polygon(h: Hex, size: f64) -> GeoResult<Geometry> {
     let c = hex_center(h, size)?;
     let mut ring = Vec::with_capacity(7);
     for k in 0..6 {
-        let angle = std::f64::consts::PI / 3.0 * k as f64;
+        let angle = std::f64::consts::PI / 3.0 * f64::from(k);
         ring.push(Coord::new(
             c.x + size * angle.cos(),
             c.y + size * angle.sin(),
@@ -104,6 +104,7 @@ pub fn hex_polygon(h: Hex, size: f64) -> GeoResult<Geometry> {
 }
 
 /// The six hexagons sharing an edge with `h`.
+#[must_use]
 pub fn hex_neighbors(h: Hex) -> [Hex; 6] {
     [
         Hex { q: h.q + 1, r: h.r },
@@ -122,6 +123,7 @@ pub fn hex_neighbors(h: Hex) -> [Hex; 6] {
 }
 
 /// The number of steps between two hexagons on the grid.
+#[must_use]
 pub fn hex_distance(a: Hex, b: Hex) -> i64 {
     let (dq, dr) = (a.q - b.q, a.r - b.r);
     ((dq.abs() + dr.abs()) + (dq + dr).abs()) / 2
@@ -151,6 +153,7 @@ pub fn hex_key(h: Hex) -> GeoResult<i64> {
 }
 
 /// Recover an axial address from its packed key.
+#[must_use]
 pub fn hex_from_key(key: i64) -> Hex {
     Hex {
         q: (key >> PACK_BITS) - PACK_LIMIT,

@@ -719,6 +719,7 @@ fn slide<T: Clone, G: Fn(usize) -> Option<T>, F: Fn(&T, &T) -> T + Copy>(
     for part in ordered {
         let len = part.len();
         let ctx = crate::window::frame::frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         let mut fold = SlidingFold::new(combine);
         // One FIFO entry per *physical* position, so the queue length tracks
@@ -727,6 +728,7 @@ fn slide<T: Clone, G: Fn(usize) -> Option<T>, F: Fn(&T, &T) -> T + Copy>(
         let mut slots: Vec<bool> = Vec::new();
         for pos in 0..len {
             let (a, b) = crate::window::frame::frame_bounds(frame, pos, len, ctx.as_ref());
+            crate::window::frame::debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 match get(part[cur_b]) {
                     Some(v) => {

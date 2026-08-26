@@ -29,7 +29,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same_ordered
+from _harness import assert_same, assert_same_ordered
 
 pytestmark = pytest.mark.differential
 
@@ -191,3 +191,38 @@ def test_the_sql_window_table_names_only_tags_the_engine_has():
 
     unknown = sorted(set(_WINDOW_AGGS.values()) - WINDOW_AGGREGATES)
     assert not unknown, f"SQL window mapping names tags the engine does not have: {unknown}"
+
+
+#: Two more the engine computes and SQL could not reach, for the same reason as the `bit_*`
+#: family and by two different mechanisms. `product` arrives as an `Anonymous` node, so the
+#: class-name key never matched it; `count(DISTINCT x)` keeps its argument inside a
+#: `Distinct` wrapper, so the unwrapped read found a node where a column was expected and
+#: refused the whole window. `ds.window(functions={"w": ("product", "a")})` and its
+#: `count_distinct` twin returned the right answers throughout.
+@pytest.mark.parametrize(
+    "fn", ["product(a)", "product(a + b)", "count(DISTINCT a)", "count(DISTINCT a + b)"]
+)
+@pytest.mark.parametrize("over", ["PARTITION BY g", "PARTITION BY g ORDER BY b", "ORDER BY b"])
+def test_product_and_count_distinct_are_reachable_from_sql(duck, fn, over):
+    t = pa.table(
+        {
+            "a": pa.array([1, 1, 3, 4, 2, None], pa.int64()),
+            "b": pa.array([1, 2, 3, 4, 5, 6], pa.int64()),
+            "g": pa.array(["x", "x", "y", "y", "x", "y"]),
+        }
+    )
+    duck.register("t", t)
+    q = f"SELECT a, b, g, {fn} OVER ({over}) AS w FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+def test_hoisting_an_anonymous_windows_argument_does_not_rename_it():
+    """`Anonymous` keeps its *name* in `this` and its arguments in `expressions`.
+
+    Writing the hoisted column back through `this`, the way every other node takes it,
+    would rename `product` to the hidden column and lose the function entirely — a failure
+    that only appears for a computed argument, not a bare one.
+    """
+    t = pa.table({"a": pa.array([1, 2, 3], pa.int64()), "g": pa.array(["x", "x", "x"])})
+    out = bt.sql("SELECT product(a + 1) OVER (PARTITION BY g) AS w FROM t", t=t).to_pydict()
+    assert out == {"w": [24.0, 24.0, 24.0]}

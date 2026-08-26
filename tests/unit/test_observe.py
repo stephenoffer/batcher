@@ -379,7 +379,11 @@ def _bar_of(fraction, monkeypatch, env=None):
         monkeypatch.delenv(key, raising=False)
     for key, value in (env or {"NO_COLOR": "1", "TERM": "xterm"}).items():
         monkeypatch.setenv(key, value)
-    return ConsoleReporter(stream=_Stream(), live=True)._bar(fraction)
+    from batcher.observe.console import bar
+    from batcher.observe.theme import detect
+
+    palette, glyphs = detect(_Stream())
+    return bar(fraction, 24, palette, glyphs, frame=3)
 
 
 def test_bar_fills_proportionally(monkeypatch):
@@ -392,8 +396,11 @@ def test_bar_fills_proportionally(monkeypatch):
 def test_bar_uses_eighth_cells_for_sub_cell_progress(monkeypatch):
     """The smoothness claim: two fractions inside one cell must render differently."""
     monkeypatch.setenv("TERM", "xterm-256color")
-    reporter = ConsoleReporter(stream=_Stream(), live=True)
-    assert reporter._bar(0.605) != reporter._bar(0.620)
+    from batcher.observe.console import bar
+    from batcher.observe.theme import detect
+
+    palette, glyphs = detect(_Stream())
+    assert bar(0.605, 24, palette, glyphs, 0) != bar(0.620, 24, palette, glyphs, 0)
 
 
 def test_unknown_total_renders_an_indeterminate_sweep_not_a_fake_percentage(monkeypatch):
@@ -1843,7 +1850,7 @@ def test_every_style_token_resolves_without_a_theme_attribute():
     first paint before the script runs — got a page with no surfaces, borders, or text
     colour. Every panel and card collapsed to an unstyled box."""
     css = (_ASSETS / "app.css").read_text()
-    base = re.search(r"^:root \{\n(.*?)\n\}\n", css, re.S | re.M)
+    base = re.search(r"^:root \{\n(.*?)\n\}\n", css, re.DOTALL | re.MULTILINE)
     assert base, "the bare :root block defines the defaults; it must exist"
     defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", base.group(1)))
     used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
@@ -2602,7 +2609,7 @@ def test_no_control_is_named_only_by_a_symbol():
     bare glyph as their entire accessible name.
     """
     html = (_ASSETS / "index.html").read_text()
-    for m in re.finditer(r"<button([^>]*)>(.*?)</button>", html, re.S):
+    for m in re.finditer(r"<button([^>]*)>(.*?)</button>", html, re.DOTALL):
         attrs, inner = m.group(1), m.group(2)
         text = re.sub(r"<[^>]+>", "", inner).strip()
         named = "aria-label" in attrs or "aria-labelledby" in attrs
@@ -2676,7 +2683,7 @@ def test_text_on_a_filled_accent_is_a_named_token():
     assert "--on-accent:" in root
     components = css[css.index("═══ chrome ═══") :]
     # The print block deliberately keeps literals — print has no theme to resolve against.
-    non_print = re.sub(r"@media print \{.*?\n\}\n", "", components, flags=re.S)
+    non_print = re.sub(r"@media print \{.*?\n\}\n", "", components, flags=re.DOTALL)
     assert "color: #fff" not in non_print, "accent text must go through the token"
 
 
@@ -3602,7 +3609,7 @@ def test_every_run_panel_empty_state_teaches_rather_than_apologises():
         assert "empty-state" in html, f"{host_id} should use the teaching empty component"
         # A teaching empty has a title and a body of real length, not a bare sentence.
         assert "<h3>" in html, f"{host_id} empty needs a heading"
-        body = re.search(r"<p>(.*?)</p>", html, re.S)
+        body = re.search(r"<p>(.*?)</p>", html, re.DOTALL)
         assert body and len(body.group(1)) > 40, f"{host_id} empty body is too thin to teach"
 
 
@@ -3622,60 +3629,6 @@ def test_sparklines_are_legible_without_sight_and_readable_on_hover():
     assert "steady" in ctx.eval("UI.sparkline([20, 21, 19, 20], {label: 'x'})")
     # An empty series draws nothing rather than an empty svg.
     assert ctx.eval("UI.sparkline([], {label: 'x'})") == ""
-
-
-def test_the_js_and_python_count_formatters_agree_where_they_overlap():
-    """The terminal logger (`console._count`) and the web UI (`UI.count`) format the same row
-    counts. If they drift, one number reads two ways depending on where you look — the same
-    class of bug as the two diverged duration formatters earlier.
-
-    They are not identical by construction (the JS handles trillions and nulls the terminal
-    never sees), so this pins the overlapping range where they must agree.
-    """
-    quickjs = pytest.importorskip("quickjs")
-    from batcher.observe.console import _count as py_count
-
-    ctx = quickjs.Context()
-    ctx.eval((_ASSETS / "ui.js").read_text())
-
-    # Cover each SI band and its boundaries, staying inside the range both format.
-    samples = [
-        0,
-        1,
-        42,
-        999,
-        1000,
-        1234,
-        9999,
-        12345,
-        999_999,
-        1_000_000,
-        3_400_000,
-        999_999_999,
-        1_000_000_000,
-        5_600_000_000,
-    ]
-    for n in samples:
-        js = ctx.eval(f"UI.count({n})")
-        py = py_count(n)
-        assert js == py, f"count({n}): JS gave {js!r}, Python gave {py!r}"
-
-
-def test_the_js_and_python_duration_formatters_agree_where_they_overlap():
-    """Same discipline for durations: `console._dur` (terminal) vs `UI.ms` (web). The web
-    formatter drops to microseconds below 1ms where the terminal does not, so this pins the
-    millisecond-and-up range where both apply.
-    """
-    quickjs = pytest.importorskip("quickjs")
-    from batcher.observe.console import _dur as py_dur
-
-    ctx = quickjs.Context()
-    ctx.eval((_ASSETS / "ui.js").read_text())
-
-    for ms in [1, 42, 850, 999, 1000, 1500, 4200, 59_999, 60_000, 90_000, 125_000]:
-        js = ctx.eval(f"UI.ms({ms})")
-        py = py_dur(ms)
-        assert js == py, f"duration({ms}): JS gave {js!r}, Python gave {py!r}"
 
 
 def test_no_two_shortcuts_claim_the_same_key():
@@ -3714,49 +3667,6 @@ def test_the_key_dispatcher_matches_the_registry():
     # global keys in one block, f/c in the run-view conditional, space as `e.key === ' '`.
     for key in single:
         assert f"e.key === '{key}'" in app, f"key '{key}' is registered but never dispatched"
-
-
-def test_the_js_and_python_percent_formatters_agree():
-    """`console._pct` (terminal) and `UI.pct` (web) format the same shares. Both must treat a
-    small-but-present share as "<1%" and clamp to 100%, or the same ratio reads two ways."""
-    quickjs = pytest.importorskip("quickjs")
-    from batcher.observe.console import _pct as py_pct
-
-    ctx = quickjs.Context()
-    ctx.eval((_ASSETS / "ui.js").read_text())
-
-    for frac in [0, 0.003, 0.01, 0.1, 0.499, 0.5, 0.624, 0.999, 1.0, 1.5]:
-        js = ctx.eval(f"UI.pct({frac})")
-        py = py_pct(frac)
-        assert js == py, f"pct({frac}): JS gave {js!r}, Python gave {py!r}"
-
-
-def test_the_js_and_python_byte_formatters_agree():
-    """`console._bytes` (added for the terminal) and `UI.bytes` (web) format the same sizes.
-    Both read `0` and `None` as an em dash and use binary units."""
-    quickjs = pytest.importorskip("quickjs")
-    from batcher.observe.console import _bytes as py_bytes
-
-    ctx = quickjs.Context()
-    ctx.eval((_ASSETS / "ui.js").read_text())
-
-    for n in [
-        0,
-        1,
-        512,
-        1023,
-        1024,
-        1536,
-        1048575,
-        1048576,
-        3_400_000,
-        1073741824,
-        1610612736,
-        1099511627776,
-    ]:
-        js = ctx.eval(f"UI.bytes({n})")
-        py = py_bytes(n)
-        assert js == py, f"bytes({n}): JS gave {js!r}, Python gave {py!r}"
 
 
 def test_the_browser_tab_title_reflects_where_you_are():
@@ -4224,3 +4134,30 @@ def test_an_engine_that_cannot_report_is_a_shrug_not_agreement(monkeypatch):
     monkeypatch.setattr(hw, "engine_hardware", dict)
     monkeypatch.setattr(hw, "available_cpu_count", lambda: 64)
     assert resources.stale_core_budget({}, [], 0.0) == []
+
+
+def test_the_terminal_renders_numbers_through_the_one_shared_vocabulary():
+    """The console must not carry its own formatters, however small they look.
+
+    It used to carry four — `_count`, `_dur`, `_pct`, `_bytes` — two of which were
+    byte-identical copies of `observe.inference.measures`, and one of which claimed in its
+    docstring to match the dashboard "exactly" while disagreeing with it on every duration
+    below a millisecond. Four hand-written tests here checked four of those pairings by
+    hand; `_internal.humanize` is now the single implementation and
+    `tests/unit/test_humanize_ui_parity.py` holds it against the real `ui.js` over a shared
+    vector table, which is both stronger and one thing to maintain instead of four.
+
+    This test's job is only to stop a fifth copy appearing.
+    """
+    import inspect
+
+    from batcher.observe.console import paint, reporter, state
+
+    for module in (paint, reporter, state):
+        source = inspect.getsource(module)
+        for banned in ("1024", "1e9", "1e6", '"KiB"', "'KiB'"):
+            assert banned not in source, (
+                f"{module.__name__} formats a magnitude itself; "
+                "use batcher._internal.humanize so the terminal and the dashboard agree"
+            )
+    assert "humanize" in inspect.getsource(paint)

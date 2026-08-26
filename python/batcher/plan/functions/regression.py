@@ -10,13 +10,27 @@ Following SQL semantics, every function considers only rows where **both** ``x``
 ``y`` are non-null; the pairing is done by null-propagating arithmetic (``x + y*0`` is
 ``x`` when both are present, null otherwise) so a null in either column drops the pair
 from all of `count`, the means, and the sums of squares. A group with fewer than two
-valid pairs has an undefined fit — slope/intercept are ``NaN`` there.
+valid pairs, or one whose ``x`` is flat, has no fit: `regr_slope` is ``NaN`` there and
+`regr_intercept` is null, which is what DuckDB answers for each.
 """
 
 from __future__ import annotations
 
+from batcher.plan.expr_ir.constructors import null, nullif, when
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column, corr, covar_pop
+
+__all__ = [
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+]
 
 
 def _paired(y: IntoExpr, x: IntoExpr) -> tuple[Expr, Expr]:
@@ -126,7 +140,7 @@ def regr_intercept(y: IntoExpr, x: IntoExpr) -> Expr:
         x: The independent column.
 
     Returns:
-        The regression intercept per group (``NaN`` if fewer than two paired rows).
+        The regression intercept per group, null when ``x`` has zero variance.
 
     Examples:
         .. doctest::
@@ -135,9 +149,18 @@ def regr_intercept(y: IntoExpr, x: IntoExpr) -> Expr:
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 3.0, 5.0, 7.0]})
             >>> ds.agg(b=bt.regr_intercept(bt.col("y"), bt.col("x"))).to_pydict()
             {'b': [-1.0]}
+
+            >>> flat = bt.from_pydict({"x": [1.0, 1.0], "y": [2.0, 5.0]})
+            >>> flat.agg(b=bt.regr_intercept(bt.col("y"), bt.col("x"))).to_pydict()
+            {'b': [None]}
     """
     yp, xp = _paired(y, x)
-    slope = covar_pop(yp, xp) / covar_pop(xp, xp)
+    # `nullif(var, 0)`, not a bare division: with no variance in `x` there is no line, and
+    # `0/0` made the intercept NaN where DuckDB and PostgreSQL both answer NULL. That also
+    # left the family contradicting itself — `regr_r2` returned NULL on the same input
+    # while this returned NaN. `regr_slope` keeps its NaN, which is what DuckDB returns
+    # there; the two genuinely differ in the oracle and are not a copy of one rule.
+    slope = covar_pop(yp, xp) / nullif(covar_pop(xp, xp), Lit(0.0))
     return yp.mean() - slope * xp.mean()
 
 
@@ -149,7 +172,8 @@ def regr_r2(y: IntoExpr, x: IntoExpr) -> Expr:
         x: The independent column.
 
     Returns:
-        The fraction of variance explained, in ``[0, 1]`` (null if undefined).
+        The fraction of variance explained, in ``[0, 1]``; null when ``x`` is flat and
+        ``1.0`` when ``y`` is flat but ``x`` is not.
 
     Examples:
         .. doctest::
@@ -158,9 +182,19 @@ def regr_r2(y: IntoExpr, x: IntoExpr) -> Expr:
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 3.0, 5.0, 7.0]})
             >>> round(ds.agg(r=bt.regr_r2(bt.col("y"), bt.col("x"))).to_pydict()["r"][0], 6)
             1.0
+
+            >>> flat_y = bt.from_pydict({"x": [1.0, 2.0, 3.0], "y": [5.0, 5.0, 5.0]})
+            >>> flat_y.agg(r=bt.regr_r2(bt.col("y"), bt.col("x"))).to_pydict()
+            {'r': [1.0]}
     """
     yp, xp = _paired(y, x)
-    return corr(yp, xp) ** 2
+    # R2 is not simply `corr**2`: the two degenerate cases are defined, differently, by both
+    # DuckDB and PostgreSQL, and `corr` is null in each of them — so the plain square
+    # answered NULL where the standard answers 1. A flat `x` has no line to explain
+    # anything (null); a flat `y` is explained perfectly by any line (1).
+    var_x, var_y = covar_pop(xp, xp), covar_pop(yp, yp)
+    explained = when(var_y == Lit(0.0)).then(Lit(1.0)).otherwise(corr(yp, xp) ** 2)
+    return when(var_x == Lit(0.0)).then(null("float64")).otherwise(explained)
 
 
 def regr_sxx(y: IntoExpr, x: IntoExpr) -> Expr:

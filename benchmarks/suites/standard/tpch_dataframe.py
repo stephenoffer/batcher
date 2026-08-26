@@ -135,6 +135,13 @@ def _q6(h: dict[str, Any]) -> pa.Table:
         .filter(
             (col("l_shipdate") >= lit(date(1994, 1, 1)))
             & (col("l_shipdate") < lit(date(1995, 1, 1)))
+            # The SQL says `BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. These literals are that
+            # band and MUST NOT be "corrected" to compute it in Python: `0.06 + 0.01` in
+            # IEEE double is 0.06999999999999999, one ulp below 0.07, which drops every
+            # `l_discount = 0.07` row — the exact bug that makes Polars' and Daft's q6
+            # revenue wrong. Batcher's own SQL path folds the literals to 0.05 / 0.07
+            # (visible as `pushed[... l_discount >= 0.05 AND l_discount <= 0.07]` in
+            # `explain()`), matching DuckDB, so these constants are what bt.sql() derives.
             & (col("l_discount") >= lit(0.05))
             & (col("l_discount") <= lit(0.07))
             & (col("l_quantity") < lit(24.0))
@@ -188,6 +195,11 @@ def _q12(h: dict[str, Any]) -> pa.Table:
         & (col("l_receiptdate") >= lit(date(1994, 1, 1)))
         & (col("l_receiptdate") < lit(date(1995, 1, 1)))
     )
+    # `low_line_count` counts a NULL `o_orderpriority` as low, where the SQL's
+    # `CASE WHEN p <> '1-URGENT' AND p <> '2-HIGH'` counts it as neither: a NULL comparison
+    # is NULL, so the CASE falls to ELSE 0 on *both* branches. TPC-H's `orders` has no NULL
+    # priority so nothing here can trigger it, and the correctness gate would catch it on
+    # data that did. Noted so a future reader does not read the asymmetry as an oversight.
     return (
         h["orders"]
         .join(line, left_on="o_orderkey", right_on="l_orderkey")

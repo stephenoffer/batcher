@@ -15,8 +15,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
-from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
+from batcher.ml.llm.channels import logprob_sink
+from batcher.ml.llm.engines.base import (
+    Engine,
+    EngineFactory,
+    batched_engine,
+    unpack_request,
+)
 from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
 
 __all__ = ["http_engine"]
@@ -171,19 +176,15 @@ def http_engine(
         # more than the inference.
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
 
-        def engine(prompts: list) -> list[str]:
-            if concurrency <= 1 or len(prompts) <= 1:
-                results = [call_one(p) for p in prompts]
-            else:
-                # `Executor.map` preserves input order; the calls overlap because each
-                # blocks on network I/O (GIL released), bounded to `concurrency` slots.
-                results = list(pool.map(call_one, prompts))
-            usage = [r.usage for r in results]
-            usage_sink().report(usage)
-            finish_reason_sink().report([r.finish_reason for r in results])
-            logprob_sink().report([r.logprob for r in results])
-            engine.last_usage = usage  # the documented legacy channel
-            return [r.text for r in results]
+        # The batch loop is `base.batched_engine`, shared with every other served-endpoint
+        # engine. Only the per-token logprobs are OpenAI's alone, and they go through its
+        # `report` hook rather than through a second copy of the loop.
+        engine = batched_engine(
+            call_one,
+            pool,
+            concurrency,
+            report=lambda results: logprob_sink().report([r.logprob for r in results]),
+        )
 
         # The pool lives as long as the worker, which is the point — but nothing was ever
         # shutting it down, so `concurrency` threads outlived every engine that was built.

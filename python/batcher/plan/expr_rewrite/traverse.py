@@ -72,7 +72,7 @@ from batcher.plan.expr_ir.func_nodes import (
 from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
 from batcher.plan.expr_ir.namespaces.sequence import SeqFunc
 from batcher.plan.expr_ir.node_base import child_fields_of
-from batcher.plan.expr_ir.nodes import HashRows, MakeStruct, Sequence
+from batcher.plan.expr_ir.nodes import HashRows, MakeMap, MakeStruct, Sequence
 from batcher.plan.expr_ir.video import VideoFunc
 
 __all__ = ["ExprRule", "transform_expr_up"]
@@ -187,7 +187,8 @@ _REGULAR: tuple[type, ...] = (
     Array, AudioFunc, Binary, Cast, Coalesce, ConvertTimezone, DateFunc, DateOffset,
     DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc, IsInf, IsNan,
     IsNotNull, IsNull, Least, ListBinary, ListContains, ListFunc, ListGet, ListGetDyn,
-    ListJoin, ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeTemporal,
+    ListJoin, ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeMap,
+    MakeTemporal,
     Math2Expr, MathExpr, MapFunc, Not, NullIf, SeqFunc, Sequence, SpatialFunc, Strftime,
     Strptime, StrFunc, StrFuncDyn, StructField, VideoFunc, WindowBuckets, WindowStart,
 )  # fmt: skip

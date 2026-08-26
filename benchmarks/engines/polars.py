@@ -32,7 +32,7 @@ from .base import Engine, Rename, SqlRunner
 # change). Queries Polars genuinely cannot express (scalar/correlated subquery
 # comparisons) still surface as PARTIAL rather than a wrong answer.
 _SPLIT_INTERVAL = re.compile(
-    r"interval\s+'(\d+)'\s+(year|month|week|day|hour|minute|second)s?\b", re.I
+    r"interval\s+'(\d+)'\s+(year|month|week|day|hour|minute|second)s?\b", re.IGNORECASE
 )
 
 

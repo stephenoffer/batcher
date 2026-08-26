@@ -23,7 +23,7 @@ __all__ = ["init_ray", "strip_broken_runtime_env_hook", "worker_pip"]
 def _req_name(requirement: str) -> str:
     """The distribution name a pip requirement string names, lowercased."""
     for sep in ("=", "<", ">", "[", "!", "~", " "):
-        requirement = requirement.split(sep)[0]
+        requirement = requirement.split(sep, maxsplit=1)[0]
     return requirement.strip().lower()
 
 
@@ -88,6 +88,31 @@ def strip_broken_runtime_env_hook(*, unconditional: bool = False) -> None:
             os.environ.pop(var, None)
 
 
+def _require_release() -> None:
+    """Refuse a dev-profile engine before any of these scripts measures anything.
+
+    Every benchmark in this directory is invoked as ``python benchmarks/<dir>/<name>.py``,
+    so only its own directory is on ``sys.path`` and ``envinfo`` two levels up is not
+    importable without help. Doing it here rather than in nineteen scripts means a new one
+    cannot forget: they all reach the cluster through the init functions below.
+
+    A dev build is 8-60x slower than release, so a number taken from one compares an
+    unoptimized Batcher against release comparators. ``BENCH_ALLOW_DEBUG_BUILD=1`` overrides.
+
+    Deliberately *not* also calling ``require_quiet_box``: the work in these benchmarks
+    happens on cluster workers, so the driver's run queue is not the contention signal that
+    would invalidate the measurement, and refusing on it would be a false negative.
+    """
+    import sys
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from envinfo import require_release_build
+
+    require_release_build()
+
+
 def init_ray(
     *,
     pip: Any = None,
@@ -103,6 +128,7 @@ def init_ray(
             ``os.environ`` does not otherwise reach a remote actor.
         unconditional_hook_strip: Forwarded to `strip_broken_runtime_env_hook`.
     """
+    _require_release()
     strip_broken_runtime_env_hook(unconditional=unconditional_hook_strip)
     import ray
 

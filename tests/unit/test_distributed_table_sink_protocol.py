@@ -123,7 +123,7 @@ def test_a_table_sink_is_routed_to_the_exit_it_survives(monkeypatch) -> None:
             return []
 
     monkeypatch.setitem(SINKS._items, "_probe_table_sink", lambda **_kw: _TableSink())
-    monkeypatch.setattr(dist_write, "engine", lambda: object())
+    monkeypatch.setattr(dist_write, "engine", object)
     monkeypatch.setattr(
         "batcher.dist.executors.partition_io.read_partition_descriptor",
         lambda _p: [pa.record_batch({"id": [1, 2]})],
@@ -136,7 +136,7 @@ def test_a_table_sink_is_routed_to_the_exit_it_survives(monkeypatch) -> None:
         def execute_plan(self, _ir, batches, _cfg):
             return list(batches[0])
 
-    monkeypatch.setattr(dist_write, "engine", lambda: _Nat())
+    monkeypatch.setattr(dist_write, "engine", _Nat)
     dist_write._write_plan_shard(
         "{}", {}, "_probe_table_sink", {}, "orders", None, 3, "{}", None, False
     )
@@ -152,7 +152,7 @@ def test_a_shard_with_no_rows_writes_nothing_to_a_table(monkeypatch) -> None:
             raise AssertionError("an empty shard reached the sink")
 
     monkeypatch.setitem(SINKS._items, "_probe_empty_sink", lambda **_kw: _Boom())
-    monkeypatch.setattr(dist_write, "engine", lambda: object())
+    monkeypatch.setattr(dist_write, "engine", object)
     monkeypatch.setattr(
         "batcher.dist.executors.partition_io.read_partition_descriptor", lambda _p: []
     )

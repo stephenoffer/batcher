@@ -409,15 +409,18 @@ the scan, or that a join was reordered the way you expected.
 print(events.filter(bt.col("status") == "active").select("region", "amount").explain())
 ```
 
-One operator per line, indented by depth, each with its row estimate and where that
+One operator per line as a tree, each with what it does, its row estimate, and where that
 estimate came from: `exact` when the source knows, `learned` from a previous run's
 measurements, `default` from a heuristic. Under `decisions:` are the calls the engine
 made along the way.
 
 ```text
-project                         est≈4 (learned)
-  filter                        est≈4 (learned)
-    scan                        est≈6 (exact) pushed[status = active]
+query plan (planned)                            3 operators
+───────────────────────────────────────────────────────────
+OPERATOR                     ESTIMATE  NOTES
+project                         est≈4  (learned)
+└─ filter  [status = active]    est≈4  (learned)
+   └─ scan  [source 0]          est≈6  (exact)  pushed[status = active]
 
 decisions:
   - [core/io] source read at 40 MB/s (learned)

@@ -354,7 +354,7 @@ mod tests {
             vec![
                 Some("GCAT".into()),
                 Some("AAATTT".into()),
-                Some("".into()),
+                Some(String::new()),
                 None
             ]
         );

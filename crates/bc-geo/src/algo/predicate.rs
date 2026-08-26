@@ -28,6 +28,7 @@ use crate::types::{Coord, Geometry};
 use crate::Geom;
 
 /// True when the two geometries share at least one point.
+#[must_use]
 pub fn intersects(a: &Geom, b: &Geom) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -84,6 +85,7 @@ fn vertices(g: &Geometry) -> Vec<Coord> {
 }
 
 /// True when the two geometries share no point at all.
+#[must_use]
 pub fn disjoint(a: &Geom, b: &Geom) -> bool {
     !intersects(a, b)
 }
@@ -93,6 +95,7 @@ pub fn disjoint(a: &Geom, b: &Geom) -> bool {
 /// The difference from `contains` is exactly the boundary: a polygon covers a point on
 /// its edge but does not contain it, and a polygon covers the polygon it shares an edge
 /// with only if it also swallows its interior.
+#[must_use]
 pub fn covers(a: &Geom, b: &Geom) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -126,16 +129,19 @@ pub fn covers(a: &Geom, b: &Geom) -> bool {
 }
 
 /// True when `b` lies in `a` and touches at least `a`'s interior.
+#[must_use]
 pub fn contains(a: &Geom, b: &Geom) -> bool {
     covers(a, b) && interiors_intersect(a, b)
 }
 
 /// True when `a` lies in `b` and touches at least `b`'s interior.
+#[must_use]
 pub fn within(a: &Geom, b: &Geom) -> bool {
     contains(b, a)
 }
 
 /// True when every point of `a` lies in `b` (boundary included).
+#[must_use]
 pub fn covered_by(a: &Geom, b: &Geom) -> bool {
     covers(b, a)
 }
@@ -146,6 +152,7 @@ pub fn covered_by(a: &Geom, b: &Geom) -> bool {
 /// A geometry's interior depends on its own dimension, not on the plane's — a line has
 /// no area but it does have an interior, and every predicate that distinguishes
 /// `touches` from `crosses` turns on that.
+#[must_use]
 pub fn in_interior(p: Coord, g: &Geometry) -> bool {
     for poly in g.polygons() {
         if point_in_polygon(p, poly) == PointRing::Inside {
@@ -231,6 +238,7 @@ fn meeting_points(a: &Geometry, b: &Geometry) -> Vec<Coord> {
 /// not an open set, so a polygon vertex landing exactly on a line proves nothing about
 /// the polygon's interior; the direct pass already handles the linear cases, because a
 /// line's probe points lie in its own interior rather than merely on its boundary.
+#[must_use]
 pub fn interiors_intersect(a: &Geom, b: &Geom) -> bool {
     if !intersects(a, b) {
         return false;
@@ -326,6 +334,7 @@ fn chains_cross_transversally(a: &Geometry, b: &Geometry) -> bool {
 /// in a line, and two linear ones meet in a line only where a pair of their segments is
 /// collinear and overlapping. That last case is the only one needing a scan, and it is
 /// what separates `crosses` from `overlaps` for line pairs.
+#[must_use]
 pub fn interior_intersection_dim(a: &Geom, b: &Geom) -> Option<i64> {
     if !interiors_intersect(a, b) {
         return None;
@@ -341,6 +350,7 @@ pub fn interior_intersection_dim(a: &Geom, b: &Geom) -> Option<i64> {
 }
 
 /// The highest topological dimension present in a geometry.
+#[must_use]
 pub fn dimension(g: &Geometry) -> i64 {
     if !g.polygons().is_empty() {
         return 2;
@@ -387,12 +397,14 @@ fn collinear_overlap(a: &Geometry, b: &Geometry) -> bool {
 }
 
 /// True when the geometries meet but their interiors do not.
+#[must_use]
 pub fn touches(a: &Geom, b: &Geom) -> bool {
     intersects(a, b) && !interiors_intersect(a, b)
 }
 
 /// True when the interiors meet in something of lower dimension than the operands, and
 /// neither geometry covers the other.
+#[must_use]
 pub fn crosses(a: &Geom, b: &Geom) -> bool {
     let Some(d) = interior_intersection_dim(a, b) else {
         return false;
@@ -403,6 +415,7 @@ pub fn crosses(a: &Geom, b: &Geom) -> bool {
 
 /// True when the geometries have the same dimension, their interiors meet in something
 /// of that same dimension, and neither covers the other.
+#[must_use]
 pub fn overlaps(a: &Geom, b: &Geom) -> bool {
     let da = dimension(&a.geometry);
     let db = dimension(&b.geometry);
@@ -421,6 +434,7 @@ pub fn overlaps(a: &Geom, b: &Geom) -> bool {
 /// and counter-clockwise, or with an extra collinear vertex, is equal. `Geom`'s derived
 /// `PartialEq` is the structural comparison, and the two are deliberately different
 /// operations because `ST_Equals` and "is the same WKB" answer different questions.
+#[must_use]
 pub fn geom_equals(a: &Geom, b: &Geom) -> bool {
     if a.is_empty() && b.is_empty() {
         return true;
@@ -432,6 +446,7 @@ pub fn geom_equals(a: &Geom, b: &Geom) -> bool {
 ///
 /// A negative radius is a caller error, not an empty result: it means the query is
 /// asking a question with no answer, and silently returning false would hide it.
+#[must_use]
 pub fn dwithin(a: &Geom, b: &Geom, radius: f64) -> Option<bool> {
     if radius < 0.0 || radius.is_nan() {
         return None;

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::RecordBatch;
 use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
 use bc_resource::{CancelToken, MemoryPool, MemoryReservation};
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec, SpillStore};
@@ -166,8 +166,7 @@ impl ExecOptions {
                 dir: cfg
                     .spill_dir
                     .as_ref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir),
+                    .map_or_else(std::env::temp_dir, PathBuf::from),
                 codec: SpillCodec::from_config_str(cfg.spill_compression.as_deref()),
             });
         }
@@ -358,8 +357,16 @@ pub fn execute_parallel_with_metrics(
 /// it, it contends for the pool's job queue, and — because a scoped pool is cached per
 /// width — a one-row query would otherwise install and spin a 96-thread pool. Batcher's
 /// stated goal of low fixed overhead on sub-second queries is exactly this case. The cap
-/// is an upper bound on useful parallelism at the leaves, so it can never remove
-/// parallelism a plan could have used, and it never changes a result (scheduling only).
+/// is an upper bound on useful parallelism *at the leaves*, and it never changes a result
+/// (scheduling only). It is **not** an upper bound on what the plan could use, which is what
+/// the two exceptions below correct: both are shapes where the work downstream of a leaf is
+/// unbounded by that leaf's morsel count.
+///
+/// **Exception — a plan that multiplies rows.** The cap also assumes an operator's output is
+/// bounded by its input, which `Unnest`, `Unpivot` and `RangeJoin` break: a hundred-row table of
+/// ten-thousand-element lists is one morsel at the leaf and a million rows immediately after it.
+/// Capping on the leaf then pins the *whole downstream* to one core. See
+/// [`RelOp::multiplies_rows`] for why `HashJoin` is not in that set.
 ///
 /// **Exception — media decode.** The morsel cap assumes per-morsel work is O(morsel)
 /// cheap columnar work, so one morsel needs at most one core. A `.image`/`.audio`/`.video`
@@ -370,12 +377,13 @@ pub fn execute_parallel_with_metrics(
 /// carries a media decode we lift the cap to all cores; the intra-kernel fan-out shares
 /// this same pool (rayon work-stealing, no oversubscription), so it is right whether the
 /// input is one morsel or many. Still scheduling only — the result is unchanged.
+#[must_use]
 pub fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) -> usize {
     if opts.parallelism > 0 {
         return opts.parallelism;
     }
     let cores = bc_arrow::usable_cores();
-    if plan.contains_media_decode() {
+    if plan.contains_media_decode() || plan.multiplies_rows() {
         return cores.max(1);
     }
     // **Every physical core, plus a third of the SMT siblings** (`bc_arrow::operator_cores`),
@@ -604,7 +612,7 @@ fn pin_threads_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("BATCHER_PIN_THREADS").as_deref(),
-            Ok("1") | Ok("true")
+            Ok("1" | "true")
         )
     })
 }
@@ -1045,25 +1053,24 @@ fn exec(
                         sp.memory_budget_bytes,
                         sp.codec,
                     )?);
-                    match bounded {
-                        Some((gc, ac)) => (gc, ac),
-                        None => {
-                            let p = grace_partitions(&partials, sp.memory_budget_bytes);
-                            let mut store = DiskSpillStore::with_codec(
-                                sp.dir.join(format!("agg-{p}p")),
-                                p,
-                                sp.codec,
-                            )?;
-                            let res = combine_finalize_spilling(
-                                partials,
-                                &funcs,
-                                &mut store,
-                                sp.memory_budget_bytes,
-                            )?;
-                            spill_vol = store.spilled_bytes(); // measured grace-spill volume
-                            warn_if_skewed(op_id, "aggregate", &store);
-                            (res.group_columns, res.agg_columns)
-                        }
+                    if let Some((gc, ac)) = bounded {
+                        (gc, ac)
+                    } else {
+                        let p = grace_partitions(&partials, sp.memory_budget_bytes);
+                        let mut store = DiskSpillStore::with_codec(
+                            sp.dir.join(format!("agg-{p}p")),
+                            p,
+                            sp.codec,
+                        )?;
+                        let res = combine_finalize_spilling(
+                            partials,
+                            &funcs,
+                            &mut store,
+                            sp.memory_budget_bytes,
+                        )?;
+                        spill_vol = store.spilled_bytes(); // measured grace-spill volume
+                        warn_if_skewed(op_id, "aggregate", &store);
+                        (res.group_columns, res.agg_columns)
                     }
                 }
                 Admit::InMemory(_reservation) => {
@@ -1233,8 +1240,9 @@ fn exec(
                             // envelope, fall back to the module default.
                             let run_target = opts
                                 .op_budget(op_id)
-                                .map(|b| (b as u64 / 4).max(1 << 20))
-                                .unwrap_or(ops::DEFAULT_RUN_TARGET_BYTES)
+                                .map_or(ops::DEFAULT_RUN_TARGET_BYTES, |b| {
+                                    (b as u64 / 4).max(1 << 20)
+                                })
                                 .min(ops::DEFAULT_RUN_TARGET_BYTES);
                             let (sorted, vol) = ops::external_merge_sort(
                                 parts,
@@ -1271,7 +1279,7 @@ fn exec(
             // budget so Carbonite's memory model isn't taught the in-core footprint. An
             // in-memory sort adds its permutation/range scratch to the materialized input.
             let peak_in = if spilled {
-                in_bytes.min(opts.op_budget(op_id).map(|b| b as u64).unwrap_or(in_bytes))
+                in_bytes.min(opts.op_budget(op_id).map_or(in_bytes, |b| b as u64))
             } else {
                 in_bytes.saturating_add(sort_scratch)
             };
@@ -1903,9 +1911,10 @@ fn exec(
                 );
                 return Ok(out);
             }
-            let (batches, spilled, spill_vol) = match keys.is_empty() {
-                true => distinct(&parts, opts, op_id)?,
-                false => distinct_on(&parts, keys, order, opts, op_id)?,
+            let (batches, spilled, spill_vol) = if keys.is_empty() {
+                distinct(&parts, opts, op_id)?
+            } else {
+                distinct_on(&parts, keys, order, opts, op_id)?
             };
             // Re-morselize (zero-copy slices) so a downstream breaker — a COUNT(DISTINCT)'s
             // outer GROUP BY, or a join — fans back out across cores instead of processing the
@@ -3087,11 +3096,7 @@ fn exec_agg_fused(
     // relation no longer bounds its peak; cap it at the operator's resolved budget so
     // Carbonite doesn't learn that a bounded-memory spill "needed" the full input.
     let peak_in = if spilled {
-        base_bytes.min(
-            opts.op_budget(op_id)
-                .map(|b| b as u64)
-                .unwrap_or(base_bytes),
-        )
+        base_bytes.min(opts.op_budget(op_id).map_or(base_bytes, |b| b as u64))
     } else {
         base_bytes
     };
@@ -3498,7 +3503,7 @@ mod tests {
                     out.push((lv.value(i), rv.value(i)));
                 }
             }
-            out.sort();
+            out.sort_unstable();
             out
         };
 
@@ -4051,6 +4056,67 @@ mod tests {
         };
         assert_eq!(auto_width(&opts, &[], &no_media_plan()), 1);
         assert_eq!(auto_width(&opts, &[vec![]], &no_media_plan()), 1);
+    }
+
+    /// A row-multiplying plan lifts the morsel-count cap, for the same reason a media decode
+    /// does: the work downstream of the leaf is not bounded by the leaf's morsel count.
+    ///
+    /// The shape that motivates it is a one-morsel table of long lists, which `Unnest` turns
+    /// into a large relation *before* anything else runs. Capping on the leaf pinned the
+    /// aggregate, sort or join after it to a single worker. `Unpivot` and `RangeJoin` are the
+    /// other two; `HashJoin` is deliberately not (see `RelOp::multiplies_rows`), and the
+    /// negative case below is what stops this test from passing for a plan-shape it should not.
+    #[test]
+    fn auto_width_lifts_the_morsel_cap_for_a_row_multiplying_plan() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            morsel_rows: 4096,
+            ..ExecOptions::default()
+        };
+        // One row: one morsel, so the cap alone would say one worker.
+        let one_morsel = vec![batch(&[1], &[1])];
+        assert_eq!(
+            auto_width(&opts, std::slice::from_ref(&one_morsel), &no_media_plan()),
+            1,
+            "the cap still binds a plan whose output is bounded by its input"
+        );
+
+        let unnest = RelOp::Unnest {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            column: "v".into(),
+            alias: "v".into(),
+            outer: false,
+            index_alias: None,
+        };
+        let cores = bc_arrow::usable_cores().max(1);
+        assert_eq!(
+            auto_width(&opts, std::slice::from_ref(&one_morsel), &unnest),
+            cores,
+            "an Unnest can turn one morsel into a large relation; the cap must not pin it"
+        );
+
+        // The lift is a property of the *plan*, so it survives operators layered above the
+        // multiplying one — that downstream work is exactly what was being pinned.
+        let over_unnest = RelOp::Aggregate {
+            input: Box::new(unnest),
+            group_keys: vec![ProjectionItem {
+                expr: bc_expr::Expr::Col { name: "k".into() },
+                alias: "k".into(),
+            }],
+            aggregates: Vec::new(),
+        };
+        assert_eq!(
+            auto_width(&opts, std::slice::from_ref(&one_morsel), &over_unnest),
+            cores
+        );
+
+        // Negative control: an explicit `parallelism` is still honored verbatim, so the lift
+        // cannot override what the control plane asked for.
+        let pinned = ExecOptions {
+            parallelism: 2,
+            ..opts.clone()
+        };
+        assert_eq!(auto_width(&pinned, &[one_morsel], &over_unnest), 2);
     }
 
     /// A media-decode plan lifts the morsel-count cap: its per-row decode is heavy and
@@ -5045,7 +5111,7 @@ mod tests {
                     let mut pairs: Vec<(i64, i64)> = (0..keys.len())
                         .map(|j| (keys.value(j), vals.value(j)))
                         .collect();
-                    pairs.sort();
+                    pairs.sort_unstable();
                     Some(pairs)
                 };
                 out.insert(k.value(i), entry);

@@ -226,7 +226,7 @@ A {py:class}`Trigger <batcher.Trigger>` sets the cadence (Spark parity):
 - `"append"` (default): only rows that are final and will not change again. For a
   plain pipeline that is every row; for a windowed aggregation it is a window's row
   once the watermark closes it.
-- `"complete"`: the full result table after every micro-batch. Aggregations only.
+- `"complete"`: the full result table after every micro-batch. Aggregations only, including the projections and HAVING filters above one ({doc}`streaming-emission`).
 - `"update"`: only the result rows whose value changed this micro-batch.
 
 Those literals are the values of the {py:class}`OutputMode <batcher.OutputMode>`

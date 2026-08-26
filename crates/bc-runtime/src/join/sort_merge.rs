@@ -64,8 +64,8 @@ pub fn sort_merge_join_indices(
     right_keys: &[ArrayRef],
     join_type: JoinType,
 ) -> Result<JoinIndices, RuntimeError> {
-    let n_left = left_keys.first().map_or(0, |a| a.len());
-    let n_right = right_keys.first().map_or(0, |a| a.len());
+    let n_left = left_keys.first().map_or(0, bc_arrow::Array::len);
+    let n_right = right_keys.first().map_or(0, bc_arrow::Array::len);
 
     // Canonicalize signed zero on float keys so `-0.0` and `0.0` join as equal, exactly as
     // the hash-join path does (see `join/mod.rs`). Arrow's row encoding gives them distinct

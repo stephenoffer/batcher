@@ -21,6 +21,7 @@ from batcher._sql.parser.expressions import _AGG_FUNCS
 from batcher._sql.parser.expressions.aggregates import (
     build_anon_agg,
     build_typed_agg,
+    distinct_input,
     is_agg_node,
     iter_agg_nodes,
 )
@@ -452,7 +453,11 @@ def _agg(tr, node) -> AggExpr | Expr:
         p = node.expression
         if not isinstance(p, exp.Literal) or p.is_string:
             raise NotImplementedError("percentile_cont requires a constant fraction")
-        return AggExpr("quantile", tr._scalar(node.this), param=float(p.name))
+        # A DISTINCT argument is unwrapped and recorded for the pre-dedup rewrite, exactly
+        # as the reductions below do; the quantile itself is then an ordinary one.
+        return AggExpr(
+            "quantile", tr._scalar(distinct_input(tr, node) or node.this), param=float(p.name)
+        )
     # array_agg(x) and string_agg(x, sep) both collect into a list; the separator
     # join for string_agg happens in the projection (see scalar._scalar).
     if fname in ("arrayagg", "groupconcat"):

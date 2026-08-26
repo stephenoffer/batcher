@@ -6,7 +6,7 @@ public dataset (``sources`` — no data is generated), runs the cases, and repor
 them. Correctness is verified before any timing is trusted (see ``harness.py``): a
 query is only timed once the engines agree.
 
-Run (single-node default lineup: batcher, duckdb, polars, pyarrow):
+Run (single-node default lineup: batcher, duckdb, polars, pyarrow, daft):
     source .venv/bin/activate
     python3 benchmarks/run.py                                  # TPC-H, scale 1
     python3 benchmarks/run.py --benchmark clickbench           # ClickBench (hits)
@@ -16,11 +16,12 @@ Run (single-node default lineup: batcher, duckdb, polars, pyarrow):
     python3 benchmarks/run.py --benchmark h2o-join             # H2O.ai db-benchmark joins
     python3 benchmarks/run.py --benchmark operators            # operator-mix
     python3 benchmarks/run.py --benchmark scan                 # parquet file-layout scan
+    python3 benchmarks/run.py --benchmark cache                # result-cache tiers + lookup join
     python3 benchmarks/run.py --benchmark images               # multimodal image ingest
     python3 benchmarks/run.py --benchmark all                  # every dataset except scan/images
 
     python3 benchmarks/run.py --engines batcher,duckdb,spark   # opt in to PySpark
-    python3 benchmarks/run.py --tier multi                     # batcher, ray, daft
+    python3 benchmarks/run.py --tier multi                     # batcher, daft
     python3 benchmarks/run.py --benchmark tpch --family tpch --only q1
     python3 benchmarks/run.py --benchmark scan --family scan-many_small
     python3 benchmarks/run.py --list                           # list, do not run
@@ -35,13 +36,20 @@ import argparse
 import dataclasses
 import time
 
-import batcher as bt
 import engines as engines_mod
 import suites  # noqa: F401  (import registers every benchmark)
 from batcher.config import active_config, set_config
 from context import CORPUS_BENCHMARKS, Context
-from envinfo import require_release_build
-from harness import compare, emit_result, print_table, run_isolated
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
+from harness import (
+    compare,
+    emit_result,
+    format_repeats,
+    format_summary,
+    print_table,
+    run_isolated,
+    summarize,
+)
 from registry import REGISTRY
 
 _SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
@@ -77,7 +85,7 @@ BENCHMARKS = (
 # (`--benchmark job`) for the same reason Spark is.
 ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators", "json")
 # Standalone benchmarks with their own reporting, dispatched by this single runner.
-AUX = ("distributed", "optimizer", "shuffle")
+AUX = ("distributed", "optimizer", "shuffle", "cache")
 
 
 def _runs_for(scale: float, benchmark: str) -> int:
@@ -113,7 +121,9 @@ def _parse_args() -> argparse.Namespace:
         "--tier",
         choices=("single", "multi"),
         default="single",
-        help="default lineup: single (batcher,duckdb,polars,pyarrow) or multi (batcher,ray,daft)",
+        help="default lineup: single (batcher,duckdb,polars,pyarrow,daft) or multi "
+        "(batcher,daft). `ray` is registered but in no default — pass it explicitly. "
+        "`duckdb_arrow` likewise; see engines/lineup.py for why each is opt-in",
     )
     p.add_argument(
         "--scale",
@@ -178,6 +188,21 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="time an unoptimized (dev-profile) engine anyway; the ratios are not comparable",
     )
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="run the whole selection N times and report the geomean spread. A suite "
+        "geomean quoted to three decimals from a single run claims a precision no single "
+        "run supports — the operator mix measures at a 4.1%% spread across three runs on "
+        "one box. Use this before quoting a figure.",
+    )
+    p.add_argument(
+        "--allow-busy-box",
+        action="store_true",
+        help="time on a contended machine anyway; the numbers are not comparable to any other run",
+    )
     return p.parse_args()
 
 
@@ -240,7 +265,16 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     runs = _runs_for(args.scale, benchmark)
     elapsed = time.perf_counter() - t0
     mode = "corpus" if benchmark in CORPUS_BENCHMARKS else ("scan" if args.scan else "loaded")
-    print(f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}\n")
+    print(f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}")
+    # Say what `--only` actually selected. It matches on *substring*, so `--only q1` pulls in
+    # q10 through q19 as well — twelve cases, and the geomean printed underneath is then a
+    # mean over all twelve rather than the one query the reader asked for. The `--isolate`
+    # path already selects by exact name for precisely this reason; the in-process path
+    # cannot, because a substring match is what makes `--only q17,q72` useful. So it says so.
+    if args.only:
+        matched = ", ".join(c.name for c in cases)
+        print(f"--only {args.only!r} matched {len(cases)} case(s): {matched}")
+    print()
     results = []
     for case in cases:
         print(f"running {case.name} ...", flush=True)
@@ -254,6 +288,7 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     print()
     print(f"=== {benchmark} ({', '.join(names)}) ===")
     print_table(results, names)
+    print(format_summary(summarize(results, names), runs))
     print()
     return results
 
@@ -268,6 +303,10 @@ def _run_aux(which: str, args: argparse.Namespace) -> int:
         from internals import optimizer_bench
 
         return optimizer_bench.main()
+    if which == "cache":
+        from internals import cache_bench
+
+        return cache_bench.main()
     from internals import shuffle_vs_object_store
 
     return shuffle_vs_object_store.main(args.partitions)
@@ -286,20 +325,75 @@ def main() -> int:
     _apply_memory_config(args)
     names = args.engines.split(",") if args.engines else engines_mod.default_names(args.tier)
     engines = engines_mod.resolve([n.strip() for n in names])
-    print(f"Batcher benchmark suite  (engine {bt.engine_version()})")
+    # The fingerprint, not just the engine version. `machine_fingerprint`'s own docstring
+    # says it "is the first record of every result document the benchmark harnesses write",
+    # and gives the reason: BENCHMARK_RESULTS.md accumulated numbers from at least four
+    # machines whose ratios differ by an order of magnitude, and two rows without it
+    # attached are not a comparison. Until now the *concurrency* harness was the only one
+    # that printed it, so every headline suite emitted a table with no record of the box it
+    # was measured on — and the hardware table in `docs/benchmarks/methodology.md` had to be
+    # maintained by hand against numbers that carried no evidence of where they came from.
+    #
+    # Both core counts are printed because when they disagree the difference is usually the
+    # whole story: `cpu_count_available` is what the cgroup grants and what the engine will
+    # use, `cpu_count_logical` is what the kernel advertises.
+    fp = machine_fingerprint()
+    load = fp["load_per_core_at_start"]
+    load_text = "load/core unmeasurable" if load is None else f"load/core {load:.2f}"
+    print(
+        f"Batcher benchmark suite  ({fp['engine_profile']} engine {fp['engine']}, {fp['git_sha']})"
+    )
+    print(f"  host {fp['host']}  ({fp['cpu_model']})")
+    print(
+        f"  {fp['cpu_count_available']} of {fp['cpu_count_logical']} cores available, "
+        f"{fp['memory_bytes'] / (1 << 30):.0f} GiB, {load_text}"
+    )
     print(f"engines: {', '.join(e.name for e in engines)}\n")
     require_release_build(allow_debug=args.allow_debug_build)
+    # `envinfo` has shipped this guard since it was written, and until now the *concurrency*
+    # benchmark was its only caller — so the suite that produces every headline ratio
+    # (TPC-H, TPC-DS, ClickBench, JOB, H2O, the operator mix) would record numbers on a
+    # contended box without so much as a warning. That is not a smaller version of the same
+    # measurement: `require_quiet_box`'s own docstring records DuckDB timing *slower* at 8
+    # threads than at 1 under load 25, which is not a fact about DuckDB, and several deltas
+    # in BENCHMARK_RESULTS.md are explicitly disavowed for it. A benchmark that cannot
+    # refuse an unusable environment reports the neighbour's load as an engine difference.
+    require_quiet_box(allow_busy=args.allow_busy_box)
 
     datasets = ALL_DATASETS if args.benchmark == "all" else (args.benchmark,)
+    names = [e.name for e in engines]
     all_results = []
-    for ds in datasets:
-        all_results += _run_dataset(ds, args, engines)
+    per_run = []
+    for i in range(max(1, args.repeat)):
+        if args.repeat > 1:
+            print(f"--- repeat {i + 1} of {args.repeat} ---")
+        run_results = []
+        for ds in datasets:
+            run_results += _run_dataset(ds, args, engines)
+        all_results += run_results
+        per_run.append(summarize(run_results, names))
+    # The spread, not another decimal place. A geomean from one run carries no evidence
+    # about its own stability, and quoting it to three decimals asserts some.
+    if args.repeat > 1:
+        print(format_repeats(per_run))
 
     if not all_results:
         print("no benchmarks matched the selection.")
         return 0
 
+    # `DIVERGENT` is deliberately not in this list. It marks a row where every difference
+    # is one `harness/divergences.py` has recorded, with a citation naming which engine is
+    # right — three of the four recorded so far are cases where a *comparator* is the wrong
+    # one. Failing the run on those would put standing pressure to change Batcher to match
+    # a comparator's deviation, which is the outcome that module exists to prevent. The row
+    # still never reads OK, still carries no ratio, and still prints its reason.
     failed = [r for r in all_results if r.status in ("FAILED", "ERROR", "KILLED")]
+    divergent = [r for r in all_results if r.status == "DIVERGENT"]
+    if divergent:
+        print(
+            f"{len(divergent)} query(ies) DIVERGENT: a recorded semantic difference, not a "
+            "defect — see the notes above and harness/divergences.py."
+        )
     if failed:
         print(f"{len(failed)} query(ies) FAILED correctness, errored, or died.")
         return 1

@@ -92,9 +92,9 @@ covers both halves and where each one stops.
 
 ## How it compares
 
-| Tool | Where it stops | What Batcher does instead | Measured (geomean, 2026-08-15) |
+| Tool | Where it stops | What Batcher does instead | Measured (geomean) |
 |------|----------------|---------------------------|----------|
-| **DuckDB**, its own compressed store | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **1.3×** TPC-H sf1 (16/22), **1.04×** all 99 TPC-DS (38/98), **1.6×** ClickBench (28/43), **4.1×** JSON (5/5), **1.1×** H2O `join` |
+| **DuckDB**, its own compressed store | fast, but single-node and plans once | scales out, and re-optimizes mid-query | *2026-08-25:* **1.35×** TPC-H sf1 (19/22), **1.04×** TPC-H **sf10** (9/22), **1.06×** all 99 TPC-DS (39/99), **1.61×** ClickBench (31/43), **3.8×** JSON (5/5), **1.44×** H2O `join` (5/5) |
 | **DuckDB**, on the same Arrow | — | the like-for-like execution comparison | **wins every suite this bar can run**: **3.9×** TPC-H sf1 (**22/22**), **14×** ClickBench (**43/43**), **26×** JSON (5/5), **11×** H2O `groupby` (**10/10**), **4.1×** H2O `join` (**5/5**), **2.8×** the operator mix |
 | **Polars** | fast, but single-node | the same code runs from one core to a cluster | **2.4×** TPC-H sf1 (21/22), **3.0×** ClickBench, **8.6×** the operator mix (19/19) |
 | **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.9×** TPC-H sf1 (20/20), **3.8×** ClickBench (41/41), **2.4×** cluster-vs-cluster |
@@ -107,17 +107,23 @@ answer is `123,141,078.2283`, because it folds the bound `0.06 + 0.01` in IEEE d
 `0.06999999999999999` and drops every `l_discount = 0.07` row. Batcher returns the official
 answer exactly.
 
-Four places Batcher does **not** win, stated up front, all of them against DuckDB reading its
-own compressed store: TPC-H at scale factor 10 (1.29× DuckDB, 8 of 22), the 113-query Join
-Order Benchmark (1.29×, 35 of 109), the H2O.ai `groupby` task (1.19×, 4 of 10), and Parquet
-decode (1.4×–2.8×, which is `arrow-rs` and is slower than PyArrow too). High-concurrency
-serving is not this engine's shape at all. All are detailed below.
+**TPC-H at scale factor 10 is now a win** (2026-08-25): 0.963× DuckDB's own compressed store,
+where it read 1.29× when this list was first written. Measured as an A/B against the same day's
+`HEAD`, two engines on both arms — q9 456 → 233 ms, q13 325 → 174, q5 189 → 122. The Join Order
+Benchmark moved with it, 1.29× → **1.11×**, and Batcher's total across all 113 queries is now
+*below* DuckDB's (8,131 ms against 8,885) even though the geomean has not crossed yet.
 
-Two of those four are the storage format rather than the engine, and the like-for-like row
+Three places Batcher does **not** yet win, stated up front, all of them against DuckDB reading
+its own compressed store: the Join Order Benchmark on geomean (1.11×, 44 of 109), the H2O.ai
+`groupby` task (1.03×, 4 of 10), and Parquet decode (1.4×–2.8×, which is `arrow-rs` and is
+slower than PyArrow too). High-concurrency serving is not this engine's shape at all. All are
+detailed below.
+
+Two of those three are the storage format rather than the engine, and the like-for-like row
 above is how you tell: `groupby` goes from a loss to a Batcher win **10 of 10** on the same
-Arrow, and sf10 to 21 of 22. The Join Order Benchmark is the one that is genuinely about
-planning — it is built to expose exactly the estimation errors this design claims to correct,
-and it remains behind.
+Arrow. The Join Order Benchmark is the one that is genuinely about planning — it is built to
+expose exactly the estimation errors this design claims to correct — and it is the suite that
+has moved furthest, which is the direction the design predicts.
 
 ## Benchmarks
 
@@ -172,23 +178,30 @@ suite geomean quoted above. &sup2; PyArrow (Acero) has no window functions. &sup
 SIGKILLed on an ordered 6M-row window (it needs ~22 GB, and `lag()` exceeds 30 GB).
 All columns re-measured 2026-08-15 on a release build, 96 cores.
 
-**Six full suites, not just an operator mix.** The first column has every engine reading the
+**Eight full suites, not just an operator mix.** The first column has every engine reading the
 identical zero-copy Arrow input, so it compares *execution* alone; the second lets DuckDB read
 its own compressed format, so it puts DuckDB's storage engine *and* execution engine against
 Batcher's execution engine:
 
-| suite | vs DuckDB on the same Arrow | vs DuckDB's own compressed store |
+| suite | vs DuckDB on the same Arrow&sup1; | vs DuckDB's own compressed store&sup2; |
 |---|---|---|
-| **TPC-H sf1** — all 22 queries | **won 22 of 22**, **3.9×** | **won 17 of 22**, **1.3×** |
-| **TPC-DS sf1** — all 99 queries | — | **won 44 of 99**, **1.04×** |
-| **ClickBench** — 43 queries | **won 43 of 43**, **14×** | **won 30 of 43**, **1.6×** |
-| **Operator mix** — 19 kernels | **won 15 of 19**, **2.9×** | **won 12 of 19**, **1.6×** |
-| **Semi-structured JSON** — 5 queries | **won 5 of 5**, **27×** | **won 5 of 5**, **4.0×** |
-| **H2O.ai `join`** — 5 queries | **won 5 of 5**, **4.2×** | **won 3 of 5**, **1.05×** |
+| **TPC-H sf1** — all 22 queries | **won 22 of 22**, **3.9×** | **won 19 of 22**, **1.35×** |
+| **TPC-H sf10** — all 22 queries | **won 21 of 22**, **3.4×** | **won 9 of 22**, **1.04×** |
+| **TPC-DS sf1** — all 99 queries | — | **won 39 of 99**, **1.06×** |
+| **ClickBench** — 43 queries | **won 43 of 43**, **14×** | **won 31 of 43**, **1.61×** |
+| **Operator mix** — 21 kernels | **won 15 of 19**, **2.9×** | **won 11 of 21**, **1.47×** |
+| **Semi-structured JSON** — 5 queries | **won 5 of 5**, **27×** | **won 5 of 5**, **3.8×** |
+| **H2O.ai `join`** — 5 queries | **won 5 of 5**, **4.2×** | **won 5 of 5**, **1.44×** |
+| **JOB** — 113 queries, real IMDb | **won 106 of 109**, **2.5×** | won 44 of 109, **0.90×** |
 
-The second column is the harder bar and the one that moved. TPC-H sf1 read 0.99x on 16 cores
-in July, and TPC-DS read 1.13x at the start of the day this was measured. Ratios are geometric
-means of the per-query ratios, 96 cores, 2026-08-15.
+&sup1; carried from the multi-engine run of 2026-08-16; that bar needs a `duckdb_arrow` lineup
+and was not re-measured on 2026-08-25. &sup2; re-measured 2026-08-25 on a two-engine
+(`batcher,duckdb`) lineup, 96-vCPU / 184 GiB, as an A/B against the same day's `HEAD`.
+
+The second column is the harder bar and the one that keeps moving: TPC-H sf1 read 0.99x on 16
+cores in July, TPC-DS 1.13x at the start of the day it was first measured, and **sf10 crossed
+from a loss to a win on 2026-08-25**. Ratios are geometric means of the per-query ratios on 96
+cores; every figure is correctness-gated against DuckDB before it is timed.
 
 Standout queries, against DuckDB's own store and against DuckDB on the same Arrow: TPC-H q15
 **4.9×** / **14×**, q19 **2.7×** / **4.3×**; ClickBench q27 **1.9×** / **88×**, q40 **1.3×** /

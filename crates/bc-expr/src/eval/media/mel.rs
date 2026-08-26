@@ -310,7 +310,9 @@ mod tests {
         let d = dct2_ortho(n, n);
         for j in 0..n {
             for k in 0..n {
-                let dot: f64 = (0..n).map(|m| d[j][m] as f64 * d[k][m] as f64).sum();
+                let dot: f64 = (0..n)
+                    .map(|m| f64::from(d[j][m]) * f64::from(d[k][m]))
+                    .sum();
                 let expected = if j == k { 1.0 } else { 0.0 };
                 assert!((dot - expected).abs() < 1e-5, "rows {j},{k} dot={dot}");
             }
@@ -379,14 +381,14 @@ mod tests {
         // without an external oracle.
         let sr = 16000.0;
         let sig: Vec<f32> = (0..16000)
-            .map(|i| (2.0 * PI * 1000.0 * i as f64 / sr).sin() as f32)
+            .map(|i| (2.0 * PI * 1000.0 * f64::from(i) / sr).sin() as f32)
             .collect();
         let (out, n_frames) = mel_spectrogram(&sig, sr, 400, 160, 80);
         // Mel band containing 1 kHz.
         let target_hz = 1000.0;
         let mut band_1k = 0usize;
         let fpts: Vec<f64> = (0..82)
-            .map(|i| mel_to_hz(hz_to_mel(0.0) + (hz_to_mel(8000.0)) * i as f64 / 81.0))
+            .map(|i| mel_to_hz(hz_to_mel(0.0) + (hz_to_mel(8000.0)) * f64::from(i) / 81.0))
             .collect();
         for m in 0..80 {
             if fpts[m] <= target_hz && target_hz <= fpts[m + 2] {

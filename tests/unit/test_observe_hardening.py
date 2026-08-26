@@ -229,9 +229,14 @@ def test_rendering_survives_a_degenerate_terminal_size(bus, monkeypatch):
     monkeypatch.setattr(
         shutil_mod, "get_terminal_size", lambda *_a, **_k: __import__("os").terminal_size((1, 1))
     )
+    from batcher.observe.console import bar
+    from batcher.observe.theme import detect
+
     reporter = ConsoleReporter(stream=Stream(), live=True)
-    assert reporter._bar(0.5)
-    assert reporter._bar(None)
+    width = reporter._bar_width()
+    palette, glyphs = detect(Stream())
+    assert bar(0.5, width, palette, glyphs, 0)
+    assert bar(None, width, palette, glyphs, 0)
 
 
 def test_ascii_stream_never_emits_a_character_it_cannot_encode(bus):
@@ -448,17 +453,43 @@ def test_a_quiet_query_emits_nothing_to_the_terminal(bus, capsys):
     assert captured.out == "" and captured.err == ""
 
 
+def _fastest(run, samples: int = 7) -> float:
+    """The shortest of `samples` runs of `run`, in seconds.
+
+    Min, not mean: contention, page faults and a cold first pass can only ever *add* time,
+    so the minimum is the least contaminated estimate of the work itself. A single sample
+    on a box this repo documents as routinely carrying three concurrent sessions is a
+    coin-flip, not a measurement.
+    """
+    best = float("inf")
+    for _ in range(samples):
+        started = time.perf_counter()
+        run()
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
 def test_progress_events_do_not_slow_a_stream_measurably(bus):
-    """A sanity bound, not a benchmark: the per-batch publish must not dominate."""
+    """A sanity bound, not a benchmark: the per-batch publish must not dominate.
+
+    This assertion used to be unfalsifiable, in three compounding ways, while reading as a
+    performance guarantee. It took **one** sample of each arm and compared them; it allowed
+    the instrumented arm to be **20x** the baseline, which is not "not measurably"; and its
+    slack term was `+ 0.5` seconds against arms that measure ~0.0005s, so the comparison
+    could not fail on any input whatsoever. It also measured the baseline arm *first*, which
+    handed it the cold-start cost and inflated the very number the bound is a multiple of.
+
+    Measured here: min-of-7 puts the instrumented arm at about **1.3x** the baseline. The
+    bound below is 4x plus 2ms, which leaves ample room for a slow machine while still
+    failing on the regression it exists to catch — a per-row rather than per-batch publish,
+    which costs an order of magnitude.
+    """
     ds = bt.from_pydict({"x": list(range(200_000))})
-    t0 = time.perf_counter()
-    list(ds.iter_batches())
-    baseline = time.perf_counter() - t0
+    stream = lambda: list(ds.iter_batches())  # noqa: E731
+    baseline = _fastest(stream)
     bus.subscribe(ActivityStore().handle)
-    t0 = time.perf_counter()
-    list(ds.iter_batches())
-    observed = time.perf_counter() - t0
-    assert observed < baseline * 20 + 0.5, f"baseline={baseline:.4f}s observed={observed:.4f}s"
+    observed = _fastest(stream)
+    assert observed < baseline * 4 + 0.002, f"baseline={baseline:.4f}s observed={observed:.4f}s"
 
 
 def test_verbose_actually_shows_more_than_normal(bus, tmp_path):

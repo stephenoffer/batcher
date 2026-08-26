@@ -200,17 +200,16 @@ fn rank_sort_live<A: ByteKeys>(arr: &A, live: &[u32], descending: bool) -> Optio
     let mut row_ids: Vec<u32> = Vec::with_capacity(live.len());
     for &i in live {
         let value = arr.key(i as usize);
-        let id = match ids.get(value) {
-            Some(&id) => id,
-            None => {
-                if distinct.len() == RANK_SORT_MAX_DISTINCT {
-                    return None; // too many distinct values for ranking to beat comparing
-                }
-                let id = distinct.len() as u32;
-                distinct.push(value);
-                ids.insert(value, id);
-                id
+        let id = if let Some(&id) = ids.get(value) {
+            id
+        } else {
+            if distinct.len() == RANK_SORT_MAX_DISTINCT {
+                return None; // too many distinct values for ranking to beat comparing
             }
+            let id = distinct.len() as u32;
+            distinct.push(value);
+            ids.insert(value, id);
+            id
         };
         row_ids.push(id);
     }

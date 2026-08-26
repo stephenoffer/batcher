@@ -42,7 +42,10 @@ use crate::window::WindowFn;
 /// exactness above 2^53 and returns DOUBLE where DuckDB returns DECIMAL. `MIN`/`MAX` do not
 /// take this path — they keep the input type exactly, via [`select_extreme`].
 pub(crate) fn widen_target(dt: &DataType) -> Option<DataType> {
-    use DataType::*;
+    use DataType::{
+        Decimal128, Decimal256, Float16, Float32, Float64, Int16, Int32, Int64, Int8, Null, UInt16,
+        UInt32, UInt64, UInt8,
+    };
     match dt {
         Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32 => Some(Int64),
         Float16 | Float32 | UInt64 | Decimal128(_, _) | Decimal256(_, _) => Some(Float64),

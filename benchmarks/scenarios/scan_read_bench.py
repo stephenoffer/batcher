@@ -33,6 +33,8 @@ import subprocess
 import sys
 import time
 
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
+
 ROWS = 20_000_000
 COLUMNS = 16
 # Where the corpus lives. Ray Data's workers are on other nodes, so it has to be somewhere
@@ -143,6 +145,17 @@ def _measure(engine: str, layout: str, reps: int) -> dict:
 
 
 def main() -> None:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     args = sys.argv[1:]
     if args and args[0] == "--child":
         print(json.dumps(_child(args[1], args[2])))

@@ -37,7 +37,7 @@ from batcher.dist.executors.partition_io import (
     merge_boundaries,
     partition_descriptors,
     sample_probs,
-    source_pushdown,
+    stage_pushdown,
 )
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
@@ -64,7 +64,7 @@ from batcher.dist.sort_boundaries import (
     sort_shape_key,
 )
 from batcher.io.source import Source
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_global_window_flight"]
@@ -89,19 +89,16 @@ def execute_global_window_flight(
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
 
-    key = window.order_keys[0]  # caller guarantees a single plain-column order key
+    key = window.order_keys[0]  # caller guarantees a plain-column LEADING order key
     key_name = key.expr.name
     desc, nulls_first = key.descending, key.nulls_first
 
     map_plan, sid = _relabel_single_source(window.input)
     map_ir = json.dumps(map_plan.to_ir())
-    # The reduce runs the window over its bucket as a single in-memory source 0. `to_ir()`
-    # memoizes and hands back the plan's shared dict/list, so copy the pieces rewritten here
-    # before touching them — mutating the cached structures would corrupt every later use of
-    # the same plan.
-    win_ir = dict(window.to_ir())
-    win_ir["input"] = task_scan_ir()
-    win_ir["functions"] = list(win_ir["functions"])
+    # The reduce runs the window over its bucket as a single in-memory source 0.
+    # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
+    # so `inject_avg_helpers` below may append to `functions` in place.
+    win_ir = unary_task_ir(window)
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; the driver reads them back per bucket and drops
     # them before the rows are returned, so the output schema is unchanged.
@@ -114,9 +111,12 @@ def execute_global_window_flight(
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = buckets_for_envelope(shuffle_partitions(workers), sources[sid])
     try:
-        # Read only the columns/rows the window's map prefix needs. `map_plan`'s scan was
-        # relabeled to source 0, so key the analysis on 0, not on the source's original index.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Read only the columns/rows this stage needs, asked of the whole stage (`above` over
+        # the window) and keyed by the source's own id. The window alone is the wrong
+        # question: it emits its input columns plus its aliases, so it correctly answers
+        # "every column" — what narrows the read is the projection above it, which the
+        # dispatcher is holding in `above` to re-apply on the driver. See `stage_pushdown`.
+        projection, predicate = stage_pushdown(above, window, sid)
         parts = partition_descriptors(
             sources[sid],
             workers,

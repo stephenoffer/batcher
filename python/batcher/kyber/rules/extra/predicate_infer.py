@@ -207,7 +207,7 @@ def filter_range_contradiction(node: Filter, _ctx: OptimizerContext) -> LogicalP
     `vL == vU` with either side strict. Equalities count as their exact-value range, so
     conflicting equalities and equality-vs-range conflicts are caught too. A
     `FALSE`-reduced filter has no bounds left to conflict, so it is idempotent."""
-    for _name, (lowers, uppers) in _bounds_of(split_conjuncts(node.predicate)).items():
+    for lowers, uppers in _bounds_of(split_conjuncts(node.predicate)).values():
         for lop, lv in lowers:
             for uop, uv in uppers:
                 try:

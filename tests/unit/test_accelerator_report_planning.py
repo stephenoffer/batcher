@@ -69,7 +69,7 @@ def test_reports_the_shape_and_what_it_cost(monkeypatch):
     """With a shape, the section names the fleet and the discount it earned a shuffle."""
     monkeypatch.setattr(
         "batcher.api.orchestration.sizing.distributed_hardware",
-        lambda: _dense_profile(),
+        _dense_profile,
         raising=True,
     )
     report: dict = {}

@@ -43,6 +43,19 @@ pub(super) fn group_columns(
     reps: Vec<u32>,
     num_rows: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // The identity short-circuit below is only sound because `reps` is strictly increasing and
+    // bounded by `num_rows` — that is what makes `reps.len() == num_rows` imply `0..num_rows`.
+    // An assigner that handed ids out in some other order would take the short-circuit and
+    // return the *ungathered* key columns: right length, wrong rows, no error. Checked here
+    // rather than trusted, because every producer of a packed key reimplements the loop.
+    debug_assert!(
+        reps.windows(2).all(|w| w[0] < w[1]),
+        "group representatives must be strictly increasing (first-seen row order)"
+    );
+    debug_assert!(
+        reps.last().is_none_or(|&r| (r as usize) < num_rows),
+        "a group representative must be a row of this batch"
+    );
     if reps.len() == num_rows {
         return Ok(keys.to_vec());
     }
@@ -832,7 +845,7 @@ fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32
     for i in 0..num_rows {
         let mut k = 0u64;
         for (j, bytes) in byte_cols.iter().enumerate() {
-            k |= (bytes[i] as u64) << (8 * j);
+            k |= u64::from(bytes[i]) << (8 * j);
         }
         keys.push(k);
     }
@@ -909,7 +922,7 @@ where
         }
         let mut key = (len as u64) << 56;
         for (j, &b) in v.iter().enumerate() {
-            key |= (b as u64) << (8 * j);
+            key |= u64::from(b) << (8 * j);
         }
         out.push(key);
     }
@@ -940,7 +953,7 @@ where
         let v = &data[lo..hi];
         let mut buf = [0u8; 16];
         buf[0] = v.len() as u8;
-        buf[1..1 + v.len()].copy_from_slice(v);
+        buf[1..=v.len()].copy_from_slice(v);
         out.push(u128::from_le_bytes(buf));
     }
     Some(out)
@@ -972,7 +985,7 @@ fn dense_multi_span(
         let (lo, hi) = values[..num_rows]
             .iter()
             .fold((i64::MAX, i64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        let span = usize::try_from(hi as i128 - lo as i128 + 1).ok()?;
+        let span = usize::try_from(i128::from(hi) - i128::from(lo) + 1).ok()?;
         lows.push(lo);
         spans.push(span);
     }
@@ -1029,34 +1042,31 @@ fn dense_multi_ids(
             *$out = *slot;
         }};
     }
-    match cols {
-        [a, b] => {
-            // Zipped, not indexed: iterating the two value slices together with the output
-            // elides the per-row bounds check on all three, which the index form re-emits
-            // because nothing proves `i` is in range for each of them independently.
-            let (la, lb) = (lows[0], lows[1]);
-            let (sa, sb) = (strides[0], strides[1]);
-            let rows = &a.values()[..num_rows];
-            let other = &b.values()[..num_rows];
-            for (row, ((x, y), out)) in rows
-                .iter()
-                .zip(other.iter())
-                .zip(group_ids.iter_mut())
-                .enumerate()
-            {
-                let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
-                assign!(out, idx, row);
-            }
+    if let [a, b] = cols {
+        // Zipped, not indexed: iterating the two value slices together with the output
+        // elides the per-row bounds check on all three, which the index form re-emits
+        // because nothing proves `i` is in range for each of them independently.
+        let (la, lb) = (lows[0], lows[1]);
+        let (sa, sb) = (strides[0], strides[1]);
+        let rows = &a.values()[..num_rows];
+        let other = &b.values()[..num_rows];
+        for (row, ((x, y), out)) in rows
+            .iter()
+            .zip(other.iter())
+            .zip(group_ids.iter_mut())
+            .enumerate()
+        {
+            let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
+            assign!(out, idx, row);
         }
-        _ => {
-            let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
-            for (row, out) in group_ids.iter_mut().enumerate() {
-                let mut idx = 0usize;
-                for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
-                    idx += v[row].wrapping_sub(low) as usize * stride;
-                }
-                assign!(out, idx, row);
+    } else {
+        let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
+        for (row, out) in group_ids.iter_mut().enumerate() {
+            let mut idx = 0usize;
+            for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
+                idx += v[row].wrapping_sub(low) as usize * stride;
             }
+            assign!(out, idx, row);
         }
     }
     (group_ids, reps)
@@ -1200,16 +1210,15 @@ where
     let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
         let value: &[u8] = a.value(i).as_ref();
-        let code = match ids.get(value) {
-            Some(&code) => code,
-            None => {
-                if ids.len() == RANK_MAX_DISTINCT {
-                    return None; // too many distinct values for ranking to pay
-                }
-                let code = ids.len() as i64;
-                ids.insert(value, code);
-                code
+        let code = if let Some(&code) = ids.get(value) {
+            code
+        } else {
+            if ids.len() == RANK_MAX_DISTINCT {
+                return None; // too many distinct values for ranking to pay
             }
+            let code = ids.len() as i64;
+            ids.insert(value, code);
+            code
         };
         codes.push(code);
     }
@@ -1426,7 +1435,7 @@ fn pack_u128_keys(group_keys: &[ArrayRef], widths: &[usize], num_rows: usize) ->
             Int64 => {
                 let values = a.as_primitive::<Int64Type>().values();
                 for (slot, &v) in packed.iter_mut().zip(values.iter()) {
-                    *slot |= ((v as u64) as u128) << shift;
+                    *slot |= u128::from(v as u64) << shift;
                 }
             }
             Utf8 => pack_bytes_column(&mut packed, a.as_string::<i32>(), shift),
@@ -1628,13 +1637,12 @@ mod tests {
         let mut reps: Vec<u32> = Vec::new();
         let mut ids = Vec::with_capacity(vals.len());
         for (i, v) in vals.iter().enumerate() {
-            match seen.iter().position(|s| s == v) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(*v);
-                    reps.push(i as u32);
-                }
+            if let Some(g) = seen.iter().position(|s| s == v) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(*v);
+                reps.push(i as u32);
             }
         }
         (ids, seen.len(), reps)
@@ -1903,14 +1911,14 @@ mod tests {
     /// Keys 0..999: dense, so the direct-map path runs.
     #[test]
     fn dense_keys_match_reference() {
-        let vals: Vec<Option<i64>> = (0..4000).map(|i| Some((i % 1000) as i64)).collect();
+        let vals: Vec<Option<i64>> = (0..4000).map(|i| Some(i64::from(i % 1000))).collect();
         check_i64(vals);
     }
 
     /// Negative keys exercise the `min` offset.
     #[test]
     fn dense_negative_keys_match_reference() {
-        let vals: Vec<Option<i64>> = (0..2000).map(|i| Some((i % 51) as i64 - 25)).collect();
+        let vals: Vec<Option<i64>> = (0..2000).map(|i| Some(i64::from(i % 51) - 25)).collect();
         check_i64(vals);
     }
 
@@ -1923,7 +1931,7 @@ mod tests {
     /// A huge, sparse range exceeds the span budget and falls back to the hash path.
     #[test]
     fn sparse_keys_fall_back_and_match_reference() {
-        let vals: Vec<Option<i64>> = (0..500).map(|i| Some(i as i64 * 1_000_003)).collect();
+        let vals: Vec<Option<i64>> = (0..500).map(|i| Some(i64::from(i) * 1_000_003)).collect();
         check_i64(vals);
     }
 
@@ -1944,7 +1952,7 @@ mod tests {
                 if i % 7 == 0 {
                     None
                 } else {
-                    Some((i % 13) as i64)
+                    Some(i64::from(i % 13))
                 }
             })
             .collect();
@@ -1977,12 +1985,11 @@ mod tests {
         let mut seen: Vec<(i64, i64)> = Vec::new();
         let mut ids = Vec::with_capacity(rows.len());
         for r in rows {
-            match seen.iter().position(|s| s == r) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(*r);
-                }
+            if let Some(g) = seen.iter().position(|s| s == r) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(*r);
             }
         }
         (ids, seen.len())
@@ -2007,7 +2014,7 @@ mod tests {
     #[test]
     fn dense_two_int_keys_match_reference() {
         let rows: Vec<(i64, i64)> = (0..3000)
-            .map(|i| ((i % 7) as i64, (i % 11) as i64))
+            .map(|i| (i64::from(i % 7), i64::from(i % 11)))
             .collect();
         check_multi(rows);
     }
@@ -2016,7 +2023,7 @@ mod tests {
     #[test]
     fn dense_two_int_keys_negative_match_reference() {
         let rows: Vec<(i64, i64)> = (0..2000)
-            .map(|i| ((i % 5) as i64 - 2, (i % 9) as i64 - 4))
+            .map(|i| (i64::from(i % 5) - 2, i64::from(i % 9) - 4))
             .collect();
         check_multi(rows);
     }
@@ -2025,7 +2032,7 @@ mod tests {
     #[test]
     fn sparse_two_int_keys_fall_back_and_match_reference() {
         let rows: Vec<(i64, i64)> = (0..500)
-            .map(|i| (i as i64 * 7919, (i % 3) as i64))
+            .map(|i| (i64::from(i) * 7919, i64::from(i % 3)))
             .collect();
         check_multi(rows);
     }
@@ -2042,7 +2049,7 @@ mod tests {
         let vals: Vec<i32> = (0..1000).map(|i| i % 37).collect();
         let arr: ArrayRef = Arc::new(Int32Array::from(vals.clone()));
         let (ids, n, _) = assign_groups(&[arr], vals.len()).unwrap();
-        let as_i64: Vec<Option<i64>> = vals.iter().map(|&v| Some(v as i64)).collect();
+        let as_i64: Vec<Option<i64>> = vals.iter().map(|&v| Some(i64::from(v))).collect();
         let (want_ids, want_n, _) = reference(&as_i64);
         assert_eq!(ids, want_ids);
         assert_eq!(n, want_n);
@@ -2054,12 +2061,11 @@ mod tests {
         let mut seen: Vec<&str> = Vec::new();
         let mut ids = Vec::with_capacity(vals.len());
         for v in vals {
-            match seen.iter().position(|s| s == v) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(v);
-                }
+            if let Some(g) = seen.iter().position(|s| s == v) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(v);
             }
         }
         (
@@ -2164,12 +2170,11 @@ mod tests {
         let mut seen: Vec<(&str, &str)> = Vec::new();
         let mut want_ids = Vec::new();
         for (f, s) in flags.iter().zip(&stat) {
-            match seen.iter().position(|p| p == &(*f, *s)) {
-                Some(g) => want_ids.push(g as u32),
-                None => {
-                    want_ids.push(seen.len() as u32);
-                    seen.push((f, s));
-                }
+            if let Some(g) = seen.iter().position(|p| p == &(*f, *s)) {
+                want_ids.push(g as u32)
+            } else {
+                want_ids.push(seen.len() as u32);
+                seen.push((f, s));
             }
         }
         assert_eq!(ids, want_ids);

@@ -69,6 +69,39 @@ computes and SQL could not spell, and a frame silently dropped on three others, 
 generalizes: reading a competitor's implementation of something Batcher already has is worth
 as much as reading one it lacks, because the comparison is what makes an internal gap visible.
 
+**Status pass, 2026-08-25 — and this one moves the board rather than an entry (item 19).** The
+operator suite was re-run at `HEAD` before any work was started, and **every sort row entry 15
+listed as a loss is now a win**: Batcher beats DuckDB on **19 of 21** operator cases and the two
+remaining losses total 2.4 ms. The ranking this document has directed sort work from since
+2026-08-18 is therefore stale, and an agent following it today would optimize four operators
+that already win. Item 19 has the table. The same pass read the two sorters entry 18 stopped
+short of (DuckDB sorts with `vergesort` over `ska_sort`), **took the first** — natural-run
+detection, now `ops/run_sort.rs`, worth 1.09-1.32x on partly-ordered input with the random
+control unchanged — and **ruled out the second** together with entry 18's proposed crossover
+gate, on the measurement that the packed radix never sees a large input in the first place.
+It also records one unbuilt candidate nobody has read before: Polars' `polars-ooc` global spill
+arbiter, which picks a spill *victim* by measured score.
+
+**All six reference engines are now covered (item 25 closes Spark and Arrow):** thirteen of
+Spark's AQE/execution techniques have a Batcher site and the fourteenth
+(`CoalesceShufflePartitions`) is deliberately *not* built, because the measurement that would
+justify it turned out to be an artifact of stale shuffle files. Arrow's compute kernels
+contribute nothing to the backlog.
+
+**The pass then widened from operators to the whole surface (items 23-24):** TPC-DS's 99
+queries measure **0.97x against DuckDB overall**, its one correctness failure is diagnosed to
+the bit as a harness artifact rather than an engine defect, a plausible `ROLLUP` bottleneck was
+measured and **refuted** (Batcher's rollup scales *better* than DuckDB's — do not "fix" it), and
+the capability census's top item is re-checked and scoped.
+
+**Five claims were found stale in this one pass, all in the same direction** — the sort ranking
+(19), the range join's ceiling (20), the sf100 OOM's location (21), the two rows `StringView`
+was ranked on (22), and `generate_series` in the capability census (24). Four of the five are
+now *wins* or built. The fourth is worse than recorded: the
+sf100 OOM is current, it has simply moved to q9. **Start at item 19 and re-measure before
+building anything from the older entries.** The one thing this pass found that is unambiguously
+open, and structural, is the >=100M-row memory profile in item 21.
+
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
 competitors' source, which specific mechanisms does Batcher not have, and which of them are
@@ -102,7 +135,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | # | Technique | Best source | Batcher today | Value |
 |---|---|---|---|---|
 | 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
-| 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
+| 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued twice.** 2026-08-04: the win is `take`/`filter` (3-13x), not comparison or sort, and only scan-native. 2026-08-25: **the two join rows it was ranked on are now wins** — see item 22 before starting it |
 | 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | **Landed** (`RelOp::Distinct { limit }` + `fuse_limit_into_distinct`) | Was the only *asymptotic* gap; now **13x over DuckDB** on the committed `op-distinct-limit` case |
 | 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; the low-cardinality half **landed** as `split_constant_ranges`; one lead left (the adaptive-width key) |
 | 10i | Common **subplan** elimination (signature-matched, plan-level) | DuckDB | **Landed** (`kyber/common_subplan.py` + `api/subplan_reuse.py`) | 1.95x on a shared aggregate feeding both sides of a join |
@@ -2492,6 +2525,606 @@ packed radix loses to the row-encoded comparison sort and gate on it, exactly as
 this very reason, and `report_the_byte_radix_crossover` records the measurement). The packed
 multi-key path has no such ceiling and should.
 
+## 19. The operator suite is no longer the deficit, and DuckDB's *other* two sorters (2026-08-25)
+
+Two findings, and the first one retires most of the second's motivation.
+
+### The item-15 table is stale, and the direction it points is wrong now
+
+Entry 15 (2026-08-18) is the ranking this document has used to direct sort work: "sorting is
+four of the top five rows and about 59 ms of the roughly 70 ms lost in total". Re-run at
+`HEAD`, same suite, same box, same TPC-H sf1, five engines, **every correctness check passed**:
+
+| case | batcher | duckdb | ratio | entry 15 said |
+|---|---|---|---|---|
+| `op-sort-string` | 146.1 ms | 153.6 ms | **0.95x** | 1.16x |
+| `op-sort-string-lowcard` | 31.4 ms | 42.4 ms | **0.74x** | 1.33x |
+| `op-sort-multikey-narrow` | 31.2 ms | 43.5 ms | **0.72x** | 1.39x |
+| `op-sort-multikey-wide` | 59.8 ms | 72.6 ms | **0.82x** | 1.21x |
+| `op-sort-limit` | 7.9 ms | 8.0 ms | 1.00x | — |
+| `op-sort-string-limit` | 10.6 ms | 9.4 ms | 1.13x | 1.37x |
+| `op-filter-project` | 10.2 ms | 9.0 ms | 1.14x | 1.28x |
+
+**Every sort row flipped from a loss to a win.** Batcher now beats DuckDB on **19 of 21**
+cases, and the two it does not total **+2.4 ms**. The work between the two runs — entries 11c,
+17, the per-shard probe blooms, `split_constant_ranges` — did it; no single entry claims the
+whole flip, which is why nothing in this document recorded that the board had changed.
+
+That is the fourth time this document has been found overstating what is left, and the first
+time in the *helpful* direction. The instruction stands and now cuts both ways: **re-measure
+before building, and expect the ranking to have moved.** An agent that had taken entry 15 at
+its word today would have spent the session optimizing four operators that already win.
+
+### DuckDB's in-memory sorter, read rather than measured
+
+Entry 18 read `sort.cpp` and `create_sort_key.cpp` — how DuckDB *builds* a sort key. It did
+not read what DuckDB then *sorts* it with, which is one line in
+`src/common/sort/sorted_run.cpp:269`:
+
+```cpp
+duckdb_vergesort::vergesort(begin, end, std::less<SORT_KEY>(), fallback);
+// fallback = duckdb_ska_sort::ska_sort(fb_begin, fb_end, ska_extract_key)
+```
+
+Two mechanisms Batcher did not have, and they are worth different amounts.
+
+**Vergesort — natural-run detection. Taken; see below.** It finds the maximal ordered runs and
+merges them, sorting only what lies between. What makes it worth copying is not the merge, it
+is the *detection*: vergesort does not scan for runs, it **strides** `n / log2(n)` positions,
+tests the pair it lands on, and only then expands outward. A run shorter than the stride is not
+worth having, so failing to find one costs about two comparisons — roughly `3 * log2(n)` over the
+whole input, sixty-odd on six million rows. Batcher had only the degenerate form of this
+(`is_ordered`: the whole column, or nothing).
+
+**ska_sort — an in-place MSD radix. Not taken, and the reason is entry 18's own measurement.**
+Entry 18 attributed the multi-key gap to "CPU efficiency… an eight-pass LSD radix over 6 M
+`u64` keys moves ~384 MB and does 48 M scattered writes", and proposed a crossover gate as the
+next move. **That model is wrong, and the measurement above is why it no longer matters.**
+`packed_multi_sort_indices` is not reached with six million rows: above 2^17 rows the sample-sort
+range-routes first, so the radix runs per range over ~94,000 rows, which is cache-resident. The
+proposed crossover would have gated a path that was already below its own cliff. `op-sort-multikey-narrow` is now 0.72x with no such gate.
+
+### What natural runs are worth here, measured
+
+Built as `bc-interp/src/ops/run_sort.rs`, wired into both radix paths (single fixed-width key
+and the composite pack). One tree, two `.so`s differing only in whether detection runs, two
+interleaved rounds, 6 M rows with a `float64` payload:
+
+| key structure | detection off | detection on | speedup |
+|---|---|---|---|
+| random (**the control**) | 36.1 ms | 34.2 ms | 1.06x |
+| fully sorted | 20.0 ms | 18.3 ms | 1.09x |
+| strictly descending | 23.6 ms | 17.8 ms | **1.32x** |
+| two sorted halves concatenated | 23.1 ms | 18.4 ms | **1.26x** |
+| eight sorted parts | 25.3 ms | 21.2 ms | 1.19x |
+| sixteen sorted parts | 23.6 ms | 21.7 ms | 1.09x |
+| sixty-four sorted parts | 25.9 ms | 25.9 ms | 1.00x |
+| sorted, 1% late arrivals | 24.3 ms | 23.1 ms | 1.05x |
+| two keys, two sorted halves | 30.1 ms | 27.6 ms | 1.09x |
+
+**Read the control row first.** Random input is unchanged, which is the property the whole
+technique rests on and the reason it needs no gate, no IR flag and no Kyber rule.
+
+**Read the ceiling second, because it says the work here is finished rather than promising.**
+A fully sorted key costs 18.3 ms, and that is almost entirely the payload gather — entry 13's
+point restated by a different route. The run shapes land at 18.4-21.7 ms, i.e. **within 20% of
+a floor that is not the sort at all.** There is no second increment to collect on this operator
+by ordering better; what is left is the gather, and that is `StringView` and selection vectors.
+
+**Why sixty-four runs measures at parity, which is the useful mechanism note.** Above 2^17 rows
+the sample-sort routes by key range *first*, so each range holds rows drawn from every run in the
+relation — sixty-four relation-level runs become sixty-four fragments of ~1,470 rows inside a
+94,000-row range, below that range's own `min_run` of ~5,500, and detection correctly declines.
+Range-routing destroys run structure. Detecting on the whole relation *before* routing would see
+it, but the table above prices that at 18.3 ms against 18.4 ms, so there is nothing there.
+
+**The one place it departs from vergesort is stability**, and it has to. Vergesort feeds
+`std::sort` and therefore reverses any *non-ascending* run; Batcher's sort is stable by
+contract, so reversing a run holding two equal keys would emit the later row first. A descending
+run is exploited only when **strictly** descending. `a_descending_key_with_ties_still_sorts_stably`
+is the test that would catch a regression here, and it is the only failure mode in the module
+that no timing would reveal.
+
+Covered by `tests/differential/test_diff_sort_ordered_runs.py` (**47 cases**: seven run
+structures x two row counts x both directions, plus nulls, temporal keys, the composite key,
+`iter_batches`, `collect(spill=True)`, and the degenerate 0/1/2-row inputs) and ten unit tests
+against a written-out stable oracle rather than against the radix, so a shared misunderstanding
+cannot pass.
+
+**And on a real cluster, because this is exactly the shape invariant #7 exists for.** Detection
+sees whatever slice it is handed, so one node and three workers take genuinely different routes
+— different run structures over the same rows — to what must be the identical permutation.
+`test_diff_distributed_sort.py::test_distributed_run_structured_sort_equals_single_node` pins
+the row *sequence* across three run structures x both directions; **9 passed in 27.9 s** on a
+fresh `RAY_ADDRESS=local` cluster (CI has no Ray, so a recorded run is the only evidence).
+
+### A candidate this pass turned up and did not build
+
+`polars/crates/polars-ooc/` is a **global spill arbiter with scored victim selection**, which no
+earlier pass has read. Every spillable registers a context; when global usage exceeds the budget
+a manager picks *which* state to spill by a measured score — byte-seconds of relief per unit of
+I/O time, with an exploration bonus for unmeasured contexts and an exponential penalty (5 s
+half-life) for anything read back soon after being spilled
+(`polars-ooc/src/{memory_manager,spill_context/stats}.rs`). Batcher spills per operator against
+an envelope; it does not choose a victim across the operators alive at once. That is a Carbonite
+concern by the layering ("Carbonite protects"), it is the same bandit shape `kyber/learning.py`
+already uses, and it is unbuilt here. Not measured, so it is a candidate and not a
+recommendation.
+
+## 20. The range join had no benchmark, and the shape with no benchmark was the broken one (2026-08-25)
+
+The range join is the only stateful operator with **no case in the committed suite**. Its
+numbers have lived in a docstring and in `competitive_architecture.md` ceiling 7, taken ad-hoc,
+and the two had drifted apart: the scorecard reports 1,493 ms at five million rows a side where
+`join/range/mod.rs` reports 522 ms for the same shape after a rewrite neither document
+propagated. This entry is what happened when that measurement was made repeatable.
+
+`benchmarks/internals/operators/range_join.py` is the case. **It ingests both tables into
+DuckDB's native store with an untimed `CREATE TABLE` and asserts `IE_JOIN` appears in the plan
+before it times anything**, because DuckDB picks its own range join only when its cardinality
+estimate clears `merge_join_threshold` and a table registered from Arrow never does — the
+Arrow-registered comparison is a `NESTED_LOOP_JOIN` and reporting it would be a two-order
+falsehood in Batcher's favour. Selectivity is held constant as `n` grows, so the emit term does
+not swamp the algorithm.
+
+### Two of the three shapes had already overtaken DuckDB, and ceiling 7 says otherwise
+
+Best of two, both engines back to back on the same data:
+
+| shape | n/side | batcher | duckdb | |
+|---|---|---|---|---|
+| band | 5,000,000 | 403.8 ms | 773.7 ms | **0.52x** |
+| general IEJoin | 5,000,000 | 377.5 ms | 801.7 ms | **0.47x** |
+
+Ceiling 7 says the operator "loses above ~1,000,000" and prices 5 M at 0.44x *against* Batcher.
+Both halves of that are now wrong: the general IEJoin **wins at every size measured**, and the
+band with it. That is the second stale competitive claim this pass has found (item 19 is the
+other), from the same cause — the work landed and the document that directs work did not move.
+
+### The third shape was 12x behind, and the tell was internal rather than competitive
+
+| n/side | matches | batcher | duckdb | |
+|---|---|---|---|---|
+| 500,000 | 1.27 M | 97.6 ms | 38.6 ms | 2.53x |
+| 1,000,000 | 3.86 M | 191.5 ms | 49.8 ms | 3.85x |
+| 2,000,000 | 5.44 M | 378.9 ms | 58.8 ms | 6.44x |
+| 5,000,000 | 13.51 M | 1,054.6 ms | 85.5 ms | **12.34x** |
+
+**A single inequality — the simplest shape the operator serves — cost more than the general
+two-inequality IEJoin over the same data** (378.9 ms against 178.4 ms at two million). A fast
+path slower than the general path it exists to avoid is a defect statement that needs no
+competitor at all, and it is the reading that located this: the ratio against DuckDB says
+"slow", the ratio against the operator's own general path says *where*.
+
+A second measurement said what kind of slow. Holding `n` at two million and varying only the
+match count, both engines' times tracked the matches — so DuckDB is not avoiding the emit — but
+Batcher carried a **~300 ms fixed cost against DuckDB's ~47 ms**. Fixed, not per-match, so it
+was the setup rather than the output.
+
+**The cause was one serial loop, and this module's own header had already documented its cost
+for the neighbouring shape.** `single_condition` did a `partition_point` per left row, serially,
+through the generic comparator. `band.rs`'s header records exactly that algorithm as having cost
+*"11.5 s of an 11.8 s join"* at five million rows a side — "23 random probes into a 40 MB array,
+five million times" — before [`Right::bounds_by_merge`] replaced it with a parallel monotone
+merge. **The band was fixed and the single inequality was not**, and nothing noticed for the same
+reason nothing noticed the drift above: no case measured it.
+
+A single inequality is a band with an open upper bound, so it wants the identical machinery. It
+now takes it (`band::run_single`), with the emission shared through `emit_slices` and the open
+bound carried as an absent array rather than a repeated value:
+
+| n/side | before | after | | vs DuckDB |
+|---|---|---|---|---|
+| 500,000 | 97.6 ms | **34.1 ms** | 2.9x | 2.53x -> **1.08x** |
+| 1,000,000 | 191.5 ms | **67.4 ms** | 2.8x | 3.85x -> 1.43x |
+| 2,000,000 | 378.9 ms | **109.3 ms** | 3.5x | 6.44x -> 2.25x |
+| 5,000,000 | 1,054.6 ms | **251.1 ms** | **4.2x** | 12.34x -> **3.81x** |
+
+Re-measured once more on the final build, all three shapes at five million rows a side, best of
+three: `one` **233.8 ms** against DuckDB's 58.8 (3.97x), `band` **382.6** against 793.6 (0.48x),
+`ie` **450.4** against 1,167.6 (0.39x). So the band and IEJoin paths did not regress through the
+shared-emission refactor, and the single inequality holds its 4x improvement. 508 `bc-runtime`
+tests pass, including `one_inequality_matches_the_cross_product_oracle`, and the benchmark's own
+gate compares every count against DuckDB before timing it.
+
+**It still loses ~4x at five million.** Batcher emits about 54,000 matches per millisecond
+against DuckDB's 205,000 — roughly 17.7 ms per million pairs against 2.8 ms.
+
+### A fix for that which was built, measured and reverted — do not rebuild it
+
+The obvious reading of those per-match numbers is that `Out::pair` is the cost, and the obvious
+culprit inside it is the **gather**: `order` holds universe entries, so every emitted pair paid
+`rmap[order[p] - nl]`, a scattered read into `rmap` charged per *match* rather than per row. A
+left row's matches are a contiguous slice, so resolving `order` to row indices once turns the
+emission into `extend_from_slice` plus a fill — a `memcpy` instead of thirteen million gathers.
+
+It was built (`IndexBuf::extend_rows`/`extend_repeat`, `Out::pairs_run`, an `order_rows`
+precompute in `emit_slices`), it is correct, and **it is worth nothing.** Two `.so`s differing
+only in that change, interleaved over two rounds at five million rows a side, each row best of
+three — and normalized by DuckDB's time *in the same round*, because the box drifted 8% between
+them and the raw numbers otherwise say whatever the load says:
+
+| shape | per-pair gather | resolved once |
+|---|---|---|
+| `one` | 4.44x DuckDB | 4.37x |
+| `band` | 0.459x | 0.453x |
+| `ie` | 0.520x | 0.525x |
+
+Neutral on all three. Reverted, because it also allocates a 20 MB array at this size for that
+nothing. The raw numbers looked like a 9% win on `band` and were not: DuckDB ran 8% faster in
+the same rounds, which is the whole of it. **An A/B against a competitor's own time in the same
+round is the only form of this measurement worth taking on a shared box**, and the first
+uninterleaved pass at these numbers said "5% better" where the interleaved one says "nothing".
+
+So the per-match cost is not the gather, and the next reader starts from a narrower question
+than "the emission is slow": something inside `Out::pair` or the loop around it costs ~6x what
+DuckDB's does, and it is not memory locality.
+
+**The generalizable finding is the missing benchmark, not the missing parallelism.** Three
+shapes, one broken, and the broken one was invisible for as long as it was unmeasured — which is
+the same sentence item 9 wrote about the string sort. An operator with no committed case has no
+regression protection and no drift protection, and this one had neither while its documentation
+disagreed with itself by 3x.
+
+## 21. TPC-H at sf100, run rather than recalled: the OOM moved, it did not go (2026-08-25)
+
+`competitive_architecture.md` has carried "**L at >=100M rows (2-11x, OOM on q3/q4/q5 at
+sf100)**" since the streaming executor landed, with the caveat that sf100 "is untested here".
+It is the oldest untested claim in either document, and it is the one that decides whether
+"any data scale" is true. This entry tests it.
+
+**Method.** 600,037,902 `lineitem` rows mirrored to local NVMe with canonical column names
+(the repo's `tools/mirror_bench_data.py` writes each table with a single `COPY`, which at sf100
+is a 600M-row conversion that was OOM-killed on this shared box; one source file per `COPY`
+bounds the peak and the destination glob already accepts many parts). Then
+`run.py --benchmark tpch --scale 100 --scan --engines batcher,duckdb`, with the process's RSS
+sampled every two seconds.
+
+**The three queries the claim names now complete.** q1 through q8 all ran. q3, q4 and q5 — the
+three recorded as OOM-killed at 133 GB — finished, with q3 peaking at about **55 GB** and q8 at
+**102 GB**. The streaming executor's structural win is real, and the specific claim about those
+three queries should be retired.
+
+**q9 is OOM-killed, twice.** First on a shared box at **127 GB**, which is not evidence on its
+own; then again with the box quiesced and nothing else of consequence running, at **125 GB**.
+Both deaths are a `SIGKILL` — no traceback, no benchmark row, the process simply gone — after a
+climb through 71, 75, 80 and 125 GB over roughly forty minutes. So the honest restatement is:
+
+> The sf100 OOM is **current**, and it has **moved**. It is not q3/q4/q5 any more; it is q9.
+
+**Two further observations, both from the same run, and both worth more than the timings.**
+
+*The memory profile is the story, not the wall clock.* q8 completing at 102 GB is not a win in
+any sense that matters — DuckDB answers the same query in single-digit GB. A 100 GB working set
+completes on a 184 GB box and OOMs on every smaller one, which is most of them. The gap at
+sf100 is memory, and the queries that die are simply the ones whose working set crosses whatever
+the box happens to have.
+
+*And q9 was not even using the machine.* Sampled repeatedly while it ran: **~5.2 cores of 96
+busy**, RSS flat for minutes at a time, 750 threads of which two were runnable. Whatever q9
+spends forty minutes doing, it is doing it nearly serially. That is a different defect from the
+memory one and probably the more tractable of the two, and no timing on a completing query
+would have surfaced it.
+
+**What this does not establish.** Both engines run in one process here, so the serial phase
+cannot be attributed to Batcher rather than DuckDB from these samples alone — the RSS is far
+more consistent with Batcher, but the next run should be `--engines batcher` so the question
+does not need arguing. Nothing here is a timing claim: the box was shared for the first run and
+q9 never produced a row in either, so **this entry reports capability and memory, not ratios.**
+
+**The scorecard needs the same correction and did not get it in this pass**, because
+`competitive_architecture.md` was being edited by another session throughout and editing it
+would have swept that work into this one's commit. The rows to fix are the "Single-node >=100M
+rows" scorecard line and ceiling 1's closing claim; the evidence is above.
+
+## 22. The two measurements that made `StringView` the top structural item no longer reproduce (2026-08-25)
+
+Entry 14 promoted `StringView` (arrow `Utf8View`) to "the new top structural item", and
+`competitive_architecture.md`'s roadmap ranks it second only to the streaming executor. Its
+case rests on two H2O join rows, both measured 2026-08-18 against DuckDB's native store at the
+1e7 tier. **Both are queries in the committed suite**, so they can simply be re-run:
+
+| | entry 14 (08-18) | run A (08-25) | run B (08-25) |
+|---|---|---|---|
+| `h2o-join-q5` — `x JOIN big USING (id3)`, full projection | 369.6 vs 204.8 = **1.80x** | 212.5 vs 252.0 = **0.84x** | 205.8 vs 249.4 = **0.83x** |
+| `h2o-join-q4` — `x JOIN medium USING (id5)`, the **string** key | 231.7 vs 74.2 = **3.12x** | 83.9 vs 101.8 = **0.82x** | 77.7 vs 102.9 = **0.76x** |
+
+Both flipped from losses to wins, on two independent runs, with every correctness check passing.
+**q4 is the string-keyed join** — entry 14's single strongest datum, the 3.12x that the whole
+"the gap is the string representation" argument was sized from — and Batcher now wins it.
+Batcher wins all five join questions in both runs (0.37x-0.84x), and beats Polars on all five
+in the run that included it.
+
+The group-by half moved the same way. Entry 2 recorded "q2 2.78x on two string keys, q7 2.04x,
+q3 1.39x"; re-run, those are **1.78x, 1.19x and 1.10x**, and Batcher beats Polars on all ten
+questions while beating DuckDB on four.
+
+### What this does and does not retire
+
+**It does not refute entry 14's mechanism.** DuckDB's `string_t` really does inline twelve
+bytes, Batcher's `Utf8` gather really does chase offsets, and the length-dependence entry 14
+measured (3.51x on six-character strings against 1.66x on 26.5-character ones) is a property of
+the two layouts rather than of any particular commit. If that argument is re-made it should be
+re-made on its own terms.
+
+**It does retire the ranking.** "Worth roughly parity-to-a-win on the two largest single-node
+losses" is now false in its premise: those two queries are not losses. `StringView` is a new
+physical type through `bc-arrow`, every `bc-expr` string kernel, the row encoder, the FFI
+boundary and the IR's type vocabulary — a grep for `as_string`/`StringArray` finds **90 files** —
+and it is a *partial* adoption that entry 2 already measured as losing. **Nothing in this
+document currently justifies starting that, and an agent that started it on entry 14's numbers
+would be optimizing two queries that already win.**
+
+### The caveat, stated because it bounds the claim
+
+This box is shared, and DuckDB's own times here are 20-37% higher than entry 14 recorded
+(249 ms against 205 for q5), so **absolute times are not comparable across the two documents** —
+only ratios measured back to back inside one run are. That is exactly why the table above prints
+both engines for both runs rather than Batcher alone. What survives that caveat is the direction
+and its size: Batcher's own q4 time is a third of what entry 14 recorded, the ratio flipped in
+two independent runs, and no reading of the load explains a 3.12x loss becoming a 0.76x win.
+
+**The generalizable point is the one items 19, 20 and 21 also make.** Four separate competitive
+claims in these two documents have now been found stale in a single pass, all in the same
+direction — the work landed and the documents that direct work did not move. The remedy is not
+to write them more carefully; it is that **every claim worth directing work from should name a
+committed benchmark case that reproduces it**, the way this entry could only be written because
+q4 and q5 are in the suite. Item 20's range join had no such case, and its shape stayed broken
+for as long as it was unmeasured.
+
+## 23. The 99-query sweep: where the operator surface actually loses (2026-08-25)
+
+Items 19-22 each re-measured one operator. This one measures the widest operator surface the
+suite has — **TPC-DS, all 99 queries, sf1, batcher against duckdb** — because a per-operator
+reading cannot say which operators a real workload spends its time in.
+
+**Result: 3,293 ms against DuckDB's 3,386 ms, 0.97x overall.** 44 queries win on ratio and 55
+lose, which sounds bad and is not: the wins are large (q36 0.04x, q64 0.06x, q75 0.08x, q74
+0.10x, q8 0.10x) and the losses are small. Ranked by **time lost** rather than by ratio — the
+ordering entry 12 argued for:
+
+| query | batcher | duckdb | ratio | lost |
+|---|---|---|---|---|
+| q22 | 188.1 ms | 77.0 ms | 2.44x | **+111.1 ms** |
+| q78 | 161.2 ms | 63.9 ms | 2.52x | **+97.3 ms** |
+| q47 | 133.7 ms | 56.6 ms | 2.36x | +77.1 ms |
+| q5 | 81.7 ms | 22.0 ms | 3.72x | +59.7 ms |
+| q77 | 66.4 ms | 12.7 ms | 5.22x | +53.7 ms |
+| q88 | 70.0 ms | 28.4 ms | 2.47x | +41.6 ms |
+
+### A hypothesis this sweep killed — do not "fix" the rollup
+
+Four of the six worst queries use `ROLLUP`, and Batcher lowers `ROLLUP` to one ordinary
+`GROUP BY` per level stacked with `UNION ALL` (`api/multi_group.py`) where DuckDB computes every
+grouping set in a single pass. That is an obvious-looking `O(levels x input)` against `O(input)`,
+and it is wrong. Measured on 4 M rows, each shape against **its own** plain group-by so the
+level count is the only variable:
+
+| shape | batcher | duckdb | b/duck | x its own plain cost |
+|---|---|---|---|---|
+| `GROUP BY k1,k2,k3,k4` | 54.3 ms | 27.7 ms | 1.96x | b 1.0 / d 1.0 |
+| `ROLLUP(k1,k2)` (3 levels) | 9.3 ms | 18.1 ms | **0.51x** | b 0.2 / d 0.7 |
+| `ROLLUP(k1,k2,k3)` (4 levels) | 22.1 ms | 24.2 ms | **0.91x** | b 0.4 / d 0.9 |
+| `ROLLUP(k1,k2,k3,k4)` (5 levels) | 83.3 ms | 75.0 ms | 1.11x | b 1.5 / d **2.7** |
+| `CUBE(k1,k2,k3)` (8 levels) | 37.2 ms | 56.0 ms | **0.66x** | b 0.7 / d **2.0** |
+
+**Batcher's rollup scales better than DuckDB's, not worse.** At five levels it costs 1.5x its
+plain group-by against DuckDB's 2.7x, and it wins `CUBE` outright. The stacked-union lowering
+gets the coarser levels almost free because each one aggregates a *smaller* input than the level
+below it, which the "N passes over the input" intuition misses entirely.
+
+So the rollup is not the bottleneck. **The plain multi-key group-by underneath it is** — 1.96x
+on four integer keys with two aggregates, and that is the term every one of those queries pays
+once per level. That is where the remaining TPC-DS time is, and it is `agg_par` / `assign_groups`
+rather than anything grouping-sets-specific.
+
+### Three hypotheses about *why*, all eliminated by measurement (2026-08-26)
+
+Chased far enough to rule out the obvious causes, so the next reader starts past them.
+
+**1. "There is a cost cliff at three keys."** Holding the group count at 65,536 and varying only
+the key count, Batcher looked flat to two keys (1.08x, 1.03x) and then jumped to 1.73x at three
+while DuckDB stayed level — a discrete threshold, which reads like a fast path switching off.
+It is an artifact of comparing *different data layouts* at each key count, not a threshold.
+
+**2. "The dense composite direct-map declines at three columns."** `dense_multi_span` gates on
+the product of the columns' value ranges against `dense_budget`, with no column-count limit, so
+this was checkable directly: run each shape twice, once with tiny spans (dense eligible) and
+once with the same group count but spans multiplied out of the budget (dense refused). It
+reported the dense path **21% slower than the fallback** at three keys — the same defect shape
+as item 20's range join, where a fast path lost to the general path it exists to avoid.
+
+**3. "So the budget is too generous and should be tightened."** This is the one worth recording,
+because it is where the discipline mattered. The apparent loss did not survive repetition. A
+second sweep showed *every* shape winning, including the 2-key/65,536-group case that had just
+measured 0.93x. Interleaving the strongest apparent loss — 4 keys, 65,536 groups, the 0.74x
+reading — five times on the same data gives **1.03x, 1.11x, 1.12x, 1.13x, 1.04x: a win in every
+round.**
+
+`dense_budget` is also shared with the single-key dense path, which measures as a clear win, so
+tightening it on the strength of that 0.74x would have degraded a good path on the basis of one
+noisy sample. **The gate is correct as written and should be left alone.**
+
+What remains true is only the top-level number: a four-key integer `GROUP BY` runs at roughly
+1.55-1.96x DuckDB, the dense-versus-hash decision is not the reason, and locating the real cause
+needs Rust-level profiling rather than black-box probing from Python. That is the honest state of
+this bottleneck.
+
+### `tpcds-q67` reports FAILED and the engine is not at fault
+
+The sweep's one correctness failure, diagnosed rather than waved through, because "1 of 99
+TPC-DS queries returns a wrong answer" is a serious claim in either direction.
+
+q67 is `rank() OVER (PARTITION BY i_category ORDER BY sumsales DESC)` where `sumsales` is a
+**float sum**. Four measurements:
+
+1. `rank()` is correct in isolation — ties, nulls, `DESC`, and all four window functions agree
+   with DuckDB exactly.
+2. Run against the **raw DECIMAL parquet**, q67 is **byte-identical** between the two engines:
+   100 rows, no difference, and both produce 56,692 exact adjacent ties.
+3. Batcher is **self-consistent** across repeated runs.
+4. Run against the harness's tables, which normalize `ss_sales_price` to `double`, the two
+   engines produce **48,878 (DuckDB) against 50,487 (Batcher) exact adjacent ties** over the
+   same 505,178 rows, with a largest sum difference of **1.19e-06**.
+
+`rank()` keys on *exact* equality, so ~1,609 tie disagreements in the last bits become integer
+rank differences, one of which lands inside `rk <= 100`. The failing row moves between runs
+because which near-tie crosses the boundary does.
+
+This is the behaviour `python-control-plane.md` explicitly permits — "floating-point reductions
+are identical *up to reassociation*... bound to near the last bits; they do not remove it". The
+defect is that **the gate compares an integer rank derived from a float ordering**, which is not
+stable under a reassociation the contract allows.
+
+**Deliberately not "fixed".** Weakening a correctness gate to make a run green is the move
+`CLAUDE.md` names as the most damaging one available, and the contract's instruction where the
+engines legitimately differ is to *surface it as a decision*. This entry is that surfacing. Whoever
+owns the harness should decide between excluding `rk` from q67's comparison and accepting a
+permanent known-failing row; both are defensible and neither should happen silently.
+
+## 24. The capability census re-checked: the MAP constructor, scoped and pinned (2026-08-25)
+
+`competitor_parity_census.md` names one item as "the next wave's highest-value single item":
+`map(...)` has no constructor, which blocks ten Spark/DuckDB names *on the argument* rather than
+on the function. That census's own instruction is to re-check before working from it, so this
+entry does.
+
+**It is accurate, and the shape is better than it reads.** Probed against DuckDB, every
+`map_*` name fails, but the reason is narrow: an Arrow `Map` **column** works end to end
+already. On a `map<string,int64>` column read from Arrow, passthrough, `.map.keys`,
+`.map.values`, `.map.entries`, `.map.len`, `.map.get` and `.map.contains` all return DuckDB's
+answer, nulls included. `ExprTag.MAP` and `bc_expr::Expr::Map { func: MapFunc }` are the
+read side and they are complete. **What is missing is only the ability to *build* a map value
+in an expression**, which is why every `map_*(map(...))` probe fails on its argument.
+
+Also confirmed missing by the same probe, and still open: `struct_insert`, `struct_values`,
+`list_reduce`, `list_zip` (the `ExprTag.LIST_ZIP` tag exists but no accessor or SQL name
+reaches it), `equi_width_bins` and `bar`. **`generate_series` is listed as open and is not** —
+it answers correctly, so that line of the census is stale.
+
+### Semantics, pinned against the oracle before writing anything
+
+| case | DuckDB |
+|---|---|
+| `map(['a','b'],[1,2])` | `{'a': 1, 'b': 2}` |
+| `map([],[])` | `{}` |
+| `map(NULL, NULL)` | `NULL` |
+| `map(['a'],[NULL])` | `{'a': None}` — a null **value** is fine |
+| `map([NULL],[1])` | **error**: "Map keys can not be NULL." |
+| `map(['a','a'],[1,2])` | **error**: "Map keys must be unique." |
+| `map(['a','b'],[1])` | **error**: key list does not align with value list |
+| `map_from_arrays` | **does not exist** — it is Spark's name, not DuckDB's |
+
+Three of those are errors, which is the part worth pinning: the tempting implementation
+silently keeps the last duplicate or truncates to the shorter list, and both produce a
+plausible wrong answer rather than a refusal.
+
+### Built (2026-08-26)
+
+`bc_expr::Expr::MakeMap { keys, values }` with the wire tag `make_map`, evaluated in
+`bc-expr/src/eval/map_ops/make_map.rs` — its own package beside `list_ops`, because map
+*construction* is not a list operation and `map_concat`/`map_from_entries` want the same
+home. Surfaced as `bt.map_from_arrays(keys, values)` (Spark's name; Python's `map` builtin
+rules out DuckDB's spelling at the top level) and as both `map(...)` and `map_from_arrays(...)`
+in SQL. The JIT classifies it `Unsupported` and falls back, which is invariant #6's required
+answer for a variant it cannot compile.
+
+Uniqueness is checked on the key's **row-encoded bytes** (`arrow::row::RowConverter`) rather
+than by a typed comparison, so one implementation covers every key type the encoder accepts
+instead of restating equality per type — which is where a quiet disagreement with the grouping
+path would otherwise start.
+
+Verified: 5 Rust unit tests (the null-key/null-value asymmetry, per-row rather than
+column-wide uniqueness, and the empty-versus-null map distinction an offsets bug collapses),
+14 differential tests against DuckDB including all three refusals, the `test_ir_snapshot`
+golden re-baselined (**13 lines, purely the new shape** — no other node moved), a new
+user-guide page whose code blocks execute, and `examples/expr_collections/map_columns.py`
+extended and run.
+
+**One deliberate divergence, pinned by a test rather than left to be rediscovered.**
+`map(NULL, NULL)` with a *bare untyped* SQL `NULL` answers a null map in DuckDB and raises
+here: sqlglot types a bare `NULL` as `Int64`, so there is no key or value type to build the
+`Map` fields from, and inventing one would put a guessed schema into the plan. A null *list
+column*, which carries a type, behaves as DuckDB's does — and that is the case real data has.
+
+### What the scoping said before it was built
+
+It needed a new `bc_expr::Expr` variant — the read side has no constructor to reuse, and
+`list_zip` + a cast cannot stand in because the accessor does not exist either. That means
+editing `bc-expr/src/lib.rs` (the **wire contract**) and `eval/dispatch.rs`, and
+`CLAUDE.md` requires the Python `to_ir()` tag and the Rust `serde` tag to move **in the same
+commit**.
+
+Both of those files were being actively edited by another session throughout this pass, and
+`bc-expr` did not compile under `clippy -D warnings` because of that in-flight work. Adding a
+variant to a contended wire contract — where two sessions could race on the tag set — is the
+one change that must not be split across commits, so it was left for a session that can hold
+`bc-expr`. The scoping above is the part that does not need to be redone: the semantics are
+pinned, the read side is confirmed complete, and the work is one variant plus its eval, the
+Python node, the two SQL names, an `test_ir_snapshot` entry and a differential test.
+
+## 25. Spark and Arrow, reviewed against the operator surface (2026-08-26)
+
+Items 19-24 read DuckDB, Polars, DataFusion and Daft. This closes the two the pass had leaned
+on earlier entries for, by walking their inventories and grepping Batcher for each entry.
+
+### Spark: AQE and `sql/execution`, thirteen techniques, one gap
+
+| Spark | Batcher |
+|---|---|
+| `PlanAdaptiveDynamicPruningFilters` (DPP) | `kyber/rules/joins/rewrites.py` + `io/formats/structured/parquet/partitions.py`; and `stream/runtime_filter.rs` sinks the build-side key set **to the scan** |
+| `OptimizeSkewedJoin` / `OptimizeSkewInRebalancePartitions` | `dist/skew.py` (item 5 — fires unasked above ~8.4 M rows) |
+| `ReuseAdaptiveSubquery` | `kyber/common_subplan.py` (item 10i) |
+| `OptimizeMetadataOnlyQuery` | `kyber/metadata_answer.py` |
+| `ConvertSortMergeJoinToShuffledHashJoin` | `kyber/rules/selection.py` (+ the UCB1 bandit over join strategies) |
+| `DemoteBroadcastHashJoin` | `dist/flight_broadcast.py` |
+| `CombineAdjacentAggregation` | `kyber/rules/agg_pushdown.py` (item 0b) |
+| `AQEPropagateEmptyRelation` | `dist/executor.py` |
+| `ExpandExec` (grouping sets) | `api/multi_group.py` — and item 23 measured it **beating** DuckDB's single-pass form |
+| `ExternalAppendOnlyUnsafeRowArray` | `dist/spill/buckets.py`, `ops/external_sort.rs` |
+| `InsertSortForLimitAndOffset` | `dist/flight_sort.py`, `TopNBound` |
+| `OptimizeShuffleWithLocalRead` | `dist/flight_sort.py` |
+| **`CoalesceShufflePartitions`** | **absent** — see below |
+
+### Arrow C++ compute kernels: no gaps found
+
+Walked the `kernels/` families — `aggregate_pivot`, `aggregate_tdigest`, `aggregate_mode`,
+`vector_cumulative_ops`, `vector_pairwise`, `vector_run_end_encode`, `vector_rank`,
+`vector_select_k`, `vector_selection`, `scalar_nested`, `scalar_random` — and every one has a
+Batcher site. Arrow contributes nothing to the backlog.
+
+### The one gap, and why it is *not* being built on this evidence
+
+Spark coalesces adjacent small reducer partitions using **this run's** map-output sizes.
+Batcher sizes reducers from the worker count and learns a per-family EMA across runs
+(`dist/adaptive_sizing/sizing.py`), which is a different answer to the same problem — and
+arguably a better one, since Spark's feature exists largely because its default
+`shuffle.partitions=200` is so often wrong, a default Batcher does not have.
+
+So the question is empirical, and the measurement **failed in a way worth recording**.
+
+A first probe globbed the shuffle scratch after a 4 M-row, 200,000-group distributed
+aggregate and reported 92 reducers, a 0.19 MB median, and a 59.3 MB maximum — a **308x
+skew**, which reads as overwhelming justification to build it. It is an artifact. The bucket
+files are written to per-worker scratch and are **not visible from the driver**, so the glob
+was counting **stale files from earlier runs in the same directory**. Re-run with per-query
+isolation (only files created after the query started), the same probe reports *no new bucket
+files visible from the driver* at all.
+
+**The 308x number is false and nothing should be built on it.** Measuring this properly needs
+the map task to report its own bucket sizes, which is also what an implementation would need —
+the driver cannot stat what it cannot see — so the measurement and the feature share a
+prerequisite. Until that exists there is no evidence Batcher's reducers are mis-sized, and the
+ledger already ranks this 11th of 14.
+
+The generalizable point is the one item 23 makes about `ROLLUP` and item 22 about
+`StringView`: **a competitor having a technique is not evidence that Batcher needs it**, and a
+number that arrives conveniently large deserves the same scrutiny as one that arrives
+inconveniently small. This pass produced **four** such numbers — a refuted rollup bottleneck, a fabricated shuffle
+skew, a bulk-emission win that was the box getting quieter, and a dense-path "loss" that won
+every round once interleaved — against three genuine gaps that were built. Every one of the
+four looked like a reason to change code. **Repeat the measurement before you do.**
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -2723,7 +3356,9 @@ from the code.** Two items move to the top and one new one appears:
     mechanism for the shapes with a discarding operator downstream (`cb-q32`'s `LIMIT`, sort
     top-k), which the census prices at single-digit milliseconds each.
 
-0a'. **`StringView` (arrow `Utf8View`) — the new top structural item.** Entry 14 has the
+0a'. **`StringView` (arrow `Utf8View`) — ~~the new top structural item~~. Demoted 2026-08-25:
+    item 22 re-ran entry 14's two rows and both are now wins, so the ranking's premise is gone.
+    The layout argument still stands on its own; the priority does not.** Entry 14 has the
     measurement and the scope. It is a physical type through `bc-arrow`, the `bc-expr` string
     kernels, the row encoder and the FFI boundary, plus a planner decision about when to produce
     it — the same shape as the dictionary item 6, which was built and reverted for want of that

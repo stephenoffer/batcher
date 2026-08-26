@@ -68,7 +68,7 @@ fn a_planted_symlink_cannot_capture_spilled_rows() {
 
     // The store must still succeed — a name clash is a stale directory as often as an attack,
     // and failing the query over it would be its own reliability bug.
-    let mut store = DiskSpillStore::new(root.clone(), 1).expect("store must skip planted names");
+    let mut store = DiskSpillStore::new(root, 1).expect("store must skip planted names");
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42_i64]))])
         .expect("batch");

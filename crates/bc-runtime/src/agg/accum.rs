@@ -275,12 +275,12 @@ fn mean_sum_i128(
         let mut total: i128 = 0;
         if arr.null_count() == 0 {
             for &v in arr.values() {
-                total += v as i128;
+                total += i128::from(v);
             }
         } else {
             for i in 0..arr.len() {
                 if arr.is_valid(i) {
-                    total += arr.value(i) as i128;
+                    total += i128::from(arr.value(i));
                 }
             }
         }
@@ -294,14 +294,14 @@ fn mean_sum_i128(
         // group is non-empty (it exists because a row mapped to it) and all its values are
         // non-null, so every group is valid.
         for (&g, &v) in group_ids.iter().zip(arr.values()) {
-            sums[g as usize] += v as i128;
+            sums[g as usize] += i128::from(v);
         }
         return masked_decimal(sums, vec![true; num_groups], precision, scale);
     }
     let mut valid = vec![false; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
         if arr.is_valid(i) {
-            sums[g as usize] += arr.value(i) as i128;
+            sums[g as usize] += i128::from(arr.value(i));
             valid[g as usize] = true;
         }
     }
@@ -660,16 +660,16 @@ pub(crate) fn bitfold_acc(
     for (i, &g) in group_ids.iter().enumerate() {
         if arr.is_valid(i) {
             let (g, v) = (g as usize, arr.value(i));
-            if !valid[g] {
-                cur[g] = v;
-                valid[g] = true;
-            } else {
+            if valid[g] {
                 cur[g] = match func {
                     AggFunc::BitAnd => cur[g] & v,
                     AggFunc::BitOr => cur[g] | v,
                     AggFunc::BitXor => cur[g] ^ v,
                     _ => unreachable!("bitfold_acc on non-bitwise func"),
                 };
+            } else {
+                cur[g] = v;
+                valid[g] = true;
             }
         }
     }
@@ -962,7 +962,7 @@ mod tests {
             let dec: ArrayRef = Arc::new(
                 values
                     .iter()
-                    .map(|v| v.map(|x| x as i128))
+                    .map(|v| v.map(i128::from))
                     .collect::<Decimal128Array>()
                     .with_precision_and_scale(20, 3)
                     .unwrap(),

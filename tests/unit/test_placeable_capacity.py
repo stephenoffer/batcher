@@ -45,7 +45,7 @@ def test_counts_per_node_not_cluster_total(monkeypatch):
 
 
 def test_unreadable_topology_reports_unknown(monkeypatch):
-    monkeypatch.setattr(scaling, "node_classes", lambda: [])
+    monkeypatch.setattr(scaling, "node_classes", list)
     assert capacity.placeable_workers(4.0) is None
 
 

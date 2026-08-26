@@ -56,6 +56,15 @@ DIR_ALLOW: dict[str, str] = {
         "`evaluate`/`calibration`/`thresholds`/`tables` here and the plan-layer "
         "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
+    "benchmarks/internals": (
+        "13 subsystem benchmarks against a cap of 12. Every one is a standalone `python "
+        "benchmarks/internals/<name>.py` entry point, cited by that path from the docs and "
+        "from the dated entries in `BENCHMARK_RESULTS.md` that record what it measured. "
+        "Grouping them into subdirectories would rewrite those historical records to hide a "
+        "count of one. Same reasoning as `benchmarks/gpu_backend` below; `operators/` shows "
+        "the growth path — a *new* category gets a subpackage, existing path-invoked scripts "
+        "stay where they are cited"
+    ),
     "benchmarks/gpu_backend": (
         "14 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
         "benchmarks/gpu_backend/<name>.py` entry point a reader runs by name, so grouping them "

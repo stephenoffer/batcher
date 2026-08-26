@@ -291,14 +291,16 @@ def test_no_sampling_window_produces_no_device_finding():
 
 
 def test_a_healthy_fleet_produces_no_device_finding(monkeypatch):
-    from batcher.observe.accelerators import diagnosis
     from batcher.observe.insights.devices import device_bottleneck
 
     window = TelemetrySampler()
     for _ in range(10):
         window.observe(0, "sm", 0.95)
+    # `series` only. `diagnosis` imports `device_window` *inside* the function that uses it,
+    # so it binds no such name at module level and a second patch there — which needed
+    # `raising=False` to be accepted at all — applied to nothing. Inert while looking
+    # load-bearing, which is the shape `lint-methodology`'s `patch-target-not-bound` gates.
     monkeypatch.setattr(series, "device_window", lambda: window)
-    monkeypatch.setattr(diagnosis, "device_window", lambda: window, raising=False)
     # Compute bound is not actionable: the device is doing its job and the only remedy is more
     # hardware, so a findings list must not carry it.
     assert device_bottleneck({}, [], 0.0) == []
@@ -442,9 +444,7 @@ def test_device_timing_reports_nothing_until_it_is_resolved(monkeypatch):
 def test_the_operator_label_carries_the_node_id(monkeypatch):
     labels = []
     monkeypatch.setattr(ranges, "profiling_enabled", lambda: True)
-    monkeypatch.setattr(
-        nvtx, "_backend", lambda: ("fake", lambda label: labels.append(label), lambda: None)
-    )
+    monkeypatch.setattr(nvtx, "_backend", lambda: ("fake", labels.append, lambda: None))
     nvtx._DISABLED.clear()
     with ranges.operator_range("HashJoin", 3):
         pass

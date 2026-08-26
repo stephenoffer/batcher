@@ -573,24 +573,57 @@ pub(super) fn extract_json(text: &str, path: &[PathPart]) -> Option<String> {
     }
 }
 
-/// `json_contains(doc, needle)` — whether `needle` (itself a JSON value) appears as an
-/// element of a top-level array, as a value of a top-level object, or equals the whole
-/// document. Comparison is on the *parsed* values, so whitespace and key order in either
-/// argument cannot change the answer.
+/// `json_contains(doc, needle)` — JSON containment, at any depth: PostgreSQL's `@>` and
+/// DuckDB's `json_contains`, which are the same relation.
+///
+/// It used to look only one level down — an element of a top-level array, a value of a
+/// top-level object, or the whole document — so `json_contains('{"a":[1,2]}', '1')` and
+/// `json_contains('{"a":{"b":1}}', '{"a":{}}')` were both `false` where both are true,
+/// which made the function useless for the shape it is actually reached for.
+///
+/// Comparison is on the *parsed* values, so whitespace and key order in either argument
+/// cannot change the answer. Unparseable text on either side is `false`, not an error,
+/// matching every other reader in this module.
 pub(super) fn contains(text: &str, needle: &str) -> bool {
-    let Ok(doc) = serde_json::from_str::<Value>(text) else {
+    let (Ok(doc), Ok(want)) = (
+        serde_json::from_str::<Value>(text),
+        serde_json::from_str::<Value>(needle),
+    ) else {
         return false;
     };
-    let Ok(want) = serde_json::from_str::<Value>(needle) else {
-        return false;
-    };
-    if doc == want {
+    contains_value(&doc, &want)
+}
+
+/// Containment of `want` in `doc`: structurally here, or anywhere below.
+///
+/// The descent is what makes containment a *search* rather than a shape check, and it is
+/// not reachable from the structural rule: `[[1,2]] @> [1]` is true through the inner array
+/// even though the outer arrays do not match elementwise.
+fn contains_value(doc: &Value, want: &Value) -> bool {
+    if structurally_contains(doc, want) {
         return true;
     }
     match doc {
-        Value::Array(items) => items.contains(&want),
-        Value::Object(fields) => fields.values().any(|v| *v == want),
+        Value::Array(items) => items.iter().any(|d| contains_value(d, want)),
+        Value::Object(fields) => fields.values().any(|d| contains_value(d, want)),
         _ => false,
+    }
+}
+
+/// The shape rule: equal values, an object superset, or an array whose elements cover the
+/// other's. Not recursive *into* `doc` — [`contains_value`] owns the descent.
+fn structurally_contains(doc: &Value, want: &Value) -> bool {
+    match (doc, want) {
+        (Value::Object(have), Value::Object(need)) => need
+            .iter()
+            .all(|(k, v)| have.get(k).is_some_and(|d| structurally_contains(d, v))),
+        // Every element of `need` must be covered by *some* element of `have`, and one
+        // element of `have` may cover several — which is why this is not a zip. An empty
+        // `need` is vacuously covered, matching `'[1,2]' @> '[]'`.
+        (Value::Array(have), Value::Array(need)) => need
+            .iter()
+            .all(|w| have.iter().any(|d| structurally_contains(d, w))),
+        _ => doc == want,
     }
 }
 
@@ -627,6 +660,12 @@ pub(super) fn structure(text: &str) -> Option<String> {
 
 fn structure_of(value: &Value) -> Value {
     match value {
+        // An object with no fields states nothing about its shape, and DuckDB names that
+        // `"JSON"` — the same opaque type it gives any value it cannot describe. Note the
+        // asymmetry with `[]`, which is `["NULL"]`: an empty *array* still says "array of
+        // something", where an empty object says nothing at all. Describing `{}` as `{}`
+        // claimed an object with exactly zero fields, which is a different assertion.
+        Value::Object(fields) if fields.is_empty() => Value::String("JSON".into()),
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
@@ -882,6 +921,82 @@ mod tests {
         assert_eq!(extract_bool(doc, &parts("$.ok")), Some(true));
         assert_eq!(extract_string(doc, &parts("$.tags[0]")), Some("x".into()));
         assert_eq!(extract_string(doc, &parts("$.tags[1]")), Some("y".into()));
+    }
+
+    /// Containment is a *search*, not a top-level scan. Each case here answered `false`
+    /// before the descent existed, and each is `true` in both DuckDB and PostgreSQL.
+    #[test]
+    fn containment_finds_a_value_at_any_depth() {
+        for (doc, needle) in [
+            (r#"{"a":[1,2]}"#, "1"),
+            (r#"{"k":1,"n":{"m":2},"arr":[1,2,3]}"#, "2"),
+            (r#"{"a":{"b":{"c":42}}}"#, "42"),
+            (r#"{"a":[{"b":7}]}"#, r#"{"b":7}"#),
+            ("[[1,2],[3]]", "3"),
+            ("[[1,2]]", "[1]"),
+            ("[1,[2]]", "2"),
+            (r#"[{"a":1,"b":2}]"#, r#"{"a":1}"#),
+            (r#"{"a":null}"#, "null"),
+        ] {
+            assert!(contains(doc, needle), "{doc} should contain {needle}");
+        }
+    }
+
+    /// The object/array *superset* half of the relation, which is what makes `@>` more than
+    /// equality — and its boundary, where a near-miss must stay `false`.
+    #[test]
+    fn containment_is_a_superset_relation_and_not_a_looser_one() {
+        for (doc, needle) in [
+            (r#"{"a":1,"b":2}"#, r#"{"a":1}"#),
+            (r#"{"a":{"b":1,"c":2}}"#, r#"{"a":{"b":1}}"#),
+            (r#"{"a":{"b":1}}"#, r#"{"a":{}}"#),
+            (r#"{"a":[1,2]}"#, r#"{"a":[1]}"#),
+            ("[1,2,3]", "[3,1]"),
+            ("[1,2]", "[]"),
+            (r#"{"a":1}"#, "{}"),
+        ] {
+            assert!(contains(doc, needle), "{doc} should contain {needle}");
+        }
+        for (doc, needle) in [
+            ("[1,2,3]", "[1,4]"),
+            (r#"{"a":1}"#, r#"{"a":2}"#),
+            (r#"{"a":1}"#, r#"{"b":1}"#),
+            (r#"{"k":2}"#, "1"),
+            (r#"{"k":"s"}"#, "1"),
+            // `true` is not `1`: containment compares parsed values, and coercing here
+            // would make `json_contains(doc, '1')` true for every boolean in the document.
+            (r#"{"k":true}"#, "1"),
+            ("not json", "1"),
+            ("[1]", "not json"),
+        ] {
+            assert!(!contains(doc, needle), "{doc} must not contain {needle}");
+        }
+    }
+
+    /// `{}` and `[]` are described differently, and the asymmetry is DuckDB's: an empty
+    /// array still says "array of something", an empty object says nothing at all.
+    #[test]
+    fn an_empty_object_has_no_structure_to_describe() {
+        assert_eq!(structure("{}").unwrap(), r#""JSON""#);
+        assert_eq!(structure("[]").unwrap(), r#"["NULL"]"#);
+        assert_eq!(structure(r#"{"a":{}}"#).unwrap(), r#"{"a":"JSON"}"#);
+    }
+
+    /// Re-serializing a document must not reorder its keys. `serde_json`'s default map is
+    /// a BTreeMap, so `structure` and `pretty` sorted where `object_keys` and `extract` did
+    /// not — the same document, two orders, neither DuckDB's.
+    #[test]
+    fn re_serializing_keeps_the_documents_key_order() {
+        let doc = r#"{"z":1,"a":2,"m":{"y":3,"b":4}}"#;
+        assert_eq!(
+            structure(doc).unwrap(),
+            r#"{"z":"UBIGINT","a":"UBIGINT","m":{"y":"UBIGINT","b":"UBIGINT"}}"#
+        );
+        assert!(
+            pretty(doc).unwrap().find("\"z\"") < pretty(doc).unwrap().find("\"a\""),
+            "pretty re-sorted the keys: {}",
+            pretty(doc).unwrap()
+        );
     }
 
     #[test]
@@ -1150,7 +1265,7 @@ mod tests {
     /// approach on a representative event document. Run explicitly:
     ///   cargo test -p bc-expr -- --ignored --nocapture bench_lazy_vs_fullparse
     #[test]
-    #[ignore]
+    #[ignore = "timing study: lazy path-scan extraction vs full parse; run with --ignored"]
     fn bench_lazy_vs_fullparse() {
         use std::time::Instant;
 

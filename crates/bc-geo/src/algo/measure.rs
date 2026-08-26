@@ -24,6 +24,7 @@ pub fn area(g: &Geometry) -> f64 {
 }
 
 /// The area of one polygon: exterior minus interiors, never negative.
+#[must_use]
 pub fn polygon_area(p: &Polygon) -> f64 {
     let holes: f64 = p.interiors.iter().map(|r| ring_area(r)).sum();
     measurement((ring_area(&p.exterior) - holes).max(0.0))
@@ -43,6 +44,7 @@ pub fn length(g: &Geometry) -> f64 {
 
 /// The total boundary length of every polygon, holes included. Zero for a non-areal
 /// geometry, matching PostGIS `ST_Perimeter`.
+#[must_use]
 pub fn perimeter(g: &Geometry) -> f64 {
     measurement(
         g.polygons()
@@ -53,6 +55,7 @@ pub fn perimeter(g: &Geometry) -> f64 {
 }
 
 /// The length of one chain.
+#[must_use]
 pub fn line_length(l: &LineString) -> f64 {
     measurement(l.windows(2).map(|w| dist(w[0], w[1])).sum())
 }
@@ -61,6 +64,7 @@ pub fn line_length(l: &LineString) -> f64 {
 ///
 /// `None` when either geometry is empty, which is what PostGIS returns and is the
 /// honest answer: there is no pair of points to measure between.
+#[must_use]
 pub fn distance(a: &Geom, b: &Geom) -> Option<f64> {
     if a.is_empty() || b.is_empty() {
         return None;
@@ -137,6 +141,7 @@ fn line_line_distance(a: &LineString, b: &LineString) -> f64 {
 
 /// The largest distance between any pair of vertices of the two geometries
 /// (PostGIS `ST_MaxDistance`).
+#[must_use]
 pub fn max_distance(a: &Geom, b: &Geom) -> Option<f64> {
     let (ca, cb) = (a.coords(), b.coords());
     if ca.is_empty() || cb.is_empty() {
@@ -158,6 +163,7 @@ pub fn max_distance(a: &Geom, b: &Geom) -> Option<f64> {
 /// PostGIS `ST_HausdorffDistance` also does. On densified inputs it converges to the
 /// continuous value; on sparse ones it under-reports, and that is the documented
 /// trade rather than a hidden one.
+#[must_use]
 pub fn hausdorff_distance(a: &Geom, b: &Geom) -> Option<f64> {
     if a.is_empty() || b.is_empty() {
         return None;
@@ -174,6 +180,7 @@ fn directed_hausdorff(from: &Geom, to: &Geom) -> f64 {
 
 /// The distance from a position to the nearest point of a geometry (0 when inside a
 /// polygon).
+#[must_use]
 pub fn nearest_distance(p: Coord, g: &Geometry) -> f64 {
     for poly in g.polygons() {
         if point_in_polygon(p, poly) != PointRing::Outside {
@@ -196,6 +203,7 @@ pub fn nearest_distance(p: Coord, g: &Geometry) -> f64 {
 /// This is the planar azimuth PostGIS `ST_Azimuth` computes on a `geometry`: it uses
 /// the coordinate axes, so on lon/lat it is only correct near the equator. The
 /// geodesic bearing is `proj::geodesy::bearing`.
+#[must_use]
 pub fn azimuth(a: Coord, b: Coord) -> Option<f64> {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     if dx == 0.0 && dy == 0.0 {
@@ -215,6 +223,7 @@ pub fn azimuth(a: Coord, b: Coord) -> Option<f64> {
 /// the reason a `GEOMETRYCOLLECTION(POLYGON, POINT)` centroid ignores the point.
 /// A zero-measure areal or linear geometry (a degenerate polygon, a zero-length line)
 /// falls back to the vertex mean rather than dividing by zero.
+#[must_use]
 pub fn centroid(g: &Geometry) -> Option<Coord> {
     let polys = g.polygons();
     if !polys.is_empty() {
@@ -272,7 +281,7 @@ fn area_centroid(polys: &[&Polygon]) -> Option<Coord> {
     let mut cy = 0.0;
     for p in polys {
         for ring in std::iter::once(&p.exterior).chain(p.interiors.iter()) {
-            let mut closed = ring.to_vec();
+            let mut closed = ring.clone();
             crate::types::close_ring(&mut closed);
             let (ra, rx, ry) = ring_centroid_moment(&closed);
             // A hole subtracts, which the shoelace sign already encodes when the hole

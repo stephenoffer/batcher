@@ -64,16 +64,15 @@ pub(super) fn strip_html_text(html: &str) -> String {
                     i += skip_element_content(&html[i..], element);
                 }
             }
-            b'&' => match decode_entity(&html[i..]) {
-                Some((decoded, consumed)) => {
+            b'&' => {
+                if let Some((decoded, consumed)) = decode_entity(&html[i..]) {
                     push_char(&mut out, decoded);
                     i += consumed;
-                }
-                None => {
+                } else {
                     push_char(&mut out, '&');
                     i += 1;
                 }
-            },
+            }
             _ => {
                 // Copy the run up to the next `<` or `&` in one go, decoding whitespace.
                 let run_end = html[i..]

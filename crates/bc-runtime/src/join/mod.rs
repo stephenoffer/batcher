@@ -77,6 +77,7 @@ fn use_probe_bloom_with(build_rows: usize, probe_rows: usize, min_build_rows: us
 /// based on columns alone undercounts the resident build table and can OOM before
 /// spilling. This is a tight, measured estimate (not worst case) so it never spills
 /// an in-memory join that would actually have fit.
+#[must_use]
 pub fn estimate_build_bytes(rows: usize) -> usize {
     // heads (u32 slot + control byte at the load factor) + next (u32) + null mask (1B).
     rows.saturating_mul(2 * std::mem::size_of::<u32>() + 4)
@@ -227,8 +228,8 @@ pub fn hash_join_indices_with(
     bloom_fp_rate: f64,
     bloom_min_build_rows: usize,
 ) -> Result<JoinIndices, RuntimeError> {
-    let left_rows = left_keys.first().map_or(0, |a| a.len());
-    let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let left_rows = left_keys.first().map_or(0, bc_arrow::Array::len);
+    let right_rows = right_keys.first().map_or(0, bc_arrow::Array::len);
     let use_bloom = use_probe_bloom_with(right_rows, left_rows, bloom_min_build_rows);
     hash_join_indices_impl(
         left_keys,
@@ -307,8 +308,8 @@ pub(crate) fn hash_join_indices_impl(
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
     let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
 
-    let left_rows = left_keys.first().map_or(0, |a| a.len());
-    let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let left_rows = left_keys.first().map_or(0, bc_arrow::Array::len);
+    let right_rows = right_keys.first().map_or(0, bc_arrow::Array::len);
     let left_null = null_mask(left_keys, left_rows);
     let right_null = null_mask(right_keys, right_rows);
 
@@ -1238,7 +1239,7 @@ const MAX_PACKED_KEY_BYTES: usize = 15;
 fn pack_byte_key(b: &[u8]) -> u128 {
     let mut w = (b.len() as u128) << 120;
     for (i, &c) in b.iter().enumerate() {
-        w |= (c as u128) << (8 * (14 - i));
+        w |= u128::from(c) << (8 * (14 - i));
     }
     w
 }
@@ -1884,8 +1885,8 @@ pub fn broadcast_hash_join_indices(
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
     let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
 
-    let left_rows = left_keys.first().map_or(0, |a| a.len());
-    let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let left_rows = left_keys.first().map_or(0, bc_arrow::Array::len);
+    let right_rows = right_keys.first().map_or(0, bc_arrow::Array::len);
     let left_null = null_mask(left_keys, left_rows);
     let right_null = null_mask(right_keys, right_rows);
     let use_bloom = use_probe_bloom_with(right_rows, left_rows, bloom_min_build_rows);
@@ -2433,7 +2434,7 @@ mod tests {
 
     // Run with: cargo test -p bc-runtime --release join_timing -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "timing study for the hash-join build and probe phases"]
     fn join_timing() {
         use std::time::Instant;
         let probe_n: i64 = 1_200_000;

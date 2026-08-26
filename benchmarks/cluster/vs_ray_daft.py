@@ -20,8 +20,13 @@ import functools
 import os
 import sys
 import time
+from pathlib import Path
 
-from _ray_env import with_timeout
+from _ray_env import _require_release, with_timeout
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_release_build
 
 # Unbuffered, line-flushed prints so a long distributed run streams progress.
 print = functools.partial(print, flush=True)
@@ -253,7 +258,14 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
     ~0.6 s with the cluster to itself — a 5x distortion, and one that pointed at a
     regression that did not exist. Running each engine's whole sweep before the next
     confines every engine's residue to its own numbers. Batcher runs first (a clean
-    cluster); an engine that leaks only ever taxes itself.
+    cluster). Batcher runs first, so it is the one engine guaranteed a clean cluster; Ray
+    inherits nothing and Daft, running third, inherits Ray's residue as well as its own,
+    because only Batcher has a release hook (`release_session_fleet`). An earlier note here
+    claimed "an engine that leaks only ever taxes itself", which is true of the leaker and
+    false of whatever runs after it — the ordering favours the system under test, and that
+    is worth knowing when reading a `vs_ray`/`vs_daft` column rather than being asserted
+    away. Set `BENCH_ENGINE_ORDER` to rotate which engine goes first if you want to bound
+    how much of a margin is ordering.
     """
     from cluster_util import ClusterMonitor
 
@@ -305,6 +317,19 @@ def _fmt_util(u: dict) -> str:
 
 
 def main() -> int:
+    # A dev-profile engine is 8-60x slower, so a ratio taken from one compares an
+    # unoptimized Batcher against release Ray and Daft. `BENCH_ALLOW_DEBUG_BUILD=1` overrides.
+    # Refuse a dev-profile engine (8-60x slower) and a contended box (a neighbour's load
+    # is not a fact about any engine), and print the machine, because a timing is only
+    # reproducible beside the box that produced it. `BENCH_ALLOW_DEBUG_BUILD=1` /
+    # `BENCH_ALLOW_BUSY_BOX=1` override.
+    # No `require_quiet_box()` here, deliberately: the work in a cluster benchmark
+    # happens on Ray workers, so the *driver's* run queue is not the contention
+    # signal that would invalidate the measurement, and refusing on it is a false
+    # negative on the multi-node deployment these scripts are written for.
+    require_release_build()
+    print(machine_fingerprint())
+    _require_release()
     scale = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     runs = int(os.environ.get("BENCH_RUNS", "2"))
     pipes = os.environ.get("BENCH_PIPES")
@@ -330,9 +355,15 @@ def main() -> int:
     # Engine-major: each engine gets the cluster to itself for its whole sweep, so no
     # engine's residue (Daft's resident flotilla actors, an abandoned timed-out thread)
     # is charged to another engine's clock. See `bench_engine`.
-    by_engine = {
-        eng: bench_engine(eng, builder, pipelines, scale, runs) for eng, builder in ENGINES.items()
-    }
+    # Sweep order matters (see `bench_engine`): only the first engine gets a cluster with
+    # no other engine's residue on it, and only Batcher has a release hook. Default order
+    # puts Batcher first, which is the order every recorded run used; `BENCH_ENGINE_ORDER`
+    # rotates it so a reader can bound how much of a margin is ordering rather than engine.
+    order = [e for e in os.environ.get("BENCH_ENGINE_ORDER", "").split(",") if e in ENGINES]
+    order = order or list(ENGINES)
+    if order != list(ENGINES):
+        print(f"engine sweep order: {' -> '.join(order)} (BENCH_ENGINE_ORDER)")
+    by_engine = {eng: bench_engine(eng, ENGINES[eng], pipelines, scale, runs) for eng in order}
 
     h = ("pipeline", "batcher_ms", "ray_ms", "daft_ms", "vs_ray", "vs_daft")
     w = (14, 12, 11, 11, 9, 9)
@@ -352,17 +383,23 @@ def main() -> int:
         def cell(v):
             return f"{v:.0f}" if isinstance(v, (int, float)) else "ERR"
 
-        vs_ray = f"{rm / bm:.2f}x" if bm and rm else "-"
-        vs_daft = f"{dm / bm:.2f}x" if bm and dm else "-"
+        # A ratio is a claim about which engine is faster, so it is withheld when the two
+        # answers disagree. This used to print the speedups first and the `!! signature
+        # mismatch` line underneath, with nothing marking the number as disqualified —
+        # and once transcribed, a number and its footnote travel separately. Same rule as
+        # `harness/report.py`, same marker.
+        sigs = {e: res[e].get("sig") for e in res if "sig" in res[e]}
+        agreed = len({(s["rows"], s["checksum"]) for s in sigs.values()}) <= 1
+        vs_ray = f"{rm / bm:.2f}x" if (agreed and bm and rm) else ("n/c" if bm and rm else "-")
+        vs_daft = f"{dm / bm:.2f}x" if (agreed and bm and dm) else ("n/c" if bm and dm else "-")
         bu = _fmt_util(res.get("batcher", {}).get("util", {}))
         ru = _fmt_util(res.get("ray", {}).get("util", {}))
         cells = f"{name:<14}{cell(bm):>12}{cell(rm):>11}{cell(dm):>11}{vs_ray:>9}{vs_daft:>9}"
         print(f"{cells}  {bu} | {ru}")
         # surface signatures + errors below the row so divergence/failures are visible.
-        sigs = {e: res[e].get("sig") for e in res if "sig" in res[e]}
         errs = {e: res[e]["error"] for e in res if "error" in res[e]}
-        if len({(s["rows"], s["checksum"]) for s in sigs.values()}) > 1:
-            print(f"    !! signature mismatch: {sigs}")
+        if not agreed:
+            print(f"    !! signature mismatch (ratios withheld as n/c): {sigs}")
         for e, msg in errs.items():
             print(f"    !! {e}: {msg}")
     return 0

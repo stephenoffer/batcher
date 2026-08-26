@@ -435,7 +435,7 @@ def test_the_grace_reducer_does_not_hold_the_whole_join_output(tmp_path, monkeyp
                 joins["n"] += 1
             return real.execute_plan(ir, inputs, config)
 
-    monkeypatch.setattr("batcher.dist.spill_breakers.join.engine", lambda: Counting())
+    monkeypatch.setattr("batcher.dist.spill_breakers.join.engine", Counting)
 
     n_sub = 8
     stream = iter_join_paths_spilling(

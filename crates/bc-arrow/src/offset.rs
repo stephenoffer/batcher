@@ -57,6 +57,7 @@ pub struct TypedOffset {
 
 impl TypedOffset {
     /// An offset of `months` calendar months, `days` exact days and `micros` exact microseconds.
+    #[must_use]
     pub const fn new(months: i64, days: i64, micros: i64) -> Self {
         Self {
             months,
@@ -66,11 +67,13 @@ impl TypedOffset {
     }
 
     /// An offset of exactly `micros` microseconds.
+    #[must_use]
     pub const fn micros(micros: i64) -> Self {
         Self::new(0, 0, micros)
     }
 
     /// True when this offset moves nothing.
+    #[must_use]
     pub const fn is_zero(&self) -> bool {
         self.months == 0 && self.days == 0 && self.micros == 0
     }
@@ -81,6 +84,7 @@ impl TypedOffset {
     /// applied, so a caller may add it to a raw key; a calendar offset is not, so it must go
     /// through a date. A range-partitioner or a bloom filter can use the first and not the
     /// second.
+    #[must_use]
     pub const fn is_exact(&self) -> bool {
         self.months == 0
     }
@@ -91,6 +95,7 @@ impl TypedOffset {
     /// is a plan-time decline the caller should report once, while an overflowed *value* is a
     /// per-row null. Collapsing the two would turn "this column cannot carry a frame" into
     /// "every row of this column overflowed".
+    #[must_use]
     pub fn supports(&self, dt: &DataType) -> bool {
         match dt {
             DataType::Date32 | DataType::Date64 => true,
@@ -108,6 +113,7 @@ impl TypedOffset {
     /// passing it beats making the caller negate all three fields and get one wrong.
     ///
     /// Returns `None` if `dt` is unsupported or the result leaves the type's range.
+    #[must_use]
     pub fn shift_scalar(&self, dt: &DataType, value: i64, sign: i8) -> Option<i64> {
         let signed = self.signed(sign)?;
         match dt {

@@ -119,3 +119,37 @@ def test_grouping_function(t, duck, sql):
 )
 def test_aggregate_filter(t, duck, sql):
     _run(t, duck, sql)
+
+
+# --- aggregating over a column that is also a rolled-up grouping key ---------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The aggregate's argument IS the grouping key. At a level that rolls the key
+        # up, the argument still reads the underlying rows (DuckDB, Postgres, the
+        # standard); only a *grouped* reference to the key becomes NULL.
+        "SELECT a, max(a) m FROM t GROUP BY ROLLUP(a)",
+        "SELECT a, min(a) m FROM t GROUP BY CUBE(a)",
+        "SELECT a, count(a) c FROM t GROUP BY GROUPING SETS ((a),())",
+        "SELECT b, sum(b) s FROM t GROUP BY ROLLUP(b)",
+        "SELECT b, avg(b) av, count(DISTINCT b) c FROM t GROUP BY ROLLUP(b)",
+        "SELECT a, b, sum(b) s FROM t GROUP BY ROLLUP(a, b)",
+        # The key appears inside a larger expression over the aggregate: the bare
+        # reference NULLs, the aggregate's argument does not.
+        "SELECT b, sum(b) + b s FROM t GROUP BY ROLLUP(b)",
+        # HAVING over the same shape.
+        "SELECT b, sum(b) s FROM t GROUP BY ROLLUP(b) HAVING sum(b) > 2",
+        # Two keys, aggregate over each.
+        "SELECT a, b, max(a) ma, sum(b) sb FROM t GROUP BY CUBE(a, b)",
+    ],
+)
+def test_aggregate_over_rolled_up_key(t, duck, sql):
+    """An aggregate whose argument is one of its own grouping keys (regression).
+
+    `MAX(a)` under `ROLLUP(a)` was rewritten to `MAX(NULLIF(MAX(a), MAX(a)))` at the
+    rolled-up level — a nested aggregate — and the query failed with
+    ``aggregate 'm' references unknown column(s) ['__agg0']``.
+    """
+    _run(t, duck, sql)

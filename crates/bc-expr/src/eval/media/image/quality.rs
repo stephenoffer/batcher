@@ -50,7 +50,7 @@ fn luma_plane(data: &[u8]) -> Option<(Vec<f64>, usize, usize)> {
     if w == 0 || h == 0 {
         return None;
     }
-    Some((grey.pixels().map(|p| p.0[0] as f64).collect(), w, h))
+    Some((grey.pixels().map(|p| f64::from(p.0[0])).collect(), w, h))
 }
 
 fn build(rows: Vec<Option<f64>>) -> ArrayRef {
@@ -207,7 +207,7 @@ pub(crate) fn colorfulness<O: OffsetSizeTrait>(
             return None;
         }
         let rgb = rgb_plane(bytes.value(i))?;
-        let n = (rgb.width() as f64) * (rgb.height() as f64);
+        let n = f64::from(rgb.width()) * f64::from(rgb.height());
         let (mut srg, mut srg2, mut syb, mut syb2) = (0.0, 0.0, 0.0, 0.0);
         for px in rgb.pixels() {
             let (r, g, b) = (f64::from(px.0[0]), f64::from(px.0[1]), f64::from(px.0[2]));
@@ -248,7 +248,7 @@ pub(crate) fn mean_color<O: OffsetSizeTrait>(
             return None;
         }
         let rgb = rgb_plane(bytes.value(i))?;
-        let n = (rgb.width() as f64) * (rgb.height() as f64);
+        let n = f64::from(rgb.width()) * f64::from(rgb.height());
         let mut sums = [0.0f64; 3];
         for px in rgb.pixels() {
             for (c, s) in sums.iter_mut().enumerate() {

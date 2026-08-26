@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import pyarrow as pa
 
+from batcher.plan.resource import StorageLevel
+
 if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.metadata import MetadataHub
@@ -49,10 +51,12 @@ class ExecutionContext:
     hub: MetadataHub
     num_workers: int | None = None
     transport: str = "auto"
-    # Whether the user opted this result into the process result cache
-    # (`Dataset.cache()`). Honored only by the single-node relational path; the
-    # conductor keys the cache by plan signature + input identity.
-    cache: bool = False
+    # The storage level the user opted this result into via `Dataset.cache()`, or `None`
+    # for an uncached result. Honored only by the single-node relational path; the
+    # conductor keys the cache by plan signature + input identity. A level rather than a
+    # flag because *where* a cached result may live is the caller's declaration about that
+    # one result, and the two datasets a job caches routinely want different answers.
+    cache: StorageLevel | None = None
     # Per-source `SourceStatistics` already collected by the conductor (e.g. the
     # metadata-answer attempt for a `count()`/`is_empty()` that missed). When set, the
     # relational path reuses it instead of re-reading every source's footer/manifest —

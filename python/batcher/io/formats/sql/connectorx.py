@@ -84,13 +84,12 @@ class _ConnectorXSplit:
 
     def _table(self, projection: list[str] | None) -> pa.Table:
         sql = apply_projection(self.query, projection)
-        table = _read_arrow(
+        return _read_arrow(
             self.conn_uri,
             sql,
             partition_on=self.partition_on,
             num_partitions=self.num_partitions,
         )
-        return table
 
     def schema(self) -> pa.Schema:
         """The query's column types — which ConnectorX can only report by running it.

@@ -170,6 +170,7 @@ def _distributed_distinct_on(
 
         return execute_keyed_shuffle_flight(
             above,
+            operator=distinct,
             map_plan=map_plan,
             reduce_ir=reduce_ir,
             key_names=list(distinct.keys),

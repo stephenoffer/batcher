@@ -22,7 +22,7 @@ from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.udf.apply import apply_udf
 from batcher.core.udf.lifecycle import build_udf_callable, release_prebuilt
-from batcher.io.schema.evolution import reconcile_batches
+from batcher.io.schema.evolution import note_dropped_columns, reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.profile import StageRecorder, logical_op_ids, stage_kind
 from batcher.plan.schema import SchemaRef
@@ -130,7 +130,9 @@ def execute_with_udfs(
         # differing schemas; without this the final `Table.from_batches` raises on the
         # first drift, so the streaming path would crash on inputs the staged path handles.
         # The chain's output is already fully listed here, so this adds no extra buffering.
-        return reconcile_batches(list(gen))
+        produced = list(gen)
+        note_dropped_columns(produced, context="map_batches")
+        return reconcile_batches(produced)
     batches, _schema = _execute_node(plan, sources, projections, cfg, recorder, op_ids)
     return batches
 
@@ -248,7 +250,9 @@ def _execute_node(
         # Reconcile a UDF whose output schema drifts across batches (e.g. LLM structured
         # outputs with varying fields) to one union schema, so the stage's batches concat
         # instead of failing — the schema-inference footgun Ray Data hits.
-        out = reconcile_batches(apply_udf(inputs, node))
+        produced = apply_udf(inputs, node)
+        note_dropped_columns(produced, context="map_batches")
+        out = reconcile_batches(produced)
         _record_stage(
             recorder,
             op_ids,

@@ -322,7 +322,7 @@ class StateStore:
             schema = reader.schema
             table = reader.read_all()
         batches = table.to_batches()
-        return batches if batches else [pa.RecordBatch.from_pylist([], schema=schema)]
+        return batches or [pa.RecordBatch.from_pylist([], schema=schema)]
 
     def prune(self, keep_through: int) -> None:
         """Delete state files no recovery can still need (bounded ``state/`` directory).

@@ -205,7 +205,7 @@ def test_gpu_collective_envelope_reaches_strict_pack(monkeypatch, mapmod):
 
     def _create(workers, env):
         seen.append(scheduling._resolve_placement_strategy(env))
-        return None
+        return
 
     monkeypatch.setattr(mapmod, "create_worker_placement", _create, raising=False)
     monkeypatch.setattr(mapmod, "release_placement", lambda pg: None, raising=False)

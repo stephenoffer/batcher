@@ -17,6 +17,19 @@ from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowS
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
 from batcher.plan.ir_tags import MICROS_PER_DAY
 
+__all__ = [
+    "current_date",
+    "current_timestamp",
+    "date_add",
+    "date_part",
+    "date_sub",
+    "from_epoch",
+    "from_unix_date",
+    "make_date",
+    "make_timestamp",
+    "window",
+]
+
 
 def _duration_micros(duration: str, *, arg: str) -> int:
     """Parse a fixed-length duration string to microseconds (no calendar units).

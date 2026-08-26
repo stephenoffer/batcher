@@ -375,7 +375,10 @@ pub fn range_join_indices(
     }
 
     if ops.len() == 1 {
-        single_condition(left_keys, right_keys, ops[0], &lmap, &rmap, &mut out)?;
+        // A single inequality is a band with an open upper bound, so it takes the same
+        // parallel merge — see `band::run_single` for what it replaced and why the
+        // difference was so large.
+        band::run_single(left_keys, right_keys, ops[0], &lmap, &rmap, &mut out)?;
     } else if let Some(sides) = band::bounds(right_keys, ops) {
         // Both conditions bound ONE right key, so the matches are a contiguous slice of it
         // sorted once — no union sort, no second axis, no mark array. See `band`.
@@ -384,51 +387,6 @@ pub fn range_join_indices(
         two_conditions(left_keys, right_keys, ops, &lmap, &rmap, &mut out)?;
     }
     Ok(out.into_indices(&right_excluded))
-}
-
-/// One inequality: the matches for a left row are a contiguous suffix of the sorted right
-/// side, so they are emitted directly — no bit array, no per-pair comparison.
-fn single_condition(
-    left_keys: &[ArrayRef],
-    right_keys: &[ArrayRef],
-    op: RangeOp,
-    lmap: &[u32],
-    rmap: &[u32],
-    out: &mut Out,
-) -> Result<(), RuntimeError> {
-    use std::cmp::Ordering;
-
-    let nl = lmap.len();
-    let n = nl + rmap.len();
-    let keys = AxisKeys::build(
-        &left_keys[0],
-        &right_keys[0],
-        op.axis1_descending(),
-        lmap,
-        rmap,
-    )?;
-    let order = keys.sorted_right(n, nl, lmap, rmap);
-
-    let strict = op.strict();
-    let all = out.needs_all_matches();
-    for (i, &l) in lmap.iter().enumerate() {
-        let e = i as u32;
-        // Satisfying right rows are a suffix; find where it starts. Strict excludes the
-        // equal-key group, non-strict includes it.
-        let lo = if strict {
-            order.partition_point(|&r| keys.cmp(r, e, nl, lmap, rmap) != Ordering::Greater)
-        } else {
-            order.partition_point(|&r| keys.cmp(r, e, nl, lmap, rmap) == Ordering::Less)
-        };
-        let matched = lo < order.len();
-        if all {
-            for &r in &order[lo..] {
-                out.pair(l, rmap[r as usize - nl]);
-            }
-        }
-        out.finish_left(l, matched);
-    }
-    Ok(())
 }
 
 /// Two inequalities: IEJoin.

@@ -57,7 +57,15 @@ pub(crate) fn radix_sort_indices(values: &ArrayRef, opts: SortOptions) -> Option
         return Some(UInt32Array::from(live_idx));
     }
 
-    let live_sorted = lsd_radix(live_idx, &keys, opts.descending);
+    // Natural runs first: an input that is already partly ordered — an appended log, a union
+    // of sorted files, a re-sort by a clustered key — merges its runs instead of radixing all
+    // of them, and an input with no runs pays only the strided detection scan. See
+    // `super::run_sort` for why that scan is `O(log n)` comparisons rather than `O(n)`.
+    let descending = opts.descending;
+    let live_sorted = super::run_sort::run_aware_sort(&live_idx, &keys, descending, |part| {
+        lsd_radix(part, &keys, descending)
+    })
+    .unwrap_or_else(|| lsd_radix(live_idx, &keys, descending));
 
     let mut out: Vec<u32> = Vec::with_capacity(n);
     if opts.nulls_first {
@@ -347,7 +355,15 @@ pub(crate) fn packed_multi_sort_indices(
     if is_ordered(&packed, false) {
         return Some(UInt32Array::from(idx));
     }
-    Some(UInt32Array::from(lsd_radix(idx, &packed, false)))
+    // The packed key is one `u64` per row, so the composite sort gets natural-run detection on
+    // exactly the same terms the single-key radix does — and it is the shape that wants it
+    // most, since a multi-key `ORDER BY` whose leading key is the one the data is clustered on
+    // is the commonest partly-ordered sort there is.
+    let sorted = super::run_sort::run_aware_sort(&idx, &packed, false, |part| {
+        lsd_radix(part, &packed, false)
+    })
+    .unwrap_or_else(|| lsd_radix(idx, &packed, false));
+    Some(UInt32Array::from(sorted))
 }
 
 /// Rows sampled to reject an over-wide key before the exact width scan reads the whole column.

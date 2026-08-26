@@ -203,11 +203,42 @@ def unknown_attribute(obj: object, label: str, name: str) -> BatcherError | Attr
         return AttributeError(f"{type(obj).__name__!r} object has no attribute {name!r}")
     from batcher._internal.errors import unknown_value
 
+    available = method_names(type(obj))
+    canonical = _SPELLINGS.get(name)
+    known = canonical if canonical in available else None
     return unknown_value(
         _unknown_format_attribute(),
         "format",
         name,
-        method_names(type(obj)),
+        available,
         label=f"Available on {label}",
-        hint=f"see repr({label}) or dir({label}) for the full list.",
+        hint=(
+            f"{label}.{known}(...) is the same format under its other name."
+            if known
+            else f"see repr({label}) or dir({label}) for the full list."
+        ),
+        suggestion=f"Did you mean {known!r}?" if known else "",
     )
+
+
+#: One format, two names in common use → the name this namespace answers to.
+#:
+#: The did-you-mean is an edit-distance match, and these are the pairs it cannot reach: no
+#: number of character edits gets from ``ipc`` to ``arrow``. The trap is real rather than
+#: hypothetical, because the *reader* already publishes both spellings — `bt.read_ipc` and
+#: `bt.read_ndjson` are public API — so a caller who read with one reaches for the same word
+#: on the writer and lands on "Unknown format 'ipc'" with a list of thirty names that does
+#: not obviously contain it.
+#:
+#: Every pair is the same bytes, not merely a similar format: `write.arrow` output is read by
+#: `read_ipc`, and `write.json` emits NDJSON, which `read_ndjson` reads. A name that is
+#: *nearly* the same format does not belong here — pointing at it would answer a different
+#: question, which is worse than not answering.
+_SPELLINGS = {
+    "ipc": "arrow",
+    "feather": "arrow",
+    "ndjson": "json",
+    "jsonl": "json",
+    "database": "sql",
+    "jdbc": "sql",
+}

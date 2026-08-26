@@ -135,7 +135,7 @@ const MAX_MERGE_DEPTH: u32 = 4;
 /// The re-partition salt for recursion `depth`. Nonzero and depth-varying, so keys that
 /// collided at one level spread at the next instead of re-colliding identically.
 fn split_salt(depth: u32) -> u64 {
-    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(depth as u64 + 1) | 1
+    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(u64::from(depth) + 1) | 1
 }
 
 /// Sub-partitions to split `bytes` into so each lands inside `budget`.
@@ -473,7 +473,7 @@ mod tests {
         let bad = RecordBatch::try_new(schema, vec![i64s(&[1])]).unwrap();
         match unpack_partial(&bad, 1, &funcs) {
             Err(RuntimeError::MalformedPartial { expected, got }) => {
-                assert_eq!((expected, got), (3, 1))
+                assert_eq!((expected, got), (3, 1));
             }
             _ => panic!("expected Err(MalformedPartial)"),
         }
@@ -742,7 +742,7 @@ mod tests {
         let drains = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut store = Counting {
             inner: MemSpillStore::new(1),
-            whole_reads: whole_reads.clone(),
+            whole_reads,
             drains: drains.clone(),
         };
         // A 1-byte budget makes every partition over-budget at every level, so the recursion
@@ -1085,7 +1085,7 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("bc_spill_shared_{}", std::process::id()));
         let mut store_a = DiskSpillStore::new(root.clone(), 8).unwrap();
-        let mut store_b = DiskSpillStore::new(root.clone(), 8).unwrap();
+        let mut store_b = DiskSpillStore::new(root, 8).unwrap();
         // Distinct private subdirectories — proving the file namespaces don't alias.
         assert_ne!(store_a.scratch_dir(), store_b.scratch_dir());
 

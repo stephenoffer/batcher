@@ -159,12 +159,7 @@ mod tests {
     fn accepts_fixed_size_list_tensor_columns() {
         let child = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0])) as ArrayRef;
         let field = Arc::new(Field::new("item", DataType::Float32, true));
-        let a = Arc::new(arrow::array::FixedSizeListArray::new(
-            field.clone(),
-            2,
-            child,
-            None,
-        )) as ArrayRef;
+        let a = Arc::new(arrow::array::FixedSizeListArray::new(field, 2, child, None)) as ArrayRef;
         let out = eval_list_zip(ListZipOp::Add, &a, &a).unwrap();
         assert_eq!(
             vals(&out),

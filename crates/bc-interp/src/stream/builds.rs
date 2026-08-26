@@ -229,8 +229,7 @@ fn driving_rows(plan: &RelOp, sources: &[Vec<RecordBatch>]) -> usize {
     };
     parallel::leftmost_scan(spine, None)
         .and_then(|sid| sources.get(sid))
-        .map(|b| b.iter().map(|x| x.num_rows()).sum())
-        .unwrap_or(0)
+        .map_or(0, |b| b.iter().map(|b| b.num_rows()).sum())
 }
 
 /// Whether a build above the ceiling may still take a per-morsel probe.

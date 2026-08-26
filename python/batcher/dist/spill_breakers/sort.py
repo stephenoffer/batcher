@@ -32,7 +32,7 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
-from batcher.plan.ir_specs import sort_keys_ir, task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import Sort
 
 
@@ -48,21 +48,36 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
     (non-spilling) sort — so a key we cannot range-partition costs memory, never
     correctness. Without `sources` the type cannot be checked, so only the shape is.
 
-    The input must also name a *single* source (the key's type is read from its schema). A
-    sort over a multi-source input — `ORDER BY` above a join — used to reach
-    `_relabel_single_source` anyway and die on its assertion; a predicate that answers
-    *whether* a path applies must never raise when the answer is "no"."""
+    The input must also name a *single* source. A sort over a multi-source input —
+    `ORDER BY` above a join — used to reach `_relabel_single_source` anyway and die on its
+    assertion; a predicate that answers *whether* a path applies must never raise when the
+    answer is "no".
+
+    The key's type is asked of **the sort's own input schema** first, and only of the raw
+    source as a fallback. That ordering matters for one shape and it is the shape this
+    predicate is most often asked about: a *computed* leading key
+    (`sort(col("a") + col("b"))`) is hoisted into a hidden column below the sort, and a
+    hidden column is by construction absent from the source's schema — so reading the source
+    alone answered "unknown type, decline" for **every** hoisted key, and the hoist could
+    never take effect. `available_schema` is the plan layer's own static inference, needs no
+    rows, and is what the global window's `_key_type_partitionable` already consults."""
     if len(sort.keys) < 1 or not isinstance(sort.keys[0].expr, Col):
         return False
     if sources is None:
         return True
     if not _single_source(sort.input):
         return False
+    name = sort.keys[0].expr.name
+    inferred = sort.input.available_schema()
+    if inferred is not None:
+        idx = inferred.arrow.get_field_index(name)
+        if idx >= 0:
+            return range_partitionable(inferred.arrow.field(idx).type)
     _, sid = _relabel_single_source(sort.input)
     schema = sources[sid].schema()
-    idx = schema.get_field_index(sort.keys[0].expr.name)
-    # A derived key (not in the source schema) has an unknown type — stay out of the
-    # range partition rather than fail inside it.
+    idx = schema.get_field_index(name)
+    # A key neither the plan nor the source can type — stay out of the range partition
+    # rather than fail inside it.
     if idx < 0:
         return False
     return range_partitionable(schema.field(idx).type)
@@ -299,9 +314,9 @@ def stream_spilling_sort(
 
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
-    keys_ir = sort_keys_ir(sort.keys)
-    scan = task_scan_ir()
-    sort_ir = json.dumps({"op": "sort", "input": scan, "keys": keys_ir, "limit": sort.limit})
+    # The per-bucket sort is this node's own shape over the bucket, built through
+    # `Sort.shape_ir()` so a field added to the operator crosses to the spilling path too.
+    sort_ir = json.dumps(unary_task_ir(sort))
 
     with spill_scratch("batcher_sort_spill_", spill_dir) as store:
         handles = stage_and_partition(

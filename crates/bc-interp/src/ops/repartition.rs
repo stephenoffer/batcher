@@ -725,7 +725,7 @@ mod tests {
         }
         seen.sort();
         let mut want: Vec<(Vec<u8>, String)> = vec![
-            (b"".to_vec(), "".into()),
+            (b"".to_vec(), String::new()),
             (b"\x00\xff".to_vec(), "aa".into()),
             (b"xyz".to_vec(), "bbb".into()),
             (b"\x01".to_vec(), "c".into()),

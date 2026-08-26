@@ -197,7 +197,7 @@ def test_groupby_std_and_var_match_pandas(ds, frame):
 
 #: ``(label, batcher expression, python reference over ROWS["x"])`` for the numeric methods.
 NUMERIC = [
-    ("arccos", lambda: (bt.col("x") / 4).arccos(), lambda v: math.acos(v / 4)),
+    ("arccos", (bt.col("x") / 4).arccos, lambda v: math.acos(v / 4)),
     ("arcsinh", lambda: bt.col("x").arcsinh(), math.asinh),
     ("clip_min", lambda: bt.col("x").clip_min(0.0), lambda v: max(v, 0.0)),
 ]

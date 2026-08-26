@@ -20,6 +20,7 @@ pub struct Vec3 {
 
 impl Vec3 {
     /// The vector with the given components.
+    #[must_use]
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
     }
@@ -28,16 +29,19 @@ impl Vec3 {
     pub const ZERO: Self = Self::new(0.0, 0.0, 0.0);
 
     /// Every component multiplied by `k`.
+    #[must_use]
     pub fn scale(self, k: f64) -> Self {
         Self::new(self.x * k, self.y * k, self.z * k)
     }
 
     /// The dot product.
+    #[must_use]
     pub fn dot(self, other: Self) -> f64 {
         self.x * other.x + self.y * other.y + self.z * other.z
     }
 
     /// The cross product, `self x other`.
+    #[must_use]
     pub fn cross(self, other: Self) -> Self {
         Self::new(
             self.y * other.z - self.z * other.y,
@@ -47,6 +51,7 @@ impl Vec3 {
     }
 
     /// The Euclidean length.
+    #[must_use]
     pub fn norm(self) -> f64 {
         self.dot(self).sqrt()
     }

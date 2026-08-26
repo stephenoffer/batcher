@@ -32,6 +32,7 @@ import pyarrow as pa
 # when the script was launched from the repo root (`ModuleNotFoundError: No module named
 # 'harness'` from anywhere else, including the spelling this file's own docstring gives).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 from harness import results_match
 from sources import load_tables
 
@@ -60,6 +61,17 @@ def _time(fn, runs: int) -> tuple[float, pa.Table]:
 
 
 def main() -> None:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--runs", type=int, default=3)

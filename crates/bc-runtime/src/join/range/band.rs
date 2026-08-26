@@ -198,6 +198,137 @@ impl Right<'_> {
     }
 }
 
+/// `order`'s keys materialized in sorted order, so a cursor walk reads sequentially.
+///
+/// `None` on the encoded (variable-width) axis, where the generic comparison path runs.
+fn sorted_right_keys(keys: &AxisKeys, order: &[u32]) -> Option<Vec<u64>> {
+    keys.fast().map(|all| {
+        // One gather over the sorted right side, so it fans out the way the merges below do.
+        // rayon's indexed `collect` writes each element at the index it was read from, so this
+        // is the sequential gather's output element for element.
+        if order.len() >= PARALLEL_GATHER_MIN {
+            order.par_iter().map(|&r| all[r as usize]).collect()
+        } else {
+            order.iter().map(|&r| all[r as usize]).collect()
+        }
+    })
+}
+
+/// Emit `order[start[e] .. end[e]]` for every left row, in `lmap` order.
+///
+/// `end` is `None` when the matches run to the end of the sorted right side, which is what a
+/// single inequality's suffix is — carried as an absent bound rather than as an array of the
+/// same value repeated, so the open case allocates nothing.
+///
+/// Left rows are independent — a row's matches are a function of the right side alone — so the
+/// slices need no shared state at all, unlike the IEJoin sweep's mark rebuild. Folded back in
+/// slice order, so the output is identical to the sequential loop's.
+fn emit_slices(
+    order: &[u32],
+    start: &[u32],
+    end: Option<&[u32]>,
+    nl: usize,
+    lmap: &[u32],
+    rmap: &[u32],
+    out: &mut Out,
+) {
+    let all = out.needs_all_matches();
+    let emit = |e: usize, l: u32, o: &mut Out| {
+        let s = start[e] as usize;
+        let t = end.map_or(order.len(), |u| u[e] as usize);
+        // An empty band gives `t <= s`; slicing on that would panic, and the row is simply
+        // unmatched.
+        let matched = s < t;
+        if all && matched {
+            for &r in &order[s..t] {
+                o.pair(l, rmap[r as usize - nl]);
+            }
+        }
+        o.finish_left(l, matched);
+    };
+
+    let workers = rayon::current_num_threads()
+        .min(nl / PARALLEL_MIN_PER_WORKER)
+        .min(SWEEP_MAX_WORKERS);
+    if workers < 2 {
+        for (i, &l) in lmap.iter().enumerate() {
+            emit(i, l, out);
+        }
+        return;
+    }
+
+    let per = nl.div_ceil(workers);
+    let parts: Vec<Out> = lmap
+        .par_chunks(per)
+        .enumerate()
+        .map(|(chunk, slice)| {
+            let mut o = out.sibling(slice.len());
+            let base = chunk * per;
+            for (i, &l) in slice.iter().enumerate() {
+                emit(base + i, l, &mut o);
+            }
+            o
+        })
+        .collect();
+    for part in parts {
+        out.absorb(part);
+    }
+}
+
+/// Join by a **single** inequality `left key op right key`, appending index pairs to `out`.
+///
+/// A single inequality is a band with an open upper bound: the matches for a left row are a
+/// contiguous *suffix* of the right key sorted once, exactly as a band's are a contiguous
+/// slice of it. So the two shapes want the same machinery, and this exists because for a long
+/// time only one of them had it.
+///
+/// The version this replaces did a `partition_point` **per left row**, serially, through the
+/// generic comparator — which is precisely the algorithm this module's header records as
+/// costing *11.5 s of an 11.8 s band join* at five million rows a side before
+/// [`Right::bounds_by_merge`] replaced it. The band was fixed and the single inequality was
+/// not, so the operator's simplest shape became its slowest: measured at five million rows a
+/// side, `l.lo < r.y` cost **1,055 ms against DuckDB's 86 ms**, while the *general*
+/// two-inequality IEJoin over the same data cost 431 ms against DuckDB's 1,044 ms. A fast path
+/// slower than the general path it exists to avoid is the tell, and it is worth stating because
+/// no ratio against a competitor would have located it — only the comparison between the two
+/// paths inside this operator does.
+///
+/// The bound is monotone in the left key (a larger left key can only move the suffix start
+/// right), which is the property [`Right::bounds_by_merge`] needs, so the merge is exact here
+/// for the same reason it is for a band's lower bound.
+pub(super) fn run_single(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    op: RangeOp,
+    lmap: &[u32],
+    rmap: &[u32],
+    out: &mut Out,
+) -> Result<(), RuntimeError> {
+    let nl = lmap.len();
+    let n = nl + rmap.len();
+    let keys = AxisKeys::build(
+        &left_keys[0],
+        &right_keys[0],
+        op.axis1_descending(),
+        lmap,
+        rmap,
+    )?;
+    let order = keys.sorted_right(n, nl, lmap, rmap);
+    let sorted = sorted_right_keys(&keys, &order);
+    let right = Right {
+        order: &order,
+        sorted: sorted.as_deref(),
+        nl,
+        lmap,
+        rmap,
+    };
+    // `Side::Lower` with the op's own strictness is the same bound the per-row search
+    // computed: strict skips the equal-key group, non-strict keeps it.
+    let start = right.bounds_by_merge(&keys, op.strict(), Side::Lower);
+    emit_slices(&order, &start, None, nl, lmap, rmap, out);
+    Ok(())
+}
+
 /// Join by the band `lower <= right key <= upper`, appending index pairs to `out`.
 pub(super) fn run(
     left_keys: &[ArrayRef],
@@ -225,18 +356,8 @@ pub(super) fn run(
     // The right keys laid out in sorted order, once, so each merge scans a contiguous array
     // instead of chasing `order[p]` into the universe. Both merges can share it: the two
     // universes encode the *same* right column with the same sense, so their right halves
-    // are identical `u64`s. `None` on the encoded (variable-width) axis, where the generic
-    // comparison path runs instead.
-    let right_sorted: Option<Vec<u64>> = k_lo.fast().map(|all| {
-        // One gather over the sorted right side, so it fans out the way the merges below do.
-        // rayon's indexed `collect` writes each element at the index it was read from, so this
-        // is the sequential gather's output element for element.
-        if order.len() >= PARALLEL_GATHER_MIN {
-            order.par_iter().map(|&r| all[r as usize]).collect()
-        } else {
-            order.iter().map(|&r| all[r as usize]).collect()
-        }
-    });
+    // are identical `u64`s.
+    let right_sorted = sorted_right_keys(&k_lo, &order);
     let right = Right {
         order: &order,
         sorted: right_sorted.as_deref(),
@@ -252,48 +373,6 @@ pub(super) fn run(
         || right.bounds_by_merge(&k_hi, ops[upper].strict(), Side::Upper),
     );
 
-    let all = out.needs_all_matches();
-    let emit = |e: usize, l: u32, o: &mut Out| {
-        let (s, t) = (start[e] as usize, end[e] as usize);
-        // An empty band gives `t <= s`; slicing on that would panic, and the row is simply
-        // unmatched.
-        let matched = s < t;
-        if all && matched {
-            for &r in &order[s..t] {
-                o.pair(l, rmap[r as usize - nl]);
-            }
-        }
-        o.finish_left(l, matched);
-    };
-
-    let workers = rayon::current_num_threads()
-        .min(nl / PARALLEL_MIN_PER_WORKER)
-        .min(SWEEP_MAX_WORKERS);
-    if workers < 2 {
-        for (i, &l) in lmap.iter().enumerate() {
-            emit(i, l, out);
-        }
-        return Ok(());
-    }
-
-    // Left rows are independent — a row's matches are a function of the right side alone —
-    // so the slices need no shared state at all, unlike the IEJoin sweep's mark rebuild.
-    // Folded back in slice order, so the output is identical to the sequential loop's.
-    let per = nl.div_ceil(workers);
-    let parts: Vec<Out> = lmap
-        .par_chunks(per)
-        .enumerate()
-        .map(|(chunk, slice)| {
-            let mut o = out.sibling(slice.len());
-            let base = chunk * per;
-            for (i, &l) in slice.iter().enumerate() {
-                emit(base + i, l, &mut o);
-            }
-            o
-        })
-        .collect();
-    for part in parts {
-        out.absorb(part);
-    }
+    emit_slices(&order, &start, Some(&end), nl, lmap, rmap, out);
     Ok(())
 }

@@ -10,6 +10,7 @@ Read {doc}`Expressions <expressions>` first. The rest assume it.
 |---|---|
 | {doc}`Expressions <expressions>` | Building, combining, and reusing an `Expr`, and why it replaces a callback |
 | {doc}`Expression accessors <expression-accessors>` | The {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` namespaces, one per column kind |
+| {doc}`Map columns <map-accessor>` | Building a map with {py:func}`map_from_arrays <batcher.map_from_arrays>` and reading one with the {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>` accessor |
 | {doc}`The sequence accessor <sequence-accessor>` | The {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` namespace: DNA, RNA, protein, and FASTQ-quality columns |
 | {doc}`Expression recipes <expression-recipes>` | The jobs people actually reach for the language to do, assembled |
 | {doc}`The type system <type-system>` | What each type means here, and why a narrow integer widens at the boundary |
@@ -27,6 +28,7 @@ expressions
 expression-accessors
 string-accessor
 sequence-accessor
+map-accessor
 expression-recipes
 type-system
 udfs

@@ -13,6 +13,7 @@ that element *i* through `values` and element *i* through `[i]` never disagree.
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 
 import batcher as bt
 from _harness import assert_same
@@ -134,3 +135,70 @@ def test_values_feeds_explode():
         .to_pydict()
     )
     assert out == {"id": [1, 1, 2], "xs": ["a", "b", "c"]}
+
+
+#: Documents whose containment answer needs more than a top-level scan. `json_contains` used
+#: to look exactly one level down — an element of a top-level array, a value of a top-level
+#: object, or the whole document — so every one of these answered `false`. DuckDB (and
+#: PostgreSQL's `@>`, the same relation) answers `true` for all of them.
+_CONTAINED = [
+    (r'{"a":[1,2]}', "1"),
+    (r'{"k":1,"n":{"m":2},"arr":[1,2,3]}', "2"),
+    (r'{"a":{"b":{"c":42}}}', "42"),
+    (r'{"a":[{"b":7}]}', r'{"b":7}'),
+    ("[[1,2],[3]]", "3"),
+    ("[[1,2]]", "[1]"),
+    ("[1,[2]]", "2"),
+    (r'[{"a":1,"b":2}]', r'{"a":1}'),
+    (r'{"a":null}', "null"),
+    (r'{"a":1,"b":2}', r'{"a":1}'),
+    (r'{"a":{"b":1,"c":2}}', r'{"a":{"b":1}}'),
+    (r'{"a":{"b":1}}', r'{"a":{}}'),
+    (r'{"a":[1,2]}', r'{"a":[1]}'),
+    ("[1,2,3]", "[3,1]"),
+    ("[1,2]", "[]"),
+    (r'{"a":1}', "{}"),
+]
+
+#: The boundary. Containment is a superset relation, not a looser "shares something" one,
+#: and it does not coerce: `true` is not `1`.
+_NOT_CONTAINED = [
+    ("[1,2,3]", "[1,4]"),
+    (r'{"a":1}', r'{"a":2}'),
+    (r'{"a":1}', r'{"b":1}'),
+    (r'{"k":2}', "1"),
+    (r'{"k":"s"}', "1"),
+    (r'{"k":true}', "1"),
+]
+
+
+@pytest.mark.parametrize(("doc", "needle"), _CONTAINED + _NOT_CONTAINED)
+def test_json_contains_is_containment_at_any_depth(duck, doc, needle):
+    t = pa.table({"js": [doc]})
+    duck.register("t", t)
+    q = f"SELECT json_contains(js, '{needle}') AS r FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize("doc", ["{}", "[]", '{"a":{}}', '{"a":[]}'])
+def test_json_structure_of_an_empty_container_matches_duckdb(duck, doc):
+    """`{}` is `"JSON"` and `[]` is `["NULL"]` — the asymmetry is real, so both are pinned."""
+    t = pa.table({"js": [doc]})
+    duck.register("t", t)
+    q = "SELECT json_structure(js) AS r FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize("fn", ["json_structure", "json_pretty"])
+def test_re_serializing_a_document_keeps_its_key_order(duck, fn):
+    """Every function that round-trips a document through a parsed value used to re-sort it.
+
+    `json_keys`, `json_extract` and a cast to JSON read the text directly and kept source
+    order; `json_structure` and `json_pretty` went through `serde_json::Value`, whose default
+    map is sorted. The same document therefore rendered two ways depending on which function
+    touched it, and only one of them was DuckDB's.
+    """
+    t = pa.table({"js": ['{"z":1,"a":2,"m":{"y":3,"b":4}}']})
+    duck.register("t", t)
+    q = f"SELECT {fn}(js) AS r FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))

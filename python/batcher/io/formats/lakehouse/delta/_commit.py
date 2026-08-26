@@ -360,14 +360,24 @@ def commit_add_actions(
 
     files = [f for f in manifest.files if f.rows or not manifest.files]
     actions = [_add_action(f, path) for f in files]
-    if not actions and mode == "append":
-        return  # nothing written, nothing to say
+    exists = deltalake.DeltaTable.is_deltatable(path, storage_options=storage_options)
+    if not actions and mode == "append" and exists:
+        return  # nothing written, and the table already says what it is
+    # An append of no rows to a table that does not exist yet is NOT nothing to say: what
+    # it has to say is the schema. Returning here left a directory holding the writer's
+    # own zero-row part file and no `_delta_log` at all -- not a Delta table, and one
+    # `bt.read(..., format="delta")` refuses with "No files in log segment". A daily job
+    # whose first run matched no rows broke its own table on day one, and `write()`
+    # reported success. `deltalake.write_deltalake` creates the log for the same input, and
+    # so does the `create_table_with_add_actions` call below when handed no actions.
     # The driver normally attaches the plan's output schema. A caller driving the `Sink`
     # protocol directly may not, so fall back to reconstructing it from what the workers
     # actually wrote — which is the only other place the truth exists.
     schema = manifest.schema
     if schema is None:
-        schema = _schema_from_written(files)
+        # `files` is empty for a zero-row write, so fall back to the part file the writer
+        # laid down anyway: its footer carries the schema the empty table needs.
+        schema = _schema_from_written(files) or _schema_from_written(list(manifest.files))
 
     properties = None
     if app_txn is not None:
@@ -376,7 +386,6 @@ def commit_add_actions(
         )
 
     try:
-        exists = deltalake.DeltaTable.is_deltatable(path, storage_options=storage_options)
         if not exists:
             if schema is None:
                 raise CommitError(

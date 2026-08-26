@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.plan.resource import StorageLevel
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -89,7 +90,7 @@ def eligible(
     adaptive: bool,
     spill: bool,
     backend: str,
-    cache: bool,
+    cache: StorageLevel | None,
 ) -> bool:
     """Whether `plan` may take the fast path — cheap, structural, and conservative.
 
@@ -104,7 +105,7 @@ def eligible(
         adaptive: Whether stage-boundary re-optimization was resolved on.
         spill: Whether the caller asked for an out-of-core run.
         backend: The requested execution backend.
-        cache: Whether the caller asked for the result to be cached.
+        cache: The storage level the caller asked the result to be cached at, if any.
 
     Returns:
         `True` when the query may skip the orchestration.

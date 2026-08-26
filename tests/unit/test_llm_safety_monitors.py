@@ -7,10 +7,13 @@ fire. A monitor that alerts on prose gets muted, which is the same as not having
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import batcher as bt
 from batcher._internal.errors import PlanError
+from batcher.plan.functions.metrics.safety.injection import _HIDDEN_UNICODE
 
 pytestmark = pytest.mark.unit
 
@@ -90,11 +93,43 @@ def test_jailbreak_markers_catch_the_public_framings(payload):
 
 
 def test_hidden_unicode_catches_a_zero_width_character():
-    assert _fires_on(bt.hidden_unicode_rate("t"), "ig​nore this")
+    assert _fires_on(bt.hidden_unicode_rate("t"), "ig\u200bnore this")
 
 
 def test_hidden_unicode_catches_a_bidi_override():
-    assert _fires_on(bt.hidden_unicode_rate("t"), "safe‮txet‬")
+    assert _fires_on(bt.hidden_unicode_rate("t"), "safe\u202etxet\u202c")
+
+
+def test_hidden_unicode_class_covers_exactly_the_documented_codepoints():
+    """The character class must be the documented set, no wider and no narrower.
+
+    This monitor is the one whose own source is invisible: the class was written with the
+    literal codepoints, so an editor, a formatter, or a paste through any Unicode-normalizing
+    tool could empty it and neither the diff nor a review would show anything. The class is now
+    spelled with escapes, and this pins what those escapes are worth.
+
+    Checked at the range boundaries rather than by scanning the whole plane: what a range
+    expression gets wrong is its ends, and each neighbour just outside must stay clean or the
+    monitor starts firing on ordinary text (`test_no_monitor_fires_on_ordinary_text` is the
+    other half of that argument).
+    """
+    covered = {
+        0x00AD,  # soft hyphen
+        *range(0x200B, 0x2010),  # ZWSP, ZWNJ, ZWJ, LRM, RLM
+        *range(0x202A, 0x202F),  # the bidirectional overrides
+        *range(0x2060, 0x2065),  # word joiner and the invisible operators
+        0xFEFF,  # zero-width no-break space (BOM)
+    }
+    # Every neighbour of a range end, so a slipped boundary fails on one side or the other.
+    neighbours = {0x00AC, 0x00AE, 0x200A, 0x2010, 0x2029, 0x202F, 0x205F, 0x2065, 0xFEFE, 0xFF00}
+
+    for cp in sorted(covered):
+        assert re.fullmatch(_HIDDEN_UNICODE, chr(cp)), f"U+{cp:04X} must be caught"
+    for cp in sorted(neighbours):
+        assert not re.fullmatch(_HIDDEN_UNICODE, chr(cp)), f"U+{cp:04X} must not be caught"
+    # And the class holds nothing else at all: an accidental `-` or a stray literal would widen
+    # it silently, which is how a monitor comes to fire on prose and get switched off.
+    assert {cp for cp in range(0x10000) if re.fullmatch(_HIDDEN_UNICODE, chr(cp))} == covered
 
 
 @pytest.mark.parametrize(

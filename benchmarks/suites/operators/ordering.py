@@ -12,7 +12,7 @@ import pyarrow as pa
 
 from registry import suite
 
-from .base import sql_fanout, with_native
+from .base import ray_to_arrow, sql_fanout, with_native
 
 if TYPE_CHECKING:
     from context import Context
@@ -45,7 +45,7 @@ def sort_limit(ctx: Context):
             ["l_extendedprice", "l_orderkey", "l_linenumber"],
             descending=[True, False, False],
         )
-        return pa.Table.from_pandas(ordered.limit(100).to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered.limit(100))
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -70,7 +70,7 @@ def sort_string(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_comment"]).sort(["l_comment"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -91,7 +91,7 @@ def sort_string_lowcard(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_shipmode"]).sort(["l_shipmode"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -123,7 +123,7 @@ def sort_string_limit(ctx: Context):
     def ray(rd) -> pa.Table:
         cols = rd.select_columns(["l_comment", "l_orderkey", "l_linenumber"])
         ordered = cols.sort(["l_comment", "l_orderkey", "l_linenumber"])
-        return pa.Table.from_pandas(ordered.limit(100).to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered.limit(100))
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -149,7 +149,7 @@ def sort_multikey_narrow(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_shipdate", "l_suppkey"]).sort(["l_shipdate", "l_suppkey"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -172,6 +172,6 @@ def sort_multikey_wide(ctx: Context):
         ordered = rd.select_columns(["l_partkey", "l_extendedprice"]).sort(
             ["l_partkey", "l_extendedprice"], descending=[True, False]
         )
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)

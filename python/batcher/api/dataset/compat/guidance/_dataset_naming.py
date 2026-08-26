@@ -161,7 +161,8 @@ DATASET_RAY_DATA: dict[str, str] = {
     "take_batch": "Spelled ds.limit(n).to_arrow() here.",
     "materialize": (
         "Spelled ds.cache() here: it pins the computed result so downstream branches reuse "
-        "it instead of recomputing. ds.persist() is the spill-backed form."
+        "it instead of recomputing. ds.persist() is the Spark spelling of the same marker; "
+        "ds.cache('disk_only') keeps it off the memory budget entirely."
     ),
     "iterator": "Spelled ds.iter_batches() here; ds.iter_rows() yields dicts.",
     "iter_torch_batches": "Spelled ds.ml.iter_torch_batches(...) here.",
@@ -207,8 +208,10 @@ DATASET_RAY_DATA: dict[str, str] = {
     "to_modin": "No Modin bridge. Collect first: ds.to_pandas().",
     "to_mars": "No Mars bridge. Collect first: ds.to_pandas().",
     "to_random_access_dataset": (
-        "No random-access key lookup service. Keep the table and filter it: "
-        "ds.filter(bt.col('key') == k), which pushes down to the scan."
+        "No random-access key lookup service. To enrich rows from a key-value store, use "
+        "ds.lookup_join('redis://...', on='key', schema={...}), which fetches each batch's "
+        "keys in one round trip. For a single value, ds.filter(bt.col('key') == k) pushes "
+        "the predicate down to the scan."
     ),
     # Ray internals — absent by design, because the data plane bypasses the object store.
     "to_arrow_refs": (

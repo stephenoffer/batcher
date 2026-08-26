@@ -79,9 +79,16 @@ def _check_memory(m: MemoryConfig) -> None:
         f"memory.streaming_state_max_bytes must be >= 0, got {m.streaming_state_max_bytes}",
     )
     _check(
-        m.result_cache_max_bytes >= 0 and m.file_cache_max_bytes >= 0,
+        m.result_cache_max_bytes >= 0
+        and m.file_cache_max_bytes >= 0
+        and m.result_cache_disk_max_bytes >= 0,
         "memory result/file cache budgets must be >= 0, got "
-        f"{m.result_cache_max_bytes}, {m.file_cache_max_bytes}",
+        f"{m.result_cache_max_bytes}, {m.file_cache_max_bytes}, "
+        f"{m.result_cache_disk_max_bytes}",
+    )
+    _check(
+        m.shared_cache_ttl_seconds >= 0,
+        f"memory.shared_cache_ttl_seconds must be >= 0, got {m.shared_cache_ttl_seconds}",
     )
     _check(
         m.spill_bucket_max_bytes > 0,

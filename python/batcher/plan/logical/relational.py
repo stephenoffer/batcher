@@ -16,6 +16,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.ir_tags import Op
+from batcher.plan.logical._setops import validate_branch_types
 from batcher.plan.logical.base import (
     LogicalPlan,
     SortKeySpec,
@@ -230,10 +231,14 @@ class Distinct(LogicalPlan):
                     "DISTINCT ON — a keyed dedup's survivor can be replaced by a later row"
                 )
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the input — see `Sort.shape_ir` for why this seam exists.
+
+        The distributed dedup re-roots this node on the bucket its reducer holds; going
+        through the shape keeps the tag and the field list stated once.
+        """
         ir: dict[str, Any] = {
             "op": Op.DISTINCT,
-            "input": self.input.to_ir(),
             "keys": list(self.keys),
             "order": sort_keys_ir(self.order),
         }
@@ -242,6 +247,9 @@ class Distinct(LogicalPlan):
         if self.limit is not None:
             ir["limit"] = self.limit
         return ir
+
+    def to_ir(self) -> dict[str, Any]:
+        return {**self.shape_ir(), "input": self.input.to_ir()}
 
     def as_aggregate(self):
         """This whole-row `Distinct` as the equivalent `Aggregate` — group by every column.
@@ -451,6 +459,7 @@ class Union(LogicalPlan):
                     "union inputs must have identical columns: "
                     f"{cols} vs {other.available_columns()}"
                 )
+        validate_branch_types([i.available_schema() for i in self.inputs], cols)
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -510,16 +519,25 @@ class Sample(LogicalPlan):
         if self.n is not None and self.n < 0:
             raise PlanError(f"sample n must be non-negative, got {self.n}")
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the input — see `Sort.shape_ir` for why this seam exists.
+
+        The streaming fixed-count driver re-applies this node to its own running best-`n`,
+        and it must carry the plan's **baked seed** rather than build a fresh one: `seed=None`
+        mints a seed at plan-build, so a re-derived node would sample a different relation and
+        the fold would not converge on the single-node answer.
+        """
         ir: dict[str, Any] = {
             "op": Op.SAMPLE,
-            "input": self.input.to_ir(),
             "fraction": self.fraction,
             "seed": self.seed,
         }
         if self.n is not None:
             ir["n"] = self.n
         return ir
+
+    def to_ir(self) -> dict[str, Any]:
+        return {**self.shape_ir(), "input": self.input.to_ir()}
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()

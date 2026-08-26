@@ -107,7 +107,7 @@ def test_a_telemetry_failure_falls_back_instead_of_raising(monkeypatch) -> None:
     def _boom():
         raise RuntimeError("nvml exploded")
 
-    monkeypatch.setattr("batcher._internal.hardware.nvml.device_telemetry", lambda: _boom())
+    monkeypatch.setattr("batcher._internal.hardware.nvml.device_telemetry", _boom)
     with (
         energy_scope() as ledger,
         measure_stage("A#1", accelerator_type="NVIDIA_H100", device_count=1),

@@ -32,6 +32,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher.api.terminal.stream.bounded import bounded_driver
 from batcher.api.terminal.stream.pipeline import _apply_peeled, _iter_streaming, _pushdown
 from batcher.api.terminal.stream.rebatch import _rebatch_exact, _take
 from batcher.api.terminal.stream.static_join import (
@@ -47,6 +48,7 @@ from batcher.api.terminal.stream.union import (
     union_streams_branchwise,
     union_streams_interleaved,
 )
+from batcher.api.terminal.stream.unstreamable import _unstreamable_reason
 from batcher.api.terminal.stream.watermark import stream_stream_join, stream_watermark_dedup
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -258,6 +260,16 @@ def _iter_batches(
                 plan, _iter_streaming(plan.input, sources, None), batch_size
             )
             return
+        # Three shapes whose bounded-memory driver is a running fold over the stream:
+        # `with_row_index`/`tail`, a fixed-count `sample(n=)`, and a keyed `DISTINCT ON`. Each
+        # needs a paragraph on why its fold is sound, and that reasoning lives beside the
+        # decision in `stream.bounded` rather than here — this file was at exactly the 500-line
+        # limit before they were added. Returns `None` for any other shape.
+        bounded = bounded_driver(plan, sources, batch_size)
+        if bounded is not None:
+            yield from bounded
+            return
+
         # A `Distinct` carrying a fused `limit` is bounded by that limit and stops reading
         # once it has that many distinct rows, so it takes the capped driver rather than the
         # running fold below — which has no early exit and whose `as_aggregate` refuses a
@@ -377,10 +389,33 @@ def _iter_batches(
             stream_spilling_join,
             stream_spilling_sort,
             stream_spilling_window,
+            supports_spilling_join,
             supports_spilling_sort,
             supports_spilling_window,
         )
-        from batcher.plan.logical import Join, Window
+        from batcher.plan.logical import AsofJoin, Join, Window, hoist_sort_key, hoist_window_keys
+
+        # A *computed* shuffle key -- `sort(col("a") + col("b"))`,
+        # `partition_by=[col("v") % 4]` -- is materialized as a hidden column first, through
+        # the same `plan.logical` rewrite the distributed dispatcher and the spilling collect
+        # both use. All three cut the operator on a partitioner that reads a key's values from
+        # a *column*, so without it the identical query distributed, and then fell out of the
+        # streaming path here and materialized its whole result -- from `iter_batches()`,
+        # whose entire promise is that it does not.
+        #
+        # Applied only where the predicate then accepts the rewrite, so a shape that still
+        # declines falls through with its original plan rather than one carrying a hidden
+        # column. `keep` is the operator's own output, and each emitted batch is cut back to
+        # it below.
+        keep: tuple[str, ...] | None = None
+        if isinstance(plan, Sort) and not supports_spilling_sort(plan, sources):
+            hoisted = hoist_sort_key(plan)
+            if hoisted is not None and supports_spilling_sort(hoisted[0], sources):
+                plan, keep = hoisted
+        elif isinstance(plan, Window) and not supports_spilling_window(plan):
+            hoisted = hoist_window_keys(plan)
+            if hoisted is not None and supports_spilling_window(hoisted[0]):
+                plan, keep = hoisted
 
         gen = None
         if (
@@ -389,7 +424,18 @@ def _iter_batches(
             and is_streamable(plan.input)
         ):
             gen = stream_spilling_sort(plan, sources)
-        elif isinstance(plan, Join) and is_streamable(plan.left) and is_streamable(plan.right):
+        elif (
+            isinstance(plan, (AsofJoin, Join))
+            and supports_spilling_join(plan)
+            and is_streamable(plan.left)
+            and is_streamable(plan.right)
+        ):
+            # An ASOF join with `by` keys co-partitions on `by` exactly as an equi-join
+            # co-partitions on its keys, so both stream through the one bucket pipeline.
+            # `supports_spilling_join` is consulted here where it was not before: the
+            # equi-join branch called straight through and relied on `stream_spilling_join`
+            # tolerating a multi-source side, which it does not -- the predicate exists
+            # precisely because that side asserts rather than declining.
             gen = stream_spilling_join(plan, sources)
         elif isinstance(plan, Window) and is_streamable(plan.input):
             # PARTITION BY window grace-partitions by those keys; a global window
@@ -407,6 +453,10 @@ def _iter_batches(
                     gen = stream_spilling_global_window(plan, sources)
         if gen is not None:
             for b in gen:
+                # The hidden shuffle key is real data in the bucket, so it is cut away here
+                # rather than left for the caller to see as an output column.
+                if keep is not None:
+                    b = b.select([b.schema.get_field_index(c) for c in keep])
                 if batch_size is None:
                     yield b
                 else:
@@ -440,6 +490,16 @@ def _iter_batches(
         peeled.append(below)
         below = below.input
     if peeled:
+        # The peeled operators are also what *narrows* the read: a pass-through breaker emits
+        # every column it is given, so `below` alone requires the whole table while the stage
+        # as a whole may need two of its columns. Pushing that projection into `below` cuts it
+        # at the source, and out-of-core is where an unread column costs the most — it is also
+        # decoded, hash-partitioned, compressed, written to a bucket file and read back.
+        # `narrow_to_stage` returns `below` unchanged whenever it cannot prove a narrowing, so
+        # a shape that needs everything is untouched.
+        from batcher.dist.spill import narrow_to_stage
+
+        below = narrow_to_stage(peeled, below)
         # Recursion terminates: `below` is a strict subtree of `plan` and is neither a
         # `Project` nor a `Filter`, so it cannot re-enter this branch.
         inner = _iter_batches(
@@ -467,41 +527,3 @@ def _iter_batches(
         table.to_batches() if batch_size is None else table.to_batches(max_chunksize=batch_size)
     )
     yield from batches
-
-
-def _unstreamable_reason(plan: LogicalPlan) -> str:
-    """Why this plan cannot stream, naming the operator that stops it.
-
-    The message used to name `type(plan).__name__` — the *top* node — which is the culprit
-    only when the breaker happens to be at the root. ``ds.sort("t").group_by("a").agg(...)``
-    reported "its top-level Aggregate forces the plan to materialize", and a streaming
-    aggregate is exactly the shape that *does* stream: the reader was pointed at the one
-    operator in their query that was fine, while the `sort` beneath it went unmentioned.
-    Kyber already knows which nodes cannot emit under a stream
-    (`kyber.streaming.blocking_operators`), so ask it rather than guess from the root.
-
-    Args:
-        plan: The plan the router found no streaming strategy for.
-
-    Returns:
-        A refusal naming the blocking operators, and the shapes that do stream.
-    """
-    from batcher.kyber.streaming import blocking_operators
-
-    blocking = blocking_operators(plan)
-    if blocking:
-        # Deduplicated and ordered so a plan with three sorts reads as "sort", not
-        # "sort / sort / sort", while a mixed plan still names each distinct offender.
-        names = sorted({type(n).__name__.lower() for n in blocking})
-        culprit = f"its {' and '.join(names)} cannot emit a row until the input ends"
-    else:
-        culprit = (
-            f"its top-level {type(plan).__name__.lower()} forces the plan to materialize "
-            "(a multi-source shape no streaming driver covers)"
-        )
-    return (
-        f"this pipeline has an unbounded (streaming) source but {culprit}, so it cannot be "
-        "streamed in bounded memory. Restructure to a streamable shape: filter / select / "
-        "with_columns / map_batches, or a single top-level aggregate, distinct, limit or "
-        "top-N over one of those."
-    )

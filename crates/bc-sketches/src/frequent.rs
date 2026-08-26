@@ -59,6 +59,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
     /// Create a summary monitoring at most `capacity` keys. Guarantees that, after
     /// processing a stream of total weight `N`, every key with frequency
     /// `> N / (capacity + 1)` is among the monitored keys.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         assert!(capacity >= 1, "capacity must be >= 1");
         Self {
@@ -190,6 +191,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
     /// the most, which is the unsafe direction. Comparing the upper bound reports every key
     /// that could be heavy and cannot miss one — the same safety choice Count-Min's `is_heavy`
     /// and the join bloom make.
+    #[must_use]
     pub fn heavy_hitters(&self, fraction: f64) -> Vec<(K, u64)> {
         let threshold = fraction * self.total as f64;
         let error = self.count_error();
@@ -209,6 +211,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
     }
 
     /// Total weight added (the true `N`).
+    #[must_use]
     pub fn total(&self) -> u64 {
         self.total
     }
@@ -334,7 +337,7 @@ mod tests {
 
         // items() exposes all three monitored pairs.
         let mut seen: Vec<(&str, u64)> = fi.items().map(|(k, c)| (*k, c)).collect();
-        seen.sort();
+        seen.sort_unstable();
         assert_eq!(seen, vec![("a", 10), ("b", 3), ("c", 1)]);
     }
 

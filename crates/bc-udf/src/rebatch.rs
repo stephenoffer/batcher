@@ -25,6 +25,7 @@ pub struct Rebatcher {
 
 impl Rebatcher {
     /// Create a rebatcher targeting `target_rows` (clamped to at least 1).
+    #[must_use]
     pub fn new(target_rows: usize) -> Self {
         Self {
             target_rows: target_rows.max(1),
@@ -35,6 +36,7 @@ impl Rebatcher {
     }
 
     /// The current target batch size in rows.
+    #[must_use]
     pub fn target_rows(&self) -> usize {
         self.target_rows
     }
@@ -47,6 +49,7 @@ impl Rebatcher {
 
     /// Rows currently buffered (less than `target_rows`, except transiently inside a
     /// `push` before emission).
+    #[must_use]
     pub fn buffered_rows(&self) -> usize {
         self.buffered_rows
     }

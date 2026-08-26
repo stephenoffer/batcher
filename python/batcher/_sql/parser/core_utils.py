@@ -129,10 +129,21 @@ def _alias_of(p) -> str:
         bare = bare.this
     if isinstance(bare, exp.Column):
         return bare.name
-    # No explicit `AS`: derive the output name from the expression, matching the
-    # convention of the reference engines (DuckDB/Polars) so a column the user did not
-    # alias lines up across engines — `sum(l_quantity)`, `count_star()` — rather than a
-    # bespoke `SUM_l_quantity`. `count(*)` is DuckDB's special `count_star()`.
+    # No explicit `AS`: derive the output name from the expression *as written*, so a
+    # column the user did not alias is named after the thing it computes —
+    # `sum(l_quantity)`, `upper(s)`, `count_star()` — rather than a bespoke
+    # `SUM_l_quantity`. `count(*)` is DuckDB's special `count_star()`.
+    #
+    # This is the same *shape* the reference engines use and not the same string for every
+    # expression: DuckDB and Spark both parenthesize a composite (`(i % 4)`, `(i > 1)`,
+    # `(i IS NULL)`) and uppercase the keywords, where this renders the SQL text lowercased
+    # and unparenthesized (`i % 4`). A function call, a bare column and `count(*)` agree
+    # exactly; a binary, unary, comparison, `CAST` or `CASE` does not. Left as it is
+    # deliberately — the auto-derived name is part of a result's *schema*, so aligning it
+    # would rename output columns in every existing query that leans on one, to buy a
+    # string that DuckDB and Spark do not fully agree on between themselves either
+    # (DuckDB renders `CASE  WHEN ((i > 1)) THEN (1) ELSE 0 END`). Alias the column when
+    # its name matters; that is the portable spelling in any engine.
     if isinstance(p, exp.Count) and isinstance(p.this, exp.Star):
         return "count_star()"
     return p.sql().lower()

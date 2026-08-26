@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn unordered_spill_keeps_one_real_row_per_key() {
         let ks: Vec<i64> = (0..4_000).map(|i| i % 97).collect();
-        let tss: Vec<i64> = (0..4_000).map(|i| i as i64 * 3).collect();
+        let tss: Vec<i64> = (0..4_000).map(|i| i64::from(i) * 3).collect();
         let vs: Vec<String> = (0..4_000).map(|i| format!("v{i}")).collect();
         let refs: Vec<&str> = vs.iter().map(String::as_str).collect();
         let morsels: Vec<RecordBatch> = (0..4_000usize)

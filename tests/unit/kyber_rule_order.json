@@ -623,7 +623,7 @@
   "union_overlapping_range_disjunction@1",
   "fold_in_list_of_literal_input@1",
   "collapse_degenerate_range_to_equality@1",
-  "projection_inlining_into_agg@2",
+  "projection_inlining_into_agg@5",
   "eliminate_identity_project@1",
   "merge_projections@1",
   "push_filter_through_project@3",

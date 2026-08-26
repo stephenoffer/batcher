@@ -8,7 +8,7 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
@@ -27,7 +27,11 @@ from batcher.io.base._layout import FileLayout
 from batcher.io.manifest import WriteManifest
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.resource import StorageLevel
 from batcher.plan.types import logical_bytes
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 __all__ = [
     "_collect",
@@ -57,7 +61,7 @@ def _collect(
     num_partitions: int | None = None,
     adaptive: bool | str = "auto",
     transport: str = "auto",
-    cache: bool = False,
+    cache: StorageLevel | None = None,
     source_stats: list | None = None,
     backend: str = "cpu",
 ) -> pa.Table:
@@ -396,16 +400,76 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     )
 
 
-def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:
+def _cached_rows(
+    plan: LogicalPlan, sources: list[Source], cache: StorageLevel | None
+) -> pa.Table | None:
+    """The cached result for `plan`, or `None` when the dataset is not cached or misses.
+
+    The guard is `cache is None`, not a probe that always runs: an uncached dataset must
+    not pay a signature computation and a dict lookup on every `count()`, and — more
+    importantly — must not be recorded as a cache *miss*, which would drive the hit rate
+    toward zero with queries that never asked to be cached.
+    """
+    if cache is None:
+        return None
+    from batcher.api.executors import cached_result
+
+    return cached_result(plan, sources)
+
+
+def cached_batches(
+    plan: LogicalPlan,
+    sources: list[Source],
+    cache: StorageLevel | None,
+    batch_size: int | None,
+) -> Iterator[pa.RecordBatch] | None:
+    """A cached result as a batch stream, or `None` when there is nothing cached to stream.
+
+    Lets `iter_batches` serve a warm cache. It deliberately does not *populate* the cache:
+    doing so would mean materializing the whole result, which is precisely what a caller
+    reaching for `iter_batches` has asked not to happen — a streaming read of a
+    larger-than-memory result must not be the thing that puts it in memory.
+
+    `batch_size` re-chunks the stored table through Arrow's own chunking, so a cached
+    stream honors the same rebatching an uncached one does.
+
+    Args:
+        plan: The plan whose result is wanted.
+        sources: Its bound sources, in scan order.
+        cache: The dataset's storage level, or `None` when it is not cached.
+        batch_size: Rows per emitted batch, or `None` for the stored chunking.
+
+    Returns:
+        An iterator over the cached result's batches, or `None` on a miss.
+    """
+    hit = _cached_rows(plan, sources, cache)
+    if hit is None:
+        return None
+    return iter(hit.to_batches(max_chunksize=batch_size) if batch_size else hit.to_batches())
+
+
+def _count(
+    plan: LogicalPlan,
+    sources: list[Source],
+    _columns: list[str],
+    cache: StorageLevel | None = None,
+) -> int:
     """Return the number of result rows — from metadata when provable, else a `COUNT(*)`.
 
     Metadata answers a derivable count (`limit(n)`, a global aggregate, empty source,
     row-preserving operators) with no execution. Otherwise a global `COUNT(*)` runs (via
     `global_count_plan`): projection pushdown reads only the filter/key columns and a count
     over a `Filter` fuses into one `count_if` pass, so no result rows are materialized.
+
+    A cached result short-circuits all of that, and is checked first: the rows are already
+    here, so counting them is an attribute read. Nothing below can beat it — the metadata
+    answer is only free when it is derivable, and the `COUNT(*)` re-reads the source.
     """
     from batcher.api.terminal.metadata_answer import global_count_plan, pushed_count
 
+    hit = _cached_rows(plan, sources, cache)
+    if hit is not None:
+        return hit.num_rows
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
@@ -444,14 +508,22 @@ def _record_count_selectivity(plan: LogicalPlan, sources: list[Source], count: i
     kyber.record_selectivity(core.default_hub(), plan, sources, count)
 
 
-def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:
+def _is_empty(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> bool:
     """Whether the result has no rows, from metadata when provable, else execute.
 
-    Falls back to a single-row probe (`limit(1)`), which the streaming early-stop
-    reads without scanning the whole source.
+    A cached result answers immediately. Otherwise this falls back to a single-row probe
+    (`limit(1)`), which the streaming early-stop reads without scanning the whole source.
     """
     from batcher.plan.logical import Limit
 
+    hit = _cached_rows(plan, sources, cache)
+    if hit is not None:
+        return hit.num_rows == 0
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_is_empty(plan, sources, source_stats)
     if answer is not None:
@@ -1150,30 +1222,54 @@ def _sink_write_partitioned(
     return sink.write_partitioned(table, path, partition_by=partition_by)
 
 
+# Every conversion terminal below takes `cache` and forwards it to `_collect`. It reads as
+# boilerplate and is not: without it, `ds.cache().to_pydict()` never consults the cache and
+# never populates it, so a cached dataset read through anything but `collect()` re-executed
+# its whole plan every time while `cache_stats()` reported neither a hit nor a miss. The
+# marker is on the *dataset*, so it has to reach every terminal that materializes that
+# dataset's result, not just the one that returns it as Arrow.
+
+
 def _to_pydict(
-    plan: LogicalPlan, sources: list[Source], columns: list[str]
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
 ) -> dict[str, list[Any]]:
     """Execute and return the result as a column-oriented dict."""
-    return _collect(plan, sources, columns).to_pydict()
+    return _collect(plan, sources, columns, cache=cache).to_pydict()
 
 
 def _to_pylist(
-    plan: LogicalPlan, sources: list[Source], columns: list[str]
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
 ) -> list[dict[str, Any]]:
     """Execute and return the result as a list of row dicts."""
-    return _collect(plan, sources, columns).to_pylist()
+    return _collect(plan, sources, columns, cache=cache).to_pylist()
 
 
-def _to_pandas(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> Any:
+def _to_pandas(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> Any:
     """Execute and return the result as a pandas `DataFrame` (via Arrow)."""
     require("pandas", feature="Dataset.to_pandas()", provides="pandas", extra="pandas")
-    return _collect(plan, sources, columns).to_pandas()
+    return _collect(plan, sources, columns, cache=cache).to_pandas()
 
 
-def _to_polars(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> Any:
+def _to_polars(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> Any:
     """Execute and return the result as a Polars `DataFrame` (zero-copy from Arrow)."""
     polars = require("polars", feature="Dataset.to_polars()", provides="polars", extra="polars")
-    return polars.from_arrow(_collect(plan, sources, columns))
+    return polars.from_arrow(_collect(plan, sources, columns, cache=cache))
 
 
 def _show(plan: LogicalPlan, sources: list[Source], columns: list[str], limit: int) -> None:

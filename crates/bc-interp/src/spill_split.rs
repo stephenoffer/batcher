@@ -54,7 +54,7 @@ pub(crate) fn grace_bucket_count(bytes: usize, budget: usize) -> usize {
 /// assignment and must never be used for a local re-split — and distinct per level, so
 /// successive splits of the same rows are independent of one another.
 pub(crate) fn split_salt(depth: u32) -> u64 {
-    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(depth as u64 + 1) | 1
+    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(u64::from(depth) + 1) | 1
 }
 
 /// Stream `partition` out of `store` and into `dest`, re-partitioned `p` ways by `keys_of`

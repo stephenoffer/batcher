@@ -125,7 +125,7 @@ def cluster_accelerator_type() -> str | None:
     if len(names) != 1:
         return None
     only = names.pop()
-    return only if only else None
+    return only or None
 
 
 def cluster_gpu_memory_bytes() -> int | None:

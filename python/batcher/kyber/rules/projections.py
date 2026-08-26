@@ -149,7 +149,7 @@ def _is_identity_over(items: tuple[Projection, ...], child: LogicalPlan) -> bool
     )
 
 
-@rule(name="projection_inlining_into_agg", phase=Phase.REWRITE, matches=(Aggregate,))
+@rule(name="projection_inlining_into_agg", phase=Phase.FUSION, matches=(Aggregate,))
 def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Aggregate(Project(x, renames))` → `Aggregate(x, …)` with the rename inlined.
 
@@ -159,6 +159,27 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
     defining column, and the projection is dropped. Restricted to projections whose
     items are all bare columns (rename/passthrough), so inlining adds zero compute
     (a computed projection might be referenced several times). Returns None otherwise.
+
+    **FUSION, not REWRITE, because the projection this consumes is one PUSHDOWN
+    produces.** Projection pushdown inserts a narrowing `Project` above a join (and above
+    a scan), and an `Aggregate` sitting over one is exactly the shape inlined here. REWRITE
+    runs *before* PUSHDOWN and the pipeline is a single forward pass over the phases
+    (`optimizer.facade._run`), so in REWRITE this rule was asked about a plan that did not
+    yet contain its own input pattern, and nothing ran it again once PUSHDOWN had built one.
+    Measured over the 22 TPC-H queries: **13 of them optimized to a plan a second
+    `optimize_logical` would still shrink**, and this rule alone accounts for 10 of those —
+    every one of them shipping a redundant operator to the engine.
+
+    FUSION is the right home rather than PUSHDOWN for two reasons: it iterates to a
+    fixpoint *and* runs after JOIN_REORDER, so a projection left behind by the join
+    enumerator is caught too; and inlining a projection into the operator above it is
+    operator fusion, which is what the phase is for. It is the same producer-after-consumer
+    correction the empty-relation family already needed (see `optimizer.driver`'s note on
+    why those eleven rules moved into FUSION).
+
+    Moving it is a plan *and* a planning-time win, because a smaller plan is cheaper for
+    every phase after it: total TPC-H plan size 418 → 408 nodes, cold optimize 38.0 →
+    34.7 ms/query. `tests/unit/kyber_rule_order.json` records the new phase.
     """
     proj = node.input
     if not isinstance(proj, Project):
@@ -213,7 +234,15 @@ def eliminate_identity_project(node: Project, _ctx: OptimizerContext) -> Logical
     return node.input
 
 
-@rule(name="merge_projections", phase=Phase.NORMALIZE, matches=(Project,))
+@rule(
+    name="merge_projections",
+    phase=Phase.NORMALIZE,
+    matches=(Project,),
+    # Projection pushdown (two phases later) stacks a narrowing `Project` on one this rule
+    # has already merged. Fired on 30 of the 99 TPC-DS queries when re-run on the final
+    # plan, for 47 redundant `Project` nodes. See `Rule.recanonicalize`.
+    recanonicalize=True,
+)
 def merge_projections(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Project(Project(x))` → one `Project(x)` by inlining the inner expressions.
 
@@ -670,10 +699,53 @@ def _collect_scan_predicates(
         combined = node.predicate if pending is None else _and(pending, node.predicate)
         _collect_scan_predicates(node.input, combined, acc)
         return
+    if isinstance(node, Project) and pending is not None:
+        # A *pass-through* projection is the one operator a pending predicate can cross,
+        # and it is the one that actually gets in the way: Kyber's own column pruning
+        # inserts a `Project` above a scan whenever a query reads fewer columns than the
+        # table has, which is most SQL. `runtime_join_filter` then adds its sideways-
+        # information-passing `BETWEEN` in `Phase.ENFORCE` -- after every pushdown pass,
+        # with nothing left to sink it -- so it landed on top of that projection and the
+        # dynamic partition pruning its docstring promises silently did not happen. The
+        # DataFrame surface, which projects for itself and leaves the pruner nothing to
+        # add, got the pushdown; `bt.sql()` did not.
+        #
+        # Crossing is a *renaming*, never a computation: only aliases whose expression is
+        # a bare `Col` qualify, and every column the predicate reads must be one of them,
+        # which is the same test `push_filter_through_project` applies before moving a
+        # filter across the same node. Anything computed, and the walk gives up as before.
+        #
+        # This is deliberately done here rather than by relocating the `Filter` in the
+        # plan, which is what an earlier version of this fix did. Moving the node also
+        # moves the filter's *gather* below the projection, so a non-selective predicate
+        # then materializes full-width rows the projection was about to discard --
+        # measured at **10% slower on TPC-H q18**, whose runtime filter is
+        # `c_custkey BETWEEN 1 AND 149999` over a 150,000-row table and removes exactly
+        # one row. Teaching the walk to see through the projection keeps the executed
+        # plan byte-identical and tells the source what it needs anyway.
+        crossed = _across_passthrough(node, pending)
+        if crossed is not None:
+            _collect_scan_predicates(node.input, crossed, acc)
+            return
     # Any other operator breaks the Filter→Scan adjacency: descend with no pending
     # predicate (children get their own immediately-enclosing filters, if any).
     for child in _children(node):
         _collect_scan_predicates(child, None, acc)
+
+
+def _across_passthrough(node: Project, pending: Expr) -> Expr | None:
+    """`pending` rewritten in the projection's *input* names, or `None` if it cannot cross.
+
+    Crossing is a pure renaming. Only aliases whose expression is a bare `Col` qualify, and
+    every column the predicate reads must be one of them -- the same test
+    `push_filter_through_project` applies before moving a filter across the same node, kept
+    as its own function so the two are obviously the same rule and so a test has a single
+    thing to disable when it wants the pre-fix behaviour back.
+    """
+    passthrough = {it.alias: it.expr for it in node.items if isinstance(it.expr, Col)}
+    if not referenced_columns(pending) <= set(passthrough):
+        return None
+    return _substitute_cols(pending, passthrough)
 
 
 def _and(left: Expr, right: Expr) -> Expr:

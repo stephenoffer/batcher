@@ -55,6 +55,19 @@ def _is_skipped(text: str) -> bool:
     return False
 
 
+def test_examples_exist() -> None:
+    """The example tree is non-empty.
+
+    `test_example_runs` is parametrized over `_example_files()`, so an empty result is not
+    a failure — it collects **zero** tests and the run still prints green. Every guard in
+    this file (does the script still import, does the API it demonstrates still exist,
+    does it still produce the right answer) would then be switched off by a moved
+    directory or a renamed glob, with nothing anywhere going red. This is the assertion
+    that cannot be satisfied vacuously.
+    """
+    assert _example_files(), f"no example scripts found under {EXAMPLES_ROOT}"
+
+
 @pytest.mark.docs
 @pytest.mark.integration
 @pytest.mark.parametrize(

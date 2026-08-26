@@ -15,7 +15,7 @@ from batcher.ml.llm.requests import _render
 
 
 def _echo():
-    return lambda prompts: list(prompts)
+    return list
 
 
 def test_null_prompt_cell_renders_empty_not_the_word_none():
@@ -58,7 +58,7 @@ def test_few_shot_prepends_demonstration_pairs():
 
 def test_few_shot_reaches_generate_end_to_end():
     ds = bt.from_pydict({"q": ["x"]})
-    echo = lambda: lambda ps: list(ps)  # noqa: E731
+    echo = lambda: list  # noqa: E731
     out = ds.ml.generate(echo, prompt_column="q", few_shot=[("a", "1")]).to_pydict()
     assert out["response"] == ["Input: a\nOutput: 1\n\nx"]
 

@@ -114,12 +114,27 @@ def _batcher_engine(tables: dict[str, pa.Table]):
 # Ray Data (attached to the existing cluster — its distributed home turf)
 # --------------------------------------------------------------------------- #
 def _ray_engine(tables: dict[str, pa.Table]):
+    # Build the handle through `engines.ray.RayEngine`, never `ray.data.from_arrow`.
+    #
+    # `from_arrow(table)` produces exactly **one block**, and a block is Ray Data's unit of
+    # parallelism — so every downstream `map_batches`, `groupby` and `sort` runs as a single
+    # task on a single core. `engines/ray.py`'s module docstring documents this at length as
+    # the harness bug that made Ray Data's TPC-H numbers meaningless (6M-row `lineitem`, one
+    # block, one CPU on a 96-core box) and fixes it by writing the table to Parquet once,
+    # untimed, with row groups sized to Ray's own two read defaults.
+    #
+    # That fix landed in the adapter and this script kept calling `from_arrow` directly, so
+    # every `ray/batcher` ratio it has ever printed compared single-threaded Ray Data against
+    # in-process Batcher. Reusing the adapter means the fix cannot come apart again: there is
+    # one definition of how a Ray handle is built, and it is the one the operator-mix and the
+    # TPC-H pipelines already use.
+    # Still needed even though the handle no longer comes from here: `expr_etl` below
+    # reaches for `ray.data.aggregate.Sum` / `.Mean`.
     import ray.data
 
-    from engines.ray import _ensure_ray
+    from engines.ray import RayEngine
 
-    _ensure_ray()
-    rd = ray.data.from_arrow(tables["lineitem"])
+    rd = RayEngine().handle(tables["lineitem"])
 
     def udf_map() -> pa.Table:
         def fn(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -221,6 +236,33 @@ def _daft_engine(tables: dict[str, pa.Table]):
     return {"udf-map": udf_map, "expr-etl": expr_etl, "top-n": top_n}
 
 
+def _reference_engine(outputs: dict[str, pa.Table]) -> str | None:
+    """The engine whose result the others are checked against — never Batcher if avoidable.
+
+    Reuses `harness.compare`'s preference order rather than restating it, so the two cannot
+    drift about which engines are trusted as oracles. Reaching into the private name is
+    deliberate: a second copy of that list is exactly the duplication that lets one of them
+    grow a new engine and the other not.
+
+    When the lineup contains no independent engine, this returns Batcher and says so. That
+    is a real state (`--engines batcher` alone), and it is worth a line of output rather
+    than a silent self-certification: every result in the table is then "Batcher agrees
+    with Batcher", which is not a correctness gate.
+    """
+    from harness.compare import _ORACLE_PREFERENCE
+
+    for candidate in _ORACLE_PREFERENCE:
+        if candidate in outputs:
+            return candidate
+    reference = next(iter(outputs), None)
+    if reference is not None:
+        print(
+            f"  !! no independent oracle in the lineup; checking against {reference!r}, "
+            "which is the system under test — these results are not correctness-gated"
+        )
+    return reference
+
+
 ENGINES: dict[str, Callable] = {
     "batcher": _batcher_engine,
     "ray": _ray_engine,
@@ -259,8 +301,17 @@ def main() -> None:
             except Exception as exc:
                 results.setdefault(w, {})[n] = f"ERR:{type(exc).__name__}"
                 print(f"[{w}] {n} error: {type(exc).__name__}: {exc}")
-        # correctness gate vs the first engine that produced a result
-        ref_name = next(iter(outputs), None)
+        # Correctness gate against an *independent* oracle, never against the system under
+        # test. `next(iter(outputs))` picked whichever engine came first in `--engines`,
+        # which defaults to `batcher,ray,daft` — so Batcher was the reference, no
+        # independent oracle was in the lineup at all, and a Batcher bug in any of these
+        # three workloads was unfalsifiable here: it would have been reported as Ray or
+        # Daft returning WRONG.
+        #
+        # `harness.compare` already states the rule and the incident behind it (with
+        # Batcher as the reference, "Daft computes q6 wrong" got recorded as Batcher's bug
+        # and back again), so this reuses that preference order rather than restating it.
+        ref_name = _reference_engine(outputs)
         if ref_name is not None:
             ref = outputs[ref_name]
             for n, out in outputs.items():

@@ -22,7 +22,7 @@ from _harness import assert_same, assert_same_ordered
 
 @pytest.fixture
 def emp():
-    t = pa.table(
+    return pa.table(
         {
             "id": [1, 2, 3, 4, 5, 6, 7],
             "dept": ["a", "a", "b", "b", "c", None, "a"],
@@ -30,7 +30,6 @@ def emp():
             "bonus": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
         }
     )
-    return t
 
 
 @pytest.mark.differential

@@ -394,6 +394,37 @@ class MemoryConfig:
     # caching never grows the process without bound. Opt-in per dataset, so this only
     # bounds what an explicitly-cached plan may retain.
     result_cache_max_bytes: int = 256 << 20  # 256 MiB
+    # On-disk byte budget for the result cache's second tier, under `StorageLevel`s that
+    # allow disk. What the memory budget evicts is written here instead of dropped, so a
+    # working set larger than `result_cache_max_bytes` costs a read-back rather than a full
+    # recompute. Scratch, not durable: it lives beside the spill files (`spill_dir`, or the
+    # node's measured local volume), overflows to `spill_remote_uri` when local disk fills,
+    # and is removed at process exit. `0` turns the tier off, which makes every level
+    # behave as `MEMORY_ONLY`.
+    #
+    # Defaults to 4 GiB rather than to zero: the tier costs nothing until something is
+    # demoted (no directory is even created), and a cache whose only answer to a full
+    # budget is to forget is the shape of cache that cannot help the workload that asked
+    # for one. A node with no writable scratch resolves this to no tier at all.
+    result_cache_disk_max_bytes: int = 4 << 30  # 4 GiB
+    # Opt-in *shared* result cache: a store outside this process that a second driver, a
+    # Ray worker, or tomorrow's run can read. `None` (the default) keeps every cached
+    # result process-local. The scheme picks the backend:
+    #
+    #   redis:// · rediss:// · unix://   a server, shared across processes and nodes
+    #   rocksdb://<path> or a bare path  an embedded database, one node, across runs
+    #
+    # A result is written here only when **every** input has a durable identity *and* a
+    # content version (`Source.stats_version`), because a shared entry outlives the run
+    # that made it and a rewritten table would otherwise serve the previous run's rows.
+    # In-memory data therefore never shares, and a source that cannot version itself
+    # declines rather than risking it. A store that is unreachable degrades to recompute.
+    shared_cache_uri: str | None = None
+    # Expiry applied to every shared-cache write, in seconds. The content version in the
+    # key already invalidates an entry when its inputs change, so this bounds staleness
+    # only where that token is coarser than the data — and bounds the store's growth when
+    # nobody configured an eviction policy on it. `0` writes entries without an expiry.
+    shared_cache_ttl_seconds: int = 24 * 60 * 60  # 1 day
     # Local-SSD read-through cache for remote (S3/GCS/Azure) file bytes — the engine's
     # Disk-Cache analog. `None` (default) disables it; set a directory to cache fetched
     # remote files there, byte-bounded to `file_cache_max_bytes` with LRU eviction. It

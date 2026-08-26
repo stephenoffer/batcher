@@ -42,14 +42,14 @@ ENCODINGS = {
 
 # Methods with a DuckDB counterpart, so the answer can be checked against the oracle.
 AGAINST_DUCKDB = [
-    (lambda: col("e").list.sum(), "SELECT k, list_sum(e) r FROM t ORDER BY k"),
+    (col("e").list.sum, "SELECT k, list_sum(e) r FROM t ORDER BY k"),
     (lambda: col("e").list.get(0), "SELECT k, e[1] r FROM t ORDER BY k"),
-    (lambda: col("e").list.first(), "SELECT k, list_first(e) r FROM t ORDER BY k"),
-    (lambda: col("e").list.last(), "SELECT k, list_last(e) r FROM t ORDER BY k"),
-    (lambda: col("e").list.len(), "SELECT k, len(e) r FROM t ORDER BY k"),
-    (lambda: col("e").list.sort(), "SELECT k, list_sort(e) r FROM t ORDER BY k"),
-    (lambda: col("e").list.reverse(), "SELECT k, list_reverse(e) r FROM t ORDER BY k"),
-    (lambda: col("e").list.median(), "SELECT k, list_median(e) r FROM t ORDER BY k"),
+    (col("e").list.first, "SELECT k, list_first(e) r FROM t ORDER BY k"),
+    (col("e").list.last, "SELECT k, list_last(e) r FROM t ORDER BY k"),
+    (col("e").list.len, "SELECT k, len(e) r FROM t ORDER BY k"),
+    (col("e").list.sort, "SELECT k, list_sort(e) r FROM t ORDER BY k"),
+    (col("e").list.reverse, "SELECT k, list_reverse(e) r FROM t ORDER BY k"),
+    (col("e").list.median, "SELECT k, list_median(e) r FROM t ORDER BY k"),
 ]
 
 # No-argument methods with no DuckDB counterpart: compared across encodings instead.

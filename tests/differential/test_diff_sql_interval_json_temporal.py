@@ -129,11 +129,15 @@ def test_temporal_constructors_match_duckdb(duck, q):
     assert_same(bt.sql(q).collect(), duck.sql(q))
 
 
-def test_time_bucket_on_a_calendar_unit_is_refused_rather_than_misaligned():
-    # DuckDB aligns month buckets to 2000-01-01; an epoch-aligned width would be off by
-    # that origin, so the call is refused instead of answered.
-    with pytest.raises(NotImplementedError):
-        bt.sql("SELECT time_bucket(INTERVAL 1 MONTH, TIMESTAMP '2024-03-05') AS r").collect()
+@pytest.mark.parametrize("width", ["1 MONTH", "3 MONTH", "1 YEAR"])
+def test_time_bucket_on_a_calendar_unit_matches_duckdb(duck, width):
+    # DuckDB aligns calendar buckets to 2000-01, which no epoch-aligned *width* can express
+    # — this used to be refused for that reason. Bucketing the month index instead needs no
+    # width at all and reproduces the origin exactly. The boundary cases (either side of
+    # 2000-01, DATE vs TIMESTAMP result types) are pinned in
+    # `test_diff_sql_time_bucket_origin.py`; this is the constructor-vocabulary check.
+    q = f"SELECT time_bucket(INTERVAL {width}, TIMESTAMP '2024-03-05') AS r"
+    assert_same(bt.sql(q).collect(), duck.sql(q))
 
 
 def test_make_timestamp_ns_truncates_to_the_microsecond_the_engine_stores(duck):

@@ -492,11 +492,11 @@ mod tests {
             Field::new("v", DataType::Utf8, true),
         ]));
         let whole = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
-                Arc::new(Int64Array::from(k.clone())) as ArrayRef,
-                Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
-                Arc::new(StringArray::from(v.clone())) as ArrayRef,
+                Arc::new(Int64Array::from(k)) as ArrayRef,
+                Arc::new(Int64Array::from(ts)) as ArrayRef,
+                Arc::new(StringArray::from(v)) as ArrayRef,
             ],
         )
         .unwrap();

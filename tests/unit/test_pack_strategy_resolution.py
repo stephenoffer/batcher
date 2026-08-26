@@ -96,7 +96,7 @@ def test_spread_stays_spread_on_a_real_cluster(monkeypatch):
 
 def test_unreadable_topology_keeps_the_preference(monkeypatch):
     """Second-guessing a preference on no evidence is worse than honoring it."""
-    monkeypatch.setattr(scaling, "node_classes", lambda: [])
+    monkeypatch.setattr(scaling, "node_classes", list)
     monkeypatch.setattr(scaling, "alive_node_count", lambda: 0)
     monkeypatch.setattr(scaling, "cluster_node_count", lambda: 0)
     env = SchedulingEnvelope(num_cpus=4.0, n_tasks=8, placement_strategy="PACK")

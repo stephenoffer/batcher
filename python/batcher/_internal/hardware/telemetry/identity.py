@@ -215,7 +215,7 @@ def device_identity() -> tuple[DeviceIdentity, ...]:
     driver = ""
     fn = getattr(nv, "nvmlSystemGetDriverVersion", None)
     if fn is not None:
-        driver = _decode(_read(lambda: fn(), ""))
+        driver = _decode(_read(fn, ""))
     cuda = _cuda_driver_version(nv)
     out: list[DeviceIdentity] = []
     for index in range(_device_count(nv)):

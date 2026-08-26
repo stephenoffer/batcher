@@ -9,6 +9,31 @@ from __future__ import annotations
 
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
+__all__ = [
+    "array_agg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count_if",
+    "covar_pop",
+    "covar_samp",
+    "kurtosis",
+    "max",
+    "mean",
+    "median",
+    "min",
+    "mode",
+    "n_unique",
+    "product",
+    "skewness",
+    "std",
+    "sum",
+    "var",
+]
+
 
 def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:
     """Pearson correlation coefficient of two columns (DuckDB/Spark ``corr``).

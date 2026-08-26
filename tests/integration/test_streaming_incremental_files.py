@@ -110,3 +110,56 @@ def test_max_files_per_trigger_splits_a_backlog_across_micro_batches(watched):
     assert q.await_termination(timeout=30) is True
     assert sorted(bt.read_memory("inc_rate").to_pydict()["a"]) == [0, 1, 2, 3]
     assert len(q.recent_progress) >= 4, "the backlog was not split one file per micro-batch"
+
+
+@pytest.mark.integration
+def test_documented_two_argument_call_works(tmp_path, monkeypatch):
+    """`bt.read.files_incremental(path, format)` — the call the docstring shows — runs.
+
+    `state_dir` was keyword-only and required, so the public reader's own documented
+    example raised a bare `TypeError` from the source constructor. `BATCHER_HOME` is
+    redirected so the derived default lands in `tmp_path` rather than the developer's
+    real `~/.batcher`.
+    """
+    monkeypatch.setenv("BATCHER_HOME", str(tmp_path / "home"))
+    data = tmp_path / "landing"
+    data.mkdir()
+    _write(data, "f1.parquet", [1, 2, 3])
+
+    ds = bt.read.files_incremental(str(data), "parquet")
+    assert sorted(b.column("a").to_pylist()[0] for b in ds.iter_batches()) == [1]
+
+
+@pytest.mark.integration
+def test_derived_state_dir_is_stable_and_path_specific(tmp_path, monkeypatch):
+    """The default store resumes the same stream and never collides with another one.
+
+    A derived default is only safe if it is a function of *what is being watched*: the
+    same directory read the same way must reuse its seen-file store across restarts (that
+    is the exactly-once property), and a different directory must never share it.
+    """
+    monkeypatch.setenv("BATCHER_HOME", str(tmp_path / "home"))
+    from batcher.io.formats.streaming.autoloader import _derived_state_dir
+
+    assert _derived_state_dir("/data/in", "parquet") == _derived_state_dir("/data/in", "parquet")
+    assert _derived_state_dir("/data/in", "parquet") != _derived_state_dir("/data/other", "parquet")
+    assert _derived_state_dir("/data/in", "parquet") != _derived_state_dir("/data/in", "json")
+    # Not a temp directory: a store a reboot clears would silently re-ingest everything.
+    assert str(tmp_path / "home") in _derived_state_dir("/data/in", "parquet")
+
+
+@pytest.mark.integration
+def test_default_state_dir_resumes_instead_of_reingesting(tmp_path, monkeypatch):
+    """A second query over the same directory sees only what arrived since the first."""
+    monkeypatch.setenv("BATCHER_HOME", str(tmp_path / "home"))
+    data = tmp_path / "landing"
+    data.mkdir()
+    _write(data, "f1.parquet", [1])
+
+    first = bt.read.files_incremental(str(data), "parquet")
+    assert [b.num_rows for b in first.iter_batches()] == [1]
+
+    _write(data, "f2.parquet", [2])
+    second = bt.read.files_incremental(str(data), "parquet")
+    seen = [v for b in second.iter_batches() for v in b.column("a").to_pylist()]
+    assert seen == [2], f"expected only the new file, got {seen}"

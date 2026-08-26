@@ -29,11 +29,13 @@ pub struct Coord {
 
 impl Coord {
     /// A 2D position (`z` defaulted to 0, unread unless the geometry is 3D).
+    #[must_use]
     pub fn new(x: f64, y: f64) -> Self {
         Coord { x, y, z: 0.0 }
     }
 
     /// A 3D position.
+    #[must_use]
     pub fn new_z(x: f64, y: f64, z: f64) -> Self {
         Coord { x, y, z }
     }
@@ -41,6 +43,7 @@ impl Coord {
     /// True when either ordinate is NaN — the one input every predicate must reject,
     /// because NaN comparisons are false in both directions and would silently make a
     /// point "outside" every polygon including the one containing it.
+    #[must_use]
     pub fn is_nan(&self) -> bool {
         self.x.is_nan() || self.y.is_nan()
     }
@@ -103,6 +106,7 @@ pub enum GeomType {
 
 impl GeomType {
     /// The uppercase OGC name (`"POINT"`), as `ST_GeometryType` reports it.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             GeomType::Point => "POINT",
@@ -138,6 +142,7 @@ impl GeomType {
     ///
     /// A collection reports the maximum of its members, which is what PostGIS
     /// `ST_Dimension` does; the empty collection reports 0.
+    #[must_use]
     pub fn dimension(self) -> i64 {
         match self {
             GeomType::Point | GeomType::MultiPoint => 0,
@@ -167,6 +172,7 @@ pub struct Bbox {
 
 impl Bbox {
     /// The box containing exactly `c`.
+    #[must_use]
     pub fn from_coord(c: Coord) -> Self {
         Bbox {
             xmin: c.x,
@@ -193,6 +199,7 @@ impl Bbox {
     }
 
     /// True when the two boxes share at least a boundary point.
+    #[must_use]
     pub fn intersects(&self, other: &Bbox) -> bool {
         self.xmin <= other.xmax
             && other.xmin <= self.xmax
@@ -201,6 +208,7 @@ impl Bbox {
     }
 
     /// True when `other` lies entirely inside this box (boundary counts as inside).
+    #[must_use]
     pub fn contains(&self, other: &Bbox) -> bool {
         self.xmin <= other.xmin
             && self.xmax >= other.xmax
@@ -209,11 +217,13 @@ impl Bbox {
     }
 
     /// True when `c` lies inside or on this box.
+    #[must_use]
     pub fn contains_coord(&self, c: Coord) -> bool {
         c.x >= self.xmin && c.x <= self.xmax && c.y >= self.ymin && c.y <= self.ymax
     }
 
     /// Grow the box by `dx` horizontally and `dy` vertically on every side.
+    #[must_use]
     pub fn expand(&self, dx: f64, dy: f64) -> Bbox {
         Bbox {
             xmin: self.xmin - dx,
@@ -228,6 +238,7 @@ impl Bbox {
     /// The cheap lower bound on `st_distance`, which is what makes it usable as a
     /// spatial-join prefilter: a pair whose boxes are further apart than the radius
     /// cannot possibly satisfy the predicate, so the expensive test never runs.
+    #[must_use]
     pub fn distance(&self, other: &Bbox) -> f64 {
         let dx = (other.xmin - self.xmax)
             .max(self.xmin - other.xmax)
@@ -239,6 +250,7 @@ impl Bbox {
     }
 
     /// The box as a closed 5-point counter-clockwise ring.
+    #[must_use]
     pub fn to_ring(self) -> LineString {
         vec![
             Coord::new(self.xmin, self.ymin),
@@ -266,6 +278,7 @@ pub struct Geom {
 
 impl Geom {
     /// A 2D geometry with an unknown SRID.
+    #[must_use]
     pub fn new(geometry: Geometry) -> Self {
         Geom {
             srid: 0,
@@ -276,12 +289,14 @@ impl Geom {
 
     /// This geometry relabelled with `srid`. Coordinates are unchanged — this is
     /// `ST_SetSRID`, the assertion, not `ST_Transform`, the conversion.
+    #[must_use]
     pub fn with_srid(mut self, srid: i32) -> Self {
         self.srid = srid;
         self
     }
 
     /// The OGC type code.
+    #[must_use]
     pub fn geom_type(&self) -> GeomType {
         match &self.geometry {
             Geometry::Point(_) => GeomType::Point,
@@ -295,11 +310,13 @@ impl Geom {
     }
 
     /// True when the geometry holds no coordinates at all.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.geometry.is_empty()
     }
 
     /// Every coordinate, in encoding order.
+    #[must_use]
     pub fn coords(&self) -> Vec<Coord> {
         let mut out = Vec::new();
         self.geometry.collect_coords(&mut out);
@@ -307,11 +324,13 @@ impl Geom {
     }
 
     /// The number of coordinates, without materializing them.
+    #[must_use]
     pub fn num_points(&self) -> usize {
         self.geometry.num_points()
     }
 
     /// The axis-aligned bounds, or `None` for an empty geometry.
+    #[must_use]
     pub fn bbox(&self) -> Option<Bbox> {
         let mut out: Option<Bbox> = None;
         self.geometry.fold_bbox(&mut out);
@@ -333,7 +352,7 @@ impl Geometry {
             Geometry::MultiPoint(ps) => ps.iter().all(|p| p.is_none()),
             Geometry::MultiLineString(ls) => ls.iter().all(|l| l.is_empty()),
             Geometry::MultiPolygon(ps) => ps.iter().all(|p| p.exterior.is_empty()),
-            Geometry::GeometryCollection(gs) => gs.iter().all(|g| g.is_empty()),
+            Geometry::GeometryCollection(gs) => gs.iter().all(Geometry::is_empty),
         }
     }
 
@@ -373,7 +392,7 @@ impl Geometry {
                 .iter()
                 .map(|p| p.exterior.len() + p.interiors.iter().map(|r| r.len()).sum::<usize>())
                 .sum(),
-            Geometry::GeometryCollection(gs) => gs.iter().map(|g| g.num_points()).sum(),
+            Geometry::GeometryCollection(gs) => gs.iter().map(Geometry::num_points).sum(),
         }
     }
 
@@ -445,6 +464,7 @@ impl Geometry {
     /// Area and point-in-polygon work the same way on a `Polygon`, a `MultiPolygon`
     /// and a collection that happens to contain one, so they iterate this instead of
     /// repeating the flattening.
+    #[must_use]
     pub fn polygons(&self) -> Vec<&Polygon> {
         let mut out = Vec::new();
         self.push_polygons(&mut out);
@@ -463,6 +483,7 @@ impl Geometry {
     /// Every line chain in the geometry, flattening collections. Polygon rings are
     /// included, because a polygon's boundary is a set of lines and the linear
     /// predicates are defined against it.
+    #[must_use]
     pub fn lines(&self) -> Vec<&LineString> {
         let mut out = Vec::new();
         self.push_lines(&mut out);
@@ -489,6 +510,7 @@ impl Geometry {
     }
 
     /// Every position in the geometry, flattening collections.
+    #[must_use]
     pub fn points(&self) -> Vec<Coord> {
         let mut out = Vec::new();
         self.push_points(&mut out);
@@ -506,6 +528,7 @@ impl Geometry {
 
     /// The number of top-level members: 1 for a simple geometry, the member count for
     /// a multi-geometry or collection (PostGIS `ST_NumGeometries`).
+    #[must_use]
     pub fn num_geometries(&self) -> usize {
         match self {
             Geometry::MultiPoint(ps) => ps.len(),
@@ -534,6 +557,7 @@ impl Geometry {
 }
 
 /// True when the ring's first and last coordinates coincide in x and y.
+#[must_use]
 pub fn is_closed(ring: &[Coord]) -> bool {
     match (ring.first(), ring.last()) {
         (Some(a), Some(b)) => a.x == b.x && a.y == b.y,
@@ -555,6 +579,7 @@ pub fn close_ring(ring: &mut LineString) {
 /// Positive is counter-clockwise. Returned undoubled-and-unsigned by `ring_area`; the
 /// raw value is what orientation tests want, and halving it first would only cost a
 /// division on a quantity that is about to be compared against zero.
+#[must_use]
 pub fn signed_area2(ring: &[Coord]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
@@ -574,6 +599,7 @@ pub fn signed_area2(ring: &[Coord]) -> f64 {
 /// the reason `st_area` of a point came out as `-0.0`. That value compares equal to zero
 /// and prints as `-0.0`, so it is invisible to a test and visible to a user. Every
 /// measurement in this crate is a sum that can be empty, so every one of them normalizes.
+#[must_use]
 pub fn measurement(v: f64) -> f64 {
     // `-0.0 == 0.0` is true, so this maps only the negative zero and leaves NaN alone.
     if v == 0.0 {
@@ -584,11 +610,13 @@ pub fn measurement(v: f64) -> f64 {
 }
 
 /// The unsigned area of a single ring.
+#[must_use]
 pub fn ring_area(ring: &[Coord]) -> f64 {
     signed_area2(ring).abs() / 2.0
 }
 
 /// True when the ring winds counter-clockwise (positive signed area).
+#[must_use]
 pub fn is_ccw(ring: &[Coord]) -> bool {
     signed_area2(ring) > 0.0
 }
@@ -674,6 +702,6 @@ mod tests {
         );
         assert_eq!(g.geometry_n(3), None);
         let p = Geometry::Point(Some(Coord::new(2.0, 2.0)));
-        assert_eq!(p.geometry_n(1), Some(p.clone()));
+        assert_eq!(p.geometry_n(1), Some(p));
     }
 }

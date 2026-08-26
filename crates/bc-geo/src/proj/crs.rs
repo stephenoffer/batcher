@@ -76,6 +76,7 @@ fn parse_utm(epsg: i32) -> Option<(u32, bool)> {
 }
 
 /// True when this module can transform to and from `epsg`.
+#[must_use]
 pub fn is_supported(epsg: i32) -> bool {
     epsg == EPSG_WGS84
         || epsg == EPSG_WEB_MERCATOR
@@ -95,7 +96,7 @@ fn unsupported(epsg: i32) -> GeoError {
 /// Project WGS 84 lon/lat to a UTM zone's easting and northing in metres.
 fn to_utm(lon: f64, lat: f64, zone: u32, north: bool) -> Coord {
     let k0 = 0.9996;
-    let lon0 = ((zone as f64 - 1.0) * 6.0 - 180.0 + 3.0).to_radians();
+    let lon0 = ((f64::from(zone) - 1.0) * 6.0 - 180.0 + 3.0).to_radians();
     let (phi, lam) = (lat.to_radians(), lon.to_radians());
     let n = WGS84_A / (1.0 - E2 * phi.sin().powi(2)).sqrt();
     let t = phi.tan().powi(2);
@@ -129,7 +130,7 @@ fn to_utm(lon: f64, lat: f64, zone: u32, north: bool) -> Coord {
 /// Invert `to_utm`.
 fn from_utm(easting: f64, northing: f64, zone: u32, north: bool) -> Coord {
     let k0 = 0.9996;
-    let lon0 = ((zone as f64 - 1.0) * 6.0 - 180.0 + 3.0).to_radians();
+    let lon0 = ((f64::from(zone) - 1.0) * 6.0 - 180.0 + 3.0).to_radians();
     let x = easting - 500_000.0;
     let y = if north {
         northing

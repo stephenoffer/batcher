@@ -149,7 +149,7 @@ def test_the_spill_gate_itself_never_trims(releases):
         advisor = SpillAdvisor.__new__(SpillAdvisor)
         advisor.peak_bytes = lambda plan, v=peak: v  # type: ignore[method-assign]
         advisor.hard_budget = lambda v=budget: v  # type: ignore[method-assign]
-        advisor._pressure = type("P", (), {"classify": staticmethod(lambda: _NORMAL())})()
+        advisor._pressure = type("P", (), {"classify": staticmethod(_NORMAL)})()
         advisor._oom_history_reason = lambda estimated: None  # type: ignore[method-assign]
         advisor.spill_reason(object())
     assert calls == []
@@ -188,7 +188,7 @@ def test_the_out_of_core_stage_trims_before_it_writes(monkeypatch):
 
     def _collect(logical_opt, sources, partitions):
         order.append("spill")
-        return None
+        return
 
     monkeypatch.setattr(spill_mod, "spill_collect", _collect)
     import batcher.api.tuning as tuning

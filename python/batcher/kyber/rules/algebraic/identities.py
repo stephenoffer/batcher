@@ -270,7 +270,16 @@ def push_filter_into_union(node: Filter, _ctx: OptimizerContext) -> LogicalPlan 
     return None
 
 
-@rule(name="merge_adjacent_filters", phase=Phase.PUSHDOWN, matches=(Filter,))
+@rule(
+    name="merge_adjacent_filters",
+    phase=Phase.PUSHDOWN,
+    matches=(Filter,),
+    # Join reordering re-parents subtrees, so two filters this phase had already separated
+    # become adjacent again after it. Fired on 38 of the 99 TPC-DS queries when re-run on
+    # the optimizer's own final plan, for 92 redundant `Filter` nodes. See
+    # `Rule.recanonicalize`.
+    recanonicalize=True,
+)
 def merge_adjacent_filters(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Filter(Filter(x, a), b)` → `Filter(x, a AND b)`. One predicate evaluation
     instead of two, and it hands predicate pushdown a single conjunction to split
@@ -411,14 +420,37 @@ def push_limit_into_union(node: Limit, _ctx: OptimizerContext) -> LogicalPlan | 
     true top-N. Restricted to non-distinct unions (dedup changes counts) at offset 0
     (an offset spans the concatenation). The guard against already-capped inputs
     keeps the rule idempotent (it fires once, then leaves the plan at a fixpoint).
+
+    "Already capped" has to look *through* a projection, and testing only the immediate
+    input is what made this rule non-confluent. `push_limit_through_project` runs in the
+    same phase and rewrites the cap this rule just installed — `Limit(Project(x))` becomes
+    `Project(Limit(x))` — so on the next iteration every union input is a `Project` again,
+    the guard sees no `Limit`, and the cap is reinstalled on top of the one already there.
+    The two rules then trade the plan back and forth for the whole `fixpoint_iterations`
+    budget. Results stay correct (both rewrites are semantics-preserving, and a doubled cap
+    is still a cap) but the plan depends on where the cap lands; `ml.smote`'s plan was the
+    recorded reproduction.
     """
     inner = node.input
     if (
         isinstance(inner, Union)
         and not inner.distinct
         and node.offset == 0
-        and not any(isinstance(i, Limit) for i in inner.inputs)
+        and not any(_caps_rows(i) for i in inner.inputs)
     ):
         capped = tuple(Limit(i, node.n, 0) for i in inner.inputs)
         return Limit(Union(capped, distinct=False), node.n, 0)
     return None
+
+
+def _caps_rows(plan: LogicalPlan) -> bool:
+    """Whether `plan` already bounds its row count with a `Limit`.
+
+    Looks through a `Project`, which neither adds nor removes rows, so a cap beneath one
+    still caps the relation. That is the only wrapper `push_limit_through_project` can put
+    between the union and the cap, and seeing through it is what keeps the two rules from
+    reinstalling each other's work forever.
+    """
+    while isinstance(plan, Project):
+        plan = plan.input
+    return isinstance(plan, Limit)

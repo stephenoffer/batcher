@@ -177,13 +177,22 @@ class Aggregate(LogicalPlan):
             what="group_by().agg()",
         )
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the input — see `Sort.shape_ir` for why this seam exists.
+
+        The distributed reducer that folds a join bucket to groups rebuilds an `aggregate`
+        node over the bucket, and was restating the tag and the field list to do it. A new
+        field on `Aggregate` would then cross the cluster on the batch path and be dropped
+        on the shuffle path, with every single-node test green.
+        """
         return {
             "op": Op.AGGREGATE,
-            "input": self.input.to_ir(),
             "group_keys": group_keys_ir(self.group_keys),
             "aggregates": aggregates_ir(self.aggregates),
         }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {**self.shape_ir(), "input": self.input.to_ir()}
 
     def available_columns(self) -> list[str]:
         return [k.alias for k in self.group_keys] + [s.alias for s in self.aggregates]

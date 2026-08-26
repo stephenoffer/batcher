@@ -107,7 +107,7 @@ pub(crate) fn external_sort_to_final_store(
         if b.num_rows() == 0 {
             continue;
         }
-        group_bytes += b.get_array_memory_size() as u64;
+        group_bytes += run_bytes(&b);
         rows_in += b.num_rows() as u64;
         group.push(b);
         if group_bytes >= run_target_bytes {
@@ -196,13 +196,40 @@ type RunReader = arrow::ipc::reader::StreamReader<std::io::BufReader<std::fs::Fi
 /// spilled in the first place.
 pub(crate) const DEFAULT_RUN_TARGET_BYTES: u64 = 64 << 20;
 
+/// How much a batch contributes to the run being accumulated — its **own** payload, not the
+/// payload of whatever buffer it is a slice of.
+///
+/// This has to be slice-aware, and using `RecordBatch::get_array_memory_size` here defeated the
+/// entire point of growing runs. The sort's input is remorselized immediately before this
+/// (`par::exec`'s spill arm), and `remorselize` emits `RecordBatch::slice`s that share one
+/// parent buffer — so `get_array_memory_size` reported the *parent's* size for every 16 k-row
+/// morsel. A single morsel therefore cleared any `run_target_bytes` worth setting, every morsel
+/// became its own run, and the merge got back exactly the one-run-per-morsel shape the run
+/// target exists to avoid: at a 1 GiB sort, thousands of runs and three fan-in-16 merge passes
+/// where a few dozen runs would have needed one. The cost is paid in spill I/O, which is the
+/// dominant cost of an out-of-core sort.
+///
+/// A run is materialized by concatenating its batches, so its true size is the sum of the
+/// slices' own payloads. [`crate::batch_bytes`] is the engine's one measure of that — slice-
+/// aware, and dictionary-aware as `sliced_batch_bytes` is not — and it is the figure Carbonite
+/// derived `run_target_bytes` from, so the run and its target are in the same units.
+///
+/// Charged one batch at a time rather than over the accumulated group, which would be
+/// quadratic. The only thing that costs is a dictionary shared *across* morsels, counted once
+/// per morsel instead of once per run; that errs toward smaller runs, which is the safe
+/// direction and is a small fraction of the parent-buffer over-count it replaces.
+fn run_bytes(b: &RecordBatch) -> u64 {
+    crate::batch_bytes(std::slice::from_ref(b))
+}
+
 /// Upper bound on the number of runs pass 0 can produce, used to size the store's partition
 /// vector up front. Exact would require summing every batch's size twice; this over-counts
 /// harmlessly (an unused partition is an unwritten file) and never under-counts, because a
 /// run is only closed once it has reached `run_target_bytes` — except the final partial run,
-/// which the `+ 1` covers.
+/// which the `+ 1` covers. Measured with the same [`run_bytes`] the accumulator uses, so the
+/// bound cannot drift from the thing it is bounding.
 fn run_slots(parts: &[RecordBatch], run_target_bytes: u64) -> usize {
-    let total: u64 = parts.iter().map(|b| b.get_array_memory_size() as u64).sum();
+    let total: u64 = parts.iter().map(run_bytes).sum();
     (total / run_target_bytes.max(1)) as usize + 1
 }
 
@@ -272,33 +299,30 @@ fn load_next_run_batch(
     keys: &[SortKey],
 ) -> Result<(), InterpError> {
     loop {
-        match readers[ri].next() {
-            Some(batch) => {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                if schema.is_none() {
-                    *schema = Some(batch.schema());
-                }
-                if converter.is_none() {
-                    *converter = Some(build_key_converter(&batch, keys)?);
-                }
-                let key_cols = eval_sort_keys(&batch, keys)?;
-                let rows = converter
-                    .as_ref()
-                    .expect("converter built above")
-                    .convert_columns(&key_cols)?;
-                cur[ri] = Some(batch);
-                cur_rows[ri] = Some(rows);
-                idx[ri] = 0;
-                return Ok(());
+        if let Some(batch) = readers[ri].next() {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
             }
-            None => {
-                cur[ri] = None;
-                cur_rows[ri] = None;
-                return Ok(());
+            if schema.is_none() {
+                *schema = Some(batch.schema());
             }
+            if converter.is_none() {
+                *converter = Some(build_key_converter(&batch, keys)?);
+            }
+            let key_cols = eval_sort_keys(&batch, keys)?;
+            let rows = converter
+                .as_ref()
+                .expect("converter built above")
+                .convert_columns(&key_cols)?;
+            cur[ri] = Some(batch);
+            cur_rows[ri] = Some(rows);
+            idx[ri] = 0;
+            return Ok(());
+        } else {
+            cur[ri] = None;
+            cur_rows[ri] = None;
+            return Ok(());
         }
     }
 }
@@ -475,6 +499,45 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A run's accounted size must be the morsel's **own** payload, not its parent buffer's.
+    ///
+    /// `remorselize` hands this module `RecordBatch::slice`s of a shared parent, and the run
+    /// accumulator closes a run once the accumulated size reaches `run_target_bytes`. Measured
+    /// with `get_array_memory_size` — which reports the whole parent for every slice — one
+    /// morsel cleared any run target, so every morsel became its own run and the merge paid
+    /// extra full passes over the dataset. This pins the measure that stops that: a 1/16th
+    /// slice must account for about a 1/16th of the whole, and `run_slots` must size the
+    /// partition vector from the same measure.
+    #[test]
+    fn a_run_is_sized_by_the_morsels_own_bytes_not_its_parents() {
+        let ids: Vec<i64> = (0..1_600).collect();
+        let fs: Vec<f64> = ids.iter().map(|&i| i as f64).collect();
+        let whole = fbatch(&ids, &fs);
+        let whole_bytes = super::run_bytes(&whole);
+        let morsel = whole.slice(0, 100);
+        let morsel_bytes = super::run_bytes(&morsel);
+
+        // A 100-row slice of 1,600 rows is a sixteenth of the payload, give or take the
+        // per-column bookkeeping the measure rounds through.
+        assert!(
+            morsel_bytes * 8 < whole_bytes,
+            "a 1/16th slice accounted {morsel_bytes} B against the whole batch's {whole_bytes} B \
+             — the measure is reporting the parent buffer"
+        );
+        // And the parent-buffer measure really does report the whole thing, which is the bug
+        // this guards: without it the assertion above would hold trivially.
+        assert!(
+            morsel.get_array_memory_size() as u64 * 8 >= whole_bytes,
+            "get_array_memory_size is expected to report a slice as its parent; if arrow has \
+             changed this, the comment on `run_bytes` needs revisiting"
+        );
+
+        // Sizing the partition vector reads the same measure, so sixteen such morsels fit in
+        // one run of the whole batch's size rather than demanding sixteen.
+        let morsels: Vec<RecordBatch> = (0..16).map(|i| whole.slice(i * 100, 100)).collect();
+        assert_eq!(super::run_slots(&morsels, whole_bytes), 1 + 1);
     }
 
     /// The external (spilling) merge sort must equal the in-memory `sort_batch` oracle

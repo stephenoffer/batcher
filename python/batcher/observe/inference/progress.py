@@ -28,15 +28,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from batcher._internal import events
+from batcher._internal.humanize import count as _count
+from batcher._internal.humanize import percent as _pct
 from batcher._internal.mathx import safe_div
 from batcher.observe.inference.measures import (
     _blocked_rising,
-    _count,
     _finding,
     _mean_util,
     _mean_vram,
     _partition_totals,
-    _pct,
     _smooth,
 )
 

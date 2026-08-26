@@ -168,6 +168,7 @@ impl PoolStats {
     /// copies of a three-way comparison is exactly the kind of thing that comes to disagree
     /// at one boundary — and the boundary here is the one that decides whether an operator
     /// is told the envelope is filling.
+    #[must_use]
     pub fn pressure(&self) -> Pressure {
         if self.limit == 0 {
             return Pressure::Nominal;
@@ -183,6 +184,7 @@ impl PoolStats {
 
     /// `used / limit` in `[0, 1]`; `1.0` for a zero-limit (unconfigured) pool, which is
     /// full by definition rather than empty.
+    #[must_use]
     pub fn utilization(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
@@ -191,6 +193,7 @@ impl PoolStats {
     }
 
     /// `peak_used / limit` in `[0, 1]` — the pressure the workload actually reached.
+    #[must_use]
     pub fn peak_utilization(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
@@ -244,6 +247,7 @@ impl std::fmt::Debug for MemoryPool {
 
 impl MemoryPool {
     /// Create a pool admitting up to `limit` bytes in flight.
+    #[must_use]
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             limit: AtomicUsize::new(limit),
@@ -487,6 +491,7 @@ pub struct MemoryReservation {
 
 impl MemoryReservation {
     /// Bytes currently held by this reservation.
+    #[must_use]
     pub fn size(&self) -> usize {
         self.size
     }

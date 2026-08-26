@@ -24,6 +24,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .divergences import explain
 from .names import canonical_names
 from .order import order_violation
 
@@ -34,10 +35,18 @@ FLOAT_RTOL = 1e-9
 # Floats are rounded to this many decimals *before* sorting, so two values that are
 # equal within tolerance land on the same grid point and therefore sort together.
 ROUND_DECIMALS = 6
-# Rounding maps two genuinely-equal values (agreeing to ~1e-9) onto adjacent grid
-# points at worst, leaving them one step (1e-6) apart. The pairwise tolerance must
-# clear one step or that boundary is a false mismatch. Real divergences in these
-# queries are >= 1e-3, far above this floor.
+# Rounding maps two values that agree to ~1e-9 *in absolute terms* onto adjacent grid
+# points at worst, leaving them one step (1e-6) apart, and the pairwise tolerance must
+# clear one step or that boundary is a false mismatch.
+#
+# That reasoning holds at small magnitudes and NOT at large ones, which is worth stating
+# rather than leaving to be rediscovered: a TPC-H revenue sum is ~1e9, where agreeing to
+# 1e-9 *relative* means differing by about one whole unit — roughly a million grid steps.
+# What actually carries the comparison there is `FLOAT_RTOL * |x|` in `_agree`, not this
+# constant. The residual exposure is that `to_rowset` sorts on every column, so two rows
+# whose float keys fall within that difference could sort differently on the two sides and
+# be compared against each other. It needs near-duplicate aggregates to bite and none of
+# these queries produce them, but it is a property of the design rather than a guarantee.
 GRID_ATOL = 1.5 * 10**-ROUND_DECIMALS
 
 # Comparison classes a column can be reconciled to, in widening order: a column's class
@@ -320,7 +329,8 @@ def compare(
         classes = column_classes(
             [t for engine, t in outputs.items() if names[engine] == names[ref_engine]]
         )
-        mismatches = []
+        mismatches: list[str] = []
+        divergent: list[str] = []
         ref_rows = to_rowset(outputs[ref_engine], classes)
         for engine, out in outputs.items():
             if names[engine] != names[ref_engine]:
@@ -334,7 +344,16 @@ def compare(
                 # this line reported every mismatch with the two engines' values SWAPPED —
                 # which is how "Daft computes q6 wrong" got recorded as Batcher's bug and back
                 # again. A diff that names the wrong culprit is worse than no diff.
-                mismatches.append(f"{ref_engine} != {engine}: {msg}")
+                known = explain(name, ref_engine, engine, msg)
+                if known is not None:
+                    # A *recorded* semantic difference, not a failure. The row still does
+                    # not read OK and its ratio is still withheld — see `divergences`.
+                    divergent.append(
+                        f"{ref_engine} != {engine}: {msg} [known: {known.reason} "
+                        f"({known.citation})]"
+                    )
+                else:
+                    mismatches.append(f"{ref_engine} != {engine}: {msg}")
         # Order, per engine and against the query rather than against another engine: the
         # multiset comparison above sorted both sides, so this is the only thing standing
         # between a skipped `ORDER BY` and a timed win on it.
@@ -345,7 +364,13 @@ def compare(
                 mismatches.append(f"{engine}: {violation}")
         if mismatches:
             result.status = "FAILED"
-            result.note = " ; ".join(mismatches)
+            result.note = " ; ".join(mismatches + divergent)
+        elif divergent:
+            # Every difference on this row is one the suite has recorded, with a citation
+            # naming which engine is right. That is not agreement and it is not a defect:
+            # `DIVERGENT` says so, keeps the row out of `OK`, and keeps the ratio withheld.
+            result.status = "DIVERGENT"
+            result.note = " ; ".join(divergent)
     else:
         result.status = "ERROR"
         result.note = "all engines failed"

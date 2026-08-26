@@ -102,7 +102,7 @@ pub(crate) fn eval_list_get_dyn(arr: &ArrayRef, index: &ArrayRef) -> Result<Arra
             if list.is_null(i) || index.is_null(i) {
                 return None;
             }
-            let (start, end) = (offsets[i] as i64, offsets[i + 1] as i64);
+            let (start, end) = (i64::from(offsets[i]), i64::from(offsets[i + 1]));
             let want = index.value(i);
             let pos = if want < 0 {
                 end.saturating_add(want)
@@ -129,7 +129,7 @@ pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, Expr
             if list.is_null(i) {
                 return None;
             }
-            let (start, end) = (offsets[i] as i64, offsets[i + 1] as i64);
+            let (start, end) = (i64::from(offsets[i]), i64::from(offsets[i + 1]));
             // Negative indices address from the end (`-1` → last element). Saturating so a
             // huge/`i64::MIN` index can't overflow — it just lands out of range → null.
             let pos = if index < 0 {

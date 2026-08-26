@@ -230,7 +230,7 @@ def _sniff(data: bytes) -> str:
     head = data[:64].lstrip()
     if head.startswith(b"ply"):
         return ".ply"
-    if head.startswith(b"#") or head.startswith(b"VERSION") or b".PCD" in data[:64]:
+    if head.startswith((b"#", b"VERSION")) or b".PCD" in data[:64]:
         return ".pcd"
     return ".bin"
 

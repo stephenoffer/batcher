@@ -128,8 +128,7 @@ def test_ndjson_byte_range_splits_exact_once(tmp_path):
 
     path = str(tmp_path / "big.jsonl")
     with open(path, "w") as f:
-        for i in range(1000):
-            f.write(json.dumps({"id": i, "v": i * 2}) + "\n")
+        f.writelines(json.dumps({"id": i, "v": i * 2}) + "\n" for i in range(1000))
 
     source = JSONSource(path)
     splits = source.splits(target_size=2000)  # tiny target → many byte ranges
@@ -163,8 +162,7 @@ def test_csv_byte_range_splits_exact_once(tmp_path):
     path = str(tmp_path / "big.csv")
     with open(path, "w") as f:
         f.write("id,v\n")
-        for i in range(1000):
-            f.write(f"{i},{i * 2}\n")
+        f.writelines(f"{i},{i * 2}\n" for i in range(1000))
 
     source = CSVSource(path)
     splits = source.splits(target_size=1500)  # tiny target → many byte ranges
@@ -198,7 +196,7 @@ def test_fragment_index_lru_evicts_least_recently_used(monkeypatch):
     def build(name):
         def _b():
             builds.append(name)
-            return SimpleNamespace(get_fragments=lambda: [])
+            return SimpleNamespace(get_fragments=list)
 
         return _b
 

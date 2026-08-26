@@ -281,6 +281,74 @@ _LIST_TYPED_BINARY = {
 }
 
 
+#: The aggregate names `list_aggregate` accepts. This is the function's *vocabulary*, which
+#: is a fact about the SQL function rather than a copy of any dispatch table — every entry
+#: still lowers through the `list_<name>` rewrite, so none of the lowerings are restated.
+#: Each is verified to equal DuckDB's answer element for element.
+_LIST_REDUCTIONS = frozenset(
+    {"sum", "min", "max", "avg", "mean", "product", "median", "first", "last", "count"}
+)
+
+#: DuckDB's five spellings of "reduce this list with the named aggregate". They differ only
+#: in name, so they share one entry point.
+_LIST_AGGREGATE_NAMES = frozenset(
+    {"list_aggregate", "list_aggr", "array_aggregate", "array_aggr", "aggregate"}
+)
+
+
+def _list_aggregate(tr, node) -> Expr:
+    """`list_aggregate(l, 'sum')` → whatever `list_sum(l)` already lowers to.
+
+    Rewritten to the named spelling and re-dispatched rather than given a table of its own.
+    The two forms are the *same* function in DuckDB, so a second table would be a copy that
+    could drift — and every reduction this file, `anonymous._UNARY_LIST` and the typed-node
+    path already serve is reachable through the rewrite for free, including the ones with a
+    correction on top (`list_count` ignores nulls, `list_distinct` is not `list_unique`).
+
+    Args:
+        tr: The translator, used to dispatch the rewritten call.
+        node: The `list_aggregate` call.
+
+    Returns:
+        The reduction expression.
+
+    Raises:
+        NotImplementedError: If the name is not a constant string, or names a reduction
+            with no `list_<name>` spelling here.
+    """
+    args = list(node.expressions)
+    if len(args) != 2 or not (isinstance(args[1], exp.Literal) and args[1].is_string):
+        raise NotImplementedError(
+            f"{node.name.lower()}(list, name): the aggregate name must be a string literal"
+        )
+    fn = args[1].this.lower()
+    if fn not in _LIST_REDUCTIONS:
+        # The rewrite would happily reach `list_reverse` or `list_distinct` and hand back a
+        # *list*, which is not what "aggregate this list" means and is not what DuckDB does
+        # (it raises there). The vocabulary is a property of the SQL function, so it is
+        # stated; how each name lowers is still derived by the rewrite below.
+        raise NotImplementedError(
+            f"{node.name.lower()}(list, '{fn}') is not supported: {fn!r} is not a list "
+            f"reduction. Supported: {', '.join(sorted(_LIST_REDUCTIONS))}"
+        )
+    try:
+        built = tr._scalar(exp.Anonymous(this=f"list_{fn}", expressions=[args[0]]))
+    except NotImplementedError as exc:
+        # Re-raised against the spelling the user typed: the rewrite is an implementation
+        # detail, and an error naming `list_stddev` for a query that says
+        # `list_aggregate(l, 'stddev')` sends them looking for the wrong thing.
+        raise NotImplementedError(
+            f"{node.name.lower()}(list, '{fn}') is not supported: there is no list "
+            f"reduction named {fn!r} here"
+        ) from exc
+    if built is None:  # pragma: no cover - _scalar raises rather than returning None
+        raise NotImplementedError(
+            f"{node.name.lower()}(list, '{fn}') is not supported: there is no list "
+            f"reduction named {fn!r} here"
+        )
+    return built
+
+
 def list_function(tr, node):
     """List/array operations dispatched to the `.list` namespace, or None."""
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
@@ -382,6 +450,8 @@ def list_function(tr, node):
         return getattr(tr._scalar(node.this).list, typed_binary)(tr._scalar(node.expression))
     if isinstance(node, exp.Anonymous):
         name = node.name.lower()
+        if name in _LIST_AGGREGATE_NAMES:
+            return _list_aggregate(tr, node)
         if name in ("list_count", "array_count") and node.expressions:
             # `list_count` is a COUNT, not a length: DuckDB ignores nulls, so
             # `list_count([NULL, 4])` is 1 and `list_count([NULL, NULL])` is 0. This was

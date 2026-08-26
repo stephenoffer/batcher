@@ -154,7 +154,7 @@ impl SimdCodegen<'_, '_> {
                 // instant — each splat to an i64 lane to compare against the matching
                 // temporal column (loaded as sign-extended / native i64).
                 Literal::Date(d) => {
-                    let s = self.b.ins().iconst(types::I64, *d as i64);
+                    let s = self.b.ins().iconst(types::I64, i64::from(*d));
                     (
                         self.b.ins().splat(vec_ty(ScalarTy::I64, self.lanes), s),
                         ScalarTy::Date32,
@@ -258,7 +258,7 @@ impl SimdCodegen<'_, '_> {
     /// excludes integer `Div`/`Mod`); two's-complement wrap is per-lane identical
     /// to the scalar `iadd`/`isub`/`imul`, so parity holds.
     fn emit_iarith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Mul, Sub};
         match op {
             Add => self.b.ins().iadd(l, r),
             Sub => self.b.ins().isub(l, r),
@@ -270,7 +270,7 @@ impl SimdCodegen<'_, '_> {
     /// Float vector arithmetic. `Add`/`Sub`/`Mul`/`Div` are IEEE per-lane identical
     /// to the scalar path; `Mod` (an `fmod` libcall) is excluded by `simd_ty`.
     fn emit_farith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Div, Mul, Sub};
         match op {
             Add => self.b.ins().fadd(l, r),
             Sub => self.b.ins().fsub(l, r),
@@ -288,7 +288,7 @@ impl SimdCodegen<'_, '_> {
     /// steps per lane, so the vector path is bit-for-bit identical to the interpreter and to
     /// the scalar JIT — not bare IEEE, and not the raw-bit order that split `-0.0` from `0.0`.
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
         let cc = match op {
             Eq => IntCC::Equal,
             Ne => IntCC::NotEqual,

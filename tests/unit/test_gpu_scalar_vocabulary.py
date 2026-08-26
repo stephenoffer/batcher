@@ -277,9 +277,9 @@ def test_rint_and_round_disagree_on_a_half_and_both_are_right(be):
 @pytest.mark.parametrize(
     "build",
     [
-        lambda a, b: bt.atan2(a, b),
-        lambda a, b: bt.hypot(a, b),
-        lambda a, b: bt.next_after(a, b),
+        bt.atan2,
+        bt.hypot,
+        bt.next_after,
     ],
     ids=["atan2", "hypot", "next_after"],
 )

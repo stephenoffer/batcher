@@ -90,10 +90,13 @@ print(left.join(right, on="k").group_by("k").agg(s=bt.sum("w")).explain())
 
 :::{dropdown} The plan, and the decision the coefficients drove
 ```text
-aggregate                       est≈2,000 (default)
-  hash_join                     est≈20,000 (default)
-    scan                        est≈20,000 (exact)
-    scan                        est≈1,000 (exact)
+query plan (planned)                                   4 operators
+──────────────────────────────────────────────────────────────────
+OPERATOR                             ESTIMATE  NOTES
+aggregate  [by region · sum]          est≈2,000  (default)
+└─ hash_join  [inner on customer]    est≈20,000  (default)
+   ├─ scan  [source 0]               est≈20,000  (exact)
+   └─ scan  [source 1]                est≈1,000  (exact)
 
 decisions:
   - [kyber/selection] join build side: left≈1,000 right≈20,000 [exact] → swap build→left + broadcast

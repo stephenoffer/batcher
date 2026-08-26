@@ -451,13 +451,15 @@ impl CompiledExpr {
                     .downcast_ref::<Int64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 DataType::Float64 => arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // Date32 is an i32 day-count buffer; the generated code loads it at a
                 // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
                 DataType::Date32 => arr
@@ -465,15 +467,16 @@ impl CompiledExpr {
                     .downcast_ref::<Date32Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
-                DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                    arr.as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap()
-                        .values()
-                        .as_ptr() as *const u8
-                }
+                DataType::Timestamp(TimeUnit::Microsecond, None) => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ptr()
+                    .cast::<u8>(),
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -491,12 +494,12 @@ impl CompiledExpr {
         match self.result_ty {
             ScalarTy::I64 => {
                 let mut out = vec![0i64; n];
-                run(p, nargs, n, &col_ptrs, out.as_mut_ptr() as *mut u8);
+                run(p, nargs, n, &col_ptrs, out.as_mut_ptr().cast::<u8>());
                 Ok(Arc::new(finish_primitive::<Int64Type>(out, validity)))
             }
             ScalarTy::F64 => {
                 let mut out = vec![0f64; n];
-                run(p, nargs, n, &col_ptrs, out.as_mut_ptr() as *mut u8);
+                run(p, nargs, n, &col_ptrs, out.as_mut_ptr().cast::<u8>());
                 Ok(Arc::new(finish_primitive::<Float64Type>(out, validity)))
             }
             ScalarTy::Bool => {
@@ -542,13 +545,15 @@ impl CompiledExpr {
                     .downcast_ref::<Int64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 DataType::Float64 => arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // Date32 is an i32 day-count buffer; the generated code loads it at a
                 // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
                 DataType::Date32 => arr
@@ -556,15 +561,16 @@ impl CompiledExpr {
                     .downcast_ref::<Date32Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
-                DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                    arr.as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap()
-                        .values()
-                        .as_ptr() as *const u8
-                }
+                DataType::Timestamp(TimeUnit::Microsecond, None) => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ptr()
+                    .cast::<u8>(),
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -576,7 +582,7 @@ impl CompiledExpr {
             let mut v = vec![1u8; n];
             if arr.null_count() != 0 {
                 for (i, slot) in v.iter_mut().enumerate() {
-                    *slot = arr.is_valid(i) as u8;
+                    *slot = u8::from(arr.is_valid(i));
                 }
             }
             valid_arrays.push(v);
@@ -690,7 +696,9 @@ impl ColumnSet {
 /// is not lowered via a libcall (handled elsewhere or left to the interpreter).
 /// Keeping this map in one place keeps `analyze` and `emit_typed` in sync.
 pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str> {
-    use bc_expr::MathFunc::*;
+    use bc_expr::MathFunc::{
+        Acos, Asin, Atan, Cos, Cosh, Exp, Ln, Log10, Log2, Sin, Sinh, Tan, Tanh,
+    };
     Some(match func {
         Ln => "log",
         Log10 => "log10",
@@ -718,7 +726,7 @@ pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str>
 /// not a single libm call (`Round`, which takes a digit count, stays on the
 /// interpreter).
 pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static str> {
-    use bc_expr::Math2Func::*;
+    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round};
     Some(match func {
         Pow => "pow",
         Atan2 => "atan2",
@@ -900,7 +908,7 @@ mod tests {
         assert_parity(&range("d1"), &batch);
 
         // Nullable date: null-propagating comparison and Kleene compound over nulls.
-        assert_parity(&bin(BinaryOp::Ge, col("dn"), mid.clone()), &batch);
+        assert_parity(&bin(BinaryOp::Ge, col("dn"), mid), &batch);
         assert_parity(&range("dn"), &batch);
     }
 
@@ -997,7 +1005,7 @@ mod tests {
             )
         };
         assert_parity(&range("t1"), &batch);
-        assert_parity(&bin(BinaryOp::Ge, col("tn"), mid.clone()), &batch);
+        assert_parity(&bin(BinaryOp::Ge, col("tn"), mid), &batch);
         assert_parity(&range("tn"), &batch);
 
         // A non-microsecond timestamp column is not in the supported subset: the JIT
@@ -1880,7 +1888,7 @@ mod tests {
     /// interpreter. We also assert bit-for-bit parity inside the bench so it can
     /// never silently measure wrong code.
     #[test]
-    #[ignore]
+    #[ignore = "timing study: compiled JIT eval vs interpreter, steady-state per batch"]
     fn bench_jit_vs_interpreter() {
         use bc_expr::{CaseBranch, MathFunc};
         use std::time::Instant;

@@ -65,7 +65,7 @@ JOB_TABLES = (
     "title",
 )
 
-_CREATE_TABLE = re.compile(r"CREATE TABLE (\w+)\s*\((.*?)\n\);", re.S)
+_CREATE_TABLE = re.compile(r"CREATE TABLE (\w+)\s*\((.*?)\n\);", re.DOTALL)
 
 
 def _schema(schema_sql: str) -> dict[str, list[tuple[str, str]]]:

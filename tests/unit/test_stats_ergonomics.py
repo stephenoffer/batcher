@@ -109,7 +109,7 @@ def test_empty_run_has_no_bottleneck_and_does_not_raise():
 
 def test_repr_shows_the_table_not_the_dataclass_fields():
     text = repr(_stats())
-    assert "rows_out" in text
+    assert "ROWS OUT" in text
     assert not text.startswith("RunStats(ops=")
 
 
@@ -122,7 +122,7 @@ def test_summary_reports_time_rows_and_spill():
     text = _stats().summary()
     assert text.startswith("wall time:")
     assert "1,000 read -> 10 out" in text
-    assert "1 operator(s) spilled" in text
+    assert "1 operator spilled" in text
 
 
 def test_to_dict_is_json_encodable_and_has_the_totals():
@@ -474,13 +474,22 @@ def test_overlapping_stages_do_not_report_a_share_above_100_percent():
         rows=100,
     )
     line = stats.bottleneck_summary()
-    assert "70%" in line, line
-    assert "operator time (stages overlap)" in line
+    assert "70% of operator time" in line, line
+    # Concurrency is reported as concurrency, on its own line, rather than by switching the
+    # denominator under the reader: 100 ms of operator time inside a 40 ms wall clock is a
+    # fact about overlap, not a share to be renormalized away.
+    assert "stages overlapped" in stats.wall_clock_summary()
 
 
-def test_a_sequential_run_still_reports_against_wall_time():
-    """The wall-clock reading is the right one when nothing overlapped, and must not be
-    silently replaced by the operator-time one."""
+def test_a_sequential_run_reports_the_wall_clock_split_separately():
+    """One denominator for the bottleneck, always, and the wall clock accounted beside it.
+
+    Two denominators — wall time when stages were sequential, operator time when they
+    overlapped — meant the same operator read "71%" in the per-operator table and "4% of
+    wall time" one line below it. The share is now always of operator time, and the wall
+    clock's own division is `wall_clock_summary`'s job, because on a short query most of it
+    belongs to planning and result assembly rather than to any operator.
+    """
     stats = RunStats(
         ops=(
             OpStat(0, "scan", 100, 100, 20.0, 0, False, ""),
@@ -490,4 +499,6 @@ def test_a_sequential_run_still_reports_against_wall_time():
         rows=50,
     )
     line = stats.bottleneck_summary()
-    assert "30% of wall time" in line, line
+    assert "60% of operator time" in line, line
+    wall = stats.wall_clock_summary()
+    assert "50ms of 100ms wall clock" in wall and "50ms elsewhere" in wall

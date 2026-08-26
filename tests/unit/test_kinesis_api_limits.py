@@ -159,7 +159,7 @@ def test_poll_skips_a_throttled_shard_instead_of_failing():
         def get_records(self, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                raise _Throttle()  # first poll is throttled
+                raise _Throttle  # first poll is throttled
             return {"Records": [], "NextShardIterator": "iter-1"}
 
     fake = _ThrottlingKinesis()

@@ -172,7 +172,7 @@ def test_a_keyed_distinct_survives_a_unique_column_outside_its_keys(duck):
 
 
 def test_col_lt_col_always_true(tmp_path, duck):
-    t = pa.table({"a": list(range(0, 10)), "b": list(range(100, 110))})
+    t = pa.table({"a": list(range(10)), "b": list(range(100, 110))})
     duck.register("f1", t)
     ds = _pq(tmp_path, t, "f1.parquet")
     assert _absent(ds.filter(col("a") < col("b")), Filter)  # max(a)=9 < min(b)=100
@@ -180,7 +180,7 @@ def test_col_lt_col_always_true(tmp_path, duck):
 
 
 def test_col_lt_col_always_false_is_empty(tmp_path, duck):
-    t = pa.table({"a": list(range(100, 110)), "b": list(range(0, 10))})
+    t = pa.table({"a": list(range(100, 110)), "b": list(range(10))})
     duck.register("f2", t)
     ds = _pq(tmp_path, t, "f2.parquet")
     out = ds.filter(col("a") < col("b"))  # min(a)=100 >= max(b)=9 → empty
@@ -188,7 +188,7 @@ def test_col_lt_col_always_false_is_empty(tmp_path, duck):
 
 
 def test_col_ge_col_always_true(tmp_path, duck):
-    t = pa.table({"a": list(range(100, 110)), "b": list(range(0, 10))})
+    t = pa.table({"a": list(range(100, 110)), "b": list(range(10))})
     duck.register("f3", t)
     ds = _pq(tmp_path, t, "f3.parquet")
     assert _absent(ds.filter(col("a") >= col("b")), Filter)  # min(a)=100 >= max(b)=9

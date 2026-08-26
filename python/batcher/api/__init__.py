@@ -48,6 +48,7 @@ from batcher.core.runtime import cancel_query, running_queries
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
 from batcher.io.formats.streaming import ForeachWriter
 from batcher.observe import start_ui, stop_ui, ui_url
+from batcher.plan.resource import StorageLevel
 from batcher.plan.streaming import (
     OutputMode,
     QueryProgressEvent,
@@ -101,6 +102,7 @@ __all__ = [
     "SinkProgress",
     "SourceProgress",
     "StateOperatorProgress",
+    "StorageLevel",
     "StreamingQueryListener",
     "StreamingQueryProgress",
     "StreamingQueryStatus",

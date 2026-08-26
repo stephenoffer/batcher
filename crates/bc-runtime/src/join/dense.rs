@@ -381,7 +381,7 @@ mod tests {
             // Slot-by-slot through the lookup the probe uses, because the two fills lay the
             // slots out differently on purpose — one flat piece against one piece per worker —
             // and it is the *answer* that has to be identical, not the arrangement.
-            for k in lo - 1..lo + span as i64 + 1 {
+            for k in (lo - 1)..=(lo + span as i64) {
                 assert_eq!(
                     smap.head(k),
                     pmap.head(k),

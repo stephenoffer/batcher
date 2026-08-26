@@ -58,6 +58,36 @@ impl NeumaierSum {
 /// mean dwarfs the spread: `var([1e9+1, 1e9+2, 1e9+3])` came back as exactly `0` instead
 /// of `1`. Welford accumulates the centered `M2` directly, so no such subtraction ever
 /// happens, and the state stays mergeable via Chan's parallel formula ([`merge_welford`]).
+///
+/// # Which Welford, and why not the other one
+///
+/// This is **Knuth's** recurrence, `M2 += δ·(x − mean_after)`. The alternative — Youngs–Cramer,
+/// `M2 += δ²·n_before/n` — is algebraically identical, is what [`merge_welford`] uses for its
+/// correction term, and is *better on exactly one thing*: it never reads back the mean it has
+/// just rounded, so over `{2^53, 2^53+2}` it returns the exact variance 2 where this form
+/// returns 4. It was tried here and **reverted**, because that is the only thing it is better
+/// at and the trade is bad:
+///
+/// | shape | Knuth rel. err | Youngs–Cramer |
+/// |---|---:|---:|
+/// | plain small vectors | 9.7e-17 | 1.0e-16 |
+/// | offset 1e15, unit spread | **1.8e-03** | 1.4e-02 |
+/// | `[1e12 + (i%5)]`, grouped | **5.0e-06** | 1.3e-05 |
+///
+/// Knuth wins five of seven measured shapes, is *eight times* better at an offset of 1e15, and
+/// is 2.5x better on the exact data in `test_diff_numeric_edges::
+/// test_grouped_variance_stable_and_matches_duckdb` — which Youngs–Cramer turned red. Reading
+/// the deviation against the *updated* mean is not a defect in Knuth's form; it is what makes
+/// it partially self-correcting for the mean's own rounding, which is the dominant error term
+/// whenever a large offset swamps the spread. That is the shape this module exists to serve
+/// (see the `1e9` case below), so the rare `2^53` case does not buy it.
+///
+/// Two traps for whoever revisits this. **DuckDB is not an oracle for the `2^53` shape** — 1.5.5
+/// answers `2.0` for those two doubles via a SQL literal union and `4.0` via a registered Arrow
+/// table, same session, values echoing back identically; it is the aggregate path that differs.
+/// And **"agrees with DuckDB more often on random data" is not the property to optimize**: it
+/// measures which engine's rounding you happen to match, not which answer is right. Compare
+/// against exact rational arithmetic, on the shapes the engine actually sees.
 pub(crate) fn var_state(
     values: &ArrayRef,
     group_ids: &[u32],
@@ -200,11 +230,12 @@ pub(crate) fn count_non_null(values: &ArrayRef, group_ids: &[u32], num_groups: u
 /// `var = M2 / (n − 1)`; null when `n < 2`. (The first arg is `mean`, unused here but
 /// kept in the state triple because `covar`/`corr` need it; named `_mean` for clarity.)
 pub(crate) fn finalize_var(
-    _mean: &ArrayRef,
+    mean: &ArrayRef,
     m2: &ArrayRef,
     count: &ArrayRef,
     stddev: bool,
 ) -> Result<ArrayRef, RuntimeError> {
+    let mean = mean.as_primitive::<Float64Type>();
     let m2 = m2.as_primitive::<Float64Type>();
     let count = count.as_primitive::<Int64Type>();
     let mut b = Float64Builder::with_capacity(count.len());
@@ -212,6 +243,23 @@ pub(crate) fn finalize_var(
         let n = count.value(i);
         if n < 2 {
             b.append_null();
+            continue;
+        }
+        // **A non-finite mean means a non-finite answer, and the mean is what decides it.**
+        //
+        // `M2` alone cannot: the recurrence's `M2` for a group containing an infinity is
+        // `NaN` or `+inf` depending on *where in the group the infinity fell* — verified over
+        // every permutation of `[1.0, inf, 2.0]`. An aggregate whose answer depends on row
+        // order is not mergeable, and mergeability is the invariant that makes a distributed
+        // result equal a single-node one, so this cannot be left to `M2`.
+        //
+        // The mean is non-finite in *every* one of those permutations, and in every merge
+        // order too, because one non-finite value makes `delta` non-finite and the mean never
+        // recovers. Keying on it restores an order-independent answer, and it also catches the
+        // finite input whose running mean overflows (`{-1.7e308, 1.7e308}`), which used to
+        // reach the clip below as `-inf` and come back as a confident `0.0`.
+        if !mean.value(i).is_finite() {
+            b.append_value(f64::NAN);
             continue;
         }
         // `max(0.0)` clips the tiny negative M2 that cancellation can leave behind, but
@@ -259,7 +307,7 @@ pub(crate) fn finalize_mean(sum: &ArrayRef, count: &ArrayRef) -> Result<ArrayRef
         // non-zero one anyway keeps this correct if a decimal sum state ever reaches it.
         DataType::Decimal128(_, scale) => {
             let sums = sum.as_primitive::<arrow::datatypes::Decimal128Type>();
-            let divisor = 10f64.powi(*scale as i32);
+            let divisor = 10f64.powi(i32::from(*scale));
             for i in 0..counts.len() {
                 push_mean(
                     &mut b,
@@ -325,6 +373,134 @@ mod tests {
         let out = finalize_var(&mean, &m2, &count, stddev).unwrap();
         let a = out.as_primitive::<Float64Type>();
         a.is_valid(0).then(|| a.value(0))
+    }
+
+    /// One group's `(mean, M2, count)` from [`var_state`] over `values`.
+    fn one_group_state(values: Vec<f64>) -> (f64, f64, i64) {
+        let n = values.len();
+        let arr: ArrayRef = Arc::new(Float64Array::from(values));
+        let ids: Vec<u32> = vec![0; n];
+        let out = var_state(&arr, &ids, 1, AggFunc::Var).expect("f64 is supported");
+        (
+            out[0].as_primitive::<Float64Type>().value(0),
+            out[1].as_primitive::<Float64Type>().value(0),
+            out[2].as_primitive::<Int64Type>().value(0),
+        )
+    }
+
+    /// The case the centered accumulator was introduced for still holds: a large offset with a
+    /// unit spread must not cancel to zero.
+    #[test]
+    fn a_large_offset_with_unit_spread_keeps_its_variance() {
+        let base = 1e9;
+        let (_, m2, n) = one_group_state(vec![base + 1.0, base + 2.0, base + 3.0]);
+        assert_eq!(n, 3);
+        assert_eq!(finalized(m2, n, false), Some(1.0));
+    }
+
+    /// The one-pass update and [`merge_welford`] use **different** recurrences, and that is a
+    /// known, bounded imprecision rather than an oversight.
+    ///
+    /// `var_state` uses Knuth (`M2 += δ·(x − mean_after)`); the merge uses Youngs–Cramer
+    /// (`δ²·na·nb/n`). So adding rows one at a time and folding one-row partials pairwise do
+    /// not produce a bit-identical `M2` — they agree to within float reassociation, which is
+    /// the same bound `python-control-plane.md` states for every distributed float reduction.
+    /// Making them identical means adopting one recurrence for both, and the accuracy table on
+    /// `var_state` is why that is not free.
+    ///
+    /// This test pins the *bound*, not equality, so it fails if the two ever drift beyond it.
+    #[test]
+    fn the_one_pass_update_and_the_merge_agree_to_within_reassociation() {
+        let xs = vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        let (_, m2_one_pass, n) = one_group_state(xs.clone());
+
+        let mut mean: ArrayRef = Arc::new(Float64Array::from(vec![xs[0]]));
+        let mut m2: ArrayRef = Arc::new(Float64Array::from(vec![0.0]));
+        let mut count: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+        for &x in &xs[1..] {
+            let merged = merge_welford(
+                &concat_f64(&mean, x),
+                &concat_f64(&m2, 0.0),
+                &concat_i64(&count, 1),
+                &[0, 0],
+                1,
+            );
+            mean = Arc::clone(&merged[0]);
+            m2 = Arc::clone(&merged[1]);
+            count = Arc::clone(&merged[2]);
+        }
+        assert_eq!(count.as_primitive::<Int64Type>().value(0), n);
+        let merged_m2 = m2.as_primitive::<Float64Type>().value(0);
+        let rel = (merged_m2 - m2_one_pass).abs() / m2_one_pass.abs();
+        assert!(
+            rel < 1e-12,
+            "one-pass M2 {m2_one_pass} vs merged {merged_m2} (relative {rel:e})"
+        );
+    }
+
+    fn concat_f64(a: &ArrayRef, extra: f64) -> ArrayRef {
+        let a = a.as_primitive::<Float64Type>();
+        Arc::new(Float64Array::from(vec![a.value(0), extra]))
+    }
+
+    fn concat_i64(a: &ArrayRef, extra: i64) -> ArrayRef {
+        let a = a.as_primitive::<Int64Type>();
+        Arc::new(Int64Array::from(vec![a.value(0), extra]))
+    }
+
+    /// One group's variance from `var_state` + `finalize_var`, end to end.
+    fn variance_of(values: Vec<f64>) -> Option<f64> {
+        let n = values.len();
+        let arr: ArrayRef = Arc::new(Float64Array::from(values));
+        let state = var_state(&arr, &vec![0u32; n], 1, AggFunc::Var).expect("f64 is supported");
+        let out = finalize_var(&state[0], &state[1], &state[2], false).unwrap();
+        let a = out.as_primitive::<Float64Type>();
+        a.is_valid(0).then(|| a.value(0))
+    }
+
+    /// A group containing an infinity gives the same answer whatever order it arrives in.
+    ///
+    /// This is a mergeability property, not a cosmetic one: partitioning is free to put the
+    /// infinity anywhere, so an order-sensitive answer means a distributed result that differs
+    /// from the single-node one. `M2` alone *is* order-sensitive here — over these six
+    /// permutations the recurrence yields `NaN` for some and `+inf` for others, because the
+    /// first value of a group is weighted by zero and `inf * 0.0` is `NaN`. The mean is
+    /// non-finite in all six, which is why `finalize_var` keys on it.
+    #[test]
+    fn an_infinity_gives_the_same_variance_in_every_row_order() {
+        let perms = [
+            [1.0, f64::INFINITY, 2.0],
+            [1.0, 2.0, f64::INFINITY],
+            [2.0, 1.0, f64::INFINITY],
+            [2.0, f64::INFINITY, 1.0],
+            [f64::INFINITY, 1.0, 2.0],
+            [f64::INFINITY, 2.0, 1.0],
+        ];
+        for p in perms {
+            let got = variance_of(p.to_vec()).expect("three rows is not null");
+            assert!(
+                got.is_nan(),
+                "var({p:?}) = {got}, expected NaN in every order"
+            );
+        }
+        // Negative infinity is the same argument, and a NaN input must not become a number.
+        assert!(variance_of(vec![1.0, f64::NEG_INFINITY, 2.0])
+            .unwrap()
+            .is_nan());
+        assert!(variance_of(vec![1.0, f64::NAN, 2.0]).unwrap().is_nan());
+    }
+
+    /// A *finite* input whose running mean overflows must not report zero variance.
+    ///
+    /// `{-1.7e308, 1.7e308}` is two ordinary finite doubles whose difference is not
+    /// representable. The mean overflows, `M2` reached the negative-clip as `-inf`, and the
+    /// clip returned `0.0` — "this column is constant", for the most spread-out pair of
+    /// doubles that exists.
+    #[test]
+    fn a_finite_input_that_overflows_the_mean_is_not_zero_variance() {
+        let got = variance_of(vec![-1.7e308, 1.7e308]).expect("two rows is not null");
+        assert!(got.is_nan(), "expected NaN, got {got}");
+        assert_ne!(got, 0.0);
     }
 
     /// A NaN `M2` must stay NaN rather than becoming a confident zero.

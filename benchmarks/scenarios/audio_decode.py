@@ -22,10 +22,16 @@ from __future__ import annotations
 
 import argparse
 import io
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 
 def _wav_bytes(sample_rate: int, num_frames: int, freq: float) -> bytes:
@@ -120,6 +126,17 @@ def _best_ms(fn, table: pa.Table, runs: int) -> tuple[float, int]:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description="Audio-decode benchmark (Batcher vs Python)")
     parser.add_argument("--clips", type=int, default=2000, help="number of audio clips")
     parser.add_argument("--runs", type=int, default=4, help="best-of-N timed repeats")

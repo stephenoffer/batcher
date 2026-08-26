@@ -32,12 +32,12 @@ pub(super) fn url_encode(s: &str) -> String {
         } else {
             out.push('%');
             out.push(
-                char::from_digit((b >> 4) as u32, 16)
+                char::from_digit(u32::from(b >> 4), 16)
                     .unwrap()
                     .to_ascii_uppercase(),
             );
             out.push(
-                char::from_digit((b & 0xf) as u32, 16)
+                char::from_digit(u32::from(b & 0xf), 16)
                     .unwrap()
                     .to_ascii_uppercase(),
             );

@@ -87,9 +87,12 @@ you wanted. Each line carries the row estimate and its provenance: `exact` from 
 `default` from a heuristic, `learned` from a previous run.
 
 ```text
-project                         est≈4 (default)
-  filter                        est≈4 (default)
-    scan                        est≈5 (exact)
+query plan (planned)                             3 operators
+────────────────────────────────────────────────────────────
+OPERATOR                      ESTIMATE  NOTES
+project                          est≈4  (default)
+└─ filter  [amount > 15]         est≈4  (default)
+   └─ scan  [source 0]           est≈5  (exact)  pushed[amount > 15]
 
 decisions:
   - [core/io] source read at 6 MB/s (learned)

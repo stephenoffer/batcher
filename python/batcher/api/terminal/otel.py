@@ -15,12 +15,13 @@ enterprise's decision, not the engine's.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from batcher.plan.profile import QueryProfile
 
-__all__ = ["emit_query_spans", "otel_enabled"]
+__all__ = ["emit_failure_span", "emit_query_spans", "otel_enabled"]
 
 _INSTRUMENTATION = "batcher"
 # Whether `opentelemetry` is importable — resolved once (it cannot change mid-process). The
@@ -57,6 +58,12 @@ def emit_query_spans(profile: QueryProfile) -> None:
     Best-effort and correctness-neutral: any error (a misbehaving exporter, a missing
     provider) is swallowed so observability never breaks a query. A no-op when disabled or
     when `opentelemetry` is absent.
+
+    Args:
+        profile: The measured profile of a query that has finished.
+
+    Returns:
+        None.
     """
     if not otel_enabled():
         return
@@ -72,7 +79,24 @@ def emit_query_spans(profile: QueryProfile) -> None:
 def _emit(tracer: object, profile: QueryProfile) -> None:
     # A query span carrying the top-line facts, then one child span per operator so the
     # bottleneck and any spill are visible in a trace waterfall exactly as in `explain`.
-    with tracer.start_as_current_span("batcher.query") as query_span:  # type: ignore[attr-defined]
+    #
+    # **The spans are given explicit timestamps.** Emission happens *after* the query has
+    # run, so a span opened and closed here lasts as long as it takes to set a dozen
+    # attributes — microseconds — and every Batcher span arrived in the backend as a
+    # zero-width tick. A waterfall is the reason to emit spans at all, and it showed
+    # nothing. The query span is placed over its real interval, and each operator span is
+    # given its real measured duration.
+    #
+    # What is *not* reconstructed is where each operator sat inside that interval: the
+    # profile records a duration per operator and no start offset, so every operator span
+    # begins at the query's start. Laying them out end to end would look more like a
+    # waterfall and would be a fabrication — and on the streaming tier, where operators
+    # genuinely interleave, it would be a wrong one.
+    end_ns = time.time_ns()
+    start_ns = end_ns - _to_ns(profile.total_ms)
+    with tracer.start_as_current_span(  # type: ignore[attr-defined]
+        "batcher.query", start_time=start_ns, end_on_exit=False
+    ) as query_span:
         query_span.set_attribute("batcher.query_id", profile.query_id)
         query_span.set_attribute("batcher.rows", profile.rows)
         query_span.set_attribute("batcher.total_ms", profile.total_ms)
@@ -85,14 +109,20 @@ def _emit(tracer: object, profile: QueryProfile) -> None:
         _set_usage(query_span, profile.usage)
         for op in profile.ops:
             if op.measured:
-                _emit_op(tracer, op)
+                _emit_op(tracer, op, start_ns=start_ns)
         # On the distributed path the driver tree is unmeasured — the measured per-operator
         # facts live in the worker map sub-plan (a separate op-id space). Emit those as child
         # spans too, or a distributed query (the one whose operators matter most) would trace
         # as a bare query span with no operator detail, unlike `render()` / `stats()` which
         # both surface the worker ops.
         for op in profile.worker_ops:
-            _emit_op(tracer, op, scope="worker")
+            _emit_op(tracer, op, scope="worker", start_ns=start_ns)
+    query_span.end(end_ns)
+
+
+def _to_ns(ms: float) -> int:
+    """Milliseconds as whole nanoseconds, never negative."""
+    return max(0, int(ms * 1_000_000))
 
 
 def _set_usage(span: object, usage) -> None:
@@ -118,13 +148,15 @@ def _set_usage(span: object, usage) -> None:
     span.set_attribute("batcher.io_write_bytes", usage.io_write_bytes)  # type: ignore[attr-defined]
 
 
-def _emit_op(tracer: object, op, *, scope: str = "driver") -> None:
-    """One operator's measured facts as a child span.
+def _emit_op(tracer: object, op, *, scope: str = "driver", start_ns: int = 0) -> None:
+    """One operator's measured facts as a child span, over its measured duration.
 
     `scope` distinguishes the driver-tree operators from the distributed map sub-plan's
     worker operators (a separate op-id space), so a trace consumer can tell them apart.
     """
-    with tracer.start_as_current_span(f"batcher.op.{op.kind}") as span:  # type: ignore[attr-defined]
+    with tracer.start_as_current_span(  # type: ignore[attr-defined]
+        f"batcher.op.{op.kind}", start_time=start_ns, end_on_exit=False
+    ) as span:
         span.set_attribute("batcher.op.id", op.op_id)
         span.set_attribute("batcher.op.kind", op.kind)
         span.set_attribute("batcher.op.scope", scope)
@@ -142,3 +174,44 @@ def _emit_op(tracer: object, op, *, scope: str = "driver") -> None:
             span.set_attribute("batcher.op.threads", op.threads)
         if op.backend:
             span.set_attribute("batcher.op.backend", op.backend)
+    span.end(start_ns + _to_ns(op.elapsed_ms))
+
+
+def emit_failure_span(query_id: str, total_ms: float, exc: BaseException) -> None:
+    """Emit a span for a query that raised, with the exception recorded on it.
+
+    Without this a failing query produced no span at all, so the one class of run an
+    operator most wants to find in a trace backend was the one class that was never there —
+    and a latency histogram built from these spans silently excluded every timeout.
+
+    Best-effort and correctness-neutral: any error here is swallowed, and the original
+    exception is neither caught nor altered by the caller.
+
+    Args:
+        query_id: The id the event log assigned.
+        total_ms: Wall time from execution start to the failure.
+        exc: The exception being raised.
+
+    Returns:
+        None.
+    """
+    if not otel_enabled():
+        return
+    tracer = _tracer()
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        end_ns = time.time_ns()
+        span = tracer.start_span(  # type: ignore[attr-defined]
+            "batcher.query", start_time=end_ns - _to_ns(total_ms)
+        )
+        span.set_attribute("batcher.query_id", query_id)
+        span.set_attribute("batcher.total_ms", total_ms)
+        span.set_attribute("batcher.ok", False)
+        span.record_exception(exc)
+        span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+        span.end(end_ns)
+    except Exception:  # pragma: no cover - telemetry must never fail a query
+        from batcher._internal.logging import get_logger
+
+        get_logger("api").debug("otel failure span emit failed", exc_info=True)

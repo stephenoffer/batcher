@@ -490,12 +490,11 @@ fn run_with_cache(
     // Reuse the caller's builds when it already ran them for this subtree (see `run_with_cache`);
     // `owned` only exists to give the freshly built cache somewhere to live for this frame.
     let owned;
-    let cache: &BuildCache = match prebuilt {
-        Some(c) => c,
-        None => {
-            owned = super::prebuild_joins(plan, sources, meter, budget, workers)?;
-            &owned
-        }
+    let cache: &BuildCache = if let Some(c) = prebuilt {
+        c
+    } else {
+        owned = super::prebuild_joins(plan, sources, meter, budget, workers)?;
+        &owned
     };
 
     // (1b) The spine breakers, once, in parallel. A breaker between the root and the driving scan
@@ -553,8 +552,7 @@ fn run_with_cache(
         .map(|&d| {
             sources
                 .get(d)
-                .map(|b| b.iter().map(|x| x.num_rows()).sum::<usize>())
-                .unwrap_or(0)
+                .map_or(0, |b| b.iter().map(|b| b.num_rows()).sum::<usize>())
         })
         .sum();
     // `nothing_to_parallelize` joins the two existing reasons not to cut the source up: a plan
@@ -637,11 +635,11 @@ fn run_with_cache(
             // Keys *and* accumulators — see the sequential path in `stream::breaker`. The
             // holistic aggregates keep a per-group value list that grows with the input, so
             // counting only `group_columns` under-reads exactly the shape that OOMs.
-            let state: u64 = partials
-                .iter()
-                .flat_map(|p| p.group_columns.iter().chain(p.states.iter().flatten()))
-                .map(|c| c.get_array_memory_size() as u64)
-                .sum();
+            let state: u64 = crate::column_bytes(
+                partials
+                    .iter()
+                    .flat_map(|p| p.group_columns.iter().chain(p.states.iter().flatten())),
+            );
             // Over budget: the materializing executor spills this; streaming does not. Hand the
             // query back rather than OOM where it would have survived.
             if budget > 0 && state as usize > budget {
@@ -774,11 +772,12 @@ fn run_with_cache(
                 let held = crate::batch_bytes(&batches);
                 let full = ops::parallel_distinct(&batches)?;
                 let distinct_rows: usize = full.iter().map(|b| b.num_rows()).sum();
-                let out = match distinct_rows > *k {
-                    false => full,
-                    true => bc_runtime::agg::distinct_prefix(&batches, *k)?
+                let out = if distinct_rows <= *k {
+                    full
+                } else {
+                    bc_runtime::agg::distinct_prefix(&batches, *k)?
                         .into_iter()
-                        .collect(),
+                        .collect()
                 };
                 if let Some(m) = meter {
                     m.breaker(
@@ -815,9 +814,10 @@ fn run_with_cache(
                     reason: "the streaming distinct does not spill",
                 });
             }
-            let out = match keys.is_empty() {
-                true => ops::parallel_distinct(&batches)?,
-                false => ops::parallel_distinct_on(&batches, keys, order)?,
+            let out = if keys.is_empty() {
+                ops::parallel_distinct(&batches)?
+            } else {
+                ops::parallel_distinct_on(&batches, keys, order)?
             };
             if let Some(m) = meter {
                 m.breaker(
@@ -1200,8 +1200,7 @@ fn spine_join_blocks_sharding(
     };
     let driving_rows: usize = leftmost_scan(spine, mats)
         .and_then(|sid| sources.get(sid))
-        .map(|b| b.iter().map(|x| x.num_rows()).sum())
-        .unwrap_or(0);
+        .map_or(0, |b| b.iter().map(|b| b.num_rows()).sum());
     // Only the **first** join on the spine is judged, and only in a single-join plan. Both
     // restrictions look over-cautious and both were measured before being left in place.
     //
@@ -1405,6 +1404,7 @@ fn count_scans(plan: &RelOp, counts: &mut HashMap<usize, usize>) {
 /// and the far faster per-core join wins, while a capped run (large scale, distributed) keeps
 /// the bounded-memory streaming path. Correctness is identical either way — both executors are
 /// checked against the sequential oracle — so this only trades memory for speed.
+#[must_use]
 pub fn streaming_parallelizes(plan: &RelOp) -> bool {
     let mut counts: HashMap<usize, usize> = HashMap::new();
     count_scans(plan, &mut counts);
@@ -1443,6 +1443,7 @@ pub fn streaming_parallelizes(plan: &RelOp) -> bool {
 /// 100.4 ms against 56.9 ms. The projection itself is over the aggregate's *output*, which is
 /// one row per group and therefore trivial next to the aggregation, so peeling it cannot change
 /// which executor is the right one.
+#[must_use]
 pub fn materializing_aggregate_is_faster(plan: &RelOp) -> bool {
     fn has_join(op: &RelOp) -> bool {
         if matches!(op, RelOp::HashJoin { .. }) {

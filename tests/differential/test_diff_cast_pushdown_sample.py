@@ -10,6 +10,12 @@ which rows are sampled: the same query returned 99 rows optimized and 95 unoptim
 An optimizer rule that changes the answer is the worst kind of bug, and it is invisible to
 any test that does not put a *value-changing* rewrite underneath a *value-reading*
 operator. That cross-product is what this pins.
+
+**The oracle here is the same query with the rule disabled** (`_without_the_rule`), not
+DuckDB: no other engine has this rewrite, so there is nothing external to compare against.
+A rewrite is semantics-preserving or it is not, and the unoptimized plan is what defines
+"preserving" — the same equivalence `tests/property/test_prop_optimizer_result_invariance.py`
+checks over a wider corpus.
 """
 
 from __future__ import annotations

@@ -374,6 +374,7 @@ pub fn fleet_bdp_bytes() -> Option<u64> {
 /// [`fleet_flow_totals`] for why a controller must difference the totals instead.
 ///
 /// `None` when nothing has been fetched.
+#[must_use]
 pub fn fleet_starved_ratio() -> Option<f64> {
     let (starved, nanos) = fleet_flow_totals();
     if nanos == 0 {

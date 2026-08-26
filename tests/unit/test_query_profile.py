@@ -168,7 +168,11 @@ def test_render_shows_spill_volume_and_rss():
         ),
     )
     out = QueryProfile(ops=ops, total_ms=5.0, rows=4, measured=True).render(analyze=True)
-    assert "spill" in out and "GB" in out  # magnitude shown, not just the bare tag
+    # Magnitude shown, not just the bare tag — and in *binary* units, because the divisor
+    # is 1024. This formatter used to label a 1024-divisor result "GB", overstating every
+    # size by 7% at that rung; `_internal.humanize.byte_size` is now the one implementation
+    # and `tests/unit/test_humanize_ui_parity.py` holds it against the dashboard's.
+    assert "spill" in out and "GiB" in out
     assert "rss+" in out
 
 
@@ -195,7 +199,7 @@ def test_summary_aggregates_spill_and_classifies_by_cpu_util():
     assert p.peak_rss_bytes == 800_000_000
     summary = p.bottleneck_summary()
     assert "I/O/launch-bound" in summary
-    assert "SPILLED" in summary and "GB" in summary
+    assert "SPILLED" in summary and "GiB" in summary
 
 
 def test_utilization_summary_grades_against_saturation_target():
@@ -238,7 +242,7 @@ def test_utilization_summary_grades_against_saturation_target():
         measured=True,
         memory_budget_bytes=1000,
     )
-    assert "peak memory 800B (80% of budget, target >80%)" in with_mem.utilization_summary()
+    assert "peak memory 800 B (80% of budget, target >80%)" in with_mem.utilization_summary()
 
     # A uniformly I/O-bound run is flagged as CPU-idle (the CPU is not the limit — no false alarm).
     cold = QueryProfile(ops=(_op(0, 0.2, 50.0),), total_ms=50.0, rows=1000, measured=True)

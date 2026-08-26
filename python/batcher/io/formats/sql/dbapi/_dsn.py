@@ -210,7 +210,7 @@ def _file_path(parsed: ParsedURI) -> str:
     directory instead.
     """
     path = urlsplit(parsed.uri).path
-    return path[1:] if path.startswith("/") else path
+    return path.removeprefix("/")
 
 
 def connect_target(parsed: ParsedURI, *, module: str | None = None) -> tuple[str, dict[str, Any]]:

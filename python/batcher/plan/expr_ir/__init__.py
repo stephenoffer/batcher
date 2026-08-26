@@ -21,6 +21,7 @@ from batcher.plan.expr_ir.constructors import (
     hash_rows,
     least,
     lit,
+    null,
     nullif,
     when,
 )
@@ -117,6 +118,7 @@ __all__ = [
     "hash_rows",
     "least",
     "lit",
+    "null",
     "nullif",
     "referenced_columns",
     "remap_columns",

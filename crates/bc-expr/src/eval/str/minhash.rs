@@ -92,7 +92,7 @@ pub(crate) fn eval_minhash(
     let mut builder = ListBuilder::new(Int64Builder::new());
     let mut signature = vec![0u64; num_perm];
     let mut offsets: Vec<usize> = Vec::new();
-    for opt in s.iter() {
+    for opt in s {
         match opt {
             Some(text) => {
                 signature.fill(MAX_HASH);

@@ -28,7 +28,7 @@ use crate::window::WindowFn;
 
 mod bounds;
 
-pub(crate) use bounds::{frame_bounds, frame_ctx};
+pub(crate) use bounds::{debug_check_monotone, frame_bounds, frame_ctx};
 pub use bounds::{Frame, FrameBound, FrameUnit, RangeOrder};
 
 /// Sliding-window sum over `f64` that only ever **adds**, never subtracts — a FIFO of
@@ -239,8 +239,10 @@ pub fn framed_value(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             let take_pos: Option<usize> = if a >= b {
                 None // empty frame → null
             } else {
@@ -284,9 +286,11 @@ fn framed_count(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b, mut cnt) = (0usize, 0usize, 0i64);
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 if values.is_valid(part[cur_b]) {
                     cnt += 1;
@@ -331,12 +335,14 @@ fn framed_i64(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         let (mut sum, mut cnt) = (0i64, 0i64);
         // Monotonic deque of partition positions holding the running min/max front.
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             // Remove the *leaving* rows before adding the *entering* ones. Both bounds are
             // non-decreasing, so either order yields the same frame — but adding first
             // makes the accumulator transiently hold the union of the old and new frames,
@@ -425,6 +431,7 @@ fn framed_f64(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         // `sum` is a two-stack FIFO (adds only, never subtracts) so a sliding SUM/AVG
         // over large-magnitude floats stays exact; `cnt` is an exact integer counter.
@@ -433,6 +440,7 @@ fn framed_f64(
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 let row = part[cur_b];
                 // One FIFO entry per physical position (nulls contribute 0.0 to the sum
@@ -524,11 +532,13 @@ fn framed_str_minmax(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         // Monotonic deque of partition positions holding the running min/max front.
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 let row = part[cur_b];
                 if arr.is_valid(row) {
@@ -590,10 +600,12 @@ fn framed_ordered_minmax(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 let row = part[cur_b];
                 if values.is_valid(row) {
@@ -646,10 +658,12 @@ fn framed_bool_minmax(
     for part in ordered {
         let len = part.len();
         let ctx = frame_ctx(frame, part, order_rows, range_order);
+        let mut prev_bounds = (0usize, 0usize);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, ctx.as_ref());
+            debug_check_monotone(&mut prev_bounds, a, b);
             while cur_b < b {
                 let row = part[cur_b];
                 if arr.is_valid(row) {

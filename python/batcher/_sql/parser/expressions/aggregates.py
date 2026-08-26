@@ -47,7 +47,13 @@ from batcher.plan.functions.regression import (
 )
 from batcher.plan.functions.statistics import sem, stddev_pop, var_pop
 
-__all__ = ["build_anon_agg", "build_typed_agg", "is_agg_node", "iter_agg_nodes"]
+__all__ = [
+    "build_anon_agg",
+    "build_typed_agg",
+    "distinct_input",
+    "is_agg_node",
+    "iter_agg_nodes",
+]
 
 
 # Single-input aggregates sqlglot promotes to a typed node → the `AggExpr` tag.
@@ -136,7 +142,18 @@ def is_agg_node(node) -> bool:
         # an `AggFunc` subclass — so without this the aggregate was invisible to
         # collection and the name reached the scalar translator instead.
         return is_agg_node(node.this)
-    return isinstance(node, exp.Anonymous) and node.name.lower() in ANON_AGG_NAMES
+    if not isinstance(node, exp.Anonymous):
+        return False
+    if node.name.lower() in ANON_AGG_NAMES:
+        return True
+    # The rest of the public function library. An aggregate has to be *recognized here*,
+    # before the query is built, or collection never sees it and the `GROUP BY` is built
+    # without it — which is what made `all_caps_rate(s)` answer correctly with no grouping
+    # and then fail under `GROUP BY g` with "window function '__bt_win_0' references
+    # unknown column". The curated names above stay first, so none of them changes meaning.
+    from batcher._sql.parser.expressions.lowering.families import library_aggregate
+
+    return library_aggregate(node.name) is not None
 
 
 def iter_agg_nodes(root):
@@ -155,6 +172,89 @@ def iter_agg_nodes(root):
     return (n for n in root.find_all(exp.AggFunc, exp.Anonymous, exp.IgnoreNulls) if is_agg_node(n))
 
 
+def distinct_input(tr, node, args=None):
+    """The single expression a ``DISTINCT`` aggregate argument holds, or `None`.
+
+    `<agg>(DISTINCT x)` is `<agg>(x)` over rows deduplicated on the group keys plus `x`.
+    The engine's aggregates carry no per-group dedup flag, so the rewrite in
+    `agg_rewrites.rewrite_distinct_aggs` dedups the *input* once up front and the
+    aggregate itself becomes an ordinary one. This records the expression for that pass —
+    the same protocol `literals._AGG_FUNCS` aggregates use — and hands back the argument
+    to build over.
+
+    Without it every aggregate reaching this module rejected a `DISTINCT` argument by
+    falling through to the scalar translator, which reported the sqlglot node it could not
+    lower (``unsupported SQL expression: Distinct``) rather than the aggregate the user
+    wrote. Eleven aggregates DuckDB supports with `DISTINCT` — `bit_and`, `bit_or`,
+    `bit_xor`, `kurtosis`, `skewness`, `approx_count_distinct`, `product`, `entropy`,
+    `mad`, `any_value`, `quantile_cont` — could not be spelled that way at all.
+
+    Args:
+        tr: The translator instance, carrying the pending-distinct list.
+        node: The aggregate node.
+        args: The argument list to read instead of ``node.this`` — anonymous calls park
+            their arguments in ``node.expressions``.
+
+    Returns:
+        The sqlglot expression the `DISTINCT` wraps, or `None` when there is no
+        `DISTINCT` to unwrap.
+
+    Raises:
+        NotImplementedError: If the `DISTINCT` holds more than one expression, which
+            needs a dedup per expression rather than the single pass this rewrite makes.
+    """
+    arg = args[0] if args else node.args.get("this")
+    if not isinstance(arg, exp.Distinct):
+        return None
+    exprs = arg.expressions
+    if len(exprs) != 1:
+        raise NotImplementedError(
+            f"{_agg_label(node)}(DISTINCT ...) supports exactly one expression"
+        )
+    tr._agg_pending_distinct.append((exprs[0].sql(), exprs[0]))
+    return exprs[0]
+
+
+def _reject_distinct(node, args=None) -> None:
+    """Refuse a `DISTINCT` argument the pre-dedup rewrite cannot serve.
+
+    A *composite* aggregate (`stddev_pop`, `var_pop`, `sem`) is an expression over several
+    aggregate leaves, and a *two-input* one (`corr`, `covar_*`, `regr_*`, `arg_min/max`)
+    reads two columns. Neither has the single input the dedup redirects, so both are
+    declined by name here instead of reaching the scalar translator, which reported only
+    that it could not lower a ``Distinct`` node.
+
+    Args:
+        node: The aggregate node.
+        args: The argument list to read instead of ``node.this``.
+
+    Raises:
+        NotImplementedError: If the argument is a `DISTINCT`.
+    """
+    arg = args[0] if args else node.args.get("this")
+    if isinstance(arg, exp.Distinct):
+        label = _agg_label(node)
+        raise NotImplementedError(
+            f"{label}(DISTINCT ...) is not supported: {label} is built from more than one "
+            "aggregate over more than one input, so there is no single column to "
+            "deduplicate. Deduplicate in a subquery first — "
+            f"SELECT {label}(x) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g"
+        )
+
+
+def _agg_label(node) -> str:
+    """The aggregate's name as the user spelled it, for a message.
+
+    An anonymous call carries its name in `node.name`; `sql_name()` would answer
+    ``"ANONYMOUS"`` for it, which names the sqlglot node rather than the function and
+    tells the reader nothing about what to change.
+    """
+    if isinstance(node, exp.Anonymous):
+        return str(node.name).lower()
+    name = getattr(node, "sql_name", None)
+    return (name() if callable(name) else str(node.name)).lower()
+
+
 def build_typed_agg(tr, node) -> AggExpr | Expr | None:
     """Build the aggregate a typed sqlglot node denotes, or None if it is not one here.
 
@@ -169,12 +269,14 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
     kind = type(node).__name__.lower()
     _reject_top_n(node, kind)
     if kind in _TYPED_UNARY:
-        return AggExpr(_TYPED_UNARY[kind], tr._scalar(node.this))
+        return AggExpr(_TYPED_UNARY[kind], tr._scalar(distinct_input(tr, node) or node.this))
     composite = _TYPED_UNARY_COMPOSITE.get(kind)
     if composite is not None:
+        _reject_distinct(node)
         return composite(tr._scalar(node.this))
     binary = _TYPED_BINARY.get(kind)
     if binary is not None:
+        _reject_distinct(node)
         return binary(tr._scalar(node.this), tr._scalar(node.expression))
     if kind == "countif":
         # `count_if(cond)` counts the rows where `cond` is true — the condition is the
@@ -183,19 +285,24 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
     if kind == "ignorenulls" and type(node.this).__name__.lower() == "anyvalue":
         # `any_value(x)` parses as `IgnoreNulls(AnyValue(x))` — the ignore-nulls wrapper
         # is what every value aggregate already does, so only the inner node matters.
-        return tr._scalar(node.this.this).any_value()
+        inner = node.this
+        return tr._scalar(distinct_input(tr, inner) or inner.this).any_value()
     if kind == "anyvalue":
-        return tr._scalar(node.this).any_value()
+        return tr._scalar(distinct_input(tr, node) or node.this).any_value()
     if kind == "percentiledisc":
         return AggExpr(
-            "quantile_disc", tr._scalar(node.this), param=_fraction(node.args.get("expression"))
+            "quantile_disc",
+            tr._scalar(distinct_input(tr, node) or node.this),
+            param=_fraction(node.args.get("expression")),
         )
     if kind == "approxtopk":
         count = node.args.get("expression")
         return tr._scalar(node.this).top_k(int(_fraction(count)))
     if kind == "approxquantile":
         return AggExpr(
-            "approx_quantile", tr._scalar(node.this), param=_fraction(node.args.get("quantile"))
+            "approx_quantile",
+            tr._scalar(distinct_input(tr, node) or node.this),
+            param=_fraction(node.args.get("quantile")),
         )
     return None
 
@@ -248,10 +355,54 @@ def build_anon_agg(tr, node) -> AggExpr | Expr:
     if parametric is not None:
         if len(args) != 2:
             raise NotImplementedError(f"{name}() takes a value and a constant")
-        return parametric(tr._scalar(args[0]), _fraction(args[1]))
+        return parametric(tr._scalar(distinct_input(tr, node, args) or args[0]), _fraction(args[1]))
+    if name not in _ANON:
+        return _library_agg(tr, node, name, args)
     if len(args) != 1:
         raise NotImplementedError(f"{name}() takes exactly one argument")
-    return _ANON[name](tr._scalar(args[0]))
+    if name == "sem":
+        # `sem` is composite (stddev / sqrt(n)) — no single input for the dedup.
+        _reject_distinct(node, args)
+    return _ANON[name](tr._scalar(distinct_input(tr, node, args) or args[0]))
+
+
+def _library_agg(tr, node, name: str, args: list) -> AggExpr | Expr:
+    """Build a library aggregate — the ones outside `_ANON`'s curated table.
+
+    Args:
+        tr: The translator instance.
+        node: The `exp.Anonymous` node, for the error messages.
+        name: The lowercased function name.
+        args: The call's argument nodes.
+
+    Returns:
+        The aggregate, or an expression over aggregates for the composite ones — which most
+        of these are, and which `GroupBy.agg` already hoists into hidden columns.
+
+    Raises:
+        NotImplementedError: On the wrong argument count, or on `DISTINCT`, which has no
+            single input to de-duplicate once the call reduces more than one column.
+    """
+    from batcher._sql.parser.expressions.lowering.families import (
+        library_aggregate,
+        positional_arity,
+    )
+
+    fn = library_aggregate(name)
+    if fn is None:  # pragma: no cover - `is_agg_node` already answered for this name
+        raise NotImplementedError(f"unknown aggregate {name!r}")
+    required, total = positional_arity(fn)
+    if len(args) < required or (total is not None and len(args) > total):
+        if total is None:
+            expected = f"at least {required}"
+        else:
+            expected = str(required) if required == total else f"{required} to {total}"
+        raise NotImplementedError(f"{name}() takes {expected} argument(s), got {len(args)}")
+    # `DISTINCT` de-duplicates *one* input before reducing; a composite aggregate reduces
+    # several columns and there is no single one to de-duplicate, so it is refused rather
+    # than silently ignored — which is the same rule `sem` already follows above.
+    _reject_distinct(node, args)
+    return fn(*(tr._scalar(a) for a in args))
 
 
 def _count_if(condition: Expr) -> AggExpr:

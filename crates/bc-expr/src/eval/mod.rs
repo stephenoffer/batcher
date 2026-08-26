@@ -33,6 +33,7 @@ pub(crate) mod in_list;
 pub(crate) mod list;
 pub(crate) mod list_ops;
 pub(crate) mod map;
+pub(crate) mod map_ops;
 pub(crate) mod math;
 pub(crate) mod media;
 pub(crate) mod mime;

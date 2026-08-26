@@ -5736,7 +5736,7 @@ class AggExpr:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("func", "input", "input2", "param")
+    __slots__ = ("func", "input", "input2", "name", "param")
 
     def __init__(
         self,
@@ -5745,10 +5745,16 @@ class AggExpr:
         *,
         input2: Expr | None = None,
         param: float | None = None,
+        name: str | None = None,
     ) -> None:
         """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
         self.input = input
+        # The output column name set by `.alias(...)`, read by `group_by().agg()` when it
+        # names a *positional* aggregate. It is consumed at the API surface and never
+        # reaches `to_ir`, where the name is carried by `AggregateSpec.alias` instead --
+        # which is why the Kyber rules that rebuild an `AggExpr` may drop it safely.
+        self.name = name
         # The second input expression — the ordering key for arg_min/arg_max or the
         # paired column for corr/covar; None for unary and parametric aggregates.
         self.input2 = input2
@@ -5763,7 +5769,35 @@ class AggExpr:
         if self.param is not None:
             args.append(repr(self.param))
         call = f"{self.func}({', '.join(args)})"
-        return call if self.input is None else f"{self.input!r}.{call}"
+        rendered = call if self.input is None else f"{self.input!r}.{call}"
+        return rendered if self.name is None else f"{rendered}.alias({self.name!r})"
+
+    def alias(self, name: str) -> AggExpr:
+        """Name this aggregate's output column — the Polars ``.alias(...)`` spelling.
+
+        ``agg(total=col("x").sum())`` and ``agg(col("x").sum().alias("total"))`` build
+        the same aggregate. The second is what a ported Polars or PySpark script is
+        already written as, and it is the only positional spelling that can name a
+        `count()` (which has no input column to be named after) or two aggregates over
+        one column.
+
+        Args:
+            name: The output column name to bind this aggregate to.
+
+        Returns:
+            A new `AggExpr` naming its output `name`; this one is unchanged.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
+                >>> ds.group_by("g").agg(
+                ...     bt.col("x").sum().alias("total"), bt.count().alias("n")
+                ... ).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'total': [3, 3], 'n': [2, 1]}
+        """
+        return AggExpr(self.func, self.input, input2=self.input2, param=self.param, name=name)
 
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.

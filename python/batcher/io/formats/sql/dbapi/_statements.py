@@ -180,7 +180,7 @@ def dialect_for_driver(module: str) -> str | None:
             >>> dialect_for_driver("pyodbc") is None
             True
     """
-    return _DRIVER_DIALECTS.get(module.split(".")[0])
+    return _DRIVER_DIALECTS.get(module.split(".", maxsplit=1)[0])
 
 
 def upsert_style(dialect: str | None) -> str | None:

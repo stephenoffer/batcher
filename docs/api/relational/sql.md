@@ -178,6 +178,41 @@ print(out.to_pydict())
 column cannot: an average needs a sum and a count, which one column cannot carry. Those raise
 rather than approximate. Compute them in a separate subquery and join.
 
+#### Which aggregates take a DISTINCT argument
+
+That constraint is about the *other* aggregates in the query. The aggregate wearing the
+`DISTINCT` has a separate and simpler rule: it needs one input column, because the dedup
+replaces that column and there is nothing to redirect otherwise. Every single-input
+aggregate qualifies:
+
+`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `MEDIAN`, `STDDEV_SAMP`, `VAR_SAMP`, `BIT_AND`,
+`BIT_OR`, `BIT_XOR`, `KURTOSIS`, `SKEWNESS`, `APPROX_COUNT_DISTINCT`, `PRODUCT`,
+`ENTROPY`, `MAD`, `ANY_VALUE`, and `QUANTILE_CONT`.
+
+```python
+readings = bt.from_pydict({"site": ["a", "a", "a", "b"], "code": [2, 2, 5, 3]})
+
+out = bt.sql(
+    """
+    SELECT site, BIT_OR(DISTINCT code) AS mask, PRODUCT(DISTINCT code) AS p
+    FROM readings GROUP BY site ORDER BY site
+    """,
+    readings=readings,
+)
+print(out.to_pydict())
+# {'site': ['a', 'b'], 'mask': [7, 3], 'p': [10.0, 3.0]}
+```
+
+Three decline, and they are the *composite* aggregates — each is built from several
+aggregates over more than one input, so no single column carries the dedup: `STDDEV_POP`,
+`VAR_POP`, and `SEM`. So do the two-input aggregates (`CORR`, `COVAR_*`, the `REGR_*`
+family, `ARG_MIN`/`ARG_MAX`). Each raises naming itself, and the rewrite that does work is
+to deduplicate in a subquery first:
+
+```sql
+SELECT site, STDDEV_POP(code) FROM (SELECT DISTINCT site, code FROM readings) GROUP BY site
+```
+
 (subqueries)=
 ### Subqueries
 

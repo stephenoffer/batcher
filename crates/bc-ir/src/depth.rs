@@ -85,6 +85,7 @@ pub const MAX_PLAN_DEPTH: usize = 512;
 /// Returns the maximum depth reached. Unbalanced input is not this function's problem —
 /// serde reports malformed JSON with a far better message than a depth scanner could, so
 /// this only ever reports a number and lets the parse decide.
+#[must_use]
 pub fn json_max_depth(s: &str) -> usize {
     let mut depth: usize = 0;
     let mut max: usize = 0;
@@ -139,7 +140,7 @@ mod tests {
     #[test]
     fn arrays_count_too() {
         // `Union` nests its inputs in a list, so an array level is a real stack level.
-        assert_eq!(json_max_depth(r#"[[[1]]]"#), 3);
+        assert_eq!(json_max_depth(r"[[[1]]]"), 3);
         assert_eq!(json_max_depth(r#"{"inputs":[{"op":"scan"}]}"#), 3);
     }
 

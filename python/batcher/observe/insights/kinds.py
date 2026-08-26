@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from batcher._internal.humanize import byte_size
+from batcher._internal.humanize import count as _count
+
 __all__ = ["Insight", "count", "gib"]
 
 #: Actual/estimated rows beyond which Kyber planned for the wrong query. 10x is the figure
@@ -115,18 +118,21 @@ def count(value: Any) -> str:
     """A compact SI-style row count for prose, tolerant of None."""
     if value is None:
         return "an unknown number of"
-    number = float(value)
-    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(number) >= limit:
-            return f"{number / limit:.1f}{suffix}"
-    return f"{number:.0f}"
+    return _count(value)
 
 
 def gib(value: int) -> str:
-    """A compact binary size, e.g. ``1.4 GiB``."""
-    size = float(value)
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024 or unit == "GiB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size:.0f} B"
-        size /= 1024
-    return f"{size:.1f} GiB"
+    """A compact binary size, e.g. ``1.4 GiB``.
+
+    Delegates to `_internal.humanize.byte_size`, which is also what the dashboard renders,
+    so an envelope reported here and the same envelope on the plan page agree. The local
+    copy this replaced stopped at GiB, which understates a petabyte-scale reading by three
+    orders of magnitude.
+
+    Args:
+        value: A byte count.
+
+    Returns:
+        The size with its binary unit.
+    """
+    return byte_size(value)

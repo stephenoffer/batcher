@@ -43,7 +43,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
-    return None
+    return
 
 
 class TestEnvironmentScrub:

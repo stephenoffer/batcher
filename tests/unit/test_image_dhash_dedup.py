@@ -62,14 +62,14 @@ def test_identical_images_share_a_hash() -> None:
 def test_a_rescaled_copy_is_within_the_near_duplicate_threshold() -> None:
     """The point of a *perceptual* hash: a thumbnail matches its original."""
     original, thumbnail = _hashes([_wave_png(256, 3), _wave_png(64, 3)])
-    distance = bin(original ^ thumbnail).count("1")
+    distance = (original ^ thumbnail).bit_count()
 
     assert distance <= 8, f"a rescaled copy moved {distance} bits"
 
 
 def test_a_different_image_is_far_away() -> None:
     a, b = _hashes([_wave_png(64, 3), _wave_png(64, 7)])
-    distance = bin(a ^ b).count("1")
+    distance = (a ^ b).bit_count()
 
     assert distance >= 16, f"different images only {distance} bits apart"
 

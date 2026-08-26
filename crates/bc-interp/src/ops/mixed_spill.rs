@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
 use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
 use bc_runtime::agg;

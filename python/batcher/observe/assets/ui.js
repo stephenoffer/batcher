@@ -63,11 +63,15 @@ const UI = (() => {
     return `${Math.floor(v / 60000)}m${((v % 60000) / 1000).toFixed(0).padStart(2, '0')}s`;
   }
 
+  /* Binary divisor, binary label. The Python half is `_internal.humanize.byte_size`, and
+   * `tests/unit/test_humanize_ui_parity.py` runs both over one vector table — which is how
+   * the PiB rung below was found missing: a petabyte-scale engine rendered its own headline
+   * scale as "1024.0 TiB". */
   function bytes(n) {
     if (n == null || n === 0) return '—';
     let size = n;
-    for (const unit of ['B', 'KiB', 'MiB', 'GiB', 'TiB']) {
-      if (size < 1024 || unit === 'TiB') return `${unit === 'B' ? size : size.toFixed(1)} ${unit}`;
+    for (const unit of ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']) {
+      if (size < 1024 || unit === 'PiB') return `${unit === 'B' ? size : size.toFixed(1)} ${unit}`;
       size /= 1024;
     }
     return `${n}`;

@@ -176,22 +176,38 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
     A bare-`Col` group key appears verbatim in the output, holding exactly the set
     of *distinct* key values of the input. Grouping invents no value and drops no
     extreme, so the key column's `min`/`max` carry through as **EXACT** bounds at the
-    child's provenance (like `Distinct`). `null_count` is dropped (duplicate nulls
-    collapse to one group) and `ndv` is not claimed here: the number of groups is only
-    an *estimate*, so tagging it EXACT would let `count_distinct` answer from a guess.
-    Per-group aggregate outputs are not constant, so only the keys are derived.
+    child's provenance (like `Distinct`). `ndv` is not claimed here: the number of groups
+    is only an *estimate*, so tagging it EXACT would let `count_distinct` answer from a
+    guess. Per-group aggregate outputs are not constant, so only the keys are derived.
+
+    `null_count` is *derived* where grouping makes it computable (see
+    `_grouped_key_null_count`) rather than dropped wholesale. Dropping it cost more than a
+    missing statistic: a known-zero null count is what `constant_value` and
+    `_predicate_status` require before either will call a key provably constant or a
+    predicate provably true, so an aggregate erased the proof its own input carried. A
+    self-equi-join of a single-key relation then cycled
+    `infer → push → merge → drop → infer` through the PUSHDOWN phase — the join-key
+    inference rules re-derived a predicate the zone-map rule kept deleting, because neither
+    side could see that the aggregate's key was already pinned — burning the entire
+    `fixpoint_iterations` budget on every such query and leaving the chosen plan dependent
+    on the iteration cap.
     """
     out: dict[str, ColumnStat] = {}
     for key in node.group_keys:
         if isinstance(key.expr, Col):
             src = child.columns.get(key.expr.name)
             if src is not None:
+                nulls = _grouped_key_null_count(node, src)
                 out[key.alias] = ColumnStat(
                     min=src.min,
                     max=src.max,
-                    null_count=None,
+                    null_count=nulls,
                     ndv=None,
                     provenance=src.provenance,  # extremes preserved → EXACT survives
+                    # Derived by counting groups, not by trusting the child's tag for
+                    # anything else, so it is exact whenever the count it came from was —
+                    # and `_grouped_key_null_count` returns nothing when it was not.
+                    null_count_provenance=Provenance.EXACT if nulls is not None else None,
                     bloom=src.bloom,  # grouping adds no value → absence proof holds
                     # A key's width is unchanged by grouping; its frequency distribution is
                     # destroyed by it (every group is one row), so the mcv must not carry.
@@ -200,6 +216,33 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
                 )
     out.update(_grouped_aggregate_bounds(node, child))
     return out
+
+
+def _grouped_key_null_count(node: Aggregate, src: ColumnStat) -> int | None:
+    """The exact null count of a bare-`Col` group key's output, or `None` when grouping
+    does not determine it.
+
+    Grouping collapses every null key into a *single* group (SQL `GROUP BY` semantics, which
+    the DuckDB oracle shares), so the output count is not the input's — but it is pinned in
+    two cases:
+
+    * **no nulls in, no nulls out.** Grouping invents no value, so a key the input never
+      held a null of cannot acquire one. Exact for any number of group keys.
+    * **one key, nulls in, exactly one out.** With a single group key the groups *are* that
+      column's distinct values, and the nulls form one of them. With several keys the group
+      is a tuple, so a null in this key can appear in as many groups as there are distinct
+      combinations of the others — at least one, which is a lower bound rather than a count,
+      and `ColumnStat` records counts.
+
+    Only an *exact* input count is used. An estimated zero is a guess that this column has no
+    nulls, and a derived count is read by the paths that decide whether a predicate is
+    provably true — where a guess does not merely mis-plan, it deletes rows.
+    """
+    if src.null_count is None or not src.null_count_is_exact:
+        return None
+    if src.null_count == 0:
+        return 0
+    return 1 if len(node.group_keys) == 1 else None
 
 
 # Aggregates whose per-group value is always one of the input column's own values, or lies

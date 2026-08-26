@@ -31,8 +31,7 @@ pytestmark = pytest.mark.unit
 
 def _write_ndjson(path: str, rows: list[dict]) -> str:
     with open(path, "w") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
+        fh.writelines(json.dumps(row) + "\n" for row in rows)
     return path
 
 
@@ -269,8 +268,7 @@ def test_csv_range_split_pushes_projection_into_the_parse(tmp_path, monkeypatch)
     path = str(tmp_path / "wide.csv")
     with open(path, "w") as fh:
         fh.write("a,b,c\n")
-        for i in range(200):
-            fh.write(f"{i},{i * 2},{i * 3}\n")
+        fh.writelines(f"{i},{i * 2},{i * 3}\n" for i in range(200))
     schema = CSVSource(path).schema()
     size = os.path.getsize(path)
 
@@ -297,8 +295,7 @@ def test_csv_range_split_projection_result_is_unchanged(tmp_path):
     path = str(tmp_path / "w.csv")
     with open(path, "w") as fh:
         fh.write("a,b,c\n")
-        for i in range(50):
-            fh.write(f"{i},{i * 2},{i * 3}\n")
+        fh.writelines(f"{i},{i * 2},{i * 3}\n" for i in range(50))
     schema = CSVSource(path).schema()
     size = os.path.getsize(path)
 
@@ -316,8 +313,7 @@ def test_csv_range_splits_cover_every_row_exactly_once(tmp_path):
     path = str(tmp_path / "t.csv")
     with open(path, "w") as fh:
         fh.write("k,v\n")
-        for i in range(2_000):
-            fh.write(f"{i},{i}\n")
+        fh.writelines(f"{i},{i}\n" for i in range(2_000))
     src = CSVSource(path)
 
     splits = src.splits(target_size=4096)

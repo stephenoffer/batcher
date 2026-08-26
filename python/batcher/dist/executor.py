@@ -1054,6 +1054,35 @@ def _is_broadcastable_global_window(window: Window) -> bool:
     )
 
 
+def _global_window_reason(window: Window) -> str:
+    """Why this global (no `PARTITION BY`) window has no distributed decomposition.
+
+    A global window has one partition over every row, so it has no per-partition seam to cut
+    along. Two things stand in for one: `OVER ()` with no ordering at all is a whole-relation
+    aggregate and broadcasts, and an *ordered* one range-partitions into ordered buckets and
+    corrects each by an offset (`dist/global_window/offsets.py`). A function that reads rows
+    its own bucket does not hold fits neither.
+
+    Args:
+        window: The global window that matched no branch.
+
+    Returns:
+        A reason naming the functions at fault, for `_unsupported`'s message.
+    """
+    from batcher.dist.global_window import supports_ordered_bucket_offsets
+
+    if supports_ordered_bucket_offsets(window):  # pragma: no cover - claimed by the caller
+        return "a global window"
+    culprits = sorted({f.func for f in window.functions if f.frame is not None or f.func})
+    named = ", ".join(culprits)
+    return (
+        f"a global window (no PARTITION BY) over {named} — each ordered bucket would have to "
+        "read rows it does not hold, or divide by a partition total it does not know, so "
+        "there is no offset that recovers the global value. Add a PARTITION BY (which gives "
+        "the shuffle a key), or materialize this stage and window it single-node"
+    )
+
+
 def _distributed_global_window(
     above: list[LogicalPlan], window: Window, sources: list[Source], workers: int, transport: str
 ) -> pa.Table:
@@ -1139,64 +1168,33 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
 
 
 def _hoist_computed_sort_key(sort: Sort):
-    """Rewrite `ORDER BY <expr>, …` so the LEADING key is a plain column.
+    """`plan.logical.hoist_sort_key` in the `(node, drop_projection)` shape this dispatcher
+    stacks onto `above`.
 
-    Returns `(sort', drop_key)` — a sort over a `Project` that materializes the computed
-    leading key as a hidden column, plus the `Project` that drops it again — or `None` when
-    the leading key is already a column (the common case, left byte-identical).
-
-    The distributed sort range-partitions on the leading key's *values*, which it can only
-    read from a column, so `df.sort(col("a") + col("b"))` had no distributed path at all.
-    Only the leading key is hoisted: the rest are evaluated by each reducer's local sort,
-    which needs no column. `hoist_computed_keys` owns the materialization itself, shared
-    with the window's partition keys.
+    The rewrite itself lives in the neutral `plan` layer because the *spilling* breakers need
+    the identical one: `collect(spill=True)` cuts a sort into the same ordered pieces the
+    cluster does, on the same range partitioner, and declined a computed leading key purely
+    because the hoist was private to this file. A query that distributed then failed to spill.
     """
-    from batcher.plan.logical import SortKeySpec, hoist_computed_keys, project_columns
+    from batcher.plan.logical import hoist_sort_key, project_columns
 
-    key = sort.keys[0]
-    hoisted = hoist_computed_keys(sort.input, [key.expr], prefix="__sort_key")
+    hoisted = hoist_sort_key(sort)
     if hoisted is None:
         return None
-    with_key, (hidden,) = hoisted
-
-    columns = sort.input.available_columns()
-    rewritten = dataclasses.replace(
-        sort,
-        input=with_key,
-        keys=(
-            SortKeySpec(hidden, descending=key.descending, nulls_first=key.nulls_first),
-            *sort.keys[1:],
-        ),
-    )
-    return rewritten, project_columns(rewritten, columns)
+    rewritten, keep = hoisted
+    return rewritten, project_columns(rewritten, keep)
 
 
 def _hoist_computed_window_keys(window: Window):
-    """Rewrite `PARTITION BY <expr>, …` so every partition key is a plain column.
+    """`plan.logical.hoist_window_keys` in the `(node, drop_projection)` shape this dispatcher
+    stacks onto `above`. See `_hoist_computed_sort_key` for why the rewrite is shared."""
+    from batcher.plan.logical import hoist_window_keys, project_columns
 
-    Returns `(window', drop_keys)` — the window over a `Project` that materializes each
-    computed partition key as a hidden column, plus the `Project` that drops those columns
-    again — or `None` when every partition key is already a column.
-
-    The distributed window hash-shuffles rows by the partition keys' column *positions*
-    (`executors/window.py` resolves each key with `cols.index(k.name)`), so a computed key
-    such as `partition_by=[col("v") % 4]` could not be shuffled on and the whole query had
-    no distributed path. This is the window's half of the same rewrite the sort already
-    used, sharing `hoist_computed_keys` rather than restating it.
-
-    The dropped set is the window's ORIGINAL output — its input columns plus the function
-    aliases — so the hidden keys vanish and nothing else does.
-    """
-    from batcher.plan.logical import hoist_computed_keys, project_columns
-
-    hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+    hoisted = hoist_window_keys(window)
     if hoisted is None:
         return None
-    with_keys, keys = hoisted
-
-    output = window.available_columns()
-    rewritten = dataclasses.replace(window, input=with_keys, partition_keys=keys)
-    return rewritten, project_columns(rewritten, output)
+    rewritten, keep = hoisted
+    return rewritten, project_columns(rewritten, keep)
 
 
 def _staged_aggregate_over_join(
@@ -1458,9 +1456,12 @@ def _dispatch(
     # row set than single-node. Only `workers x (k + n)` rows ever reach the driver, never
     # the whole source.
     #
-    # `hub=None`: the per-worker plan is truncated, so its row count must not be learned
-    # as the source's cardinality. A `map_batches` prefix returned above, so the pipeline
-    # here is pure scan/filter/project/unnest.
+    # The per-worker plan is truncated, so its row count is not the source's cardinality.
+    # `_record_source_rows` refuses a plan that resizes its input
+    # (`plan.logical.preserves_source_row_count`), so the hub is passed for what it is good
+    # for here — seeding the partition count from a past run — without teaching it that a
+    # billion-row table holds `workers x (k + n)` rows. A `map_batches` prefix returned
+    # above, so the pipeline here is pure scan/filter/project/unnest.
     limit_split = _split_at(plan, Limit)
     if limit_split is not None:
         above, lim = limit_split
@@ -1471,7 +1472,7 @@ def _dispatch(
                 from batcher.dist.executors.map import _distributed_map
 
                 per_worker = Limit(input=base, n=offset + n, offset=0)
-                table = _distributed_map(per_worker, sources, workers, None, preserve_order=True)
+                table = _distributed_map(per_worker, sources, workers, hub, preserve_order=True)
                 table = table.slice(offset, n)
                 return table if not above else _apply_above(above, table)
 
@@ -1492,7 +1493,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                table = _distributed_map(rowid.input, sources, workers, None, preserve_order=True)
+                table = _distributed_map(rowid.input, sources, workers, hub, preserve_order=True)
                 index = pa.array(
                     range(rowid.offset, rowid.offset + table.num_rows), type=pa.int64()
                 )
@@ -1516,8 +1517,9 @@ def _dispatch(
     # and breaks hash ties by row *content*, so no `preserve_order` is needed here (unlike
     # the `Limit` path above): the result does not depend on how the input was split.
     #
-    # `hub=None`: the per-worker plan is truncated to `n` rows, so its row count must not be
-    # learned as the source's cardinality.
+    # The per-worker plan is truncated to `n` rows, so its row count is not the source's
+    # cardinality — `_record_source_rows` declines a plan that resizes its input, so the hub
+    # is passed only for the learned partition sizing it also carries.
     sample_split = _split_at(plan, Sample)
     if sample_split is not None:
         above, sample = sample_split
@@ -1526,7 +1528,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                partials = _distributed_map(sample, sources, workers, None)
+                partials = _distributed_map(sample, sources, workers, hub)
                 # `sample` innermost: the global n-smallest of the union of the partials,
                 # then whatever the user stacked above it.
                 return _apply_above([*above, sample], partials)
@@ -1545,17 +1547,17 @@ def _dispatch(
         # all. Reached only when `_partition_local_chain` holds, which is what keeps a `Limit`
         # in the chain out.
         #
-        # `hub=None` deliberately: what comes back is one row per group, and learning that as
-        # the *source's* cardinality would teach the optimizer that a thousand-partition table
-        # holds a thousand rows. The distributed `LIMIT` path above withholds it for the same
-        # reason.
+        # What comes back is one row per group, which is not the source's cardinality —
+        # learning it as one would teach the optimizer that a thousand-partition table holds
+        # a thousand rows. `_record_source_rows` refuses an `Aggregate` on exactly that
+        # ground, so the hub is passed here for its learned partition sizing alone.
         if _single_source(agg.input):
             aligned = _partition_aligned_aggregate(agg, sources, workers, hub)
             if aligned:
                 from batcher.dist.executors.map import _distributed_map
 
                 _note_exchange_eliminated("aggregate", aligned)
-                table = _distributed_map(agg, sources, workers, None, cluster_by=aligned)
+                table = _distributed_map(agg, sources, workers, hub, cluster_by=aligned)
                 return table if not above else _apply_above(above, table)
         # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
         # user `distinct().agg(...)`) must be caught BEFORE the map/shuffle aggregate path:
@@ -1814,15 +1816,16 @@ def _dispatch(
         if _single_source(distinct.input) and not _has_breaker(distinct.input):
             # The table's layout already groups the duplicates: every row that could be a
             # duplicate of another is in the same directory, hence on the same worker. Dedup
-            # per partition and concatenate -- see `_partition_aligned_aggregate` for why the
-            # hub is withheld (the output is one row per key, not the source's row count).
+            # per partition and concatenate. The output is one row per key rather than the
+            # source's row count, which `_record_source_rows` declines to learn as one --
+            # see `_partition_aligned_aggregate`.
             aligned = _partition_aligned_distinct(distinct, sources, workers, hub)
             if aligned:
                 from batcher.dist.executors.map import _distributed_map
 
                 _note_exchange_eliminated("distinct", aligned)
 
-                table = _distributed_map(distinct, sources, workers, None, cluster_by=aligned)
+                table = _distributed_map(distinct, sources, workers, hub, cluster_by=aligned)
                 return table if not above else _apply_above(above, table)
             from batcher.dist.executors.distinct import _distributed_distinct
 
@@ -1871,13 +1874,12 @@ def _dispatch(
 
                     _note_exchange_eliminated("window", aligned)
 
-                    # The hub is passed here where the aggregate and dedup paths withhold it,
-                    # and the difference is the operator's row arithmetic: a window emits one
-                    # row per input row, so what comes back IS the source's (post-filter) row
-                    # count and is the same measurement any other map pipeline records. An
-                    # aggregate returns one row per group, which learned as a source
-                    # cardinality would teach the optimizer that a thousand-partition table
-                    # holds a thousand rows.
+                    # A window emits one row per input row, so unlike an aggregate or a dedup
+                    # its output is a measurement of the relation beneath it -- and when that
+                    # relation is an unfiltered scan, of the source itself.
+                    # `_record_source_rows` decides which of those it is; the comment this
+                    # replaced asserted the post-filter count *was* the source's, which it is
+                    # not, and the recording was made on that basis.
                     table = _distributed_map(window, sources, workers, hub, cluster_by=aligned)
                     return table if not above else _apply_above(above, table)
                 hoisted = _hoist_computed_window_keys(window)
@@ -1904,6 +1906,14 @@ def _dispatch(
                 return _distributed_window(
                     above, window, sources, workers, hub, metrics_out, materialize=materialize
                 )
+            # A global window none of the three branches above claimed. Named here rather
+            # than left to the generic "unsupported operator combination" at the bottom,
+            # because that message sends the reader looking for the wrong thing: the
+            # *operator* is supported, and what is missing is a decomposition for these
+            # particular functions. Say which ones, and say what a caller can do about it —
+            # the query has a perfectly good single-node answer, and the raise exists only
+            # to stop it being taken silently on distributed data.
+            return _unsupported(plan, sources, _global_window_reason(window))
 
     # UNION: distribute each branch independently, then concatenate (+ dedup).
     union_split = _split_at(plan, Union)
@@ -2271,8 +2281,14 @@ def _distributed_asof(
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     asof_ir = json.dumps(_asof_reducer_ir(asof))
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # Asked of the ASOF node, keyed by each side's own source id. A side's prefix asked on
+    # its own is typically a bare scan, which requires every column it has: what narrows the
+    # read is the operator above it, whose `output` list Kyber has already pruned. The
+    # equi-join paths reach the same answer either by asking the join (the disk shuffle) or
+    # by pre-projecting each side (`flight_join._project_join_side`); this one did neither,
+    # so an ASOF over a wide table read every column of it on every worker.
+    left_proj, left_pred = source_pushdown(asof, left_sid)
+    right_proj, right_pred = source_pushdown(asof, right_sid)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -2578,8 +2594,9 @@ def _distributed_asof_keyless(
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     asof_ir = json.dumps(_asof_reducer_ir(asof))
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # See `_distributed_asof`: asked of the node, keyed by each side's own source id.
+    left_proj, left_pred = source_pushdown(asof, left_sid)
+    right_proj, right_pred = source_pushdown(asof, right_sid)
 
     work_dir = distributed_work_dir("batcher_asofk_")
     try:

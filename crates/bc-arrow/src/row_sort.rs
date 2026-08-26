@@ -86,6 +86,7 @@ pub const MIN_KEYS_FOR_ROW_ENCODING: usize = 3;
 /// a multi-megabyte encoded buffer into a register compare. Shared with `bc-runtime`'s window
 /// partitioner, which found the technique first: sorting bare indices there made the cache
 /// misses "the whole window cost".
+#[must_use]
 pub fn row_prefix(encoded: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     let n = encoded.len().min(8);

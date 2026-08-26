@@ -41,6 +41,14 @@ from pathlib import Path
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+# `envinfo` lives in `benchmarks/`, two levels up — these scripts are invoked as
+# `python benchmarks/cluster/<dir>/<name>.py`, so only their own directory is on
+# `sys.path` and the import below cannot resolve without this. The sibling scripts one
+# level up need `parents[1]`; a depth-blind copy of that line is what broke these three.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from envinfo import machine_fingerprint, require_release_build
+
 print = functools.partial(print, flush=True)
 
 ROWS_PER_BATCH = 16_384
@@ -302,8 +310,7 @@ def _wait_two_nodes(consumer: Consumer, timeout_s: float = 2400.0) -> str:
     last = None
     while time.time() < deadline:
         try:
-            ip = ray.get(consumer.node_ip.remote(), timeout=10)
-            return ip
+            return ray.get(consumer.node_ip.remote(), timeout=10)
         except ray.exceptions.GetTimeoutError:
             alive = sum(1 for n in ray.nodes() if n["Alive"])
             if alive != last:
@@ -356,6 +363,20 @@ def main() -> None:
     # Forms (append --compressible for realistic post-sort/grouped shuffle data):
     #   xnode.py [n_partitions] [n_batches] [reps]      — one config
     #   xnode.py --sweep 256,1024,4096 [reps]           — block-count curve
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    # No `require_quiet_box()` here, deliberately: the work in a cluster benchmark
+    # happens on Ray workers, so the *driver's* run queue is not the contention
+    # signal that would invalidate the measurement, and refusing on it is a false
+    # negative on the multi-node deployment these scripts are written for.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
     flags = {"--compressible", "--big-consumer"}
     # `--rows N` sets the per-block row count (default 16384); smaller blocks expose the
     # make-available asymmetry (Ray's per-block ray.put serialize vs Carbonite's zero-copy

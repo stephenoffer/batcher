@@ -285,6 +285,43 @@ print(bt.from_pydict({"text": ["ab", "cd"]}).map_batches(explode_chars).to_pydic
 Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.ml.flat_map <batcher.api.dataset.ml.DatasetML.flat_map>`, which
 declares the row-at-a-time cost rather than hiding it.
 
+## Keep the output schema stable across batches
+
+Your function is called once per batch, and Batcher reconciles the batches it returns into
+one result. A column a later batch adds is filled with nulls for the earlier rows. That is
+deliberate: it lets a stage whose output grows a field, such as an LLM returning structured
+output, concatenate instead of failing at the merge:
+
+```python
+def gains_a_field(batch):
+    yield {"a": [1]}
+    yield {"a": [2], "extra": [9]}
+
+
+print(bt.from_pydict({"x": [1]}).map_batches(gains_a_field).to_pydict())
+# {'a': [1, 2], 'extra': [None, 9]}
+```
+
+The reverse is almost always a bug. A column missing from a later batch is kept and
+null-filled, so a function that renames or drops one returns a result that is mostly null:
+
+```python
+def renames_halfway(batch):
+    yield {"a": [1, 2]}
+    yield {"b": [3, 4]}
+
+
+print(bt.from_pydict({"x": [1]}).map_batches(renames_halfway).to_pydict())
+# {'a': [1, 2, None, None], 'b': [None, None, 3, 4]}
+```
+
+Batcher logs a warning naming the dropped columns, because the result otherwise looks
+complete. It is a warning rather than an error because a column appearing and a column
+disappearing are the same operation at the schema level, and the first is supported.
+
+Build the output columns once, outside any per-batch branching, so every return path has
+the same keys. A function that decides its columns inside an `if` is the shape this catches.
+
 ## map_groups: one call per group
 
 {py:meth}`map_groups <batcher.GroupBy.map_groups>` hands your function every row of one group and no row of another. It is the

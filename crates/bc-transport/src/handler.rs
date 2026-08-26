@@ -101,8 +101,7 @@ impl FlightService for FlightHandler {
         // an empty-but-typed result. Pick a schema from the batches if any.
         let schema = batches
             .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
+            .map_or_else(|| Arc::new(Schema::empty()), |b| b.schema());
 
         let batch_vec = (*batches).clone();
         let input = futures::stream::iter(batch_vec.into_iter().map(Ok));
@@ -211,8 +210,7 @@ impl FlightService for FlightHandler {
                 .flight_descriptor
                 .as_ref()
                 .and_then(|d| d.path.get(1))
-                .map(String::as_str)
-                .unwrap_or("");
+                .map_or("", String::as_str);
             if !token_matches(provided, expected) {
                 return Err(Status::unauthenticated("shuffle token mismatch"));
             }
@@ -302,8 +300,7 @@ impl FlightService for FlightHandler {
 
         let schema = batches
             .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
+            .map_or_else(|| Arc::new(Schema::empty()), |b| b.schema());
         // Serve only this shard's interleaved slice (whole bucket when nshards == 1).
         //
         // Zero-row batches are dropped: the Flight encoder emits no data message for one, so

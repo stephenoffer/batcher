@@ -104,6 +104,7 @@ pub struct TopNBound {
 impl TopNBound {
     /// A bound for a top-N whose first key sorts in the given direction. Starts unestablished,
     /// so nothing is skipped until some worker has seen `k` candidates.
+    #[must_use]
     pub fn new(descending: bool) -> Self {
         Self {
             value: AtomicI64::new(if descending { i64::MIN } else { i64::MAX }),

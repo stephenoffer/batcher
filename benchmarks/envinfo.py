@@ -77,13 +77,19 @@ def require_release_build(*, allow_debug: bool = False) -> None:
     A dev build is a hard stop rather than a warning. A warning above a table of numbers is
     a warning that gets copied into a document without its warning.
 
+    ``BENCH_ALLOW_DEBUG_BUILD=1`` is the same escape as `allow_debug`, for the many
+    standalone benchmarks that have no argument parser to hang a flag on. Both exist because
+    a guard nobody can override is a guard somebody deletes the first time it is in the way,
+    and a deleted guard protects nothing — whereas an override leaves a trace in the command
+    that was run.
+
     Args:
         allow_debug: Skip the check, for deliberately timing a debug build.
 
     Raises:
         SystemExit: If the installed engine is not a release build.
     """
-    if allow_debug:
+    if allow_debug or os.environ.get("BENCH_ALLOW_DEBUG_BUILD") == "1":
         return
     from batcher._internal.native import engine
 
@@ -115,6 +121,10 @@ def require_quiet_box(*, threshold: float = QUIET_LOAD_PER_CORE, allow_busy: boo
     (6.94 s), which is not a fact about DuckDB. Several deltas in ``BENCHMARK_RESULTS.md``
     are explicitly disavowed for exactly this.
 
+    ``BENCH_ALLOW_BUSY_BOX=1`` is the same escape as `allow_busy`, for the many standalone
+    benchmarks with no argument parser to hang a flag on — see the note on
+    `require_release_build` for why an overridable guard outlives an absolute one.
+
     Args:
         threshold: Maximum tolerated load per core.
         allow_busy: Warn instead of exiting, for a run whose purpose is the contention.
@@ -122,6 +132,7 @@ def require_quiet_box(*, threshold: float = QUIET_LOAD_PER_CORE, allow_busy: boo
     Raises:
         SystemExit: If the box is busier than `threshold` and `allow_busy` is False.
     """
+    allow_busy = allow_busy or os.environ.get("BENCH_ALLOW_BUSY_BOX") == "1"
     load = load_per_core()
     if load is None or load <= threshold:
         return

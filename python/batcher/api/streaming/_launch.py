@@ -146,8 +146,8 @@ def start_streaming_query(
     # returns. `iter_batches` has streamed this since S29 (`map_stream`); the sink path
     # answered it with a bare `NotImplementedError` from `MapBatches.to_ir()`, which is the
     # single most common shape an ML streaming job has -- inference, then a rollup.
-    mapped_aggregate = _is_mapped_aggregate(plan)
-    if mapped_aggregate and checkpoint is not None:
+    mapped_fold = _mapped_aggregate_fold(plan)
+    if mapped_fold is not None and checkpoint is not None:
         raise PlanError(
             "checkpoint= is refused for an aggregate over map_batches: the running state is "
             "folded against whatever schema the UDF returns, which is not knowable before "
@@ -155,8 +155,8 @@ def start_streaming_query(
             "offset log said the rows were already counted. Aggregate without the UDF (or "
             "materialize the mapped output first) if you need resumption."
         )
-    if mapped_aggregate:
-        run_batch, projection, predicate = _build_run_batch(plan.input, sources)
+    if mapped_fold is not None:
+        run_batch, projection, predicate = _build_run_batch(mapped_fold.input, sources)
     else:
         run_batch, projection, predicate = (
             _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
@@ -367,14 +367,36 @@ def _is_driver_shape(plan: LogicalPlan) -> bool:
     return isinstance(plan, (Limit, StreamingSessionWindow, WatermarkDedup))
 
 
-def _is_mapped_aggregate(plan: LogicalPlan) -> bool:
-    """A top-level aggregate whose input is a breaker-free `map_batches` pipeline."""
-    from batcher import core
-    from batcher.plan.logical import Aggregate, is_streamable
+def _mapped_aggregate_fold(plan: LogicalPlan):
+    """The fold of a `map_batches → aggregate` stream, under any row-wise tail, or None.
 
-    return (
-        isinstance(plan, Aggregate)
-        and plan.watermark is None
-        and is_streamable(plan.input)
-        and core.has_map_batches(plan.input)
-    )
+    The peeling matters as much as the test, for the same reason it does in
+    `_is_driver_shape`. This asked `isinstance(plan, Aggregate)` of the *top* node, so a
+    single `select` or HAVING filter above the aggregate made the shape unrecognizable —
+    and the consequence was not a refusal but a worse error than the one that shape used
+    to give: with no `run_batch` built, the fold tried to lower the `MapBatches` beneath
+    it and raised `NotImplementedError: map_batches is executed in Python, not lowered to
+    the engine IR`. That is the internal-wire-contract message this function exists to
+    keep users from seeing.
+
+    `split_streaming_tail` is the same predicate the processor router peels by, so the two
+    cannot drift into disagreeing about which plans are a mapped aggregate.
+
+    Args:
+        plan: The top-level streaming plan.
+
+    Returns:
+        The `Aggregate` to fold when this is a mapped aggregate, else None.
+    """
+    from batcher import core
+    from batcher.plan.logical import split_streaming_tail
+
+    split = split_streaming_tail(plan)
+    if split is None:
+        return None
+    fold = split[1]
+    # A watermarked aggregate takes the windowed processor, which owns its own input path;
+    # `split_streaming_tail` has already established the input is breaker-free.
+    if fold.watermark is not None or not core.has_map_batches(fold.input):
+        return None
+    return fold

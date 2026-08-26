@@ -1,0 +1,90 @@
+"""The shapes whose bounded-memory streaming driver is a running fold over the stream.
+
+Three operators materialized under `iter_batches()` — `with_row_index` (and `tail`, which
+lowers to the same node), a fixed-count `sample(n=)`, and a keyed `DISTINCT ON` — each for a
+reason that is correct about *partitioning* and does not carry to a *stream*. They are grouped
+here rather than inline in `dispatch` because each needs a paragraph saying why its fold is
+sound, and that reasoning belongs beside the decision it justifies; the router keeps a
+pointer.
+
+`bounded_driver` returns a generator for a shape it serves and `None` for everything else, so
+the router's branch is a single call with no knowledge of which shapes those are.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import pyarrow as pa
+
+from batcher.api.terminal.stream.pipeline import _iter_streaming, _pushdown
+from batcher.io.source import Source, is_bounded
+from batcher.plan.logical import Distinct, LogicalPlan, RowId, Sample, is_streamable
+
+__all__ = ["bounded_driver"]
+
+
+def bounded_driver(
+    plan: LogicalPlan, sources: list[Source], batch_size: int | None
+) -> Iterator[pa.RecordBatch] | None:
+    """A running-fold driver for `plan`, or `None` when this module does not serve it.
+
+    Args:
+        plan: The plan the streaming router is dispatching.
+        sources: The query's bound inputs.
+        batch_size: The caller's requested batch size, or `None`.
+
+    Returns:
+        The batch iterator, or `None` to let the router continue.
+    """
+    from batcher import core
+
+    if core.has_map_batches(plan.input) or not is_streamable(plan.input):
+        return None
+
+    # `with_row_index` / `tail` / `with_random` all lower to `RowId`, and it materialized —
+    # the router had no branch for it at all. A row index is a *position*, so `RowId` is not
+    # partition-independent and the peeling loop correctly refuses it: run per partition,
+    # every partition restarts the counter at zero.
+    #
+    # A stream is where that difficulty does not arise, because batches arrive in the input's
+    # own row order. `stream_row_index` says why that makes one counter sufficient, and why
+    # the distributed path needs `preserve_order` and a driver-side assembly where this needs
+    # neither. Unbounded is fine here: an index is assigned on arrival and never retracted.
+    if isinstance(plan, RowId):
+        from batcher.core.streaming import stream_row_index
+
+        return stream_row_index(plan, _iter_streaming(plan.input, sources, batch_size))
+
+    if not isinstance(plan, (Distinct, Sample)):
+        return None
+    keyed_dedup = isinstance(plan, Distinct) and bool(plan.keys)
+    fixed_sample = isinstance(plan, Sample) and plan.n is not None
+    if not (keyed_dedup or fixed_sample):
+        return None
+
+    # **Bounded sources only, and that is a correctness bound rather than caution.** Both
+    # answers are final only once the input ends: which row wins a key is, in the sink path's
+    # own words, "decided by an ordering over rows that have not arrived", and the `n`
+    # smallest hashes of an unbounded relation are never settled. Each driver accumulates and
+    # emits at the end, which an unbounded source never reaches.
+    #
+    # `core/streaming_query/processors.py` already refuses a keyed dedup on exactly this
+    # ground, pointing the caller at `drop_duplicates_within_watermark` whose state a
+    # watermark bounds — and `test_streaming_sink_matches_batch.py` asserts that it and this
+    # router agree about what streams. Without this guard they would not, which is how one
+    # query comes to have one capability through `iter_batches` and another through `write`.
+    if not all(is_bounded(s) for s in sources):
+        return None
+
+    # Both are mergeable in their own right, which is what the router's aggregate/dedup branch
+    # could not use: it folds through `Distinct.as_aggregate`, and a keyed dedup is not a
+    # group-by — its survivor carries columns the key does not determine, so per-column
+    # aggregates would build a row that was never in the input. Re-applying each *operator*
+    # to (running + batch) has no such problem: the dedup keeps the minimum under `order` and
+    # min associates, and `sample(n=)` keeps the `n` smallest-hash rows so the running `n` is
+    # closed under adding a batch. Peak memory is the key count and `n` respectively.
+    from batcher.core.streaming import stream_distinct_on, stream_sample_n
+
+    driver = stream_distinct_on if keyed_dedup else stream_sample_n
+    return driver(plan, sources[0], batch_size, projection=_pushdown(plan))

@@ -29,6 +29,26 @@ def sql_fanout(ctx: Context, sql: str) -> EngineQueries:
     return {name: (lambda run=run: run(sql)) for name, run in ctx.sql_runners().items()}
 
 
+def ray_to_arrow(ds: object) -> pa.Table:
+    """Materialize a Ray Dataset to Arrow without a pandas round trip.
+
+    Every native Ray case here used to end `pa.Table.from_pandas(ds.to_pandas())`, which for
+    a full-relation result — `op-sort-string` returns 6M `l_comment` values — converts Arrow
+    to a NumPy array of Python objects and back, inside the timed region, for one engine
+    only. Every other engine in the lineup returns Arrow directly. The conversion can cost
+    more than the operator it wraps, so the Ray column was measuring the harness.
+
+    `to_arrow_refs()` is Ray Data's own Arrow accessor: the blocks are already Arrow, so this
+    is a fetch and a concat rather than a format change.
+    """
+    import ray
+
+    blocks = [b for b in ray.get(ds.to_arrow_refs()) if b is not None]
+    if not blocks:
+        return pa.table({})
+    return pa.concat_tables(blocks) if len(blocks) > 1 else blocks[0]
+
+
 def cannot_run(fns: EngineQueries, engine: str, reason: str) -> EngineQueries:
     """Replace `engine`'s runner with one that reports `reason` instead of executing.
 

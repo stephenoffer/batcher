@@ -128,7 +128,13 @@ def _gate_and_fingerprint(ctx, case_names: list[str], engines: list[str], benchm
         case = REGISTRY.select(dataset=benchmark, name=name)[0]
         fns = case.build(ctx)
         print(f"gating {name} ...", flush=True)
-        result = compare(name, fns, engines, runs=1)
+        # `ordered_by` is not optional here. `compare()` checks results as row *multisets*,
+        # so without the case's order keys an engine that skipped the query's `ORDER BY`
+        # passes this gate — and this gate is what every client's response is then
+        # fingerprinted against, so the whole concurrency run would be validating against an
+        # unordered oracle. `run.py` passes it; dropping it here reopened the hole
+        # `harness/order.py` exists to close.
+        result = compare(name, fns, engines, runs=1, ordered_by=case.ordered_by)
         if result.status in ("FAILED", "ERROR"):
             raise SystemExit(f"correctness gate failed for {name}: {result.note}")
         oracle = next((e for e in ("duckdb", "polars") if fns.get(e)), engines[0])

@@ -161,19 +161,29 @@ Without it, one table's `id` column answered for another's.
 
 ## Backends
 
-`MetadataBackend` is a four-method Protocol (`get`, `put`, `scan`, `batch_put`) with five
+`MetadataBackend` is a four-method Protocol (`get`, `put`, `scan`, `batch_put`) with six
 implementations:
 
 | Backend | Storage | Use |
 |---|---|---|
 | `in_process` | nested dicts | **the default**; learns within a session, forgets on exit |
 | `sqlite` | one `kv` table, commit per put | carry learning across restarts |
+| `rocksdb` | one embedded LSM tree, `table\x00key` per entry | the same, under a heavy write rate |
 | `redis` | one hash per table | share learning across drivers |
 | `object_storage` | one fsspec object per key | shared, durable, slow |
 | `layered` | in-process cache over a durable store | the practical shared setup |
 
 `backend="sqlite"` with no `uri` persists to `$BATCHER_HOME`, defaulting to
 `~/.batcher/metadata.db`, so cross-run learning is one line with no path to manage.
+
+`rocksdb` and `sqlite` answer the same question on different storage engines, and the write
+rate is what separates them. Core records feedback after every query and Kyber reads it back
+before every plan, so a busy single node presents this store with a sustained stream of small
+writes. SQLite answers each one with a B-tree update and a journal write; RocksDB appends to a
+memtable and merges later, which is what a log-structured merge tree is for. The encoding is
+identical either way, because `encode_key` is prefix-preserving and orders the way a byte
+comparison does, so a prefix `scan` is a seek and a walk on both. RocksDB locks its directory,
+so only one process may hold it open; use `redis` or `object_storage` to share across drivers.
 `LayeredBackend` writes durable-first then caches, and
 reads cache-first with fall-through. Its `refresh()` drops the cache entirely, which is the
 cross-driver freshness hook.

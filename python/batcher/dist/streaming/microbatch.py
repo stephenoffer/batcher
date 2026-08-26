@@ -86,6 +86,7 @@ class DistributedRunner:
         "_source",
         "_spent",
         "_split_cache",
+        "_tail",
         "_workers",
     )
 
@@ -103,7 +104,9 @@ class DistributedRunner:
         drain: bool,
         should_stop: Callable[[], bool],
         agg: Any | None = None,
+        tail: tuple = (),
     ) -> None:
+        from batcher.core.streaming import StreamingTail
         from batcher.dist.executors.ray_runtime import engine_config_json
 
         self._source = source
@@ -121,6 +124,11 @@ class DistributedRunner:
         # aggregate's input pipeline) — `dist` schedules it, it does not re-decide it.
         self._agg = agg
         self._fold = RunningAggregate(agg) if agg is not None else None
+        # The row-wise operators above the fold, applied by the driver to the *combined*
+        # result — the same `StreamingTail` the single-node processor applies to its fold
+        # snapshot, so the two paths cannot come to compute different things above one
+        # aggregate (invariant #7).
+        self._tail = StreamingTail(tail)
         self._plan_ir = plan_ir
         self._projection = projection
 
@@ -332,6 +340,9 @@ class DistributedRunner:
             self._fold.absorb(partial)
         result = self._fold.finalize()
         if result is None or not result.num_rows:
+            return 0
+        result = self._tail.apply(result)
+        if result is None or not result.num_rows:  # a HAVING filter left nothing this epoch
             return 0
         from batcher.io.formats.streaming.sinks import FileStreamSink, TransactionalStreamSink
 

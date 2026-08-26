@@ -23,6 +23,7 @@ pub struct CountMinSketch {
 impl CountMinSketch {
     /// Create a sketch with `depth` rows of `width` counters. More width → less
     /// over-estimation; more depth → lower failure probability.
+    #[must_use]
     pub fn new(width: usize, depth: usize) -> Self {
         assert!(width >= 1 && depth >= 1, "dimensions must be >= 1");
         Self {
@@ -35,6 +36,7 @@ impl CountMinSketch {
 
     /// Size the sketch for additive error ≤ `epsilon · N` with probability
     /// `1 − delta` (`width = ⌈e/ε⌉`, `depth = ⌈ln(1/δ)⌉`).
+    #[must_use]
     pub fn with_error(epsilon: f64, delta: f64) -> Self {
         assert!(epsilon > 0.0 && (0.0..1.0).contains(&delta));
         let width = (std::f64::consts::E / epsilon).ceil() as usize;
@@ -43,6 +45,7 @@ impl CountMinSketch {
     }
 
     /// Total weight added (the true `N`), used to judge "heavy" relative to average.
+    #[must_use]
     pub fn total(&self) -> u64 {
         self.total
     }
@@ -50,7 +53,7 @@ impl CountMinSketch {
     // The `i`-th row index for a key hash, via Kirsch–Mitzenmacher double hashing
     // (`h1 + i·h2`) — `depth` independent-enough functions from one 64-bit hash.
     fn index(&self, hash: u64, row: usize) -> usize {
-        let h1 = hash as u32 as u64;
+        let h1 = u64::from(hash as u32);
         let h2 = (hash >> 32) | 1; // odd → full period
         row * self.width + ((h1.wrapping_add((row as u64).wrapping_mul(h2))) as usize % self.width)
     }
@@ -70,6 +73,7 @@ impl CountMinSketch {
     }
 
     /// Estimate the frequency of a pre-hashed key (an upper bound on the truth).
+    #[must_use]
     pub fn estimate_hash(&self, hash: u64) -> u64 {
         (0..self.depth)
             .map(|row| self.counts[self.index(hash, row)])
@@ -98,6 +102,7 @@ impl CountMinSketch {
     ///
     /// This is what a *decision* should read. The raw minimum is what a caller needing the
     /// guaranteed no-under-count bound should read.
+    #[must_use]
     pub fn estimate_debiased_hash(&self, hash: u64) -> f64 {
         let upper = self.estimate_hash(hash) as f64;
         if self.width < 2 || self.total == 0 {
@@ -113,7 +118,7 @@ impl CountMinSketch {
         corrected.sort_by(|a, b| a.partial_cmp(b).expect("counts are finite"));
         let mid = corrected.len() / 2;
         let median = if corrected.len() % 2 == 0 {
-            (corrected[mid - 1] + corrected[mid]) / 2.0
+            f64::midpoint(corrected[mid - 1], corrected[mid])
         } else {
             corrected[mid]
         };
@@ -135,6 +140,7 @@ impl CountMinSketch {
 
     /// Serialize to a byte blob. Layout (all little-endian):
     /// `[width: u64][depth: u64][total: u64][counts: width·depth × u64]`.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(24 + self.counts.len() * 8);
         out.extend_from_slice(&(self.width as u64).to_le_bytes());
@@ -148,6 +154,7 @@ impl CountMinSketch {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on malformed
     /// input (zero dimensions, or a length that doesn't match `width·depth`).
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let read_u64 = |off: usize| -> Option<u64> {
             let chunk: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;

@@ -126,7 +126,7 @@ def test_curation_then_deduplication_then_a_model_tensor(photos: Path) -> None:
     by_name = dict(zip((u.rsplit("/", 1)[-1] for u in out["uri"]), out["digest"], strict=True))
 
     def _distance(a: str, b: str) -> int:
-        return bin((by_name[a] ^ by_name[b]) & (2**64 - 1)).count("1")
+        return ((by_name[a] ^ by_name[b]) & (2**64 - 1)).bit_count()
 
     rescaled = _distance("scene.png", "scene_small.png")
     unrelated = _distance("scene.png", "noise.png")

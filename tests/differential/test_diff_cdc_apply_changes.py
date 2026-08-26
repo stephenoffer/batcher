@@ -52,10 +52,9 @@ def _apply(duck, changes: pa.Table, target: pa.Table | None):
     changes_ds = bt.from_arrow(changes)
     stored = cdc_stored_columns(changes_ds.columns, _KEYS, _SEQ, _COLUMNS)
     target_ds = None if target is None else bt.from_arrow(target)
-    got = compose_cdc_apply(
+    return compose_cdc_apply(
         changes_ds, target_ds, _KEYS, _SEQ, stored, Col("op") == "DELETE"
     ).to_arrow()
-    return got
 
 
 def _changes(ids, cities, ops, seqs) -> pa.Table:

@@ -207,27 +207,27 @@ fn cmp_survives(
                 (i32_unsigned(s.min_opt()), i32_unsigned(s.max_opt()))
             } else {
                 (
-                    s.min_opt().map(|x| *x as i128),
-                    s.max_opt().map(|x| *x as i128),
+                    s.min_opt().map(|x| i128::from(*x)),
+                    s.max_opt().map(|x| i128::from(*x)),
                 )
             };
-            range_survives(mn, mx, *v as i128, op)
+            range_survives(mn, mx, i128::from(*v), op)
         }
         (Statistics::Int64(s), Lit::Int(v)) => {
             let (mn, mx) = if unsigned {
                 (i64_unsigned(s.min_opt()), i64_unsigned(s.max_opt()))
             } else {
                 (
-                    s.min_opt().map(|x| *x as i128),
-                    s.max_opt().map(|x| *x as i128),
+                    s.min_opt().map(|x| i128::from(*x)),
+                    s.max_opt().map(|x| i128::from(*x)),
                 )
             };
-            range_survives(mn, mx, *v as i128, op)
+            range_survives(mn, mx, i128::from(*v), op)
         }
         // Float columns vs a float literal (the stored floats compare exactly).
         (Statistics::Float(s), Lit::Float(v)) => float_range_survives(
-            s.min_opt().map(|x| *x as f64),
-            s.max_opt().map(|x| *x as f64),
+            s.min_opt().map(|x| f64::from(*x)),
+            s.max_opt().map(|x| f64::from(*x)),
             *v,
             op,
         ),
@@ -237,8 +237,8 @@ fn cmp_survives(
         // Float column vs an integer literal: exact only when the int is representable
         // in f64 (|v| < 2^53); larger magnitudes keep the group (no lossy prune).
         (Statistics::Float(s), Lit::Int(v)) if int_exact_in_f64(*v) => float_range_survives(
-            s.min_opt().map(|x| *x as f64),
-            s.max_opt().map(|x| *x as f64),
+            s.min_opt().map(|x| f64::from(*x)),
+            s.max_opt().map(|x| f64::from(*x)),
             *v as f64,
             op,
         ),
@@ -265,12 +265,12 @@ fn int_exact_in_f64(v: i64) -> bool {
 
 /// Reinterpret a signed `i32` physical stat as its unsigned value, widened to `i128`.
 fn i32_unsigned(v: Option<&i32>) -> Option<i128> {
-    v.map(|x| *x as u32 as i128)
+    v.map(|x| i128::from(*x as u32))
 }
 
 /// Reinterpret a signed `i64` physical stat as its unsigned value, widened to `i128`.
 fn i64_unsigned(v: Option<&i64>) -> Option<i128> {
-    v.map(|x| *x as u64 as i128)
+    v.map(|x| i128::from(*x as u64))
 }
 
 /// `range_survives` for float bounds, but a NaN bound *keeps* the group (never prunes).

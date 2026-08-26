@@ -359,60 +359,42 @@ def _fold_const_arith(node) -> Expr | None:
     return lit(float(r))
 
 
-# INTERVAL units, by which component of `offset_by` they contribute to. Calendar
-# months clamp at end-of-month; days and microseconds are exact. Every DuckDB unit
-# spelling is here, singular and plural (`INTERVAL 2 HOURS`), so a unit that the
-# engine can express is never refused for a spelling.
-_INTERVAL_MONTHS = {
-    "MONTH": 1,
-    "QUARTER": 3,
-    "YEAR": 12,
-    "DECADE": 120,
-    "CENTURY": 1200,
-    "MILLENNIUM": 12000,
-}
-_INTERVAL_DAYS = {"DAY": 1, "WEEK": 7}
-_INTERVAL_MICROS = {
-    "HOUR": 3_600_000_000,
-    "MINUTE": 60_000_000,
-    "SECOND": 1_000_000,
-    "MILLISECOND": 1_000,
-    "MICROSECOND": 1,
-}
-
-
 def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
-    """`ts/date +/- INTERVAL n <unit>` for a DATE or TIMESTAMP operand.
+    """`ts/date +/- INTERVAL ...` for a DATE or TIMESTAMP operand.
 
-    Calendar units (MONTH/QUARTER/YEAR/DECADE/CENTURY/MILLENNIUM) add months,
-    DAY/WEEK add exact days, and the sub-day units add exact microseconds — all via
-    the type-preserving `offset_by` (`DateOffset`) node so the shift is applied
-    correctly whether the operand is a Date32 (epoch days) or a Timestamp
-    (microseconds).
+    The literal is read into the three components `DateOffset` takes — calendar months,
+    whole days, and exact microseconds — by `lowering.intervals.interval_parts`, which is
+    where the unit vocabulary and the compound / fractional / clock spellings live. The
+    shift then goes through the one type-preserving `offset_by` node, so it is applied
+    correctly whether the operand is a Date32 (epoch days) or a Timestamp (microseconds).
 
-    A sub-day offset is not representable on a Date32, and DuckDB promotes the
-    operand to TIMESTAMP for exactly that reason (`DATE '2024-03-05' + INTERVAL 1
-    HOUR` is a timestamp there), so the cast is applied here rather than letting the
-    engine reject the shift. On a timestamp operand the cast is a no-op.
+    A sub-day offset is not representable on a Date32, and DuckDB promotes the operand to
+    TIMESTAMP for exactly that reason (`DATE '2024-03-05' + INTERVAL 1 HOUR` is a
+    timestamp there), so the cast is applied whenever the literal carries microseconds.
+    On a timestamp operand the cast is a no-op, and a whole-day shift keeps the DATE.
     """
+    # Imported here rather than at module scope: `lowering/__init__` re-exports `matching`,
+    # which imports this module's `_like_to_regex`, so a top-level import is a cycle.
+    from batcher._sql.parser.expressions.lowering.intervals import interval_parts
+
     if isinstance(interval, exp.Interval):
-        n = int(interval.this.name)
-        unit = (interval.text("unit") or "DAY").upper()
+        count = interval.this
+        if not isinstance(count, exp.Literal):
+            raise NotImplementedError("only constant interval literals are supported")
+        text, default_unit = count.name, interval.text("unit") or "day"
     elif isinstance(interval, exp.Literal) and not interval.is_string:
-        n, unit = int(interval.name), "DAY"  # date_add(d, 5) — bare day count
+        text, default_unit = interval.name, "day"  # date_add(d, 5) — bare day count
     else:
         raise NotImplementedError("only constant interval literals are supported")
+    try:
+        months, days, micros = interval_parts(text, default_unit)
+    except ValueError as exc:
+        raise NotImplementedError(str(exc)) from None
     if subtract:
-        n = -n
-    unit = unit.removesuffix("S")  # `INTERVAL 2 HOURS` — no unit name ends in S
-
-    if unit in _INTERVAL_MONTHS:
-        return DateOffset(date_expr, n * _INTERVAL_MONTHS[unit], 0, 0)
-    if unit in _INTERVAL_DAYS:
-        return DateOffset(date_expr, 0, n * _INTERVAL_DAYS[unit], 0)
-    if unit in _INTERVAL_MICROS:
-        return DateOffset(Cast(date_expr, "timestamp"), 0, 0, n * _INTERVAL_MICROS[unit])
-    raise NotImplementedError(f"INTERVAL unit {unit} is not supported")
+        months, days, micros = -months, -days, -micros
+    if micros:
+        return DateOffset(Cast(date_expr, "timestamp"), months, days, micros)
+    return DateOffset(date_expr, months, days, 0)
 
 
 def _temporal_literal(text: str, kind: str) -> Expr:

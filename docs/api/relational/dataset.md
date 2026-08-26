@@ -324,11 +324,15 @@ print(total_rows)
 # 6
 ```
 
-`explain` returns the plan for inspection.
+`explain` returns the plan for inspection: a header, a tree of operators with what each one
+does, and its row estimate.
 
 ```python
-print(ds.explain().splitlines()[0])
-# scan                            est≈6 (exact)
+plan = ds.explain()
+print(plan.splitlines()[0].split("  ")[0])
+# query plan (planned)
+print([line.strip() for line in plan.splitlines() if "scan" in line][0])
+# scan  [source 0]     est≈6  (exact)
 ```
 
 Writers persist results; they need a real path, so they are not run here.

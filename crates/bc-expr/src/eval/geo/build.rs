@@ -55,7 +55,15 @@ macro_rules! num_arg {
 
 /// Evaluate one row.
 fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{
+        StAffine, StBoundary, StBuffer, StCentroid, StClosestPoint, StCollect, StConvexHull,
+        StEndPoint, StEnvelope, StExpand, StExteriorRing, StFlipCoordinates, StForce2d, StForce3d,
+        StForcePolygonCcw, StForcePolygonCw, StGeomFromGeohash, StGeomFromGeojson, StGeomFromText,
+        StGeomFromWkb, StGeometryN, StInteriorRingN, StLineInterpolatePoint, StLineSubstring,
+        StMakeEnvelope, StMakeLine, StMakePolygon, StPoint, StPointN, StPointOnSurface, StPointZ,
+        StProject, StRemoveRepeatedPoints, StReverse, StRotate, StScale, StSegmentize, StSetSrid,
+        StShortestLine, StSimplify, StSnapToGrid, StStartPoint, StTransform, StTranslate,
+    };
     // The constructors that build from plain numbers or text, before any geometry decode.
     match func {
         StPoint => {

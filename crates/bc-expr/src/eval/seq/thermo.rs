@@ -99,7 +99,7 @@ fn tm_of(seq: &str) -> Option<f64> {
         ds += s;
     }
     // Initiation at each end, which depends on whether that end is a G·C or an A·T pair.
-    for &end in [upper[0], upper[upper.len() - 1]].iter() {
+    for &end in &[upper[0], upper[upper.len() - 1]] {
         let (h, s) = if end == b'G' || end == b'C' {
             INIT_GC
         } else {

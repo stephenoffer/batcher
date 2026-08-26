@@ -5,7 +5,8 @@ Kyber annotates each physical operator with the resources it expects to need
 `FeasibilityVerdict`, whose counter-offer Kyber can re-plan around — closing the
 optimizer/resource loop without either layer importing the other. `SchedulingEnvelope` is the
 per-task grant that falls out, and `HardwareProfile` (with the fleet's `ClusterShape`) is the
-hardware all of it is sized against.
+hardware all of it is sized against. `StorageLevel` is the same shape of contract for the
+result cache: `api` states which media a cached result may occupy, Carbonite honors it.
 
 A façade: every name below is defined in a sibling module and re-exported here, so
 `batcher.plan.resource` remains the one import path.
@@ -21,6 +22,7 @@ from batcher.plan.resource.bounds import (
 from batcher.plan.resource.cluster import ClusterShape, NodeShape
 from batcher.plan.resource.hardware import HardwareProfile
 from batcher.plan.resource.locality import LocalityShares
+from batcher.plan.resource.storage import StorageLevel
 
 __all__ = [
     "ClusterShape",
@@ -30,4 +32,5 @@ __all__ = [
     "NodeShape",
     "ResourceBounds",
     "SchedulingEnvelope",
+    "StorageLevel",
 ]

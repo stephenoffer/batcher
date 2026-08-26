@@ -85,6 +85,7 @@ pub struct TlsServerConfig {
 impl TlsServerConfig {
     /// Server-auth TLS: encrypt the connection with `identity`, without requiring a
     /// client certificate.
+    #[must_use]
     pub fn new(identity: TlsIdentity) -> Self {
         Self {
             identity,
@@ -133,6 +134,7 @@ impl TlsClientConfig {
     }
 
     /// Present `identity` to an mTLS peer.
+    #[must_use]
     pub fn with_identity(mut self, identity: TlsIdentity) -> Self {
         self.identity = Some(identity);
         self
@@ -197,10 +199,7 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----",
         );
 
-        for rendered in [
-            format!("{id:?}"),
-            format!("{:?}", TlsServerConfig::new(id.clone())),
-        ] {
+        for rendered in [format!("{id:?}"), format!("{:?}", TlsServerConfig::new(id))] {
             assert!(
                 !rendered.contains("SUPERSECRETKEYMATERIAL"),
                 "the private key reached a Debug rendering: {rendered}",

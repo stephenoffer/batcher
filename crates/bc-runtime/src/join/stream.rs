@@ -113,6 +113,7 @@ fn is_probe_driven(join_type: JoinType) -> bool {
 /// first paying to materialize the build side**. The conditions are the module's: a
 /// probe-driven join type, `Int64` key columns, and a build that stays under the cache-radix
 /// cliff.
+#[must_use]
 pub fn streaming_supported(
     join_type: JoinType,
     key_types: &[&arrow::datatypes::DataType],
@@ -130,6 +131,7 @@ pub fn streaming_supported(
 /// ceiling is a **cost** comparison against the partitioned radix join, and a caller whose real
 /// alternative is something else entirely is not entitled to that answer (the same distinction
 /// [`BroadcastProbe::over_any_build`] draws for the fused-aggregate path).
+#[must_use]
 pub fn streaming_shape_supported(
     join_type: JoinType,
     key_types: &[&arrow::datatypes::DataType],

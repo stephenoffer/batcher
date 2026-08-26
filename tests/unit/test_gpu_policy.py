@@ -161,7 +161,7 @@ def test_gpu_memory_budget_is_detected_not_assumed(monkeypatch):
 
     # No visible device → a T4-shaped nameplate, so a CPU-only driver planning for a remote
     # GPU worker keeps a budget within a gigabyte of the one it always had.
-    monkeypatch.setattr(hw, "gpu_inventory", lambda: [])
+    monkeypatch.setattr(hw, "gpu_inventory", list)
     assert dc.resolved_gpu_memory_gb() == 16.0
 
     # An explicit setting always wins over detection.

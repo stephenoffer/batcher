@@ -15,7 +15,16 @@ use crate::SpatialFunc;
 /// it. Split by argument shape rather than by function so each group reads its
 /// arguments once, in the order the vocabulary documents them.
 pub(super) fn apply(func: SpatialFunc, a: &[f64]) -> Option<f64> {
-    use SpatialFunc::*;
+    use SpatialFunc::{
+        QuatAngle, QuatAngularDistance, QuatFromEulerW, QuatFromEulerX, QuatFromEulerY,
+        QuatFromEulerZ, QuatFromRotmatW, QuatFromRotmatX, QuatFromRotmatY, QuatFromRotmatZ,
+        QuatInverseRotateX, QuatInverseRotateY, QuatInverseRotateZ, QuatInverseW, QuatInverseX,
+        QuatInverseY, QuatInverseZ, QuatMultiplyW, QuatMultiplyX, QuatMultiplyY, QuatMultiplyZ,
+        QuatNorm, QuatNormalizeW, QuatNormalizeX, QuatNormalizeY, QuatNormalizeZ, QuatRotateX,
+        QuatRotateY, QuatRotateZ, QuatSlerpW, QuatSlerpX, QuatSlerpY, QuatSlerpZ, QuatToPitch,
+        QuatToRoll, QuatToYaw, Se3InverseTransformX, Se3InverseTransformY, Se3InverseTransformZ,
+        Se3TransformX, Se3TransformY, Se3TransformZ,
+    };
     match func {
         // --- roll, pitch, yaw -----------------------------------------------
         QuatFromEulerX | QuatFromEulerY | QuatFromEulerZ | QuatFromEulerW => {
@@ -128,7 +137,10 @@ fn pose(a: &[f64]) -> Pose {
 
 /// Pick the component a vector-valued function's name asks for.
 fn component(v: Vec3, func: SpatialFunc) -> Option<f64> {
-    use SpatialFunc::*;
+    use SpatialFunc::{
+        QuatInverseRotateX, QuatInverseRotateY, QuatRotateX, QuatRotateY, Se3InverseTransformX,
+        Se3InverseTransformY, Se3TransformX, Se3TransformY,
+    };
     Some(match func {
         QuatRotateX | QuatInverseRotateX | Se3TransformX | Se3InverseTransformX => v.x,
         QuatRotateY | QuatInverseRotateY | Se3TransformY | Se3InverseTransformY => v.y,

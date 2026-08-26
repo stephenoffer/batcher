@@ -32,6 +32,7 @@ pub enum FetchFault {
 /// Classify a transport error so the recovery layer retries only what a retry can
 /// fix. A dead/idle peer or an unavailable server is `Retryable` (recompute +
 /// re-fetch); everything else is `Fatal`.
+#[must_use]
 pub fn classify(err: &TransportError) -> FetchFault {
     match err {
         TransportError::Transport(_) | TransportError::IdleTimeout(_) => FetchFault::Retryable,
@@ -177,6 +178,7 @@ impl ShuffleExchange {
     }
 
     /// The local socket address this node's exchange is bound to.
+    #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -185,6 +187,7 @@ impl ShuffleExchange {
     ///
     /// Equals [`Self::addr`] in the single-host case; on a cluster it is the
     /// routable `{node_ip}:{port}` set via [`Self::bind_advertised`].
+    #[must_use]
     pub fn advertised_addr(&self) -> &str {
         &self.advertised
     }
@@ -284,6 +287,7 @@ impl ShuffleExchange {
     /// caller must treat as "not right now" rather than as an error — the alternative,
     /// blocking on the store's lock from an arbitrary thread, can deadlock the runtime
     /// serving the fetches that would drain it.
+    #[must_use]
     pub fn try_spill_at_least(&self, target: usize) -> usize {
         self.store.try_spill_at_least(target)
     }
@@ -596,12 +600,14 @@ pub struct ClientPool {
 
 impl ClientPool {
     /// An empty pool. Connections are established lazily on first fetch per peer.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Number of peer addresses with a live connection pool (telemetry/tests). Counts
     /// *peers*, not connections — striping to one peer stays a single entry here.
+    #[must_use]
     pub fn connection_count(&self) -> usize {
         self.peers.len()
     }

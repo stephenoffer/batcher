@@ -52,7 +52,7 @@ from batcher.dist.sort_boundaries import (
     sort_shape_key,
 )
 from batcher.io.source import Source
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_global_window_disk"]
@@ -72,17 +72,16 @@ def execute_global_window_disk(
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to workers
 
-    key = window.order_keys[0]  # caller guarantees a single plain-column order key
+    key = window.order_keys[0]  # caller guarantees a plain-column LEADING order key
     key_name = key.expr.name
     desc, nulls_first = key.descending, key.nulls_first
 
     map_plan, sid = _relabel_single_source(window.input)
     map_ir = json.dumps(map_plan.to_ir())
-    # The reduce runs the window over its bucket as a single in-memory source 0. `to_ir()`
-    # memoizes and hands back the plan's shared structures, so copy what is rewritten here.
-    win_ir = dict(window.to_ir())
-    win_ir["input"] = task_scan_ir()
-    win_ir["functions"] = list(win_ir["functions"])
+    # The reduce runs the window over its bucket as a single in-memory source 0.
+    # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
+    # so `inject_avg_helpers` below may append to `functions` in place.
+    win_ir = unary_task_ir(window)
     avg_helpers = inject_avg_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
     n_buckets = buckets_for_envelope(shuffle_partitions(workers), sources[sid])

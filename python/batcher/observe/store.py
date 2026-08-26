@@ -293,8 +293,12 @@ class ActivityStore:
                 stage.spill_bytes = int(fields.get("spill_bytes", 0) or 0)
                 stage.done = True
         elif event.kind == events.PROGRESS:
-            record.rows_seen += int(fields.get("rows", 0))
-            record.bytes_seen += int(fields.get("bytes", 0))
+            # `or 0` on both, matching `STAGE_END` above: the bus is best-effort and a sink
+            # that raises on a malformed payload is now *detached* after three strikes, so
+            # one publisher passing `None` where a number was documented would cost the
+            # dashboard its whole feed rather than one event.
+            record.rows_seen += int(fields.get("rows", 0) or 0)
+            record.bytes_seen += int(fields.get("bytes", 0) or 0)
         elif event.kind == events.DECISION:
             record.decisions.append(dict(fields))
         elif event.kind == events.QUERY_END:

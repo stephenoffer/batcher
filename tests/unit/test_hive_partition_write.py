@@ -143,19 +143,32 @@ def test_the_partition_column_is_dropped_from_the_payload() -> None:
 
 
 def test_cost_does_not_grow_with_the_partition_count() -> None:
-    """The whole point. The mask form was linear in partitions; this must not be."""
+    """The whole point. The mask form was linear in partitions; this must not be.
+
+    Timed as the **minimum** of several runs, not a single sample. Contention can only
+    ever add time to a measurement, never remove it, so the minimum is the estimator that
+    survives a shared box -- and this box is shared: several agent sessions run suites here
+    at once, and a single-sample version of this assertion failed at load average 22 while
+    passing standalone on the same commit. Taking one sample of each made the test report
+    the machine's load rather than the algorithm's complexity.
+    """
     import time
 
     rows = 100_000
+    repeats = 5
 
     def elapsed(partitions: int) -> float:
         table = pa.table({"v": list(range(rows)), "p": [str(i % partitions) for i in range(rows)]})
-        start = time.perf_counter()
-        list(FileSink._hive_partition(table, ["p"]))
-        return time.perf_counter() - start
+
+        def once() -> float:
+            start = time.perf_counter()
+            list(FileSink._hive_partition(table, ["p"]))
+            return time.perf_counter() - start
+
+        return min(once() for _ in range(repeats))
 
     few, many = elapsed(50), elapsed(5000)
 
     # A 100x increase in partitions must not cost anything like 100x the time. The mask
-    # form did exactly that; a generous bound still fails it and is robust to a noisy box.
+    # form did exactly that, by a margin this bound catches many times over.
     assert many < few * 20, f"{few:.3f}s at 50 partitions, {many:.3f}s at 5000"

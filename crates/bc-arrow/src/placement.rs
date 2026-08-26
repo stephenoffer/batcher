@@ -38,6 +38,7 @@ use crate::topology::{affinity_cpus, numa_node_cpus};
 /// cannot be read, which callers must treat as "do not pin" rather than falling back to a
 /// modulo over the core count — an unpinned thread is strictly better than one pinned to a
 /// CPU chosen by guesswork.
+#[must_use]
 pub fn pinning_order() -> Vec<usize> {
     let allowed = affinity_cpus();
     let siblings = core_groups(&allowed);
@@ -136,8 +137,7 @@ fn node_lookup() -> impl Fn(usize) -> usize {
         nodes
             .iter()
             .find(|(_, cpus)| cpus.binary_search(&cpu).is_ok())
-            .map(|(id, _)| *id)
-            .unwrap_or(0)
+            .map_or(0, |(id, _)| *id)
     }
 }
 

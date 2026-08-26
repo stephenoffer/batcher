@@ -84,7 +84,7 @@ def test_serving_udf_appends_outputs():
         def predict(self, inputs):
             return {"pred": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: Fake(), input_columns=["x"], output_columns=["pred"])()
+    udf = serving_udf(Fake, input_columns=["x"], output_columns=["pred"])()
     out = udf(pa.record_batch({"x": pa.array([1, 2, 3]), "id": [7, 8, 9]}))
     assert out.column("pred").to_pylist() == [2, 4, 6]
     assert out.column("id").to_pylist() == [7, 8, 9]  # other columns preserved
@@ -101,7 +101,7 @@ def test_serving_udf_handles_tensor_columns():
             return {"cls": inputs["img"].reshape(inputs["img"].shape[0], -1).sum(axis=1)}
 
     imgs = to_tensor_column(np.arange(2 * 4 * 4 * 3, dtype=np.uint8).reshape(2, 4, 4, 3))
-    udf = serving_udf(lambda: Fake(), input_columns=["img"], output_columns=["cls"])()
+    udf = serving_udf(Fake, input_columns=["img"], output_columns=["cls"])()
     udf(pa.record_batch({"img": imgs}))
     assert captured["shape"] == (2, 4, 4, 3)  # tensor column kept its shape
 

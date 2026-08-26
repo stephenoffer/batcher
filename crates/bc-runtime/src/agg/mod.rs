@@ -195,14 +195,51 @@ impl AggFunc {
     /// `mean` and `arg_min`/`arg_max` are 2; `var`/`stddev` are 3). The spill path
     /// *and* the distributed flatten/unflatten use this to pack/unpack a
     /// [`Partial`]'s state columns — it is the single source of truth for arity.
+    ///
+    /// **Exhaustive on purpose — do not add a `_` arm.** This one number decides how many
+    /// columns the distributed shuffle packs per aggregate and how many it unpacks on the
+    /// other side, so a variant answering `1` when it carries three states does not fail: it
+    /// reads the *next* aggregate's first state column as its own second and third, and the
+    /// query returns a plausible wrong number. Single-node never packs anything, so every
+    /// local test passes. A wildcard arm makes that the default for a variant nobody
+    /// remembered; without one, adding a variant does not compile until its arity is stated.
+    #[must_use]
     pub fn state_arity(self) -> usize {
         match self {
+            // Two: a value and the counter or key that qualifies it.
             AggFunc::Mean | AggFunc::ArgMin | AggFunc::ArgMax | AggFunc::KahanSum => 2,
             AggFunc::Mode | AggFunc::ApproxTopK(_) => 2, // distinct values AND their counts
+            // Three: (sum, sum_of_squares, count).
             AggFunc::Var | AggFunc::Stddev => 3,
+            // Five / six: the sum-of-powers moment states.
             AggFunc::Skewness | AggFunc::Kurtosis | AggFunc::KurtosisPop => 5,
             AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => 6,
-            _ => 1,
+            // One: a scalar accumulator, a sketch, or a per-group value list.
+            AggFunc::CountStar
+            | AggFunc::Count
+            | AggFunc::CountDistinct
+            | AggFunc::Sum
+            | AggFunc::Min
+            | AggFunc::Max
+            | AggFunc::Median
+            | AggFunc::Quantile(_)
+            | AggFunc::QuantileDisc(_)
+            | AggFunc::ListAgg
+            | AggFunc::BoolAnd
+            | AggFunc::BoolOr
+            | AggFunc::ApproxCountDistinct
+            | AggFunc::ApproxQuantile(_)
+            | AggFunc::NLength(_)
+            | AggFunc::LCount(_)
+            | AggFunc::AuN
+            | AggFunc::Product
+            | AggFunc::BitAnd
+            | AggFunc::BitOr
+            | AggFunc::BitXor
+            | AggFunc::Histogram
+            | AggFunc::AnyValue
+            | AggFunc::Entropy
+            | AggFunc::Mad => 1,
         }
     }
 
@@ -266,6 +303,7 @@ pub struct AggCall {
 
 impl AggCall {
     /// A single-input aggregate call (no ordering key).
+    #[must_use]
     pub fn new(func: AggFunc, values: Option<ArrayRef>) -> Self {
         Self {
             func,
@@ -275,6 +313,7 @@ impl AggCall {
     }
 
     /// A two-input aggregate call (`arg_min`/`arg_max`): value + ordering key.
+    #[must_use]
     pub fn with_key(func: AggFunc, values: Option<ArrayRef>, key: Option<ArrayRef>) -> Self {
         Self { func, values, key }
     }
@@ -372,6 +411,7 @@ pub fn partial(
 ///
 /// A caller may pin a number instead (`EngineConfig.radix_parallel_threshold`); that is a
 /// performance override, never a semantic one, since both paths compute the same relation.
+#[must_use]
 pub fn radix_parallel_threshold(configured: usize) -> usize {
     if configured > 0 {
         configured

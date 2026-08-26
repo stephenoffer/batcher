@@ -25,8 +25,13 @@ import random
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import batcher as bt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 #: Repeats per measurement. The linear metrics are fast enough that one sample is noise.
 REPEATS = 3
@@ -71,6 +76,17 @@ def _time(label: str, build_metric: Callable[[], object], ds: bt.Dataset) -> flo
 
 def main() -> None:
     """Time every generation metric over one corpus and report them together."""
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     rows = int(sys.argv[1]) if len(sys.argv) > 1 else 50_000
     tokens = int(sys.argv[2]) if len(sys.argv) > 2 else 40
     ds = build(rows, tokens)

@@ -160,7 +160,7 @@ def iter_torch_batches(
     move = device if device not in (None, "cpu") else None
     to_torch = partial(arrays_to_torch, zero_copy=zero_copy)
     cast = _dtype_caster(dtypes)
-    depth = prefetch_batches if prefetch_batches else 0
+    depth = prefetch_batches or 0
     mover = DeviceMover(move, pin_memory=pin_memory, depth=depth) if move is not None else None
 
     warn = collate_fn is None  # a collate_fn receives every column, so nothing is dropped

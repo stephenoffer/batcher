@@ -166,9 +166,84 @@ print(trades.join_asof(quotes, on="t", by="sym", direction="nearest").sort("sym"
 Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or
 temporal `on` column. A string key still orders fine for a plain backward or forward search.
 
+## Lookup joins against a key-value store
+
+Every join above reads its right side as a dataset, which means reading all of it. That is
+the right thing when the dimension is small enough to broadcast or when you need a
+consistent snapshot of it. It is the wrong thing when the dimension is a hundred million
+rows in Redis and the data touches ten thousand of them.
+
+{py:meth}`lookup_join() <batcher.Dataset.lookup_join>` asks the store for the keys each
+batch actually contains, instead of reading the store:
+
+```python
+# docs: skip
+enriched = orders.lookup_join(
+    "redis://localhost:6379/0",
+    on="customer_id",
+    schema={"name": "string", "tier": "int64"},
+    prefix="cust_",
+)
+```
+
+The cost scales with the distinct keys in your data, not with the size of the store, which
+is what makes the join possible at all when the store is far larger than memory. It works
+unchanged single-node, distributed, and over an unbounded source, because the enrichment
+happens per batch. `rocksdb:///path/to/db` reads an embedded database instead of a server.
+
+`how="left"` keeps every row and null-fills the misses; `how="inner"` drops them. A right or
+full outer join is not offered, because producing one would mean enumerating the store,
+which is the scan this exists to avoid.
+
+### Why it is fast, and what it costs
+
+Repeated keys are the whole mechanism. Each worker keeps an LRU of what it has looked up,
+so a fact stream that hits the same few thousand customers over and over pays for a few
+thousand lookups rather than a few million. It also caches **absences**, which is what stops
+an unmatched key from costing a round trip on every batch. On a dirty join key that is the
+larger of the two wins.
+
+| Option | Meaning |
+| --- | --- |
+| `cache_size` | Entries each worker holds, hits and absences together. `0` disables the cache, which is how you measure what it is buying. |
+| `cache_ttl` | How long an entry stays usable (`"30s"`, `"5m"`). `None` keeps it for the life of the worker. |
+| `batch_size` | Rows per lookup batch. `None`, the default, is right unless you have measured otherwise. Larger batches mean fewer round trips and cheaper assembly; see the warning below. |
+| `num_workers` | How many workers issue lookups at once. This is what hides the store's latency, at the cost of one cache per worker. |
+
+The cache is **per worker**, not shared between them, because sharing one would put a lock
+in front of the thing the workers exist to do concurrently. So `num_workers=8` warms eight
+caches and issues up to eight times the round trips for the same distinct keys. That is the
+right trade against a store whose latency you are hiding, and the wrong one against a store
+you are close to rate-limiting. Flink's lookup join has the same property.
+
+:::{warning}
+Setting `batch_size` small is the one way to make a lookup join slow. The per-batch cost is
+one unit of work per *distinct key in the batch*, so a batch smaller than the distinct-key
+count pays for the same keys over and over. On a two-million-row probe over five thousand
+distinct keys, `batch_size=16384` runs seven times slower than the engine's own batching.
+Leave it alone unless you have measured a reason not to.
+:::
+
+What you give up is a consistent snapshot. The store is read as it stands when each batch
+arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer
+is what you meant, read the dimension as a dataset and use `join`.
+
+On this hardware, against an in-process store, a lookup join runs about twice as slow as the
+hash join it replaces while reading 0.25% of the dimension. That ratio is the mechanism's
+overhead, not its benefit: the case it is for is a store the hash join cannot read at all
+without pulling every row of it over the network. Reach for it when the dimension lives
+somewhere else, not to beat a join over data you already have. See
+`benchmarks/internals/cache_bench.py`.
+
+`schema` is required and cannot be inferred. A join's output columns cannot depend on which
+keys the first batch happened to contain, or a batch that matched nothing would have a
+different shape from the batch before it, and two workers would disagree about the shape of
+the same result.
+
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: summarize joined results.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: per-row computations over partitions.
-- {doc}`Dataset API </api/relational/dataset>`: the `join` and `join_asof` reference.
+- {doc}`Dataset API </api/relational/dataset>`: the `join`, `join_asof` and `lookup_join` reference.
+- {doc}`Caching results </user-guide/operate/tuning/caching>`: the other place a key-value store speeds a query up, by holding whole results.
 - {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join, as a script.

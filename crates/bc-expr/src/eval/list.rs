@@ -435,7 +435,7 @@ pub(crate) fn eval_list_binary(
                 if n == 0 {
                     b.append_null(); // no positions to agree on
                 } else {
-                    b.append_value(s.agree as f64 / n as f64)
+                    b.append_value(s.agree as f64 / n as f64);
                 }
             }
             ListBinaryFunc::CosineSimilarity => {
@@ -527,7 +527,7 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
 
     if let ListFunc::Len = func {
         let n = (0..list.len())
-            .map(|i| (!list.is_null(i)).then(|| (offsets[i + 1] - offsets[i]) as i64));
+            .map(|i| (!list.is_null(i)).then(|| i64::from(offsets[i + 1] - offsets[i])));
         return Ok(Arc::new(n.collect::<Int64Array>()));
     }
 
@@ -691,7 +691,9 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             sorted.sort_by(|a, b| float_total_cmp(*a, *b));
             let mid = sorted.len() / 2;
             let m = if sorted.len() % 2 == 0 {
-                (sorted[mid - 1] + sorted[mid]) / 2.0
+                // Overflow-free: `(a + b) / 2.0` reports `inf` when both middles are
+                // large finite doubles. See `bc_runtime::agg::median`.
+                f64::midpoint(sorted[mid - 1], sorted[mid])
             } else {
                 sorted[mid]
             };

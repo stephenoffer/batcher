@@ -68,7 +68,7 @@ _UNARY_CASES = [
     ("date_fn", lambda inner: DateFunc("year", inner), col("t"), col("t")),
     ("date_trunc", lambda inner: DateTrunc(inner, "month"), col("t"), col("t")),
     ("strftime", lambda inner: Strftime(inner, "%Y"), col("t"), col("t")),
-    ("nan_check", lambda inner: IsNan(inner), col("f"), lit(1.0)),
+    ("nan_check", IsNan, col("f"), lit(1.0)),
 ]
 
 

@@ -163,6 +163,62 @@ def python_tags(dotted: str) -> set[str]:
     }
 
 
+# --- Second check: nothing edits a memoized `to_ir()` result ------------------
+#
+# `LogicalPlan.__init_subclass__` memoizes `to_ir`, `available_columns` and `available_schema`
+# in the instance `__dict__`, so what a node hands back **is** its own cached value, not a
+# copy. Four distributed paths
+# re-root an operator on the bucket its reducer holds, and two of them did it by writing
+# `ir["input"] = task_scan_ir()` into that dict — which left the plan reading the
+# operator's child as a bare `scan(source 0)` for the rest of the process. The batch path
+# then returned the wrong rows (or raised `unknown column`) on the *next* `collect()` of the
+# same `Dataset`, with every distributed test green, because the corruption is invisible
+# until the plan is lowered again.
+#
+# The seam that makes it unnecessary is `shape_ir()` + `plan.ir_specs.unary_task_ir` /
+# `binary_task_ir`, which build the operator's shape with no input at all. This check keeps
+# the old spelling from coming back.
+_MUTATION_ROOTS = ("python/batcher",)
+
+#: Every method `LogicalPlan.__init_subclass__` memoizes, with the writes that would corrupt
+#: the cached value. `to_ir` is the one this check was written for and the only one that has
+#: gone wrong so far; the other two are here because they are cached by the same mechanism and
+#: nothing else says so. `available_columns` hands back a **list**, so appending to it is the
+#: shape to watch — and the memo helper's own docstring asserts that nothing does, which was
+#: an unverified claim about every call site in the tree until this read them.
+_MEMOIZED_WRITES = {
+    "to_ir": r"\b{v}\[[^\]]+\]\s*=|\b{v}\.(?:pop|update|setdefault|clear)\(",
+    "available_columns": (
+        r"\b{v}\[[^\]]+\]\s*=|"
+        r"\b{v}\.(?:append|extend|insert|remove|pop|sort|reverse|clear)\("
+    ),
+    "available_schema": r"\b{v}\.(?:pop|update|setdefault|clear)\(",
+}
+
+_ASSIGN_MEMOIZED = re.compile(
+    r"^\s*(\w+)\s*=\s*[\w\.\[\]]+\.(" + "|".join(_MEMOIZED_WRITES) + r")\(\)\s*$"
+)
+
+
+def _to_ir_mutations() -> list[str]:
+    """Every `x = <node>.<memoized>()` followed by a write into `x`, as `path:line` strings."""
+    found: list[str] = []
+    for root in _MUTATION_ROOTS:
+        for path in sorted((REPO / root).rglob("*.py")):
+            lines = path.read_text().splitlines()
+            for i, line in enumerate(lines):
+                m = _ASSIGN_MEMOIZED.match(line)
+                if not m:
+                    continue
+                var, method = m.group(1), m.group(2)
+                write = re.compile(_MEMOIZED_WRITES[method].replace("{v}", var))
+                for nxt in lines[i + 1 : i + 9]:
+                    if write.search(nxt):
+                        found.append(f"{path.relative_to(REPO)}:{i + 1} ({method})")
+                        break
+    return found
+
+
 def main() -> int:
     sys.path.insert(0, str(REPO / "python"))
     failures = 0
@@ -181,15 +237,30 @@ def main() -> int:
         else:
             print(f"ok   {enum:18} {len(rust):3d} tags == {dotted}")
 
-    if failures:
-        print(
-            f"\nlint-ir-contract: FAIL ({failures} vocabulary/vocabularies drifted).\n"
-            "A tag Python emits that Rust rejects is a hard runtime error; a tag Rust\n"
-            "accepts that Python never emits is dead wire surface. Change both sides in\n"
-            "the same commit (CLAUDE.md invariant #8)."
-        )
+    mutations = _to_ir_mutations()
+    if mutations:
+        print("\nFAIL a memoized `to_ir()` result is edited in place at:")
+        for where in mutations:
+            print(f"  {where}")
+
+    if failures or mutations:
+        if failures:
+            print(
+                f"\nlint-ir-contract: FAIL ({failures} vocabulary/vocabularies drifted).\n"
+                "A tag Python emits that Rust rejects is a hard runtime error; a tag Rust\n"
+                "accepts that Python never emits is dead wire surface. Change both sides in\n"
+                "the same commit (CLAUDE.md invariant #8)."
+            )
+        if mutations:
+            print(
+                "\nlint-ir-contract: FAIL (a plan's own lowered IR is mutated).\n"
+                "`to_ir()` is memoized in the node's `__dict__`, so that dict IS the plan.\n"
+                "Re-root an operator with `plan.ir_specs.unary_task_ir(node)` (or\n"
+                "`binary_task_ir`), which builds it from `shape_ir()` and never touches the\n"
+                "cache; add `shape_ir()` to the node if it has none."
+            )
         return 1
-    print(f"\nlint-ir-contract: OK ({len(PAIRS)} vocabularies agree)")
+    print(f"\nlint-ir-contract: OK ({len(PAIRS)} vocabularies agree, no IR mutated in place)")
     return 0
 
 

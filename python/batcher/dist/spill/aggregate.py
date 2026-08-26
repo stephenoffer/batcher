@@ -49,6 +49,7 @@ from batcher.plan.expr_ir import col
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import (
     Aggregate,
+    AsofJoin,
     Distinct,
     Filter,
     Join,
@@ -58,10 +59,13 @@ from batcher.plan.logical import (
     Projection,
     Sort,
     Window,
+    hoist_sort_key,
+    hoist_window_keys,
 )
 
 __all__ = [
     "execute_spilling_aggregate",
+    "narrow_to_stage",
     "spill_collect",
 ]
 
@@ -138,18 +142,45 @@ def spill_collect(
         )
     # The ordering/binary breakers live in `spill_breakers` (imported lazily so this
     # module stays import-cycle-free: `spill_breakers` depends on this one's helpers).
-    if isinstance(plan, (Join, Sort, Window)):
+    if isinstance(plan, (AsofJoin, Join, Sort, Window)):
         from batcher.dist import spill_breakers as br
 
-        if isinstance(plan, Join):
+        # An ASOF join with `by` keys grace-partitions on exactly the same argument an
+        # equi-join does -- rows that can match share a `by` group, so hashing on `by` puts
+        # them in one bucket -- so it rides the same path rather than a second one.
+        # `supports_spilling_join` refuses the keyless form, which needs the range
+        # decomposition instead.
+        if isinstance(plan, (AsofJoin, Join)):
             # A join whose side spans several sources cannot be grace-partitioned (see
             # `supports_spilling_join`); decline so the caller runs it in memory rather
             # than asserting.
             if br.supports_spilling_join(plan):
                 return br.execute_spilling_join(plan, sources, num_partitions)
             return None
+        # A *computed* shuffle key — `sort(col("a") + col("b"))`,
+        # `partition_by=[col("v") % 4]` — is materialized as a hidden column first, exactly
+        # as the distributed dispatcher does it and through the same
+        # `plan.logical.hoist_sort_key` / `hoist_window_keys`. Both cut the operator into
+        # pieces on the same partitioner, which reads a key's values from a *column*, so
+        # without this the identical query distributed and then declined to spill: it fell
+        # back to the in-memory kernel under the very memory envelope the spill exists for.
+        # `keep` is the operator's original output, so the hidden column is dropped from the
+        # result — in pyarrow, since the rows are already materialized here.
+        #
+        # Applied to a *copy*, and only where the spilling path then accepts it: falling
+        # through with the rewrite still in place would carry the hidden column into the
+        # generic peeling path below and return it to the caller as a real output column.
+        keep: tuple[str, ...] | None = None
+        if isinstance(plan, Sort) and not br.supports_spilling_sort(plan, sources):
+            hoisted = hoist_sort_key(plan)
+            if hoisted is not None and br.supports_spilling_sort(hoisted[0], sources):
+                plan, keep = hoisted
+        elif isinstance(plan, Window) and not br.supports_spilling_window(plan):
+            hoisted = hoist_window_keys(plan)
+            if hoisted is not None and br.supports_spilling_window(hoisted[0]):
+                plan, keep = hoisted
         if isinstance(plan, Sort) and br.supports_spilling_sort(plan, sources):
-            return br.execute_spilling_sort(plan, sources, num_partitions)
+            return _dropping(br.execute_spilling_sort(plan, sources, num_partitions), keep)
         if isinstance(plan, Window):
             # PARTITION BY window → grace-partition by those keys; a *global* window
             # (no PARTITION BY, single plain-column ORDER BY) → ordered-bucket offset.
@@ -167,8 +198,8 @@ def spill_collect(
             if gen is not None:
                 batches = list(gen)
                 if batches:
-                    return pa.Table.from_batches(batches)
-                return empty_result_table(plan, plan.available_columns())
+                    return _dropping(pa.Table.from_batches(batches), keep)
+                return _dropping(empty_result_table(plan, plan.available_columns()), keep)
     # Peel the row-wise / limit operators sitting *above* a spillable breaker (e.g. the
     # output `Project` of a `COUNT(DISTINCT)`, whose raw plan is `Project → Aggregate`),
     # spill the breaker out-of-core, then re-apply the peeled ops to its bounded result.
@@ -192,7 +223,7 @@ def spill_collect(
         # (tests/integration/test_spill_route_is_taken.py).
         if not isinstance(node, Sort) and any(isinstance(n, Limit) for n in above):
             return None
-        inner = spill_collect(node, sources, num_partitions)
+        inner = spill_collect(narrow_to_stage(above, node), sources, num_partitions)
         if inner is None:
             return None
         from batcher.dist.executors.partition_io import _apply_above
@@ -208,6 +239,97 @@ def spill_collect(
     # more than one pass does. The bound for this shape has to come from a streaming source
     # handoff at the FFI boundary, not from re-chunking on the Python side.
     return None
+
+
+def narrow_to_stage(above: list[LogicalPlan], node: LogicalPlan) -> LogicalPlan:
+    """`node` with a `Project` inserted below it selecting only what this stage needs.
+
+    A pass-through breaker narrows nothing by itself: a sort emits every column it is given
+    and a window those plus its aliases, so every out-of-core path below reads the whole
+    table. What narrows the read is the projection the caller just peeled into `above` — and
+    the out-of-core path is exactly where that costs the most, because every unread column is
+    also decoded, hash-partitioned, compressed, written to a bucket file and read back.
+    `map_projection`'s own docstring makes the point for the source read; this extends it to
+    the columns the stage as a whole can prove it never needs.
+
+    Rewriting the *plan* rather than threading a projection through six signatures is what
+    keeps this correct by construction: every path below — the source read, the bucket write,
+    the reducer, the empty-result schema — derives from the plan it is handed, so none of
+    them can disagree about which columns exist.
+
+    The distributed dispatcher answers the same question with
+    `dist.executors.partition_io.stage_pushdown`, and the two are deliberately not one
+    function: that one produces a projection for the *source read* and may therefore speak in
+    source columns alone, while this one puts a `Project` under the breaker and so must also
+    keep every column the plan derived. See the note on `stage_pushdown`.
+
+    `required_columns_per_source` is asked of `above` rebuilt over `node`, so a `Filter` that
+    was peeled upward keeps the columns it tests even though the breaker does not use them.
+    Returns `node` unchanged whenever the analysis cannot narrow (an opaque node, a source
+    that needs everything, a plan whose columns cannot be resolved), so this is only ever an
+    optimization.
+    """
+    import dataclasses
+
+    from batcher.dist.executors.plan_analysis import _single_source, scanned_source_ids
+    from batcher.plan.logical import project_columns
+
+    if not _single_source(node):
+        return node
+    try:
+        from batcher.kyber.rules.projections import required_columns_per_source
+
+        stage: LogicalPlan = node
+        for outer in reversed(above):
+            stage = dataclasses.replace(outer, input=stage)
+        source_id = next(iter(scanned_source_ids(node)))
+        needed = required_columns_per_source(stage).get(source_id)
+        available = node.input.available_columns()
+    except Exception:  # pragma: no cover - an opaque node the analysis cannot walk
+        return node
+    if not needed:
+        return node
+    # `needed` names **source** columns, but `available` may hold columns the plan *derived*
+    # below the breaker — a `with_columns` the breaker then keys on, or a hoisted shuffle key.
+    # Dropping one of those is not a missed optimization, it is a broken plan: the breaker's
+    # own `__post_init__` re-validates its keys against the narrowed input and raises
+    # `ColumnNotFoundError`. So a column is dropped only when it is a source column the stage
+    # proved it does not need; anything the plan computed is kept regardless. That still
+    # removes the whole unread tail of a wide table, which is the entire win.
+    source_columns = _scan_columns(node)
+    if source_columns is None:
+        return node
+    keep = [c for c in available if c in set(needed) or c not in source_columns]
+    if not keep or len(keep) == len(available):
+        return node
+    return dataclasses.replace(node, input=project_columns(node.input, keep))
+
+
+def _scan_columns(node: LogicalPlan) -> set[str] | None:
+    """The column names the single scan beneath `node` reads, or `None` if there isn't one.
+
+    Needed to tell a column the *source* supplies from one the plan *computed*, which is the
+    distinction `required_columns_per_source` cannot make on its own: it answers about the
+    source, and its answer is only safe to subtract from a set that contains nothing else.
+    """
+    from batcher.plan.logical import Scan
+
+    seen: LogicalPlan | None = node
+    while seen is not None and not isinstance(seen, Scan):
+        seen = getattr(seen, "input", None)
+    if not isinstance(seen, Scan) or seen.schema is None:
+        return None
+    return set(seen.schema.arrow.names)
+
+
+def _dropping(table: pa.Table, keep: tuple[str, ...] | None) -> pa.Table:
+    """`table` cut back to `keep`, or unchanged when no key was hoisted.
+
+    The hidden shuffle key a hoist materializes is real data in the spilled result, so the
+    caller's relation is the result minus that column. Selecting by name is exact and costs
+    nothing: the columns are already in memory and Arrow selection is a buffer reference.
+    """
+    return table if keep is None else table.select(list(keep))
 
 
 def execute_spilling_aggregate(

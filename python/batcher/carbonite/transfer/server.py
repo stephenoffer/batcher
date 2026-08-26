@@ -81,7 +81,7 @@ class FlightShuffleServer:
         tls: ShuffleTlsMaterial | None = None,
         port_range: tuple[int, int] | None = None,
     ) -> None:
-        port_min, port_max = port_range if port_range else (None, None)
+        port_min, port_max = port_range or (None, None)
         if tls is None:
             self._srv = engine().FlightShuffleServer(
                 advertise_host, token, None, None, None, port_min, port_max

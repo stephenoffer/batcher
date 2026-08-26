@@ -69,7 +69,7 @@ def empty(duck):
 _CASES = [
     (
         "push_upper",
-        lambda: bt.when(col("a") > lit(1)).then(lit("ab")).otherwise(lit("cd")).str.upper(),
+        bt.when(col("a") > lit(1)).then(lit("ab")).otherwise(lit("cd")).str.upper,
         "upper(CASE WHEN a > 1 THEN 'ab' ELSE 'cd' END)",
     ),
     (
@@ -79,7 +79,7 @@ _CASES = [
     ),
     (
         "push_year",
-        lambda: bt.when(col("a") > lit(1)).then(col("ts")).otherwise(col("ts")).dt.year(),
+        bt.when(col("a") > lit(1)).then(col("ts")).otherwise(col("ts")).dt.year,
         "year(CASE WHEN a > 1 THEN ts ELSE ts END)",
     ),
     (

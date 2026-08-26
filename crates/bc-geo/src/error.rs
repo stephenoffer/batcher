@@ -55,6 +55,7 @@ impl GeoError {
     /// `Invalid` is deliberately excluded: it reports a caller mistake (a negative
     /// buffer quadrant count, a grid precision out of range) that is a property of the
     /// *plan*, not of one row, so nulling it would hide the bug on every row.
+    #[must_use]
     pub fn is_row_local(&self) -> bool {
         matches!(self, GeoError::Parse { .. } | GeoError::Unsupported { .. })
     }

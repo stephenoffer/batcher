@@ -122,7 +122,7 @@ pub(super) fn row_number_top_k(
         let n = len[g] as usize;
         if n < k {
             heap[base + n] = entry;
-            sift_up(&mut heap[base..base + n + 1], n);
+            sift_up(&mut heap[base..=(base + n)], n);
             len[g] = (n + 1) as u32;
         } else if entry < heap[base] {
             heap[base] = entry;

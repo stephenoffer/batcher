@@ -129,7 +129,7 @@ def test_the_translated_path_is_tried_before_the_legacy_group_by(monkeypatch):
     def _note(name):
         def _fn(*_args, **_kwargs):
             called.append(name)
-            return None
+            return
 
         return _fn
 

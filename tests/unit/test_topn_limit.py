@@ -22,7 +22,7 @@ from batcher.kyber.rules.extra.topn_limit import (
     push_offset_limit_into_union,
 )
 from batcher.kyber.stats.estimator import StatsEstimator
-from batcher.plan.logical import Distinct, Limit, RowId, Scan, Union
+from batcher.plan.logical import Distinct, Limit, Project, RowId, Scan, Union
 from batcher.plan.stats import Provenance
 
 
@@ -289,3 +289,75 @@ def test_unfused_distinct_omits_the_limit_from_the_ir():
     distinct_ir = _find_op(_ir(ds), "distinct")
     assert distinct_ir is not None
     assert "limit" not in distinct_ir
+
+
+# --- the branch-cap guard must look through a projection ----------------------
+#
+# `push_limit_into_union` / `push_offset_limit_into_union` cap each UNION ALL branch with a
+# `Limit`, and both docstrings promise the "already capped?" guard makes them fire once and
+# then rest. They did not: `push_limit_through_project` runs in the same phase and rewrites
+# `Limit(Project(x))` into `Project(Limit(x))`, so on the next iteration every branch is a
+# bare `Project` again, the guard sees no `Limit`, and the cap is reinstalled on top of the
+# one already there. The two rules then trade the plan back and forth for the whole
+# `fixpoint_iterations` budget — the cycle `ml.smote`'s plan reproduced, recorded as a
+# strict xfail in `test_kyber_constant_key_fixpoint.py` until it was closed.
+#
+# Every rewrite involved is semantics-preserving and a doubled cap is still a cap, so the
+# answers were never wrong; what was wrong is that the plan depended on where the iteration
+# cap landed, and that ~20 whole-plan passes were spent reaching it.
+
+
+def _projected_union(offset=0, n=2):
+    """`Limit(UNION ALL(Project(a), Project(b)), n, offset)` — the shape that cycled."""
+    left = _ds(3).select(y=bt.col("k") + 1)
+    right = _ds(4).select(y=bt.col("k") + 1)
+    return left.union(right).limit(n, offset=offset)._plan
+
+
+def test_push_limit_into_union_does_not_recap_a_branch_capped_below_a_project():
+    from batcher.kyber.rules.algebraic.identities import (
+        push_limit_into_union,
+        push_limit_through_project,
+    )
+
+    once = push_limit_into_union(_projected_union(), None)
+    assert once is not None, "the rule must still fire on an uncapped union"
+    # What the same phase does next: the branch caps sink through their projections.
+    sunk = tuple(push_limit_through_project(b, None) or b for b in once.input.inputs)
+    assert all(isinstance(b, Project) for b in sunk), "the branch caps must have sunk"
+    rebuilt = Limit(Union(sunk, distinct=False), once.n, once.offset)
+    assert push_limit_into_union(rebuilt, None) is None, "the rule re-capped a capped branch"
+
+
+def test_push_offset_limit_into_union_does_not_recap_a_branch_capped_below_a_project():
+    """The `offset > 0` companion carried the identical guard, and the identical defect."""
+    from batcher.kyber.rules.algebraic.identities import push_limit_through_project
+
+    once = push_offset_limit_into_union(_projected_union(offset=3), None)
+    assert once is not None
+    sunk = tuple(push_limit_through_project(b, None) or b for b in once.input.inputs)
+    assert all(isinstance(b, Project) for b in sunk)
+    rebuilt = Limit(Union(sunk, distinct=False), once.n, once.offset)
+    assert push_offset_limit_into_union(rebuilt, None) is None
+
+
+def test_caps_rows_sees_through_a_project_and_nothing_else():
+    """The guard's own contract: a projection is transparent, an aggregate is not."""
+    from batcher.kyber.rules.algebraic.identities import _caps_rows
+
+    capped = _ds(3).limit(2)._plan
+    assert _caps_rows(capped)
+    assert _caps_rows(Project(capped, _ds(3).select("k")._plan.items))
+    assert not _caps_rows(_ds(3)._plan)
+    # An aggregate collapses rows rather than passing them through, so a cap beneath it
+    # says nothing about the relation above it — and the descent must stop.
+    assert not _caps_rows(_ds(3).limit(2).group_by("k").agg(c=bt.col("v").count())._plan)
+
+
+def test_the_union_limit_still_returns_the_right_rows():
+    """The cycle never changed an answer, and neither does closing it."""
+    left = _ds(3).select(y=bt.col("k") + 1)
+    right = _ds(4).select(y=bt.col("k") + 1)
+    assert left.union(right).limit(2).collect().num_rows == 2
+    assert left.union(right).limit(2, offset=3).collect().num_rows == 2
+    assert left.union(right).limit(100).collect().num_rows == 7

@@ -95,8 +95,8 @@ def test_a_decimal_column_scaled_by_a_float_literal_still_maps(expr, lo, hi):
         Provenance.EXACT,
         {
             "x": ColumnStat(
-                min=Decimal("0"),
-                max=Decimal("100"),
+                min=Decimal(0),
+                max=Decimal(100),
                 ndv=101.0,
                 null_count=0,
                 provenance=Provenance.EXACT,

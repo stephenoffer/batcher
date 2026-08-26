@@ -121,3 +121,49 @@ def test_a_key_the_hoist_cannot_lower_still_refuses_by_name():
     table = _table()
     with pytest.raises(Exception, match=r"(?i)window"):
         bt.sql("SELECT sum(x) OVER (PARTITION BY sum(x) OVER ()) AS s FROM ts", ts=table).collect()
+
+
+#: A window aggregate over a computed argument, one per aggregate the translator knows.
+#: `sum`/`avg`/`min`/`max`/`count` were hoisted; the rest were not, because the hoist list
+#: was written by hand beside the aggregate table instead of derived from it. So
+#: `sum(a + b) OVER (...)` worked and `bool_or(a > 0) OVER (...)` was refused — and a
+#: predicate is the only thing anyone passes `bool_or`, which made the one shape that
+#: matters the one that failed.
+_COMPUTED_ARG_WINDOWS = [
+    "bool_or(a > 0)",
+    "bool_and(a > 0)",
+    "bit_or(a + b)",
+    "bit_and(a + b)",
+    "bit_xor(a + b)",
+    "stddev(a * 1.0)",
+    "variance(a * 1.0)",
+    "median(a * 1.0)",
+    # The five that already worked, so a change that narrowed the set would be caught.
+    "sum(a + b)",
+    "avg(a * 1.0)",
+    "min(a - b)",
+    "max(a - b)",
+    "count(a + b)",
+]
+
+
+@pytest.mark.parametrize("fn", _COMPUTED_ARG_WINDOWS)
+@pytest.mark.parametrize("over", ["PARTITION BY g", "PARTITION BY g ORDER BY b", "ORDER BY b"])
+def test_every_window_aggregate_accepts_a_computed_argument(duck, fn, over):
+    t = pa.table(
+        {
+            "a": pa.array([1, -2, 3, 4, None], pa.int64()),
+            "b": pa.array([2, 3, 4, 5, 6], pa.int64()),
+            "g": pa.array(["x", "x", "y", "y", "x"]),
+        }
+    )
+    duck.register("t", t)
+    q = f"SELECT a, {fn} OVER ({over}) AS w FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+def test_the_hoisted_argument_column_does_not_reach_the_output():
+    """The hoist is an implementation detail; a `__bc_warg` column in the result is a bug."""
+    t = pa.table({"a": pa.array([1, -2], pa.int64()), "g": pa.array(["x", "x"])})
+    out = bt.sql("SELECT a, bool_or(a > 0) OVER (PARTITION BY g) AS w FROM t", t=t).collect()
+    assert out.column_names == ["a", "w"]

@@ -131,7 +131,7 @@ class _FakeConsumer:
         ready, self.pending = self.pending[:max_batch_size], self.pending[max_batch_size:]
         if ready:
             self._deliver(ready)
-        return None  # the real client returns nothing; the callback is the only channel
+        return  # the real client returns nothing; the callback is the only channel
 
     def close(self):
         self.closed += 1
