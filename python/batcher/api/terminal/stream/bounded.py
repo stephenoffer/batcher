@@ -19,9 +19,17 @@ import pyarrow as pa
 
 from batcher.api.terminal.stream.pipeline import _iter_streaming, _pushdown
 from batcher.io.source import Source, is_bounded
-from batcher.plan.logical import Distinct, LogicalPlan, RowId, Sample, is_streamable
+from batcher.plan.logical import (
+    AsofJoin,
+    Distinct,
+    LogicalPlan,
+    RowId,
+    Sample,
+    is_streamable,
+)
+from batcher.plan.visitor import scanned_source_ids
 
-__all__ = ["bounded_driver"]
+__all__ = ["asof_lookup_driver", "bounded_driver"]
 
 
 def bounded_driver(
@@ -88,3 +96,76 @@ def bounded_driver(
 
     driver = stream_distinct_on if keyed_dedup else stream_sample_n
     return driver(plan, sources[0], batch_size, projection=_pushdown(plan))
+
+
+def asof_lookup_driver(
+    asof: AsofJoin, sources: list[Source], batch_size: int | None
+) -> Iterator[pa.RecordBatch] | None:
+    """A **keyless** ASOF join, streamed by materializing only the right side.
+
+    The `by`-keyed form does not come here: it co-partitions on `by` and rides the grace join
+    (`spill_breakers.stream_spilling_join`), which is bounded on both sides and is the better
+    plan when the right is large. A keyless ASOF has no group to hash, so that decomposition
+    is unavailable and the shape materialized *both* sides instead.
+
+    It does not need a decomposition, because it is not a fold. Each left row's match is a
+    **lookup** into the right side — the nearest row at or before it, or after it, within
+    `tolerance` — and it depends on nothing but that row's `on` value and the right side
+    itself. No state carries from one left row to the next. So running the operator per left
+    batch against the whole right side yields exactly the rows the collected form yields, in
+    exactly the same order, and peak memory drops from the whole join to the right side alone.
+    That is the ordinary shape for this operator: a large fact stream against a smaller quote
+    or dimension table.
+
+    Verified before it was written, on all four match settings (`backward`, `forward`,
+    `nearest`, and a `tolerance`) and **row for row** rather than as a multiset — the output
+    order is the property a per-batch rewrite is most likely to change and a sorted comparison
+    would not see. Also verified with an *unsorted* left, since the operator emits in left-row
+    order either way.
+
+    The right side must be bounded, because it is materialized once up front; the left may be
+    unbounded, which is the direction that matters. Returns `None` when either condition fails,
+    leaving the caller's own path unchanged.
+    """
+    from batcher import core
+    from batcher.api.terminal.core import _collect
+
+    # The router calls this for **every** plan, above the single-source block, so the type
+    # test comes first. Without it the very next line reaches for `left_by` on whatever node
+    # is passing through — a `Limit`, a `Project` — and the router dies on an `AttributeError`
+    # for a shape that has nothing to do with ASOF joins.
+    if not isinstance(asof, AsofJoin):
+        return None
+    if asof.left_by or core.has_map_batches(asof) or not is_streamable(asof.left):
+        return None
+    right_ids = scanned_source_ids(asof.right)
+    if len(right_ids) != 1:
+        return None
+    right_id = next(iter(right_ids))
+    if not is_bounded(sources[right_id]):
+        return None
+
+    return _asof_batches(asof, sources, batch_size, _collect)
+
+
+def _asof_batches(asof, sources, batch_size, collect) -> Iterator[pa.RecordBatch]:
+    """Materialize the right once, then run the ASOF per left batch."""
+    import dataclasses
+
+    from batcher.io.source import InMemorySource
+    from batcher.plan.logical import Scan
+    from batcher.plan.schema import SchemaRef
+
+    right = collect(asof.right, sources, asof.right.available_columns())
+    right_source = InMemorySource(
+        right.to_batches() or [pa.RecordBatch.from_pylist([], schema=right.schema)]
+    )
+    right_scan = Scan(1, SchemaRef.from_arrow(right.schema))
+
+    for batch in _iter_streaming(asof.left, sources, batch_size):
+        left_source = InMemorySource([batch])
+        node = dataclasses.replace(
+            asof, left=Scan(0, SchemaRef.from_arrow(batch.schema)), right=right_scan
+        )
+        table = collect(node, [left_source, right_source], node.available_columns())
+        yield from table.to_batches()

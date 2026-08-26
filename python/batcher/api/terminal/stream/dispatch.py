@@ -32,7 +32,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
-from batcher.api.terminal.stream.bounded import bounded_driver
+from batcher.api.terminal.stream.bounded import asof_lookup_driver, bounded_driver
 from batcher.api.terminal.stream.pipeline import _apply_peeled, _iter_streaming, _pushdown
 from batcher.api.terminal.stream.rebatch import _rebatch_exact, _take
 from batcher.api.terminal.stream.static_join import (
@@ -217,6 +217,15 @@ def _iter_batches(
             "result to a bounded source before joining the next stream, or restructure "
             "to a single two-stream join."
         )
+
+    # A keyless ASOF is a lookup, not a fold: each left row's match depends on the right
+    # side alone, so the right materializes once and the left streams past it. This must
+    # sit *above* the single-source block below — an ASOF has two sources, so placing it
+    # inside made it silently unreachable while every correctness test still passed.
+    asof_stream = asof_lookup_driver(plan, sources, batch_size)
+    if asof_stream is not None:
+        yield from asof_stream
+        return
 
     if len(sources) == 1:
         if is_streamable(plan):

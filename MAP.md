@@ -426,8 +426,8 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `bounded.py` | 90 | The shapes whose bounded-memory streaming driver is a running fold over the stream. |
-| `dispatch.py` | 529 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `bounded.py` | 171 | The shapes whose bounded-memory streaming driver is a running fold over the stream. |
+| `dispatch.py` | 538 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `pipeline.py` | 212 | How a streaming strategy is *driven*, once `dispatch` has chosen one. |
 | `rebatch.py` | 99 | The exact output-shape contract for `iter_batches`: how many rows, in what chunks. |
 | `session.py` | 239 | The streaming session window — sessions whose end you only learn by waiting. |
@@ -948,7 +948,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 472 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `hardware_probe.py` | 823 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 693 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `lifecycle.py` | 698 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 362 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
