@@ -25,6 +25,7 @@ import pickle
 import pyarrow as pa
 
 from batcher._internal.errors import ExecutionError
+from batcher._internal.logging import note_suppressed
 from batcher.dist.executors.partition_io.assignment import (
     assign_clustered_splits,
     assign_splits,
@@ -73,7 +74,18 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
         projection = required_columns_per_source(plan).get(source_id)
         predicate = required_predicates_per_source(plan).get(source_id)
         return projection, predicate
-    except Exception:
+    except Exception as exc:
+        # Recorded, not swallowed. `(None, None)` is the safe answer -- read everything and
+        # let the operator filter -- but it silently reproduces the exact defect this
+        # function was written to fix, and the docstring above measures that defect: the
+        # same query read two columns spilled and thirteen distributed. A plan shape the
+        # analysis cannot walk would put every distributed read back to thirteen with
+        # nothing to show for it but a slower query.
+        #
+        # Quiet in practice, which is what makes it worth logging: measured across
+        # project/filter/aggregate/sort/window/union and a `map_batches` pipeline, this
+        # path does not fire.
+        note_suppressed("dist", "compute the source pushdown for a partitioned read", exc)
         return None, None
 
 

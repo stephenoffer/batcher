@@ -1,4 +1,4 @@
-"""A source whose `splits()` raises must be recorded, not silently un-distributed.
+"""The two distributed paths that lose a capability silently must leave a record.
 
 `dist.executor._is_splittable_source` decides whether real distributed data exists, by
 *calling* `source.splits()` rather than trusting a declared flag. When that call raises it
@@ -13,8 +13,16 @@ That is the exact difference `note_suppressed` was written to keep observable --
 docstring calls it the difference between "this optimization did not apply" and "this
 optimization has been broken since March".
 
-The behaviour is deliberately unchanged. The refusal to distribute is correct; only its
-silence was not.
+`partition_io._sources.source_pushdown` is the same shape with a different casualty. When
+its analysis raises it returns `(None, None)` -- read every column, push no predicate --
+which is safe and silently reproduces the exact defect the function was written to fix. Its
+own docstring measures that defect: "the same query read two columns spilled and thirteen
+distributed".
+
+Both behaviours are deliberately unchanged. The safe answers are the right answers; only
+their silence was not. Both paths are quiet in practice, which is what makes a record cheap:
+`source_pushdown` does not raise for project/filter/aggregate/sort/window/union or a
+`map_batches` pipeline, measured before the log was added.
 """
 
 from __future__ import annotations
@@ -98,3 +106,42 @@ def test_an_in_memory_source_is_still_not_splittable():
 
     ds = bt.from_arrow(pa.table({"a": [1, 2, 3]}))
     assert _is_splittable_source(ds._sources[0]) is False
+
+
+def test_a_broken_pushdown_analysis_leaves_a_record(caplog):
+    """`source_pushdown` falling back to "read everything" must say so."""
+    import batcher as bt
+    from batcher.dist.executors.partition_io import _sources
+
+    ds = bt.from_arrow(pa.table({"a": [1, 2, 3]})).select("a")
+
+    def boom(_plan):
+        raise RuntimeError("plan shape not walkable")
+
+    import batcher.kyber.rules.projections as projections
+
+    original = projections.required_columns_per_source
+    projections.required_columns_per_source = boom
+    try:
+        with caplog.at_level(logging.DEBUG, logger="batcher.dist"):
+            assert _sources.source_pushdown(ds._plan, 0) == (None, None)
+    finally:
+        projections.required_columns_per_source = original
+
+    assert [r for r in caplog.records if "source pushdown" in _step(r)], (
+        "the pushdown analysis failed and nothing recorded it; the read silently widens to "
+        "every column with no way to tell that from a plan that needs every column"
+    )
+
+
+def test_an_ordinary_plan_computes_a_pushdown_without_logging(caplog):
+    """The control: the quiet path must stay quiet, or the record means nothing."""
+    import batcher as bt
+    from batcher.dist.executors.partition_io import _sources
+
+    ds = bt.from_arrow(pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})).select("a")
+    with caplog.at_level(logging.DEBUG, logger="batcher.dist"):
+        projection, _predicate = _sources.source_pushdown(ds._plan, 0)
+
+    assert projection == ["a"], f"expected a narrowed read, got {projection}"
+    assert not [r for r in caplog.records if "source pushdown" in _step(r)]
