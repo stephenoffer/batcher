@@ -1,5 +1,98 @@
 # Batcher CPU benchmark results
 
+## Re-measuring the whole board found nothing above noise, and took nine runs to say so (2026-08-26)
+
+`benchmarks/` only. No engine change is recorded here. This entry exists because the board
+that was on file had been measured against a **stale `.so`** — 189 Rust files and seven
+hours behind the tree — and because re-measuring it produced a result worth writing down
+even though that result is "no change".
+
+Engine `9cbf6a05-dirty`, release profile, `benchmarks/run.py`, best-of-5 per query.
+Host `ip-10-0-94-43`, Xeon Platinum 8275CL @ 3.00 GHz, 92 of 96 cores available, 184 GiB,
+load/core 0.11-0.24 at the start of each pass. Raw run files kept per suite; every figure
+below is a geomean of the harness's per-query `b/duckdb` column, recomputed from those
+files rather than read off a summary line.
+
+### The board
+
+Three suites were run three times so their repeatability could be stated. The rest are
+single passes and are marked as such: a single pass carries no error bar, and none is
+implied by quoting it to two decimals.
+
+| Suite | Cases | Geomean | Spread | Passes | Previous board |
+|---|---|---|---|---|---|
+| Operator mix | 21 | 0.61 | 2.4% | 3 | 0.579 |
+| ClickBench | 43 | 0.64 | - | 1 | 0.621 |
+| H2O join | 5 | 0.68 | - | 1 | 0.658 |
+| TPC-H sf1 | 22 | 0.69 | - | 1 | not on file |
+| TPC-DS sf1 | 98 | 0.90 | - | 1 | 0.879 |
+| TPC-H sf10 | 22 | 0.95 | - | 1 | 0.922 |
+| H2O groupby | 10 | 1.00 | 5.3% | 3 | 1.042 |
+| Join Order Benchmark | 109 | 1.05 | 3.5% | 3 | 1.078 |
+
+Below 1.00 is Batcher faster. The three repeated suites, pass by pass:
+
+| Suite | Pass 1 | Pass 2 | Pass 3 | Median |
+|---|---|---|---|---|
+| Operator mix | 0.604 | 0.613 | 0.619 | 0.613 |
+| H2O groupby | 1.044 | 1.000 | 0.991 | 1.000 |
+| Join Order Benchmark | 1.034 | 1.050 | 1.071 | 1.050 |
+
+### The last column is withdrawn, not compared
+
+Every previous-board figure is a single pass from an instrument whose repeatability was
+never measured, so setting one against an interval is not a comparison. Where repeatability
+has now been measured it is 2.4%, 3.5% and 5.3% - large enough that most differences
+between the two boards are unresolvable in principle rather than merely unresolved.
+
+Two specific consequences:
+
+**The operator mix's 0.579 is withdrawn as an outlier.** It sits below all three passes of
+the re-measurement. Reporting 0.579 to 0.613 as a 5.4% regression, or 0.579 as the engine's
+figure, would both be wrong for the same reason: it is one draw from a distribution whose
+width nobody had measured.
+
+**Nothing done to the engine on 2026-08-26 is visible on this board.** Three suites, three
+passes each, and not one separates from its previous figure by more than its own noise.
+That is the result. It is worth recording precisely because it took nine runs to establish
+and one run would have produced a different, confident, wrong answer.
+
+### A two-run spread is a lower bound, not a spread
+
+JOB is the reason the third pass was run on every repeated suite, and it is the clearest
+methodological finding here:
+
+| Passes | Geomean | Spread | Reading against the previous 1.078 |
+|---|---|---|---|
+| 1 | 1.034 | - | a clear 4.5% improvement |
+| 2 | 1.04 | 1.5% | decisive - 1.078 well outside a tight range |
+| 3 | 1.05 | 3.5% | nothing - 1.078 is 0.65% outside, a fifth of the spread |
+
+**Two points produced a tighter spread than three, and a more confident wrong answer.** That
+is not bad luck. A two-point range is a lower bound on the spread and reads as precision, so
+the statistic that is supposed to express uncertainty gets *better* the less sampling you do.
+The n=2 figure was circulated as the one real signal in the re-measurement; the third pass
+retracted it. Publishing at n=2 would have put a 4.5% JOB improvement into this file that
+does not exist.
+
+So: **do not quote a two-run spread.** Either run a third pass or report the figure as a
+single pass with no interval.
+
+### Suite caveats that are not new
+
+TPC-DS excludes q67. Its correctness gate fails on a pre-existing divergence rather than a
+regression: float reassociation moves sums in their last bits, which changes which sums tie,
+which moves an integer `rank()`. Neither engine is deterministic there.
+
+JOB is the real 2014 IMDb snapshot, every query a 3-to-16-way join. 109 of 113 queries clear
+the correctness gate and only those 109 are timed, on both engines.
+
+On both suites Batcher loses on geomean it is faster than DuckDB in **total** time - H2O
+groupby 595-604 ms against 758-792 ms, JOB 7,714-7,895 ms against 8,982-9,376 ms, over the
+same three passes each. It wins the large queries and loses a larger number of small ones,
+so the total and the geomean disagree, and the geomean is what gets quoted. Neither summary
+is wrong; they answer different questions, and the geomean is the harder one.
+
 ## Work above a streaming aggregate reached neither sink, single-node or distributed (2026-08-25)
 
 `python/batcher/plan/logical/transforms.py`; `python/batcher/core/streaming/folds/shared.py`;
