@@ -71,13 +71,17 @@ RATCHET: dict[str, int] = {
     # separates them** (see the rule's docstring). The budget stops the shape spreading; it
     # does not claim the 15 are defects.
     #
-    # The rule is not tuned to a known answer -- it was measured against the tree and then
-    # checked against a bug found independently. `_ROUNDING` reports `round`/`trunc` uncovered
-    # and `_IDEMPOTENT_MATH` reports `sign`; commit `87d82730` ("trunc and sign of an integer
-    # stay integers in every tier") had to fix exactly those three, hours later. The detector
-    # named them from the enumerations alone. b9's `FORMATS` hit was a shipped engine defect
-    # of the same kind: `polars` uncovered, silently widening every `string` to `large_string`
-    # through `map_batches`, so `Dataset.schema` and `collect()` disagreed.
+    # The evidence is one shipped defect, not three. `FORMATS` is hand-listed as
+    # `["pyarrow", "numpy", "pandas"]` against six formats and has been since `18b85ead`; the
+    # uncovered `polars` silently widened every `string` to `large_string` through
+    # `map_batches`, so `Dataset.schema` and `collect()` disagreed and a Parquet file written
+    # from that plan was `large_string` on disk. That gap predates the defect's discovery.
+    #
+    # The `_ROUNDING`/`_IDEMPOTENT_MATH` hits were cited as further evidence when this rule
+    # landed and they are **not**: running it against `87d82730^` gives zero findings there.
+    # `trunc` was inside the tested list before that fix, and the finding exists only because
+    # the fix moved it out. Both are false positives -- `sign` likewise, covered by a sibling
+    # test asserting the opposite behaviour (`sign(NaN)` is 0.0).
     #
     # Known-deliberate entries, so nobody re-triages them: `STR_FNS` (4 of 105, a security
     # test sampling), `MATH_FNS` (GPU conformance sampling), `_TRANSIENT_MARKERS`,

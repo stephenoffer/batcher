@@ -1087,13 +1087,22 @@ def _shadowed_production_sets(
     someone thought of on the day. What it leaves out is invisible: the test passes, the
     count looks deliberate, and the gap only surfaces when a user hits it.
 
-    Found by b9 against live defects rather than proposed as tidiness, and the strongest
-    evidence is that it is not tuned: `_ROUNDING` reports `round` and `trunc` uncovered, which
-    are exactly the two functions `87d82730` had to fix hours later for folding an integer to
-    a float literal -- fingered from the enumeration alone, with no knowledge of the bug. The
-    `FORMATS` hit was a shipped engine defect: `polars` was uncovered, and it silently widened
-    every `string` to `large_string` on the way through `map_batches`, so `Dataset.schema` and
-    `collect()` disagreed and a Parquet file written from that plan was `large_string` on disk.
+    One finding is a shipped engine defect and is the evidence for the rule. `FORMATS` is
+    hand-listed as `["pyarrow", "numpy", "pandas"]` against six production formats, unchanged
+    since `18b85ead`; the uncovered `polars` silently widened every `string` to `large_string`
+    on the way through `map_batches`, so `Dataset.schema` said `string` while `collect()`
+    returned `large_string` and a Parquet file written from that plan was `large_string` on
+    disk. The gap predates the defect's discovery, which is what makes it predictive.
+
+    **A claim originally made for this rule does not survive checking, and is recorded here so
+    it is not repeated.** `_ROUNDING` reports `round`/`trunc` uncovered and `_IDEMPOTENT_MATH`
+    reports `sign`, and `87d82730` ("trunc and sign of an integer stay integers in every
+    tier") fixed exactly those three -- which reads as the detector predicting a bug. It did
+    not. Running this rule against the pre-fix tree (`87d82730^`) yields **zero** findings in
+    that file: before the fix `trunc` was inside the tested list, and the finding exists only
+    *because* the fix moved it out into a deliberate exclusion. The right counterfactual is
+    "would it have fired before the bug was fixed", not "does it name the bug now", and the
+    two differ.
 
     **Precision is about half, and the rule cannot do better.** A narrow set is sometimes
     correct and says so: `test_relational_window_rules` parametrizes three of
