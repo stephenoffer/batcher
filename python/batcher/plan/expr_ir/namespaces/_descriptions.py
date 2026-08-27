@@ -148,13 +148,29 @@ _DESCRIPTIONS: dict[str, str] = {
     ),
     "epoch": (
         "Seconds since the Unix epoch, 1970-01-01 00:00:00 UTC (→ Int64).\n\n"
+        "This is the whole second *containing* the instant, so any sub-second part is\n"
+        "discarded rather than rounded. The result is floored, which matters only before\n"
+        "1970, where flooring moves away from zero: 1969-12-31 23:59:59.25 is inside\n"
+        "second -1, not second 0. That matches ``date_trunc('second', ...)``. Note that\n"
+        "DuckDB's ``epoch`` returns a DOUBLE keeping the fraction, so it reports -0.75\n"
+        "for the same instant. Use ``.dt.epoch_ms()``, ``.dt.epoch_us()`` or\n"
+        "``.dt.epoch_ns()`` when the sub-second part matters; those are exact and agree\n"
+        "with DuckDB's counterparts.\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
         "        >>> import datetime as dt\n"
         '        >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 3, 15, 13, 45, 30)]})\n'
         '        >>> ds.select(bt.col("d").dt.epoch().alias("r")).to_pydict()\n'
-        "        {'r': [1615815930]}"
+        "        {'r': [1615815930]}\n\n"
+        "        >>> # A pre-epoch instant floors into the second that contains it.\n"
+        "        >>> before = dt.datetime(1969, 12, 31, 23, 59, 59, 250000)\n"
+        '        >>> pre = bt.from_pydict({"d": [before]})\n'
+        '        >>> pre.select(s=bt.col("d").dt.epoch()).to_pydict()\n'
+        "        {'s': [-1]}\n\n"
+        "        >>> # The finer-grained members keep it.\n"
+        '        >>> pre.select(ms=bt.col("d").dt.epoch_ms()).to_pydict()\n'
+        "        {'ms': [-750]}"
     ),
     "dayname": (
         'The full English weekday name, e.g. "Monday" (→ Utf8).\n\n'
