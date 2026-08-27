@@ -1024,6 +1024,92 @@ def _single_sample_timings(tree: ast.Module, rel: str) -> Iterator[Finding]:
                 break
 
 
+#: Reads that report *how a query ran* rather than what it produced. A helper returning one
+#: of these is observing the machine, not the data.
+_RUN_OBSERVATIONS = frozenset(
+    {
+        "cpu_utilization",
+        "threads",
+        "peak_bytes",
+        "spilled",
+        "elapsed_ns",
+        "cpu_ns",
+        "buckets",
+        "partitions",
+        "rows_in",
+    }
+)
+
+#: Calls that force a knob before the engine runs. A helper that sets one is *causing* the
+#: difference it goes on to assert; a helper that sets none is hoping for it.
+_KNOB_SETTERS = ("set_config", "set_option", "setenv", "configure", "replace(")
+
+#: Ways a helper actually runs the engine.
+_RUNS_ENGINE = ("collect(", "explain(", "iter_batches(", "execute_local", "execute_plan")
+
+
+def _uncontrolled_runtime_comparisons(tree: ast.Module, rel: str) -> Iterator[Finding]:
+    """Two runs compared on an observation neither run controlled.
+
+    The shape: a test-local helper runs the engine and returns a figure describing *how* it
+    ran -- CPU utilization, thread count, bucket count -- and the test calls it twice with
+    different inputs and asserts one is strictly greater. That reads like a controlled
+    experiment and is not one. Nothing forced the difference; the test varied an input and
+    hoped the machine responded, so on a loaded box it reports the neighbour's load.
+
+    The discriminator is mechanical rather than a judgement about intent: **did the helper
+    set a knob?** `threads_at` in `test_diff_morsel_size_invariance` calls
+    `set_config(morsel_rows=...)` and `run_with` in `test_spilling` sets a spill bound --
+    both force the difference and then assert it reached the engine, which is a control
+    proving a knob is live. A helper that sets nothing is making an observational claim in a
+    controlled experiment's clothes.
+
+    Advisory, not ratcheted: the population is three helpers tree-wide and the rule is new.
+    """
+    for fn in ast.walk(tree):
+        if not isinstance(fn, _Func) or not fn.name.startswith("test_"):
+            continue
+        for helper in ast.walk(fn):
+            if not isinstance(helper, _Func) or helper is fn:
+                continue
+            body = ast.unparse(helper)
+            if not any(marker in body for marker in _RUNS_ENGINE):
+                continue
+            if not any(obs in body for obs in _RUN_OBSERVATIONS):
+                continue
+            if any(setter in body for setter in _KNOB_SETTERS):
+                continue  # the helper forces the difference: a control, not a hope
+            calls = [
+                node
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == helper.name
+            ]
+            if len(calls) < 2:
+                continue
+            for assertion in ast.walk(fn):
+                if not isinstance(assertion, ast.Assert):
+                    continue
+                for compare in ast.walk(assertion.test):
+                    if not (isinstance(compare, ast.Compare) and len(compare.ops) == 1):
+                        continue
+                    if not isinstance(compare.ops[0], (ast.Lt, ast.Gt)):
+                        continue
+                    yield Finding(
+                        "uncontrolled-runtime-comparison",
+                        "medium",
+                        rel,
+                        assertion.lineno,
+                        f"`{fn.name}` compares two runs on `{helper.name}`, which observes "
+                        f"how the engine ran rather than what it produced, and sets no knob "
+                        f"to force the difference it asserts — so a loaded box reports the "
+                        f"neighbour's load; set the knob and assert it reached the engine, "
+                        f"or compare a property the run controls",
+                    )
+                    return
+
+
 #: Clock reads that mark a module as *timing* something.
 _BENCH_TIMERS = frozenset({"perf_counter", "monotonic", "process_time", "perf_counter_ns"})
 
@@ -1375,6 +1461,7 @@ def detect_methodology(ctx: Context) -> Iterator[Finding]:  # noqa: ARG001 — u
     yield from _uncontrolled_negatives(modules)
     for path, tree in modules:
         yield from _single_sample_timings(tree, _rel(path))
+        yield from _uncontrolled_runtime_comparisons(tree, _rel(path))
         yield from _inert_patches(path, tree)
     for path, tree in _example_scripts():
         yield from check_example(path, tree)

@@ -65,6 +65,21 @@ ALLOW: dict[str, str] = {}
 #:
 #: The number may fall and may never rise. Re-record it *down* when you fix some.
 RATCHET: dict[str, int] = {
+    # A test comparing two engine runs on a figure describing *how* they ran -- CPU
+    # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
+    # and the one is a live failure rather than an accepted shape:
+    # `test_hardware_telemetry.py::test_streaming_cpu_utilization_is_measured_not_a_constant`
+    # varies the row count and asserts utilization rises, which on a shared box reports the
+    # neighbour's load. Its owner has it characterised as load-sensitive and is on it; the
+    # budget exists so the shape cannot spread while that is true, not to bless it. **Re-record
+    # to 0 when it lands** -- the number may fall and may never rise.
+    #
+    # Two helpers matched the shape and were correctly exonerated, which is what makes the
+    # rule worth having rather than a name-based heuristic: `threads_at`
+    # (test_diff_morsel_size_invariance) and `run_with` (test_spilling) both `set_config(...)`
+    # before running, so they *force* the difference and then prove it reached the engine.
+    # Setting a knob is the discriminator between a control and a hope.
+    "uncontrolled-runtime-comparison": 1,
     # Standalone timing entry points under `benchmarks/` that never call
     # `require_release_build`, so they can publish a number from a debug build — 8-60x
     # slower by the guard's own docstring — without saying so. Was **60 of 64**; 40 have
