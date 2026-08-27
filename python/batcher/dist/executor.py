@@ -2162,20 +2162,36 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
         # A join over a multi-source operand HAS a distributed path — the staged one. The
         # caller reached here only by forcing `adaptive=False`, so say that rather than
         # implying the operator is missing.
-        hint = (
-            "this shape distributes stage by stage (a join whose operand spans two sources, "
-            "or a pipeline breaker beneath another breaker); it was disabled by an explicit "
-            '`adaptive=False`. Re-run with `adaptive=True` (or the default `"auto"`). '
-            "Running it in one shot would evaluate the inner plan once per partition and "
-            "return wrong values, so it is refused rather than computed."
-            if requires_staging(plan)
-            else "File/extend the distributed operator, or run with distributed=False "
-            "to force single-node explicitly."
-        )
+        #
+        # The whole sentence branches, not just the tail. It used to open with "distributed
+        # execution has no path for this plan shape (an unsupported operator combination)"
+        # and *then* explain that the shape distributes stage by stage after all — a headline
+        # that contradicted its own remedy, and the exact implication the comment above says
+        # not to make. A reader who stopped at the first clause, which is where a reader
+        # stops, concluded their query could not be distributed at all.
+        if requires_staging(plan):
+            # Deliberately does NOT assert *why* staging is not carrying this shape. Two
+            # different callers arrive here and `_unsupported` cannot tell them apart: one
+            # forced `adaptive=False`, and one is already staging but has a sub-stage with no
+            # decomposition of its own -- which is what `batcher.graph`'s eleven refusing
+            # algorithms hit (an aggregate over a `union` feeding another breaker). An earlier
+            # draft of this message told the second caller to "re-run with `adaptive=True`",
+            # which they already had, and that is a worse failure than saying less.
+            raise PlanError(
+                "distributed execution runs this plan shape stage by stage (a join whose "
+                "operand spans two sources, or a pipeline breaker beneath another breaker), "
+                "and it did not stage here. If you passed `adaptive=False`, re-run without "
+                'it (the default is `"auto"`). Otherwise staging is already on and some '
+                "stage of this plan has no distributed decomposition; materializing the "
+                "intermediate (`bt.from_arrow(...collect())`) is the workaround. Running it "
+                "in one shot would evaluate the inner plan once per partition and return "
+                "wrong values, so it is refused rather than computed."
+            )
         raise PlanError(
             "distributed execution has no path for this plan shape "
             f"({reason}); refusing to silently fall back to single-node on distributed "
-            f"data. {hint}"
+            "data. File/extend the distributed operator, or run with distributed=False "
+            "to force single-node explicitly."
         )
     _warn_accelerator_stage_falls_back(plan, reason)
     return _single_node(plan, sources)

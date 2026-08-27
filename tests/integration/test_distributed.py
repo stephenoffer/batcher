@@ -1792,12 +1792,13 @@ def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(clust
     )
     run(unioned.group_by("k").agg(m=count()).filter(col("m") > 0).sort("k"))
 
-    # The aggregate over the union cannot feed a join, even against a plain scan.
-    with pytest.raises(PlanError, match="no path for this plan shape"):
+    # The aggregate over the union feeds a join only stage by stage, so with staging off
+    # the one-shot dispatcher refuses -- and says which of the two it is.
+    with pytest.raises(PlanError, match="runs this plan shape stage by stage"):
         run(unioned.group_by("k").agg(m=count()).join(scan_side, on="k"))
 
-    # ...nor a second aggregate.
-    with pytest.raises(PlanError, match="no path for this plan shape"):
+    # ...and the same for a second aggregate beneath the first.
+    with pytest.raises(PlanError, match="runs this plan shape stage by stage"):
         run(unioned.group_by("k").agg(m=count()).group_by("m").agg(c=count()))
 
     # Materializing between the two clears it, which is the documented workaround.
