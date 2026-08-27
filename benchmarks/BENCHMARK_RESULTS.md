@@ -1,5 +1,80 @@
 # Batcher CPU benchmark results
 
+## JOB's derived `IN` range bounds are not the loss, and the profile that said they were (2026-08-26)
+
+No code change. A fifth negative result on the same performance thread, recorded with the
+instrument error that produced it, because the error is the more useful half.
+
+### The shape
+
+59 of JOB's 109 timed queries lose to DuckDB, and the worst cluster by *family*: q27a/b/c at
+3.2-3.4x, q33a/c at 3.2-3.6x, q21a/c at 2.8-3.0x, q29a/b/c at 2.2-2.7x. **52 of 114 JOB queries
+carry a multi-value string `IN` list**, `mi.info` alone in 32 of them, over the 14.8M-row
+`movie_info`.
+
+`or_to_in_and_range` (NORMALIZE) adds `c >= min(vs) AND c <= max(vs)` beside such a list. On
+q27a that produced, as two separate `Filter` nodes:
+
+```
+op 52   info >= German                                  in 14,835,720   out 8,638,999   sel 0.58
+op 51   info <= Swedish AND info IN (Sweden,...,German)  in  8,638,999   out   134,239   sel 0.016
+```
+
+The derived range is 58% selective where the `IN` is 1.6%, so the cheap-but-unselective half ran
+first and materialized 8.6M variable-length strings; op 51 then re-evaluated the whole `IN`
+anyway. The bound is *logically implied* by the `IN`, so it removes no row the `IN` would keep -
+it is provably redundant at runtime. And its stated purpose does not hold for the `IN` form:
+`zonemap_pruning::_in_list_status` decides `col IN (...)` from column bounds directly, and
+`prune_in_list_by_zonemap` / `prune_in_list_by_bloom` narrow such a list member by member. The
+docstring's "opaque to range-based zone-map pruning" is true of the raw `OR` chain, which
+`or_equalities_to_in_list` has already folded to an `InList` by the time this rule sees it.
+
+Every sentence above is correct. The conclusion drawn from it was not.
+
+### Measured: it does nothing
+
+`_in_list_values` patched to decline, so the bounds are never derived. Control confirmed the
+plan changed (4 -> 0 derived bounds on q27a) and results were identical:
+
+| query | baseline | no bounds | speedup |
+|---|---|---|---|
+| job-q27a | 59.8 | 61.3 | 0.98x |
+| job-q27b | 56.7 | 52.3 | 1.08x |
+| job-q33a | 85.3 | 80.2 | 1.06x |
+| job-q5b | 65.4 | 63.1 | 1.04x |
+| job-q21c | 57.9 | 56.3 | 1.03x |
+
+**No effect.** The rule is redundant work and removing it buys nothing measurable, so the 1582 ms
+that `filter (op 52)` was charged is not a cost the bound created.
+
+### The instrument error, which is the point
+
+The hypothesis came from `explain(analyze=True)` on a fresh session. **That run measured 4,269 ms
+for a query the benchmark records at 64 ms** - a 67x mismatch, with the profile's own summary
+line reading `elsewhere 2.62s 61% planning, optimization, FFI crossing`. Every per-operator
+number in it, including op 52's 1582 ms, came from a cold regime: first-touch pages, an
+uncached plan, and 21 tables freshly registered.
+
+The profile was internally consistent, and consistent profiles are persuasive. It was measuring
+a different query than the one that loses. **A profile is only evidence about the regime it was
+taken in, and the regime is a property of the measurement, not of the query.** The check costs
+one line: compare the profile's total against the benchmark's figure for the same query before
+reading a single operator row. 4,269 against 64 fails it immediately.
+
+A first A/B repeated the error - it built a `Session` inside the timed region, reported 4.5 s
+baselines, and returned 1.00x. The 1.00x was right by luck; the instrument agreed with the
+profile because it shared the profile's defect. Two methods with the same blind spot agreeing
+is not corroboration.
+
+### Where this leaves JOB
+
+The gap is real and unexplained: q27a runs 59.8 ms warm against DuckDB's 20.0. The `IN` bounds
+are not it. What is now ruled out on this suite is one rule; what is established is that the
+losing families share a shape - a 12-table star around `title` with a large join-key equivalence
+class and cardinality estimates the engine itself flags as 10,000x to 1,600,000x under. Those
+`est_error` figures are from the same cold profile and want re-reading warm before anyone
+acts on them.
+
 ## Where the group-by actually loses, and four fixes for it that do not work (2026-08-26)
 
 No code change. This is a bottleneck study with negative results, recorded so the next attempt
@@ -16662,3 +16737,241 @@ Verified by `packed_byte_radix_matches_flat` (the packed radix against the flat 
 duplicates, misses, nulls, empty sides and keys that are prefixes of one another, for all four
 left-driven join types), `pack_byte_key_is_injective`, `byte_keys_packable_boundary`, and 1,361
 join differential tests against DuckDB.
+
+
+## Full-suite baseline, and the fast path stops costing the moat (2026-08-26)
+
+Machine: 96-core Xeon 8275CL, 184 GB, no GPU, release engine. Every suite below is
+correctness-gated against DuckDB by `harness.compare` (best-of-5, best-of-3 at sf10), one
+family at a time (never
+two benchmarks at once). The box was shared with other agents' test runs throughout; the
+per-family *ratios* are taken inside one run and are comparable, the absolute milliseconds are
+not publishable.
+
+### Where Batcher stands, measured rather than recalled
+
+| suite | cases | correctness | b/duckdb | b/polars | b/pyarrow | b/daft |
+|---|---|---|---|---|---|---|
+| TPC-H sf1 | 22 | no Batcher failure | **0.72** | 0.42 | n/a | 0.22 |
+| TPC-H sf10 | 22 | no Batcher failure | **0.93** | 0.29 | n/a | 0.15 |
+| TPC-DS sf1 | 71 of 99 | no Batcher failure | **0.87** | -- | n/a | -- |
+| ClickBench | 43 | no Batcher failure | **0.64 / 0.67** | 0.31 / 0.33 | n/a | 0.12 |
+| operators | 21 | 21/21 OK | **0.63** | 0.12 | 0.03 | 0.07 |
+| h2o-groupby (1e7) | 10 | 10/10 OK | **1.10** | 0.39 | n/a | 0.37 |
+| h2o-join (1e7) | 5 | 5/5 OK | **0.67** | 0.46 | n/a | 0.24 |
+| json | 5 | 5/5 OK | **0.26** | 0.01 | n/a | 0.04 |
+
+Batcher wins **seven of the eight** against DuckDB, and every family it is measured against
+Polars and Daft on. TPC-H at sf10 is a win (0.93), which puts the single-node crossover with
+DuckDB above 60M rows rather than at ~10M.
+
+**TPC-DS needs `--isolate`, and the reason is not q64.** The suite OOM-kills the benchmark
+process at q64 at scale 1, reproducibly -- twice, once on a contended box and once with 167 GB
+free. It is tempting to read that as a q64 defect, and it is not: run alone under the *same*
+auto-sensed envelope, with the process rlimited so a runaway would die by itself, **q64
+completes in 4.2 s with a 4.9 GB peak**. Capped at 8, 24 and 48 GiB it completes identically,
+and the optimized plan is byte-identical (same digest) at every envelope. So the failure is
+**accumulation across ~60 preceding queries in one process**, not a single query's peak -- and
+`run.py --isolate`, which exists for exactly this ("use it when a suite cannot complete"),
+runs all 99 with no kill attributable to Batcher.
+
+The 71 figure above is queries that produced a `b/duckdb` ratio. The other 28 are q63 onward,
+killed mid-run when a **concurrent session's** half-applied edit left the tree unimportable
+(`ImportError: cannot import name 'API_SHADOWED' from 'batcher._exports'`); every isolated
+child spawned after that point failed to import Batcher. That is a shared-tree artifact, not a
+result, and it is excluded on that ground rather than because the queries were slow. 38 of the
+71 are wins; the worst losses are q77 5.21x, q5 3.54x, q80 2.80x, q78 2.44x.
+
+PyArrow appears in one family only (`operators`, 0.03): it has no SQL surface, so it cannot run
+TPC-H, h2o or the JSON suite, and "beats PyArrow everywhere" would be a claim about four suites
+it never entered.
+
+**h2o-groupby is the one family it loses**, on the multi-key and multi-aggregate shapes: q4
+(`avg` x3 over a 100-group int key) 1.96x, q2 (two string keys) 1.90x, q9 1.54x, q8 1.42x,
+q7 1.35x, q3 1.33x -- against wins on q1, q5, q6 and q10. The section below shows that loss is
+a fixed per-query cost rather than a slow kernel, and that the same term decides the TPC-H sf1
+and operator losses too.
+
+Every non-OK row across all seven suites is a **comparator** defect, not Batcher's: Daft
+returns the 0.05+0.06 revenue share on TPC-H q6 (the known IEEE fold), errors on q15/q21/q22
+and on ClickBench q03/q18/q28; Polars' SQL front end lacks `regexp_replace` and `date_trunc`
+and duplicates a group key on ClickBench q28/q35/q42.
+
+ClickBench was run twice, unplanned (a stale sweep re-ran it), and the two passes give
+0.64 and 0.67 against DuckDB -- so the suite's own spread is a few points and the win is not a
+sampling artifact. Where a family was run once, the geomean is quoted to two decimals because
+that is what one pass supports.
+
+**Do not read ClickBench q00-q06 as execution wins.** Their 0.02x-0.19x comes from
+`api/terminal/metadata_answer`, which answers a `count`/`count distinct` from recorded
+statistics without reaching the engine -- the same caveat this document already records for
+q04, and the same one that makes `global_sum` a non-baseline below.
+
+### The remaining DuckDB losses are one constant, not a slow kernel
+
+A `GROUP BY` over **one row** costs 1.43 ms against DuckDB's 0.56 ms. There is nothing to
+compute, so that gap is orchestration, and it is the same size at every scale:
+
+| rows | batcher | duckdb | gap |
+|---|---:|---:|---:|
+| 1 | 1.427 ms | 0.560 ms | 0.87 ms |
+| 1,000 | 1.397 | 0.613 | 0.78 |
+| 100,000 | 1.649 | 1.002 | 0.65 |
+| 6,000,000 | 3.624 | 2.349 | 1.28 |
+
+`op-groupby-sum` is 4.3 vs 3.2 ms -- a 1.1 ms gap against a ~1.1 ms fixed cost. The same
+arithmetic covers `op-groupby-2key` (1.6 ms), `op-filter-project` (1.6 ms) and TPC-H
+q1/q5/q6/q18. **These are not kernel losses.**
+
+Attributed for a 1-row GROUP BY (cProfile, event log off, ms/query): `execute_plan_metered`
+0.30, `_close_learning_loops` 0.42, Carbonite (`_admit` + `recommended_config` +
+`recommend_morsel_target` + `should_spill`) 0.58, `_optimize` 0.27. Read the engine figure as
+near-exact and the rest as inflated: the engine is a *single C call* per query, which cProfile
+barely touches, while every other line is Python frames it roughly doubles. So the honest split
+of the 1.43 ms is about **0.30 ms engine and ~1.1 ms control plane**, and deflating all of them
+by one factor -- which an earlier draft of this entry did -- understates the engine and
+overstates the orchestration.
+
+**`global_sum` is not a valid engine baseline**: it never reaches `execute_plan_metered` at
+all, being answered by `api/terminal/metadata_answer`. Its flat 0.31 ms at every scale is that
+layer, not execution -- the same caveat this document already records for ClickBench q04.
+
+### h2o-groupby is not a kernel loss either -- the kernel is *faster* per byte
+
+The one family Batcher loses invites the obvious reading: the hash aggregate is slower than
+DuckDB's. Measured, it is not. Same 10 M rows, same 100 groups, varying only how many value
+columns the aggregate touches, so time is read against **bytes** rather than against a query
+name:
+
+| value columns | bytes read | batcher | GB/s | duckdb | GB/s | b/duckdb |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 160 MB | 4.39 ms | 36.4 | 2.68 ms | 59.7 | 1.64x |
+| 2 | 240 MB | 5.73 ms | 41.9 | 3.29 ms | 72.9 | 1.74x |
+| 3 | 320 MB | 6.06 ms | 52.8 | 4.46 ms | 71.8 | 1.36x |
+| 4 | 400 MB | 6.42 ms | 62.3 | 5.05 ms | 79.3 | 1.27x |
+
+Batcher's throughput *rises* with the work (36 -> 62 GB/s) while DuckDB's is flat near its
+roof, and the ratio narrows monotonically. A least-squares fit of ms against MB separates the
+two terms:
+
+* **marginal cost — batcher 125 GB/s, duckdb 97 GB/s.** Per byte aggregated, Batcher's kernel
+  is about **1.3x faster**.
+* **fixed cost — batcher 3.40 ms, duckdb 0.97 ms.** That 2.4 ms is the entire loss.
+
+Read the two terms with different confidence. DuckDB's fit is tight (R^2 0.981); Batcher's is
+not (R^2 0.875, over four points), because its throughput is still *climbing* across this
+range rather than sitting on a roof. So "125 GB/s" is a lower bound on the marginal rate and
+"3.40 ms" an upper bound on the fixed term -- both of which make the conclusion stronger, not
+weaker: the flatter the true marginal cost, the more of the gap is fixed. What the fit cannot
+be read as is a precise intercept.
+
+So the h2o-groupby column in the table above is measuring the same thing the TPC-H sf1 and
+operator losses measure, and no amount of kernel work addresses it. It also explains the shape
+of the family: the queries Batcher *wins* there (q5, q6, q10) are the ones whose per-byte work
+is large enough to bury a fixed cost, and the ones it loses (q1, q2, q4) are the cheap ones.
+
+**An earlier reading of this same data was wrong and is worth recording.** The per-operator
+`cpu_ms` in `stats()` showed 6.5 ms of CPU for a 6.5 ms aggregate -- one core -- which reads
+as a serial-execution bug and would have sent the next session to parallelize a kernel that is
+already parallel. Measuring process CPU directly showed **31 cores** on the same query at every
+cardinality (100, 10 k, 100 k, 1 M groups). The field is documented as holding *only on a
+materializing executor* and the streaming executor is the default; it was read outside its
+stated domain. The measurement that settled it took two minutes and the inference would have
+cost a week.
+
+### The fast path no longer costs the cross-query moat
+
+`fast_path` skipped Carbonite admission, sizing, the event bus **and the whole write side of
+the learned-stats loop**, bundled. They are independent: admission is skipped because
+`eligible` bounds the input below any envelope it could have defended, and that argument says
+nothing about whether the run is *measured*. `run_fast` now passes the hub to the engine and
+closes `learn_column_stats` + the new `run.close_plan_learning_loops`; `Prepared.execute` --
+the replay, where a hot shape spends its life -- does the same, so the loop is not merely
+closed on the first execution of a shape and open on every one after it.
+
+Five small shapes at 1,000 rows, two sandboxes over one `lib_native.so` (ms, total):
+
+| build | `fast_path` | total | per query | vs default |
+|---|---|---:|---:|---:|
+| HEAD | off | 5.600 | 1.120 | -- |
+| HEAD | on (no learning) | 1.586 | 0.317 | 3.53x |
+| this change | off | 5.432 | 1.086 | unchanged |
+| this change | on (learning kept) | 2.840 | 0.568 | **1.97x** |
+
+Keeping the moat costs **0.251 ms a query** and retains **2.0x of the 3.5x**. The default path
+is untouched. Run twice -- once with four test suites hammering the box and once quiet -- and
+the four figures reproduce to within 1-4% (5.642/1.598/5.657/2.857 loaded), which is what makes
+this a measurement rather than a sample: the effect is far larger than the spread. What `fast_path` still gives up is *observability*
+(`explain(analyze=True)`, the event log, the dashboard) and the *resource* half of the loop --
+it holds no `ResourceManager`, so it has no flap rate or high-water mark to report, which is
+an absence rather than a gap. It remains off by default; this removes the stated reason it
+could not be defaulted.
+
+Two things the change had to get right, both silent if wrong:
+
+- `Prepared.execute` reads its own sources, so it **derives** the per-source complete-scan
+  flag `stages.resolve_sources` computes rather than passing `True`. `learn_column_stats`
+  records a distinct count as *exact* when that flag is set, so claiming a filtered or capped
+  read saw the whole source teaches a wrong row count on every later run -- and both wrong
+  answers (`True` and `None`) mean "saw the whole thing".
+- `_replace_refs` rebuilt `Prepared` field by field, so a field added later is dropped
+  silently -- the entry still caches and still answers correctly, and only the new field's
+  *effect* goes missing. It now goes through `dataclasses.replace`.
+
+`tests/unit/test_fast_path_learns.py` pins the replay half against the hub's two write
+counters; it fails on the prior tree with `assert 0 > 0`.
+
+### The `cpu-underutilized` insight was wrong on the default executor
+
+Found while chasing the paragraph above, and worth its own entry because a diagnostic that
+lies is worse than no diagnostic: it is *read as authoritative* and it sends the reader to fix
+something that is not broken.
+
+`observe/insights/resources.py::idle_cpu` derived utilization from the per-operator `cpu_util`,
+which is `cpu_ms / (elapsed_ms x threads)`. The per-operator hardware fields hold **only on a
+materializing executor** (`api.stats.RunStats.usage` says so); on the streaming default each
+operator reports `cpu_ms == elapsed_ms` -- one thread's accounting -- beside a `threads` count
+for the whole pool. So `cpu_util` is ~`1 / threads` regardless of what ran, and the rule fired
+on essentially every streaming query past `_TRIVIAL_MS`.
+
+Measured: a 10 M-row `GROUP BY` burning 177 ms of CPU in 14.3 ms of wall clock -- **12 cores** --
+was reported as **"CPU 2% utilized"**, with the advice "the query may be too small to
+parallelize".
+
+`QueryUsage.cores_busy` already exists, is `cpu_ms / wall_ms` for the whole run, holds on every
+tier, and its own docstring calls it "the one figure a per-operator utilization ratio cannot be
+summed into". The rule now reads it against the machine's core count and falls back to the
+per-operator ratio only when the platform reported no whole-run figure -- which is the
+materializing case, where that ratio is sound. The same query now reports **33%**, which is
+true (30.7 of 92 cores) and still worth saying.
+
+`tests/unit/test_insight_idle_cpu_uses_whole_run.py` pins it, including the positive control
+that a genuinely serial run is still reported. Against the prior tree two of its five cases
+fail, one of them on a run using 85% of the machine.
+
+### A recorded Batcher/DuckDB divergence: NaN across two relations
+
+`WHERE a.f = b.f` with NaN on both sides keeps the row in Batcher and drops it in DuckDB. Both
+engines call `NaN = NaN` **true** as a scalar (checked both ways). Across two relations DuckDB
+decorrelates the predicate into a hash join, whose key comparison is IEEE, so NaN stops
+matching NaN; Batcher applies it as a filter and keeps its scalar answer. Neither engine
+changed what `=` means on its own. Pinned by
+`tests/differential/test_diff_nan_cross_relation_equality.py`.
+
+This is also why a rewrite that turns such a predicate into a join key must refuse floats: the
+engine's key identity folds every NaN to one bit pattern (`bc_arrow::canon_f64_bits`,
+deliberately, so `GROUP BY` and `=` agree on the two zeros), which is the opposite of an IEEE
+key comparison.
+
+### Two work-list entries that are stale, and one rule that was not needed
+
+- **"TPC-DS q72, 593.7x (29.8 s vs 50 ms), 65% of Batcher's whole TPC-DS time"** is stale.
+  Measured at scale 1: **1,804 ms cold, 702 ms warm**. The hypothesis attached to it -- that
+  `d1.d_week_seq = d2.d_week_seq` is applied as a post-join filter -- is also wrong: the
+  region has 9 leaves and **9 edges**, so the equality is already a join edge.
+- An equi-residual -> join-edge promotion rule was written for that hypothesis, proved correct
+  with unit and differential tests, and then measured to **never fire on any of the 99 TPC-DS
+  queries**: `rules/pushdown.py::derive_join_keys` already absorbs such a conjunct in an
+  earlier phase, including through an intervening projection (checked with a comma join under
+  a derived table, which plans as `hash_join [inner on k]`, not a filtered cartesian product).
+  Reverted rather than kept as speculative generality.
