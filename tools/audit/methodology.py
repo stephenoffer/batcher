@@ -1024,6 +1024,109 @@ def _single_sample_timings(tree: ast.Module, rel: str) -> Iterator[Finding]:
                 break
 
 
+#: Minimum size for a production constant to count as an enumeration worth deriving from,
+#: and for a test's hand-written list to count as an attempt to mirror one.
+_SHADOW_MIN_PROD = 4
+_SHADOW_MIN_TEST = 3
+
+
+def _string_set(node: ast.expr) -> list[str] | None:
+    """The string literals in a set/list/tuple literal, or `None` if it is not purely those."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"frozenset", "set"}
+        and node.args
+    ):
+        node = node.args[0]
+    if not isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        return None
+    values = [
+        e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+    ]
+    return values if values and len(values) == len(node.elts) else None
+
+
+def production_string_sets(root: Path) -> dict[str, list[set[str]]]:
+    """Module-level `_UPPER` constants under `root` holding a set of string literals.
+
+    Module-level and upper-cased on purpose: a local named `parts` collides with half the
+    test suite and produced the only pure-noise hit in the first measurement.
+    """
+    found: dict[str, list[set[str]]] = {}
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            target = None
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target = node.target.id
+            elif (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                target = node.targets[0].id
+            if not target or not target.lstrip("_").isupper():
+                continue
+            values = _string_set(node.value) if node.value is not None else None
+            if values and len(values) >= _SHADOW_MIN_PROD:
+                found.setdefault(target, []).append(set(values))
+    return found
+
+
+def _shadowed_production_sets(
+    tree: ast.Module, source: str, rel: str, constants: dict[str, list[set[str]]]
+) -> Iterator[Finding]:
+    """A hand-written test list that is a strict subset of a production constant it names.
+
+    The engine enumerates its own vocabulary -- `AGG_FNS`, `JOIN_TYPES`, `FORMATS`,
+    `_OBJECT_STORE_SCHEMES` -- and a test that retypes a few of those by hand covers what
+    someone thought of on the day. What it leaves out is invisible: the test passes, the
+    count looks deliberate, and the gap only surfaces when a user hits it.
+
+    Found by b9 against live defects rather than proposed as tidiness, and the strongest
+    evidence is that it is not tuned: `_ROUNDING` reports `round` and `trunc` uncovered, which
+    are exactly the two functions `87d82730` had to fix hours later for folding an integer to
+    a float literal -- fingered from the enumeration alone, with no knowledge of the bug. The
+    `FORMATS` hit was a shipped engine defect: `polars` was uncovered, and it silently widened
+    every `string` to `large_string` on the way through `map_batches`, so `Dataset.schema` and
+    `collect()` disagreed and a Parquet file written from that plan was `large_string` on disk.
+
+    **Precision is about half, and the rule cannot do better.** A narrow set is sometimes
+    correct and says so: `test_relational_window_rules` parametrizes three of
+    `WINDOW_RANKING`'s members and its docstring explains that the rule under test keeps a
+    deliberately narrower `_PREFIX_STABLE_RANKING`, because the other members divide by a
+    partition total. Nothing mechanical separates that from an oversight -- both are a short
+    list beside a longer constant. Treat a finding as a question, not a verdict.
+    """
+    for node in ast.walk(tree):
+        values = _string_set(node)
+        if not values or len(values) < _SHADOW_MIN_TEST:
+            continue
+        subset = set(values)
+        for name, populations in constants.items():
+            if name not in source:
+                continue
+            for full in populations:
+                if not subset < full:
+                    continue
+                missing = sorted(full - subset)
+                yield Finding(
+                    "shadowed-production-set",
+                    "medium",
+                    rel,
+                    getattr(node, "lineno", 0),
+                    f"hand-lists {len(subset)} of `{name}`'s {len(full)} members; "
+                    f"{missing[:4]}{' ...' if len(missing) > 4 else ''} are never exercised — "
+                    f"derive the parametrization from `{name}` and classify what it cannot "
+                    f"cover, so a new member fails here instead of shipping untested",
+                )
+                return
+
+
 #: Reads that report *how a query ran* rather than what it produced. A helper returning one
 #: of these is observing the machine, not the data.
 _RUN_OBSERVATIONS = frozenset(
@@ -1459,9 +1562,13 @@ def detect_methodology(ctx: Context) -> Iterator[Finding]:  # noqa: ARG001 — u
         if path.parent.name == "differential":
             yield from check_differential_oracle(path, tree, path.read_text())
     yield from _uncontrolled_negatives(modules)
+    # Read the engine's own enumerations once, not per test module: `shadowed-production-set`
+    # compares every test's hand-written list against all of them.
+    constants = production_string_sets(Path("python") / "batcher")
     for path, tree in modules:
         yield from _single_sample_timings(tree, _rel(path))
         yield from _uncontrolled_runtime_comparisons(tree, _rel(path))
+        yield from _shadowed_production_sets(tree, path.read_text(), _rel(path), constants)
         yield from _inert_patches(path, tree)
     for path, tree in _example_scripts():
         yield from check_example(path, tree)

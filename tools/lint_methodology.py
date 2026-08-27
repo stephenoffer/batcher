@@ -65,6 +65,27 @@ ALLOW: dict[str, str] = {}
 #:
 #: The number may fall and may never rise. Re-record it *down* when you fix some.
 RATCHET: dict[str, int] = {
+    # A test hand-listing a few members of a production enumeration it names, where what it
+    # leaves out is never exercised. Budget 15 = the measured population, untriaged: roughly a
+    # third are real gaps and the rest are deliberate samples, and **nothing mechanical
+    # separates them** (see the rule's docstring). The budget stops the shape spreading; it
+    # does not claim the 15 are defects.
+    #
+    # The rule is not tuned to a known answer -- it was measured against the tree and then
+    # checked against a bug found independently. `_ROUNDING` reports `round`/`trunc` uncovered
+    # and `_IDEMPOTENT_MATH` reports `sign`; commit `87d82730` ("trunc and sign of an integer
+    # stay integers in every tier") had to fix exactly those three, hours later. The detector
+    # named them from the enumerations alone. b9's `FORMATS` hit was a shipped engine defect
+    # of the same kind: `polars` uncovered, silently widening every `string` to `large_string`
+    # through `map_batches`, so `Dataset.schema` and `collect()` disagreed.
+    #
+    # Known-deliberate entries, so nobody re-triages them: `STR_FNS` (4 of 105, a security
+    # test sampling), `MATH_FNS` (GPU conformance sampling), `_TRANSIENT_MARKERS`,
+    # `_BUILD_ARTIFACT_EXCLUDES`, and `WINDOW_RANKING` -- whose test docstring explains that
+    # the rule under test keeps a narrower `_PREFIX_STABLE_RANKING` because the other members
+    # divide by a partition total. Re-record **down** as the real ones are derived from their
+    # constants.
+    "shadowed-production-set": 15,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
