@@ -23,7 +23,9 @@ import os
 import threading
 from inspect import signature
 
+from batcher._internal.hardware.memory import machine_memory_bytes
 from batcher._internal.logging import note_suppressed
+from batcher.config import active_config
 from batcher.io.splits import Split
 from batcher.plan.types import retained_bytes
 
@@ -109,12 +111,19 @@ def _scan_cache_siblings() -> int:
 
 def _default_scan_cache_cap() -> int:
     frac = max(0.0, float(os.environ.get("BATCHER_SCAN_CACHE_FRACTION", "0.3")))
-    try:
-        import psutil
-
-        total = psutil.virtual_memory().total
-    except Exception:
-        total = 8 * 1024**3
+    # `machine_memory_bytes` rather than `psutil.virtual_memory().total`, which reports the
+    # **host's** RAM. Under a container -- the ordinary way a Ray worker runs -- the cgroup
+    # cap is the real ceiling, and a 4 GiB container on a 512 GiB node sized this cache
+    # against 512 GiB and got the cgroup to OOM-kill it. That is precisely the failure the
+    # comment below worries about, arriving through the number rather than the divisor, and
+    # `machine_memory_bytes` is documented as "the one implementation" every memory-sizing
+    # decision reads: it takes the tightest of host RAM, `memory.max`, `memory.high`, the
+    # batch scheduler's grant and `RLIMIT_AS`.
+    #
+    # The fallback is the configured default, not a hardcoded 8 GiB. Same spelling
+    # `carbonite.memory.probe` uses, so an operator who tells Batcher how much memory it has
+    # is believed here too instead of being overridden by a constant.
+    total = machine_memory_bytes() or active_config().memory.default_total_bytes
     # `total` is the *node's* RAM but this cap is enforced per process, so divide it by the
     # processes sharing the node. Without this the bound is real per process and meaningless
     # per node — every worker independently fills to `frac * node_RAM` and the node OOMs.
