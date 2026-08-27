@@ -1051,7 +1051,15 @@ def production_string_sets(root: Path) -> dict[str, list[set[str]]]:
     """Module-level `_UPPER` constants under `root` holding a set of string literals.
 
     Module-level and upper-cased on purpose: a local named `parts` collides with half the
-    test suite and produced the only pure-noise hit in the first measurement.
+    test suite and was the only pure-noise hit in the first measurement.
+
+    **Set arithmetic is resolved**, and that is not a refinement -- without it the detector
+    reports a false positive it cannot explain. `arith_extra` defines
+    `_ROUNDING_PROMOTES_INT = _ROUNDING - {"round", "trunc"}`, and a test tracking that
+    derived constant *exactly* was matched against `_ROUNDING` instead, because the constant
+    it actually tracked was invisible to a literal-only reader and the superset was the
+    nearest name in the file. Resolved left-to-right within a module, which is the order
+    Python itself binds them in.
     """
     found: dict[str, list[set[str]]] = {}
     for path in sorted(root.rglob("*.py")):
@@ -1059,6 +1067,7 @@ def production_string_sets(root: Path) -> dict[str, list[set[str]]]:
             tree = ast.parse(path.read_text())
         except SyntaxError:
             continue
+        local: dict[str, set[str]] = {}
         for node in tree.body:
             target = None
             if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
@@ -1069,12 +1078,38 @@ def production_string_sets(root: Path) -> dict[str, list[set[str]]]:
                 and isinstance(node.targets[0], ast.Name)
             ):
                 target = node.targets[0].id
-            if not target or not target.lstrip("_").isupper():
+            if not target or not target.lstrip("_").isupper() or node.value is None:
                 continue
-            values = _string_set(node.value) if node.value is not None else None
-            if values and len(values) >= _SHADOW_MIN_PROD:
-                found.setdefault(target, []).append(set(values))
+            values = _resolved_set(node.value, local)
+            if values is None:
+                continue
+            local[target] = values
+            # Recorded whatever its size. `_SHADOW_MIN_PROD` gates what a finding may be
+            # matched *against*, not what counts as "a set this test already tracks" -- a
+            # three-member derived constant is exactly the case the suppression below exists
+            # for, and filtering it here made the suppression unable to see it.
+            found.setdefault(target, []).append(values)
     return found
+
+
+def _resolved_set(node: ast.expr, local: dict[str, set[str]]) -> set[str] | None:
+    """A string-literal set, resolving `NAME - {...}` / `|` / `&` against `local`."""
+    literal = _string_set(node)
+    if literal is not None:
+        return set(literal)
+    if isinstance(node, ast.Name):
+        return local.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Sub, ast.BitOr, ast.BitAnd)):
+        left = _resolved_set(node.left, local)
+        right = _resolved_set(node.right, local)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.BitOr):
+            return left | right
+        return left & right
+    return None
 
 
 def _shadowed_production_sets(
@@ -1113,14 +1148,25 @@ def _shadowed_production_sets(
     """
     for node in ast.walk(tree):
         values = _string_set(node)
-        if not values or len(values) < _SHADOW_MIN_TEST:
+        if not values:
             continue
         subset = set(values)
+        # Distinct values, not literals. A `parametrize` **row** like `("rint", "rint",
+        # "rint")` is three string literals and one value -- an argument triple, not an
+        # enumeration -- and counting literals matched it against every rounding constant.
+        if len(subset) < _SHADOW_MIN_TEST:
+            continue
+        # A list that *exactly* equals some production set is tracking that set completely,
+        # even if it is also a strict subset of a wider one. Suppressing here is what makes a
+        # real finding self-retire: the fix is to classify the members, and a classified list
+        # equals the narrower constant it now tracks.
+        if any(subset == full for populations in constants.values() for full in populations):
+            continue
         for name, populations in constants.items():
             if name not in source:
                 continue
             for full in populations:
-                if not subset < full:
+                if len(full) < _SHADOW_MIN_PROD or not subset < full:
                     continue
                 missing = sorted(full - subset)
                 yield Finding(

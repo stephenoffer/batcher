@@ -97,7 +97,11 @@ RATCHET: dict[str, int] = {
     # its alias table, and asserts the *behaviour* (`atomic_rename is False` out of
     # `_wrap_user_filesystem`) rather than membership in the set it drew the scheme from,
     # which was true by construction.
-    "shadowed-production-set": 13,
+    # 13 -> 11 after three refinements from b9 (see the rule docstring): resolving set
+    # arithmetic so a derived constant is visible, suppressing a list that exactly equals some
+    # production set, and counting *distinct* values so a `parametrize` row of repeated
+    # literals is not read as an enumeration.
+    "shadowed-production-set": 11,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
