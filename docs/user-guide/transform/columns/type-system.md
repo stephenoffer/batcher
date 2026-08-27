@@ -80,6 +80,25 @@ except Exception as exc:
     print(type(exc).__name__)
 ```
 
+Whether it raises depends on the total, not on the order the rows arrive in. A column whose
+large values cancel sums cleanly, even though adding them left to right passes outside
+`Int64` on the way:
+
+```python
+cancels = bt.from_pydict({"x": [2**62, 2**62, -(2**62), -(2**62)]})
+print(cancels.agg(total=bt.col("x").sum()).to_pydict()["total"])
+```
+
+That distinction matters more than it looks. How a table is split into batches, and across
+how many machines, is a scheduling decision. If a running total decided the outcome, the
+same query would succeed on one node and fail across several, on identical data.
+
+One limit remains, and it is worth knowing before you rely on the guarantee. Each partition
+is summed into its own `Int64` before the partitions are merged, so a partition whose *own*
+total exceeds `Int64` still raises, even when the totals across partitions would cancel. Row
+order inside a partition never decides anything. How the rows are divided between partitions
+still can, in that one case.
+
 So the rule to carry is: an integer *expression* can wrap, an integer *aggregate* cannot.
 If a column's values approach `2**63` and the arithmetic matters, cast before computing —
 `Float64` for magnitude, `decimal(38, s)` when the digits have to be exact.

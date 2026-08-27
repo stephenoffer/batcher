@@ -30,6 +30,95 @@ mod argextreme;
 mod dispatch;
 mod inputs;
 
+/// Widen an `i64` sum accumulator to `i128`, preserving every group's running total.
+///
+/// The three functions below are the engine's answer to one problem, shared by the plain
+/// aggregate (`accum`), the fused multi-aggregate (`fused`) and the whole-partition window
+/// sum (`window::partition_agg`): **`checked_add` on an `i64` accumulator errors on the
+/// running total, and the running total depends on the order rows arrive in.**
+///
+/// The multiset `{2^62, 2^62, -2^62, -2^62}` sums to 0, which fits an `i64` with room to
+/// spare, yet it exceeds `i64` partway whenever the two positives land first. Erroring there
+/// made a valid query's success a property of how its input happened to be batched:
+///
+/// ```text
+/// one batch  [M, M, -M, -M]      -> SumOverflow
+/// two        [M, -M] [M, -M]     -> 0
+/// two        [M, M] [-M, -M]     -> SumOverflow
+/// ```
+///
+/// Batching and partition count are scheduling decisions, so the same query succeeded
+/// single-node and failed distributed on identical data. That is not one of the two
+/// divergences the engine allows between one node and many (float reassociation, and a
+/// window tie the `ORDER BY` leaves open); both of those are cases where the query does not
+/// determine an answer, and here it determines 0.
+///
+/// Accumulating wide and narrowing once decides overflow on the *true* sum, which is a
+/// property of the data alone. It is a **retry**, not the default, because a blanket `i128`
+/// accumulator measured 1.29-1.37x the `i64` scatter loop; the fast path is untouched until
+/// it actually overflows. `window::frame` avoids the same trap differently, by removing
+/// leaving rows before adding entering ones so the accumulator never holds a superset of the
+/// frame — which the aggregate path cannot do, because it has to add every row.
+///
+/// `i128` cannot itself overflow here: 2^64 rows of `i64::MAX` is below 2^127.
+///
+/// **Residual limit, deliberately not fixed:** a partial's state is still an `i64` column, so
+/// a single partition whose own true sum exceeds `i64` still errors even when the grand total
+/// would fit. Closing that needs a wider intermediate schema, which is a wire-contract change.
+pub(crate) fn promote_wide(sums: &[i64]) -> Vec<i128> {
+    sums.iter().copied().map(i128::from).collect()
+}
+
+/// Narrow a promoted accumulator back to `i64`, erroring only if the **true** sum does not
+/// fit. The retry widens the accumulator, never the result type.
+pub(crate) fn narrow_wide(sums: Vec<i128>) -> Result<Vec<i64>, RuntimeError> {
+    sums.into_iter()
+        .map(|s| i64::try_from(s).map_err(|_| RuntimeError::SumOverflow))
+        .collect()
+}
+
+/// The single-group form of [`sum_i64_wide`], which sums the column directly.
+///
+/// It exists because the caller's fast path is reached with an **empty** `group_ids`: with one
+/// group there is nothing to look up, so that path never builds the slice. Retrying through
+/// the group-id loop therefore visited no rows at all and returned NULL for a query whose
+/// answer was 0 — silently, since a null sum is what an empty input legitimately produces.
+pub(crate) fn global_sum_i64_wide(arr: &Int64Array) -> Result<ArrayRef, RuntimeError> {
+    let mut sum = 0i128;
+    let mut any = false;
+    for i in 0..arr.len() {
+        if arr.is_valid(i) {
+            sum += i128::from(arr.value(i));
+            any = true;
+        }
+    }
+    // An all-null or empty input is a NULL sum, not 0, and must not report overflow.
+    let narrowed = if any {
+        i64::try_from(sum).map_err(|_| RuntimeError::SumOverflow)?
+    } else {
+        0
+    };
+    Ok(Arc::new(accum::masked_i64(vec![narrowed], vec![any])))
+}
+
+/// One exact `i128` pass over a whole `Int64` column, for the non-streaming callers that can
+/// simply redo the work. See [`promote_wide`] for why the `i64` pass is not enough.
+pub(crate) fn sum_i64_wide(
+    arr: &Int64Array,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let mut sums = vec![0i128; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            sums[g as usize] += i128::from(arr.value(i));
+            valid[g as usize] = true;
+        }
+    }
+    Ok(Arc::new(accum::masked_i64(narrow_wide(sums)?, valid)))
+}
+
 // The per-function dispatch lives in its own module; `finalize` is re-exported so every
 // caller's `agg::finalize(..)` is unchanged by the move, and `accumulate` is reachable as
 // `crate::agg::accumulate` for `group::combine`.
@@ -1252,6 +1341,64 @@ mod tests {
         assert_eq!(
             radix_map, oracle_map,
             "radix combine sums must match the oracle"
+        );
+    }
+
+    /// The mergeable invariant for the wide-retry path, and the exact edge of what it can
+    /// promise: `combine(partial(p_k))` equals the single-node answer for every split whose
+    /// **partials each fit an `i64`**, even when the running total inside a partial does not.
+    ///
+    /// Before the retry this held for almost no split at all: `[M,-M][M,-M]` returned 0 while
+    /// every other arrangement of the same rows raised, so the operator's answer depended on a
+    /// scheduling decision.
+    ///
+    /// `step == 2` is the documented residual and is asserted, not skipped. It puts both
+    /// positives in one partial, whose own true sum is 2^63, and a partial's state is an
+    /// `i64` column — so there is nothing for it to hold. Widening the *intermediate schema*
+    /// is what would close that, and it is a wire-contract change.
+    #[test]
+    fn a_partitioned_int_sum_that_overflows_partway_still_merges_to_the_true_total() {
+        const M: i64 = 1 << 62;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![M, M, -M, -M, 5, -5]));
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![0i64; 6]))];
+        let n = 6usize;
+
+        let call = AggCall::with_key(AggFunc::Sum, Some(values.clone()), None);
+        let oracle = group_aggregate(&keys, std::slice::from_ref(&call), n).unwrap();
+        let oracle_sum = oracle.agg_columns[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(oracle_sum, 0, "single-node oracle");
+
+        let split = |step: usize| -> Result<i64, RuntimeError> {
+            let partials = (0..n)
+                .step_by(step)
+                .map(|off| {
+                    let len = step.min(n - off);
+                    let ck: Vec<ArrayRef> = keys.iter().map(|k| k.slice(off, len)).collect();
+                    let call =
+                        AggCall::with_key(AggFunc::Sum, Some(values.slice(off, len)), None);
+                    partial(&ck, std::slice::from_ref(&call), len)
+                })
+                .collect::<Result<Vec<Partial>, _>>()?;
+            let merged = combine_with(&partials, &[AggFunc::Sum], 1)?;
+            let agg = finalize(&[AggFunc::Sum], &merged)?;
+            Ok(agg[0].as_any().downcast_ref::<Int64Array>().unwrap().value(0))
+        };
+
+        // Every partial fits an i64; the running total inside one of them does not.
+        for step in [1usize, 3, 4, 5, 6] {
+            let got = split(step)
+                .unwrap_or_else(|e| panic!("chunks of {step} should merge, got {e:?}"));
+            assert_eq!(got, oracle_sum, "split into chunks of {step}");
+        }
+
+        // The residual: `[M, M]` is a partial whose own true sum is 2^63.
+        assert!(
+            matches!(split(2), Err(RuntimeError::SumOverflow)),
+            "a partial that cannot fit its own true sum must still say so"
         );
     }
 

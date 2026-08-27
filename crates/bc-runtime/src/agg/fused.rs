@@ -56,12 +56,18 @@ enum FusedAcc<'a> {
     SumI64NoNull {
         v: &'a [i64],
         sums: Vec<i64>,
+        wide: Option<Vec<i128>>,
     },
     /// `sum` over `Int64` with **checked** add — a wrap would be a wrong answer.
+    ///
+    /// `wide` is `None` until an `i64` running total overflows, at which point the whole
+    /// accumulator promotes to `i128` and stays there. See [`super::promote_wide`] for why the
+    /// running total must not be what decides the query.
     SumI64 {
         v: &'a Int64Array,
         sums: Vec<i64>,
         valid: Vec<bool>,
+        wide: Option<Vec<i128>>,
     },
     SumDecimal {
         v: &'a Decimal128Array,
@@ -168,15 +174,33 @@ impl FusedAcc<'_> {
                     sums[gid as usize] += x;
                 }
             }
-            FusedAcc::SumI64NoNull { v, sums } => {
-                for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+            FusedAcc::SumI64NoNull { v, sums, wide } => {
+                // One branch per *block*, not per row: once promoted, the accumulator stays
+                // wide for the rest of the aggregation.
+                if let Some(w) = wide {
+                    for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+                        w[gid as usize] += i128::from(x);
+                    }
+                    return Ok(());
+                }
+                for (n_done, (&gid, &x)) in ids[start..end].iter().zip(&v[start..end]).enumerate() {
                     let slot = &mut sums[gid as usize];
                     // Checked throughout, exactly as `accum::sum_acc` is: a silent i64 wrap
                     // would be a wrong answer. It costs a not-taken branch, not a fast path —
                     // provided the error is built only when it is taken (see `accum::sum_acc`).
                     match slot.checked_add(x) {
                         Some(n) => *slot = n,
-                        None => return Err(RuntimeError::SumOverflow),
+                        // Not an error — the *running* total overflowed. Promote and finish
+                        // this block wide, starting at the row that did not fit.
+                        None => {
+                            let mut w = super::promote_wide(sums);
+                            let from = start + n_done;
+                            for (&g2, &x2) in ids[from..end].iter().zip(&v[from..end]) {
+                                w[g2 as usize] += i128::from(x2);
+                            }
+                            *wide = Some(w);
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -188,16 +212,48 @@ impl FusedAcc<'_> {
                     }
                 })
             }
-            FusedAcc::SumI64 { v, sums, valid } => {
-                block_loop!(ids, start, end, |i, g| {
-                    if v.is_valid(i) {
-                        let slot = &mut sums[g];
-                        *slot = slot
-                            .checked_add(v.value(i))
-                            .ok_or(RuntimeError::SumOverflow)?;
-                        valid[g] = true;
+            FusedAcc::SumI64 {
+                v,
+                sums,
+                valid,
+                wide,
+            } => {
+                if let Some(w) = wide {
+                    block_loop!(ids, start, end, |i, g| {
+                        if v.is_valid(i) {
+                            w[g] += i128::from(v.value(i));
+                            valid[g] = true;
+                        }
+                    });
+                    return Ok(());
+                }
+                for i in start..end {
+                    let g = ids[i] as usize;
+                    if !v.is_valid(i) {
+                        continue;
                     }
-                })
+                    let slot = &mut sums[g];
+                    match slot.checked_add(v.value(i)) {
+                        Some(n) => *slot = n,
+                        None => {
+                            let mut w = super::promote_wide(sums);
+                            // Re-walk from the row that did not fit — it has not been added
+                            // to `sums`, and its `valid` bit is set after the match, so the
+                            // wide pass owns both.
+                            for (off, &gid) in ids[i..end].iter().enumerate() {
+                                let j = i + off;
+                                let gj = gid as usize;
+                                if v.is_valid(j) {
+                                    w[gj] += i128::from(v.value(j));
+                                    valid[gj] = true;
+                                }
+                            }
+                            *wide = Some(w);
+                            return Ok(());
+                        }
+                    }
+                    valid[g] = true;
+                }
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
                 block_loop!(ids, start, end, |i, g| {
@@ -326,12 +382,20 @@ impl FusedAcc<'_> {
                 let n = sums.len();
                 Arc::new(masked_f64(sums, vec![true; n]))
             }
-            FusedAcc::SumI64NoNull { sums, .. } => {
+            FusedAcc::SumI64NoNull { sums, wide, .. } => {
                 let n = sums.len();
-                Arc::new(masked_i64(sums, vec![true; n]))
+                match wide {
+                    Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, vec![true; n])),
+                    None => Arc::new(masked_i64(sums, vec![true; n])),
+                }
             }
             FusedAcc::SumF64 { sums, valid, .. } => Arc::new(masked_f64(sums, valid)),
-            FusedAcc::SumI64 { sums, valid, .. } => Arc::new(masked_i64(sums, valid)),
+            FusedAcc::SumI64 {
+                sums, valid, wide, ..
+            } => match wide {
+                Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, valid)),
+                None => Arc::new(masked_i64(sums, valid)),
+            },
             FusedAcc::SumDecimal {
                 sums,
                 valid,
@@ -468,12 +532,14 @@ fn sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
                 FusedAcc::SumI64NoNull {
                     v: v.values(),
                     sums: vec![0; num_groups],
+                    wide: None,
                 }
             } else {
                 FusedAcc::SumI64 {
                     v,
                     sums: vec![0; num_groups],
                     valid: vec![false; num_groups],
+                    wide: None,
                 }
             }
         }
@@ -840,6 +906,62 @@ mod tests {
         let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
         let r = run_fused(&calls, &group_ids, 1, &mut out);
         assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
+    }
+
+    /// The fused accumulator promotes to `i128` rather than erroring when the *running* total
+    /// overflows, so a grouped `SUM` whose true value fits succeeds however the rows are
+    /// ordered. Before that, `{2^62, 2^62, -2^62, -2^62}` — which sums to 0 — errored on any
+    /// order putting the two positives first, making the query's success depend on batching.
+    #[test]
+    fn fused_i64_sum_that_fits_succeeds_in_every_row_order() {
+        const M: i64 = 1 << 62;
+        for order in [
+            [M, M, -M, -M],
+            [M, -M, M, -M],
+            [-M, -M, M, M],
+            [M, -M, -M, M],
+        ] {
+            let i: ArrayRef = Arc::new(Int64Array::from(order.to_vec()));
+            let calls = vec![
+                AggCall::new(AggFunc::Sum, Some(i.clone())),
+                AggCall::new(AggFunc::CountStar, None),
+            ];
+            let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
+            run_fused(&calls, &[0u32; 4], 1, &mut out)
+                .unwrap_or_else(|e| panic!("{order:?} failed: {e:?}"));
+            let got = out[0].as_ref().expect("sum produced")[0].clone();
+            let got = got.as_primitive::<Int64Type>();
+            assert_eq!(got.value(0), 0, "order {order:?}");
+        }
+    }
+
+    /// Promotion happens mid-stream, so it must carry the *other* groups' running totals and
+    /// the null validity across with it. Group 0 overflows partway and returns to 0; group 1
+    /// never overflows and must be untouched; group 2 is all-null and must stay null.
+    #[test]
+    fn fused_i64_sum_promotion_preserves_other_groups_and_nulls() {
+        const M: i64 = 1 << 62;
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(M),
+            Some(7),
+            None,
+            Some(M),
+            Some(-M),
+            Some(-M),
+            Some(5),
+        ]));
+        let group_ids = [0u32, 1, 2, 0, 0, 0, 1];
+        let calls = vec![
+            AggCall::new(AggFunc::Sum, Some(i.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
+        run_fused(&calls, &group_ids, 3, &mut out).expect("must promote, not error");
+        let got = out[0].as_ref().expect("sum produced")[0].clone();
+        let got = got.as_primitive::<Int64Type>();
+        assert_eq!(got.value(0), 0, "group 0 overflowed partway and came back");
+        assert_eq!(got.value(1), 12, "group 1 must survive the promotion");
+        assert!(got.is_null(2), "an all-null group stays null");
     }
 
     #[test]

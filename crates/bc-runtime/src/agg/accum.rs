@@ -135,8 +135,15 @@ pub(crate) fn sum_acc(
     if num_groups == 1 {
         match values.data_type() {
             DataType::Int64 => {
-                let s = arrow::compute::sum_checked(values.as_primitive::<Int64Type>())
-                    .map_err(|_| RuntimeError::SumOverflow)?;
+                let arr = values.as_primitive::<Int64Type>();
+                // `sum_checked` reports the *running* total overflowing, which some row
+                // orders do and others do not on the same data. Retry wide.
+                let Ok(s) = arrow::compute::sum_checked(arr) else {
+                    // NB: **not** `sum_i64_wide` — this path is reached with an *empty*
+                    // `group_ids`, because with one group there is nothing to look up. A
+                    // group-id-driven retry silently summed zero rows and returned NULL.
+                    return super::global_sum_i64_wide(arr);
+                };
                 return Ok(Arc::new(masked_i64(
                     vec![s.unwrap_or(0)],
                     vec![s.is_some()],
@@ -158,8 +165,8 @@ pub(crate) fn sum_acc(
             let arr = values.as_primitive::<Int64Type>();
             let mut sums = vec![0i64; num_groups];
             // Checked add throughout: a silent i64 wrap would be a wrong answer. (DuckDB
-            // promotes BIGINT sums to 128-bit; we error rather than corrupt until that
-            // wider-output promotion lands.)
+            // promotes BIGINT sums to 128-bit; we return an `i64` and error only when the
+            // *true* sum will not fit.) An overflow re-runs wide — see [`super::sum_i64_wide`].
             if arr.null_count() == 0 {
                 // No-null fast path: gather straight from the values slice, skipping the
                 // per-row validity branch and the per-row `valid` write (every group is
@@ -174,7 +181,9 @@ pub(crate) fn sum_acc(
                     // hides: the symbol names the error type, not the aggregate.
                     match slot.checked_add(v) {
                         Some(n) => *slot = n,
-                        None => return Err(RuntimeError::SumOverflow),
+                        // The *running* total overflowed, which says nothing about the
+                        // true sum. Retry wide rather than erroring — see [`super::sum_i64_wide`].
+                        None => return super::sum_i64_wide(arr, group_ids, num_groups),
                     }
                 }
                 return Ok(Arc::new(masked_i64(sums, vec![true; num_groups])));
@@ -185,7 +194,7 @@ pub(crate) fn sum_acc(
                     let slot = &mut sums[g as usize];
                     match slot.checked_add(arr.value(i)) {
                         Some(n) => *slot = n,
-                        None => return Err(RuntimeError::SumOverflow),
+                        None => return super::sum_i64_wide(arr, group_ids, num_groups),
                     }
                     valid[g as usize] = true;
                 }
@@ -779,10 +788,100 @@ mod tests {
 
     #[test]
     fn int64_sum_overflow_errors_instead_of_wrapping() {
-        // i64::MAX + 1 in one group must error, not silently wrap to i64::MIN.
+        // i64::MAX + 1 in one group must error, not silently wrap to i64::MIN. The true sum
+        // is 2^63, which no `i64` holds, so the wide retry must fail too.
         let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
         let group_ids = [0u32, 0];
         let r = sum_acc(&values, &group_ids, 1, AggFunc::Sum);
+        assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
+    }
+    /// Whether an integer `SUM` succeeds must be a property of the *data*, not of the order
+    /// the rows arrive in. `{2^62, 2^62, -2^62, -2^62}` sums to 0 in every order, but an
+    /// `i64` running total overflows partway whenever the two positives land first — so
+    /// before the wide retry, this query's success depended on how its input was batched,
+    /// and single-node and distributed could disagree about a query whose answer is 0.
+    #[test]
+    fn an_integer_sum_that_fits_succeeds_in_every_row_order() {
+        const M: i64 = 1 << 62;
+        let orders: [[i64; 4]; 4] = [
+            [M, M, -M, -M],
+            [M, -M, M, -M],
+            [-M, -M, M, M],
+            [M, -M, -M, M],
+        ];
+        for order in orders {
+            let values: ArrayRef = Arc::new(Int64Array::from(order.to_vec()));
+            let got = sum_acc(&values, &[0u32; 4], 1, AggFunc::Sum)
+                .unwrap_or_else(|e| panic!("{order:?} failed: {e:?}"));
+            let got = got.as_primitive::<Int64Type>();
+            assert_eq!(got.value(0), 0, "order {order:?}");
+        }
+    }
+
+    /// The global fast path is entered with an **empty** `group_ids`, because with one group
+    /// there is nothing to look up. Every single-group test above passes a full slice, so none
+    /// of them exercises the convention the engine actually calls with — and a wide retry that
+    /// looped over `group_ids` therefore summed zero rows and returned NULL for a query whose
+    /// answer is 0. Silently: a null sum is what an empty input legitimately produces, so
+    /// nothing downstream could tell the two apart.
+    #[test]
+    fn the_global_path_is_correct_with_an_empty_group_id_slice() {
+        const M: i64 = 1 << 62;
+        // Overflows partway, true sum 0.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![M, M, -M, -M]));
+        let out = sum_acc(&values, &[], 1, AggFunc::Sum).expect("must not error");
+        let out = out.as_primitive::<Int64Type>();
+        assert!(!out.is_null(0), "returned NULL for a sum of 0");
+        assert_eq!(out.value(0), 0);
+
+        // Does not overflow: the fast path answers without the retry, same convention.
+        let plain: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let out = sum_acc(&plain, &[], 1, AggFunc::Sum).unwrap();
+        assert_eq!(out.as_primitive::<Int64Type>().value(0), 6);
+
+        // All-null is a NULL sum, and must not be reported as an overflow.
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>, None]));
+        let out = sum_acc(&nulls, &[], 1, AggFunc::Sum).unwrap();
+        assert!(
+            out.as_primitive::<Int64Type>().is_null(0),
+            "all-null is NULL"
+        );
+
+        // A true overflow on this path still errors.
+        let big: ArrayRef = Arc::new(Int64Array::from(vec![M, M, M, M]));
+        let r = sum_acc(&big, &[], 1, AggFunc::Sum);
+        assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
+    }
+
+    /// The same property per group, on the null-carrying path (a null must not make a group
+    /// valid, and must not contribute to its sum).
+    #[test]
+    fn the_wide_retry_keeps_group_and_null_semantics() {
+        const M: i64 = 1 << 62;
+        // group 0: M + M - M - M = 0 (overflows partway). group 1: all null -> null.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(M),
+            Some(M),
+            None,
+            Some(-M),
+            Some(-M),
+            None,
+        ]));
+        let group_ids = [0u32, 0, 1, 0, 0, 1];
+        let out = sum_acc(&values, &group_ids, 2, AggFunc::Sum).expect("must not overflow");
+        let out = out.as_primitive::<Int64Type>();
+        assert_eq!(out.value(0), 0, "group 0");
+        assert!(out.is_null(1), "an all-null group is null, not 0");
+    }
+
+    /// A sum whose true value genuinely exceeds `i64` still errors rather than wrapping —
+    /// the retry widens the *accumulator*, not the result type.
+    #[test]
+    fn a_sum_past_i64_still_errors_after_the_wide_retry() {
+        const M: i64 = 1 << 62;
+        // 4 * 2^62 = 2^64, which no i64 holds however it is ordered.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![M, M, M, M]));
+        let r = sum_acc(&values, &[0u32; 4], 1, AggFunc::Sum);
         assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
     }
 
