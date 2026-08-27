@@ -1,5 +1,117 @@
 # Batcher CPU benchmark results
 
+## Where the group-by actually loses, and four fixes for it that do not work (2026-08-26)
+
+No code change. This is a bottleneck study with negative results, recorded so the next attempt
+starts after these four rather than at them. Every number is from `9cbf6a05`-era release
+builds on the 92-core box, 10 M rows, `best-of-5` or better.
+
+### Separating storage from execution first
+
+The board's `b/duckdb` bar compares Batcher over Arrow against DuckDB over its own compressed
+store, so part of any group-by gap is invariant #3 rather than a kernel. With the
+`duckdb_arrow` bar fixed (see the entry above), the two can be read apart. Single `int32` key,
+`sum(v1)` over 10 M rows:
+
+| groups | batcher | duckdb native | duckdb on Arrow | vs native | vs Arrow |
+|---|---|---|---|---|---|
+| 100 | 4.5 | 2.5 | 13.2 | 1.81x | **0.34x** |
+| 10,000 | 23.1 | 12.8 | 17.1 | 1.81x | **1.35x** |
+| 100,000 | 29.3 | 40.0 | 40.0 | 0.73x | 0.73x |
+
+**The one band where Batcher loses on execution rather than storage is the middle one.** At 100
+groups it is 3x faster than DuckDB on the same bytes and the native gap is compression. At
+100,000 it wins both. At 10,000 it loses both, and losing the Arrow bar is what makes it a
+kernel question.
+
+### It is a scaling limit, and it is specific to the aggregate
+
+Same query, same data, thread count swept on each engine independently:
+
+| groups | engine | 4 | 8 | 16 | 24 | 48 | 92 |
+|---|---|---|---|---|---|---|---|
+| 10,000 | batcher | 30.6 | 20.3 | **17.1** | 18.3 | 21.3 | 32.1 |
+| | duckdb | 47.1 | 33.5 | 21.1 | 15.0 | **9.9** | 12.3 |
+| 100,000 | batcher | 43.4 | **32.8** | 37.0 | 36.1 | 34.2 | 43.9 |
+| | duckdb | 108.0 | 88.1 | 46.6 | 37.3 | **27.0** | 30.9 |
+
+**Batcher is faster per core and stops scaling far earlier.** At four threads it beats DuckDB
+on both cardinalities. Its aggregate peaks at 8-16 threads and then *degrades*; DuckDB's keeps
+gaining to 48. Both fall off at 92, which is the box's hyperthread boundary and is not
+engine-specific.
+
+It is the aggregate and not the pipeline. The same sweep over three shapes of increasing
+statefulness, at 10,000 groups:
+
+| shape | 4 | 8 | 16 | 24 | 48 | 92 |
+|---|---|---|---|---|---|---|
+| filter + count (streaming) | 7.3 | 4.7 | 4.0 | 3.7 | **3.5** | 5.0 |
+| group_by 10k | 23.6 | **15.6** | 18.2 | 18.0 | 21.6 | 33.2 |
+
+The streaming shape scales to 48 on the same box and morsel pipeline.
+
+### Where the time goes
+
+Phase timers around `partial` and `combine_sized`, single int32 key, 10,000 groups:
+
+| threads | partials | partial rows | partial ms | combine ms | total |
+|---|---|---|---|---|---|
+| 8 | 8 | 80,000 | 16.25 | 0.84 | 17.1 |
+| 16 | 16 | 160,000 | 10.99 | 1.42 | **12.4** |
+| 48 | 47 | 470,000 | 11.48 | 2.89 | 14.4 |
+| 92 | 88 | 878,878 | 16.31 | 6.96 | 23.3 |
+
+Two effects, and both need answering:
+
+1. **`combine` is linear in worker count.** Partial rows are `workers x groups` by construction,
+   so 92 workers hand the merge 879 k rows to reduce to 10 k. 0.84 ms to 6.96 ms is 8.3x for
+   11.5x the workers. This cost exists *only because* the workers exist.
+2. **`partial` stops scaling at 16 threads and then regresses** - 10.99 ms at 16, 16.31 at 92.
+   `explain(analyze=True)` labels the 92-thread run `contended(354 preempt/core-s)` and
+   "I/O/launch-bound" where the 8-thread run is "compute-bound", on a box measured at
+   load/core 0.078. So it is Batcher's own fan-out, not a neighbour.
+
+### Four fixes that do not work
+
+Each was implemented behind a temporary knob, measured, and reverted.
+
+**1. Cap the `chunked_partials` width.** The obvious read of effect (1): fewer chunks, smaller
+merge. Swept at full scan parallelism, it does nothing - 10,000 groups reads 22.5 ms at the
+default 92 and 22.0 at width 32, with width 4 *worse* at 38.1. The saving in `combine` is paid
+back in `partial`, because the narrowed width leaves most of the pool idle while the morsels it
+must gather were produced across every NUMA node.
+
+**2. Cap `combine`'s radix partition count.** `radix_partitions` forces at least one partition
+per core, so 10,000 groups on 92 threads gives 109 groups per partition. Swept 4 to 92 at full
+pool: 22.1 to 24.1 ms, non-monotonic, default inside the range. Not the lever.
+
+**3. Grow the morsel.** 16,384 rows is what makes a morsel's partial keep 0.61 of its rows at
+this cardinality. Larger morsels make it *worse* at every cardinality measured - 10,000 groups
+goes 22.6 ms at 16 k rows to 36.3 at 1 M.
+
+**4. Narrow the pool for aggregates.** The strongest candidate on the synthetic probe, where 16
+threads beat 92 by 1.9x. **On the real suite it is a large regression**: h2o-groupby geomean
+1.161 at the default against **1.440** at 16 threads and 1.381 at 24. q10 - six keys, near-unique,
+10 M groups - goes 205.6 ms to 571.2. That shape needs every core, and a rule derived from a
+single-key 10,000-group probe does not know it exists.
+
+**The fourth is the instructive one and it is the same error twice in one day.** A clean
+controlled result on one synthetic shape licensed a claim about a suite of ten. The probe was
+not wrong; the population it was generalized to was assumed. Before generalizing a controlled
+result, name the property that produced it and confirm each case has it - here, "the group count
+is small enough that worker-count-linear merge dominates", which is false for four of the ten
+queries.
+
+### What is left
+
+The two effects above are real, quantified and unaddressed. Anything that fixes (1) has to keep
+q10's width, so it must key off the measured group count rather than a global setting - the
+machinery for that already exists in `agg_par::decide`, which samples and measures. (2) is
+unexplained: a partial phase that regresses from 16 threads to 92 while the streaming pipeline
+scales to 48 on the same morsels is not explained by merge width, radix width, or morsel size,
+and the next attempt should profile it rather than reason about it. `perf` is unavailable on this
+box (`perf_event_paranoid=4`), which is why this study used in-tree phase timers.
+
 ## The like-for-like DuckDB bar was measuring a thread count on two suites (2026-08-26)
 
 `benchmarks/engines/duckdb_arrow.py`.
