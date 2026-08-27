@@ -48,6 +48,12 @@ class TabularAdapter(Protocol):
     methods: tuple[str, ...]
     #: File suffixes that identify a saved model of this framework.
     suffixes: tuple[str, ...]
+    #: URI scheme prefixes this framework owns, e.g. ``("models:/",)``. Checked before the
+    #: suffix, because a registry URI has no meaningful file extension.
+    uri_schemes: tuple[str, ...]
+    #: Whether `load` takes the URI as written. A framework with its own resolver (a model
+    #: registry) must never be handed a file the loader copied out from under it.
+    handles_uri: bool
     #: The feature-matrix precision this framework should be fed by default.
     default_dtype: str
 
@@ -82,6 +88,8 @@ class BaseAdapter:
     name = ""
     methods: tuple[str, ...] = ("predict",)
     suffixes: tuple[str, ...] = ()
+    uri_schemes: tuple[str, ...] = ()
+    handles_uri: bool = False
     #: Top-level module names whose classes belong to this framework.
     modules: tuple[str, ...] = ()
     # float32 is the boosters' own internal precision, so building float64 doubles the
@@ -197,7 +205,11 @@ def _load_adapters() -> None:
     the imports costs a `sys.modules` lookup once they are cached, which is what "idempotent"
     should have meant here.
     """
-    from batcher.ml.tabular import boosters, estimators  # noqa: F401  (registration import)
+    from batcher.ml.tabular import (  # noqa: F401  (registration import)
+        boosters,
+        estimators,
+        mlflow_model,
+    )
 
 
 def get_adapter(framework: str) -> TabularAdapter:
@@ -256,6 +268,12 @@ def detect_framework(model: Any) -> str:
     """
     _load_adapters()
     if isinstance(model, str):
+        # A scheme is checked first and is decisive. `models:/churn/3` has no extension at
+        # all, and `runs:/<id>/model` ends in something that is not a suffix any framework
+        # claims, so suffix detection cannot see either.
+        for adapter in FRAMEWORKS.values():
+            if any(model.startswith(scheme) for scheme in adapter.uri_schemes):
+                return adapter.name
         suffix = model.rsplit(".", 1)[-1].lower() if "." in model else ""
         for adapter in FRAMEWORKS.values():
             if suffix in adapter.suffixes:
@@ -300,7 +318,10 @@ def load_model(source: Any, framework: str) -> Any:
     if not isinstance(source, str):
         return source
     adapter = get_adapter(framework)
-    path = _localize(source)
+    # A framework with its own resolver gets the URI as written. Copying a model registry's
+    # `models:/name/3` to a temp file would strip exactly the indirection that makes it
+    # useful, and there is no single file at the other end of it to copy.
+    path = source if getattr(adapter, "handles_uri", False) else _localize(source)
     try:
         return adapter.load(path)
     except PlanError:

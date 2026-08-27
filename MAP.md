@@ -782,7 +782,7 @@ Tabular batch inference — XGBoost, LightGBM, CatBoost, scikit-learn, ONNX.
 | `boosters.py` | 285 | Gradient-boosted-tree adapters — XGBoost, LightGBM, CatBoost. |
 | `estimators.py` | 207 | scikit-learn and ONNX Runtime adapters. |
 | `features.py` | 269 | Arrow batch → dense feature matrix, and model output → Arrow columns. |
-| `mlflow_model.py` | 138 | Scoring a model out of an MLflow registry, by URI, without leaving the pipeline. |
+| `mlflow_model.py` | 165 | Scoring a model out of an MLflow registry, by URI, without leaving the pipeline. |
 | `predictor.py` | 298 | `tabular_predictor` — the load-once class UDF that scores a tabular model. |
 | `registry.py` | 414 | The tabular-framework registry — detect, load, and score a model uniformly. |
 

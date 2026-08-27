@@ -145,6 +145,10 @@ xgboost = ["xgboost>=2"]
 lightgbm = ["lightgbm>=4"]
 catboost = ["catboost>=1.2"]
 onnx = ["onnxruntime>=1.17"]
+# Scoring a model straight out of an MLflow registry by URI (`ds.ml.predict` with a
+# `models:/` or `runs:/` reference). The pyfunc flavor covers every logged model, so one
+# adapter serves sklearn/XGBoost/LightGBM/PyTorch alike.
+mlflow = ["mlflow>=2.9"]
 sklearn = ["scikit-learn>=1.3", "joblib>=1.3"]
 # --- Local model runtimes for an exported deep model (batcher.ml.*_predictor) ---
 # `onnx` above covers the ONNX graph path, and TensorRT with it: TensorRT is reached as an
