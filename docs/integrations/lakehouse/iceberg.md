@@ -137,6 +137,34 @@ files. Do not sweep the directory.
 Staged names carry a per-write token, so a later write cannot clobber a file an earlier snapshot
 still references, while a preempted-and-rerun shard overwrites its own file and stays idempotent.
 
+## Table statistics
+
+An Iceberg table can carry a statistics file per snapshot: a Puffin blob per column whose
+`ndv` property holds the distinct-count estimate that whichever engine last ran an ANALYZE
+wrote. Batcher reads them, so the first query against a table someone else analyzed plans
+its joins on a real distinct count rather than a default heuristic.
+
+Nothing is required of you. If the table publishes statistics they are used, and if it does
+not the plan falls back to the same estimates as before.
+
+Two details are worth knowing because they affect what the numbers can do:
+
+A published count is treated as an estimate, never as an answer. It informs join ordering,
+build-side choice, and equality selectivity. It can never satisfy `count_distinct`, which
+still executes. The distinct count and the column's min/max carry separate trust tags, so
+attaching a sketch does not disturb the exact manifest bounds that answer `min()` and
+`max()` without a scan.
+
+Statistics computed for an ancestor snapshot are used when the current snapshot has none,
+which is the normal case: an ANALYZE is almost always older than the newest append. A
+statistics file belonging to a snapshot that is not an ancestor of the one being read is
+ignored, because it describes rows this read will not see.
+
+Batcher does not currently write statistics files. The specification requires the blob to
+be a conformant Apache DataSketches theta sketch, and Batcher's own mergeable sketches are
+HLL. Publishing an HLL under a theta blob type would produce a file every other engine
+misreads, which is worse than publishing nothing.
+
 ## Failure modes worth knowing
 
 :::{warning}

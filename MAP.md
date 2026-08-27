@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1427 Python modules across 213 packages and 276 Rust files across 15 crates.
+Covering 1428 Python modules across 213 packages and 276 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -809,7 +809,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 |---|---|---|
 | `agg_rewrites.py` | 191 | Aggregate pre-pass rewrites for the SQL translator. |
 | `ai_functions.py` | 263 | Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``. |
-| `clauses.py` | 574 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
+| `clauses.py` | 628 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 586 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 628 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 539 | Grouping, aggregation, and projection mapping for the SQL translator. |
@@ -890,7 +890,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 2772 | The distributed executor — the dispatcher. |
+| `executor.py` | 2788 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 810 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 327 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 551 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -1825,8 +1825,9 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_common.py` | 102 | Shared helpers for the Iceberg connector: the dependency gate, write tokens, and |
 | `_manifest.py` | 97 | Iceberg's per-file metrics, normalized into the add-action layout the engine prunes with. |
 | `maintenance.py` | 125 | Iceberg table maintenance: snapshot expiry, and an honest refusal to compact. |
+| `puffin.py` | 199 | The distinct-value counts a table's Puffin statistics publish, read for planning. |
 | `sink.py` | 240 | Writing an Iceberg table: workers stage data files, the driver commits one snapshot. |
-| `source.py` | 555 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
+| `source.py` | 563 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
 
 ### `batcher/io/formats/ml/` — 2 · neutral IO
 

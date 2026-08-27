@@ -213,14 +213,22 @@ class IcebergSource:
         if rows is None:
             return None  # a filtered / merge-on-read source: the manifest overstates it
 
+        from batcher.io.formats.lakehouse.iceberg.puffin import (
+            statistics_ndv,
+            with_statistics_ndv,
+        )
         from batcher.io.stats import manifest_statistics
 
+        # Distinct counts the table publishes as Puffin statistics. Read here rather than
+        # left on the floor: without them a first query against someone else's table plans
+        # its joins on a Selinger guess, which is the estimate an ANALYZE exists to replace.
+        ndv = statistics_ndv(self._table(), self._snapshot_id)
         manifest = self._manifest()
         if manifest is not None:
             stats = manifest_statistics(manifest)
             if stats is not None:
-                return stats
-        return SourceStatistics(row_count=rows, exact_rows=True)
+                return with_statistics_ndv(stats, ndv)
+        return with_statistics_ndv(SourceStatistics(row_count=rows, exact_rows=True), ndv)
 
     def _manifest(self) -> pa.Table | None:
         """The snapshot's per-file manifest, read once per source.
