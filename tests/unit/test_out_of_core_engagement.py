@@ -17,6 +17,22 @@ through. The declaration below is the contract: for a shape, either it names the
 must run, or it says `None` with the reason the operator legitimately materializes. A new
 operator that materializes silently fails here until someone writes down which of the two it is.
 
+**What this spy can and cannot see, because it cost someone twenty minutes.** Every entry
+point below is in the *Python control plane*. An operator whose out-of-core path lives in the
+Rust data plane spills perfectly well and still shows up here as though it materialized. That
+is not a gap in the engine and must not be recorded as one: `distinct(subset=[...])` declines
+the Python spill path on purpose — its surviving row carries columns the key does not
+determine, so the group-by-every-column equivalence that a whole-row `DISTINCT` rides is
+simply false for it — and `bc_interp::distinct_on_spill` reduces it out of core under the same
+envelope. A probe watching only these names reports it as unbounded, twice over, since
+`iter_batches` reaches it through `stream_distinct_on` rather than `stream_distinct`.
+
+So read `None` below as "takes no *Python* bounded-memory path", not as "holds the relation in
+memory". Only `window_global_lag` means the stronger thing, and its comment says so. Before
+adding a `None` entry, check for a Rust path: `crates/bc-interp/src/*_spill.rs`, and
+`ExecMetrics.spilled` from `core.execute_local_metered`, which is the one instrument that sees
+across the FFI boundary.
+
 The third mode — `collect(distributed=True)` — asks the same question of the dispatcher and
 lives in `tests/integration/test_distributed_engagement.py`, because answering it needs a real
 cluster. This file is deliberately Ray-free so it runs at unit speed in every CI job.
