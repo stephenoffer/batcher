@@ -102,7 +102,37 @@ long-running process cannot keep acting on a token that lapsed hours ago.
 
 For a fleet where a submitter authenticates users and hands tokens to workers, use
 `HmacTokenVerifier` (standard library only, key resolvable as `env:`/`file:`). For an
-existing identity provider, use `JwtVerifier` against its JWKS endpoint.
+existing identity provider, use `JwtVerifier`.
+
+Name the issuer and let Batcher find its keys, rather than looking up a JWKS URL and
+pasting it into another config file:
+
+```python
+# docs: skip
+import batcher as bt
+from batcher.governance.authn import JwtVerifier
+
+bt.set_verifier(
+    JwtVerifier.from_issuer(
+        "https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher"
+    )
+)
+```
+
+`from_issuer` reads the provider's OIDC metadata at
+`<issuer>/.well-known/openid-configuration` and binds to the `jwks_uri` it publishes. A
+provider that does not publish metadata still works: pass `jwks_url` to the constructor
+directly.
+
+Both the metadata and the key set are cached per process, and each worker on a distributed
+query fetches for itself against its own network path to the provider. That matters for
+more than latency. A key set shipped from the driver would be the driver vouching for the
+issuer, which is the trust hop the verifier exists to remove, and it would make the
+identity provider a hard dependency of every query rather than of every five minutes.
+
+Signature algorithms default to asymmetric only. That default is load-bearing: allowing
+`HS256` alongside `RS256` is the algorithm-confusion attack, where an attacker signs a
+token with the public key used as an HMAC secret.
 
 ```{warning}
 This is a deployment control, not a security boundary. Code inside the engine's process can

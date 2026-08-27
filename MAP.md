@@ -1729,7 +1729,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 76 | The contract a credential verifier implements, and what it may not promise. |
-| `verifiers.py` | 309 | The credential verifiers Batcher ships. |
+| `verifiers.py` | 419 | The credential verifiers Batcher ships. |
 
 ### `batcher/io/` — 2 · neutral IO
 
