@@ -1163,6 +1163,26 @@ def _shadowed_production_sets(
         if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("batcher")
         for alias in node.names
     }
+    # `import batcher.x.y as ax` + `ax._FOLDABLE_MATH` reaches the constant just as directly
+    # as `from batcher.x.y import _FOLDABLE_MATH`, and only the second is an `ImportFrom`.
+    # Missing this form reported `test_arith_fold_type_completeness` -- a file whose docstring
+    # says it "derives its cases from `_FOLDABLE_MATH` itself" and whose two 4-member sets
+    # *partition* the eight -- as hand-listing four of them. That is the shape this rule's own
+    # message asks for, so flagging it was the rule contradicting its own advice.
+    module_aliases = {
+        alias.asname or alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name.startswith("batcher")
+    }
+    imported |= {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in module_aliases
+    }
     for node in ast.walk(tree):
         values = _string_set(node)
         if not values:

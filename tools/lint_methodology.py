@@ -111,7 +111,9 @@ RATCHET: dict[str, int] = {
     # `FORMATS`'s uncovered `polars` was a shipped engine defect. `_BUILD_ARTIFACT_EXCLUDES`,
     # `MATH_FNS` and `WINDOW_RANKING` are known deliberate samples. `_FOLDABLE_MATH` is new
     # from set-arithmetic resolution and untriaged.
-    "shadowed-production-set": 6,
+    # 6 -> 5: `import batcher.x.y as ax` + `ax._CONST` reaches the constant as directly as
+    # `from batcher.x.y import _CONST`, and only the second is an `ImportFrom`.
+    "shadowed-production-set": 5,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
