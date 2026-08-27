@@ -14,6 +14,8 @@ that is exactly what is counted.
 
 from __future__ import annotations
 
+import contextlib
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -45,6 +47,42 @@ def hive_tree(tmp_path):
     for day in ("2024-01-01", "2024-01-02", "2024-01-03"):
         _write(tmp_path / "data" / f"date={day}" / "part-0.parquet", _t(x=[1, 2]))
     return tmp_path / "data"
+
+
+@contextlib.contextmanager
+def _footer_ceiling(monkeypatch, limit: int):
+    """Lower `_MAX_FOOTER_PLAN_FILES` for the body, by patching the name the code reads.
+
+    `_too_many_files_to_sweep` looks the module global up at call time, so patching the
+    attribute is enough — and it is enough in a way that the obvious alternative is not.
+
+    The obvious alternative is `setenv` plus `importlib.reload`, because the constant is
+    *initialized* from the environment at import. Two successive versions of this helper did
+    that, and both were wrong in the same direction:
+
+    1. `setenv` / `reload` / `try` / `finally: reload` — the teardown reload runs **before**
+       pytest undoes the `setenv`, so it re-reads the *patched* value and pins the ceiling at
+       the test's limit for the rest of the process. Nothing fails here; the damage lands in
+       whatever runs next. With the ceiling stuck at 4, a later source of 24 files reported
+       `row_count() is None` rather than 4,800, and `tests/io/test_many_files_metadata.py`
+       failed 4 of its 5 — while passing standalone.
+    2. Restoring the environment first and reloading second fixes the ordering and
+       introduces the same bug one level down: `monkeypatch.delenv` **removes** the variable
+       rather than restoring it, so a developer running with a real
+       `BATCHER_MAX_FOOTER_PLAN_FILES=777` gets 10000 back after teardown. Verified; CI not
+       setting the variable is the only reason it would go unnoticed.
+
+    Patching the attribute has neither hazard: no environment, no reload, nothing whose
+    order matters, and `monkeypatch` restores the genuine prior value whatever it was. The
+    general lesson is worth more than this helper — a cleanup is only correct relative to
+    the order of the *other* cleanups, so the fix is to remove the ordering rather than to
+    sequence around it.
+    """
+    from batcher.io.base import source as source_module
+
+    monkeypatch.setattr(source_module, "_MAX_FOOTER_PLAN_FILES", limit)
+    assert limit == source_module._MAX_FOOTER_PLAN_FILES
+    yield source_module
 
 
 def test_a_wildcard_in_a_directory_component_matches_its_files(hive_tree) -> None:
@@ -277,21 +315,13 @@ def test_planning_a_wide_corpus_does_not_read_a_footer_per_file(tmp_path, monkey
     """
     for i in range(12):
         _write(tmp_path / f"part-{i}.parquet", _t(x=[1, 2]))
-    monkeypatch.setenv("BATCHER_MAX_FOOTER_PLAN_FILES", "4")
-    import importlib
-
-    from batcher.io.base import source as source_module
-
-    importlib.reload(source_module)
-    try:
+    with _footer_ceiling(monkeypatch, 4) as source_module:
         seen = _count_footer_reads(monkeypatch)
         splits = source_module.FileSource.splits(ParquetSource(str(tmp_path)))
 
         assert len(splits) == 12
         assert all(isinstance(s, FileSplit) for s in splits)
         assert seen == [], "planning a wide corpus must not read a footer per file"
-    finally:
-        importlib.reload(source_module)
 
 
 def test_a_narrow_corpus_still_gets_row_group_splits(tmp_path) -> None:
@@ -316,13 +346,7 @@ def test_a_predicate_keeps_the_footer_sweep_even_on_a_wide_corpus(tmp_path, monk
     """
     for i in range(12):
         _write(tmp_path / f"part-{i}.parquet", _t(x=[i, i + 1]))
-    monkeypatch.setenv("BATCHER_MAX_FOOTER_PLAN_FILES", "4")
-    import importlib
-
-    from batcher.io.base import source as source_module
-
-    importlib.reload(source_module)
-    try:
+    with _footer_ceiling(monkeypatch, 4) as source_module:
         predicate = {
             "e": "binary",
             "op": "gt",
@@ -334,8 +358,6 @@ def test_a_predicate_keeps_the_footer_sweep_even_on_a_wide_corpus(tmp_path, monk
         assert not any(isinstance(s, FileSplit) for s in splits), (
             "a pushed predicate must still reach the footers that prune with it"
         )
-    finally:
-        importlib.reload(source_module)
 
 
 # ---------------------------------------------------------------------------
