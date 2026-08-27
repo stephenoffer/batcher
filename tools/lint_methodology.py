@@ -89,7 +89,11 @@ RATCHET: dict[str, int] = {
     # the rule under test keeps a narrower `_PREFIX_STABLE_RANKING` because the other members
     # divide by a partition total. Re-record **down** as the real ones are derived from their
     # constants.
-    "shadowed-production-set": 15,
+    # 15 -> 14: `test_resilience_profile` now derives its platform-marker parametrization
+    # from `_MANAGED_AUTOSCALE_VARS` instead of retyping five of the six. The omitted
+    # `ANYSCALE_CLUSTER_ID` was a real gap and contradicted the test's own claim that no
+    # vendor marker is privileged.
+    "shadowed-production-set": 14,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:

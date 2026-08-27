@@ -14,7 +14,11 @@ import pytest
 
 from batcher.carbonite.resilience import PreemptionMonitor
 from batcher.config import Config, DistributedConfig
-from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, apply_resilience_profile
+from batcher.config.profiles import (
+    _MANAGED_AUTOSCALE_VARS,
+    AUTOSCALE_WAIT_AUTO,
+    apply_resilience_profile,
+)
 from batcher.config.validation import validate_config
 
 
@@ -185,16 +189,12 @@ def test_detect_managed_cluster_off_with_no_signal(_clean_autoscale_env):
     assert detect_managed_cluster() is False
 
 
-@pytest.mark.parametrize(
-    "var",
-    [
-        "ANYSCALE_SESSION_ID",  # Anyscale
-        "RAY_CLUSTER_NAME",  # KubeRay, on any cloud or on-prem Kubernetes
-        "RAY_CLUSTER_NAMESPACE",
-        "RAY_USAGE_STATS_KUBERAY_IN_USE",
-        "BATCHER_RAY_CLUSTER",  # the escape hatch for an unnamed platform
-    ],
-)
+#: Derived from the production tuple, not retyped beside it. The hand-written list covered
+#: five of the six and omitted `ANYSCALE_CLUSTER_ID` -- which this test's own docstring says
+#: must not happen, since its whole claim is that no marker is privileged. A hand list makes
+#: that claim about whichever markers someone remembered; deriving makes it about all of them,
+#: and a seventh marker added to `_MANAGED_AUTOSCALE_VARS` is covered the moment it lands.
+@pytest.mark.parametrize("var", _MANAGED_AUTOSCALE_VARS)
 def test_detect_managed_cluster_is_platform_neutral(_clean_autoscale_env, var):
     """Every platform marker is equally authoritative — batcher must not privilege one
     vendor, or "attach to the running cluster" works on that vendor and silently strands a
