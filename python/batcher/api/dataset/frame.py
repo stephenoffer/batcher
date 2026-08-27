@@ -564,6 +564,17 @@ class Dataset:
         materializing first. Executing the plan is therefore a side effect of the
         consumer iterating, which makes this a terminal operation.
 
+        **Routed like `collect()`, not like `iter_batches()`.** The protocol takes no
+        execution arguments, so the export has to pick a routing policy, and the two
+        available defaults disagree: `collect()` resolves ``distributed="auto"`` while
+        `iter_batches()` defaults to ``False``. Taking the latter meant that on a
+        multi-node cluster ``pl.DataFrame(ds)`` silently ran single-node while
+        ``pl.DataFrame(ds.collect())`` distributed — the same query, the same cluster, one
+        of them not using it. A caller who wants a specific mode has `iter_batches`; an
+        export that cannot be told has to match the terminal op it stands in for. On one
+        node ``"auto"`` resolves to single-node, so nothing changes there, and it never
+        starts a cluster that was not already connected.
+
         Args:
             requested_schema: A schema capsule the consumer would prefer, per the
                 protocol. Honoured only when it matches; otherwise the stream's own
@@ -572,7 +583,8 @@ class Dataset:
         Returns:
             An ``ArrowArrayStream`` PyCapsule.
         """
-        reader = pa.RecordBatchReader.from_batches(self.schema, self.iter_batches())
+        batches = self.iter_batches(distributed="auto")
+        reader = pa.RecordBatchReader.from_batches(self.schema, batches)
         return reader.__arrow_c_stream__(requested_schema)
 
     def __contains__(self, name: object) -> bool:

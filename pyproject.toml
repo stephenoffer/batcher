@@ -69,6 +69,13 @@ cloud = ["fsspec", "s3fs", "gcsfs", "adlfs", "aiohttp"]
 # OpenTelemetry span export (observability.otel_traces). Only the API is needed to emit;
 # the host app owns the SDK + OTLP exporter that ships spans to its collector.
 otel = ["opentelemetry-api>=1.20"]
+# --- Key stores for a secret reference (io.secret_backends) ---
+# `vault:` needs nothing: Vault's KV read is one authenticated GET, answered with urllib,
+# and this module is in the import path of every connector. The cloud stores need their
+# vendor SDK, imported only when that scheme is actually used.
+aws-secrets = ["boto3>=1.34"]
+gcp-secrets = ["google-cloud-secret-manager>=2.16"]
+azure-secrets = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
 tensorflow = ["tensorflow>=2.15"]
