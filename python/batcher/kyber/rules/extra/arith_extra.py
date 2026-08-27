@@ -103,13 +103,22 @@ _IDEMPOTENT_MATH = frozenset({"abs", "sign", "floor", "ceil", "trunc", "round", 
 _ROUNDING = frozenset({"floor", "ceil", "trunc", "round", "rint"})
 # The subset of `_ROUNDING` that the engine really does evaluate by promoting an Int64 to
 # Float64 first, so that over an integer the whole call collapses to that promotion.
-# **`round` is not one of them.** `bc_expr::eval::math::eval_math` special-cases
-# `(Round, Int64)` and returns the array *unchanged*, because DuckDB answers BIGINT for
-# `round(bigint)` and the f64 round-trip corrupts values above 2^53. Treating `round` as
-# promoting made this rule rewrite it to `cast(i, float64)`, which reintroduced exactly
-# that corruption at plan time: `round(2^53+1, 0)` came back as `9007199254740992.0`
-# against the engine's own `9007199254740993`, and the column changed from int64 to double.
-_ROUNDING_PROMOTES_INT = _ROUNDING - {"round"}
+#
+# **Neither `round` nor `trunc` is one of them**, and they are excluded for one reason twice.
+# `bc_expr::eval::math::eval_math` special-cases `(Round, Int64)` and `(Trunc, Int64)` and
+# returns the array *unchanged*, because DuckDB answers BIGINT for both and the f64
+# round-trip corrupts values above 2^53. Treating either as promoting makes this rule rewrite
+# it to `cast(i, float64)`, which reintroduces exactly that corruption **at plan time**:
+# `round(2^53+1, 0)` came back as `9007199254740992.0` against the engine's own
+# `9007199254740993`, and the column changed from int64 to double.
+#
+# `trunc` was the same defect, found later and from the other end. The engine promoted it too,
+# so the rule and the kernel agreed — and agreeing is what made it invisible: every tier gave
+# the same wrong number, and `assert_same` is int/float tolerant so no differential test could
+# see the retype either. Fixing `eval_math` alone was not enough, because this rule deletes
+# the call before the engine ever sees it. **A premise about what the engine does has to be
+# re-checked whenever the engine changes**; that is the whole content of this constant.
+_ROUNDING_PROMOTES_INT = _ROUNDING - {"round", "trunc"}
 # Unary math functions whose value over an *integer* literal is exactly computable here.
 _FOLDABLE_MATH = _IDEMPOTENT_MATH | {"sqrt"}
 # The bitwise logic ops (associative/commutative, and closed over i64). Each is also
@@ -284,9 +293,11 @@ def rounding_of_int_is_cast(node: LogicalPlan, _ctx: OptimizerContext) -> Logica
     produce it), and nulls propagate through the cast exactly as through the kernel. Fires
     only on a provably Int64 operand — over a float, rounding is real work.
 
-    **`round` is excluded**, because that premise is false for it alone: the engine returns
-    an Int64 `round(i)` unchanged rather than promoting, so the rewrite both retyped the
-    column double and corrupted every value past 2^53. See `_ROUNDING_PROMOTES_INT`.
+    **`round` and `trunc` are excluded**, because that premise is false for them: the engine
+    returns `round(i)` and `trunc(i)` unchanged rather than promoting, so the rewrite both
+    retyped the column double and corrupted every value past 2^53. See
+    `_ROUNDING_PROMOTES_INT`. `floor`/`ceil`/`rint` genuinely do promote, and DuckDB returns
+    DOUBLE for them too, so the rewrite stays right for those three.
     """
     return schema_rule(node, _rounding_of_int, carries=_CARRIES)
 
@@ -301,7 +312,11 @@ def _math_of_int(fn: str, value: int) -> Lit | None:
         # arbitrary-precision `abs` would silently produce 2**63, a different number.
         return None if value == _INT64_MIN else Lit(abs(value))
     if fn == "sign":
-        return Lit(float((value > 0) - (value < 0)))
+        # An integer's sign is an integer. Folding to a float retyped the column double,
+        # where the engine's `(Sign, Int64)` arm and DuckDB both answer an integer type.
+        # The *values* were right either way, which is why this survived: -1, 0 and 1 are
+        # exact in an f64 and `assert_same` is int/float tolerant.
+        return Lit((value > 0) - (value < 0))
     if fn == "sqrt":
         # A negative operand yields NaN in the engine, and this IR has no NaN literal to
         # fold to. Otherwise: `sqrt` is one of the five operations IEEE-754 *requires* to
@@ -315,9 +330,14 @@ def _math_of_int(fn: str, value: int) -> Lit | None:
         # precision past 2^53 — `round(2^53+1)` folded to `9007199254740992.0` where the
         # engine returns `9007199254740993`.
         return Lit(value)
-    # floor/ceil/trunc/rint: the engine promotes the integer to f64 and applies the
-    # function, which is the identity on the (integral) result — so the fold is the
-    # promotion alone. `float(value)` rounds exactly as the engine's cast does.
+    if fn == "trunc":
+        # `trunc` keeps an integer an integer for the same reason `round` does, and was
+        # missed for the same reason: the engine used to promote it, so the fold agreed with
+        # the kernel and both were wrong past 2^53. See `_ROUNDING_PROMOTES_INT`.
+        return Lit(value)
+    # floor/ceil/rint: the engine promotes the integer to f64 and applies the function,
+    # which is the identity on the (integral) result — so the fold is the promotion alone.
+    # `float(value)` rounds exactly as the engine's cast does.
     return Lit(float(value))
 
 

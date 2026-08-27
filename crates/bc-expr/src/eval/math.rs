@@ -293,7 +293,7 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
 /// on an integer, and DuckDB returns BIGINT for both); `floor`/`ceil`/`sqrt` yield
 /// Float64, promoting integer inputs, as DuckDB does.
 pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use MathFunc::{Abs, BitCount, Factorial, Round};
+    use MathFunc::{Abs, BitCount, Factorial, Round, Sign, Trunc};
     // `bit_count`/`factorial` are integer functions: their result is defined by the
     // two's-complement i64 bits, not an f64 approximation. Routing them through f64
     // (a) mistyped the schema as `double` and (b) gave wrong answers above 2^53 —
@@ -316,6 +316,25 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // above 2^53 — `round(2^53+1)` came back as `2^53`. `floor`/`ceil`/`sqrt` really
         // do yield double in DuckDB, so the promotion below stays right for them.
         (Round, DataType::Int64) => Ok(Arc::clone(arr)),
+        // `trunc` of an integer is that integer, and the f64 promotion below did to it exactly
+        // what it did to `round`: mistyped the schema as `double` (DuckDB returns BIGINT) and
+        // **silently returned the wrong number above 2^53** — `trunc(2^53+1)` came back as
+        // 2^53, and `trunc(2^62+7)` as 4.611686018427388e18. `round` was fixed for this and
+        // `trunc` was not, which is the whole reason it survived: nothing compares the two.
+        // The Cranelift tier preserves the integer here too (see `analyze.rs`/`emit.rs`), so
+        // the tiers stay bit-for-bit identical.
+        (Trunc, DataType::Int64) => Ok(Arc::clone(arr)),
+        // `sign` of an integer is an integer in {-1, 0, 1}. The f64 path returned the right
+        // *values* — they are exact in a double — but typed the column `double`, where DuckDB
+        // returns an integer and this engine's own `abs`/`round` preserve. A wrong column type
+        // is invisible to `assert_same`, which is int/float tolerant by design, so no
+        // differential test could have caught it. `Sign` is deliberately not JIT-compiled
+        // (`analyze.rs` keeps it on the interpreter), so there is no compiled tier to match.
+        (Sign, DataType::Int64) => {
+            let a = arr.as_primitive::<Int64Type>();
+            let out: Int64Array = unary(a, i64::signum);
+            Ok(Arc::new(out))
+        }
         (_, DataType::Int64 | DataType::Decimal128(..) | DataType::Decimal256(..)) => {
             // Promote to Float64 and apply the float function.
             //
@@ -387,7 +406,10 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // `UInt64` holds values no `Int64` does, so it cannot take the promotion above.
         // `abs`/`round` of an unsigned integer is that integer, exactly — returning it
         // untouched keeps the values above `i64::MAX` that a float promotion would round.
-        (Abs | Round, DataType::UInt64) => Ok(Arc::clone(arr)),
+        // `trunc` joins these for the same reason: an unsigned integer truncates to itself.
+        // `sign` does not — it has to compute 0-or-1 — and falls through to the float path,
+        // which is exact for an unsigned magnitude a `u64` can hold.
+        (Abs | Round | Trunc, DataType::UInt64) => Ok(Arc::clone(arr)),
         // The narrow floats, and `UInt64` for the genuinely float-valued functions.
         (_, DataType::Float16 | DataType::Float32 | DataType::UInt64) => {
             let f = cast(arr, &DataType::Float64)?;
@@ -604,6 +626,102 @@ mod int_math_tests {
             assert_eq!(r.data_type(), &DataType::Int64);
             assert_eq!(as_i64(&r), vec![Some(two53p1), Some(i64::MAX), Some(-7)]);
         }
+    }
+
+    /// `trunc` stays Int64 on an integer input and is exact above 2^53.
+    ///
+    /// The identical regression to `round` above, in the function immediately beside it, and
+    /// it outlived the `round` fix because nothing compares the two. Truncating an integer
+    /// yields that integer, but `trunc` sat in the `floor`/`ceil`/`sqrt` blanket rule and went
+    /// through f64: `trunc(2^53+1)` returned 2^53 and `trunc(2^62+7)` returned
+    /// 4.611686018427388e18 — wrong numbers, silently, with the column typed `double` where
+    /// DuckDB returns BIGINT.
+    ///
+    /// `floor`/`ceil` are checked alongside as the negative control: they genuinely do yield
+    /// f64 here and in DuckDB, so a fix that swept them up would be wrong.
+    #[test]
+    fn trunc_is_exact_int64_above_2_pow_53() {
+        let two53p1 = (1i64 << 53) + 1;
+        let two62p7 = (1i64 << 62) + 7;
+        let vals = i64arr(vec![
+            Some(two53p1),
+            Some(two62p7),
+            Some(-two53p1),
+            Some(-7),
+            None,
+        ]);
+
+        let r = eval_math(MathFunc::Trunc, &vals).unwrap();
+        assert_eq!(
+            r.data_type(),
+            &DataType::Int64,
+            "trunc(int) must stay Int64"
+        );
+        assert_eq!(
+            as_i64(&r),
+            vec![Some(two53p1), Some(two62p7), Some(-two53p1), Some(-7), None]
+        );
+
+        // Negative control: floor/ceil really are f64 on an integer, in DuckDB too.
+        for f in [MathFunc::Floor, MathFunc::Ceil] {
+            let r = eval_math(f, &vals).unwrap();
+            assert_eq!(r.data_type(), &DataType::Float64, "{f:?} must stay Float64");
+        }
+    }
+
+    /// The same claim through the **whole expression path** rather than the kernel alone.
+    ///
+    /// `trunc_is_exact_int64_above_2_pow_53` calls `eval_math` directly. That is the kernel,
+    /// not the path a query takes: a query builds an `Expr::Math` and calls `Expr::eval`,
+    /// which is where a promotion inserted anywhere between the two would show up. Asserting
+    /// the kernel alone is how a fix passes its own test and changes nothing observable.
+    #[test]
+    fn trunc_through_expr_eval_keeps_int64() {
+        use crate::Expr;
+        use arrow::record_batch::RecordBatch;
+        let two53p1 = (1i64 << 53) + 1;
+        let col: ArrayRef = Arc::new(Int64Array::from(vec![Some(two53p1), Some(-7)]));
+        let batch = RecordBatch::try_from_iter(vec![("x", col)]).unwrap();
+        let e = Expr::Math {
+            func: MathFunc::Trunc,
+            input: Box::new(Expr::Col { name: "x".into() }),
+        };
+        let out = e.eval(&batch).unwrap();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Int64,
+            "Expr::eval promoted trunc to f64"
+        );
+        assert_eq!(as_i64(&out), vec![Some(two53p1), Some(-7)]);
+    }
+
+    /// `sign` of an integer is an integer, and its column says so.
+    ///
+    /// The values were always right — -1, 0 and 1 are exact in an f64 — so this was a *type*
+    /// defect only, which is exactly why no differential test could see it: `assert_same` is
+    /// int/float tolerant by design. The column came back `double` where DuckDB returns an
+    /// integer type and this engine's own `abs`/`round` preserve.
+    #[test]
+    fn sign_of_an_integer_is_an_integer() {
+        let vals = i64arr(vec![
+            Some(i64::MIN),
+            Some(-7),
+            Some(0),
+            Some(9),
+            Some(i64::MAX),
+            None,
+        ]);
+        let r = eval_math(MathFunc::Sign, &vals).unwrap();
+        assert_eq!(r.data_type(), &DataType::Int64, "sign(int) must be Int64");
+        assert_eq!(
+            as_i64(&r),
+            vec![Some(-1), Some(-1), Some(0), Some(1), Some(1), None]
+        );
+
+        // A float input keeps the float path, where sign is still exact.
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![Some(-2.5), Some(0.0), Some(3.5)]));
+        let r = eval_math(MathFunc::Sign, &f).unwrap();
+        assert_eq!(r.data_type(), &DataType::Float64);
     }
 
     /// A negative `digits` rounds an integer to that power of ten, half away from zero,

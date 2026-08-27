@@ -1348,6 +1348,11 @@ mod tests {
             math(MathFunc::Ceil, col("c")),
             math(MathFunc::Trunc, col("c")),
             math(MathFunc::Floor, col("a")),
+            // `trunc` over an *integer* column. This list covered trunc-over-float and
+            // floor-over-int but never trunc-over-int, which is the one combination where the
+            // two tiers could disagree about the result *type* — and where an f64 round-trip
+            // silently loses the low bit above 2^53.
+            math(MathFunc::Trunc, col("a")),
             // abs: float -> Float64, int -> Int64 (type preserved).
             math(MathFunc::Abs, col("c")),
             math(MathFunc::Abs, col("a")),

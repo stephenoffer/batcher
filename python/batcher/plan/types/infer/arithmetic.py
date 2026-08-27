@@ -47,11 +47,14 @@ _BINARY_ARITH = frozenset({"add", "sub", "mul", "mod"})
 #: wrong answers above 2^53.
 _MATH_INT_RESULT = frozenset({"bit_count", "factorial"})
 
-#: Unary math functions that keep an integer input integral. `bc_expr` special-cases both
-#: (`(Abs, Int64)` and `(Round, Int64)`) because each is integer-valued on an integer and
-#: DuckDB returns BIGINT for it; promoting to f64 first corrupted values above 2^53.
+#: Unary math functions that keep an integer input integral. `bc_expr` special-cases each
+#: (`(Abs, Int64)`, `(Round, Int64)`, `(Trunc, Int64)`, `(Sign, Int64)`) because each is
+#: integer-valued on an integer and DuckDB returns an integer type for it; promoting to f64
+#: first corrupted values above 2^53.
 #: `floor`/`ceil`/`sqrt` genuinely do yield double there, so they are deliberately absent.
-_MATH_TYPE_PRESERVING = frozenset({"abs", "round"})
+#: `trunc` and `sign` were absent for no reason anyone recorded, and it cost a silent wrong
+#: answer: `trunc(2^53+1)` returned 2^53. `sign` was values-correct but mistyped.
+_MATH_TYPE_PRESERVING = frozenset({"abs", "round", "trunc", "sign"})
 
 #: Binary math functions returning Int64 whatever their operands' types -- the integer arms
 #: of `bc_expr::eval::math::eval_math2`. A GCD or LCM is an integer quantity by definition.

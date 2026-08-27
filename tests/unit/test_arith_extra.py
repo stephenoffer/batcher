@@ -184,6 +184,43 @@ def test_round_of_large_int_keeps_every_bit():
     assert out.column("r").to_pylist() == [big, 7]
 
 
+def test_trunc_of_int_is_not_cast_to_float():
+    """`trunc` is the second member the engine does not promote, and it was missed.
+
+    `round` was excluded from `_ROUNDING_PROMOTES_INT` when this defect was found the first
+    time, and the reasoning was written down. `trunc` has the identical property — the engine
+    special-cases `(Trunc, Int64)` and returns the array untouched, DuckDB answers BIGINT —
+    but stayed in the set, so the rule kept rewriting it to `cast(i, float64)` and losing
+    every value past 2^53.
+
+    It hid for a reason worth remembering: the engine promoted `trunc` too, so the rule and
+    the kernel *agreed*, and agreement is indistinguishable from correctness from inside. The
+    retype was invisible for a second reason — `assert_same` is int/float tolerant by design,
+    so no differential test could see an int64 column arriving as double.
+    """
+    _noop(ax.rounding_of_int_is_cast, col("x").trunc())
+    assert _optimized(col("x").trunc()) == MathExpr("trunc", Col("x")).to_ir()
+
+
+def test_trunc_of_large_int_keeps_every_bit():
+    """The end-to-end regression, mirroring `test_round_of_large_int_keeps_every_bit`."""
+    big = 2**53 + 1
+    ds = bt.from_pydict({"x": [big, 2**62 + 7, -7]})
+    out = ds.select(r=col("x").trunc()).collect()
+    assert out.schema.field("r").type == pa.int64()
+    assert out.column("r").to_pylist() == [big, 2**62 + 7, -7]
+
+
+def test_floor_ceil_rint_of_int_still_fold():
+    """The negative control: the three that genuinely do promote must keep folding.
+
+    Without this, excluding `trunc` could be over-applied to the whole family and the rule
+    would quietly stop doing its job, which no correctness test would notice.
+    """
+    for fn in ("floor", "ceil", "rint"):
+        assert _optimized(MathExpr(fn, Col("x"))) == Cast(Col("x"), "float64").to_ir(), fn
+
+
 def test_rounding_of_float_is_kept():
     _noop(ax.rounding_of_int_is_cast, col("f").floor())
 
@@ -200,7 +237,7 @@ def test_fold_abs_of_int_literal():
 
 
 def test_fold_sign_of_int_literal():
-    assert _fire(ax.fold_math_of_int_literal, lit(-7).sign()) == Lit(-1.0).to_ir()
+    assert _fire(ax.fold_math_of_int_literal, lit(-7).sign()) == Lit(-1).to_ir()
 
 
 def test_fold_rounding_of_int_literal():

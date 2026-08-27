@@ -363,6 +363,10 @@ impl Codegen<'_, '_> {
                             unreachable!("validated in analyze")
                         }
                     },
+                    // `trunc` on an integer is the identity — truncating an integer yields
+                    // that integer — so it must NOT round-trip through f64, which drops the
+                    // low bit above 2^53. Mirrors the interpreter's `(Trunc, Int64)` arm.
+                    Trunc if vt == ScalarTy::I64 => (v, ScalarTy::I64),
                     // floor/ceil/sqrt/trunc operate on f64; promote an int input to
                     // f64 first, exactly as the interpreter's `cast` does.
                     Floor | Ceil | Sqrt | Trunc => {
@@ -484,8 +488,8 @@ impl Codegen<'_, '_> {
                 _ => ScalarTy::I64,
             },
             Expr::Math { func, input } => match func {
-                // `abs` preserves the input type; the rest produce f64.
-                MathFunc::Abs => self.case_ty(input),
+                // `abs` and `trunc` preserve the input type; the rest produce f64.
+                MathFunc::Abs | MathFunc::Trunc => self.case_ty(input),
                 _ => ScalarTy::F64,
             },
             // Two-arg math (pow/atan2) always produces f64.

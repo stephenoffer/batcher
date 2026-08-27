@@ -56,6 +56,38 @@ An `Int32` overflow that would have wrapped in another engine does not wrap here
 the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it
 differs slightly from a `Float32` engine's answer, and it is the more accurate of the two.
 
+Widening moves the overflow boundary; it does not remove it. Scalar integer arithmetic
+**wraps** at the edge of `Int64`, silently, the way Rust and Polars do:
+
+```python
+big = bt.from_pydict({"x": [2**63 - 1]})
+print(big.select(r=bt.col("x") + 1).to_pydict()["r"])
+```
+
+That is deliberate rather than an oversight. The Cranelift JIT compiles `+` to a machine
+`iadd`, which wraps, and the interpreter is required to be bit-for-bit identical to the
+compiled tier on every expression it supports. An interpreter that raised where the JIT
+wrapped would make the same query answer differently depending on whether it compiled.
+
+Reductions do not inherit the convention, because nothing forces them to match a compiled
+kernel. `sum` over an `Int64` column raises rather than wrapping, and `cum_prod` returns
+`Float64` for an integer input for the same reason:
+
+```python
+try:
+    big.agg(total=bt.col("x").sum()).to_pydict()
+except Exception as exc:
+    print(type(exc).__name__)
+```
+
+So the rule to carry is: an integer *expression* can wrap, an integer *aggregate* cannot.
+If a column's values approach `2**63` and the arithmetic matters, cast before computing —
+`Float64` for magnitude, `decimal(38, s)` when the digits have to be exact.
+
+```python
+print(big.select(r=bt.col("x").cast("float64") + 1).to_pydict()["r"])
+```
+
 :::{warning}
 A schema assertion copied from a pandas or Spark test fails on the type *name*, and it
 reads as a data bug when it is not one. `int32` in the file is `int64` in the
