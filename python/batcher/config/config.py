@@ -2140,6 +2140,26 @@ class ObservabilityConfig:
     # the host app configured (Batcher owns no exporter). Uses the same measured profile
     # as the event log, so turning it on adds only the span emit, not extra measurement.
     otel_traces: bool = False
+    # Emit an OpenLineage run event per query (START before execution, COMPLETE/FAIL after),
+    # carrying the column-level lineage `governance.lineage` already computes. Off by
+    # default; needs `openlineage_url` (or the standard ``OPENLINEAGE_URL``) to name a
+    # receiver. Batcher owns no client: the event is POSTed to OpenLineage's HTTP transport
+    # off a bounded background queue, so a slow backend costs a dropped event, never latency.
+    openlineage: bool = False
+    # The lineage receiver's base URL, e.g. ``http://marquez:5000``. Empty → read
+    # ``OPENLINEAGE_URL``, which is the variable every other OpenLineage integration in a
+    # platform already sets; a second name meaning the same thing is how the two drift.
+    openlineage_url: str = ""
+    # The namespace jobs and datasets are recorded under. One namespace per environment is
+    # the convention (``prod``, ``staging``), not one per job.
+    openlineage_namespace: str = "batcher"
+    # Bearer token for the receiver. Empty → read ``OPENLINEAGE_API_KEY``. Accepts a
+    # ``env:``/``file:``/``cmd:`` secret reference for the same reason every other
+    # credential here does.
+    openlineage_api_key: str = ""
+    # Per-request timeout, in seconds, for the lineage POST. Bounds how long the drain
+    # thread can be held by an unresponsive receiver; it never bounds a query.
+    openlineage_timeout_s: float = 5.0
     # Directory for event-log documents. Empty → ``$BATCHER_HOME/logs`` (or
     # ``~/.batcher/logs``), resolved at write time so `config` stays free of filesystem I/O.
     event_log_dir: str = ""

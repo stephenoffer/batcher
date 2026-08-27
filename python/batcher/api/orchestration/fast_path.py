@@ -110,7 +110,14 @@ def eligible(
     Returns:
         `True` when the query may skip the orchestration.
     """
-    if not active_config().execution.fast_path:
+    cfg = active_config()
+    if not cfg.execution.fast_path:
+        return False
+    # The fast path skips the reporting hooks entirely, which is fine for a counter but not
+    # for a governance artifact: a lineage record with a hole in it is worse than none,
+    # because the hole is invisible. Declining here costs the orchestration skip only for
+    # deployments that opted into lineage emission.
+    if cfg.observability.openlineage:
         return False
     # Each of these routes to a different executor, and the fast path is the single-node
     # in-memory one. `cache` is orchestration in its own right (`api.executors`).

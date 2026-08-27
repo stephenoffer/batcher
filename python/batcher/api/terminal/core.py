@@ -288,6 +288,11 @@ def _collect(
 
     ensure_sinks()  # attach the progress bar / dashboard the config asks for (idempotent)
     query_id = start_query_report(query_label(plan), pipeline_signature(plan))
+    # Open the lineage run before execution, so a query that fails still leaves a record of
+    # what it was going to read. A no-op unless `observability.openlineage` names a receiver.
+    from batcher.api.terminal.lineage import emit_run_start
+
+    emit_run_start(query_id, plan, sources)
 
     ctx = core.ExecutionContext(
         columns=columns,

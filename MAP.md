@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1425 Python modules across 213 packages and 276 Rust files across 15 crates.
+Covering 1426 Python modules across 213 packages and 276 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -312,7 +312,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `fast_path.py` | 224 | The small-query fast path: Kyber and the engine, and nothing else. |
+| `fast_path.py` | 231 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `prepared.py` | 225 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 645 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 197 | What the conductor needs to know about a plan's size before it runs it. |
@@ -388,9 +388,10 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 586 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1341 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1346 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 614 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 624 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `lineage.py` | 440 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 217 | Emit a query's execution profile as OpenTelemetry spans. |
 | `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
@@ -2618,7 +2619,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2993 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3013 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 180 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
@@ -2888,7 +2889,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg_par.rs` | 759 | The high-cardinality parallel aggregate: partition first, aggregate once. |
+| `agg_par.rs` | 775 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `dist.rs` | 586 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 136 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
@@ -2945,7 +2946,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 642 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1625 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 619 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 626 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
@@ -2955,7 +2956,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
 | `agg/spill/store.rs` | 800 | The two spill stores and the codec that writes them. |
-| `agg/stats.rs` | 428 | Two-input covariance/correlation and single-input skewness/kurtosis. |
+| `agg/stats.rs` | 447 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 215 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |

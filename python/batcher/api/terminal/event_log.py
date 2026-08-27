@@ -68,7 +68,7 @@ def event_log_collector() -> ProfileCollector | None:
     from batcher.config import active_config
 
     obs = active_config().observability
-    if not (obs.event_log or obs.otel_traces or events.listening()):
+    if not (obs.event_log or obs.otel_traces or obs.openlineage or events.listening()):
         return None
     return ProfileCollector()
 
@@ -104,7 +104,8 @@ def start_query_report(label: str, signature: str = "") -> str:
     same one `write_event_log` later stamps on the profile and the on-disk document, so the
     live view and the archived artifact refer to the query by one name.
 
-    Returns `""` when no sink is attached, which is the default. Minting an id costs a
+    Returns `""` when no sink is attached and lineage emission is off, which is the
+    default. Minting an id costs a
     `strftime` and a `getpid`, and this runs on every terminal op — so the common case,
     where nobody is watching, must not pay for a name nothing will ever read.
 
@@ -116,8 +117,13 @@ def start_query_report(label: str, signature: str = "") -> str:
         The query id, to hand back to `write_event_log`, or `""` if nothing is listening.
     """
     from batcher._internal import events
+    from batcher.api.terminal.lineage import openlineage_enabled
 
-    if not events.listening():
+    # Lineage emission consumes the id too: without this the START event minted its own
+    # placeholder and the COMPLETE event used the one `write_event_log` allocated, so the
+    # two halves of one run reached the backend as two unrelated runs. `events.listening()`
+    # is checked first so the common case still costs one attribute read.
+    if not (events.listening() or openlineage_enabled()):
         return ""
     query_id = _query_id(next(_counter))
     events.publish(
@@ -180,11 +186,12 @@ def write_event_log(
     from batcher._internal import events
     from batcher._internal.logging import get_logger
     from batcher._internal.paths import open_private
+    from batcher.api.terminal.lineage import emit_run_complete, openlineage_enabled
     from batcher.api.terminal.otel import emit_query_spans, otel_enabled
     from batcher.config import active_config
 
     cfg = active_config().observability
-    if not (cfg.event_log or events.listening() or otel_enabled()):
+    if not (cfg.event_log or events.listening() or otel_enabled() or openlineage_enabled()):
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
     seq = next(_counter)
@@ -215,6 +222,7 @@ def write_event_log(
             get_logger("api").debug("event-log write failed", exc_info=True)
     # The emitter is itself a no-op unless OTel is enabled and a provider is configured.
     emit_query_spans(profile)
+    emit_run_complete(profile, plan, sources)
 
 
 def _is_udf_pipeline(plan: object) -> bool:
@@ -296,6 +304,7 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
         exc: The exception that ended the query.
     """
     from batcher._internal import events
+    from batcher.api.terminal.lineage import emit_run_failure
     from batcher.api.terminal.otel import emit_failure_span
 
     if not query_id:
@@ -314,6 +323,7 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
     # wants to find in a trace backend was the only class that was never in it, and a
     # latency histogram built from these spans silently excluded every timeout.
     emit_failure_span(query_id, total_ms, exc)
+    emit_run_failure(query_id, exc)
 
 
 def report_stream(batches: Iterator[Any], *, label: str, signature: str = "") -> Iterator[Any]:
