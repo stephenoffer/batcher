@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from batcher.dist.spill.aggregate import _MAX_SPILL_RECURSION as _MAX_SPILL_RECURSION
 from batcher.dist.spill.aggregate import _SUB_BUCKETS as _SUB_BUCKETS
-from batcher.dist.spill.aggregate import _empty_table as _empty_table
 from batcher.dist.spill.aggregate import _peel_to_breaker as _peel_to_breaker
 from batcher.dist.spill.aggregate import _reduce_agg_bucket as _reduce_agg_bucket
 from batcher.dist.spill.aggregate import _split_salt as _split_salt

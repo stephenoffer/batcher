@@ -11,17 +11,10 @@ import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
 from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
-from batcher.graph._iterate import iterate, max_abs_change
+from batcher.graph._iterate import check_iterations, iterate, max_abs_change
 from batcher.graph.degree import degree
 
 __all__ = ["degree_centrality", "pagerank", "personalized_pagerank"]
-
-
-def _check_iterations(max_iterations: int, tolerance: float) -> None:
-    if max_iterations < 1:
-        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
-    if tolerance < 0.0:
-        raise PlanError(f"tolerance must be non-negative, got {tolerance}")
 
 
 def _out_strength(g: Graph) -> Dataset:
@@ -105,7 +98,7 @@ def pagerank(
     """
     if not 0.0 <= damping < 1.0:
         raise PlanError(f"damping must be in [0, 1), got {damping}")
-    _check_iterations(max_iterations, tolerance)
+    check_iterations(max_iterations, tolerance)
 
     nodes = g.nodes().cache()
     n = nodes.count()
@@ -196,7 +189,7 @@ def personalized_pagerank(
     """
     if not 0.0 <= damping < 1.0:
         raise PlanError(f"damping must be in [0, 1), got {damping}")
-    _check_iterations(max_iterations, tolerance)
+    check_iterations(max_iterations, tolerance)
 
     nodes = g.nodes().cache()
     seeds = (

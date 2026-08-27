@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from batcher.api.tuning.decisions import total_source_rows
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
@@ -225,7 +226,7 @@ def _resolve_distributed(
             return learned >= min_rows
         if sources is None:
             return True
-        rows = _estimated_input_rows(sources)
+        rows = total_source_rows(sources)
         if rows is not None:
             return rows >= min_rows
         # Unknown size. The rule is "distribute, staying safe for large data" — but that is
@@ -319,16 +320,3 @@ def _plan_has_gpu_stage(plan: LogicalPlan) -> bool:
     from batcher.plan.accelerator import plan_requests_accelerator
 
     return plan_requests_accelerator(plan)
-
-
-def _estimated_input_rows(sources: list[Source]) -> int | None:
-    """Total estimated input rows across `sources` (cheap — a Parquet footer read), or
-    `None` if any source can't cheaply report one (→ distribute, staying safe for large
-    or unknown data)."""
-    total = 0
-    for s in sources:
-        rc = s.row_count() if hasattr(s, "row_count") else None
-        if rc is None:
-            return None
-        total += rc
-    return total

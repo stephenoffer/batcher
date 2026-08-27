@@ -28,7 +28,11 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
-from batcher.dist.executors.plan_analysis import empty_result_table, restore_declared_types
+from batcher.dist.executors.plan_analysis import (
+    _empty_agg_table,
+    empty_result_table,
+    restore_declared_types,
+)
 from batcher.dist.spill.buckets import (
     GRACE_DEPTH,
     GRACE_SUB_BUCKETS,
@@ -394,10 +398,10 @@ def execute_spilling_aggregate(
             # Same reason the distributed reducer restores them: a group-key round trip
             # hands an extension-typed column back as its plain storage.
             table = pa.Table.from_batches(out)
-            return restore_declared_types(table, declared or _empty_table(agg).schema)
+            return restore_declared_types(table, declared or _empty_agg_table(agg).schema)
         # Empty input. A *global* aggregate over zero rows still returns exactly one row
         # (`count() -> 0`, `median() -> NULL`), which is what both the single-node engine
-        # and DuckDB do — so it cannot take the zero-row `_empty_table` path.
+        # and DuckDB do — so it cannot take the zero-row `_empty_agg_table` path.
         #
         # `combine_finalize(..., [])` cannot serve it: with no partial state it has no
         # schema to type the result from, and raises. Route a schema-carrying *empty*
@@ -411,14 +415,7 @@ def execute_spilling_aggregate(
             return pa.Table.from_batches(
                 [nat.combine_finalize(group_keys_json, aggregates_json, [partial])]
             )
-        return _empty_table(agg)
-
-
-def _empty_table(agg: Aggregate) -> pa.Table:
-    # Typed, not null-typed: an empty aggregate result must carry the same column types a
-    # non-empty one would, or `distributed == single-node` is false for every empty result.
-    names = [k.alias for k in agg.group_keys] + [s.alias for s in agg.aggregates]
-    return empty_result_table(agg, names)
+        return _empty_agg_table(agg)
 
 
 # Named here because the skew test and this module's own reduce read them; the values, the
