@@ -29,16 +29,11 @@ from collections.abc import Callable
 
 from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit, Not
+from batcher.plan.expr_ir.core import int_literal
 from batcher.plan.expr_ir.func_nodes import StrFunc
 from batcher.plan.ir_tags import COMPARISON_FLIP
 
 __all__ = ["COUNTING_PREDICATE_RULES", "REVERSE_EQUALITY_RULES", "SLICE_PREDICATE_RULES"]
-
-
-def _int_literal(expr: Expr) -> int | None:
-    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    return None
 
 
 def _comparison(expr: Expr) -> tuple[str, Expr, Expr] | None:
@@ -70,7 +65,7 @@ def _counting_leaf(fn: str, key: tuple[str, int]) -> Callable[[Expr], Expr]:
         if parts is None:
             return expr
         op, computed, literal = parts
-        if (op, _int_literal(literal)) != key:
+        if (op, int_literal(literal)) != key:
             return expr
         if not isinstance(computed, StrFunc) or computed.fn != fn:
             return expr

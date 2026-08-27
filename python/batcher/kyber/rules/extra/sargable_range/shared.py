@@ -33,6 +33,7 @@ comparison over the same operand, so a null column yields a null answer either w
 from __future__ import annotations
 
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
+from batcher.plan.expr_ir.core import int_literal
 from batcher.plan.ir_tags import ORDERING_COMPARISONS, ORDERING_FLIP
 
 __all__ = [
@@ -81,13 +82,6 @@ def narrow_int_range(dtype: object) -> tuple[int, int] | None:
     return None if dtype is None else _NARROW_RANGES.get(str(dtype))
 
 
-def _int_lit(expr: Expr) -> int | None:
-    """The value of a plain integer literal, else ``None`` (a `bool` is not one)."""
-    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    return None
-
-
 def _split_inner(inner: Binary) -> tuple[str, Col, int] | None:
     """`(form, col, k)` for `col + k`, `k + col`, `col - k`, or `k - col`.
 
@@ -98,15 +92,15 @@ def _split_inner(inner: Binary) -> tuple[str, Col, int] | None:
     left, right = inner.left, inner.right
     if inner.op == "add":  # commutative, so the literal may sit on either side
         for col, other in ((left, right), (right, left)):
-            k = _int_lit(other)
+            k = int_literal(other)
             if isinstance(col, Col) and k is not None:
                 return "add", col, k
         return None
     if inner.op == "sub":
-        k = _int_lit(right)
+        k = int_literal(right)
         if isinstance(left, Col) and k is not None:
             return "sub", left, k
-        k = _int_lit(left)
+        k = int_literal(left)
         if isinstance(right, Col) and k is not None:
             return "rsub", right, k
     return None
@@ -132,7 +126,7 @@ def decompose(expr: Expr) -> tuple[str, str, Col, int, int] | None:
         (expr.left, expr.right, expr.op),
         (expr.right, expr.left, ORDERING_FLIP[expr.op]),
     ):
-        lit = _int_lit(other)
+        lit = int_literal(other)
         if lit is None or not isinstance(inner, Binary):
             continue
         split = _split_inner(inner)

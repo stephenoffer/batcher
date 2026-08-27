@@ -1246,8 +1246,8 @@ Expression-level Kyber rule families.
 | `complex_types.py` | 454 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 326 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
 | `guards.py` | 274 | Schema-aware helpers for expression rules that may only fire on a known type. |
-| `numeric.py` | 481 | Numeric algebra the earlier arithmetic families leave on the table. |
-| `numeric_rounding.py` | 43 | Rounding calls whose digit argument makes them a different function. |
+| `numeric.py` | 474 | Numeric algebra the earlier arithmetic families leave on the table. |
+| `numeric_rounding.py` | 42 | Rounding calls whose digit argument makes them a different function. |
 | `temporal.py` | 249 | Temporal identities: reading a date part through a truncation, and offset fusion. |
 | `text.py` | 339 | Regex de-specialization and the remaining string identities. |
 | `text_algebra.py` | 150 | String structure: de-specializing the remaining regex calls, and composing substrings. |
@@ -1285,7 +1285,7 @@ Extended Kyber rule families.
 | `metadata_adaptive.py` | 317 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 187 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
 | `nullability.py` | 367 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
-| `predicate_impossible.py` | 391 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
+| `predicate_impossible.py` | 385 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
 | `predicate_infer.py` | 495 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 470 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
@@ -1338,7 +1338,7 @@ Ordered-comparison sargable transposition, proved rather than assumed.
 | module | lines | what it is |
 |---|---|---|
 | `bounds.py` | 107 | Ordered sargable transposition proved by a column's **measured min/max**. |
-| `shared.py` | 184 | The decomposition and the overflow proof shared by the ordered sargable rules. |
+| `shared.py` | 178 | The decomposition and the overflow proof shared by the ordered sargable rules. |
 
 ### `batcher/kyber/rules/joins/` — 3 · subsystem
 
@@ -1418,7 +1418,7 @@ Temporal rule families that put a predicate back onto the raw timestamp column.
 
 | module | lines | what it is |
 |---|---|---|
-| `epoch.py` | 207 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
+| `epoch.py` | 202 | `epoch(ts) OP seconds` restated as a half-open interval on the timestamp itself. |
 | `offsets.py` | 187 | `offset_by(ts, …) OP instant` restated as `ts OP shifted_instant`. |
 
 ### `batcher/kyber/rules/text_algebra/` — 3 · subsystem
@@ -1429,7 +1429,7 @@ String rule families: predicate absorption, predicate normalization, and lengths
 |---|---|---|
 | `absorption.py` | 168 | Two string predicates on one column where one implies the other. |
 | `lengths.py` | 144 | A comparison against a string's length is almost always an emptiness test. |
-| `predicates.py` | 195 | A string call whose *comparison* is the real predicate, restated as that predicate. |
+| `predicates.py` | 190 | A string call whose *comparison* is the real predicate, restated as that predicate. |
 
 ### `batcher/kyber/rules/window_algebra/` — 3 · subsystem
 
@@ -2310,7 +2310,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 403 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6086 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6112 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 467 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |

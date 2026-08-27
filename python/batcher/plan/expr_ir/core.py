@@ -5521,6 +5521,32 @@ class Lit(Expr):
         return out
 
 
+def int_literal(expr: Expr) -> int | None:
+    """The Python `int` a plain integer literal holds, or `None` if it is not one.
+
+    The `bool` check is the whole point and the reason this is shared rather than rewritten
+    per caller: `bool` subclasses `int` in Python, so `isinstance(Lit(True).value, int)` is
+    true and a rule that skips the guard silently treats `WHERE flag = TRUE` as `= 1`. Five
+    Kyber rule families each carried their own copy of this function -- `_int_lit` three
+    times, plus `_int_literal` and `_seconds_literal` -- byte-identical including the guard.
+    Five copies of one subtlety is five chances for four of them to be left behind by a fix.
+
+    Lives beside `Lit` in the neutral `plan` layer rather than in a Kyber helpers module
+    because every caller already imports `plan.expr_ir`, so sharing it adds no import edge --
+    and an edge into `kyber.rules.exprs` would have run that package's `@rule` decorators
+    from two families that do not currently import it, changing rule registration order.
+
+    Args:
+        expr: The expression to inspect.
+
+    Returns:
+        The integer value, or `None` when `expr` is not a plain integer literal.
+    """
+    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+        return expr.value
+    return None
+
+
 @expr_node
 class Binary(IRNode):
     """A binary operation over two sub-expressions."""

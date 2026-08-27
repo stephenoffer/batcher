@@ -59,6 +59,7 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.cast_unwrap import _oriented
 from batcher.kyber.rules.exprs.guards import is_integer, node_schema
 from batcher.plan.expr_ir import Binary, Expr, Lit
+from batcher.plan.expr_ir.core import int_literal
 from batcher.plan.expr_rewrite import split_conjuncts
 from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Filter, LogicalPlan
@@ -77,13 +78,6 @@ _ARITH = frozenset({"mod", "mul", "bit_and", "bit_or"})
 _U64 = (1 << 64) - 1
 
 
-def _int_lit(expr: Expr) -> int | None:
-    """The value of a plain integer literal, else ``None`` (a `bool` is not one)."""
-    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    return None
-
-
 def _decompose(conjunct: Expr) -> tuple[str, str, Expr, int, int] | None:
     """`(arith_op, cmp_op, operand, k, lit)` for a comparison between `operand <arith> k` and
     an integer literal, normalized so the arithmetic reads as the left-hand side."""
@@ -93,7 +87,7 @@ def _decompose(conjunct: Expr) -> tuple[str, str, Expr, int, int] | None:
         (conjunct.left, conjunct.right, conjunct.op),
         (conjunct.right, conjunct.left, COMPARISON_FLIP[conjunct.op]),
     ):
-        lit = _int_lit(other)
+        lit = int_literal(other)
         if lit is None or not isinstance(inner, Binary) or inner.op not in _ARITH:
             continue
         # `mod` is not commutative, so its divisor must be on the right; `mul`/`bit_and`/
@@ -104,7 +98,7 @@ def _decompose(conjunct: Expr) -> tuple[str, str, Expr, int, int] | None:
             else ((inner.left, inner.right), (inner.right, inner.left))
         )
         for operand, constant in candidates:
-            k = _int_lit(constant)
+            k = int_literal(constant)
             if k is not None:
                 return inner.op, op, operand, k, lit
     return None
