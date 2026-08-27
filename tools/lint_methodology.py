@@ -101,7 +101,17 @@ RATCHET: dict[str, int] = {
     # arithmetic so a derived constant is visible, suppressing a list that exactly equals some
     # production set, and counting *distinct* values so a `parametrize` row of repeated
     # literals is not read as an enumeration.
-    "shadowed-production-set": 11,
+    # 11 -> 6: a file that *imports* the constant and derives from it is enumerating it,
+    # whatever local classification sets it also defines. Keyed on the import rather than the
+    # name, so it does not hide a file that hand-copies the vocabulary instead of importing it
+    # -- which is exactly what the surviving `JOIN_TYPES` finding does.
+    #
+    # Of the 6 that remain: `JOIN_TYPES` and `FORMATS` are the two b9 verified with a
+    # per-revision counterfactual (present since each test was written, no narrowing), and
+    # `FORMATS`'s uncovered `polars` was a shipped engine defect. `_BUILD_ARTIFACT_EXCLUDES`,
+    # `MATH_FNS` and `WINDOW_RANKING` are known deliberate samples. `_FOLDABLE_MATH` is new
+    # from set-arithmetic resolution and untriaged.
+    "shadowed-production-set": 6,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:

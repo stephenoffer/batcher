@@ -1146,6 +1146,23 @@ def _shadowed_production_sets(
     partition total. Nothing mechanical separates that from an oversight -- both are a short
     list beside a longer constant. Treat a finding as a question, not a verdict.
     """
+    # Names the file *imports* from the engine. A file that imports a constant and derives
+    # from it is enumerating it, whatever local classification sets it also defines --
+    # `test_aggregate_input_domains` imports `AGG_FNS`, parametrizes over
+    # `AGG_FNS - {"count_star", "approx_top_k"}`, and keeps `_PARAMETRIC`/`_BINARY` beside it
+    # to classify the members; those helpers are not a sample of anything.
+    #
+    # Deliberately keyed on the **import**, not on the name appearing. b9 measured a
+    # suppression on "the file's own lists partition the set" and it hid a real gap:
+    # `test_diff_runtime_filters` *hand-copies* `JOIN_TYPES = ["inner", ...]` as a local, so
+    # the name is present and the constant is not. Requiring the import separates a file that
+    # tracks the engine's vocabulary from one that has transcribed it.
+    imported = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("batcher")
+        for alias in node.names
+    }
     for node in ast.walk(tree):
         values = _string_set(node)
         if not values:
@@ -1163,7 +1180,7 @@ def _shadowed_production_sets(
         if any(subset == full for populations in constants.values() for full in populations):
             continue
         for name, populations in constants.items():
-            if name not in source:
+            if name not in source or name in imported:
                 continue
             for full in populations:
                 if len(full) < _SHADOW_MIN_PROD or not subset < full:
