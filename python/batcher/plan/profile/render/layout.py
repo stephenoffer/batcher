@@ -166,18 +166,57 @@ def _accounting(profile: QueryProfile, opts: RenderOptions) -> list[str]:
     wall time" and leaving the remaining 99% unnamed. On a small query that remainder is
     usually the dominant cost and it is the number worth acting on: it is planning,
     optimization, admission, the FFI crossing, and assembling the Arrow result.
+
+    **`OpProfile.elapsed_ms` is not wall time and must not be divided by `total_ms`.** It is
+    the operator's own transform time *summed over every morsel and every worker that ran
+    it* (`bc_interp::stream::meter`), which is deliberate: operators interleave in a
+    pipelined model, so no wall-clock interval belongs to one alone. The consequence is that
+    a parallel operator's figure exceeds the whole query's wall clock, and this block used
+    to divide the two anyway. A three-operator `filter` over 20M rows on 64 workers printed:
+
+        filter [a > 500]  ...  112ms  #####.  96%
+        where the time went
+          operators       116ms   315%  of 37ms
+
+    -- a filter reporting 112 ms inside a 37 ms query, and a share of 315%. Worse silently:
+    `rest` was `max(0.0, total - ops_ms)`, so the "elsewhere" line this section exists for
+    was clamped to zero and vanished *exactly* when the operators were parallel, which is
+    when the planning/FFI remainder is most worth naming.
+
+    So each operator is converted to the wall time its work must have occupied -- `T` cpu-ms
+    spread over `N` workers occupies `T / N` -- and that is what is reported against the
+    clock. It is an estimate in one direction only: pipelined operators overlap, so summing
+    per-operator occupancy can over-count the wall time actually spent inside operators. It
+    cannot under-count. When the sum exceeds the clock the split is not attributable at all,
+    and the block says so rather than printing a number: an unattributable split is a fact
+    about the measurement, and clamping it to zero reported the opposite.
+
+    Sequential operators are unaffected -- `threads <= 1` makes the conversion the identity,
+    so a single-threaded profile renders exactly as before.
     """
-    ops_ms = sum(o.elapsed_ms for o in profile.ops if o.measured)
+    measured = [o for o in profile.ops if o.measured]
+    ops_cpu = sum(o.elapsed_ms for o in measured)
+    ops_wall = sum(o.elapsed_ms / max(o.threads, 1) for o in measured)
     total = profile.total_ms
     if total <= 0:
         return []
     style = opts.style
-    rest = max(0.0, total - ops_ms)
-    lines = [
-        style("head", "where the time went"),
-        f"  operators   {pad(duration_ms(ops_ms), 9, align='right')}"
-        f"  {pad(percent(ops_ms / total), 5, align='right')}  of {duration_ms(total)}",
-    ]
+    lines = [style("head", "where the time went")]
+    cpu_note = f"  ({duration_ms(ops_cpu)} cpu across workers)" if ops_cpu > ops_wall * 1.05 else ""
+    if ops_wall > total:
+        # Overlapping operators, or a `threads` the engine did not record. Either way the
+        # wall clock cannot be split between operators and everything else.
+        lines.append(
+            f"  operators   {pad(duration_ms(ops_wall), 9, align='right')}"
+            f"  {pad('n/a', 5, align='right')}  occupancy exceeds the {duration_ms(total)}"
+            f" clock — overlapping operators, not attributable{cpu_note}"
+        )
+        return lines
+    lines.append(
+        f"  operators   {pad(duration_ms(ops_wall), 9, align='right')}"
+        f"  {pad(percent(ops_wall / total), 5, align='right')}  of {duration_ms(total)}{cpu_note}"
+    )
+    rest = total - ops_wall
     if rest > 0:
         note = "planning, optimization, admission, FFI crossing, result assembly"
         role = "warn" if rest / total > 0.5 else "muted"

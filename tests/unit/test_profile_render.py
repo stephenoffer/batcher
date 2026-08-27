@@ -10,6 +10,8 @@ while saying nothing about the other 99%.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from batcher.plan.profile import OpProfile, QueryProfile
@@ -179,6 +181,39 @@ def test_the_unaccounted_remainder_is_reported_rather_than_left_to_be_inferred()
     assert "operators" in text and "elsewhere" in text
     assert "99%" in text
     assert "planning, optimization, admission, FFI crossing, result assembly" in text
+
+
+def test_a_parallel_operator_does_not_report_more_time_than_the_query_took():
+    """`elapsed_ms` is CPU summed over workers, so dividing it by the clock printed 315%.
+
+    Measured shape: a 20M-row filter on 64 workers reported 113ms inside a 37ms query, and
+    the "elsewhere" line was clamped away by `max(0.0, total - ops_ms)` exactly when the
+    operators were parallel. Both halves are asserted -- the absent nonsense and the
+    present remainder -- because dropping the section entirely would also pass the first.
+    """
+    profile = QueryProfile(
+        ops=(_op(0, "filter", 0, elapsed_ms=113.0, threads=64),),
+        total_ms=37.0,
+        rows=1,
+        measured=True,
+    )
+    text = render_profile(profile, analyze=True)
+    assert "where the time went" in text
+    shares = [int(m) for m in re.findall(r"(\d+)%", text)]
+    assert shares, "positive control: the section must still print a share at all"
+    assert max(shares) <= 100, f"share above 100% in: {text}"
+    # 113ms over 64 workers occupies ~1.8ms of a 37ms clock, so the remainder is real.
+    assert "elsewhere" in text
+    assert "planning, optimization, admission, FFI crossing, result assembly" in text
+
+
+def test_a_sequential_profile_renders_exactly_as_it_did_before_the_wall_conversion():
+    """`threads <= 1` makes the occupancy conversion the identity — the control for it."""
+    profile = QueryProfile(
+        ops=(_op(0, "scan", 0, elapsed_ms=40.0, threads=1),), total_ms=100.0, rows=10, measured=True
+    )
+    text = render_profile(profile, analyze=True)
+    assert "40" in text and "60%" in text  # 40ms in operators, 60ms elsewhere
 
 
 def test_a_profile_whose_operators_cover_the_clock_reports_no_remainder():
