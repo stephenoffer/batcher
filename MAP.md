@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1428 Python modules across 213 packages and 276 Rust files across 15 crates.
+Covering 1429 Python modules across 213 packages and 276 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -782,8 +782,9 @@ Tabular batch inference — XGBoost, LightGBM, CatBoost, scikit-learn, ONNX.
 | `boosters.py` | 285 | Gradient-boosted-tree adapters — XGBoost, LightGBM, CatBoost. |
 | `estimators.py` | 207 | scikit-learn and ONNX Runtime adapters. |
 | `features.py` | 269 | Arrow batch → dense feature matrix, and model output → Arrow columns. |
+| `mlflow_model.py` | 138 | Scoring a model out of an MLflow registry, by URI, without leaving the pipeline. |
 | `predictor.py` | 298 | `tabular_predictor` — the load-once class UDF that scores a tabular model. |
-| `registry.py` | 393 | The tabular-framework registry — detect, load, and score a model uniformly. |
+| `registry.py` | 414 | The tabular-framework registry — detect, load, and score a model uniformly. |
 
 ### `batcher/ml/timeseries/` — 6 · front-end
 
@@ -2623,7 +2624,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 3013 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 180 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 181 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |

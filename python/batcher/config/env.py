@@ -53,6 +53,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_WRITE_RETRY_ATTEMPTS": "retries for a failed sink write",
     "BATCHER_WRITE_RETRY_BACKOFF_S": "base backoff between sink write retries",
     "BATCHER_JSON_CHUNK_BYTES": "JSON reader chunk size",
+    "BATCHER_SECRET_TIMEOUT_SECONDS": "per-request timeout for an HTTP-answered key store",
     "BATCHER_NATIVE_STREAM_MAX_DEPTH": "native Parquet stream prefetch depth",
     "BATCHER_NATIVE_WINDOW_BYTES": "native Parquet decode window",
     "BATCHER_FOOTER_CACHE_ROW_GROUPS": "row groups held in the split planner's footer cache",
