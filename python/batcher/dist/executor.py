@@ -692,7 +692,14 @@ def _is_splittable_source(source: Source) -> bool:
 
     try:
         splits = source.splits()
-    except Exception:
+    except Exception as exc:
+        # Recorded, not swallowed. Returning False here is right -- a source that cannot
+        # enumerate its splits must not be handed to workers -- but it routes the query to
+        # `_single_node` *without* passing `_unsupported`, so the loud refusal four functions
+        # below never fires. A broken splitter and a genuinely unsplittable source then look
+        # identical from the outside: the query returns the right rows, on one node, forever.
+        # That is the distinction `note_suppressed` exists to keep observable.
+        note_suppressed("dist", f"enumerate splits for {type(source).__name__}", exc)
         return False
     return bool(splits) and not (len(splits) == 1 and isinstance(splits[0], WholeSourceSplit))
 
