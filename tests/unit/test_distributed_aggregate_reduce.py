@@ -46,19 +46,26 @@ class _FakeNative:
 def wired(monkeypatch):
     import types
 
-    import batcher
-
     nat = _FakeNative()
-    # `import batcher._native as nat` binds via the PARENT ATTRIBUTE `batcher._native`
-    # (not sys.modules), so a stub must set that attribute — otherwise the real compiled
-    # module (when the engine is built) shadows a sys.modules-only patch. Provide a proper
-    # module object exposing the fake's combine/combine_finalize, working whether or not
-    # the native engine is present.
+    # The `sys.modules` entry is the load-bearing one, and it is the only one needed. Every
+    # path to the engine goes through `_internal.native.engine()`, which is
+    # `importlib.import_module("batcher._native")` -- a `sys.modules` lookup -- and that
+    # accessor's own docstring names this exact mechanism: "distributed reducers install a
+    # stub `batcher._native` in `sys.modules`".
+    #
+    # There used to be a `monkeypatch.setattr(batcher, "_native", mod, raising=False)` here
+    # too, explained as necessary because `import batcher._native as nat` binds the PARENT
+    # ATTRIBUTE and would shadow a sys.modules-only patch. That was true before the accessor
+    # existed. It is not now: `tests/unit/test_native_is_reached_through_the_accessor.py`
+    # holds that exactly one module in the tree imports the extension directly, and it is
+    # `_internal/errors/hierarchy.py` lifting error types -- not anything on this path. So
+    # the attribute was never read, `raising=False` meant it was *created* rather than
+    # overridden, and deleting it changes nothing: five tests pass either way, with or
+    # without `hierarchy` pre-imported so the attribute genuinely exists.
     mod = types.ModuleType("batcher._native")
     mod.combine = nat.combine
     mod.combine_finalize = nat.combine_finalize
     monkeypatch.setitem(sys.modules, "batcher._native", mod)
-    monkeypatch.setattr(batcher, "_native", mod, raising=False)
     written: list = []
     monkeypatch.setattr(
         "batcher.dist.shuffle_io.write_ipc", lambda batches, path: written.append((path, batches))
