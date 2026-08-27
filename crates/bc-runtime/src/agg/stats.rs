@@ -359,6 +359,25 @@ pub(crate) fn finalize_corr(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError
 /// Sample skewness (adjusted Fisher–Pearson, matching DuckDB):
 /// `g1·√(n(n−1))/(n−2)` where `g1 = m3 / m2^1.5` and `mk` are the population central
 /// moments. Null when n < 3 or the variance is zero.
+///
+/// # A stated divergence from the oracle, on a zero-variance group
+///
+/// Every value equal makes `m2 = 0` and the ratio `m3/m2^1.5` a `0/0`. **This returns NULL;
+/// DuckDB's `skewness` returns `NaN`.** That is a real differential difference on a shape that
+/// is not exotic at all — a constant column is ordinary — so it is written down here rather
+/// than left for someone to discover as a failing test.
+///
+/// It is chosen for **internal consistency**, because DuckDB is not consistent with itself
+/// here: fed the same constant column its `kurtosis` returns NULL while its `skewness` returns
+/// NaN, and [`finalize_kurtosis`] below takes the same `m2 <= 0.0` branch this does. Matching
+/// the oracle on skewness would therefore mean making Batcher's two moment aggregates disagree
+/// with each other about what an undefined moment is, to reproduce a disagreement inside the
+/// oracle. NULL — "there is no value" — is also the better answer for the callers that reach
+/// for these: a drift check or a feature selector treats NULL as missing and NaN as a number
+/// that poisons a comparison.
+///
+/// Pinned by `tests/differential/test_diff_moment_zero_variance.py`, which asserts the
+/// divergence deliberately rather than tolerating it.
 pub(crate) fn finalize_skewness(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
     moment_finalize(state, |n, m2, m3, _m4| {
         if n < 3.0 || m2 <= 0.0 {
