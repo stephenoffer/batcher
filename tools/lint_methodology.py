@@ -93,7 +93,11 @@ RATCHET: dict[str, int] = {
     # from `_MANAGED_AUTOSCALE_VARS` instead of retyping five of the six. The omitted
     # `ANYSCALE_CLUSTER_ID` was a real gap and contradicted the test's own claim that no
     # vendor marker is privileged.
-    "shadowed-production-set": 14,
+    # 14 -> 13: `test_object_store_portability` now derives from `_OBJECT_STORE_SCHEMES` and
+    # its alias table, and asserts the *behaviour* (`atomic_rename is False` out of
+    # `_wrap_user_filesystem`) rather than membership in the set it drew the scheme from,
+    # which was true by construction.
+    "shadowed-production-set": 13,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
