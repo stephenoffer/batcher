@@ -669,6 +669,38 @@ def test_sort_paths_agree_on_every_ordering(shape, key, descending, nulls_first)
     assert_tables_equal(_stream(plan), oracle, ordered=True)
 
 
+@pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))
+@pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+@pytest.mark.parametrize("key", ["k", "g"])
+def test_the_sort_contract_holds_under_every_scheduling(
+    scheduling, shape, key, descending, nulls_first
+):
+    """The replanning and repartitioning paths must sort too, not merely return the rows.
+
+    `test_the_replanning_and_repartitioning_paths_agree_too` runs the four schedulings over
+    `UNORDERED_OPS` only, and it compares with `assert_tables_equal`, which is
+    order-independent. So no test asked whether a **sort** survives them -- and these are the
+    four paths most likely to break one: `repartitioned` splits the input before the operator,
+    `spill_partitioned` forces a bucket count the data-sized default would not pick, and
+    `adaptive` exists to arrive at a *different plan* than the one-shot one did.
+
+    That is not a hypothetical shape of bug. `CLAUDE.md` cites `sort(descending=True)`
+    returning unsorted data under spill, with every gate green, as the reason the
+    cross-product matters.
+
+    Asserted with `assert_sort_contract`, never row-by-row against `collect()`. Which of two
+    rows tied on the key comes first is a free choice, and a different partitioning is
+    entitled to break ties differently: comparing `to_pydict()` across these schedulings
+    reports 96 of 160 combinations as violations, all of them the comparison's fault and none
+    the engine's.
+    """
+    table = INPUTS[shape]
+    plan = bt.from_arrow(table).sort(bt.col(key), descending=descending, nulls_first=nulls_first)
+    out = _SCHEDULINGS[scheduling](plan)
+    assert_sort_contract(out, table, key=key, descending=descending, nulls_first=nulls_first)
+
+
 # --- the assertions themselves, tested ----------------------------------------------
 #
 # `assert_sort_contract` replaced a row-by-row DuckDB comparison that could not survive a
