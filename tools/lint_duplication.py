@@ -17,6 +17,21 @@ stays high — this reports copied *logic*, not coincidence.
 
 Exceptions go in `DUPLICATION_ALLOW` with a one-line reason, the same way `lint_structure.py`
 handles its allowlist: visible, justified, and shrinking.
+
+**What this cannot see, and why that is on purpose.** `MIN_STATEMENTS` excludes bodies under
+four statements, so a *short* duplicated helper passes silently. That is not a gap to be
+closed by lowering the number -- measured on this tree, `MIN_STATEMENTS = 2` reports **65**
+blocks and `3` reports **15**, against **0** at the shipped `4`. Almost all of the extra are
+the shape `if <cond>: return <x>` / `return <y>`, which is ubiquitous and carries no shared
+logic; the normalizer erases constants and attribute names, so at that size it genuinely
+cannot tell a copied guard from a coincidence.
+
+The cost is real and worth stating rather than discovering: six byte-identical copies of a
+two-statement integer-literal reader lived across five Kyber rule families under five names,
+and this gate was clean the whole time (`a1ad3e11`). Three more two-statement pairs went the
+same way (`ce532ce0`). **A clean run here means no duplicated *blocks*, not no duplication.**
+Short helpers are found by reading, or by an ad-hoc exact-body scan that tolerates the noise
+because a human is triaging it -- not by this gate.
 """
 
 from __future__ import annotations
