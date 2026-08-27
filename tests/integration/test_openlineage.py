@@ -26,13 +26,26 @@ from batcher.config import Config, ObservabilityConfig, active_config, config_co
 pytestmark = pytest.mark.integration
 
 
+class _CollectingServer(HTTPServer):
+    """An HTTP server that owns the list its handler appends to.
+
+    Declaring the attribute on a subclass rather than assigning it onto a stock
+    `HTTPServer` is what lets the handler read `self.server.events` without a type
+    suppression — the handler's `server` really does have the attribute.
+    """
+
+    def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(address, handler)
+        self.events: list[dict] = []
+
+
 class _Receiver(BaseHTTPRequestHandler):
     """Collects posted lineage events into the server's `events` list."""
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        self.server.events.append(  # type: ignore[attr-defined]
+        self.server.events.append(
             {
                 "path": self.path,
                 "auth": self.headers.get("Authorization"),
@@ -49,8 +62,7 @@ class _Receiver(BaseHTTPRequestHandler):
 @pytest.fixture()
 def receiver():
     """A localhost lineage receiver, yielding the list it collects events into."""
-    server = HTTPServer(("127.0.0.1", 0), _Receiver)
-    server.events = []  # type: ignore[attr-defined]
+    server = _CollectingServer(("127.0.0.1", 0), _Receiver)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
