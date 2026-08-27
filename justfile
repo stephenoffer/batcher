@@ -124,6 +124,13 @@ surface-save path="/tmp/batcher-surface.json":
 surface-diff path="/tmp/batcher-surface.json":
     python tools/surface_snapshot.py --diff {{path}}
 
+# Regenerate the lazy re-export routing tables (`python/batcher/_exports.py`). The three
+# public facades — `batcher`, `batcher.api`, `batcher.api.session` — resolve their names
+# through it, so `import batcher` costs 5 ms instead of 545. Run after adding or renaming
+# a public name; `tests/unit/test_lazy_exports.py` fails when the committed table is stale.
+gen-exports:
+    python tools/gen_lazy_exports.py
+
 # Regenerate MAP.md — the file-level index of what every module is for. It is derived
 # from each module's own docstring and each crate's manifest, so it cannot drift; run
 # this after adding, moving, or re-documenting a module. `--check` runs in CI.
@@ -134,6 +141,12 @@ map:
 # *wrong* way to share between them — this is what catches it.
 lint-duplication:
     python tools/lint_duplication.py
+
+# The installed engine must not predate the Rust it is supposed to contain. Nothing else
+# catches a stale `_native.abi3.so`: it passes every lint gate, `just docs`, and most of
+# `test-py`, so the suite goes green while validating an engine that does not match the tree.
+lint-build-freshness:
+    python tools/lint_build_freshness.py
 
 # The agent-facing docs (CLAUDE.md, .claude/rules, .claude/skills) must stay TRUE: every path
 # and `just` recipe they name has to exist. Guidance pointing at a file that is not there is
