@@ -1,5 +1,103 @@
 # Batcher CPU benchmark results
 
+## The like-for-like DuckDB bar was measuring a thread count on two suites (2026-08-26)
+
+`benchmarks/engines/duckdb_arrow.py`.
+
+`duckdb_arrow` is the bar the README, the scorecard and `docs/benchmarks/` all describe as the
+execution-parity comparison: DuckDB over the same zero-copy Arrow Batcher runs on, with no
+untimed ingest. It binds each table with `con.register`.
+
+**DuckDB parallelizes an Arrow scan across the table's chunks**, so the chunk count sets how
+many threads its scan can use. The tables `datagen` builds arrive as a *single* chunk, which
+pinned that bar to one scan thread on a 92-core box.
+
+### The controlled result
+
+Real H2O groupby table, all ten real queries, with the bytes, the values, the connection and
+the SQL held identical and only the chunking of the registered table varied:
+
+| registered as | total (ms) | per-query range vs best |
+|---|---|---|
+| 1 chunk (as built) | 6146.9 | 4.6x - 17.8x |
+| 16 chunks | 1186.4 | |
+| 32 chunks | 765.4 | |
+| 64 chunks | 702.9 | flat plateau |
+| 128 chunks | 736.5 | |
+| 512 chunks | 971.2 | |
+
+**8.7x from a presentation detail of the input.**
+
+The control is what makes it a defect rather than a handicap both engines shared. Batcher, same
+two tables, same ten queries, same adapter: **595.7 ms on 1 chunk, 637.2 ms on 64** - 7%, and
+*slower* on the chunked input, because it morselizes internally regardless of how the input
+arrives. The single chunk penalized DuckDB alone.
+
+### Scope: two suites, not the board
+
+The first version of this entry claimed every `duckdb_arrow` figure was inflated by that 8.7x.
+**That was false and is withdrawn.** It generalized one suite's controlled result to suites
+whose inputs do not share the property. What actually decides it is where a suite's tables come
+from:
+
+| suite | source | chunks | effect on `b/duckdb_arrow` |
+|---|---|---|---|
+| h2o-groupby, h2o-join | `datagen` | 1 | severe - groupby 0.10 to **0.72** |
+| json | `datagen` | 1 | severe, same shape, not re-run |
+| clickbench | parquet | 2 (500k rows) | mild - 2 scan threads of 92 |
+| tpch, tpcds | parquet | ~123k rows/chunk | **none** |
+
+A suite that reads Parquet arrives pre-chunked at its row-group size. TPC-H sf10's `lineitem`
+loads as 481 chunks of 124,711 rows, within 2% of the target this fix sets, so it was already
+where the fix would put it.
+
+**TPC-H sf10 is the control that establishes the "none".** Three bars, after the fix:
+
+| | b/duckdb | b/duckdb_arrow |
+|---|---|---|
+| tpch sf10 | 0.91 (22 of 22) | **0.27** (22 of 22) |
+| h2o-groupby | 1.02 (10 of 10) | **0.72** (10 of 10) |
+
+0.27 against the 0.26-0.297 recorded before the fix: unchanged. **The published sf10 and JOB
+claims against `duckdb_arrow` stand and must not be withdrawn.** The H2O and JSON ones do not.
+
+### The fix
+
+Re-slice to `_ROWS_PER_CHUNK = 122_880` before registering - DuckDB's own default Parquet
+row-group size, so it is its native reader's arrangement rather than a constant tuned against
+this suite. Two independent arguments for that value over a tuned one: the real Parquet corpora
+already sit within 2% of it, and chunk-*size* tuning is below its own noise floor on this box
+(the same configuration measured 180.7 ms and 226.7 ms minutes apart, +25%, which exceeds every
+chunk-size difference being compared). The single-chunk effect is an order of magnitude above
+that floor, so it is resolvable where the tuning question is not.
+
+The re-slice is zero-copy - `to_batches(max_chunksize=...)` slices the existing buffers - so
+"identical bytes" stays literally true and only the batch boundaries move. It is untimed, which
+is what makes it symmetric: the native bar's `CREATE TABLE` ingest is untimed too, and it is
+what produces *its* well-formed row groups. Neither bar is charged for arranging its input.
+
+### Why an audit passed the file
+
+That docstring is among the most carefully argued in the tree. It explains the storage-versus-
+execution conflation, retracts an older "~100x slower on joins" claim as stale, and instructs
+the reader to report both bars. **All of that reasoning is sound and none of it is about the
+thing that was wrong.** The care went into *which* comparison to make; the defect was in whether
+the comparison was happening at all. A well-argued instrument reads as a verified one.
+
+The tell was in the same file: the docstring says a registered-Arrow query is "~1.5-3x native."
+The instrument said 10-20x. **The document's own stated expectation disagreed with the
+instrument by an order of magnitude and the instrument was believed.** When a measurement
+disagrees with its own documentation by more than the documentation's stated range, suspect the
+instrument before the claim.
+
+Two checks worth keeping, one for the defect and one for the over-read that followed it:
+
+- For any engine handed data in a format it did not choose, vary a presentation property that
+  should not matter - chunking, row order, column order, nullability - and confirm the number
+  does not move. If it moves, you are measuring the presentation.
+- Before generalizing a controlled result across cases, name the property that produced it and
+  verify each case has it. Here that was one `num_chunks` call per suite.
+
 ## Re-measuring the whole board found nothing above noise, and took nine runs to say so (2026-08-26)
 
 `benchmarks/` only. No engine change is recorded here. This entry exists because the board
