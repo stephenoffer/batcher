@@ -47,6 +47,15 @@ def bounded_driver(
     """
     from batcher import core
 
+    # The type test comes first because the two below dereference `plan.input`, and the router
+    # calls this for *every* plan it is handed — including one whose root is a `Union`, which
+    # has `inputs`. `rollup`/`cube` over an empty relation is such a plan (the grouping sets
+    # fold to a union of constants), and `iter_batches` on it raised `AttributeError: 'Union'
+    # object has no attribute 'input'` where `collect()` answered. Ordering the checks the
+    # other way is not a narrowing: every shape this module serves is single-input, so a plan
+    # that fails the test was going to be declined by the next line anyway.
+    if not isinstance(plan, (RowId, Distinct, Sample)):
+        return None
     if core.has_map_batches(plan.input) or not is_streamable(plan.input):
         return None
 
