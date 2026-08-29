@@ -136,6 +136,10 @@ _MULTI_KEY_FUNCS = {
     "count": ("count", "v"),
     "first_value": ("first_value", "v"),
     "bit_xor": ("bit_xor", "v"),
+    # `lag` is the one member offset by a *boundary exchange* rather than a running scalar, so
+    # it is the one whose correctness depends on the bucket layout rather than merely
+    # surviving it — which is why it belongs in the table that is parametrized over the cut.
+    "lag": ("lag", "v"),
 }
 
 

@@ -34,10 +34,17 @@ parallel formula over `(count, mean, M2)`, the same one the mergeable aggregate 
 kernel is asked for a running `count` and a running `avg` beside each and the triple is
 reconstructed per row (`M2 == var * (count - 1)`).
 
-`lag` / `lead` / `median` / `count_distinct` / the fills and the EWM series are still **not**
-offsettable this way (each reads rows the bucket does not hold, in an order the kernel does
-not return them in), so `supports_ordered_bucket_offsets` refuses them and the caller keeps
-the materializing kernel -- still correct, just not split.
+`lag` is offsettable in a third way again: it reads rows a bucket does not hold, but only the
+`k` immediately before it, so a **boundary exchange** of that bounded tail recovers it. That
+lives in `boundary`, because unlike everything above it needs a neighbouring bucket rather than
+a running scalar, and because identifying "the first `k` rows" of a bucket the kernel returns
+in arrival order takes a helper of its own.
+
+`lead` / `median` / `count_distinct` / the fills and the EWM series are still **not**
+offsettable (each reads rows the bucket does not hold in a direction or an order no bounded
+exchange recovers -- `lead` reads the bucket the walk has not reached yet), so
+`supports_ordered_bucket_offsets` refuses them and the caller keeps the materializing kernel --
+still correct, just not split.
 
 Both consumers of this algebra live one directory up from here in spirit and one import away
 in fact: `stream` runs the buckets one at a time on a single node under a memory envelope,
@@ -50,6 +57,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from batcher.dist.global_window.boundary import TrailingValues, lag_across_buckets
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Window
 
@@ -122,6 +130,10 @@ _ASSEMBLED = frozenset({"percent_rank", "cume_dist", "ntile", "last_value"})
 #: each one is needed in one place. `avg` was the first and had its pair written out inline.
 _HELPERS: dict[str, tuple[tuple[str, str], ...]] = {
     "avg": (("sum", "sum"), ("cnt", "count")),
+    # `lrn` is the bucket-LOCAL row number and is deliberately never offset: what identifies a
+    # row as one of the `k` the previous bucket has to lend to is its position inside its own
+    # bucket, and the kernel returns a bucket's rows in arrival order, so nothing else does.
+    "lag": (("lrn", "row_number"),),
     "var": (("cnt", "count"), ("avg", "avg")),
     "stddev": (("cnt", "count"), ("avg", "avg")),
     "percent_rank": (("rank", "rank"),),
@@ -143,12 +155,12 @@ _RANKING_HELPERS = frozenset({"rank", "row_number"})
 #: `avg` qualifies through its running `sum` and `count`, each of which is a constant shift;
 #: `var`/`stddev` through the moment triple above.
 _OFFSETTABLE = frozenset(
-    {"row_number", "rank", "dense_rank", "count", "min", "max", "avg", *_MOMENTS, *_FOLDS}
+    {"row_number", "rank", "dense_rank", "count", "min", "max", "avg", "lag", *_MOMENTS, *_FOLDS}
 )
 #: Functions whose offset reads the *input* column out of the bucket, so the input must be a
 #: plain column the kernel also emits alongside the running one.
 _NEEDS_COL_INPUT = frozenset(
-    {"count", "min", "max", "avg", "first_value", "last_value", *_MOMENTS, *_FOLDS}
+    {"count", "min", "max", "avg", "first_value", "last_value", "lag", *_MOMENTS, *_FOLDS}
 )
 _UNSET = object()
 
@@ -372,6 +384,10 @@ class OrderedBucketOffsets:
         self._last: dict[str, object] = dict.fromkeys(aliases, _UNSET)
         #: Chan state per moment function: `(count, mean, M2)` over every prior bucket.
         self._moment: dict[str, tuple[int, float, float]] = dict.fromkeys(aliases, (0, 0.0, 0.0))
+        #: The rolling boundary tail each `lag` reads back across a cut (`boundary`).
+        self._trailing = {
+            f.alias: TrailingValues(f.offset) for f in window.functions if f.func == "lag"
+        }
         self._dense = dict.fromkeys(aliases, 0)
         self._sum: dict[str, float] = dict.fromkeys(aliases, 0)
         # The prior buckets' accumulation for each running fold (`_FOLDS`), or `_UNSET` when
@@ -421,6 +437,14 @@ class OrderedBucketOffsets:
                 col = self._avg_column(wt, fn)
             elif fn.func in _MOMENTS:
                 col = self._moment_column(wt, fn)
+            elif fn.func == "lag":
+                col = lag_across_buckets(
+                    wt,
+                    col,
+                    self._helpers[alias]["lrn"],
+                    fn.input.name,
+                    self._trailing[alias],
+                )
             elif fn.func in _ASSEMBLED:
                 # Corrected by `finalize`; here the helper is carried forward instead. Each of
                 # the three helpers is a running count of rows under a different name, so each
@@ -437,7 +461,7 @@ class OrderedBucketOffsets:
                 else:
                     col = pa.array([self._first[alias]] * n, type=col.type)
             wt = wt.set_column(idx, wt.schema.field(idx), col)
-        spent = self._helper_aliases(_MOMENTS | {"avg"})
+        spent = self._helper_aliases(_MOMENTS | {"avg", "lag"})
         if spent:
             # Drop the private columns the one-pass offsets borrowed. The `_ASSEMBLED` helpers
             # stay: `finalize` has not run yet and they are the only record of the running

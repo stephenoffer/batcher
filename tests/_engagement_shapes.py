@@ -21,7 +21,6 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from batcher._internal.errors import PlanError
 
 _ROWS = 600
 _T = pa.table(
@@ -74,9 +73,13 @@ def _build(name):
     return _BUILDERS[name](bt.from_arrow(_T), bt.from_arrow(_R))
 
 
-#: shape -> the executor that must run it, a set when the transport decides between two, or
-#: `PlanError` when the contract is that the dispatcher refuses rather than quietly using one
-#: node. `map` covers the breaker-free shapes, which fan the *read* out rather than shuffling.
+#: shape -> the executor that must run it, or a set when the transport decides between two.
+#: `map` covers the breaker-free shapes, which fan the *read* out rather than shuffling.
+#:
+#: Every shape here now reaches an executor. The table used to carry a `PlanError` entry for
+#: the one global-window function with no decomposition, and that entry was the honest reading
+#: of the contract at the time; a shape that gains a decomposition moves, it does not get an
+#: exception.
 EXPECTED_DISTRIBUTED: dict[str, object] = {
     "sort_plain": "sort",
     "sort_string_key": "sort",
@@ -87,11 +90,12 @@ EXPECTED_DISTRIBUTED: dict[str, object] = {
     # pinning one would make this a topology assay rather than a routing check.
     "window_global_ordered": {"global_window", "global_window_flight"},
     "window_global_fold": {"global_window", "global_window_flight"},
-    # A global `lag` reads rows its own ordered bucket does not hold, so no offset recovers
-    # the global value and there is no decomposition. The dispatcher **raises** rather than
-    # routing the whole query to one node behind the user's back; that is the policy
-    # `_unsupported` states, so the raise is the contract and is asserted as one.
-    "window_global_lag": PlanError,
+    # A global `lag` reads rows its own ordered bucket does not hold — but only the `k`
+    # immediately before it, which a bounded boundary exchange carries across the cut
+    # (`dist/global_window/boundary.py`). It used to be the shape this table asserted a
+    # **raise** for, and the raise was the honest contract while no decomposition existed.
+    # `lead` still has none: it reads the bucket the walk has not reached.
+    "window_global_lag": {"global_window", "global_window_flight"},
     "aggregate": "aggregate",
     "distinct": "distinct",
     "join": "join",

@@ -13,9 +13,15 @@ splittable Parquet source, and the assertion is which dispatch branch fired.
 It earned itself on the first run. A global window with a **multi-key** `ORDER BY` did not run
 slowly, it *raised*: `supports_ordered_bucket_offsets` required exactly one order key, and a
 global window is not a `_split_at` pass-through so nothing carried it up. All three drivers
-already cut on the leading key alone. And a global `lag` still raises, correctly — an ordered
-bucket would have to read rows it does not hold — but the message now names the functions and
-the reason instead of "an unsupported operator combination".
+already cut on the leading key alone. A global `lag` raised too, and no longer does: the rows
+its bucket does not hold are only the `k` before it, which a bounded boundary exchange carries
+across the cut.
+
+No shape in the table expects a raise any more, so the branch that asserted one is gone with
+them. The policy it checked has not changed — `_unsupported` still refuses rather than running
+a distributable shape on one node, and `test_dist_single_node_fallback` and the dispatcher's
+own message tests still hold it to that — but a branch no shape reaches is a branch that would
+go on passing after it stopped meaning anything.
 
 The shape table is imported from the unit file, so the two cannot drift: an operator added
 there is asked this question too, and `test_every_declared_shape_is_covered` fails if the
@@ -31,7 +37,6 @@ import pytest
 import batcher as bt
 from _engagement_shapes import _BUILDERS, _R, _T, EXPECTED_DISTRIBUTED
 from _ray_cluster import init_test_ray, shutdown_test_ray
-from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.integration
 
@@ -133,13 +138,6 @@ def test_the_spy_itself_records_a_call(dist_spy, splittable):
 def test_the_dispatcher_routes_the_shape_to_an_executor(dist_spy, splittable, shape):
     ds = _BUILDERS[shape](bt.read.parquet(splittable), bt.from_arrow(_R))
     expected = EXPECTED_DISTRIBUTED[shape]
-    if expected is PlanError:
-        # The contract is that it says so loudly rather than running the whole query on one
-        # node, and that the message names the operator rather than "an unsupported operator
-        # combination", which sends the reader looking for a missing operator.
-        with pytest.raises(PlanError, match="global window"):
-            ds.collect(distributed=True, num_workers=_WORKERS)
-        return
     ds.collect(distributed=True, num_workers=_WORKERS)
     reached = set(dist_spy)
     wanted = {expected} if isinstance(expected, str) else set(expected)

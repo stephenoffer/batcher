@@ -334,9 +334,12 @@ def test_the_unoffsettable_functions_are_refused():
     number rather than an error. This is the only thing standing between that and a user.
     """
     assert supports_ordered_bucket_offsets(_window([("row_number", None, "r")]))
-    # Genuinely unoffsettable, on either kind of driver: each reads a row its own bucket does
-    # not hold, in an order the kernel does not return the bucket in.
-    for func, arg in [("lag", "v"), ("lead", "v"), ("median", "v"), ("count_distinct", "v")]:
+    # Genuinely unoffsettable, on either kind of driver. `lead` reads the bucket the walk has
+    # not reached (where `lag` reads the one behind it, which a bounded boundary exchange
+    # carries); `median` and `count_distinct` need the whole relation at every row; `product`
+    # is excluded on numerical grounds rather than structural ones, and is the member most
+    # likely to be "fixed" by someone who has not read why.
+    for func, arg in [("lead", "v"), ("median", "v"), ("count_distinct", "v"), ("product", "v")]:
         win = _window([(func, arg, "r")])
         assert not supports_ordered_bucket_offsets(win), func
         assert not supports_ordered_bucket_offsets(win, assembled=True), func
@@ -357,8 +360,8 @@ def test_the_unoffsettable_functions_are_refused():
         assert unoffsettable_functions(win, assembled=True) == [], func
     # A function it *does* cover is never named as the culprit. The message this feeds used
     # to list every function in the window, so a `lag` beside a `row_number` reported both.
-    mixed = _window([("row_number", None, "a"), ("lag", "v", "b")])
-    assert unoffsettable_functions(mixed, assembled=True) == ["lag"]
+    mixed = _window([("row_number", None, "a"), ("lead", "v", "b")])
+    assert unoffsettable_functions(mixed, assembled=True) == ["lead"]
     # A PARTITION BY has its own (hash) shuffle and must not be routed here.
     win = _window([("row_number", None, "r")])
     assert not supports_ordered_bucket_offsets(

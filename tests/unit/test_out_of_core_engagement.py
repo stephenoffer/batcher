@@ -28,7 +28,9 @@ envelope. A probe watching only these names reports it as unbounded, twice over,
 `iter_batches` reaches it through `stream_distinct_on` rather than `stream_distinct`.
 
 So read `None` below as "takes no *Python* bounded-memory path", not as "holds the relation in
-memory". Only `window_global_lag` means the stronger thing, and its comment says so. Before
+memory". `window_global_lag` used to be the one entry meaning the stronger thing, and a
+boundary exchange has since given it a bounded path, so no entry here means it any more —
+which is worth keeping in mind before reading the remaining `None`s as a memory bound. Before
 adding a `None` entry, check for a Rust path: `crates/bc-interp/src/*_spill.rs`, and
 `ExecMetrics.spilled` from `core.execute_local_metered`, which is the one instrument that sees
 across the FFI boundary.
@@ -103,10 +105,10 @@ _EXPECTED: dict[str, str | None] = {
     "window_computed_key": "window",
     "window_global_ordered": "global_window",
     "window_global_fold": "global_window",
-    # A global window over `lag` reads rows its own ordered bucket does not hold, so no offset
-    # recovers it — `global_window.offsets` declines it by design and the materializing kernel
-    # runs. Correct, and the one shape here that is *meant* to hold the relation in memory.
-    "window_global_lag": None,
+    # A global window over `lag` reads rows its own ordered bucket does not hold — but only the
+    # `k` before it, which `global_window.boundary` carries across the cut as a bounded tail.
+    # It was the one shape here *meant* to hold the relation in memory, and no longer is.
+    "window_global_lag": "global_window",
     "aggregate": "aggregate",
     "distinct": "aggregate",  # a whole-row dedup IS the group-by-every-column aggregate
     "join": "join",
