@@ -84,7 +84,11 @@ def _dist_modules():
 #: gap someone has not got to yet -- the whole point of `_unsupported` raising is that a
 #: missing path stays loud.
 _REFUSES = {
-    "window_lag_global": "an unpartitioned `lag` would have to read rows its bucket does not hold",
+    "window_lead_global": (
+        "an unpartitioned `lead` reads the ordered bucket the offset walk has not reached, so "
+        "no rolling tail carries it -- unlike `lag`, whose source rows are the bounded set "
+        "immediately behind it and which routes through `global_window/boundary.py`"
+    ),
 }
 
 
@@ -132,6 +136,7 @@ _SHAPE_NAMES = (
     "window_agg",
     "window_global",
     "window_lag_global",
+    "window_lead_global",
     "window_partitioned",
     "with_columns",
 )
@@ -167,6 +172,7 @@ def _shapes(ldir: str, rdir: str):
         "window_global": ds().with_columns(r=bt.row_number().over(order_by="v")),
         "window_agg": ds().with_columns(s=bt.col("v").sum().over(partition_by="k")),
         "window_lag_global": ds().with_columns(p=bt.lag(bt.col("v"), 1).over(order_by="v")),
+        "window_lead_global": ds().with_columns(p=bt.lead(bt.col("v"), 1).over(order_by="v")),
         "row_index": ds().with_row_index("i"),
         "union": ds().union(ds()),
         "sample_n": ds().sample(n=2, seed=1),
