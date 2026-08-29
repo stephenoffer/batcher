@@ -41,6 +41,14 @@ _AGG_FLOAT = frozenset(
     {
         "mean",
         "median",
+        # Measured against the engine rather than reasoned from the name: `quantile_disc`
+        # returns a Float64 like the interpolating `quantile` does, and `kahan_sum` returns
+        # one whatever the summed column's type — a compensated sum is a float algorithm.
+        "quantile_disc",
+        "kahan_sum",
+        "entropy",
+        "kurtosis_pop",
+        "mad",
         "quantile",
         "approx_quantile",
         # Contiguity lengths: `n_length` is a contig length and `aun` a base-weighted mean,
@@ -60,11 +68,21 @@ _AGG_FLOAT = frozenset(
     }
 )
 _AGG_BOOL = frozenset({"bool_and", "bool_or"})
+# Collection-valued aggregates: one column of the input's (widened) type per group.
+# `list_agg` gathers the group's values and `approx_top_k` its most frequent ones, so both
+# are a list of that type; `histogram` is a map from value to occurrence count.
+_AGG_LIST_OF_INPUT = frozenset({"list_agg", "approx_top_k"})
+_AGG_MAP_COUNT_OF_INPUT = frozenset({"histogram"})
 # `l_count` is a number of contigs, so Int64 — reporting it as a float would be the
 # same mistake as a fractional row count. `n_length`/`aun` are lengths and land in
 # `_AGG_FLOAT` beside the other length-valued statistics.
 _AGG_INPUT = frozenset({"min", "max", "mode", "arg_min", "arg_max"})  # preserve input type
-_AGG_WIDEN_INPUT = frozenset({"sum", "bit_and", "bit_or", "bit_xor"})  # widen(input)
+_AGG_WIDEN_INPUT = frozenset(
+    # `any_value` widens rather than preserves: it crosses the FFI boundary as an ordinary
+    # gathered value, so an Int32 column's arbitrary member comes back Int64 like every other
+    # narrow type does.
+    {"sum", "bit_and", "bit_or", "bit_xor", "any_value"}
+)  # widen(input)
 
 
 def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | None:
@@ -76,22 +94,28 @@ def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | Non
         return pa.float64()
     if func in _AGG_BOOL:
         return pa.bool_()
-    if func in _AGG_INPUT or func in _AGG_WIDEN_INPUT:
-        if agg.input is None:
-            return None
-        t = infer_type(agg.input, input_schema)
-        if t is None:
-            return None
-        if pa.types.is_null(t):
-            # A `null`-typed input is the one case where these do not preserve their input:
-            # the accumulators have no null-typed slot to gather into, so they materialize
-            # the group's values as Int64 and the column comes back `int64` all-null. The
-            # column *does* survive as `null` when nothing aggregates it (a passthrough
-            # crosses the boundary untouched), so this is an aggregate rule and not a
-            # widening one — `widen` is right to leave `null` alone.
-            return pa.int64()
-        return widen(t) if func in _AGG_WIDEN_INPUT else t
-    return None  # histogram, list_agg, … — leave to the engine
+    if func not in _AGG_INPUT | _AGG_WIDEN_INPUT | _AGG_LIST_OF_INPUT | _AGG_MAP_COUNT_OF_INPUT:
+        return None  # nothing left in `AGG_FNS`; a new one lands here until it is classified
+    if agg.input is None:
+        return None
+    t = infer_type(agg.input, input_schema)
+    if t is None:
+        return None
+    if pa.types.is_null(t):
+        # A `null`-typed input is the one case where these do not preserve their input:
+        # the accumulators have no null-typed slot to gather into, so they materialize
+        # the group's values as Int64 and the column comes back `int64` all-null. The
+        # column *does* survive as `null` when nothing aggregates it (a passthrough
+        # crosses the boundary untouched), so this is an aggregate rule and not a
+        # widening one — `widen` is right to leave `null` alone.
+        t = pa.int64()
+    elif func not in _AGG_INPUT:
+        t = widen(t)
+    if func in _AGG_LIST_OF_INPUT:
+        return pa.list_(t)
+    if func in _AGG_MAP_COUNT_OF_INPUT:
+        return pa.map_(t, pa.int64())
+    return t
 
 
 def _validate_agg_input_types(source: LogicalPlan, aggregates: tuple[AggregateSpec, ...]) -> None:

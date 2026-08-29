@@ -568,10 +568,21 @@ class OrderedBucketOffsets:
         combined = pm2 + m2 + delta * delta * pn * cnt / safe
         defined = total >= 2
         out = np.where(defined, combined / np.maximum(total - 1.0, 1.0), 0.0)
+        # Clamp below at zero, **NaN included**, because that is what the kernel does: it
+        # finishes with Rust's `f64::max(_, 0.0)`, which returns the non-NaN operand when
+        # either is NaN. So a variance poisoned by a NaN input comes back as `0.0` rather
+        # than `NaN` — measured on `[1, 2, NaN, 4, 5]`, where the kernel returns
+        # `[null, 0.5, 0.0, 0.0, 0.0]`. numpy's `maximum` propagates NaN instead, so an
+        # unguarded translation of the same expression disagreed on every row after the
+        # first NaN, on the one input shape (a float column) where NaN is reachable at all.
+        #
+        # Matching the kernel is the contract here even where the kernel's own answer is
+        # arguable: `bc-interp` is the oracle, and a split result that "improves" on it is a
+        # divergence, not a fix. If the NaN answer is to change it changes in the kernel and
+        # this follows.
+        out = np.where(np.isnan(out), 0.0, np.maximum(out, 0.0))
         if fn.func == "stddev":
-            # Guarded: a combined M2 can land a hair below zero on cancellation, and an
-            # unguarded sqrt would turn that into a NaN the mask does not cover.
-            out = np.sqrt(np.maximum(out, 0.0))
+            out = np.sqrt(out)
         col = pa.array(out, type=pa.float64(), mask=~defined)
 
         self._moment[alias] = _chan(self._moment[alias], _bucket_moment(wt.column(fn.input.name)))
@@ -611,14 +622,52 @@ class OrderedBucketOffsets:
         return col
 
     def _extreme(self, col, wt, fn, state, element_wise, pick, reduce_fn):
-        """Offset a running `min`/`max` against the prior buckets' running extreme."""
+        """Offset a running `min`/`max` against the prior buckets' running extreme.
+
+        The kernel orders floats by a **total** order in which NaN is the greatest value, so a
+        running `max` that has seen a NaN stays NaN for the rest of the partition while a
+        running `min` never picks one up. Arrow's `max`/`max_element_wise` instead *skip* NaN,
+        which is the same answer on every input that has none and a different one on every
+        input that does: measured over 40,000 rows with a NaN every 23rd, the split path
+        returned a real number for 32,229 of the rows the kernel gave NaN. `_nan_aware` is
+        that difference and nothing else; `min` needs no such care, because a value that is
+        greatest can never win a minimum.
+        """
         alias = fn.alias
         if state[alias] is not None:
-            col = element_wise(col, pa.scalar(state[alias], col.type))
-        bucket = reduce_fn(wt.column(fn.input.name)).as_py()
+            col = self._nan_aware(col, state[alias], fn, element_wise)
+        bucket = self._bucket_extreme(wt.column(fn.input.name), fn, reduce_fn)
         if bucket is not None:
             state[alias] = bucket if state[alias] is None else pick(state[alias], bucket)
         return col
+
+    @staticmethod
+    def _nan_aware(col, prior, fn, element_wise):
+        """`element_wise(col, prior)` with the kernel's NaN-is-greatest order for `max`."""
+        import pyarrow.compute as pc
+
+        scalar = pa.scalar(prior, col.type)
+        if fn.func != "max" or not pa.types.is_floating(col.type):
+            return element_wise(col, scalar)
+        if isinstance(prior, float) and prior != prior:
+            # A NaN already carried in is the greatest value there is, so it wins every row —
+            # including the rows where this bucket's own running max is still null.
+            return pa.array([prior] * len(col), type=col.type)
+        # `is_nan` is null where the running value is (no non-null input through that row yet),
+        # and a null condition selects neither arm, so it is filled before it is a condition.
+        keep = pc.fill_null(pc.is_nan(col), False)
+        return pc.if_else(keep, col, element_wise(col, scalar))
+
+    @staticmethod
+    def _bucket_extreme(column, fn, reduce_fn):
+        """This bucket's contribution to the running extreme, under the same total order."""
+        import pyarrow.compute as pc
+
+        if fn.func == "max" and pa.types.is_floating(column.type):
+            has_nan = pc.any(pc.fill_null(pc.is_nan(column), False)).as_py()
+            if has_nan:
+                return float("nan")
+        return reduce_fn(column).as_py()
 
     def _avg_column(self, wt, fn):
         """Offset a running `avg` through its injected running `sum` and `count`."""

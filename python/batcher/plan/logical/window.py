@@ -43,8 +43,10 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     # so they are Float64 — the plain-int64 ranking branch below would misreport the schema.
     if fn.func in ("percent_rank", "cume_dist"):
         return pa.float64()
-    if fn.func in WINDOW_RANKING or fn.func in ("count", "rle_id"):
+    if fn.func in WINDOW_RANKING or fn.func in ("count", "count_distinct", "rle_id"):
         return pa.int64()
+    if fn.func in ("bool_and", "bool_or"):
+        return pa.bool_()
     # The EWM statistics and `interpolate` are ratios of weighted sums, so an integer
     # input widens: the value between two integers is generally not one.
     if fn.func == "avg" or fn.func in WINDOW_EWM or fn.func == "interpolate":
@@ -73,9 +75,22 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
         # one the math family already carries for decimals and is recorded beside it in
         # `competitor_parity_census.md`; closing it means giving the window fold a decimal
         # accumulator, which is a kernel change rather than a declaration.
+        if pa.types.is_null(t):
+            # A `null`-typed input has no slot the fold can accumulate into, so the engine
+            # materializes it as Int64 and the column comes back `int64` all-null — the same
+            # rule the grouped aggregates already carry. Declaring `null` here was the one
+            # window type the schema got outright *wrong* rather than merely unknown.
+            return pa.int64()
         return pa.float64() if pa.types.is_decimal(t) else widen(t)
     if fn.func in WINDOW_VALUE or fn.func in {"min", "max"}:
         return t
+    if fn.func in ("bit_and", "bit_or", "bit_xor"):
+        # The bitwise folds accumulate in the widened integer, exactly as the grouped ones do.
+        # They fell through to `None`, so a window carrying one reported no schema at all —
+        # and an unknown schema is not cosmetic here: an empty result is typed from it, so
+        # `collect()` and `collect(spill=True)` disagreed about the column types of a
+        # `bit_or() OVER ()` that matched no rows.
+        return pa.int64() if pa.types.is_null(t) else widen(t)
     return None
 
 
