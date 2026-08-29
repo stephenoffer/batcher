@@ -175,3 +175,38 @@ def test_a_computed_leading_order_key_is_still_refused(rows):
     assert supports_ordered_bucket_offsets(computed._plan) is False
     multi = bt.from_arrow(rows).window(order_by=["k", "v"], functions={"w": "row_number"})
     assert supports_ordered_bucket_offsets(multi._plan) is True
+
+
+@pytest.mark.parametrize("func", ["var", "stddev"])
+@pytest.mark.parametrize("partitions", [2, 3, 7])
+def test_a_split_running_moment_equals_the_single_node_one(rows, func, partitions):
+    """The running moments split too — and are the one pair compared with a tolerance.
+
+    `var` and `stddev` are not a constant shift. Each bucket contributes a
+    `(count, mean, M2)` triple that combines with the prior buckets' by Chan's parallel
+    formula, the same one the mergeable *aggregate* variance uses; the kernel's running
+    `count` and `avg` beside each row are what reconstruct the triple.
+
+    Every other function in this file is compared exactly, because every other function is
+    exact: the folds are integer or boolean arithmetic, and `sum`/`avg` over an integer column
+    reduce exactly. A variance does not — it is a float reduction, so the two paths sum in
+    different orders and agree only up to reassociation, which is the bound the distributed
+    contract actually states. Measured over this fixture (values to ±2^40, so a variance near
+    4e23) the worst disagreement is 2.6e-15 relative, about a dozen ULPs; `1e-12` leaves room
+    for a wider split without admitting a real defect, which would be wrong by orders of
+    magnitude rather than by ULPs.
+
+    Asserting bit-equality here would be worse than useless: it would fail on correct code,
+    and the natural repair — widening the comparison until it passes — is how a tolerance
+    stops meaning anything.
+    """
+    ds = bt.from_arrow(rows).window(order_by=["k"], functions={"w": (func, bt.col("v"))})
+    split = _by_rid(ds.collect(spill=True, num_partitions=partitions)).column("w").to_pylist()
+    whole = _by_rid(ds.collect()).column("w").to_pylist()
+    assert len(split) == len(whole)
+    # The NULL pattern is part of the answer and is exact: a running moment is NULL until the
+    # second non-null input, and the offset must not invent a value there.
+    assert [x is None for x in split] == [x is None for x in whole]
+    assert [x for x in split if x is not None] == pytest.approx(
+        [x for x in whole if x is not None], rel=1e-12
+    )

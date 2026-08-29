@@ -41,7 +41,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.global_window.offsets import (
     OrderedBucketOffsets,
     bucket_order,
-    inject_avg_helpers,
+    inject_window_helpers,
 )
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.dist.sort_boundaries import (
@@ -80,9 +80,9 @@ def execute_global_window_disk(
     map_ir = json.dumps(map_plan.to_ir())
     # The reduce runs the window over its bucket as a single in-memory source 0.
     # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
-    # so `inject_avg_helpers` below may append to `functions` in place.
+    # so `inject_window_helpers` below may append to `functions` in place.
     win_ir = unary_task_ir(window)
-    avg_helpers = inject_avg_helpers(window, win_ir)
+    helpers = inject_window_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
     n_buckets = buckets_for_envelope(shuffle_partitions(workers), sources[sid])
 
@@ -171,7 +171,7 @@ def execute_global_window_disk(
 
         # Walk the buckets in global key order, shifting each one's window columns to their
         # global values. Buckets are ordered relative to each other by construction.
-        offsets = OrderedBucketOffsets(window, avg_helpers)
+        offsets = OrderedBucketOffsets(window, helpers)
         out: list[pa.RecordBatch] = []
         for r in bucket_order(n_buckets, desc):
             if windowed_paths[r] is None:
@@ -181,7 +181,7 @@ def execute_global_window_disk(
                 continue
             out.extend(offsets.apply(pa.Table.from_batches(batches)).to_batches())
         result = (
-            pa.Table.from_batches(out)
+            offsets.finalize(pa.Table.from_batches(out))
             if out
             else empty_result_table(window, window.available_columns())
         )

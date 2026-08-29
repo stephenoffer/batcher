@@ -29,7 +29,7 @@ from batcher.dist.executor import _relabel_single_source
 from batcher.dist.global_window.offsets import (
     OrderedBucketOffsets,
     bucket_order,
-    inject_avg_helpers,
+    inject_window_helpers,
 )
 from batcher.dist.spill import _fd_safe, map_projection
 from batcher.dist.spill.buckets import spill_scratch
@@ -63,12 +63,12 @@ def stream_spilling_global_window(
     # touching them — mutating the cached structures would corrupt every later use of the
     # same plan.
     # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
-    # so `inject_avg_helpers` below may append to `functions` in place.
+    # so `inject_window_helpers` below may append to `functions` in place.
     win_ir = unary_task_ir(window)
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; they are read back per bucket and dropped before
     # the rows are yielded, so the output schema is unchanged.
-    avg_helpers = inject_avg_helpers(window, win_ir)
+    helpers = inject_window_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
 
     with spill_scratch("batcher_winstream_", spill_dir) as store:
@@ -86,7 +86,7 @@ def stream_spilling_global_window(
         # Process buckets in *global sort order* (reversed for descending) so the running
         # offsets accumulate correctly. `handles`, not `n_buckets`: `stage_and_partition`
         # sizes the split from the staged bytes, so the bucket count is decided there.
-        offsets = OrderedBucketOffsets(window, avg_helpers)
+        offsets = OrderedBucketOffsets(window, helpers)
         for b in bucket_order(len(handles), desc):
             if handles[b] is None:
                 continue

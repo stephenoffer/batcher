@@ -53,7 +53,7 @@ from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.global_window.offsets import (
     OrderedBucketOffsets,
     bucket_order,
-    inject_avg_helpers,
+    inject_window_helpers,
 )
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.dist.sort_boundaries import (
@@ -97,12 +97,12 @@ def execute_global_window_flight(
     map_ir = json.dumps(map_plan.to_ir())
     # The reduce runs the window over its bucket as a single in-memory source 0.
     # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
-    # so `inject_avg_helpers` below may append to `functions` in place.
+    # so `inject_window_helpers` below may append to `functions` in place.
     win_ir = unary_task_ir(window)
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; the driver reads them back per bucket and drops
     # them before the rows are returned, so the output schema is unchanged.
-    avg_helpers = inject_avg_helpers(window, win_ir)
+    helpers = inject_window_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
     credits = _shuffle_credits()
 
@@ -217,7 +217,7 @@ def execute_global_window_flight(
     # Walk the buckets in global key order and shift each one's window columns to their
     # global values. Buckets are ordered relative to each other by construction, so this
     # prefix scan is the whole of what the driver has to do sequentially.
-    offsets = OrderedBucketOffsets(window, avg_helpers)
+    offsets = OrderedBucketOffsets(window, helpers)
     out: list[pa.RecordBatch] = []
     for b in bucket_order(n_buckets, desc):
         batches = [x for x in results.get(b, []) if x.num_rows > 0]
@@ -225,7 +225,7 @@ def execute_global_window_flight(
             continue
         out.extend(offsets.apply(pa.Table.from_batches(batches)).to_batches())
     table = (
-        pa.Table.from_batches(out)
+        offsets.finalize(pa.Table.from_batches(out))
         if out
         else empty_result_table(window, window.available_columns())
     )

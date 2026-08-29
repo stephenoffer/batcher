@@ -120,12 +120,28 @@ def range_partitionable(dtype: pa.DataType) -> bool:
     that cost the most: a fixed-width key over a wide payload is the canonical large-sort
     shape, and refusing it here meant the whole relation had to fit one node.
 
+    **Temporal and decimal keys are in, and were the second-most expensive omission.** A
+    `Date`, `Timestamp`, `Time`, `Duration` or `Decimal` column has an order-preserving numeric
+    backing (days, ticks, unscaled units), which is what both the sampler and the Rust router
+    read — measured directly against `sample_key_grid` + `bucketize`, not inferred. Only
+    `Boolean` genuinely raises `NonNumericRangeKey` of the types anyone sorts by.
+
     It is a function rather than a `frozenset` beside each caller for the reason this module
     exists: every `supports_spilling_*` predicate is answering the same question about the
     same two primitives, and when they each spelled it out they drifted. The global-window
     predicate never grew the type test its sort sibling had, so a `rank()` over a Boolean
     column collected fine and raised a bare Rust `RuntimeError` the moment the same plan was
     streamed.
+
+    **And then they drifted the other way, which is the more expensive direction and the
+    harder one to see.** The distributed sort found this function too narrow for a temporal
+    key and widened it *at its own call site*
+    (`dist.executor._range_partitionable_sort_key`) rather than here, so a distributed
+    ``ORDER BY <timestamp>`` worked while the out-of-core sort of the same key declined to
+    spill and a global window ordered by it had no distributed path at all — the canonical
+    time-series shape, refused by the two paths that exist because the relation does not fit.
+    Nothing failed; each predicate simply answered a question it was asked and no test asked
+    both. A widening belongs here, where every caller gets it.
 
     Args:
         dtype: The Arrow type of the leading sort/order key.
@@ -142,10 +158,14 @@ def range_partitionable(dtype: pa.DataType) -> bool:
             (True, False)
             >>> range_partitionable(pa.binary()), range_partitionable(pa.binary(10))
             (True, True)
+            >>> range_partitionable(pa.timestamp("us")), range_partitionable(pa.decimal128(10, 2))
+            (True, True)
     """
     return (
         pa.types.is_integer(dtype)
         or pa.types.is_floating(dtype)
+        or pa.types.is_temporal(dtype)
+        or pa.types.is_decimal(dtype)
         or grid_kind_of(dtype) != "numeric"
     )
 
