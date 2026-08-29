@@ -240,7 +240,23 @@ def _collect(
         partitions = num_partitions or auto_num_partitions(plan, sources, hub)
         # Spill the optimized plan (COUNT(DISTINCT)→COUNT over DISTINCT; derived join keys).
         opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
-        spilled = spill_collect(opt_lp, sources, partitions)
+        # `map_batches` runs in Python and deliberately does not lower to the engine IR, so
+        # the disk-shuffle spill executor cannot run a plan carrying one. It did not *decline*
+        # that plan, though — it entered the executor and raised `NotImplementedError:
+        # map_batches is executed in Python, not lowered to the engine IR` from inside
+        # `to_ir()`, an internal message about a wire contract escaping the public API. So
+        # `collect(spill=True)` was a hard failure for every batch-inference pipeline with a
+        # breaker over it (`map_batches(model).group_by(...).agg(...)` and friends), which is
+        # the workload most likely to ask for bounded memory in the first place.
+        #
+        # Asking before dispatching restores the fallback every other unspillable shape gets.
+        # It does not *give* these pipelines a bounded-memory path — that wants the map prefix
+        # staged to disk and the breaker run over it, the way `dist.executor._stage_map_prefix`
+        # does for the distributed route — and `iter_batches()` remains the bounded way to run
+        # one today.
+        spilled = (
+            None if core.has_map_batches(opt_lp) else spill_collect(opt_lp, sources, partitions)
+        )
         if spilled is not None:
             # This route bypasses `run_relational`, so it must close its own loops — it
             # recorded nothing at all, which made an explicit `spill=True` the one way to run
