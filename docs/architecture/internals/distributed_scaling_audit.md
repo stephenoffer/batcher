@@ -10,6 +10,37 @@ that cost is measured separately rather than smeared across the ladder.
 The bias of this pass is the same one `competitor_technique_review.md` adopted: prefer a number
 that closes off a direction to a plausible technique that opens one.
 
+## The corpora, so the numbers can be re-taken
+
+Nothing below is reproducible without these, and neither corpus is committed — they are
+generated, not fixtures. Both are plain Parquet (zstd), four columns, written to shared cluster
+storage:
+
+| | small | large |
+|---|---|---|
+| rows | 64 M (16 files x 4 M) | 512 M (64 files x 8 M) |
+| on disk | ~1.0 GB | ~8.4 GB |
+| `k` | `randint(0, 200_000)` | `randint(0, 5_000_000)` |
+| `g` | `randint(0, 64)` | `randint(0, 64)` |
+| `v` | `random()` (float64) | `random()` |
+| `w` | `randint(0, 1_000_000)` | `randint(0, 100_000_000)` |
+| seed | `default_rng(7)` | `default_rng(1000 + file_index)` |
+
+The **file count is load-bearing** and is the variable the retraction below turns on:
+`partition_descriptors` caps the map at the splits the source actually has, so a 64-file corpus
+gives 64 map sources at *any* worker count above 16, and every measurement here that did not
+explicitly lower `map_partition_multiplier` was taken at exactly 64 sources. A corpus with a
+different file count is a different experiment, not a re-run of this one.
+
+Lower cardinalities are derived rather than regenerated — `k % 100`, `k % 10_000`,
+`k % 1_000_000` over the large corpus — which is what holds the input size and the source count
+fixed while only the group count moves.
+
+The cluster is four `96cpu-192gb` workers plus a head: 384 schedulable CPUs, 960 GiB, one
+availability zone. Worker counts are always passed explicitly (`num_workers=`), because the
+automatic fan-out was being rewritten by another session throughout this pass — see the
+provenance note below.
+
 ## What the ladder actually shows
 
 `group_by(k).agg(sum(v), count(v))`, warm, wall time and the two phases it decomposes into:
