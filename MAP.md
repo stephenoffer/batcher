@@ -1850,7 +1850,7 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 |---|---|---|
 | `_ndarray.py` | 75 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
 | `hdf5.py` | 128 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
-| `numpy.py` | 228 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
+| `numpy.py` | 233 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
 | `point_cloud.py` | 448 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `ragged.py` | 207 | Variable-shape tensor columns — arrays of differing shape in one Arrow column. |
 | `tensor.py` | 139 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |

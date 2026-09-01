@@ -366,6 +366,50 @@ only as the reason they were.
 The general form is worth keeping: **on a shared tree, a surprising measurement is a reason to
 check `git status` on the files the path reads before it is a reason to open the code.**
 
+## Concurrent queries in one process
+
+The rest of this document measures one query at a time. `execution.max_concurrent_queries`
+defaults to `0`, so `ConcurrencyLimiter` is off, and `carbonite/policies/concurrency.py` records
+a *single-node* collapse behind it — 124 QPS to 88 going from 1 client to 16. The distributed
+path had not been measured. Eight threads in one process, each running the 64 M-row aggregate
+at `num_workers=8` over the shared session fleet:
+
+| clients | QPS | p50 | p95 |
+|---|---|---|---|
+| 1 | 1.39 | 441 ms | 442 ms |
+| 2 | 3.19 | 624 ms | 652 ms |
+| 4 | 3.94 | 1,001 ms | 1,053 ms |
+| 8 | 4.13 | 1,940 ms | 1,974 ms |
+
+It **saturates rather than collapsing** — throughput flattens at ~4 QPS from four clients on,
+while p50 grows 4.4x. No errors at any point.
+
+**Most of that is not a defect, and the test design is why.** Pinning `num_workers=8` fixes the
+fleet at eight actors however many clients arrive, so eight concurrent queries are eight times
+oversubscribed on the same eight workers while the cluster's other 376 cores sit idle. A fair
+reading is that this measures fleet sharing, not the engine's concurrency ceiling.
+
+What it does isolate is a real serialization point, and it is the one `_session_fleet_alive`
+was already suspected of being. `_acquire_session_fleet` pings every actor for liveness
+**inside `_SESSION_LOCK`**, so arriving queries queue behind each other's pings. Attributed:
+
+| | 1 client | 8 clients |
+|---|---|---|
+| query p50 | 440 ms | 1,708 ms |
+| `acquire_fleet` p50 | 2.6 ms | **49.2 ms** (max 380.5) |
+| liveness ping p50 | 2.6 ms | 15.1 ms |
+
+`acquire_fleet` grows 19x and its tail reaches 380 ms. But it is 49 ms of a 1,708 ms query —
+**about 3% of the added latency, not the cause of it**, and saying otherwise would be reading a
+confirmed prediction as a confirmed explanation. The reason it is still worth recording is that
+its cost is `O(workers x concurrent queries)` on both axes: the ping was 2.6 ms across 8 actors
+here and 8.7 ms across 64 in the single-client measurement above, and only the first factor was
+being paid then. A wider fleet under real concurrency is where this stops being 3%.
+
+The fix is the one already described and not made — cache the liveness verdict for a short TTL,
+so back-to-back queries skip the fan-out — and it remains blocked on `dist/fleet/_fleet.py`,
+which carried another session's staged work for this entire pass.
+
 ## Ruled out
 
 Kept because the ratio of already-built to genuinely-missing is the most useful thing this
