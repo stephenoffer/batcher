@@ -154,20 +154,26 @@ fn byte_span_fits<T: ByteArrayType>(arrays: &[&dyn Array]) -> Result<(), Runtime
 
 /// The byte window one input contributes, or `None` when its offsets cannot describe one.
 ///
-/// Arrow byte offsets are **signed** and must ascend from a non-negative first element. An
-/// array that violates that has had its offsets wrap — a `Utf8` column built past 2 GiB
-/// somewhere upstream truncates each position to `i32`, and everything after the 2 GiB mark
-/// comes back negative. `as_usize()` sign-extends such a value into a number near `2^64`, and
-/// the subtractions below then wrap in the other direction, so the arithmetic reaches the
-/// copy as a plausible-looking slice range over a buffer that cannot hold it.
+/// Arrow byte offsets are **signed** and must ascend from a non-negative first element.
+/// `as_usize()` sign-extends, so a negative first offset becomes a number near `2^64`, the
+/// subtractions below then wrap the other way, and the arithmetic reaches the parallel copy
+/// as a plausible-looking slice range over a buffer that cannot hold it.
 ///
 /// That is not a hypothetical. A distributed outer join panicked here with `range start index
 /// 18446744073520397944 out of range for slice of length 0` — an `i32` first offset of
-/// -189,153,672, which is 4,105,813,624 truncated. **A panic is the one outcome this module
-/// exists to prevent**: it happens inside a rayon worker, crosses the FFI as an unrecoverable
-/// `PanicException`, and takes the query engine down with it, which is exactly what
-/// `concat_columns` says about arrow's `.expect()` two functions up. Refusing sends the caller
-/// to `byte_span_fits`, which names the column and the fix.
+/// -189,153,672.
+///
+/// **Why that offset is what it is remains unknown, and the arithmetic invites a wrong
+/// guess.** -189,153,672 is 4,105,813,624 truncated to `i32`, which reads as a `Utf8` column
+/// built past 2 GiB upstream — and that was the first conclusion drawn here. It is wrong for
+/// this case: the join was 90 rows against 6, about 2.7 KB, so no column in it was ever near
+/// 4 GiB. Some other corruption produces the same shape. This function does not need to know
+/// which, and must not claim to.
+///
+/// **A panic is the one outcome this module exists to prevent**: it happens inside a rayon
+/// worker, crosses the FFI as an unrecoverable `PanicException`, and takes the query engine
+/// down with it, which is exactly what `concat_columns` says about arrow's `.expect()` two
+/// functions up. Refusing sends the caller to `byte_span_fits`, which reports what it saw.
 fn byte_span<T: ByteArrayType>(a: &GenericByteArray<T>) -> Option<(usize, usize)> {
     let o = a.value_offsets();
     let start = o[0].to_usize()?;
@@ -745,11 +751,13 @@ mod tests {
     /// A `Utf8` column whose offsets have already wrapped must be **refused**, not indexed.
     ///
     /// This is the input a distributed outer join actually handed `concat_bytes`: a first
-    /// offset of -189,153,672, which is 4,105,813,624 truncated to `i32`. `as_usize()`
-    /// sign-extends that to 18,446,744,073,520,397,944, and the copy panicked with exactly
-    /// that number as a slice range. A panic here is unrecoverable — it is raised on a rayon
-    /// worker and crosses the FFI as a `PanicException` — so the whole point of this module's
-    /// bulk path is that it must not produce one.
+    /// offset of -189,153,672. `as_usize()` sign-extends that to 18,446,744,073,520,397,944,
+    /// and the copy panicked with exactly that number as a slice range. A panic here is
+    /// unrecoverable — it is raised on a rayon worker and crosses the FFI as a
+    /// `PanicException` — so the whole point of this module's bulk path is that it must not
+    /// produce one. The value is reproduced verbatim rather than rounded because matching it
+    /// exactly is what proves this test models the failure rather than resembling it; see
+    /// `byte_span` for why its *origin* is deliberately not asserted.
     ///
     /// The array is built with `build_unchecked` on purpose: the corruption is what arrives
     /// over the shuffle, so a test that could not express it would be testing nothing.
@@ -787,8 +795,8 @@ mod tests {
             .expect_err("a column with wrapped offsets must be an error, not a result");
         let message = err.to_string();
         assert!(
-            message.contains("already overflowed") && message.contains("large_string"),
-            "the error should name the cause and the fix, got: {message}"
+            message.contains("cannot describe a byte range") && message.contains("-189153672"),
+            "the error should report what it saw, got: {message}"
         );
     }
 

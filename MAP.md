@@ -2978,9 +2978,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 447 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 215 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
-| `error.rs` | 123 | The crate's error type: how the stateful runtime structures report failure. |
+| `error.rs` | 125 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 258 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
-| `gather/mod.rs` | 741 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
+| `gather/mod.rs` | 747 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 357 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |

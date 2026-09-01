@@ -22,13 +22,15 @@ pub enum RuntimeError {
     ByteOffsetOverflow { dtype: String, bytes: usize },
 
     /// Raised when an input's own offsets are already unusable, rather than when the
-    /// *result* would be. Reported separately from `ByteOffsetOverflow` because the byte
-    /// count is not recoverable once the offsets have wrapped: the array is already wrong
-    /// when it arrives, and saying how big it "is" would be a guess.
+    /// *result* would be -- which is what `ByteOffsetOverflow` reports. Deliberately says
+    /// what was **observed** and not why: a 32-bit offset wrapped past 2 GiB produces
+    /// exactly this shape, and in the one case seen so far it cannot have been the cause,
+    /// because the inputs were kilobytes. Naming a cause here would send the reader after
+    /// the wrong one, and the byte count is not recoverable from wrapped offsets anyway.
     #[error(
-        "a {dtype} column arrived with 32-bit offsets that had already overflowed (its \
-         first offset is {first}, which cannot be a byte position); cast the column to \
-         large_string (or large_binary) so its offsets are 64-bit"
+        "a {dtype} column arrived with offsets that cannot describe a byte range (its \
+         first offset is {first}); the array is already malformed when this operator \
+         receives it, so the concatenation is refused rather than indexed with it"
     )]
     MalformedByteOffsets { dtype: String, first: i64 },
 
