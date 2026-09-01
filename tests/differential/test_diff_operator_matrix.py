@@ -469,12 +469,74 @@ def test_every_path_agrees_with_the_oracle(op, shape):
 #: `repartitioned_sparse` asks for far more partitions than some shapes have rows, so most
 #: come back empty. An operator that mishandles an empty partial — by skipping the merge, or
 #: by seeding an identity that is wrong for it — passes every dense test and fails here.
+#: `cached` and `cached_evicted` run the operator through `Dataset.cache()` and return the
+#: **second** collect, which is the one served from the store rather than computed. The
+#: cache is a path that can return the wrong *rows* — a mis-keyed entry serves another
+#: query's result, and nothing raises — and it had no coverage against the operator table
+#: at all. What existed pinned the cache mechanism (levels, stats, terminals, uncache) on a
+#: single three-row `group_by`, so every operator's interaction with storing and reloading
+#: its result was untested. `cached_evicted` additionally shrinks the budget to nothing
+#: between the two collects, so the entry is evicted and the answer comes back through the
+#: disk tier's encode/decode rather than from the memory copy — the round trip is where a
+#: type or a null would be lost, and it is per-operator by nature.
 _SCHEDULINGS = {
     "spill_partitioned": lambda ds: ds.collect(spill=True, num_partitions=3),
     "adaptive": lambda ds: ds.collect(adaptive=True),
     "repartitioned": lambda ds: ds.repartition(4).collect(),
     "repartitioned_sparse": lambda ds: ds.repartition(64).collect(),
+    "cached": lambda ds: _second_collect(ds, evict=False),
+    "cached_evicted": lambda ds: _second_collect(ds, evict=True),
 }
+
+
+def _second_collect(ds, *, evict: bool):
+    """`ds.cache()` collected twice, returning the copy the store served.
+
+    Args:
+        ds: The dataset to run.
+        evict: Drop the memory entry between the two collects, so the second is answered
+            from the disk tier rather than from the resident table.
+
+    Returns:
+        The second collect's table.
+    """
+    from batcher.carbonite.cache import result_cache
+
+    warm = ds.cache()
+    warm.collect()
+    if evict:
+        # `evict_to_free` sheds by keep-value and demotes what it sheds, which is the path
+        # a real budget takes; `clear()` would drop the entry outright and make the second
+        # collect a plain recompute, testing nothing the first one did not.
+        store = result_cache()
+        store.evict_to_free(store.used_bytes)
+    return warm.collect()
+
+
+def test_the_cached_schedulings_are_actually_on_the_paths_they_name():
+    """A positive control for the two cache arms above.
+
+    Without this the 540 cases they contribute could all be plain recomputes -- if the
+    second collect stopped hitting the store, or the disk tier were off so an eviction
+    dropped the entry instead of demoting it, every one of them would still pass while
+    testing nothing the uncached arm does not. That failure is invisible in the output,
+    which is exactly the shape `just lint-methodology` exists to catch.
+    """
+    from batcher.carbonite.cache import reset_result_cache, result_cache
+
+    def deltas(*, evict: bool) -> dict[str, int]:
+        reset_result_cache()
+        store = result_cache()
+        _second_collect(bt.from_arrow(INPUTS["base"]).filter(bt.col("v") > 3), evict=evict)
+        return store.stats()
+
+    plain = deltas(evict=False)
+    assert plain["hits"] == 1, "the second collect recomputed instead of reading the store"
+
+    evicted = deltas(evict=True)
+    assert evicted["demotions"] == 1, "eviction dropped the entry rather than demoting it"
+    assert evicted["promotions"] == 1, "the second collect did not come back off the disk tier"
+    assert evicted["disk_hits"] == 1
 
 
 @pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))
