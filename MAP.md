@@ -2209,7 +2209,7 @@ The terminal face of the engine — a live progress bar plus structured status l
 | module | lines | what it is |
 |---|---|---|
 | `paint.py` | 168 | Drawing one status line: the bar, the indeterminate sweep, and the sparkline. |
-| `reporter.py` | 402 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
+| `reporter.py` | 439 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
 | `state.py` | 189 | What the console knows about one in-flight query, and how it learns it from the bus. |
 
 ### `batcher/observe/counters/` — 2 · neutral sinks

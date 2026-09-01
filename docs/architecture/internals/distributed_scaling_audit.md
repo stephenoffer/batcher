@@ -167,6 +167,40 @@ What survives, and what does not:
 - **The falsified fan-in mechanism stays falsified**, now for a second reason: it was fitted to
   a table that turns out to be an artefact.
 
+### A rule that survived an out-of-sample prediction
+
+Two interleaved optima — `r=1` at 100 groups and `r=8` at 5 M — are both fitted by bounding a
+reducer's share of the partial state at about **625,000 groups**, i.e. `ceil(groups / 625_000)`.
+That is not a new shape: it is exactly the `ceil(rows / target_rows_per_task)` rule
+`aggregate_reducer_count` already applies, with a target ~6.4x smaller than the configured 4 M.
+
+Fitting two points proves nothing, so the rule was used to predict a third it had not seen. At
+1 M groups it requires 2 reducers. Round-robin, five caps, three rounds each:
+
+| reducers | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| median | **1,752 ms** | **1,763 ms** | 1,793 ms | 1,792 ms | 1,919 ms |
+
+`r=1` and `r=2` are 0.6% apart with overlapping ranges, so the optimum is 1-2 against a
+predicted 2, and `r=16` is 9% worse. **The prediction holds.**
+
+So the shippable change is a single constant: `_MIN_GROUPS_PER_REDUCER`, 50,000 to 625,000.
+It gives 1 reducer at 100 groups, 1 at 1 M and 8 at 5 M — the three measured optima — and it
+leaves the case the floor was built for untouched (5 M groups on 8 workers still wants
+`min(8, 8) = 8`). At 5 M groups on 64 workers it replaces the engine's current 64, which is the
+worst end of the measured range, with the best: 1.27x within the run where both were measured.
+
+**It is still not shipped, and the reason is narrower than before.** Every point behind it
+comes from one fleet shape — 4 nodes, 64 workers, 64 map partitions. `625_000` is a
+groups-per-reducer figure, and nothing here shows it is not really a groups-per-*node* or
+groups-per-*core* figure wearing a constant's clothes; a 16-node cluster would tell those apart
+in one afternoon and this one cannot tell them apart at all. Given that the previous two
+confident readings in this section were both wrong — an ordering artefact, then an
+extrapolation below the measured range — the bar for changing sizing on this cluster's numbers
+alone is not met. What it does mean is that this is now **one measurement on differently-shaped
+hardware away from being actionable**, which is a different state from the rest of this
+document's open items.
+
 **No formula is shipped here**, and after the retraction above the reason is stronger than it
 was. The one measurement in this section taken with an interleaved design says fewer reducers
 is monotonically better at low cardinality, which is what the shipped `_busy_floor` already
