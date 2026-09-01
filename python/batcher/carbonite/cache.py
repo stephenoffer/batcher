@@ -1,12 +1,17 @@
-"""The result cache — a memory-bounded LRU of materialized query results.
+"""The result cache — a memory-bounded, cost-aware store of materialized query results.
 
 Carbonite owns the engine's *storage* memory the way it owns execution memory: a
 single process-wide [`CacheStore`] holds the Arrow results of `Dataset.cache()`d
 plans, keyed by an opaque string (the conductor builds it from the plan signature
 plus the inputs' identities, so a changed input misses). The store is bounded by a
-byte budget and evicts least-recently-used entries — a cached result never grows the
-process without bound, and it yields that RAM back to execution under memory pressure
+byte budget and evicts by **Greedy-Dual-Size-Frequency** — recompute cost and access
+frequency against retained size, over a rising inflation floor that ages out what has
+stopped being asked for (`_Entry.value`). A cached result never grows the process
+without bound, and it yields that RAM back to execution under memory pressure
 (`on_pressure`), the storage-vs-execution split Spark's `UnifiedMemoryManager` makes.
+
+Not LRU, though it was described as such for long enough to be worth saying plainly:
+recency is one of three inputs here, not the ranking.
 
 Eviction is not the end of an entry. Under `StorageLevel.MEMORY_AND_DISK` — the default —
 what the memory budget sheds is **demoted** to `cache_disk.DiskCacheTier` rather than
@@ -105,9 +110,14 @@ class _Entry:
     # process routinely want different answers — a small hot lookup table wants memory, a
     # re-scanned fact table wants disk.
     level: StorageLevel = StorageLevel.MEMORY_AND_DISK
+    # The store's eviction clock as of this entry's last *access* (its admission counts
+    # as one) — GDSF's `L`. Carried per entry rather than read from the store at ranking
+    # time so an entry's keep-value stays a pure function of itself, which is what lets
+    # `_evict_to` sort once instead of re-ranking after every victim.
+    base: float = 0.0
 
     def value(self) -> float:
-        """Greedy-Dual-Size-Frequency keep-value: recompute-cost x frequency / size.
+        """Greedy-Dual-Size-Frequency keep-value: `L` + recompute-cost x frequency / size.
 
         Higher means more worth keeping. Expensive, frequently-served, *small* results
         score high; cheap, cold, *large* ones score low and are evicted first — far
@@ -117,9 +127,18 @@ class _Entry:
 
         Size is the *retained* footprint, so an entry that pins a large parent buffer
         ranks as the large entry it is rather than as the small window it addresses.
+
+        `base` is Cherkasova's inflation term, and without it the ranking is not GDSF but
+        the frequency half of it — which freezes. A result hit a thousand times during
+        warmup outranks every later arrival forever, because a fresh entry starts at zero
+        hits and is therefore always the cheapest victim: it is evicted by the `put` that
+        admitted it, and the store serves whatever got hot first for the rest of the
+        process's life. Admitting each entry at the keep-value of the last thing evicted
+        prices it against the current floor rather than against an unbounded history, so a
+        working set that moves can actually displace one that has stopped being asked for.
         """
         size = max(1, self.size)
-        return (self.cost + 1e-9) * (self.hits + 1) / size
+        return self.base + (self.cost + 1e-9) * (self.hits + 1) / size
 
 
 @dataclass(slots=True)
@@ -198,6 +217,12 @@ class CacheStore:
         # could" — the first says the cache is not useful here, the second says it is too
         # small — and those call for opposite responses.
         self._evictions = 0
+        # GDSF's inflation clock `L`: the highest keep-value this store has ever evicted,
+        # and the base every newly admitted entry starts from. It only rises, so it acts
+        # as an aging floor — the accumulated frequency of an entry nothing asks for any
+        # more is eventually passed by the arrivals that are being asked for. See
+        # `_Entry.value` for what goes wrong without it.
+        self._clock = 0.0
         self._lock = threading.Lock()
 
     @property
@@ -252,6 +277,12 @@ class CacheStore:
             entry = self._entries.get(key)
             if entry is not None:
                 entry.hits += 1  # access frequency feeds the keep-value
+                # Re-base on the *access*, not just the admission. This is what makes the
+                # ranking a recency/frequency hybrid rather than frequency-with-aging: an
+                # entry still being read carries the current floor, while one that has gone
+                # cold keeps the floor from whenever it was last wanted, and the rising
+                # clock overtakes it. Basing only at admission drops that half of GDSF.
+                entry.base = self._clock
                 self._hits += 1
                 return entry.table
             if key not in self._demoted:
@@ -355,7 +386,13 @@ class CacheStore:
         with self._lock:
             self._forget(key)
             self._entries[key] = _Entry(
-                table=table, keepalive=keepalive, cost=cost, hits=0, size=size, level=level
+                table=table,
+                keepalive=keepalive,
+                cost=cost,
+                hits=0,
+                size=size,
+                level=level,
+                base=self._clock,
             )
             self._used += size
             victims = self._evict_to(self._max_bytes)
@@ -399,6 +436,9 @@ class CacheStore:
             self._entries.clear()
             self._demoted.clear()
             self._used = 0
+            # Nothing is left to age against, and carrying the floor forward would price
+            # the next admission against a generation that no longer exists.
+            self._clock = 0.0
         self._disk.clear()
 
     def evict_to_free(self, n_bytes: int) -> int:
@@ -488,6 +528,7 @@ class CacheStore:
             hits=1,
             size=size,
             level=demoted.level,
+            base=self._clock,
         )
         self._used += size
         self._promotions += 1
@@ -579,6 +620,14 @@ class CacheStore:
             del self._entries[key]
             self._used -= entry.size
             self._evictions += 1
+            # The clock rises to what it just discarded, and is monotone without needing
+            # a `max` to make it so. Inductively: after an eviction every survivor ranks
+            # at or above the victim, which is the new clock; and every subsequent entry
+            # is based on the clock at its last access plus a strictly positive term. So
+            # no resident entry can ever rank below the clock, and the next victim — the
+            # lowest-ranked resident — cannot lower it. A guard was written here first and
+            # a randomized probe over 240k operations never once reached it.
+            self._clock = entry.value()
             evicted.append((key, entry))
         return evicted
 
