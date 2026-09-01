@@ -133,6 +133,10 @@ exclude_patterns = [
     # A measured audit of the connectors at TB/PB scale, kept in-tree as the record behind
     # the scale work. A working document for contributors, not a published page.
     "architecture/internals/connector_scale_audit.md",
+    # The measured record of the distributed scale-out pass: where the aggregate ladder stops
+    # being linear, and the three findings behind it. Same reason as the audit above, plus an
+    # explicit "what this pass deliberately did not do" register.
+    "architecture/internals/distributed_scaling_audit.md",
     # The enterprise-requirement scorecard against the commercial platforms (Databricks,
     # Snowflake, SageMaker, Anyscale, SkyPilot). Every cell carries an evidence citation or
     # reads UNMEASURED. A working record for contributors deciding what to build next, and it

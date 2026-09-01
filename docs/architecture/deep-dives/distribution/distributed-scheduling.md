@@ -80,6 +80,10 @@ The count is a ceiling. `partition_descriptors` returns the smaller of it and th
 
 Finer map partitions do not dilute skew, which is the usual reason given for many-tasks-per-executor. They divide the *input*, and a shuffle's imbalance lives in its hash buckets. That is the next section.
 
+The *reduce* side is bounded the same way and for a different reason. A bucket is reduced by the one worker it hashes to (`bucket % workers`), so anything launched past the worker count is a task sitting in Ray's scheduler that cannot start, and `max_shuffle_partitions` permits 2,048 buckets. `dist/executors/ray_runtime/reduce.py::gather_in_windows` therefore keeps at most `distributed.pending_window_factor` times the worker count outstanding, `distributed.max_pending_tasks` overriding it when set.
+
+That window **slides**: one completion launches one new task, exactly as `map_barrier` fills from a `ray.wait`. Stepping it a chunk at a time bounds the queue just as well and serializes the stage behind its slowest task once per chunk, which matters most where the fan-out is a product of two of them. A combiner level is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, so a 64-worker aggregate over 128 map partitions runs 1,024 tasks through a 256-deep window: four barriers where one slow bucket holds 255 idle actors, against four slots that refill the moment anything finishes. Results are returned in submission order either way, so nothing above this sees which shape it is.
+
 ## Skew
 
 Two mechanisms handle skew, and they're separate.
