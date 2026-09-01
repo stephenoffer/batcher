@@ -702,6 +702,51 @@ def test_the_system_panel_reports_the_process_budget_not_the_host():
         assert host["memory_available_bytes"] <= host["memory_total_bytes"]
 
 
+def test_a_gpu_report_with_no_reading_does_not_become_a_device_at_zero_percent():
+    """A `GPU` event carrying no measurement must not render a Prometheus series.
+
+    `dist.gpu.device_read` publishes a transfer-path report on the `GPU` kind. Folding it as a
+    sample produced `batcher_gpu_utilization_percent{device="gpu0"} 0.0` -- a device at 0% and
+    0 bytes of VRAM that nothing had measured. A monitoring system cannot tell that from a
+    genuinely idle accelerator, which makes the fabricated zero worse than the absent series.
+    """
+    from batcher._internal import events
+    from batcher.observe import (
+        metrics_snapshot,
+        prometheus_text,
+        reset_metrics,
+        start_metrics,
+        stop_metrics,
+    )
+
+    # `stop_metrics` on the way out, not just `reset_metrics`: resetting zeroes the counters
+    # and leaves the collector *attached*, and `events.listening()` is global state the engine
+    # reads to decide whether optional work is worth doing. A test that starts collection and
+    # never stops it switches that work on for every test after it in the same process, which
+    # is how an absence-assertion elsewhere quietly stopped being able to fail. See the
+    # `collecting` fixture in `test_metrics_exposition.py`, which records that incident.
+    start_metrics()
+    reset_metrics()
+    try:
+        events.publish(
+            events.GPU,
+            name="device_read",
+            event="transfer_path",
+            cufile_present=False,
+            eligible=0,
+        )
+        assert metrics_snapshot()["gpu"]["devices"] == {}
+        assert "batcher_gpu_utilization_percent" not in prometheus_text()
+
+        # ... and a genuine sample is still exported.
+        events.publish(events.GPU, device="0", util_pct=87.5, mem_used_bytes=1, mem_total_bytes=2)
+        assert metrics_snapshot()["gpu"]["devices"]["0"]["util_pct"] == 87.5
+        assert 'batcher_gpu_utilization_percent{device="0"} 87.5' in prometheus_text()
+    finally:
+        reset_metrics()
+        stop_metrics()
+
+
 def test_the_snapshot_does_not_carry_two_answers_for_the_same_machine():
     """The `host` and `hardware` blocks must not disagree about the same figure.
 

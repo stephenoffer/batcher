@@ -112,6 +112,38 @@ def test_severe_gpu_underuse_is_critical():
     assert codes["gpu_underused"] == "critical"
 
 
+def test_a_transfer_path_report_is_not_a_utilization_sample():
+    """The `GPU` kind carries more than one shape, and only a sample may reach the panel.
+
+    `dist.gpu.device_read` publishes a transfer-path report on this kind saying whether a scan
+    reached the device directly. It measures no utilization at all, and reading `util_pct` off
+    it with a `0` default invented a device sitting at 0% -- which then fell through the advice
+    bands and raised a *critical* "severe under-use" finding about hardware nothing had
+    measured, during a run that may well have been saturating it.
+    """
+    store = InferenceProgress()
+    store.handle(
+        _event(
+            events.GPU,
+            ts=1.0,
+            name="device_read",
+            event="transfer_path",
+            cufile_present=False,
+            eligible=0,
+        )
+    )
+    assert store.snapshot()["gpu"] == {}, "a report with no reading created a device"
+    assert not [d for d in store.diagnostics() if d["code"] == "gpu_underused"]
+
+
+def test_a_real_sample_is_still_folded_after_a_transfer_path_report():
+    """The gate must not swallow the measurement it sits in front of."""
+    store = InferenceProgress()
+    store.handle(_event(events.GPU, ts=1.0, name="device_read", event="transfer_path"))
+    store.handle(_event(events.GPU, ts=2.0, device="cuda:0", util_pct=91.0))
+    assert store.snapshot()["gpu"]["cuda:0"]["util_pct"] == pytest.approx(91.0)
+
+
 def test_gpu_oscillation_flags_data_starvation():
     store = InferenceProgress()
     # Alternating idle/saturated within the window — the starvation signal an average hides.

@@ -24,7 +24,7 @@ import contextlib
 import contextvars
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,6 +51,7 @@ __all__ = [
     "Event",
     "Subscriber",
     "current_query_id",
+    "is_gpu_sample",
     "listening",
     "publish",
     "query_scope",
@@ -105,9 +106,16 @@ DQ = "dq"
 #: in the stage, may be None when unknown), ``rows`` (rows this partition produced). `name`
 #: is the stage/operator label. Emit one per partition as it completes.
 PARTITION = "partition"
-#: A GPU utilization / VRAM sample from one actor. Fields: ``device`` (id/name), ``actor``
-#: (actor id), ``util_pct`` (0-100), ``mem_used_bytes``, ``mem_total_bytes``. Emit on a
-#: sampling interval from inside the worker, not only when the pool tears down.
+#: Something a GPU did. The common shape is a utilization / VRAM **sample** from one actor:
+#: ``device`` (id/name), ``actor`` (actor id), ``util_pct`` (0-100), ``mem_used_bytes``,
+#: ``mem_total_bytes``, emitted on a sampling interval from inside the worker rather than only
+#: when the pool tears down.
+#:
+#: It is **not the only shape on this kind**: `dist.gpu.device_read` publishes a
+#: ``event="transfer_path"`` report saying whether a scan reached the device directly, and that
+#: one measures no utilization at all. A fold that reads the sample fields off every `GPU`
+#: event turns such a report into a device at 0% — see [`is_gpu_sample`], which every fold
+#: must gate on.
 GPU = "gpu"
 #: One inference micro-batch completed on a worker. Fields: ``rows``, ``latency_ms``,
 #: ``blocked_ms`` (time the worker waited for its next input — the pipeline-starvation
@@ -335,6 +343,33 @@ _failures: dict[int, int] = {}
 # failure this module promises cannot happen. The guard makes the nested publish a no-op, so
 # the first failure is still reported and the cycle cannot form.
 _publishing = threading.local()
+
+
+#: The fields that make a `GPU` event a utilization sample. A report on the same kind that
+#: carries none of them measured no utilization, and reading them off it with a `0` default
+#: fabricates an idle device rather than omitting an unknown one.
+_GPU_SAMPLE_FIELDS = ("util_pct", "mem_used_bytes", "mem_total_bytes")
+
+
+def is_gpu_sample(fields: Mapping[str, Any]) -> bool:
+    """Whether a `GPU` event carries a utilization or VRAM reading.
+
+    The `GPU` kind carries more than one shape, and only this one is a measurement. Every fold
+    over it read the sample fields with a `0` default, so a `transfer_path` report — which
+    measures nothing — produced a device at 0% utilization and 0 bytes of VRAM. That is worse
+    than reporting nothing: a flatlined GPU is a signal an operator acts on, and the inference
+    panel turned it into a *critical* "severe under-use" finding on hardware that was busy.
+
+    Tested by shape rather than by the `event` discriminator, so a future report on this kind
+    is handled without a second edit here.
+
+    Args:
+        fields: The event's field mapping.
+
+    Returns:
+        True when at least one reading is present, so the event is worth folding.
+    """
+    return any(name in fields for name in _GPU_SAMPLE_FIELDS)
 
 
 def listening() -> bool:

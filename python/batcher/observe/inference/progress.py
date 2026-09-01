@@ -199,7 +199,18 @@ class InferenceProgress:
         self._advance_rate(job, event.ts, int(fields.get("rows", 0)))
 
     def _on_gpu(self, job: _Job, event: events.Event) -> None:
+        """Fold one GPU sample into the job's per-device panel.
+
+        Gated on the event actually carrying a reading, for the reason `_Collector._record_gpu`
+        gives: the `GPU` kind also carries a transfer-path report that measures no utilization,
+        and defaulting its absent `util_pct` to `0` created a device at 0% here too. That one
+        did not merely render a wrong series — it fell straight through the advice bands below
+        and raised a *critical* "severe under-use; the accelerator is mostly idle" finding
+        about a device nothing had measured.
+        """
         fields = event.fields
+        if not events.is_gpu_sample(fields):
+            return
         device = str(fields.get("device", fields.get("actor", "gpu0")))
         gpu = job.gpus.get(device)
         if gpu is None:

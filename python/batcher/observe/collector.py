@@ -196,7 +196,17 @@ class _Collector:
             entry["failed"] += 1
 
     def _record_gpu(self, fields: dict[str, Any]) -> None:
-        """Fold one GPU sample in as a per-device gauge. Assumes the lock is held."""
+        """Fold one GPU sample in as a per-device gauge. Assumes the lock is held.
+
+        Ignores a `GPU` event that carries no reading. The kind is not only used for
+        utilization samples — `dist.gpu.device_read` reports a scan's transfer path on it —
+        and reading `util_pct` off one of those with a `0` default invented a device named
+        `gpu0` sitting at 0% with 0 bytes of VRAM, which then rendered as
+        `batcher_gpu_utilization_percent`. A monitoring system cannot tell that from a real
+        idle device, so the fabricated zero is worse than the missing series.
+        """
+        if not events.is_gpu_sample(fields):
+            return
         device = str(fields.get("device", fields.get("actor", "gpu0")))
         util = float(fields.get("util_pct", 0.0))
         self.gpu_util_pct_max = max(self.gpu_util_pct_max, util)
