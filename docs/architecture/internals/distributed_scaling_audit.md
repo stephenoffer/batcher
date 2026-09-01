@@ -107,53 +107,64 @@ And **the penalty for exceeding it grows with the fan-out**, 1.05x to 1.26x for 
 which is the `mappers x reducers` stream count showing up as a cost: 1,024 streams at 32
 workers against 4,096 at 64.
 
-Holding the corpus, the mapper count and the worker count all fixed, and moving only the
-cardinality (`k % m` over the same 512 M rows, 64 mappers, 64 workers), removes the confound
-the three earlier points had — they came from two corpora, so group count and input size moved
-together:
+### Retracted: the cardinality sweep below was an ordering artefact
 
-| groups | r=2 | r=4 | **r=8** | r=16 | r=32 | r=64 | penalty at one-per-worker |
-|---|---|---|---|---|---|---|---|
-| 100 | 406 | 415 | **385** | 408 | 414 | 424 | 10% |
-| 10,000 | 622 | 665 | **595** | 630 | 624 | 684 | 15% |
-| 1,000,000 | 1,751 | 1,778 | **1,706** | 1,819 | 1,793 | 1,754 | 2.8% |
-| 5,000,000 | 3,402 | 3,117 | **2,941** | 2,984 | 3,143 | 3,480 | 18% |
+The sweep that follows, and the "eight is the optimum at every cardinality" conclusion drawn
+from it, **do not reproduce and should not be relied on.** They are kept because the way they
+failed is the useful part.
 
-**Eight is the optimum at every cardinality**, across five orders of magnitude, and
-one-per-worker is the worst or near-worst point in all four rows. That the answer does *not*
-move with the group count is the surprise, and it is what makes the earlier "4 at 200k, 20 at
-1M, 16 at 5M" reading an artefact of comparing across corpora rather than a cardinality effect.
+| groups | r=2 | r=4 | r=8 | r=16 | r=32 | r=64 |
+|---|---|---|---|---|---|---|
+| 100 | 406 | 415 | 385 | 408 | 414 | 424 |
+| 10,000 | 622 | 665 | 595 | 630 | 624 | 684 |
+| 1,000,000 | 1,751 | 1,778 | 1,706 | 1,819 | 1,793 | 1,754 |
+| 5,000,000 | 3,402 | 3,117 | 2,941 | 2,984 | 3,143 | 3,480 |
 
-A candidate mechanism was proposed, tested, and **falsified**. The combiner tree's first level
-is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, which at the default `fan_in = 8` is
-`n_reducers x 8`; saturating 64 workers would then need `64 / 8 = 8` reducers, and every reducer
-above that multiplies the `mappers x reducers` stream count without adding parallelism the fleet
-can use. It predicts the observed 8 exactly. It was derived after seeing those numbers, from the
-same data, so the prediction it had not already fit is what happens when `shuffle_fan_in`
-changes: at `fan_in = 16` the level becomes `n_reducers x 4`, so the rule requires
-`64 / 4 = 16` reducers.
+Every one of those rows ran its caps **in a fixed order**, `[2, 4, 8, 16, 32, 64]`, three timed
+reps each. Anything that drifts over the life of the process — fleet warmth, page cache, a
+co-tenant arriving — therefore maps onto cap position rather than onto the cap, and an interior
+minimum appears where the drift happened to trough. Re-measured **round-robin** (one rep of each
+cap per round, five rounds, every cap warmed first), 100 groups, same corpus and fan-out:
 
-Re-run at `flow_control.shuffle_fan_in = 16`, 5 M groups, 64 workers:
+| reducers | median | min | max |
+|---|---|---|---|
+| 1 | **407 ms** | 385 | 443 |
+| 2 | 418 ms | 387 | 468 |
+| 8 | 487 ms | 458 | 505 |
+| 16 | 709 ms | 587 | 790 |
 
-| reducers | 4 | 8 | 16 | 32 |
-|---|---|---|---|---|
-| median | 3,224 ms | **3,041 ms** | 3,103 ms | 3,063 ms |
+Monotone: at low cardinality fewer reducers is strictly better, and `r=8` — the claimed optimum
+— is 20% *worse* than `r=1`, not 5% better. A separate fixed-order run had already read `r=8` at
+480 ms against the sweep's 385 ms for the same configuration, which is the contradiction that
+prompted the re-measurement.
 
-The optimum stayed at 8 where the rule required 16, so the mechanism is wrong. What survives is
-the bare empirical fact, now measured across four cardinalities and two fan-in settings: **eight
-reducers is the optimum in all six configurations, and the engine picks 64.** Eight is not
-derived from anything here — it may well be a property of this fleet's shape (4 nodes, 64
-workers) rather than a constant — which is precisely why the sizing is not being changed on it.
-Shipping "use 8" would be fitting one cluster, and the falsified rule above is the evidence that
-the plausible-looking derivation of it does not hold.
+What survives, and what does not:
 
-**No formula is shipped here**, and that is deliberate. What the data supports is the
-structural claim — *one reducer per worker was the worst or near-worst choice at every
-cardinality and every fan-out measured*, and the floor producing it is indexed on the wrong
-quantity — plus a mechanism that predicts the right answer but has not been tested against a
-prediction it did not already fit. Changing the sizing on a post-hoc fit to one cluster's
-numbers is how a heuristic that looks derived becomes a regression on a fleet with a different
-fan-in or source count.
+- **The Finding 2 fix is validated by this.** `_busy_floor` gives 1 reducer at these
+  cardinalities, and 1 is the measured optimum. The engine's own choice measured 385 ms against
+  `r=8`'s 487 ms.
+- **The large-corpus ladder survives.** Its phases are measured *inside* each query, so drift
+  moves the map and the reduce together — and there the map fell 6.9x while the reduce rose
+  2.9x over the same runs, which no ordering artefact produces.
+- **The high-cardinality end is monotone too**, re-measured round-robin at 5 M groups: `r=8`
+  4,306 ms, `r=32` 4,948 ms, `r=64` 5,455 ms — 1.27x between the engine's choice and the
+  fewest reducers tested. (Absolute times run higher than the fixed-order sweeps because the
+  cluster was busier; only the within-run ordering is being read.) So the corrected picture at
+  *both* ends is the same one, and it is simpler than the retracted table's interior optimum:
+  **fewer reducers is monotonically better, as far down as was measured.** That the reduction
+  cannot continue indefinitely is what `ceil(groups / target_rows_per_task)` is already for —
+  each reducer's state has to fit — so the open question is no longer "where is the optimum"
+  but "does the worker floor buy anything at all at high cardinality", which is a question about
+  the floor rather than about a new heuristic.
+- **The falsified fan-in mechanism stays falsified**, now for a second reason: it was fitted to
+  a table that turns out to be an artefact.
+
+**No formula is shipped here**, and after the retraction above the reason is stronger than it
+was. The one measurement in this section taken with an interleaved design says fewer reducers
+is monotonically better at low cardinality, which is what the shipped `_busy_floor` already
+does. Everything past that — where the optimum sits once the groups are numerous enough to
+matter — rests on fixed-order sweeps that have now been shown to manufacture optima, so it is
+not a basis for sizing anything.
 
 ## Finding 1 — a warm fleet reserves the whole cluster, against every other process
 
