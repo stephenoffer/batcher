@@ -477,6 +477,41 @@ its cost is `O(workers x concurrent queries)` on both axes: the ping was 2.6 ms 
 here and 8.7 ms across 64 in the single-client measurement above, and only the first factor was
 being paid then. A wider fleet under real concurrency is where this stops being 3%.
 
+### What the in-process ceiling is *not*
+
+Four candidates were measured and each is ruled out, which is worth more than the ceiling
+itself: it is where the next person would otherwise start.
+
+The number to explain is that **eight concurrent clients yield about twice one client's
+throughput, not eight times**, and that ratio barely moves:
+
+| fleet width | solo p50 | solo QPS | 8 clients QPS | speedup over solo |
+|---|---|---|---|---|
+| 8 workers | 452 ms | 2.21 | 4.14 | 1.87x |
+| 32 workers | 370 ms | 2.70 | 5.49 | 2.03x |
+
+- **Not the fleet actor's call slots.** `scheduling.FLEET_CONCURRENCY` is 4, so an obvious
+  reading is that eight queries queue on four slots per actor. Raised to 16, interleaved:
+  4 gave 3.01 and 3.50 QPS, 16 gave 3.32 and 3.55. The ranges overlap, so these runs do not
+  separate them — and that constant is deliberately coupled to the spill budget
+  (`_FlightWorker._reduce_budget` divides by exactly it), so not touching it is the right
+  outcome rather than a missed one.
+- **Not the fleet's width.** Quadrupling it, 8 to 32 workers, buys 1.33x on eight-client
+  throughput and leaves the speedup-over-solo essentially unchanged (1.87x to 2.03x). If the
+  shared fleet were the constraint, four times the fleet would not read like that.
+- **Not the driver's CPU or its GIL.** The control plane is Python and every client thread
+  drives Ray from one interpreter, which makes this the natural next guess. Sampled at 4 Hz:
+  median 8% of one core at one client, 20% at four, 24% at eight, with p90 76% and a 140%
+  peak. Bursty above one core at the tail, nowhere near saturated at the median, on a box
+  with 96 of them.
+- **Not fleet acquisition.** The `_session_fleet_alive` fan-out under `_SESSION_LOCK` does
+  grow 19x under eight-way concurrency, but it is 49 ms of a ~1,900 ms query.
+
+So the cause is not identified. What is established is that the four things one would try
+first are not it, and that the shape — a flat ~2x whatever the fleet or the actor concurrency
+— looks like serialisation somewhere in the per-query path rather than contention for a
+resource that can be widened.
+
 The fix is the one already described and not made — cache the liveness verdict for a short TTL,
 so back-to-back queries skip the fan-out — and it remains blocked on `dist/fleet/_fleet.py`,
 which carried another session's staged work for this entire pass.
