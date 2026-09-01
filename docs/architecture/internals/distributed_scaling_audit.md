@@ -507,7 +507,24 @@ throughput, not eight times**, and that ratio barely moves:
 - **Not fleet acquisition.** The `_session_fleet_alive` fan-out under `_SESSION_LOCK` does
   grow 19x under eight-way concurrency, but it is 49 ms of a ~1,900 ms query.
 
-So the cause is not identified. What is established is that the four things one would try
+- **Not the blocking eviction wait, and this one is a trap worth naming.** Sampling every
+  client thread's stack (`sys._current_frames`, 20 Hz, 7,644 samples over 224 queries) puts
+  **89.1%** of client-thread time in `ray.wait` — 48.0% in `gather_map_results`, 32.1% in
+  `gather_with_backups`, and **8.0% in `eviction.py:105`**, which is
+  `ray.wait(refs, num_returns=len(refs))` blocking until every worker has dropped the query's
+  buckets. That function's docstring calls it "fire-and-forget with a bounded wait", true of
+  its error handling and not of its latency, so an 8% share reads like 8% to reclaim.
+
+  It is not. With the timeout dropped to zero, interleaved: `wait` 3.78 and 3.57 QPS,
+  `nowait` 3.82 and 3.74. The ranges overlap, so these runs do not separate them.
+
+  **A blocked thread's share of a concurrent profile is not its share of the critical path.**
+  Eight threads, one parked in eviction while seven work, costs the throughput nothing — the
+  sample says where a thread *was*, not what anyone was waiting *for*. That is the same class
+  of error as the ordering artefact retracted above, one level up: a number that is real,
+  correctly measured, and answers a question nobody asked.
+
+What is established is that the five things one would try
 first are not it, and that the shape — a flat ~2x whatever the fleet or the actor concurrency
 — looks like serialisation somewhere in the per-query path rather than contention for a
 resource that can be widened.
@@ -563,6 +580,32 @@ network-bound than to launch-bound, and shaving driver round trips would not obv
 
 The explicit-`num_workers` thinning (Finding 1) is written and green but uncommitted, for the
 file-contention reason recorded above.
+
+## Two fixes written, verified, and not committed
+
+Both were blocked the whole pass by another session's uncommitted work in the file they touch.
+`git commit --only` bounds paths, not hunks, so committing either would have carried that
+session's in-flight change under this one's message. Recorded here because a working-tree
+change is not a durable artefact.
+
+**The explicit-`num_workers` grant thinning** (`dist/executor.py`, plus two composition tests
+in `tests/unit/test_placeable_grant.py`). One `elif` in `execute_distributed` routing the
+explicit fan-out's grant through `_placeable_grant`, which the automatic path has always used.
+It is left in the working tree. `dist/executor.py` carried a rewrite of `_numa_sliced` and the
+fan-out constants throughout.
+
+**The session-fleet liveness TTL** (`dist/fleet/_fleet.py`, plus a new test module). Held as a
+*patch outside the tree* rather than applied, precisely so its lines could not be swept into
+the other session's commit of that file — a copy lives at
+`/mnt/cluster_storage/batcher-pending-liveness/` with a README, the apply script, the tests and
+the commit message. It is verified: applies idempotently, ruff- and format-clean, seven tests
+pass against a patched sandbox, and removing only the cache-hit short-circuit fails exactly the
+one behavioural test while the six pinning its safety properties still pass.
+
+Both had a watcher polling for the file to free, with a mechanical guard rather than a
+judgement call — the executor one refuses to commit while any line matching the other session's
+markers appears in the diff it would carry, and the fleet one applies the patch, runs the
+tests, and reverts rather than committing if they fail. Neither file freed.
 
 ## What this pass deliberately did not do
 
