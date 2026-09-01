@@ -93,26 +93,42 @@ sf10 going from 27 s to over 20 minutes that way). The `_fleet_is_too_thin` resp
 weakens that objection but does not obviously retire it, and re-deciding it wants the
 measurement, not an argument.
 
-## Finding 2 — the reducer floor makes the exchange O(workers squared) on a small aggregate
+## Finding 2 — the reducer floor made the exchange O(workers squared) on a small aggregate — FIXED
 
 `aggregate_reducer_count` sizes an aggregate's reduce by its **learned group count**, which is
 the right basis: an aggregate exchanges partial state, not rows. For this corpus that is
-`ceil(200,000 / target_rows_per_task)` = 1 reducer. The count is then floored at the worker
+`ceil(200,000 / target_rows_per_task)` = 1 reducer. The count was then floored at the worker
 count, because a bucket is reduced by exactly one worker and fewer buckets than workers idles
 the rest — measured, on a 9-node cluster, at 0.65 s / 1.05 s / 4.47 s for 2 / 4 / 8 workers.
 
-The floor wins here, so a 64-worker run gets **64 reducers against 64 map sources**: 4,096
-exchange streams carrying about 5 MB of partial state between them, roughly 1 KB per stream. The
-combiner tree's cost tracked that product rather than the data — 100 ms at 32 workers against
-291 ms at 64, for the same input.
+The floor won here, so a 64-worker run got **64 reducers against 64 map sources**: 4,096
+exchange streams carrying about 5 MB of partial state, roughly 1 KB per stream. The combiner
+tree's cost tracked that product rather than the data — 100 ms at 32 workers against 291 ms at
+64, for the same input.
 
-Both rules are individually well-founded and they disagree at low cardinality. The shape of a fix
-is a floor that is itself bounded by how much work a reducer would receive — something like
-`min(workers, max(1, groups / min_groups_per_reducer))`, which leaves the 5 M-group case that
-motivated the floor untouched (it clamps to `workers` either way) while giving this one 4
-reducers instead of 64. **It is not implemented**: the justification has to be a measurement, the
-cluster was saturated by concurrent sessions for the rest of this pass, and a number taken under
-that contention would not mean anything.
+Both rules are individually well-founded and they disagreed at low cardinality. The fix bounds
+the *floor* by whether the groups can keep those workers busy (`_busy_floor`, at 50,000 groups
+per reducer), leaving the high-cardinality rule and the case the floor was added for untouched.
+Measured warm, median of seven, every case checked against DuckDB:
+
+| groups | workers | before | after | speedup |
+|---|---|---|---|---|
+| 64 | 64 | 302 ms | 91 ms (1 reducer) | 3.30x |
+| 200,000 | 8 | 461 ms | 416 ms (4) | 1.11x |
+| 200,000 | 16 | 442 ms | 389 ms (4) | 1.14x |
+| 200,000 | 64 | 348 ms | 249 ms (4) | 1.40x |
+| 1,000,000 | 64 | 880 ms | 434 ms (20) | 2.03x |
+
+Note what the 64-group row is. `aggregate_reducer_count`'s own docstring already said a
+60M-row-to-4-group aggregate "needs one" reducer, and the module's test asserted exactly that —
+but the test passed the default `floor=1` while every real caller passes `floor=workers`, so
+the documented behaviour was never exercised where it applies. The claim was true of the
+function and false of the engine.
+
+The end-to-end effect on the ladder this document opens with, same corpus and cluster: 64
+workers went from 421 ms to 274 ms, and the reduce phase from 264 ms to 136 ms, so the curve is
+now monotone across the top end instead of turning back up past eight workers. It is still not
+linear — the map stage is capped by a 16-file source — but the reduce no longer *anti*-scales.
 
 ## Finding 3 — the combiner tree builds an O(reducers x sources) structure on the driver
 
@@ -130,8 +146,16 @@ standalone:
 
 Ticket construction is 46 ms of that 65.6 ms; the tuples and the empty fallback lists are the
 rest. At the fan-outs reachable today this is tens of milliseconds and not the reason the reduce
-anti-scales — Finding 2 is. It is on the list because it is *quadratic in the fan-out* and it is
+anti-scaled — Finding 2 was. It is on the list because it is *quadratic in the fan-out* and it is
 control-plane work, which `.claude/rules/architecture.md` reserves for the data plane.
+
+**Fixing Finding 2 shrank this one rather than exposing it**, which is worth recording because
+the opposite was expected. The frontier is `reducers x sources`, and bounding the reducer count
+by the work available took the 64-worker aggregate from `64 x 64` pairs to `4 x 64` — so the
+term this section is about is now a few hundred objects, not eight thousand. It still binds for
+a *raw-row* shuffle (join, sort, window), where `row_shuffle_reducer_count` may only raise the
+count above one bucket per worker and the sources scale with the fleet. That is where to measure
+it next, not on an aggregate.
 
 The cheap half (not allocating `reducers x sources` empty lists when replication is off) is worth
 about 2 ms of the 65 and was judged not worth the churn. The half that matters is shipping the
@@ -142,7 +166,7 @@ pickle from 131,072 ticket objects to a list of integers. That is a change to `c
 worker protocol, shared with the recovery and replication paths that index replicas positionally,
 and it was not landed blind on a cluster too busy to measure it on.
 
-## What landed in this pass
+## What landed
 
 - The shuffle reduce's submit-ahead window **slides** instead of stepping. It was a chunked
   barrier — launch `window`, `ray.get` all of them, launch the next `window` — which bounds the
@@ -153,12 +177,15 @@ and it was not landed blind on a cluster too busy to measure it on.
   docstring already called itself that barrier's reduce-side twin; it was the twin in everything
   except the pipelining. Results are still returned in submission order, so nothing above it can
   see which shape it is.
-Nothing else. The explicit-`num_workers` thinning (Finding 1) is written and green but
-uncommitted, for the file-contention reason recorded above.
+- The aggregate reduce's worker floor is bounded by the work available (Finding 2), which is
+  the largest single win in this pass and the one that removed the anti-scaling.
+
+The explicit-`num_workers` thinning (Finding 1) is written and green but uncommitted, for the
+file-contention reason recorded above.
 
 ## What this pass deliberately did not do
 
-- No change to `aggregate_reducer_count` (Finding 2) or to the combiner-tree wire shape
-  (Finding 3). Both want a number from an uncontended cluster first.
+- No change to the combiner-tree wire shape (Finding 3). It wants a measurement on a raw-row
+  shuffle, which is where it still binds.
 - No cross-process fleet arbitration (Finding 1). It is the right answer and it is a feature.
 - No Rust data-plane work. Everything above is control plane.

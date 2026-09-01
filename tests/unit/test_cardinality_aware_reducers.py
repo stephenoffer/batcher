@@ -122,3 +122,66 @@ def test_never_below_one(monkeypatch):
 
     monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 0.0)
     assert aggregate_reducer_count(_agg_node(), 4) >= 1
+
+
+# ---- the worker floor is itself bounded by whether there is work to floor ----------------
+
+
+def test_low_cardinality_collapses_to_one_reducer_at_the_real_call_site(monkeypatch):
+    """The same claim as `test_low_cardinality_collapses_to_one_reducer`, with a real floor.
+
+    That test passes the default `floor=1`, which is not what any caller passes: the
+    aggregate calls this as `aggregate_reducer_count(agg, shuffle_partitions(w), w, sources)`,
+    so the floor is the worker count. Under that floor a 4-group aggregate came back with 64
+    reducers on a 64-worker cluster — one Flight stream per mapper per reducer to move a
+    handful of rows, which is precisely the near-empty all-to-all the module docstring says
+    it avoids. Measured on the project cluster at 302 ms against 89 ms.
+    """
+    from batcher.kyber import learned_tuning
+
+    monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 4.0)
+    assert aggregate_reducer_count(_agg_node(), 64, 64) == 1
+
+
+def test_the_floor_only_buys_reducers_it_can_keep_busy(monkeypatch):
+    """Between the two extremes the floor is the group count divided by the busy threshold.
+
+    Measured optima on the project cluster, warm, median of 7: 200,000 groups wants 4
+    reducers at every worker count tried (8, 16 and 64 — 1.11x, 1.14x and 1.42x against the
+    floored count), and 1,000,000 wants 20 at 64 workers (2.02x).
+    """
+    from batcher.dist.adaptive_sizing import sizing
+    from batcher.kyber import learned_tuning
+
+    per = sizing._MIN_GROUPS_PER_REDUCER
+    monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 4.0 * per)
+    for workers in (8, 16, 64):
+        assert aggregate_reducer_count(_agg_node(), workers, workers) == min(workers, 4)
+    monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 20.0 * per)
+    assert aggregate_reducer_count(_agg_node(), 64, 64) == 20
+
+
+def test_a_floor_the_groups_can_keep_busy_is_untouched(monkeypatch):
+    """The regression this must not cause: the case the floor was added for.
+
+    5M groups on an 8-worker cluster is what made the reduce slower the more workers were
+    added (0.65 s / 1.05 s / 4.47 s at 2 / 4 / 8 workers) before the floor existed. Every one
+    of those 8 workers has 625,000 groups to reduce, so the bound never binds.
+    """
+    from batcher.kyber import learned_tuning
+
+    monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 5e6)
+    assert aggregate_reducer_count(_agg_node(), 8, 8) == 8
+
+
+def test_high_cardinality_still_overrides_the_bounded_floor(monkeypatch):
+    """The bound applies to the floor, not to the count: memory sizing still wins when higher.
+
+    A billion groups needs `ceil(1e9 / target)` reducers to keep each one's state bounded,
+    which is far above any floor. Bounding the floor must not cap that.
+    """
+    from batcher.kyber import learned_tuning
+
+    monkeypatch.setattr(learned_tuning, "learned_signature_rows", lambda *a, **k: 1e9)
+    target = active_config().optimizer.target_rows_per_task
+    assert aggregate_reducer_count(_agg_node(), 8, 8) == math.ceil(1e9 / target)

@@ -339,7 +339,7 @@ Session entry points that create `Dataset`s.
 |---|---|---|
 | `_scan.py` | 43 | The one place a `Source` becomes a `Dataset`. |
 | `admin.py` | 386 | Session-level administration: table maintenance and streaming-query control. |
-| `cache.py` | 92 | Session-level control of the process result cache: what it holds, and dropping it. |
+| `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 562 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 419 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
@@ -915,7 +915,7 @@ Learned execution-time sizing for the distributed executor (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `sizing.py` | 540 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
+| `sizing.py` | 597 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
 
 ### `batcher/dist/executors/` — 4 · backend
 
@@ -1542,7 +1542,7 @@ The shared (cross-process, cross-node) result cache.
 | `factory.py` | 107 | Building the shared result cache from its config URI, once per process. |
 | `redis.py` | 134 | Redis-backed shared result cache — low-latency reuse across processes and nodes. |
 | `rocksdb.py` | 189 | RocksDB-backed shared result cache — durable reuse across runs on one node. |
-| `store.py` | 209 | The shared result cache as the engine uses it: serialize, store, count, never fail. |
+| `store.py` | 217 | The shared result cache as the engine uses it: serialize, store, count, never fail. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1752,7 +1752,7 @@ Credential verification: turning a presented credential into a verified `Princip
 |---|---|---|
 | `_backend.py` | 606 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
 | `_concurrent.py` | 121 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
-| `_file_cache.py` | 300 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
+| `_file_cache.py` | 320 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
@@ -1918,9 +1918,9 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `json.py` | 488 | JSON format — newline-delimited (line) JSON read + write. |
-| `json_encoding.py` | 223 | Process-pool machinery for the JSON **write** path. |
+| `json_encoding.py` | 231 | Process-pool machinery for the JSON **write** path. |
 | `json_tolerance.py` | 146 | Dropping the unparseable line from a newline-delimited JSON buffer. |
-| `json_vector.py` | 234 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
+| `json_vector.py` | 306 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
 | `logs.py` | 222 | Log format — line-delimited text logs read as raw lines (core, no extra). |
 | `msgpack.py` | 100 | MessagePack format — row-oriented read + write via `ormsgpack`, to Arrow. |
 | `protobuf.py` | 145 | Protobuf format — length-delimited message stream → Arrow via `protarrow`. |
@@ -2170,7 +2170,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 
 | module | lines | what it is |
 |---|---|---|
-| `collector.py` | 341 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
+| `collector.py` | 351 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
 | `control.py` | 253 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `fabric.py` | 49 | The node's wires as flat metric rows, for a dashboard that watches a fleet rather than a run. |
@@ -2242,7 +2242,7 @@ Live progress for a long-running distributed or batch-inference job.
 | module | lines | what it is |
 |---|---|---|
 | `measures.py` | 70 | Stateless computations behind the live-progress snapshot and its diagnostics. |
-| `progress.py` | 470 | Live progress for a long-running distributed or batch-inference job. |
+| `progress.py` | 481 | Live progress for a long-running distributed or batch-inference job. |
 
 ### `batcher/observe/insights/` — 2 · neutral sinks
 
@@ -2663,7 +2663,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 |---|---|---|
 | `accelerators.py` | 604 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
 | `device_share.py` | 338 | How much of one accelerator a claimant gets — the fractional-scheduling vocabulary. |
-| `events.py` | 512 | The engine's one observability event bus — every subsystem publishes here. |
+| `events.py` | 547 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 376 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 131 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
 | `native.py` | 101 | The single accessor for the compiled Rust data plane (``batcher._native``). |
