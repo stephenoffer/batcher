@@ -432,10 +432,33 @@ at `num_workers=8` over the shared session fleet:
 It **saturates rather than collapsing** — throughput flattens at ~4 QPS from four clients on,
 while p50 grows 4.4x. No errors at any point.
 
-**Most of that is not a defect, and the test design is why.** Pinning `num_workers=8` fixes the
-fleet at eight actors however many clients arrive, so eight concurrent queries are eight times
-oversubscribed on the same eight workers while the cluster's other 376 cores sit idle. A fair
-reading is that this measures fleet sharing, not the engine's concurrency ceiling.
+That was first written up with the caveat that most of it was the test design — pinning
+`num_workers=8` fixes the fleet at eight actors however many clients arrive, so eight
+concurrent queries are eightfold oversubscribed on eight workers while 376 cores idle, and a
+fair reading was that it measured fleet sharing rather than a concurrency ceiling.
+
+**Re-run with the fan-out left to the engine (`num_workers=None`), the ceiling is the same**,
+so that caveat was wrong:
+
+| clients | QPS (pinned at 8) | QPS (engine-sized) | p50 (engine-sized) |
+|---|---|---|---|
+| 1 | 1.39 | 1.76 | 551 ms |
+| 2 | 3.19 | 2.66 | 757 ms |
+| 4 | 3.94 | 3.62 | 1,095 ms |
+| 8 | 4.13 | **3.65** | 2,210 ms |
+
+Letting the engine size the fleet does not lift the ceiling — it is marginally *lower* — so
+the saturation is not an artefact of the pin. What it still does not separate is a
+process-level limit from fleet sharing at a different width, because every query in one
+process shares one `_SESSION` fleet whatever that fleet's size.
+
+Separating those would mean concurrent queries in *different* processes, each with its own
+fleet — and that is Finding 1, where two drivers each size against nameplate capacity, both
+demand the whole cluster, and both stall on placement for the full timeout. So on this
+cluster there is no measured configuration in which concurrent Batcher queries scale: shared
+within a process they saturate around 4 QPS, and separated across processes they contend for
+placement. Whether the in-process ceiling has a cause worth fixing beyond fleet sharing is
+open; the cross-process one is Finding 1 and is a design decision.
 
 What it does isolate is a real serialization point, and it is the one `_session_fleet_alive`
 was already suspected of being. `_acquire_session_fleet` pings every actor for liveness

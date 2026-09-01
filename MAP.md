@@ -2175,7 +2175,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `control.py` | 253 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `fabric.py` | 49 | The node's wires as flat metric rows, for a dashboard that watches a fleet rather than a run. |
-| `metrics.py` | 351 | Process-wide counters and timings, as a plain dict. |
+| `metrics.py` | 359 | Process-wide counters and timings, as a plain dict. |
 | `node_metrics.py` | 219 | What the *hardware* is doing, as gauges a fleet alerts on. |
 | `store.py` | 498 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 260 | The host and engine the queries are running on — the dashboard's hardware panel. |
@@ -2222,7 +2222,7 @@ The per-domain folds behind the metrics export.
 | `_series.py` | 49 | The two primitives every fold needs to turn an event field into a metric series. |
 | `resources.py` | 201 | Resource gauges — what the engine's envelopes, disks, and channels are holding. |
 | `streams.py` | 155 | Streaming counters — the one workload that runs for weeks, made scrapeable. |
-| `work.py` | 321 | Per-operator work counters — what the engine spent, not just how long it took. |
+| `work.py` | 358 | Per-operator work counters — what the engine spent, not just how long it took. |
 | `writes.py` | 129 | Write counters — what the job produced, not just what it consumed. |
 
 ### `batcher/observe/dag/` — 2 · neutral sinks
@@ -2698,7 +2698,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `hierarchy.py` | 662 | The Batcher exception hierarchy. |
+| `hierarchy.py` | 710 | The Batcher exception hierarchy. |
 | `suggest.py` | 390 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 80 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
@@ -2888,7 +2888,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `errors.rs` | 110 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
+| `errors.rs` | 120 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 703 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 287 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
