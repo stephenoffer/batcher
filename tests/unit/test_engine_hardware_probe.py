@@ -141,3 +141,60 @@ def test_the_real_engine_reports_a_coherent_machine():
         assert hw["has_smt"], "more logical CPUs than cores means SMT, whatever the quota says"
     order = detected.engine_pinning_order()
     assert len(set(order)) == len(order), "a repeated CPU would oversubscribe one core"
+
+
+def test_the_two_planes_describe_the_same_machine():
+    """The control plane's CPU facts must equal the data plane's.
+
+    Kyber sizes thresholds from `_internal.hardware`; the engine sizes its thread pools and
+    shard counts from `bc_arrow::CpuTopology`. They are separate implementations of the same
+    questions in two languages, so nothing but a test keeps them from drifting apart, and a
+    drift is silent: the plan is sized for one machine and executed on another.
+
+    The NUMA count must agree exactly. The two core counts are allowed to differ by one, and
+    only one, because the engine reaches the affinity mask through `available_parallelism`
+    while the control plane reads `sched_getaffinity`, and on a *fractional* CFS quota the two
+    can round the same `cpu.max` differently. One core is the whole width of that effect; the
+    failure this test exists to catch is the other order of magnitude entirely, a plane
+    reporting the host's 48 cores for a process budgeted 4.
+
+    The cache sizes are deliberately not compared. The two planes apply different domain
+    policies today -- the control plane takes the binding domain across usable CPUs, the engine
+    reads `cpu0` -- so an equality here would either fail on a hybrid or stacked-cache part or
+    freeze that divergence in place as expected behavior.
+    """
+    hw = detected.engine_hardware()
+    if not hw:
+        pytest.skip("the engine extension is not built in this environment")
+
+    from batcher._internal.hardware import available_cpu_count
+    from batcher._internal.hardware.topology import numa_node_count, physical_core_count
+
+    assert abs(hw["logical_cores"] - available_cpu_count()) <= 1, (
+        f"the engine says {hw['logical_cores']} usable cores and the control plane says "
+        f"{available_cpu_count()}; a plan sized against one will be executed with the other"
+    )
+    assert abs(hw["physical_cores"] - physical_core_count()) <= 1, (
+        f"the engine says {hw['physical_cores']} physical cores and the control plane says "
+        f"{physical_core_count()}; that is the denominator both use for compute-bound fan-out"
+    )
+    assert hw["numa_nodes"] == numa_node_count()
+
+
+def test_both_planes_hold_physical_cores_under_the_cpu_budget():
+    """Neither plane may report more physical cores than the process is allowed CPUs.
+
+    `/sys` is host-wide, so a sibling walk sees every core on the box. A cpuset pin narrows it;
+    a CFS *bandwidth* quota does not appear in the mask at all, so the walk has to be capped
+    explicitly. The engine has always clamped; the control plane did not, and reported the
+    host's physical core count for a process throttled to a fraction of it.
+    """
+    from batcher._internal.hardware import available_cpu_count
+    from batcher._internal.hardware.topology import physical_core_count
+
+    budget = available_cpu_count()
+    assert 1 <= physical_core_count() <= budget
+
+    hw = detected.engine_hardware()
+    if hw:
+        assert 1 <= hw["physical_cores"] <= hw["logical_cores"] <= budget

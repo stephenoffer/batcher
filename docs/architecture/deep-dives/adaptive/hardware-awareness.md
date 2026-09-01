@@ -13,6 +13,39 @@ Kyber never samples hardware itself. It reads static facts from the layer below 
 consumes *measurements* that Core recorded on earlier runs. That split is the architecture's
 rule: Core measures, Kyber decides, Carbonite protects.
 
+## The facts describe the process, not the host
+
+Every CPU, memory, and cache figure on this page is what *this process* may use, not what the
+machine contains. The distinction is invisible on a bare-metal box, where the two are the same
+number, and it is the whole problem inside a container. A Kubernetes pod, a Ray worker slice,
+and a Slurm allocation all see the host through the ordinary interfaces: `os.cpu_count()`
+reports the host's cores, `SC_PHYS_PAGES` reports the host's RAM, and `/sys` enumerates every
+core, cache, and NUMA node on the box whether or not this process can be scheduled on one.
+
+So each probe reads the host source and then narrows it by whatever binds:
+
+| Fact | What narrows it |
+|---|---|
+| Logical CPUs | the affinity mask (a cpuset pin), the cgroup CFS bandwidth quota, and a batch scheduler's core grant, whichever is tightest |
+| Physical cores | SMT siblings collapsed within the affinity mask, then capped by the logical-CPU budget above, since a bandwidth quota narrows what the mask cannot |
+| Memory ceiling | host RAM less any reserved hugepage pool, then `memory.max`, `memory.high`, a scheduler's memory grant, and `RLIMIT_AS` |
+| Swap availability | the tightest `memory.swap.max` anywhere in the cgroup ancestry, since v2 enforces it at every level |
+| Cache sizes and NUMA nodes | restricted to the CPUs in the affinity mask, and reported as the binding domain rather than an average |
+
+Two consequences run through everything above. Fan-out sized to a host figure oversubscribes:
+exceeding a CFS quota does not waste one thread, it gets the whole cgroup throttled for the
+rest of the period, so the extra worker buys stalls for every other one. And because these
+figures are fingerprint material, two containers on one host with different quotas are
+different classes of machine. Reporting the host's numbers would give them one key and blend
+their learned coefficients into a model wrong for both.
+
+The recurring failure is a probe that reads a host-wide source and forgets to narrow it. It
+never raises, and the number it returns is entirely plausible, so nothing downstream can tell
+it apart from a correct reading. A cpuset pin is the easier half to remember because it appears
+in the affinity mask that `/sys` walks are already filtered by. A *bandwidth* quota is the
+harder half, because it appears in neither the mask nor `/sys`, and it is the one Kubernetes
+sets when you write a `cpu` limit.
+
 ## The hardware fingerprint
 
 Every learned parameter is scoped to a *class of machine* rather than to the fleet. The

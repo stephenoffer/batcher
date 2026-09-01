@@ -261,6 +261,31 @@ def test_reset_clears_the_host_pid_memo(monkeypatch):
     assert nvml.host_pid() == 9999, "reset_hardware_probes left host_pid memoized"
 
 
+def test_reset_clears_the_windowed_cpu_contention_reading():
+    """The one sampled reading that is not an `lru_cache`, so the walk below cannot see it.
+
+    `cpu_contention` reuses its answer for 50 ms in a module-level slot. A caller that stubs
+    the underlying counters and resets in the documented way runs well inside that window, so
+    without this it is answered from whatever the previous caller measured.
+    """
+    from batcher._internal.hardware import cpu
+
+    cpu.reset_cpu_probe()
+    measured: list[dict[str, float]] = [{"load_per_core": 1.0, "probe_marker": 111.0}]
+    original = cpu._measure_contention
+    try:
+        cpu._measure_contention = lambda: measured[0]
+        assert cpu.cpu_contention()["probe_marker"] == 111.0
+        measured[0] = {"load_per_core": 1.0, "probe_marker": 999.0}
+        hardware.reset_hardware_probes()
+        assert cpu.cpu_contention()["probe_marker"] == 999.0, (
+            "reset_hardware_probes() left the contention window populated"
+        )
+    finally:
+        cpu._measure_contention = original
+        cpu.reset_cpu_probe()
+
+
 def test_reset_clears_every_memoized_probe_in_the_package():
     """Mechanical completeness: no `lru_cache` in the package survives a reset.
 
