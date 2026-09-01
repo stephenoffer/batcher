@@ -1752,7 +1752,7 @@ Credential verification: turning a presented credential into a verified `Princip
 |---|---|---|
 | `_backend.py` | 606 | The `pyarrow.fs`-backed filesystem façade every IO source and sink talks to. |
 | `_concurrent.py` | 121 | Concurrent per-file reads — the shared fan-out for footer/header stats and file bytes. |
-| `_file_cache.py` | 320 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
+| `_file_cache.py` | 354 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
@@ -1920,7 +1920,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `json.py` | 488 | JSON format — newline-delimited (line) JSON read + write. |
 | `json_encoding.py` | 231 | Process-pool machinery for the JSON **write** path. |
 | `json_tolerance.py` | 146 | Dropping the unparseable line from a newline-delimited JSON buffer. |
-| `json_vector.py` | 306 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
+| `json_vector.py` | 317 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
 | `logs.py` | 222 | Log format — line-delimited text logs read as raw lines (core, no extra). |
 | `msgpack.py` | 100 | MessagePack format — row-oriented read + write via `ormsgpack`, to Arrow. |
 | `protobuf.py` | 145 | Protobuf format — length-delimited message stream → Arrow via `protarrow`. |
@@ -2030,7 +2030,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `_parquet_native.py` | 153 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 234 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 392 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
-| `csv.py` | 501 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
+| `csv.py` | 558 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
 | `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |
 | `orc.py` | 413 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |

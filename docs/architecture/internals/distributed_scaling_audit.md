@@ -30,11 +30,30 @@ the source can split. **The reduce anti-scales**: 63 ms at one worker to 264 ms 
 crosses over the map at eight workers. Past that point every worker added makes the query's
 dominant phase slower, which is why the total flattens at ~2.9x and then wobbles.
 
-A `sort(w).limit(1000)` ladder over the same corpus flattens the same way, at 16 workers.
-Those figures are **cold** — 6,817 ms at one worker to 2,020 ms at 32, 3.4x — because each rung
-asked for a different worker count and a fleet that is too narrow for the request is torn down
-and respawned rather than grown. They are quoted for the shape of the curve, not against the
-warm table above.
+Four shapes over the same corpus, warm, median of 5, **every timed run given a distinct
+plan** so the result cache cannot serve it (see the note below). Reported after the Finding 2
+fix, so this is the current state rather than the one the findings were found in:
+
+| shape | 1 worker | 4 | 16 | 64 | speedup |
+|---|---|---|---|---|---|
+| `join` + `group_by` | 7,981 ms | 3,023 ms | 650 ms | 560 ms | **14.3x** |
+| `sort` + `limit` | 248 ms | 127 ms | 115 ms | 76 ms | 3.3x |
+| `group_by(200k)` | 746 ms | 397 ms | 405 ms | 274 ms | 2.7x |
+| `distinct(200k)` | 421 ms | 351 ms | 408 ms | 299 ms | **1.1x** |
+
+The join is what the distributed path is built for and it behaves like it. `distinct` is the
+outlier and the reason is not its shuffle: at 64 workers it spends 119 ms in the map, 107 ms in
+the reduce and **73 ms on the driver**, against 554/30/29 at one worker. Its scan parallelises
+and everything else gets worse, so a shape whose single-worker time is already under half a
+second has little left to win.
+
+**A methodological trap worth recording, because it invalidated a whole ladder.** The first
+`sort` ladder here read 31 ms at one worker rising to 70 ms at 64, which looks like a dramatic
+anti-scaling result and is not a sort at all: `carbonite.cache` had served every repeat, because
+a 1,000-row top-N result fits the result cache and an identical query is an identical cache key.
+The aggregate ladders were unaffected — a 200,000-row result does not fit, and identical
+(250 ms) and varied (257 ms) runs measured the same — but nothing about the timings said which
+was which. Every ladder in this document now varies one literal per run.
 
 ## Finding 1 — a warm fleet reserves the whole cluster, against every other process
 
@@ -165,6 +184,37 @@ worker build its own eight would move the whole quadratic term off the driver an
 pickle from 131,072 ticket objects to a list of integers. That is a change to `combine_publish`'s
 worker protocol, shared with the recovery and replication paths that index replicas positionally,
 and it was not landed blind on a cluster too busy to measure it on.
+
+## Ruled out
+
+Kept because the ratio of already-built to genuinely-missing is the most useful thing this
+kind of pass produces, and a candidate that was measured and lost costs the next reader
+nothing to skip.
+
+**Batching the metrics drain's `ray.get`.** `metering.py::drain_worker_metrics` reads its
+per-worker documents with `for ref in pending: ray.get(ref)` — one blocking call per worker,
+where `shuffle_replication.py` settles the same shape concurrently with a `ray.wait` first.
+It reads like an obvious O(workers) round-trip bug, and `drain_metrics` does cost 5.6 ms at 8
+workers rising to 15.0 ms at 64, which fits. Measured directly against 64 and 128 same-sized
+remote tasks, warm: serial 7.3 ms against wait-then-get 8.7 ms at 128 refs — no difference.
+The first 64-ref reading did show 47 ms against 8 ms, which is what the change would have been
+justified on; re-running it warm showed that figure was scheduler cold-start, not the pattern.
+Refs that all become ready at about the same time cost the same either way, and these do,
+because every worker drains after the same barrier. The cost is the 64 actor RPCs themselves,
+which is what closing the Core-to-Kyber loop on a 64-worker fleet is worth.
+
+**Skipping the locality probe for a small reduce.** `_locality_reducer_hosts` asks all
+`workers` mappers for their published bucket sizes so reducers can be placed near their data —
+64 actor RPCs, and after Finding 2 it is spending them to place 4 reducers. Disabling it
+measured 305 ms against 322 ms, a 5% win that looked like a disproportionate probe. It did not
+reproduce: interleaved off/on/off/on runs read 300.3 / 304.1 / 303.7 / 304.3 ms, so the gap is
+noise and the probe's RPCs overlap with work that is happening anyway. The first reading was
+one unreplicated 5% difference, which is not enough to change scheduling code on.
+
+**The remaining reduce time is not obviously coordination.** After Finding 2 the 64-worker
+aggregate's reduce is ~136 ms for a two-level combiner tree over 4 buckets and 64 sources,
+moving about 307 MB. That is roughly 2.3 GB/s aggregate through the tree, so it is closer to
+network-bound than to launch-bound, and shaving driver round trips would not obviously move it.
 
 ## What landed
 
