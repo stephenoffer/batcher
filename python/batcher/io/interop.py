@@ -55,6 +55,7 @@ __all__ = [
     "from_tf",
     "from_torch",
     "numpy_to_column",
+    "structured_to_columns",
 ]
 
 
@@ -150,7 +151,7 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
     `column` is unused — the same reading `pandas.DataFrame` gives it. Each field goes
     through the rank rules above, so a sub-array field keeps its per-row shape.
     """
-    columns = _structured_to_columns(ndarray)
+    columns = structured_to_columns(ndarray)
     if columns is not None:
         return _source_from_table(pa.table(columns))
     return InMemorySource([pa.RecordBatch.from_arrays([numpy_to_column(ndarray)], names=[column])])
@@ -404,8 +405,6 @@ def _reject_untypable(arr: Any, *, masked: bool) -> None:
     along on a fixed-shape-tensor column, where filling it silently would be the very defect
     the mask handling above exists to prevent.
     """
-    import numpy as np
-
     if arr.dtype.kind == "c":
         raise PlanError(
             f"a {arr.dtype} column has no Arrow type: Arrow does not represent complex "
@@ -423,10 +422,9 @@ def _reject_untypable(arr: Any, *, masked: bool) -> None:
             "place to record a per-element mask. Fill it first with `a.filled(0)`, or move "
             "the masked axis into its own column."
         )
-    _ = np
 
 
-def _structured_to_columns(ndarray: Any) -> dict[str, pa.Array] | None:
+def structured_to_columns(ndarray: Any) -> dict[str, pa.Array] | None:
     """A structured NumPy array as ``{field: column}``, or `None` when it is not one.
 
     A structured (record) array is NumPy's table: a 1-D array of a compound dtype, which is
@@ -463,7 +461,7 @@ def _field_columns(arr: Any) -> dict[str, pa.Array]:
     """The columns of a structured array's fields, in dtype order.
 
     Split out so `numpy_to_column` can reach it for a *nested* compound field without going
-    back through `_structured_to_columns`, whose rank check is about the outermost array and
+    back through `structured_to_columns`, whose rank check is about the outermost array and
     whose `None` return would then be unreachable — a branch that exists only to be asserted
     away is worse than the one line it saves.
     """
