@@ -985,7 +985,7 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 439 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 455 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
 | `_faults.py` | 372 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 
@@ -1584,7 +1584,7 @@ Carbonite fault tolerance: surviving a fleet where nodes and devices fail.
 |---|---|---|
 | `blocklist.py` | 447 | Learning which nodes and devices are bad from what actually happened on them. |
 | `budget.py` | 170 | A ceiling on how much of a job may be spent retrying. |
-| `classify.py` | 502 | What kind of failure this was, and therefore what to do with it. |
+| `classify.py` | 510 | What kind of failure this was, and therefore what to do with it. |
 | `collectives.py` | 150 | Making a collective fail instead of hang. |
 | `lineage.py` | 113 | Shuffle lineage — how to recompute an output a lost worker produced. |
 | `preemption.py` | 484 | Preemption detection so the engine drains proactively, not reactively. |

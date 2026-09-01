@@ -231,10 +231,20 @@ What this costs and what it buys:
 - **The shippable one-constant change is withdrawn.** `_MIN_GROUPS_PER_REDUCER = 625_000` fits
   four measurements and is confounded with a fifth variable that was never moved. Shipping it
   would have put a corpus-shape artefact into the sizing of every aggregate.
-- **The same caveat attaches to the 50,000 already shipped** in Finding 2. Its measured wins
-  stand — it only ever *lowers* a floor shown to be too high, and every case measured got faster
-  or stayed level — but the number itself carries the same confound and should not be read as
-  derived.
+- **The same caveat attaches to the 50,000 already shipped** in Finding 2, but the change is
+  safe under it for a structural reason rather than a lucky one. `_busy_floor` returns
+  `min(floor, rows // 50_000)`, which is `<= floor` by construction, and it enters the same
+  `max(...)` the memory rule does — so the shipped count is **never higher** than the count
+  before it, at any cardinality or floor. Checked exhaustively over the cross-product of eight
+  cardinalities (4 to 50 M groups) and six floors (1 to 256): no configuration asks for more
+  reducers than the old rule did. Since fewer reducers measured faster or level in every
+  interleaved comparison taken, a confounded constant here can cost an opportunity and cannot
+  cost a regression. The number is still not derived and should not be quoted as one; what it
+  is, is monotone in the safe direction.
+
+  The 16-source run above is a good illustration of both halves at once: there
+  `_busy_floor(16, 5e6) = min(16, 100) = 16`, which is exactly the measured optimum — right,
+  and right by accident, since nothing in the rule knows the source count that made 16 correct.
 - **The direction is now well established across every design tried**: one reducer per worker
   was worse than a data-derived count in every cardinality, fan-in, worker count and source
   count measured. What is not established is the count, and the missing term is `sources`, which
