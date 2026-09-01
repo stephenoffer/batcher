@@ -124,14 +124,28 @@ one-per-worker is the worst or near-worst point in all four rows. That the answe
 move with the group count is the surprise, and it is what makes the earlier "4 at 200k, 20 at
 1M, 16 at 5M" reading an artefact of comparing across corpora rather than a cardinality effect.
 
-There is a candidate mechanism, and it is recorded as a hypothesis rather than acted on. The
-combiner tree's first level is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, which here
-is `n_reducers x 8`; saturating 64 workers therefore needs only `64 / 8 = 8` reducers, and every
-reducer above that multiplies the `mappers x reducers` stream count without adding parallelism
-the fleet can use. That predicts the observed 8 exactly — but it was derived *after* seeing
-these numbers, from the same data, so it is not evidence for itself. Testing it means moving
-`shuffle_fan_in` or the source count and checking the optimum tracks `workers / ceil(sources /
-fan_in)`, which has not been done.
+A candidate mechanism was proposed, tested, and **falsified**. The combiner tree's first level
+is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, which at the default `fan_in = 8` is
+`n_reducers x 8`; saturating 64 workers would then need `64 / 8 = 8` reducers, and every reducer
+above that multiplies the `mappers x reducers` stream count without adding parallelism the fleet
+can use. It predicts the observed 8 exactly. It was derived after seeing those numbers, from the
+same data, so the prediction it had not already fit is what happens when `shuffle_fan_in`
+changes: at `fan_in = 16` the level becomes `n_reducers x 4`, so the rule requires
+`64 / 4 = 16` reducers.
+
+Re-run at `flow_control.shuffle_fan_in = 16`, 5 M groups, 64 workers:
+
+| reducers | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| median | 3,224 ms | **3,041 ms** | 3,103 ms | 3,063 ms |
+
+The optimum stayed at 8 where the rule required 16, so the mechanism is wrong. What survives is
+the bare empirical fact, now measured across four cardinalities and two fan-in settings: **eight
+reducers is the optimum in all six configurations, and the engine picks 64.** Eight is not
+derived from anything here — it may well be a property of this fleet's shape (4 nodes, 64
+workers) rather than a constant — which is precisely why the sizing is not being changed on it.
+Shipping "use 8" would be fitting one cluster, and the falsified rule above is the evidence that
+the plausible-looking derivation of it does not hold.
 
 **No formula is shipped here**, and that is deliberate. What the data supports is the
 structural claim — *one reducer per worker was the worst or near-worst choice at every

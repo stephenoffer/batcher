@@ -2593,7 +2593,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
-| `collections.py` | 167 | Output types for the container accessors: `list`, `struct` and `map`. |
+| `collections.py` | 183 | Output types for the container accessors: `list`, `struct` and `map`. |
 | `dispatch.py` | 267 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
