@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -32,16 +34,81 @@ def _norm(t):
     )
 
 
+#: Held-partial budget small enough that this module's fixture overflows it in one chunk.
+#:
+#: `collect(spill=True)` selects the out-of-core *operator*; it does not by itself write a
+#: bucket. A reducing aggregate holds its partials in memory and only starts bucketing once
+#: they exceed `memory.spill_bucket_max_bytes` (128 MiB by default) -- a deliberate and
+#: measured optimization, worth 1.40x on TPC-H sf100. `_streaming_dataset` is 2,000 groups,
+#: whose partial state is a few tens of kilobytes, so under the default budget every
+#: aggregate test in this module ran the *in-memory* path and spilled nothing at all.
+#:
+#: They passed, they ran real code, and they took real time, which is why nobody noticed.
+#: Measured with a filesystem watch over a dedicated `spill_dir`: zero files written under
+#: the default budget, 594 under this one, same answer both ways.
+_FORCE_BUCKETS_BYTES = 4096
+
+
+@contextlib.contextmanager
+def _forcing_buckets(budget=_FORCE_BUCKETS_BYTES, **memory):
+    """Run the block with a held-partial budget small enough to make the aggregate spill.
+
+    Args:
+        budget: `memory.spill_bucket_max_bytes` for the block. The default overflows this
+            module's 2,000-group fixture in one chunk. A hand-built fixture of a dozen rows
+            needs a smaller one, because its partial state is a few hundred bytes -- pass
+            `1` there, which buckets on the first chunk whatever the input is. The setting
+            is also the grace-resplit threshold, so a tiny value makes the reduce re-split
+            more; that terminates at `_MAX_SPILL_RECURSION` rather than running away.
+        **memory: Further `MemoryConfig` overrides for the block.
+
+    Yields:
+        None, inside the configured context.
+    """
+    from batcher.config import Config, MemoryConfig, config_context
+
+    with config_context(
+        Config().replace(memory=MemoryConfig(spill_bucket_max_bytes=budget, **memory))
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _counting_buckets():
+    """Yield a one-key dict that ends up holding how many spill buckets were opened.
+
+    Every bucket this module writes is opened through `TieredSpillStore.writer`, so
+    counting that call is what distinguishes a test that exercised the spill round trip
+    from one that ran the in-memory path and asserted the same thing the oracle did.
+    """
+    from batcher.carbonite.spill.store import TieredSpillStore
+
+    counts = {"buckets": 0}
+    original = TieredSpillStore.writer
+
+    def counting(self, name):
+        counts["buckets"] += 1
+        return original(self, name)
+
+    TieredSpillStore.writer = counting
+    try:
+        yield counts
+    finally:
+        TieredSpillStore.writer = original
+
+
 def test_spill_grouped_matches_in_memory():
     factory, schema, table = _streaming_dataset()
     agg = {"s": col("v").sum(), "n": count(), "a": col("v").mean(), "mx": col("v").max()}
 
-    spilled = (
-        bt.from_batches(factory, schema)
-        .group_by("k")
-        .agg(**agg)
-        .collect(spill=True, num_partitions=16)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by("k")
+            .agg(**agg)
+            .collect(spill=True, num_partitions=16)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).group_by("k").agg(**agg).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -52,11 +119,13 @@ def test_spill_distinct_matches_in_memory(num_partitions):
     # (a `Distinct` top op) must reproduce the in-memory dedup. Regression for a
     # high-cardinality DISTINCT failing fast under memory pressure instead of spilling.
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .distinct()
-        .collect(spill=True, num_partitions=num_partitions)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .distinct()
+            .collect(spill=True, num_partitions=num_partitions)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).distinct().collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -66,11 +135,13 @@ def test_spill_count_distinct_matches_in_memory():
     # breaker); the out-of-core path must peel the projection, spill the aggregate, and
     # re-apply — not fail fast because the top op is a Project.
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .agg(c=col("k").n_unique())
-        .collect(spill=True, num_partitions=16)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .agg(c=col("k").n_unique())
+            .collect(spill=True, num_partitions=16)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).agg(c=col("k").n_unique()).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -79,12 +150,14 @@ def test_spill_count_distinct_matches_in_memory():
 def test_spill_partition_count_invariant(num_partitions):
     # The result must not depend on the number of spill buckets.
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .group_by("k")
-        .agg(s=col("v").sum())
-        .collect(spill=True, num_partitions=num_partitions)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by("k")
+            .agg(s=col("v").sum())
+            .collect(spill=True, num_partitions=num_partitions)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).group_by("k").agg(s=col("v").sum()).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -131,12 +204,16 @@ def test_streaming_partial_aggregate_matches_whole_partition(group):
 
 def test_spill_global_aggregate():
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .group_by()
-        .agg(s=col("v").sum(), n=count())
-        .collect(spill=True)
-    )
+    # `budget=1`: a keyless aggregate is one bucket whose partial state is a single row,
+    # so nothing short of bucketing on the first chunk reaches the spill path at all.
+    with _forcing_buckets(budget=1), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by()
+            .agg(s=col("v").sum(), n=count())
+            .collect(spill=True)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).group_by().agg(s=col("v").sum(), n=count()).collect()
     assert spilled.to_pylist() == in_memory.to_pylist()
 
@@ -147,18 +224,19 @@ def test_spill_result_invariant_under_compression(codec):
     # spilled IPC streams are uncompressed, LZ4, or ZSTD (the read path
     # auto-detects). Covers value-list state (median) + constant state (sum) so the
     # codec threads through every spill path.
-    from batcher.config import Config, MemoryConfig, config_context
-
     factory, schema, table = _streaming_dataset()
     agg = {"s": col("v").sum(), "m": col("v").median()}
-    cfg = Config().replace(memory=MemoryConfig(spill_compression=codec))
-    with config_context(cfg):
+    with _forcing_buckets(spill_compression=codec), _counting_buckets() as counts:
         spilled = (
             bt.from_batches(factory, schema)
             .group_by("k")
             .agg(**agg)
             .collect(spill=True, num_partitions=8)
         )
+    assert counts["buckets"] > 0, (
+        f"no IPC stream was written, so {codec!r} was never used and all three "
+        "parametrizations ran the identical in-memory path"
+    )
     in_memory = bt.from_arrow(table).group_by("k").agg(**agg).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -166,12 +244,14 @@ def test_spill_result_invariant_under_compression(codec):
 def test_spill_with_stddev():
     # Mergeable 3-column state (var/stddev) survives partition-and-spill.
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .group_by("k")
-        .agg(sd=col("v").std())
-        .collect(spill=True, num_partitions=8)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by("k")
+            .agg(sd=col("v").std())
+            .collect(spill=True, num_partitions=8)
+        )
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = bt.from_arrow(table).group_by("k").agg(sd=col("v").std()).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -181,12 +261,14 @@ def test_spill_list_state_aggregates():
     # that variable-length state survives the Arrow-IPC spill round-trip and merges
     # correctly per bucket.
     factory, schema, table = _streaming_dataset()
-    spilled = (
-        bt.from_batches(factory, schema)
-        .group_by("k")
-        .agg(m=col("v").median(), nd=col("v").n_unique())
-        .collect(spill=True, num_partitions=8)
-    )
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by("k")
+            .agg(m=col("v").median(), nd=col("v").n_unique())
+            .collect(spill=True, num_partitions=8)
+        )
+    assert counts["buckets"] > 0, "no IPC round trip happened, so nothing here was verified"
     in_memory = (
         bt.from_arrow(table)
         .group_by("k")
@@ -825,7 +907,9 @@ def test_spill_global_value_list_matches_in_memory():
             md=col("v").mode(),
         )
 
-    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=16)
+    with _forcing_buckets(), _counting_buckets() as counts:
+        spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=16)
+    assert counts["buckets"] > 0, "nothing spilled, so this compared two in-memory runs"
     in_memory = q(bt.from_arrow(table)).collect()
     assert _norm(spilled) == _norm(in_memory)
 
@@ -878,12 +962,14 @@ def test_spill_groups_by_a_dictionary_key_whose_dictionaries_differ_per_morsel()
         .agg(sv=bt.col("v").sum())
         .collect()
     )
-    spilled = (
-        bt.from_batches(lambda: iter(batches), b1.schema)
-        .group_by("k")
-        .agg(sv=bt.col("v").sum())
-        .collect(spill=True, num_partitions=4)
-    )
+    with _forcing_buckets(budget=1), _counting_buckets() as counts:
+        spilled = (
+            bt.from_batches(lambda: iter(batches), b1.schema)
+            .group_by("k")
+            .agg(sv=bt.col("v").sum())
+            .collect(spill=True, num_partitions=4)
+        )
+    assert counts["buckets"] > 0, "the partitioner was never reached, so nothing was tested"
 
     assert len(in_memory) == 2, "the fixture should produce two groups"
     assert _norm(spilled) == _norm(in_memory), (
@@ -916,12 +1002,14 @@ def test_spill_groups_by_decimal_and_timestamp_keys():
 
     for key, expected in (("d", 13), ("t", 7)):
         in_memory = bt.from_arrow(table).group_by(key).agg(sv=bt.col("v").sum()).collect()
-        spilled = (
-            bt.from_batches(lambda: iter(batches), batches[0].schema)
-            .group_by(key)
-            .agg(sv=bt.col("v").sum())
-            .collect(spill=True, num_partitions=8)
-        )
+        with _forcing_buckets(budget=1), _counting_buckets() as counts:
+            spilled = (
+                bt.from_batches(lambda: iter(batches), batches[0].schema)
+                .group_by(key)
+                .agg(sv=bt.col("v").sum())
+                .collect(spill=True, num_partitions=8)
+            )
+        assert counts["buckets"] > 0, f"{key}: nothing spilled, so no key encoding was tested"
         assert len(in_memory) == expected, f"{key}: fixture should give {expected} groups"
         assert _norm(spilled) == _norm(in_memory), f"{key}: spilled result differs"
 
