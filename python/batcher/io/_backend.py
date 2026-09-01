@@ -516,7 +516,12 @@ class _ArrowFileSystem:
                 return None
             info = self._fs.get_file_info(in_path)
             key = f"{in_path}\0{info.size}\0{info.mtime_ns}"
-            return cache.get_or_fetch(key, lambda dst: self._download(in_path, dst))
+            # The size is already in hand from the stat above, so pass it: a file too big
+            # for the whole budget is declined without downloading it, and the read below
+            # goes straight to the object store.
+            return cache.get_or_fetch(
+                key, lambda dst: self._download(in_path, dst), size_hint=info.size
+            )
         except Exception as exc:  # pragma: no cover - a cache failure must not break reads
             note_suppressed("io", "read cached remote file", exc)
             return None
