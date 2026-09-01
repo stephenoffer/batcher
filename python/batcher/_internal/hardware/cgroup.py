@@ -119,7 +119,15 @@ def cgroup_v2_dirs() -> tuple[str, ...]:
     memo cannot hand a mutable object to every caller (`reset_hardware_probes` clears it).
 
     Returns:
-        Candidate cgroup v2 directories, mount root first and leaf-most last.
+        Candidate cgroup v2 directories: the mount root first, then the leaf and each of its
+        ancestors in *descending* depth, so the shallowest named cgroup comes last.
+
+        Read every entry and combine them — `cfs_quota_count` takes the minimum, and so does
+        `memory.swap_configured` — rather than stopping at the first one that answers. An
+        earlier revision of this line said "leaf-most last", which is the reverse of what the
+        loop below builds; a caller that trusted it wrote `reversed(...)` to reach the leaf
+        and reached the outermost ancestor instead. Order is not load-bearing for a caller
+        that reduces over the whole tuple, and that is the reason to be one.
     """
     dirs = ["/sys/fs/cgroup"]
     sub = ""

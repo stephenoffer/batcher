@@ -42,7 +42,11 @@ _MEMOIZED = (
     (topology, ("numa_node_count", "cpus_per_numa_node", "physical_core_count")),
     (storage, ("device_class",)),
     # The NVML handshake, not a reading: telemetry itself is deliberately never cached.
-    (nvml, ("_nvml",)),
+    # `host_pid` is the exception and was missing here. It is a reading — this process's PID
+    # as the *host* kernel numbers it, parsed out of `/proc/self/sched` — and every per-process
+    # NVML attribution is compared against it. A test faking the host PID namespace, which is
+    # the whole reason the probe exists, kept reading whatever the first call returned.
+    (nvml, ("_nvml", "host_pid")),
     # What the engine reported about its own CPU. Memoized for the same reason the `/sys`
     # probes are, and resettable for one more: a test that substitutes a stub engine in
     # `sys.modules` would otherwise keep reading the real one's answers. The allocator
