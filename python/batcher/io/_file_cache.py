@@ -131,24 +131,10 @@ class FileBytesCache:
         key = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()
         local = os.path.join(self._dir, key)
         with self._lock:
-            if key in self._entries:
-                if not os.path.exists(local):
-                    # The bytes went without this process's ledger hearing about it. The
-                    # cache directory is a *node* volume, not a private one: `"auto"` puts
-                    # it on shared scratch, several workers on one node keep separate
-                    # ledgers over the same files, and the node's own cleaner may sweep it.
-                    # So one process evicting -- or anything at all deleting -- hands
-                    # another a hit for a file that is gone, and the caller opens a path
-                    # that does not exist. Self-heal into a miss; the read below re-fetches.
-                    self._stale += 1
-                    self._used -= self._entries.pop(key)
-                    self._misses += 1
-                else:
-                    self._entries.move_to_end(key)  # mark most-recently-used
-                    self._hits += 1
-                    return local
-            else:
-                self._misses += 1
+            if self._resident_locked(key, local):
+                self._hits += 1
+                return local
+            self._misses += 1
             leader = self._inflight.get(key)
             mine = leader is None
             if mine:
@@ -164,48 +150,96 @@ class FileBytesCache:
             assert leader is not None
             leader.wait(_INFLIGHT_WAIT_S)
             with self._lock:
-                if key in self._entries:
-                    self._entries.move_to_end(key)
+                # Validated, not merely present: the leader's file can be evicted by a
+                # worker sharing this volume between its admission and this wake, and
+                # returning the path unchecked would reintroduce the stale hit one branch
+                # over from where it is handled.
+                if self._resident_locked(key, local):
                     return local
             # The leader failed, timed out, or its entry was evicted before we woke.
             # Fetch it ourselves; we do not own `_inflight[key]`, so we must not clear it.
 
-        # Miss: fetch outside the lock (slow remote I/O) to a unique temp, then rename.
-        tmp = f"{local}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
-            try:
-                fetch(tmp)
-                size = os.path.getsize(tmp)
-                os.replace(tmp, local)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.remove(tmp)
-                raise
-
-            with self._lock:
-                if size > self._max_bytes:
-                    # No `size_hint` was given and the file turns out not to fit. Admitting
-                    # it would evict the cache and then itself; keeping it unaccounted would
-                    # leak it. Drop it and let the caller read remotely.
-                    self._declined += 1
-                    with contextlib.suppress(OSError):
-                        os.remove(local)
-                    return None
-                # A racing thread may have admitted the same key first; only one accounts
-                # for the bytes (the file content is identical, so the rename is harmless).
-                if key not in self._entries:
-                    self._entries[key] = size
-                    self._used += size
-                    self._evict_locked(protect=key)
-                else:
-                    self._entries.move_to_end(key)
-            return local
+            return self._fetch_and_admit(key, local, fetch)
         finally:
             if mine:
                 with self._lock:
                     self._inflight.pop(key, None)
                 assert leader is not None
                 leader.set()
+
+    def _fetch_and_admit(self, key: str, local: str, fetch: Callable[[str], None]) -> str | None:
+        """Materialize `key`'s bytes and account them, returning the path or `None`.
+
+        The fetch runs with the lock released, because it is slow remote I/O, and lands on
+        a unique temp that is atomically renamed into place — so a concurrent reader never
+        observes a half-written file.
+
+        Args:
+            key: The hashed cache key.
+            local: The path the key resolves to.
+            fetch: Writes the full file to the path it is given.
+
+        Returns:
+            The local path, or `None` when the file turned out to be too large to keep.
+        """
+        tmp = f"{local}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            fetch(tmp)
+            size = os.path.getsize(tmp)
+            os.replace(tmp, local)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+
+        with self._lock:
+            if size > self._max_bytes:
+                # No `size_hint` was given and the file turns out not to fit. Admitting it
+                # would evict the cache and then itself; keeping it unaccounted would leak
+                # it. Drop it and let the caller read remotely.
+                self._declined += 1
+                with contextlib.suppress(OSError):
+                    os.remove(local)
+                return None
+            # A racing thread may have admitted the same key first; only one accounts for
+            # the bytes (the file content is identical, so the rename is harmless).
+            if key not in self._entries:
+                self._entries[key] = size
+                self._used += size
+                self._evict_locked(protect=key)
+            else:
+                self._entries.move_to_end(key)
+        return local
+
+    def _resident_locked(self, key: str, local: str) -> bool:
+        """Whether `key`'s file is both in the ledger and still on disk. Caller holds the lock.
+
+        The two can disagree, and the ledger is not the authority. The cache directory is a
+        *node* volume rather than a private one: `file_cache_dir="auto"` puts it on shared
+        scratch, several workers on one node keep separate ledgers over the same files, and
+        the node's own cleaner may sweep it. So another process evicting -- or anything at
+        all deleting -- leaves this ledger reporting a hit for a path that no longer exists,
+        and the caller opens it and raises.
+
+        A missing file is dropped here and reported as a miss, which re-fetches. The `stat`
+        is paid on every hit, against a local-disk read the caller is about to do anyway.
+
+        Args:
+            key: The hashed cache key.
+            local: The path the key resolves to.
+
+        Returns:
+            True when the entry may be served, having marked it most-recently-used.
+        """
+        if key not in self._entries:
+            return False
+        if not os.path.exists(local):
+            self._stale += 1
+            self._used -= self._entries.pop(key)
+            return False
+        self._entries.move_to_end(key)  # mark most-recently-used
+        return True
 
     def _evict_locked(self, protect: str | None = None) -> None:
         """Drop least-recently-used entries until within budget (caller holds lock).

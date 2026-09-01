@@ -307,6 +307,43 @@ def test_a_cached_file_deleted_underneath_the_ledger_is_re_fetched_not_handed_ba
     assert one.used_bytes == len(b"payload"), "the deleted entry's bytes were never given back"
 
 
+def test_a_coalesced_waiter_also_checks_the_file_survived_the_wait(tmp_path):
+    # The validated hit has two call sites: the direct one, and the coalesced waiter that
+    # re-checks after its leader finishes. The window between the leader admitting an entry
+    # and a waiter waking is exactly when a worker sharing the volume can evict it, so a
+    # waiter that trusted the ledger would reintroduce the stale hit one branch over from
+    # where it is handled.
+    #
+    # Driven through `_inflight` rather than with threads: the race is a specific
+    # interleaving, and a timing-based version of this test would pass whether or not the
+    # check is there.
+    import os
+
+    cache = FileBytesCache(str(tmp_path), max_bytes=1 << 20)
+    key = __import__("hashlib").sha256(b"s3://b/dim.parquet").hexdigest()
+    local = os.path.join(str(tmp_path), key)
+
+    class _LeaderThatLosesTheFile:
+        """Stands in for the leader's event: admits the entry, then the file vanishes."""
+
+        def wait(self, _timeout: float) -> bool:
+            with open(local, "wb") as fh:
+                fh.write(b"leader")
+            cache._entries[key] = len(b"leader")
+            cache._used += len(b"leader")
+            os.remove(local)  # a peer on the same volume evicts it before we wake
+            return True
+
+    cache._inflight[key] = _LeaderThatLosesTheFile()
+
+    got = cache.get_or_fetch("s3://b/dim.parquet", _writer(b"refetched"))
+
+    assert got is not None
+    with open(got, "rb") as fh:
+        assert fh.read() == b"refetched", "the waiter served a file its leader no longer had"
+    assert cache.stats()["stale"] == 1
+
+
 def test_the_file_cache_counters_are_reachable_from_cache_stats(tmp_path):
     # `FileBytesCache.stats` counted hits, coalesced fetches and declines, and no caller
     # anywhere read them -- so the one cache tier whose value is measured in bytes off the
