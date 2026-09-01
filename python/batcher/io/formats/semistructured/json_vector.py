@@ -27,7 +27,7 @@ from typing import Any
 
 import pyarrow as pa
 
-__all__ = ["ndjson_vectorized"]
+__all__ = ["ndjson_vectorized", "render_for_fallback"]
 
 
 # Rows encoded per pass. Bounds peak memory to one chunk's rendered text, and keeps the
@@ -55,6 +55,89 @@ _SHORT_ESCAPES = (
     ("\f", "\\f"),
 )
 _UNESCAPABLE = r"[\x00-\x07\x0b\x0e-\x1f]"
+
+
+def _fallback_type(dtype: pa.DataType) -> pa.DataType | None:
+    """The type a fallback encoder renders correctly, or None when `dtype` already is one.
+
+    Two substitutions, each undoing a specific way pandas' C encoder gets a temporal column
+    wrong. A timestamp or date becomes its ISO-8601 `string`, the spelling the vectorized
+    path already writes. A **duration becomes its `int64` count** in the column's own unit,
+    which is what the CSV writer in this same package already emits for one — so it is the
+    house convention rather than a new one.
+
+    Recurses through struct, list and map, because a column nested in one reaches the same
+    encoder the top-level column does and was wrong in the same way.
+    """
+    if pa.types.is_timestamp(dtype) or pa.types.is_date(dtype):
+        return pa.string()
+    if pa.types.is_duration(dtype):
+        return pa.int64()
+    if pa.types.is_struct(dtype):
+        fields = [dtype.field(i) for i in range(dtype.num_fields)]
+        swapped = [_fallback_type(f.type) for f in fields]
+        if not any(s is not None for s in swapped):
+            return None
+        return pa.struct(
+            [f.with_type(s) if s is not None else f for f, s in zip(fields, swapped, strict=True)]
+        )
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+        inner = _fallback_type(dtype.value_type)
+        if inner is None:
+            return None
+        return (pa.large_list if pa.types.is_large_list(dtype) else pa.list_)(inner)
+    if pa.types.is_map(dtype):
+        item = _fallback_type(dtype.item_type)
+        return None if item is None else pa.map_(dtype.key_type, item)
+    return None
+
+
+def render_for_fallback(table: pa.Table) -> pa.Table:
+    """`table` with the columns a fallback encoder gets wrong replaced by ones it gets right.
+
+    The fallback encoders are only reached when *some* column declines the vectorized path,
+    and one of them — pandas' C encoder — renders a temporal column as a number of its own
+    choosing. Two separate defects follow from that, and this fixes both before either
+    fallback sees the table.
+
+    **A timestamp's rendering depended on the company it kept.** Alone it was
+    `"2020-01-01 12:00:00.000000"`; beside a decimal, binary or list column the whole table
+    fell back and the same column became `1577880000`. Adding an unrelated column silently
+    changed how a timestamp was serialized, and the number was not self-consistent either --
+    `timestamp[us]` came out in seconds, `date32` and `timestamp[ns]` in milliseconds -- so no
+    single reading of the output was right for a table holding several, and all of them read
+    back as `int64`. They now take the same ISO-8601 cast `_temporal` applies, which is what
+    makes `_ndjson_bytes`' claim that its three encoders produce the same values true.
+
+    **A duration was written as `0`.** Not truncated -- flatly zero, for every value in every
+    unit, including durations of a billion seconds. That is total silent data loss on an
+    ordinary write, so it is corrected here rather than left to a convention debate: the
+    column becomes its `int64` count in its own unit, which is what this package's CSV writer
+    already emits for a duration.
+
+    Time columns are deliberately untouched: both paths already render a time as ISO text, so
+    there is nothing to reconcile.
+
+    Args:
+        table: The rows about to be encoded by a fallback encoder.
+
+    Returns:
+        The same table with those columns cast, or `table` itself when it has none — the
+        common case, which pays one type walk and no data touch.
+    """
+    import pyarrow.compute as pc
+
+    targets = [_fallback_type(f.type) for f in table.schema]
+    if not any(t is not None for t in targets):
+        return table
+    columns = [
+        pc.cast(column, target) if target is not None else column
+        for column, target in zip(table.columns, targets, strict=True)
+    ]
+    fields = [
+        f.with_type(t) if t is not None else f for f, t in zip(table.schema, targets, strict=True)
+    ]
+    return pa.Table.from_arrays(columns, schema=pa.schema(fields))
 
 
 def _renderable(dtype: pa.DataType) -> bool:

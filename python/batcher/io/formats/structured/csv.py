@@ -345,6 +345,58 @@ class CSVSource(FileSource):
         ]
 
 
+def _reject_types_csv_cannot_write(schema: pa.Schema) -> None:
+    """Raise, naming the column, rather than let pyarrow blame a type the caller never typed.
+
+    CSV is a grid of scalars: it has no nested form, so a `list`, `struct`, `map` or
+    `fixed_size_list` column has nowhere to go. pyarrow says so as
+    ``ArrowInvalid: Unsupported Type:list<item: int64>`` — which names neither the column, nor
+    CSV, nor anything to do about it. On a fifty-column frame that is a type the caller then
+    has to go looking for, and the natural guess (that Batcher cannot hold the column at all)
+    is wrong: Parquet, Arrow and JSON all carry it.
+
+    This mirrors what the Avro writer already does for the same class of problem, and what
+    `orc._reject_unrepresentable_timestamps` does for its own: check the schema once, up
+    front, and name the fix. Checking the schema rather than wrapping the writer is what
+    makes it cover all three of this sink's encode paths — the serial write, the parallel
+    row-range encode, and the streaming window — instead of whichever one a test happened
+    to take.
+
+    Raises:
+        SchemaError: If a column's type has no CSV representation.
+    """
+    from batcher._internal.errors import SchemaError
+
+    for field in schema:
+        if _csv_writable(field.type):
+            continue
+        raise SchemaError(
+            f"column {field.name!r} is {field.type}, which CSV cannot write: CSV is a grid "
+            f"of scalar cells and has no nested form. Flatten it to text first "
+            f"(`col({field.name!r}).cast('string')`, or `.list.join(',')` for a list "
+            f"column), drop it, or write a format that carries it — Parquet, Arrow IPC and "
+            f"JSON all do."
+        )
+
+
+def _csv_writable(dtype: pa.DataType) -> bool:
+    """Whether pyarrow's CSV writer has a cell rendering for `dtype`.
+
+    Phrased as "is it nested", because that is the actual rule: the writer renders every
+    scalar type, including decimals, temporals and binary, and refuses exactly the four
+    nested ones. A dictionary column is written as its values, so it follows its value type.
+    """
+    if pa.types.is_dictionary(dtype):
+        return _csv_writable(dtype.value_type)
+    return not (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_struct(dtype)
+        or pa.types.is_map(dtype)
+    )
+
+
 @SINKS.register("csv")
 class CSVSink(FileSink):
     """Write a CSV file.
@@ -385,6 +437,7 @@ class CSVSink(FileSink):
         # engine that shards its write. But CSV is just row-wise text, so encode row
         # ranges CONCURRENTLY (pyarrow's CSV encoder releases the GIL) into in-memory
         # buffers — only the first carries the header — and write them back to back.
+        _reject_types_csv_cannot_write(table.schema)
         table = self._options.apply_nulls(table)
         n = table.num_rows
         workers = min(n // _CSV_PARALLEL_MIN_ROWS, available_cpu_count())
@@ -446,8 +499,12 @@ class CSVSink(FileSink):
     def _encode_stream_parallel(self, batches: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
         import pyarrow.csv as pacsv
 
+        # Checked per batch rather than once, because this path is handed an *iterator* and
+        # has no schema before the first batch arrives. It is a field-list walk, so paying it
+        # per batch costs nothing measurable next to encoding the rows.
         def _encode(item: tuple[int, pa.RecordBatch]) -> pa.Buffer:
             idx, batch = item
+            _reject_types_csv_cannot_write(batch.schema)
             sink = pa.BufferOutputStream()
             # `idx` counts batches across the WHOLE stream, not within a window, so exactly
             # one chunk is ever offered the header; `write_options` then honors `header=`.

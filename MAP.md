@@ -3187,7 +3187,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 |---|---|---|
 | `client_pool.rs` | 344 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
 | `exchange.rs` | 563 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
-| `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
+| `handler.rs` | 444 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 408 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 410 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
