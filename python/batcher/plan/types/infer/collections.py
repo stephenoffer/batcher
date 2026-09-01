@@ -135,14 +135,30 @@ def struct_field_type(struct_t: pa.DataType | None, field: str) -> pa.DataType |
     return struct_t.field(idx).type if idx >= 0 else None
 
 
-def mapfunc_type(fn: str, map_t: pa.DataType | None) -> pa.DataType | None:
-    """The Arrow type a `map` accessor function produces over `map_t`."""
-    if map_t is not None and pa.types.is_struct(map_t) and fn == "map_keys":
-        # `.struct.keys()` is the same node as `.map.keys()` — a struct is a keyed
-        # container and the kernel answers both — but its keys come from the *type*, so
-        # they are always text. Without this arm the whole `.struct.keys()` column
-        # declared `null` while producing `List<Utf8>`.
-        return pa.list_(pa.string())
+def mapfunc_type(fn: str, map_t: pa.DataType | None, key: object = None) -> pa.DataType | None:
+    """The Arrow type a `map` accessor function produces over `map_t`.
+
+    `key` is the literal lookup an `element_at` carries. It is only consulted for a
+    **struct** input, where the answer is a named field's type rather than the container's
+    uniform value type.
+    """
+    if map_t is not None and pa.types.is_struct(map_t):
+        # A struct is a keyed container and the same kernel answers both namespaces, so
+        # `.struct.keys()`/`.struct.get()` arrive here as `.map` nodes.
+        if fn == "map_keys":
+            # A struct's keys come from the *type*, so they are always text. Without this
+            # the whole `.struct.keys()` column declared `null` while producing
+            # `List<Utf8>`.
+            return pa.list_(pa.string())
+        if fn == "element_at" and isinstance(key, str):
+            # `.struct.get(name)` is documented as the subscript spelling of
+            # `.struct.field(name)` -- it is what ``s["x"]`` lowers to -- and the two built
+            # different nodes, of which only `StructField` was typed. So the *same* field
+            # projection declared `string` written one way and nothing at all written the
+            # other, which cost every column in the projection its type. Answered by the
+            # helper `StructField` already uses, so the two spellings cannot drift again.
+            return struct_field_type(map_t, key)
+        return None
     if map_t is None or not pa.types.is_map(map_t):
         return None
     if fn == "map_keys":

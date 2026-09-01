@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1442 Python modules across 213 packages and 282 Rust files across 15 crates.
+Covering 1443 Python modules across 213 packages and 282 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -316,10 +316,11 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 |---|---|---|
 | `autoconfig.py` | 121 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
+| `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 268 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 692 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 676 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 197 | What the conductor needs to know about a plan's size before it runs it. |
-| `stages.py` | 394 | The three ways the conductor can execute an admitted plan, plus the source read. |
+| `stages.py` | 400 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
 ### `batcher/api/security/` — 5 · conductor
 
@@ -985,9 +986,9 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 455 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 473 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
-| `_faults.py` | 372 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
+| `_faults.py` | 434 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 
 ### `batcher/dist/fleet/` — 4 · backend
 
@@ -1385,7 +1386,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
 | `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 364 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
-| `simplify.py` | 172 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
+| `simplify.py` | 195 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
 ### `batcher/kyber/rules/nulls/` — 3 · subsystem
 
@@ -2208,8 +2209,8 @@ The terminal face of the engine — a live progress bar plus structured status l
 
 | module | lines | what it is |
 |---|---|---|
-| `paint.py` | 168 | Drawing one status line: the bar, the indeterminate sweep, and the sparkline. |
-| `reporter.py` | 439 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
+| `paint.py` | 173 | Drawing one status line: the bar, the indeterminate sweep, and the sparkline. |
+| `reporter.py` | 451 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
 | `state.py` | 189 | What the console knows about one in-flight query, and how it learns it from the bus. |
 
 ### `batcher/observe/counters/` — 2 · neutral sinks
@@ -2593,8 +2594,8 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
-| `collections.py` | 167 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 267 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `collections.py` | 183 | Output types for the container accessors: `list`, `struct` and `map`. |
+| `dispatch.py` | 293 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
 ### `batcher/metadata/` — 1 · contract
@@ -2663,7 +2664,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 |---|---|---|
 | `accelerators.py` | 604 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
 | `device_share.py` | 338 | How much of one accelerator a claimant gets — the fractional-scheduling vocabulary. |
-| `events.py` | 547 | The engine's one observability event bus — every subsystem publishes here. |
+| `events.py` | 561 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 376 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 131 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
 | `native.py` | 101 | The single accessor for the compiled Rust data plane (``batcher._native``). |

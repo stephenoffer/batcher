@@ -74,14 +74,21 @@ def _simplify(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     op, left, right = expr.op, expr.left, expr.right
 
     if op == "and":
-        if _is_true(right):
+        # The surviving operand must be provably Boolean, for the same reason `x + 0` needs
+        # a provably integral one: the identity holds for the type it is stated over and
+        # rewrites the answer for any other. `and_kleene` *refuses* a non-Boolean argument
+        # (`ExpectedBoolean`, `bc-expr/src/eval/binary.rs`), so folding the operator away
+        # does not merely change a type here -- it deletes the engine's own error and
+        # returns the operand untouched. `col("i").and_(True)` returned `6`, and
+        # `col("s").and_(True)` returned `"a"`, both typed `bool` by the control plane.
+        if _is_true(right) and _is_boolean(left, schema):
             return left
-        if _is_true(left):
+        if _is_true(left) and _is_boolean(right, schema):
             return right
     elif op == "or":
-        if _is_false(right):
+        if _is_false(right) and _is_boolean(left, schema):
             return left
-        if _is_false(left):
+        if _is_false(left) and _is_boolean(right, schema):
             return right
     elif op == "add":
         # `x + 0 → x` only when `x` is provably integral — see the module docstring: for a
@@ -131,6 +138,22 @@ def _is_integral(expr: Expr, schema: SchemaRef | None) -> bool:
         return False
     dtype = infer_type(expr, schema)
     return dtype is not None and pa.types.is_integer(dtype)
+
+
+def _is_boolean(expr: Expr, schema: SchemaRef | None) -> bool:
+    """Whether `expr` provably has Boolean type -- the guard `x AND true -> x` requires.
+
+    Returns False when the type cannot be inferred, on the same rule the rest of this
+    module follows: an unproven type is not a proof. The cost of being wrong is asymmetric
+    here. Declining to fold leaves a redundant `AND true` in the plan; folding a
+    non-Boolean operand removes the only thing that would have reported the mistake.
+    """
+    if isinstance(expr, Lit) and isinstance(expr.value, bool):
+        return True
+    if schema is None:
+        return False
+    dtype = infer_type(expr, schema)
+    return dtype is not None and pa.types.is_boolean(dtype)
 
 
 def _keeps_its_type(expr: Expr, schema: SchemaRef | None) -> bool:
