@@ -176,12 +176,21 @@ def from_huggingface(hf_dataset: Any) -> Dataset:
 
 
 def from_torch(dataset_or_tensors: Any) -> Dataset:
-    """Create a `Dataset` from a PyTorch tensor, tuple of tensors, or `Dataset`.
+    """Create a `Dataset` from a PyTorch tensor, mapping/tuple of tensors, or `Dataset`.
 
     Tensors are moved to CPU and adapted via their NumPy buffers (one column per
     tensor); only bulk buffers cross into the engine, never per-row Python. Needs
     ``torch`` (``pip install 'batcher-engine[torch]'``); raises `BackendError` if
     it is absent.
+
+    A ``{name: tensor}`` mapping keeps its keys as column names, which makes this the
+    inverse of `ml.to_torch`. Shapes follow the same rules as `from_numpy`: an
+    ``(n, dim)`` tensor becomes a fixed-size-list column and a higher-rank one a
+    fixed-shape-tensor column.
+
+    ``bfloat16`` and the ``float8`` dtypes have no NumPy or Arrow equivalent, so they widen
+    to ``float32`` — exactly, since ``float32`` has more mantissa and no fewer exponent bits
+    — and a `UserWarning` names the wider column.
 
     Examples:
         .. doctest::
@@ -191,8 +200,12 @@ def from_torch(dataset_or_tensors: Any) -> Dataset:
             >>> bt.from_torch(torch.tensor([1, 2, 3])).to_pydict()  # doctest: +SKIP
             {'data': [1, 2, 3]}
 
+            >>> bt.from_torch({"x": torch.arange(3)}).schema.names  # doctest: +SKIP
+            ['x']
+
     Args:
-        dataset_or_tensors: A PyTorch tensor, tuple of tensors, or ``Dataset``.
+        dataset_or_tensors: A PyTorch tensor, a ``{name: tensor}`` mapping, a tuple or
+            list of tensors, or a map-style ``Dataset``.
 
     Returns:
         A lazy `Dataset`, one column per tensor.

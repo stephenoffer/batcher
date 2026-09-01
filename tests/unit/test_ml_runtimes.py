@@ -261,3 +261,61 @@ class TestTorchInputPrecision:
         module = TorchModule(lambda: torch.nn.Embedding(10, 4), device="cpu")
         out = module.predict({"ids": np.array([[1, 2, 3]], dtype="int64")})
         assert out["output"].shape == (1, 3, 4)
+
+
+class TestTorchModuleAcceptsABuiltModule:
+    """A module you already hold is the commonest thing to pass, and it was the broken one.
+
+    ``TorchModule`` documented "a path, or a zero-arg callable returning an ``nn.Module``",
+    and an ``nn.Module`` *is* callable — so the factory branch claimed it and called the
+    module with no arguments. The failure was ``forward() missing 1 required positional
+    argument``, raised at construction, before a row was read: an error about the model's own
+    signature from a line that only handed the model over.
+    """
+
+    def test_a_built_module_is_used_rather_than_called_as_a_factory(self):
+        torch = pytest.importorskip("torch", reason="torch not installed")
+
+        from batcher.ml.runtimes import TorchModule
+
+        module = TorchModule(torch.nn.Linear(3, 2), device="cpu")
+        out = module.predict({"x": np.zeros((2, 3), dtype="float64")})
+        assert out["output"].shape == (2, 2)
+
+    def test_the_built_module_is_the_one_that_scores(self):
+        """Not merely that it runs: the weights that answer must be the ones handed in."""
+        torch = pytest.importorskip("torch", reason="torch not installed")
+
+        from batcher.ml.runtimes import TorchModule
+
+        linear = torch.nn.Linear(1, 1)
+        with torch.no_grad():
+            linear.weight.fill_(2.0)
+            linear.bias.fill_(1.0)
+        out = TorchModule(linear, device="cpu").predict({"x": np.array([[3.0]])})
+        assert out["output"].tolist() == [[7.0]]
+
+    def test_a_factory_still_works(self):
+        """The documented spelling must keep working; a module is an addition, not a swap."""
+        torch = pytest.importorskip("torch", reason="torch not installed")
+
+        from batcher.ml.runtimes import TorchModule
+
+        module = TorchModule(lambda: torch.nn.Linear(3, 2), device="cpu")
+        assert module.predict({"x": np.zeros((1, 3))})["output"].shape == (1, 2)
+
+    def test_a_built_module_is_put_in_eval_mode(self):
+        """`eval()` is applied by the constructor and must not be skipped on the new branch.
+
+        A module left training applies dropout and lets batch-norm update its running
+        statistics from the data it is scoring, so a row's answer depends on what shared its
+        batch. Nothing in the output says so, which is why it is pinned rather than trusted.
+        """
+        torch = pytest.importorskip("torch", reason="torch not installed")
+
+        from batcher.ml.runtimes import TorchModule
+
+        linear = torch.nn.Linear(2, 2)
+        assert linear.training
+        TorchModule(linear, device="cpu")
+        assert not linear.training

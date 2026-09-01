@@ -513,3 +513,35 @@ def test_the_booster_adapters_register_even_when_estimators_imported_first() -> 
     assert {"xgboost", "lightgbm", "catboost"} <= set(FRAMEWORKS), (
         f"the booster adapters went unregistered; FRAMEWORKS = {sorted(FRAMEWORKS)}"
     )
+
+
+def test_a_torch_module_is_pointed_at_the_entry_point_that_runs_it() -> None:
+    """The generic refusal sent a deep model somewhere that does not work.
+
+    `ds.ml.predict` assembles a feature matrix and calls `predict`/`predict_proba`/
+    `decision_function`/`transform`. An ``nn.Module`` has none of them — its entry point is
+    the forward — so it fell to the catch-all, which said "pass framework= explicitly (one
+    of ['catboost', 'lightgbm', 'mlflow', 'onnx', 'sklearn', 'xgboost'])". Every one of those
+    six then fails further in, so the only actionable sentence in the error led nowhere.
+    """
+    torch = pytest.importorskip("torch", reason="torch not installed")
+
+    with pytest.raises(PlanError, match="torch_predictor"):
+        detect_framework(torch.nn.Linear(2, 1))
+
+
+def test_a_keras_model_still_scores_through_the_duck_typed_route() -> None:
+    """It carries `predict`, so it must keep being claimed as scikit-learn, not redirected.
+
+    This is the control on the redirect above: the rule is "has no scoring method", not
+    "is a deep model", and a framework that happens to implement the scikit-learn entry
+    point is scored rather than refused.
+    """
+
+    class _KerasLike:
+        __module__ = "keras.src.models.sequential"
+
+        def predict(self, matrix):  # pragma: no cover - detection never calls it
+            return matrix
+
+    assert detect_framework(_KerasLike()) == "sklearn"

@@ -28,6 +28,7 @@ the one actionable thing in the message was a command that fails; both are now d
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -53,6 +54,7 @@ __all__ = [
     "from_spark",
     "from_tf",
     "from_torch",
+    "numpy_to_column",
 ]
 
 
@@ -136,14 +138,22 @@ def from_items(items: list[Any], *, column: str = "item") -> Source:
 
 
 def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
-    """Build a single-column `Source` from a NumPy array under name `column`.
+    """Build a `Source` from a NumPy array — one column named `column`, or one per field.
 
     The leading axis is the row axis. A 1-D array becomes a scalar column; an
     ``(n, dim)`` array becomes a ``FixedSizeList<…, dim>`` column (the embedding
     convention); an ``(n, *shape)`` array with ``shape`` of rank >= 2 becomes a
     fixed-shape-tensor column that preserves the full per-row shape.
+
+    A **structured** array (one with a compound dtype: ``np.genfromtxt``, ``np.recarray``,
+    an h5py compound dataset) is NumPy's own table, so it becomes one column per field and
+    `column` is unused — the same reading `pandas.DataFrame` gives it. Each field goes
+    through the rank rules above, so a sub-array field keeps its per-row shape.
     """
-    return InMemorySource([pa.RecordBatch.from_arrays([_numpy_to_column(ndarray)], names=[column])])
+    columns = _structured_to_columns(ndarray)
+    if columns is not None:
+        return _source_from_table(pa.table(columns))
+    return InMemorySource([pa.RecordBatch.from_arrays([numpy_to_column(ndarray)], names=[column])])
 
 
 # ---- optional-framework adapters -----------------------------------------
@@ -182,26 +192,84 @@ def from_huggingface(hf_dataset: Any) -> Source:
 
 
 def from_torch(dataset_or_tensors: Any) -> Source:
-    """Build a `Source` from a PyTorch tensor, tuple of tensors, or `Dataset`.
+    """Build a `Source` from a PyTorch tensor, a mapping/tuple of tensors, or a `Dataset`.
 
     Tensors are moved to CPU and adapted via NumPy (one column per tensor); an
     iterable `Dataset` of tensor rows is stacked column-wise. No per-row Python
     crosses into the engine — only the bulk NumPy buffers do.
+
+    A ``{name: tensor}`` **mapping** keeps its keys as column names, which makes this the
+    exact inverse of `ml.to_torch`: what the loader yields, this reads back. Before, a
+    mapping fell through to the map-style-`Dataset` branch and indexed it by integer, so the
+    natural round-trip raised ``KeyError: 0`` — an error naming nothing the caller wrote.
+
+    A tuple or list of tensors becomes ``col_0``, ``col_1``, … and now goes through the same
+    rank rules as every other door, so ``(features, labels)`` with an ``(n, dim)`` feature
+    tensor — the canonical PyTorch pair — becomes a `FixedSizeList` column instead of raising
+    ``only handle 1-dimensional arrays``.
     """
     torch = require("torch", feature="PyTorch interop", provides="torch", extra="torch")
 
     def _np(t: Any) -> Any:
-        return t.detach().cpu().numpy()
+        return _tensor_to_numpy(t, torch)
 
     if isinstance(dataset_or_tensors, torch.Tensor):
         return from_numpy(_np(dataset_or_tensors))
+    if isinstance(dataset_or_tensors, Mapping):
+        named = {
+            str(name): numpy_to_column(_np(value) if isinstance(value, torch.Tensor) else value)
+            for name, value in dataset_or_tensors.items()
+        }
+        return _source_from_table(pa.table(named))
     if isinstance(dataset_or_tensors, (tuple, list)) and all(
         isinstance(t, torch.Tensor) for t in dataset_or_tensors
     ):
-        cols = {f"col_{i}": pa.array(_np(t)) for i, t in enumerate(dataset_or_tensors)}
-        return from_pydict(cols)
+        cols = {f"col_{i}": numpy_to_column(_np(t)) for i, t in enumerate(dataset_or_tensors)}
+        return _source_from_table(pa.table(cols))
     columns = _stack_torch_dataset(dataset_or_tensors, _np)
     return from_pydict(columns)
+
+
+def _tensor_to_numpy(tensor: Any, torch: Any) -> Any:
+    """One detached CPU `torch.Tensor` as a NumPy array, widening what NumPy cannot hold.
+
+    ``Tensor.numpy()`` raises ``TypeError: Got unsupported ScalarType BFloat16`` for exactly
+    the dtypes modern ML runs in — ``bfloat16`` is what almost every LLM checkpoint and every
+    mixed-precision training loop carries, and ``float8_e4m3fn``/``float8_e5m2`` are what
+    quantized inference emits. NumPy has no such dtype and neither does Arrow, so the tensor
+    is widened to the narrowest type that holds it exactly (``float32``) and the widening is
+    announced, rather than the ingest failing on a message that names a torch-internal enum.
+
+    ``float32`` is exact for all three: bfloat16 and both float8 formats have fewer mantissa
+    and no more exponent bits, so no value moves. What changes is the column's width on the
+    wire, which is why it is said out loud rather than done quietly.
+
+    Args:
+        tensor: The tensor to convert.
+        torch: The imported ``torch`` module (the caller already holds it).
+
+    Returns:
+        The NumPy array. Complex tensors are left to `numpy_to_column` to decline, so the
+        complex remedy is stated in one place.
+    """
+    detached = tensor.detach().cpu()
+    try:
+        return detached.numpy()
+    except TypeError:
+        import warnings
+
+        name = str(detached.dtype).removeprefix("torch.")
+        warnings.warn(
+            f"a torch.{name} tensor has no NumPy or Arrow dtype, so it is widened to "
+            "float32 on the way in. No value moves — float32 has more mantissa bits and no "
+            f"fewer exponent bits than {name} — but the column is 4 bytes a value rather "
+            "than 1 or 2. Cast it yourself first (`t.to(torch.float16)`) for a narrower "
+            "column, or keep the tensor out of the engine if the width matters more than "
+            "the query.",
+            UserWarning,
+            stacklevel=6,
+        )
+        return detached.to(torch.float32).numpy()
 
 
 def from_tf(tf_dataset: Any) -> Source:
@@ -270,26 +338,136 @@ def from_ray_dataset(ray_dataset: Any) -> Source:
 
 
 # ---- helpers --------------------------------------------------------------
-def _numpy_to_column(ndarray: Any) -> pa.Array:
+def numpy_to_column(ndarray: Any) -> pa.Array:
     """One Arrow column from a NumPy array whose leading axis is the row axis.
 
     The single place the rank rules live: 1-D is a scalar column, ``(n, dim)`` is a
     ``FixedSizeList`` (the embedding convention), and anything deeper is a
     fixed-shape-tensor column. :func:`from_numpy`, :func:`from_torch` and
     :func:`from_tf` all route through here so a per-row vector has the same type
-    whichever door it came in by.
+    whichever door it came in by — and `api.session.frames` reaches it for the
+    ``{name: array}`` spelling, so a ``(n, 384)`` embedding is one type through every door
+    rather than a `FixedSizeList` through one and an error through another.
+
+    A **masked** array keeps its mask. ``np.asarray`` drops the `np.ma` subclass, so a
+    masked value used to arrive as whatever happened to sit under the mask — the fill,
+    read as data, with no error and no warning. That is the one failure here that a
+    correct-looking result hides, and it is why the mask is taken *before* any
+    normalization: `np.ma` is how netCDF, h5py and ``np.genfromtxt`` spell a missing value.
+
+    Args:
+        ndarray: The array to convert; its first axis indexes rows.
+
+    Returns:
+        The Arrow column.
+
+    Raises:
+        PlanError: If the array's dtype or rank has no Arrow column form, naming the fix.
     """
     import numpy as np
 
-    arr = np.asarray(ndarray)
+    arr = ndarray if isinstance(ndarray, np.ndarray) else np.asarray(ndarray)
+    mask = np.ma.getmaskarray(arr) if np.ma.isMaskedArray(arr) else None
+    if mask is not None:
+        arr = np.ma.getdata(arr)
+        if not mask.any():
+            mask = None
+    if arr.dtype.names is not None:
+        # A *nested* compound field — a C struct inside a record, which an h5py compound
+        # dataset produces routinely. It is a struct column, not a table, because it sits
+        # inside one: only the outermost compound dtype names the rows.
+        fields = _field_columns(arr)
+        return pa.StructArray.from_arrays(list(fields.values()), names=list(fields))
+    _reject_untypable(arr, masked=mask is not None)
     if arr.ndim <= 1:
-        return pa.array(arr)
+        return pa.array(arr, mask=mask)
+    flat = np.ascontiguousarray(arr).reshape(-1)
     if arr.ndim == 2:
-        flat = pa.array(np.ascontiguousarray(arr).reshape(-1))
-        return pa.FixedSizeListArray.from_arrays(flat, arr.shape[1])
+        child = pa.array(flat, mask=None if mask is None else np.ascontiguousarray(mask).ravel())
+        return pa.FixedSizeListArray.from_arrays(child, arr.shape[1])
     from batcher.io.formats.ml.tensor import to_tensor_column
 
     return to_tensor_column(arr)
+
+
+def _reject_untypable(arr: Any, *, masked: bool) -> None:
+    """Refuse an array Arrow has no column type for, naming the conversion that fixes it.
+
+    Every case here already failed; what it raised was a pyarrow message quoting an internal
+    dtype *number* — ``Unsupported numpy type 15`` for a complex column, ``only handle
+    1-dimensional arrays`` for a 0-d one. Neither names the column, the dtype, or anything to
+    do about it, and both reach a user who wrote one ordinary line of NumPy.
+
+    The three are declines rather than conversions on purpose. Arrow has no complex type, so
+    any automatic split invents a column layout the caller did not ask for; a 0-d array has no
+    row axis at all, so there is no row count to give it; and a rank >= 3 mask cannot ride
+    along on a fixed-shape-tensor column, where filling it silently would be the very defect
+    the mask handling above exists to prevent.
+    """
+    import numpy as np
+
+    if arr.dtype.kind == "c":
+        raise PlanError(
+            f"a {arr.dtype} column has no Arrow type: Arrow does not represent complex "
+            "numbers. Split it into two real columns first, e.g. "
+            "`bt.from_numpy({'re': a.real, 'im': a.imag})`."
+        )
+    if arr.ndim == 0:
+        raise PlanError(
+            f"a 0-d array ({arr.dtype}) has no row axis, so it cannot become a column. "
+            "Wrap it in one with `np.atleast_1d(a)` for a single-row column."
+        )
+    if masked and arr.ndim >= 3:
+        raise PlanError(
+            f"a masked {arr.ndim}-D array becomes a fixed-shape-tensor column, which has no "
+            "place to record a per-element mask. Fill it first with `a.filled(0)`, or move "
+            "the masked axis into its own column."
+        )
+    _ = np
+
+
+def _structured_to_columns(ndarray: Any) -> dict[str, pa.Array] | None:
+    """A structured NumPy array as ``{field: column}``, or `None` when it is not one.
+
+    A structured (record) array is NumPy's table: a 1-D array of a compound dtype, which is
+    what ``np.genfromtxt``, ``np.rec.array``, an h5py compound dataset and most scientific
+    binary readers produce. It reached Arrow as a single ``void`` column and failed with
+    ``ArrowNotImplementedError: Unsupported numpy type 20`` — a message with neither the
+    field names it holds nor the fact that they are what the caller wanted.
+
+    One column per field is the reading every neighbor gives it (``pandas.DataFrame(rec)``,
+    ``polars.from_numpy(rec)``), and each field goes back through `numpy_to_column`, so a
+    sub-array field — ``dtype=[("emb", "f4", (384,))]`` — keeps the embedding convention
+    instead of being flattened.
+
+    Args:
+        ndarray: The candidate array.
+
+    Returns:
+        The field columns in dtype order, or None when `ndarray` has no compound dtype.
+    """
+    import numpy as np
+
+    if not isinstance(ndarray, np.ndarray) or ndarray.dtype.names is None:
+        return None
+    if ndarray.ndim != 1:
+        raise PlanError(
+            f"a structured array is a table, so its rows are its one axis; got "
+            f"{ndarray.ndim}-D with fields {list(ndarray.dtype.names)}. Flatten it first "
+            "with `a.reshape(-1)`."
+        )
+    return _field_columns(ndarray)
+
+
+def _field_columns(arr: Any) -> dict[str, pa.Array]:
+    """The columns of a structured array's fields, in dtype order.
+
+    Split out so `numpy_to_column` can reach it for a *nested* compound field without going
+    back through `_structured_to_columns`, whose rank check is about the outermost array and
+    whose `None` return would then be unreachable — a branch that exists only to be asserted
+    away is worse than the one line it saves.
+    """
+    return {str(name): numpy_to_column(arr[name]) for name in arr.dtype.names}
 
 
 def _column_from_rows(values: list[Any]) -> pa.Array:
@@ -302,7 +480,7 @@ def _column_from_rows(values: list[Any]) -> pa.Array:
     """
     import numpy as np
 
-    return _numpy_to_column(np.stack(values))
+    return numpy_to_column(np.stack(values))
 
 
 def _stack_torch_dataset(dataset: Any, to_np: Any) -> dict[str, Any]:

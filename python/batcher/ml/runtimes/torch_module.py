@@ -27,7 +27,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
     import numpy as np
 
@@ -43,13 +43,15 @@ class TorchModule:
     Examples:
         .. doctest::
 
-            >>> from batcher.ml import TorchModule  # doctest: +SKIP
+            >>> from batcher.ml.runtimes import TorchModule  # doctest: +SKIP
             >>> module = TorchModule("scripted.pt", device="cuda")  # doctest: +SKIP
             >>> module.predict({"x": features})  # doctest: +SKIP
             {'output': array([[0.2, 0.8]], dtype=float32)}
 
     Args:
-        model: a TorchScript file path, or a zero-arg callable returning an ``nn.Module``.
+        model: a built ``nn.Module``, a TorchScript file path, or a zero-arg callable
+            returning an ``nn.Module``. Prefer a path or a factory for a distributed run:
+            a built module is pickled to every worker, where a path is opened by each one.
         device: torch device string; defaults to the detected accelerator.
         dtype: ``"float16"``/``"bfloat16"``/``"float32"`` (or an abbreviation). `None`
             keeps the checkpoint's own precision — half precision is a numerical change,
@@ -66,7 +68,7 @@ class TorchModule:
 
     def __init__(
         self,
-        model: str | Callable[[], Any],
+        model: str | Any,
         *,
         device: str | None = None,
         dtype: str | None = None,
@@ -179,7 +181,7 @@ def _parameter_dtype(module: Any) -> Any | None:
     return None
 
 
-def _load_module(torch: Any, model: str | Callable[[], Any], device: str) -> Any:
+def _load_module(torch: Any, model: str | Any, device: str) -> Any:
     """The ``nn.Module`` behind a TorchScript path, a pickled module, or a factory.
 
     A path is tried as TorchScript first and as a pickled module second, because
@@ -188,7 +190,17 @@ def _load_module(torch: Any, model: str | Callable[[], Any], device: str) -> Any
     ``'dict' object is not callable`` from inside the forward. A state dict has no
     architecture in it, so it needs a factory; saying that here is more useful than the
     failure it otherwise produces.
+
+    **An `nn.Module` is checked for before the factory branch, and the order is the whole
+    point.** A module is itself callable, so ``callable(model)`` cannot tell an already-built
+    module from a zero-arg factory that builds one — and the factory branch wins by default,
+    calling ``model()`` with no arguments. Handing over the module you already have, which is
+    what a notebook and a fine-tuning script both do, therefore ran the *forward* with no
+    input and raised ``forward() missing 1 required positional argument`` before a single row
+    was read: an error about the model's signature, from a line that only passed the model.
     """
+    if isinstance(model, torch.nn.Module):
+        return model.to(device)
     if not isinstance(model, str):
         loaded = model()
         return loaded.to(device) if hasattr(loaded, "to") else loaded
@@ -276,7 +288,7 @@ def _tensor_to_numpy(value: Any) -> np.ndarray:
 
 
 def torch_predictor(
-    model: str | Callable[[], Any],
+    model: str | Any,
     *,
     input_columns: Sequence[str],
     output_columns: Sequence[str] | None = None,
@@ -308,9 +320,11 @@ def torch_predictor(
             >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
     Args:
-        model: a TorchScript path, a pickled module path, or a zero-arg factory returning
-            an ``nn.Module`` (the shape a checkpoint needs, since a ``state_dict`` carries
-            no architecture).
+        model: a built ``nn.Module``, a TorchScript path, a pickled module path, or a
+            zero-arg factory returning an ``nn.Module`` (the shape a checkpoint needs, since
+            a ``state_dict`` carries no architecture). A path or a factory is the better
+            choice for a distributed run — it is opened per worker rather than pickled to
+            each one — but a module you already hold is accepted rather than refused.
         input_columns: dataset columns to feed, in the forward's argument order.
         output_columns: names for the appended result columns; defaults to the forward's
             output names.

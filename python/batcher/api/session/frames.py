@@ -80,6 +80,22 @@ def from_arrow(data: pa.Table | pa.RecordBatch | Sequence[pa.RecordBatch]) -> Da
     return _scan(InMemorySource(batches))
 
 
+#: What a failed Arrow conversion raises, and the reason `ArrowNotImplementedError` belongs
+#: in it. The three types this started as are what pyarrow raises for a value it can *type*
+#: but not *hold*; a dtype it has no column form for at all — a NumPy structured array, the
+#: `void` kind — raises `ArrowNotImplementedError`, which derives from `NotImplementedError`
+#: rather than from `ValueError`. So it escaped every one of these handlers, and the column
+#: diagnosis, the tensor retry, and the `PlanError` wrapping were all skipped for the case
+#: that most needed them: the caller got a bare ``Unsupported numpy type 20`` naming neither
+#: the column nor the constructor it came from.
+_ARROW_CONVERSION_ERRORS = (
+    pa.ArrowInvalid,
+    pa.ArrowTypeError,
+    pa.ArrowNotImplementedError,
+    TypeError,
+)
+
+
 def from_pydict(mapping: Mapping[str, Any], *, schema: pa.Schema | None = None) -> Dataset:
     """Create a `Dataset` from a column-oriented ``{name: values}`` dict.
 
@@ -114,7 +130,7 @@ def from_pydict(mapping: Mapping[str, Any], *, schema: pa.Schema | None = None) 
     columns = dict(mapping)
     try:
         table = pa.table(columns, schema=schema)
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+    except _ARROW_CONVERSION_ERRORS as exc:
         table = _retry_as_tensors(columns, schema)
         if table is None:
             raise PlanError(_column_error("from_pydict", columns, exc)) from None
@@ -134,7 +150,7 @@ def _retry_as_tensors(columns: dict[str, Any], schema: pa.Schema | None) -> pa.T
     from batcher.io.formats.ml.tensor import tensor_from_values
 
     converted = {
-        name: tensor_from_values(value) or ragged_from_values(value)
+        name: _column_from_ndarray(value) or tensor_from_values(value) or ragged_from_values(value)
         for name, value in columns.items()
     }
     if not any(v is not None for v in converted.values()):
@@ -142,8 +158,40 @@ def _retry_as_tensors(columns: dict[str, Any], schema: pa.Schema | None) -> pa.T
     rebuilt = {name: converted[name] or value for name, value in columns.items()}
     try:
         return pa.table(rebuilt, schema=schema)
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError):
+    except _ARROW_CONVERSION_ERRORS:
         return None
+
+
+def _column_from_ndarray(value: Any) -> pa.Array | None:
+    """A multi-dimensional NumPy column converted by the `from_numpy` rank rules, else `None`.
+
+    ``{"emb": np.random.rand(n, 384)}`` is how an embedding table is built from NumPy, and it
+    is the one spelling of it that failed: `tensor_from_values` takes a *sequence* of per-row
+    arrays and an `ndarray` is not a `collections.abc.Sequence`, so a bare N-D array declined
+    and the caller was told the column "holds a sequence of numpy.ndarray, which Arrow cannot
+    represent. Convert it to ... an ndarray" — advice they had already followed.
+
+    Routing it through `io.interop.numpy_to_column` is what makes the two doors agree:
+    ``bt.from_numpy(a)`` and ``bt.from_pydict({"x": a})`` now give the same array the same
+    column type, where the first worked and the second raised.
+
+    A **structured** array is claimed at any rank, because a compound dtype is a struct
+    column and never converts on the first attempt whatever its shape. As a whole `Dataset`
+    it is a table (`bt.from_numpy`); named as one column among others it is that column.
+
+    Plain 1-D arrays are left alone deliberately. They convert on the first attempt and never
+    reach here, and claiming them would put an untested second path under every ordinary
+    numeric column for no gain.
+    """
+    import numpy as np
+
+    if not isinstance(value, np.ndarray):
+        return None
+    if value.ndim < 2 and value.dtype.names is None:
+        return None
+    from batcher.io.interop import numpy_to_column
+
+    return numpy_to_column(value)
 
 
 def _column_error(caller: str, columns: dict[str, Any], cause: Exception) -> str:
@@ -216,7 +264,7 @@ def from_pylist(rows: Sequence[Mapping[str, Any]]) -> Dataset:
     listed = list(rows)
     try:
         return _scan(interop.from_pylist(listed))
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+    except _ARROW_CONVERSION_ERRORS as exc:
         raise PlanError(_column_error("from_pylist", _as_columns(listed), exc)) from None
 
 
@@ -329,7 +377,7 @@ def from_items(items: Sequence[Any], *, column: str = "item") -> Dataset:
     rows = list(items)
     try:
         return _scan(interop.from_items(rows, column=column))
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+    except _ARROW_CONVERSION_ERRORS as exc:
         raise PlanError(_items_error("from_items", rows, exc)) from None
 
 
@@ -411,7 +459,7 @@ def from_iter(
     rows = list(iterable)
     try:
         return _scan(interop.from_items(rows, column=column))
-    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+    except _ARROW_CONVERSION_ERRORS as exc:
         raise PlanError(_items_error("from_iter", rows, exc)) from None
 
 
@@ -476,15 +524,26 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Dataset:
     ``(n, dim)`` array a fixed-size-list column (the embedding convention), and a
     higher-rank array a fixed-shape-tensor column. Needs only ``numpy`` (core).
 
-    Pass a ``{name: array}`` dict to build one column per array instead.
+    Pass a ``{name: array}`` dict to build one column per array instead; each one follows
+    the same rules, so ``{"id": ids, "emb": vectors}`` is an embedding table in one call.
+
+    A **structured** array — one with a compound dtype, as ``np.genfromtxt``,
+    ``np.rec.array`` and an h5py compound dataset produce — is NumPy's own table, so it
+    becomes one column per field and `column` is unused. A **masked** array keeps its mask:
+    a masked value becomes a null, not the fill sitting underneath it.
 
     Args:
         ndarray: The array to ingest; its first axis indexes rows. A mapping of
-            name to array builds one column each.
+            name to array builds one column each, and a structured array one column
+            per field.
         column: The name of the single output column.
 
     Returns:
-        A lazy `Dataset` with one column over the array.
+        A lazy `Dataset` with one column over the array, or one per field.
+
+    Raises:
+        PlanError: If the array has no Arrow column form — a complex dtype, which Arrow
+            does not represent, or a 0-d array, which has no row axis.
 
     Examples:
         .. doctest::
@@ -493,6 +552,10 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Dataset:
             >>> import batcher as bt
             >>> bt.from_numpy(np.array([1, 2, 3])).to_pydict()
             {'data': [1, 2, 3]}
+
+            >>> rows = np.array([(1, 2.5)], dtype=[("id", "i8"), ("score", "f8")])
+            >>> bt.from_numpy(rows).to_pydict()
+            {'id': [1], 'score': [2.5]}
     """
     if isinstance(ndarray, Mapping):
         return from_pydict(ndarray)

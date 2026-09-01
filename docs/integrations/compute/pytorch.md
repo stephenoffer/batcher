@@ -20,8 +20,9 @@ so measure it against your own data rather than taking either figure on trust.
 
 ## Tensors in
 
-`bt.from_torch` adapts a tensor, a tuple of tensors, or a map-style {py:class}`Dataset <batcher.Dataset>` into the engine.
-Tensors are moved to CPU and adapted through NumPy in bulk, with no per-row Python.
+`bt.from_torch` adapts a tensor, a mapping of tensors, a tuple of tensors, or a map-style
+{py:class}`Dataset <batcher.Dataset>` into the engine. Tensors are moved to CPU and adapted through NumPy in bulk, with
+no per-row Python.
 
 ```python
 import torch
@@ -34,11 +35,29 @@ print(ds.to_pydict())
 # {'data': [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]}
 ```
 
+A `{name: tensor}` mapping keeps its keys as column names, which makes it the exact inverse of
+the loader: what `iter_torch_batches` yields, `from_torch` reads back.
+
+```python
+batch = {"x": torch.arange(3), "y": torch.ones(3)}
+print(bt.from_torch(batch).schema.names)
+# ['x', 'y']
+```
+
 :::{dropdown} What each tensor shape becomes as a column
 An `(n, dim)` tensor becomes a fixed-size-list column of width `dim`, which is the embedding
 convention, and a higher-rank tensor becomes a fixed-shape-tensor column that keeps its per-row
-shape. A tuple of tensors becomes one column each, named `col_0`, `col_1`, and so on.
+shape. A tuple or list of tensors becomes one column each, named `col_0`, `col_1`, and so on, and
+each one goes through the same shape rules, so a `(features, labels)` pair keeps its feature matrix
+as a vector column.
 :::
+
+**Low-precision dtypes widen to `float32` on the way in, and say so.** `bfloat16` is what nearly
+every LLM checkpoint carries and `float8_e4m3fn`/`float8_e5m2` are what quantized inference emits.
+Neither NumPy nor Arrow has a dtype for any of them, so the tensor is widened and a `UserWarning`
+names the column's new width. No value moves, because `float32` has more mantissa bits and no fewer
+exponent bits than all three. What changes is four bytes a value instead of one or two, so cast the
+tensor yourself to `torch.float16` first if the width matters more than the precision.
 
 This is for adapting something you already have in memory. It is not the ingest path; for that,
 read the corpus with {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and never build the tensors twice.
@@ -185,6 +204,32 @@ scored.write.parquet("s3://lake/scores")
 `batch_format="torch"` hands the `fn` tensors instead of an Arrow batch; the engine boundary stays
 Arrow either way, and the conversion happens only around the call. `model_memory_gb` lets the
 resource layer budget host RAM per worker and pack small models onto a shared GPU.
+
+### When the class is just a module
+
+For a module with nothing to wire beyond its inputs, {py:func}`torch_predictor <batcher.ml.torch_predictor>` writes the class for
+you. It applies `eval()` and `torch.inference_mode()`, casts each input to the weights'
+precision, and loads once per worker.
+
+```python
+# docs: skip
+from batcher.ml import torch_predictor
+
+udf = torch_predictor(model, input_columns=["features"], output_columns=["logits"])
+scored = ds.ml.map_batches(udf, num_gpus=1).collect()
+```
+
+`model` may be a TorchScript path, a pickled-module path, a zero-arg factory, or an `nn.Module`
+you already hold. Prefer a path or a factory for a distributed run: each worker opens it, where a
+built module is pickled to every one of them.
+
+:::{note}
+{py:meth}`ds.ml.predict() <batcher.api.dataset.ml.DatasetML.predict>` does not score an `nn.Module`. It assembles a feature matrix and calls
+`predict`/`predict_proba`/`decision_function`/`transform`, which is the scikit-learn contract that
+XGBoost, LightGBM, CatBoost, ONNX and MLflow models also follow. A deep model's entry point is its
+forward, so it goes through `torch_predictor` instead. Passing one to `predict` raises a
+{py:class}`PlanError <batcher.PlanError>` that says so and names the function to use.
+:::
 
 ## Failure modes worth knowing
 

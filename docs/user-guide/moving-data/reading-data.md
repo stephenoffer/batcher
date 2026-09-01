@@ -104,10 +104,54 @@ except bt.PlanError as err:
 # True
 ```
 
+### From NumPy arrays
+
+{py:func}`from_numpy <batcher.from_numpy>` reads an array's **leading axis as the row axis**, and the rank decides the
+column type. A `{name: array}` mapping builds one column per array, and each one follows the same
+rules, so an embedding table is one call.
+
+```python
+import numpy as np
+
+ds = bt.from_numpy({"id": np.arange(3), "emb": np.zeros((3, 4))})
+print(ds.schema.names, ds.count())
+# ['id', 'emb'] 3
+```
+
+The rules, in the order they apply:
+
+| Array | Column |
+| --- | --- |
+| 1-D | a scalar column of that dtype |
+| `(n, dim)` | a fixed-size-list column of width `dim`, the embedding convention |
+| `(n, *shape)`, rank 3 or more | a fixed-shape-tensor column keeping the per-row shape |
+| Structured (a compound dtype) | one column per field, each following the rules above |
+
+A structured array is NumPy's own table, so it becomes a table. This is what `np.genfromtxt`,
+`np.rec.array`, and an h5py compound dataset produce, and it is the reading `pandas.DataFrame`
+gives them too.
+
+```python
+rows = np.array([(1, 2.5), (3, 4.5)], dtype=[("id", "i8"), ("score", "f8")])
+print(bt.from_numpy(rows).to_pydict())
+# {'id': [1, 3], 'score': [2.5, 4.5]}
+```
+
+A masked array keeps its mask: a masked value becomes a null, not the fill sitting under it.
+
+```python
+print(bt.from_numpy(np.ma.array([1, 2, 3], mask=[False, True, False])).to_pydict())
+# {'data': [1, None, 3]}
+```
+
+Two shapes have no Arrow column form and are refused rather than approximated. A complex array
+has no Arrow type, so split it into two real columns (`{"re": a.real, "im": a.imag}`). A 0-d array
+has no row axis at all, so give it one with `np.atleast_1d`.
+
 ### From other frameworks
 
 Adapters convert a frame from another library into a `Dataset`:
-{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_numpy <batcher.from_numpy>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`,
+{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`,
 {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>`. They require the corresponding
 library to be installed.
 
@@ -117,6 +161,10 @@ import pandas as pd
 
 ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
 ```
+
+{py:func}`from_torch <batcher.from_torch>` takes a tensor, a `{name: tensor}` mapping, a tuple of tensors, or a map-style
+`Dataset`, and applies the same rank rules as `from_numpy`. See {doc}`PyTorch </integrations/compute/pytorch>` for
+the loader on the way back out, and for how `bfloat16` and the `float8` dtypes are handled.
 
 ## File and path readers
 
