@@ -1757,7 +1757,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 658 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
-| `interop.py` | 545 | Framework-interop ingestion — build a `Source` from a foreign object. |
+| `interop.py` | 546 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 302 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
@@ -1848,9 +1848,9 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 
 | module | lines | what it is |
 |---|---|---|
-| `_ndarray.py` | 47 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
+| `_ndarray.py` | 75 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
 | `hdf5.py` | 128 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
-| `numpy.py` | 196 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
+| `numpy.py` | 228 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
 | `point_cloud.py` | 448 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `ragged.py` | 207 | Variable-shape tensor columns — arrays of differing shape in one Arrow column. |
 | `tensor.py` | 139 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |

@@ -55,6 +55,66 @@ The aggregate ladders were unaffected — a 200,000-row result does not fit, and
 (250 ms) and varied (257 ms) runs measured the same — but nothing about the timings said which
 was which. Every ladder in this document now varies one literal per run.
 
+## The same ladder at 8.4 GB, which is the one to read
+
+Everything above runs on 64 M rows in 1 GB. At 64 workers that is ~16 MB of input each, so the
+coordination floor dominates and every shape converges on ~300 ms whatever the fan-out — which
+looks like a scaling wall and is mostly over-provisioning. Re-run on **512 M rows / 8.4 GB /
+5 M distinct keys** (64 files, so the split count no longer caps the map either), warm, median
+of 3:
+
+| workers | total | map | reduce |
+|---|---|---|---|
+| 4 | 8,744 ms | 7,820 ms | 848 ms |
+| 8 | 4,437 ms | 3,285 ms | 1,006 ms |
+| 16 | 3,470 ms | 2,302 ms | 1,049 ms |
+| 32 | 3,361 ms | 1,626 ms | 1,588 ms |
+| 64 | 3,551 ms | 1,131 ms | **2,461 ms** |
+
+**The map scales and the reduce does not.** 7,820 ms to 1,131 ms is 6.9x across a 16x fan-out,
+which is the scan and partial-aggregate path behaving as intended. Over the same range the
+reduce gets **2.9x worse**, overtakes the map between 32 and 64 workers, and turns the total
+back up. Finding 2's fix does not reach this: at 5 M groups `_busy_floor` computes
+`min(64, 5e6 // 50,000) = 64`, so the floor still hands the exchange one reducer per worker and
+`mappers x reducers` is 4,096 streams again.
+
+Swept directly at 64 workers, holding everything else fixed:
+
+| reducers | median | vs. current |
+|---|---|---|
+| 64 (what the engine picks) | 3,784 ms | — |
+| 32 | 3,093 ms | 1.22x |
+| 16 | **2,996 ms** | **1.26x** |
+| 8 | 3,048 ms | 1.24x |
+| 4 | 3,216 ms | 1.18x |
+
+A clear interior optimum with a broad basin from 8 to 32, and the engine's own choice is the
+worst point on the curve.
+
+The same sweep at **32** workers, same corpus, separates the two explanations:
+
+| reducers | w=32 | w=64 |
+|---|---|---|
+| one per worker (the engine's choice) | 3,883 ms | 3,784 ms |
+| 16 | **3,687 ms** | **2,996 ms** |
+| 8 | 3,737 ms | 3,048 ms |
+| penalty for one-per-worker | 1.05x | **1.26x** |
+
+Two things follow, and both are stronger than the 64-worker sweep alone supports. **The optimum
+is the same 16 at both fan-outs**, so it is a property of the data rather than of the cluster —
+the reducer count should stop following the worker count once the data has enough reducers.
+And **the penalty for exceeding it grows with the fan-out**, 1.05x to 1.26x for a doubling,
+which is the `mappers x reducers` stream count showing up as a cost: 1,024 streams at 32
+workers against 4,096 at 64.
+
+**No formula is proposed here**, and that is deliberate. The measured optima are 4 reducers at
+200,000 groups, 20 at 1 M and 16 at 5 M — not monotone in the group count, because those
+corpora differ in input size too, so the partial-state volume each mapper produces differs.
+Three points across two datasets do not determine a heuristic, and fitting one would repeat the
+mistake the "Ruled out" section below exists to record. What the data does support is the
+structural claim: *one reducer per worker was the worst choice at every cardinality and every
+fan-out measured*, and the floor that produces it is indexed on the wrong quantity.
+
 ## Finding 1 — a warm fleet reserves the whole cluster, against every other process
 
 The highest-impact result in this pass, and the one that is a *cluster* property rather than a
