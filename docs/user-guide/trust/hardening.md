@@ -162,6 +162,7 @@ hardened = cfg.replace(
         cfg.execution,
         udf_isolation="strict",
         udf_memory_limit_bytes=8 * 1024**3,
+        udf_cpu_limit_seconds=300,
         udf_timeout_s=600.0,
     )
 )
@@ -171,9 +172,12 @@ print(hardened.execution.udf_isolation)
 
 `udf_memory_limit_bytes` becomes an `RLIMIT_AS` on the child, so a runaway allocation
 raises `MemoryError` in the guilty worker instead of drawing the kernel's OOM killer onto
-whatever else is on the box. `udf_timeout_s` bounds a wedged UDF, which otherwise hangs the
-query with no error at all. If a UDF needs a variable the allowlist drops, name it in
-`execution.udf_env_allowlist` rather than turning isolation off.
+whatever else is on the box. `udf_cpu_limit_seconds` becomes an `RLIMIT_CPU`, which bounds
+a UDF that is spinning rather than allocating, and does so in the kernel so the driver does
+not have to be watching. `udf_timeout_s` bounds a wedged UDF by wall clock, which otherwise
+hangs the query with no error at all. The two ceilings answer different failures, so a
+strict deployment usually wants both. If a UDF needs a variable the allowlist drops, name
+it in `execution.udf_env_allowlist` rather than turning isolation off.
 
 ```{warning}
 This is defense in depth, not a sandbox, and the difference matters. A UDF is arbitrary
