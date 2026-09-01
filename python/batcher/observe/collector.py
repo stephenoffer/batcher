@@ -245,13 +245,34 @@ class _Collector:
                 self._buckets[edge] += 1
 
     def snapshot(self) -> dict[str, Any]:
-        """A consistent, deep-copied view of every counter. Assumes nothing about callers."""
+        """A consistent, deep-copied view of every counter. Assumes nothing about callers.
+
+        **Every reading is taken before the lock, and the two that were not deadlocked the
+        scrape.** `node_conditions` and `window_snapshot` read the *hardware*, and both wrap
+        their probes in `except Exception: note_suppressed(...)` so a scrape can never fail on
+        a driver that has gone away. `note_suppressed` publishes a LOG event; the bus delivers
+        it synchronously to every sink; this collector is a sink, and `handle` takes
+        `self._lock` -- which this thread is already holding, on a plain `threading.Lock`.
+
+        So a probe raising during a scrape did not degrade the scrape, it hung the thread
+        forever, still holding the lock that every query's `QUERY_END` needs. The `# pragma:
+        no cover - a scrape must never fail a process` comment on that handler is exact about
+        its intent and was the mechanism of something worse: a failed scrape returns, a hung
+        one does not, and it takes the engine's event bus down with it.
+
+        Hoisting them is the whole fix and it needs no new machinery, because it is what the
+        six readings above already do -- each of those owns its own lock and is read outside
+        this one for the same reason.
+        """
         operators = self.work.operators()
         totals = self.work.totals()
         rows_scanned, bytes_scanned = self.work.scanned()
         resources = self.resources.snapshot()
         streaming = self.streams.snapshot()
         writes = self.writes.snapshot()
+        # Hardware reads, and the ones that can log. Never move these inside the lock.
+        device_window = window_snapshot()
+        node = node_conditions()
         with self._lock:
             ok = self.queries_total - self.queries_failed
             return {
@@ -345,7 +366,7 @@ class _Collector:
                     # of repeated snapshots still cannot tell a steadily half-fed device from
                     # one alternating between saturated and idle. Empty and flagged unsampled
                     # unless sampling was turned on, so nothing here invents a quiet fleet.
-                    "window": window_snapshot(),
+                    "window": device_window,
                 },
-                "node": node_conditions(),
+                "node": node,
             }

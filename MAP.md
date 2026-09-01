@@ -1385,7 +1385,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
 | `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 364 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
-| `simplify.py` | 172 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
+| `simplify.py` | 195 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
 ### `batcher/kyber/rules/nulls/` — 3 · subsystem
 
@@ -2170,7 +2170,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 
 | module | lines | what it is |
 |---|---|---|
-| `collector.py` | 369 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
+| `collector.py` | 372 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
 | `control.py` | 253 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `fabric.py` | 49 | The node's wires as flat metric rows, for a dashboard that watches a fleet rather than a run. |
@@ -2594,7 +2594,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 183 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 267 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `dispatch.py` | 283 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
 ### `batcher/metadata/` — 1 · contract

@@ -82,6 +82,57 @@ def test_a_failing_sink_cannot_recurse_through_the_logging_bridge(bus, tmp_path)
     assert len(delivered) == 200  # every publish still delivered to the healthy sink
 
 
+def test_a_scrape_does_not_deadlock_when_a_device_probe_raises(monkeypatch, tmp_path):
+    """Regression: `snapshot()` holds the collector lock -> a probe raises -> `note_suppressed`
+    publishes a LOG event -> the bus delivers it to this same collector -> `handle` takes the
+    lock this thread already holds. `threading.Lock` is not reentrant, so the scrape hung.
+
+    It hung *holding* the lock, so every later `QUERY_END` blocked on it too: one flaky driver
+    read took out the metrics endpoint and the event bus with it. The handler that caused it is
+    commented "a scrape must never fail a process", which is exactly right about the intent and
+    was the mechanism of something strictly worse -- a failed scrape returns, a hung one does
+    not.
+
+    **Debug logging is a precondition and the test sets it up itself.** `note_suppressed`
+    records at DEBUG, so the LOG event only reaches the bus when the batcher logger passes
+    DEBUG records; at the default level nothing is published and there is no re-entry. Written
+    without this, the test passed against the unfixed code -- the failure mode
+    `lint-methodology` exists for. It is also what the bug costs in production: the endpoint
+    deadlocks when an operator turns debug logging on, which is exactly when they are already
+    chasing something.
+
+    Driven through a **local** collector rather than the process-wide one in `observe.metrics`,
+    so that a regression *fails* instead of hanging the suite: the wedged worker holds only
+    this collector's lock, and the cleanup below needs no lock at all. Tearing down the global
+    collector would itself block on the lock the hung thread is holding, which is how the first
+    version of this test hung rather than failing.
+    """
+    from batcher._internal.hardware.telemetry import throughput
+    from batcher.observe.collector import _Collector
+
+    blog._applied = None
+    blog.configure(
+        ObservabilityConfig(log_level="DEBUG", console=False, log_file=str(tmp_path / "l"))
+    )
+
+    def _boom():
+        raise RuntimeError("driver went away")
+
+    monkeypatch.setattr(throughput, "device_throughput", _boom)
+
+    collector = _Collector()
+    detach = events.subscribe(collector.handle)
+    done = threading.Event()
+    try:
+        worker = threading.Thread(target=lambda: (collector.snapshot(), done.set()), daemon=True)
+        worker.start()
+        assert done.wait(timeout=30), (
+            "snapshot() did not return: the scrape re-entered the collector's own lock"
+        )
+    finally:
+        detach()
+
+
 def test_reporter_survives_a_failing_sink_under_debug_logging(bus, tmp_path):
     """The same cycle, through the real reporter, which takes a lock while rendering."""
     blog._applied = None
