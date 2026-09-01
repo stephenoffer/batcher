@@ -128,6 +128,12 @@ small, frequently-read result outlives a cheap, large, cold one. Plain LRU gets 
 backwards whenever cached results differ by orders of magnitude in either dimension, which
 they usually do.
 
+The ranking also ages. A result that was read heavily during a warmup and is then never
+asked for again does not hold its place forever: entries are scored against a floor that
+rises as the cache evicts, so a working set that moves on can displace the one before it.
+You do not have to clear the cache between phases of a job to stop an early query from
+crowding out a later one.
+
 ```python
 from batcher.config import Config
 
@@ -275,12 +281,31 @@ Three consequences follow, and they are all silent by design:
 
 Declining costs a recompute, which is why nothing here guesses.
 
+### What is too large to share
+
+A result over 256 MB is not written to the shared store. Sharing it would serialize a
+second full copy of it into the process that just computed it, then push those bytes at
+the network on every run of the query, and Redis refuses a value over 512 MB in any case.
+The process cache and its disk tier still hold results of any size, so a large result is
+cached locally and simply not shared.
+
+Declined writes are counted, so a workload whose results are all too large can tell that
+the shared store is doing nothing for it rather than assuming it is merely cold:
+
+```python
+# docs: skip
+stats = bt.cache_stats()
+print(stats["shared_writes"], stats["shared_declined"])
+```
+
 ### When the store is down
 
 A shared cache degrades to recompute. Every read and write is contained: an unreachable
 server, a slow one, or an entry this version cannot decode all become a miss, and the query
 runs. That is deliberate, and it means an outage is invisible in the timings alone. Watch
-`shared_errors`:
+`shared_errors`, and read `shared_hit_rate` alongside it: the rate is taken over every
+lookup the store was asked for, so a store failing half its reads reports 0.5 rather than
+looking healthy on the half it answered.
 
 ```python
 # docs: skip

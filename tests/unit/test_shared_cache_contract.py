@@ -212,3 +212,80 @@ def test_stats_report_the_bytes_actually_moved():
     assert stats["bytes_written"] > 0
     assert stats["bytes_read"] == stats["bytes_written"]
     assert stats["hit_rate"] == 1.0
+
+
+def test_an_oversized_result_is_declined_before_it_is_serialized(monkeypatch):
+    # The local store declines an entry larger than its budget; this one had no equivalent,
+    # so an arbitrarily large result was serialized into a second full copy of itself in
+    # the driver and then pushed at the network — on the query that was already expensive,
+    # every time it ran, with the backend's refusal contained and retried identically next
+    # time. The check must happen on the table, because the serialization is half the cost.
+    from batcher.carbonite.cache_shared import store as store_mod
+
+    # The cap is patched down rather than met for real: allocating a table over the
+    # shipped 256 MiB to prove a comparison costs 20s of test time and pins nothing the
+    # small cap does not. `test_the_shared_size_guard_stays_under_what_a_backend_accepts`
+    # is what holds the shipped value.
+    monkeypatch.setattr(store_mod, "_MAX_SHARED_BYTES", 512)
+
+    backend = _DictCache()
+    store = SharedResultCache(backend)
+
+    serialized: list[int] = []
+    real_to_ipc = store_mod.table_to_ipc
+
+    def _spy(table: pa.Table) -> bytes:
+        serialized.append(table.num_rows)
+        return real_to_ipc(table)
+
+    monkeypatch.setattr(store_mod, "table_to_ipc", _spy)
+
+    oversized = pa.table({"v": pa.array(range(512), pa.int64())})  # 4096 bytes, over the cap
+    store.put("big", oversized)
+
+    assert backend.store == {}, "an oversized result reached the backend"
+    assert store.stats()["declined"] == 1
+    assert serialized == [], "the guard ran after serializing, which is the cost it exists to avoid"
+
+    # A result under the guard is unaffected, and *is* serialized — which is what makes
+    # the assertion above a statement about the guard rather than about the spy.
+    store.put("small", _table())
+    assert "small" in backend.store
+    assert serialized == [_table().num_rows]
+    assert store.stats()["declined"] == 1
+
+
+def test_the_hit_rate_counts_lookups_a_failing_store_never_answered():
+    # `hits / (hits + misses)` counts only the lookups that got an answer, so a store
+    # failing half its reads reported the hit rate of a perfectly healthy one — while
+    # every one of those reads cost a round trip and returned nothing.
+    class _Flaky(_DictCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def get(self, key: str) -> bytes | None:
+            self.reads += 1
+            if self.reads % 2 == 0:
+                raise SharedCacheError("timeout")
+            return self.store.get(key)
+
+    store = SharedResultCache(_Flaky())
+    store.put("k", _table())
+    for _ in range(20):
+        store.get("k")
+
+    stats = store.stats()
+    assert stats["hits"] == 10 and stats["errors"] == 10
+    assert stats["hit_rate"] == pytest.approx(0.5), (
+        f"a store answering half its lookups reports {stats['hit_rate']}"
+    )
+
+
+def test_the_shared_size_guard_stays_under_what_a_backend_accepts():
+    # Redis refuses a string value over 512 MiB outright, so a guard at or above that
+    # bound would let through exactly the writes it exists to stop -- they would fail at
+    # the backend instead, which is the contained-and-retried-forever path.
+    from batcher.carbonite.cache_shared.store import _MAX_SHARED_BYTES
+
+    assert 0 < _MAX_SHARED_BYTES < 512 << 20
