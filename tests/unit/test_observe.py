@@ -676,6 +676,72 @@ def test_system_snapshot_reports_real_host_facts():
     assert isinstance(hardware["caches"], dict)
 
 
+def test_the_system_panel_reports_the_process_budget_not_the_host():
+    """The hardware panel must describe the machine the engine is planning for.
+
+    Its core count always resolved cgroup quotas and affinity masks; the memory total and
+    the physical-core count did not, and read `psutil` (or `SC_PHYS_PAGES`), which report the
+    *host*. A panel pairing a cgroup-aware "2 cores" with a host "184 GiB" describes a machine
+    nobody is running on, and the memory total is exactly the figure a spill verdict has to be
+    read against.
+    """
+    from batcher._internal.hardware import machine_memory_bytes
+    from batcher._internal.hardware.topology import physical_core_count
+    from batcher.observe.system import system_snapshot
+
+    host = system_snapshot()["host"]
+    binding = machine_memory_bytes()
+    if binding:
+        assert host["memory_total_bytes"] == binding, (
+            "the panel reports the host's RAM where the engine's ceiling is the cgroup limit"
+        )
+    assert host["cpus_physical"] == physical_core_count()
+    # The pair has to stay coherent: a host-scoped "available" beside a cgroup-scoped
+    # "total" can report more free memory than the process is allowed to hold at all.
+    if host["memory_total_bytes"] and host["memory_available_bytes"]:
+        assert host["memory_available_bytes"] <= host["memory_total_bytes"]
+
+
+def test_the_snapshot_does_not_carry_two_answers_for_the_same_machine():
+    """The `host` and `hardware` blocks must not disagree about the same figure.
+
+    The snapshot publishes a `hardware` block from `HardwareProfile` beside a `host` block
+    assembled here, and they overlap on memory and on both core counts. They disagreed:
+    `hardware.memory_bytes` was the binding ceiling and `host.memory_total_bytes` was the
+    host's RAM, so one document reported two memory totals in adjacent sections, on the same
+    panel. That is worse than either number alone, because a reader cannot tell which one the
+    engine is actually planning against.
+    """
+    from batcher.observe.system import system_snapshot
+
+    snap = system_snapshot()
+    host, hardware = snap["host"], snap["hardware"]
+    if hardware.get("memory_bytes"):
+        assert host["memory_total_bytes"] == hardware["memory_bytes"]
+    assert host["cpus"] == hardware["logical_cpus"]
+    assert host["cpus_physical"] == hardware["physical_cores"]
+
+
+def test_the_system_panel_degrades_rather_than_raising_without_psutil(monkeypatch):
+    """No `psutil` means no live `available`, not a broken panel."""
+    import builtins
+
+    from batcher.observe import system
+
+    real_import = builtins.__import__
+
+    def no_psutil(name, *args, **kwargs):
+        if name == "psutil":
+            raise ImportError("psutil is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_psutil)
+    total, available = system._memory()
+    assert available is None
+    assert total is None or total > 0
+    assert system._physical_cpus() >= 1
+
+
 def test_ui_serves_pipelines_and_system(ui):
     url, store = ui
     _feed(store, events.QUERY_START, query_id="q1", fields={"label": "scan", "signature": "s1"})
