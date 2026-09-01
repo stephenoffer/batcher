@@ -285,6 +285,34 @@ pickle from 131,072 ticket objects to a list of integers. That is a change to `c
 worker protocol, shared with the recovery and replication paths that index replicas positionally,
 and it was not landed blind on a cluster too busy to measure it on.
 
+## What these numbers were measured against
+
+Every figure in this document was taken from a **working tree, not from `HEAD`**, and this
+repository is written by several agents at once. That is worth stating precisely, because it
+bounds what the numbers mean.
+
+The files the aggregate path reads — `adaptive_sizing/sizing.py`, `flight_aggregate.py`,
+`executors/ray_runtime/reduce.py` — were clean throughout, so the reduce and reducer-count
+results are measurements of committed code plus this pass's own changes. The files that decide
+**worker sizing and fleet lifetime** were not: `dist/executor.py` carried another session's
+rewrite of `_numa_sliced` and the fan-out constants for the whole pass, and `fleet/_fleet.py`
+carried 107 staged lines. So the *absolute* wall times here were produced under a fan-out policy
+that is not the one at `HEAD`, and they should be re-taken before anyone quotes them as
+Batcher's numbers. The *relative* comparisons are unaffected: every A/B in this document varied
+one thing inside a single process against everything else held fixed.
+
+One measurement had to be discarded outright. A join ladder on the 8.4 GB corpus produced
+`BroadcastOutputTooLarge: broadcast probe output reached 0.0 GiB on this node, over the 0.0 GiB
+bound` 56 times, which reads as two defects at once — a bound small enough that any output
+trips it, and a message that renders both sides as `0.0` and so says nothing. Neither is a
+defect in Batcher: `BroadcastOutputTooLarge` does not exist at `HEAD`. It is 242 uncommitted
+lines of another session's in-flight broadcast rewrite, and the join ladder was measuring that
+rewrite rather than the engine. The numbers were dropped and the observation is recorded here
+only as the reason they were.
+
+The general form is worth keeping: **on a shared tree, a surprising measurement is a reason to
+check `git status` on the files the path reads before it is a reason to open the code.**
+
 ## Ruled out
 
 Kept because the ratio of already-built to genuinely-missing is the most useful thing this
