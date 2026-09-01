@@ -30,6 +30,13 @@ def cache_stats() -> dict[str, int | float]:
     recompute rather than failing a query, so an unreachable store looks exactly like a
     cold one until that count moves.
 
+    When ``memory.file_cache_dir`` is set, ``file_*`` keys report the local-disk cache of
+    remote file bytes. That one answers a different question from the rest: it is the only
+    tier that saves *network* rather than compute, so ``file_coalesced`` (fetches that
+    waited on another thread instead of downloading their own copy) and ``file_declined``
+    (files too large for the whole budget, read remotely every time) are what say whether
+    the budget is sized for the working set.
+
     The counts are lifetime figures for the process and are deliberately **not** reset by
     `clear_cache`: they are how you judge whether the cache is worth its budget, and a
     figure that resets whenever the cache is emptied cannot answer that. Take a difference
@@ -37,8 +44,9 @@ def cache_stats() -> dict[str, int | float]:
 
     Returns:
         The hit, miss, eviction, demotion and promotion counts, the aggregate hit-rate,
-        the entry count, and the bytes held against each tier's budget. Every value is
-        zero on a process that has cached nothing.
+        the entry count, and the bytes held against each tier's budget, plus ``shared_*``
+        and ``file_*`` for whichever of those tiers is configured. Every value is zero on
+        a process that has cached nothing.
 
     Examples:
         .. doctest::
@@ -53,11 +61,20 @@ def cache_stats() -> dict[str, int | float]:
     """
     from batcher import carbonite
     from batcher.carbonite.cache_shared import current_shared_cache
+    from batcher.io.filesystem import get_file_cache
 
     stats = carbonite.result_cache().stats()
     shared = current_shared_cache()
     if shared is not None:
         stats.update({f"shared_{name}": value for name, value in shared.stats().items()})
+    # The file cache counts hits, coalesced fetches and declines, and nothing read them:
+    # the numbers existed but no caller could reach them, so the one tier whose value is
+    # measured in bytes off the network was the one with no way to tell whether it was
+    # working. It is prefixed like the shared store rather than merged, because `hits`
+    # here means a remote file was not re-fetched, not that a result was not recomputed.
+    files = get_file_cache()
+    if files is not None:
+        stats.update({f"file_{name}": value for name, value in files.stats().items()})
     return stats
 
 

@@ -316,6 +316,45 @@ print(stats["shared_hits"], stats["shared_misses"], stats["shared_errors"])
 `bt.clear_cache()` empties this process's tiers and leaves the shared store alone, because
 it belongs to every process reading it.
 
+## Caching remote file bytes
+
+The caches above hold query *results*. A separate one holds the remote *files* a query
+reads. Point `memory.file_cache_dir` at a local disk and the first read of an object-store
+file streams it there, so later reads of the same file come off local disk instead of
+crossing the network again. It is transparent and result-invariant, since a miss just
+re-fetches.
+
+Use `"auto"` on a cluster. The right directory is a per-node fact, so naming a literal path
+in a shared config names the wrong one everywhere but the machine it was written for. Each
+node resolves its own fast local volume, and a node with no fast local disk gets no cache
+rather than competing for the container overlay:
+
+```python
+# docs: skip
+from batcher.config import Config, MemoryConfig, config_context
+
+cached = Config().replace(memory=MemoryConfig(file_cache_dir="auto"))
+with config_context(cached):
+    totals = bt.read.parquet("s3://bucket/events/").group_by("region").agg(n=bt.count())
+    print(totals.collect().num_rows)
+```
+
+This tier is the only one that saves network rather than compute, so it is measured
+differently. `file_coalesced` counts fetches that waited on another thread rather than
+downloading their own copy of the same file, which is what a scan whose workers all open
+one dimension table saves. `file_declined` counts files larger than the whole budget: those
+are read remotely every time, so a non-zero count with a low hit rate means the budget is
+too small for a single file rather than too small for the working set.
+
+```python
+# docs: skip
+stats = bt.cache_stats()
+print(stats["file_hit_rate"], stats["file_coalesced"], stats["file_declined"])
+```
+
+Local paths are never cached, and `memory.file_cache_max_bytes` bounds what the directory
+holds.
+
 ## When to write instead
 
 If the result is needed by another process, or is expensive enough that you do not want

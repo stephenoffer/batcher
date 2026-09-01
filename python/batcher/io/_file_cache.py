@@ -51,6 +51,7 @@ class FileBytesCache:
         "_lock",
         "_max_bytes",
         "_misses",
+        "_stale",
         "_used",
     )
 
@@ -70,6 +71,11 @@ class FileBytesCache:
         # still happens, straight from the object store. A workload where this dominates
         # has a budget too small for its files, which reads as a zero hit-rate otherwise.
         self._declined = 0
+        # Hits whose file had been deleted underneath this ledger. Non-zero means something
+        # else is managing the same directory -- another worker on the node, or the node's
+        # scratch cleaner -- which is worth knowing, because each one is a re-fetch that the
+        # hit rate alone would report as a hit.
+        self._stale = 0
         # Fetches that waited on another thread's fetch of the same file instead of
         # issuing their own. This is the figure the cache saves *network* on, as distinct
         # from the hits it saves round trips on.
@@ -126,10 +132,23 @@ class FileBytesCache:
         local = os.path.join(self._dir, key)
         with self._lock:
             if key in self._entries:
-                self._entries.move_to_end(key)  # mark most-recently-used
-                self._hits += 1
-                return local
-            self._misses += 1
+                if not os.path.exists(local):
+                    # The bytes went without this process's ledger hearing about it. The
+                    # cache directory is a *node* volume, not a private one: `"auto"` puts
+                    # it on shared scratch, several workers on one node keep separate
+                    # ledgers over the same files, and the node's own cleaner may sweep it.
+                    # So one process evicting -- or anything at all deleting -- hands
+                    # another a hit for a file that is gone, and the caller opens a path
+                    # that does not exist. Self-heal into a miss; the read below re-fetches.
+                    self._stale += 1
+                    self._used -= self._entries.pop(key)
+                    self._misses += 1
+                else:
+                    self._entries.move_to_end(key)  # mark most-recently-used
+                    self._hits += 1
+                    return local
+            else:
+                self._misses += 1
             leader = self._inflight.get(key)
             mine = leader is None
             if mine:
@@ -233,6 +252,7 @@ class FileBytesCache:
                 "hit_rate": (self._hits / total) if total else 0.0,
                 "coalesced": self._coalesced,
                 "declined": self._declined,
+                "stale": self._stale,
                 "used_bytes": self._used,
             }
 

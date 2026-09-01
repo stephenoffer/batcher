@@ -278,3 +278,48 @@ def test_a_failed_leader_does_not_block_or_break_the_readers_waiting_on_it(tmp_p
     assert elapsed < 5.0, f"the next reader waited {elapsed:.1f}s on a claim nobody holds"
     with open(local, "rb") as fh:
         assert fh.read() == b"ok"
+
+
+def test_a_cached_file_deleted_underneath_the_ledger_is_re_fetched_not_handed_back(tmp_path):
+    # The cache directory is a node volume, not a private one. `file_cache_dir="auto"` puts
+    # it on shared scratch, several workers on one node keep separate ledgers over the same
+    # files, and the node's own cleaner may sweep it. So one process evicting handed another
+    # a hit for a file that was gone, and the caller opened a path that did not exist --
+    # `FileNotFoundError` out of the read, past the containment in `_cached_local`.
+    import os
+
+    one = FileBytesCache(str(tmp_path), max_bytes=1 << 20)
+    other = FileBytesCache(str(tmp_path), max_bytes=1 << 20)  # a second worker, same volume
+
+    first = one.get_or_fetch("s3://b/dim.parquet", _writer(b"payload"))
+    same = other.get_or_fetch("s3://b/dim.parquet", _writer(b"payload"))
+    assert first is not None and first == same, "the two ledgers must address the same file"
+
+    os.remove(same)  # the other worker evicts it, or the node's cleaner sweeps it
+
+    recovered = one.get_or_fetch("s3://b/dim.parquet", _writer(b"payload"))
+
+    assert recovered is not None
+    with open(recovered, "rb") as fh:
+        assert fh.read() == b"payload", "the ledger served a file it no longer had"
+    stats = one.stats()
+    assert stats["stale"] == 1
+    assert one.used_bytes == len(b"payload"), "the deleted entry's bytes were never given back"
+
+
+def test_the_file_cache_counters_are_reachable_from_cache_stats(tmp_path):
+    # `FileBytesCache.stats` counted hits, coalesced fetches and declines, and no caller
+    # anywhere read them -- so the one cache tier whose value is measured in bytes off the
+    # network was the only one with no way to tell whether it was doing anything.
+    import batcher as bt
+    from batcher.config import Config, MemoryConfig, config_context
+
+    assert not [k for k in bt.cache_stats() if k.startswith("file_")], (
+        "file_* keys appear with no file cache configured"
+    )
+
+    configured = Config().replace(memory=MemoryConfig(file_cache_dir=str(tmp_path)))
+    with config_context(configured):
+        keys = {k for k in bt.cache_stats() if k.startswith("file_")}
+
+    assert {"file_hits", "file_misses", "file_coalesced", "file_declined"} <= keys
