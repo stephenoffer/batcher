@@ -1251,6 +1251,37 @@ def test_health_is_ok_on_a_clean_session():
     assert report["uptime_s"] >= 0
 
 
+def test_the_estimate_check_does_not_vouch_for_estimates_nobody_made():
+    """A clean estimate verdict needs evidence, not merely an absence of bad news.
+
+    The check counted only the steps that *missed*, so with nothing to count it reported the
+    optimizer accurate -- on a process that had never profiled a run. Its two siblings say
+    "No runs yet" and "No run spilled", and the memory check omits itself entirely when it
+    cannot read the host, so this was the one place the panel vouched for a property nobody
+    had measured. That is the reading an operator cannot recover from: a warning invites a
+    look, and a clean bill does not.
+    """
+    from batcher.observe.analytics import health_report
+
+    def _estimates(details):
+        report = health_report([], details, {})
+        return {c["name"]: c for c in report["checks"]}["Plan estimates"]
+
+    # Nothing profiled at all, and a run whose steps carried no estimate: both are absence.
+    assert _estimates([])["detail"] == "No estimates recorded yet"
+    assert _estimates([{"dag": {"nodes": [{"kind": "scan"}]}}])["detail"] == (
+        "No estimates recorded yet"
+    )
+    # A step that did carry one, and was accurate, is what earns the clean verdict.
+    good = _estimates([{"dag": {"nodes": [{"est_error": 1.2}]}}])
+    assert good["detail"] == "Estimates were within 10x"
+    assert good["status"] == "ok"
+    # ... and a bad one still warns, so the absence case did not swallow the signal.
+    bad = _estimates([{"query_id": "q", "dag": {"nodes": [{"est_error": 50.0}]}}])
+    assert bad["status"] == "warn"
+    assert "missed their row estimate" in bad["detail"]
+
+
 def test_ui_serves_every_analytics_route(ui):
     url, store = ui
     _feed(store, events.QUERY_START, query_id="q1", fields={"label": "scan", "signature": "s1"})

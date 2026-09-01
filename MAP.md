@@ -1385,7 +1385,7 @@ NORMALIZE-phase whole-tree rewrites, grouped by family.
 | `fold.py` | 280 | Constant folding — evaluate constant sub-expressions at plan time. |
 | `predicates.py` | 232 | Boolean-predicate normalizations in the NORMALIZE phase. |
 | `ranges.py` | 364 | Predicate → sargable-range rewrites in the NORMALIZE phase. |
-| `simplify.py` | 195 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
+| `simplify.py` | 172 | Expression simplification — drop the algebraic identities a rewrite leaves behind. |
 
 ### `batcher/kyber/rules/nulls/` — 3 · subsystem
 
@@ -2197,7 +2197,7 @@ Cross-run analysis — percentiles, trends, rollups, comparisons, and a health v
 | module | lines | what it is |
 |---|---|---|
 | `comparison.py` | 95 | Run-against-run comparison — what changed between two executions. |
-| `health.py` | 118 | The engine's current verdict — a small set of checks over recent runs. |
+| `health.py` | 131 | The engine's current verdict — a small set of checks over recent runs. |
 | `pipeline.py` | 206 | The per-pipeline report — its runs, its steps, its plan graph, and its run grid. |
 | `rollups.py` | 102 | Grouping across runs — cost by operator kind, and failures by cause. |
 | `series.py` | 92 | Distributions and time series over many runs — percentiles and session throughput. |
@@ -2593,8 +2593,8 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | module | lines | what it is |
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
-| `collections.py` | 183 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 293 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `collections.py` | 167 | Output types for the container accessors: `list`, `struct` and `map`. |
+| `dispatch.py` | 267 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
 ### `batcher/metadata/` — 1 · contract
@@ -3048,7 +3048,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
-| `error.rs` | 114 | The crate's error type: every way scalar expression evaluation can fail. |
+| `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 762 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/branch/case.rs` | 64 | `CASE`: the first branch whose condition holds supplies the row's value. |
 | `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
@@ -3076,7 +3076,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/mod.rs` | 28 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
 | `eval/list_ops/multiset.rs` | 142 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
-| `eval/map.rs` | 267 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
+| `eval/map.rs` | 270 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/map_ops/make_map.rs` | 148 | Map construction for `Expr::MakeMap` — SQL `map(keys, values)`, Spark's `map_from_arrays` — pairing two `List` columns into one Arrow `Map` column. |
 | `eval/map_ops/mod.rs` | 9 | `Map`-column **construction**, as the counterpart to the read-side accessors in `eval/map.rs` (`map_keys`/`map_values`/`map_entries`/`element_at`). |
 | `eval/math.rs` | 551 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
@@ -3187,7 +3187,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 |---|---|---|
 | `client_pool.rs` | 344 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
 | `exchange.rs` | 563 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
-| `handler.rs` | 444 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
+| `handler.rs` | 447 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 408 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 410 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |

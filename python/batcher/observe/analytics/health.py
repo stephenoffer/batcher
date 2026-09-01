@@ -69,19 +69,32 @@ def health_report(
             )
         )
 
+    # Whether any step *carried* an estimate at all, kept separate from whether the ones that
+    # did were accurate. Without it this check reported "Estimates were within 10x" on a
+    # process that had never profiled a run -- a verdict on a property nobody measured, next to
+    # two sibling checks that say "No runs yet" and "No run spilled" and a memory check that
+    # omits itself entirely when it cannot read the host. Claiming the optimizer was found
+    # accurate when it was never examined is the one reading an operator cannot recover from.
+    estimated = [
+        n for d in details for n in (d.get("dag") or {}).get("nodes", []) if n.get("est_error")
+    ]
     misestimates = [
         d
         for d in details
         for n in (d.get("dag") or {}).get("nodes", [])
         if n.get("est_error") and (n["est_error"] > 10 or n["est_error"] < 0.1)
     ]
+    if misestimates:
+        estimate_detail = f"{len(misestimates)} step(s) missed their row estimate by 10x or more"
+    elif estimated:
+        estimate_detail = "Estimates were within 10x"
+    else:
+        estimate_detail = "No estimates recorded yet"
     checks.append(
         _check(
             "Plan estimates",
             "warn" if misestimates else "ok",
-            f"{len(misestimates)} step(s) missed their row estimate by 10x or more"
-            if misestimates
-            else "Estimates were within 10x",
+            estimate_detail,
             "Re-run: measured cardinalities are learned and reused." if misestimates else "",
             runs=list(dict.fromkeys(d.get("query_id", "") for d in misestimates))[:8],
         )
