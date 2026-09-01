@@ -13,7 +13,13 @@ import pytest
 
 from batcher._internal import events
 from batcher.api.stats import OpStat, RunStats
-from batcher.observe import metrics_snapshot, prometheus_text, reset_metrics, start_metrics
+from batcher.observe import (
+    metrics_snapshot,
+    prometheus_text,
+    reset_metrics,
+    start_metrics,
+    stop_metrics,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -164,15 +170,14 @@ def clean_metrics():
     The detach matters: a bus subscriber left attached tells the engine that per-query
     profiles are being consumed, which silently changes behavior for every later test.
     """
-    import batcher.observe.metrics as m
-
     start_metrics()
     reset_metrics()
     yield
-    if m._detach is not None:
-        m._detach()
-        m._detach = None
     reset_metrics()
+    # `stop_metrics()` rather than reaching for `metrics._detach` by hand: it also clears the
+    # module-level handle, which is the half a manual detach forgets and which `start_metrics`
+    # reads to decide whether it is already attached.
+    stop_metrics()
 
 
 def test_metrics_snapshot_shape(clean_metrics):
