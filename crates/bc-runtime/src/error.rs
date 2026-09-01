@@ -21,6 +21,17 @@ pub enum RuntimeError {
     )]
     ByteOffsetOverflow { dtype: String, bytes: usize },
 
+    /// Raised when an input's own offsets are already unusable, rather than when the
+    /// *result* would be. Reported separately from `ByteOffsetOverflow` because the byte
+    /// count is not recoverable once the offsets have wrapped: the array is already wrong
+    /// when it arrives, and saying how big it "is" would be a guess.
+    #[error(
+        "a {dtype} column arrived with 32-bit offsets that had already overflowed (its \
+         first offset is {first}, which cannot be a byte position); cast the column to \
+         large_string (or large_binary) so its offsets are 64-bit"
+    )]
+    MalformedByteOffsets { dtype: String, first: i64 },
+
     #[error("window function {func} is not supported for column type {dtype}")]
     UnsupportedWindow { func: String, dtype: String },
 

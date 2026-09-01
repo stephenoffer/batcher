@@ -132,8 +132,16 @@ fn byte_span_fits<T: ByteArrayType>(arrays: &[&dyn Array]) -> Result<(), Runtime
         let Some(s) = a.as_any().downcast_ref::<GenericByteArray<T>>() else {
             return Ok(()); // not the layout we model; let arrow decide
         };
-        let o = s.value_offsets();
-        total += o[s.len()].as_usize() - o[0].as_usize();
+        let Some((start, end)) = byte_span::<T>(s) else {
+            // `as_usize()` sign-extends, so casting back to `i64` recovers the signed offset
+            // that `to_usize()` rejected -- which is the number worth putting in the message,
+            // because it is the one that shows the wrap.
+            return Err(RuntimeError::MalformedByteOffsets {
+                dtype: arrays[0].data_type().to_string(),
+                first: s.value_offsets()[0].as_usize() as i64,
+            });
+        };
+        total += end - start;
     }
     if T::Offset::from_usize(total).is_none() {
         return Err(RuntimeError::ByteOffsetOverflow {
@@ -144,6 +152,30 @@ fn byte_span_fits<T: ByteArrayType>(arrays: &[&dyn Array]) -> Result<(), Runtime
     Ok(())
 }
 
+/// The byte window one input contributes, or `None` when its offsets cannot describe one.
+///
+/// Arrow byte offsets are **signed** and must ascend from a non-negative first element. An
+/// array that violates that has had its offsets wrap — a `Utf8` column built past 2 GiB
+/// somewhere upstream truncates each position to `i32`, and everything after the 2 GiB mark
+/// comes back negative. `as_usize()` sign-extends such a value into a number near `2^64`, and
+/// the subtractions below then wrap in the other direction, so the arithmetic reaches the
+/// copy as a plausible-looking slice range over a buffer that cannot hold it.
+///
+/// That is not a hypothetical. A distributed outer join panicked here with `range start index
+/// 18446744073520397944 out of range for slice of length 0` — an `i32` first offset of
+/// -189,153,672, which is 4,105,813,624 truncated. **A panic is the one outcome this module
+/// exists to prevent**: it happens inside a rayon worker, crosses the FFI as an unrecoverable
+/// `PanicException`, and takes the query engine down with it, which is exactly what
+/// `concat_columns` says about arrow's `.expect()` two functions up. Refusing sends the caller
+/// to `byte_span_fits`, which names the column and the fix.
+fn byte_span<T: ByteArrayType>(a: &GenericByteArray<T>) -> Option<(usize, usize)> {
+    let o = a.value_offsets();
+    let start = o[0].to_usize()?;
+    let end = o[a.len()].to_usize()?;
+    // Ascending is the other half of the contract: a descending pair yields a wrapped width.
+    (end >= start).then_some((start, end))
+}
+
 fn concat_bytes<T: ByteArrayType>(arrays: &[&dyn Array]) -> Option<GenericByteArray<T>> {
     let arrs: Vec<&GenericByteArray<T>> = arrays
         .iter()
@@ -151,14 +183,12 @@ fn concat_bytes<T: ByteArrayType>(arrays: &[&dyn Array]) -> Option<GenericByteAr
         .collect::<Option<_>>()?;
 
     // Each input contributes the byte window its own offsets describe — which is not the whole
-    // value buffer when the array is a slice of a larger one.
+    // value buffer when the array is a slice of a larger one. `byte_span` refuses an input
+    // whose offsets are already unusable rather than computing a garbage window from them.
     let spans: Vec<(usize, usize)> = arrs
         .iter()
-        .map(|a| {
-            let o = a.value_offsets();
-            (o[0].as_usize(), o[a.len()].as_usize())
-        })
-        .collect();
+        .map(|a| byte_span::<T>(a))
+        .collect::<Option<_>>()?;
     let total_rows: usize = arrs.iter().map(|a| a.len()).sum();
     let total_bytes: usize = spans.iter().map(|(s, e)| e - s).sum();
     // Refuse rather than wrap when the result would not fit this offset width.
@@ -711,6 +741,96 @@ fn take_bytes_parallel<T: ByteArrayType>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A `Utf8` column whose offsets have already wrapped must be **refused**, not indexed.
+    ///
+    /// This is the input a distributed outer join actually handed `concat_bytes`: a first
+    /// offset of -189,153,672, which is 4,105,813,624 truncated to `i32`. `as_usize()`
+    /// sign-extends that to 18,446,744,073,520,397,944, and the copy panicked with exactly
+    /// that number as a slice range. A panic here is unrecoverable — it is raised on a rayon
+    /// worker and crosses the FFI as a `PanicException` — so the whole point of this module's
+    /// bulk path is that it must not produce one.
+    ///
+    /// The array is built with `build_unchecked` on purpose: the corruption is what arrives
+    /// over the shuffle, so a test that could not express it would be testing nothing.
+    #[test]
+    fn a_column_whose_offsets_already_wrapped_is_refused_rather_than_indexed() {
+        use arrow::array::{ArrayData, ArrayRef, StringArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // Two rows whose offsets ascend from the wrapped position, as a truncated buffer's do.
+        let wrapped: i32 = -189_153_672;
+        let offsets: Vec<i32> = vec![wrapped, wrapped + 1, wrapped + 2];
+        // SAFETY-of-the-test: deliberately invalid, and never read through a safe accessor —
+        // the assertions below only require that nothing indexes the (empty) value buffer.
+        let data = unsafe {
+            ArrayData::builder(DataType::Utf8)
+                .len(2)
+                .add_buffer(Buffer::from_slice_ref(&offsets))
+                .add_buffer(Buffer::from(Vec::<u8>::new()))
+                .build_unchecked()
+        };
+        let bad: ArrayRef = Arc::new(arrow::array::StringArray::from(data));
+        let good: ArrayRef = Arc::new(StringArray::from(vec![Some("ok"), Some("fine")]));
+
+        // The bulk path declines instead of computing a window from unusable offsets.
+        assert!(
+            super::concat_bytes::<arrow::datatypes::Utf8Type>(&[bad.as_ref(), good.as_ref()])
+                .is_none(),
+            "the bulk concat accepted a column with wrapped offsets"
+        );
+        // And the guard in front of arrow names the column and the fix, rather than panicking
+        // or handing the array to arrow's aborting builder.
+        let err = super::concat_columns(&[bad.as_ref(), good.as_ref()])
+            .expect_err("a column with wrapped offsets must be an error, not a result");
+        let message = err.to_string();
+        assert!(
+            message.contains("already overflowed") && message.contains("large_string"),
+            "the error should name the cause and the fix, got: {message}"
+        );
+    }
+
+    /// The control: an ordinary pair still takes the bulk path and concatenates.
+    #[test]
+    fn a_well_formed_pair_still_takes_the_bulk_path() {
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let left: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("cc")]));
+        let right: ArrayRef = Arc::new(StringArray::from(vec![Some("ddd"), Some("")]));
+        assert!(
+            super::concat_bytes::<arrow::datatypes::Utf8Type>(&[left.as_ref(), right.as_ref()])
+                .is_some(),
+            "the bulk path stopped accepting a well-formed pair"
+        );
+        let out = super::concat_columns(&[left.as_ref(), right.as_ref()]).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let got: Vec<Option<&str>> = (0..out.len())
+            .map(|i| (!out.is_null(i)).then(|| out.value(i)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![Some("a"), None, Some("cc"), Some("ddd"), Some("")]
+        );
+    }
+
+    /// A *sliced* input is the shape `byte_span` must keep accepting: its first offset is
+    /// non-zero and legitimate, which is the case a naive "offsets start at 0" check breaks.
+    #[test]
+    fn a_sliced_input_still_contributes_only_its_own_window() {
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let whole = StringArray::from(vec![Some("aa"), Some("bb"), Some("cc"), Some("dd")]);
+        let tail = whole.slice(2, 2);
+        let other: ArrayRef = Arc::new(StringArray::from(vec![Some("zz")]));
+        let out = super::concat_columns(&[&tail as &dyn Array, other.as_ref()]).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let got: Vec<&str> = (0..out.len()).map(|i| out.value(i)).collect();
+        assert_eq!(got, vec!["cc", "dd", "zz"]);
+    }
 
     /// The one property `assembled` takes on trust: a gathered string column is still valid
     /// UTF-8. Multi-byte values are what make this a real assertion rather than a tautology —
