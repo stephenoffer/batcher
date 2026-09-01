@@ -107,13 +107,39 @@ And **the penalty for exceeding it grows with the fan-out**, 1.05x to 1.26x for 
 which is the `mappers x reducers` stream count showing up as a cost: 1,024 streams at 32
 workers against 4,096 at 64.
 
-**No formula is proposed here**, and that is deliberate. The measured optima are 4 reducers at
-200,000 groups, 20 at 1 M and 16 at 5 M — not monotone in the group count, because those
-corpora differ in input size too, so the partial-state volume each mapper produces differs.
-Three points across two datasets do not determine a heuristic, and fitting one would repeat the
-mistake the "Ruled out" section below exists to record. What the data does support is the
-structural claim: *one reducer per worker was the worst choice at every cardinality and every
-fan-out measured*, and the floor that produces it is indexed on the wrong quantity.
+Holding the corpus, the mapper count and the worker count all fixed, and moving only the
+cardinality (`k % m` over the same 512 M rows, 64 mappers, 64 workers), removes the confound
+the three earlier points had — they came from two corpora, so group count and input size moved
+together:
+
+| groups | r=2 | r=4 | **r=8** | r=16 | r=32 | r=64 | penalty at one-per-worker |
+|---|---|---|---|---|---|---|---|
+| 100 | 406 | 415 | **385** | 408 | 414 | 424 | 10% |
+| 10,000 | 622 | 665 | **595** | 630 | 624 | 684 | 15% |
+| 1,000,000 | 1,751 | 1,778 | **1,706** | 1,819 | 1,793 | 1,754 | 2.8% |
+| 5,000,000 | 3,402 | 3,117 | **2,941** | 2,984 | 3,143 | 3,480 | 18% |
+
+**Eight is the optimum at every cardinality**, across five orders of magnitude, and
+one-per-worker is the worst or near-worst point in all four rows. That the answer does *not*
+move with the group count is the surprise, and it is what makes the earlier "4 at 200k, 20 at
+1M, 16 at 5M" reading an artefact of comparing across corpora rather than a cardinality effect.
+
+There is a candidate mechanism, and it is recorded as a hypothesis rather than acted on. The
+combiner tree's first level is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, which here
+is `n_reducers x 8`; saturating 64 workers therefore needs only `64 / 8 = 8` reducers, and every
+reducer above that multiplies the `mappers x reducers` stream count without adding parallelism
+the fleet can use. That predicts the observed 8 exactly — but it was derived *after* seeing
+these numbers, from the same data, so it is not evidence for itself. Testing it means moving
+`shuffle_fan_in` or the source count and checking the optimum tracks `workers / ceil(sources /
+fan_in)`, which has not been done.
+
+**No formula is shipped here**, and that is deliberate. What the data supports is the
+structural claim — *one reducer per worker was the worst or near-worst choice at every
+cardinality and every fan-out measured*, and the floor producing it is indexed on the wrong
+quantity — plus a mechanism that predicts the right answer but has not been tested against a
+prediction it did not already fit. Changing the sizing on a post-hoc fit to one cluster's
+numbers is how a heuristic that looks derived becomes a regression on a fleet with a different
+fan-in or source count.
 
 ## Finding 1 — a warm fleet reserves the whole cluster, against every other process
 

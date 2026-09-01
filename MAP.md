@@ -2170,7 +2170,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 
 | module | lines | what it is |
 |---|---|---|
-| `collector.py` | 372 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
+| `collector.py` | 369 | The counter store behind ``observe.metrics`` — one process-wide event-bus subscriber. |
 | `control.py` | 253 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `fabric.py` | 49 | The node's wires as flat metric rows, for a dashboard that watches a fleet rather than a run. |
