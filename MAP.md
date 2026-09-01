@@ -391,9 +391,9 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 600 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1362 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1393 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 624 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 694 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 440 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 217 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -787,7 +787,7 @@ Tabular batch inference — XGBoost, LightGBM, CatBoost, scikit-learn, ONNX.
 | `features.py` | 269 | Arrow batch → dense feature matrix, and model output → Arrow columns. |
 | `mlflow_model.py` | 165 | Scoring a model out of an MLflow registry, by URI, without leaving the pipeline. |
 | `predictor.py` | 298 | `tabular_predictor` — the load-once class UDF that scores a tabular model. |
-| `registry.py` | 414 | The tabular-framework registry — detect, load, and score a model uniformly. |
+| `registry.py` | 457 | The tabular-framework registry — detect, load, and score a model uniformly. |
 
 ### `batcher/ml/timeseries/` — 6 · front-end
 
@@ -959,7 +959,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `lifecycle.py` | 698 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
-| `reduce.py` | 362 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
+| `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 197 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 779 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 758 | The metadata-driven scheduling envelope and placement-group machinery. |
@@ -2207,7 +2207,7 @@ The terminal face of the engine — a live progress bar plus structured status l
 | module | lines | what it is |
 |---|---|---|
 | `paint.py` | 168 | Drawing one status line: the bar, the indeterminate sweep, and the sparkline. |
-| `reporter.py` | 374 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
+| `reporter.py` | 381 | The bus sink that owns the terminal: a live progress line and permanent status lines. |
 | `state.py` | 182 | What the console knows about one in-flight query, and how it learns it from the bus. |
 
 ### `batcher/observe/counters/` — 2 · neutral sinks

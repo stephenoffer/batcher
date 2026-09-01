@@ -113,7 +113,18 @@ RATCHET: dict[str, int] = {
     # from set-arithmetic resolution and untriaged.
     # 6 -> 5: `import batcher.x.y as ax` + `ax._CONST` reaches the constant as directly as
     # `from batcher.x.y import _CONST`, and only the second is an `ImportFrom`.
-    "shadowed-production-set": 5,
+    #
+    # 5 -> 1: three were paid off by deriving the parametrization from the production set and
+    # *classifying* what it cannot cover, which is the shape the finding asks for and is worth
+    # stating because "parametrize over the whole set" is the wrong fix for all three:
+    # `FORMATS` splits into the formats that carry a string column and the two that have no
+    # representation for one (they drop it, with a warning, and that decline is now its own
+    # case); `MATH_FNS` splits into the thirty-one the device tier translates and the four it
+    # declines to the CPU engine; `_BUILD_ARTIFACT_EXCLUDES` needed neither -- a containment
+    # check over a list built from the tuple is a tautology -- so each pattern now names the
+    # build output it must match and is held against paths the upload must carry.
+    # The remaining 1 is `JOIN_TYPES`, whose file was another session's at the time.
+    "shadowed-production-set": 1,
     # A test comparing two engine runs on a figure describing *how* they ran -- CPU
     # utilization, thread count -- where nothing forced the difference it asserts. Budget 1,
     # and the one is a live failure rather than an accepted shape:
