@@ -581,6 +581,23 @@ network-bound than to launch-bound, and shaving driver round trips would not obv
 The explicit-`num_workers` thinning (Finding 1) is written and green but uncommitted, for the
 file-contention reason recorded above.
 
+## Debt this pass created
+
+`benchmarks/harness/interleave.py` — the round-robin timing helper written after the ordering
+artefact above — **shipped with no caller**, which is the "no empty frameworks, add the seam
+when the second use case arrives" rule in `python-quality.md` and `maintainability.md`. It is
+not a close call: every sibling in that package has between one and eight importers *and* is
+re-exported from `harness/__init__.py`; this one has zero and is not re-exported, so it is not
+reachable through the package's public surface at all.
+
+Its natural caller is `benchmarks/scenarios/scaling/ladder.py`, which walks a worker-count
+sequence in fixed rung order and reports best-of — best-of blunts within-rung noise and does
+nothing about drift across the whole sweep, which is exactly the bias the helper removes.
+`ladder.py` and `harness/__init__.py` were both held by another session for the whole pass, so
+neither the wiring nor the re-export could be made. Doing both is the follow-up; until then
+this is unused code carried on the strength of a lesson rather than a caller, and that is worth
+naming rather than leaving for someone else to find.
+
 ## Two fixes written, verified, and not committed
 
 Both were blocked the whole pass by another session's uncommitted work in the file they touch.
