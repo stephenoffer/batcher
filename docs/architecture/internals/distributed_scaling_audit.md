@@ -146,16 +146,24 @@ What survives, and what does not:
 - **The large-corpus ladder survives.** Its phases are measured *inside* each query, so drift
   moves the map and the reduce together — and there the map fell 6.9x while the reduce rose
   2.9x over the same runs, which no ordering artefact produces.
-- **The high-cardinality end is monotone too**, re-measured round-robin at 5 M groups: `r=8`
-  4,306 ms, `r=32` 4,948 ms, `r=64` 5,455 ms — 1.27x between the engine's choice and the
-  fewest reducers tested. (Absolute times run higher than the fixed-order sweeps because the
-  cluster was busier; only the within-run ordering is being read.) So the corrected picture at
-  *both* ends is the same one, and it is simpler than the retracted table's interior optimum:
-  **fewer reducers is monotonically better, as far down as was measured.** That the reduction
-  cannot continue indefinitely is what `ceil(groups / target_rows_per_task)` is already for —
-  each reducer's state has to fit — so the open question is no longer "where is the optimum"
-  but "does the worker floor buy anything at all at high cardinality", which is a question about
-  the floor rather than about a new heuristic.
+- **The high-cardinality end has a genuine interior optimum**, and reporting it as monotone
+  was a second error in this section — made by extrapolating from a round-robin run that
+  started at `r=8` and never looked below it. Round-robin at 5 M groups, the upper arm and the
+  lower arm (separate runs, so read each arm's ordering rather than across them):
+
+  | reducers | 1 | 2 | 4 | **8** | 32 | 64 |
+  |---|---|---|---|---|---|---|
+  | median | 3,979 | 3,586 | 3,231 | **3,040** | 4,948* | 5,455* |
+
+  (*upper arm, taken while the cluster was busier; `r=8` read 4,306 ms in that run.) The curve
+  falls to 8 and rises on both sides, so the shape is U-shaped here and monotone-increasing at
+  100 groups where the minimum is `r=1`. That is a coherent picture rather than a puzzling one:
+  with almost no partial state there is nothing to parallelise and one reducer wins, and with a
+  lot of it the merge is worth spreading until the `mappers x reducers` stream count starts
+  charging more than the parallelism returns.
+
+  The engine picks 64 here, which is the worst end of the measured range — 1.27x off `r=8`
+  within the run where both were measured. That win is real and unclaimed.
 - **The falsified fan-in mechanism stays falsified**, now for a second reason: it was fitted to
   a table that turns out to be an artefact.
 
