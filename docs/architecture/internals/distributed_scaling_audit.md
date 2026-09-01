@@ -167,46 +167,53 @@ What survives, and what does not:
 - **The falsified fan-in mechanism stays falsified**, now for a second reason: it was fitted to
   a table that turns out to be an artefact.
 
-### A rule that survived an out-of-sample prediction
+### The rule that survived a prediction and then died — retracted
 
-Two interleaved optima — `r=1` at 100 groups and `r=8` at 5 M — are both fitted by bounding a
-reducer's share of the partial state at about **625,000 groups**, i.e. `ceil(groups / 625_000)`.
-That is not a new shape: it is exactly the `ceil(rows / target_rows_per_task)` rule
-`aggregate_reducer_count` already applies, with a target ~6.4x smaller than the configured 4 M.
+Two interleaved optima, `r=1` at 100 groups and `r=8` at 5 M, are both fitted by bounding a
+reducer's share of the partial state at about **625,000 groups** — the
+`ceil(rows / target_rows_per_task)` shape `aggregate_reducer_count` already uses, with a target
+~6.4x smaller than the configured 4 M. Used to predict a third cardinality it had not seen, it
+held: at 1 M groups it requires 2, and round-robin measurement put the optimum at 1-2
+(`r=1` 1,752 ms, `r=2` 1,763 ms, `r=4` 1,793 ms, `r=16` 1,919 ms). It also survived two
+invariance checks — the optimum stayed at 8 across `shuffle_fan_in` 8 and 16, and across 16 and
+64 workers (`r=2` 3,583 ms, `r=8` 3,258 ms, `r=16` 3,300 ms at 16 workers), which ruled out its
+being a per-node or per-core quantity in disguise.
 
-Fitting two points proves nothing, so the rule was used to predict a third it had not seen. At
-1 M groups it requires 2 reducers. Round-robin, five caps, three rounds each:
+**It is still wrong, and one more measurement showed why.** Every run above was on the 64-file
+corpus, where `partition_descriptors` caps the map at 64 sources whatever the worker count — so
+`sources` was 64 in all of them and could not be attributed. Setting
+`distributed.map_partition_multiplier = 1` at 16 workers gives 16 sources instead, holding data,
+cardinality and fan-out fixed:
 
-| reducers | 1 | 2 | 4 | 8 | 16 |
-|---|---|---|---|---|---|
-| median | **1,752 ms** | **1,763 ms** | 1,793 ms | 1,792 ms | 1,919 ms |
+| reducers | 2 | 8 | **16** |
+|---|---|---|---|
+| median | 3,015 ms | 2,904 ms | **2,727 ms** |
 
-`r=1` and `r=2` are 0.6% apart with overlapping ranges, so the optimum is 1-2 against a
-predicted 2, and `r=16` is 9% worse. **The prediction holds.**
+The optimum moves from 8 to 16. Quartering the sources doubles it, which is `r*` proportional to
+`1 / sqrt(sources)` — the shape a cost of `merge_work / r + stream_cost x sources x r` has, and
+the shape suggested by the `mappers x reducers` stream count all along. **625,000 was never a
+groups-per-reducer figure.** It was a groups-per-reducer figure *at 64 sources*, and it would be
+wrong on any corpus that splits differently — which is most of them.
 
-So the shippable change is a single constant: `_MIN_GROUPS_PER_REDUCER`, 50,000 to 625,000.
-It gives 1 reducer at 100 groups, 1 at 1 M and 8 at 5 M — the three measured optima — and it
-leaves the case the floor was built for untouched (5 M groups on 8 workers still wants
-`min(8, 8) = 8`). At 5 M groups on 64 workers it replaces the engine's current 64, which is the
-worst end of the measured range, with the best: 1.27x within the run where both were measured.
+What this costs and what it buys:
 
-**It is still not shipped, and the reason is narrower than before.** Every point behind it
-comes from one fleet shape — 4 nodes, 64 workers, 64 map partitions. `625_000` is a
-groups-per-reducer figure, and nothing here shows it is not really a groups-per-*node* or
-groups-per-*core* figure wearing a constant's clothes; a 16-node cluster would tell those apart
-in one afternoon and this one cannot tell them apart at all. Given that the previous two
-confident readings in this section were both wrong — an ordering artefact, then an
-extrapolation below the measured range — the bar for changing sizing on this cluster's numbers
-alone is not met. What it does mean is that this is now **one measurement on differently-shaped
-hardware away from being actionable**, which is a different state from the rest of this
-document's open items.
+- **The shippable one-constant change is withdrawn.** `_MIN_GROUPS_PER_REDUCER = 625_000` fits
+  four measurements and is confounded with a fifth variable that was never moved. Shipping it
+  would have put a corpus-shape artefact into the sizing of every aggregate.
+- **The same caveat attaches to the 50,000 already shipped** in Finding 2. Its measured wins
+  stand — it only ever *lowers* a floor shown to be too high, and every case measured got faster
+  or stayed level — but the number itself carries the same confound and should not be read as
+  derived.
+- **The direction is now well established across every design tried**: one reducer per worker
+  was worse than a data-derived count in every cardinality, fan-in, worker count and source
+  count measured. What is not established is the count, and the missing term is `sources`, which
+  neither `aggregate_reducer_count` nor `target_rows_per_task` currently references at all.
 
-**No formula is shipped here**, and after the retraction above the reason is stronger than it
-was. The one measurement in this section taken with an interleaved design says fewer reducers
-is monotonically better at low cardinality, which is what the shipped `_busy_floor` already
-does. Everything past that — where the optimum sits once the groups are numerous enough to
-matter — rests on fixed-order sweeps that have now been shown to manufacture optima, so it is
-not a basis for sizing anything.
+**No formula is shipped here.** Two were proposed in this section and both are now retracted —
+the first by an ordering artefact, the second by a confound with the source count that four
+prior measurements and one successful out-of-sample prediction all failed to expose. The
+surviving statement is a direction, not a number, and the next person to work on this should
+start by putting `sources` into the model rather than by re-fitting a constant.
 
 ## Finding 1 — a warm fleet reserves the whole cluster, against every other process
 
