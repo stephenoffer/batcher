@@ -39,11 +39,19 @@ __all__ = ["SharedResultCache"]
 #: query that was *already* the expensive one, and neither is visible: the write fails
 #: inside `SharedCacheError` containment, is counted, and is retried identically next time.
 #:
-#: 256 MiB. Two things bound it from above and they agree closely: Redis refuses a string
-#: value over 512 MiB outright, so anything past that is guaranteed waste; and the entry
-#: has to be worth a round trip at *both* ends, since every reader pays the fetch and the
-#: decode before it can use a row. Below the cap the trade is clearly right — a cached
-#: result skips a whole query — and the cap only has to keep the clearly-wrong case out.
+#: 256 MiB, measured on the table rather than on the bytes that would be written. Those
+#: differ: `table_to_ipc` compresses with LZ4, so the wire size is some fraction of this,
+#: and the guard is therefore conservative against Redis's own 512 MiB refusal by whatever
+#: the ratio turns out to be. That is the right side to be wrong on, and deliberately so.
+#: The check has to happen *before* serializing to spare the copy and the compression pass,
+#: which is most of what it exists to avoid, and the compressed size is not knowable until
+#: that work is already done. Declining a compressible 400 MiB result costs one recompute;
+#: measuring it properly would cost the compression of every result the guard rejects.
+#:
+#: The value is where it is because an entry has to be worth a round trip at *both* ends —
+#: every reader pays the fetch and the decode before it can use a row. Below the cap the
+#: trade is clearly right, since a cached result skips a whole query, and the cap only has
+#: to keep the clearly-wrong case out.
 _MAX_SHARED_BYTES = 256 << 20
 
 

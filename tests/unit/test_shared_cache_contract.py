@@ -285,7 +285,9 @@ def test_the_hit_rate_counts_lookups_a_failing_store_never_answered():
 def test_the_shared_size_guard_stays_under_what_a_backend_accepts():
     # Redis refuses a string value over 512 MiB outright, so a guard at or above that
     # bound would let through exactly the writes it exists to stop -- they would fail at
-    # the backend instead, which is the contained-and-retried-forever path.
+    # the backend instead, which is the contained-and-retried-forever path. The guard is
+    # measured on the uncompressed table and the write is LZ4-compressed, so this is the
+    # conservative direction; what must hold is only that it cannot exceed the limit.
     from batcher.carbonite.cache_shared.store import _MAX_SHARED_BYTES
 
     assert 0 < _MAX_SHARED_BYTES < 512 << 20
