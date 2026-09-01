@@ -63,8 +63,22 @@ _LIST_FLOAT_REDUCE = frozenset(
         "max_abs",
     }
 )
-# Reductions that preserve the (numeric) element type: `sum` alongside `min`/`max`.
-_LIST_ELEMENT_REDUCE = frozenset({"sum", "min", "max"})
+# Reductions that preserve the element type, whatever it is. An ordering comparison is
+# defined for every element type the engine carries, so `min`/`max` over a String list is a
+# String and over a Date list a Date (verified against the engine for int, float, string,
+# bool, date32 and timestamp elements).
+_LIST_ORDER_REDUCE = frozenset({"min", "max"})
+
+# `sum` preserves the element type only while that type is *numeric*. It reads as `min`'s
+# and `max`'s sibling and is not one: there is no such thing as adding two strings here, so
+# the engine coerces the elements and returns Double. Classifying it with them declared
+# `string` for a `List<String>` sum that the engine returns as `double` -- worse than an
+# uncertain answer, because a confident wrong one is what a caller plans against. It also
+# made the *same query* return two different types: `Project.available_schema` types an
+# empty result, so a filter that matched nothing produced `v: string` where a filter that
+# matched produced `v: double`. Measured: String, Boolean, Timestamp and Null elements all
+# sum to Double; Date raises; Int64 and Float64 are preserved.
+_LIST_NUMERIC_SUM = frozenset({"sum"})
 
 
 def list_operand(expr: object) -> Expr:
@@ -95,10 +109,15 @@ def listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None
     if fn in _LIST_FLOAT_REDUCE:
         return pa.float64()  # always double, whatever the element width
-    if fn in _LIST_ELEMENT_REDUCE:
-        # `sum`/`min`/`max` preserve the element type (already widened at the scan leaf):
-        # summing/minning an Int list yields Int64, a Float list yields Float64.
+    if fn in _LIST_ORDER_REDUCE:
+        # `min`/`max` preserve the element type (already widened at the scan leaf).
         return list_element_type(input_t)
+    if fn in _LIST_NUMERIC_SUM:
+        element = list_element_type(input_t)
+        if element is None:
+            return None
+        numeric = pa.types.is_integer(element) or pa.types.is_floating(element)
+        return element if numeric else pa.float64()
     if fn in ("normalize", "log_softmax"):
         # Rescale each element (unit L2 norm, or the log-domain distribution) -> List<Float64>.
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None

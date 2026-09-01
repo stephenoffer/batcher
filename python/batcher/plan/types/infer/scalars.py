@@ -16,7 +16,22 @@ __all__ = ["datefunc_type", "strfunc_type"]
 
 # `str` accessor functions whose output type is certain.
 _STR_BOOL = frozenset(
-    {"contains", "starts_with", "ends_with", "like", "ilike", "regexp_matches", "json_extract_bool"}
+    {
+        "contains",
+        "starts_with",
+        "ends_with",
+        "like",
+        "ilike",
+        "regexp_matches",
+        "json_extract_bool",
+        # The two `.json` predicates. Both answer yes/no about a document -- whether a key
+        # or value is present, and whether a path resolves -- and both were absent, which
+        # is the same miss `json_array_length` had below: a `.json` accessor reads as its
+        # own family rather than as a string function, so the string tables get updated
+        # without it.
+        "json_contains",
+        "json_exists",
+    }
 )
 _STR_INT = frozenset(
     {
@@ -24,6 +39,9 @@ _STR_INT = frozenset(
         "position",
         "regexp_count",
         "levenshtein",
+        # An edit *distance* is a count of edits. `damerau_levenshtein` is `levenshtein`
+        # plus the transposition edit and was declaring nothing two lines from its twin.
+        "damerau_levenshtein",
         "ascii",
         "bit_length",
         "octet_length",
@@ -38,7 +56,11 @@ _STR_INT = frozenset(
         "json_array_length",
     }
 )
-_STR_FLOAT = frozenset({"json_extract_float", "jaccard_similarity"})
+#: The similarity measures return a score in [0, 1]; `jaro_winkler_similarity` is `jaro`
+#: with a common-prefix bonus, so the two share a type as they share a definition.
+_STR_FLOAT = frozenset(
+    {"json_extract_float", "jaccard_similarity", "jaro_similarity", "jaro_winkler_similarity"}
+)
 
 _STR_STR = frozenset(
     {
@@ -76,6 +98,11 @@ _STR_STR = frozenset(
         "overlay",
         "split_part",
         "json_extract_string",
+        # The two general `.json` extracts. Both render whatever the path resolves to as
+        # *text* -- a number comes back as `'1'` and a string keeps its quotes, matching
+        # DuckDB on both -- so the result is String whatever the document holds.
+        "json_extract",
+        "json_value",
         "reverse",
         "translate",
         "unhex",
@@ -92,6 +119,11 @@ _STR_STR = frozenset(
         # the result is String regardless of the operand. They were absent, which left
         # `Dataset.schema` reporting `null` for a provably-String column.
         "chr",
+        # `bin` spells an integer in base 2 and sits one line from `to_base`, which spells
+        # it in an arbitrary radix and was already here. Same family, same result type.
+        "bin",
+        # `to_case` re-cases an identifier (`snake`, `camel`, ...): text in, text out.
+        "to_case",
         "format_bytes",
         "format_bytes_si",
         "json_pretty",
@@ -100,6 +132,12 @@ _STR_STR = frozenset(
         "to_base",
     }
 )
+
+#: The two `str` functions that return **bytes** rather than text. Compressing a value
+#: produces a frame, and decompressing one produces the original bytes; neither is a string,
+#: and both were the only members of the family with no table at all, so a compressed column
+#: reported `null` for itself and for every column beside it.
+_STR_BINARY = frozenset({"compress", "decompress"})
 
 # `str` accessor functions that split one document into many pieces -> List<String>.
 _STR_STR_LIST = frozenset(
@@ -136,6 +174,8 @@ def strfunc_type(fn: str) -> pa.DataType | None:
         return pa.list_(pa.int64())  # the signature: one value per permutation
     if fn in _STR_STR_LIST:
         return pa.list_(pa.string())
+    if fn in _STR_BINARY:
+        return pa.binary()
     if fn in _STR_BOOL:
         return pa.bool_()
     if fn in _STR_INT:

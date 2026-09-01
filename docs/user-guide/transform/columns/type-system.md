@@ -406,6 +406,30 @@ Because these are plan-derived, they are also the fastest way to catch a schema 
 a bad `select` or a missing `output_columns` on a UDF fails here, before a single row is
 read.
 
+### The declared schema is what an empty result is made of
+
+The declared types are not only for inspection. A query that matches no rows has no data to
+take its types from, so the engine builds the empty result out of this same schema. A filter
+matching nothing still returns properly typed columns rather than null ones.
+
+The schema is all or nothing, so one column the control plane cannot type costs the whole
+projection its types and every column reports `null`. If `schema` says `null` for a column
+you know is typed, the cause is usually a different expression in the same `select`. A
+column carrying no type of its own, such as an all-null column read from JSON, adopts the
+type of whatever you combine it with; alone, a numeric function reads it as a double.
+
+```python
+src = bt.from_arrow(
+    pa.table({"v": pa.array([1.5, 2.5], pa.float64()), "u": pa.array([None, None], pa.null())})
+)
+nothing = src.filter(bt.col("v") > 100).select(total=bt.col("v").abs())
+print(nothing.schema, nothing.collect().schema, sep=" | ")
+# total: double | total: double
+print(src.select(adopts=bt.col("u") + bt.col("v"), alone=bt.col("u").abs()).schema)
+# adopts: double
+# alone: double
+```
+
 ## Nested types
 
 Lists, structs, and maps pass through the boundary unchanged, and each has an accessor
