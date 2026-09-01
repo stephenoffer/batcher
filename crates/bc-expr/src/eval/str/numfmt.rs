@@ -56,7 +56,7 @@ pub(super) fn eval_numeric_input(
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| ExprError::ExpectedString {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
+                got: crate::error::type_name(arr.data_type()),
             })?;
 
     let radix = match func {

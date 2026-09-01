@@ -44,7 +44,7 @@ pub(crate) fn eval_map(
         .ok_or_else(|| ExprError::ExpectedType {
             func: format!("{func:?}"),
             want: "a Map or Struct argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     match func {
         MapFunc::MapKeys => Ok(list_of(
@@ -96,7 +96,7 @@ fn struct_field(
         MapFunc::MapValues => Err(ExprError::ExpectedType {
             func: "map_values".into(),
             want: "a Map argument (a struct's values need not share one type)",
-            got: fields.data_type().to_string(),
+            got: crate::error::type_name(fields.data_type()),
         }),
         // Same reason `map_values` refuses: the entries of a `Struct<a: Int, b: Utf8>`
         // would need `Struct<key: Utf8, value: ???>`, and there is no honest `value`
@@ -105,7 +105,7 @@ fn struct_field(
         MapFunc::MapEntries => Err(ExprError::ExpectedType {
             func: "map_entries".into(),
             want: "a Map argument (a struct's values need not share one type)",
-            got: fields.data_type().to_string(),
+            got: crate::error::type_name(fields.data_type()),
         }),
         MapFunc::ElementAt => {
             let name = match key {
@@ -129,7 +129,10 @@ fn struct_field(
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "element_at".into(),
                     want: "a field this struct has",
-                    got: format!("no field {name:?} in {}", fields.data_type()),
+                    got: format!(
+                        "no field {name:?} in {}",
+                        crate::error::type_name(fields.data_type())
+                    ),
                 })?;
             Ok(merge_parent_nulls(child, fields.nulls()))
         }
@@ -245,7 +248,7 @@ pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, 
         return Err(ExprError::ExpectedType {
             func: "struct.field".into(),
             want: "a Struct argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         });
     }
     let s = arr.as_struct();

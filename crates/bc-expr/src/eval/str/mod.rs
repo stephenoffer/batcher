@@ -143,7 +143,7 @@ pub(crate) fn eval_str(
             .downcast_ref::<StringArray>()
             .ok_or_else(|| ExprError::ExpectedString {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
+                got: crate::error::type_name(arr.data_type()),
             })?;
 
     let out: ArrayRef = match func {

@@ -224,6 +224,6 @@ pub(crate) fn as_bool<'a>(arr: &'a ArrayRef, op: &str) -> Result<&'a BooleanArra
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| ExprError::ExpectedBoolean {
             op: op.to_string(),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })
 }

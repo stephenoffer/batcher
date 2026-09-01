@@ -151,7 +151,7 @@ fn to_f64(col: &ArrayRef, func: SpatialFunc) -> Result<ArrayRef, ExprError> {
         return Err(ExprError::ExpectedType {
             func: fn_name(func),
             want: "a numeric argument",
-            got: col.data_type().to_string(),
+            got: crate::error::type_name(col.data_type()),
         });
     }
     cast(col, &DataType::Float64).map_err(|e| ExprError::InvalidArgument {

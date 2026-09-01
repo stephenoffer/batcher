@@ -84,7 +84,7 @@ impl<'a> Clips<'a> {
             other => {
                 return Err(ExprError::ExpectedBinary {
                     func: format!("video.{func:?}"),
-                    got: other.to_string(),
+                    got: crate::error::type_name(other),
                 })
             }
         };

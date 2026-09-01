@@ -112,3 +112,135 @@ pub enum ExprError {
     #[error(transparent)]
     Arrow(#[from] ArrowError),
 }
+
+/// A nested Arrow type rendered so a person can read it, for the `got`/`want` fields above.
+///
+/// `DataType`'s `Display` is its `Debug`, which for a leaf is what you want (`Int64`, `Utf8`)
+/// and for anything nested is a struct literal. So every type-mismatch message on a list,
+/// struct, map or dictionary column arrived like this:
+///
+/// ```text
+/// string function RegexpCount expected a Utf8 argument, got List(Field { name: "item",
+/// data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })
+/// ```
+///
+/// Six of those seven fields are noise, the reader has to find `Int64` inside them, and the
+/// one thing they came for -- "it is a list of integers" -- is the hardest part to see. It is
+/// the commonest error on the whole expression surface: applying a string, sequence or
+/// temporal function to a column that is not one.
+///
+/// Leaves keep Arrow's own spelling rather than pyarrow's, because the sentence around them
+/// already uses it ("expected a Utf8 argument"): rendering the argument as `list<item: int64>`
+/// beside a `Utf8` in the same line would leave the reader with two vocabularies and no
+/// statement of which is which. Only the nesting changes.
+pub fn type_name(dtype: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::DataType;
+
+    match dtype {
+        DataType::List(f) | DataType::LargeList(f) | DataType::ListView(f) => {
+            format!("List<{}>", type_name(f.data_type()))
+        }
+        DataType::LargeListView(f) => format!("List<{}>", type_name(f.data_type())),
+        DataType::FixedSizeList(f, width) => {
+            format!("FixedSizeList<{}, {width}>", type_name(f.data_type()))
+        }
+        DataType::Struct(fields) => format!("Struct<{}>", named_fields(fields)),
+        // A map's single child is a struct of (key, value); naming that struct would report
+        // the layout rather than the type the caller wrote.
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(kv) if kv.len() == 2 => format!(
+                "Map<{}, {}>",
+                type_name(kv[0].data_type()),
+                type_name(kv[1].data_type())
+            ),
+            other => format!("Map<{}>", type_name(other)),
+        },
+        DataType::Dictionary(key, value) => {
+            format!("Dictionary<{}, {}>", type_name(key), type_name(value))
+        }
+        // Every leaf, and the handful of nested types with no shorter honest rendering.
+        other => other.to_string(),
+    }
+}
+
+/// ``name: Type`` for each field, comma-separated — the body of a `Struct<...>`.
+fn named_fields(fields: &arrow::datatypes::Fields) -> String {
+    fields
+        .iter()
+        .map(|f| format!("{}: {}", f.name(), type_name(f.data_type())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::type_name;
+    use arrow::datatypes::{DataType, Field, Fields};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_leaf_keeps_arrows_own_spelling() {
+        assert_eq!(type_name(&DataType::Utf8), "Utf8");
+        assert_eq!(type_name(&DataType::Int64), "Int64");
+    }
+
+    #[test]
+    fn a_list_names_its_item_type_and_nothing_else() {
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        assert_eq!(type_name(&list), "List<Int64>");
+    }
+
+    #[test]
+    fn nesting_recurses() {
+        let inner = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let outer = DataType::List(Arc::new(Field::new("item", inner, true)));
+        assert_eq!(type_name(&outer), "List<List<Utf8>>");
+    }
+
+    #[test]
+    fn a_struct_names_its_fields() {
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            type_name(&DataType::Struct(fields)),
+            "Struct<a: Int64, b: Utf8>"
+        );
+    }
+
+    #[test]
+    fn a_map_names_its_key_and_value_not_its_entry_struct() {
+        let kv = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]);
+        let map = DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(kv), false)),
+            false,
+        );
+        assert_eq!(type_name(&map), "Map<Utf8, Int64>");
+    }
+
+    #[test]
+    fn a_fixed_size_list_keeps_its_width() {
+        let f = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 384);
+        assert_eq!(type_name(&f), "FixedSizeList<Float64, 384>");
+    }
+
+    #[test]
+    fn a_dictionary_names_both_halves() {
+        let d = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert_eq!(type_name(&d), "Dictionary<Int32, Utf8>");
+    }
+
+    #[test]
+    fn the_rendering_carries_no_arrow_field_debris() {
+        // The property the whole function exists for, stated once against the shape that
+        // produced the original message.
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let rendered = type_name(&list);
+        assert!(!rendered.contains("Field {"), "{rendered}");
+        assert!(!rendered.contains("metadata"), "{rendered}");
+    }
+}

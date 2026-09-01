@@ -80,7 +80,7 @@ pub(crate) fn eval_image(
             // Namespaced, because `Decode` alone is a name three namespaces share and the
             // error otherwise reported an image failure without saying it was one.
             func: format!("image.{func:?}"),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -158,7 +158,7 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         .downcast_ref::<GenericBinaryArray<O>>()
         .ok_or_else(|| ExprError::ExpectedBinary {
             func: format!("{func:?}"),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     // Every bytes-out op writes the same container, resolved once for the batch so an
     // unknown format name is one plan error rather than n identical per-row failures.
@@ -698,7 +698,7 @@ pub(crate) fn eval_image_crop(arr: &ArrayRef, bounds: &Bounds<'_>) -> Result<Arr
         ),
         other => Err(ExprError::ExpectedBinary {
             func: "image.crop".to_string(),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }

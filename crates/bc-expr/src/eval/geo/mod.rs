@@ -130,7 +130,7 @@ pub(crate) fn geom_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<
             return Err(ExprError::ExpectedType {
                 func: fn_name(func),
                 want: "a geometry column (Binary WKB, or Utf8 WKT/GeoJSON/hex)",
-                got: other.to_string(),
+                got: crate::error::type_name(other),
             })
         }
     };
@@ -163,7 +163,7 @@ pub(crate) fn f64_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<f
         other => Err(ExprError::ExpectedType {
             func: fn_name(func),
             want: "a numeric argument",
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -201,7 +201,7 @@ pub(crate) fn i64_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<i
         other => Err(ExprError::ExpectedType {
             func: fn_name(func),
             want: "an integer argument",
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -227,7 +227,7 @@ pub(crate) fn str_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<&
         other => Err(ExprError::ExpectedType {
             func: fn_name(func),
             want: "a text argument",
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }

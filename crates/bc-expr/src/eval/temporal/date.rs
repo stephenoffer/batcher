@@ -117,7 +117,7 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "isodow".into(),
                     want: "an Int32 day-of-week kernel result",
-                    got: part.data_type().to_string(),
+                    got: crate::error::type_name(part.data_type()),
                 })?;
         let out: Int64Array = (0..dow.len())
             .map(|i| (!dow.is_null(i)).then(|| i64::from(dow.value(i)) + 1))
@@ -142,7 +142,7 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "century/decade/millennium".into(),
                     want: "an Int32 year kernel result",
-                    got: years.data_type().to_string(),
+                    got: crate::error::type_name(years.data_type()),
                 })?;
         let out: Int64Array = (0..y.len())
             .map(|i| {

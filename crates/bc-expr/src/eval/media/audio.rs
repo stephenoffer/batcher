@@ -89,7 +89,7 @@ pub(crate) fn eval_audio(
             // Namespaced, because `Decode` alone is a name three namespaces share and the
             // error otherwise reported an audio failure as an image one.
             func: format!("audio.{func:?}"),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -204,7 +204,7 @@ fn eval_audio_sized<O: OffsetSizeTrait>(
         .downcast_ref::<GenericBinaryArray<O>>()
         .ok_or_else(|| ExprError::ExpectedBinary {
             func: format!("{func:?}"),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     // The rate-independent ops fall through to `eval_waveform`, which is the *same*
     // implementation the waveform path uses — so a level measure cannot mean one thing on

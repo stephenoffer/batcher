@@ -72,7 +72,7 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
         other => Err(ExprError::ExpectedType {
             func: func.to_string(),
             want: "a List argument",
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }

@@ -24,7 +24,7 @@ pub(crate) fn eval_flatten(
         return Err(ExprError::ExpectedType {
             func: "list.flatten".into(),
             want: "a list of lists",
-            got: format!("List<{}>", inner.data_type()),
+            got: format!("List<{}>", crate::error::type_name(inner.data_type())),
         });
     };
     let item_field = Arc::new(Field::new("item", item_field.data_type().clone(), true));
