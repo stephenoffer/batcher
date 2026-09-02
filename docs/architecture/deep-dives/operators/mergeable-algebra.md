@@ -92,8 +92,14 @@ its bounds costs nothing.
 The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
 of memory linear in the group's values**. That is a real trade. When you can't afford it,
 `approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
-(`crates/bc-sketches/`), which merges in constant space with a fixed seed so partition-built
-sketches merge identically.
+(`crates/bc-sketches/`), which merges in constant space with a fixed seed.
+
+Read "mergeable" there as "in any order", not as "to the same bits". `approx_count_distinct`
+is a HyperLogLog, which folds register-wise by `max` and so does reach an identical state
+whatever order the partials arrive in. `approx_quantile` is a KLL or a TDigest, whose merge
+compacts and re-clusters, and that is order-sensitive by construction: two reduces that take
+the same partials in different orders return estimates that differ, within the rank error the
+sketch already promises. That is the sketch being approximate, not the merge being wrong.
 
 ## One canonical key
 

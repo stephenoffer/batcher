@@ -224,8 +224,8 @@ constant column whenever the child's exact statistics determine it, so `count(*)
 ## Sketches
 
 Once a query has run, sketches from `bc-sketches` supersede the constants. They are all
-`Mergeable` with a fixed seed, so a sketch built on partition 3 of worker 7 merges
-identically with one built anywhere else:
+`Mergeable` with a fixed seed, so a sketch built on partition 3 of worker 7 merges with one
+built anywhere else, in any order:
 
 ```rust
 // crates/bc-sketches/src/lib.rs
