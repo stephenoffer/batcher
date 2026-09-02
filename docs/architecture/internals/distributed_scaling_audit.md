@@ -584,11 +584,41 @@ Query latency grows **6.7x** and the workers' GIL lag does not move — p50 fall
 is unchanged within noise. The workers are not GIL-bound, so that is a sixth eliminated cause
 rather than the answer.
 
-What it leaves is a shape pointing away from the workers altogether: their CPU is idle, their
-GIL is free, their call slots are not the limit, and widening the fleet does not help, yet each
-query's latency grows almost in step with the client count. The next place to look is Ray's own
-task dispatch and per-actor queueing rather than anything in this repository, and that needs
-instrumentation nothing here has.
+### Located: the fleet actors are the queue
+
+Their CPU is idle, their GIL is free, their call slots are not the limit and widening the fleet
+does not help — so the next question is whether work *reaches* them promptly. A `queue_ping`
+method that does nothing at all answers it: timed as a **round trip on the driver's clock**, so
+no cross-machine comparison is involved, and compared against its own idle baseline.
+
+| state | ping round trip p50 | p90 | max |
+|---|---|---|---|
+| fleet idle | 2.56 ms | 3.62 ms | — |
+| 1 client running | 5.07 ms | 11.50 ms | 57.9 ms |
+| 8 clients running | **91.63 ms** | **418.15 ms** | **661.88 ms** |
+
+A call that does no work takes **36x longer to complete** under eight-way concurrency than
+under one. That is not transport and it is not execution; it is waiting for the actor. The
+`_FlightWorker` fleet is where concurrent queries queue, and it is saturated **as a dispatch
+point** while every resource measured on it — cores, GIL — sits idle.
+
+That reconciles the whole set. Latency grows in step with client count because each query makes
+many actor calls and each now waits ~92 ms to start. Cluster CPU stays near 30% because the
+actors are queueing rather than computing. The GIL is free for the same reason. And the ceiling
+is indifferent to whether the query is I/O or arithmetic because the wait happens before either
+begins.
+
+**What it does not settle is why the slots do not free.** Raising `FLEET_CONCURRENCY` from 4 to
+16 measurably did not help, which says the *count* of slots is not the binding constraint — so
+the calls holding them are blocked on something shared rather than merely numerous. The credit
+window and the Flight gather are the candidates, and picking between them is the next
+measurement, not a conclusion available from these numbers.
+
+A caveat on the instrument: the ping competes for the same slots as real work, which is the
+point — it measures what any caller experiences — but it means the figure is queue depth as
+seen by a new arrival, not an independent observer. An earlier version of this measurement
+subtracted an actor-side `perf_counter_ns` from a driver-side one and reported a 998 ms
+"delay" that was entirely clock skew; only the round-trip form above is on one clock.
 
 **A note on the instrument, because it failed silently first.** The canary initially kept its
 buffer and its started-flag in `flight_worker` module globals, and reported *no samples at all*

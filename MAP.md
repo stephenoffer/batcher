@@ -554,7 +554,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 |---|---|---|
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
-| `generate.py` | 522 | LLM batch generation — the columnar half of offline text generation. |
+| `generate.py` | 448 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 303 | Turning a `RecordBatch` into the per-row requests an engine receives. |
