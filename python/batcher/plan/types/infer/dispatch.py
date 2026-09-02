@@ -25,6 +25,7 @@ from batcher.plan.types.infer.collections import (
     mapfunc_type,
     struct_field_type,
 )
+from batcher.plan.types.infer.geospatial import geofunc_type, spatialfunc_type
 from batcher.plan.types.infer.scalars import datefunc_type, make_temporal_type, strfunc_type
 from batcher.plan.types.lattice import promote
 from batcher.plan.types.media import audiofunc_type, imagefunc_type, videofunc_type
@@ -64,7 +65,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.func_nodes import ListTransform, MakeTemporal
+    from batcher.plan.expr_ir.func_nodes import GeoFunc, ListTransform, MakeTemporal, SpatialFunc
     from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
@@ -183,6 +184,10 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.bool_()
     if isinstance(expr, ListPosition):
         return pa.int64()  # 1-based index of the first match, 0 if absent
+    if isinstance(expr, GeoFunc):
+        return geofunc_type(expr.fn)
+    if isinstance(expr, SpatialFunc):
+        return spatialfunc_type(expr.fn)
     if isinstance(expr, ListBinary):
         return pa.float64()  # pairwise reduction over two list columns
     if isinstance(expr, ListZip):
