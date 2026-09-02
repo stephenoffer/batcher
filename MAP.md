@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1447 Python modules across 213 packages and 282 Rust files across 15 crates.
+Covering 1447 Python modules across 213 packages and 283 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -1782,7 +1782,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1500 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1505 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -2892,10 +2892,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
+| `coalesce.rs` | 153 | Merge a result's small batches before it crosses the FFI boundary. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 703 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 287 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 639 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 154 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |

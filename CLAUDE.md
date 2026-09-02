@@ -13,9 +13,9 @@ the simplest shape. The flat "off below 20M rows" is retired; don't restore it.
 `docs/architecture/internals/competitive_architecture.md` is the code-checked scorecard;
 **read it before making a competitive claim, and never restore a claim it retires.** It does
 not currently always win, and the gaps are specific rather than vague: it loses to DuckDB
-single-node above ~10M rows, it has no `StringView`, it cannot express Flink's streaming
-guarantees, and it buys several of its wall-clock wins with 1.4–4.4x more CPU. Say "aiming to"
-and mean it.
+single-node at sf100 (600M rows; the ~10M figure is retired), it has no `StringView`, it cannot
+express Flink's streaming guarantees, and it buys several of its wall-clock wins with 1.4–4.4x
+more CPU. Say "aiming to" and mean it.
 
 ## How to read this contract
 

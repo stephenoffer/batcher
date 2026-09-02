@@ -1313,7 +1313,21 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
 Until 1–2 land, the defensible positioning is narrower than the current one, and *still strong*:
 
 > The fastest **distributed** Arrow engine, with an optimizer that learns across runs — beating
-> Ray Data by 50–450×, Spark by 13–197×, and Polars at most shapes; on a single node it wins below
-> ~10M rows and cedes to DuckDB above it.
+> Ray Data by 50–450×, Spark by 13–197×, and Polars at most shapes; on a single node it wins to
+> at least 60M rows and cedes to DuckDB at sf100.
 
 That is a claim the benchmarks in this repo actually support.
+
+**The single-node half of that sentence said "wins below ~10M rows and cedes to DuckDB above
+it" until 2026-09-01.** It was stale against this file's own body, which retired the sf10 half
+of that row on 2026-08-25: TPC-H at sf10 is a 60M-row `lineitem` and it is a **win** at 0.963x.
+The loss is at sf100 — 600M rows, with q3/q4/q5 OOM — so the crossover is somewhere between
+60M and 600M rows and is not near 10M.
+
+A fresh four-shape check at 16M rows on the 96-core node agrees, and is recorded because it
+was run to test the retired sentence rather than to support it: `ORDER BY` 0.14x, filter
+0.27x, join 0.35x, and a 100-group `GROUP BY` at 2.40x. Three decisive wins and one loss, and
+the loss is the low-cardinality `GROUP BY` floor of sections 9 and 10 rather than anything
+about scale. Batcher's position *improves* with size across those shapes -- filter goes 1.22x
+at 1M to 0.49x at 4M to 0.27x at 16M -- which is the opposite of what the old sentence
+predicts.
