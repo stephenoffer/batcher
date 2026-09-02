@@ -71,7 +71,22 @@ bc-io = { path = "crates/bc-io" }
 # `cannot allocate memory in static TLS block`. The `local-dynamic` model allocates the slot
 # on first use instead, which is the correct model for a dlopen'd library. Tiny per-access cost,
 # and it makes the allocator load reliably regardless of what Python imported first.
-mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+#
+# `v2` pins mimalloc's **2.x** line rather than the 3.x the sys crate defaults to, and it is a
+# correctness pin, not a tuning one. Under 3.0.2, a thread that allocated through the engine
+# and then exited left state behind that faulted the *next* thread the process created, inside
+# `mi_thread_init` -> `mi_heap_main` -> `_mi_subproc`. Any embedding that runs a query off the
+# main thread reaches that: a request handler, a `concurrent.futures` worker, or
+# `iter_torch_batches(prefetch_batches>0)`, which is where it was found — two sequential
+# threads each running `collect()` segfaulted on the second, before reaching any Batcher code.
+# `tests/integration/test_engine_thread_lifecycle.py` pins both shapes in a subprocess, because
+# the failure is a signal rather than an exception.
+#
+# It costs nothing. Both arms were built from one commit and interleaved over three rounds on
+# 6 M rows (filter, filter+project, low- and high-cardinality group-by, join+aggregate,
+# top-N, distinct, string group-by): every case overlaps between the arms in every round, and
+# the per-thread heaps this dependency exists for are a 2.x feature as much as a 3.x one.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls", "v2"] }
 
 # Shared utility deps.
 thiserror = "2"
