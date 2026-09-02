@@ -33,6 +33,7 @@ import dataclasses
 import os
 import resource
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -58,6 +59,10 @@ DEFAULT_ROWS = 120_000_000
 _WIDTH_FRACTIONS = (0.0, 0.67, 0.80, 0.91, 1.00, 1.20)
 
 _REPEATS = 3
+
+#: Sampling rate for the utilization profile. Fast enough to resolve the ramp and the tail
+#: on a query of a second or two, cheap enough that the sampler is not itself a co-tenant.
+_SAMPLE_HZ = 50.0
 
 
 def _process_cpu_seconds() -> float:
@@ -103,6 +108,17 @@ def _shapes(rows: int) -> dict:
             s=col("b").sum(), n=col("a").count()
         ),
         "sort": lambda: base.select(k=col("a") % 1_000_003, v=col("b")).sort("k"),
+        # The same join with a *grouped* finalize. The `join` shape above ends in a global
+        # aggregate -- one output row, so its finalize is serial by construction, and the
+        # resulting tail is the query's fault rather than the engine's. Measured: the share of
+        # wall below 10% of the budget is 11.1% for `join` and 1.2% here. Any tail this shape
+        # still shows is the engine's.
+        "join_grouped": lambda: (
+            base.select(k=col("a") % 500_000, v=col("b"))
+            .join(base.select(k=col("a") % 500_000, w=col("c")), on="k", how="inner")
+            .group_by("k")
+            .agg(s=col("v").sum())
+        ),
     }
 
 
@@ -125,6 +141,93 @@ def measure(build, width: int) -> tuple[float, float]:
         dataset = build()
         runs = [_time_once(dataset) for _ in range(_REPEATS)]
     return min(runs, key=lambda run: run[0])
+
+
+def _self_cpu_seconds() -> float:
+    """CPU seconds from `/proc/self/stat`, which a sampling thread can read cheaply.
+
+    `getrusage` would do, but this is read fifty times a second from a second thread and
+    `/proc/self/stat` is one open and one parse.
+    """
+    with open("/proc/self/stat") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _sample_while(run) -> tuple[list[float], float]:
+    """Run `run()`, sampling cores-busy at `_SAMPLE_HZ`; return `(samples, wall)`.
+
+    The aggregate `cpu / wall` a sweep reports cannot distinguish a query that held half the
+    budget throughout from one that saturated it and then ran a long serial tail. Those want
+    opposite fixes, so the shape is sampled rather than averaged.
+    """
+    samples: list[float] = []
+    stop = threading.Event()
+
+    def sampler() -> None:
+        previous_wall, previous_cpu = time.monotonic(), _self_cpu_seconds()
+        while not stop.is_set():
+            time.sleep(1.0 / _SAMPLE_HZ)
+            now, cpu = time.monotonic(), _self_cpu_seconds()
+            elapsed = now - previous_wall
+            if elapsed > 0:
+                samples.append((cpu - previous_cpu) / elapsed)
+            previous_wall, previous_cpu = now, cpu
+
+    thread = threading.Thread(target=sampler, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    run()
+    wall = time.monotonic() - started
+    stop.set()
+    thread.join(timeout=1.0)
+    return samples, wall
+
+
+def utilization_profile(rows: int) -> None:
+    """Mean utilization and the share of wall above 80%, per operator width.
+
+    This is the question a utilization target actually asks, and an average cannot answer it:
+    the default width holds a *flat* plateau at `operator_cores` for ~90% of the query and
+    still never reaches 80%, because the plateau itself is the cap. Widening moves the
+    plateau; it does not remove a tail, and the two are not distinguishable from a mean.
+    """
+    budget = available_cpu_count()
+    build = _shapes(rows)["join_grouped"]
+    pressure = cpu_oversubscription()
+    print(
+        f"\n=== utilization profile (join_grouped, {rows:,} rows, "
+        f"oversubscription {pressure:.2f}x) ==="
+    )
+    if pressure > 1.15:
+        # Worth saying loudly, because the two columns fail differently under contention and
+        # only one of them looks wrong. Measured on a box at load 69/96 with the widths below:
+        # utilization read 64% -> 91% while wall went 50.8s -> 61.2s. The utilization column is
+        # still true -- the threads really were on a CPU -- and the wall column is the one that
+        # matters, so a reader who takes the headline number here concludes the opposite of the
+        # truth. `require_quiet_box` refuses this run by default; `BENCH_ALLOW_BUSY_BOX=1` is
+        # how it gets bypassed, and this is what it buys.
+        print("  WARNING: the box is contended. The wall column is not usable, and widening")
+        print("           raises utilization while *lowering* throughput -- read neither as a")
+        print("           recommendation. Re-run on a quiet box.")
+    print(f"{'width':>7} {'wall':>8} {'mean cores':>11} {'mean util':>10} {'wall >=80%':>11}")
+    for fraction in _WIDTH_FRACTIONS:
+        width = 0 if fraction == 0.0 else max(1, round(budget * fraction))
+        config = active_config()
+        scoped = config.replace(execution=dataclasses.replace(config.execution, parallelism=width))
+        with config_context(scoped):
+            dataset = build()
+            dataset.collect()  # warm: thread pools up, plan cached
+            samples, wall = _sample_while(dataset.collect)
+        if not samples:
+            continue
+        mean = sum(samples) / len(samples)
+        saturated = len([s for s in samples if s >= 0.8 * budget]) / len(samples)
+        label = "default" if width == 0 else str(width)
+        print(
+            f"{label:>7} {wall:>7.2f}s {mean:>10.1f} {100 * mean / budget:>9.1f}% "
+            f"{100 * saturated:>10.1f}%"
+        )
 
 
 def check_the_metrics_are_true(rows: int) -> int:
@@ -211,6 +314,7 @@ def main() -> int:
 
     failed = check_the_metrics_are_true(rows)
     sweep(rows)
+    utilization_profile(rows)
     return failed
 
 
