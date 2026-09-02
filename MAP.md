@@ -303,7 +303,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `clauses.py` | 231 | The clause model of a SQL ``MERGE`` — and how a clause names a source vs a target column. |
 | `compose.py` | 318 | Compose a full SQL ``MERGE`` out of relational algebra — no new IR, so it distributes. |
 | `delta_native.py` | 207 | Native Delta ``MERGE INTO`` — the full clause set, executed as one transaction. |
-| `execute.py` | 265 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
+| `execute.py` | 273 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
 | `format.py` | 96 | Which format is the table at this path? — the one question a merge can answer by looking. |
 | `iceberg_native.py` | 140 | Native Iceberg ``MERGE INTO`` via pyiceberg's `Table.upsert`. |
 | `native.py` | 103 | Dispatch a MERGE to the target format's own implementation, when it has one. |
@@ -554,7 +554,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | module | lines | what it is |
 |---|---|---|
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
-| `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
+| `columns.py` | 226 | Building the columns a generation appends, from what the engine reported. |
 | `generate.py` | 536 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
@@ -900,7 +900,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 2974 | The distributed executor — the dispatcher. |
+| `executor.py` | 2976 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 810 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
