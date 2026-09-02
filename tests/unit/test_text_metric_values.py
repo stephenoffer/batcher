@@ -25,7 +25,11 @@ because the obvious one is wrong about them and reading the name alone reproduce
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
+import urllib.parse
+import zlib
 from collections.abc import Callable
 
 import pytest
@@ -106,6 +110,34 @@ REFERENCE: dict[str, Callable[[str], object]] = {
     "remove_emails": lambda s: re.sub(_EMAIL, "", s),
     "remove_html_tags": lambda s: re.sub(r"<[^>]*>", "", s),
 }
+
+#: Interop-critical: these must equal the standard implementation byte for byte, because
+#: something downstream is going to compare the result against one. A `md5` that is merely
+#: self-consistent is worthless -- the point of a digest is that another system computes the
+#: same one. Checked against `hashlib`, `zlib`, `base64` and `urllib`, not against the engine.
+INTEROP: dict[str, Callable[[str], object]] = {
+    "md5": lambda s: hashlib.md5(s.encode()).hexdigest(),
+    "sha1": lambda s: hashlib.sha1(s.encode()).hexdigest(),
+    "sha256": lambda s: hashlib.sha256(s.encode()).hexdigest(),
+    "crc32": lambda s: zlib.crc32(s.encode()),
+    "base64": lambda s: base64.b64encode(s.encode()).decode(),
+    "url_encode": lambda s: urllib.parse.quote(s, safe=""),
+    "len_bytes": lambda s: len(s.encode()),
+    "len_chars": len,
+    "octet_length": lambda s: len(s.encode()),
+    "bit_length": lambda s: len(s.encode()) * 8,
+    "upper": str.upper,
+    "lower": str.lower,
+    "capitalize": str.capitalize,
+    "reverse": lambda s: s[::-1],
+    "isalpha": str.isalpha,
+    "isdigit": str.isdigit,
+    "isalnum": str.isalnum,
+    "isspace": lambda s: len(s) > 0 and s.isspace(),
+    "is_blank": lambda s: len(s.strip()) == 0,
+    "normalize_whitespace": lambda s: " ".join(s.split()),
+}
+
 
 #: The four whose documented definition is not the one the name suggests. Written from the
 #: docstring, and listed apart so the distinction is visible rather than buried in the table.
@@ -197,3 +229,33 @@ class TestTheFourThatLookWrong:
     def test_digits_per_word_is_not_a_fraction(self):
         by_value = dict(zip(VALUES, _engine("digit_to_word_ratio"), strict=True))
         assert by_value["abc123"] == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("name", sorted(INTEROP))
+def test_an_interop_function_matches_the_standard_implementation(name):
+    """These leave the process. A digest or an encoding that is only self-consistent is
+    worthless: the whole point is that another system computes the same one."""
+    got, want = _engine(name), _python(INTEROP[name])
+    mismatches = [(v, g, w) for v, g, w in zip(VALUES, got, want, strict=True) if not _equal(g, w)]
+    assert mismatches == [], f"{name} differs from the standard implementation on: {mismatches}"
+
+
+class TestHexIsSqlNotPython:
+    """`hex` is uppercase, which is SQL's convention and not Python's.
+
+    Python's `bytes.hex()` is lowercase, so using it as the oracle reports a defect that is
+    not one. DuckDB's `hex('hello')` is `68656C6C6F`, and so is Batcher's. This is recorded
+    because reaching for Python here is the obvious move and it gives the wrong answer.
+    """
+
+    def test_hex_is_uppercase(self):
+        by_value = dict(zip(VALUES, _engine("hex"), strict=True))
+        assert by_value["Hello World"] == b"Hello World".hex().upper()
+        assert b"Hello World".hex().islower(), "Python's is lowercase; the engine's is not"
+
+    def test_unhex_round_trips_through_non_ascii(self):
+        """The round trip is the property that matters, and it has to survive multi-byte
+        characters -- `café` is five characters and six bytes."""
+        data = bt.from_pydict({"s": ["hello", "café", ""]})
+        out = data.select(r=bt.col("s").str.hex().str.unhex()).to_pydict()["r"]
+        assert out == ["hello", "café", ""]
