@@ -1734,7 +1734,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |
 | `lineage.py` | 213 | Column-level lineage — which source columns each output column is derived from. |
-| `masks.py` | 166 | Declarative, picklable column-mask factories. |
+| `masks.py` | 193 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
 | `residency.py` | 413 | Data residency — where a dataset is allowed to be computed on, not just stored. |
