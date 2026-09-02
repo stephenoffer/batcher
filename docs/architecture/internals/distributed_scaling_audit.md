@@ -717,6 +717,41 @@ rather than in the sampler thread, so the sampler never excluded itself and spen
 samples recording its own `sleep`. An instrument that cannot see itself correctly cannot be
 trusted about anything else it did not see.
 
+## The one experiment this cluster would not allow
+
+The remaining hypothesis for the concurrency ceiling is structural rather than mechanical.
+`_acquire_session_fleet` keeps **one fleet per process**, sized by whichever query spawned it,
+and `_session_fleet_resizable()` permits a respawn only when `_SESSION_LEASES <=
+_SESSION_QUERY_LEASES and active_query_scopes() <= 1`. Growth is therefore possible only when
+there is no concurrency, and needed only when there is. A steady concurrent workload in one
+process can never widen its fleet: eight queries asking for eight workers each share the same
+eight actors, which is consistent with every number in this section and with the cluster
+sitting ~70% idle while they queue.
+
+`acquire_fleet` already has the arm that would test it -- with `distributed.reuse_session_fleet`
+off, each query spawns its own fleet -- so the A/B is a config flip and no code change.
+
+**It was attempted and abandoned, because the private-fleet arm reserved the entire cluster.**
+Four clients at four workers each took `CPU 384, available 0 (0% free)`; killing the arms
+returned it to `384 available (100% free)` within seconds, so the attribution to my own
+processes is a controlled observation rather than an inference. Which arm did it is *not*
+equally certain: the run was ~7 minutes in, which by the arm durations puts it inside a
+`reuse_session_fleet=False` arm, and no run in this audit with reuse *on* has ever exhausted
+the cluster -- but that is circumstantial and is written here as such.
+
+That outcome is worth more than the measurement would have been, because it is Finding 1
+reproduced from the opposite direction and it is the exact gap the uncommitted `executor.py`
+change closes. `_even_cpu_share` divides **nameplate** cores by the worker count, so four
+workers ask for four bundles of ninety-six on a 384-core cluster however much of it a co-tenant
+already holds, and on the explicit-`num_workers` path nothing routes that grant through
+`_placeable_grant`. Turning off session-fleet reuse on a shared cluster is therefore not a safe
+thing to suggest to a user today, and the fix for that is written, tested, and sitting in
+`/mnt/cluster_storage/batcher-pending-liveness/` because its file never freed.
+
+So the hypothesis stands **unmeasured and explicitly so**. It should be tested on a cluster
+this session does not share, or after the placeability fix lands, and not before. The mechanism
+above is a code reading; the cost of a wrong guess here would be borne by other people's jobs.
+
 ## Ruled out
 
 Kept because the ratio of already-built to genuinely-missing is the most useful thing this

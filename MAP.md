@@ -303,7 +303,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `clauses.py` | 231 | The clause model of a SQL ``MERGE`` — and how a clause names a source vs a target column. |
 | `compose.py` | 318 | Compose a full SQL ``MERGE`` out of relational algebra — no new IR, so it distributes. |
 | `delta_native.py` | 207 | Native Delta ``MERGE INTO`` — the full clause set, executed as one transaction. |
-| `execute.py` | 273 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
+| `execute.py` | 292 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
 | `format.py` | 96 | Which format is the table at this path? — the one question a merge can answer by looking. |
 | `iceberg_native.py` | 140 | Native Iceberg ``MERGE INTO`` via pyiceberg's `Table.upsert`. |
 | `native.py` | 103 | Dispatch a MERGE to the target format's own implementation, when it has one. |
@@ -965,7 +965,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 197 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 792 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 771 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 772 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
