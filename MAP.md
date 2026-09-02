@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1443 Python modules across 213 packages and 282 Rust files across 15 crates.
+Covering 1444 Python modules across 213 packages and 282 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -289,7 +289,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 1981 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 1983 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -302,7 +302,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `clauses.py` | 231 | The clause model of a SQL ``MERGE`` — and how a clause names a source vs a target column. |
 | `compose.py` | 318 | Compose a full SQL ``MERGE`` out of relational algebra — no new IR, so it distributes. |
 | `delta_native.py` | 207 | Native Delta ``MERGE INTO`` — the full clause set, executed as one transaction. |
-| `execute.py` | 262 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
+| `execute.py` | 265 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
 | `format.py` | 96 | Which format is the table at this path? — the one question a merge can answer by looking. |
 | `iceberg_native.py` | 140 | Native Iceberg ``MERGE INTO`` via pyiceberg's `Table.upsert`. |
 | `native.py` | 93 | Dispatch a MERGE to the target format's own implementation, when it has one. |
@@ -331,6 +331,7 @@ The conductor's half of governance: install a policy, and apply it at every read
 | `_authn.py` | 104 | Installing a credential verifier, and using it to establish an identity. |
 | `_binding.py` | 169 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
 | `_context.py` | 142 | The security context: which catalog and principal are in effect for this scope. |
+| `_write.py` | 212 | Where governance meets a write: which privilege it needs, and whether the principal has it. |
 
 ### `batcher/api/session/` — 5 · conductor
 
@@ -380,7 +381,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_diagnostics.py` | 106 | What a streaming plan will do to memory, said at `start()` rather than at the OOM. |
-| `_distributed.py` | 283 | Streaming with the micro-batch fanned across the cluster. |
+| `_distributed.py` | 287 | Streaming with the micro-batch fanned across the cluster. |
 | `_launch.py` | 402 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 426 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
@@ -392,7 +393,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 600 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1418 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1427 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 712 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 440 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -553,7 +554,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 |---|---|---|
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
-| `generate.py` | 448 | LLM batch generation — the columnar half of offline text generation. |
+| `generate.py` | 522 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 303 | Turning a `RecordBatch` into the per-row requests an engine receives. |
@@ -1725,14 +1726,14 @@ Governance — who may read which rows and columns, and through what mask.
 | module | lines | what it is |
 |---|---|---|
 | `_validate.py` | 111 | Input checks for the governance declaration surface. |
-| `audit.py` | 89 | `GovernanceEvent` — the record of one authorization decision. |
+| `audit.py` | 103 | `GovernanceEvent` — the record of one authorization decision. |
 | `audit_log.py` | 115 | The durable audit sink: governance decisions appended to a file that outlives the query. |
-| `catalog.py` | 792 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
+| `catalog.py` | 800 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |
 | `lineage.py` | 213 | Column-level lineage — which source columns each output column is derived from. |
 | `masks.py` | 166 | Declarative, picklable column-mask factories. |
-| `policy.py` | 241 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
+| `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
 | `residency.py` | 372 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 

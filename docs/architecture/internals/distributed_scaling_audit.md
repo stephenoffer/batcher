@@ -524,6 +524,57 @@ throughput, not eight times**, and that ratio barely moves:
   of error as the ordering artefact retracted above, one level up: a number that is real,
   correctly measured, and answers a question nobody asked.
 
+### What the ceiling *is*, measured rather than eliminated
+
+Ruling five candidates out left the shape unexplained, so two further measurements went at it
+directly. Both were taken in a sandbox built from `HEAD` (`git archive HEAD python` over the
+existing extension module), because the working tree's Python had drifted to a seven-argument
+`set_flight_transport_config` against a five-argument `.so` and could not run a distributed
+query at all.
+
+**The cluster is not full.** One zero-CPU probe actor pinned per node, sampling system-wide
+`psutil.cpu_percent`, so this is the fleet's utilisation and not the driver's:
+
+| clients | QPS | p50 | cluster CPU (median) |
+|---|---|---|---|
+| 1 | 1.05 | 705 ms | 17.0% |
+| 2 | 1.80 | 1,116 ms | 24.3% |
+| 4 | 1.98 | 2,014 ms | 29.3% |
+| 8 | 2.31 | 3,340 ms | **30.5%** |
+
+Eight concurrent queries leave roughly **70% of the cluster idle** while latency grows 4.7x and
+throughput flattens. That kills the last benign explanation — that one query simply cannot
+saturate its fleet and concurrency fills the gaps until the cluster is full. The gaps are still
+there at eight clients.
+
+**And it is not the storage.** The corpus is on NFS, so "they queue on the filer" fits those
+numbers as well as "they queue on the engine". Holding the bytes read fixed and multiplying the
+arithmetic per row by twenty separates them: if the pipe were the constraint, the CPU-heavy
+variant should scale better, spending proportionally less of its life on it.
+
+| shape | 1 client | 8 clients | scaling |
+|---|---|---|---|
+| as measured above | 0.94 QPS | 2.22 QPS | 2.36x |
+| same bytes, ~20x CPU per row | 0.79 QPS | 1.86 QPS | **2.35x** |
+
+The ratios are the same to two decimal places, on queries whose single-client latency differs
+by 50%. The ceiling is **invariant to the workload's I/O-to-CPU mix**, which is not what a
+contended resource looks like.
+
+So the honest statement is no longer "throughput plateaus" but something with a number in it:
+**a fixed fraction of each query is serialised against other queries, on a cluster that is
+70% idle, independent of what the query spends its time on.** Read through Amdahl, a speedup
+saturating near 2.3 implies a serial fraction around `1/2.3`, or roughly 40% of a query — and
+that is an *inference from the shape*, not a measurement of any particular section, which is
+the distinction this document has already had to learn twice.
+
+One candidate is worth writing down precisely because it has **not** been tested: a
+`_FlightWorker` method that does not release the GIL would give exactly this signature —
+`max_concurrency` raised from 4 to 16 buying nothing, cluster CPU stuck well below saturation,
+and a ceiling indifferent to whether the work is I/O or arithmetic. Testing it means measuring
+GIL hold time inside a worker, which nothing here has done. It is a hypothesis with a matching
+shape, which this document has twice mistaken for a cause.
+
 What is established is that the five things one would try
 first are not it, and that the shape — a flat ~2x whatever the fleet or the actor concurrency
 — looks like serialisation somewhere in the per-query path rather than contention for a
