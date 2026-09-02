@@ -568,12 +568,36 @@ saturating near 2.3 implies a serial fraction around `1/2.3`, or roughly 40% of 
 that is an *inference from the shape*, not a measurement of any particular section, which is
 the distinction this document has already had to learn twice.
 
-One candidate is worth writing down precisely because it has **not** been tested: a
-`_FlightWorker` method that does not release the GIL would give exactly this signature —
-`max_concurrency` raised from 4 to 16 buying nothing, cluster CPU stuck well below saturation,
-and a ceiling indifferent to whether the work is I/O or arithmetic. Testing it means measuring
-GIL hold time inside a worker, which nothing here has done. It is a hypothesis with a matching
-shape, which this document has twice mistaken for a cause.
+**The GIL candidate was then tested, and is wrong.** A `_FlightWorker` method that did not
+release the GIL would give exactly this signature — `max_concurrency` 4 to 16 buying nothing,
+cluster CPU below saturation, indifference to I/O versus arithmetic — so a canary thread was
+put inside each actor: it asks to sleep 5 ms and records the overshoot, which it can only
+suffer if another thread in that actor holds the GIL. Idle baseline across eight actors is
+0.14 ms p50, 0.23 ms max.
+
+| clients | QPS | query p50 | GIL lag p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|
+| 1 | 1.10 | 503 ms | 0.13 ms | 0.27 ms | 10.58 ms | 14.58 ms |
+| 8 | 2.38 | **3,377 ms** | **0.10 ms** | 0.66 ms | 10.72 ms | 18.46 ms |
+
+Query latency grows **6.7x** and the workers' GIL lag does not move — p50 falls slightly, p99
+is unchanged within noise. The workers are not GIL-bound, so that is a sixth eliminated cause
+rather than the answer.
+
+What it leaves is a shape pointing away from the workers altogether: their CPU is idle, their
+GIL is free, their call slots are not the limit, and widening the fleet does not help, yet each
+query's latency grows almost in step with the client count. The next place to look is Ray's own
+task dispatch and per-actor queueing rather than anything in this repository, and that needs
+instrumentation nothing here has.
+
+**A note on the instrument, because it failed silently first.** The canary initially kept its
+buffer and its started-flag in `flight_worker` module globals, and reported *no samples at all*
+— which reads exactly like "no GIL contention" and would have been a clean, wrong, confirming
+result. The actor class is defined inside a function, so what reaches the worker is a
+pickled-by-value class whose functions did not share those globals: the starter set its flag in
+one namespace and the reader looked in another. Moving both onto `self` fixed it. An
+instrument that returns "nothing to see" is not evidence until it has been shown to see
+something — hence the idle baseline above, which exists to prove the canary works at all.
 
 What is established is that the five things one would try
 first are not it, and that the shape — a flat ~2x whatever the fleet or the actor concurrency

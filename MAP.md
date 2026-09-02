@@ -1735,7 +1735,7 @@ Governance — who may read which rows and columns, and through what mask.
 | `masks.py` | 166 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
-| `residency.py` | 372 | Data residency — where a dataset is allowed to be computed on, not just stored. |
+| `residency.py` | 385 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
 ### `batcher/governance/authn/` — 3 · subsystem
 
