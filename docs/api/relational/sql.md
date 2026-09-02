@@ -50,7 +50,7 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} … AS …` and `DROP TABLE` register/unregister a lazy table in the session. |
-| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns. Both come back as ordinary relations. |
+| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables` and `information_schema.columns` answer both in ANSI form. All come back as ordinary relations. |
 
 ### WHERE and GROUP BY
 
@@ -455,6 +455,27 @@ one.
 <batcher.Dataset.schema>` reports Arrow, so printing a DuckDB spelling here would describe
 storage that does not exist. The shape is DuckDB's; the content is this engine's.
 ```
+
+### The ANSI spelling
+
+A SQLAlchemy reflection and several BI tools read `information_schema` rather than `SHOW` or
+`DESCRIBE`. Two views are served, answered from the same session catalog, so the three
+spellings cannot disagree about what exists:
+
+```python
+print(s.sql("SELECT table_name FROM information_schema.tables ORDER BY table_name").to_pydict())
+```
+
+`information_schema.tables` carries `table_catalog`, `table_schema`, `table_name` and
+`table_type`. `information_schema.columns` carries those first three plus `column_name`,
+`ordinal_position`, `column_default`, `is_nullable` and `data_type` — the columns a
+reflection actually selects. DuckDB's views are wider; the extra columns are null for an
+Arrow relation, and padding them out would be inventing a shape rather than reporting one.
+
+`table_type` is always `BASE TABLE`. Batcher does not distinguish a table from a view:
+`CREATE TABLE … AS`, `CREATE VIEW … AS` and {py:meth}`Session.register
+<batcher.Session.register>` all bind a lazy `Dataset`, so there is one kind of thing in the
+catalog and one value to report for it.
 
 ## Binding the current dataset
 

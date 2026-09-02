@@ -15,7 +15,7 @@ import pyarrow as pa
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser import udf
+from batcher._sql.parser import statements, udf
 from batcher._sql.parser.ai_functions import ai_table, is_ai_source
 from batcher._sql.parser.joins import and_conjuncts as _and_conjuncts
 from batcher._sql.parser.joins import asof_join, is_asof, outer_theta_join, swap_on_sides
@@ -397,6 +397,13 @@ def _split_join_on(on, left_cols=None, right_cols=None):
 
 
 def _table(tr, node) -> Dataset:
+    # FROM information_schema.tables / .columns — the ANSI catalog views, answered from the
+    # same registry `SHOW TABLES` reads. Before the lookup below, which has no entry for
+    # them and would report `unknown table 'tables'`.
+    catalogued = statements.information_schema_table(tr, node)
+    if catalogued is not None:
+        return _apply_tablesample(catalogued, node)
+
     # A PIVOT / UNPIVOT modifier reshapes the table. sqlglot attaches it as `pivots`;
     # it maps onto the relational `Dataset.pivot` / `unpivot` the engine already has, so
     # it is applied rather than rejected. Deferred until after the base relation is

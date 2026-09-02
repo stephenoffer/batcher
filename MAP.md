@@ -818,10 +818,10 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `ai_functions.py` | 263 | Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``. |
 | `clauses.py` | 628 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 586 | Small stateless AST helpers shared across translator theme modules. |
-| `from_clause.py` | 628 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
+| `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 539 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 320 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
-| `statements.py` | 135 | SQL statements that describe rather than query: ``EXPLAIN``, ``SHOW``, ``DESCRIBE``. |
+| `statements.py` | 212 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 332 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 664 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 197 | Registered-Python-function support for the SQL translator. |
