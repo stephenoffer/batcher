@@ -1115,6 +1115,95 @@ optimization if something mechanically proves it agrees with the oracle.** Keep 
 JIT differential tests, and treat a comment that explains *why* two implementations must match as
 load-bearing code, not commentary.
 
+
+### 10. `sort().limit(n)` costs a whole scan; DuckDB's costs about 40% of one (measured 2026-09-01)
+
+Batcher wins the two shapes either side of this one and loses this one, which is what makes it
+worth writing down rather than folding into a general "sorting is fine".
+
+Release build, 2,000,000 rows, six columns, local Parquet, min of five runs, DuckDB at
+`PRAGMA threads=8`:
+
+| Shape | Batcher | DuckDB | Ratio |
+|---|---|---|---|
+| bare scan, all columns | 64.2 ms | 165.5 ms | **0.39x** |
+| full sort, all columns | 95.9 ms | 419.1 ms | **0.23x** |
+| `ORDER BY x LIMIT 100`, all columns | 70.1 ms | 42.2 ms | **1.66x** |
+| `ORDER BY x LIMIT 100`, one column | 16.5 ms | 13.1 ms | 1.26x |
+
+The plan is not the problem. `explain()` shows the limit fused into the sort and pushed into
+the scan -- `sort [top 100 by x]` over `scan ... pushed[top 100 by x]` -- so the optimizer is
+doing what it should.
+
+What the numbers say is narrower and is about *cost relative to a scan*. Batcher's top-N costs
+essentially what materializing the whole relation costs; DuckDB's costs a fraction of it. Over
+1,000,000 rows at three widths:
+
+| Columns | Batcher top-N | vs its own scan | DuckDB top-N | vs its own scan |
+|---|---|---|---|---|
+| 2 | 45.9 ms | 2.49x | 15.3 ms | 0.78x |
+| 10 | 87.1 ms | 1.12x | 41.8 ms | 0.44x |
+| 40 | 361.3 ms | 1.05x | 167.2 ms | 0.39x |
+
+So the gap is not a fixed overhead and it does not close as the query gets bigger: at ten
+columns and above, Batcher pays a full materialization for a hundred rows and DuckDB pays
+about 40% of one.
+
+**Batcher's side of it is not an inference.** The engine's own counters, over the 40-column
+table, say what it reads. A full scan and a `LIMIT 100` report the *same* figures:
+
+| | rows scanned | bytes scanned | rows returned |
+|---|---|---|---|
+| full scan | 1,000,000 | 320,000,000 | 1,000,000 |
+| `ORDER BY x LIMIT 100` | 1,000,000 | 320,000,000 | 100 |
+
+Byte for byte identical, to return a hundred rows out of a million. The top-N materializes
+every column of every row and then discards 99.99% of it, which is why its cost tracks the
+full scan and why widening the projection widens the gap. The shape of a fix follows from
+that and needs no further measurement: read the sort key, resolve the surviving row ids, and
+fetch the other columns only for those hundred rows.
+
+**The other half of the explanation was hypothesized, tested and rejected**, and that is
+recorded because the hypothesis is the obvious one and someone will have it again. The guess was that DuckDB
+late-materializes -- reads the sort key, picks the surviving row ids, then fetches only those
+rows' remaining columns -- which predicts its top-N is roughly *flat* in the projected width.
+It is not: 15.3 -> 41.8 -> 167.2 ms as the width goes 2 -> 10 -> 40, growing at much the same
+rate as Batcher's. Whatever DuckDB is doing costs a stable ~40% of its own scan rather than
+avoiding the columns altogether. So the asymmetry is real and measured on both sides, and
+only *Batcher's* half of it has a mechanism attached: DuckDB's remains unidentified, and
+nothing here should be read as saying otherwise.
+
+Worth keeping in proportion. The same sweep has Batcher at 0.23x on a full sort, 0.31x on
+`DISTINCT`, 0.34x on `COUNT(DISTINCT)` and 0.36x on a self-join. The only other losses were
+`GROUP BY` shapes, and following them up folded them into section 9 rather than adding a
+finding: **Batcher's `GROUP BY` is nearly flat in cardinality and DuckDB's is not.**
+
+Over 2,000,000 rows, the same key drawn as an integer and as a string:
+
+| Key | Groups | Batcher | DuckDB | Ratio |
+|---|---|---|---|---|
+| int | 10 | 26.3 ms | 12.0 ms | 2.20x |
+| string | 10 | 30.4 ms | 11.7 ms | 2.59x |
+| int | 1,000 | 25.3 ms | 10.9 ms | 2.33x |
+| string | 1,000 | 34.1 ms | 11.9 ms | 2.86x |
+| int | 200,000 | 46.6 ms | 94.5 ms | **0.49x** |
+| string | 200,000 | 61.6 ms | 143.9 ms | **0.43x** |
+
+Batcher goes 26 ms to 47 ms across four orders of magnitude of group count; DuckDB goes 12 ms
+to 95 ms. That is section 9 again at a different scale, and the two together say what the
+floor is made of. It is **flat in the group count and not flat in the row count**: ~25 ms
+here at 2M rows against ~60 ms in section 9 at 4M, which is what a floor made of
+`heavy_hitters` and `column_stats_full` should do, since both walk the column. Calling it a
+fixed per-query cost would be wrong and would point at the wrong fix -- it is per-row work
+that the group count does not change, sitting under an aggregation that scales better than
+DuckDB's.
+
+The string key is worth naming only to rule it out. It adds 4-15 ms over the integer key at
+matched cardinality and does not change the shape of either curve, so the 2.54x on a
+string-keyed `GROUP BY` in the sweep was the fixed overhead with a modest string cost on top,
+not a string-hashing problem. Reporting it as one would have sent someone to the wrong file.
+
+
 ## The roadmap that would make the claim true
 
 In dependency order. (1) and (2) are the ones that change what Batcher *is*.
