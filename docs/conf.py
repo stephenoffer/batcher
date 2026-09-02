@@ -142,6 +142,15 @@ exclude_patterns = [
     # reads UNMEASURED. A working record for contributors deciding what to build next, and it
     # names gaps in a register a published page should not carry.
     "architecture/internals/platform_parity_scorecard.md",
+    # The record of one pass over the governance key: what a policy is matched against, and
+    # the five ways a read evaded it. Kept in-tree as the reasoning behind the refusals,
+    # including the one argument (why a governed MERGE is refused rather than repaired) that
+    # a reader will otherwise want to reopen. Working document, not a published page.
+    "architecture/internals/governance_bypass_audit.md",
+    # A value-level audit of the 132 text-quality metrics: one defect (`mean_line_length`
+    # counts the line separators, biasing short-line documents up to 80% high) and four
+    # apparent defects that are not. Working document, not a published page.
+    "architecture/internals/text_metric_audit.md",
     # The three per-platform ledgers the scorecard above hoists from. Same reason: working
     # records with an explicit ⚠️ register of claims that still need a primary source, which
     # is exactly the kind of thing a published page must not carry.
