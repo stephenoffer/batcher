@@ -239,6 +239,10 @@ example-library:
 docs:
     python tools/example_library.py --check
     sphinx-build -b doctest docs docs/_build/doctest
+    # The doctest builder prints its failures and exits 0, so without this the recipe walks
+    # past them into the HTML build and reports success. Two stale examples got through two
+    # consecutive `just docs` runs that way.
+    python tools/check_doctests.py docs/_build/doctest/output.txt
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
 
