@@ -496,6 +496,15 @@ throughput, not eight times**, and that ratio barely moves:
   separate them — and that constant is deliberately coupled to the spill budget
   (`_FlightWorker._reduce_budget` divides by exactly it), so not touching it is the right
   outcome rather than a missed one.
+
+  **Read that bullet with its code state attached, because it is not this branch's.**
+  `FLEET_CONCURRENCY` does not exist at `HEAD`. It is another session's *unstaged*
+  working-tree change to `dist/executors/ray_runtime/scheduling.py`, and the run above was
+  taken against an installed build of that tree. At `HEAD` the fleet actor takes no
+  `max_concurrency` at all, so it is an ordinary single-threaded Ray actor. Neither reading is
+  wrong; they are measurements of two different programs, and only one of them is committed.
+  This is the ordinary hazard of benchmarking a shared tree — `git show HEAD:<file>` is what
+  separates the codebase from whatever is resident in it at the time.
 - **Not the fleet's width.** Quadrupling it, 8 to 32 workers, buys 1.33x on eight-client
   throughput and leaves the speedup-over-solo essentially unchanged (1.87x to 2.03x). If the
   shared fleet were the constraint, four times the fleet would not read like that.
@@ -638,6 +647,76 @@ The fix is the one already described and not made — cache the liveness verdict
 so back-to-back queries skip the fan-out — and it remains blocked on `dist/fleet/_fleet.py`,
 which carried another session's staged work for this entire pass.
 
+## The actor's call slots, measured at HEAD rather than inferred
+
+Three instruments in this section had already failed silently, so this one counts real work on
+the actor instead of sampling for it. Every `_FlightWorker` method is wrapped to accumulate the
+thread-seconds spent inside it and the peak number of calls in flight, and `map_publish` bumps a
+per-actor counter, so "which actors run the query" is read off the actor rather than inferred
+from the fleet the driver happens to hold.
+
+**The probed actors are the working actors.** Across three queries each of the eight actors in
+`_SESSION` recorded exactly four more `map_publish` calls (4 to 16), with unchanged OS pids. So
+the `queue_ping` result in the previous section did address the actors that execute the work,
+and its identification of them as the queue stands.
+
+That reading was very nearly published inverted. The first version of the probe printed
+`these are NOT the working actors` from
+
+```python
+delta = [a.get("map_publish", 0) - b.get("map_publish", 0) for a, b in zip(before, after)]
+```
+
+where `a` is bound to `before` and `b` to `after`, so it computed `before - after` and reported
+a per-actor delta of **-12**. A count that decreases is impossible, which is the only reason it
+was caught: the sign was not plausible enough to believe. Had the load been arranged so the
+magnitude came out positive, it would have read as a clean confirming result.
+
+**At HEAD the actor is single-threaded**, which the peak-in-flight counter shows directly: 1,
+at one client and at eight. Giving it slots does exactly what it says, and does not help.
+Interleaved, eight clients, 45 s per arm, each arm re-checking every result against a
+single-client answer:
+
+| `max_concurrency` | peak in flight | actor busy (thread-s per wall-s) | QPS | p50 | p90 | wrong results |
+|---|---|---|---|---|---|---|
+| 1 (HEAD) | 1 | 0.46 | 1.73 | 3740 ms | 4664 ms | 0 |
+| 4 | 4 | 1.02, 1.01 | 1.81, 1.89 | 3416, 3140 ms | 4431, 4405 ms | 0 |
+| 8 | 8 | 1.50, 1.81 | 1.62, 1.82 | 3451, 3226 ms | 5477, 4454 ms | 0 |
+
+Two interleaved rounds, so 4 and 8 carry two samples each. **`max_concurrency` 1 carries only
+one** — the second round's arm died without printing a result line, and a missing arm is
+reported rather than quietly averaged over. It is also the arm that matters least to the
+conclusion, since the utilization column separates the levels on its own.
+
+The actors do 3.3x to 3.9x more thread-work per wall second and deliver no more queries. That is the
+whole result: the extra thread-time is spent *waiting*, not computing, so the occupied slots are
+held by calls blocked on something further down rather than by a shortage of slots. Widening
+them moves the wait inside the actor instead of removing it, and at 8 it starts to cost the
+tail. This replicates the `FLEET_CONCURRENCY` 4-to-16 bullet above on genuinely different code —
+that arm had the constant, this one does not exist at `HEAD` — which is worth more than either
+run alone.
+
+It also retires the obvious fix. "Give the fleet actor more concurrency" is the first thing a
+reader of the `queue_ping` result will reach for, and it is measured here as buying nothing.
+
+**Correctness held at every level**, which is not a given: the actor hosts mutable
+`ShuffleSession` state written for one caller at a time, and every arm above re-checked each
+result against the single-client answer with zero mismatches. That is evidence the sessions
+tolerate concurrent calls, not a proof, and it is not a reason to raise the constant — there is
+no throughput to buy.
+
+### Why the in-actor stack sampler saw nothing
+
+Worth recording because it reads as a result. The sampler attributes each sample to the deepest
+batcher frame, and under known single-client load it returned 50% its own `_sampler` frame and
+50% a non-batcher `threading.py:wait`. That looks like "the actors are idle", which would have
+contradicted everything else in this section.
+
+It was the instrument. `me = _th.get_ident()` was evaluated in the thread that *called* `where()`
+rather than in the sampler thread, so the sampler never excluded itself and spent half its
+samples recording its own `sleep`. An instrument that cannot see itself correctly cannot be
+trusted about anything else it did not see.
+
 ## Ruled out
 
 Kept because the ratio of already-built to genuinely-missing is the most useful thing this
@@ -743,6 +822,23 @@ Both had a watcher polling for the file to free, with a mechanical guard rather 
 judgement call — the executor one refuses to commit while any line matching the other session's
 markers appears in the diff it would carry, and the fleet one applies the patch, runs the
 tests, and reverts rather than committing if they fail. Neither file freed.
+
+**Both watchers were then stopped, because their release condition could never be met.** They
+waited for "nothing of theirs staged and nothing of theirs unstaged", which reads as a
+transient state and on this branch is not one: **553 files and ~20,800 insertions are staged in
+the shared index, and that staged state predates this session**. `_fleet.py` is among them,
+carrying another session's `_free_cluster_cpus` / `yield_session_fleet` / `held_placement_group`
+work; `executor.py` is worse, because its unstaged hunks interleave my one `elif` with their
+`_TARGET_WORKER_CORES` / `_MIN_WORKER_CORES` / `_numa_sliced` rewrite in the same file. After
+3.5 hours of polling, the honest reading is that the guard was correct and the premise was not:
+these are not files that will free, and a watcher against an unreachable condition is a way of
+looking busy rather than a way of landing a change.
+
+The patches are preserved outside the tree at `/mnt/cluster_storage/batcher-pending-liveness/`,
+with a README stating exactly which hunks are mine, so whoever owns those files next can land
+them in one step. That is the correct terminal state for a change that is finished and
+unlandable, and it is worth stating plainly rather than leaving a watcher running to imply
+otherwise.
 
 ## What this pass deliberately did not do
 
