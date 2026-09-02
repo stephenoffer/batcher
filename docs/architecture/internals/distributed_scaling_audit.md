@@ -720,6 +720,45 @@ result against the single-client answer with zero mismatches. That is evidence t
 tolerate concurrent calls, not a proof, and it is not a reason to raise the constant — there is
 no throughput to buy.
 
+### The corrected run, which reverses the conclusion
+
+Same fleet, same query, same interleaving. The verification is now one Arrow-side sum instead
+of a 200,000-entry Python dict, and each query carries a distinct literal in an always-true
+filter so the result cache cannot serve it. That literal is `_CEIL + n` with `_CEIL = 1e6`
+rather than the `1e18 + n` written first, because `1e18 + 1 == 1e18` in float64 — the obvious
+spelling varies nothing and turns every query after the first into a cache hit while looking
+like a fresh one. The harness asserts the ceiling sits above `max(v)` and that the first two
+queries agree before it times anything.
+
+| `max_concurrency` | peak in flight | actor busy (thread-s per wall-s) | QPS | p50 | p90 | queries | wrong |
+|---|---|---|---|---|---|---|---|
+| 1 (HEAD) | 1 | 0.96, 0.96 | **3.47, 3.45** | 2225, 2236 ms | 2887, 2863 ms | 160, 159 | 0 |
+| 4 | 4 | 2.89, 2.96 | **4.70, 4.79** | 1676, 1696 ms | 2018, 1907 ms | 216, 219 | 0 |
+| 8 | 8 | 4.36, 4.68 | **4.65, 4.67** | 1689, 1704 ms | 1977, 1911 ms | 213, 213 | 0 |
+
+**At `HEAD` the actor is saturated, not blocked.** `busy/wall` is 0.96 against a single-thread
+ceiling of 1.00, reproduced to two decimal places across both rounds. The slot is busy
+essentially all the time, so the queue in front of it is a queue for a full server rather than
+a symptom of one waiting on something downstream.
+
+Giving it four slots is worth **37% throughput** (mean 3.46 to 4.75 QPS across both rounds), with p50 down about a
+quarter and p90 down about a third. Eight slots buys nothing further — throughput is flat
+against four while utilization keeps climbing to 4.4 thread-seconds per wall second, which is
+the signature of the actor no longer being the constraint. Correctness held at every level and
+in every round.
+
+**This independently confirms an uncommitted change and its exact constant.** Another session's
+working tree adds `scheduling.FLEET_CONCURRENCY = 4` and `max_concurrency` on
+`fleet_actor_options`, with `_FlightWorker._reduce_budget` dividing the spill threshold by
+exactly that number to keep the memory envelope honest. Its comment predicts that "a larger
+value buys progressively less overlap for proportionally more spilling", and the 4-versus-8
+arms here are that prediction measured: 4 takes the whole gain, 8 adds none of it. The
+measurement was taken at `HEAD`, where the constant does not exist, so it is evidence about
+that change rather than a restatement of it.
+
+The earlier reading in this section — that widening the slots buys nothing — was an artifact of
+a harness spending 404 ms of GIL-bound driver work per query, and is retracted above.
+
 ### Why the in-actor stack sampler saw nothing
 
 Worth recording because it reads as a result. The sampler attributes each sample to the deepest

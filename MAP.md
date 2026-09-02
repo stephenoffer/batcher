@@ -330,7 +330,7 @@ The conductor's half of governance: install a policy, and apply it at every read
 | module | lines | what it is |
 |---|---|---|
 | `_authn.py` | 104 | Installing a credential verifier, and using it to establish an identity. |
-| `_binding.py` | 169 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
+| `_binding.py` | 183 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
 | `_context.py` | 142 | The security context: which catalog and principal are in effect for this scope. |
 | `_write.py` | 267 | Where governance meets a write: which privilege it needs, and whether the principal has it. |
 
@@ -1781,7 +1781,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1458 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1485 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
