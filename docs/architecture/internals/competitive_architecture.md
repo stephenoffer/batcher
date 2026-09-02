@@ -1324,6 +1324,14 @@ of that row on 2026-08-25: TPC-H at sf10 is a 60M-row `lineitem` and it is a **w
 The loss is at sf100 — 600M rows, with q3/q4/q5 OOM — so the crossover is somewhere between
 60M and 600M rows and is not near 10M.
 
+One instance is left standing and is named here so it is not mistaken for agreement.
+`docs/benchmarks/methodology.md` still calls above-10M "the regime the project concedes it
+loses in"; it was uncommitted in another session's tree when this was written and is theirs
+to correct. The quoted one-line summary earlier in *this* file is deliberate and stays --
+the sf10 retirement note says so explicitly, keeping the sentence for the history of the
+number. What changed is the closing *recommendation*, which is advice about what to say now
+rather than a record of what was once measured.
+
 A fresh four-shape check at 16M rows on the 96-core node agrees, and is recorded because it
 was run to test the retired sentence rather than to support it: `ORDER BY` 0.14x, filter
 0.27x, join 0.35x, and a 100-group `GROUP BY` at 2.40x. Three decisive wins and one loss, and

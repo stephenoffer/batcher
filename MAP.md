@@ -3153,7 +3153,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `dtype_name.rs` | 226 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
 | `float_ident.rs` | 161 | The engine's one definition of **float identity**. |
-| `hardware.rs` | 322 | Host CPU capability detection for adaptive execution. |
+| `hardware.rs` | 368 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 230 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 233 | `bc-arrow` — Arrow building blocks shared across the engine. |
