@@ -2354,7 +2354,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 
 | module | lines | what it is |
 |---|---|---|
-| `_bind.py` | 171 | Shared accessor-generation helper for the namespace families. |
+| `_bind.py` | 180 | Shared accessor-generation helper for the namespace families. |
 | `_descriptions.py` | 497 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
 | `collections.py` | 1671 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |

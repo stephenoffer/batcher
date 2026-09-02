@@ -65,15 +65,24 @@ def _bind_accessors(
     """
     ns_globals = sys.modules[ns.__module__].__dict__
     for name, tag in table.items():
-
+        # `_tag` and `_build` are keyword-only, and the `*` is the whole point of this
+        # function rather than a style choice. As positional parameters they were reachable
+        # from a public call: `col("s").str.upper("lower")` returned *lowercase*, and
+        # `.str.upper("reverse")` reversed, because the caller's first argument landed on
+        # `_tag` and redirected the method to another function in the same family. These
+        # accessors advertise `upper() -> Expr` through `_ACCESSOR_SIGNATURE`, so a type
+        # checker and the reference page both said no argument was accepted while one
+        # silently changed the answer. Keyword-only makes that a `TypeError`.
         def accessor(
             self: Any,
+            *,
             _tag: str = tag,
             _build: Callable[[Expr, str], Expr] = build,
         ) -> Expr:
             return _build(self._e, _tag)
 
         bound = types.FunctionType(accessor.__code__, ns_globals, name, accessor.__defaults__)
+        bound.__kwdefaults__ = {"_tag": tag, "_build": build}
         bound.__qualname__ = f"{ns.__name__}.{name}"
         bound.__module__ = ns.__module__
         bound.__signature__ = _ACCESSOR_SIGNATURE  # type: ignore[attr-defined]
