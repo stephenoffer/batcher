@@ -177,7 +177,7 @@ The public, fluent, lazy, expression-first API surface.
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 950 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 188 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `query_history.py` | 227 | `bt.query_history()` — the queries this deployment has run, as a `Dataset`. |
+| `query_history.py` | 249 | `bt.query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `source_stats.py` | 567 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 444 | Compute a repeated subplan once and read it back (control plane, `api`). |
@@ -206,7 +206,7 @@ The `Dataset` builder package.
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 540 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 6635 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 3588 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `ml.py` | 3595 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/_build/` — 5 · conductor
@@ -290,7 +290,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 1983 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 1992 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -306,7 +306,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `execute.py` | 265 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
 | `format.py` | 96 | Which format is the table at this path? — the one question a merge can answer by looking. |
 | `iceberg_native.py` | 140 | Native Iceberg ``MERGE INTO`` via pyiceberg's `Table.upsert`. |
-| `native.py` | 93 | Dispatch a MERGE to the target format's own implementation, when it has one. |
+| `native.py` | 103 | Dispatch a MERGE to the target format's own implementation, when it has one. |
 | `plan.py` | 219 | Deciding what a MERGE has to rewrite — the pruning half, with no side effects. |
 
 ### `batcher/api/orchestration/` — 5 · conductor
@@ -555,10 +555,10 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 |---|---|---|
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
-| `generate.py` | 448 | LLM batch generation — the columnar half of offline text generation. |
+| `generate.py` | 536 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
-| `requests.py` | 303 | Turning a `RecordBatch` into the per-row requests an engine receives. |
+| `requests.py` | 312 | Turning a `RecordBatch` into the per-row requests an engine receives. |
 | `sizing.py` | 348 | Sizing an LLM engine from the workload instead of from the model's maximum. |
 | `structured.py` | 527 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
 
@@ -900,7 +900,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 2920 | The distributed executor — the dispatcher. |
+| `executor.py` | 2974 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 810 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -964,7 +964,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 197 | How finely a shuffle divides its work — on both sides of the exchange. |
-| `scaling.py` | 787 | What the live cluster is, and what of it a query may use. |
+| `scaling.py` | 792 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 771 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
@@ -2982,7 +2982,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `byte_key.rs` | 215 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 125 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 258 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
-| `gather/mod.rs` | 747 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
+| `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 357 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |

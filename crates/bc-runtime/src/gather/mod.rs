@@ -175,6 +175,12 @@ fn byte_span_fits<T: ByteArrayType>(arrays: &[&dyn Array]) -> Result<(), Runtime
 /// down with it, which is exactly what `concat_columns` says about arrow's `.expect()` two
 /// functions up. Refusing sends the caller to `byte_span_fits`, which reports what it saw.
 fn byte_span<T: ByteArrayType>(a: &GenericByteArray<T>) -> Option<(usize, usize)> {
+    // A row-less input contributes no rows and no bytes, so its offsets are not consulted at
+    // all. That is not only an economy: a 0-row array is exactly where a malformed offset
+    // buffer is survivable, because nothing in it is ever read.
+    if a.is_empty() {
+        return Some((0, 0));
+    }
     let o = a.value_offsets();
     let start = o[0].to_usize()?;
     let end = o[a.len()].to_usize()?;
@@ -798,6 +804,54 @@ mod tests {
             message.contains("cannot describe a byte range") && message.contains("-189153672"),
             "the error should report what it saw, got: {message}"
         );
+    }
+
+    /// A **0-row** input must contribute nothing without its offsets being consulted.
+    ///
+    /// This is the one that mattered in production. A length-0 `Utf8` array is valid Arrow
+    /// with a zero-byte offsets buffer, or with no offsets buffer at all -- pyarrow's own
+    /// `validate(full=True)` accepts both -- so `value_offsets()[0]` reads a position the
+    /// array is not required to define. The distributed `right` and `outer` joins ship
+    /// exactly such an array: `flight_join.probe` builds a 0-row batch so a reducer whose
+    /// bucket is missing a side has something schema-bearing to null-extend from.
+    ///
+    /// Measured before and after, at 8 reducers over the operator matrix's fixture, six runs
+    /// each: `right` and `outer` failed 6/6 and now pass 6/6, while `inner` and `left` --
+    /// which never null-extend from the probe -- passed 6/6 throughout. The row count is
+    /// what makes it survivable: nothing from a 0-row input is ever read, so the only way
+    /// its offsets can matter is if something asks for them.
+    #[test]
+    fn a_row_less_input_contributes_nothing_without_its_offsets_being_read() {
+        use arrow::array::{Array, ArrayData, ArrayRef, StringArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        // Length 0, carrying the offset the shuffle actually delivered. Arrow-rs normalises
+        // a *missing* offsets buffer, so an empty one would not reproduce anything: the
+        // pathological part is a 0-row array whose single offset is not a byte position.
+        let offsets: Vec<i32> = vec![-189_153_672];
+        let data = unsafe {
+            ArrayData::builder(DataType::Utf8)
+                .len(0)
+                .add_buffer(Buffer::from_slice_ref(&offsets))
+                .add_buffer(Buffer::from(Vec::<u8>::new()))
+                .build_unchecked()
+        };
+        let empty: ArrayRef = Arc::new(arrow::array::StringArray::from(data));
+        let real: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("cc")]));
+
+        for inputs in [
+            [empty.as_ref(), real.as_ref()],
+            [real.as_ref(), empty.as_ref()],
+        ] {
+            let out = super::concat_columns(&inputs).expect("a 0-row input must not fail");
+            let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+            let got: Vec<Option<&str>> = (0..out.len())
+                .map(|i| (!out.is_null(i)).then(|| out.value(i)))
+                .collect();
+            assert_eq!(got, vec![Some("a"), None, Some("cc")]);
+        }
     }
 
     /// The control: an ordinary pair still takes the bulk path and concatenates.
