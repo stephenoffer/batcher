@@ -79,6 +79,64 @@ def test_the_published_signature_still_advertises_no_arguments():
     assert [p for p in signature.parameters if not p.startswith("_")] == []
 
 
+def _every_zero_argument_accessor() -> list[tuple[str, str]]:
+    """(namespace, method) for every accessor that takes no arguments, read off the live
+    objects rather than a list, so a namespace added later is covered."""
+    column = bt.col("x")
+    out: list[tuple[str, str]] = []
+    holders = [(ns, getattr(column, ns)) for ns in _NAMESPACES if getattr(column, ns, None)]
+    holders.append(("Expr", column))
+    for label, holder in holders:
+        for name in dir(holder):
+            if name.startswith("_"):
+                continue
+            function = getattr(holder, name, None)
+            if not callable(function):
+                continue
+            try:
+                signature = inspect.signature(function)
+            except (TypeError, ValueError):
+                continue
+            if [p for p in signature.parameters if not p.startswith("_")]:
+                continue
+            out.append((label, name))
+    return out
+
+
+_NAMESPACES = ("str", "dt", "list", "struct", "json", "map", "image", "audio", "video")
+_ALL_ZERO_ARG = _every_zero_argument_accessor()
+
+
+def test_the_sweep_found_the_surface():
+    """A sweep that enumerates nothing passes while checking nothing."""
+    assert len(_ALL_ZERO_ARG) >= 300, f"only {len(_ALL_ZERO_ARG)} zero-argument accessors found"
+
+
+def test_no_zero_argument_accessor_accepts_a_positional_argument():
+    """The whole surface, not the five cases above.
+
+    This is the check that would have caught the original defect, and the signature-based
+    equivalent is the one that would not: these accessors publish a synthetic
+    `__signature__` reading `upper() -> Expr`, so `inspect` reported no parameters while the
+    runtime accepted one. Scanning signatures for a private positional parameter finds
+    nothing here even with the bug present. Only calling them does.
+    """
+    accepted = []
+    for label, name in _ALL_ZERO_ARG:
+        holder = bt.col("x") if label == "Expr" else getattr(bt.col("x"), label)
+        try:
+            getattr(holder, name)("an_unexpected_positional_argument")
+        except TypeError:
+            continue
+        except Exception:
+            continue
+        accepted.append(f"{label}.{name}")
+    assert accepted == [], (
+        "these accessors silently accepted a positional argument, which for a table-bound "
+        f"accessor redirects it to another function in its family: {accepted}"
+    )
+
+
 class TestTheBehaviourItProtects:
     """The redirect, spelled out on real data, so a regression is legible rather than a
     `TypeError` disappearing from a parametrized list."""
