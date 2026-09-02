@@ -276,6 +276,48 @@ questions about its values, and `min`/`max` are two of those values outright.
 This happens automatically. It is worth knowing because it is a reason to *use* the
 `security()` block even for a pipeline that only writes.
 
+## Know what a partial mask does to a short value
+
+`Redact` reveals the first or last few characters of a value, which is the "card ending 1234"
+pattern. A value no longer than what the policy reveals is masked **completely** rather than
+returned as it is.
+
+That case is not rare. A masking policy is usually written about names, postcodes, national
+identifiers and country codes, and many of the values in such a column are shorter than the
+four characters a card policy reveals:
+
+```python
+import batcher as bt
+from batcher.governance import Redact
+
+people = bt.from_pydict(
+    {"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]}
+)
+masked = people.select(
+    name=Redact(show_first=1)(bt.col("name")),
+    postcode=Redact(show_last=3)(bt.col("postcode")),
+)
+print(masked.to_pydict())
+```
+
+```text
+{'name': ['AXXXXXXXX', 'BX', 'LX'], 'postcode': ['XXXXX2AA', 'XXX', 'XX']}
+```
+
+`EC1` and `N1` are no longer than the three characters the postcode policy reveals, so they
+come back fully masked. `Bo` and `Li` are longer than the single character the name policy
+reveals, so they keep their initial.
+
+Two things follow when you write a policy:
+
+- Choose `show_first` and `show_last` against the *shortest* values you expect, not the
+  longest. Revealing four characters of a column whose median value is five characters is a
+  policy that mostly discloses.
+- Masking is length-preserving, so the output still tells a reader how long the value was.
+  Where the length itself is sensitive, reach for {py:class}`Pseudonymize
+  <batcher.governance.Pseudonymize>` or {py:class}`Nullify <batcher.governance.Nullify>`
+  instead.
+
 ## Checklist
 
 Before a deployment that matters, complete the following:
@@ -289,6 +331,7 @@ Before a deployment that matters, complete the following:
 1. Pass every key and credential by reference.
 1. Confirm the `MetadataHub` backend's access controls match the data it will hold
    statistics about.
+1. Size every partial mask against the shortest values in its column, not the longest.
 
 ## Requirements and limitations
 
