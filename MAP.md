@@ -2913,7 +2913,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `agg_par.rs` | 759 | The high-cardinality parallel aggregate: partition first, aggregate once. |
-| `coalesce.rs` | 145 | Merge a result's small batches before it leaves the engine. |
+| `coalesce.rs` | 149 | Merge a result's small batches before it leaves the engine. |
 | `dist.rs` | 586 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 136 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
