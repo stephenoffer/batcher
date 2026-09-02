@@ -18,12 +18,23 @@ idle, running a 200M-row grouped aggregate off shared storage:
     wall 13.26s   sampled 14.1% of the cluster = 54 of 384 cores = 717.5 CPU-seconds
     engine reported 46 ms of CPU and 0.96 cores busy
 
-Four orders of magnitude. The mechanism to carry it is present and documented --
-`ProfileCollector.to_profile` folds each worker `ExecMetrics` document's `query` block into
-`usage`, and `QueryUsage.merged` sums them precisely because "a stage's cost is the sum of
-what its workers spent" -- but the documents do not arrive: the captured `QUERY_END` payload
-carried `worker_ops: 1` and a `usage` block the size of one short task. Every
-`record_usage` call site in the tree is on the single-node or the spill path.
+Four orders of magnitude.
+
+**The Python aggregation is not the cause, and an earlier revision of this docstring said it
+was.** That claim rested on every `record_usage` call site being single-node or spill, which
+is true and irrelevant: the distributed path carries usage by a different route --
+`stages.py` sets `prof.worker_metrics`, `ProfileCollector.to_profile` folds each worker
+document's `query` block in, and `QueryUsage.merged` sums them. Instrumenting the driver
+shows that route working exactly as written: both drains fire (`record_worker_metrics` and
+`drain_worker_metrics`, 64 documents each), every document carries a `query` block, and
+their summed `cpu_ns` reaches `QUERY_END` unchanged -- 51.2 ms in, 51.2 ms out.
+
+The documents themselves are what is small. 128 of them total **0.099 seconds** of worker
+CPU, 0.35-5.23 ms apiece, for a run that burned some 300 CPU-seconds across the fleet. So
+the gap is upstream of the metrics layer: the great majority of the work runs in tasks that
+never produce a metered `ExecMetrics` document, or produce one that accounts for a sliver of
+what the task spent. Localising that further means reading the distributed executor, which
+is mid-rewrite, or instrumenting the Rust engine.
 
 The consequence is not a cosmetic gap. It is that Batcher's own metrics cannot answer "how
 much of this cluster did that query use", which is the first question anyone sizing a cluster
