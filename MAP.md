@@ -1727,12 +1727,12 @@ Governance — who may read which rows and columns, and through what mask.
 | `_validate.py` | 111 | Input checks for the governance declaration surface. |
 | `audit.py` | 89 | `GovernanceEvent` — the record of one authorization decision. |
 | `audit_log.py` | 115 | The durable audit sink: governance decisions appended to a file that outlives the query. |
-| `catalog.py` | 457 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
+| `catalog.py` | 792 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |
 | `lineage.py` | 213 | Column-level lineage — which source columns each output column is derived from. |
 | `masks.py` | 166 | Declarative, picklable column-mask factories. |
-| `policy.py` | 149 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
+| `policy.py` | 241 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
 | `residency.py` | 372 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
@@ -1757,7 +1757,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 253 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 471 | Format and layout detection for the generic `read(path, format=None)` entry point. |
-| `filesystem.py` | 658 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
+| `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 543 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 302 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |

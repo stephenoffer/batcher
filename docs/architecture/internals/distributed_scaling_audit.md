@@ -581,22 +581,37 @@ network-bound than to launch-bound, and shaving driver round trips would not obv
 The explicit-`num_workers` thinning (Finding 1) is written and green but uncommitted, for the
 file-contention reason recorded above.
 
-## Debt this pass created
+## When to interleave a sweep, and when block order is forced
 
-`benchmarks/harness/interleave.py` — the round-robin timing helper written after the ordering
-artefact above — **shipped with no caller**, which is the "no empty frameworks, add the seam
-when the second use case arrives" rule in `python-quality.md` and `maintainability.md`. It is
-not a close call: every sibling in that package has between one and eight importers *and* is
-re-exported from `harness/__init__.py`; this one has zero and is not re-exported, so it is not
-reachable through the package's public surface at all.
+The ordering artefact retracted above cost a published finding, so this pass added a
+round-robin timing helper to `benchmarks/harness/` to prevent a repeat. **It has been removed
+again**, and the reason is more useful than the code was.
 
-Its natural caller is `benchmarks/scenarios/scaling/ladder.py`, which walks a worker-count
-sequence in fixed rung order and reports best-of — best-of blunts within-rung noise and does
-nothing about drift across the whole sweep, which is exactly the bias the helper removes.
-`ladder.py` and `harness/__init__.py` were both held by another session for the whole pass, so
-neither the wiring nor the re-export could be made. Doing both is the follow-up; until then
-this is unused code carried on the strength of a lesson rather than a caller, and that is worth
-naming rather than leaving for someone else to find.
+It shipped with no caller, which is the "no empty frameworks, add the seam when the second use
+case arrives" rule — and not a close call, since every sibling in that package has between one
+and eight importers and is re-exported from `harness/__init__.py` while that one had zero and
+was not. The obvious remedy was to wire it into `benchmarks/scenarios/scaling/ladder.py`, the
+strong-scaling ladder, which walks a worker-count sequence in fixed rung order.
+
+**That would have broken the ladder.** It calls `_drop_session_fleet()` before each rung and
+then takes one untimed warm-up that respawns the fleet at that rung's width, so the timed runs
+all land on a warm fleet of the right size. Interleaving the rungs would force a teardown and
+respawn before *every* timed run, and a fleet spawn is seconds against a sub-second query. The
+block structure there is load-bearing, not incidental.
+
+So the rule is about the cost of switching variants, not about sweeps in general:
+
+- **Cheap switch** — a config value, a cap, a flag, with the same fleet and data underneath.
+  Block ordering charges drift to whichever variant held the floor while it drifted, which is
+  exactly how `[2, 4, 8, 16, 32, 64]` manufactured an interior optimum at 8 across four
+  cardinalities. Interleave: one rep of each, in order, repeated, every variant warmed first.
+- **Expensive switch** — anything that must tear down and rebuild state between variants, as
+  the ladder's rungs must. Interleaving pays that cost per run and measures the rebuild.
+  Block, and control drift another way: reset the shared state per block (`_drop_session_fleet`),
+  warm inside the block, and report best-of rather than a median.
+
+Every sweep in this document is the first kind, which is why every one of them was re-taken
+round-robin. The ladder is the second, and was right as written.
 
 ## Two fixes written, verified, and not committed
 
