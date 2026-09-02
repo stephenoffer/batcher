@@ -330,7 +330,7 @@ The conductor's half of governance: install a policy, and apply it at every read
 | module | lines | what it is |
 |---|---|---|
 | `_authn.py` | 104 | Installing a credential verifier, and using it to establish an identity. |
-| `_binding.py` | 183 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
+| `_binding.py` | 257 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
 | `_context.py` | 142 | The security context: which catalog and principal are in effect for this scope. |
 | `_write.py` | 267 | Where governance meets a write: which privilege it needs, and whether the principal has it. |
 
@@ -1729,14 +1729,14 @@ Governance — who may read which rows and columns, and through what mask.
 | `_validate.py` | 111 | Input checks for the governance declaration surface. |
 | `audit.py` | 103 | `GovernanceEvent` — the record of one authorization decision. |
 | `audit_log.py` | 119 | The durable audit sink: governance decisions appended to a file that outlives the query. |
-| `catalog.py` | 800 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
+| `catalog.py` | 821 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |
 | `lineage.py` | 213 | Column-level lineage — which source columns each output column is derived from. |
 | `masks.py` | 166 | Declarative, picklable column-mask factories. |
 | `policy.py` | 240 | The policy objects a `SecurityCatalog` holds: grants, column masks, row filters. |
 | `principal.py` | 212 | `Principal` — who is running the query. |
-| `residency.py` | 385 | Data residency — where a dataset is allowed to be computed on, not just stored. |
+| `residency.py` | 413 | Data residency — where a dataset is allowed to be computed on, not just stored. |
 
 ### `batcher/governance/authn/` — 3 · subsystem
 
@@ -1745,7 +1745,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 76 | The contract a credential verifier implements, and what it may not promise. |
-| `verifiers.py` | 419 | The credential verifiers Batcher ships. |
+| `verifiers.py` | 463 | The credential verifiers Batcher ships. |
 
 ### `batcher/io/` — 2 · neutral IO
 
@@ -1781,7 +1781,7 @@ Template-Method base classes for file-backed sources and sinks.
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
 | `sink.py` | 774 | `FileSink` — the Template-Method base every file-format writer subclasses. |
-| `source.py` | 1485 | `FileSource` — the Template-Method base every file-format reader subclasses. |
+| `source.py` | 1500 | `FileSource` — the Template-Method base every file-format reader subclasses. |
 
 ### `batcher/io/formats/` — 2 · neutral IO
 
@@ -1815,7 +1815,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_staging.py` | 139 | Staged-file writes for the Iceberg sink. |
 | `_time.py` | 88 | Normalize a user's time-travel timestamp into the form a table-format client accepts. |
 | `delta_sharing.py` | 366 | Delta Sharing format — read a shared table directly into Arrow. |
-| `hudi.py` | 415 | Apache Hudi format — read-only via `hudi` (hudi-rs). |
+| `hudi.py` | 431 | Apache Hudi format — read-only via `hudi` (hudi-rs). |
 | `maintenance.py` | 157 | Table maintenance — compaction, clustering, and reclamation, as transactions. |
 
 ### `batcher/io/formats/lakehouse/delta/` — 2 · neutral IO
@@ -1829,8 +1829,8 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_snapshot.py` | 523 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
 | `sink.py` | 470 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
-| `source.py` | 527 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
-| `stream.py` | 379 | Reading a Delta table's Change Data Feed, unbounded or over a fixed version window. |
+| `source.py` | 544 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
+| `stream.py` | 395 | Reading a Delta table's Change Data Feed, unbounded or over a fixed version window. |
 
 ### `batcher/io/formats/lakehouse/iceberg/` — 2 · neutral IO
 
@@ -1843,7 +1843,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `maintenance.py` | 125 | Iceberg table maintenance: snapshot expiry, and an honest refusal to compact. |
 | `puffin.py` | 199 | The distinct-value counts a table's Puffin statistics publish, read for planning. |
 | `sink.py` | 240 | Writing an Iceberg table: workers stage data files, the driver commits one snapshot. |
-| `source.py` | 563 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
+| `source.py` | 579 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
 
 ### `batcher/io/formats/ml/` — 2 · neutral IO
 
@@ -1977,7 +1977,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `autoloader.py` | 427 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
-| `dev.py` | 342 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
+| `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
 | `eventhubs.py` | 364 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 716 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 314 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
@@ -1994,7 +1994,7 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 | module | lines | what it is |
 |---|---|---|
 | `schema.py` | 289 | The fixed broker message schema, the message record, and option redaction. |
-| `source.py` | 644 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
+| `source.py` | 662 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
 | `split.py` | 204 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
@@ -2069,7 +2069,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `_extract.py` | 300 | Reading prose out of the document formats a corpus actually contains. |
 | `binary.py` | 198 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
 | `documents.py` | 241 | Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown. |
-| `text.py` | 453 | Plain-text source — one row per line or one row per whole file. |
+| `text.py` | 470 | Plain-text source — one row per line or one row per whole file. |
 | `warc.py` | 319 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
 
 ### `batcher/io/lookup/` — 2 · neutral IO
@@ -3191,7 +3191,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 |---|---|---|
 | `client_pool.rs` | 344 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
 | `exchange.rs` | 563 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
-| `handler.rs` | 447 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
+| `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 107 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 408 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 410 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |

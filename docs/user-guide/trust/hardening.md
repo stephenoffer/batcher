@@ -134,6 +134,19 @@ Signature algorithms default to asymmetric only. That default is load-bearing: a
 `HS256` alongside `RS256` is the algorithm-confusion attack, where an attacker signs a
 token with the public key used as an HMAC secret.
 
+**Set the issuer and the audience.** Both default to empty and both are then skipped, and
+what that costs is a property of how the large identity providers are deployed: they publish
+one key set across many tenants and many applications. A valid signature proves which key
+set signed the token, never who it was minted for. So with `iss` unchecked a token from
+another tenant of the same provider verifies, and with `aud` unchecked a token minted for
+another application of the same tenant verifies. Both are real tokens, correctly signed,
+issued to somebody else and replayed at you.
+
+`from_issuer` sets the issuer for you. Nothing can guess the audience, so pass it. Leaving
+either unset stays legal, because a deployment mid-migration may not know its audience yet,
+and raises a `SecurityWarning` naming the check that was skipped and what verifies without
+it.
+
 ```{warning}
 This is a deployment control, not a security boundary. Code inside the engine's process can
 set `issuer` by hand. It makes "we only accept established identities" enforceable for the

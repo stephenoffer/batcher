@@ -29,9 +29,11 @@ import hmac
 import json
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
+from batcher._internal.errors import SecurityWarning
 from batcher._internal.optional import require
 from batcher.governance.authn.base import AuthenticationError
 from batcher.governance.principal import Principal
@@ -296,11 +298,27 @@ class JwtVerifier:
     algorithm-confusion attack, where an attacker signs a token with the *public* key as an
     HMAC secret and the verifier accepts it.
 
+    **Set `issuer` and `audience`.** Both default to empty, both are then skipped, and both
+    skips are accepted attacks rather than merely loose configuration. A valid signature
+    proves the token came from the key set at `jwks_url`; it proves nothing about *who it
+    was minted for*. The large identity providers publish one key set across many tenants
+    and many applications, so without `iss` a token from another tenant of the same provider
+    verifies, and without `aud` a token minted for a different application of the same tenant
+    verifies -- in both cases a real token, correctly signed, issued to somebody else and
+    replayed here. Leaving either empty is legal and warns (`SecurityWarning`), because a
+    deployment mid-migration may genuinely not know its audience yet; it is not a
+    configuration to run on.
+
     Examples:
         .. doctest::
 
             >>> from batcher.governance.authn import JwtVerifier
-            >>> JwtVerifier(jwks_url="https://idp/.well-known/jwks.json").algorithms
+            >>> verifier = JwtVerifier(
+            ...     jwks_url="https://idp/.well-known/jwks.json",
+            ...     issuer="https://idp/",
+            ...     audience="batcher",
+            ... )
+            >>> verifier.algorithms
             ('RS256', 'ES256')
     """
 
@@ -312,6 +330,32 @@ class JwtVerifier:
     audience: str = ""
     #: Permitted signature algorithms. Asymmetric only, by default and on purpose.
     algorithms: tuple[str, ...] = ("RS256", "ES256")
+
+    def __post_init__(self) -> None:
+        """Warn about the two checks that are skipped when left unset.
+
+        At construction rather than at `verify`, so the warning names the line that
+        configured the verifier rather than a line in the middle of a pipeline, and so it is
+        emitted once per verifier instead of once per credential.
+        """
+        skipped = [
+            f"{what} unset, so a token issued to {who} verifies"
+            for what, value, who in (
+                ("issuer (`iss`)", self.issuer, "another tenant of the same identity provider"),
+                ("audience (`aud`)", self.audience, "another application of the same tenant"),
+            )
+            if not value
+        ]
+        if not skipped:
+            return
+        detail = "; ".join(skipped)
+        warnings.warn(
+            f"JwtVerifier(jwks_url={self.jwks_url!r}) skips a claim check: {detail}. "
+            "A valid signature proves which key set signed the token, never who it was "
+            "minted for.",
+            SecurityWarning,
+            stacklevel=3,
+        )
 
     @classmethod
     def from_issuer(cls, issuer: str, *, audience: str = "", timeout: float = 10.0) -> JwtVerifier:
