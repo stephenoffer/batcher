@@ -18,6 +18,7 @@ use arrow::array::RecordBatch;
 use bc_ir::RelOp;
 
 mod agg_par;
+mod coalesce;
 pub mod dist;
 mod distinct_on_spill;
 mod error;
@@ -45,6 +46,7 @@ pub use bc_expr::sniff_mime;
 // edge: the Flight gather stages its buckets as Arrow IPC exactly as the spill store does,
 // and one policy is the point.
 pub use bc_runtime::agg::spill::SpillCodec;
+pub use coalesce::coalesce_small_batches;
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
