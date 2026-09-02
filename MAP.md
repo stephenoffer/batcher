@@ -1728,7 +1728,7 @@ Governance — who may read which rows and columns, and through what mask.
 |---|---|---|
 | `_validate.py` | 111 | Input checks for the governance declaration surface. |
 | `audit.py` | 103 | `GovernanceEvent` — the record of one authorization decision. |
-| `audit_log.py` | 115 | The durable audit sink: governance decisions appended to a file that outlives the query. |
+| `audit_log.py` | 119 | The durable audit sink: governance decisions appended to a file that outlives the query. |
 | `catalog.py` | 800 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
 | `filters.py` | 144 | Declarative, picklable row-filter factories for attribute-based row access. |

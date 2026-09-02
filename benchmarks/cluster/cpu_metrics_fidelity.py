@@ -1,0 +1,127 @@
+"""Does a distributed run report what it cost the cluster? Measured, not assumed.
+
+`observe.metrics` publishes `cores_busy`, `time_ms_total` and `execution_ms_total` for every
+query, and a family of things reads them: the Prometheus `batcher_cpu_*` series, the
+dashboard's CPU panel, and every "is the box holding this query back" finding in
+`observe.insights`. On the single-node path those counters are accurate --
+`benchmarks/internals/cpu_utilization.py` holds them against `resource.getrusage` and they
+agree inside 0.4%.
+
+This is the same check for the distributed path, where the driver's own `getrusage` cannot be
+the reference: the work happened on other machines. The reference here is the cluster itself,
+sampled per node through `cluster_util.ClusterMonitor` (one `num_cpus=0` actor per node
+reading `psutil`), which is the same instrument `vs_ray_daft.py` reports utilization with.
+
+**What it found when it was written (2026-09-01).** A 5-node / 384-core cluster, otherwise
+idle, running a 200M-row grouped aggregate off shared storage:
+
+    wall 13.26s   sampled 14.1% of the cluster = 54 of 384 cores = 717.5 CPU-seconds
+    engine reported 46 ms of CPU and 0.96 cores busy
+
+Four orders of magnitude. The mechanism to carry it is present and documented --
+`ProfileCollector.to_profile` folds each worker `ExecMetrics` document's `query` block into
+`usage`, and `QueryUsage.merged` sums them precisely because "a stage's cost is the sum of
+what its workers spent" -- but the documents do not arrive: the captured `QUERY_END` payload
+carried `worker_ops: 1` and a `usage` block the size of one short task. Every
+`record_usage` call site in the tree is on the single-node or the spill path.
+
+The consequence is not a cosmetic gap. It is that Batcher's own metrics cannot answer "how
+much of this cluster did that query use", which is the first question anyone sizing a cluster
+asks, and they answer it *confidently and wrongly* rather than declining.
+
+Run (needs a Ray cluster and a shared source; see `SOURCE`):
+    python benchmarks/cluster/cpu_metrics_fidelity.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _ray_env import init_batcher_ray
+
+#: A Parquet source every node can read. Written once with, e.g.
+#: ``bt.range(200_000_000).select(...).write.parquet(SOURCE)``. Overridable so the check can
+#: run against whatever a fleet already has staged.
+SOURCE = os.environ.get("BATCHER_FIDELITY_SOURCE", "/mnt/cluster_storage/batcher_util_probe")
+
+#: How far the engine's reported CPU may fall below the sampled figure before this is a
+#: failure. Generous on purpose: the sampler counts whole nodes including the head and any
+#: co-tenant, so it legitimately over-counts somewhat, and the reading is a 200 ms cadence.
+#: Nothing inside an order of magnitude is being called a defect here. The gap this exists to
+#: catch was four orders.
+_MAX_UNDER_REPORT = 10.0
+
+
+def main() -> int:
+    init_batcher_ray()
+
+    import ray
+    from cluster_util import ClusterMonitor
+
+    import batcher as bt
+    from batcher import col
+    from batcher._internal import events
+
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
+    cluster_cpus = int(sum(n["Resources"].get("CPU", 0) for n in nodes))
+    if cluster_cpus <= 0:
+        print("no CPU capacity visible on the cluster; nothing to measure")
+        return 0
+
+    finished: list[dict] = []
+    events.subscribe(
+        lambda event: finished.append(event.fields) if event.kind == events.QUERY_END else None
+    )
+
+    dataset = (
+        bt.read_parquet(SOURCE)
+        .group_by(k=col("a") % 200_000)
+        .agg(s=col("b").sum(), n=col("a").count())
+    )
+
+    monitor = ClusterMonitor(interval_s=0.2)
+    monitor.start()
+    started = time.monotonic()
+    rows = len(dataset.collect(distributed=True))
+    wall = time.monotonic() - started
+    sampled = monitor.stop()
+
+    usage = (finished[-1].get("usage") if finished else None) or {}
+    busy_cores = sampled["mean_busy_pct"] / 100.0 * cluster_cpus
+    sampled_cpu_seconds = busy_cores * wall
+    reported_cpu_seconds = float(usage.get("cpu_ms", 0.0)) / 1000.0
+
+    print(f"\ncluster: {len(nodes)} nodes / {cluster_cpus} CPUs;  rows {rows};  wall {wall:.2f}s")
+    print(
+        f"  sampled : {sampled['mean_busy_pct']:.1f}% busy = {busy_cores:.0f} cores"
+        f"  ({sampled_cpu_seconds:.1f} CPU-seconds, {sampled['active_nodes']:.0f} active nodes)"
+    )
+    print(
+        f"  engine  : {reported_cpu_seconds:.3f} CPU-seconds,"
+        f" cores_busy {float(usage.get('cores_busy', 0.0)):.2f}"
+    )
+
+    if sampled_cpu_seconds < 1.0:
+        print("\n  the query did not load the cluster enough to judge; use a larger source")
+        return 0
+    if reported_cpu_seconds <= 0.0:
+        print("\n  FAIL: the engine reported no CPU at all for a run that used the cluster")
+        return 1
+    factor = sampled_cpu_seconds / reported_cpu_seconds
+    print(f"  under-report factor: {factor:.0f}x")
+    if factor > _MAX_UNDER_REPORT:
+        print(
+            f"\n  FAIL: distributed CPU accounting is {factor:.0f}x low. The workers' whole-"
+            "execution readings are not reaching `QueryUsage` -- see this module's docstring."
+        )
+        return 1
+    print("\n  OK: the engine's CPU accounting is within an order of magnitude of the cluster")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
