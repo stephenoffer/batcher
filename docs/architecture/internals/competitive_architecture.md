@@ -1203,6 +1203,37 @@ matched cardinality and does not change the shape of either curve, so the 2.54x 
 string-keyed `GROUP BY` in the sweep was the fixed overhead with a modest string cost on top,
 not a string-hashing problem. Reporting it as one would have sent someone to the wrong file.
 
+A second sweep, run to see whether top-N was one of many losses or one of few, says few. Same
+release build, 2,000,000 rows, seven columns including a string and a timestamp, row counts
+checked against DuckDB's before any time was reported:
+
+| Shape | Batcher vs DuckDB |
+|---|---|
+| `ORDER BY g, x` | **0.23x** |
+| `replace()` | **0.25x** |
+| `upper()` + `length()` | **0.27x** |
+| `split_part()` | 0.33x |
+| `CASE WHEN` | 0.42x |
+| `regexp_extract()` | 0.46x |
+| `sum() OVER (PARTITION BY)` | 0.48x |
+| semi-join (`EXISTS`) | 0.49x |
+| `GROUP BY` two keys | 0.52x |
+| `median()` | 0.72x |
+| `UNION ALL` | 0.99x |
+| `sum/avg/min/max` | 1.03x |
+| `stddev()` | 1.40x |
+| `GROUP BY ... HAVING` | 1.51x |
+
+Batcher wins twelve of the fourteen, several by 3-4x, and the two it loses are the two that
+return almost nothing -- `stddev` returns one row and the `HAVING` returns 2,412. Both are
+19 ms against 13 ms, which is the floor above and not a property of either operator.
+
+That is the useful conclusion from twenty-six measured shapes across the two sweeps: apart
+from top-N, **every shape Batcher loses is a small result, and every one of them is the same
+floor.** There is no scattered set of slow operators to go and optimize. There is one
+cost, it is the learning loop and the optimizer's own statistics, and section 9 already says
+where it lives.
+
 
 ## The roadmap that would make the claim true
 
