@@ -114,6 +114,41 @@ was still wrong about the mechanism: pushdown works, and the filter came from
 inference would have modified correct code and left the real bug in place. An over-read
 experiment is more dangerous than an unread one, because it arrives with evidence attached.
 
+### A knob that moves is not a knob that tests what you think
+
+`collect(num_partitions=N)` is a **spill** knob. It is the obvious reach when you want to
+show an operator gives the same answer however the work is divided, and it does not show
+that.
+
+Measured here: varying it from 1 to 8 visibly changes physical execution -- a spilled
+300,000-row sort came back in 61 batches against 72, with the timing to match -- and it did
+not move a `LIMIT` over an unordered `group_by` at all. Not at 200 rows, not at 300,000
+(both sides of `MIN_ROWS_TO_SHARD`, which is 4 morsels = 65,536), with spill on or off, from
+an in-memory source or four Parquet files. That shape is precisely the one
+`.claude/rules/python-control-plane.md` records as diverging between a single-node run and a
+two-worker one over four Parquet files: groups 0, 1, 2 against 3, 5, 8.
+
+So a test asserting "the same result at 1, 4 and 8 partitions" is a true statement about
+spilling and says nothing about distribution, while reading exactly like a distributed
+equivalence test. The only thing that tests single-node == distributed is `distributed=True`
+against a real cluster, which CI cannot do and `just lint-skips` prices.
+
+Two further traps sit on either side of this one, and both were walked into in the session
+that wrote this entry:
+
+- **Below `MIN_ROWS_TO_SHARD` nothing shards at all**, so a small fixture makes *every*
+  parallelism knob inert and every such comparison vacuous. A 200-row fixture proves
+  nothing about parallel execution, and the first reading of the measurement above -- "the
+  lever is inert" -- was wrong for exactly that reason before it was re-run at 300,000.
+- **A sweep over many operations at once inherits the weakness of its lever.** 32 graph
+  algorithms were swept for "determinism across partition counts" and all 32 agreed, which
+  looked like a strong result and was worth nothing: one inert lever, 32 vacuous rows. The
+  breadth made it more convincing, not more valid.
+
+The general form: before trusting a comparison across a setting, show the setting changes
+something you can see. If you cannot make the *un*fixed version of the system fail the test,
+the test is not measuring the setting.
+
 ## Correctness before timing
 
 The benchmark harness refuses to time a query whose result doesn't match the oracle
