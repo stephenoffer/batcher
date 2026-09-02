@@ -806,7 +806,7 @@ SQL frontend — run standard SQL over Batcher datasets.
 
 | module | lines | what it is |
 |---|---|---|
-| `dml.py` | 189 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
+| `dml.py` | 388 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
 
 ### `batcher/_sql/parser/` — 6 · front-end
 

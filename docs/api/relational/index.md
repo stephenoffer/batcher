@@ -12,6 +12,7 @@ The verbs, the column language, and the boundary data crosses. Each page leads w
 | {doc}`/api/relational/spatial` | Rotations, poses and coordinate frames for robotics and AV |
 | {doc}`/api/relational/graph` | Graph analytics and graph-ML features over an edge table |
 | {doc}`/api/relational/sql` | The SQL surface, and how it lowers to the DataFrame API |
+| {doc}`/api/relational/sql-statements` | DDL, `MERGE INTO`, and the catalog statements a client opens with |
 | {doc}`/api/relational/io` | Every reader and writer, with the optional extras |
 
 ```{toctree}
@@ -26,5 +27,6 @@ geospatial
 spatial
 graph
 sql
+sql-statements
 io
 ```
