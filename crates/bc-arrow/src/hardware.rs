@@ -10,7 +10,9 @@
 //! disable SIMD, opt into AVX-512 width), which [`HardwareProfile::resolved`] layers
 //! on top of detection.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Detected host CPU capabilities plus the SIMD width/unroll the JIT should use.
 ///
@@ -209,6 +211,50 @@ fn slurm_expansion_min(raw: &str) -> Option<usize> {
 /// honors no scheduler grant either; see [`scheduler_granted_cores`]. This is the figure to size
 /// thread pools and shard counts from.
 pub fn usable_cores() -> usize {
+    let now = process_nanos();
+    let last = CORE_COUNT_TAKEN_AT.load(Ordering::Relaxed);
+    let cached = CORE_COUNT.load(Ordering::Relaxed);
+    if cached != 0 && now.saturating_sub(last) < CORE_COUNT_TTL_NANOS {
+        return cached;
+    }
+    let fresh = measure_usable_cores();
+    CORE_COUNT.store(fresh, Ordering::Relaxed);
+    CORE_COUNT_TAKEN_AT.store(now, Ordering::Relaxed);
+    fresh
+}
+
+/// How long a reading of [`usable_cores`] is reused before it is taken again.
+///
+/// The reading is not free: on cgroup v2 the quota is enforced at every level of the
+/// hierarchy, so [`cfs_quota_cores`] reads `/proc/self/cgroup` and then one `cpu.max` per
+/// ancestor. Traced on a query with a five-deep cgroup path, one `execute_plan` cost **six
+/// `/proc/self/cgroup` reads and twelve `cpu.max` opens** — the figure is asked for once per
+/// pool sizing, once per shard-count decision, and once per profile consult, and each answer
+/// costs a handful of syscalls.
+///
+/// A tenth of a second is short enough that the freshness this function exists for still
+/// holds: a Ray worker whose CPU affinity is applied *after* the process starts (the hazard
+/// `ExecOptions::workers` documents) is picked up within one tick, and nothing sizes a pool
+/// more often than that in a way a stale-by-100 ms answer would get wrong.
+const CORE_COUNT_TTL_NANOS: u64 = 100_000_000;
+
+/// The last reading, and when it was taken. Zero means "never read".
+///
+/// Two relaxed atomics rather than a lock: a racing pair of readers may both measure and
+/// store, which costs one extra reading and cannot produce a wrong one, since every writer
+/// stores a value it just measured.
+static CORE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CORE_COUNT_TAKEN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds since the first call, on a monotonic clock that cannot jump backwards.
+fn process_nanos() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// [`usable_cores`] with no caching — the reading itself.
+fn measure_usable_cores() -> usize {
     let affinity = std::thread::available_parallelism().map_or(1, |n| n.get());
     [cfs_quota_cores(), scheduler_granted_cores()]
         .into_iter()
@@ -379,6 +425,23 @@ mod usable_cores_tests {
             "quota may only narrow the affinity mask, never widen it ({usable} > {affinity})"
         );
         assert_eq!(usable, HardwareProfile::detect().logical_cores);
+    }
+
+    /// The cached reading must be the reading. A cache that returned a stale, zero or
+    /// otherwise invented figure would size every pool in the process from it, silently, so
+    /// this holds the memoized answer against a fresh measurement rather than against itself.
+    ///
+    /// The TTL's *expiry* is deliberately not asserted here: a test that sleeps past it would
+    /// be a wall-clock assertion in a unit suite, and what it would prove — that a constant is
+    /// finite — is visible in the constant. What matters and is checked is that the value
+    /// served is the measured one.
+    #[test]
+    fn the_memoized_reading_equals_a_fresh_measurement() {
+        let fresh = measure_usable_cores();
+        assert_eq!(usable_cores(), fresh);
+        // Warm, so this call is served from the cache rather than by measuring again.
+        assert_eq!(usable_cores(), fresh);
+        assert!(fresh >= 1);
     }
 
     /// A quota, when present, is a whole-core ceiling ≥ 1 — `cpu.max` of "50000 100000"
