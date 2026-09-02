@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1445 Python modules across 213 packages and 282 Rust files across 15 crates.
+Covering 1446 Python modules across 213 packages and 282 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -332,7 +332,7 @@ The conductor's half of governance: install a policy, and apply it at every read
 | `_authn.py` | 104 | Installing a credential verifier, and using it to establish an identity. |
 | `_binding.py` | 169 | Where the governance subsystem meets a scan: naming a table, governing it, auditing it. |
 | `_context.py` | 142 | The security context: which catalog and principal are in effect for this scope. |
-| `_write.py` | 212 | Where governance meets a write: which privilege it needs, and whether the principal has it. |
+| `_write.py` | 267 | Where governance meets a write: which privilege it needs, and whether the principal has it. |
 
 ### `batcher/api/session/` — 5 · conductor
 
@@ -341,7 +341,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 43 | The one place a `Source` becomes a `Dataset`. |
-| `admin.py` | 386 | Session-level administration: table maintenance and streaming-query control. |
+| `admin.py` | 401 | Session-level administration: table maintenance and streaming-query control. |
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 562 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -2597,7 +2597,8 @@ Per-expression output-type inference — a column's Arrow type before the engine
 |---|---|---|
 | `arithmetic.py` | 356 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 183 | Output types for the container accessors: `list`, `struct` and `map`. |
-| `dispatch.py` | 293 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `dispatch.py` | 298 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
+| `geospatial.py` | 106 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
 | `scalars.py` | 234 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
 ### `batcher/metadata/` — 1 · contract

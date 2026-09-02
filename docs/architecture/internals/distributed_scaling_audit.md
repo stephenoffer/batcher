@@ -688,16 +688,31 @@ one** — the second round's arm died without printing a result line, and a miss
 reported rather than quietly averaged over. It is also the arm that matters least to the
 conclusion, since the utilization column separates the levels on its own.
 
-The actors do 3.3x to 3.9x more thread-work per wall second and deliver no more queries. That is the
-whole result: the extra thread-time is spent *waiting*, not computing, so the occupied slots are
-held by calls blocked on something further down rather than by a shortage of slots. Widening
-them moves the wait inside the actor instead of removing it, and at 8 it starts to cost the
-tail. This replicates the `FLEET_CONCURRENCY` 4-to-16 bullet above on genuinely different code —
-that arm had the constant, this one does not exist at `HEAD` — which is worth more than either
-run alone.
+```{warning}
+**The QPS column of that table is retracted. It measured this harness, not the fleet.**
 
-It also retires the obvious fix. "Give the fleet actor more concurrency" is the first thing a
-reader of the `queue_ping` result will reach for, and it is measured here as buying nothing.
+Each client verified every query by materializing the full result in Python:
+`{x["k"]: round(x["s"], 6) for x in r.to_pylist()}`. That result is **200,000 groups and the
+comparison costs 404 ms of driver-side Python per query**, under the GIL, shared across all
+eight client threads. At the observed ~1.8 QPS over a 45 s window that is roughly **33 s of
+every 45 s spent inside the verification loop**, so the throughput being flat across
+`max_concurrency` is a statement about the checker and not about the actors.
+
+The tell was a second probe on the same fleet and the same query that did no such check and
+reported **3.36 QPS at concurrency 1 rising to 4.56 at concurrency 4** — a 36% gain where this
+table shows none. Two harnesses disagreeing by that much on the same code is the harness.
+
+What survives is what was measured on the actor rather than derived from wall-clock: peak
+calls in flight (1 at `HEAD`, so the actor is single-threaded), the `busy` column (actor-side
+thread-seconds, so concurrency demonstrably engages), the `map_publish` counts that identify
+the working actors, and the sampler defect below. The QPS and latency columns should not be
+cited. A corrected run, with the check reduced to one Arrow-side sum and a per-query literal
+defeating the result cache, replaces them in the section below.
+```
+
+The actors do 3.3x to 3.9x more thread-work per wall second. Whether that extra thread-time is
+spent waiting or computing is exactly what the retracted column was supposed to answer and
+does not.
 
 **Correctness held at every level**, which is not a given: the actor hosts mutable
 `ShuffleSession` state written for one caller at a time, and every arm above re-checked each
