@@ -28,7 +28,16 @@ from _harness import assert_same_ordered
 pytestmark = pytest.mark.differential
 
 _EMPTY_SQL = "CREATE TABLE e (v DOUBLE, a BIGINT)"
-_FULL_SQL = "CREATE TABLE t AS SELECT * FROM (VALUES (8.0,1),(7.0,2),(9.0,2)) x(v,a)"
+#: The `::DOUBLE` is load-bearing. DuckDB types a bare `8.0` in a `VALUES` list as
+#: `DECIMAL(2,1)`, not `DOUBLE`, so without it the oracle computes decimal aggregates while
+#: Batcher computes binary-float ones and the comparison is between two different types that
+#: happen to agree on this data. The same typing difference is why a `CAST(2.5 AS BIGINT)`
+#: probe against a `VALUES` fixture reads as half-away-from-zero rounding while the real
+#: DOUBLE cast is half-to-even in both engines -- an hour was lost to that, on this file.
+_FULL_SQL = (
+    "CREATE TABLE t AS SELECT * FROM "
+    "(VALUES (8.0::DOUBLE,1),(7.0::DOUBLE,2),(9.0::DOUBLE,2)) x(v,a)"
+)
 
 
 @pytest.fixture
@@ -89,6 +98,17 @@ def test_the_answers_are_not_all_the_same(empty):
     assert answers["n_unique"] == 0
     assert answers["sum"] is None
     assert answers["all"] is None, "bool_and over no rows is NULL, not vacuous truth"
+
+
+def test_the_oracle_column_is_a_double_not_a_decimal(full, duck):
+    """Pins the fixture's typing, since the bug it prevents is invisible in the results.
+
+    A `DECIMAL` oracle agrees with a `DOUBLE` engine on well-behaved data and stops agreeing
+    exactly where these tests are pointed -- rounding, quantiles, and anything with a
+    representation boundary. Asserting the type is the only way this stays true, because
+    asserting the values does not notice."""
+    assert duck.execute("SELECT typeof(v) FROM t LIMIT 1").fetchone()[0] == "DOUBLE"
+    assert full.collect_schema()["v"] == "float64"
 
 
 class TestFirstRequiresAnOrdering:
