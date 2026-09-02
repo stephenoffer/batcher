@@ -965,6 +965,74 @@ structural too — fewer passes (converge detection per rule family rather than 
 moving the fixpoint loop out of Python — and neither is a tuning exercise. It remains the
 largest single latency item on the board.
 
+### 9. A small `GROUP BY` pays most of its wall time learning, not aggregating (measured 2026-09-01)
+
+The one relational shape where Batcher loses to DuckDB in-process, and the reason is not the
+aggregation.
+
+Measured on 96 cores, 4M rows, one `int64` key and one `float64` measure, three repetitions
+taking the minimum, **a fresh `Dataset` per repetition** and `collect()` rather than
+`count()` (see the two traps below):
+
+| groups | Batcher | DuckDB | ratio |
+|---|---|---|---|
+| 2 | 59.5 ms | 50.3 ms | 1.18x |
+| 10 | 60.8 ms | 48.1 ms | 1.26x |
+| 100 | 70.8 ms | 47.9 ms | **1.48x** |
+| 1,000 | 76.0 ms | 50.4 ms | **1.51x** |
+| 10,000 | 84.0 ms | 67.1 ms | 1.25x |
+| 100,000 | 91.3 ms | 148.3 ms | 0.62x |
+| 1,000,000 | 92.0 ms | 275.4 ms | **0.33x** |
+
+Read the shape of the two curves before the ratios. Batcher's cost is **nearly flat** --
+59.5 ms to 92.0 ms across five hundred thousand times more groups -- where DuckDB's climbs
+50 ms to 275 ms. That is the mergeable algebra doing what it is for, and it is why the
+crossover exists at all. Holding groups at 100 and varying rows instead, the crossover is
+between 4M and 16M rows: 74.7 ms against 47.6 ms at 4M, and **93.8 ms against 147.6 ms at
+16M**.
+
+**Where the time goes.** Profiling a 100,000-row grouped aggregation (`cProfile`, five
+iterations, cumulative):
+
+| call | share |
+|---|---|
+| `_close_learning_loops` → `learn_column_stats` → `_native.heavy_hitters` | **49%** |
+| `_optimize` → `column_statistics` → `_native.column_stats_full` | 14% |
+| `seed_column_ndv` → `_native.column_ndv` | 7% |
+
+So roughly **70% of a small grouped query is the cross-query learning loop and the
+optimizer's own statistics**, and the aggregation it is timing is the remainder. That is
+not a defect in the aggregate kernel and no amount of work on it would move this number.
+
+**It is, however, the rule in `.claude/rules/performance.md` being broken by its own moat:**
+"Don't add per-query setup cost ... that hurts the small case to help the large one. Make it
+adaptive." The learning loop is already bounded by *columns* -- `learn_column_stats` sketches
+only the columns the estimator can consult, which is what took a 20M-row scan's overhead from
+22.9 s down -- and it is not bounded by *rows*. The adaptive re-optimization loop next to it
+is (`api/adaptive/gating.py`), for exactly this reason.
+
+**Recorded rather than changed.** `api/terminal/_metadata.py` and `core/stats.py` were both
+another session's uncommitted work at the time of measurement, and that work
+(`_sketch_shards`, re-slicing the input so the sketch parallelizes) is aimed at this same
+cost. A second edit there would collide with it.
+
+**Two measurement traps, both of which inflate Batcher, both hit before the numbers above
+were believed.** They are recorded because anyone re-running this will hit them:
+
+1. **`count()` is answered from metadata.** A sort does not change the row count, so
+   `ds.sort(...).count()` never executes the sort -- the first run of this probe reported a
+   4M-row sort in **0.2 ms**. Materialize with `collect()`.
+2. **The result cache serves repetitions 2..n.** A min-of-three over one `Dataset` measures a
+   cache hit; it reported a 4M-row full sort at 43 ms against DuckDB's 608 ms. Build a fresh
+   `Dataset` each repetition so the source identity differs.
+
+**Every other shape measured here Batcher wins**, verified equal-result on the same Arrow
+input: filter 0.24x, high-cardinality group-by 0.41x, distinct 0.20x, sort+limit 0.78x, full
+sort 0.14x, string group-by 0.42x. So did every string and expression case -- `upper` 0.06x,
+`contains` 0.12x, `replace` 0.03x, `split`+`len` 0.11x, `regexp_extract` 0.43x, three-term
+arithmetic 0.18x, `CASE WHEN` 0.15x -- with the outputs checked element-for-element against
+DuckDB rather than assumed.
+
 ## Claims to retire
 
 These are asserted in the repo and contradicted by its own code.
