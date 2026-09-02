@@ -1727,7 +1727,7 @@ Governance — who may read which rows and columns, and through what mask.
 | module | lines | what it is |
 |---|---|---|
 | `_validate.py` | 111 | Input checks for the governance declaration surface. |
-| `audit.py` | 103 | `GovernanceEvent` — the record of one authorization decision. |
+| `audit.py` | 101 | `GovernanceEvent` — the record of one authorization decision. |
 | `audit_log.py` | 119 | The durable audit sink: governance decisions appended to a file that outlives the query. |
 | `catalog.py` | 821 | `SecurityCatalog` — the declared policies, and how they resolve for a principal. |
 | `enforce.py` | 202 | `enforce` — rewrite a plan so a principal can only read what the catalog allows. |
@@ -1852,7 +1852,7 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 | module | lines | what it is |
 |---|---|---|
 | `_ndarray.py` | 75 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
-| `hdf5.py` | 128 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
+| `hdf5.py` | 139 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
 | `numpy.py` | 233 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
 | `point_cloud.py` | 448 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `ragged.py` | 207 | Variable-shape tensor columns — arrays of differing shape in one Arrow column. |
@@ -1894,7 +1894,7 @@ Multimodal sources — images/audio/video/embeddings as queryable Arrow columns.
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 579 | Shared shape for NoSQL / operational-store scan sources. |
+| `base.py` | 595 | Shared shape for NoSQL / operational-store scan sources. |
 | `cassandra.py` | 449 | Cassandra / ScyllaDB connector — token-range parallel scan to Arrow. |
 | `couchbase.py` | 216 | Couchbase connector — Columnar (analytics) SDK to Arrow. |
 | `dynamodb.py` | 665 | DynamoDB connector — native parallel scan to Arrow. |
@@ -1936,15 +1936,15 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `_common.py` | 416 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
-| `_source_base.py` | 311 | Template-Method base for a query-backed source the server returns as one result. |
-| `bigquery.py` | 382 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
+| `_source_base.py` | 330 | Template-Method base for a query-backed source the server returns as one result. |
+| `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
 | `clickhouse.py` | 145 | ClickHouse source — Arrow reads via clickhouse-connect. |
 | `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
-| `databricks.py` | 304 | Databricks source — direct lakehouse read, warehouse fallback. |
+| `databricks.py` | 320 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 312 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 326 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -1954,7 +1954,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `sink.py` | 161 | ADBC bulk-ingest sink. |
-| `source.py` | 559 | ADBC / FlightSQL source — Arrow-native database connectivity. |
+| `source.py` | 572 | ADBC / FlightSQL source — Arrow-native database connectivity. |
 
 ### `batcher/io/formats/sql/dbapi/` — 2 · neutral IO
 
@@ -1968,7 +1968,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_dsn.py` | 313 | Connection URI → the PEP 249 driver and the ``connect()`` kwargs it wants. |
 | `_statements.py` | 485 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
 | `sink.py` | 520 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
-| `source.py` | 664 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
+| `source.py` | 677 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
 
 ### `batcher/io/formats/streaming/` — 2 · neutral IO
 
@@ -1976,7 +1976,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `autoloader.py` | 427 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
+| `autoloader.py` | 440 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
 | `eventhubs.py` | 364 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 716 | Kafka broker source — one Split per topic-partition, exactly-once commits. |

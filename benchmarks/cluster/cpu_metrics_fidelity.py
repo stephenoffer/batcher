@@ -40,8 +40,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _ray_env import init_batcher_ray
+
+from envinfo import machine_fingerprint, require_release_build
 
 #: A Parquet source every node can read. Written once with, e.g.
 #: ``bt.range(200_000_000).select(...).write.parquet(SOURCE)``. Overridable so the check can
@@ -57,6 +60,13 @@ _MAX_UNDER_REPORT = 10.0
 
 
 def main() -> int:
+    # Refuse a dev-profile engine (8-60x slower) and print the machine, because a timing is
+    # only reproducible beside the box that produced it. `init_batcher_ray` guards the build
+    # too, but it does so *after* attaching to the cluster and it prints no fingerprint --
+    # and a check that runs where nobody can see it is how a debug-build number gets
+    # published. Same placement and same reasoning as the GPU scripts beside this one.
+    require_release_build()
+    print(machine_fingerprint())
     init_batcher_ray()
 
     import ray
