@@ -806,6 +806,60 @@ So the hypothesis stands **unmeasured and explicitly so**. It should be tested o
 this session does not share, or after the placeability fix lands, and not before. The mechanism
 above is a code reading; the cost of a wrong guess here would be borne by other people's jobs.
 
+## What one query costs every other process on the cluster — measured
+
+Finding 1 said a warm fleet reserves the whole cluster. This puts numbers on it, on the
+explicit-`num_workers` path that every benchmark and integration test in this repo uses, with
+an idle baseline first so a reading of "nothing free" cannot be someone else's job.
+
+Cluster: 384 CPUs, 5 nodes, `384/384` free before each arm. One query, session fleet released
+between arms, Ray's available CPU sampled from a background thread at 4 Hz. The figure is the
+**minimum** — what a co-tenant arriving at the worst moment finds.
+
+| `num_workers` | query time | min available CPU | reserved |
+|---|---|---|---|
+| 2 | 7.73 s | 192 / 384 | 50% of the cluster |
+| 4 | 4.21 s | 0 / 384 | **100%** |
+| 8 | 2.24 s | 0 / 384 | **100%** |
+| 16 | 2.48 s | 0 / 384 | **100%** |
+
+`_even_cpu_share` divides **nameplate** cores by the worker count, so the reservation is a
+function of the cluster's size and not of the query's need: two workers take 192 cores because
+the cluster has 384, and any `num_workers >= 4` takes all of it. Nothing on this path consults
+what a co-tenant already holds.
+
+**And the reservation outlives the query by the idle timer.** Same corpus, `num_workers=8`,
+sampling until the cluster comes back:
+
+```text
+idle baseline: 384/384 free
+query returned at t=5.92s
+cluster released at t=36.1s -> held for 30.2s AFTER the query returned
+```
+
+That 30.2 s is `distributed.session_fleet_idle_s`, which defaults to 30. So a **5.9-second
+query reserves 100% of a 384-core cluster for 36 seconds**, a 6x amplification, and a second
+Batcher process arriving in that window cannot place a fleet at all. That is the mechanism
+behind the two-process stall recorded earlier in this audit as `360/384 CPU reserved, 0.0
+used`, with both drivers waiting 120 s — not a deadlock in the locking sense, just a
+first-come-first-served cluster with a grant sized to take all of it and a timer holding it
+afterwards.
+
+Both halves have a fix in flight and neither is mine to land:
+
+- The **width** is what the uncommitted `executor.py` change addresses, by routing the
+  explicit-`num_workers` grant through `_placeable_grant` the way the automatic path already
+  does. It is written, tested, and held at `/mnt/cluster_storage/batcher-pending-liveness/`
+  because its file never freed.
+- The **hold** is what another session is building in `_fleet.py` right now — the staged
+  `_free_cluster_cpus` / `yield_session_fleet` / `held_placement_group` functions are exactly a
+  fleet that gives its bundles back when someone else needs them.
+
+The warm fleet is worth keeping: it is what turns a ~3 s cold query into ~1 s, and the 2.24 s
+at eight workers above is a fleet spawn plus the query. The defect is not that the fleet is
+held, it is that what it holds is *everything*, and that holding it is unconditional on whether
+anyone else wants any of it.
+
 ## Ruled out
 
 Kept because the ratio of already-built to genuinely-missing is the most useful thing this
