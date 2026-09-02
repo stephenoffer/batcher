@@ -22,6 +22,7 @@ from batcher._sql.parser import (
     from_clause,
     grouping,
     grouping_sets,
+    statements,
     subquery,
     windowing,
 )
@@ -453,11 +454,8 @@ class _Translator:
         if isinstance(node, exp.Values):
             # A bare `VALUES (..), (..)` statement is an inline literal relation.
             return from_clause._values_table(node)
-        if isinstance(node, exp.Command) and str(node.this).upper() == "EXPLAIN":
-            # sqlglot does not model EXPLAIN; it parses as a Command carrying the rest
-            # of the query as text. Re-parse it, render the *planned* tree (no
-            # execution), and hand it back as a one-row relation like DuckDB's EXPLAIN.
-            return self._explain(node)
+        if (described := statements.describing_statement(self, node)) is not None:
+            return described
         # A semicolon-separated script parses as one Block. Saying "got Block" tells a
         # user nothing about what they typed, so name the actual cause.
         if type(node).__name__ == "Block":
@@ -471,19 +469,6 @@ class _Translator:
             "EXPLAIN. (CREATE/DROP and the DML statements are dispatched before this "
             "point, so reaching here means the statement form is not supported at all.)"
         )
-
-    def _explain(self, node) -> Dataset:
-        """Translate an ``EXPLAIN [ANALYZE] <query>`` command into a plan relation."""
-        import sqlglot
-
-        text = node.args["expression"].this if node.args.get("expression") else ""
-        analyze = False
-        stripped = text.lstrip()
-        if stripped[:8].upper() == "ANALYZE ":
-            analyze, text = True, stripped[8:]
-        inner = sqlglot.parse_one(text, read="duckdb")
-        plan = self.statement(inner).explain(analyze=analyze)
-        return _as_dataset(pa.table({"explain_key": ["plan"], "explain_value": [plan]}))
 
     def _apply_setop_tail(self, node, ds: Dataset) -> Dataset:
         """Apply a trailing ORDER BY / LIMIT / OFFSET on a set-operation result."""

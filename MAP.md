@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1446 Python modules across 213 packages and 282 Rust files across 15 crates.
+Covering 1447 Python modules across 213 packages and 282 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -821,8 +821,9 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `from_clause.py` | 628 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 539 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 320 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
+| `statements.py` | 135 | SQL statements that describe rather than query: ``EXPLAIN``, ``SHOW``, ``DESCRIBE``. |
 | `table_functions.py` | 332 | Built-in table functions in the FROM clause: the series generators and model scoring. |
-| `translator.py` | 679 | The `_Translator` skeleton plus the public `sql()` entry point. |
+| `translator.py` | 664 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 197 | Registered-Python-function support for the SQL translator. |
 
 ### `batcher/_sql/parser/expressions/` — 6 · front-end

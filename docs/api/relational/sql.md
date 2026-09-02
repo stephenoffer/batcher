@@ -50,6 +50,7 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} … AS …` and `DROP TABLE` register/unregister a lazy table in the session. |
+| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns. Both come back as ordinary relations. |
 
 ### WHERE and GROUP BY
 
@@ -424,6 +425,35 @@ Settings there go in the trailing `STRUCT`, as `ML.PREDICT(MODEL m, TABLE t, STR
 s.sql("CREATE VIEW big_events AS SELECT id, amount FROM events WHERE amount > 25")
 print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
 # {'id': [3, 4, 5], 'amount': [30.0, 40.0, 50.0]}
+```
+
+## Listing and describing tables
+
+`SHOW TABLES` and `DESCRIBE` are the two statements a SQL client issues before it issues a
+query: a BI tool fills its table picker from the first, and a schema browser or a SQLAlchemy
+reflection reads the second. Both return ordinary relations, so you can filter and join them
+like any other result.
+
+```python
+print(s.sql("SHOW TABLES").to_pydict())
+```
+
+`DESCRIBE` returns DuckDB's six columns, so a client written against DuckDB reads it
+unchanged:
+
+```python
+print(s.sql("DESCRIBE events").to_pydict()["column_name"])
+```
+
+`key`, `default` and `extra` are always null. Batcher has no primary keys, column defaults
+or storage attributes to report, and a plausible value there would be worse than an empty
+one.
+
+```{note}
+`column_type` carries Batcher's own type names, not DuckDB's: an integer column reads
+`int64` where DuckDB says `BIGINT`. The engine stores Arrow and {py:attr}`Dataset.schema
+<batcher.Dataset.schema>` reports Arrow, so printing a DuckDB spelling here would describe
+storage that does not exist. The shape is DuckDB's; the content is this engine's.
 ```
 
 ## Binding the current dataset
