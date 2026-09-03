@@ -257,3 +257,82 @@ def test_orc_statistics_exact_row_count(tmp_path):
     orc.write_table(pa.table({"x": list(range(37))}), path)
     stats = orc_statistics(_FakeFS(), [path])
     assert stats is not None and stats.row_count == 37 and stats.exact_rows
+
+
+def test_the_manifest_reads_each_row_group_once_and_is_unchanged_by_it(tmp_path):
+    """One pass over the row groups must produce exactly the table the per-column passes did.
+
+    `_row_group_manifest` used to ask `meta.row_group(i)` for the footer metadata once for
+    `num_records` and again inside every wanted column's own loop — `1 + len(columns)` passes
+    to read what one pass has in hand. Hoisting the handle is only safe if the table is
+    identical, and "identical" is the whole claim: `file_prune_mask` consumes this table, so a
+    reordered column or a shifted null would silently change which row groups survive.
+
+    The reference below is the pre-change implementation, kept here rather than described,
+    because an equivalence test whose baseline is prose cannot fail.
+    """
+    from batcher.io.splits.parquet import _is_nan, _row_group_manifest
+
+    def per_column_passes(meta, columns):
+        position = {name: i for i, name in enumerate(meta.schema.names)}
+        wanted = {c: i for c in columns if (i := position.get(c)) is not None}
+        if not wanted:
+            return None
+        n = meta.num_row_groups
+        data = {
+            "path": [str(i) for i in range(n)],
+            "num_records": [meta.row_group(i).num_rows for i in range(n)],
+        }
+        for name, index in wanted.items():
+            lows, highs, nulls = [], [], []
+            for i in range(n):
+                stats = meta.row_group(i).column(index).statistics
+                if stats is None or not getattr(stats, "has_min_max", False):
+                    lows.append(None)
+                    highs.append(None)
+                    nulls.append(None)
+                    continue
+                low, high = stats.min, stats.max
+                if _is_nan(low) or _is_nan(high):
+                    low = high = None
+                lows.append(low)
+                highs.append(high)
+                nulls.append(stats.null_count if getattr(stats, "has_null_count", False) else None)
+            data[f"min.{name}"] = lows
+            data[f"max.{name}"] = highs
+            data[f"null_count.{name}"] = nulls
+        return pa.table(data)
+
+    # Several row groups, and column shapes that exercise the arms that differ: an integer with
+    # bounds, a string, a float carrying a NaN (dropped as unordered), and an all-null column
+    # (no min/max at all).
+    rows = 900
+    table = pa.table(
+        {
+            "i": pa.array(list(range(rows)), pa.int64()),
+            "s": pa.array([f"k{i % 37}" for i in range(rows)], pa.string()),
+            "f": pa.array(
+                [float("nan") if i % 300 == 0 else float(i) for i in range(rows)], pa.float64()
+            ),
+            "allnull": pa.array([None] * rows, pa.int64()),
+        }
+    )
+    path = tmp_path / "rg.parquet"
+    pq.write_table(table, path, row_group_size=100)
+    meta = pq.ParquetFile(path).metadata
+    assert meta.num_row_groups > 1, "the fixture must have several row groups to compare passes"
+
+    for columns in (
+        ["i"],
+        ["i", "s"],
+        ["allnull"],
+        ["f"],
+        ["allnull", "f", "i", "s"],
+        ["absent"],
+        [],
+    ):
+        want = per_column_passes(meta, sorted(columns))
+        got = _row_group_manifest(meta, sorted(columns))
+        assert (want is None) == (got is None), columns
+        if want is not None:
+            assert got.equals(want), columns

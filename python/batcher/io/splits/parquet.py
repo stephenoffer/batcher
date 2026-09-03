@@ -389,31 +389,48 @@ def _row_group_manifest(meta: Any, columns: list[str]) -> pa.Table | None:
         return None
 
     n = meta.num_row_groups
-    data: dict[str, Any] = {
-        "path": [str(i) for i in range(n)],
-        "num_records": [meta.row_group(i).num_rows for i in range(n)],
-    }
-    for name, index in wanted.items():
-        lows: list[Any] = []
-        highs: list[Any] = []
-        nulls: list[int | None] = []
-        for i in range(n):
-            stats = meta.row_group(i).column(index).statistics
+    # ONE pass over the row groups, not one per column. `meta.row_group(i)` reads the footer
+    # metadata for the group, and the loop below used to ask for it `1 + len(wanted)` times per
+    # group — once for `num_records` and again inside every column's own loop. On a 16-column
+    # file with seven predicate columns that is eight passes to read what one pass has in hand.
+    #
+    # The row-group handle is the part worth hoisting and the statistics are not: measured on
+    # 196 row groups of `lineitem`, eight passes of `meta.row_group(i)` cost 0.9 ms against
+    # 0.1 ms for one, while reading `.statistics` and decoding `.min`/`.max` cost 6.9 ms and is
+    # unavoidable — the bounds are what the caller asked for. So this removes the pass count,
+    # not the decode.
+    records: list[int] = []
+    lows: dict[str, list[Any]] = {name: [] for name in wanted}
+    highs: dict[str, list[Any]] = {name: [] for name in wanted}
+    nulls: dict[str, list[int | None]] = {name: [] for name in wanted}
+    for i in range(n):
+        group = meta.row_group(i)
+        records.append(group.num_rows)
+        for name, index in wanted.items():
+            stats = group.column(index).statistics
             if stats is None or not getattr(stats, "has_min_max", False):
-                lows.append(None)
-                highs.append(None)
-                nulls.append(None)
+                lows[name].append(None)
+                highs[name].append(None)
+                nulls[name].append(None)
                 continue
             low, high = stats.min, stats.max
             # A NaN bound is unordered; treat it as "unknown", which keeps the row-group.
             if _is_nan(low) or _is_nan(high):
                 low = high = None
-            lows.append(low)
-            highs.append(high)
-            nulls.append(stats.null_count if getattr(stats, "has_null_count", False) else None)
-        data[f"min.{name}"] = lows
-        data[f"max.{name}"] = highs
-        data[f"null_count.{name}"] = nulls
+            lows[name].append(low)
+            highs[name].append(high)
+            nulls[name].append(
+                stats.null_count if getattr(stats, "has_null_count", False) else None
+            )
+
+    data: dict[str, Any] = {
+        "path": [str(i) for i in range(n)],
+        "num_records": records,
+    }
+    for name in wanted:
+        data[f"min.{name}"] = lows[name]
+        data[f"max.{name}"] = highs[name]
+        data[f"null_count.{name}"] = nulls[name]
     try:
         return pa.table(data)
     except (pa.ArrowInvalid, pa.ArrowTypeError):

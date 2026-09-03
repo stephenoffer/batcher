@@ -2135,7 +2135,7 @@ Splits — independently-readable, picklable slices of a source.
 | `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
 | `gds.py` | 211 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
-| `parquet.py` | 440 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
+| `parquet.py` | 457 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
 | `text.py` | 168 | Byte-range splits for line-delimited text — what lets one huge log fan across workers. |
 
 ### `batcher/io/stats/` — 2 · neutral IO
