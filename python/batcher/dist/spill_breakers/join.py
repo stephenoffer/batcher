@@ -84,6 +84,16 @@ def supports_spilling_join(join: _Joinish) -> bool:
     because all three are resolved within a bucket.
 
     `False` falls back to the in-memory join: costs memory, never correctness."""
+    # A `map_batches` anywhere beneath the breaker makes the plan unserialisable: the operator
+    # runs a Python callable and `to_ir()` raises by design, so every path here that ships the
+    # plan to the engine dies inside `json.dumps`. Answering "yes" and letting the executor
+    # discover that is exactly the shape `test_spill_predicates_never_raise` exists to stop —
+    # `iter_batches()` on `map_batches(...).sort(...)` surfaced as
+    # `NotImplementedError: map_batches is executed in Python, not lowered to the engine IR`.
+    from batcher.core.udf import has_map_batches
+
+    if has_map_batches(join):
+        return False
     if isinstance(join, AsofJoin) and not join.left_by:
         return False
     return _single_source(join.left) and _single_source(join.right)

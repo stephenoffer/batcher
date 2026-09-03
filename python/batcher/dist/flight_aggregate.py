@@ -39,7 +39,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_worker import _ticket, current_plan_id
-from batcher.dist.reduction import chunks
+from batcher.dist.reduction import chunks, fold_width
 from batcher.dist.shuffle_replication import (
     placement_probe,
     replicate_interior_outputs,
@@ -266,8 +266,15 @@ def execute_aggregate_flight(
         # workers would cross a fan-in of 8, so nearly every aggregate would take the tree —
         # and the tree cannot leave its result on the actors, so the adaptive path would lose
         # the `FlightMaterializedSource` hand-off and collect through the driver instead.
+        # `on_actors`: keep the result on the workers — each reducer publishes its bucket
+        # and the driver gets only handles, so the next adaptive stage reads the intermediate
+        # in place. Otherwise the reducers return their batches. Decided once, for **both**
+        # reduce shapes: it used to be asked only inside the flat branch, so a fleet wider
+        # than `fan_in` — which is every fleet past 8 workers — collected its whole aggregate
+        # through the driver however large the result was.
+        on_actors = materialize is False and not above
         if workers > fan_in:
-            batches = _tree_reduce_with_recovery(
+            out = _tree_reduce_with_recovery(
                 actors,
                 addrs,
                 partitions,
@@ -282,12 +289,9 @@ def execute_aggregate_flight(
                 replicas,
                 stage_base,
                 placement,
+                materialize=on_actors,
             )
         else:
-            # `on_actors`: keep the result on the workers — each reducer publishes its
-            # bucket and the driver gets only handles, so the next adaptive stage reads
-            # the intermediate in place. Otherwise the reducers return their batches.
-            on_actors = materialize is False and not above
             out = _reduce_with_recovery(
                 *reduce_args,
                 materialize=on_actors,
@@ -297,24 +301,24 @@ def execute_aggregate_flight(
                 stage_base=stage_base,
                 placement=placement,
             )
-            if on_actors:
-                from batcher.dist.fleet import FlightMaterializedSource
+        if on_actors:
+            from batcher.dist.fleet import FlightMaterializedSource
 
-                schema = out[0][3] if out else _empty_agg_table(agg).schema
-                keep_actors = True  # the source owns them now
-                # A borrowed fleet outlives this stage and is freed once by the adaptive
-                # loop, so the source must NOT own the actors/pg (its `cleanup()` no-ops);
-                # only a self-spawned fleet is handed to the source to tear down.
-                src_actors, src_pg = (actors, pg) if owns else (None, None)
-                handles = [(a, t, n) for a, t, n, _s in out]
-                return FlightMaterializedSource(
-                    handles,
-                    schema,
-                    src_actors,
-                    src_pg,
-                    session_lease=borrows_session and not owns,
-                )
-            batches = out
+            schema = out[0][3] if out else _empty_agg_table(agg).schema
+            keep_actors = True  # the source owns them now
+            # A borrowed fleet outlives this stage and is freed once by the adaptive
+            # loop, so the source must NOT own the actors/pg (its `cleanup()` no-ops);
+            # only a self-spawned fleet is handed to the source to tear down.
+            src_actors, src_pg = (actors, pg) if owns else (None, None)
+            handles = [(a, t, n) for a, t, n, _s in out]
+            return FlightMaterializedSource(
+                handles,
+                schema,
+                src_actors,
+                src_pg,
+                session_lease=borrows_session and not owns,
+            )
+        batches = out
     finally:
         # Collect what the workers measured, before anything below can kill them. Nothing
         # subscribes to the event bus inside a Ray worker, so the measurements have to be
@@ -598,7 +602,17 @@ def _reduce_with_recovery(
 
 
 def _tree_reduce(
-    actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None, replicas=None, stage_base=0
+    actors,
+    leaf_addrs,
+    n_reducers,
+    gk,
+    aj,
+    fan_in,
+    workers,
+    dead=None,
+    replicas=None,
+    stage_base=0,
+    materialize=False,
 ):
     """Combine each bucket's leaf partials — one per map source — into one via a combiner tree.
 
@@ -608,15 +622,28 @@ def _tree_reduce(
     which is finalized. No node ever reads from more than `fan_in` upstreams, so
     per-node fan-in stays bounded as the cluster grows to many thousands. Workers in
     `dead` are never assigned combine work (their leaf inputs are expected to have
-    been recomputed onto a live worker's address in `leaf_addrs`). Returns the
-    finalized batches. Raises if a combine touches a lost worker, so the caller's
-    recovery loop can recompute and retry.
+    been recomputed onto a live worker's address in `leaf_addrs`). Raises if a combine
+    touches a lost worker, so the caller's recovery loop can recompute and retry.
+
+    Returns the finalized batches, or — when `materialize` — the
+    `(addr, ticket, rows, schema)` handles of each bucket left published on the worker that
+    finalized it, exactly as the flat reduce's `materialize` does. Without it the tree root
+    is the one point in a distributed aggregate that has to funnel through the driver, and
+    the tree is taken by **every** aggregate on a fleet wider than `shuffle_fan_in` — so the
+    wider the cluster, the more certain the funnel. Measured on a 150M-group `GROUP BY` at
+    TPC-H sf100: the query flattens at ~7.5 s from 16 workers to 64, which is where the flat
+    reduce stops being eligible.
     """
     dead = dead or set()
     live = [i for i in range(workers) if i not in dead]
     # Leaves are per SOURCE; combiners are per WORKER. The two counts are equal only when
     # the map stage runs one partition per worker.
     n_sources = len(leaf_addrs)
+    # The arity the tree FOLDS at, which is not the arity that selected it. `fan_in` stays the
+    # trigger the caller tested (`workers > fan_in`); widening it here shortens the tree
+    # without moving that decision. See `reduction.fold_width` for why the two must not be the
+    # same number.
+    width = fold_width(fan_in, n_sources)
 
     # frontier[r]: the (addr, ticket) sources currently holding bucket r's partials.
     frontier = {
@@ -640,7 +667,7 @@ def _tree_reduce(
     # not move inside one attempt, and re-probing would charge two driver fan-outs per level
     # to learn the same thing.
     probe = placement_probe(actors, workers)
-    while any(len(srcs) > fan_in for srcs in frontier.values()):
+    while any(len(srcs) > width for srcs in frontier.values()):
         tasks, next_frontier, assign = [], {r: [] for r in range(n_reducers)}, 0
         next_fallbacks: dict[int, list[list[str]]] = {r: [] for r in range(n_reducers)}
         for r in range(n_reducers):
@@ -648,8 +675,15 @@ def _tree_reduce(
             # the disk shuffle's arithmetic too (`executors.aggregate._tree_combine_buckets`),
             # and the two transports must chunk a frontier the same way or a level's fan-out
             # means something different depending on how the bytes happen to move.
+            #
+            # The *width* they chunk at now differs, and that part is deliberate. `width` is
+            # `fold_width`'s derived arity, measured on this transport; the disk tree still
+            # chunks at the configured `shuffle_fan_in`, because its own tests state that
+            # value as a hard per-task bound and there is no disk-path measurement to justify
+            # moving it. `test_the_disk_tree_keeps_the_configured_fan_in_as_a_hard_bound`
+            # pins the divergence so it stays a decision rather than becoming drift.
             for chunk, chunk_reps in zip(
-                chunks(frontier[r], fan_in), chunks(fallbacks[r], fan_in), strict=True
+                chunks(frontier[r], width), chunks(fallbacks[r], width), strict=True
             ):
                 if len(chunk) == 1:
                     next_frontier[r].append(chunk[0])  # nothing to combine yet
@@ -690,7 +724,29 @@ def _tree_reduce(
             next_fallbacks[r].append(list(level_reps[i]) if level_reps else [])
         frontier, fallbacks, stage = next_frontier, next_fallbacks, stage + 1
 
-    # Final level: each bucket has <= fan_in sources — one combine+finalize per bucket.
+    # Final level: each bucket has <= width sources — one combine+finalize per bucket.
+    if materialize:
+        # One stage id for every bucket of THIS published result, exactly as the flat reduce
+        # mints one (`next_result_stage`). Leaving it at `combine_finalize_publish`'s default
+        # published every tree-reduced intermediate in the process at the same literal stage
+        # 100, so two of them in one query were byte-identical tickets on the same worker and
+        # the second overwrote the first. `left.join(right)` over two `group_by` aggregates
+        # reproduced it at 12 workers and not at 8 — the fan-in threshold is what selects the
+        # tree — surfacing three frames away as `KeyError: Field "a" does not exist in schema`
+        # when the join projected the surviving bucket's columns.
+        result_stage = next_result_stage()
+        finals = gather_in_windows(
+            lambda r: actors[live[r % len(live)]].combine_finalize_publish.remote(
+                gk, aj, frontier[r], fallbacks[r], r, result_stage
+            ),
+            list(range(n_reducers)),
+            workers,
+        )
+        # `_publish_result` yields no handle for an empty bucket, on purpose — see its
+        # docstring; a published zero-row partition hangs its reader rather than reading
+        # empty. The status is always "ok" here because a lost peer reaches the driver as a
+        # raised `RayTaskError`, which is what the recovery loop above catches.
+        return [h for _status, h in finals if h is not None]
     finals = gather_in_windows(
         lambda r: actors[live[r % len(live)]].combine_finalize_fetch.remote(
             gk, aj, frontier[r], fallbacks[r]
@@ -716,6 +772,7 @@ def _tree_reduce_with_recovery(
     replicas=None,
     stage_base=0,
     placement=None,
+    materialize=False,
 ):
     """Run the tree reduce under Carbonite recompute-on-worker-loss recovery.
 
@@ -757,7 +814,17 @@ def _tree_reduce_with_recovery(
     def attempt():
         try:
             return _tree_reduce(
-                actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead, replicas, stage_base
+                actors,
+                leaf_addrs,
+                n_reducers,
+                gk,
+                aj,
+                fan_in,
+                workers,
+                dead,
+                replicas,
+                stage_base,
+                materialize,
             ), set()
         except ray.exceptions.RayTaskError as exc:
             # A combine fetches inside its task, so a lost peer arrives here as a

@@ -29,7 +29,7 @@ import logging
 import threading
 
 from batcher._internal.errors import ResourceError
-from batcher._internal.logging import note_suppressed
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query_shuffle_scope
 
 __all__ = [
@@ -37,12 +37,14 @@ __all__ = [
     "acquire_fleet",
     "borrows_session_fleet",
     "current_fleet",
+    "held_placement_group",
     "release_fleet",
     "release_session_fleet",
     "release_session_lease",
     "reset_fleet",
     "session_fleet_lease",
     "set_fleet",
+    "yield_session_fleet",
 ]
 
 # The shuffle fleet in force for the current adaptive query, if any. Ambient so a
@@ -127,6 +129,7 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
                 "; retry or reduce num_workers"
             )
         addrs = list(ray.get(addr_refs))
+        _tell_workers_about_node_peers(actors, addrs)
         ok = True
         return actors, pg, addrs
     finally:
@@ -135,6 +138,40 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
                 with contextlib.suppress(Exception):
                     ray.kill(a)
             release_placement(pg)
+
+
+def _tell_workers_about_node_peers(actors, addrs) -> None:
+    """Tell each worker whether another worker landed on its node.
+
+    A shuffle address is `{node_ip}:{port}`, so two workers share a node exactly when their
+    addresses' hosts match — the fleet already has every address by this point, and nothing
+    else in the system does. The workers use it to skip mirroring buckets into shared memory
+    when no other process on the node could read one (`ShuffleSession._shm_mirror_ok`), which
+    is the ordinary shape of a fleet of small nodes: one worker per node, so every mirrored
+    file is written, never read, and unlinked.
+
+    Best-effort and one round-trip per fleet, not per query. A failure here leaves every
+    worker at its default of "assume a peer", which is exactly today's behaviour, so this can
+    only ever remove wasted work — never correctness, since a missing mirror already falls
+    back to Flight.
+    """
+    import ray
+
+    from batcher.carbonite.transfer.lifecycle import host_of
+
+    try:
+        seen: dict[str, int] = {}
+        hosts = [host_of(a) for a in addrs]
+        for h in hosts:
+            seen[h] = seen.get(h, 0) + 1
+        ray.get(
+            [
+                actor.set_shm_peers.remote(seen.get(host, 0) > 1)
+                for actor, host in zip(actors, hosts, strict=True)
+            ]
+        )
+    except Exception as exc:
+        note_suppressed("dist", "tell the fleet whether its workers share nodes", exc)
 
 
 def _fleet_demand_reason() -> str | None:
@@ -171,8 +208,6 @@ def _warn_degraded_fleet(placed: int, wanted: int, timeout: float) -> None:
     if placed >= wanted:
         return
     try:
-        from batcher._internal.logging import get_logger, log_kv
-
         log_kv(
             get_logger("dist"),
             logging.WARNING,
@@ -549,6 +584,110 @@ def release_session_fleet() -> None:
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
             _SESSION = None
+
+
+def _free_cluster_cpus() -> float:
+    """CPUs the cluster can hand a task right now, or `inf` when it cannot be read.
+
+    Cores reserved inside a placement group count as *used* here even while the bundle sits
+    idle, which is exactly the accounting `yield_session_fleet` needs: a warm fleet holding
+    the whole cluster reads as zero free, because that is what a plain task sees.
+
+    `inf` on failure, so an unreadable cluster never causes a teardown.
+    """
+    import ray
+
+    try:
+        return float(ray.available_resources().get("CPU", 0.0))
+    except Exception as exc:
+        note_suppressed("dist", "read the cluster's free CPU", exc)
+        return float("inf")
+
+
+def yield_session_fleet(needed_cpus: float) -> bool:
+    """Release the warm fleet's cores for a stage whose work is Ray **tasks**, not actors.
+
+    A fleet is a placement-group reservation of the cluster's *whole* CPU capacity (one
+    worker per node holding that node's cores — see `_even_cpu_share`). A stage that runs
+    as plain Ray tasks submits them **outside** that reservation, so when the fleet is up
+    those tasks have nowhere to go and the barrier waits forever: `{'CPU': 0.125}: 1+
+    pending` against `384.0/384.0`, no error, no timeout.
+
+    `session_fleet_lease` already documents this deadlock and fixes the half it can see —
+    a query that *never* shuffles no longer takes the hold on entry. This is the other
+    half: a **staged** query whose first stage does shuffle takes the hold legitimately,
+    and then its next stage is a map. Reproduced single-process on
+    `tests/integration/test_distributed.py`, where it hung indefinitely.
+
+    Yielding is safe under exactly the condition a respawn is (`_session_fleet_resizable`):
+    no operator is mid-shuffle and nothing is published on the actors that a teardown would
+    destroy. The next `acquire_fleet` respawns transparently, so the cost of yielding
+    unnecessarily is one fleet spawn — which is why it is asked only when the cluster
+    genuinely cannot place the caller's largest task.
+
+    Args:
+        needed_cpus: The largest single CPU ask among the tasks about to be submitted. A
+            task can never run while the cluster's free CPU is below this, however long
+            the barrier waits.
+
+    Returns:
+        Whether the fleet was torn down.
+    """
+    global _SESSION, _SESSION_TIMER
+
+    if needed_cpus <= 0:
+        return False
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            return False
+        free = _free_cluster_cpus()
+        if free >= needed_cpus:
+            return False
+        if not _session_fleet_resizable():
+            # An intermediate published on these actors, or a second pipeline shuffling over
+            # them, makes the teardown a wrong answer rather than a slow one — so the caller
+            # keeps the fleet and runs inside its reservation instead
+            # (`fleet_task_options`). Reported because it is the state a stall would be
+            # explained by, and the lease counts are what distinguish the two cases.
+            log_kv(
+                get_logger("dist"),
+                logging.DEBUG,
+                "keeping the warm fleet: an intermediate is published on it",
+                needed_cpus=needed_cpus,
+                free_cpus=free,
+                leases=_SESSION_LEASES,
+                query_leases=_SESSION_QUERY_LEASES,
+                query_scopes=active_query_scopes(),
+            )
+            return False
+        fleet, _SESSION = _SESSION, None
+        if _SESSION_TIMER is not None:
+            _SESSION_TIMER.cancel()
+            _SESSION_TIMER = None
+    with contextlib.suppress(Exception):
+        fleet.cleanup()
+    log_kv(
+        get_logger("dist"),
+        logging.INFO,
+        "released the warm shuffle fleet so this stage's tasks can be placed",
+        needed_cpus=needed_cpus,
+    )
+    return True
+
+
+def held_placement_group():
+    """The placement group of whatever fleet this process is holding, or None.
+
+    The query fleet first (the adaptive loop's ambient handle), then the warm session
+    fleet. Read by a task stage that cannot be placed on the open cluster: the bundles keep
+    a sliver free (`fleet_task_headroom`) so it can run inside the reservation instead of
+    pending against it forever.
+
+    Returns:
+        A Ray placement group, or None when no fleet is up.
+    """
+    fleet = _FLEET.get() or _SESSION
+    return getattr(fleet, "pg", None) if fleet is not None else None
 
 
 def acquire_fleet(workers: int, credits: int, cfg_json: str):

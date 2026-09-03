@@ -299,6 +299,22 @@ class IcebergSource:
         row_filter = f"|{self._row_filter}" if self._row_filter is not None else ""
         return f"iceberg:{catalog}:{self._identifier}@{ref}{row_filter}"
 
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: the table identifier.
+
+        Distinct from `identity`, which names a *relation* and so carries the catalog,
+        the snapshot and any row filter -- one relation's statistics must not be handed
+        to another. A policy is written about the **table**, before anyone has read it
+        and without knowing which snapshot they will land on. Reading the table name off
+        the identity meant a policy on ``db.orders`` never fired on a read of it, whose
+        identity is ``iceberg:rest:db.orders@1234``, so a governed table was read
+        ungoverned with nothing raised to say so.
+
+        Returns:
+            The table identifier a policy is keyed on.
+        """
+        return self._identifier
+
     def splits(
         self,
         target_size: int | None = None,  # noqa: ARG002 — protocol signature; Iceberg splits per file

@@ -24,6 +24,7 @@ use serde::Deserialize;
 mod analyze;
 mod error;
 mod select;
+mod subset;
 mod supertype;
 pub use error::ExprError;
 pub use select::ConjunctOrder;

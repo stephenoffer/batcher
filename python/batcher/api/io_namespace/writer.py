@@ -32,6 +32,7 @@ from batcher.api.io_namespace._write_opts import (
     one_or_many,
     reject_row_index,
 )
+from batcher.api.security._write import authorize_write, required_privileges
 from batcher.api.session import read as _read
 from batcher.io.formats.sql.routing import write_backend
 from batcher.io.sink import check_write_options
@@ -551,6 +552,15 @@ class Writer:
                 )
                 if drain is not None:
                     return drain
+            # The distributed drain above authorizes inside `_write`; this branch never
+            # reaches it, so a governed streaming write would otherwise be governed only
+            # when it happened to be distributed. Authorize once here, before the query
+            # starts -- a stream refused after its first micro-batch has already written.
+            authorize_write(
+                path,
+                self._ds.columns,
+                required_privileges(mode if dml_mode else "append"),
+            )
             sink = self._stream_sink_for(
                 path, fmt, opts, query_name, max_rows_per_file, mode=mode if dml_mode else None
             )
@@ -707,6 +717,7 @@ class Writer:
             target_bytes_per_file=target_bytes,
             directory=_writes_into_a_partition_directory(path, single_file),
             sink_kwargs=sink_kwargs,
+            privileges=required_privileges(mode),
         )
         # Overwrite must REPLACE the output: drop any stale files a prior, differently
         # shaped write left under `path` that this write did not rewrite (else the next

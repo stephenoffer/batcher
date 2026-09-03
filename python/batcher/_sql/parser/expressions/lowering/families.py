@@ -41,6 +41,7 @@ from typing import Any
 
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.expressions.lowering.signatures import build_arguments, parameter_kinds
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir.walk import contains_aggregate
 
@@ -68,11 +69,10 @@ _ALIASES: dict[str, str] = {
 #: so every other arity mismatch raises and names the arity instead.
 _STANDARD_DEFAULTS: dict[str, Any] = {"stbuffer": 8}
 
-#: Parameter annotations that are a *Python* value rather than a column. A SQL argument
-#: arrives as a lowered `Expr`, so a function wanting a bare `str`/`int` cannot take one;
-#: those need the constant read off the literal node, which is a per-function decision and
-#: not something a derived dispatch can make. They are left out rather than guessed at.
-_LITERAL_ANNOTATIONS = frozenset({"str", "int", "float", "bool"})
+#: A value per literal parameter kind for the aggregate probe below. Deliberately the
+#: emptiest of each type: the probe only has to *build*, and a value with structure (a real
+#: regex, a real format) would make the classification depend on the value.
+_PROBE_CONSTANTS: dict[type, object] = {str: "", int: 0, float: 0.0, bool: False}
 
 _REGISTRY: dict[str, Any] | None = None
 
@@ -145,13 +145,18 @@ def _grouped_parameters(fn) -> list[str]:
 def is_scalar_callable(fn) -> bool:
     """Whether `fn` is a one-column-in, one-column-out function SQL can call.
 
-    Three shapes are not. A **grouped parameter** (`distance_3d(a: Point, b: Point)`) wants
-    a tuple of columns where SQL has only scalars; a **grouped return**
+    Two shapes are not. A **grouped parameter** (`distance_3d(a: Point, b: Point)`) wants a
+    tuple of columns where SQL has only scalars, and a **grouped return**
     (`quat_multiply -> dict[str, Expr]`) answers a whole rotation where a SQL expression is
-    one value -- both have per-component spellings that *are* callable. A **Python-literal
-    parameter** (a bare `str`/`int`) cannot take the lowered `Expr` a SQL argument becomes,
-    and reading the constant off the literal node is a per-function decision rather than
-    something a derived dispatch can make.
+    one value. Both have per-component spellings that *are* callable.
+
+    A **Python-literal parameter** (a bare `str`/`int`) used to be a third, on the reasoning
+    that reading the constant off the literal node is a per-function decision. It is not:
+    `signatures.parameter_kinds` makes it mechanically, the accessor dispatch has been
+    making it since it existed, and an argument that is not a literal is refused by name.
+    Treating it as a veto cost **49 public functions their SQL spelling** -- `hmac_sha256`,
+    `aes_encrypt`, `great_circle_distance`, `render_template` and the text-quality metrics
+    were all `bt.`-callable and unknown to `SELECT`.
 
     Deciding this here rather than at each call site is what stops the dispatcher and the
     test that walks these families from disagreeing about which names are in scope — and
@@ -163,19 +168,15 @@ def is_scalar_callable(fn) -> bool:
         fn: A member of one of the families.
 
     Returns:
-        True when the function takes and returns single columns.
+        True when the function takes single columns or plan-time constants and returns one
+        column.
     """
     try:
         signature = inspect.signature(fn)
     except (TypeError, ValueError):  # pragma: no cover - a builtin without a signature
         return False
-    if _grouped_parameters(fn):
+    if _grouped_parameters(fn) or parameter_kinds(fn) is None:
         return False
-    for p in signature.parameters.values():
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and (
-            str(p.annotation).strip("'\"") in _LITERAL_ANNOTATIONS
-        ):
-            return False
     returns = str(signature.return_annotation)
     return "dict" not in returns and "tuple" not in returns
 
@@ -227,7 +228,7 @@ def family_function(tr, node) -> Expr | None:
             f"({node.name or key}_x, _y, _z, _w), or the DataFrame API"
         )
     required, total = positional_arity(fn)
-    built = [tr._scalar(a) for a in args]
+    built = build_arguments(tr, fn, args, node.name or key)
     if len(built) == required - 1 and key in _STANDARD_DEFAULTS:
         built.append(_STANDARD_DEFAULTS[key])
     if len(built) < required or (total is not None and len(built) > total):
@@ -296,12 +297,23 @@ def _builds_an_aggregate(fn) -> bool:
         for p in inspect.signature(fn).parameters.values()
         if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
     ]
+    # One probe value per parameter *kind*: a column where the function wants a column, and
+    # a constant where it wants one. Probing a constant parameter with a column made every
+    # such function raise, which read as "not an aggregate" -- a wrong answer arrived at by
+    # a broken probe, and the direction that hides an aggregate rather than inventing one.
+    kinds = parameter_kinds(fn) or []
+    probes = [
+        col("__bc_probe")
+        if index >= len(kinds) or kinds[index] is Expr
+        else _PROBE_CONSTANTS.get(kinds[index], 0)
+        for index in range(len(required))
+    ]
     try:
         with warnings.catch_warnings():
             # A couple of builders warn when handed a literal key (`aes_encrypt`); this is
             # a classification probe, not a query, so the warning has no audience.
             warnings.simplefilter("ignore")
-            built = fn(*[col("__bc_probe") for _ in required])
+            built = fn(*probes)
     except Exception:
         return False
     return contains_aggregate(built)

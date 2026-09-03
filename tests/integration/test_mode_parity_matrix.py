@@ -51,7 +51,7 @@ def _ray_session():
 
 
 @pytest.fixture(scope="module")
-def path(tmp_path_factory) -> str:
+def path(cluster_scratch) -> str:
     """A multi-row-group Parquet file — a splittable source, so the dispatcher must
     either distribute a shape or refuse it, never silently run it on one node.
 
@@ -74,7 +74,7 @@ def path(tmp_path_factory) -> str:
             "lst": pa.array([[i % 3, i % 5] for i in range(n)]),
         }
     )
-    out = str(tmp_path_factory.mktemp("mode_parity") / "t.parquet")
+    out = str(cluster_scratch("mode_parity") / "t.parquet")
     pq.write_table(table, out, row_group_size=1_000)
     return out
 

@@ -70,6 +70,46 @@ def groupby_2key(ctx: Context):
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
+@agg.case("op-groupby-multi-int")
+def groupby_multi_int(ctx: Context):
+    """GROUP BY on four integer keys — the shape TPC-DS spends its aggregate time in.
+
+    The suite already covers a single key (`op-groupby-sum`) and a two-key *byte* key
+    (`op-groupby-2key`), and both take specialized paths: a dense direct map and a packed
+    one-byte-per-column integer. Neither reaches the composite **integer** hash path, which
+    is what every level of a `ROLLUP` over an integer dimension pays and what
+    `competitor_technique_review.md` item 23 measured as the residue of the TPC-DS board.
+    A bottleneck with no case in the suite is how item 9's string sort stayed invisible.
+
+    The keys are chosen so their value ranges multiply past the dense-map budget, which is
+    what forces the hash path rather than the mixed-radix direct map — `l_partkey` alone
+    exceeds it. `l_linenumber` and `l_quantity` are narrow, so the pair in front of them
+    does not make the composite trivially unique either.
+    """
+    sql = (
+        "SELECT l_linenumber, l_quantity, l_suppkey, l_partkey, "
+        "SUM(l_extendedprice) AS s, COUNT(*) AS n "
+        "FROM lineitem GROUP BY l_linenumber, l_quantity, l_suppkey, l_partkey"
+    )
+    keys = ["l_linenumber", "l_quantity", "l_suppkey", "l_partkey"]
+
+    def pyarrow(t: pa.Table) -> pa.Table:
+        a = t.group_by(keys).aggregate([("l_extendedprice", "sum"), ("l_extendedprice", "count")])
+        cols = {k: a[k] for k in keys}
+        cols["s"] = a["l_extendedprice_sum"]
+        cols["n"] = a["l_extendedprice_count"]
+        return pa.table(cols)
+
+    def ray(rd) -> pa.Table:
+        from ray.data.aggregate import Count, Sum
+
+        g = rd.groupby(keys).aggregate(Sum("l_extendedprice"), Count())
+        df = g.to_pandas().rename(columns={"sum(l_extendedprice)": "s", "count()": "n"})
+        return pa.Table.from_pandas(df, preserve_index=False)
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
+
+
 @agg.case("op-global-sum")
 def global_sum(ctx: Context):
     """Global SUM(l_extendedprice) — a single mergeable reduction.

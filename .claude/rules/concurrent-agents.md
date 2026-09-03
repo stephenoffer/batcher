@@ -23,6 +23,21 @@ agent's work here:
   `stash@{0}` outlived the session. If you need a baseline, read it with
   `git show HEAD:path` or copy the file aside — never stash.
 - **`git checkout .` / `git checkout <branch>` / `git reset`** — same problem, worse.
+- **`git checkout -- <path>`, even one named path.** This entry used to list only the
+  whole-tree forms above, which made a *named* path read as the safe alternative. It is not:
+  the operation discards uncommitted work in whatever it touches, and the only thing the
+  narrower form buys is a smaller blast radius. An agent reverting its own instrumentation
+  ran it on three `crates/` files without looking at them first, having checked
+  `git status benchmarks/` carefully an hour earlier and then classified itself as "working
+  in benchmarks". **A scope check covers the scope it was run against and expires outside
+  it** — the check was real, it was about a different set of files, and its result was
+  carried forward to files it never covered.
+
+  Nothing was lost, and the reason is worth knowing because it is not judgement: the other
+  session's work had already landed in a commit, so `checkout --` restored it *from* `HEAD`
+  rather than destroying it. Anyone still holding **uncommitted** edits in those paths would
+  have lost them. So: `git status <the exact paths>` immediately before, every time, and if
+  anything is dirty that you did not write, do not run it.
 - **Repo-wide autofix**: `ruff check --fix python`, `ruff format python`,
   `cargo fmt --all`. One agent's repo-wide `--fix` silently rewrote 13 findings inside
   other agents' half-finished files. **Scope every fix and format command to the paths

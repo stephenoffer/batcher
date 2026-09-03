@@ -341,14 +341,33 @@ def signed_ratio(actual: float, estimate: float) -> str:
             >>> from batcher._internal.humanize import signed_ratio
             >>> signed_ratio(1000, 300), signed_ratio(300, 1000), signed_ratio(100, 100)
             ('3.3x under', '3.3x over', 'exact')
+            >>> signed_ratio(200, 1e-12)   # an estimate below one row compares against one
+            '200.0x under'
+            >>> signed_ratio(200, 1_000_000)   # a real miss is reported in full
+            '5000.0x over'
     """
     if not estimate or math.isnan(estimate) or math.isnan(actual):
         return UNKNOWN
-    ratio = actual / estimate if actual > estimate else estimate / max(actual, 1e-9)
+    # Both sides are floored at one row before the division. A selectivity estimate
+    # underflows toward zero down a chain of independent predicates -- each one multiplies
+    # the last -- so a six-filter plan reaches a denominator like 9.7e-13 and printed
+    # ``205891132094649.4x under``: fifteen significant digits of an artifact, in a column
+    # whose width every operator on the plan then pays for.
+    #
+    # The magnitude was never the problem, the denominator was. A row count is a count, so
+    # an estimate below one row means "the optimizer expects nothing" -- which is what the
+    # `est≈0` printed beside it already says -- and the honest comparison is against one
+    # row. That makes the example above read ``200.0x under``, and leaves a *real* miss
+    # untouched: an estimate of 1,000,000 against 200 actual rows is still ``5000.0x over``,
+    # which is exactly the signal the diagnosis section exists to raise. A cap on the
+    # rendered figure would have suppressed that one too.
+    scale = max(estimate, 1.0)
+    measured = max(actual, 1.0)
+    ratio = measured / scale if measured > scale else scale / measured
     # A ratio that would render as "1.0x" is reported as exact rather than as a miss. The
     # alternative reads as a contradiction: a row showing `est≈1  actual=1` beside
     # `1.0x over` invites the reader to hunt for a rounding they cannot see, and a 4%
     # estimate error is not a fact anyone acts on.
     if ratio < 1.05:
         return "exact"
-    return f"{ratio:.1f}x under" if actual > estimate else f"{ratio:.1f}x over"
+    return f"{ratio:.1f}x under" if measured > scale else f"{ratio:.1f}x over"

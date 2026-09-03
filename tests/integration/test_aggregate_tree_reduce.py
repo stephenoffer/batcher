@@ -90,6 +90,41 @@ def test_two_aggregates_in_one_query_do_not_share_ticket_stages(table):
     assert got == single
 
 
+@pytest.mark.parametrize("workers", [4, 12])
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(
+            lambda d: d.group_by("wide").agg(s=col("v").sum()).agg(g=count(), t=col("s").sum()),
+            id="agg-over-agg",
+        ),
+        pytest.param(
+            lambda d: d.group_by("wide").agg(s=col("v").sum()).filter(col("s") > 50).agg(n=count()),
+            id="filter-over-agg",
+        ),
+        pytest.param(
+            lambda d: d.select("wide").distinct().agg(n=count()),
+            id="agg-over-distinct",
+        ),
+    ],
+)
+def test_a_staged_tree_keeps_its_result_on_the_workers_and_still_agrees(table, build, workers):
+    """A **staged** wide aggregate: its output feeds another stage instead of the caller.
+
+    Every other case in this file ends at the aggregate, so the tree collects its buckets to
+    the driver and returns a table. That hid a gap for as long as the tree existed: only the
+    *flat* reduce could publish its result on the workers and hand back handles, so an
+    aggregate wide enough to need a tree — which is every aggregate past `shuffle_fan_in`
+    workers — funnelled its whole result through the driver however large it was. The
+    `workers` parametrization is the point: 4 takes the flat reduce and 12 the tree, and the
+    two must agree with single-node and with each other.
+    """
+    ds = bt.from_arrow(table)
+    single = _sorted(build(ds).collect().to_pylist(), "")
+    got = _sorted(build(ds).collect(distributed=True, num_workers=workers).to_pylist(), "")
+    assert got == single
+
+
 def _disk(cfg, fan_in):
     return cfg.replace(
         flow_control=dataclasses.replace(cfg.flow_control, shuffle_fan_in=fan_in),

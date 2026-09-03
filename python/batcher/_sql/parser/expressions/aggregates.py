@@ -289,6 +289,17 @@ def build_typed_agg(tr, node) -> AggExpr | Expr | None:
         return tr._scalar(distinct_input(tr, inner) or inner.this).any_value()
     if kind == "anyvalue":
         return tr._scalar(distinct_input(tr, node) or node.this).any_value()
+    if kind == "quantile":
+        # DuckDB's bare `quantile(x, p)` is `quantile_disc`, not the continuous one.
+        # `bt.quantile(...)` is the *continuous* quantile and is spelled `quantile_cont` in
+        # SQL, so routing this to the library function by name would answer 2.5 where
+        # DuckDB answers 2.0 — a name shared by the two front ends that means two different
+        # things is worse than the "unsupported aggregate" it used to raise.
+        return AggExpr(
+            "quantile_disc",
+            tr._scalar(distinct_input(tr, node) or node.this),
+            param=_fraction(node.args.get("quantile")),
+        )
     if kind == "percentiledisc":
         return AggExpr(
             "quantile_disc",
@@ -387,6 +398,7 @@ def _library_agg(tr, node, name: str, args: list) -> AggExpr | Expr:
         library_aggregate,
         positional_arity,
     )
+    from batcher._sql.parser.expressions.lowering.signatures import build_arguments
 
     fn = library_aggregate(name)
     if fn is None:  # pragma: no cover - `is_agg_node` already answered for this name
@@ -402,7 +414,10 @@ def _library_agg(tr, node, name: str, args: list) -> AggExpr | Expr:
     # several columns and there is no single one to de-duplicate, so it is refused rather
     # than silently ignored — which is the same rule `sem` already follows above.
     _reject_distinct(node, args)
-    return fn(*(tr._scalar(a) for a in args))
+    # `build_arguments`, not `tr._scalar` per argument: several of these take a plan-time
+    # constant (`char_repetition_rate(text, n)`, `approx_quantile(x, q)`), and lowering it
+    # to a `Lit` fails inside the function with an error naming an internal node.
+    return fn(*build_arguments(tr, fn, args, name))
 
 
 def _count_if(condition: Expr) -> AggExpr:

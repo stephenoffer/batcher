@@ -137,20 +137,6 @@ impl GeomType {
             }
         })
     }
-
-    /// The topological dimension: 0 for points, 1 for lines, 2 for areas.
-    ///
-    /// A collection reports the maximum of its members, which is what PostGIS
-    /// `ST_Dimension` does; the empty collection reports 0.
-    #[must_use]
-    pub fn dimension(self) -> i64 {
-        match self {
-            GeomType::Point | GeomType::MultiPoint => 0,
-            GeomType::LineString | GeomType::MultiLineString => 1,
-            GeomType::Polygon | GeomType::MultiPolygon => 2,
-            GeomType::GeometryCollection => 0,
-        }
-    }
 }
 
 /// An axis-aligned bounding box.

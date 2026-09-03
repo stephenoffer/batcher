@@ -316,12 +316,21 @@ def cluster_tmp_path(tmp_path, request):
     passed.
 
     Set `BATCHER_TEST_SHARED_DIR` to override the mount chosen.
+
+    **Cleared on the way in as well as on the way out**, for the reason `cluster_scratch`
+    states beside it: the teardown does not run when a run is killed, and killed runs are
+    normal here (a hung distributed test, an OOM, a session that stopped a suite). Unlike
+    `tmp_path`, whose per-run directory is unique, this one is named after the *test*, so a
+    re-run inherited whatever the killed run left behind. That surfaces as a wrong answer
+    rather than a missing file: `test_each_micro_batch_is_exactly_one_transaction` read
+    `[2] == [1]`, having counted the previous run's transaction alongside its own.
     """
     base = _shared_base()
     if base is None:
         yield tmp_path
         return
     scratch = base / "batcher-tests" / _safe_dirname(request.node.name)
+    shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True, exist_ok=True)
     yield scratch
     shutil.rmtree(scratch, ignore_errors=True)
@@ -351,3 +360,35 @@ def cluster_tmp_dir(tmp_path_factory):
     scratch.mkdir(parents=True, exist_ok=True)
     yield scratch
     shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def cluster_scratch(cluster_tmp_dir):
+    """Make a fresh, cluster-visible directory by name -- the session-scoped `mktemp`.
+
+    [`cluster_tmp_dir`] is one directory per xdist worker, so a module wanting several
+    corpora has to name them apart, and a module that is re-run has to cope with the
+    previous run's files still being there: the teardown that removes them does not run
+    when a run is killed, and killed runs are normal here (a hung distributed test, an
+    OOM). Writing a second corpus on top of the first gives a partitioned table with every
+    partition twice, which fails as a *wrong aggregate* rather than as a missing file --
+    much harder to read than the `FileNotFoundError` this whole family exists to prevent.
+    So the directory handed back is always empty.
+
+    That makes it a drop-in for the `tmp_path_factory.mktemp(name)` these fixtures used
+    before, with the one difference that matters: every worker node can read it.
+
+    Args:
+        cluster_tmp_dir: The per-worker cluster-visible root to allocate under.
+
+    Returns:
+        A callable taking a directory name and returning the empty `Path` it made.
+    """
+
+    def make(name: str) -> Path:
+        scratch = cluster_tmp_dir / _safe_dirname(name)
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+        return scratch
+
+    return make

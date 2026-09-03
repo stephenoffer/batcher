@@ -15,6 +15,7 @@ from collections import deque
 from batcher._internal import events
 from batcher.config import active_config
 
+from ..scheduling import map_slots_per_worker
 from ._drain import draining_workers  # noqa: F401  (re-exported for the façade)
 from ._faults import (
     _DEFAULT_PENDING_WINDOW,
@@ -115,6 +116,7 @@ def gather_map_results(
     sink=None,
     task_cpus: float = 1.0,
     budget=None,
+    stage: str = "",
 ) -> list:
     """Gather `n` partition results, resubmitting any whose task died to preemption.
 
@@ -125,7 +127,8 @@ def gather_map_results(
     error (`RayTaskError`) re-raises immediately rather than wasting attempts on a
     fault a rerun cannot fix.
 
-    `on_lost(idx)`, when given, is called with the failed partition *before* it is
+    `on_lost(idx, exc)`, when given, is called with the failed partition and the failure
+    that lost it, *before* it is
     requeued, and `on_done(idx)` after one completes. Stateless tasks need neither (Ray
     reschedules them anywhere), but a barrier over pinned **actors** must record which
     worker died so `submit` can retarget the retry at a survivor, and which workers have
@@ -163,6 +166,15 @@ def gather_map_results(
     *is* its own lineage — a map/inference UDF recomputes idempotently from its durable
     partition descriptor, so a resubmit neither loses nor duplicates output. Without
     this loop a single preemption fails the whole stage (a plain ``ray.get`` raises).
+    `stage` labels the `PARTITION` event published as each partition lands. This barrier
+    holds both halves of "N of M" -- the width of the stage and the slot that just finished
+    -- and is therefore the only place that can answer it *while* the stage runs. Without
+    it a long map or inference stage reported nothing at all until it returned: the shuffle
+    barrier (`carbonite.resilience.gather_with_backups`) has published this since it
+    existed, and the map path, which is where a multi-hour job actually spends its time,
+    did not. The live progress line falls back to an indeterminate sweep with no ETA when
+    nothing publishes it.
+
     Returns results in partition order (assembly is index-addressed, so the submit
     order never affects the output).
     """
@@ -206,6 +218,7 @@ def gather_map_results(
     barrier_started = time.monotonic()
     stall_warnings = 0
     finished = 0
+    completed = 0
     while inflight:
         done, _ = ray.wait(list(inflight), num_returns=1, timeout=_STALL_POLL_S)
         if not done:
@@ -228,6 +241,13 @@ def gather_map_results(
             del value
             if on_done is not None:
                 on_done(idx)
+            completed += 1
+            # After the result is safely handled, so a partition is only ever counted when
+            # it really landed -- `finished` above counts *wakeups*, including the ones that
+            # turn out to be a transient failure and get resubmitted.
+            events.publish(
+                events.PARTITION, name=stage or "stage", total=n, slot=idx, done=completed
+            )
         except RayTaskError as exc:
             # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
             # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
@@ -258,7 +278,7 @@ def gather_map_results(
             # gone but not yet observed, and charging that to the partition's budget can
             # exhaust it while survivors still exist. Progress is bounded (each worker is
             # discovered dead at most once), and `submit` raises once none are left.
-            progressed = bool(on_lost(idx)) if on_lost is not None else False
+            progressed = bool(on_lost(idx, exc)) if on_lost is not None else False
             if not progressed:
                 attempts[idx] += 1
                 # Charged to the job-wide budget for the same reason it is charged to the
@@ -375,7 +395,16 @@ def map_barrier(
 
     # Actors free to take the next source, in the order they went idle. Only consulted
     # when there are more sources than workers; the pinned barrier never touches it.
-    idle: deque[int] = deque(range(workers))
+    #
+    # Each actor appears `slots` times, so `slots` of its sources are in flight at once.
+    # A map task reads its partition from object storage and then folds it, and at one
+    # slot per actor the node does neither while doing the other — the same gap
+    # `FLEET_CONCURRENCY` was introduced to close on the *reduce* side, left open on the
+    # map side, which is where a scan-heavy query spends nearly all of its time. Measured
+    # on a 64 x 16-core fleet at TPC-H sf100, the map phase held the cluster at 7-14% of
+    # its cores while the barrier waited on 64 single-threaded S3 reads.
+    slots = map_slots_per_worker() if not pinned else 1
+    idle: deque[int] = deque(h for _ in range(slots) for h in range(workers))
 
     def _next_idle() -> int:
         while idle:
@@ -394,12 +423,27 @@ def map_barrier(
             placement.relocate(src, host)
         return launch(host, src)
 
-    def _on_lost(src: int) -> bool:
+    def _on_lost(src: int, exc: BaseException) -> bool:
         host = assigned.get(src, src)  # the HOST died; `src` may be a relocated slot
         newly_dead = host not in dead
         dead.add(host)
         if ledger is not None:
-            ledger.record_failure(str(host), "worker_lost")
+            # The failure's own category, not a hardcoded `worker_lost`. The ledger weights
+            # blame by category precisely so a machine is quarantined for being unhealthy
+            # rather than for being given work, and every loss arriving as the heaviest
+            # non-hardware category defeated that: a **preemption scores 0.0** — the table's
+            # own words are "a planned reclamation says nothing about the node's health" —
+            # and was being charged 1.0, so a spot fleet quarantined its own nodes for
+            # behaving exactly as spot nodes do. An `ActorUnavailableError` is charged half,
+            # because Ray defines it as *temporarily* inaccessible (restarting, a network
+            # blip, or a death not yet reported) and tells callers to ping rather than to
+            # declare death; a confirmed `ActorDiedError` still charges in full.
+            #
+            # This is only the *blame* weight. Whether to retry is decided above by
+            # exception type, and is unchanged.
+            from batcher.carbonite.resilience import classify_failure
+
+            ledger.record_failure(str(host), classify_failure(exc).name)
         confirmed.discard(host)  # a host that completed earlier can still be preempted
         if newly_dead:
             # The first moment anything in the engine knows this worker is gone. Published
@@ -424,15 +468,16 @@ def map_barrier(
             # describes only ever shrinks.
             ledger.record_success(str(assigned[src]))
 
-    # An over-partitioned barrier runs exactly `workers` tasks at a time: the window IS the
-    # actor pool, so a completion both frees a host and releases the slot that refills it.
-    # A wider window would queue several sources behind one actor and give the assignment
-    # back to Ray's arrival order, which is the static dealing this exists to avoid.
+    # An over-partitioned barrier runs exactly `workers * slots` tasks at a time: the window
+    # IS the actor pool, so a completion both frees a host and releases the slot that refills
+    # it. The window must stay equal to the pool — a *wider* one would queue several sources
+    # behind one actor and give the assignment back to Ray's arrival order, which is the
+    # static dealing this exists to avoid, and a narrower one would leave slots unusable.
     results = gather_map_results(
         _submit,
         sources,
         policy,
-        max_pending=None if pinned else workers,
+        max_pending=None if pinned else workers * slots,
         on_lost=_on_lost,
         on_done=_on_done,
     )

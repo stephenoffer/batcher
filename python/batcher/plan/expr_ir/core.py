@@ -3671,7 +3671,11 @@ class Expr:
     def first(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the first row in `order_by` order (SQL ``first``).
 
-        Equivalent to ``arg_min(order_by)``.
+        Equivalent to ``arg_min(order_by)``, and that equivalence is the precise
+        contract: like ``arg_min``, this **skips rows where the expression is null** and
+        returns the first non-null value. SQL's own ``FIRST(x ORDER BY k)`` does not --
+        it returns whatever sits in the first row, null included -- so the two agree on
+        every column without nulls and differ exactly where one has them.
 
         An explicit `order_by` is **required**: an arrival-order first/last is not
         partition-independent, so it could not stay identical single-node and
@@ -3697,9 +3701,10 @@ class Expr:
     def last(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
 
-        Equivalent to ``arg_max(order_by)``. As with :meth:`first`, an explicit
-        `order_by` is required so the result stays deterministic and mergeable across
-        partitions.
+        Equivalent to ``arg_max(order_by)``, which -- as on :meth:`first` -- means it
+        **skips nulls** where SQL's ``LAST(x ORDER BY k)`` would return one. As with
+        :meth:`first`, an explicit `order_by` is required so the result stays
+        deterministic and mergeable across partitions.
 
         Args:
             order_by: The ordering expression; the value at its last row is returned.
@@ -3929,6 +3934,12 @@ class Expr:
     ) -> WindowExpr:
         """Cumulative (running) sum from the first row to the current one — Polars ``cum_sum``.
 
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
+
         A window expression (one value per row, no row collapse) — use it in
         ``with_columns``/``select``, not in scalar arithmetic or ``filter``. Without
         `order_by` the running order is the row order.
@@ -3955,6 +3966,12 @@ class Expr:
     ) -> WindowExpr:
         """Cumulative (running) minimum up to the current row — Polars ``cum_min``.
 
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
+
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
 
@@ -3979,6 +3996,12 @@ class Expr:
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
         """Cumulative (running) maximum up to the current row — Polars ``cum_max``.
+
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
 
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
@@ -5868,17 +5891,30 @@ class AggExpr:
 
         ``col("x").sum().over(partition_by=["g"])`` computes the per-partition sum
         broadcast to every row (no grouping/row collapse). With `order_by` it becomes
-        a running aggregate; `frame` sets an explicit ``ROWS`` window. Used inside
+        a running aggregate; `frame` sets an explicit window. Used inside
         `with_columns`, which lowers it to the relational `Window` operator. Only the
         aggregate functions (`sum`/`mean`/`min`/`max`/`count`) support `over`.
+
+        **The frame bounds are signed offsets, not PRECEDING/FOLLOWING magnitudes.**
+        Negative precedes the current row, ``0`` is the current row, positive follows,
+        and ``None`` is unbounded in that direction -- so SQL's
+        ``ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`` is ``frame=(-2, 0)``, not
+        ``(2, 0)``. Reading them as magnitudes is not a harmless slip: ``(2, 0)`` is
+        rejected outright, and ``(2, 2)`` is *accepted* as "two following through two
+        following" and quietly answers a different question than the one intended.
+
+        An optional third element chooses the frame units, ``"rows"`` (the default),
+        ``"range"`` or ``"groups"``, which differ exactly when rows tie on the
+        ``order_by`` key: ``"rows"`` counts rows, ``"range"`` and ``"groups"`` treat a
+        run of tied rows as one unit, matching SQL.
 
         Args:
             partition_by: Key expressions whose groups the aggregate is computed within.
                 ``None`` or empty means unpartitioned, over the whole input.
             order_by: Expressions to order rows by, making it a running aggregate.
                 ``None`` or empty leaves the aggregate unordered.
-            frame: An explicit ``ROWS`` frame as ``(preceding, following)`` offsets; ``None`` for
-                the default.
+            frame: ``(start, end)`` signed offsets, optionally with a third units element
+                as ``(start, end, units)``; ``None`` for the default frame.
 
         Examples:
             .. doctest::
@@ -5888,6 +5924,11 @@ class AggExpr:
                 >>> w = bt.col("v").sum().over(partition_by=["g"])
                 >>> ds.with_columns(total=w).sort("v").to_pydict()
                 {'g': ['a', 'a', 'b'], 'v': [1, 2, 10], 'total': [3, 3, 10]}
+
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "v": [1.0, 2.0, 3.0, 4.0]})
+                >>> trailing = bt.col("v").sum().over(order_by=["t"], frame=(-2, 0))
+                >>> ds.with_columns(s=trailing).sort("t").to_pydict()["s"]
+                [1.0, 3.0, 6.0, 9.0]
         """
         from batcher.plan.expr_ir.nodes import WindowExpr
 

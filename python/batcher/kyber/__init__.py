@@ -25,10 +25,13 @@ from batcher.kyber.column_tables import (
 )
 from batcher.kyber.correction import estimate_is_reliable
 from batcher.kyber.learning import (
+    MeasuredColumns,
     is_material_change,
     load_learned_stats,
     record_column_row_bytes,
+    record_column_row_bytes_batch,
     record_column_stats,
+    record_column_stats_batch,
     record_execution,
     record_selectivity,
 )
@@ -60,6 +63,7 @@ __all__ = [
     "NDV_KEY",
     "QUANTILES_KEY",
     "ROW_BYTES_KEY",
+    "MeasuredColumns",
     "Optimizer",
     "answer_aggregate",
     "answer_column_summary",
@@ -80,7 +84,9 @@ __all__ = [
     "optimize_logical",
     "optimize_traced",
     "record_column_row_bytes",
+    "record_column_row_bytes_batch",
     "record_column_stats",
+    "record_column_stats_batch",
     "record_execution",
     "record_selectivity",
     "required_columns_per_source",

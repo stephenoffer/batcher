@@ -17,13 +17,13 @@
 //! work through one path. A null list row on either side yields null; a null *element* is
 //! dropped, since a null never equals anything.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Builder, ListArray};
 use arrow::compute::concat;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{Row, RowConverter, SortField};
 
+use crate::eval::FastMap;
 use crate::ExprError;
 
 /// The clipped multiset intersection size of each row's two lists, as Float64.
@@ -54,8 +54,14 @@ pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<Ar
 
     let (lo, ro) = (la.value_offsets(), ra.value_offsets());
     let mut out = Float64Builder::with_capacity(la.len());
-    // Reused across rows so a batch of short lists does not allocate a map per row.
-    let mut counts: HashMap<OwnedRow, i64> = HashMap::new();
+    // Reused across rows so a batch of short lists does not allocate a map per row, and
+    // keyed on a **borrowed** row: `OwnedRow` copies the element's encoded bytes into a
+    // fresh `Vec<u8>`, which the count-up pass paid once per right element and the
+    // draw-down paid again per left element purely to look one up. `rows` outlives the
+    // loop, so there is nothing to own. ahash for the same reason `crate::eval::FastSet`
+    // gives: this is a per-element probe, and the answer is a count, which no hasher can
+    // change.
+    let mut counts: FastMap<Row<'_>, i64> = FastMap::default();
     for i in 0..la.len() {
         if la.is_null(i) || ra.is_null(i) {
             out.append_null();
@@ -68,14 +74,14 @@ pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<Ar
             if rv.is_null(k) {
                 continue;
             }
-            *counts.entry(rows.row(roffset + k).owned()).or_insert(0) += 1;
+            *counts.entry(rows.row(roffset + k)).or_insert(0) += 1;
         }
         let mut overlap = 0i64;
         for k in lo[i] as usize..lo[i + 1] as usize {
             if lv.is_null(k) {
                 continue;
             }
-            if let Some(remaining) = counts.get_mut(&rows.row(k).owned()) {
+            if let Some(remaining) = counts.get_mut(&rows.row(k)) {
                 if *remaining > 0 {
                     *remaining -= 1;
                     overlap += 1;
@@ -105,7 +111,7 @@ fn utf8_overlap(
 ) -> ArrayRef {
     let (lo, ro) = (la.value_offsets(), ra.value_offsets());
     let mut out = Float64Builder::with_capacity(la.len());
-    let mut counts: HashMap<&str, i64> = HashMap::new();
+    let mut counts: FastMap<&str, i64> = FastMap::default();
     for i in 0..la.len() {
         if la.is_null(i) || ra.is_null(i) {
             out.append_null();

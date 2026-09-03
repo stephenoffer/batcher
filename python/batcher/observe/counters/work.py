@@ -60,12 +60,35 @@ _SUMMED_FIELDS = (
 #: The subset exported as a per-operator Prometheus series. Deliberately smaller than
 #: `_SUMMED_FIELDS`: a series per kind per field is real cardinality in a scrape, and the
 #: rest stay available in `metrics_snapshot()` for a consumer that wants them.
+#: ``(field, exported name, help)``. The name is not the field: Prometheus asks for **base
+#: units** -- seconds, not milliseconds -- and the engine measures in milliseconds, so the
+#: two vocabularies differ by a factor of a thousand and by a suffix. See `_SECONDS`.
 _PER_KIND_SERIES = (
-    ("elapsed_ms", "Operator wall time by kind, in milliseconds"),
-    ("cpu_ms", "Operator CPU time by kind, summed across worker threads"),
-    ("rows_in", "Rows fed into an operator by kind"),
-    ("rows_out", "Rows produced by an operator by kind"),
-    ("spill_bytes", "Logical bytes an operator routed to disk, by kind"),
+    ("elapsed_ms", "operator_elapsed_seconds_total", "Operator wall time by kind"),
+    (
+        "cpu_ms",
+        "operator_cpu_seconds_total",
+        "Operator CPU time by kind, summed across worker threads",
+    ),
+    ("rows_in", "operator_rows_in_total", "Rows fed into an operator by kind"),
+    ("rows_out", "operator_rows_out_total", "Rows produced by an operator by kind"),
+    ("spill_bytes", "operator_spill_bytes_total", "Logical bytes an operator routed to disk"),
+)
+
+#: The exported names whose value is a duration and must be divided by a thousand.
+#:
+#: Prometheus's naming conventions are explicit that a metric uses base units, and the
+#: shipped Grafana dashboard was compensating for the deviation in three of its own panel
+#: expressions (`... / 1000`) -- which is the tell that the exporter, not the dashboard, had
+#: the unit wrong. `metrics_snapshot()` keeps its millisecond keys: it is a plain Python dict
+#: with its own documented shape, and the convention being followed here is Prometheus's.
+_SECONDS = frozenset(
+    {
+        "cpu_seconds_total",
+        "execution_seconds_total",
+        "operator_elapsed_seconds_total",
+        "operator_cpu_seconds_total",
+    }
 )
 
 #: The whole-execution fields summed across queries. These come from the engine's
@@ -88,8 +111,8 @@ _USAGE_FIELDS = (
 #: rather than for the operator vocabulary, because these are the figures a capacity
 #: dashboard plots without knowing what a `hash_join` is.
 _TOTAL_SERIES = (
-    ("cpu_ms", "cpu_ms_total", "CPU milliseconds consumed executing queries"),
-    ("wall_ms", "execution_ms_total", "Milliseconds spent inside the engine executing"),
+    ("cpu_ms", "cpu_seconds_total", "CPU seconds consumed executing queries"),
+    ("wall_ms", "execution_seconds_total", "Seconds spent inside the engine executing"),
     ("io_read_bytes", "io_read_bytes_total", "Bytes read from block devices, page cache excluded"),
     ("io_write_bytes", "io_write_bytes_total", "Bytes written to block devices"),
     ("minor_faults", "minor_page_faults_total", "Page faults served without disk I/O"),
@@ -105,6 +128,19 @@ _TOTAL_SERIES = (
         "Times the scheduler preempted a query — CPU contention",
     ),
 )
+
+
+def _scaled(metric: str, value: float) -> float:
+    """`value` in the unit `metric` is named for -- milliseconds converted to seconds.
+
+    Args:
+        metric: The exported metric name, without the ``batcher_`` prefix.
+        value: The measured value, in the engine's own unit.
+
+    Returns:
+        The value to publish.
+    """
+    return value / 1000.0 if metric in _SECONDS else value
 
 
 class WorkCounters:
@@ -291,7 +327,7 @@ class WorkCounters:
         for key, metric, help_text in _TOTAL_SERIES:
             out.append(f"# HELP batcher_{metric} {help_text}")
             out.append(f"# TYPE batcher_{metric} counter")
-            out.append(f"batcher_{metric} {totals.get(key, 0)}")
+            out.append(f"batcher_{metric} {_scaled(metric, totals.get(key, 0))}")
         out.append("# HELP batcher_spill_bytes_total Logical bytes routed to disk")
         out.append("# TYPE batcher_spill_bytes_total counter")
         out.append(f"batcher_spill_bytes_total {totals.get('spill_bytes', 0)}")
@@ -306,13 +342,14 @@ class WorkCounters:
         out.append(f"batcher_cores_busy {totals.get('cores_busy', 0.0)}")
         if not operators:
             return out
-        for field, help_text in _PER_KIND_SERIES:
-            metric = f"batcher_operator_{field}_total"
+        for field, name, help_text in _PER_KIND_SERIES:
+            metric = f"batcher_{name}"
             out.append(f"# HELP {metric} {help_text}")
             out.append(f"# TYPE {metric} counter")
             for kind, stats in operators.items():
                 label = escape_label(kind)
-                out.append(f'{metric}{{kind="{label}"}} {stats[f"{field}_total"]}')
+                value = _scaled(name, stats[f"{field}_total"])
+                out.append(f'{metric}{{kind="{label}"}} {value}')
         out.append("# HELP batcher_operator_spills_total Operators that engaged their spill path")
         out.append("# TYPE batcher_operator_spills_total counter")
         for kind, stats in operators.items():

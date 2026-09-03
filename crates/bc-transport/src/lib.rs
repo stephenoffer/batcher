@@ -97,6 +97,7 @@ use tonic::transport::{Channel, Server};
 use crate::handler::FlightHandler;
 use crate::store::PartitionStore;
 
+mod client_pool;
 mod exchange;
 mod handler;
 mod peers;
@@ -107,7 +108,8 @@ mod tls;
 #[cfg(test)]
 mod tls_test_certs;
 
-pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
+pub use client_pool::ClientPool;
+pub use exchange::{classify, group_name, FetchFault, ShuffleExchange};
 pub use peers::{
     fleet_bdp_bytes, fleet_flow_totals, fleet_starved_ratio, peer_transfers, record_fetch,
     record_retry, reset_peer_transfers, slowest_peer, PeerTransfer,
@@ -212,6 +214,65 @@ mod tunables {
     /// saturate a 10 Gbps NIC; four gives headroom for 25 Gbps instances).
     static CONNECTIONS_PER_PEER: AtomicU64 = AtomicU64::new(4);
 
+    /// Concurrent Flight streams a reducer runs across **all** its peers, whatever the
+    /// shuffle's shape.
+    ///
+    /// A stream's throughput is neither the link's nor the bucket's: it is what one encode
+    /// pipeline sustains, measured here at roughly 700-900 MiB/s of logical data. So the
+    /// figure that decides a gather's rate is how many streams run at once — and left to
+    /// itself that number is an accident of the shuffle's shape, because it comes out as one
+    /// stream per bucket and a hash shuffle cuts `workers^2` of them. Measured across one 25
+    /// Gbps link at the shipped defaults, 1.4 GiB with only the bucket count varying: 4
+    /// buckets 2,854 MiB/s, 16 5,342, 64 4,785, 256 3,888, 1,024 3,118, 4,096 **1,608** —
+    /// against 7,470 MiB/s at the same total when the stream count happened to land right.
+    /// A growing cluster slides down the right-hand side of that curve.
+    ///
+    /// A **cluster total** rather than a per-peer figure, because the per-peer reading is the
+    /// one that does not scale: at 100 peers it would open 1,600 streams and hold every one
+    /// of their windows resident. Split across the peers a gather actually has, it gives a
+    /// single link many streams and a wide fan-in one each — which is the right answer in
+    /// both cases, since a wide fan-in is already stream-parallel across its peers.
+    static GATHER_STREAMS: AtomicU64 = AtomicU64::new(48);
+
+    /// Set the gather's concurrent-stream target (see [`GATHER_STREAMS`]). `0` keeps the
+    /// current value; clamped to at least 1 on read.
+    pub fn set_gather_streams(n: u64) {
+        if n > 0 {
+            GATHER_STREAMS.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The current gather stream target (always >= 1).
+    pub fn gather_streams() -> usize {
+        GATHER_STREAMS.load(Ordering::Relaxed).max(1) as usize
+    }
+
+    /// Decoded bytes a gather may hold in flight across every stream.
+    ///
+    /// This is the memory bound that replaces the old one, and the replacement is the point:
+    /// the fan-in bound counted *buckets*, which stopped meaning anything once a bucket was
+    /// a fraction of a megabyte — eight of them is eight megabytes on a wide cluster and
+    /// three gigabytes on a narrow one, for the same setting. Bytes are what a memory
+    /// manager can reason about, and dividing this by the stream count is what tells a
+    /// stream how many buckets to ask for at once.
+    static GATHER_INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(768 << 20);
+
+    /// Set the gather's in-flight byte budget (see [`GATHER_INFLIGHT_BYTES`]). `0` keeps the
+    /// current value. Set per worker from Carbonite, which knows the envelope.
+    pub fn set_gather_inflight_bytes(bytes: u64) {
+        if bytes > 0 {
+            GATHER_INFLIGHT_BYTES.store(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes one stream aims to carry before it asks for the next group, given how many
+    /// streams the gather is running. Never below 1 MiB: a stream that carries less than a
+    /// couple of morsels cannot amortize its own setup.
+    pub fn stream_bytes_for(streams: usize) -> u64 {
+        let budget = GATHER_INFLIGHT_BYTES.load(Ordering::Relaxed);
+        (budget / streams.max(1) as u64).max(1 << 20)
+    }
+
     /// Set the process-wide transport timeouts. `idle_ms == 0` keeps the current
     /// idle timeout; `keepalive_ms == 0` disables keepalive.
     pub fn set_transport_timeouts(idle_ms: u64, keepalive_ms: u64) {
@@ -310,9 +371,10 @@ mod tunables {
 }
 
 pub use tunables::{
-    client_tls, compression, connections_per_peer, fetch_idle_timeout, keepalive, set_client_tls,
-    set_compression, set_connections_per_peer, set_shuffle_store_cap, set_transport_timeouts,
-    shuffle_store_cap,
+    client_tls, compression, connections_per_peer, fetch_idle_timeout, gather_streams, keepalive,
+    set_client_tls, set_compression, set_connections_per_peer, set_gather_inflight_bytes,
+    set_gather_streams, set_shuffle_store_cap, set_transport_timeouts, shuffle_store_cap,
+    stream_bytes_for,
 };
 
 impl From<tonic::Status> for TransportError {
@@ -1361,6 +1423,155 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(whole.len() as i64, N);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_concurrent_fetches_to_a_dead_peer_all_finish() {
+        // Every fetch to an unreachable peer routes through `forget_unreachable`, so a peer
+        // that is gone is exactly the case where many of them run it at once. It used to
+        // await while holding the peer map's shard lock, which is synchronous: the awaiting
+        // task parked, every other task wanting that shard blocked its thread without
+        // yielding, and with enough of them the runtime had nothing left to run the first
+        // one on. The gather then never returned — no error, no timeout, just a worker that
+        // stopped — which is the worst way for a lost peer to present.
+        let pool = Arc::new(ClientPool::new());
+        let dead = "127.0.0.1:1".to_string();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..64u32 {
+            let (pool, dead) = (pool.clone(), dead.clone());
+            set.spawn(async move {
+                let ticket = ShuffleTicket::new(14, 0, i, 0, 0);
+                pool.fetch_secured(&dead, &ticket, 8, None).await.is_err()
+            });
+        }
+        let all = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut failures = 0;
+            while let Some(joined) = set.join_next().await {
+                failures += u32::from(joined.expect("fetch task must not panic"));
+            }
+            failures
+        })
+        .await
+        .expect("64 concurrent fetches to a dead peer must finish, not deadlock");
+        assert_eq!(all, 64, "every fetch to a dead peer reports a fault");
+    }
+
+    #[tokio::test]
+    async fn a_grouped_fetch_returns_every_bucket_exactly_once() {
+        // Several buckets served over ONE stream must deliver the union of all of them,
+        // each batch exactly once — the property that lets a reducer hold its stream count
+        // constant while the cluster multiplies its buckets.
+        const BUCKETS: i64 = 5;
+        const PER: i64 = 7;
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let mut tickets = Vec::new();
+        for b in 0..BUCKETS {
+            let t = ShuffleTicket::new(11, 0, b as u32, 0, 0);
+            producer.publish(&t, seq_batches(b * PER, PER)).await;
+            tickets.push(t);
+        }
+
+        let pool = ClientPool::new();
+        for stripe in [1u32, 3] {
+            let got = pool
+                .fetch_secured_group_striped(&addr, &tickets, 8, None, stripe)
+                .await
+                .unwrap();
+            let mut vals: Vec<i64> = got
+                .iter()
+                .map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .collect();
+            vals.sort_unstable();
+            assert_eq!(
+                vals,
+                (0..BUCKETS * PER).collect::<Vec<_>>(),
+                "stripe={stripe}: union of a grouped fetch == every bucket, once"
+            );
+        }
+
+        // A one-ticket group is the un-grouped fetch, byte for byte.
+        let single = pool
+            .fetch_secured_group_striped(&addr, &tickets[..1], 8, None, 1)
+            .await
+            .unwrap();
+        let direct = pool
+            .fetch_secured(&addr, &tickets[0], 8, None)
+            .await
+            .unwrap();
+        assert_eq!(single.len(), direct.len());
+        assert_eq!(single, direct, "a group of one is the plain fetch");
+    }
+
+    #[tokio::test]
+    async fn a_group_of_unpublished_buckets_is_empty_and_a_partial_group_is_not() {
+        // An unpublished ticket is the expected empty-bucket case, so a group of nothing but
+        // those must read as no rows rather than as a fault — and a group that mixes a live
+        // bucket with dead ones must still deliver the live one, never fail the whole group.
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let live = ShuffleTicket::new(12, 0, 0, 0, 0);
+        producer.publish(&live, seq_batches(0, 3)).await;
+        let dead_a = ShuffleTicket::new(12, 0, 1, 0, 0);
+        let dead_b = ShuffleTicket::new(12, 0, 2, 0, 0);
+
+        let pool = ClientPool::new();
+        let none = pool
+            .fetch_secured_group_striped(&addr, &[dead_a, dead_b], 8, None, 1)
+            .await
+            .unwrap();
+        assert!(none.is_empty(), "a group of unpublished buckets is empty");
+
+        let some = pool
+            .fetch_secured_group_striped(&addr, &[dead_a, live, dead_b], 8, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            some.len(),
+            3,
+            "a live bucket in the group is still delivered whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_buckets_disagree_on_schema_is_refused() {
+        // One Flight stream carries one IPC schema. Serving mismatched buckets on it would
+        // reinterpret one under the other's schema — a wrong answer, not an error — so the
+        // server must refuse instead.
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ints = ShuffleTicket::new(13, 0, 0, 0, 0);
+        producer.publish(&ints, seq_batches(0, 2)).await;
+
+        let strings = ShuffleTicket::new(13, 0, 1, 0, 0);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a"]))])
+            .expect("build a string batch");
+        producer.publish(&strings, vec![batch]).await;
+
+        let pool = ClientPool::new();
+        let err = pool
+            .fetch_secured_group_striped(&addr, &[ints, strings], 8, None, 1)
+            .await
+            .expect_err("mismatched schemas must not be served on one stream");
+        assert_eq!(
+            classify(&err),
+            FetchFault::Fatal,
+            "a schema disagreement is a routing bug, not a lost peer: {err}"
+        );
     }
 
     #[tokio::test]

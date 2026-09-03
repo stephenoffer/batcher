@@ -514,7 +514,15 @@ def split_hot_bucket(parts: list, hot_bucket: int, subs: int, sub: int) -> list:
     return out
 
 
-def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, descending: bool):
+def plan_hot_split(
+    grids,
+    boundaries: list,
+    n_buckets: int,
+    nulls_first: bool,
+    descending: bool,
+    *,
+    single_key: bool = True,
+):
     """Decide whether one dominant key should be spread across several buckets, and how.
 
     A range partition must keep equal keys together, because the result is the ordered
@@ -531,6 +539,22 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
     order. Nothing about the relation changes: the same rows come back, in the same key
     order, with ties in the same order as before.
 
+    **That argument holds only when the leading key is the whole sort key**, which is what
+    `single_key` records. Rows sharing the hot value tie on the *leading* key; they do not
+    necessarily tie on the sort. Spread across sub-buckets and concatenated in mapper order,
+    rows a secondary key would have ordered come back in mapper order instead — the relation
+    is mis-sorted, not merely tie-broken differently. Measured on TPC-H q7
+    (`ORDER BY supp_nation, cust_nation, l_year`, whose leading key holds two values over
+    millions of rows and is therefore always hot): single-node returns the four rows in key
+    order, and the distributed run returned `(GERMANY, FRANCE, 1996)` before
+    `(GERMANY, FRANCE, 1995)`. The suite reported it as
+    `not ordered by 'l_year' ASC: row 2 is 1996 before 1995`, and it was `OK` single-node —
+    a distributed-only wrong answer on a query that asked for an order.
+
+    So a multi-key sort keeps the unsplit partition and pays the imbalance, exactly as a
+    descending one does below: a slower sort beats a wrong one, and nothing in the result
+    tells the caller it was wrong.
+
     Declined for a **descending** sort (see the comment on that branch — the layout is not
     yet right on the Flight reduce), on a key whose boundaries carry a NaN (no total order to
     isolate a value within), and when the hot value would share its bucket with the nulls,
@@ -543,6 +567,8 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
         n_buckets: The bucket count the caller sized the shuffle for.
         nulls_first: Whether nulls sort before non-nulls.
         descending: Whether the driver concatenates buckets high to low.
+        single_key: Whether the sort has exactly one key. The split is only order-preserving
+            when it does; see above.
 
     Returns:
         `(boundaries, logical_buckets, hot_bucket, subs)`, or `None` to partition as usual.
@@ -560,6 +586,9 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
     # on one transport and not the other would be worse than none. So a descending sort keeps
     # the unsplit partition and pays the imbalance, which costs time and never an answer.
     if descending:
+        return None
+    # A secondary key orders rows that the hot split would hand back in mapper order.
+    if not single_key:
         return None
     hot = hot_key_share(grids)
     if hot is None or hot[1] * max(1, n_buckets) < _HOT_SPLIT_OVERLOAD:

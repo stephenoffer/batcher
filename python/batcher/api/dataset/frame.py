@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError, require_float, require_int
+from batcher._internal.errors import (
+    ColumnNotFoundError,
+    PlanError,
+    require_float,
+    require_int,
+)
 from batcher.api._join_helpers import (
     _as_expr,
     _as_key_expr,
@@ -1157,7 +1162,9 @@ class Dataset:
             partition_by: Columns or expressions to partition rows by.
             order_by: Ordering keys — names, ``(name, descending)`` tuples, or expressions.
             functions: Output name to a ranking function or an ``(agg, column)`` pair.
-            frame: An explicit ``ROWS`` frame as a ``(start, end)`` offset pair.
+            frame: ``(start, end)`` signed row offsets, optionally with a third
+                units element as ``(start, end, units)`` -- ``"rows"`` (default),
+                ``"range"`` or ``"groups"``.
 
         Returns:
             A new `Dataset` with the window columns appended.
@@ -1603,7 +1610,7 @@ class Dataset:
                 >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
                 {'a': [2, 3], 'd': [4, 6]}
         """
-        from batcher.api.session import _catalog
+        from batcher.api.session.sql import _catalog
 
         session = _catalog if dialect is None else _catalog._with_dialect(dialect)
         return session._run(query, {table_name: self})
@@ -5099,11 +5106,7 @@ class Dataset:
                     "key a name, e.g. group_by(bucket=col('x') % 10)"
                 )
             if k not in available:
-                cols = sorted(available)
-                raise PlanError(
-                    f"group_by key {k!r} is not a column; available: {cols}"
-                    f"{suggest_columns(k, cols)}"
-                )
+                raise ColumnNotFoundError.of(k, sorted(available), where="in group_by()")
         for alias, expr in named.items():
             if not isinstance(expr, Expr):
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
@@ -5206,11 +5209,7 @@ class Dataset:
         available = set(self._plan.available_columns())
         for k in keys:
             if not isinstance(k, str) or k not in available:
-                cols = sorted(available)
-                raise PlanError(
-                    f"{what}() key {k!r} is not a column; available: {cols}"
-                    f"{suggest_columns(str(k), cols)}"
-                )
+                raise ColumnNotFoundError.of(k, sorted(available), where=f"in {what}()")
 
     def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:
         """Aggregate over the whole dataset (no grouping).

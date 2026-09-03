@@ -59,9 +59,9 @@ a serialized protocol.
 - The distributed executor (`dist/`) composes the *same* mergeable primitives
   (`partial_aggregate` / `partition_batches` / `combine_finalize`) the single-node
   path uses. Distributed is a scheduling concern, not a second semantics.
-- **A result MUST be identical whether produced on one node or many — with two stated
+- **A result MUST be identical whether produced on one node or many — with three stated
   exceptions.** The multiset of rows, every column name, and every column *type* are exact.
-  Both exceptions are places where the *query itself* does not determine an answer, so neither
+  All three are places where the *query itself* does not determine an answer, so none of them
   is a licence to differ anywhere else.
 
   **Floating-point reductions are identical up to reassociation.** `combine` is associative in
@@ -85,8 +85,29 @@ a serialized protocol.
   refuses the same freedom elsewhere: `bc_interp::ops::reshape::sample_n_batches` breaks its
   hash ties by row *content* precisely so a fixed-count `sample` does not depend on how the
   input was split. Making `row_number` deterministic the same way is a decision available to
-  anyone who wants it — a content tiebreak, paid per tie — not a limit of the architecture. A
-  divergence that is **not** of these two kinds is a defect, however plausible its rows look.
+  anyone who wants it — a content tiebreak, paid per tie — not a limit of the architecture.
+
+  **A `LIMIT` over a relation with no order may keep different rows.** `group_by(k).agg(...)`
+  emits its groups in whatever order the hash table walks, which is not a property of the
+  query, so `LIMIT n` over it selects *some* `n` groups rather than a defined `n`. Measured on
+  17 groups over a four-file Parquet source: single-node returned groups 0, 1 and 2 and the
+  two-worker run returned 3, 5 and 8 — three rows either way, every one of them a row of the
+  full aggregate, and neither more correct than the other. A `DISTINCT` diverges the same way,
+  which is unsurprising: it *is* a group-by over every column.
+
+  Measured on the same fixture, a `UNION` did **not** diverge and `sort(...).limit(n)` did not
+  either. The sort is a guarantee — a top-N has a defined answer and both paths compute it.
+  The union is not: it was simply observed to agree, and the difference between "agrees" and
+  "must agree" is exactly what this section exists to keep straight. Do not read the union
+  result as a promise, and do not read it as a defect if it ever stops holding.
+
+  What still binds, and is what to check when this shape looks wrong: the row *count* is
+  exact, every returned row is a row of the unlimited result, and every column type matches.
+  A `LIMIT` that returned four rows where one node returned three, or a row the unlimited
+  answer does not contain, is a defect and not this exception.
+
+  A divergence that is **not** of these three kinds is a defect, however plausible its rows
+  look.
 
 ## Streaming and batch
 

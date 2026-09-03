@@ -8,10 +8,12 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher._internal import events as _events
 from batcher._internal.errors import PlanError
 from batcher._internal.optional import require
 from batcher.api.orchestration import with_auto_config
@@ -50,6 +52,35 @@ __all__ = [
 ]
 
 
+def _shortcut(plan: LogicalPlan, route: str, rows: int, started: float) -> None:
+    """Report a query a shortcut answered without reaching the executor.
+
+    Module level rather than a closure inside each terminal, because these are the fastest
+    paths in the engine -- a `count()` read off a Parquet footer is tens of microseconds --
+    and building a closure object per call to reach a function that usually returns
+    immediately was measurable against exactly the case it describes.
+
+    Args:
+        plan: The plan that was answered.
+        route: Which shortcut answered it; a key of `event_log.SHORTCUT_REASONS`.
+        rows: Rows in the returned answer.
+        started: The `perf_counter` reading from the start of the terminal op.
+    """
+    # The `listening()` check is made *here*, before the import, and that is the whole
+    # reason this function exists rather than the call sites reaching `report_shortcut`
+    # directly. `report_shortcut` makes the same check and returns in 0.5 us, but the
+    # `from batcher.api.terminal.event_log import ...` needed to reach it costs 4.5 us
+    # even against a warm `sys.modules` -- measured, and it made a metadata-answered
+    # `count()` 17% slower with no sink attached at all. Hoisting that import to module
+    # scope would pay it once, but `core` keeps its heavy imports lazy on purpose;
+    # `_internal.events` is layer 0 and stdlib-only, so hoisting *that* one is free.
+    if not _events.listening():
+        return
+    from batcher.api.terminal.event_log import report_shortcut
+
+    report_shortcut(plan, route=route, rows=rows, total_ms=(time.perf_counter() - started) * 1000.0)
+
+
 @with_auto_config
 def _collect(
     plan: LogicalPlan,
@@ -85,6 +116,11 @@ def _collect(
     """
     from batcher.io.source import is_bounded
 
+    # Every route out of this function that returns a finished table without reaching the
+    # executor reports through `_shortcut`. See `event_log.report_shortcut`: each of them is
+    # a correct answer to a real query, and each was invisible to every observability sink.
+    started = time.perf_counter()
+
     # A prepared hit answers before any of the routing below runs, which is the point: for a
     # re-issued small query every one of those guards recomputes an answer the entry already
     # holds. The key carries the arguments, and the entry re-proves its sources and config on
@@ -111,7 +147,9 @@ def _collect(
         )
         hit = _prepared.lookup(prepared_key, sources, active_config())
         if hit is not None:
-            return hit.execute(sources)
+            answer = hit.execute(sources)
+            _shortcut(plan, "prepared", answer.num_rows, started)
+            return answer
 
     if any(not is_bounded(s) for s in sources) and not _is_bounded_peek(plan):
         raise PlanError(
@@ -124,7 +162,9 @@ def _collect(
 
         peeked = list(_iter_batches(plan, sources, columns))
         schema = peeked[0].schema if peeked else _peek_schema(plan)
-        return pa.Table.from_batches(peeked, schema=schema)
+        answer = pa.Table.from_batches(peeked, schema=schema)
+        _shortcut(plan, "streaming_peek", answer.num_rows, started)
+        return answer
     # Collect source statistics once when the metadata-aggregate attempt could use
     # them (a keyless aggregate), so a *missed* attempt doesn't re-read every footer
     # during execution. A non-aggregate collect skips this entirely (the attempt
@@ -146,10 +186,12 @@ def _collect(
             )
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
+        _shortcut(plan, "metadata_aggregate", metadata.num_rows, started)
         return metadata
     # Provably-empty short-circuit: a scan-free empty table (contradiction / limit(0) /
     # empty-side join) when metadata proves zero rows (see `metadata_empty_table`).
     if (empty := metadata_empty_table(plan, sources, source_stats)) is not None:
+        _shortcut(plan, "metadata_empty", empty.num_rows, started)
         return empty
     # GPU backend. `backend="gpu"` forces the GPU for any supported shape (honoring the user past
     # the small-input threshold, but Kyber still routes single-device vs sharded by working-set
@@ -166,6 +208,7 @@ def _collect(
             plan, sources, core.default_hub(), force=(backend == "gpu"), columns=columns
         )
         if gpu_result is not None:
+            _shortcut(plan, "gpu", gpu_result.num_rows, started)
             return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
     # through as tiny handles). Inserted before execution routing so the resulting
@@ -205,7 +248,9 @@ def _collect(
 
             batches = list(stream_limit(plan, sources[0], projection=_pushdown(plan)))
             schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
-            return pa.Table.from_batches(batches, schema=schema)
+            answer = pa.Table.from_batches(batches, schema=schema)
+            _shortcut(plan, "streaming_limit", answer.num_rows, started)
+            return answer
 
     if adaptive:
         from batcher import core
@@ -283,7 +328,9 @@ def _collect(
         backend=backend,
         cache=cache,
     ):
-        return run_fast(plan, sources, columns, remember_as=prepared_key)
+        answer = run_fast(plan, sources, columns, remember_as=prepared_key)
+        _shortcut(plan, "fast_path", answer.num_rows, started)
+        return answer
 
     # Imported here (not at module load) to keep the layer-import contract
     # simple and avoid importing the engine for pure-Python tooling. `time` is not one of
@@ -488,13 +535,16 @@ def _count(
     """
     from batcher.api.terminal.metadata_answer import global_count_plan, pushed_count
 
+    started = time.perf_counter()
     hit = _cached_rows(plan, sources, cache)
     if hit is not None:
+        _shortcut(plan, "cached", 1, started)
         return hit.num_rows
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
         _record_count_selectivity(plan, sources, answer)
+        _shortcut(plan, "metadata_count", 1, started)
         return answer
     # A source that can count itself, asked only now: the free answers have declined, and
     # the remaining option is to read the relation to count it. One `COUNT(*)` round trip
@@ -502,6 +552,7 @@ def _count(
     answer = pushed_count(plan, sources)
     if answer is not None:
         _record_count_selectivity(plan, sources, answer)
+        _shortcut(plan, "pushed_count", 1, started)
         return answer
     if _is_bounded_peek(plan):
         # `global_count_plan` wraps the peek in an aggregate, and an aggregate over an
@@ -542,12 +593,18 @@ def _is_empty(
     """
     from batcher.plan.logical import Limit
 
+    started = time.perf_counter()
     hit = _cached_rows(plan, sources, cache)
     if hit is not None:
+        _shortcut(plan, "cached", 1, started)
         return hit.num_rows == 0
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_is_empty(plan, sources, source_stats)
     if answer is not None:
+        # Reported for the same reason `count()`'s metadata answer is: the caller asked a
+        # question and got one, and "no query ran" and "the answer was already known" are
+        # different facts that looked identical from every sink.
+        _shortcut(plan, "metadata_count", 1, started)
         return answer
     # The `limit(1)` probe runs over the same sources, so their stats still apply.
     return _collect(Limit(plan, 1), sources, columns, source_stats=source_stats).num_rows == 0
@@ -924,6 +981,7 @@ def _write(
     sink_kwargs: dict[str, Any] | None = None,
     sink: Any | None = None,
     directory: bool = False,
+    privileges: Sequence[str] = ("INSERT",),
 ) -> WriteManifest:
     """Execute the plan and write the result via the `fmt` sink.
 
@@ -936,8 +994,15 @@ def _write(
     default to `False`, so on a cluster every write — the one terminal whose output size
     is the whole result — ran the read, the transform, and the write on the driver alone.
     """
+    from batcher.api.security._write import authorize_write
     from batcher.io.sink import SINKS, table_sink_kwargs
     from batcher.plan.logical import is_streamable
+
+    # Before anything is executed or created. Every write — batch, streaming, MERGE —
+    # reaches this function, which is why the check lives here rather than in each of
+    # the three callers: an authorization check with three call sites has three ways to
+    # be forgotten. Returns silently unless a `security()` block governs the destination.
+    authorize_write(path, columns, privileges)
 
     distributed = _resolve_distributed(distributed, plan, sources)
 

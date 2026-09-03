@@ -66,6 +66,20 @@ _DIST_ENTRY_POINTS = {
     "distinct": ("_distributed_distinct", ("batcher.dist.executors.distinct",)),
     "window": ("_distributed_window", ("batcher.dist.executors.window",)),
     "join": ("_distributed_join", ("batcher.dist.executors.join",)),
+    # The Flight halves of the four shapes that have one. `_dispatch` picks between these
+    # and the `_distributed_*` entries above on `transport`, which is resolved from the
+    # cluster — so watching only the disk half is not a narrower check, it is a check that
+    # silently inverts on a fleet that has Flight. Measured: on this 5-node cluster a plain
+    # `left.sort("k")` runs `flight_sort.execute_sort_flight` and returns all 2,400 rows,
+    # and the spy reported "reached nothing" for seven of the twelve shapes — the exact
+    # instrument failure the module docstring above describes, arrived at from the other
+    # direction. `distinct` needs no entry here: `_distributed_distinct` takes `transport`
+    # as an argument rather than being chosen by it.
+    "sort_flight": ("execute_sort_flight", ("batcher.dist.flight_sort",)),
+    "topn_flight": ("execute_topn_flight", ("batcher.dist.flight_sort",)),
+    "aggregate_flight": ("execute_aggregate_flight", ("batcher.dist.flight_aggregate",)),
+    "join_flight": ("execute_join_flight", ("batcher.dist.flight_join",)),
+    "window_flight": ("execute_window_flight", ("batcher.dist.flight_window",)),
     "global_window": (
         "execute_global_window_disk",
         ("batcher.dist.global_window.disk", "batcher.dist.global_window"),
@@ -106,7 +120,7 @@ def dist_spy(monkeypatch):
 
 
 @pytest.fixture(scope="module")
-def splittable(tmp_path_factory):
+def splittable(cluster_scratch):
     """A four-file Parquet directory — a genuinely splittable source.
 
     In-memory sources are deliberately not used: `_unsupported` runs those single-node by
@@ -114,7 +128,7 @@ def splittable(tmp_path_factory):
     """
     import pyarrow.parquet as pq
 
-    directory = tmp_path_factory.mktemp("engagement_parquet")
+    directory = cluster_scratch("engagement_parquet")
     for part in range(4):
         pq.write_table(_T, directory / f"p{part}.parquet")
     return str(directory)
@@ -127,11 +141,17 @@ def test_the_spy_itself_records_a_call(dist_spy, splittable):
     entry point renamed, a caller switched to a spelling nothing wraps — those would fail
     loudly, but nothing would distinguish that from the engine having genuinely changed. A
     plain sort has the longest-standing distributed path, so its absence means the harness.
+
+    Which of the two sort drivers runs is the fleet's choice, so the guard reads the same
+    `EXPECTED_DISTRIBUTED` entry the parametrized test does rather than restating one of
+    them. Naming `"sort"` alone made this guard fail on a Flight fleet — announcing a broken
+    harness while the harness was working and the query was running correctly, which is the
+    one report a vacuity guard must never produce.
     """
     _BUILDERS["sort_plain"](bt.read.parquet(splittable), bt.from_arrow(_R)).collect(
         distributed=True, num_workers=_WORKERS
     )
-    assert "sort" in dist_spy
+    assert set(dist_spy) & set(EXPECTED_DISTRIBUTED["sort_plain"])
 
 
 @pytest.mark.parametrize("shape", sorted(EXPECTED_DISTRIBUTED))

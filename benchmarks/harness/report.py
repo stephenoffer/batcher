@@ -33,7 +33,7 @@ def _fmt_ms(er: EngineResult) -> str:
 NOT_COMPARABLE = "n/c"
 
 
-def _ratio(b: EngineResult, other: EngineResult) -> str:
+def _ratio(b: EngineResult, other: EngineResult, status: str = "OK") -> str:
     """The ``b/<engine>`` cell — or a refusal, when the division would assert something false.
 
     ``compare()`` deliberately times an engine even when its result disagreed with the
@@ -50,7 +50,7 @@ def _ratio(b: EngineResult, other: EngineResult) -> str:
     engine: one comparator disagreeing, or one engine failing the sort-order check, must not
     void the ratios of the engines that agreed.
     """
-    if b.correct is False or other.correct is False:
+    if b.correct is False or other.correct is False or status in ("DIVERGENT", "DEGENERATE"):
         return NOT_COMPARABLE
     if not b.ms or not other.ms:
         return "-"
@@ -79,7 +79,7 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
         if has_batcher:
             b = r.engines.get("batcher", EngineResult())
             for e in comparators:
-                cells.append(_ratio(b, r.engines.get(e, EngineResult())))
+                cells.append(_ratio(b, r.engines.get(e, EngineResult()), r.status))
         cells.append(r.status)
         rows.append(cells)
 
@@ -115,10 +115,10 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
     if any(NOT_COMPARABLE in row for row in rows):
         print()
         print(
-            f"{NOT_COMPARABLE} = not comparable: the two engines did not produce the same "
-            "answer, so the timings are shown but the ratio is withheld. See the row's "
-            "status — FAILED is a defect, DIVERGENT is a recorded semantic difference "
-            "whose reason and citation print above."
+            f"{NOT_COMPARABLE} = not comparable: the timings are shown but the ratio is "
+            "withheld. The row's status says why — FAILED is a defect, DIVERGENT a recorded\n"
+            "      semantic difference, DEGENERATE an agreement between results carrying no "
+            "information (the engines agree; nothing was compared)."
         )
 
 

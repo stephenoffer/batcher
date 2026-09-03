@@ -115,29 +115,68 @@ fn chains_meet_improperly(a: &LineString, b: &LineString) -> bool {
     false
 }
 
-/// True when two non-adjacent segments of the chain meet.
+/// The chain with consecutive duplicate positions removed.
 ///
-/// Adjacent segments always share their common vertex, and a closed chain's first and
-/// last segments share the closing one; neither is an anomaly, so both are excluded.
-/// Anything else — including a chain that merely touches itself without crossing — is.
+/// A repeated vertex carries no geometry: it contributes a zero-length segment, and the
+/// two real segments on either side of it are still *adjacent*. Leaving it in makes them
+/// look like a non-adjacent pair that shares a point, which is the signature of a genuine
+/// self-intersection — so `LINESTRING(0 0, 1 1, 1 1, 2 2)` was reported non-simple while
+/// GEOS, PostGIS and DuckDB all call it simple.
+fn without_repeated_positions(l: &LineString) -> Vec<Coord> {
+    let mut out: Vec<Coord> = Vec::with_capacity(l.len());
+    for c in l {
+        if out.last().is_none_or(|p: &Coord| p.x != c.x || p.y != c.y) {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// True when the chain meets itself anywhere other than at a shared vertex it is
+/// entitled to share.
+///
+/// Two exclusions are legitimate and both are narrower than they look:
+///
+/// * **Adjacent segments** share their common vertex, which is proper — but only that
+///   one point. When the chain doubles back along the segment it just drew
+///   (`LINESTRING(0 0, 2 2, 1 1)`) the two adjacent segments *overlap*, which is a real
+///   self-intersection. Skipping every adjacent pair outright, as this used to, reported
+///   every such retrace as simple; the overlap is now tested for directly.
+/// * **A closed chain's first and last segments** share the closing position, and that
+///   is what closure means.
+///
+/// The old `len < 4` early exit was the same mistake in a cheaper disguise: a three-point
+/// chain is exactly the shortest one that can double back, so the one shape the guard
+/// excluded is the one it most needed to see.
 fn self_intersects(l: &LineString) -> bool {
-    if l.len() < 4 {
+    let pts = without_repeated_positions(l);
+    let n = pts.len().saturating_sub(1); // segment count
+    if n < 2 {
         return false;
     }
-    let closed = is_closed(l);
-    let n = l.len() - 1;
+    let closed = pts[0].x == pts[n].x && pts[0].y == pts[n].y;
+    // Non-adjacent pairs: any contact at all is improper.
     for i in 0..n {
-        for j in (i + 1)..n {
-            if j == i + 1 {
-                continue;
-            }
+        for j in (i + 2)..n {
             if closed && i == 0 && j == n - 1 {
                 continue;
             }
-            if segments_intersect(l[i], l[i + 1], l[j], l[j + 1]) {
+            if segments_intersect(pts[i], pts[i + 1], pts[j], pts[j + 1]) {
                 return true;
             }
         }
+    }
+    // Adjacent pairs: improper only when they share more than the common vertex, which
+    // (after de-duplication) happens exactly when the far endpoint of the second segment
+    // lies back on the first.
+    let doubles_back = |a: usize, b: usize, c: usize| on_segment(pts[c], pts[a], pts[b]);
+    for i in 0..n - 1 {
+        if doubles_back(i, i + 1, i + 2) {
+            return true;
+        }
+    }
+    if closed && n >= 2 && doubles_back(n - 1, n, 1) {
+        return true;
     }
     false
 }
@@ -428,5 +467,41 @@ mod tests {
     fn disjoint_multilinestring_members_stay_simple() {
         let g = read_wkt("MULTILINESTRING((0 0, 1 1), (10 10, 11 11))").expect("wkt");
         assert!(is_simple(&g.geometry));
+    }
+
+    /// Every expectation below is GEOS's, cross-checked against DuckDB's spatial
+    /// extension. The two shapes at the top are the ones the previous implementation got
+    /// wrong, in opposite directions, and neither was reachable by the tests above.
+    #[test]
+    fn simplicity_matches_geos_on_retraces_and_repeated_vertices() {
+        // A chain that doubles back along the segment it just drew overlaps itself. The
+        // adjacent-pair skip hid it, and the `len < 4` exit hid it again: three points is
+        // the *shortest* chain that can retrace, so the guard excluded exactly the case
+        // it needed to see. Reported simple; it is not.
+        assert!(!is_simple(&g("LINESTRING(0 0, 2 2, 1 1)").geometry));
+        assert!(!is_simple(&g("LINESTRING(0 0, 1 1, 0 0)").geometry));
+
+        // A repeated vertex is not a self-intersection: it contributes a zero-length
+        // segment, and the two real segments either side of it stay adjacent. Reported
+        // non-simple; it is simple.
+        assert!(is_simple(&g("LINESTRING(0 0, 1 1, 1 1, 2 2)").geometry));
+        assert!(is_simple(&g("LINESTRING(0 0, 0 0)").geometry));
+
+        // Unchanged verdicts, kept here so a fix in one direction cannot pay for itself
+        // by breaking the other.
+        assert!(is_simple(&g("LINESTRING(0 0, 1 1, 2 2)").geometry));
+        assert!(!is_simple(&g("LINESTRING(0 0, 2 0, 1 1, 1 -1)").geometry));
+        assert!(is_simple(
+            &g("LINESTRING(0 0, 1 0, 1 1, 0 1, 0 0)").geometry
+        ));
+        // Collinear continuation is not a retrace: the far point is beyond the shared
+        // vertex, not back inside the first segment.
+        assert!(is_simple(&g("LINESTRING(0 0, 1 1, 3 3)").geometry));
+    }
+
+    #[test]
+    fn a_repeated_vertex_does_not_stop_a_ring_being_one() {
+        // The same de-duplication has to reach `is_ring`, which shares `self_intersects`.
+        assert!(is_ring(&g("LINESTRING(0 0, 4 0, 4 4, 4 4, 0 0)").geometry));
     }
 }

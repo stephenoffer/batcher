@@ -264,8 +264,28 @@ pub(crate) fn combine_radix_parts(
             // index per output row, and this bucket may hold millions.
             let mut part_of: Vec<u32> = Vec::with_capacity(idx.len());
             let mut row_of: Vec<u32> = Vec::with_capacity(idx.len());
+            // A **cursor**, not a binary search per row. `idx` is globally ascending by
+            // construction: each chunk bins its own contiguous range of global rows in
+            // increasing order, and a bucket's list is those per-chunk runs concatenated in
+            // chunk order (see the counting sort above). So the owning partial only ever
+            // moves forward, and the whole bucket costs `O(idx.len() + parts.len())` instead
+            // of a `partition_point` over `parts.len() + 1` starts for every one of what may
+            // be millions of rows — `workers x groups` of them, which is the term this merge
+            // is already linear in.
+            //
+            // Asserted rather than assumed, in debug only: if a future binning ever emitted a
+            // bucket out of order the cursor would silently attribute rows to the wrong
+            // partial, which reads back as wrong *values* in the merged group rather than as
+            // an error.
+            debug_assert!(
+                idx.windows(2).all(|w| w[0] < w[1]),
+                "a radix bucket's row list must be globally ascending for the cursor below"
+            );
+            let mut p = 0usize;
             for &g in idx {
-                let p = starts.partition_point(|&s| s <= g) - 1;
+                while starts[p + 1] <= g {
+                    p += 1;
+                }
                 part_of.push(p as u32);
                 row_of.push(g - starts[p]);
             }

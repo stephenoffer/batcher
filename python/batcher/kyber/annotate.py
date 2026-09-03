@@ -368,6 +368,31 @@ def _desired_parallelism(
 
     Returns:
         The desired task count, at least 1.
+
+    Note:
+        **There is deliberately no floor at the fleet's width, and that is a measurement
+        rather than an oversight.** It reads like one: Kyber holds the cluster profile,
+        `clamp_workers` downstream only ever *reduces* this number, and a 20M-row aggregate
+        asking for five tasks on a 384-slot fleet plainly leaves the fleet idle. Measured on
+        exactly that fleet (4 nodes x 96 cores), against the count this function returns:
+
+        | workload                              | asked | measured at higher fan-out       |
+        |---------------------------------------|------:|----------------------------------|
+        | 20M-row aggregate, in-memory source   |     5 | 16: 2.8x slower, 64: 8.4x,       |
+        |                                       |       | 128: **18.5x** slower            |
+        | 160M-row scan + `GROUP BY`, parquet   |    40 | 96: 1.00x, 192: 1.08x faster,    |
+        |                                       |       | 384: **2.7x slower** than 192    |
+
+        The shuffle is what turns the extra tasks into a loss: a task costs a partition
+        through the exchange plus its share of the merge, and past the point where the data
+        justifies it that cost grows faster than the work it removes. Even the scan-heavy
+        shape, which is the case that most favours a wide fan-out, is flat from 40 tasks to
+        192 and then falls off a cliff at the fleet's full width. So a cluster-width floor
+        would buy at most 1.08x where it helps and cost up to 18.5x where it does not.
+
+        Size this from the data, in other words, and let `clamp_workers` fit the result to
+        the cluster. What a wider fleet changes is how many of these tasks run at once, not
+        how many there should be.
     """
     by_rows = math.ceil(in_rows / max(1, target_rows))
     by_bytes = math.ceil(in_rows * max(0.0, width) / max(1, target_bytes))
@@ -526,6 +551,10 @@ def annotate_ops(
                         n_max_parallelism=n_par,
                         c_cpu_shares=c_cpu,
                         prefers_locality=prefers_local,
+                        # Published rather than kept local: Carbonite cannot import
+                        # `_BREAKER_KINDS` (the subsystems are independent) and needs the
+                        # same distinction to decide which capacity a fleet belongs on.
+                        materializes=materializes,
                     ),
                     inputs=tuple(op_id_of[id(c)] for c in children(node)),
                     properties=PlanProperties(

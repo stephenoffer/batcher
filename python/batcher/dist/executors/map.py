@@ -21,13 +21,14 @@ from __future__ import annotations
 import atexit
 import contextlib
 import contextvars
+import logging
 import os
 from collections import deque
 
 import pyarrow as pa
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
-from batcher._internal.logging import get_logger, note_suppressed
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
@@ -586,6 +587,59 @@ def _resolve_pool_size(spec: object, num_partitions: int, default: int) -> int:
     return int(spec)
 
 
+def _placeable_scheduling(needed_cpus: float) -> dict:
+    """Make room for this stage's tasks against a fleet holding the whole cluster.
+
+    A shuffle fleet reserves every schedulable core (one worker per node, holding that
+    node's cores), and these are plain Ray tasks submitted *outside* that reservation. So
+    the fleet does not slow them down, it makes them unplaceable — measured as
+    `{'CPU': 0.125}: 1+ pending` against `384.0/384.0`, indefinitely, with no error and no
+    timeout.
+
+    Two answers, in order of preference:
+
+    1. **Hand the fleet back** (`yield_session_fleet`) and take the whole cluster. Available
+       whenever nothing is mid-shuffle and no intermediate is published on the actors; the
+       next Flight stage respawns the fleet for the price of one spawn.
+    2. **Run inside the reservation.** A staged query's final scan reads an intermediate
+       *published on those very actors*, so the fleet cannot be released — and that is the
+       shape the deadlock was found on. The bundles keep `fleet_task_headroom` unclaimed for
+       exactly this, so the tasks run beside the actors, on the nodes holding their data.
+
+    Never raises: a stage that cannot be helped is left exactly where it was, and the
+    barrier's own stall reporting says so.
+
+    Args:
+        needed_cpus: The largest single CPU ask among the tasks about to be submitted.
+
+    Returns:
+        Ray `.options(...)` scheduling kwargs, empty when the open cluster can place them.
+    """
+    from batcher.dist.fleet import held_placement_group, yield_session_fleet
+
+    try:
+        if yield_session_fleet(needed_cpus):
+            return {}
+        pg = held_placement_group()
+        if pg is None:
+            return {}
+        from batcher.dist.executors.ray_runtime import fleet_task_options
+
+        opts = fleet_task_options(pg)
+        if opts:
+            log_kv(
+                get_logger("dist"),
+                logging.INFO,
+                "running this stage inside the shuffle fleet's reservation",
+                reason="the cluster's CPU is held by a fleet carrying a published intermediate",
+                needed_cpus=needed_cpus,
+            )
+        return opts
+    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+        note_suppressed("dist", "make room for a task stage beside the fleet", exc)
+        return {}
+
+
 def _distributed_map(
     plan: LogicalPlan,
     sources: list[Source],
@@ -727,12 +781,18 @@ def _distributed_map(
         # partition (packed many-per-core), several cores for a large one. A heavier
         # (skewed) partition therefore gets proportionally more CPU than its peers.
         shares = _adaptive_task_cpus(partitions, plan, hub)
+        # A held shuffle fleet reserves the cluster's whole CPU capacity, and these tasks
+        # are submitted outside it — so they are unplaceable, not merely slow.
+        placeable = _placeable_scheduling(max(shares) if shares else 1.0)
         # Resolve SPREAD vs Ray's locality-aware DEFAULT against the live cluster: SPREAD
         # only where these right-sized (often sub-node) tasks would otherwise pack onto one
         # node and idle the rest, DEFAULT (restoring argument locality) when packing isn't a
         # risk or the cluster is large enough that DEFAULT's balancing suffices. On a
         # heterogeneous cluster this also keeps a CPU-only map fleet off GPU nodes.
-        sched = _map_scheduling_options(env, shares)
+        # `placeable` is empty unless the cluster is full, and then it *replaces* the
+        # SPREAD/DEFAULT choice below: a strategy that cannot be scheduled is not a
+        # placement preference to be balanced against, it is the whole question.
+        sched = placeable or _map_scheduling_options(env, shares)
         plan_ref = _shared_arg(plan0)
         cfg_for = _engine_config_cache()
 
@@ -762,7 +822,7 @@ def _distributed_map(
         # partitions runs several tasks per core, and a cores-derived window would cap
         # its concurrency at a fraction of what the cluster can hold.
         results = gather_map_results(
-            _launch, len(partitions), task_cpus=min(shares) if shares else 1.0
+            _launch, len(partitions), task_cpus=min(shares) if shares else 1.0, stage="map"
         )
 
     if write_spec is not None:
@@ -932,12 +992,17 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
     (locality-aware: prefers nodes already holding the task's args, then low utilization).
     An explicit ``STRICT_SPREAD`` envelope preference always forces SPREAD. When the
     envelope asks to stay off GPU nodes, a hard CPU-only node selector is merged in (a
-    no-op unless the cluster opts in and can host the fleet). Returns `{}` for DEFAULT
+    no-op unless the cluster opts in and can host the fleet), and a spot-capacity label
+    selector is merged in on a mixed fleet that opted into capacity-aware placement (a
+    no-op otherwise) — these tasks recompute from their partition descriptor, so a
+    reclamation costs a resubmission rather than the stage. Returns `{}` for DEFAULT
     with no selector. Placement never changes which rows a partition holds, so the result
     is identical for any choice.
     """
     from batcher.config import active_config
-    from batcher.dist.executors.ray_runtime import node_class_selector
+    from batcher.dist.executors.ray_runtime import node_class_selector, task_event_options
+    from batcher.dist.executors.ray_runtime.fabric.market import capacity_selector
+    from batcher.plan.resource import CAPACITY_SPOT
 
     mode = active_config().distributed.map_spread
     if env is not None and env.placement_strategy == "STRICT_SPREAD":
@@ -953,6 +1018,14 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
         sel = node_class_selector(env.prefer_cpu_only_nodes, len(shares), mean_share)
         if sel:
             opts["resources"] = {**opts.get("resources", {}), **sel["resources"]}
+        # These tasks are stateless and idempotent — `gather_map_results` resubmits one whose
+        # worker died, from the same durable partition descriptor — so they are exactly the
+        # work spot capacity is for, whatever the fleet-level envelope says. Asked for by name
+        # rather than read off the envelope, which carries the *shuffle* fleet's preference.
+        opts.update(capacity_selector(CAPACITY_SPOT, workers=len(shares), num_cpus=mean_share))
+    # The widest stage in the engine, and the one whose per-task Ray events cost most. A
+    # no-op below the configured fan-out cap, which ordinary queries never reach.
+    opts.update(task_event_options(len(shares)))
     return opts
 
 

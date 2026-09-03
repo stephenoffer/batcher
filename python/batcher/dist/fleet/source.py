@@ -106,6 +106,13 @@ class FlightMaterializedSource:
     __slots__ = ("_actors", "_handles", "_pg", "_schema", "_session_lease")
     bounded = True
 
+    #: This relation exists for one query and cannot be named by another. Its splits are
+    #: addressed `flight:{addr}:{ticket}`, and the ticket carries the query's own plan id, so
+    #: nothing a statistics pass files under this source's key can ever be read back. The
+    #: learners skip it on that basis -- see `api.terminal._metadata.seed_column_ndv`, which
+    #: records what happened when an ephemeral stage source was sketched anyway.
+    ephemeral = True
+
     def __init__(self, handles, schema: pa.Schema, actors, pg, session_lease: bool = False) -> None:
         self._handles = handles  # [(addr, ticket, rows)] per non-empty reducer bucket
         self._schema = schema

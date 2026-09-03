@@ -22,12 +22,14 @@ would mean copy-pasting it — which is exactly how the three divergent copies h
 from __future__ import annotations
 
 import difflib
+import functools
 from collections.abc import Iterable
 
 __all__ = [
     "absent_error",
     "candidate_list",
     "did_you_mean",
+    "public_members",
     "suggestion",
     "unknown_message",
 ]
@@ -258,6 +260,32 @@ def unknown_message(
     return " ".join(parts)
 
 
+@functools.lru_cache(maxsize=256)
+def public_members(cls: type) -> tuple[str, ...]:
+    """The public attribute names of `cls`, for a did-you-mean pool.
+
+    Cached on the class, because `dir` is not free and the answer cannot change between
+    two lookups on the same type: a class's member list is fixed once it is defined. The
+    callers are attribute-error paths that the optimizer walks into thousands of times per
+    query while probing for optional IR fields, so computing this per *failure* rather
+    than per *type* was measurable on its own.
+
+    Args:
+        cls: The type whose public members to list.
+
+    Returns:
+        The names in ``dir(cls)`` that do not start with an underscore.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import public_members
+            >>> "upper" in public_members(str)
+            True
+    """
+    return tuple(n for n in dir(cls) if not n.startswith("_"))
+
+
 def absent_error(
     label: str,
     name: str,
@@ -297,8 +325,66 @@ def absent_error(
     """
     if name in table:
         return AttributeError(f"{label} has no attribute {name!r}. {table[name]}")
+    return AttributeError(_Guidance(label, name, tuple(members)))
+
+
+def _absent_message(label: str, name: str, members: tuple[str, ...]) -> str:
+    """The rendered "no attribute" line for a name with no curated guidance."""
     msg = f"{label} has no attribute {name!r}."
     phrase = suggestion(name, members)
-    if phrase:
-        msg += " " + phrase
-    return AttributeError(msg)
+    return f"{msg} {phrase}" if phrase else msg
+
+
+class _Guidance:
+    """An `absent_error` message rendered only when something actually reads it.
+
+    This is an optimization with a correctness-shaped justification, so it is worth
+    stating why it is not premature. Building the message is the expensive half of a
+    failed attribute lookup: `suggestion` runs a `difflib` ratio against *every* member of
+    the type, and an `Expr` has 319 of them. The lookup itself is cheap.
+
+    That would be a fair price if the message were read, but on the dominant path it never
+    is. A probe -- ``getattr(node, "left", None)``, ``hasattr(...)`` -- discards the
+    exception without ever formatting it, and the optimizer probes constantly: one
+    profile of a six-join plan spent **82% of the entire query** in `difflib`, building
+    2,172 messages that were all thrown away. Deferring the render made that cost
+    proportional to the errors a user actually sees, which is zero on a working query.
+
+    It is deliberately *not* an `AttributeError` subclass. The exception class has to stay
+    exactly `AttributeError` so a traceback still prints ``AttributeError: ...`` rather
+    than a private class path -- which is what the doctests above, and every caller's
+    ``pytest.raises(..., match=...)``, read. Making only ``args[0]`` lazy keeps the type,
+    the traceback, `str`, and `repr` identical to the eager message.
+    """
+
+    __slots__ = ("_parts", "_text")
+
+    def __init__(self, label: str, name: str, members: tuple[str, ...]) -> None:
+        self._parts: tuple[str, str, tuple[str, ...]] | None = (label, name, members)
+        self._text: str | None = None
+
+    def _render(self) -> str:
+        if self._text is None:
+            assert self._parts is not None
+            self._text = _absent_message(*self._parts)
+            # Drop the member list once rendered: it can be a few hundred strings, and an
+            # exception that is caught and stored would otherwise pin them.
+            self._parts = None
+        return self._text
+
+    def __str__(self) -> str:
+        return self._render()
+
+    def __repr__(self) -> str:
+        return repr(self._render())
+
+    def __eq__(self, other: object) -> bool:
+        return self._render() == other
+
+    def __hash__(self) -> int:
+        return hash(self._render())
+
+    def __reduce__(self) -> tuple[type[str], tuple[str]]:
+        # Pickled (across the Ray boundary, say) it becomes the plain string it renders to,
+        # so nothing outside this module ever meets the wrapper.
+        return (str, (self._render(),))

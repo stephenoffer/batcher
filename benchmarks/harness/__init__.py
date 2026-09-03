@@ -39,7 +39,15 @@ from .divergences import KNOWN_DIVERGENCES, Divergence, explain
 from .names import canonical_column_name, canonical_names
 from .order import OrderKey, order_keys_of, order_violation
 from .report import RESULT_PREFIX, emit_result, print_table, run_isolated
-from .summary import Summary, format_repeats, format_summary, geomean, summarize
+from .summary import (
+    Summary,
+    case_ratios,
+    format_repeats,
+    format_summary,
+    format_unstable,
+    geomean,
+    summarize,
+)
 
 __all__ = [
     "FLOAT_ATOL",
@@ -57,12 +65,14 @@ __all__ = [
     "bench",
     "canonical_column_name",
     "canonical_names",
+    "case_ratios",
     "column_classes",
     "compare",
     "emit_result",
     "explain",
     "format_repeats",
     "format_summary",
+    "format_unstable",
     "geomean",
     "order_keys_of",
     "order_violation",

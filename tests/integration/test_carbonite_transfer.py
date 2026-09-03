@@ -211,6 +211,51 @@ def test_gather_concat_reports_unreachable_source():
     assert all(why for _, why in unreachable), f"a fault with no reason: {unreachable}"
 
 
+def test_gather_groups_many_buckets_from_one_peer():
+    """Many small buckets from one peer come back as exactly their union.
+
+    A hash shuffle cuts one bucket per reducer out of every mapper, so a cluster of W
+    workers makes W^2 buckets and each one shrinks as it grows. The gather therefore packs
+    several buckets onto each Flight stream rather than opening a stream per bucket, which
+    is what keeps its rate independent of the cluster's width. Packing must not change the
+    answer: every bucket exactly once, none dropped and none doubled.
+
+    Enough buckets that the grouping is actually exercised — well past the stream count, so
+    at least one stream carries several of them.
+    """
+    producer, reducer = ShuffleSession(), ShuffleSession()
+    n = 200
+    for i in range(n):
+        producer.publish(ShuffleTicket(20, 0, i, 0), [pa.record_batch({"k": [i]})])
+
+    rows, unreachable = reducer.gather_concat(
+        [(producer.addr, ShuffleTicket(20, 0, i, 0)) for i in range(n)]
+    )
+    assert unreachable == []
+    assert _keys(rows) == list(range(n))
+
+
+def test_a_grouped_gather_still_names_every_lost_source():
+    """A peer that is gone is reported once per *source*, however they were packed.
+
+    The driver recomputes exactly what it is told is lost, so a grouped fetch that failed
+    must name every source in the group rather than the group. Reporting fewer would leave
+    those buckets neither delivered nor recomputed — a silently short answer, which is worse
+    than the fault itself.
+    """
+    live, reducer = ShuffleSession(), ShuffleSession()
+    live.publish(ShuffleTicket(21, 0, 0, 0), [pa.record_batch({"k": [7]})])
+    dead = "127.0.0.1:1"
+    sources = [(live.addr, ShuffleTicket(21, 0, 0, 0))]
+    sources += [(dead, ShuffleTicket(21, 0, i, 0)) for i in range(1, 41)]
+
+    rows, unreachable = reducer.gather_concat(sources)
+    assert [src for src, _ in unreachable] == list(range(1, 41))
+    assert all(why for _, why in unreachable), f"a fault with no reason: {unreachable}"
+    # The reachable source is still delivered: a lost neighbour does not cost it.
+    assert _keys(rows) == [7]
+
+
 def test_gather_combine_matches_serial_combine_finalize():
     """`gather_combine` fetches partials concurrently and folds them in Rust; the
     result equals a serial `combine_finalize` (combine is associative+commutative)."""

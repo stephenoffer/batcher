@@ -52,6 +52,14 @@ def topology(monkeypatch):
         import batcher.dist.executors.ray_runtime.scaling as scaling
 
         monkeypatch.setattr(scaling, "node_classes", lambda: list(nodes))
+        # The census view derives from the same stub, so a consumer reading either seam sees
+        # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+        # describe; the weighting itself is pinned in `test_node_class_census.py`.
+        monkeypatch.setattr(
+            scaling,
+            "node_class_census",
+            lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+        )
         monkeypatch.setattr(
             capacity, "_missing_custom_resources", lambda d: _missing(d, totals or {})
         )

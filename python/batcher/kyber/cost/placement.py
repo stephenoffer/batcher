@@ -93,8 +93,13 @@ def _packing_order(cluster) -> list:
     precisely the fleet where packing is most available. `node_id` breaks ties so the count and
     the priced view below cannot disagree about which nodes were chosen.
     """
-    usable = [n for n in cluster.nodes if n.cpu_cores > 0]
-    return sorted(usable, key=lambda n: (n.gpus > 0, -n.cpu_cores, n.node_id))
+    usable = [(n, w) for n, w in cluster._census if n.cpu_cores > 0]
+    # `(shape, how many nodes have it)`, because the fleet describes itself as a census —
+    # a hundred-thousand-node cluster is a handful of classes, and expanding it here to sort
+    # one record per node would put the O(nodes) term back into a decision the cost model
+    # takes per pipeline breaker. The remaining fields break ties in place of `node_id`,
+    # which a census entry no longer carries and which was arbitrary anyway.
+    return sorted(usable, key=lambda e: (e[0].gpus > 0, -e[0].cpu_cores, e[0].zone, e[0].rack))
 
 
 def _packed_nodes(hardware, workers: int) -> int:
@@ -110,11 +115,13 @@ def _packed_nodes(hardware, workers: int) -> int:
     if not order:
         return 0
     used = 0
-    for node in order:
+    for node, available in order:
         if workers <= 0:
             break
-        workers -= node.cpu_cores
-        used += 1
+        # How many of this class the gang needs, capped at how many exist.
+        wanted = min(available, -(-workers // node.cpu_cores))
+        workers -= wanted * node.cpu_cores
+        used += wanted
     return used if workers <= 0 else 0
 
 
@@ -197,11 +204,28 @@ def _packed_view(hardware, nodes: int):
     from dataclasses import replace
 
     from batcher.plan.resource import ClusterShape
+    from batcher.plan.resource.cluster import NodeShape
 
     cluster = getattr(hardware, "cluster", None)
     if cluster is None or not cluster.known:
         return hardware
-    chosen = _packing_order(cluster)[:nodes]
+    order = _packing_order(cluster)
+    if not order:
+        return hardware
+    # The first `nodes` *nodes*, which may be a fraction of the last class rather than a
+    # whole one — the packed fleet is a census like any other.
+    chosen: list[tuple[NodeShape, int]] = []
+    left = nodes
+    for node, available in order:
+        if left <= 0:
+            break
+        take = min(available, left)
+        chosen.append((node, take))
+        left -= take
     if not chosen:
         return hardware
-    return replace(hardware, cluster=ClusterShape(nodes=tuple(chosen)))
+    packed = ClusterShape(
+        nodes=tuple(node for node, _ in chosen),
+        multiplicity=tuple(count for _, count in chosen),
+    )
+    return replace(hardware, cluster=packed)

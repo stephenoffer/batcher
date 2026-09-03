@@ -25,11 +25,32 @@ HOSTILE = 'NVIDIA "A100" \\ SXM\nrev2'
 
 @pytest.fixture
 def collecting():
-    """Metrics collection on and reset, so each test sees only what it published."""
+    """Metrics collection on and reset, so each test sees only what it published.
+
+    `stop_metrics` on the way out, not only `reset_metrics`. Resetting zeroes the counters
+    and leaves the collector *attached* to the event bus, and `events.listening()` is global
+    state the engine reads to decide whether optional work is worth doing at all. So a test
+    that started collection and never stopped it silently switches that work on for every
+    test running after it in the same process.
+
+    The way this surfaced is the reason it is worth a paragraph.
+    `test_device_link_and_gds.py::test_nothing_is_probed_when_nobody_is_listening` asserts
+    the *absence* of a GDS probe when nothing is subscribed. Once this fixture has run, that
+    test cannot fail -- something is always listening -- so it passed in file order and
+    failed only under a reversed run, where this file comes first. An assertion that quietly
+    stops being able to fail is worse than one that is missing, because the suite still
+    reports it as covered.
+
+    `stop_metrics` rather than the raw unsubscribe handle: it also clears the module-level
+    handle, so the next test's `start_metrics` can attach again. Detaching without clearing
+    it silences collection for the rest of the process, which `stop_metrics`'s own docstring
+    records as the mistake made the first time.
+    """
     bm.start_metrics()
     bm.reset_metrics()
     yield
     bm.reset_metrics()
+    bm.stop_metrics()
 
 
 def _label_values(text: str, metric: str, key: str) -> list[str]:
@@ -102,7 +123,7 @@ def test_a_hostile_operator_kind_cannot_break_the_exposition(collecting):
         elapsed_ms=1.0,
     )
     text = bm.prometheus_text()
-    kinds = _label_values(text, "batcher_operator_elapsed_ms_total", "kind")
+    kinds = _label_values(text, "batcher_operator_elapsed_seconds_total", "kind")
     assert any("MapBatches" in k for k in kinds), text
     assert any('\\"score\\"' in k for k in kinds), kinds
     _assert_every_labelled_line_parses(text)

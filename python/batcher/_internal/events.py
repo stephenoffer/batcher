@@ -36,6 +36,7 @@ __all__ = [
     "LOG",
     "MALFORMED",
     "PARTITION",
+    "PHASE",
     "POOL",
     "PROGRESS",
     "QUERY_END",
@@ -74,6 +75,19 @@ STAGE_END = "stage_end"
 PROGRESS = "progress"
 #: A subsystem hand-off worth explaining (see `plan.profile.Decision`).
 DECISION = "decision"
+#: The control plane moved to a new phase of the *current* query. `name` is a short
+#: present-participle label for a person (``optimizing``, ``executing``); ``phase`` is the
+#: stable machine name the DEBUG log uses (``kyber.optimize_full``).
+#:
+#: Deliberately not a `STAGE_START`. A stage is an *operator*, keyed by `op_id`, and the
+#: profile replays every one of them when the query ends; a control-plane phase has no
+#: operator and would collide with operator 0 in the dashboard's timeline. It is also the
+#: only thing that can be reported *while* the slow part is happening: the engine runs
+#: inside Rust and reports nothing until it returns, so between `QUERY_START` and
+#: `QUERY_END` the bus was silent for the entire duration of planning and execution --
+#: measured at 122 ms of a 142 ms query -- and the live progress line said ``running``
+#: throughout, which is the one word that adds nothing.
+PHASE = "phase"
 #: A `batcher.*` log record, bridged onto the bus so the UI shows logs beside metrics.
 LOG = "log"
 

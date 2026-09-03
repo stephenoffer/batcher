@@ -495,6 +495,16 @@ pub(crate) fn flight_fetch(
 /// lifts effective throughput past line rate for the compressible data a real shuffle
 /// carries.
 ///
+/// `gather_streams` is how many concurrent Flight streams a reducer runs across all its
+/// peers and `gather_inflight_bytes` the decoded bytes those streams may hold between them
+/// (`0` keeps either). Together they are the gather's shape *and* its memory bound: a hash
+/// shuffle cuts `workers^2` buckets, so a stream per bucket makes the transfer's rate an
+/// accident of the cluster's width — 1.4 GiB over one 25 Gbps link measured 1,608 MiB/s at
+/// 4,096 buckets against 7,470 at the same total when the stream count landed right. Holding
+/// the streams fixed and packing buckets into them by *bytes* is what makes the rate
+/// independent of the width, and it replaces a fan-in bound counted in buckets, which meant
+/// nothing once a bucket was a fraction of a megabyte.
+///
 /// `shuffle_store_cap_bytes` bounds the *in-memory* shuffle-output store: above it a
 /// worker spills its largest published buckets to local disk and reads them back on
 /// fetch. This is the one large footprint Carbonite's buffer pool cannot see — a published
@@ -507,13 +517,15 @@ pub(crate) fn flight_fetch(
 /// Called once per worker process when its Flight server starts. The cap is captured by
 /// each store at construction, so it must be set before the server is created.
 #[pyfunction]
-#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0))]
+#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0, gather_streams=0, gather_inflight_bytes=0))]
 pub(crate) fn set_flight_transport_config(
     idle_timeout_ms: u64,
     keepalive_ms: u64,
     connections_per_peer: u64,
     compression: Option<u64>,
     shuffle_store_cap_bytes: u64,
+    gather_streams: u64,
+    gather_inflight_bytes: u64,
 ) {
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
     bc_transport::set_connections_per_peer(connections_per_peer);
@@ -521,6 +533,8 @@ pub(crate) fn set_flight_transport_config(
         bc_transport::set_compression(code);
     }
     bc_transport::set_shuffle_store_cap(shuffle_store_cap_bytes);
+    bc_transport::set_gather_streams(gather_streams);
+    bc_transport::set_gather_inflight_bytes(gather_inflight_bytes);
 }
 
 /// Install (or clear) the process-wide client TLS for outbound shuffle fetches.

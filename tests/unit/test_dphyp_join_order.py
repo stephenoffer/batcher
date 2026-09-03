@@ -117,23 +117,14 @@ def test_dphyp_covers_all_leaves_for_large_chain():
     assert seen == set(range(n))
 
 
-def test_dphyp_bails_to_greedy_on_dense_large_graph(monkeypatch):
-    # A dense (near-complete) graph has ~3ⁿ connected subsets/pairs — DPhyp must bail
-    # to greedy (return None) rather than blow the planning budget (small-query
-    # mandate). A tiny budget makes the bail observable without a huge enumeration.
-    # Patch the module the search *reads* it from: `order` imports the searches by name,
-    # so patching `order._MAX_DP_PAIRS` would bind a name `_rebuild_dphyp` never looks at
-    # and the bail would silently stop being exercised.
-    from batcher.kyber.rules.joins import order_search as jo
-
-    monkeypatch.setattr(jo, "_MAX_DP_PAIRS", 50)
-    n = 13
+def _complete_graph(n: int):
+    """An `n`-leaf join graph with an edge between every pair, and its leaves/estimator."""
     incident: list[set[str]] = [set() for _ in range(n)]
     col_edges = []
     ndv = {}
     k = 0
     for i in range(n):
-        for j in range(i + 1, n):  # complete graph
+        for j in range(i + 1, n):
             col = f"c{k}"
             incident[i].add(col)
             incident[j].add(col)
@@ -145,11 +136,31 @@ def test_dphyp_bails_to_greedy_on_dense_large_graph(monkeypatch):
         for i in range(n)
     ]
     stats = [SourceStatistics(row_count=1000) for _ in range(n)]
-    required = [("c0", (0, "c0"))]
     est = StatsEstimator([None] * n, learned={"__column_ndv__": ndv}, source_stats=stats)
     ctx = OptimizerContext(config=active_config(), sources=[None] * n, hub=None, estimator=est)
+    return leaves, col_edges, [("c0", (0, "c0"))], ctx
 
-    assert _rebuild_dphyp(leaves, col_edges, required, ctx) is None
+
+def test_dphyp_bails_to_greedy_on_dense_large_graph():
+    # A dense (near-complete) graph has ~3**n connected subsets/pairs — DPhyp must bail
+    # to greedy (return None) rather than blow the planning budget (small-query
+    # mandate). A tiny budget makes the bail observable without a huge enumeration.
+    #
+    # The budget is now an argument rather than a module constant, so it is passed in
+    # directly. That also removes the hazard the previous spelling had to warn about: a
+    # `monkeypatch.setattr` on the wrong module bound a name the search never reads, and
+    # the bail silently stopped being exercised while the test kept passing.
+    leaves, col_edges, required, ctx = _complete_graph(13)
+    assert _rebuild_dphyp(leaves, col_edges, required, ctx, None, 50) is None
+
+
+def test_dphyp_searches_a_dense_graph_it_can_afford():
+    # The positive control for the bail above: a dense graph small enough to search within
+    # budget is searched, not declined. Without it the assertion above would pass just as
+    # well if `_rebuild_dphyp` had stopped planning complete graphs for some unrelated
+    # reason, and the test would be checking nothing.
+    leaves, col_edges, required, ctx = _complete_graph(8)
+    assert _rebuild_dphyp(leaves, col_edges, required, ctx) is not None
 
 
 def _collect_scan_ids(node, out: set[int]) -> None:

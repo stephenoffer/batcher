@@ -73,7 +73,7 @@ def _merge(path: str, changes: pa.Table, *, distributed, workers=None):
     return builder.when_matched().update_all().when_not_matched().insert_all().execute()
 
 
-def test_distributed_merge_equals_single_node(tmp_path):
+def test_distributed_merge_equals_single_node(cluster_tmp_path):
     """The same merge, one core vs four workers — identical tables."""
     changes = pa.table(
         {
@@ -83,11 +83,11 @@ def test_distributed_merge_equals_single_node(tmp_path):
         }
     )
 
-    solo = str(tmp_path / "solo")
+    solo = str(cluster_tmp_path / "solo")
     _target(solo)
     _merge(solo, changes, distributed=False)
 
-    dist = str(tmp_path / "dist")
+    dist = str(cluster_tmp_path / "dist")
     _target(dist)
     _merge(dist, changes, distributed=True, workers=4)
 
@@ -98,14 +98,14 @@ def test_distributed_merge_equals_single_node(tmp_path):
     assert _rows(solo)[6] == (60, "t6")  # an untouched row is untouched
 
 
-def test_distributed_merge_does_not_clobber_the_files_it_pruned(tmp_path):
+def test_distributed_merge_does_not_clobber_the_files_it_pruned(cluster_tmp_path):
     """The token test: a worker must not name its shard over a file pruning preserved.
 
     Without a per-write token the worker's sink writes ``part-00000.parquet`` — which is a
     *live data file* of the target that this merge never read. The row count is what catches
     it: clobbering one 100-row file loses 100 rows.
     """
-    path = str(tmp_path / "t")
+    path = str(cluster_tmp_path / "t")
     _target(path, rows=2_000, rows_per_file=100)
     before = _rows(path)
 
@@ -126,7 +126,7 @@ def test_distributed_merge_does_not_clobber_the_files_it_pruned(tmp_path):
             assert after[key] == before[key], f"row {key} changed but nothing should have"
 
 
-def test_distributed_merge_with_every_clause_kind(tmp_path):
+def test_distributed_merge_with_every_clause_kind(cluster_tmp_path):
     """All three populations, guarded, on the distributed path — vs the single-node result."""
     changes = pa.table(
         {
@@ -155,8 +155,8 @@ def test_distributed_merge_with_every_clause_kind(tmp_path):
         )
         return _rows(path)
 
-    solo = run(str(tmp_path / "solo"), distributed=False)
-    dist = run(str(tmp_path / "dist"), distributed=True)
+    solo = run(str(cluster_tmp_path / "solo"), distributed=False)
+    dist = run(str(cluster_tmp_path / "dist"), distributed=True)
     assert solo == dist
 
     assert 20 not in solo  # the guarded DELETE fired
@@ -165,9 +165,9 @@ def test_distributed_merge_with_every_clause_kind(tmp_path):
     assert solo[100][1] == "t2"  # not-matched-by-source, guard false → untouched
 
 
-def test_repeated_distributed_merges_stay_consistent(tmp_path):
+def test_repeated_distributed_merges_stay_consistent(cluster_tmp_path):
     """Five merges in a row: no duplicate keys, no lost rows, layout intact."""
-    path = str(tmp_path / "t")
+    path = str(cluster_tmp_path / "t")
     _target(path, rows=1_000, rows_per_file=100)
 
     for i in range(5):

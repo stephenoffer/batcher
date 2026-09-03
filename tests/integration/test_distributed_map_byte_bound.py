@@ -31,14 +31,33 @@ from batcher.dist.executors import map as mapmod
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
 
-_ROWS = 120_000
-# Enough files that the source has splits to spread over: the partition count is capped at
-# `len(source.splits())`, so a byte budget can only bind if there are splits to give it.
-_FILES = 160
+#: Rows per file. Only the *file count* has to track the cluster; each file stays tiny.
+_PER_FILE = 750
 # Small enough that the byte term lands well ABOVE the cluster's core count, which is the
 # only regime where the two formulas differ: below it, clamping the byte term to the cores is
 # a no-op and the test would pass against the very bug it exists for.
 _TIGHT_BUDGET = 4 << 10
+
+
+def _files() -> int:
+    """Enough files that the byte term can exceed the cluster's core count.
+
+    The partition count is capped at `len(source.splits())`, so a byte budget can only bind
+    if there are splits to give it — and the regime this test exists for is the one *above*
+    the core count. A fixed 160 files was therefore a fixture sized to whatever cluster
+    happened to be attached: on this 5-node fleet `_cluster_cores()` is 384, the byte term
+    capped at 160, and the test failed on its own guard ("the fixture must need more tasks
+    (160) than the cluster has cores (384)") rather than on the behaviour it checks.
+
+    Deriving it keeps the guard true on any fleet. The files are `_PER_FILE` rows each, so a
+    wider cluster costs more tiny files and no more data per task.
+    """
+    return max(160, int(mapmod._cluster_cores()) + 64)
+
+
+def _rows_total() -> int:
+    """Total corpus rows — a product of the derived file count, not a fixed constant."""
+    return _files() * _PER_FILE
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -73,15 +92,19 @@ def _corpus_root(tmp_path_factory):
 
 
 @pytest.fixture
-def corpus(tmp_path_factory) -> list[str]:
-    """Several Parquet files, so the source has splits to spread over many tasks."""
+def corpus(_ray_session, tmp_path_factory) -> list[str]:
+    """Several Parquet files, so the source has splits to spread over many tasks.
+
+    Depends on `_ray_session` explicitly because `_files()` asks the *live* cluster how many
+    cores it has, which is only answerable once Ray is up.
+    """
     import pyarrow.parquet as pq
 
     root = _corpus_root(tmp_path_factory)
     rng = np.random.default_rng(11)
     paths = []
-    per_file = _ROWS // _FILES
-    for i in range(_FILES):
+    per_file = _PER_FILE
+    for i in range(_files()):
         table = pa.table(
             {
                 "price": rng.random(per_file) * 100.0,
@@ -158,7 +181,7 @@ def _row_term() -> int:
     from batcher.config import active_config
 
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
-    return max(1, min(math.ceil(_ROWS / rows_per_cpu), int(mapmod._cluster_cores())))
+    return max(1, min(math.ceil(_rows_total() / rows_per_cpu), int(mapmod._cluster_cores())))
 
 
 def _byte_term(paths: list[str], byte_budget: int) -> int:
@@ -173,7 +196,7 @@ def _byte_term(paths: list[str], byte_budget: int) -> int:
     ds = bt.read.parquet(paths)
     source = ds._sources[0]
     with _tiny_byte_budget(byte_budget):
-        needed = mapmod._byte_partition_count(source, ds._plan, _ROWS)
+        needed = mapmod._byte_partition_count(source, ds._plan, _rows_total())
     return min(needed, len(source.splits()))
 
 
@@ -213,7 +236,7 @@ def test_a_byte_bounded_fan_out_equals_single_node(corpus, observed) -> None:
 
     assert observed.partitions >= needed
     assert _rows(distributed) == _rows(single)
-    assert sum(r[1] for r in _rows(distributed)) == _ROWS
+    assert sum(r[1] for r in _rows(distributed)) == _rows_total()
 
 
 def test_a_generous_byte_budget_leaves_the_fan_out_to_the_parallelism_term(corpus, observed):

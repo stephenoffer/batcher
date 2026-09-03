@@ -55,6 +55,7 @@ could move it:
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import weakref
 from collections import OrderedDict
@@ -108,13 +109,22 @@ class Prepared:
     config: Config
     #: Weak references to the source objects, checked with `is` on every hit.
     source_refs: tuple[weakref.ReferenceType, ...]
+    #: The *pre*-optimization plan, which is the identity every learner keys on. Held so a
+    #: replayed query still closes the learning loop: a feedback loop that records the first
+    #: execution of a shape and nothing after it is the half-loop `fast_path`'s docstring
+    #: argues is worse than none, and a prepared hit is where a hot shape spends its life.
+    #: A reference to an object the caller already holds, so it costs the entry nothing.
+    plan: LogicalPlan | None = None
+    #: The optimizer's per-join build-side decisions, for the run-feedback recorder.
+    decisions: tuple = ()
 
     def execute(self, sources: list[Source]) -> pa.Table:
         """Read the sources and run the engine -- the whole of a prepared query.
 
         Mirrors `stages.resolve_sources` followed by `run._execute_in_memory`, minus the
-        derivation both of those would redo and minus the source-IO measurement the
-        fast-path trade already gives up.
+        derivation both of those would redo. The learning loop is *not* skipped: the engine
+        call feeds the hub and the close-out below records what the run measured, so a hot
+        shape keeps teaching the optimizer for as long as it keeps running.
 
         Args:
             sources: The plan's bound sources, in scan order. Verified by `lookup` to be
@@ -123,9 +133,13 @@ class Prepared:
         Returns:
             The result table -- the same rows, names and types the ordinary path returns.
         """
+        import time
+
         from batcher import core
+        from batcher.api.orchestration.sizing import declared_row_count
         from batcher.io.source import read_source
 
+        started = time.perf_counter()
         phys = self.physical
         projections, predicates = phys.source_projections, phys.source_predicates
         limits, orderings = phys.source_limits, phys.source_orderings
@@ -133,11 +147,40 @@ class Prepared:
             read_source(src, projections.get(i), predicates.get(i), limits.get(i), orderings.get(i))
             for i, src in enumerate(sources)
         ]
+        hub = core.default_hub()
+        # A bare scan is already its own result (`_execute_in_memory` takes the same
+        # shortcut), but it is still a run that happened, so it closes the same loops below
+        # rather than returning early past them -- which is what the ordinary path does, and
+        # the asymmetry would have left exactly the cheapest shapes unmeasured.
         table = core.scan_only_result(self.logical, batches, predicates)
-        if table is not None:
+        if table is None:
+            out = core.execute_local(phys, batches, feedback=hub)
+            table = pa.Table.from_batches(out, schema=out[0].schema if out else self.empty_schema)
+        if self.plan is None:
             return table
-        out = core.execute_local(phys, batches, feedback=None)
-        return pa.Table.from_batches(out, schema=out[0].schema if out else self.empty_schema)
+
+        from batcher.api.orchestration.run import close_plan_learning_loops
+        from batcher.api.terminal._metadata import learn_column_stats
+
+        # The same per-source "was this scan whole" flag `stages.resolve_sources` computes,
+        # derived rather than assumed: `learn_column_stats` records a distinct count as
+        # *exact* when the flag is true, so claiming a filtered or capped read saw the whole
+        # source teaches the optimizer a wrong row count on every later run. Belt-and-braces
+        # in the same way the original is -- `scanned == declared` would catch a capped read
+        # on its own, but the cost of the two mistakes is lopsided.
+        complete = [
+            predicates.get(i) is None
+            and limits.get(i) is None
+            and (declared := declared_row_count(src)) is not None
+            and sum(b.num_rows for b in batches[i]) == declared
+            for i, src in enumerate(sources)
+        ]
+        ctx = core.ExecutionContext(columns=list(table.column_names), hub=hub, profile=None)
+        learn_column_stats(hub, batches, sources, self.plan, complete)
+        close_plan_learning_loops(
+            self.plan, self.logical, ctx, sources, table.num_rows, self.decisions, started=started
+        )
+        return table
 
 
 def lookup(key: tuple, sources: list[Source], config: Config) -> Prepared | None:
@@ -215,11 +258,11 @@ def clear() -> None:
 
 
 def _replace_refs(prepared: Prepared, refs: tuple[weakref.ReferenceType, ...]) -> Prepared:
-    """`prepared` with its source references set -- the one field `run_fast` cannot fill."""
-    return Prepared(
-        physical=prepared.physical,
-        logical=prepared.logical,
-        empty_schema=prepared.empty_schema,
-        config=prepared.config,
-        source_refs=refs,
-    )
+    """`prepared` with its source references set -- the one field `run_fast` cannot fill.
+
+    Through `dataclasses.replace` rather than by listing the fields: a rebuild that names
+    them drops any field added later, and the failure is silent -- the entry caches, the
+    query answers correctly, and only the dropped field's *effect* goes missing. That is
+    exactly how a learning loop would be reopened by an unrelated change.
+    """
+    return dataclasses.replace(prepared, source_refs=refs)

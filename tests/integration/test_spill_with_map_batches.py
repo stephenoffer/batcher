@@ -64,6 +64,20 @@ _SHAPES = {
 }
 
 
+#: The same three breakers over an ordinary expression rather than a UDF. They are the control
+#: for the predicate guard: a guard that declined everything would satisfy every assertion
+#: about the UDF plans while quietly retiring the out-of-core path for every query.
+_PLAIN = {
+    "sort": lambda ds: ds.with_columns(t=bt.col("t") * 2).sort("t"),
+    "join": lambda ds: ds.with_columns(t=bt.col("t") * 2).join(
+        bt.from_pydict({"k": list(range(11)), "w": [f"w{i}" for i in range(11)]}), on="k"
+    ),
+    "window": lambda ds: ds.with_columns(t=bt.col("t") * 2).window(
+        partition_by=["k"], order_by=["t"], functions={"r": "row_number"}
+    ),
+}
+
+
 def _multiset(table: pa.Table) -> list:
     data = table.to_pydict()
     names = sorted(table.column_names)
@@ -86,19 +100,43 @@ def test_spilling_a_map_pipeline_returns_the_in_memory_answer(rows, shape):
 def test_the_same_pipeline_streams(rows, shape):
     """`iter_batches()` is the bounded-memory route these shapes actually have.
 
-    Not every one of them takes it — `sort` over a map prefix declines there too — so this
-    asserts the weaker, true thing: streaming either answers with the in-memory answer or
-    declines in a way the caller sees, and never returns a *different* answer. When the map
-    prefix gains a staged spill path, this is the test that says which shapes already had one.
+    It raised for three of the six until the three `supports_spilling_*` predicates learned to
+    decline a plan carrying a UDF: they answered "yes" for a `map_batches(...).sort(...)` and
+    the streaming sort then died serializing it, which is the same defect as the one above one
+    layer down. This arm used to skip on `NotImplementedError` for exactly that reason; the
+    skip is gone because nothing reaches it, and a skip nothing reaches is a case nobody runs.
     """
     build = _SHAPES[shape]
     expected = build(bt.from_arrow(rows)).collect()
-    try:
-        batches = list(build(bt.from_arrow(rows)).iter_batches())
-    except NotImplementedError:
-        pytest.skip(f"{shape} has no streaming path either")
+    batches = list(build(bt.from_arrow(rows)).iter_batches())
     streamed = pa.Table.from_batches(batches) if batches else expected.slice(0, 0)
     assert _multiset(streamed) == _multiset(expected)
+
+
+@pytest.mark.parametrize(
+    ("name", "predicate", "shape"),
+    [
+        ("sort", "supports_spilling_sort", "sort"),
+        ("join", "supports_spilling_join", "join"),
+        ("window", "supports_spilling_window", "window"),
+    ],
+)
+def test_the_spill_predicates_decline_a_udf_plan(rows, name, predicate, shape):
+    """Each breaker's own predicate must say no, rather than the executor discovering it.
+
+    A predicate that answers *whether a path applies* must never raise and must never claim a
+    plan the path cannot run — `test_spill_predicates_never_raise` states the first half, and
+    this is the second. All three said yes to a plan carrying a `map_batches`, whose `to_ir()`
+    raises by design, so every caller that trusted them died inside `json.dumps`.
+    """
+    import importlib
+
+    module = importlib.import_module(f"batcher.dist.spill_breakers.{name}")
+    check = getattr(module, predicate)
+    assert check(_SHAPES[shape](bt.from_arrow(rows))._plan) is False
+    # The control: the same breaker over an expression instead of a UDF must still be claimed,
+    # or the guard has simply retired the out-of-core path for everyone.
+    assert check(_PLAIN[shape](bt.from_arrow(rows))._plan) is True
 
 
 def test_a_pipeline_without_a_udf_still_takes_the_spill_path(rows):

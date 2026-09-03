@@ -12,8 +12,9 @@ from __future__ import annotations
 import math
 import weakref
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
@@ -47,7 +48,9 @@ __all__ = [
     "load_learned_stats",
     "q_error_window",
     "record_column_row_bytes",
+    "record_column_row_bytes_batch",
     "record_column_stats",
+    "record_column_stats_batch",
     "record_execution",
     "record_selectivity",
 ]
@@ -508,12 +511,39 @@ def record_column_row_bytes(
         source_key: The source these columns belong to. `None` skips the write — a width that
             cannot be attributed to a source is a width that would be applied to the wrong one.
     """
-    if hub is None or not widths or not source_key:
+    record_column_row_bytes_batch(hub, [(source_key, widths)])
+
+
+def record_column_row_bytes_batch(
+    hub: MetadataHub | None, measured: Sequence[tuple[str | None, dict[str, float]]]
+) -> None:
+    """Record several sources' measured byte widths with **one write per table**.
+
+    The batching rationale is `record_column_stats_batch`'s: the width table is a single
+    backend entry, so recording per source re-serialized the whole of it once per source.
+
+    Args:
+        hub: The metadata hub to write to; `None` is a no-op.
+        measured: One `(source_key, {column: bytes per row})` pair per source. A pair whose
+            source key is `None` is skipped -- a width that cannot be attributed to a source
+            is a width that would be applied to the wrong one.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.kyber.learning import record_column_row_bytes_batch
+            >>> record_column_row_bytes_batch(None, [])  # no hub: a no-op, never raises
+    """
+    if hub is None:
+        return
+    widths_out: dict[str, float] = {}
+    for source_key, widths in measured:
+        if widths and source_key:
+            widths_out.update({qualify(source_key, c): w for c, w in widths.items()})
+    if not widths_out:
         return
     try:
-        merge_column_table(
-            hub, ROW_BYTES_KEY, {qualify(source_key, c): w for c, w in widths.items()}
-        )
+        merge_column_table(hub, ROW_BYTES_KEY, widths_out)
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "persist measured column row widths", exc)
 
@@ -543,33 +573,89 @@ def record_column_stats(
     Best-effort; never raises. Core measures (`core.column_statistics` /
     `core.heavy_hitters`); Kyber persists/consumes.
     """
-    avg_bytes = avg_bytes or {}
-    mcv = mcv or {}
-    if hub is None or (not ndv and not quantiles and not avg_bytes and not mcv):
+    record_column_stats_batch(
+        hub, [MeasuredColumns(source_key, ndv, quantiles, avg_bytes or {}, mcv or {})]
+    )
+
+
+class MeasuredColumns(NamedTuple):
+    """One source's measured column statistics, awaiting a coalesced write.
+
+    Attributes:
+        source_key: The source these were measured from, or `None` for the legacy
+            unqualified shape.
+        ndv: Measured distinct counts by column.
+        quantiles: Measured quantile grids by column.
+        avg_bytes: Measured average widths by column.
+        mcv: Measured most-common-value frequencies by column.
+    """
+
+    source_key: str | None
+    ndv: dict[str, float]
+    quantiles: dict[str, dict[str, list[float]]]
+    avg_bytes: dict[str, float]
+    mcv: dict[str, dict[str, float]]
+
+
+def record_column_stats_batch(hub: MetadataHub | None, measured: Sequence[MeasuredColumns]) -> None:
+    """Record several sources' column statistics with **one write per table**.
+
+    Each reserved column key (`NDV_KEY`, `QUANTILES_KEY`, ...) is a single backend entry
+    holding the whole table, so a write serializes all of it. Recording per source
+    therefore cost one full re-serialization *per source*: an eleven-source star join
+    rewrote four tables eleven times, 833 KB of JSON for a query over 64 rows, and the
+    cost grew with both the source count and everything the session had already learned.
+    Because every entry is qualified by its source, the sources' maps are disjoint and
+    merging them is a plain union -- so the whole batch lands in one write per table and
+    the serialization is paid once.
+
+    Args:
+        hub: The metadata hub, or `None` to do nothing.
+        measured: One `MeasuredColumns` per source.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.kyber.learning import record_column_stats_batch
+            >>> record_column_stats_batch(None, [])  # no hub: a no-op, never raises
+    """
+    if hub is None or not measured:
         return
 
-    def keyed(values: dict[str, Any]) -> dict[str, Any]:
-        if source_key is None:
-            return values
-        return {qualify(source_key, col): v for col, v in values.items()}
+    def merged(field: str) -> dict[str, Any]:
+        """Every source's entries for one table, each qualified by the source it came from."""
+        out: dict[str, Any] = {}
+        for record in measured:
+            values = getattr(record, field)
+            if not values:
+                continue
+            key = record.source_key
+            if key is None:
+                out.update(values)
+            else:
+                out.update({qualify(key, col): v for col, v in values.items()})
+        return out
 
+    ndv, quantiles = merged("ndv"), merged("quantiles")
+    avg_bytes, mcv = merged("avg_bytes"), merged("mcv")
+    if not (ndv or quantiles or avg_bytes or mcv):
+        return
     try:
         # Each reserved column key is its own backend entry, updated independently
         # so a concurrent per-signature record (or another column update) can't
         # clobber it.
         if ndv:
-            fresh = keyed(ndv)
             existing = hub.get_keyed_param(_NAMESPACE, NDV_KEY) or {}
             # A column measured for the first time can change every join and group-by
             # estimate that reads it — the one column-stat event worth re-planning for.
-            if any(name not in existing for name in fresh):
+            if any(name not in existing for name in ndv):
                 _bump_generation()
-            merge_column_table(hub, NDV_KEY, fresh, existing)
+            merge_column_table(hub, NDV_KEY, ndv, existing)
         if quantiles:
-            merge_column_table(hub, QUANTILES_KEY, keyed(quantiles))
+            merge_column_table(hub, QUANTILES_KEY, quantiles)
         if avg_bytes:
-            merge_column_table(hub, AVG_BYTES_KEY, keyed(avg_bytes))
+            merge_column_table(hub, AVG_BYTES_KEY, avg_bytes)
         if mcv:
-            merge_column_table(hub, MCV_KEY, keyed(mcv))
+            merge_column_table(hub, MCV_KEY, mcv)
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("kyber", "persist learned column statistics", exc)

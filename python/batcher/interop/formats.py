@@ -24,7 +24,13 @@ import pyarrow as pa
 
 from batcher.interop.arrays import arrays_to_torch, to_numpy_batches
 
-__all__ = ["FORMATS", "restore_null_typed_columns", "result_to_arrowable", "to_format"]
+__all__ = [
+    "FORMATS",
+    "restore_null_typed_columns",
+    "restore_widened_columns",
+    "result_to_arrowable",
+    "to_format",
+]
 
 #: The batch formats a `map_batches` `fn` may speak. ``polars`` is Arrow-native (near
 #: zero-copy) and ``jax`` reuses the numpy path — the two most-requested Ray Data / Daft
@@ -98,6 +104,75 @@ def restore_null_typed_columns(batch: pa.RecordBatch, reference: pa.Schema) -> p
         else:
             fields.append(field)
             columns.append(column)
+    return pa.RecordBatch.from_arrays(columns, schema=pa.schema(fields))
+
+
+#: Offset-width widenings a framework round-trip performs on its own. Each pair is the
+#: *same* logical type at a wider offset, so casting back is value-preserving by
+#: construction -- the only thing that changes is how the offsets are stored.
+_OFFSET_WIDENINGS: tuple[tuple[Any, Any], ...] = (
+    (pa.types.is_large_string, pa.types.is_string),
+    (pa.types.is_large_binary, pa.types.is_binary),
+    (pa.types.is_large_list, pa.types.is_list),
+)
+
+
+def _is_offset_widening(actual: pa.DataType, want: pa.DataType) -> bool:
+    """Whether `actual` is `want` at a wider offset width, and nothing else."""
+    for wide, narrow in _OFFSET_WIDENINGS:
+        if wide(actual) and narrow(want):
+            if wide is pa.types.is_large_list:
+                return actual.value_type == want.value_type
+            return True
+    if pa.types.is_dictionary(actual) and pa.types.is_dictionary(want):
+        return _is_offset_widening(actual.value_type, want.value_type)
+    return False
+
+
+def restore_widened_columns(batch: pa.RecordBatch, reference: pa.Schema) -> pa.RecordBatch:
+    """Undo the offset-width widening a framework round-trip applies to its own containers.
+
+    Polars represents every variable-length type at 64-bit offsets, so an Arrow batch that
+    goes through it and back comes out with `string` as `large_string`, `binary` as
+    `large_binary` and `list` as `large_list` -- including inside a dictionary. An identity
+    `fn` therefore changes the *type* of every string column in the query, and
+    `batch_format` is documented as choosing what the `fn` speaks rather than what the query
+    returns.
+
+    That divergence is not cosmetic. `LogicalPlan.available_schema` -- the static analysis
+    `Dataset.schema` is answered from -- keeps saying `string`, so the declared type and the
+    delivered type disagree, and the disagreement follows the data out: a Parquet file
+    written from such a plan is `large_string` on disk while the schema that described it
+    said otherwise.
+
+    Only a column the reference *names* is touched, and only when the difference is one of
+    the pairs above, so a column the `fn` genuinely retyped or invented is left alone. The
+    cast is value-preserving by construction; it is still guarded, because a column whose
+    reference type is an extension type has a storage type here rather than the extension
+    itself, and failing a user's query to correct an offset width would be the worse trade.
+
+    The trade this *does* make, stated because it cannot be detected: a `fn` that
+    deliberately widens a column it was handed -- `string` in, `large_string` out, same name
+    -- is indistinguishable from the round-trip doing it, and is reverted. That is the right
+    way round. `Dataset.schema` answered `string` before the `fn` ran, callers and the
+    optimizer have already read it, and a query whose declared type disagrees with its
+    delivered one is the more expensive of the two surprises. A `fn` that needs the wide type
+    to reach the output can rename the column, which takes it out of the reference.
+    """
+    if batch.schema == reference:
+        return batch
+    fields, columns = [], []
+    for column, field in zip(batch.columns, batch.schema, strict=True):
+        want = reference.field(field.name) if field.name in reference.names else None
+        if want is not None and _is_offset_widening(field.type, want.type):
+            try:
+                columns.append(column.cast(want.type))
+                fields.append(field.with_type(want.type))
+                continue
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+                pass  # a cast we cannot make is not worth failing the query over
+        fields.append(field)
+        columns.append(column)
     return pa.RecordBatch.from_arrays(columns, schema=pa.schema(fields))
 
 

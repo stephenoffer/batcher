@@ -25,7 +25,7 @@ pytestmark = pytest.mark.integration
 DASHBOARD = Path(__file__).resolve().parents[2] / "tools" / "grafana" / "batcher-overview.json"
 
 # Prometheus appends these to a histogram's base name; a panel referencing
-# `batcher_query_duration_ms_bucket` is referencing the `batcher_query_duration_ms` family.
+# `batcher_query_duration_seconds_bucket` references the `batcher_query_duration_seconds` family.
 _HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 
 # Deliberately not on the dashboard: uptime is a liveness detail rather than a signal an

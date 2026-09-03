@@ -90,9 +90,10 @@ at once. The core families live in `kyber/rules/`:
   `push_filter_through_aggregate`, `push_filter_through_sort`, `push_filter_into_union`,
   `push_limit_through_project`, `push_limit_into_union`.
 - `algebraic`: `remove_redundant_distinct`.
-- `join_order`: cost-based multi-table ordering, using exact DP at or below
-  `optimizer.join_dp_max_tables` tables (default 12), a greedy heuristic up to
-  `greedy_max_tables` (25), and no reordering above that.
+- `join_order`: cost-based multi-table ordering by DP over connected subsets of the join
+  graph, with a greedy fallback. How much search the DP may spend is a per-query budget
+  derived from the region's own estimated cost (`rules/joins/order_budget.py`), not a fixed
+  table count.
 - `fusion`: `topn_fusion`, where a `Limit` over a `Sort` becomes a single top-N operator.
 - `selection`: `adaptive_build_side`, the cost-based choice of which join input
   builds the hash table.

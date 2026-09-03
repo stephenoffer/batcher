@@ -43,3 +43,6 @@ scratchpad/
 # `python/batcher/dist/`, which silently swallowed a new module there on `git add`.
 /dist/
 wt-build.sh
+
+# MLflow tracking output written by the ML integration tests.
+mlruns/

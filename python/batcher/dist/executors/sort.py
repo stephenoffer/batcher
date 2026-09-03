@@ -192,9 +192,12 @@ def _distributed_sort(
         # share of the rows on a single reducer however wide the shuffle is — the busiest
         # bucket simply stops shrinking as workers are added. `plan_hot_split` gives that
         # value a bucket of its own and spreads it over `subs` of them, one per contiguous
-        # run of mappers, which is sound precisely because those rows all tie. `None` when
-        # there is no such value, and then nothing below changes.
-        split = plan_hot_split(grids, boundaries, n_buckets, nulls_first, desc)
+        # run of mappers, which is sound precisely because those rows all tie *on the whole
+        # sort key* — true only for a single-key sort, hence `single_key`. `None` when there
+        # is no such value, and then nothing below changes.
+        split = plan_hot_split(
+            grids, boundaries, n_buckets, nulls_first, desc, single_key=len(sort.keys) == 1
+        )
         if split is not None:
             boundaries, n_buckets, hot_bucket, subs = split
             n_physical = n_buckets + subs - 1

@@ -7,7 +7,7 @@ of that bus:
 
 | Surface | What it is for | Default |
 | --- | --- | --- |
-| Terminal progress bar | watching a query run, interactively | on in a real terminal |
+| {doc}`Terminal progress bar <terminal>` | watching a query run, interactively | on in a real terminal |
 | Structured logs | what the engine decided, and why | `WARNING` and above |
 | Web dashboard | plans, per-operator timings, throughput, live logs | off ({py:func}`bt.start_ui() <batcher.start_ui>`) |
 | JSON event log | the durable per-query artifact, on disk | on |
@@ -79,92 +79,10 @@ makes the precedence unambiguous, which is why it is the default rather than `"W
 
 ## The terminal
 
-In an interactive terminal, a query renders a live status line carrying the spinner,
-operator, progress bar, rows, throughput, a throughput sparkline, elapsed time, and an ETA
-when one can be known:
-
-```text
-⠹  filter            streaming     ▕████████████▋░░░░░░░░░░░▏  62%   241.6K rows   1.0M/s  ▁▃▅▆██▇  238ms  ETA 143ms
-```
-
-On a distributed run the bar is driven by *partitions* rather than rows, because a stage
-knows exactly how many buckets it has while the row estimate is a guess the query is in the
-middle of disproving:
-
-```text
-⠹  shuffle           hash_join     ▕██████████▊░░░░░░░░░░░░░░▏  42%   27/64 parts   3.1M rows   840K/s  12.4s  ETA 17s
-```
-
-When it finishes, the line collapses to one aligned summary:
-
-```text
-✔  filter            383.5K rows  ·  400ms  ·  959.9K rows/s
-✘  join              PlanError: unknown column 'nope'
-```
-
-The summary carries what else happened, when anything did. These are counted from the same
-bus and appended to the success line rather than printed separately, because a caveat that
-scrolls away from its result is a caveat nobody connects to it:
-
-```text
-✔  ingest            12.4M rows  ·  1m18s  ·  159.0K rows/s  ·  wrote 24 files (3.1 GiB)  ·  3 inputs skipped  ·  spilled 4.2 GiB  ·  1x worker lost  ·  2x recompute
-```
-
-That line is the difference between a run that read every file and one that quietly read
-98% of its corpus, and between a job that was four times too slow and one that
-transparently survived losing two workers. Both used to print the same thing.
-
-Two events do not wait for the end, because acting on them late is acting too late: a
-fault-tolerance action on the distributed path, and a data-quality contract that failed.
-Both print an immediate `!` line naming what happened and where.
-
-Details worth knowing, because they are deliberate:
-
-- **The bar advances in eighth-cells**, giving it eight times the resolution of its width,
-  which is what makes it read as motion rather than as stepping blocks.
-- **Throughput is measured over a trailing window**, not averaged since the query started.
-  That is what lets the sparkline show a stall: a cumulative average thirty seconds into a
-  run moves by a few percent per second, so it stays flat through exactly the event you are
-  watching for.
-- **Live row counts only exist on the streaming path.** {py:meth}`iter_batches <batcher.Dataset.iter_batches>` surfaces each Arrow
-  batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
-  the profile at the end, so its bar shows an indeterminate sweep and its counts appear in the
-  summary line.
-- **Nothing is invented.** With no row estimate and no partition count, the bar shows an
-  honest indeterminate sweep instead of a fabricated percentage, and the ETA is omitted
-  rather than guessed. That is the common case, because Kyber leaves an operator unbudgeted
-  whenever the source size is unknown.
-- **The terminal is left as it was found.** The cursor is hidden while a bar animates and
-  restored when the run ends or the reporter is detached, so a job interrupted mid-query
-  does not leave a hidden cursor and a frozen line behind.
-- **Several queries in flight say so.** One moving line is an instrument and five
-  interleaved ones are a mess, so the most recently started run is drawn and the rest are
-  counted: `+4 more`.
-
-Rendering degrades by detected capability rather than assuming one. Color falls back from
-truecolor to 256-color to 16-color to none, and block-drawing falls back to ASCII.
-`NO_COLOR`, `FORCE_COLOR`/`CLICOLOR_FORCE`,
-`COLORTERM`, and `TERM=dumb` are all honored, and the ASCII forms are chosen so a `LANG=C`
-terminal gets readable output rather than mojibake.
-
-This is **automatic and self-suppressing**. Batcher renders escape codes only into a real
-TTY that has not asked for plain output, so a script whose output you redirect to a file
-gets no bar and no control characters. Continuous integration is suppressed by name as well
-(`CI` or `GITHUB_ACTIONS` in the environment): a CI runner is a terminal nobody is watching,
-and thousands of repainted frames bury the output someone will actually read. Set it
-explicitly when you need to:
-
-```python
-import batcher as bt
-from batcher.config import ObservabilityConfig, active_config, set_config
-
-set_config(active_config().replace(
-    observability=ObservabilityConfig(progress="off")   # "auto" | "on" | "off"; None derives it
-))
-```
-
-`progress="on"` forces rendering, which helps inside a pseudo-terminal your tooling owns.
-`"off"` disables it entirely. The `NO_COLOR` and `TERM=dumb` conventions are honored.
+In an interactive terminal a query renders a live status line naming the phase it is in, and
+collapses to one aligned summary when it finishes. {doc}`The terminal <terminal>` covers
+what each field means, how the display degrades on a terminal that cannot draw it, and when
+it suppresses itself.
 
 ## Logs
 

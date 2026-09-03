@@ -52,12 +52,13 @@ if TYPE_CHECKING:
 __all__ = ["render_profile"]
 
 
-def _rows(ops: Sequence[OpProfile], opts: RenderOptions) -> tuple[list[list[str]], int]:
+def _rows(ops: Sequence[OpProfile], opts: RenderOptions) -> tuple[list[list[str]], int, bool]:
     """One list of cells per visible operator, plus the fold markers, in plan order.
 
     Returns:
-        The cell rows and how many operators were folded away, so the caller can print the
-        one footnote that explains the elision rather than repeating it on every marker.
+        The cell rows, how many operators were folded away, and whether the critical-path
+        mark column was drawn — so the caller can print the two footnotes that explain the
+        elision and the mark, rather than repeating either on every row.
     """
     flags = last_child_flags(ops)
     subtree = subtree_ms(ops)
@@ -117,7 +118,7 @@ def _rows(ops: Sequence[OpProfile], opts: RenderOptions) -> tuple[list[list[str]
             ]
         )
         i += 1
-    return out, folded
+    return out, folded, bool(critical)
 
 
 #: Column headers, by whether the profile is analyzed. Deliberately never the word
@@ -429,8 +430,20 @@ def render_profile(
     if not profile.ops:
         head = _header(profile, opts, 40)
         return "\n".join([*head, "  (no operators)", *_footer(profile, opts)])
-    rows, folded = _rows(profile.ops, opts)
+    rows, folded, marked = _rows(profile.ops, opts)
     body = _table(rows, opts)
+    if marked:
+        # The mark was drawn with nothing anywhere saying what it meant. A glyph a reader
+        # has to guess at is worse than no glyph: the two readings available to them --
+        # "this operator is important" and "this operator is on the path that sets the
+        # query's duration" -- lead to different next actions, and only one is right.
+        body.append(
+            opts.style(
+                "muted",
+                f"  {opts.glyphs['mark']} marks the critical path -- the operators whose "
+                "times set the query's duration.",
+            )
+        )
     if folded:
         # One footnote rather than an explanation on every marker: the markers are inside a
         # width-constrained column and the reader needs the rule once, with the way to see

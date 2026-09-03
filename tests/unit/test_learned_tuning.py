@@ -367,6 +367,60 @@ def test_both_hashing_arms_are_always_offered():
     assert set(arms) == {"hash", "broadcast"}
 
 
+def test_broadcast_is_not_offered_when_the_build_is_far_over_the_replication_budget():
+    """The mirror of the sort-merge rule, from the other end of the size range.
+
+    Broadcast cannot win on a build side the executor's own measured re-check will refuse:
+    the strategy declines and the join falls back to the co-partition shuffle, so the arm's
+    entire contribution is the driver work spent finding that out. Measured on TPC-H sf100
+    `lineitem ⋈ orders` over 8 workers, where the build is ~3 GB against a 140 MiB budget:
+    **23.5 s on the exploring run against 11.7 s on the hash arm.**
+    """
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    budget = 140 << 20
+    huge = BuildSideDecision(1e9, 1e9, False, "exact", build_bytes=3e9, build_measured=True)
+    assert "broadcast" not in _admissible_arms(huge, 30e9, broadcast_max_bytes=budget)
+    assert "hash" in _admissible_arms(huge, 30e9, broadcast_max_bytes=budget)
+
+
+def test_a_build_near_the_broadcast_budget_keeps_the_arm():
+    """The margin is what keeps this an admissibility rule and not a second decision.
+
+    Near the budget the byte estimate and the executor's measurement disagree in both
+    directions, and being wrong there costs about a budget's worth of reading — cheap
+    enough that the bandit should keep measuring it.
+    """
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    budget = 140 << 20
+    near = BuildSideDecision(
+        1e9, 1e9, False, "exact", build_bytes=budget * 2.0, build_measured=True
+    )
+    assert "broadcast" in _admissible_arms(near, 30e9, broadcast_max_bytes=budget)
+
+
+def test_an_unmeasured_build_size_never_withholds_the_broadcast_arm():
+    """Same qualifier the memory guard uses: a guess may not withdraw an experiment.
+
+    An unbounded build size is a product of compounding estimates, so a large figure is not
+    evidence that broadcasting would fail — and withholding the arm on it would make the
+    bandit unable to correct the guess.
+    """
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    guessed = BuildSideDecision(1e9, 1e9, False, "default", build_bytes=3e9, build_measured=False)
+    assert "broadcast" in _admissible_arms(guessed, 30e9, broadcast_max_bytes=140 << 20)
+
+
+def test_no_broadcast_budget_withholds_nothing():
+    """A caller outside the rule passes no budget and must see the arm set unchanged."""
+    from batcher.kyber.rules.selection import BuildSideDecision, _admissible_arms
+
+    huge = BuildSideDecision(1e9, 1e9, False, "exact", build_bytes=3e9, build_measured=True)
+    assert "broadcast" in _admissible_arms(huge, 30e9)
+
+
 def test_a_memory_fitting_build_is_not_sort_merged_cold():
     """The cost model's own cold choice, not just the bandit's exploration.
 

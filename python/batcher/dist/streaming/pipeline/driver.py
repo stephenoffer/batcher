@@ -233,21 +233,46 @@ def _narrow_for_overlap(workers: int, bounds) -> object | None:
     return set_scheduling_envelope(narrowed)
 
 
+def _shipping_options() -> dict:
+    """`.options(...)` that make `import batcher` work in a streaming stage's actor.
+
+    Only the `runtime_env`, deliberately: the resource grant for these actors is decided by
+    the caller's envelope narrowing above, and `task_options` would also rewrite `num_cpus`.
+
+    The streaming actors are declared with a bare `@ray.remote` and created with a bare
+    `.remote(...)`, so unlike the Flight fleet (which goes through `fleet_actor_options` ->
+    `task_options`) nothing attached the package. On a job where a **foreign** `ray.init` ran
+    first — `tests/_ray_cluster.init_test_ray`, and any user who attaches to their own cluster
+    — the actor died in its creation task with
+    `RaySystemError: System error: No module named 'batcher'`, taking every distributed
+    streaming test with it. `worker_runtime_env()` returns `None` when Batcher initialized Ray
+    itself, which is why this was invisible on the default path.
+    """
+    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
+
+    env = worker_runtime_env()
+    return {"runtime_env": env} if env else {}
+
+
 def _producer_factory(stage, credits: int, target_rows: int):
     def spawn():
-        return ProducerActor.remote(stage.sub_plan, credits, target_rows)
+        opts = _shipping_options()
+        cls = ProducerActor.options(**opts) if opts else ProducerActor
+        return cls.remote(stage.sub_plan, credits, target_rows)
 
     return spawn
 
 
 def _actor_factory(cls, stage, credits: int, target_rows: int, *, terminal: bool):
     def spawn():
+        opts = _shipping_options()
+        bound = cls.options(**opts) if opts else cls
         # A terminal consumer returns its rows to the driver, so it runs no Flight server and
         # takes no credit window; a relay republishes and takes both.
         return (
-            cls.remote(stage.sub_plan)
+            bound.remote(stage.sub_plan)
             if terminal
-            else cls.remote(stage.sub_plan, credits, target_rows)
+            else bound.remote(stage.sub_plan, credits, target_rows)
         )
 
     return spawn

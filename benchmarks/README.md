@@ -371,6 +371,8 @@ benchmarks/
   scenarios/     standalone workload benchmarks, run directly rather than through run.py
     claims/      does a claim the project makes survive measurement? cost, learning
                  curve, scheduler equivalence, cold start
+    scaling/     strong-scaling ladder: same data, 1 -> 2 -> 4 workers, with the
+                 efficiency against ideal beside every speedup
     formats/ genomics/ robotics/ streaming/ training/
   cluster/       distributed + GPU multimodal benchmarks (inference/LLM/audio/video)
   gpu_backend/   the device tier: kernels, multi-GPU, energy, the public gpu path
@@ -522,8 +524,15 @@ The harness (`harness/`):
 3. **Times best-of-N** wall-clock in milliseconds. Each engine is executed once for the
    correctness check and once as `bench()`'s warm-up, so a timed run is the third — the
    fixed cost of a *cold* process is deliberately not visible here, and
-   `scenarios/claims/cold_start.py` measures it instead. An engine that cannot express a
-   query is `n/a` (`PARTIAL` overall); one that errors records the error.
+   `scenarios/claims/cold_start.py` measures it instead. **What those discarded executions
+   cost is not the same per engine, and the difference is the largest asymmetry this suite
+   has:** a first-seen TPC-H query costs Batcher 2.60x its steady state against DuckDB's
+   1.15x (`scenarios/claims/learning_curve.py`). The shared 1.15x is page cache, JIT and
+   allocator; the 2.27x excess is Batcher's plan cache and learned store filling, and it is
+   gone by the second or third execution — which is what makes best-of-N a fair steady-state
+   comparison, and also what makes the board silent about the number a single-shot user sees.
+   An engine that cannot express a query is `n/a` (`PARTIAL` overall); one that errors records
+   the error.
 4. **Reports an aligned table** whose columns adapt to the lineup:
    `query | <engine>_ms ... | b/<engine> ratios | status`. A failed engine is still timed —
    how fast a wrong answer was is diagnostic — but its **ratio is withheld and printed
@@ -545,6 +554,14 @@ agreeing to 0.001 is a coincidence and not corroboration — a claim of exactly 
 published and has been withdrawn. Run `--repeat N`, which re-runs the whole selection and
 reports min / median / max and the spread, then quote the median to a precision the spread
 supports.
+
+**A per-query row is much less reproducible than the geomean under it.** Measured over five
+whole TPC-H sf1 passes, the median per-query ratio moved **19%** and the worst moved **61%**,
+while the geomean over the same 22 moved 6% — averaging cancels noise that a single row keeps.
+q6 ranged 0.76 to 1.57 across those passes, so from one pass it reads as a comfortable win or
+a clear loss depending only on which pass was printed. `--repeat N` now names the least
+reproducible rows and flags any whose range crosses 1.00. Quote a row only if it was
+repeated; quote the geomean otherwise.
 
 `b/<engine>` is `batcher_ms / engine_ms` — **lower means Batcher is faster**, and every
 table `run.py` prints uses this direction. Two standalone scripts print the reciprocal
@@ -578,3 +595,32 @@ timings. A divergence is a correctness bug and fails the run. Multi-node through
 large scale depends on network and cluster size; the engine keeps per-node memory
 bounded through the mergeable algebra and spill, and moves batches over Arrow Flight
 with credit-based backpressure rather than through the Ray object store.
+
+## scenarios/scaling/ladder.py: does N times the cluster give N times the throughput?
+
+```bash
+python benchmarks/scenarios/scaling/ladder.py                    # sf100, every case
+python benchmarks/scenarios/scaling/ladder.py --rungs 1,2,4 --only hash-join
+python benchmarks/scenarios/scaling/ladder.py --scale 10 --source /path/to/sf10
+```
+
+`internals/distributed.py` above answers "is the distributed result the same"; this answers
+"was the cluster worth buying". One query shape runs at each rung of a worker-count sequence
+over the same data, and each rung reports its speedup over the first plus an **efficiency**
+against the ideal, so hardware that bought nothing shows up as a number rather than as two
+timings a reader has to divide. A `driver` row runs the same query single-node in-process,
+which is the figure `BENCHMARK_RESULTS.md` records for one large box.
+
+Every rung is held to the driver's rows before its timing is quoted, and the sort case is
+additionally held to its own order — `results_match` sorts both sides, so without that a sort
+would be the one case in the file that could not fail.
+
+Each case gets **its own process**, because cross-query session state is worth a factor of two
+here: `hash-join` at sf100 scales 3.14x on four workers alone and 1.68x when two other cases ran
+first in the same interpreter. `--in-process` opts out, for measuring a session deliberately.
+
+**Vary the width in one process and you must tear the session fleet down between rungs**, which
+this does. A cached fleet is respawned only when it is too *narrow* for the request, so a
+`num_workers=1` query arriving after a 4-worker one silently borrows all four actors — correct
+for a session, fatal for a ladder. The first version of this benchmark did not, and reported a
+flat line for every case after the first.

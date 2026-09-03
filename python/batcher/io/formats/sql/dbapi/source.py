@@ -625,6 +625,19 @@ class DBAPISource:
             f"{self.query or self.table}"
         )
 
+    def governed_name(self) -> str:
+        """The table this DB-API read names, when it names one rather than a query.
+
+        Distinct from `identity`, which names a *relation* and folds in a
+        `connection_fingerprint` so staging and production cannot share one statistics
+        entry. A policy is written before the first read by someone who has to be able to
+        type the name, and a fingerprint is a sha256 of the connection options.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when a query was given instead.
+        """
+        return self.table or ""
+
     def splits(
         self,
         target_size: int | None = None,  # noqa: ARG002 (protocol signature)

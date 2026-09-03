@@ -38,6 +38,8 @@ import batcher as bt
 from batcher.plan.expr_ir import AggExpr
 from batcher.plan.ir_tags import AGG_FNS
 from batcher.plan.logical.window import WINDOW_FUNCS
+from batcher.plan.types import widen
+from batcher.plan.types.domains import aggregate_domain_error
 
 pytestmark = pytest.mark.differential
 
@@ -131,6 +133,20 @@ def _agree(dataset_for, order: str) -> None:
         assert got[2] == expected[2], f"{path}: rows differ from collect()"
 
 
+#: Aggregates that read a *second* column -- an ordering key or the other variable of a
+#: bivariate statistic. Built with one argument they raise "requires an input column",
+#: which is not a statement about the column's type: `arg_max` is perfectly happy with an
+#: integer. Naming them here is what gets them exercised rather than skipped.
+_TWO_ARG_AGGS = frozenset({"arg_max", "arg_min", "corr", "covar_pop", "covar_samp"})
+
+
+def _agg_expr(func: str, column: str) -> AggExpr:
+    """`AggExpr` for `func` over `column`, supplying a second input where one is needed."""
+    if func in _TWO_ARG_AGGS:
+        return AggExpr(func, bt.col(column), input2=bt.col("rid"))
+    return AggExpr(func, bt.col(column))
+
+
 @pytest.mark.parametrize("column", ["k", "f", "s"])
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("func", sorted(AGG_FNS))
@@ -138,12 +154,21 @@ def test_a_grouped_aggregate_agrees_across_paths(tables, func, shape, column):
     rows = tables[shape]
 
     def build():
-        return bt.from_arrow(rows).group_by("g").agg(v=AggExpr(func, bt.col(column)))
+        return bt.from_arrow(rows).group_by("g").agg(v=_agg_expr(func, column))
 
-    try:
-        build().collect()
-    except Exception:
-        pytest.skip(f"{func} does not accept a {column!r} column")
+    # A skip is earned only when the control plane's *declared domain* says this
+    # (aggregate, column type) pair is out of range -- asked of `aggregate_domain_error`,
+    # the same function the planner raises from, rather than matched against its wording.
+    #
+    # Catching bare `Exception` here made this test unable to fail: any engine regression
+    # that raised removed its own case from the run and reported green. It also
+    # mislabelled the five two-argument aggregates as "not accepting" an integer column,
+    # so nothing in this file -- whose whole subject is every member of `AGG_FNS` --
+    # ever reached them.
+    declined = aggregate_domain_error(func, column, widen(rows.schema.field(column).type))
+    if declined:
+        pytest.skip(declined)
+    build().collect()
     _agree(build, "g")
 
 

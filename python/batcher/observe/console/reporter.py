@@ -29,7 +29,15 @@ from collections.abc import Callable
 from typing import TextIO
 
 from batcher._internal import events
-from batcher._internal.humanize import UNKNOWN, count, duration_ms, fit, rate
+from batcher._internal.humanize import (
+    UNKNOWN,
+    byte_size,
+    count,
+    duration_ms,
+    fit,
+    plural,
+    rate,
+)
 from batcher._internal.mathx import clamp
 from batcher.observe.console.paint import LABEL_W, compose
 from batcher.observe.console.state import RunState
@@ -165,6 +173,19 @@ class ConsoleReporter:
             elif kind == events.LOG:
                 self._write_log(event)
                 return
+            elif kind == events.WRITE and event.query_id not in self._runs:
+                # A commit lands *after* the query that produced the rows has ended: the
+                # sink writes its files, then commits, and only then is there a manifest to
+                # report. So this event names a query the reporter has already summarized
+                # and popped, and folding it into a run would drop it -- which is why the
+                # `wrote 24 files (3.1 GiB)` the summary line documents never once appeared
+                # for a `ds.write.parquet(...)`.
+                #
+                # Given its own line rather than held back for a run that is not coming.
+                # The write is the thing an ETL job exists to produce, and it was the one
+                # thing nothing printed.
+                self._write_committed(event)
+                return
             elif not self._fold(event):
                 return
             self._draw()
@@ -180,7 +201,19 @@ class ConsoleReporter:
         if run is None:
             return False
         kind, fields = event.kind, event.fields
-        if kind == events.STAGE_START:
+        if kind == events.PHASE:
+            # The only thing that arrives *while* the query is slow. Operator stages are
+            # replayed from the profile once it has finished, so before this the line said
+            # "running" from the first millisecond to the last.
+            run.stage = event.name
+            # Repaint now rather than at the next 20 fps tick. The rate limit exists because
+            # progress arrives per morsel; a phase change arrives at most six times in a
+            # query and is the one thing on the line that has actually changed. Left
+            # rate-limited, a phase shorter than the 50 ms frame interval is recorded and
+            # never drawn -- which silently hid `optimizing` on exactly the small queries
+            # where planning is the dominant cost and the reason to look.
+            self._last_draw = 0.0
+        elif kind == events.STAGE_START:
             run.stage = event.name
             if fields.get("est_rows") is not None:
                 run.est = fields["est_rows"]
@@ -188,6 +221,16 @@ class ConsoleReporter:
             # The measured volume, which no other event carries: a stage that spilled 40 GiB
             # and one that spilled 4 MiB were both reported as "spilled" and nothing else.
             run.spilled_bytes += int(fields.get("spill_bytes", 0) or 0)
+            # Rows read, taken from the scans only. Summing every operator's `rows_in` would
+            # count the same row once per operator it passes through, so a six-operator
+            # pipeline would report six times the throughput it achieved.
+            #
+            # Both scopes are summed. On a distributed run the driver publishes the plan's
+            # shape with zero measurements and the workers publish the counts, so the sum is
+            # the workers' total; where a driver does read rows itself (a broadcast side it
+            # collected) those are rows the engine moved and belong in the figure.
+            if event.name == "scan":
+                run.scanned += int(fields.get("rows_in", 0) or 0)
         elif kind == events.PROGRESS:
             run.observe(int(fields.get("rows", 0)), int(fields.get("bytes", 0) or 0))
         elif kind == events.PARTITION:
@@ -270,9 +313,27 @@ class ConsoleReporter:
             head = f"{p.critical}{g.fail}{p.reset}  {p.bold}{fit(label, LABEL_W)}{p.reset}"
             self._emit_line(f"{head}  {p.critical}{event.fields.get('error', '')}{p.reset}")
             return
-        parts = [f"{count(rows)} rows", duration_ms(ms)]
-        if ms > 0 and rows:
-            parts.append(rate(rows / (ms / 1000)))
+        parts = [f"{count(rows)} {'row' if rows == 1 else 'rows'}", duration_ms(ms)]
+        # A query answered without executing says *how*, in place of a throughput figure it
+        # has no basis for. "12 rows/s" on a `sum()` read off a Parquet footer describes the
+        # width of the answer divided by the time to fetch it, which reads as an engine
+        # crawling and is the opposite of what happened. See `event_log.SHORTCUT_REASONS`.
+        note = str(event.fields.get("note") or "")
+        # Throughput is the rows the query *read* per second, not the rows it returned. Any
+        # query that filters or aggregates returns fewer rows than it processed, so the
+        # output-based figure understates the engine by exactly the selectivity -- a
+        # `group_by` reducing 400,000 rows to five in 104 ms reported "48 rows/s". The rows
+        # returned are already the first field on this line; repeating them as a rate said
+        # nothing and actively misled.
+        scanned = run.scanned if run is not None else 0
+        moved = scanned if scanned > rows else rows
+        if note:
+            parts.append(note)
+        else:
+            if scanned > rows:
+                parts.append(f"{count(scanned)} read")
+            if ms > 0 and moved:
+                parts.append(rate(moved / (ms / 1000)))
         if run is not None:
             written = run.written()
             if written:
@@ -288,6 +349,22 @@ class ConsoleReporter:
             joined = f"  {g.sep}  ".join(anomalies)
             line += f"  {p.warn}{g.sep}  {joined}{p.reset}"
         self._emit_line(line)
+
+    def _write_committed(self, event: events.Event) -> None:
+        """Print the one-line record of a commit that outlived its query."""
+        p, g = self._palette, self._glyphs
+        fields = event.fields
+        files = int(fields.get("files", 0) or 0)
+        rows = int(fields.get("rows", 0) or 0)
+        written = int(fields.get("bytes", 0) or 0)
+        parts = [plural(files, "file")]
+        if rows:
+            parts.append(f"{count(rows)} {'row' if rows == 1 else 'rows'}")
+        if written:
+            parts.append(byte_size(written))
+        detail = f"  {p.muted}{g.sep}{p.reset}  ".join(parts)
+        head = f"{p.good}{g.ok}{p.reset}  {p.bold}{fit(f'wrote {event.name}', LABEL_W)}{p.reset}"
+        self._emit_line(f"{head}  {p.dim}{detail}{p.reset}")
 
     def _notice(self, role: str, text: str) -> None:
         """Print one immediate, unmissable line for an event that cannot wait for the end.

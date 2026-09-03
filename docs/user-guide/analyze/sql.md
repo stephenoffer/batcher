@@ -127,6 +127,10 @@ print(out.to_pydict())
 Both paths build one logical plan, push it through one optimizer, and execute it on
 one Rust data plane. There is no separate SQL engine.
 
+Every method on the expression accessors is callable from SQL too, under the name of the
+namespace and the method: `col("s").str.slugify()` is `str_slugify(s)`. See
+{doc}`/api/relational/expression-accessors` for the naming rules and the full surface.
+
 (sessions-tables-and-python-functions)=
 
 ## Sessions, tables, and Python functions

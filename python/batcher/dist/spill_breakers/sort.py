@@ -61,6 +61,16 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
     alone answered "unknown type, decline" for **every** hoisted key, and the hoist could
     never take effect. `available_schema` is the plan layer's own static inference, needs no
     rows, and is what the global window's `_key_type_partitionable` already consults."""
+    # A `map_batches` anywhere beneath the breaker makes the plan unserialisable: the operator
+    # runs a Python callable and `to_ir()` raises by design, so every path here that ships the
+    # plan to the engine dies inside `json.dumps`. Answering "yes" and letting the executor
+    # discover that is exactly the shape `test_spill_predicates_never_raise` exists to stop —
+    # `iter_batches()` on `map_batches(...).sort(...)` surfaced as
+    # `NotImplementedError: map_batches is executed in Python, not lowered to the engine IR`.
+    from batcher.core.udf import has_map_batches
+
+    if has_map_batches(sort):
+        return False
     if len(sort.keys) < 1 or not isinstance(sort.keys[0].expr, Col):
         return False
     if sources is None:

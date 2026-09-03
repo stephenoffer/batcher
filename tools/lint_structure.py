@@ -207,6 +207,13 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # __init__ is supposed to be; it is only over 120 lines because the ML surface has
     # more names than 120. Collapsing the imports would hide them from editors and from
     # `just lint-docstrings`, which introspects this list.
+    # GENERATED (`just gen-exports`): one line per public name, mapping it to the module
+    # that defines it. This is the data that lets `batcher`, `batcher.api` and
+    # `batcher.api.session` resolve their 674 names lazily, which is what takes
+    # `import batcher` from 545 ms to ~1 ms. It is a table, not logic — splitting it by
+    # size would leave three arbitrary fragments and a loader, and the file is never read
+    # by a person.
+    "python/batcher/_exports.py": "generated lazy-export routing table; one line per public name",
     "python/batcher/ml/__init__.py": "ML re-export facade; one name per line over 8 subpackages",
     # The same case one level down: a pure re-export façade over the preprocessor family,
     # now covering vectorizers and feature selection alongside scalers, encoders, imputers

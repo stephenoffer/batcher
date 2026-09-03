@@ -23,7 +23,7 @@ from batcher.governance.enforce import enforce
 from batcher.governance.filters import AttributeIn, MatchesAttribute
 from batcher.governance.lineage import Origin, column_lineage
 from batcher.governance.masks import Encrypt, Nullify, Pseudonymize, Redact
-from batcher.governance.policy import ColumnMask, Grant, RowFilter, TagMask
+from batcher.governance.policy import PRIVILEGES, ColumnMask, Denial, Grant, RowFilter, TagMask
 from batcher.governance.principal import Principal
 from batcher.governance.residency import (
     RESIDENCY_MODES,
@@ -35,10 +35,12 @@ from batcher.governance.residency import (
 )
 
 __all__ = [
+    "PRIVILEGES",
     "RESIDENCY_MODES",
     "AttributeIn",
     "ColumnMask",
     "DataResidency",
+    "Denial",
     "Encrypt",
     "GovernanceEvent",
     "Grant",

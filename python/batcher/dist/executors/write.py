@@ -35,6 +35,75 @@ from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import logical_bytes, retained_bytes
 
 
+def _write_task_cpus() -> float:
+    """The CPU share one write-shard task should reserve.
+
+    A write shard serializes Arrow and pushes bytes at object storage. It waits on the
+    network far more than it saturates a core, which is exactly the stage
+    `execution.cpu_share_io` exists for — the field's own comment names "write" in its list
+    — and this path was the one that never asked for it. Every shard reserved the whole core
+    the fleet envelope grants, so a 96-core cluster ran 96 concurrent uploads while nearly
+    all of them sat in `send`.
+
+    Packing more of them per core is safe here for the reason it is safe on the map path:
+    `task_options` puts the per-task **memory** grant on the same task, and Ray's `memory=`
+    is a reservation, so RAM — not the CPU share — is what bounds how many shards a node
+    takes. Lowering the CPU ask raises concurrency only up to what the node can hold.
+
+    Never *raises* the ask: a fleet whose envelope already grants less than the IO share
+    keeps its smaller grant, because that grant was derived from the plan and this is only a
+    prior. Floored at `cpu_share_min` so a shard never asks for an unschedulable sliver.
+
+    Returns:
+        Cores to request per shard task; `1.0` when there is no envelope to read.
+    """
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime import current_envelope
+
+    env = current_envelope()
+    granted = float(env.num_cpus) if env is not None else 1.0
+    execution = active_config().execution
+    return max(execution.cpu_share_min, min(granted, execution.cpu_share_io))
+
+
+def _write_task_scheduling(task_cpus: float) -> dict:
+    """Ray `.options(...)` that let a write's shard tasks run against a full cluster.
+
+    A distributed write submits plain Ray tasks, and it very often follows a *shuffle* in
+    the same query — `sort(...).write.parquet(distributed=True)` is the canonical shape.
+    The shuffle's fleet reserves every schedulable core, and these tasks are submitted
+    **outside** that reservation, so the fleet does not slow them down, it makes them
+    unplaceable. There is no error and no timeout: the barrier waits forever, reporting
+    `0/N tasks finished, cluster CPU 384/384 in use` every two minutes.
+
+    Reproduced on a 4 x 96-core cluster with nothing else running, from
+    `bt.read.parquet(...).sort("a").write.parquet(out, distributed=True, num_workers=4)`
+    alone in a fresh process — the sort's own fleet is what fills the cluster, so the write
+    deadlocks against a reservation its own query made one statement earlier.
+
+    `map._placeable_scheduling` is the answer the map path already had for exactly this,
+    and the reason it belongs here too rather than being reimplemented: it hands the
+    session fleet back when nothing is mid-shuffle, and otherwise schedules into the
+    fleet's own placement group, where `fleet_task_headroom` keeps a sliver unclaimed for
+    precisely these stages. Empty when the cluster can place the tasks as they are, which
+    is the common case and leaves the ordinary path untouched.
+
+    The IO-sized CPU share (`_write_task_cpus`) rides along, because it is part of the same
+    question: `_placeable_scheduling` reserves headroom for *these* tasks, and asking it about
+    a whole core when the task wants half of one reserves twice what the stage needs.
+
+    Args:
+        task_cpus: Cores one shard task will request.
+
+    Returns:
+        Scheduling kwargs for `.options(**kwargs)`. Never empty — the CPU share is always
+        stated — so the caller no longer has to branch on an empty fragment.
+    """
+    from batcher.dist.executors.map import _placeable_scheduling
+
+    return {"num_cpus": task_cpus, **_placeable_scheduling(task_cpus)}
+
+
 def _distributed_write(
     sink: Any,
     table: pa.Table,
@@ -66,11 +135,17 @@ def _distributed_write(
     # Gather with preemption recovery: a write-shard whose worker is lost is resubmitted
     # onto a survivor. Each shard writes a deterministic `part-{idx}` file, so a resubmit
     # overwrites any partial file the dead worker left — idempotent, no orphan.
+    # `.options(...)` only when there is something to say: an open cluster needs no
+    # accommodation, and leaving the submission untouched there keeps the ordinary path
+    # exactly as it was rather than routing it through a second Ray object per shard.
+    task_cpus = _write_task_cpus()
+    shard = _write_shard.options(**_write_task_scheduling(task_cpus))
     results: list[list[WrittenFile]] = gather_map_results(
-        lambda idx: _write_shard.remote(
+        lambda idx: shard.remote(
             sink, shards[idx], path, partition_by, idx, layout.for_shard(idx, len(shards)), resume
         ),
         len(shards),
+        task_cpus=task_cpus,
     )
     return WriteManifest(tuple(f for shard_files in results for f in shard_files))
 
@@ -305,8 +380,11 @@ def _distributed_write_plan(
     # partition from the durable split descriptor and rewrites its `part-{idx}` file
     # (deterministic name ⇒ idempotent overwrite, no orphaned partial output).
     shard_layout = layout or FileLayout()
+    # See `_distributed_write` above: untouched submission when nothing is in the way.
+    task_cpus = _write_task_cpus()
+    shard = _write_plan_shard.options(**_write_task_scheduling(task_cpus))
     results: list[list[WrittenFile]] = gather_map_results(
-        lambda idx: _write_plan_shard.remote(
+        lambda idx: shard.remote(
             map_ir,
             parts[idx],
             fmt,
@@ -319,6 +397,7 @@ def _distributed_write_plan(
             resume,
         ),
         len(parts),
+        task_cpus=task_cpus,
     )
     return WriteManifest(tuple(f for shard_files in results for f in shard_files))
 

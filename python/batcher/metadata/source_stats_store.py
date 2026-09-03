@@ -15,6 +15,7 @@ falls through to a normal read.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from batcher._internal.logging import note_suppressed
@@ -26,6 +27,17 @@ __all__ = ["load_source_stats", "save_source_stats"]
 
 _NAMESPACE = "io.source_stats"
 _JSON_SCALARS = (int, float, str, bool)
+
+# Ceilings on the two variable-length descriptive stats, so one pathological column cannot
+# grow the hub without bound. The two are capped in *opposite* ways, and the asymmetry is the
+# point: dropping the tail of an MCV table only removes the least common of the most common
+# values, which weakens the estimate and cannot make it wrong, so an oversized table is
+# truncated. A quantile grid has no such property — truncating it silently misdescribes the
+# CDF's upper tail, and a range predicate above the cut then interpolates against a maximum
+# that is not the column's. An oversized grid is therefore dropped whole, which costs the
+# cold-start estimate and keeps every retained grid honest.
+_MAX_QUANTILE_POINTS = 1024
+_MAX_MCV_ENTRIES = 256
 
 
 def save_source_stats(
@@ -155,7 +167,7 @@ def _decode_sort_key(blob: str | dict[str, Any]) -> SortOrder:
 
 def _encode_column(col: ColumnStat) -> dict[str, Any]:
     out: dict[str, Any] = {"provenance": col.provenance.name}
-    for field in ("min", "max", "null_count", "ndv", "total_sum", "mean"):
+    for field in ("min", "max", "null_count", "ndv", "total_sum", "mean", "avg_bytes"):
         value = getattr(col, field)
         if isinstance(value, _JSON_SCALARS):
             out[field] = value
@@ -163,6 +175,17 @@ def _encode_column(col: ColumnStat) -> dict[str, Any]:
         import base64
 
         out["bloom"] = base64.b64encode(col.bloom).decode("ascii")
+    # The distributional pair. They are what answers a *cold* range or equality predicate:
+    # without them a first-ever read of a written path falls back to the Selinger range
+    # constant and `1/ndv`, which is the regime `TPCH_FINDINGS` measured the largest
+    # cold-start wins against. Both are already JSON-native, so persisting them costs the
+    # bytes and nothing else.
+    grid = _encode_quantiles(col.quantiles)
+    if grid is not None:
+        out["quantiles"] = grid
+    mcv = _encode_mcv(col.mcv)
+    if mcv is not None:
+        out["mcv"] = mcv
     # Drop a bare provenance with no usable values.
     if len(out) == 1:
         return {}
@@ -183,6 +206,47 @@ def _encode_column(col: ColumnStat) -> dict[str, Any]:
         if sub is not None:
             out[field] = sub.name
     return out
+
+
+def _encode_quantiles(grid: Any) -> dict[str, list[float]] | None:
+    """The ascending quantile grid as JSON, or None when it is absent or unusable.
+
+    Requires the two arrays to be present, numeric, the same length, and non-empty — the
+    shape `plan.stats.ColumnStat` documents. A grid failing any of those is dropped rather
+    than repaired: a half-decoded CDF produces a confident wrong selectivity, where a missing
+    one produces the documented fallback.
+    """
+    if not isinstance(grid, Mapping):
+        return None
+    probs, values = grid.get("probs"), grid.get("values")
+    if not isinstance(probs, (list, tuple)) or not isinstance(values, (list, tuple)):
+        return None
+    if not probs or len(probs) != len(values) or len(probs) > _MAX_QUANTILE_POINTS:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (*probs, *values)):
+        return None
+    return {"probs": [float(p) for p in probs], "values": [float(v) for v in values]}
+
+
+def _encode_mcv(mcv: Any) -> dict[str, float] | None:
+    """Most-common values as JSON, keeping the most frequent when there are too many.
+
+    Truncation is safe here in a way it is not for a quantile grid: the entries dropped are
+    the least frequent of the table, and every retained frequency is still that value's own.
+    """
+    if not isinstance(mcv, Mapping) or not mcv:
+        return None
+    usable = {
+        str(k): float(v)
+        for k, v in mcv.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    if not usable:
+        return None
+    if len(usable) > _MAX_MCV_ENTRIES:
+        top = sorted(usable.items(), key=lambda kv: -kv[1])[:_MAX_MCV_ENTRIES]
+        usable = dict(top)
+    return usable
 
 
 def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
@@ -222,8 +286,13 @@ def _decode_column(blob: dict[str, Any]) -> ColumnStat:
         ndv=blob.get("ndv"),
         total_sum=blob.get("total_sum"),
         mean=blob.get("mean"),
+        avg_bytes=blob.get("avg_bytes"),
         provenance=prov,
         bloom=bloom,
+        # Re-validated on the way in, not trusted because this module wrote it: the hub is a
+        # file on disk that another process, an older build, or a partial write can reach.
+        quantiles=_encode_quantiles(blob.get("quantiles")),
+        mcv=_encode_mcv(blob.get("mcv")),
         ndv_provenance=Provenance[ndv_prov] if isinstance(ndv_prov, str) else None,
         null_count_provenance=Provenance[null_prov] if isinstance(null_prov, str) else None,
         moments_provenance=Provenance[moments_prov] if isinstance(moments_prov, str) else None,

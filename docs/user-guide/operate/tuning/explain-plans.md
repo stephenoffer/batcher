@@ -167,11 +167,11 @@ Every field on an operator line, and what it is telling you:
 
 | Column | Reads as | What it means |
 | --- | --- | --- |
-| `▶` | present or absent | the operator is on the *critical path*: the hottest chain from the root down. Drawn only when the plan branches, because on a straight chain every operator is on it. |
+| `▶` | present or absent | the operator is on the *critical path*: the hottest chain from the root down. Drawn only when the plan branches, because on a straight chain every operator is on it, and a legend below the table says so wherever it appears. |
 | `OPERATOR` | a tree, then `[detail]` | the optimized plan. The spine says what feeds what; a `└─` is a last input. The bracket says what the operator does: join type and keys, group keys and aggregates, sort keys, predicate. |
 | `ESTIMATE` | `est≈N` | the rows Kyber planned for, with its provenance in `NOTES` when the plan was not run. |
 | `ACTUAL` | `actual=N` | the rows the operator really produced. |
-| `MISS` | `exact`, `3.4x over`, `3.4x under` | how far the estimate missed, and **which way**. `over` means the plan expected more rows than arrived. |
+| `MISS` | `exact`, `3.4x over`, `5000.0x under` | how far the estimate missed, and **which way**. `over` means the plan expected more rows than arrived. An estimate below one row is compared against one row rather than against itself: a row count is a count, so a selectivity that underflowed down a chain of predicates has no usable denominator, and dividing by it printed fifteen digits of an artifact. A genuine miss, however large, is still reported in full. |
 | `TIME` | `268µs`, `54ms`, `1m03s` | wall time in the operator. Sub-millisecond work is reported in microseconds rather than rounded to `0.0ms`, which used to make the fastest steps look unmeasured. |
 | `OP SHARE` | a bar and a percentage | the operator's share of **total operator time**, so the column ranks operators against each other. The wall clock's own division is the `where the time went` block. |
 | `NOTES` | conditional clauses | strategy (`broadcast`), backend (`interp` / `jit`), `spill 2.0 GiB`, `rss+…`, `pushed[…]`, `PAGING(…)`, `contended(…)`. Each appears only when it has something to say. |
@@ -233,6 +233,13 @@ And it folds subtrees that cannot contain the answer:
         │  ├─ … 17 more
   17 operators folded: subtrees under 1% of operator time. explain(format="json") lists every one.
 ```
+
+Indentation stops growing past ten levels, and a `⋯` in place of the outermost ancestor
+bars says where it stopped. A long pipeline of chained `with_columns` and `filter` calls is
+a *deep* plan rather than a wide one, and the spine costs three columns per level: left
+unbounded it consumed the whole operator column, so the part of each row that survived
+truncation was the indentation and the part discarded was the operator's name. The nearest
+ancestors are the ones kept, because those are the branches a reader is still resolving.
 
 A run of consecutive cold siblings collapses into one line rather than one line each,
 because seventeen `… 1 operator folded` markers are exactly as long as the seventeen rows

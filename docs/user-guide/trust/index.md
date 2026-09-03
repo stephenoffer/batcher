@@ -23,6 +23,18 @@ Row counts, distributions, freshness, and schema — the checks no single row fa
 Column masks, row-level security, lineage, audit.
 :::
 
+:::{grid-item-card} {octicon}`file-directory;1.1em` How a table is named
+:link: /user-guide/trust/table-names
+:link-type: doc
+The name a policy is keyed on, and which path spellings fold together.
+:::
+
+:::{grid-item-card} {octicon}`pencil;1.1em` Write privileges
+:link: /user-guide/trust/write-privileges
+:link-type: doc
+Which privilege each write needs, and the two operations refused inside a policy block.
+:::
+
 :::{grid-item-card} {octicon}`key;1.1em` Secrets and keys
 :link: /user-guide/trust/secrets
 :link-type: doc
@@ -42,6 +54,8 @@ The settings to change before production, and the boundaries Batcher does not en
 data-quality
 data-contracts
 governance
+table-names
+write-privileges
 secrets
 hardening
 ```

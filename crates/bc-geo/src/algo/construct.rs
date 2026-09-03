@@ -60,6 +60,13 @@ pub fn make_envelope(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> GeoResult<Ge
 
 /// The boundary of a geometry: a polygon's rings, a chain's endpoints, nothing for a
 /// point set or a closed chain.
+///
+/// "Nothing" is not one spelling. OGC represents the empty boundary in the type the
+/// operand's boundary *would* have had: a chain's boundary is a point set, so a closed
+/// chain reports `MULTIPOINT EMPTY`; a point set has no lower dimension to fall to, so
+/// a `Point`/`MultiPoint` reports `GEOMETRYCOLLECTION EMPTY`. Both are empty and both
+/// compare equal by area, which is exactly why returning the wrong one is invisible to
+/// every value assertion and shows up only in the column's type.
 pub fn boundary(g: &Geometry) -> Geometry {
     match g {
         Geometry::Polygon(p) => {
@@ -96,7 +103,10 @@ pub fn boundary(g: &Geometry) -> Geometry {
                 .flat_map(|l| [Some(l[0]), Some(l[l.len() - 1])])
                 .collect(),
         ),
-        Geometry::Point(_) | Geometry::MultiPoint(_) => Geometry::MultiPoint(Vec::new()),
+        // The empty set at dimension -1: a point set's boundary has no type of its own
+        // to be empty in, so OGC (and GEOS, and PostGIS) spell it as an empty collection
+        // rather than as an empty MULTIPOINT.
+        Geometry::Point(_) | Geometry::MultiPoint(_) => Geometry::GeometryCollection(Vec::new()),
         Geometry::GeometryCollection(gs) => {
             Geometry::GeometryCollection(gs.iter().map(boundary).collect())
         }
@@ -557,6 +567,31 @@ mod tests {
         assert_eq!(
             wkt(boundary(&g("POLYGON((0 0, 1 0, 1 1, 0 0))").geometry)),
             "LINESTRING(0 0, 1 0, 1 1, 0 0)"
+        );
+    }
+
+    #[test]
+    fn the_empty_boundary_keeps_the_type_ogc_gives_it() {
+        // Three different empty geometries, and which one you get is the whole content
+        // of the answer: every value-level assertion passes on any of them. GEOS and
+        // PostGIS agree on each of these.
+        for w in ["POINT(1 2)", "MULTIPOINT((0 0), (1 1))"] {
+            assert_eq!(
+                wkt(boundary(&g(w).geometry)),
+                "GEOMETRYCOLLECTION EMPTY",
+                "a point set falls to no lower dimension, so its empty boundary is a \
+                 collection, not an empty MULTIPOINT ({w})"
+            );
+        }
+        assert_eq!(
+            wkt(boundary(&g("LINESTRING(0 0, 1 0, 1 1, 0 0)").geometry)),
+            "MULTIPOINT EMPTY",
+            "a chain's boundary is a point set even when it is empty"
+        );
+        assert_eq!(
+            wkt(boundary(&g("POLYGON EMPTY").geometry)),
+            "MULTILINESTRING EMPTY",
+            "an areal boundary is a line set even when it is empty"
         );
     }
 

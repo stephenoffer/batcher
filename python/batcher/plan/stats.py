@@ -40,6 +40,7 @@ __all__ = [
     "AXIS_DATETIME",
     "AXIS_NUMERIC",
     "ColumnStat",
+    "LazyColumns",
     "Provenance",
     "RelStats",
     "SortOrder",
@@ -401,6 +402,126 @@ class ColumnStat:
                 None if self.moments_provenance is None else weakest(self.moments_provenance, floor)
             ),
         )
+
+    def carried_through_join(self, ndv: float | None) -> ColumnStat:
+        """This column's stats as they survive an equi-join's output, in one construction.
+
+        Exactly `downgrade(Provenance.DEFAULT)` followed by dropping the facts a match
+        invalidates: the null count (a match duplicates rows, an outer join adds nulls),
+        the sum and the mean (facts about a set of rows the output no longer is), and the
+        most-common values (a join re-weights the distribution by match multiplicity).
+        `min`/`max`, the bloom, the quantile grid and the measured width survive, for the
+        reasons `downgrade` gives. `ndv` is the caller's, because it is the one part that
+        needs the join's estimated output cardinality.
+
+        This is one method rather than a `downgrade` and a `dataclasses.replace` because
+        join costing is the hottest statistics path in the engine, and the pair built two
+        objects per output column per candidate order. A ten-way star join costs about
+        5,000 candidate orders, which came to 103,000 generic `replace` calls -- a third
+        of that query's entire control-plane time, spent introspecting a field list that
+        is known here at author time.
+
+        Args:
+            ndv: The output distinct count for this column, or `None` to drop it.
+
+        Returns:
+            The column's statistics as they hold over the join's output.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.stats import ColumnStat, Provenance
+                >>> c = ColumnStat(min=1, max=9, ndv=8.0, mean=4.0, provenance=Provenance.EXACT)
+                >>> j = c.carried_through_join(5.0)
+                >>> (j.min, j.max, j.ndv, j.mean, j.provenance is Provenance.EXACT)
+                (1, 9, 5.0, None, False)
+        """
+        floor = Provenance.DEFAULT
+        own_ndv = self.ndv_provenance if self.ndv_provenance is not None else self.provenance
+        own_nulls = (
+            self.null_count_provenance
+            if self.null_count_provenance is not None
+            else self.provenance
+        )
+        return ColumnStat(
+            min=self.min,
+            max=self.max,
+            null_count=None,
+            ndv=ndv,
+            total_sum=None,
+            mean=None,
+            provenance=weakest(self.provenance, floor),
+            bloom=self.bloom,
+            quantiles=self.quantiles,
+            mcv=None,
+            avg_bytes=self.avg_bytes,
+            ndv_provenance=weakest(own_ndv, floor),
+            null_count_provenance=weakest(own_nulls, floor),
+            moments_provenance=(
+                None if self.moments_provenance is None else weakest(self.moments_provenance, floor)
+            ),
+        )
+
+
+class LazyColumns(Mapping[str, "ColumnStat"]):
+    """A relation's column statistics, built on the first read rather than at construction.
+
+    `RelStats.columns` is typed `Mapping`, so this substitutes for the plain dict with no
+    change to the 40 places that build a `RelStats` or the 70-odd that read one.
+
+    It exists because join *ordering* reads a candidate's row count and nothing else. The
+    DP prices thousands of candidate orders -- a ten-way star join costs about 5,000 --
+    and `cost.join_op_cost` reaches only `estimate(node).rows`, while building the
+    `RelStats` to answer that also propagated a `ColumnStat` for all ~17 output columns.
+    Roughly four in five of those candidates lose immediately and their column stats are
+    never read by anything. Deferring the propagation makes it proportional to the plans
+    that survive, and the winner still pays in full the moment the level above reads its
+    key statistics.
+
+    The build callable must be pure and safe to run late: it runs once, on first access,
+    and the result is cached.
+    """
+
+    __slots__ = ("_build", "_resolved")
+
+    def __init__(self, build: Any) -> None:
+        self._build = build
+        self._resolved: Mapping[str, ColumnStat] | None = None
+
+    def _columns(self) -> Mapping[str, ColumnStat]:
+        if self._resolved is None:
+            self._resolved = self._build()
+            self._build = None  # release the closure and everything it captured
+        return self._resolved
+
+    def __getitem__(self, key: str) -> ColumnStat:
+        return self._columns()[key]
+
+    def __iter__(self):
+        return iter(self._columns())
+
+    def __len__(self) -> int:
+        return len(self._columns())
+
+    def __eq__(self, other: object) -> bool:
+        # `collections.abc.Mapping` supplies no `__eq__`, so without this a resolved lazy
+        # map would compare unequal to the identical dict -- and `RelStats` is a dataclass
+        # whose generated `__eq__` compares this field.
+        if isinstance(other, LazyColumns):
+            return dict(self._columns()) == dict(other._columns())
+        if isinstance(other, Mapping):
+            return dict(self._columns()) == dict(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]  # a Mapping is unhashable, as dict is
+
+    def __repr__(self) -> str:
+        return repr(dict(self._columns()))
+
+    def __reduce__(self) -> tuple[type[dict], tuple[list[tuple[str, ColumnStat]]]]:
+        # Pickled (across the Ray boundary, say) it becomes the plain dict it resolves to,
+        # so a closure never has to be serializable and nothing downstream meets the wrapper.
+        return (dict, (list(self._columns().items()),))
 
 
 @dataclass(frozen=True, slots=True, order=True)

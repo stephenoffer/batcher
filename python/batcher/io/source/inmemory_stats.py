@@ -89,31 +89,105 @@ def _value_dtype(dtype: pa.DataType) -> pa.DataType:
     return dtype.value_type if pa.types.is_dictionary(dtype) else dtype
 
 
+#: Rows below which slicing a column to bound it in parallel costs more than it saves.
+#: The same four-morsel floor `core.stats._sketch_shards` uses, for the same decision.
+_MIN_BOUNDS_SHARD_ROWS = 4 * 16_384
+
+
+def _bound_slices(col: pa.ChunkedArray | pa.Array) -> list:
+    """`col` cut into one piece per usable core, or `[col]` when it is not worth cutting.
+
+    `pc.min_max` is single-threaded and does not parallelize across chunks — measured at
+    4.09 ns/cell on 100M `float64` rows whether the column arrives as 1 chunk or 96. On the
+    float path it is worse than one pass: `drop_null`, `is_nan`, `any`, `filter` and
+    `min_max` are five passes over the whole column, all serial, which is why bounding two
+    columns of a 100M-row resident source cost 1.29 s while the rest of the query ran on
+    every core.
+
+    min/max is exactly mergeable, so the fix is to cut the column up and combine — no
+    approximation, and slicing is O(1) and shares buffers.
+    """
+    from batcher._internal.hardware import available_cpu_count
+
+    rows = len(col)
+    pieces = min(available_cpu_count(), max(1, rows // _MIN_BOUNDS_SHARD_ROWS))
+    if pieces <= 1:
+        return [col]
+    per = -(-rows // pieces)
+    return [col.slice(off, min(per, rows - off)) for off in range(0, rows, per)]
+
+
+def _merge_bounds(parts: list, null_count: int):
+    """Combine per-slice partials into the column's own `ColumnStat`, or `None` if unsound.
+
+    A slice that yielded nothing (all-null, or all-NaN on the float path) contributes no
+    bound but its rows still counted toward `null_count`, which is taken from the whole
+    column rather than summed — Arrow tracks it as a field, so it is exact and free.
+
+    NaN dominates the maximum, exactly as `_float_bounds` defines it for a single slice: if
+    any slice saw a NaN, the column's max is NaN.
+    """
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    saw_nan = any(nan for _, nan in parts)
+    got = [b for b, _ in parts if b is not None]
+    if not got:
+        return None  # no slice held a finite value — no sound bound, as the serial path says
+    lo = min(b[0] for b in got)
+    hi = float("nan") if saw_nan else max(b[1] for b in got)
+    return ColumnStat(min=lo, max=hi, null_count=null_count, provenance=Provenance.EXACT)
+
+
+def _bounds_one(col, dtype: pa.DataType):
+    """The EXACT bound of a whole column — the original body, for the unsharded path."""
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    if pa.types.is_floating(dtype):
+        return _float_bounds(col)
+    mm = pc.min_max(col, skip_nulls=True)
+    lo, hi = mm["min"].as_py(), mm["max"].as_py()
+    if lo is None:  # all-null column
+        return None
+    return ColumnStat(min=lo, max=hi, null_count=col.null_count, provenance=Provenance.EXACT)
+
+
+def _bounds_partial(col, dtype: pa.DataType) -> tuple[tuple | None, bool]:
+    """`((min, max), saw_nan)` for one slice — the unit [`_merge_bounds`] combines."""
+    if pa.types.is_floating(dtype):
+        return _float_partial(col)
+    mm = pc.min_max(col, skip_nulls=True)
+    lo, hi = mm["min"].as_py(), mm["max"].as_py()
+    return (None if lo is None else (lo, hi)), False
+
+
 def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
     """EXACT `ColumnStat` (min/max/null-count) for one column, or `None` if not derivable.
 
-    A single vectorized ``min_max`` pass over an ordered type ([`_ORDERED_TYPES`]). Returns
-    `None` for a non-ordered type (string/nested), an all-null column (its SQL ``MIN``/``MAX``
-    is NULL — let a run return it), or an unsupported kernel — the same skips [`statistics`]
-    makes per column.
+    A vectorized ``min_max`` over an ordered type ([`_ORDERED_TYPES`]), run over per-core
+    slices and merged — see [`_bound_slices`] for why the serial form was the largest cost
+    of a fresh in-memory query. Returns `None` for a non-ordered type (string/nested), an
+    all-null column (its SQL ``MIN``/``MAX`` is NULL — let a run return it), or an
+    unsupported kernel — the same skips [`statistics`] makes per column.
     Float columns take [`_float_bounds`], whose NaN handling `pc.min_max` does not give us.
     """
     dtype = _value_dtype(dtype)
     if not any(ordered(dtype) for ordered in _ORDERED_TYPES):
         return None
-    from batcher.plan.stats import ColumnStat, Provenance
 
     try:
         col = _decoded(build(name))
-        if pa.types.is_floating(dtype):
-            return _float_bounds(col)
-        mm = pc.min_max(col, skip_nulls=True)
-        lo, hi = mm["min"].as_py(), mm["max"].as_py()
+        slices = _bound_slices(col)
+        if len(slices) == 1:
+            return _bounds_one(col, dtype)
+        # The kernels release the GIL, so threads are real parallelism here and the only
+        # Python per slice is the call itself — O(cores), never O(rows).
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(slices)) as pool:
+            parts = list(pool.map(lambda c: _bounds_partial(c, dtype), slices))
     except _ARROW_ERRORS:
         return None
-    if lo is None:  # all-null column
-        return None
-    return ColumnStat(min=lo, max=hi, null_count=col.null_count, provenance=Provenance.EXACT)
+    return _merge_bounds(parts, col.null_count)
 
 
 def _float_bounds(col: pa.Array):
@@ -137,21 +211,40 @@ def _float_bounds(col: pa.Array):
     """
     from batcher.plan.stats import ColumnStat, Provenance
 
-    non_null = col.drop_null()
-    if len(non_null) == 0:  # all-null column — SQL MIN/MAX is NULL; let a run return it
+    bounds, has_nan = _float_partial(col)
+    if bounds is None:
         return None
-    nan_mask = pc.is_nan(non_null)
-    has_nan = bool(pc.any(nan_mask).as_py())
-    finite = pc.filter(non_null, pc.invert(nan_mask))
-    if len(finite) == 0:  # every value is NaN — no usable bound
-        return None
-    mm = pc.min_max(finite)
+    lo, hi = bounds
     return ColumnStat(
-        min=mm["min"].as_py(),
-        max=float("nan") if has_nan else mm["max"].as_py(),
+        min=lo,
+        max=float("nan") if has_nan else hi,
         null_count=col.null_count,
         provenance=Provenance.EXACT,
     )
+
+
+def _float_partial(col) -> tuple[tuple, bool]:
+    """`((min, max_of_finite), saw_nan)` for a float column or slice; `(None, saw_nan)` when
+    it holds no finite value.
+
+    The NaN flag is returned *beside* the bound rather than folded into it, and that is the
+    whole reason this is separate. A slice whose values are all NaN has no usable bound, so
+    it reports `None` — but it has still seen a NaN, and under SQL's total order that fact
+    decides the **column's** maximum. Folding it in would lose it exactly there: an all-NaN
+    slice merged with a numeric one reported the numeric maximum, so a column that is half
+    NaN answered `max` as 99.0 where a run returns NaN. One definition, used by both the
+    whole-column path and the per-slice one, so the two cannot drift.
+    """
+    non_null = col.drop_null()
+    if len(non_null) == 0:  # all-null — SQL MIN/MAX is NULL; let a run return it
+        return None, False
+    nan_mask = pc.is_nan(non_null)
+    has_nan = bool(pc.any(nan_mask).as_py())
+    finite = pc.filter(non_null, pc.invert(nan_mask)) if has_nan else non_null
+    if len(finite) == 0:  # every value is NaN — no usable bound, but the NaN still counts
+        return None, has_nan
+    mm = pc.min_max(finite)
+    return (mm["min"].as_py(), mm["max"].as_py()), has_nan
 
 
 def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStatistics:

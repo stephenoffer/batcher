@@ -227,6 +227,7 @@ def start_distributed_stream_drain(
     """
     from time import perf_counter, time
 
+    from batcher.api.security._write import required_privileges
     from batcher.api.terminal import _write
 
     t0 = perf_counter()
@@ -239,6 +240,9 @@ def start_distributed_stream_drain(
         distributed=True,
         num_workers=num_workers if num_workers is not None else _drain_workers(sources[0]),
         sink_kwargs=sink_kwargs,
+        # A drain writes whatever mode the sink was configured with. When the sink names
+        # none it is a plain append, which is what a stream does to its destination.
+        privileges=required_privileges(sink_kwargs.get("mode") or "append"),
     )
     rows = manifest.total_rows
     progress = StreamingQueryProgress(

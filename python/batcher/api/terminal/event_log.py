@@ -45,6 +45,7 @@ __all__ = [
     "pipeline_signature",
     "query_label",
     "report_failure",
+    "report_shortcut",
     "report_stream",
     "start_query_report",
     "write_event_log",
@@ -324,6 +325,93 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
     # latency histogram built from these spans silently excluded every timeout.
     emit_failure_span(query_id, total_ms, exc)
     emit_run_failure(query_id, exc)
+
+
+#: What each answered-without-executing route did, as a phrase a reader can act on.
+#:
+#: Carried on the `QUERY_END` event and rendered on the console summary. The route is the
+#: whole point of reporting these at all: a `sum()` that took 0.2 ms because it was read off
+#: a Parquet footer and one that took 0.2 ms because the data was already resident are very
+#: different facts about a system, and neither is distinguishable from "no query ran".
+SHORTCUT_REASONS = {
+    "metadata_aggregate": "answered from source statistics, no scan",
+    "metadata_count": "row count read from metadata, no scan",
+    "metadata_empty": "provably empty, no scan",
+    "pushed_count": "counted by the source, no rows transferred",
+    "cached": "served from the cached result",
+    "prepared": "replayed a prepared plan",
+    "fast_path": "small-query fast path",
+    "gpu": "ran on the device tier",
+    "streaming_limit": "stopped reading once the limit was met",
+    "streaming_peek": "bounded peek off a streaming source",
+}
+
+
+def report_shortcut(plan: object, *, route: str, rows: int, total_ms: float) -> None:
+    """Report a query that a shortcut answered without reaching the executor.
+
+    Six routes through `_collect` return a finished table before the instrumentation the
+    ordinary path runs under: a prepared-plan replay, a bounded peek off a streaming source,
+    a keyless aggregate answered from source statistics, a provably-empty result, the device
+    tier, and the opt-in small-query fast path. Each is a correct answer to a real query and
+    each was **invisible to every sink at once** -- the console printed no line, the
+    dashboard showed no row, the OTel exporter emitted no span, and `batcher_queries_total`
+    did not count it. A job built out of `agg()` over a statistics-bearing source therefore
+    reported that it had run no queries at all, which is the shape of wrongness that reads
+    as healthy.
+
+    It also hid the optimization from the person it benefits. A shortcut that fires is worth
+    saying out loud, and there was no way to find out that one had.
+
+    Deliberately *not* routed through `start_query_report` plus `write_event_log`: there is
+    no profile to assemble, because there are no operators and no measured stages. This
+    announces and closes the query in one pair of events, so a progress bar cannot be left
+    spinning on a query that has already returned.
+
+    The plan is taken rather than a rendered label so that *both* the label and the pipeline
+    signature are computed behind the `listening()` guard. Signing a plan hashes its shape,
+    and these routes are the cheapest paths in the engine -- a `count()` read off a Parquet
+    footer -- so paying for one at a call site that will usually discard it would put a real
+    cost on the fastest thing Batcher does.
+
+    Args:
+        plan: The `LogicalPlan` that was answered.
+        route: Which shortcut answered it; a key of `SHORTCUT_REASONS`.
+        rows: Rows in the returned answer.
+        total_ms: Wall time from the start of the terminal op.
+
+    Returns:
+        None.
+    """
+    from batcher._internal import events
+
+    if not events.listening():
+        return
+    query_id = _query_id(next(_counter))
+    reason = SHORTCUT_REASONS.get(route, route)
+    label = query_label(plan)
+    events.publish(
+        events.QUERY_START,
+        query_id=query_id,
+        name=label,
+        label=label,
+        stage=reason,
+        # The signature is what groups repeated runs into one pipeline in the dashboard.
+        # Without it every shortcut-answered query is its own singleton -- and a `count()`
+        # in a loop, which is exactly the shape these routes serve, is the case where that
+        # grouping matters most.
+        signature=pipeline_signature(plan),
+    )
+    events.publish(
+        events.QUERY_END,
+        query_id=query_id,
+        ok=True,
+        total_ms=total_ms,
+        rows=rows,
+        shortcut=route,
+        note=reason,
+        profile=None,
+    )
 
 
 def report_stream(batches: Iterator[Any], *, label: str, signature: str = "") -> Iterator[Any]:

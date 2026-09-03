@@ -1,4 +1,4 @@
-"""Exactly one module may import `batcher._native` directly, and this is the check.
+"""No module may import `batcher._native` directly, and this is the check.
 
 `CLAUDE.md` opens its silent-failure section with this rule: "**Never `import
 batcher._native`.** Always `from batcher._internal.native import engine`." The reason is
@@ -15,12 +15,19 @@ one: the same blindness that causes the phantom edge means grimp sees the import
 `batcher`, and `_internal` is not a member of the independence contract, so the offending
 import produces no violation there at all. The rule has been guidance with no teeth.
 
-One module is exempt, and it has to be. `_internal/errors/hierarchy.py` lifts five error types
-out of the extension so they can be `raise`d and caught by type. It cannot use the accessor,
-because `_internal/native.py` itself does `from batcher._internal.errors import BackendError`
--- routing the errors module through the accessor would be a genuine cycle inside `_internal`,
-not a phantom one. So the exemption is recorded here by path, with that reason, and the
-assertion is that it stays a set of exactly one.
+**There is now no exemption at all**, and the way the last one went is worth keeping. It was
+`_internal/errors/hierarchy.py`, which lifted five error types *out of* the extension so they
+could be raised and caught by type, and it could not use the accessor because
+`_internal/native.py` itself imports `_internal.errors` -- a genuine cycle, not a phantom one.
+The reason it disappeared is that lifting them out was itself the bug: a type built by Rust's
+`create_exception!` has `RuntimeError` as its base and cannot be re-parented afterwards, so
+all five were `RuntimeError` subclasses and none of them was a `BatcherError` in any built
+install. Inverting the ownership -- Python defines the classes, `bc_py::errors` looks them up
+by name on the error path -- fixed the hierarchy and removed the import in the same move.
+
+So the assertion is now that the set is **empty**. Keep it that way: an exemption is a
+precedent, and the one recorded here outlived its reason without anyone noticing until the
+scan said so.
 """
 
 from __future__ import annotations
@@ -39,13 +46,9 @@ _DIRECT_IMPORT = re.compile(
     r"^\s*(?:from\s+batcher\._native\s+import|import\s+batcher\._native)", re.M
 )
 
-#: The one module allowed to bypass the accessor, and why.
-_ALLOWED: dict[str, str] = {
-    "_internal/errors/hierarchy.py": (
-        "lifts the engine's error types so callers can catch them by type; cannot use "
-        "`_internal.native`, which imports `_internal.errors` and would cycle"
-    ),
-}
+#: Modules allowed to bypass the accessor, and why. Empty, and meant to stay empty -- see
+#: the module docstring for how the last entry came to be retired.
+_ALLOWED: dict[str, str] = {}
 
 
 def _offenders() -> list[str]:
@@ -56,10 +59,11 @@ def _offenders() -> list[str]:
     return sorted(found)
 
 
-def test_only_the_recorded_module_imports_the_extension_directly():
-    unexpected = sorted(set(_offenders()) - set(_ALLOWED))
-    assert not unexpected, (
-        f"{unexpected} import `batcher._native` directly. Use "
+def test_no_module_imports_the_extension_directly():
+    """The contract, now that nothing is exempt from it."""
+    offenders = sorted(set(_offenders()) - set(_ALLOWED))
+    assert not offenders, (
+        f"{offenders} import `batcher._native` directly. Use "
         "`from batcher._internal.native import engine`. A direct import is attributed to the "
         "root `batcher` package, forging a `core -> batcher -> api -> kyber` cycle that "
         "breaks all six independence contracts -- and `lint-layers` cannot see it, which is "
@@ -67,40 +71,33 @@ def test_only_the_recorded_module_imports_the_extension_directly():
     )
 
 
-def test_the_recorded_exemption_is_still_real():
-    """An exemption for a module that no longer needs it is an invitation to copy it."""
-    stale = sorted(set(_ALLOWED) - set(_offenders()))
-    assert not stale, (
-        f"{stale} no longer imports `batcher._native` directly, so its entry in `_ALLOWED` "
-        "is stale. Delete it -- a recorded exception outlives the reason for it and becomes "
-        "precedent"
-    )
+def test_the_allowlist_is_empty():
+    """An exemption is a precedent, and the last one outlived its reason unnoticed.
 
-
-def test_the_accessor_really_would_cycle():
-    """Pin the reason the exemption exists, so it cannot quietly stop being true.
-
-    If `_internal/native.py` ever stops importing `_internal.errors`, the cycle argument
-    evaporates and `hierarchy.py` should go through the accessor like everything else.
+    Asserted separately from the scan so the two failures read differently: one says a
+    module started bypassing the accessor, this one says somebody wrote down permission to.
+    A new entry should be argued in review, not appended.
     """
-    accessor = (_PACKAGE / "_internal" / "native.py").read_text()
-    assert re.search(r"^from batcher\._internal\.errors import", accessor, re.M), (
-        "`_internal/native.py` no longer imports `_internal.errors`, so routing "
-        "`hierarchy.py` through the accessor would no longer cycle -- the exemption in "
-        "`_ALLOWED` has lost its justification and should be retired"
+    assert _ALLOWED == {}, (
+        f"{sorted(_ALLOWED)} are recorded as allowed to import `batcher._native` directly. "
+        "The exemption this file used to carry was itself the symptom of a bug -- see the "
+        "module docstring -- so adding one back needs an argument, not a line"
     )
 
 
 def test_the_scan_reads_the_package():
     """Guard against a vacuous suite.
 
-    Both assertions above are set differences, and an empty scan satisfies the first one
-    trivially. Pin that the walk sees the package and that the pattern matches the real
-    spelling -- which is indented, inside a `try:`, and would be missed by an anchored
-    `^from` without `\\s*`.
+    The assertions above are set differences, and an empty scan satisfies both trivially.
+    Pin that the walk sees the package, and that the pattern matches the spelling it has to
+    catch -- indented, inside a `try:`, which an anchored `^from` without `\\s*` would miss.
     """
     files = list(_PACKAGE.rglob("*.py"))
     assert len(files) > 500, f"only {len(files)} modules found; the package walk is broken"
-    assert _offenders() == list(_ALLOWED), (
-        f"expected exactly the recorded exemption, found {_offenders()}"
+    assert _DIRECT_IMPORT.search("    from batcher._native import Foo\n"), (
+        "the pattern no longer matches an indented import, so the scan cannot see the "
+        "spelling it exists to catch"
+    )
+    assert not _DIRECT_IMPORT.search("from batcher._internal.native import engine\n"), (
+        "the pattern matches the accessor, so every module would read as an offender"
     )

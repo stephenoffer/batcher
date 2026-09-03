@@ -15,8 +15,8 @@ import batcher as bt
 
 
 @pytest.mark.integration
-def test_distributed_split_read_matches_single_node(tmp_path):
-    path = str(tmp_path / "big.parquet")
+def test_distributed_split_read_matches_single_node(cluster_tmp_path):
+    path = str(cluster_tmp_path / "big.parquet")
     pq.write_table(
         pa.table({"k": [i % 5 for i in range(1000)], "v": list(range(1000))}),
         path,
@@ -29,10 +29,10 @@ def test_distributed_split_read_matches_single_node(tmp_path):
 
 
 @pytest.mark.integration
-def test_distributed_write_roundtrip(tmp_path):
-    src = str(tmp_path / "src.parquet")
+def test_distributed_write_roundtrip(cluster_tmp_path):
+    src = str(cluster_tmp_path / "src.parquet")
     pq.write_table(pa.table({"v": list(range(1000))}), src, row_group_size=100)
-    out = str(tmp_path / "out")
+    out = str(cluster_tmp_path / "out")
 
     manifest = bt.read.parquet(src).write.parquet(out, distributed=True, num_workers=4)
     assert manifest.num_files >= 1

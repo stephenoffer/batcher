@@ -51,6 +51,7 @@ from batcher.dist.spill.scratch import (
 from batcher.io.source import Source
 from batcher.plan.expr_ir import col
 from batcher.plan.ir_specs import agg_spec_json
+from batcher.plan.types import logical_bytes
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -336,6 +337,42 @@ def _dropping(table: pa.Table, keep: tuple[str, ...] | None) -> pa.Table:
     return table if keep is None else table.select(list(keep))
 
 
+#: Partial-aggregate state the out-of-core aggregate may hold before it starts bucketing.
+#:
+#: `memory.spill_bucket_max_bytes` is already the size a *bucket* may reach before the reduce
+#: re-partitions it, so it is the figure this path has been tuned against; holding one
+#: bucket's worth in memory instead of writing it is the same bound, spent on the other side
+#: of the disk. It is a ceiling on the whole held state, not on any one partial.
+#:
+#: The configured value is used as-is, with **no floor under it**. A floor would silently
+#: hold more than a caller who tightened the bound asked for, and the caller that tightens it
+#: is the one that means it: `_tight()` in `tests/integration/test_carbonite_skew_out_of_core.py`
+#: sets 4096 bytes precisely to force the bucketing path, and a 1 MiB floor held that whole
+#: fixture in memory instead — the nine skew tests stopped reaching the code they exist to
+#: cover while still reporting the right answer, which is the one failure shape a correct
+#: answer cannot reveal. `config.validation` already rejects a non-positive value, so there is
+#: nothing left for a floor to defend against.
+def _held_partial_budget() -> int:
+    """Bytes of partial state the partition phase may keep in memory before it spills."""
+    return int(active_config().memory.spill_bucket_max_bytes)
+
+
+def _spill_partial(writers, nat, partial, key_idx, n_buckets: int) -> None:
+    """Write one partial to its bucket(s) — the one place the shuffle-or-not test lives."""
+    if n_buckets == 1:
+        writers.write(0, partial)  # global aggregate, or a single bucket: no shuffle
+    else:
+        writers.add(nat.partition_batches([partial], key_idx, n_buckets))
+
+
+def _finalize_held(nat, gk: str, aj: str, held, agg, declared):
+    """Finalize partials that never left memory, restoring the declared output types."""
+    if not held:
+        return None  # caller falls through to its empty-input handling
+    table = pa.Table.from_batches([nat.combine_finalize(gk, aj, held)])
+    return restore_declared_types(table, declared or _empty_agg_table(agg).schema)
+
+
 def execute_spilling_aggregate(
     agg: Aggregate,
     sources: list[Source],
@@ -371,17 +408,56 @@ def execute_spilling_aggregate(
     with spill_scratch("batcher_spill_", spill_dir) as store:
         # --- partition phase: stream source, partial-aggregate, spill by key ---
         writers = BucketWriters(store, "bucket")
+        # A *reducing* aggregate's whole partial state fits in memory however large its
+        # input is, and then none of the machinery below is needed: no hash-partition per
+        # chunk, no bucket files, no reduce pass. Hold the partials until they prove
+        # otherwise, and only start bucketing once they actually exceed the budget.
+        #
+        # This is a measurement, not an estimate, and that is the point. The estimate is
+        # routinely wrong in exactly the direction that hurts: `GROUP BY l_returnflag,
+        # l_linestatus` over TPC-H `lineitem` has **four** groups, but with no column
+        # statistics Kyber reads the group count as at least a morsel's worth, so
+        # `kyber.annotate._aggregate_resident_bytes` sizes the operator's envelope at the
+        # whole input — 17.6 GB at sf100 — which both routes the query here and asks for 132
+        # buckets. Measured on that query, sf100 on local NVMe: **40.4 s -> 28.8 s (1.40x)**,
+        # with the per-chunk `partition_batches` going from 9.8 s to zero and the reduce pass
+        # from 5.6 s to 1.8 s. A high-cardinality aggregate exceeds the cap within a few
+        # chunks and pays one extra byte count per chunk before it does.
+        held: list[pa.RecordBatch] = []
+        held_bytes = 0
+        bucketing = False
         for batch in _iter_spill_morsels(source, map_projection(agg, source_id)):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
                 continue
             partial = nat.partial_aggregate(group_keys_json, aggregates_json, mapped)
-            # One bucket (global aggregate, or num_partitions=1) needs no shuffle.
-            if n_buckets == 1:
-                writers.write(0, partial)
-            else:
-                writers.add(nat.partition_batches([partial], key_idx, n_buckets))
-        handles = writers.close()
+            if not bucketing:
+                held.append(partial)
+                held_bytes += logical_bytes(partial)
+                if held_bytes <= _held_partial_budget():
+                    continue
+                # The state outgrew memory: flush what is held through the same
+                # partitioning every later chunk takes, and carry on as before. Ordering is
+                # irrelevant — `combine` is associative and commutative, so a group's rows
+                # meet in their bucket whichever side of the switch they arrived on.
+                bucketing = True
+                for spilled_partial in held:
+                    _spill_partial(writers, nat, spilled_partial, key_idx, n_buckets)
+                held = []
+                held_bytes = 0
+                continue
+            _spill_partial(writers, nat, partial, key_idx, n_buckets)
+        if bucketing:
+            handles = writers.close()
+        else:
+            # Nothing was ever written, so there is nothing to read back. An *empty* input
+            # held nothing either, and that case still owes a global aggregate its one
+            # identity row — so it falls through to the same empty-input handling below
+            # rather than being answered here.
+            finalized = _finalize_held(nat, group_keys_json, aggregates_json, held, agg, declared)
+            if finalized is not None:
+                return finalized
+            handles = {}
 
         # --- reduce phase: combine+finalize one bucket at a time, recursing into
         # any bucket too large to fit (skew) ------------------------------------

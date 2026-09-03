@@ -1185,10 +1185,19 @@ _DT_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "month_end": (
         "last_day",
-        "Last day of the month — the Polars ``month_end`` spelling of ``last_day``.",
+        "Last day of the month, as a DATE — the ``month_end`` spelling of ``last_day``.",
         '{"d": [dt.datetime(2024, 2, 15)]}',
         'bt.col("d").dt.month_end()',
         "{'r': [datetime.date(2024, 2, 29)]}",
+        "Two things this does *not* share with the name it borrows. Polars'\n"
+        "``dt.month_end`` returns the input's own type and keeps its time of day; this is\n"
+        "``last_day``, so it returns a ``date32`` and the time is gone. And it is the one\n"
+        "member of the period-boundary family that is not a timestamp at midnight --\n"
+        "``month_start``, ``quarter_start``, ``quarter_end``, ``year_start`` and\n"
+        "``year_end`` all are. For a September timestamp ``month_end`` and ``quarter_end``\n"
+        "name the same instant in two different column types. Use ``quarter_end``'s\n"
+        "spelling, ``truncate('month').dt.offset_by('1mo').dt.offset_by('-1d')``, if you\n"
+        "want the timestamp.",
     ),
     "day_name": (
         "dayname",

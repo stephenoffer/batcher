@@ -49,9 +49,18 @@ def _kinds() -> set[str]:
 
 
 def _rows(kind: str) -> list[dict]:
+    """The rows recorded for `kind` **so far** — a copy, so it stays a snapshot.
+
+    `op_stats_by_kind` hands back the hub's own per-kind list (it is a planning read on the
+    hot path and deliberately does not copy), so the obvious spelling returns a live view
+    that keeps growing. The shuffle-join test below reads this, *then* runs the same join
+    single-node to compare results, and asserted afterwards — so the single-node run's rows
+    landed in the list it had already "snapshotted" and its 32 build rows read as 64. The
+    comment there has always said it snapshots first; this is what makes that true.
+    """
     from batcher.core import default_hub
 
-    return default_hub().op_stats_by_kind().get(kind, [])
+    return list(default_hub().op_stats_by_kind().get(kind, []))
 
 
 def _source(n: int = 4096) -> pa.Table:

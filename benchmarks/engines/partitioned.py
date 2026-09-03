@@ -46,10 +46,49 @@ MIN_ROW_GROUP_ROWS = 8192
 SPLITS_PER_CORE = 2
 
 
+#: Environment override for the corpus directory, and the mounts tried when it is unset.
+#: Same names and same order as `tests/conftest._shared_base`, deliberately: a benchmark and
+#: a test that both need "somewhere every node can read" should not disagree about where it
+#: is on a given cluster.
+SHARED_DIR_ENV = "BATCHER_BENCH_SHARED_DIR"
+_SHARED_DIR_CANDIDATES = ("/mnt/cluster_storage", "/mnt/shared_storage")
+
+
+def _shared_base() -> str | None:
+    """A directory every worker node can read, or `None` if there is no reason to think so."""
+    for candidate in (os.environ.get(SHARED_DIR_ENV), *_SHARED_DIR_CANDIDATES):
+        if candidate and os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return candidate
+    return None
+
+
 @cache
 def scratch_dir(tag: str) -> str:
-    """A per-engine temp directory, removed at exit. Cached so one engine reuses one dir."""
-    path = tempfile.mkdtemp(prefix=f"batcher-bench-{tag}-")
+    """A per-engine corpus directory, removed at exit. Cached so one engine reuses one dir.
+
+    **Cluster-visible when the cluster has a shared mount.** Daft and Ray Data are the
+    multi-node comparators, and both read this corpus back through their own native reader
+    *from their own workers* — so a driver-local `tempfile.mkdtemp` is a path that exists on
+    exactly one node of the fleet. Every multi-node query then died in a worker task with
+    `daft-<hash>.parquet: No such file or directory (os error 2)` /
+    `RayTaskError(FileNotFoundError)`, and the suite reported `ERR` for all 22 TPC-H queries
+    against both engines while Batcher's own column filled in normally.
+
+    That is the failure shape that makes a comparison quietly stop being one: the table still
+    prints, the row that is missing is the competitor's, and `0 of 0 cases` is easy to read as
+    "nothing to report" rather than "the comparison did not run". `--tier multi` is the only
+    lineup this affects, and it is the lineup whose entire purpose is the cluster.
+
+    Falls back to a local temp dir when no shared mount is found, which is correct on a
+    single-node box and is what every run before this did everywhere.
+    """
+    base = _shared_base()
+    if base is None:
+        path = tempfile.mkdtemp(prefix=f"batcher-bench-{tag}-")
+    else:
+        root = os.path.join(base, "batcher-bench")
+        os.makedirs(root, exist_ok=True)
+        path = tempfile.mkdtemp(prefix=f"{tag}-", dir=root)
     atexit.register(shutil.rmtree, path, True)
     return path
 

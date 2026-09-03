@@ -157,7 +157,8 @@ def test_a_relational_gang_packs_onto_the_cpu_nodes_of_a_mixed_fleet():
     from batcher.kyber.cost.placement import _packed_view, _packing_order
 
     fleet = _mixed_fleet()
-    order = [n.node_id for n in _packing_order(fleet)]
+    # `(shape, node count)` pairs now: the fleet describes itself as a census.
+    order = [n.node_id for n, _ in _packing_order(fleet)]
     assert order[:4] == ["c0", "c1", "c2", "c3"], "CPU-only nodes first"
     assert order[4:] == ["g0", "g1"], "the accelerator nodes are the last resort"
 
@@ -178,4 +179,4 @@ def test_a_gpu_only_fleet_is_still_ordered_by_density():
             NodeShape(node_id="g1", cpu_cores=96, memory_bytes=1 << 40, gpus=8),
         )
     )
-    assert [n.node_id for n in _packing_order(fleet)] == ["g1", "g0"]
+    assert [n.node_id for n, _ in _packing_order(fleet)] == ["g1", "g0"]

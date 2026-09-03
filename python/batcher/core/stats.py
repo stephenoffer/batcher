@@ -28,6 +28,71 @@ __all__ = [
 ]
 
 
+#: Rows below which splitting a batch for the sketch costs more than the parallelism buys.
+#: The same figure `bc_interp::stream::parallel::MIN_ROWS_TO_SHARD` uses for the identical
+#: decision on the execution side — four morsels — expressed in the control plane's own units
+#: so it tracks a retuned morsel rather than drifting from it.
+_MIN_SKETCH_SHARD_MORSELS = 4
+
+
+def _sketch_shards(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+    """`batches` re-sliced so the native sketch has a piece per usable core.
+
+    Every sketch below parallelizes **across batches**, which makes the batch count — not
+    the row count — decide how much of the machine measures a column. That is invisible
+    until a caller hands over one big batch, and the most natural way to give Batcher data
+    does exactly that: `pa.table(...)` built from NumPy arrays, anything through
+    `combine_chunks()`, and every `Table` PyArrow hands back after a `to_table()` are all a
+    single chunk per column.
+
+    Measured on 100M `int64` rows, one column, sketching distinct counts:
+
+    | batches | seconds | ns/cell |
+    |--------:|--------:|--------:|
+    |       1 |   0.553 |    5.53 |
+    |       2 |   0.288 |    2.88 |
+    |       8 |   0.107 |    1.07 |
+    |      32 |   0.032 |    0.32 |
+    |      96 |   0.031 |    0.31 |
+
+    So a single-batch column is sketched **17x** slower than the same rows in 32 pieces, and
+    the multi-batch figure is the ~0.4 ns/cell the rest of the engine's sizing assumes —
+    `optimizer.ndv_sketch_max_cells` is a *cell* budget, and it was set against the batched
+    rate. On one batch the same ceiling admits fourteen times the wall-clock it was sized
+    for, which is how a 200M-row in-memory query came to spend most of its time in the
+    planner rather than in the engine.
+
+    `RecordBatch.slice` is O(1) and shares buffers, so this costs a few objects and no data
+    movement. Batches already numerous enough are returned untouched, and a relation too
+    small to be worth splitting keeps its shape — the parallelism is not free below a few
+    morsels, which is the same trade the execution side makes in `MIN_ROWS_TO_SHARD`.
+
+    Args:
+        batches: The batches about to be sketched.
+
+    Returns:
+        The same rows, in enough pieces to occupy the machine.
+    """
+    from batcher._internal.hardware import available_cpu_count
+
+    target = available_cpu_count()
+    if len(batches) >= target:
+        return batches
+    floor = max(1, active_config().execution.morsel_rows * _MIN_SKETCH_SHARD_MORSELS)
+    out: list[pa.RecordBatch] = []
+    for b in batches:
+        rows = b.num_rows
+        # How many ways this batch alone should go, bounded by the whole target so a single
+        # huge batch does not produce more pieces than there are cores to sketch them on.
+        pieces = min(target, max(1, rows // floor))
+        if pieces <= 1:
+            out.append(b)
+            continue
+        per = -(-rows // pieces)  # ceil, so the last piece is the short one
+        out.extend(b.slice(off, min(per, rows - off)) for off in range(0, rows, per))
+    return out
+
+
 def column_ndv(batches: list[pa.RecordBatch], columns: list[str]) -> dict[str, float]:
     """Measure each column's distinct-count estimate (HLL), in parallel across batches.
 
@@ -52,7 +117,7 @@ def column_ndv(batches: list[pa.RecordBatch], columns: list[str]) -> dict[str, f
         return {}
     try:
         _native = engine()
-        return _native.column_ndv(list(columns), batches)
+        return _native.column_ndv(list(columns), _sketch_shards(batches))
     except Exception as exc:  # pragma: no cover - measurement must never break a query
         note_suppressed("core", "measure column ndv", exc)
         return {}
@@ -88,7 +153,9 @@ def column_statistics(
         _native = engine()
         # One sketch pass for both summary stats and quantiles (the native side builds
         # each column's HLL+KLL once), instead of two FFI calls that each rebuilt it.
-        stats, quants = _native.column_stats_full(list(columns), batches, list(probs))
+        stats, quants = _native.column_stats_full(
+            list(columns), _sketch_shards(batches), list(probs)
+        )
     except Exception as exc:  # pragma: no cover - measurement must never break execution
         note_suppressed("core", "measure column statistics", exc)
         return {}, {}, {}
@@ -135,7 +202,7 @@ def tail_quantiles(
         return {}
     try:
         _native = engine()
-        out = _native.tail_quantiles(list(columns), batches, list(probs))
+        out = _native.tail_quantiles(list(columns), _sketch_shards(batches), list(probs))
     except Exception as exc:  # pragma: no cover - measurement must never break execution
         note_suppressed("core", "measure tail quantiles", exc)
         return {}
@@ -150,7 +217,7 @@ def tdigest_partial(batches: list[pa.RecordBatch], column: str) -> bytes | None:
         return None
     try:
         _native = engine()
-        return _native.tdigest_partial(column, batches)
+        return _native.tdigest_partial(column, _sketch_shards(batches))
     except Exception as exc:  # pragma: no cover - measurement must never break execution
         note_suppressed("core", "build a t-digest partial", exc)
         return None
@@ -182,7 +249,7 @@ def heavy_hitters(
         return {}
     try:
         _native = engine()
-        out = _native.heavy_hitters(list(columns), batches, float(fraction))
+        out = _native.heavy_hitters(list(columns), _sketch_shards(batches), float(fraction))
     except Exception as exc:  # pragma: no cover - measurement must never break execution
         note_suppressed("core", "measure heavy hitters", exc)
         return {}

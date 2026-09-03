@@ -368,11 +368,16 @@ class DfBackend:
     def is_integer(self, value: Any) -> bool:
         """Whether `value` is an integer column.
 
-        Asked by exactly one caller, and for a narrow reason: `abs` is the only unary math
-        function whose result keeps its input's integer type — every other one widens to
-        double on both the engine and here. Routing an integer `abs` through the float ufunc
-        path returns `1.0` where the engine returns `1`, which is not a wrong number but is a
-        wrong *column*, and a shard that contributes one cannot be concatenated with its peers.
+        Asked for a narrow reason: `abs` and `sign` are the unary math functions whose result
+        keeps its input's integer type — every other one widens to double on both the engine
+        and here. Routing an integer `abs` through the float ufunc path returns `1.0` where the
+        engine returns `1`, which is not a wrong number but is a wrong *column*, and a shard
+        that contributes one cannot be concatenated with its peers.
+
+        This docstring said `abs` was the *only* one for as long as `sign` was translated with
+        an unconditional double cast, so the sentence and the defect agreed with each other and
+        neither pointed at the engine. `sign` is the counter-example, and the general rule is
+        the one to hold: derive the result type from the input, never assert it.
         """
         if not self.is_series(value):
             return isinstance(value, int) and not isinstance(value, bool)

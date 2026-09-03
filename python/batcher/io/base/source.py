@@ -237,8 +237,13 @@ class FileSource(ABC):
         )
         self._schema_cache: pa.Schema | None = None
         # "strict" (default) keeps the historical behavior — file 0's schema is
-        # assumed for all. "union"/"latest" reconcile differing per-file schemas
-        # (`io.schema_evolution`); each file's batches are normalized to the result.
+        # assumed for all. "union"/"latest" reconcile differing per-file schemas; each
+        # file's batches are normalized to the result. It is a per-read option
+        # (`read.parquet(path, schema_mode="union")`) and deliberately not a config
+        # setting: which files a *particular* source spans is a property of that read,
+        # not of the process. This comment used to cite `io.schema_evolution`, which has
+        # never existed — `Config` has no `io` section at all — so anyone following it
+        # went looking for a knob they could not find.
         self._schema_mode = schema_mode
         # `columns` (pandas `usecols`, Polars `columns`) and `n_rows` (pandas `nrows`,
         # Polars `n_rows`) are format-agnostic — they restrict *which* columns and *how
@@ -1190,6 +1195,48 @@ class FileSource(ABC):
             return base
         digest = hashlib.sha256(" || ".join(parts).encode()).hexdigest()[:16]
         return f"{base}#{digest}"
+
+    def governed_name(self) -> str:
+        """The **table** this source reads, which is what a governance policy is about.
+
+        Distinct from `identity`, and the distinction is load-bearing rather than tidy.
+        `identity` names a *relation*: a source pinned to some of a directory's files, or
+        capped at `n_rows`, or narrowed to `columns`, is a different relation from the
+        directory and gets its own key, because it must not inherit the whole table's
+        cached statistics. A **policy** is written about the table, before anyone has read
+        it and without knowing how they will slice it.
+
+        Keying governance on `identity` conflated the two, and the result was a total
+        bypass reachable by typing an ordinary keyword argument. Under a catalog masking
+        `email` and withholding `ssn`, `read.parquet(path)` returned the mask and no `ssn`,
+        while **`read.parquet(path, n_rows=2)` returned the raw address and the whole
+        `ssn` column** -- the subset digest made the name one no policy mentioned, so
+        `catalog.governs()` was False and the scan was left ungoverned. `columns=[...]` did
+        the same, and so did the file list a pruned MERGE reads its target through.
+
+        Returning the path rather than stripping the digest off the identity string is
+        deliberate: a path may legitimately contain ``#``, and a rule that guessed where the
+        suffix began would fail *open* on exactly such a path.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io.formats.base import SOURCES
+                >>> SOURCES.get("parquet")("/data/orders").governed_name()
+                '/data/orders'
+
+                A narrowed read is a different *relation* and the same *table*:
+
+                >>> narrowed = SOURCES.get("parquet")("/data/orders", n_rows=5)
+                >>> narrowed.governed_name()
+                '/data/orders'
+                >>> narrowed.identity() == SOURCES.get("parquet")("/data/orders").identity()
+                False
+
+        Returns:
+            The path this source reads, without any subset qualifier.
+        """
+        return self._path
 
     @staticmethod
     def _subset_identity(base: str, label: str, values: Iterable[str] | None) -> str:

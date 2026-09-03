@@ -11,9 +11,12 @@ The properties pinned here are the ones a wrong answer would hide behind:
 * every source runs exactly once and every result lands at its own index — an
   index-addressed assembly means a mis-dealt source is a silently wrong shuffle, not an
   error;
-* at most `workers` tasks are in flight, because the actor pool *is* the window — a wider
-  one queues sources behind a busy actor and hands the assignment back to arrival order,
-  which is the static dealing this exists to avoid;
+* the in-flight count is exactly the actor pool and no wider — a wider window queues
+  sources behind a busy actor and hands the assignment back to arrival order, which is the
+  static dealing this exists to avoid. The pool is `workers x map_slots_per_worker()`: a
+  map task reads its partition from object storage and then folds it, so one slot per actor
+  left a node doing neither while doing the other, and the barrier now deals each actor
+  several. What is pinned is the *equality* — the window tracks the pool — not the number;
 * a slow actor takes fewer sources (the whole point) and a dead one's sources are re-dealt
   across survivors rather than replayed onto one;
 * `SourcePlacement` knows where each source actually landed. Recovery is driven by *worker*
@@ -101,10 +104,14 @@ def test_over_partitioned_barrier_runs_every_source_exactly_once(monkeypatch):
     assert all(addrs[s].endswith(f"/{s}") for s in range(12))
 
 
-def test_over_partitioned_barrier_keeps_one_task_per_worker_in_flight(monkeypatch):
-    # The actor pool is the window. If more than `workers` were submitted at once, two
-    # sources would queue on one actor and the dealing would be static again.
+def test_over_partitioned_barrier_keeps_the_window_equal_to_the_actor_pool(monkeypatch):
+    # The actor pool is the window. If MORE than the pool were submitted at once, sources
+    # would queue behind a busy actor and the dealing would be static again; if fewer, the
+    # slots would be unusable. The pool used to be `workers` and is now
+    # `workers x map_slots_per_worker()` -- this asserts the relationship, not the constant,
+    # so it keeps discriminating if the slot count is ever retuned.
     from batcher.dist.executors.ray_runtime import map_barrier
+    from batcher.dist.executors.ray_runtime.scheduling import map_slots_per_worker
 
     install_fake_ray(monkeypatch)
     inflight, peak = [], []
@@ -119,32 +126,48 @@ def test_over_partitioned_barrier_keeps_one_task_per_worker_in_flight(monkeypatc
 
         return _run
 
-    map_barrier(16, launch, RecoveryPolicy(max_attempts=3), workers=4)
+    workers, sources = 4, 64
+    pool = workers * map_slots_per_worker()
+    map_barrier(sources, launch, RecoveryPolicy(max_attempts=3), workers=workers)
 
-    assert max(peak) <= 4
+    assert max(peak) <= pool, "the window outgrew the pool: sources queue behind a busy actor"
+    assert max(peak) == pool, "the window never filled the pool: slots left unusable"
 
 
-def test_over_partitioned_barrier_never_double_books_an_actor(monkeypatch):
+def test_over_partitioned_barrier_books_an_actor_exactly_its_slot_count(monkeypatch):
+    """An actor takes several sources at once, and never more than it was spawned to hold.
+
+    This test used to assert an actor is *never* double-booked, which was the contract when
+    the barrier dealt one source per actor. It deals `map_slots_per_worker()` now, on a
+    measurement -- the map phase of a 64-worker TPC-H sf100 scan held the cluster at 7-14% of
+    its cores while every actor waited on a single S3 read, and overlapping them took the map
+    barrier from 1,247 ms to 157 ms. So the bound moved; it did not go away, and the ceiling
+    is what the actors' own `max_concurrency` was set to. Anything above it is not overlap,
+    it is queueing inside Ray.
+    """
     from batcher.dist.executors.ray_runtime import map_barrier
+    from batcher.dist.executors.ray_runtime.scheduling import map_slots_per_worker
 
     install_fake_ray(monkeypatch)
-    busy: set[int] = set()
-    conflicts: list[int] = []
+    slots = map_slots_per_worker()
+    live: collections.Counter[int] = collections.Counter()
+    peak_per_host: collections.Counter[int] = collections.Counter()
 
     def launch(host: int, src: int):
-        if host in busy:
-            conflicts.append(host)
-        busy.add(host)
+        live[host] += 1
+        peak_per_host[host] = max(peak_per_host[host], live[host])
 
         def _run():
-            busy.discard(host)
+            live[host] -= 1
             return f"addr{host}"
 
         return _run
 
-    map_barrier(20, launch, RecoveryPolicy(max_attempts=3), workers=5)
+    map_barrier(80, launch, RecoveryPolicy(max_attempts=3), workers=5)
 
-    assert conflicts == []
+    assert max(peak_per_host.values()) <= slots, "an actor was booked past its concurrency"
+    if slots > 1:
+        assert max(peak_per_host.values()) > 1, "no actor ever overlapped two sources"
 
 
 def test_a_dead_worker_s_sources_spread_across_survivors(monkeypatch):

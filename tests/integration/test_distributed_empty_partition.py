@@ -15,8 +15,14 @@ import pytest
 import batcher as bt
 
 
-def _write(tmp_path) -> str:
-    path = str(tmp_path / "t.parquet")
+def _write(cluster_scratch) -> str:
+    """Write the corpus where every worker can read it, not on the driver's own disk.
+
+    See `_write_dataset` in `test_distributed_dataset.py`: a `tmp_path` corpus is invisible
+    to any worker not on the driver's node, which fails as `FileNotFoundError` on whichever
+    splits happened to be scheduled elsewhere.
+    """
+    path = str(cluster_scratch("distributed_empty_partition") / "t.parquet")
     # 10 row groups; a filter of x>800 empties row-groups 0..7 entirely.
     pq.write_table(
         pa.table({"x": list(range(1000)), "k": [i % 5 for i in range(1000)]}),
@@ -27,8 +33,8 @@ def _write(tmp_path) -> str:
 
 
 @pytest.mark.integration
-def test_distributed_global_aggregate_with_emptying_filter(tmp_path):
-    path = _write(tmp_path)
+def test_distributed_global_aggregate_with_emptying_filter(cluster_scratch):
+    path = _write(cluster_scratch)
     single = bt.read.parquet(path).filter(bt.col("x") > 800).group_by().agg(n=bt.count()).collect()
     dist = (
         bt.read.parquet(path)
@@ -41,8 +47,8 @@ def test_distributed_global_aggregate_with_emptying_filter(tmp_path):
 
 
 @pytest.mark.integration
-def test_distributed_grouped_aggregate_with_emptying_filter(tmp_path):
-    path = _write(tmp_path)
+def test_distributed_grouped_aggregate_with_emptying_filter(cluster_scratch):
+    path = _write(cluster_scratch)
 
     def q(**kw):
         ds = bt.read.parquet(path).filter(bt.col("x") > 800).group_by("k").agg(s=bt.col("x").sum())

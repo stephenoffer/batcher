@@ -223,7 +223,29 @@ def test_a_device_read_reports_the_transfer_path_it_took(monkeypatch):
 
 
 def test_nothing_is_probed_when_nobody_is_listening(monkeypatch):
+    """The probe is skipped entirely when no sink is attached, so an unobserved read pays
+    neither the mount-table walk nor the cuFile library probe.
+
+    The precondition is asserted rather than assumed, and that is the whole point of the
+    first two lines. `events.listening()` is process-global: any test anywhere in the run
+    that attaches a sink and does not detach it makes this function's guard true forever
+    after, and the assertion below then *cannot fail* -- it reports success on a property it
+    is no longer able to observe. That is exactly what happened. A metrics fixture called
+    `start_metrics()` and only `reset_metrics()` on the way out, so under a reversed file
+    order this test ran with a collector still attached, probed, and failed; in normal order
+    it ran first, passed, and hid the leak from both ends.
+
+    Failing loudly on a dirty bus is the right trade. A test that cleared the subscribers
+    itself would be robust and would have concealed the leak just as effectively.
+    """
+    from batcher._internal import events
     from batcher.dist.gpu import device_read
+
+    assert not events.listening(), (
+        "a previous test left "
+        f"{[type(s).__name__ for s in events._subscribers]} attached to the event bus; "
+        "this test cannot observe its own property while anything is listening"
+    )
 
     monkeypatch.setattr(gds, "cufile_available", lambda: pytest.fail("probed with no subscriber"))
     device_read._publish_transfer_path([gds_spec("/nvme/a.parquet")])

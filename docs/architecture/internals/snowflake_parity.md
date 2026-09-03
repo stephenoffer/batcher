@@ -76,7 +76,7 @@ Every one of these is a product property Batcher structurally lacks:
 | Encryption at rest with customer-managed keys | ⚠️ Batcher makes artifacts owner-only and stops there (`_internal/paths.py`). |
 | Time travel, cloning, replication | Storage features. Out of scope by charter. |
 | Workload management, resource monitors, chargeback | ⚠️ Batcher has per-process admission (`carbonite/policies/concurrency.py`) and no cross-node coordinator. |
-| Auditability | ⚠️ Snowflake has a durable query history; Batcher's `GovernanceConfig.audit_path` is declared and the sink is not yet written. |
+| Auditability | ⚠️ Snowflake has a durable query history; Batcher now writes an append-only JSONL sink to `GovernanceConfig.audit_path` (`governance/audit_log.py`), which is a per-decision audit trail rather than a queryable history. |
 | Governed writes | Batcher's grants cover SELECT. **Writes are ungoverned.** |
 
 ## The one honest headline

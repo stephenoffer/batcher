@@ -1131,6 +1131,10 @@ Release build, 2,000,000 rows, six columns, local Parquet, min of five runs, Duc
 | `ORDER BY x LIMIT 100`, all columns | 70.1 ms | 42.2 ms | **1.66x** |
 | `ORDER BY x LIMIT 100`, one column | 16.5 ms | 13.1 ms | 1.26x |
 
+Every top-N figure in this section is a **cold** one -- the first execution of that shape in
+the process -- which is the only case the learned bound below cannot help. On the 40-column
+table the same query is 5.22x cold and **1.87x warm**.
+
 The plan is not the problem. `explain()` shows the limit fused into the sort and pushed into
 the scan -- `sort [top 100 by x]` over `scan ... pushed[top 100 by x]` -- so the optimizer is
 doing what it should.
@@ -1149,19 +1153,37 @@ So the gap is not a fixed overhead and it does not close as the query gets bigge
 columns and above, Batcher pays a full materialization for a hundred rows and DuckDB pays
 about 40% of one.
 
-**Batcher's side of it is not an inference.** The engine's own counters, over the 40-column
-table, say what it reads. A full scan and a `LIMIT 100` report the *same* figures:
+**Batcher's side of it is not an inference, and it is a statement about the *first* run of a
+shape rather than about the engine.** That distinction was missing from this section until
+2026-09-02 and it inverted the conclusion, so it is worth stating carefully.
+
+The engine's own counters, over the 40-column table. A full scan and a first `LIMIT 100`
+report the same figures; the *second* `LIMIT 100` of the same shape does not:
 
 | | rows scanned | bytes scanned | rows returned |
 |---|---|---|---|
 | full scan | 1,000,000 | 320,000,000 | 1,000,000 |
-| `ORDER BY x LIMIT 100` | 1,000,000 | 320,000,000 | 100 |
+| `ORDER BY x LIMIT 100`, first run | 1,000,000 | 320,000,000 | 100 |
+| `ORDER BY x LIMIT 100`, second run | **100** | **32,000** | 100 |
 
-Byte for byte identical, to return a hundred rows out of a million. The top-N materializes
-every column of every row and then discards 99.99% of it, which is why its cost tracks the
-full scan and why widening the projection widens the gap. The shape of a fix follows from
-that and needs no further measurement: read the sort key, resolve the surviving row ids, and
-fetch the other columns only for those hundred rows.
+**Ten thousand times fewer bytes materialized, from one previous execution.** The mechanism is
+`kyber/learned_tuning/topn_bound.py`, which records the k-th best value a top-N returned and
+seeds the next run of the same shape with it as a predicate the scan can push down. A stale
+bound cannot return a wrong answer -- every row it removes is strictly worse than every row it
+keeps -- so the only failure is too few survivors, which the caller detects by counting and
+answers by re-running unseeded.
+
+An earlier revision of this section proposed late materialization as "the shape of a fix" that
+"needs no further measurement". That was wrong twice over: the engine already solves this, by
+a different and arguably better mechanism, and the proposal was made without checking whether
+it was already solved. The learned bound is the cross-run half of the moat doing exactly what
+the moat is for, on the shape this section had written off.
+
+**What the bound does not fix, which is the finding that survives.** Wall time falls 3.5x with
+it (1,286 ms to 363 ms) where materialized bytes fall 10,000x, and Batcher is still 1.87x
+DuckDB warm. So after the I/O is gone the residual cost is *not* materialization, and the
+remaining gap is somewhere this section has not measured -- evaluating the seeded predicate
+across every row group, or per-file overhead. That is the open question, not the byte count.
 
 **The other half of the explanation was hypothesized, tested and rejected**, and that is
 recorded because the hypothesis is the obvious one and someone will have it again. The guess was that DuckDB

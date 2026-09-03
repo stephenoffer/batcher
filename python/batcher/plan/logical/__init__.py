@@ -57,6 +57,7 @@ from batcher.plan.logical.transforms import (
     project_columns,
     rebuild_over_scan,
     remap_sources,
+    share_sources,
     split_streaming_tail,
     streaming_fold_target,
 )
@@ -107,6 +108,7 @@ __all__ = [
     "project_columns",
     "rebuild_over_scan",
     "remap_sources",
+    "share_sources",
     "split_streaming_tail",
     "streaming_fold_target",
 ]

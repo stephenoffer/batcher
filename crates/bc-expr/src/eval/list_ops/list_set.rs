@@ -16,7 +16,7 @@ use arrow::array::{Array, ArrayRef, ListArray, UInt32Array};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::{cast, concat, take};
 use arrow::datatypes::Field;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{Row, RowConverter, SortField};
 
 use crate::eval::list::require_list;
 use crate::{ExprError, ListSetOp};
@@ -66,38 +66,46 @@ pub(crate) fn eval_list_set(
     offsets.push(0);
     let mut valid: Vec<bool> = Vec::with_capacity(l.len());
 
+    // `FastSet`, not `HashSet`: every probe here is one element of one row, so the
+    // per-probe hash cost is paid once per element of the whole column. Membership and
+    // first-occurrence dedup are hasher-independent (the output order comes from the
+    // element scan below, never from iterating the set), so this changes no result.
+    //
+    // Both sets are built once and cleared per row, and they hold **borrowed** rows.
+    // `OwnedRow` copies the element's encoded bytes into a fresh `Vec<u8>`, so the
+    // previous spelling allocated once per element on the left, once per element on the
+    // right, and twice more per row for the sets themselves — to answer a membership
+    // question that reads the bytes and forgets them. `crows` outlives the loop, so
+    // there is nothing to own.
+    let mut rset: FastSet<Row<'_>> = FastSet::default();
+    let mut seen: FastSet<Row<'_>> = FastSet::default();
     for row in 0..l.len() {
         if l.is_null(row) {
             offsets.push(*offsets.last().unwrap());
             valid.push(false);
             continue;
         }
-        // The right row's element set (null right row → empty set). `OwnedRow` owns its
-        // bytes, so it can live in the set across the loop.
-        // `FastSet`, not `HashSet`: these sets are rebuilt for every list row, so the
-        // per-probe hash cost is paid once per element per row. Membership and
-        // first-occurrence dedup are hasher-independent (the output order comes from the
-        // element scan below, never from iterating the set), so this changes no result.
-        let mut rset: FastSet<OwnedRow> = FastSet::default();
+        // The right row's element set (null right row → empty set).
+        rset.clear();
         if row < r.len() && r.is_valid(row) {
             for k in ro[row] as usize..ro[row + 1] as usize {
-                rset.insert(crows.row(roffset + k).owned());
+                rset.insert(crows.row(roffset + k));
             }
         }
-        let mut seen: FastSet<OwnedRow> = FastSet::default();
+        seen.clear();
         // Left elements: kept by membership for intersect/except, always for union.
         for k in lo[row] as usize..lo[row + 1] as usize {
-            let owned = crows.row(k).owned();
+            let elem = crows.row(k);
             let keep_it = match op {
-                ListSetOp::Intersect => rset.contains(&owned),
-                ListSetOp::Except => !rset.contains(&owned),
+                ListSetOp::Intersect => rset.contains(&elem),
+                ListSetOp::Except => !rset.contains(&elem),
                 ListSetOp::Union => true,
                 // Handled by `eval_list_concat` above; this arm is unreachable and is
                 // spelled out rather than wildcarded so a new op cannot slip through.
                 ListSetOp::Concat => unreachable!("concat takes its own path"),
                 ListSetOp::Gather => unreachable!("gather takes its own path"),
             };
-            if keep_it && seen.insert(owned) {
+            if keep_it && seen.insert(elem) {
                 keep.push(k as u32);
             }
         }
@@ -105,7 +113,7 @@ pub(crate) fn eval_list_set(
         if matches!(op, ListSetOp::Union) && row < r.len() && r.is_valid(row) {
             for k in ro[row] as usize..ro[row + 1] as usize {
                 let idx = roffset + k;
-                if seen.insert(crows.row(idx).owned()) {
+                if seen.insert(crows.row(idx)) {
                     keep.push(idx as u32);
                 }
             }

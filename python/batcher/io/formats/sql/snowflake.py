@@ -217,6 +217,20 @@ class SnowflakeSource:
         """
         return f"snowflake:{connection_fingerprint(self.connection_kwargs)}:{self.query}"
 
+    def governed_name(self) -> str:
+        """Empty: a Snowflake read here is a query, and a query is not a table.
+
+        A raw SQL string names no table this engine can resolve without parsing it, and
+        guessing would be worse than admitting it: a policy that matched the wrong table is
+        a policy that governs the wrong data. Saying so plainly is also what lets
+        `governance.mode` refuse or warn about the read, which it cannot do for a source
+        that returns a plausible-looking name nothing matches.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none.
+        """
+        return ""
+
     def splits(
         self,
         target_size: int | None = None,  # noqa: ARG002 (protocol signature)

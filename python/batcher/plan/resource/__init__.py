@@ -15,6 +15,10 @@ A façade: every name below is defined in a sibling module and re-exported here,
 from __future__ import annotations
 
 from batcher.plan.resource.bounds import (
+    CAPACITY_ANY,
+    CAPACITY_ON_DEMAND,
+    CAPACITY_PREFERENCES,
+    CAPACITY_SPOT,
     FeasibilityVerdict,
     ResourceBounds,
     SchedulingEnvelope,
@@ -25,6 +29,10 @@ from batcher.plan.resource.locality import LocalityShares
 from batcher.plan.resource.storage import StorageLevel
 
 __all__ = [
+    "CAPACITY_ANY",
+    "CAPACITY_ON_DEMAND",
+    "CAPACITY_PREFERENCES",
+    "CAPACITY_SPOT",
     "ClusterShape",
     "FeasibilityVerdict",
     "HardwareProfile",

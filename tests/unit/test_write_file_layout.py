@@ -200,7 +200,16 @@ def test_distributed_write_hands_every_shard_its_layout_and_resume(monkeypatch):
     original = dw._write_shard
 
     class _Remote:
-        """Stand in for a `ray.remote` wrapper: `.remote(...)` yields a callable thunk."""
+        """Stand in for a `ray.remote` wrapper: `.remote(...)` yields a callable thunk.
+
+        `.options(...)` returns the wrapper itself, the way Ray's does: the caller sizes the
+        task's CPU share and placement before submitting, and a stub without it turns that
+        into an `AttributeError` rather than a scheduling question.
+        """
+
+        @classmethod
+        def options(cls, **_kwargs):
+            return cls
 
         @staticmethod
         def remote(*args):

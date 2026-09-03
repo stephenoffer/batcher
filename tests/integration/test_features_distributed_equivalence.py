@@ -62,7 +62,7 @@ def test_filter_aggregate_distributed_equals_single_node():
     assert single == dist
 
 
-def test_enrich_join_over_splittable_source_distributed_equals_single_node(tmp_path):
+def test_enrich_join_over_splittable_source_distributed_equals_single_node(cluster_tmp_path):
     """The feature-engineering *enrich* shape over real (splittable) distributed data:
     join fact rows back to a per-key aggregate of the SAME source, then a derived column.
 
@@ -74,7 +74,7 @@ def test_enrich_join_over_splittable_source_distributed_equals_single_node(tmp_p
     `from_arrow` source never exercises the raise path."""
     import pyarrow.parquet as pq
 
-    d = tmp_path / "txns"
+    d = cluster_tmp_path / "txns"
     d.mkdir()
     n, accts = 6000, 300
     for s in range(6):

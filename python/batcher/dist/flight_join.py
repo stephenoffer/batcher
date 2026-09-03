@@ -98,7 +98,14 @@ def execute_join_flight(
     # aggregate is *always* a partial the driver closes. The flag has no counterpart here.
     if broadcast_eligible(join):
         out = execute_broadcast_join_flight(
-            above, join, sources, workers, fused_agg=fused_agg, materialize=materialize
+            above,
+            join,
+            sources,
+            workers,
+            fused_agg=fused_agg,
+            materialize=materialize,
+            hub=hub,
+            metrics_out=metrics_out,
         )
         if out is not None:
             return out

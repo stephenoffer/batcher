@@ -176,28 +176,34 @@ def _coerce_udf_result(result: object, reference: pa.Schema) -> list[pa.RecordBa
     ``list_view`` built by a NumPy or Polars round-trip used to reach the user as
     ``Extracting byte ranges not supported for type list_view<item: int64>``.
 
-    `restore_null_typed_columns` is the third, and it needs `reference` -- the schema the
+    `restore_null_typed_columns` and `restore_widened_columns` are the third and fourth, and
+    both need `reference` -- the schema the
     `fn` was *given*. A non-Arrow `batch_format` cannot tell an empty string column from an
     empty column of nothing, so it returns Arrow `null` and the column silently changes type
-    on exactly the batches with no data in them. Passing the input schema is what lets the
-    original type be put back; callers that have it should pass it.
+    on exactly the batches with no data in them; a Polars round-trip separately re-lays every
+    variable-length column at 64-bit offsets, so `string` comes back `large_string` on *every*
+    batch. Both are an identity `fn` changing a column's type, and passing the input schema is
+    what lets the original be put back; callers that have it should pass it.
 
     Args:
         result: Whatever the user's `fn` returned.
         reference: Schema of the batch the `fn` was called on, used to restore a column that
-            came back `null`-typed. Required rather than defaulted, so a new call site has to
+            came back `null`-typed or offset-widened. Required rather than defaulted, so a
+            new call site has to
             decide what the result is held against instead of silently reintroducing the
             type loss.
 
     Returns:
         Record batches, every column of which arrow-rs can import.
     """
-    from batcher.interop.formats import restore_null_typed_columns
+    from batcher.interop.formats import restore_null_typed_columns, restore_widened_columns
     from batcher.plan.types.layout import importable_batch
 
-    return [
-        restore_null_typed_columns(importable_batch(b), reference) for b in _coerce_parts(result)
-    ]
+    def _repaired(b: pa.RecordBatch) -> pa.RecordBatch:
+        typed = restore_null_typed_columns(importable_batch(b), reference)
+        return restore_widened_columns(typed, reference)
+
+    return [_repaired(b) for b in _coerce_parts(result)]
 
 
 def _coerce_parts(result: object) -> list[pa.RecordBatch]:

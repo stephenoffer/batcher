@@ -375,6 +375,15 @@ def test_optimizer_is_result_idempotent(case: tuple[bt.Dataset, bool]) -> None:
     assert converged_at is not None, "optimizer did not reach a plan fixpoint within 5 passes"
 
 
+# `deadline=None`, as every other property test in this suite has — this was the one that
+# did not, and it is not a hypothetical omission. Measured over 100 draws on this box:
+# median 8.2 ms, p95 19.9 ms, **max 235.8 ms**, with one example already past hypothesis's
+# 200 ms default. So the test could fail with `DeadlineExceeded` on a draw that satisfies
+# the property perfectly, at a rate set by the machine's load rather than by the optimizer.
+#
+# A property test that can fail for a reason unrelated to its property is worse than a slow
+# one: the failure names the wrong thing, and the habit it teaches is re-running.
+@settings(deadline=None)
 @given(_query())
 def test_rules_converge_within_production_cap_and_deterministically(case: tuple[bt.Dataset, bool]):
     """The full 154-rule set converges within the *production* fixpoint budget, and the

@@ -23,6 +23,7 @@ for a subprocess.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -65,6 +66,22 @@ print(json.dumps(out))
 """
 
 
+def _child_env(seed: str) -> dict[str, str]:
+    """A deliberately minimal environment, plus whatever the dynamic loader needs.
+
+    The point of building the environment by hand is `PYTHONHASHSEED`: the child must be a
+    genuinely different interpreter, not this one's inherited settings. It is not about the
+    loader, and dropping `LD_LIBRARY_PATH` on a box that needs one only makes the child fail
+    to `import` at all -- which reports as "seed 0 failed", three tests down, and says nothing
+    about identity stability.
+    """
+    env = {"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
+
 def _identities(seed: str) -> dict[str, str]:
     table = _REPO / "tests" / "unit" / "test_governed_source_names.py"
     result = subprocess.run(
@@ -72,7 +89,7 @@ def _identities(seed: str) -> dict[str, str]:
         capture_output=True,
         text=True,
         cwd=_REPO,
-        env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+        env=_child_env(seed),
     )
     assert result.returncode == 0, f"seed {seed} failed:\n{result.stderr[-2000:]}"
     return json.loads(result.stdout.strip().splitlines()[-1])

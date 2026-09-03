@@ -35,6 +35,12 @@ bt.from_pydict(
 ).write(customers, format="parquet")
 ```
 
+### What a table is named
+
+A policy is keyed on the **table**, never on the slice of it a particular query reads. See
+{doc}`How a table is named </user-guide/trust/table-names>` for what each source is named by
+and which path spellings fold together.
+
 ## Principals
 
 A principal has a name, roles, and free-form attributes. Attributes are what let one
@@ -75,6 +81,52 @@ value you can print and diff and review, rather than a service you have to inter
 A column the principal may not select does not exist for it at all. Referencing
 `salary` raises the ordinary unknown-column error, not "access denied". An error that
 said "you may not read `salary`" would itself confirm that `salary` exists.
+
+### Taking access away
+
+Grants union across a principal's roles, so a principal holding both `analyst` and
+`auditor` sees whatever either role sees. Two things follow, and neither can be written
+with `grant` alone.
+
+`revoke` withdraws a grant. Afterwards the catalog reads as though the grant had never
+been written, which is what keeps it reviewable. Revoking a privilege nobody granted is
+not an error, so an offboarding script does not have to check what it is undoing first.
+
+```python
+staged = bt.SecurityCatalog().grant("intern", on=customers).grant("analyst", on=customers)
+staged.revoke("intern", on=customers)
+
+print([g.role for g in staged.grants_on(customers)])
+```
+
+`deny` records a {py:class}`Denial <batcher.governance.Denial>`, which refuses access
+outright and **beats every grant**. It is the only way to say "every column except
+`salary`" without enumerating the complement, which the next added column silently
+widens.
+
+```python
+catalog = (
+    bt.SecurityCatalog()
+    .grant("analyst", on=customers)
+    .deny("analyst", on=customers, select=["salary"])
+)
+
+with bt.security(catalog, analyst):
+    print(bt.read.parquet(customers).columns)
+```
+
+The difference matters most in the case they look alike. `revoke` removes a rule, so a
+later `grant` restores access. `deny` adds a rule, so a later `grant` does not. If the
+intent is "this role must never read this", write `deny`.
+
+## Write privileges
+
+`SELECT` is not the only privilege. A read policy says nothing about the table a query
+*writes*, and leaving that ungoverned undoes the read policy. Grants therefore carry one of
+the four SQL privileges, and every write path checks them.
+
+See {doc}`Write privileges </user-guide/trust/write-privileges>` for the privilege each
+write needs, how a `MERGE` is charged, and why maintenance runs outside a `security()` block.
 
 ## Masking PII
 

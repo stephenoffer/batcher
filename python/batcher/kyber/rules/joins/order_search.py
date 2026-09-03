@@ -6,7 +6,8 @@ and this module answers the question that graph poses: which shape of tree is ch
 what does that tree look like as `LogicalPlan` nodes.
 
 Three searches, tried widest-first by `order._try_reorder`: an exhaustive subset DP up to
-`_MAX_EXHAUSTIVE_LEAVES`, a connected-subset (DPhyp-style) DP up to `_MAX_DP_LEAVES`, and a
+`_MAX_EXHAUSTIVE_LEAVES`, a connected-subset (DPhyp-style) DP within a per-query search
+budget (`order_budget`) up to `_MAX_DP_LEAVES`, and a
 greedy size-minimizing builder beyond. All three return the *same* logical relation and are
 interchangeable; they differ only in how much of the search space they can afford to read.
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 from itertools import combinations
 
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.rules.joins import order_budget
 from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals
 from batcher.plan.expr_ir import Col, Lit
 from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
@@ -147,14 +149,20 @@ def _rebuild_greedy(
     return _final_projection(current, schema, required)
 
 
-# Exhaustive O(3ⁿ) subset DP up to `_MAX_EXHAUSTIVE_LEAVES`; the connected-subset DP
-# (`_rebuild_dphyp`) up to `_MAX_DP_LEAVES`; greedy beyond. `_MAX_DP_PAIRS` caps the
-# connected-subset DP's work so a dense large graph bails to greedy (small-query
-# mandate) instead of blowing up. Keeping the exhaustive DP for the small case leaves
-# its plans unchanged.
+# The connected-subset DP (`_rebuild_dphyp`) runs up to `_MAX_DP_LEAVES` leaves; greedy
+# beyond. How much *work* it may do inside that reach is not a constant -- it is the
+# per-query budget `order_budget.search_pair_budget` derives from what the query is estimated
+# to cost, because leaf count does not predict search work (a 14-leaf chain evaluates 455
+# pairs and a 14-leaf star 53,248) and neither predicts what a better order is worth. The flat
+# 200,000-pair cap this replaces was a bound on neither: it permitted ~30 s of planning for a
+# query that might run in a millisecond. `_MAX_DP_LEAVES` survives as a *memory* guard -- the
+# DP holds a plan per connected subset -- rather than as a proxy for time.
+#
+# `_MAX_EXHAUSTIVE_LEAVES` no longer selects a search -- it bounds how far `order.py` will
+# merge join regions to hoist a residual filter, which is a plan-quality decision (see the
+# comment there) rather than a cost-of-search one.
 _MAX_EXHAUSTIVE_LEAVES = 12
 _MAX_DP_LEAVES = 20
-_MAX_DP_PAIRS = 200_000
 
 
 def _rebuild_dp(
@@ -164,7 +172,16 @@ def _rebuild_dp(
     ctx: OptimizerContext,
     residuals: list[Residual] | None = None,
 ) -> LogicalPlan | None:
-    """Cost-optimal join order via DP over connected leaf subsets (DPccp-style).
+    """Cost-optimal join order by exhaustive DP over *every* leaf subset.
+
+    **This is the test oracle, not a production path.** It is the obviously-correct
+    statement of the recurrence -- enumerate all 2ⁿ subsets and all 3ⁿ splits, keep the
+    cheapest -- against which `_rebuild_dphyp` is checked on 120 random graphs by
+    `tests/unit/test_dphyp_join_order.py`. It enumerates disconnected subsets too, and
+    only learns they are disconnected by failing to build a join for each of their
+    splits, so on a sparse graph it is exponentially slower than the DP that replaced it
+    on the live path. `order.py` calls `_rebuild_dphyp` at every size now. Keep this one:
+    an oracle that shared the optimization under test would not be an oracle.
 
     For each subset of leaves, keep the minimum-cost sub-plan; a subset's plan is
     the cheapest join of two of its sub-partitions that share an edge. Unlike the
@@ -229,6 +246,7 @@ def _rebuild_dphyp(
     required: list[tuple[str, SrcRef]],
     ctx: OptimizerContext,
     residuals: list[Residual] | None = None,
+    budget: int | None = None,
 ) -> LogicalPlan | None:
     """Cost-optimal bushy join order over **connected subgraphs only**, by size.
 
@@ -241,6 +259,11 @@ def _rebuild_dphyp(
     n = len(leaves)
     if n > _MAX_DP_LEAVES:
         return None
+    # `None` means "search as hard as anything is ever allowed to" -- what the oracle test
+    # wants, and what a caller with no cost model in hand gets. A real query always arrives
+    # with a budget priced from its own estimated cost.
+    if budget is None:
+        budget = order_budget.max_pairs()
     residuals = residuals or []
     needed = _needed_cols(required, edges) | _residual_refs(residuals)
     cost = ctx.costs()
@@ -277,8 +300,12 @@ def _rebuild_dphyp(
                 if t not in connected:
                     connected.add(t)
                     nxt.append(t)
-                    if len(connected) > _MAX_DP_PAIRS:
-                        return None  # too many connected subsets → defer to greedy
+                    if order_budget.predicted_pairs(len(connected)) > budget:
+                        # Too dense to search within budget. Bailing *here* -- before a single
+                        # cardinality estimate or cost -- is the point of predicting from the
+                        # subset count: the alternative is to spend the whole budget
+                        # discovering it and hand the answer to greedy anyway.
+                        return None
         frontier = nxt
 
     # dp[mask] = (plan, schema, accumulated_cost); base case = each singleton leaf.
@@ -311,7 +338,9 @@ def _rebuild_dphyp(
                 right = dp.get(s2)
                 if left is not None and right is not None:  # both halves connected
                     pairs += 1
-                    if pairs > _MAX_DP_PAIRS:
+                    if pairs > budget:
+                        # The exact guarantee behind the prediction above, for a graph whose
+                        # pairs-per-subset ratio runs above the measured band.
                         return None
                     built = _join_plans(left[0], left[1], right[0], right[1], edges)
                     if built is not None:

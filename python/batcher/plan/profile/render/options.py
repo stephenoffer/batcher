@@ -18,6 +18,7 @@ __all__ = [
     "FOLD_ABOVE_OPS",
     "FOLD_BELOW_SHARE",
     "HOTSPOTS",
+    "MAX_SPINE_DEPTH",
     "RenderOptions",
     "Styler",
     "plain_styler",
@@ -37,8 +38,37 @@ FOLD_BELOW_SHARE = 0.01
 #: How many operators the hot-spot table names. Enough to see a pattern, few enough to read.
 HOTSPOTS = 5
 
-GLYPHS = {"tee": "├─ ", "last": "└─ ", "pipe": "│  ", "gap": "   ", "rule": "─", "mark": "▶"}
-ASCII = {"tee": "|- ", "last": "`- ", "pipe": "|  ", "gap": "   ", "rule": "-", "mark": ">"}
+#: Ancestor levels the tree spine draws before it stops indenting.
+#:
+#: A deep *linear* plan -- thirty chained `with_columns`/`filter` calls, which is the shape
+#: any long pipeline has -- pushed the operator's own name out of its own column. The
+#: indent is three characters per level, so depth 20 costs 60; the operator column is
+#: capped at 48; and `fit` keeps the *front* of a string. So the forty deepest operators of
+#: a 61-operator plan rendered as a column of bare ellipsis: correct indentation, and not
+#: one operator name anywhere on the page. Past this depth the indentation is not carrying
+#: information a reader can act on, and it was displacing the information that is.
+MAX_SPINE_DEPTH = 10
+
+GLYPHS = {
+    "tee": "├─ ",
+    "last": "└─ ",
+    "pipe": "│  ",
+    "gap": "   ",
+    "rule": "─",
+    "mark": "▶",
+    #: Stands in for the ancestor bars `MAX_SPINE_DEPTH` elides. Same width as `pipe`, so
+    #: clamped rows stay aligned with unclamped ones.
+    "elide": "⋯  ",
+}
+ASCII = {
+    "tee": "|- ",
+    "last": "`- ",
+    "pipe": "|  ",
+    "gap": "   ",
+    "rule": "-",
+    "mark": ">",
+    "elide": "~  ",
+}
 #: Eighth-blocks, so a five-cell share bar resolves 40 steps rather than 5.
 BLOCKS = "▏▎▍▌▋▊▉█"
 

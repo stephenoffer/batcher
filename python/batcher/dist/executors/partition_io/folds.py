@@ -21,7 +21,7 @@ _FOLD_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_FOLD_CHUNK_BYTES", 
 
 
 def streaming_partial_aggregate(
-    nat, map_ir, gk, aj, batches, engine_config, chunk_bytes=_FOLD_CHUNK_BYTES
+    nat, map_ir, gk, aj, batches, engine_config, chunk_bytes=_FOLD_CHUNK_BYTES, on_metrics=None
 ):
     """Fold a partition's batches through the (breaker-free) map prefix + partial aggregate
     into one running partial, a byte-bounded chunk at a time.
@@ -29,14 +29,30 @@ def streaming_partial_aggregate(
     The map side never holds the whole partition or the whole mapped output: peak is one chunk
     plus the running partial. `combine` of the per-chunk partials equals one partial over the
     whole partition (see the module note).
+
+    `on_metrics` receives each chunk's `ExecMetrics` document. It is how the **Flight**
+    aggregate keeps `Core measures`: `flight_worker.map_publish` — the map side of every
+    Flight aggregate, and of the whole-row `DISTINCT` that rides it — called the unmetered
+    engine here, so the driver's `drain_worker_metrics` after the barrier collected nothing
+    and a distributed aggregate on a Flight fleet taught the cost model nothing at all. The
+    disk aggregate beside it has always metered its map task, which is why the hole was
+    invisible on any fleet that resolved to disk. Left `None` by in-process callers, which
+    then run exactly as before.
     """
+    from batcher.dist.executors.ray_runtime.metering import execute_metered
+
     running = None
     chunk: list = []
     size = 0
 
     def fold(rows):
         nonlocal running
-        mapped = nat.execute_plan(map_ir, [rows], engine_config)
+        if on_metrics is None:
+            mapped = nat.execute_plan(map_ir, [rows], engine_config)
+        else:
+            mapped, metrics_json = execute_metered(map_ir, [rows], engine_config)
+            if metrics_json:
+                on_metrics(metrics_json)
         partial = nat.partial_aggregate(gk, aj, mapped)
         running = partial if running is None else nat.combine(gk, aj, [running, partial])
 

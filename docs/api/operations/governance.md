@@ -100,8 +100,8 @@ trust domain. See {doc}`/user-guide/trust/hardening`.
 ## The catalog
 
 {py:obj}`SecurityCatalog <batcher.SecurityCatalog>` holds the policy: which
-roles may select which columns, which columns are masked, and which rows each principal
-may see.
+roles hold which privilege on which columns, which columns are masked, and which rows
+each principal may see.
 
 ```{eval-rst}
 .. autoclass:: SecurityCatalog
@@ -109,6 +109,40 @@ may see.
    :no-index:
 
 .. autoclass:: Grant
+   :members:
+```
+
+### Privileges
+
+A grant carries one of `PRIVILEGES`, the four SQL privileges spelled the way Snowflake
+and Unity Catalog spell them. `SELECT` governs reads and is the default; `INSERT`,
+`UPDATE`, and `DELETE` govern writes, and which of them a write needs follows from what
+it does to the rows already in the destination. The {doc}`governance guide
+</user-guide/trust/governance>` has the table.
+
+A table nobody has granted anything on is open. Once any grant names it, every privilege
+on it is deny-by-default, so granting one privilege never confers another: a role given
+`INSERT` can add rows and cannot drop them.
+
+```{eval-rst}
+.. autodata:: PRIVILEGES
+   :annotation:
+```
+
+### Denials
+
+A `Denial` refuses a privilege regardless of what any grant says, the same precedence
+`DENY` has in SQL Server and Unity Catalog. It exists because grants *union* across a
+principal's roles, which leaves two things unsayable: "every column except `salary`",
+whose complement is wrong as soon as a column is added; and a hard block on a role that
+another role's grant would otherwise union around.
+
+Declare one with `SecurityCatalog.deny`, and withdraw a grant with
+`SecurityCatalog.revoke`. The two are not interchangeable: `revoke` removes a rule, so a
+later grant restores access, while `deny` adds one that a later grant does not override.
+
+```{eval-rst}
+.. autoclass:: Denial
    :members:
 ```
 

@@ -57,9 +57,9 @@ def recommend_accelerator_type(model_memory_gb: float) -> str | None:
 
         if not ray.is_initialized():
             return None
-        from batcher.dist.executors.ray_runtime.scaling import node_classes
+        from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
-        classes = node_classes()
+        classes = node_class_census()
     except Exception:
         return None
     candidates = sorted({c.get("accelerator_type") or "" for c in classes if c["gpus"] > 0})
@@ -117,9 +117,9 @@ def cluster_accelerator_type() -> str | None:
 
         if not ray.is_initialized():
             return None
-        from batcher.dist.executors.ray_runtime.scaling import node_classes
+        from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
-        names = {c.get("accelerator_type") for c in node_classes() if c["gpus"] > 0}
+        names = {c.get("accelerator_type") for c in node_class_census() if c["gpus"] > 0}
     except Exception:
         return None
     if len(names) != 1:

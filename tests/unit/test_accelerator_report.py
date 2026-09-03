@@ -8,7 +8,7 @@ defaulted.
 
 from __future__ import annotations
 
-import sys
+import importlib
 
 import pytest
 
@@ -19,13 +19,15 @@ from batcher.config import AcceleratorConfig, Config, EnergyConfig, config_conte
 pytestmark = pytest.mark.unit
 
 # The modules, not the functions the package re-exports over them (the same shadowing
-# `versions` has). An `import a.b.c as m` would bind the function here.
+# `versions` has). An `import a.b.c as m` would bind the function here, and reading them
+# out of `sys.modules` assumed the façade had imported them as a side effect — which it
+# no longer does, since `batcher.api.session` resolves its names lazily.
 #
 # `accelerators` became a package when the report outgrew one file: `rows` builds each
 # device's row and `report` decides what a reader is shown, so a patch belongs on whichever
 # of the two owns the name.
-accel_mod = sys.modules["batcher.api.session.accelerators.report"]
-rows_mod = sys.modules["batcher.api.session.accelerators.rows"]
+accel_mod = importlib.import_module("batcher.api.session.accelerators.report")
+rows_mod = importlib.import_module("batcher.api.session.accelerators.rows")
 
 
 def test_a_cpu_only_host_reports_a_backend_and_no_devices() -> None:

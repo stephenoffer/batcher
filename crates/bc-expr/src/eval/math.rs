@@ -268,27 +268,6 @@ fn coalesce_arrays(arrs: &[ArrayRef]) -> Result<ArrayRef, ExprError> {
     Ok(acc)
 }
 
-/// COALESCE: first non-null among the inputs, per row. Folds from the last input
-/// upward so earlier inputs win.
-pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
-    if inputs.is_empty() {
-        return Err(ExprError::MissingArgument {
-            func: "coalesce".to_string(),
-            arg: "inputs",
-        });
-    }
-    let mut acc = inputs[inputs.len() - 1].eval(batch)?;
-    for expr in inputs[..inputs.len() - 1].iter().rev() {
-        let v = expr.eval(batch)?;
-        let present = is_not_null(&v)?;
-        // Promote mixed numeric inputs to a common type (e.g. coalesce(int,float)
-        // → float) so `zip` sees matching types, matching SQL coercion.
-        let (v, acc_c) = coerce_numeric(&v, &acc)?;
-        acc = zip(&present, &v.as_ref(), &acc_c.as_ref())?;
-    }
-    Ok(acc)
-}
-
 /// Unary math. `abs` and `round` keep the input numeric type (both are integer-valued
 /// on an integer, and DuckDB returns BIGINT for both); `floor`/`ceil`/`sqrt` yield
 /// Float64, promoting integer inputs, as DuckDB does.

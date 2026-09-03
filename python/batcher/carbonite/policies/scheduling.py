@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.memory.estimator import learned_plan_peak
-from batcher.plan.resource import SchedulingEnvelope
+from batcher.plan.resource import CAPACITY_ANY, CAPACITY_ON_DEMAND, SchedulingEnvelope
 
 if TYPE_CHECKING:
     from batcher.carbonite.base import ResourceContext
@@ -259,4 +259,30 @@ class DefaultSchedulingPolicy:
             credits=cfg.flow_control.default_credits,
             placement_strategy=placement_strategy,
             prefer_cpu_only_nodes=True,
+            capacity_preference=_capacity_preference(plan),
         )
+
+
+def _capacity_preference(plan: PhysicalPlan) -> str:
+    """Which market this fleet's tasks belong on: `"on_demand"` for a plan with a breaker,
+    `"any"` otherwise.
+
+    Carbonite protects, and what it is protecting here is *work already done*. A pipeline
+    breaker holds the accumulated state of every row its stage has read, plus the mapped
+    output its peers have yet to fetch; losing the worker holding it costs the stage, because
+    there is no descriptor to re-derive it from. A breaker-free pipeline has the opposite
+    property — every partition recomputes idempotently, which is exactly why the map barrier
+    resubmits a preempted one — so it states no preference here and the stateless map path
+    asks for spot capacity on its own behalf.
+
+    A *preference*, not a requirement. `dist` emits nothing at all unless the live fleet is
+    mixed and labelled, and pairs whatever it does emit with a fallback, so a cluster that has
+    run out of on-demand capacity runs the stage on spot rather than pending.
+
+    Args:
+        plan: The physical plan whose fleet is being sized.
+
+    Returns:
+        `"on_demand"` when any operator materializes, else `"any"`.
+    """
+    return CAPACITY_ON_DEMAND if any(op.bounds.materializes for op in plan.ops) else CAPACITY_ANY

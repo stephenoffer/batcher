@@ -310,7 +310,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(batcher_query_duration_ms_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(batcher_query_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -321,7 +321,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(batcher_query_duration_ms_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(batcher_query_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -332,7 +332,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(batcher_query_duration_ms_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(batcher_query_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -340,7 +340,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "unit": "s",
           "custom": {
             "lineWidth": 1,
             "fillOpacity": 8,
@@ -889,7 +889,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(batcher_cpu_ms_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) / 1000",
+          "expr": "sum(rate(batcher_cpu_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "cpu cores",
           "range": true,
           "refId": "A"
@@ -900,7 +900,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(batcher_execution_ms_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) / 1000",
+          "expr": "sum(rate(batcher_execution_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "wall (in-engine)",
           "range": true,
           "refId": "B"
@@ -1266,7 +1266,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(batcher_inference_blocked_ms_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) / 1000",
+          "expr": "sum(rate(batcher_inference_blocked_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "workers blocked on input",
           "range": true,
           "refId": "C"
@@ -1277,8 +1277,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(batcher_inference_latency_ms_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(batcher_inference_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "mean batch latency (ms)",
+          "expr": "sum(rate(batcher_inference_latency_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(batcher_inference_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "mean batch latency (s)",
           "range": true,
           "refId": "D"
         }

@@ -215,7 +215,7 @@ def test_reset_zeroes_every_counter():
 def test_render_exports_the_process_totals_even_before_anything_is_measured():
     lines = WorkCounters().render()
     # A scrape config must not have to be conditional on whether a query has run yet.
-    assert any(line.startswith("batcher_cpu_ms_total ") for line in lines)
+    assert any(line.startswith("batcher_cpu_seconds_total ") for line in lines)
     assert any(line.startswith("batcher_cores_busy ") for line in lines)
 
 
@@ -411,7 +411,7 @@ def test_the_exposition_carries_the_utilization_and_resource_series(collector, b
     bus.publish(bus.RESOURCE, name="admission", stats={"active": 2})
     text = metrics_mod.prometheus_text()
     for series in (
-        "batcher_cpu_ms_total",
+        "batcher_cpu_seconds_total",
         "batcher_cores_busy",
         "batcher_io_write_bytes_total",
         "batcher_major_page_faults_total",

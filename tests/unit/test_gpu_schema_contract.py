@@ -162,6 +162,7 @@ def test_an_agreeing_result_is_returned_unchanged_and_a_diverging_one_falls_back
         pytest.param(lambda ds: ds.select("g", "v"), id="project"),
         pytest.param(lambda ds: ds.filter(col("g") > 1), id="filter"),
         pytest.param(lambda ds: ds.select(a=col("n").abs()), id="integer-abs"),
+        pytest.param(lambda ds: ds.select(a=col("n").sign()), id="integer-sign"),
         pytest.param(lambda ds: ds.select(w=col("n") + 1), id="narrow-arithmetic"),
         pytest.param(lambda ds: ds.select("d"), id="date-passthrough"),
         pytest.param(lambda ds: ds.filter(col("g") > 99).select("s"), id="empty-string"),

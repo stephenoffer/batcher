@@ -117,10 +117,17 @@ ds = ds.sort("score", descending=True).limit(100)  # fused into top-N
 
 Join order dominates the cost of a multi-table query, because the wrong order
 materializes a large intermediate that a better order never builds. Kyber reorders
-joins cost-based, minimizing the estimated intermediate sizes. The search is exact
-dynamic programming at or below `optimizer.join_dp_max_tables` tables, 12 by default,
-and a greedy heuristic up to `optimizer.greedy_max_tables`, 25 by default. Beyond that
-count, exhaustive search stops paying for itself and Kyber leaves the order alone.
+joins cost-based, minimizing the estimated intermediate sizes, using dynamic
+programming over connected subsets of the join graph and falling back to a greedy
+builder when the graph is too large or too dense to search.
+
+How hard Kyber searches is decided per query rather than by a fixed table count. The
+optimizer prices the join region, grants a share of that estimated cost back as search
+time, and spends it in units of candidate join pairs. A query too cheap to repay the
+search stops early and takes the greedy order, and a query large enough to repay far
+more searching gets it. See
+{doc}`Cost model </architecture/deep-dives/adaptive/cost-model>` for the measurements
+behind the budget.
 
 ```python
 result = table_a.join(table_b, on="key").join(table_c, on="key")

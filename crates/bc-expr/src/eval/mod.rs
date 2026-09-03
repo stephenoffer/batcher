@@ -18,11 +18,19 @@
 /// iterating the set. Swapping the hasher therefore cannot change a result — which is what
 /// makes it a free win rather than a trade.
 ///
-/// It lives at the module root because three evaluators want it (`in_list`, `list_ops::set`,
-/// `list::unique`) and the alternative was writing it out three times.
+/// It lives at the module root because several evaluators want it and the alternative was
+/// writing it out once per caller. `grep FastSet` for who, rather than a list here: the list
+/// this replaces was already wrong, naming `list::unique` while that evaluator was still on
+/// `std::collections::HashSet` — a docstring asserting an adoption that had not happened.
 pub(crate) type FastSet<T> = std::collections::HashSet<T, ahash::RandomState>;
 
+/// The map counterpart of [`FastSet`], for the same reason and with the same argument:
+/// every use counts or looks up one element of one row, so the hasher is on the per-element
+/// path, and a count is not something a hasher can change.
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+
 pub(crate) mod binary;
+pub(crate) mod branch;
 pub(crate) mod cast;
 pub(crate) mod coerce;
 mod dispatch;

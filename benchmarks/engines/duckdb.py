@@ -14,6 +14,38 @@ import pyarrow as pa
 from .base import Engine, Rename, SqlRunner, sql_projection
 
 
+def match_batcher_budget(con: object) -> None:
+    """Give DuckDB the same CPU and memory budget Batcher gives itself.
+
+    Left alone the two engines size themselves independently and the difference favours
+    Batcher. Measured on this box: DuckDB defaults `memory_limit` to **80% of RAM** (147.1
+    GiB of 184), while Batcher auto-senses the whole machine and applies a `hard_limit`
+    fraction of 0.9, giving it **165.6 GiB — 13% more headroom before it spills.**
+
+    Thirteen percent decides nothing at sf1, where neither engine spills. It decides whether
+    a query spills *at all* somewhere above 10M rows, which is exactly the regime the project
+    concedes it loses in — so an undisclosed 13% sits right on the boundary of the honest
+    claim, and on the flattering side of it.
+
+    Threads are pinned for a different reason. The two engines agree at 92 on this box today,
+    but they arrive there by separate auto-detections — Batcher's is cgroup-aware, DuckDB's
+    is its own — and parity that holds by coincidence is parity nobody will notice losing.
+    Pinning makes it a property of the harness rather than of the host.
+
+    Both budgets come from Batcher's config, so the comparator is matched *to* the system
+    under test rather than the reverse. That is the direction that removes an advantage.
+    """
+    from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
+    from batcher.config import active_config
+
+    cfg = active_config()
+    cap = cfg.memory.max_memory_bytes or machine_memory_bytes()
+    effective = int(cap * (cfg.memory.hard_limit or 1.0))
+    threads = cfg.execution.parallelism or available_cpu_count()
+    con.execute(f"SET memory_limit='{effective}B'")
+    con.execute(f"SET threads={max(1, int(threads))}")
+
+
 class DuckDBEngine(Engine):
     name = "duckdb"
     tier = "single"
@@ -39,6 +71,7 @@ class DuckDBEngine(Engine):
         import duckdb
 
         con = duckdb.connect()
+        match_batcher_budget(con)
         # Ingest into DuckDB's NATIVE columnar storage — how every official
         # TPC-H/ClickBench result runs it, and the "DuckDB at its best" bar. Ingestion is
         # one-time and untimed; the timed query then runs on DuckDB's compressed, dictionary-
@@ -62,6 +95,7 @@ class DuckDBEngine(Engine):
         import duckdb
 
         con = duckdb.connect()
+        match_batcher_budget(con)
         con.sql("INSTALL httpfs; LOAD httpfs;")
         region = os.environ.get("BENCH_S3_REGION")
         if region:
@@ -75,6 +109,7 @@ class DuckDBEngine(Engine):
         import duckdb
 
         con = duckdb.connect()
+        match_batcher_budget(con)
         con.sql("INSTALL httpfs; LOAD httpfs;")
 
         def run(query: str) -> pa.Table:

@@ -71,8 +71,12 @@ def _phase(name: str, seconds: float, **fields: object) -> None:
     the dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
     `log_level` as everything else, and the phase name and duration are structured fields
     rather than a sentence — so "which phase dominates this sort" is a query, not a grep.
+
+    Milliseconds, not rounded seconds, and named for its unit — see
+    `api.orchestration.run._phase`, which states why.
     """
-    log_kv(_log, logging.DEBUG, "sort phase", phase=name, seconds=round(seconds, 3), **fields)
+    elapsed_ms = round(seconds * 1000, 3)
+    log_kv(_log, logging.DEBUG, "sort phase", phase=name, duration_ms=elapsed_ms, **fields)
 
 
 def _sort_ir(sort: Sort, input_ir: dict) -> str:
@@ -336,8 +340,11 @@ def execute_sort_flight(
         # whole share on a single reducer however wide the shuffle is — the busiest bucket
         # stops shrinking as workers are added. `plan_hot_split` gives that value a bucket of
         # its own and spreads it over `subs` of them, one per contiguous run of mappers,
-        # which is sound precisely because those rows tie. `None` leaves everything as it was.
-        split = plan_hot_split(grids, boundaries, n_buckets, nulls_first, desc)
+        # which is sound precisely because those rows tie *on the whole sort key* — which is
+        # only so when there is one key, hence `single_key`. `None` leaves everything as it was.
+        split = plan_hot_split(
+            grids, boundaries, n_buckets, nulls_first, desc, single_key=len(sort.keys) == 1
+        )
         if split is not None:
             boundaries, n_buckets, hot_bucket, subs = split
             n_physical = n_buckets + subs - 1

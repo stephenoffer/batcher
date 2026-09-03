@@ -52,6 +52,7 @@ from batcher.api.merge.compose import compose_merge
 from batcher.api.merge.format import target_format
 from batcher.api.merge.native import NATIVE_MERGE_SINKS, native_merge
 from batcher.api.merge.plan import MergePlan, plan_merge
+from batcher.api.security._write import merge_privileges, refuse_governed_rewrite
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -127,9 +128,28 @@ def run_merge(
     fmt = target_format(target, format)
 
     # A transactional target runs the clauses through its own MERGE; the copy-on-write path
-    # below cannot serve one at all (see `native`).
+    # below cannot serve one at all (see `native`). It is also the path that stays available
+    # on a governed table: the format's client merges against the raw table inside itself,
+    # so nothing is read through the principal's view and nothing can be written back
+    # narrowed. `native_merge` authorizes by the clauses' privileges.
     if fmt in NATIVE_MERGE_SINKS:
         return native_merge(source, target, keys, clauses, fmt, opts)
+
+    # The copy-on-write path is a read-modify-write: it reads the files it will rewrite,
+    # composes the clauses over them, and writes the result back. Inside a `security()`
+    # block that read is the *principal's* view, so every row the clauses do **not** match
+    # is carried through masked and rewritten masked. Measured: a two-row table under a
+    # mask on `email`, merged on `id = 1`, came back with the matched row updated and the
+    # unmatched row's real address destroyed.
+    #
+    # Refused rather than made to work. The obvious repair -- read the target with the
+    # statement's own authority, as SQL does, since the rows never surface to the caller --
+    # is not sound here without more: a `when_matched` clause writes arbitrary expressions
+    # into target columns, so `update(notes=col("email"))` would move a masked column's raw
+    # value into an unmasked one of the same table and the principal could then read it.
+    # Making the merge safe means checking every clause expression against the mask policy,
+    # which is a real piece of design and not a keyword argument.
+    refuse_governed_rewrite(target, "merge")
 
     plan = plan_merge(source, target, keys, clauses, prune=prune, format=fmt)
     return _run(source, target, keys, clauses, fmt, plan, opts)
@@ -168,7 +188,7 @@ def _run(
         return merged.write(target, fmt, mode="overwrite", **opts)
 
     fs = resolve_filesystem(target)
-    return _write_and_swap(merged, target, fmt, plan, fs, opts)
+    return _write_and_swap(merged, target, fmt, plan, fs, opts, clauses)
 
 
 def _read_files(target: str, fmt: str, files: list[str]) -> Dataset:
@@ -178,7 +198,7 @@ def _read_files(target: str, fmt: str, files: list[str]) -> Dataset:
     rewrite safe to run against the directory it is writing into: the reader cannot pick up
     the new files the write is landing beside it.
     """
-    from batcher.api.session import _scan
+    from batcher.api.session._scan import _scan
     from batcher.io.formats.base import SOURCES
 
     return _scan(SOURCES.get(fmt)(target, files=files))
@@ -197,13 +217,21 @@ def _write_new_table(
     Composing against ``source.limit(0)`` rather than special-casing the insert path keeps
     one code path — the clause chain, its conditions, and its column defaults all behave
     exactly as they would against a real (empty) table.
+
+    The write is ``mode="error"`` rather than ``"overwrite"``, which says what this path
+    knows: the target was absent when the merge planned. It buys two things. If something
+    created the table between the plan and the write, refusing beats destroying what that
+    writer put there. And an overwrite is charged `DELETE` by write governance, because an
+    overwrite normally destroys the rows already present — while this one, by construction,
+    has none to destroy. Charging it meant an insert-only merge job granted `INSERT`
+    succeeded on every run *except its first*, which is the run it was granted for.
     """
     from batcher.io.manifest import WriteManifest
 
     if not any(c.kind == NOT_MATCHED for c in clauses):
         return WriteManifest()  # no insert clause ⇒ nothing can land in a table with no rows
     merged = compose_merge(source, source.limit(0), keys, clauses)
-    return merged.write(target, fmt, mode="overwrite", **opts)
+    return merged.write(target, fmt, mode="error", **opts)
 
 
 def _write_and_swap(
@@ -213,6 +241,7 @@ def _write_and_swap(
     plan: MergePlan,
     fs: Any,
     opts: dict,
+    clauses: Sequence[MergeClause],
 ) -> WriteManifest:
     """Write the merged rows as new, uniquely-named files, then delete the ones they replace.
 
@@ -237,6 +266,7 @@ def _write_and_swap(
         fmt,
         directory=True,
         sink_kwargs={"file_token": token},
+        privileges=merge_privileges(clauses),
         **options,
     )
     for path in plan.rewritten:

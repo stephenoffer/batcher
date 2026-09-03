@@ -24,24 +24,21 @@
 //! query fast. Ticket minting and epoch/plan fencing stay in Python: Rust only sees
 //! opaque ticket strings.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
 use arrow_pyarrow::PyArrowType;
 use bc_interp::InterpError;
-use bc_transport::{classify, FetchFault, ShuffleTicket, TransportError};
-use pyo3::exceptions::PyRuntimeError;
+use bc_transport::ShuffleTicket;
 use pyo3::prelude::*;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+mod gather;
 
-use crate::errors::transport_to_pyerr;
+use std::path::PathBuf;
+
 use crate::flight::{FlightShuffleServer, ShuffleClient};
 use crate::process::shared_runtime;
 use crate::{parse_aggregates, parse_group_keys, to_pyerr, unwrap_batches};
+use gather::{drive, GatherErr};
 
 /// Validate partition-key inputs at the FFI boundary before they reach the engine.
 ///
@@ -263,181 +260,6 @@ fn wrap_buckets(parts: Vec<Vec<RecordBatch>>) -> Vec<Vec<PyArrowType<RecordBatch
         .into_iter()
         .map(|bucket| bucket.into_iter().map(PyArrowType).collect())
         .collect()
-}
-
-/// A reducer fetch failure that must surface as a Python exception once the GIL is
-/// re-acquired (a `PyErr` cannot be built while the GIL is released inside the runtime).
-enum GatherErr {
-    /// A fatal transport fault (decode/protocol/auth) — fail the query fast.
-    Fatal(TransportError),
-    /// A combine/finalize error over the fetched partials.
-    Combine(InterpError),
-    /// A fetch task panicked or was cancelled.
-    Join(String),
-}
-
-impl GatherErr {
-    fn into_pyerr(self) -> PyErr {
-        match self {
-            GatherErr::Fatal(e) => transport_to_pyerr(e),
-            GatherErr::Combine(e) => to_pyerr(e),
-            GatherErr::Join(m) => PyRuntimeError::new_err(m),
-        }
-    }
-}
-
-/// The node identity of a shuffle address — its host, dropping the `:port`. Advertised
-/// addresses are `{node_ip}:{port}`, so equal hosts ⇒ same node (⇒ shm is reachable).
-fn host_of(addr: &str) -> &str {
-    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
-}
-
-/// Fetch every source concurrently, invoking `on_batches` for each non-empty result
-/// as it arrives; returns the sources that hit a *retryable* fault, each with the
-/// message of the fault that made it retryable.
-///
-/// The message travels because the index alone is a lie by omission. A reducer that
-/// cannot reach a mapper reports "unreachable worker", the driver recomputes, and after
-/// `recovery_max_attempts` the query fails with a worker-loss error — on a cluster where
-/// every worker is alive. The cause is then three frames and one wrong noun away from
-/// whatever actually broke, which is how a ticket collision here spent hours looking like
-/// a fleet problem.
-///
-/// Co-located sources (`addr == own_addr`) read the local store with no socket. Remote
-/// fetches run on the shared runtime, bounded by a `fan_in` semaphore so no more than
-/// `fan_in` are in flight at once. A fatal fault aborts; a retryable one is collected.
-///
-/// `replicas[i]` holds the *fallback* addresses for source `i` — peers carrying a
-/// byte-identical copy of that bucket under the same ticket (see the replication factor
-/// in `DistributedConfig`). A retryable fault against one address transparently falls
-/// over to the next, so losing a worker costs a re-fetch from a survivor rather than the
-/// lineage recompute (re-read the source, re-run the map) it would otherwise force. A
-/// source is reported unreachable only once *every* copy is gone, which is when the
-/// driver's recompute loop is genuinely the right answer. Empty (the default) ⇒ the
-/// single-address behavior, unchanged.
-#[allow(clippy::too_many_arguments)]
-async fn drive(
-    own: &FlightShuffleServer,
-    pool: Arc<bc_transport::ClientPool>,
-    sources: &[(String, ShuffleTicket)],
-    replicas: &[Vec<String>],
-    credits: u32,
-    fan_in: usize,
-    token: Option<String>,
-    shm: bool,
-    mut on_batches: impl FnMut(Vec<RecordBatch>) -> Result<(), InterpError>,
-) -> Result<Vec<(usize, String)>, GatherErr> {
-    let mut unreachable: Vec<(usize, String)> = Vec::new();
-
-    // Co-located buckets first — a cheap in-process read, no network, no permit.
-    let own_addr = own.exchange.advertised_addr();
-    let own_host = host_of(own_addr);
-    let mut set: JoinSet<(usize, Result<Vec<RecordBatch>, TransportError>)> = JoinSet::new();
-    let sem = Arc::new(Semaphore::new(fan_in.max(1)));
-
-    // How many TCP flows to split EACH peer's bucket across. Batcher runs one Flight
-    // endpoint per node, so a reducer pulls each node's whole bucket over a single
-    // stream — one TCP flow, capped below the NIC's line rate. When there are few
-    // distinct remote peers (the small-cluster / autoscaling-ramp / skew case), split
-    // each bucket across several connections to use the whole link; when there are many
-    // peers the gather is already flow-parallel across them, so don't over-connect.
-    // `ceil(fan_in / distinct_peers)` keeps total concurrent streams ~`fan_in`, clamped
-    // to the per-peer connection bound.
-    let distinct_remote = sources
-        .iter()
-        .filter(|(a, _)| a.as_str() != own_addr)
-        .map(|(a, _)| a.as_str())
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-    let stripe = if distinct_remote == 0 {
-        1
-    } else {
-        (bc_transport::connections_per_peer() as u32)
-            .min((fan_in.max(1)).div_ceil(distinct_remote) as u32)
-            .max(1)
-    };
-    for (idx, (addr, ticket)) in sources.iter().enumerate() {
-        // Every address carrying this bucket: the primary, then its replicas. They hold
-        // byte-identical batches under the same ticket, so which one answers is invisible
-        // to the result — only to how long it takes.
-        let mut candidates: Vec<&str> =
-            Vec::with_capacity(1 + replicas.get(idx).map_or(0, Vec::len));
-        candidates.push(addr.as_str());
-        candidates.extend(replicas.get(idx).into_iter().flatten().map(String::as_str));
-
-        // A copy on this very worker is free (local store, no socket) wherever it sits in
-        // the candidate list — so a replica that landed here also skips the network.
-        if candidates.contains(&own_addr) {
-            if let Some(batches) = own.exchange.local_partition(ticket).await {
-                if !batches.is_empty() {
-                    on_batches(batches).map_err(GatherErr::Combine)?;
-                }
-                continue;
-            }
-            // Not actually registered here — fall through to a remote copy.
-        }
-        let remote: Vec<String> = candidates
-            .iter()
-            .filter(|c| **c != own_addr)
-            .map(|c| c.to_string())
-            .collect();
-        if remote.is_empty() {
-            continue; // only copy is a local one that read back empty (unchanged behavior)
-        }
-        let (pool, sem, ticket, token) = (pool.clone(), sem.clone(), *ticket, token.clone());
-        // Owned: the task outlives `own`'s borrow, so the co-location test needs its own copy.
-        let own_host = own_host.to_string();
-        set.spawn(async move {
-            // Hold a permit for the whole fetch so at most `fan_in` stream concurrently.
-            let _permit = sem.acquire_owned().await;
-            let mut last: Option<TransportError> = None;
-            // Try each copy in turn; a retryable fault (a lost/idle peer) falls over to the
-            // next replica instead of failing the source. Only when every copy is gone does
-            // this report the fault the driver recomputes from.
-            for addr in &remote {
-                // Same node, different process: a zero-copy shared-memory mmap read beats a
-                // loopback Flight hop by ~20x. Try it inside the concurrent set (so cross-node
-                // fetches still fan out in parallel) and fall back to Flight on a miss — the
-                // producer may not have mirrored this bucket (shm off, or skipped under memory
-                // pressure), which is a benign, result-preserving fallback.
-                if shm && host_of(addr) == own_host.as_str() {
-                    let (a, t) = (addr.clone(), ticket.to_string());
-                    // shm read is blocking file I/O + decode → off the async reactor.
-                    if let Ok(Ok(Some(batches))) =
-                        tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t))
-                            .await
-                    {
-                        return (idx, Ok(batches));
-                    }
-                }
-                match pool
-                    .fetch_secured_striped(addr, &ticket, credits, token.as_deref(), stripe)
-                    .await
-                {
-                    Ok(batches) => return (idx, Ok(batches)),
-                    // A fatal fault (decode/protocol/auth) is not a lost peer — every replica
-                    // would fail it identically, so fail fast instead of retrying the same bug.
-                    Err(e) if matches!(classify(&e), FetchFault::Fatal) => return (idx, Err(e)),
-                    Err(e) => last = Some(e),
-                }
-            }
-            (idx, Err(last.expect("remote is non-empty")))
-        });
-    }
-
-    while let Some(joined) = set.join_next().await {
-        let (idx, res) = joined.map_err(|e| GatherErr::Join(e.to_string()))?;
-        match res {
-            Ok(batches) if batches.is_empty() => {}
-            Ok(batches) => on_batches(batches).map_err(GatherErr::Combine)?,
-            Err(e) => match classify(&e) {
-                FetchFault::Retryable => unreachable.push((idx, e.to_string())),
-                FetchFault::Fatal => return Err(GatherErr::Fatal(e)),
-            },
-        }
-    }
-    unreachable.sort_unstable();
-    Ok(unreachable)
 }
 
 /// Concurrently gather aggregate partials from every `(addr, ticket)` source and fold

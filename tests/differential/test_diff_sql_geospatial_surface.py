@@ -309,21 +309,52 @@ def _scalar_library() -> list:
 
 @pytest.fixture
 def library_table() -> pa.Table:
+    # Three numeric columns, not one, and ordered `f` < `f2` < `f3`. A function taking
+    # several numbers got the *same* column for each, which makes a (value, low, high)
+    # triple degenerate: `width_bucket(f, f, f, 1)` divides by a zero-width range and the
+    # engine raises on the NaN, so the probe reported a front-end disagreement that was
+    # entirely its own fixture.
     return pa.table(
         {
             "g": pa.array(["a", "b"]),
             "f": pa.array([1.0, 2.0]),
+            "f2": pa.array([0.0, 0.0]),
+            "f3": pa.array([10.0, 10.0]),
             "s": pa.array(["Alpha beta gamma", "x y"]),
             "l": pa.array([[1.0, 2.0], [3.0, 4.0]], pa.list_(pa.float64())),
         }
     )
 
 
-def _library_argument(param) -> str:
+#: A SQL literal and the Python value it denotes, per plan-time constant parameter type.
+#: Deliberately values every function accepts: an `n` of 1 and a probability of 0.5 are in
+#: range for all of them, where a 0 or a 7 is not.
+_CONSTANT_PROBE: dict[type, tuple[str, object]] = {
+    str: ("'a'", "a"),
+    bool: ("TRUE", True),
+    int: ("1", 1),
+    float: ("0.5", 0.5),
+}
+
+
+#: The numeric columns, handed out in order so a multi-number call gets distinct values.
+_NUMERIC_COLUMNS = ("f", "f2", "f3")
+
+
+def _library_argument(param, kind, position: int = 0) -> tuple[str, object]:
+    """How to write one argument in SQL, and the value the DataFrame call gets.
+
+    A parameter the engine reads at plan time takes a literal on *both* sides -- a constant
+    is what it is in either front end. Handing it a column instead is how this probe used
+    to make `wrap_tag(text, tag)` look like a disagreement when the two front ends agree
+    exactly: both refuse a column there, and only SQL was being asked.
+    """
+    if kind is not None and kind in _CONSTANT_PROBE:
+        return _CONSTANT_PROBE[kind]
     annotation = str(param.annotation).strip("'\"").lower()
     name = param.name.lower()
     if "list" in annotation or name in {"vec", "embedding", "vector"}:
-        return "l"
+        return "l", bt.col("l")
     if name == "s" or any(
         k in name
         for k in (
@@ -338,8 +369,23 @@ def _library_argument(param) -> str:
             "document",
         )
     ):
-        return "s"
-    return "f"
+        return "s", bt.col("s")
+    column = _NUMERIC_COLUMNS[min(position, len(_NUMERIC_COLUMNS) - 1)]
+    return column, bt.col(column)
+
+
+#: Names where the two front ends deliberately answer differently, and why. Each is a case
+#: where the SQL name is *already* a SQL name, so the DuckDB oracle outranks agreement with
+#: the Python function that happens to share it — and both operations stay reachable from
+#: both surfaces under an unambiguous spelling.
+_DELIBERATELY_DIFFERENT = {
+    # A clock read twice is two answers; nothing to compare.
+    "current_timestamp",
+    # DuckDB's `quantile(x, p)` picks an element (it is `quantile_disc`); `bt.quantile` and
+    # SQL's `quantile_cont` interpolate. Both are reachable either way: the DataFrame API
+    # spells the discrete one `col(...).quantile_disc(p)`.
+    "quantile",
+}
 
 
 def test_the_scalar_library_answers_what_the_dataframe_api_answers(library_table):
@@ -348,21 +394,30 @@ def test_the_scalar_library_answers_what_the_dataframe_api_answers(library_table
     Parametrizing 400 cases would make the failure list unreadable and the run slow; the
     interesting number is *how many* disagree, and which. A single case is enough to fail on.
     """
+    from batcher._sql.parser.expressions.lowering.signatures import parameter_kinds
+
     ds = bt.from_arrow(library_table)
     checked, mismatched = 0, []
     for name, fn, params in _scalar_library():
-        args = [_library_argument(p) for p in params]
+        kinds = parameter_kinds(fn) or []
+        pairs = [
+            _library_argument(p, kinds[i] if i < len(kinds) else None, i)
+            for i, p in enumerate(params)
+        ]
+        args = [sql for sql, _ in pairs]
         try:
-            expected = ds.select(v=fn(*(bt.col(a) for a in args))).to_pydict()["v"]
+            expected = ds.select(v=fn(*(value for _, value in pairs))).to_pydict()["v"]
         except Exception:
             continue  # the generated argument is not one this function takes
         try:
             actual = bt.sql(f"SELECT {name}({', '.join(args)}) AS v FROM t", t=library_table)
         except NotImplementedError as exc:
             # Two deliberate refusals, both explained rather than "unknown function": an
-            # aggregate needs the aggregate dispatch, and a function taking a Python value
-            # (`bleu(candidate, reference, n: int)`) cannot take the `Expr` a SQL argument
-            # lowers to. Neither is a disagreement; a *third* kind of failure would be.
+            # aggregate needs the aggregate dispatch, and a function taking or returning a
+            # *group* of columns (`quat_multiply -> dict[str, Expr]`) has no scalar SQL
+            # spelling at all. Neither is a disagreement; a third kind of failure would be.
+            # A Python-value parameter used to be a third refusal and is not one any more:
+            # SQL passes it a literal, which is what the DataFrame API passes it too.
             if "is an aggregate" in str(exc) or "no scalar SQL spelling" in str(exc):
                 continue
             if "no scan-order aggregate" in str(exc):
@@ -382,7 +437,7 @@ def test_the_scalar_library_answers_what_the_dataframe_api_answers(library_table
         # column carrying one — which several of these metrics do by design.
         canon = ["nan" if isinstance(v, float) and math.isnan(v) else v for v in (got, expected)[0]]
         want = ["nan" if isinstance(v, float) and math.isnan(v) else v for v in expected]
-        if canon != want and name != "current_timestamp":
+        if canon != want and name not in _DELIBERATELY_DIFFERENT:
             mismatched.append((name, f"api={expected} sql={got}"))
     assert checked > 80, f"only {checked} library functions were exercised — the probe broke"
     assert not mismatched, f"SQL and the DataFrame API disagree: {mismatched[:8]}"

@@ -47,27 +47,14 @@
 //! and a fallback would turn a bug here into a silent slow path. They propagate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{
-    Array, BooleanArray, BooleanBufferBuilder, RecordBatch, RecordBatchOptions, UInt32Array,
-};
-use arrow::buffer::BooleanBuffer;
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::kernels::boolean;
-use arrow::compute::take;
-use arrow::datatypes::{Field, Schema};
 
 use crate::eval::coerce::as_bool;
+use crate::subset::{all_set, compact_rows, scatter_mask, should_compact, truthy};
 use crate::{Expr, ExprError};
-
-/// Cost (in [`Expr::eval_cost`] units) at or below which a conjunct counts as cheap.
-///
-/// Calibrated to sit just above a comparison against a literal (`col cmp lit` is 3)
-/// and a null test, and below a cast (8 plus its input) and a string kernel (40 plus
-/// its input). It decides only *how eagerly* a gather is paid for, so the boundary
-/// wants to be roughly right rather than exact.
-const CHEAP_CONJUNCT_COST: u32 = 8;
 
 impl Expr {
     /// Evaluate `self` as a filter predicate, short-circuiting its `AND` conjuncts.
@@ -153,11 +140,15 @@ impl Expr {
                 break;
             };
             let alive = live.values().count_set_bits();
-            if !should_compact(alive, view.num_rows(), conjuncts[next].eval_cost()) {
+            // `should_compact` deliberately does not decide `alive == 0`, because its two
+            // callers want opposite answers. Here the answer is no: handing a conjunct an
+            // empty batch is the one way this rewrite could change an outcome, since a type
+            // error the whole-batch path raises might not fire on no rows.
+            if alive == 0 || !should_compact(alive, view.num_rows(), conjuncts[next].eval_cost()) {
                 continue;
             }
-            let Some(next_view) =
-                compact(batch, &conjuncts, remaining, &live, view_abs.as_deref())?
+            let still_to_read: Vec<&Expr> = remaining.iter().map(|&i| conjuncts[i]).collect();
+            let Some(next_view) = compact_rows(batch, &still_to_read, &live, view_abs.as_deref())?
             else {
                 return Ok(None);
             };
@@ -168,7 +159,7 @@ impl Expr {
 
         Ok(Some(match view_abs {
             None => live,
-            Some(abs) => scatter(n, &abs, &live),
+            Some(abs) => scatter_mask(n, &abs, &live),
         }))
     }
 }
@@ -306,118 +297,13 @@ const MIN_REMOVED_FRACTION: f64 = 1.0 / 65_536.0;
 /// (nanoseconds per row divided by a fraction), so measured conjuncts sort first.
 const UNMEASURED_RANK_BASE: f64 = 1.0e9;
 
-/// The mask with its nulls folded into false, so a chain of them composes with a
-/// plain `AND`.
-///
-/// This is the same reduction `filter_record_batch` performs on a nullable mask
-/// before gathering, which is why doing it per conjunct changes no keep decision.
-fn truthy(mask: &BooleanArray) -> BooleanArray {
-    match mask.nulls() {
-        Some(nulls) => BooleanArray::new(mask.values() & nulls.inner(), None),
-        None => mask.clone(),
-    }
-}
-
-fn all_set(len: usize) -> BooleanArray {
-    BooleanArray::new(BooleanBuffer::new_set(len), None)
-}
-
-/// Whether gathering the survivors now beats evaluating the rest at full width.
-///
-/// A gather costs one pass over the surviving rows of the named columns; skipping
-/// buys one pass over the removed rows per remaining conjunct. So the threshold is a
-/// function of what the *next* conjunct costs: an expensive one (a cast, a regex, a
-/// dictionary-set membership) repays the gather after a modest reduction, while
-/// another bare comparison has to see most of the batch disappear first.
-///
-/// Both guards at the top matter. Compacting when nothing was removed is pure loss,
-/// and compacting to zero rows would hand the remaining conjuncts an empty batch —
-/// on which a type error that the whole-batch path raises might not fire, the one way
-/// this optimization could otherwise change an outcome.
-fn should_compact(alive: usize, view_rows: usize, next_cost: u32) -> bool {
-    if alive == 0 || alive == view_rows {
-        return false;
-    }
-    if next_cost > CHEAP_CONJUNCT_COST {
-        alive * 8 <= view_rows * 7
-    } else {
-        alive * 4 <= view_rows
-    }
-}
-
-/// A compacted view: the surviving rows of just the columns still to be read.
-struct Compacted {
-    batch: RecordBatch,
-    /// Row `j` of `batch` is row `abs[j]` of the original batch, ascending.
-    abs: Vec<u32>,
-}
-
-/// Gather the rows `live` keeps, projected to the columns `remaining` names.
-///
-/// Indices are always resolved against the *original* batch — `view_abs` maps the
-/// current view's rows back first — so repeated compaction composes without
-/// accumulating a chain of gathers. Returns `None` if a named column is absent, so
-/// the caller can fall back and let the ordinary path report it.
-fn compact(
-    batch: &RecordBatch,
-    conjuncts: &[&Expr],
-    remaining: &[usize],
-    live: &BooleanArray,
-    view_abs: Option<&[u32]>,
-) -> Result<Option<Compacted>, ExprError> {
-    let set = live.values().set_indices();
-    let abs: Vec<u32> = match view_abs {
-        None => set.map(|i| i as u32).collect(),
-        Some(prev) => set.map(|i| prev[i]).collect(),
-    };
-
-    let mut names: Vec<&str> = Vec::new();
-    for &i in remaining {
-        conjuncts[i].collect_columns(&mut names);
-    }
-    names.sort_unstable();
-    names.dedup();
-
-    let indices = UInt32Array::from(abs.clone());
-    let schema = batch.schema();
-    let mut fields: Vec<Field> = Vec::with_capacity(names.len());
-    let mut columns = Vec::with_capacity(names.len());
-    for name in names {
-        let Ok(i) = schema.index_of(name) else {
-            return Ok(None);
-        };
-        fields.push(schema.field(i).clone());
-        columns.push(take(batch.column(i).as_ref(), &indices, None)?);
-    }
-
-    // The row count must be stated: a predicate over literals alone names no column,
-    // and a zero-column batch has no other way to say how long it is.
-    let options = RecordBatchOptions::new().with_row_count(Some(abs.len()));
-    let projected =
-        RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)?;
-    Ok(Some(Compacted {
-        batch: projected,
-        abs,
-    }))
-}
-
-/// Expand a mask over compacted rows back to one over all `n` original rows.
-///
-/// Rows absent from `abs` were removed by an earlier conjunct, so they are false.
-fn scatter(n: usize, abs: &[u32], live: &BooleanArray) -> BooleanArray {
-    let mut bits = BooleanBufferBuilder::new(n);
-    bits.append_n(n, false);
-    for j in live.values().set_indices() {
-        bits.set_bit(abs[j] as usize, true);
-    }
-    BooleanArray::new(bits.finish(), None)
-}
-
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int32Array, Int64Array, StringArray};
-    use arrow::compute::filter_record_batch;
-    use arrow::datatypes::DataType;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int32Array, Int64Array, StringArray, UInt32Array};
+    use arrow::compute::{filter_record_batch, take};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
     use crate::{BinaryOp, Literal};
@@ -596,8 +482,8 @@ mod tests {
             start: None,
             length: None,
         };
-        assert!(cheap.eval_cost() <= CHEAP_CONJUNCT_COST);
-        assert!(expensive.eval_cost() > CHEAP_CONJUNCT_COST);
+        assert!(cheap.eval_cost() <= crate::subset::CHEAP_EXPR_COST);
+        assert!(expensive.eval_cost() > crate::subset::CHEAP_EXPR_COST);
     }
 
     /// A conjunct that is not boolean must be declined rather than coerced, so the

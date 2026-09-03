@@ -148,6 +148,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | **Unreachable** — decoded at the FFI boundary, so the dict-native kernels never see a dictionary from Python | Compounds with 2 |
 | 7 | Adaptive morsel sizing as a pluggable strategy | Daft | Fixed 16,384 rows | Small, and mostly a latency story |
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
+| 26 | Composite integer keys hashed **column at a time**, and that table presized | DuckDB, Polars | **Landed** (`hash_columns_i64` + `GroupGrowth` in `assign_groups_int64_multi`) | 1.4x-6.2x on a multi-key integer `GROUP BY` with many groups; 1.07x-1.12x at low cardinality. Generalizing either half to the *other* group paths loses — see item 26 |
 | 11 | Compressed materialization — narrow a key to its *measured* range | DuckDB | **Landed for the multi-key sort** (`packed_multi_sort_indices`); **measured and reverted** for the composite group key | 1.5-3.0x on a multi-key `ORDER BY`; 0.86x-1.04x on grouping, so not taken there — see 11 |
 
 **Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
@@ -2950,6 +2951,12 @@ What remains true is only the top-level number: a four-key integer `GROUP BY` ru
 needs Rust-level profiling rather than black-box probing from Python. That is the honest state of
 this bottleneck.
 
+**Followed up and found, 2026-08-29 — see item 26.** Reading the code rather than probing it
+from Python located two causes in the same function, and this entry's own framing is worth
+correcting on one point: the cost was never in the dense-versus-hash *decision*, which is what
+all three hypotheses above tested. It was in the hash path itself, in how a composite key's hash
+is built and how the table that holds it grows.
+
 ### `tpcds-q67` reports FAILED and the engine is not at fault
 
 The sweep's one correctness failure, diagnosed rather than waved through, because "1 of 99
@@ -3124,6 +3131,157 @@ inconveniently small. This pass produced **four** such numbers — a refuted rol
 skew, a bulk-emission win that was the box getting quieter, and a dense-path "loss" that won
 every round once interleaved — against three genuine gaps that were built. Every one of the
 four looked like a reason to change code. **Repeat the measurement before you do.**
+
+## 26. The composite-integer `GROUP BY` hashed row-major — **landed, 1.4x to 6.2x** (2026-08-29)
+
+Item 23 left the TPC-DS board with one undiagnosed residue: a four-key integer `GROUP BY` at
+**1.55-1.96x DuckDB**, the term every level of every `ROLLUP` in that suite pays once. It ruled
+out three hypotheses (a cost cliff at three keys, the dense composite map declining, a too-
+generous `dense_budget`) and closed by saying that locating the cause needed Rust-level reading
+rather than black-box probing from Python. This is that pass.
+
+### What the code was doing
+
+`assign_groups_int64_multi` built each row's composite hash **row-major**: construct an `ahash`
+hasher, walk the column list writing every column's value into it, finish it — per row. DuckDB
+(`src/common/vector_operations/vector_hash.cpp::TightLoopCombineHash`) and Polars
+(`polars-core/src/hashing/vector_hasher.rs::vec_hash_combine`) both do the opposite, and the
+same thing as each other: seed one hash per row, then make **one pass per column**, folding
+that column's values into the running hashes.
+
+The per-row cost is the smaller half of the difference. The larger half is the group table's
+**resize**, and it is invisible in the loop that pays for it. `HashTable` rehashes every entry
+it already holds on each growth step, and what an entry held here was a *representative row
+index* — so the rehash closure read that row back out of **every** key column, one random
+access each into an array of `8 x num_rows` bytes, with representatives scattered across the
+whole relation. Keeping the hashes live makes that closure a single array read.
+
+And the table grew far more than it needed to. `group_table_capacity` deliberately starts small
+(analytical `GROUP BY`s are overwhelmingly low-cardinality, and sizing at the row count measured
+**2.6x** slower), with `GroupGrowth` extrapolating the real group count once that initial
+capacity fills. `GroupGrowth` was wired into two of the paths that grow such a table — the
+`RowConverter` fallback and `assign_groups_packed_wide` — and **not** into this one, so a
+near-unique composite integer key paid the full doubling cascade, each doubling rehashing every
+entry through the scattered-read closure above. The two defects multiply, which is why the
+column-major hash is worth four times as much before the presize as after it.
+
+### Measured
+
+Interleaved in one process, three implementations alternating over the same data, best of nine
+rounds, with the group ids asserted **identical** on every round. Separate runs cannot resolve
+anything below roughly 30% on this box, so the A/B alternates rather than comparing two
+binaries; this run was also the only test in its process, on a box at load 11 rather than 25.
+1,048,576 rows, single-threaded, `assign_groups` only (no aggregate). The middle column is the
+old row-major hashing **with** the presize, so the two halves stay attributable:
+
+| key | groups | before | + presize | + column-major | presize alone | both |
+|---|---|---|---|---|---|---|
+| 2 x `Int64`, near-unique | 1,016,244 | 177.5 ns/row | 56.0 | 48.6 | 3.17x | **3.65x** |
+| 3 x `Int64` | 257,417 | 99.3 | 92.7 | 70.5 | 1.07x | **1.41x** |
+| 4 x `Int64` | 860,183 | 155.7 | 101.3 | 78.3 | 1.54x | **1.99x** |
+| 4 x `Int64`, near-unique | 1,048,576 | 285.6 | 69.8 | 46.4 | 4.09x | **6.15x** |
+| 6 x `Int64` | 884,263 | 223.4 | 125.9 | 92.9 | 1.78x | **2.40x** |
+| 2 x `Int64`, 1,024 groups | 1,024 | 15.8 | 16.9 | 14.4 | 0.93x | 1.10x |
+| 3 x `Int64`, 4,096 groups | 4,096 | 28.4 | 29.0 | 25.3 | 0.98x | 1.12x |
+| 4 x `Int64`, 4,096 groups | 4,096 | 35.7 | 36.3 | 33.4 | 0.98x | 1.07x |
+
+**The presize is the larger half, and that is the opposite of what this pass set out to fix.**
+It began as "Batcher hashes row-major where DuckDB and Polars hash column-major", which is true
+and is worth 1.07x-1.41x on its own. The missing `GroupGrowth` is worth 3.2x-4.1x on the shapes
+that matter, and it was not a missing technique at all — it was an existing, tested, documented
+one wired into one composite path and not this one. Read that before reaching for a competitor's
+design again: the largest number here came from finishing something this repository had already
+built.
+
+The two are also not independent, which is why the middle arm was worth running rather than
+assumed. Column-major hashing is worth much more *before* the presize than after it (at four
+columns near-unique: 285.6 to 69.8 by presizing, then 69.8 to 46.4), because a large part of
+what it removes is the scattered per-column read inside the rehash closure — and presizing
+removes most of the rehashes. Either fix alone leaves value on the table.
+
+**The low-cardinality rows are the point of the table, not filler**, and they are the reason the
+two must ship together. Presizing *alone* is 0.93x-0.98x there — a small loss, in the shape the
+small initial capacity was tuned for — and the column-major hash is what turns those rows back
+into 1.07x-1.12x. This is also where the one previous attempt on this operator died: delegating
+a two-column key to `assign_groups_packed` bought 1.4-1.6x at high cardinality and cost **1.7x**
+at low, so it was reverted, and the note recording that is still in `assign_groups_int64_multi`.
+
+Two earlier runs of the same bench, contended, read the four high-cardinality `before` rows at
+225.0 / 373.5 / 165.7 / 278.5 and 184.7 / 300.4 / 144.6 / 239.4 ns/row against the
+177.5 / 285.6 / 155.7 / 223.4 above. The machine drifted by more than 25% between them; the
+**ratios** stayed within about 0.2x throughout. That is the argument for interleaving, restated
+as data — and the reason the absolute figures here are quoted only alongside their ratios.
+
+### One smaller thing in the same function
+
+`dense_multi_span` checks the running product of the columns' value ranges against the budget
+**inside** its scan loop rather than after it, so a key that cannot be dense stops at the column
+that proves it. It reads every row of every key column and is the one part of the composite
+decision that is never free; on a high-cardinality key — exactly where the hash path is already
+the expensive one — it was scanning all of them to learn what the first one said.
+
+### Three obvious generalizations, all built, all measured, all reverted
+
+Every one of these follows from the entry above by an argument that sounds right, and every one
+loses. They are recorded so the next reader does not spend the afternoon this cost.
+
+**Storing the hash in the table entry instead of materializing the array.** The array is 8 bytes
+per input row; putting the hash in the entry removes it, makes the rehash closure the identity
+rather than an array read, and lets a probe compare a full 64-bit hash before it touches the key
+columns. Three wins and a memory saving. Measured against the shipped version it is **0.62x to
+0.83x** on the four high-cardinality shapes — the entry goes from 4 bytes to 16, and past a few
+hundred thousand groups the wider table costs more cache than any of that saves. The memory
+argument that motivated it was also weaker than it looked: `assign_groups_packed` on the very
+next path already materializes a `u128` per row, and the `RowConverter` path a whole encoded
+row, so 8 bytes per row is *below* what this file already spends.
+
+**Presizing the single-`Int64` hash table the same way.** `int_group_ids` has no `GroupGrowth`
+and a near-unique sparse key reaches it, so this reads as the same bug one column narrower. It
+is **0.80x to 0.93x** across 500 to 660,000 groups. The reason is the same as the one above and
+is worth stating as a rule: this table's entry is `(key, group_id)` — sixteen bytes, chosen
+deliberately so a probe does not have to fetch the key back out of the column — and presizing a
+sixteen-byte-entry table scatters every probe across the final footprint from row zero, where
+doubling into it keeps the live set compact for most of the pass. **`GroupGrowth` pays where the
+entry is narrow and the rehash is expensive. It costs where the entry is wide.** The composite
+path is the first; the single-key paths are the second.
+
+**Presizing `assign_groups_bytes` and `group_by_u128`.** Same shape again. The string path split
+— 1.56x on a near-unique key, 0.89x at 300,000 groups — which is not a result to ship on, and
+`group_by_u128` was never measured at all. Both reverted; both are open questions rather than
+known wins.
+
+These three were measured in a process that was also running the rest of the crate's 515 tests,
+so the magnitudes are soft. The **direction** was consistent across every shape and reproduced
+the same explanation each time, which is what the reverts rest on. Anyone reviving one of them
+should re-measure in isolation first — and should expect the entry width, not the presize, to be
+the variable that decides it.
+
+### What this does not claim
+
+The figures above are `assign_groups` in isolation, single-threaded. A whole query divides them
+by everything else it does — the scan, the accumulators, the combine — and the parallel path
+calls this per 16,384-row morsel, where the table is small and the cascade barely fires. The
+shape that collects the full win is the **whole-relation** call: `combine`'s regroup, a
+distributed partition, and `DISTINCT` on a near-unique composite key. The end-to-end number
+belongs against `op-groupby-multi-int`, which this pass added because the suite had no composite
+*integer* case at all — only a single key and a two-column *byte* key, each of which takes a
+specialized path that never reaches this code. A bottleneck with no case in the suite is how
+item 9's string sort stayed invisible for months.
+
+That case, at sf1 over `lineitem`, `GROUP BY l_linenumber, l_quantity, l_suppkey, l_partkey`
+with a `SUM` and a `COUNT`, correctness gate passed on all three engines:
+
+| batcher | duckdb | polars |
+|---|---|---|
+| 73.5 ms | 66.9 ms (1.10x) | 218.7 ms (0.34x) |
+
+**Read that as where the shape stands, not as this change's delta.** It is a single run on a box
+carrying several other sessions, and the suite geomean's own spread across three repeats was
+**42%** — so the third digit is noise and the second is not safe either. The attributable figure
+is the interleaved A/B above; this row exists so the shape has a number in the suite at all, and
+so the next session has something to A/B a build against. It belongs in
+`benchmarks/BENCHMARK_RESULTS.md` and is recorded here instead only because that file was being
+rewritten by another session at the time.
 
 ## Things Batcher already has, so do not "add" them
 

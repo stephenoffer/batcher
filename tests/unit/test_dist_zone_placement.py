@@ -44,6 +44,14 @@ def topology(monkeypatch):
         import batcher.dist.executors.ray_runtime.scaling as scaling
 
         monkeypatch.setattr(scaling, "node_classes", lambda: list(nodes))
+        # The census view derives from the same stub, so a consumer reading either seam sees
+        # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+        # describe; the weighting itself is pinned in `test_node_class_census.py`.
+        monkeypatch.setattr(
+            scaling,
+            "node_class_census",
+            lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+        )
 
     return _install
 
@@ -133,16 +141,16 @@ def test_a_gpu_collective_is_never_zone_pinned(monkeypatch):
     Asserted at the gate rather than at `preferred_fleet_zone`, because the exclusion is a
     scheduling decision about which fleets the optimization applies to.
     """
-    from batcher.dist.executors.ray_runtime import scheduling
+    from batcher.dist.executors.ray_runtime.fabric import bundles
     from batcher.plan.resource import SchedulingEnvelope
 
     # Fails loudly if the gate is reached at all: the collective must be excluded before any
     # topology or config is read, so a later refactor that moves the check cannot go quiet.
     monkeypatch.setattr(
-        scheduling, "active_config", lambda: pytest.fail("a collective must be gated out first")
+        bundles, "active_config", lambda: pytest.fail("a collective must be gated out first")
     )
     env = SchedulingEnvelope(num_cpus=1.0, gpu_collective=True)
-    assert scheduling._fleet_zone_selector(4, env) == {}
+    assert bundles.fleet_zone_selector(4, env) == {}
 
 
 def test_the_config_switch_turns_the_pin_off(monkeypatch):
@@ -150,14 +158,14 @@ def test_the_config_switch_turns_the_pin_off(monkeypatch):
     import dataclasses
 
     from batcher.config import active_config, config_context
-    from batcher.dist.executors.ray_runtime import scheduling
+    from batcher.dist.executors.ray_runtime.fabric import bundles
 
     base = active_config()
     off = base.replace(
         distributed=dataclasses.replace(base.distributed, zone_aware_placement=False)
     )
     with config_context(off):
-        assert scheduling._fleet_zone_selector(4, None) == {}
+        assert bundles.fleet_zone_selector(4, None) == {}
 
 
 # --- market type -------------------------------------------------------------------------

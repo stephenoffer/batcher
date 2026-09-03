@@ -63,6 +63,37 @@ class Engine:
         """Whether this engine's package can be imported here (override per engine)."""
         return False
 
+    def prepare(self) -> None:
+        """One-time setup this engine needs **before any engine runs**. Default: nothing.
+
+        It exists for one real ordering problem. Ray Data's workers need the `benchmarks/`
+        directory on their `PYTHONPATH` — the TPC-H pipelines are module-level functions, so
+        cloudpickle sends them by reference and a worker that cannot import `suites` dies
+        before running a batch. A job-level `runtime_env` can only be set by whoever calls
+        `ray.init`, and the adapter only did so `if not ray.is_initialized()`. In the
+        `--tier multi` lineup Batcher leads and initializes Ray first, so that branch never
+        ran and every Ray Data query failed with `ModuleNotFoundError: No module named
+        'suites'` — the comparison the tier exists for, reported as `ERR` on all 22 queries.
+
+        Calling this for every selected engine before the first case lets the engine that
+        needs to own `ray.init` take it.
+        """
+
+    def release(self) -> None:
+        """Give up cluster-wide resources this engine is holding. Default: nothing.
+
+        A multi-engine run times each engine in turn on one cluster, so an engine that keeps
+        the cluster reserved between its own calls starves whichever engine is timed next.
+        Batcher is the one that does: its session fleet is a placement group reserving ~99%
+        of the cores and is deliberately kept warm across `collect()` calls. Daft then could
+        not start at all — every query failed with `No flotilla workers became available
+        within 120s (4 attempted)` — so the comparison the `--tier multi` lineup exists for
+        produced no competitor column.
+
+        Called after an engine's runs for a case, and only when it shares the lineup, so a
+        single-engine run keeps the warm fleet it would have in production.
+        """
+
     def handle(self, table: pa.Table) -> Any:
         """Native handle wrapping an in-memory Arrow table (for operator-mix cases)."""
         raise NotImplementedError(f"{self.name} has no in-memory handle")

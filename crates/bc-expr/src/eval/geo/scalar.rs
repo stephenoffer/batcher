@@ -236,7 +236,7 @@ fn int_of(func: GeoFunc, g: Option<&Geom>) -> Option<i64> {
     };
     let g = g?;
     Some(match func {
-        StDimension => g.geom_type().dimension(),
+        StDimension => bc_geo::algo::predicate::dimension(&g.geometry),
         StSrid => i64::from(g.srid),
         StNumPoints => g.num_points() as i64,
         StNumGeometries => g.geometry.num_geometries() as i64,

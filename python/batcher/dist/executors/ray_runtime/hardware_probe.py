@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 
 from batcher._internal.logging import get_logger, note_suppressed
+from batcher.dist.executors.ray_runtime.scheduling import probe_options
 
 __all__ = [
     "cluster_device_health",
@@ -461,7 +462,7 @@ def _probe_representatives(ray, node_ids: list[str]) -> tuple[dict, ...]:
     """
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    probe = ray.remote(num_cpus=0)(_profile_on_this_worker)
+    probe = ray.remote(**probe_options())(_profile_on_this_worker)
     refs = [
         probe.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
@@ -757,7 +758,7 @@ def _probe_fleet_health() -> tuple[dict, ...]:
         ]
         if not nodes:
             return ()
-        probe = ray.remote(num_cpus=0)(_device_health_on_this_worker)
+        probe = ray.remote(**probe_options())(_device_health_on_this_worker)
         refs = {
             probe.options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(n["NodeID"], soft=False)

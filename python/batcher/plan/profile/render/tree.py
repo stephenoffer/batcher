@@ -12,7 +12,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from batcher.plan.profile.render.options import FOLD_ABOVE_OPS, FOLD_BELOW_SHARE, RenderOptions
+from batcher.plan.profile.render.options import (
+    FOLD_ABOVE_OPS,
+    FOLD_BELOW_SHARE,
+    MAX_SPINE_DEPTH,
+    RenderOptions,
+)
 
 if TYPE_CHECKING:
     from batcher.plan.profile.types import OpProfile
@@ -138,7 +143,13 @@ def spine(ops: Sequence[OpProfile], i: int, flags: Sequence[bool], glyphs: dict[
         if ops[j].depth == wanted:
             bars.append(glyphs["gap"] if flags[j] else glyphs["pipe"])
             wanted -= 1
-    return "".join(reversed(bars)) + (glyphs["last"] if flags[i] else glyphs["tee"])
+    bars.reverse()  # outermost ancestor first, as drawn
+    if len(bars) > MAX_SPINE_DEPTH:
+        # Keep the *nearest* ancestors -- the ones whose branches a reader is still
+        # resolving -- and stand one marker in for the rest. See `MAX_SPINE_DEPTH` for what
+        # the unbounded form did to a deep plan.
+        bars = [glyphs["elide"], *bars[-(MAX_SPINE_DEPTH - 1) :]]
+    return "".join(bars) + (glyphs["last"] if flags[i] else glyphs["tee"])
 
 
 def has_branch(ops: Sequence[OpProfile]) -> bool:

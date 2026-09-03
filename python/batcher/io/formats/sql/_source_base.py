@@ -309,3 +309,22 @@ class SingleResultQuerySource(ABC):
         Returns:
             A stable, non-secret string naming this relation.
         """
+
+    def governed_name(self) -> str:
+        """Empty: a read defined by a query names no table a policy can be written about.
+
+        A raw SQL string names no table this engine can resolve without parsing it, and
+        guessing would be worse than admitting it: a policy matched against the wrong table
+        governs the wrong data. Saying so plainly is also what lets `governance.mode` refuse
+        or warn about the read, which it cannot do for a source that returns a
+        plausible-looking name nothing matches. Keying on `identity` produced exactly such a
+        name -- ``<connection fingerprint>:SELECT * FROM orders`` -- which no operator could
+        have typed into a policy, so every warehouse read was ungoverned in silence.
+
+        A subclass that *can* be given a table rather than a query overrides this and
+        returns it.
+
+        Returns:
+            The empty string.
+        """
+        return ""

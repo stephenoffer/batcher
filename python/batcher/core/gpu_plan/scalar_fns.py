@@ -149,9 +149,16 @@ def eval_math(ir, df, be, eval_expr):
         # Neither Series type has `.sign()`. The arithmetic form has to restore the null
         # itself: a comparison against a null yields null, and casting that to an integer
         # raises rather than propagating.
+        #
+        # The result keeps an integer input's type, exactly as `abs` below does — the engine
+        # answers `sign(int64)` in int64 and only a float input in double. Casting the
+        # difference to double unconditionally returned the right number in the wrong column,
+        # which is this tier's characteristic defect and which `enforce_schema_contract` now
+        # declines the whole query for.
         pos = (x > 0).fillna(False).astype("int64")
         neg = (x < 0).fillna(False).astype("int64")
-        return (pos - neg).astype(be.dtype(_float64())).where(x.notna(), None)
+        out = _int64() if be.is_integer(x) else _float64()
+        return (pos - neg).astype(be.dtype(out)).where(x.notna(), None)
     if fn == "round":
         if be.is_integer(x):
             # Rounding an integer to zero digits is the identity, and the engine says so —

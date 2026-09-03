@@ -119,6 +119,17 @@ class HDF5Source:
     def identity(self) -> str:
         return f"hdf5:{self._path}:{self._dataset}"
 
+    def governed_name(self) -> str:
+        """The file a policy is written about; the dataset is a slice of it.
+
+        `identity` names the *relation*, so it carries the dataset a read is pinned to. A
+        policy is about the file, which is what an operator can name before opening it.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none.
+        """
+        return self._path
+
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         n = self._length()
         slice_rows = active_config().execution.morsel_rows

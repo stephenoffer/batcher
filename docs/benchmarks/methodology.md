@@ -87,6 +87,7 @@ are the representative way that engine is run, and both are why the like-for-lik
 | Daft | Native multithreaded local engine (`DAFT_RUNNER=native`), or its Ray runner for the cluster grid | Its fastest runner for each shape |
 | DuckDB, Polars | In-process | The only way they run |
 | Ray Data | Tables written to Parquet once, untimed, then read back with Ray-sized row groups | `from_arrow` makes one block, and a block is Ray's unit of parallelism — a one-block dataset runs every operator on a single core. The cost is that Ray decodes Parquet inside each timed run while the in-process engines read Arrow; the alternative was measuring Ray single-threaded |
+| DuckDB (both bars) | CPU and memory budget **pinned to Batcher's** | Left to their defaults DuckDB takes 80% of RAM and Batcher takes 90% of the whole machine — 147.1 against 165.6 GiB here, a 13% headroom advantage to Batcher before it spills. That decides nothing at sf1 and decides whether a query spills at all above 10M rows, which is the regime the project concedes it loses in. Threads are pinned for a second reason: the two agree at 92 on this box by separate auto-detections, and parity that holds by coincidence is parity nobody notices losing |
 | Distributed engines | Attached to the live cluster (`ray.init(address="auto")`) | Where they are designed to be strongest |
 
 ### Which surface each engine runs
@@ -115,6 +116,66 @@ three decimals asserts a stability nobody measured, and two figures agreeing to 
 coincidence rather than evidence that two boards agree. `python benchmarks/run.py --repeat N`
 re-runs a selection and reports min / median / max and the spread; quote the median, to a
 precision the spread supports.
+
+### Three asymmetries that remain, stated rather than removed
+
+**Planning.** Batcher's `Session.sql` caches the parsed AST, the optimized plan and the
+prepared physical plan, so across `bench()`'s warm-up and repeats it plans once. DuckDB's
+`con.sql(query)` re-parses and re-plans on every call, because that is the API a DuckDB user
+writes. Measured on TPC-H sf1, giving DuckDB `PREPARE`d statements moves the geomean from
+**0.764 to 0.783 — 2.3% against Batcher**, with 15 of 22 queries moving against it and
+per-query planning running 8–20% on the plan-heavy shapes. It is left as it is because both
+sides are the ordinary way each engine is used, and it is recorded because 2.3% is real even
+though it sits below this suite's own 2.9% run-to-run spread.
+
+**Output format.** Batcher returns Arrow natively; DuckDB converts to it. Two attempts to
+isolate that conversion here disagreed in sign, so **no figure is quoted for it** — it is
+named as a known asymmetry of unmeasured size rather than estimated.
+
+**Warm-up.** `bench()` discards one execution and reports the best of the next N, so every
+figure on the board is a *steady-state* one. That is the standard way to benchmark and it is
+not the asymmetry. The asymmetry is what the discarded execution costs each engine, which is
+not the same number: on TPC-H sf1 a first-seen query costs Batcher **2.60x** its steady state
+against DuckDB's **1.15x** (`benchmarks/scenarios/claims/learning_curve.py`, geomean over 22
+queries, 8 executions each in a fresh process). DuckDB's 1.15x is the page-cache, JIT and
+allocator floor both engines pay; the **2.27x excess** is Batcher's plan cache and learned
+store filling up, and it is gone by the second or third execution, which is why best-of-N
+lands both engines in steady state and the comparison stays fair.
+
+It is recorded here because it is by far the largest of the three, and because of what it
+implies about scope rather than about bias: a user who runs a query **once** — the most common
+thing a user does — sees a number this board never prints, and the gap between the board and
+that number is engine-specific and roughly 2.3x, not the 2.3% of the planning row above. The
+board answers "how fast is this engine on a query it has seen before". `cold_start.py` and
+`learning_curve.py` are where the other question is answered, and neither feeds a headline
+ratio.
+
+One honest limit, inherited from the experiment: run 1 to run 2 folds the plan cache and the
+learned store together and does not separate them.
+
+**Process isolation.** `run.py --isolate` runs each case in its own subprocess, which the
+harness needs whenever a query takes the process down rather than raising. It is not a
+neutral packaging choice. On TPC-H sf1 over four alternated passes the suite geomean reads
+**0.725 isolated against 0.693 in-process**, a 4.4% difference from a flag that changes
+nothing about the queries, against a pass-to-pass spread inside each mode of under 1%. Three
+quarters of it lands on the comparator, which is misleading about the cause. Run **alone**,
+DuckDB does not care which mode it is in (+1.3%, per-query signs 11 of 22 — a coin flip)
+while Batcher gains **3.8%** from the shared process (15 of 22 queries faster). The capacity
+to benefit from one process is Batcher's, because cross-query carry-over is exactly what this
+engine has and DuckDB does not; in the paired lineup part of that gain is spent being crowded
+by a co-resident DuckDB, so it shows up on DuckDB's side of the table instead. **The
+shared-process mode credits Batcher's cross-query carry-over into the headline ratio**, and
+it is the mode TPC-H, TPC-DS and ClickBench are published from, while JOB is published
+isolated.
+
+Two consequences. A figure is only comparable to another figure taken the same way, so
+`run.py` now names the mode in its header rather than printing an identical table for both.
+And `--isolate` is **not** a cold-start measurement, which a note in
+`benchmarks/BENCHMARK_RESULTS.md` claimed until it was checked: the child still executes the
+query once for the correctness check, once as a warm-up, and N more times reporting only the
+best, so the plan cache and the learned store are warm when the number is taken. If it were
+the cold-start case Batcher would read ~2.6x its steady state; it reads 1.012x. What
+`--isolate` removes is cross-*query* carry-over, not cold start.
 
 ## Suite coverage
 
@@ -173,6 +234,9 @@ python benchmarks/scenarios/point_cloud_load.py
 
 # distributed batcher on a live cluster
 python benchmarks/scenarios/dist_bench.py --workers 4
+
+# does N times the cluster give N times the throughput?
+python benchmarks/scenarios/scaling/ladder.py --rungs 1,2,4
 ```
 :::
 

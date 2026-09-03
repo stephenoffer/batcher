@@ -80,12 +80,18 @@ def _build(name):
 #: the one global-window function with no decomposition, and that entry was the honest reading
 #: of the contract at the time; a shape that gains a decomposition moves, it does not get an
 #: exception.
+#:
+#: Where a shape has both a disk and a Flight driver the entry names **both**, for the reason
+#: the global-window pair already states: `_dispatch` chooses between them on the resolved
+#: `transport`, so naming one turns a routing check into a topology assay. That was not a
+#: hypothetical — pinning the disk name made seven of these twelve shapes fail on a fleet with
+#: Flight, while every one of them was running correctly on the driver the fleet had chosen.
 EXPECTED_DISTRIBUTED: dict[str, object] = {
-    "sort_plain": "sort",
-    "sort_string_key": "sort",
-    "sort_computed_key": "sort",
-    "window_partitioned": "window",
-    "window_computed_key": "window",
+    "sort_plain": {"sort", "sort_flight"},
+    "sort_string_key": {"sort", "sort_flight"},
+    "sort_computed_key": {"sort", "sort_flight"},
+    "window_partitioned": {"window", "window_flight"},
+    "window_computed_key": {"window", "window_flight"},
     # Which of the two global-window drivers runs is resolved from the cluster shape, so
     # pinning one would make this a topology assay rather than a routing check.
     "window_global_ordered": {"global_window", "global_window_flight"},
@@ -96,9 +102,11 @@ EXPECTED_DISTRIBUTED: dict[str, object] = {
     # **raise** for, and the raise was the honest contract while no decomposition existed.
     # `lead` still has none: it reads the bucket the walk has not reached.
     "window_global_lag": {"global_window", "global_window_flight"},
-    "aggregate": "aggregate",
+    "aggregate": {"aggregate", "aggregate_flight"},
+    # `distinct` takes `transport` as an argument instead of being routed by it, so it has
+    # exactly one entry point on either fleet.
     "distinct": "distinct",
-    "join": "join",
+    "join": {"join", "join_flight"},
     "asof_join_by": "asof_by",
     "asof_join_keyless": "asof_keyless",
 }

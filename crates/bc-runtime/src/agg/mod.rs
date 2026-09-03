@@ -1378,20 +1378,23 @@ mod tests {
                 .map(|off| {
                     let len = step.min(n - off);
                     let ck: Vec<ArrayRef> = keys.iter().map(|k| k.slice(off, len)).collect();
-                    let call =
-                        AggCall::with_key(AggFunc::Sum, Some(values.slice(off, len)), None);
+                    let call = AggCall::with_key(AggFunc::Sum, Some(values.slice(off, len)), None);
                     partial(&ck, std::slice::from_ref(&call), len)
                 })
                 .collect::<Result<Vec<Partial>, _>>()?;
             let merged = combine_with(&partials, &[AggFunc::Sum], 1)?;
             let agg = finalize(&[AggFunc::Sum], &merged)?;
-            Ok(agg[0].as_any().downcast_ref::<Int64Array>().unwrap().value(0))
+            Ok(agg[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0))
         };
 
         // Every partial fits an i64; the running total inside one of them does not.
         for step in [1usize, 3, 4, 5, 6] {
-            let got = split(step)
-                .unwrap_or_else(|e| panic!("chunks of {step} should merge, got {e:?}"));
+            let got =
+                split(step).unwrap_or_else(|e| panic!("chunks of {step} should merge, got {e:?}"));
             assert_eq!(got, oracle_sum, "split into chunks of {step}");
         }
 

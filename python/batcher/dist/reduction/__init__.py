@@ -7,6 +7,6 @@ as nodes are added. `tree` holds the arithmetic; the operators supply the combin
 
 from __future__ import annotations
 
-from batcher.dist.reduction.tree import chunks, reduce_levels, tree_reduce
+from batcher.dist.reduction.tree import chunks, fold_width, reduce_levels, tree_reduce
 
-__all__ = ["chunks", "reduce_levels", "tree_reduce"]
+__all__ = ["chunks", "fold_width", "reduce_levels", "tree_reduce"]

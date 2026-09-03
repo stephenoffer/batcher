@@ -2876,4 +2876,105 @@ mod tests {
             }
         }
     }
+
+    /// Whether the vector path admits `op`, stated here so it can be checked.
+    ///
+    /// An exhaustive `match`: adding a variant to [`bc_expr::BinaryOp`] stops this compiling
+    /// until someone classifies it, and the prose subset at the top of `simd.rs` is what to
+    /// update beside it.
+    ///
+    /// That prose had already drifted. It listed `And`/`Or` and temporal comparison as
+    /// *excluded* long after `simd_ty` began admitting both, and nothing in this crate could
+    /// see the difference — the emitter was right, the tests passed, and only the sentence
+    /// describing the tier was wrong. For a tier whose entire contract is bit-for-bit
+    /// agreement with the interpreter, a misdescribed subset is how someone comes to
+    /// "add" support that is already here, or reasons that a compound predicate falls back
+    /// to the oracle when it does not.
+    fn simd_admits(op: BinaryOp) -> bool {
+        use BinaryOp::{
+            AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
+            Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
+        };
+        match op {
+            // Comparisons over numeric or same-type temporal operands - the filter win.
+            Eq | Ne | Lt | Le | Gt | Ge => true,
+            // Integer wrap and IEEE float, both per-lane identical to the scalar path.
+            BinaryOp::Add | Sub | Mul => true,
+            // Float division only; the integer form is excluded with `Mod` below.
+            Div => true,
+            // Bitwise `band`/`bor` over two canonical masks, on a null-free batch.
+            And | Or => true,
+            // Scalarized `sdiv`/`srem` can trap; float `Mod` is an `fmod` libcall.
+            Mod | FloorDiv => false,
+            // Not numeric lanes: strings, integer bit twiddling, calendar arithmetic.
+            Concat | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | AddMonths => false,
+        }
+    }
+
+    /// Operands that give `op` its best chance of the vector path, so a `false` below means
+    /// "declined by design" rather than "asked with the wrong types".
+    fn simd_operands(op: BinaryOp) -> (Expr, Expr) {
+        match op {
+            // Boolean ops need boolean sub-results, which only a comparison produces here.
+            BinaryOp::And | BinaryOp::Or => (
+                bin(BinaryOp::Lt, col("a"), lit_i(0)),
+                bin(BinaryOp::Gt, col("b"), lit_i(0)),
+            ),
+            // Integer `/` is excluded by design, so ask with the float column instead.
+            BinaryOp::Div => (col("c"), col("c")),
+            _ => (col("a"), col("b")),
+        }
+    }
+
+    #[test]
+    fn the_documented_simd_binary_subset_is_what_simd_ty_admits() {
+        const ALL: [BinaryOp; 21] = [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Mod,
+            BinaryOp::FloorDiv,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Concat,
+            BinaryOp::BitAnd,
+            BinaryOp::BitOr,
+            BinaryOp::BitXor,
+            BinaryOp::ShiftLeft,
+            BinaryOp::ShiftRight,
+            BinaryOp::AddMonths,
+        ];
+        let batch = make_batch(64, 7);
+        let mut admitted_count = 0;
+        for op in ALL {
+            let (left, right) = simd_operands(op);
+            let expr = bin(op, left, right);
+            let mut cols = ColumnSet::default();
+            let admitted =
+                analyze(&expr, &batch, &mut cols).is_ok() && simd_ty(&expr, &cols).is_some();
+            admitted_count += usize::from(admitted);
+            assert_eq!(
+                admitted,
+                simd_admits(op),
+                "{op:?}: simd_ty admits it = {admitted}, but this table says {}. \
+                 Update the table AND the subset list at the top of simd.rs.",
+                simd_admits(op)
+            );
+        }
+        // A positive control: if `analyze` or `simd_ty` ever started declining everything,
+        // every row above would agree with a table of all-`false` and this test would pass
+        // while proving nothing.
+        assert_eq!(
+            admitted_count, 12,
+            "expected 12 admitted binary ops: 6 comparisons, 3 integer/float arithmetic, \
+             float `Div`, and `And`/`Or`"
+        );
+    }
 }

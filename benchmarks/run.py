@@ -46,6 +46,7 @@ from harness import (
     emit_result,
     format_repeats,
     format_summary,
+    format_unstable,
     print_table,
     run_isolated,
     summarize,
@@ -250,6 +251,17 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
         return []
     names = [e.name for e in engines]
     if args.isolate:
+        # Say which mode produced these numbers. `--isolate` is not a neutral packaging
+        # choice: measured on TPC-H sf1 over four alternated passes, the suite geomean reads
+        # **0.725 isolated against 0.693 in-process** — a 4.4% difference from a flag that
+        # changes nothing about the queries, against a within-mode pass-to-pass spread of
+        # under 1%. Run alone, DuckDB does not care which mode it is in (+1.3%, per-query
+        # signs 11 of 22) while Batcher gains 3.8% from the shared process, so what the
+        # shared-process board credits into the ratio is Batcher's cross-query carry-over —
+        # a credit the comparator has nothing to gain from. The two modes otherwise print an
+        # identical table, which is how a board saved from one gets compared against a board
+        # saved from the other.
+        print(f"isolated {benchmark} (scale {args.scale}), one process per case")
         results = run_isolated([c.name for c in cases])
         print(f"=== {benchmark} ({', '.join(names)}) ===")
         print_table(results, names)
@@ -265,7 +277,10 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     runs = _runs_for(args.scale, benchmark)
     elapsed = time.perf_counter() - t0
     mode = "corpus" if benchmark in CORPUS_BENCHMARKS else ("scan" if args.scan else "loaded")
-    print(f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}")
+    print(
+        f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}, "
+        "one process for every case"
+    )
     # Say what `--only` actually selected. It matches on *substring*, so `--only q1` pulls in
     # q10 through q19 as well — twelve cases, and the geomean printed underneath is then a
     # mean over all twelve rather than the one query the reader asked for. The `--isolate`
@@ -288,7 +303,7 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     print()
     print(f"=== {benchmark} ({', '.join(names)}) ===")
     print_table(results, names)
-    print(format_summary(summarize(results, names), runs))
+    print(format_summary(summarize(results, names), runs, repeated=args.repeat > 1))
     print()
     return results
 
@@ -349,6 +364,12 @@ def main() -> int:
         f"{fp['memory_bytes'] / (1 << 30):.0f} GiB, {load_text}"
     )
     print(f"engines: {', '.join(e.name for e in engines)}\n")
+    # Before any case runs, so an engine that must own a piece of global setup can take it.
+    # Ray Data is the one that does: the job-level `runtime_env` carrying `benchmarks/` to
+    # its workers can only be attached by whoever calls `ray.init`, and Batcher leads this
+    # lineup — see `Engine.prepare`.
+    for engine in engines:
+        engine.prepare()
     require_release_build(allow_debug=args.allow_debug_build)
     # `envinfo` has shipped this guard since it was written, and until now the *concurrency*
     # benchmark was its only caller — so the suite that produces every headline ratio
@@ -364,6 +385,7 @@ def main() -> int:
     names = [e.name for e in engines]
     all_results = []
     per_run = []
+    per_run_results = []
     for i in range(max(1, args.repeat)):
         if args.repeat > 1:
             print(f"--- repeat {i + 1} of {args.repeat} ---")
@@ -371,11 +393,15 @@ def main() -> int:
         for ds in datasets:
             run_results += _run_dataset(ds, args, engines)
         all_results += run_results
+        per_run_results.append(run_results)
         per_run.append(summarize(run_results, names))
     # The spread, not another decimal place. A geomean from one run carries no evidence
     # about its own stability, and quoting it to three decimals asserts some.
     if args.repeat > 1:
         print(format_repeats(per_run))
+        # The geomean carries a spread and the rows above it do not, which is the wrong way
+        # round: averaging 22 queries cancels most of the noise, a single row keeps all of it.
+        print(format_unstable(per_run_results, names))
 
     if not all_results:
         print("no benchmarks matched the selection.")
@@ -389,10 +415,19 @@ def main() -> int:
     # still never reads OK, still carries no ratio, and still prints its reason.
     failed = [r for r in all_results if r.status in ("FAILED", "ERROR", "KILLED")]
     divergent = [r for r in all_results if r.status == "DIVERGENT"]
+    degenerate = [r for r in all_results if r.status == "DEGENERATE"]
     if divergent:
         print(
             f"{len(divergent)} query(ies) DIVERGENT: a recorded semantic difference, not a "
             "defect — see the notes above and harness/divergences.py."
+        )
+    if degenerate:
+        # Not a failure: TPC-DS q17 legitimately returns zero rows at sf1. But a row where
+        # every engine returned nothing must never read as a fast pass, so it is counted
+        # out loud rather than folded into the OK count.
+        print(
+            f"{len(degenerate)} query(ies) DEGENERATE: every engine returned a result "
+            "carrying no information. Check the data actually loaded before reading these."
         )
     if failed:
         print(f"{len(failed)} query(ies) FAILED correctness, errored, or died.")

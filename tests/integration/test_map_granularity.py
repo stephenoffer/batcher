@@ -23,6 +23,7 @@ import pytest
 import batcher as bt
 from _ray_cluster import init_test_ray, shutdown_test_ray
 from batcher import col, count
+from batcher.carbonite.resilience import SourcePlacement
 from batcher.config import (
     Config,
     DistributedConfig,
@@ -48,7 +49,7 @@ def _ray_session():
 
 
 @pytest.fixture(scope="module")
-def split_source(tmp_path_factory):
+def split_source(cluster_scratch):
     """A Parquet file of 32 row-groups — enough splits to fill a 4x over-partitioned map.
 
     Over-partitioning is bounded by the splits a source actually has, so an in-memory
@@ -65,7 +66,7 @@ def split_source(tmp_path_factory):
             "v": rng.integers(0, 100, n).astype("int64"),
         }
     )
-    path = str(tmp_path_factory.mktemp("granularity") / "t.parquet")
+    path = str(cluster_scratch("granularity") / "t.parquet")
     pq.write_table(table, path, row_group_size=5_000)
     return path
 
@@ -178,6 +179,69 @@ def test_the_per_worker_unit_is_still_available(split_source):
     assert _norm(got) == _norm(expected)
 
 
+def test_the_barrier_runs_several_of_a_worker_s_sources_at_once():
+    """The barrier's in-flight window is `workers * map_slots_per_worker()`, not `workers`.
+
+    A map task reads its partition from object storage and then folds it, so one slot per
+    actor left a node doing neither while doing the other — the gap `FLEET_CONCURRENCY`
+    closes on the reduce side, left open on the map side. This is the positive control for
+    the slot arithmetic: without it every equivalence test in this file passes on the serial
+    deal, because dealing more sources at once cannot change an answer, only a duration.
+
+    It watches the overlap rather than reading the constant back — each task reports itself
+    in and out of a counter actor, and the assertion is on the highest count that counter
+    ever held for one host.
+    """
+    import time
+
+    import ray
+
+    from batcher.dist.executors.ray_runtime.policies._barrier import map_barrier
+    from batcher.dist.executors.ray_runtime.scheduling import map_slots_per_worker
+
+    slots = map_slots_per_worker()
+    if slots < 2:
+        pytest.skip("this build deals one map slot per worker")
+    workers, sources = 2, 2 * slots
+
+    @ray.remote(num_cpus=0)
+    class Overlap:
+        def __init__(self):
+            self.live: dict[int, int] = {}
+            self.peak = 0
+
+        def enter(self, host):
+            self.live[host] = self.live.get(host, 0) + 1
+            self.peak = max(self.peak, self.live[host])
+
+        def leave(self, host):
+            self.live[host] -= 1
+
+        def peak_per_host(self):
+            return self.peak
+
+    counter = Overlap.remote()
+
+    @ray.remote(num_cpus=0)
+    def one_source(counter, host):
+        ray.get(counter.enter.remote(host))
+        time.sleep(0.25)  # long enough that a serial deal cannot overlap by accident
+        ray.get(counter.leave.remote(host))
+        return host
+
+    results, dead = map_barrier(
+        sources,
+        lambda host, src: one_source.remote(counter, host),
+        workers=workers,
+        placement=SourcePlacement(workers),
+    )
+    assert not dead
+    assert len(results) == sources
+    assert ray.get(counter.peak_per_host.remote()) >= 2, (
+        "the map barrier held only one source per worker at a time"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The other three shuffles. Each maps its own input, so each has its own task unit —
 # and the sort and the join have a wrinkle the aggregate does not. The sort samples
@@ -211,14 +275,14 @@ def test_over_partitioned_window_matches_single_node(split_source):
     assert _norm(got) == _norm(expected)
 
 
-def test_over_partitioned_join_matches_single_node(split_source, tmp_path_factory):
+def test_over_partitioned_join_matches_single_node(split_source, cluster_scratch):
     # Deliberately lopsided: a small dimension against the big fact, which is the shape
     # where the two sides' achievable partition counts differ and the shorter list is
     # padded. Getting the padding wrong drops the unpadded side's tail rows.
     import pyarrow.parquet as pq
 
     dim = pa.table({"k": list(range(50)), "label": [f"g{i}" for i in range(50)]})
-    dim_path = str(tmp_path_factory.mktemp("granularity_dim") / "d.parquet")
+    dim_path = str(cluster_scratch("granularity_dim") / "d.parquet")
     pq.write_table(dim, dim_path)
 
     def q():

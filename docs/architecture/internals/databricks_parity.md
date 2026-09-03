@@ -124,7 +124,7 @@ so this gap is Spark's, not Databricks'. Compare against Databricks-on.
 | Capability | Databricks | Batcher | Verdict |
 |---|---|---|---|
 | Rule-based rewrites | Catalyst, hundreds of rules | **722 rules / 7 phases**, live-verified registry; hybrid fixpoint with depth-scaled bound (`optimizer/driver.py:31,49`) | **Parity** |
-| Join reordering | Selinger DP, 3–12 joins, **biased left-deep**; `JoinReorderDPFilters` states bushy suppression "not implemented" | **Bushy** DP: exhaustive ≤12 leaves, DPccp-style ≤20 / 200k pairs, greedy fallback (`kyber/rules/joins/order.py`, `_rebuild_dp` / `_rebuild_dphyp` / `_rebuild_greedy`) | **Batcher ahead** (bushy) |
+| Join reordering | Selinger DP, 3–12 joins, **biased left-deep**; `JoinReorderDPFilters` states bushy suppression "not implemented" | **Bushy** DP: connected-subset (DPccp-style) enumeration ≤20 leaves / 200k pairs, greedy fallback (`kyber/rules/joins/order.py`, `_rebuild_dphyp` / `_rebuild_greedy`). The exhaustive O(3ⁿ) DP (`_rebuild_dp`) is retained only as the oracle `tests/unit/test_dphyp_join_order.py` checks the search against | **Batcher ahead** (bushy) |
 | Cardinality estimation | histograms off by default even on Spark; Databricks auto-stats during writes | HLL/KLL sketches → `Provenance.SKETCH`; Selinger containment w/ PK-FK detection, MCV skew floors, range pruning (`estimator.py:726`) | **Parity**, different mechanism |
 | Multi-column / joint histograms | Spark: off. Databricks: ⚠️ unverified whether they flip `histogram.enabled` | **Absent** | **Gap** (small — both weak) |
 | Cost model calibration | Enzyme: history-calibrated on similar plans | 8 coefficients fit from measured stats, Bayesian shrinkage (`calibration.py:125`) | **Parity** |

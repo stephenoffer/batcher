@@ -243,3 +243,28 @@ def test_resident_cpu_sources_never_read_the_cluster(monkeypatch):
     gpu = bt.from_pydict({"x": [1, 2, 3]}).map_batches(lambda b: b, num_gpus=1.0)
     assert resolve_distributed("auto", gpu._plan, [resident]) is True
     assert calls == [1]
+
+
+def test_a_batch_factory_source_stays_single_node(multinode):
+    """`bt.from_batches(...)` is driver-local data, and `auto` must not ship it out.
+
+    An `IteratorSource` reports no row count — a generator's length is unknown — so it
+    reached the unknown-size branch and distributed. That is wrong twice over. The factory
+    is a Python callable in *this* process, so the rows have to pass through the driver
+    whatever runs the query; and `IteratorSource.splits()` returns a single
+    `WholeSourceSplit` precisely because a generator cannot be sliced, so the fan-out hands
+    every row to one remote reader and gathers it back. It is the resident-data case
+    `InMemorySource` already declines, reached by a different route.
+
+    Observed as a hang-then-crash rather than a slow query: on a Ray-connected process a
+    20,000-row `ds.ml.map_batches(SomeClass)` over `from_batches` fanned out to the cluster,
+    where the worker could not import the module `SomeClass` was defined in.
+    """
+    from batcher.io import IteratorSource
+
+    schema = __import__("pyarrow").schema([("x", __import__("pyarrow").int64())])
+    src = IteratorSource(lambda: iter([]), schema)
+    assert src.row_count() is None, "the premise: the size is unknown, so the branch is reached"
+    assert resolve_distributed("auto", None, [src]) is False
+    # An explicit request still wins — a caller may have a factory every worker can run.
+    assert resolve_distributed(True, None, [src]) is True

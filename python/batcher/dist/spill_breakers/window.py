@@ -47,6 +47,16 @@ def supports_spilling_window(window: Window) -> bool:
     "no". `supports_spilling_join`'s docstring already claimed "Sort and Window already gate
     this way"; Sort did, Window did not.
     """
+    # A `map_batches` anywhere beneath the breaker makes the plan unserialisable: the operator
+    # runs a Python callable and `to_ir()` raises by design, so every path here that ships the
+    # plan to the engine dies inside `json.dumps`. Answering "yes" and letting the executor
+    # discover that is exactly the shape `test_spill_predicates_never_raise` exists to stop —
+    # `iter_batches()` on `map_batches(...).sort(...)` surfaced as
+    # `NotImplementedError: map_batches is executed in Python, not lowered to the engine IR`.
+    from batcher.core.udf import has_map_batches
+
+    if has_map_batches(window):
+        return False
     if not (bool(window.partition_keys) and all(isinstance(k, Col) for k in window.partition_keys)):
         return False
     return _single_source(window.input)

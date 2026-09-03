@@ -65,6 +65,11 @@ def cluster_shape() -> ClusterShape:
     `node_classes()` and `gpu_node_topology()` hold to. The cost of that is a `ray.nodes()`
     round trip per optimize, which is the same call the sizing path already makes.
 
+    Inside a `topology_scope()` it is memoized alongside `node_classes()`, for the reason
+    given there: the scope fixes the topology, so a projection of it is fixed too, and
+    building one `NodeShape` per node was 271 ms of a 50,000-node query's placement phase.
+    Outside a scope nothing is cached, so the autoscale wait still sees the fleet grow.
+
     Each node contributes its cores, RAM, devices, device model, and the labels that place it
     physically. Two figures are *derived* rather than reported, and both are derived
     conservatively:
@@ -85,53 +90,93 @@ def cluster_shape() -> ClusterShape:
     """
     from batcher._internal.accelerators import accelerator_memory_bytes
     from batcher.dist.executors.ray_runtime.fabric.topology import (
-        POWER_ZONE_LABEL,
-        RACK_LABEL,
         nvlink_domain_size,
     )
-    from batcher.dist.executors.ray_runtime.hardware_probe import unhealthy_gpus_by_node
+    from batcher.dist.executors.ray_runtime.scaling import _TOPOLOGY, fleet_census
 
-    # Devices the fleet has taken out of rotation, from whatever health sample is already in
-    # hand — never a fresh probe, which would put a fleet-wide fan-out on every optimize.
-    # Without this the `unhealthy_gpus` field was declared, documented, derived into
-    # `healthy_gpus`, summarized in `ClusterShape.summary()` and read by `exchange_width`, and
-    # *never once set*: every health-aware sizing decision in the engine was inert, and a
-    # device fan-out was sized onto boards the scheduler would refuse to place on.
-    out_of_rotation = unhealthy_gpus_by_node()
+    snapshot = _TOPOLOGY.get()
+    if snapshot is not None:
+        cached = snapshot.derived.get("cluster_shape")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
 
-    nodes: list[NodeShape] = []
-    for node in _node_records():
-        resources = node.get("Resources", {}) or {}
-        cores = int(float(resources.get("CPU", 0.0)))
+    # One pass, shared with the placement path: `scaling.fleet_census()` already walked the
+    # fleet and classified it, so this groups that census down to the fields a plan is sized
+    # against instead of walking every node a second time. Building the per-node form here
+    # was 170 ms of a single query against a synthetic 100,000-node fleet, on top of the
+    # 240 ms the placement path spent on its own pass over the same records.
+    fabric = _declared_fabric_gbps()
+    counts: dict[tuple, int] = {}
+    for node, ids in fleet_census().items():
+        cores = int(node.cpus)
         if cores <= 0:
             continue  # a node with no schedulable cores hosts no worker, so it holds no share
-        labels = node.get("Labels", {}) or {}
-        gpus = int(float(resources.get("GPU", 0.0)))
-        model = str(labels.get("ray.io/accelerator-type") or "")
-        node_id = str(node.get("NodeID", ""))
-        nodes.append(
+        key = (
+            cores,
+            int(node.memory),
+            int(node.gpus),
+            str(node.accelerator_type or ""),
+            node.rack,
+            node.shape_zone,
+            node.power_zone,
+            node.unhealthy_gpus,
+        )
+        counts[key] = counts.get(key, 0) + len(ids)
+
+    census: dict[NodeShape, int] = {}
+    for key, count in counts.items():
+        cores, memory, gpus, model, rack, zone, power_zone, unhealthy = key
+        census[
             NodeShape(
-                node_id=node_id,
+                node_id="",
                 cpu_cores=cores,
-                memory_bytes=int(float(resources.get("memory", 0.0))),
+                memory_bytes=memory,
                 gpus=gpus,
                 accelerator_type=model,
                 gpu_memory_bytes=accelerator_memory_bytes(model) if gpus > 0 else 0,
                 nvlink_domain=nvlink_domain_size(model, gpus) if gpus > 0 and model else 0,
-                rack=str(labels.get(RACK_LABEL) or ""),
-                zone=_zone_label(labels),
-                power_zone=str(labels.get(POWER_ZONE_LABEL) or ""),
-                fabric_gbps=_declared_fabric_gbps(),
+                rack=rack,
+                zone=zone,
+                power_zone=power_zone,
+                fabric_gbps=fabric,
                 rails=0,
-                # Capped at the node's own device count: a stale health record naming devices
-                # a resized node no longer has must never drive `healthy_gpus` negative.
-                unhealthy_gpus=min(gpus, out_of_rotation.get(node_id, 0)),
+                unhealthy_gpus=unhealthy,
             )
-        )
-    # Ordered by node id so two reads of an unchanged cluster produce an identical shape. The
+        ] = count
+
+    # Ordered canonically so two reads of an unchanged cluster produce an identical shape. The
     # shape reaches the plan cache key, and a set-ordered tuple would invalidate every memoized
-    # plan on a cluster that had not changed at all.
-    return ClusterShape(nodes=tuple(sorted(nodes, key=lambda n: n.node_id)))
+    # plan on a cluster that had not changed at all. This used to sort by node id, which a
+    # census entry no longer carries and which was itself an arbitrary tie-break, since Ray
+    # node ids are random. Sorting by the fields instead makes the order a property of the
+    # fleet rather than of which machines happened to register first.
+    ordered = sorted(
+        census.items(),
+        # Densest first, then every remaining field, so the order is total and depends on
+        # nothing but the fleet. `NodeShape` is frozen but not `order=True`, so the tie-break
+        # spells the fields out rather than comparing the records.
+        key=lambda item: (
+            -item[0].cpu_cores,
+            -item[0].gpus,
+            item[0].zone,
+            item[0].rack,
+            item[0].power_zone,
+            item[0].accelerator_type,
+            -item[0].memory_bytes,
+            -item[0].gpu_memory_bytes,
+            -item[0].nvlink_domain,
+            -item[0].fabric_gbps,
+            -item[0].rails,
+            item[0].unhealthy_gpus,
+        ),
+    )
+    result = ClusterShape(
+        nodes=tuple(shape for shape, _ in ordered),
+        multiplicity=tuple(count for _, count in ordered),
+    )
+    if snapshot is not None:
+        snapshot.derived["cluster_shape"] = result
+    return result
 
 
 #: Labels a node's availability zone can arrive under, most current first. The Kubernetes

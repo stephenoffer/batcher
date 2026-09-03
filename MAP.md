@@ -373,7 +373,7 @@ The SQL `Session`: a table catalog, a Python-function registry, and a read diale
 |---|---|---|
 | `registry.py` | 103 | What a Python function registered for SQL looks like to the translator. |
 | `session.py` | 625 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
-| `statements.py` | 105 | SQL statements that change the catalog rather than only reading it. |
+| `statements.py` | 116 | SQL statements that change the catalog rather than only reading it. |
 
 ### `batcher/api/streaming/` — 5 · conductor
 
@@ -392,7 +392,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 600 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 639 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1427 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -902,7 +902,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 2976 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 868 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 877 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 568 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -1003,7 +1003,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
-| `source.py` | 215 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
+| `source.py` | 222 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
 
 ### `batcher/dist/global_window/` — 4 · backend
 
@@ -2119,7 +2119,7 @@ Source connectors — the façade over the source implementation modules.
 | `inmemory_aggregates.py` | 285 | Exact aggregate answers over an immutable in-memory Arrow relation. |
 | `inmemory_stats.py` | 466 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 213 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
-| `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
+| `materialized.py` | 76 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
 | `read.py` | 278 | The neutral read helpers every executor calls a `Source` through. |
 
 ### `batcher/io/splits/` — 2 · neutral IO
@@ -2135,7 +2135,7 @@ Splits — independently-readable, picklable slices of a source.
 | `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
 | `gds.py` | 211 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
-| `parquet.py` | 457 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
+| `parquet.py` | 506 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
 | `text.py` | 168 | Byte-range splits for line-delimited text — what lets one huge log fan across workers. |
 
 ### `batcher/io/stats/` — 2 · neutral IO

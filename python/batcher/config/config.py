@@ -692,6 +692,21 @@ class FlowControlConfig:
     # is the actual buffering governor; this only caps how many peers are dialed at once,
     # so a thousand-mapper shuffle still can't open a thousand sockets.
     shuffle_fetch_fan_in: int = 32
+    # Concurrent Flight streams a reducer runs across *all* its peers, and the decoded
+    # bytes those streams may hold between them. Together they replace what the fan-in
+    # settings above were being asked to decide by accident: a hash shuffle cuts one bucket
+    # per reducer out of every mapper, so a cluster of W workers makes W^2 buckets and each
+    # shrinks as it grows -- and one stream per bucket made the transfer's rate a function of
+    # the cluster's width rather than of the link. Measured across one 25 Gbps link, 1.4 GiB
+    # with only the bucket count varying: 4,096 buckets moved at 1,608 MiB/s against 7,470 at
+    # the same total when the stream count landed right. Holding the stream count fixed and
+    # packing buckets into streams by *bytes* is what makes the rate width-independent; the
+    # byte budget is then the gather's real memory bound, where a bucket count is not one.
+    # Both are clamped by the engine rather than validated here (a stream target below 1
+    # and a budget below a megabyte per stream are floored), which is how the neighbouring
+    # fan-in knobs are treated too.
+    gather_streams: int = 48
+    gather_inflight_bytes: int = 768 << 20  # 768 MiB across every stream
     aimd_alpha: int = 1  # additive increase: +1 credit / RTT
     aimd_beta: float = 0.5  # multiplicative decrease on congestion
     backpressure_high: float = 0.70
@@ -1916,6 +1931,41 @@ class DistributedConfig:
     heterogeneous_node_isolation: bool = False
     # The custom resource CPU-only nodes advertise for `heterogeneous_node_isolation`.
     cpu_node_resource: str = "cpu_node"
+    # Place each stage on the capacity its failure model fits: recomputable work on spot,
+    # state-holding work on on-demand.
+    #
+    # A stateless map partition is its own lineage — it re-derives idempotently from a durable
+    # partition descriptor, which is why the map barrier resubmits one after a preemption
+    # instead of failing the stage. A shuffle worker is not: it holds accumulated partial
+    # state and the mapped output its peers will fetch, so reclaiming it costs the stage. On a
+    # mixed fleet those two belong on different capacity, and Ray can say so — `label_selector`
+    # holds a task to nodes carrying a market-type label and `fallback_strategy` names where it
+    # goes when that market is full, so the preference degrades instead of pending.
+    #
+    # Off by default because it is a placement change that can only be measured on a genuinely
+    # mixed spot/on-demand fleet, which no test lane here has. When on, it is still a no-op
+    # unless the live fleet is mixed *and* labelled under one market-type label key
+    # (`fabric.market.capacity_selector` states every gate) — so an unlabelled, single-market,
+    # or single-node cluster is unchanged whatever this says. Result-identical either way:
+    # placement never changes which rows a task processes.
+    capacity_aware_placement: bool = False
+    # Whether each task reports its lifecycle to Ray's dashboard and State API.
+    #
+    # Ray emits a running/finished event per task to the GCS so `ray list tasks`, the Ray
+    # Dashboard and the State API can show it. That is worth paying for at ordinary fan-out and
+    # stops being worth it at Batcher's: a stage of a hundred thousand partitions puts a
+    # hundred thousand events onto a control plane every driver in the fleet shares, to
+    # populate a task table nobody can read at that size. `"auto"` (the default) keeps the
+    # events on for any stage at or below `task_events_fanout_cap` tasks and turns them off
+    # above it; `"always"` and `"never"` pin the answer.
+    #
+    # This is an **observability** trade, not a scheduling one — the tasks run identically
+    # either way, they simply stop appearing in the task table — which is why the default
+    # engages only where the table has already stopped being useful. The cap is a chosen
+    # default rather than a measured breakpoint; Batcher's own progress reporting
+    # (`observe/`) is unaffected, since it reads the engine's event bus and not Ray's.
+    task_events: str = "auto"
+    task_events_fanout_cap: int = 10_000
     # Reserve a shuffle fleet's placement group inside ONE availability zone when the cluster
     # spans several and one of them can host the whole fleet.
     #

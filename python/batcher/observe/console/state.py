@@ -48,6 +48,7 @@ class RunState:
         "recoveries",
         "rows",
         "samples",
+        "scanned",
         "skipped",
         "spark",
         "spilled_bytes",
@@ -64,6 +65,12 @@ class RunState:
         # query, a phase that ended in its first millisecond.
         self.stage = stage
         self.rows = 0
+        #: Rows the query *read*, summed across its scans. The summary's throughput figure
+        #: is computed from this rather than from the rows returned. Dividing the output by
+        #: the elapsed time describes the width of the answer, not the speed of the engine:
+        #: a `group_by` that reduced 400,000 rows to five in 104 ms reported "48 rows/s",
+        #: which reads as a system that is broken rather than one running at 3.8M rows/s.
+        self.scanned = 0
         self.bytes = 0
         self.est = est
         self.t0 = t0

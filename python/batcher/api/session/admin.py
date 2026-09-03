@@ -222,6 +222,7 @@ def compact(
         transactional table.
     """
     from batcher._internal.errors import PlanError
+    from batcher.api.security._write import refuse_governed_rewrite
     from batcher.api.session.read import read
     from batcher.io.detect import detect_format, hive_partition_keys
     from batcher.io.filesystem import prune_empty_dirs, resolve_filesystem
@@ -229,6 +230,11 @@ def compact(
     from batcher.io.formats.lakehouse.maintenance import table_maintenance
 
     fmt = detect_format(path, format)
+
+    # Before either backend does anything. A compaction reads the table and writes the
+    # result back over it, so inside a security() block it writes the principal's masked,
+    # column-pruned view over the real data -- silently, and permanently.
+    refuse_governed_rewrite(path, "compact")
 
     # A transactional table must be maintained transactionally. The file rewrite below
     # deletes what it replaces, and a table's older versions still *reference* those files
@@ -372,6 +378,7 @@ def vacuum(
             log, so nothing is unreferenced and there is nothing to reclaim).
     """
     from batcher._internal.errors import PlanError
+    from batcher.api.security._write import authorize_write
     from batcher.io.detect import detect_format
     from batcher.io.formats.lakehouse.maintenance import table_maintenance
 
@@ -383,4 +390,12 @@ def vacuum(
             "with no transaction log, so no file is unreferenced and there is nothing "
             "to reclaim."
         )
+    # A real vacuum permanently removes data files, which is what the DELETE privilege
+    # names. It reaches the backend directly rather than through `terminal.core._write`,
+    # so without this it was a way to destroy a governed table's data holding no privilege
+    # at all. A dry run reads a listing and deletes nothing, so it needs none -- and
+    # refusing it would take away the check an operator runs *before* deciding whether the
+    # deletion is safe.
+    if not dry_run:
+        authorize_write(path, ("*",), ("DELETE",))
     return maintenance.vacuum(path, retention_hours=retention_hours, dry_run=dry_run, **opts)

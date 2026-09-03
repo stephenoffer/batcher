@@ -21,7 +21,7 @@ import math
 
 import pytest
 
-from batcher.dist.reduction import chunks, reduce_levels, tree_reduce
+from batcher.dist.reduction import chunks, fold_width, reduce_levels, tree_reduce
 
 pytestmark = pytest.mark.unit
 
@@ -41,6 +41,64 @@ def test_chunks_of_empty_is_empty():
 def test_chunks_never_loops_forever_on_a_nonpositive_size(size):
     # A caller that computes its fan-out can hand this a 0; a step of 0 would spin.
     assert [list(c) for c in chunks([1, 2], size)] == [[1], [2]]
+
+
+# --------------------------------------------------------------------------------------
+# `fold_width`: the arity the tree folds at, which is NOT the arity that selects a tree.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("sources", [1, 2, 7, 8, 9, 64, 128, 256, 1024, 40_000])
+@pytest.mark.parametrize("fan_in", [2, 8, 32, 64])
+def test_fold_width_never_narrows_the_configured_fan_in(fan_in, sources):
+    """The floor is the whole safety argument: widening may only ever remove levels.
+
+    An operator who configured a wide fold did so for a reason, and a derived width that came
+    out below it would silently deepen their tree.
+    """
+    assert fold_width(fan_in, sources) >= fan_in
+
+
+@pytest.mark.parametrize("sources", [1, 8, 64, 256, 1024, 40_000, 10**7])
+def test_fold_width_stays_bounded_however_many_leaves_there_are(sources):
+    """A cluster's inbound fan-in must not grow with the cluster — the property
+    `flow_control.shuffle_fan_in` exists for. `ceil(sqrt(n))` alone would fold 200 partials at
+    40,000 leaves and 3,163 at ten million."""
+    assert fold_width(8, sources) <= 32
+
+
+def test_fold_width_is_a_no_op_when_the_tree_already_has_one_level():
+    for sources in range(0, 9):
+        assert fold_width(8, sources) == 8
+
+
+@pytest.mark.parametrize("workers", [8, 16, 32, 64, 128])
+def test_fold_width_keeps_the_tree_at_two_levels_across_the_fan_out(workers):
+    """The point of deriving the width rather than fixing it: the tree's depth stops tracking
+    the cluster size. Leaves are map partitions (`workers x map_partition_multiplier`, 4)."""
+    sources = workers * 4
+    width = fold_width(8, sources)
+    assert reduce_levels(sources, width) <= 2, (workers, sources, width)
+
+
+def test_the_disk_tree_keeps_the_configured_fan_in_as_a_hard_bound():
+    """The widening is deliberately **not** shared with the disk transport, and this says so.
+
+    `fold_width` is measured on the Flight shuffle. The disk tree's per-task fan-in is a
+    contract its own tests state as a hard bound ("never reads more than `fan_in` per task"),
+    and widening it there would be changing that contract on no measurement — so
+    `executors.aggregate._tree_combine_buckets` still chunks at the configured value. If that
+    ever changes, the tests below this one fail, which is the intended alarm.
+    """
+    import inspect
+
+    from batcher.dist.executors import aggregate
+
+    source = inspect.getsource(aggregate._tree_combine_buckets)
+    assert "fold_width" not in source, (
+        "the disk tree adopted the Flight tree's widened fold; its bounded-fan-in tests "
+        "encode that width as a contract, so this needs a disk-path measurement first"
+    )
 
 
 @pytest.mark.parametrize(

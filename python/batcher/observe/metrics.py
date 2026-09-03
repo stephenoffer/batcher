@@ -219,15 +219,23 @@ def prometheus_text() -> str:
         for error, count in snap["queries"]["failed_by_error"].items():
             out.append(f'batcher_query_errors_total{{error="{escape_label(error)}"}} {count}')
 
-    out.append("# HELP batcher_query_duration_ms Query wall time in milliseconds")
-    out.append("# TYPE batcher_query_duration_ms histogram")
+    # Seconds, and named for it. Prometheus's naming conventions ask for base units, and a
+    # histogram is where the deviation costs most: `histogram_quantile` returns a value in
+    # the bucket's unit, so a panel plotting it was labelling milliseconds as seconds unless
+    # its author noticed. The buckets are the same boundaries, expressed in the unit the
+    # series claims. `metrics_snapshot()` keeps its millisecond keys -- it is a plain dict
+    # with its own documented shape, and this convention is Prometheus's.
+    out.append("# HELP batcher_query_duration_seconds Query wall time")
+    out.append("# TYPE batcher_query_duration_seconds histogram")
     cumulative = 0
     for edge, count in snap["queries"]["duration_ms_buckets"].items():
         cumulative = max(cumulative, count)
-        out.append(f'batcher_query_duration_ms_bucket{{le="{edge}"}} {cumulative}')
-    out.append(f'batcher_query_duration_ms_bucket{{le="+Inf"}} {snap["queries"]["total"]}')
-    out.append(f"batcher_query_duration_ms_sum {snap['queries']['duration_ms_total']}")
-    out.append(f"batcher_query_duration_ms_count {snap['queries']['total']}")
+        le = float(edge) / 1000
+        out.append(f'batcher_query_duration_seconds_bucket{{le="{le}"}} {cumulative}')
+    out.append(f'batcher_query_duration_seconds_bucket{{le="+Inf"}} {snap["queries"]["total"]}')
+    total_seconds = snap["queries"]["duration_ms_total"] / 1000.0
+    out.append(f"batcher_query_duration_seconds_sum {total_seconds}")
+    out.append(f"batcher_query_duration_seconds_count {snap['queries']['total']}")
 
     # The per-operator series and the process-wide work totals — CPU, spill volume, real
     # block-device I/O, faults, preemption — all of which the engine already measured per
@@ -291,13 +299,13 @@ def prometheus_text() -> str:
     counter("inference_batches_total", snap["inference"]["batches_total"], "Inference batches run")
     counter("inference_rows_total", snap["inference"]["rows_total"], "Rows through inference")
     counter(
-        "inference_latency_ms_total",
-        snap["inference"]["latency_ms_total"],
+        "inference_latency_seconds_total",
+        snap["inference"]["latency_ms_total"] / 1000.0,
         "Cumulative inference batch latency",
     )
     counter(
-        "inference_blocked_ms_total",
-        snap["inference"]["blocked_ms_total"],
+        "inference_blocked_seconds_total",
+        snap["inference"]["blocked_ms_total"] / 1000.0,
         "Cumulative worker time blocked on input",
     )
     gpu_devices = snap["gpu"]["devices"]

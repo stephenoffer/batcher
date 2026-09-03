@@ -31,7 +31,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from batcher.plan.resource.locality import LocalityShares, _domain_split, _group_share, _spread
+from batcher.plan.resource.locality import (
+    LocalityShares,
+    _domain_split,
+    _group_share_census,
+    _spread_census,
+)
 
 __all__ = ["ClusterShape", "NodeShape"]
 
@@ -130,14 +135,41 @@ class NodeShape:
 
 @dataclass(frozen=True, slots=True)
 class ClusterShape:
-    """The fleet's structure: one record per node, and what falls out of them.
+    """The fleet's structure: one record per *class* of node, and what falls out of them.
 
     An empty shape — the default, and what a single-node run or an unreadable topology
     produces — reports the flat answers the engine used before this existed. Every consumer
     must therefore treat `0`, `""` and `unknown` as "keep what you had", never as a measurement.
+
+    A fleet is described as a **census**: distinct node shapes, each with how many nodes have
+    it. A hundred-thousand-node cluster is a handful of instance types across a handful of
+    zones, and holding one record per node made every figure here O(nodes) — recomputed on
+    each property access, since these are properties and not stored fields. Measured on a
+    synthetic 100,000-node fleet: 106 ms for one `locality_shares` call, which the cost model
+    makes once per pipeline breaker, and 28 ms to hash the shape, which happens on every plan
+    cache lookup because the shape reaches the key.
+
+    `multiplicity` is parallel to `nodes`. Empty means one node per entry, which is what every
+    caller that builds a shape by hand gets and is bit-identical to the per-node form — the
+    census is a compression of the description, never a change to it.
+
+    Attributes:
+        nodes: One entry per distinct node shape.
+        multiplicity: How many nodes have each shape, or empty for one each.
     """
 
     nodes: tuple[NodeShape, ...] = field(default_factory=tuple)
+    multiplicity: tuple[int, ...] = field(default_factory=tuple)
+
+    @property
+    def _weights(self) -> tuple[int, ...]:
+        """How many nodes each entry stands for, defaulting to one each."""
+        return self.multiplicity or (1,) * len(self.nodes)
+
+    @property
+    def _census(self) -> tuple[tuple[NodeShape, int], ...]:
+        """`(shape, node count)` pairs — the fleet as this class actually reasons about it."""
+        return tuple(zip(self.nodes, self._weights, strict=True))
 
     # ---- counts -------------------------------------------------------------------------
 
@@ -149,32 +181,48 @@ class ClusterShape:
     @property
     def node_count(self) -> int:
         """Nodes in the fleet, `0` when the topology is unknown."""
-        return len(self.nodes)
+        return sum(self._weights)
 
     @property
     def gpu_nodes(self) -> tuple[NodeShape, ...]:
-        """The subset of nodes carrying at least one accelerator."""
+        """The distinct accelerator-bearing node shapes.
+
+        Shapes, not nodes: on a census fleet two entries here can stand for a thousand
+        machines each. Every caller reads it for a `min`, a `max` or a set of models, all of
+        which are indifferent to how many nodes share a shape. The two that are not — the
+        device count and the exchange placement — use `gpu_census` instead.
+        """
         return tuple(n for n in self.nodes if n.gpus > 0)
+
+    @property
+    def gpu_census(self) -> tuple[tuple[NodeShape, int], ...]:
+        """`(shape, node count)` for the accelerator-bearing part of the fleet."""
+        return tuple((n, w) for n, w in self._census if n.gpus > 0)
+
+    @property
+    def gpu_node_count(self) -> int:
+        """Nodes carrying at least one accelerator."""
+        return sum(w for _, w in self.gpu_census)
 
     @property
     def total_gpus(self) -> int:
         """Accelerator devices across the fleet."""
-        return sum(n.gpus for n in self.nodes)
+        return sum(n.gpus * w for n, w in self._census)
 
     @property
     def healthy_gpus(self) -> int:
         """Devices across the fleet that are schedulable right now."""
-        return sum(n.healthy_gpus for n in self.nodes)
+        return sum(n.healthy_gpus * w for n, w in self._census)
 
     @property
     def total_cores(self) -> int:
         """Usable cores across the fleet."""
-        return sum(n.cpu_cores for n in self.nodes)
+        return sum(n.cpu_cores * w for n, w in self._census)
 
     @property
     def total_memory_bytes(self) -> int:
         """Usable host RAM across the fleet."""
-        return sum(n.memory_bytes for n in self.nodes)
+        return sum(n.memory_bytes * w for n, w in self._census)
 
     @property
     def aggregate_gpu_memory_bytes(self) -> int:
@@ -187,7 +235,7 @@ class ClusterShape:
         admits work it cannot. Use `known` and `binding_gpu_memory_bytes` to tell "the fleet is
         small" from "the fleet did not say".
         """
-        return sum(n.aggregate_gpu_memory_bytes for n in self.nodes)
+        return sum(n.aggregate_gpu_memory_bytes * w for n, w in self._census)
 
     @property
     def device_models(self) -> tuple[str, ...]:
@@ -325,36 +373,53 @@ class ClusterShape:
         """
         count = max(1, int(workers))
         local = 1.0 / count
-        candidates = self.gpu_nodes if unit == "gpu" else self.nodes
-        capacities = [(n.gpus if unit == "gpu" else n.cpu_cores) for n in candidates]
-        if not candidates or sum(capacities) <= 0 or count == 1:
+        census = self.gpu_census if unit == "gpu" else self._census
+        classes = [((n.gpus if unit == "gpu" else n.cpu_cores), w) for n, w in census]
+        if not census or sum(c * w for c, w in classes) <= 0 or count == 1:
             return LocalityShares(local=local, cross_rack=1.0 - local)
 
-        placement = _spread(capacities, count)
-        paired = zip(candidates, placement, strict=True)
-        per_node = [(node, placed) for node, placed in paired if placed > 0]
-        if not per_node:
-            return LocalityShares(local=local, cross_rack=1.0 - local)
-
-        same_node = _group_share([placed for _, placed in per_node], count)
-        same_domain = _group_share(
-            [size for node, placed in per_node for size in _domain_split(node, placed, unit)],
-            count,
-        )
+        # Per class: the workers it took as a whole, then the individual placements inside it.
+        # `_spread` deals evenly among equal capacities, so a class's nodes differ by at most
+        # one worker and `divmod` recovers the exact split — `taken` nodes hold `each + 1` and
+        # the rest hold `each`. Working in classes is what keeps this O(classes) rather than
+        # O(nodes); on a 100,000-node fleet the per-node form took 106 ms per call, and the
+        # cost model makes one call per pipeline breaker.
+        node_groups: list[tuple[int, int]] = []
+        domain_groups: list[tuple[int, int]] = []
+        solo_racks: list[tuple[int, int]] = []
         by_rack: dict[tuple[str, str], int] = {}
-        for index, (node, placed) in enumerate(per_node):
-            # An unlabelled node is its own rack: two nodes that never said they were adjacent
-            # are not evidence that they are, and assuming otherwise would under-charge every
-            # cross-host byte on an unlabelled fleet — the common case.
-            #
-            # Qualified by zone, so a rack label is only ever compared within the availability
-            # zone that issued it. Rack identifiers are namespaced per zone by every scheduler
-            # that emits them, so two nodes in different zones sharing the string `"rack-3"` are
-            # in different buildings — and grouping them would report a cross-zone byte as
-            # rack-local, which is the largest single under-charge the tier model can make.
-            key = (node.zone, node.rack or f"\x00{index}")
-            by_rack[key] = by_rack.get(key, 0) + placed
-        same_rack = _group_share(list(by_rack.values()), count)
+        for (node, weight), total in zip(census, _spread_census(classes, count), strict=True):
+            if total <= 0:
+                continue
+            each, taken = divmod(total, weight)
+            for placed, many in ((each + 1, taken), (each, weight - taken)):
+                if placed <= 0 or many <= 0:
+                    continue
+                node_groups.append((placed, many))
+                domain_groups.extend((size, many) for size in _domain_split(node, placed, unit))
+                if node.rack:
+                    # Qualified by zone, so a rack label is only ever compared within the
+                    # availability zone that issued it. Rack identifiers are namespaced per
+                    # zone by every scheduler that emits them, so two nodes in different zones
+                    # sharing the string `"rack-3"` are in different buildings — and grouping
+                    # them would report a cross-zone byte as rack-local, which is the largest
+                    # single under-charge the tier model can make.
+                    key = (node.zone, node.rack)
+                    by_rack[key] = by_rack.get(key, 0) + placed * many
+                else:
+                    # An unlabelled node is its own rack: two nodes that never said they were
+                    # adjacent are not evidence that they are, and assuming otherwise would
+                    # under-charge every cross-host byte on an unlabelled fleet — the common
+                    # case. So these stay `many` separate groups rather than one of `many`.
+                    solo_racks.append((placed, many))
+        if not node_groups:
+            return LocalityShares(local=local, cross_rack=1.0 - local)
+
+        same_node = _group_share_census(node_groups, count)
+        same_domain = _group_share_census(domain_groups, count)
+        same_rack = _group_share_census(
+            [*solo_racks, *((placed, 1) for placed in by_rack.values())], count
+        )
 
         # Clamped and ordered so rounding in the spread can never produce a negative share or
         # one tier claiming data another already took. The containment local <= domain <= node
@@ -381,7 +446,7 @@ class ClusterShape:
         return {
             "known": self.known,
             "nodes": self.node_count,
-            "gpu_nodes": len(self.gpu_nodes),
+            "gpu_nodes": self.gpu_node_count,
             "gpus": self.total_gpus,
             "healthy_gpus": self.healthy_gpus,
             "cores": self.total_cores,

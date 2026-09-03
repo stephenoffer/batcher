@@ -149,7 +149,12 @@ def compose(
         cells.append(pad(percent(fraction), 4, align="right"))
     if run.partitions_total:
         cells.append(f"{p.dim}{run.partitions_done}/{run.partitions_total}{p.reset} parts")
-    cells.append(f"{p.dim}{pad(count(run.rows), 7, align='right')}{p.reset} rows")
+    if run.rows:
+        cells.append(f"{p.dim}{pad(count(run.rows), 7, align='right')}{p.reset} rows")
+    # No count at all when none has been observed. `collect` measures inside Rust and
+    # reports nothing until it returns, so a standing "0 rows" was not a reading of zero --
+    # it was the absence of a reading, rendered as the most alarming number it could have
+    # been. The elapsed clock beside it already says the query is alive.
     if run.rate > 0:
         cells.append(f"{p.dim}{pad(count(run.rate), 7, align='right')}/s{p.reset}")
         spark = sparkline(run.spark, p, g)

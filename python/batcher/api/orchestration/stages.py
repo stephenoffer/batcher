@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.api.orchestration import phases
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
     declared_row_count,
@@ -74,13 +75,23 @@ def execute_distributed(
     from batcher.api.terminal._metadata import collect_source_metadata
     from batcher.api.tuning import distributed_grant, record_distributed
 
+    staged = _stage_if_optimization_requires_it(
+        plan, logical_opt, sources, ctx, materialize=materialize
+    )
+    if staged is not None:
+        return staged
+
     # Learned scheduling: size worker fan-out from the measured data volume (when the user
     # gave none) and warm-start the shuffle credit window from what this signature converged
     # on last time. Both are pure scheduling levers, so a cold hub grants the default.
+    phases.begin("distributed_grant")
     mark = time.perf_counter()
     workers, envelope = distributed_grant(rm, opt, plan, sources, ctx)
     phase("distributed_grant", time.perf_counter() - mark)
 
+    # The long one. Before this the line showed whatever phase had ended last -- on a
+    # seven-second distributed run, `admission`, which had taken 0.3 ms.
+    phases.begin("execute_distributed")
     mark = time.perf_counter()
     prof = ctx.profile
     worker_metrics: list = []
@@ -96,6 +107,7 @@ def execute_distributed(
     )
     phase("execute_distributed", time.perf_counter() - mark)
 
+    phases.begin("collect_source_metadata")
     mark = time.perf_counter()
     if prof is not None:
         prof.worker_metrics = worker_metrics
@@ -112,6 +124,91 @@ def execute_distributed(
     )
     _record_distributed_cardinality(ctx.hub, plan, sources, result)
     return result
+
+
+def _stage_if_optimization_requires_it(
+    plan: LogicalPlan,
+    logical_opt: LogicalPlan,
+    sources: list[Source],
+    ctx: ExecutionContext,
+    *,
+    materialize: bool,
+) -> pa.Table | None:
+    """Run the plan staged when *optimization* is what made staging the only route.
+
+    `resolve_adaptive` asks `requires_staging` of the plan the caller wrote. This function is
+    handed the plan **Kyber produced**, and the two are not the same question: a rewrite can
+    introduce a breaker beneath a join that the raw plan did not have. Eager aggregation is
+    the one that does it — `Aggregate(Join(lineitem, orders))` becomes
+    `Aggregate(Join(orders, Aggregate(lineitem)))`, pre-reducing the fact table on the join
+    key — which is a good rewrite and a shape `dist._dispatch` has no one-shot path for.
+
+    It fires on *measured* statistics, so the raw plan and the cold-hub optimized plan both
+    say "no staging needed" and the warm one says otherwise. The observable symptom was that
+    a `join -> group_by -> agg` over parquet — TPC-H q3, q5, q9, q10 and most of any star
+    schema — ran fine distributed the first time and raised `PlanError` on **every run after
+    it**, with the query, the data and the arguments unchanged. Cross-run learning turning a
+    working query into a failing one is the worst shape a learning loop can have, and nothing
+    in the suites could see it: a differential test runs each query once.
+
+    Asking the question again is the whole fix, and here is where it can first be asked —
+    this module is the one place the optimized plan and the distributed route meet.
+
+    Args:
+        plan: The pre-optimization plan, which is what the staged loop re-optimizes.
+        logical_opt: The optimized plan the one-shot dispatcher would otherwise be handed.
+        sources: The plan's bound sources.
+        ctx: The execution context carrying the hub, fan-out and transport.
+        materialize: False when this call is producing a partitioned intermediate.
+
+    Returns:
+        The staged result, or `None` when the one-shot route is fine (the common case).
+    """
+    from batcher.api.adaptive.staging import staged_depth_exhausted
+
+    # Bounded, not forbidden, from inside the loop. Every stage executes through
+    # `run_relational`, which comes back through this function, and the loop's **final**
+    # stage is the whole residual plan — so an *unbounded* re-entry let a plan the loop could
+    # not cut re-enter the loop on itself: `RecursionError` rather than the `PlanError` the
+    # caller should get, on
+    # `test_diff_exists_mixed_correlation::test_mixed_exists_matches_distributed`.
+    # `materialize` alone does not cover it: that final stage materializes, like any ordinary
+    # query.
+    #
+    # Refusing the *first* re-entry also refused the one case that makes progress. The loop
+    # picks its cuts from the plan the caller wrote, and Kyber then re-optimizes each stage —
+    # so eager aggregation can put a breaker beneath a join in a stage the loop had already
+    # decided needed no cut. That breaker is new and strictly below the root, so staging it
+    # materializes something and the residual shrinks. `_MAX_STAGED_DEPTH` caps how often
+    # that may happen, which is what makes the recorded `RecursionError` impossible rather
+    # than unlikely: a rewrite that does not make progress spends the budget and then yields
+    # the same `PlanError` as before.
+    if not materialize or staged_depth_exhausted():
+        return None
+    from batcher.dist import requires_staging
+
+    if not requires_staging(logical_opt):
+        return None
+    from batcher.api.adaptive import execute_adaptive
+
+    # Deliberately NOT recorded through `record_adaptive_route`. That feeds the bandit which
+    # chooses between the staged and one-shot routes on cost, and here there is no choice to
+    # learn from: the one-shot route cannot run this plan at all. Timing it as if it had won
+    # a comparison would teach the chooser about an arm the other queries do have.
+    return execute_adaptive(
+        plan,
+        sources,
+        ctx.hub,
+        distributed=True,
+        num_workers=ctx.num_workers,
+        transport=ctx.transport,
+        # Staging is the only route for this plan, which the loop cannot work out for
+        # itself: it is handed `plan`, and it is `logical_opt` that has no one-shot path.
+        # Without saying so, the loop would fall back to `_worth_staging`, whose answer
+        # depends on what the hub has learned — so the query would run or raise according
+        # to how many times it had been run before.
+        force_structural=True,
+    ).table
 
 
 def _record_distributed_cardinality(hub, plan: LogicalPlan, sources: list[Source], result) -> None:

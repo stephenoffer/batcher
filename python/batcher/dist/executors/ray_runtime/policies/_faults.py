@@ -302,6 +302,66 @@ def recovery_policy():
     )
 
 
+def transient_exception_allowlist() -> list[type[BaseException]]:
+    """The application exception types Ray may retry on its own, narrowest first.
+
+    Ray's `retry_exceptions` takes an **allowlist of classes**, not just a boolean, and the
+    difference matters here. `True` means *every* application exception is retried, so a
+    deterministic UDF bug — a `KeyError`, a bad cast — runs `max_retries + 1` times across
+    the fleet before anything in Batcher sees it. That is exactly the failure this engine's
+    own recovery loop is built to avoid, described in `classify`'s docstring as "a
+    deterministic bug retried across the fleet, burning the recovery budget and surfacing
+    minutes later as a resource error with the real traceback gone".
+
+    So the allowlist is the *retryable* half of `classify._BY_TYPE`, restricted to what Ray
+    can match: a class, by `isinstance`. `ConnectionError` is listed rather than its four
+    subclasses because matching is by instance, and the worker-death categories are absent
+    because those are `RayError`s that `max_retries` already covers without this option.
+
+    `ResourceError` is deliberately **not** here, and the omission is worth stating because
+    the barrier's *other* predicate disagrees: `is_recoverable_task_failure` calls it
+    recoverable, for the narrow case of a spill file that went with an ephemeral disk, while
+    `classify` puts it in `application` — not retryable. Both are defensible in their own
+    context and Ray's match is by class, with no context at all: `ResourceError` is also what
+    "shuffle did not recover after N attempts" raises, and retrying *that* underneath the loop
+    that just gave up is the retry storm this whole file exists to prevent. Where the two
+    predicates disagree, the shared taxonomy wins, which is what
+    `test_the_allowlist_agrees_with_the_shared_failure_taxonomy` pins.
+
+    **Narrowing this can never lose a retry.** Anything Ray declines still arrives at
+    `gather_map_results`, which applies the full classifier (`_is_transient_udf_error`, which
+    reads messages and cause chains, not just types) and retries there. What it removes is
+    Ray silently retrying a deterministic bug underneath the layer that would have surfaced
+    it immediately.
+
+    This completes a deferral the config comment for `retry_on_transient` states outright —
+    "gated to transport-classified transient errors once that classification lands" — which
+    it now has.
+
+    Returns:
+        Exception classes for `.options(retry_exceptions=...)`. Never empty: the builtins are
+        always importable, so the caller's empty-list fallback is unreachable in practice.
+    """
+    allow: list[type[BaseException]] = [
+        MemoryError,  # host and device OOM, including what a UDF raises directly
+        TimeoutError,
+        ConnectionError,  # base of Reset / Refused / Aborted / BrokenPipe
+    ]
+    try:
+        from ray.exceptions import OutOfMemoryError
+
+        allow.append(OutOfMemoryError)  # Ray's memory monitor killing a task under pressure
+    except Exception as exc:  # pragma: no cover - a Ray without the type keeps the builtins
+        note_suppressed("dist", "add Ray's OOM type to the retry allowlist", exc)
+    try:
+        from batcher._internal.errors import RetryableShuffleError
+
+        allow.append(RetryableShuffleError)  # the transport's own word for a lost peer
+    except Exception as exc:  # pragma: no cover
+        note_suppressed("dist", "add the engine's retryable types to the allowlist", exc)
+    return allow
+
+
 def fault_options() -> dict:
     """Ray task fault-tolerance kwargs from config — the first line of defense.
 
@@ -309,13 +369,44 @@ def fault_options() -> dict:
     durable source, so a rerun is safe) so a transient node/connection failure
     self-heals before the heavier app-level recompute loop engages. With
     `retry_on_transient`, retries also cover application exceptions, not just worker
-    death; a deterministic failure still re-fails and surfaces once retries exhaust.
+    death — but only the ones `transient_exception_allowlist` names, so a deterministic
+    failure surfaces on its first attempt instead of after `max_retries` reruns.
     """
     d = active_config().distributed
     opts: dict = {"max_retries": int(d.task_max_retries)}
     if d.retry_on_transient:
-        opts["retry_exceptions"] = True
+        allow = transient_exception_allowlist()
+        opts["retry_exceptions"] = allow or True
     return opts
+
+
+def task_event_options(n_tasks: int) -> dict:
+    """`{"enable_task_events": False}` for a stage too wide for per-task reporting, else `{}`.
+
+    Ray emits a running and a finished event per task to the GCS, which is what makes a task
+    visible to `ray list tasks`, the Dashboard, and the State API. At ordinary fan-out that is
+    worth its cost. At the fan-out this engine reaches it is not: a hundred-thousand-partition
+    stage puts a hundred thousand events onto a control plane shared by every driver in the
+    fleet, to fill a table nobody can read at that size.
+
+    Purely an observability trade — the tasks run identically either way — so it is gated on
+    `distributed.task_events` and engages by default only above
+    `distributed.task_events_fanout_cap`, where the table has already stopped being useful.
+    Batcher's own progress reporting is unaffected: `observe/` reads the engine's event bus,
+    not Ray's.
+
+    Args:
+        n_tasks: How many tasks this stage will submit.
+
+    Returns:
+        A `.options(...)` fragment, empty when the events should stay on.
+    """
+    dc = active_config().distributed
+    if dc.task_events == "always":
+        return {}
+    if dc.task_events == "never" or n_tasks > dc.task_events_fanout_cap:
+        return {"enable_task_events": False}
+    return {}
 
 
 def actor_fault_options() -> dict:

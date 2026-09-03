@@ -264,15 +264,81 @@ class CompareResult:
 # the reference the row was blamed on Batcher even though it agreed with DuckDB and with
 # the published TPC-H answer. Any engine that produced a result may serve as a last
 # resort, so a run without DuckDB still cross-checks.
-_ORACLE_PREFERENCE = ("duckdb", "polars", "spark", "daft", "pyarrow")
+# `duckdb_arrow` sits beside `duckdb`: it is the same engine on a different binding, so it
+# is exactly as good an oracle. Leaving it out was a quiet hole — `--engines
+# batcher,duckdb_arrow` is the *documented* like-for-like invocation, and with no listed
+# engine present the fallback below picked the only remaining output, which is Batcher. The
+# system under test became its own oracle on a lineup the README tells people to run. `ray`
+# is last because it has no SQL surface and answers only the native cases, not because its
+# answers are suspect.
+#
+# This list is hand-maintained while the adapters self-register, so an engine added to
+# `engines/lineup.py` and not added here silently becomes ineligible. That is what happened.
+_ORACLE_PREFERENCE = ("duckdb", "duckdb_arrow", "polars", "spark", "daft", "pyarrow", "ray")
+
+
+def degenerate_reason(table: pa.Table) -> str | None:
+    """Why `table` carries no information, or ``None`` when it carries some.
+
+    The equality gate is a comparison, and a comparison between two empty answers succeeds.
+    `rowsets_match` checks `num_rows` first, so `0 == 0` matches; `_column_diff` then returns
+    `None` for a zero-length column. Both are individually right and compose into **"the
+    engines agree because none of them did anything"** — reported `OK`, and timed, at the
+    fastest speed any query can be answered.
+
+    Four shapes reach it and all four passed: zero rows, zero *columns*, every value null,
+    and a single null row. Zero columns is the sharpest — `pa.table({})` against
+    `pa.table({})` is a result that is broken under any reading, and also the cheapest
+    possible one to produce. The failure modes that land here are the ordinary ones: a wrong
+    path, an empty glob, a truncated write, a data load that silently produced nothing.
+    """
+    if table.num_columns == 0:
+        return "zero columns"
+    if table.num_rows == 0:
+        return "zero rows"
+    if all(table.column(c).null_count == table.num_rows for c in table.column_names):
+        return "every value null"
+    return None
 
 
 def _reference_engine(outputs: dict[str, pa.Table]) -> str:
-    """The engine whose result the others are checked against."""
+    """The engine whose result the others are checked against.
+
+    Falls back to whatever produced a result when no preferred oracle ran — and **says so**,
+    because the fallback's most likely value is Batcher itself and a silent self-check reads
+    exactly like a passing one. A lineup with no independent engine is a real state
+    (`--engines batcher` alone); it is not a correctness gate, and the run should not look
+    like it was.
+    """
     for candidate in _ORACLE_PREFERENCE:
         if candidate in outputs:
             return candidate
-    return next(iter(outputs))
+    reference = next(iter(outputs))
+    print(
+        f"  !! no independent oracle in this lineup; checking against {reference!r}, "
+        "which is the engine under test — these rows are not correctness-gated"
+    )
+    return reference
+
+
+def _release_engine(engine: str, lineup: list[str]) -> None:
+    """Let `engine` give up cluster-wide resources before the next one is timed.
+
+    Only when it shares the lineup: a single-engine run should keep whatever warm state it
+    would have in production. See `engines.base.Engine.release` for what this is for — a
+    Batcher session fleet reserving the cluster left Daft unable to start a worker.
+
+    Best-effort in every direction. This is teardown between measurements; nothing here is
+    worth failing a benchmark row for.
+    """
+    if len(lineup) < 2:
+        return
+    try:
+        import engines as engines_mod
+
+        engines_mod.get(engine).release()
+    except Exception:  # pragma: no cover - teardown must never fail a case
+        pass
 
 
 def compare(
@@ -317,8 +383,10 @@ def compare(
             tb = traceback.format_exc().strip().splitlines()
             er.error += " | " + tb[-1] if tb else ""
             result.engines[engine] = er
+            _release_engine(engine, engines)
             continue
         result.engines[engine] = er
+        _release_engine(engine, engines)
 
     # Correctness: compare every produced output to a reference. Column types are
     # reconciled across the whole lineup first, so each output is canonicalized once
@@ -362,6 +430,19 @@ def compare(
             if violation is not None:
                 result.engines[engine].correct = False
                 mismatches.append(f"{engine}: {violation}")
+        # Agreement between engines that all returned nothing is not agreement. It is not
+        # a *defect* either — TPC-DS q17 legitimately returns zero rows at sf1, measured —
+        # so this is its own status rather than a failure: never `OK`, no ratio, reason
+        # printed, and the run does not fail on it. A reader sees "every engine returned
+        # nothing" where they would otherwise have seen a fast pass.
+        degenerate = {e: degenerate_reason(o) for e, o in outputs.items()}
+        if not mismatches and all(degenerate.values()):
+            kinds = sorted(set(degenerate.values()))
+            result.status = "DEGENERATE"
+            result.note = (
+                f"every engine returned a result carrying no information ({', '.join(kinds)}) "
+                "— they agree, but nothing was compared"
+            )
         if mismatches:
             result.status = "FAILED"
             result.note = " ; ".join(mismatches + divergent)
@@ -383,6 +464,7 @@ def compare(
             result.engines[engine].ms = bench(fn, runs=runs)
         except Exception as exc:
             result.engines[engine].error = f"timing failed: {exc}"
+        _release_engine(engine, engines)
 
     if result.status == "OK" and any(e.error and e.error != "n/a" for e in result.engines.values()):
         # At least one engine errored out (but others agreed). Flag it.

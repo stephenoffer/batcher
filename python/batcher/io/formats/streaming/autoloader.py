@@ -397,6 +397,19 @@ class IncrementalFileSource:
     def identity(self) -> str:
         return f"files_incremental:{self._format}:{self._path}"
 
+    def governed_name(self) -> str:
+        """The watched directory, which is the table a policy is written about.
+
+        `identity` prefixes the format, so parsing the table off it yielded
+        ``parquet:/data/orders`` -- a name nobody writes a policy about. The directory is
+        durable and knowable before the first file lands in it, which is exactly what a
+        policy needs.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none.
+        """
+        return self._path
+
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One :class:`FileSplit` per new file (locator-only, picklable).
 

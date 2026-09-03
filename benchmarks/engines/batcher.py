@@ -67,6 +67,22 @@ class BatcherEngine(Engine):
     def available(cls) -> bool:
         return True  # batcher is the package under test; always present
 
+    def release(self) -> None:
+        """Tear down the warm session fleet, so the next engine can get workers.
+
+        The same teardown `scenarios/scaling/ladder.py` performs between rungs, for the
+        adjacent reason: there it stops a wide fleet being reused by a narrow rung, here it
+        stops Batcher's placement group holding the cluster while another engine is timed.
+        `release_session_fleet` is a no-op when nothing is cached and refuses while a fleet
+        is leased, so this is safe to call unconditionally.
+        """
+        try:
+            from batcher.dist.fleet import release_session_fleet
+
+            release_session_fleet()
+        except Exception:  # pragma: no cover - a teardown must never fail a benchmark
+            pass
+
     def handle(self, table: pa.Table) -> bt.Dataset:
         return bt.from_arrow(table)
 

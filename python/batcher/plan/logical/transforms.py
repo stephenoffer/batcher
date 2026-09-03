@@ -1,7 +1,8 @@
 """Plan transforms and predicates over `LogicalPlan` trees.
 
 `remap_sources` shifts every `Scan.source_id` (used when appending a right side's
-sources after the left's); `is_streamable` reports whether a plan is
+sources after the left's) and `share_sources` renumbers several branches onto one source
+list, giving one relation one slot; `is_streamable` reports whether a plan is
 partition-independent (only row-wise operators, no pipeline breaker);
 `empty_result_schema` types a zero-batch result; `hoist_computed_keys` and
 `project_columns` materialize a computed shuffle key as a hidden column and project it
@@ -11,7 +12,8 @@ away again, which is what gives an expression-keyed sort or window a distributed
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import TypeVar
 
 import pyarrow as pa
 
@@ -33,6 +35,10 @@ from batcher.plan.logical.relational import (
 from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
 from batcher.plan.schema import SchemaRef, placeholder_schema
 
+#: A bound source object. `plan` is layer 1 and cannot name `io.source.Source` (layer 2),
+#: and does not need to: `share_sources` only ever compares sources by identity.
+_S = TypeVar("_S")
+
 __all__ = [
     "constant_column_literal",
     "empty_result_schema",
@@ -47,6 +53,7 @@ __all__ = [
     "project_columns",
     "rebuild_over_scan",
     "remap_sources",
+    "share_sources",
     "split_streaming_tail",
     "streaming_fold_target",
 ]
@@ -189,20 +196,76 @@ def remap_sources(plan: LogicalPlan, offset: int) -> LogicalPlan:
     Used when joining two datasets: the right side's sources are appended after
     the left's, so its scans must point past them.
 
+    Args:
+        plan: The plan to rewrite.
+        offset: The amount to add to every `source_id`.
+
+    Returns:
+        A copy of `plan` whose scans point past `offset` earlier sources.
+    """
+    return _rewrite_source_ids(plan, lambda sid: sid + offset)
+
+
+def share_sources(
+    branches: Sequence[tuple[LogicalPlan, Sequence[_S]]],
+) -> tuple[list[LogicalPlan], list[_S]]:
+    """Put several branches on one source list, giving the *same* source one slot.
+
+    `Dataset.union` concatenates its inputs' source lists, because in general two
+    unioned datasets are unrelated and a source that appears in both is two relations
+    that merely compare equal. This is the narrower operation for the callers that can
+    prove otherwise -- the grouping levels of a `ROLLUP`/`CUBE`/`GROUPING SETS`, which
+    are the *same* query over the *same* relations, differing only in what they group by.
+    Concatenating there binds one relation once per level (a five-level rollup over three
+    tables takes fifteen slots for three relations), and that alone is enough to stop
+    plan-level common-subplan reuse recognizing the levels as sharing a subtree, so every
+    level re-reads and re-joins the whole input.
+
+    Sameness is **object identity**, never equality: two sources that compare equal may
+    still be two independent handles, and merging those would change which relation a
+    scan reads. Identity is the only test a caller can hand over without also handing
+    over what its sources mean.
+
+    Args:
+        branches: Each branch's plan paired with the source list its scans index.
+
+    Returns:
+        The branches' plans rewritten onto one merged source list, and that list.
+    """
+    merged: list[_S] = []
+    slot_of: dict[int, int] = {}
+    plans: list[LogicalPlan] = []
+    for plan, sources in branches:
+        mapping: dict[int, int] = {}
+        for index, source in enumerate(sources):
+            slot = slot_of.get(id(source))
+            if slot is None:
+                slot = len(merged)
+                slot_of[id(source)] = slot
+                merged.append(source)
+            mapping[index] = slot
+        moved = any(index != slot for index, slot in mapping.items())
+        plans.append(_rewrite_source_ids(plan, mapping.__getitem__) if moved else plan)
+    return plans, merged
+
+
+def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> LogicalPlan:
+    """Return a copy of `plan` with every `Scan.source_id` passed through `renumber`.
+
     Only `Scan` carries a `source_id`; every other node is rebuilt generically with
     its remapped children by `transform_up`, so a new node type needs no edit here.
     The import is function-local because `plan.visitor` imports this module.
     """
     from batcher.plan.visitor import transform_up
 
-    def shift(node: LogicalPlan) -> LogicalPlan:
+    def move(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Scan):
             # `replace`, not a fresh `Scan`: the source key is this scan's identity and
             # rebuilding without it would silently return the plan to the collided key.
-            return dataclasses.replace(node, source_id=node.source_id + offset)
+            return dataclasses.replace(node, source_id=renumber(node.source_id))
         return node
 
-    return transform_up(plan, shift)
+    return transform_up(plan, move)
 
 
 def empty_result_schema(plan: LogicalPlan, names: list[str]) -> pa.Schema:

@@ -12,12 +12,13 @@ call over a constant folds away, and the bitwise identity elements (`x | 0`, `x 
 Soundness is anchored to the engine's actual kernels, not to intuition:
 
 * `bc_expr::eval_math` promotes an Int64 array to Float64 and applies the `f64`
-  function — *except* `abs`, which stays Int64. So `floor`/`ceil`/`trunc`/`round` of an
-  **integer** expression is exactly `cast(x, float64)` (the value is already integral),
-  and every rounding function is the identity on an integral float — which is what makes
-  the nesting collapses exact, NaN and ±inf included.
-* `sign` is `v > 0 ? 1 : v < 0 ? -1 : 0` — its output is one of three float64 values, so
-  it is idempotent; `abs` is `f64::abs`/`i64::abs`, also idempotent.
+  function — *except* `abs`, `sign`, `round` and `trunc`, which stay Int64. So
+  `floor`/`ceil`/`rint` of an **integer** expression is exactly `cast(x, float64)` (the
+  value is already integral), and every rounding function is the identity on an integral
+  float — which is what makes the nesting collapses exact, NaN and ±inf included.
+* `sign` is `v > 0 ? 1 : v < 0 ? -1 : 0` and preserves its operand's type — three exact
+  Int64 values over an integer, three exact Float64 values over a float — so it is
+  idempotent either way; `abs` is `f64::abs`/`i64::abs`, also idempotent.
 * The bitwise ops **cast both operands to Int64** before applying the arrow kernel. That
   makes the identity rules type-sensitive, not just value-sensitive: `bit_or(f, 0)` on a
   Float64 `f` *returns Int64*, so dropping the `| 0` would change the column's type. Every
@@ -218,11 +219,12 @@ def collapse_idempotent_math_fn(node: LogicalPlan, _ctx: OptimizerContext) -> Lo
     `ceil`, `trunc`, `round`.
 
     Each is its own fixpoint over the engine's kernels: `abs` of a non-negative value is
-    itself (NaN → NaN, `-0.0` → `0.0` → `0.0`); `sign` yields one of `1.0/-1.0/0.0`, each
-    of which is its own sign; and each rounding function returns an integral float (or
-    NaN/±inf), on which it is the identity. The outer call is therefore pure overhead. The
-    output type cannot move — the two calls are the *same* function, and `f(f(x))` and
-    `f(x)` are typed identically (`abs` preserves its input type, the rest yield Float64).
+    itself (NaN → NaN, `-0.0` → `0.0` → `0.0`); `sign` yields one of `1/-1/0` in the
+    operand's own type, each of which is its own sign; and each rounding function returns an
+    integral value (or NaN/±inf), on which it is the identity. The outer call is therefore
+    pure overhead. The output type cannot move — the two calls are the *same* function, and
+    `f(f(x))` and `f(x)` are typed identically (`abs`, `sign`, `round` and `trunc` preserve
+    their input type, `floor`/`ceil`/`rint` yield Float64).
     Nulls propagate through both. No type guard is needed, and none would help.
     """
     return _rewrite_node(node, _collapse_idempotent)
@@ -358,18 +360,20 @@ def _fold_math_lit(expr: Expr) -> Expr:
 )
 def fold_math_of_int_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Evaluate a unary math function over an **integer literal** at plan time: `abs(-5)` →
-    `5`, `sign(-5)` → `-1.0`, `floor(5)` → `5.0`, `sqrt(4)` → `2.0`.
+    `5`, `sign(-5)` → `-1`, `floor(5)` → `5.0`, `sqrt(4)` → `2.0`.
 
     `normalize.fold` folds a `Binary` over two literals but never looks at `MathExpr`, so
     these survive to the data plane as a per-row kernel over a constant. Only the functions
-    whose value is *exactly* computable here fold, and only over an integer literal: the
-    rounding family is the identity on an integer (so the fold is just the engine's own
-    Float64 promotion), `sign` yields one of three exact floats, `sqrt` is correctly rounded
-    by IEEE-754 mandate (Python and Rust cannot disagree). `abs(INT64_MIN)` and `sqrt(<0)`
-    are refused (no i64 result / no NaN literal), as are `ln`/`exp`/the trig family (libm is
-    not correctly rounded) and every *float* literal (`-0.0` and NaN make the fold's identity
-    observable). The output type is preserved exactly: `abs` folds to an int literal (Int64,
-    as `abs` preserves its input type), everything else to a float literal (Float64).
+    whose value is *exactly* computable here fold, and only over an integer literal:
+    `floor`/`ceil`/`rint` are the identity on an integer (so the fold is just the engine's
+    own Float64 promotion), `round` and `trunc` hand the integer back unchanged, `sign`
+    yields one of three exact integers, and `sqrt` is correctly rounded by IEEE-754 mandate
+    (Python and Rust cannot disagree). `abs(INT64_MIN)` and `sqrt(<0)` are refused (no i64
+    result / no NaN literal), as are `ln`/`exp`/the trig family (libm is not correctly
+    rounded) and every *float* literal (`-0.0` and NaN make the fold's identity observable).
+    The output type is preserved exactly: `abs`, `sign`, `round` and `trunc` fold to an int
+    literal (Int64, the type each of them preserves), `floor`/`ceil`/`rint` and `sqrt` to a
+    float literal (Float64).
     """
     return _rewrite_node(node, _fold_math_lit)
 

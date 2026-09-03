@@ -107,15 +107,24 @@ def _relation_key(plan: LogicalPlan, ctx: OptimizerContext) -> tuple | None:
     optimize) or there is no scan: an identity we cannot resolve to data is not one we may
     act on.
     """
+    # Memoized per run: the answer is a pure function of `(plan, ctx)`, plan nodes are
+    # immutable and `ctx` is fixed, but the three self-join rules ask for the same two
+    # subtrees on every fixpoint iteration -- and each miss lowers the whole subtree to IR
+    # and deep-copies it. See `OptimizerContext.relation_keys` for the id-reuse guard.
+    memo = ctx.relation_keys
+    hit = memo.get(id(plan))
+    if hit is not None and hit[0] is plan:
+        return hit[1]
     identities: list[int] = []
     for node in walk(plan):
         if isinstance(node, Scan):
             if node.source_id >= len(ctx.sources):
+                memo[id(plan)] = (plan, None)
                 return None
             identities.append(id(ctx.sources[node.source_id]))
-    if not identities:
-        return None
-    return (_blank_source_ids(plan.to_ir()), tuple(identities))
+    key = None if not identities else (_blank_source_ids(plan.to_ir()), tuple(identities))
+    memo[id(plan)] = (plan, key)
+    return key
 
 
 def _blank_source_ids(ir: object) -> object:

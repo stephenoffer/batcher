@@ -22,6 +22,34 @@ pipeline fails somewhere nobody predicted.
 one this module infers: guessing a region from a bucket name or an endpoint URL would be a
 fabricated legal fact, and the failure mode of guessing wrong is a compliance incident in
 whichever direction it errs.
+
+**Nothing currently consults this catalog, and the sentence above about "a check that runs
+before placement" describes a hook rather than a live path.** Traced 2026-09-01:
+`active_residency()` has exactly one consumer,
+`dist/executors/ray_runtime/fabric/placement.py::_eligible`, which is reached only through
+`plan_collective(..., datasets=...)`; `plan_collective`'s only caller,
+`dist/executors/ray_runtime/scheduling.py::_collective_bundles`, calls it as
+``plan_collective(workers, cpus_per_device=...)`` and passes no datasets. So ``if datasets:``
+is never true, the catalog is never read, and a rule an operator registers changes no
+placement. Confirmed by running it rather than by reading it: instrumenting
+`active_residency` and `plan_collective` and then calling `_collective_bundles` with a
+four-worker GPU-collective envelope shows ``datasets = ()`` at the call and
+`active_residency` never reached. `plan_collective`'s own docstring names the distinction
+it is failing on: passing the datasets is "the difference between a compliance control and
+a compliance report".
+
+Even wired, the reach would be narrower than the opening paragraph implies:
+`_collective_bundles` returns early unless the stage is a **GPU collective** of more than one
+worker at one device per worker, so an ordinary distributed scan or shuffle would still not
+be gated.
+
+This is recorded here rather than quietly fixed because wiring it means threading each
+stage's input names through the scheduling envelope, and because a policy surface that is
+exported, documented and enforced by nothing is exactly the failure this file's own
+"guessing wrong is a compliance incident" paragraph is about. **Do not cite residency as an
+enforced control until this note is removed and a test pins a placement it changed.** The
+value objects, the mode ladder and the matching are real and unit-tested
+(`tests/unit/test_residency_placement.py`); it is the call site that is missing.
 """
 
 from __future__ import annotations
@@ -29,6 +57,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from batcher._internal.errors import AccessDeniedError
+from batcher.io.filesystem import canonical_path
 
 __all__ = [
     "RESIDENCY_MODES",
@@ -179,15 +208,27 @@ class ResidencyCatalog:
         Longest-prefix wins, so a narrow exception under a broad default is expressible
         without ordering rules by hand.
 
+        Paths are matched **canonically**: ``s3a://`` is the Hadoop spelling of ``s3://``
+        and names the same objects, so a rule written about one governs a read of the
+        other. Matching the raw string made every alias a way to process regulated data in
+        a region the rule forbids — the same bypass `SecurityCatalog` had, in the one place
+        where the consequence is a sovereignty breach rather than an over-broad read.
+
+        A key's trailing slash is preserved through that folding, because it is the
+        difference between a directory prefix and a name prefix: ``"s3://eu/"`` governs
+        ``s3://eu/orders`` and not ``s3://eubank/orders``.
+
         Args:
-            dataset: Dataset name or path.
+            dataset: Dataset name or path, in any spelling.
 
         Returns:
             The governing rule, or `None` when the dataset is unregistered.
         """
+        target = canonical_path(dataset)
         best: DataResidency | None = None
         for key, rule in self.rules.items():
-            matches = dataset == key or dataset.startswith(key)
+            prefix = canonical_path(key) + ("/" if key.endswith("/") else "")
+            matches = target == prefix.rstrip("/") or target.startswith(prefix)
             if matches and (best is None or len(key) > len(best.dataset)):
                 best = rule
         return best

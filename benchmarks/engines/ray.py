@@ -63,28 +63,50 @@ def _neutralize_broken_runtime_env_hook() -> None:
 
 
 def _worker_runtime_env() -> dict:
-    """Drop an unresolvable local editable from the pip env, and put the suite on the path.
+    """Ship the suite and Batcher to the workers, and leave the cluster's pip env alone.
 
-    Some managed platforms inject the workspace's ``requirements.txt`` as the default runtime-env
-    ``pip`` block, inherited by every task/actor. When that list contains the local
-    editable ``batcher-engine`` (not on any index), the per-worker pip build hard-fails
-    and Ray Data cannot launch a single task. Ray Data's own dependencies already live
-    in the cluster's base env, so nulling ``pip`` for the comparison is both correct and
-    the representative setup (workers run the stock Ray Data image). Mirrors
-    ``_neutralize_broken_runtime_env_hook`` — a broken inherited env is a no-op to strip.
+    Three things have to be importable in a Ray Data worker for the TPC-H pipelines to run,
+    and on a multi-node cluster none of them was:
 
-    ``PYTHONPATH`` carries the ``benchmarks/`` directory to the workers. The TPC-H
-    pipelines live in ``suites.standard.tpch_ray``, and cloudpickle serializes their
-    ``map_batches`` callables *by reference* because they belong to an importable
-    module -- so a worker that cannot import ``suites`` dies with
+    * **the suite** — the pipelines are module-level functions, so cloudpickle sends them by
+      *reference* and the worker imports ``suites.standard.tpch_ray``. `working_dir` uploads
+      the directory and unpacks it per node. See the note on that below.
+    * **batcher** — importing ``suites`` pulls in the engine adapters, which import
+      ``batcher``. Shipped as a ``py_modules`` entry, the same mechanism Batcher's own
+      distributed path uses.
+    * **the cluster's pip packages** — ``duckdb`` above all, which the reference side of
+      several suites imports.
+
+    This used to pass ``pip: None``, to drop an unresolvable local editable
+    (``batcher-engine``) from a platform-injected ``requirements.txt``. That nulls the
+    **whole** inherited pip block, not just the bad entry — so it also removed ``duckdb``
+    from every worker, and importing ``suites`` then died with
+    ``ModuleNotFoundError: No module named 'duckdb'``. Measured here: with the block
+    inherited, workers import ``duckdb``, ``pandas``, ``pyarrow`` and ``numpy`` fine
+    (``pip_check`` is false on this cluster's block, so the unresolvable marker entries do
+    not fail the build). Nulling it was solving a problem this cluster does not have, at the
+    cost of one it does.
+
+    ``working_dir`` **uploads** the ``benchmarks/`` directory to the workers, which is what
+    makes `suites` importable there. The TPC-H pipelines live in ``suites.standard.tpch_ray``,
+    and cloudpickle serializes their ``map_batches`` callables *by reference* because they
+    belong to an importable module -- so a worker that cannot import ``suites`` dies with
     ``ModuleNotFoundError: No module named 'suites'`` before running a single batch.
-    The driver gets that directory from ``sys.path[0]``; workers are separate processes
-    and inherit nothing, so it has to be passed explicitly.
+
+    It used to pass that directory as an absolute ``PYTHONPATH`` instead, and that is only a
+    fix on a single node. The path names a location on the **driver's** filesystem; a worker
+    on another host has nothing there, so the entry resolves to nothing and the import fails
+    exactly as before. The tell is which nodes failed: tasks that happened to land on the
+    head node succeeded, and every task on a worker node raised. Ray uploads a ``working_dir``
+    to the object store and unpacks it per node, so it is the same directory everywhere --
+    the mechanism Batcher already uses for its own package, applied to the suite.
+
+    3.8 MB, uploaded once per session.
     """
+    from batcher._internal.paths import package_dir
+
     benchmarks_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    inherited = os.environ.get("PYTHONPATH", "")
-    path = f"{benchmarks_dir}{os.pathsep}{inherited}" if inherited else benchmarks_dir
-    return {"pip": None, "env_vars": {"PYTHONPATH": path}}
+    return {"working_dir": benchmarks_dir, "py_modules": [package_dir()]}
 
 
 def _ensure_ray() -> None:
@@ -144,6 +166,14 @@ class RayEngine(Engine):
     def available(cls) -> bool:
         # ray.data needs pandas for the Arrow<->block bridge used by the cases.
         return all(importlib.util.find_spec(m) is not None for m in ("ray", "pandas"))
+
+    def prepare(self) -> None:
+        """Attach to the cluster now, so this adapter is the one that sets the job env.
+
+        See `Engine.prepare`: the worker `PYTHONPATH` this engine needs can only be attached
+        by whoever calls `ray.init`, and Batcher leads the multi-node lineup.
+        """
+        _ensure_ray()
 
     def handle(self, table: pa.Table):
         import ray.data

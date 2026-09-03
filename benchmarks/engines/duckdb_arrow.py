@@ -79,7 +79,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from .base import SqlRunner
-from .duckdb import DuckDBEngine
+from .duckdb import DuckDBEngine, match_batcher_budget
 
 #: Rows per Arrow chunk when registering. DuckDB's own default Parquet row-group size, so
 #: it is its native reader's arrangement rather than a constant tuned against this suite.
@@ -95,6 +95,11 @@ class DuckDBArrowEngine(DuckDBEngine):
         import duckdb
 
         con = duckdb.connect()
+        # Same CPU and memory budget Batcher gives itself — this override has its own
+        # connection, so it does not inherit the parent's. Left out, the *like-for-like*
+        # bar would be the one bar running with 13% less memory than the engine it exists
+        # to compare against, which is the opposite of what it is for.
+        match_batcher_budget(con)
         # Zero-copy Arrow views — the same in-memory bytes Batcher executes over, with no
         # untimed ingest/compression step. This is the execution-engine comparison.
         for name, tbl in tables.items():

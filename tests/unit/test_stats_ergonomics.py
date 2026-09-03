@@ -322,10 +322,12 @@ def test_prometheus_text_exposes_the_counters(clean_metrics):
 def test_prometheus_text_emits_a_well_formed_histogram(clean_metrics):
     events.publish(events.QUERY_END, query_id="q1", name="q", ok=True, total_ms=12.5, rows=0)
     text = prometheus_text()
-    assert "# TYPE batcher_query_duration_ms histogram" in text
-    assert 'batcher_query_duration_ms_bucket{le="+Inf"} 1' in text
-    assert "batcher_query_duration_ms_sum 12.5" in text
-    assert "batcher_query_duration_ms_count 1" in text
+    assert "# TYPE batcher_query_duration_seconds histogram" in text
+    assert 'batcher_query_duration_seconds_bucket{le="+Inf"} 1' in text
+    # 12.5 ms is 0.0125 s: the buckets and the sum move together, or the mean a
+    # backend derives from them is wrong by a factor of a thousand.
+    assert "batcher_query_duration_seconds_sum 0.0125" in text
+    assert "batcher_query_duration_seconds_count 1" in text
 
 
 def test_prometheus_every_sample_line_has_a_numeric_value(clean_metrics):
