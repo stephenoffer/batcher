@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1447 Python modules across 213 packages and 283 Rust files across 15 crates.
+Covering 1447 Python modules across 213 packages and 284 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -902,12 +902,12 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 2976 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 810 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 868 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 568 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1749 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1831 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 433 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 304 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 336 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -966,7 +966,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 197 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 792 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 772 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 800 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
@@ -989,7 +989,7 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 473 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 484 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
 | `_faults.py` | 434 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 
@@ -999,7 +999,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 
 | module | lines | what it is |
 |---|---|---|
-| `_fleet.py` | 743 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
+| `_fleet.py` | 778 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
@@ -1050,7 +1050,7 @@ Reduction shapes shared by the distributed operators.
 
 | module | lines | what it is |
 |---|---|---|
-| `tree.py` | 146 | The shape of a mergeable reduction: how `n` partials collapse to one without any node |
+| `tree.py` | 215 | The shape of a mergeable reduction: how `n` partials collapse to one without any node |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -1622,8 +1622,8 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `locality.py` | 178 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 235 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 106 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 449 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 497 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `session.py` | 524 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
@@ -2921,7 +2921,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `lib.rs` | 731 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 378 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/byte_sort.rs` | 508 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
+| `ops/byte_sort.rs` | 511 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
@@ -2931,7 +2931,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
 | `ops/quantile_spill/mod.rs` | 741 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
-| `ops/radix_sort.rs` | 623 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
+| `ops/radix_sort/mod.rs` | 389 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
+| `ops/radix_sort/packed.rs` | 498 | The **composite** packed key: several sort columns narrowed into one integer. |
 | `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |

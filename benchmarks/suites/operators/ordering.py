@@ -128,6 +128,32 @@ def sort_string_limit(ctx: Context):
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
+@ordering.case("op-sort-float", ordered_by="l_extendedprice")
+def sort_float(ctx: Context):
+    """Full sort on a single `Float64` key — the one fixed-width type with no narrow range.
+
+    Every other fixed-width case here sorts an integer or a temporal, whose live range is far
+    narrower than its type and whose radix therefore runs three counting passes rather than
+    eight. A float has no such range: its rank spans all 64 bits by construction, so it is the
+    only fixed-width key for which the sort's cost is the *whole* key width.
+
+    That is a different shape, and the suite had no case for it while carrying two multi-key
+    ones. It was measured at **3.15x DuckDB** the first time anybody looked, with the sort
+    falling past both fast paths onto arrow's two-column comparator — exactly the invisibility
+    `op-sort-multikey-narrow` describes, one type over.
+    """
+    sql = "SELECT l_extendedprice FROM lineitem ORDER BY l_extendedprice"
+
+    def pyarrow(t: pa.Table) -> pa.Table:
+        cols = t.select(["l_extendedprice"])
+        return cols.sort_by([("l_extendedprice", "ascending")])
+
+    def ray(rd) -> pa.Table:
+        return ray_to_arrow(rd.select_columns(["l_extendedprice"]).sort(["l_extendedprice"]))
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
+
+
 @ordering.case("op-sort-multikey-narrow", ordered_by="l_shipdate, l_suppkey")
 def sort_multikey_narrow(ctx: Context):
     """Full sort on two fixed-width keys whose live ranges are far narrower than their types.

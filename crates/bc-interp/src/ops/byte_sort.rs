@@ -254,10 +254,13 @@ const RADIX_MIN_ROWS: usize = 1 << 12;
 /// Rows above which the byte radix declines, because its random-scatter index array no longer
 /// fits cache and it loses to the comparison sort.
 ///
-/// The same bound, for the same reason and at the same value, as
-/// `super::radix_sort::FLOAT_RADIX_MAX_ROWS`. A whole-relation sort of a large column therefore
-/// never radixes — it arrives here only per-range (the parallel sample-sort) or per-run (the
-/// external merge sort), and both are below this by construction.
+/// The same bound and the same reason as `super::radix_sort::FLOAT_SCATTER_MAX_ROWS`, and at the
+/// same value — but no longer the same *answer*. A packed byte key spans its whole `u64` exactly
+/// as a float rank does, so it has the same all-eight-passes problem, and above the bound the
+/// float key now switches to a pair sort instead of declining. This one still declines, because
+/// nothing here has been measured: `op-sort-string` and `op-sort-string-lowcard` are both ahead
+/// of DuckDB today, and the reasoning that carries over from the float is a reason to measure,
+/// not a result.
 const RADIX_MAX_ROWS: usize = 1 << 18;
 
 /// The permutation that sorts `live` by **LSD radix over the key bytes themselves**, or `None`
