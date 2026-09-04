@@ -546,7 +546,49 @@ that static dealing is what lets "one oversized partition hold the barrier open"
 dealing gives it to whichever actor went idle. Index-stability is exactly what buys the cache
 hit this route was rebuilt for, so the two goals are in direct opposition here and cannot both
 be had by choosing harder. Anyone taking it further should measure the per-partition
-completion spread first, and treat "stragglers" as a hypothesis until they have.
+completion spread first, and treat "stragglers" as a hypothesis until they have. The entry
+below takes the first step: collapsing the four rounds to one is worth 8-10%, which says the
+round structure is part of that residual without saying stragglers are.
+
+### One round instead of four is worth 8-10%, and is still the wrong change to make
+
+The subtraction above put 210-450 ms of a `udf` sweep outside the actor, and named static
+dealing as a suspect: 256 partitions over 64 actors is four sequential rounds, and
+`actors[idx % n]` deals them statically, so a heavy partition holds the barrier open where a
+dynamic assignment would have handed it to whichever actor went idle. Collapsing the rounds
+tests that directly — one partition per actor, which also makes `idx % n` the identity map.
+
+Two pairs, **with the arm order reversed between them** so a warm-up bias would show up as a
+sign flip rather than a confirmation:
+
+| | 256 partitions (4 rounds) | 64 partitions (1 round) |
+|---|---:|---:|
+| pair 1 (`auto` first) | 812 ms | **733 ms** |
+| pair 2 (`equal` first) | 862 ms | **792 ms** |
+
+Consistent, direction-stable, 70-79 ms — about 8-10%, with sums identical. It is a real
+effect and it is small enough that a single pair would not have earned it.
+
+**It is not shipped, and the reason is in this file already.** The partition count is sized
+from *data* by `_adaptive_partition_count`, and forcing it to the worker count ignores that:
+one partition per actor here is 9.4 M rows where the adaptive count gives 2.3 M, a 4x rise in
+per-partition memory. The 2026-09-02 entry records what that costs on the shape it would hurt
+most — per-task memory going `O(dataset)`, "an OOM rather than a slow query", "exactly when
+the wide multimodal scan the byte term was written for gets large". Trading a reliable OOM on
+wide multimodal data for 8% on a one-column TPC-H aggregate is a bad trade, and the fact that
+this benchmark is a narrow scan is precisely why the benchmark cannot be the thing that
+decides it.
+
+The lever that would collect this safely is **dynamic dealing**, not a coarser partition
+count: hand each partition to whichever actor is idle rather than to `idx % n`. The barrier
+already supports it — `gather_map_results` takes `on_lost`/`on_done` for exactly this, and
+`map_barrier` documents the idle-actor model. What makes it real work rather than a
+substitution is that index-stability is what buys the scan-cache hit this whole route was
+rebuilt for, so a dynamic version has to prefer the cached actor and fall back to an idle one,
+and then be measured on both counts. That is the next change, and it is a design with a
+trade-off rather than a knob.
+
+For scale: at 733-792 ms this arm would still not reach 10x, which is 506 ms.
 
 ### Batching the barrier's completions: built, measured, rejected
 
