@@ -47,6 +47,30 @@ reported `ERR` for every Daft pipeline: the failure is the environment, not the 
 Daft column of `ERR` would have been a false result. Shipping it with
 `runtime_env={"pip": ["daft==0.7.24"]}` is what the table above does.
 
+### The single-node board, re-measured on the same tree
+
+The routing fix committed alongside this (a grouped aggregate under a top-N was never
+matching `materializing_aggregate_is_faster`) is confirmed on the full suites rather than on
+the five queries it was developed against. Head node, 15 usable cores, best-of-5, one pass —
+the distributed test driver was running beside it, so read these as "in the recorded band",
+not as new records:
+
+| suite | b/duckdb | b/polars | cases |
+|---|---:|---:|---|
+| TPC-H sf1 | **0.84** | 0.66 | 22 of 22 |
+| ClickBench | **0.84** | 0.51 | 41 of 43 comparable |
+| operators | **0.58** | 0.18 | 23 of 23 |
+
+The five ClickBench queries the routing change touches, `batcher_ms` before and after:
+`cb-q32` 63.0 -> **24.4** (and from 2.23x DuckDB to **0.79x** — a loss turned into a win),
+`cb-q39` 91.5 -> **68.8**, `cb-q36` 29.8 -> 29.7, against `cb-q33` 34.0 -> 38.9 and `cb-q34`
+35.6 -> 37.5. Net **-54.6 ms**, which reproduces the isolated measurement to within a
+millisecond.
+
+Three shapes still lose to DuckDB in `operators` — `op-sort-string-limit` 1.97x,
+`op-sort-multikey-narrow` 1.11x, `op-filter-project` 1.04x — and one to Polars,
+`op-sort-float` 1.66x. All four are on `benchmarks/results/LOSS_BACKLOG.md` and none moved.
+
 ### The defect: a map stage asks for a fixed slice of any cluster
 
 `_adaptive_task_cpus` gives task *i* `rows_i x weight / rows_per_cpu` CPUs. Summed over the
