@@ -285,12 +285,38 @@ An `_AffinityQueue` (partition *i* preferring actor ``i % n``, an actor with an 
 stealing from the longest so none could idle) was built and unit-tested for this, then
 reverted when it measured flat. It is withdrawn rather than kept as evidence.
 
-So the actor-locality hypothesis is **untested, not refuted**, and `concurrency` is not the
-knob that tests it — reaching `_distributed_map`'s pool needs a plan with no breaker above the
-map. What is established stays: 2.3x from the cache for the UDF-free route against ~0 for the
-map route, at `hit_rate 0.0` with hundreds of megabytes resident per worker, plus exactly one
-genuinely falsified mechanism (read/compute overlap, which was measured on the path it claimed
-to fix).
+### Tested properly, the actor-locality mechanism is real
+
+Reaching `_distributed_map`'s pool needs a plan with no breaker above the map, so the UDF was
+made to reduce its own batch to one row — a map-side reduction, output 2,280 rows, no `.agg()`.
+`_is_linear_map_pipeline` is then True and the pool is genuinely used (`_MapActor.run` prints,
+where before it printed nothing). Same pipeline, same fleet, three consecutive runs:
+
+| route | cold | warm | warm |
+|---|---:|---:|---:|
+| stateless tasks | 15,074 ms | 1,798 ms | 1,596 ms |
+| **actor pool (`concurrency=64`)** | 15,053 ms | **1,324 ms** | **1,154 ms** |
+
+**1.36-1.38x warm, and the counters say why:**
+
+    ACTORSTAT pid=124496 idx=36 {'hits': 0, 'misses': 1, 'hit_rate': 0.0, ...}   run 1
+    ACTORSTAT pid=124496 idx=36 {'hits': 1, 'misses': 1, 'hit_rate': 0.5, ...}   run 2  [x64]
+
+The same actor process received the same partition index on the next run and served it from
+its cache. Persistent, index-stable workers hit; scattered stateless tasks do not. That is the
+mechanism the two withdrawn experiments were reaching for and never tested.
+
+**What it is worth, and what it needs.** The board's `udf` shape is `map_batches(...).agg(...)`,
+which routes to `_distributed_map_aggregate` and its stateless tasks, so it gets none of this.
+Giving that route the same persistent index-stable workers — `_launch(idx)` dispatching to
+`actors[idx % n].run_agg(...)` instead of a fresh task, reusing the existing warm-pool registry
+and the existing barrier for recovery — is the concrete next change. At the 1.36x measured here
+it would take the `udf` board from ~1,300 ms to ~950 ms, i.e. **4.4x to ~6x** against Ray Data,
+not to 10x. It is a real step and it is not the whole distance.
+
+The other established numbers stand: 2.3x from the cache for the UDF-free route against ~0 for
+the map route at `hit_rate 0.0`, and one genuinely falsified mechanism (read/compute overlap,
+measured on the path it claimed to fix).
 
 ### Batching the barrier's completions: built, measured, rejected
 
