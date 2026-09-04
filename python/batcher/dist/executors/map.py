@@ -701,13 +701,23 @@ def _distributed_map(
         else _adaptive_partition_count(sources[sid], plan, workers, hub)
     )
     proj, pred = _scan_pushdown(plan0)
+    # The partition count goes in as `max_partitions`, NOT as the worker count, and the two
+    # are not interchangeable: `_scan_splits` coalesces adjacent row-groups to
+    # `_SPLIT_TARGET_BYTES` only while the result still holds `workers x _SCAN_PREFETCH`
+    # splits, so passing a compute-derived partition count there sets a floor no large read
+    # can meet and silently disables coalescing. Measured on TPC-H sf100 `lineitem`: this
+    # route planned **4,902** splits where `flight_aggregate` — same query, same projected
+    # column, and this same idiom — planned **2,494**, i.e. twice the object-store requests
+    # for the same bytes. `partition_descriptors` takes `max(workers, min(max_partitions,
+    # len(splits)))`, so the descriptor count is unchanged; only the split *shape* is.
     partitions = partition_descriptors(
         sources[sid],
-        n_parts,
+        workers,
         projection=proj,
         predicate=pred,
         preserve_order=preserve_order,
         cluster_by=cluster_by,
+        max_partitions=n_parts,
     )
     if write_spec is not None:
         # A `num_files` layout names a total across the whole write, so each shard needs to
@@ -2197,7 +2207,12 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     gk, aj = agg_spec_json(agg)
     n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
     proj, pred = _scan_pushdown(map_plan)
-    partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)
+    # `max_partitions`, not the worker count — see `_distributed_map`'s note: a
+    # compute-derived count passed as `workers` sets `_scan_splits`' coalescing floor out of
+    # reach and doubles this route's object-store requests.
+    partitions = partition_descriptors(
+        sources[sid], workers, projection=proj, predicate=pred, max_partitions=n_parts
+    )
     # Skew-aware adaptive CPU per task (sized to the partition that runs the UDF here);
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
