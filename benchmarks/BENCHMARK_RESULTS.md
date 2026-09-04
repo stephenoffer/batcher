@@ -79,7 +79,8 @@ The heavy UDF then adds 995 ms against a floor of **167 ms**: it is 171.5 core-s
 (measured single-core at 285.8 ns/row over 600 M rows), so 995 ms is **172 effective cores** of
 1,024 — which is what the 9-11% mean cluster busy in every one of these runs reports.
 
-Two levers that look like the answer and are not:
+Four levers that look like the answer and are not. Each one moves its own input and
+none of them moves the wall:
 
 * **`BATCHER_MAP_COMPUTE_WEIGHT`.** "465 tasks x 2.46 CPU = 1,200 CPU asked of a 1,024-core
   fleet" reads like a stage throttling itself. It is not: `_filled_to_the_fleet` scales whatever
