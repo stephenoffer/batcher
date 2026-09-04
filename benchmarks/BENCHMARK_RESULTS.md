@@ -326,18 +326,25 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 | `filter_count` | **166-200 ms** | 3,561 ms | 1,204 ms | 18-21x | 6.0-7.3x |
 | `groupby` | **172-197 ms** | 5,477 ms | 1,400 ms | 28-32x | 7.1-8.1x |
 | `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
-| `udf` | **1,236 ms** | 5,685 ms | n/a¹ | **4.6x** | — |
+| `udf` | **1,236-1,367 ms** | 5,685 ms | n/a¹ | **4.2-4.6x** | — |
 
-Ranges, not best-of-run, because this fleet's run-to-run spread is about 12% — established
+Ranges, not best-of-run, because this fleet's run-to-run spread is about 12-20% — established
 the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A
 single figure from one sweep would be a number this board cannot reproduce.
+
+Part of that spread is probably not the fleet at all. Several runs log `no worker answered the
+hardware probe on any of 1 node shape(s); cache-sized and device-sized planning falls back to
+defaults` — the failure the 2026-08-30 entry documents — and others do not. A run that plans
+against measured worker hardware and one that plans against defaults are not the same query,
+so an A/B that straddles the two is comparing planners as much as code. Worth pinning down
+before anyone chases a sub-20% effect on this board again.
 
 ¹ `daft_thunk` declines the `udf` shape (the UDF surfaces diverge), and a declined pipeline
 prints in the same `ERR` cell as a failure — worth separating, since one is a fact about the
 harness and the other about the engine.
 
-`udf` moves from **2.1x to 4.6x** against Ray Data — 2,779 ms to 1,236 ms on the warm
-board, at 21% mean / 69% peak cluster busy against 10% / 36%. It is still the one shape where Batcher is
+`udf` moves from **2.1x to 4.2-4.6x** against Ray Data — 2,779 ms to 1,236-1,367 ms on the
+warm board over two sweeps, at 21% mean / 69-84% peak cluster busy against 10% / 36%. It is still the one shape where Batcher is
 not far ahead, and the decomposition above prices what 10x would take. 10x is 569 ms against
 Ray Data's 5,685 ms, and which side of that line the target falls on depends entirely on
 whether the read is cold:
