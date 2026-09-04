@@ -376,6 +376,8 @@ competitor number would have booked that 12% as a win.
 |---|---:|---:|---:|---:|---:|
 | `udf` | 1,236-1,367 ms | **803-1,069 ms** | 5,061 ms | 3.7-4.1x | **4.7-6.3x** |
 
+The fleet-sized actor width below takes this further, to **581-822 ms** and **6.2-8.7x**.
+
 The prediction in the section above was "~1,300 ms to ~950 ms, i.e. 4.4x to ~6x, not to 10x."
 The direction and rough size were right and the estimate was optimistic.
 
@@ -385,8 +387,18 @@ The direction and rough size were right and the estimate was optimistic.
 
 * **350 ms is the read**, warm, with no map stage on it at all. That is 69% of the 506 ms
   target before the UDF runs, and it is a floor this change does not touch.
-* **The map stage now costs 234 ms on an identity UDF** (584 - 350), which is dispatch,
-  the per-batch Python call, `partial_aggregate`, and 256 barrier completions.
+* **The map route costs 47-104 ms over the pure aggregate route**, not the 234 ms an
+  earlier revision of this bullet claimed. That figure was `584 - 350`, differenced across
+  two separate runs, and this fleet's spread is wide enough that such a subtraction is not a
+  measurement. Measured properly — both pipelines in **one process, back to back**, same
+  bytes and same answer, three pairs — `scan + sum` routes to `execute_aggregate_flight` at
+  358/372/403 ms and `scan + identity UDF + sum` routes to `_distributed_map_aggregate` at
+  462/445/450 ms. Difference the pairs, not the runs: 104, 73, 47 ms.
+
+  Which changes the conclusion rather than refining it. 10x is 506 ms, and the identity
+  pipeline **already runs in 445-462 ms**. On this shape the engine is no longer what stands
+  between the board and 10x; the user's own UDF is, and the board's is 20 transcendental
+  passes over 600 M float64.
 * **Cluster busy is still 12-16% mean / 31-34% peak**, against 21% for the task path it
   replaced. The obvious reading is that the actors gave back per-partition width, and it is
   wrong: `_MapActor.__init__` sets a CPU stage to `_INFERENCE_CPU_WORKERS` (4) via
@@ -420,6 +432,71 @@ partitions and the stage stops finishing. The 64-actor pool is where this fleet'
 stage runs, and 803-1,069 ms is what it costs.
 
 The relational shapes are unaffected by all of this and remain 18-32x against Ray Data.
+
+### The lever three arms had missed: the actor's own width, which nothing had ever varied
+
+The bullet above concluded that what the pool gives back is worker **count**, on the evidence
+that widening each actor's Ray *reservation* to 4 cores changed nothing. That conclusion was
+sound about the reservation and wrong about width, for a reason no amount of re-reading the
+arm would have surfaced: **`_MapActor.__init__` overrides whatever width it is handed.** It
+calls `_with_inference_workers`, which sets a CPU stage to `_INFERENCE_CPU_WORKERS` — 4 — so
+the arm that widened the plan and the arm that did not were both running four threads. Width
+was never a variable. Two arms and a paragraph of reasoning were spent on a lever that was
+wired shut.
+
+Varied properly, forwarding `BATCHER_INFERENCE_CPU_WORKERS` to the workers so the actors read
+it, same 64-actor pool and same pipeline, two independent pairs:
+
+| threads per actor | run 1 | run 2 |
+|---|---:|---:|
+| 4 (the inference default) | 1,068 ms | 1,144 ms |
+| **16 (the node)** | **746 ms** | **752 ms** |
+
+**1.42-1.52x**, with sums identical to the last digit. 64 actors x 16 threads is 1,024-way on a
+1,024-core fleet — which is precisely what the 256-actor arm was reaching for when it stalled,
+reached instead by making 64 actors bigger rather than making more of them.
+
+#### Why 4 was there, and what replaces it
+
+The 4 is not arbitrary and is not wrong where it lives: it exists to keep a fast model's
+decode/preprocess ahead of a **GPU**, the fix for a device sitting under 50% utilization. A
+CPU-only map/aggregate pool has no device to feed and a whole node to use, so it now passes
+its own width and the inference default is untouched. `_agg_actor_width` derives it rather
+than picking a number: `cluster cores / pool size`, capped by `_placeable_node_cores()` — the
+smallest alive node — because an actor's threads share one process on one machine. On this
+fleet that is `1024 / 64 = 16`, capped at 16, and the cap is what stops an 8-actor pool asking
+a 16-core box for 128 threads.
+
+The width is checked where it matters rather than where it is convenient. `_AGG_POOL_WIDTH`
+records what the live pool was built with and a change rebuilds the pool, because an actor
+fixes its width in `__init__` and a resized fleet would otherwise keep the old shape forever.
+And the shipped path was verified in the **worker**, not on the driver: asking five actors for
+their own plan's `num_workers` returns `[[16], [16], [16], [16], [16]]`. The driver-side
+counter agreeing with itself is not evidence, which is the same lesson as the route control
+above.
+
+#### The board
+
+sf100, `BENCH_PIPES=udf`, three sweeps each, against the Ray Data figure re-measured the same
+day (5,061 ms):
+
+| | wall | cluster busy (mean/peak) | vs ray |
+|---|---:|---|---:|
+| before the pool (stateless tasks) | 1,236-1,367 ms | 21% / 69-84% | 3.7-4.1x |
+| index-stable pool, 4 threads | 803-1,069 ms | 12-16% / 31-34% | 4.7-6.3x |
+| **index-stable pool, fleet-sized width** | **581-822 ms** | **26-36% / 53-62%** | **6.2-8.7x** |
+
+The utilization column is the one to read: the pool at width 4 was *less* busy than the tasks
+it replaced and won anyway on locality, which is what made "count" look like the whole answer.
+Sized to the fleet it is busier than either and faster than both.
+
+**Still not 10x**, which is 506 ms, and the remaining distance is now almost entirely floor.
+The warm read alone is 358-403 ms and the best `udf` sweep is 581 ms, so between them sit
+roughly 180-220 ms of transcendental arithmetic on 600 M values that some engine has to do.
+Closing that means overlapping the read with the compute rather than making either faster --
+and read/compute overlap is already recorded below as built, measured and rejected, on a
+pipeline that did not yet have this pool. That is the arm worth re-running, and it is the only
+one left that does not require the user's function to get cheaper.
 
 ### Batching the barrier's completions: built, measured, rejected
 
@@ -550,8 +627,8 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 | `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
 | `udf` | **1,236-1,367 ms** | 5,685 ms | n/a¹ | **4.2-4.6x** | — |
 
-**Superseded for `udf` by the actor-pool entry above**: 803-1,069 ms against a Ray Data
-re-measured at 5,061 ms the same day, i.e. 4.7-6.3x. The four relational rows here stand.
+**Superseded for `udf` by the actor-pool entries above**: 581-822 ms against a Ray Data
+re-measured at 5,061 ms the same day, i.e. 6.2-8.7x. The four relational rows here stand.
 
 Ranges, not best-of-run, because this fleet's run-to-run spread is about 12-20% — established
 the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A

@@ -108,6 +108,11 @@ _SESSION_POOLS: dict[tuple, list] = {}
 # of deadlocking.
 _AGG_POOLS: dict[tuple, list] = {}
 
+# The intra-actor width `_AGG_POOLS`' live pool was built with. An actor fixes its width in
+# `__init__`, so a fleet that grew or shrank leaves a pool running the old one; recording it is
+# what lets `_agg_actor_pool` notice and rebuild rather than silently keep the stale shape.
+_AGG_POOL_WIDTH: list[int] = []
+
 # Pins the `fn` objects whose `id()` a live pool's key was built from. Without this the key
 # is a bare address: once a pipeline's model callable is freed (its `Dataset` went out of
 # scope while the warm pool outlived it), CPython may hand that same address to a *different*
@@ -195,11 +200,14 @@ def _unpin_pool_keys(sigs) -> None:
         _POOL_KEEPALIVE.pop(sig, None)
 
 
-def _new_map_actor(plan0: LogicalPlan, opts: dict):
+def _new_map_actor(plan0: LogicalPlan, opts: dict, cpu_workers: int | None = None):
     """Spawn one model-loaded `_MapActor` (the single actor-creation point, so residency
-    reuse and tests can account for every build)."""
+    reuse and tests can account for every build).
+
+    `cpu_workers` overrides the actor's intra-actor width; `None` keeps
+    `_INFERENCE_CPU_WORKERS`, which is what every inference caller wants."""
     cls = _MapActor.options(**opts) if opts else _MapActor
-    return cls.remote(plan0)
+    return cls.remote(plan0, None, cpu_workers)
 
 
 def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
@@ -244,7 +252,12 @@ def _evict_stale_configurations(key: tuple, registry: dict) -> None:
 
 
 def _resident_pool_for(
-    plan0: LogicalPlan, opts: dict, size: int, registry: dict, devices: int = 0
+    plan0: LogicalPlan,
+    opts: dict,
+    size: int,
+    registry: dict,
+    devices: int = 0,
+    cpu_workers: int | None = None,
 ) -> list:
     """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
@@ -264,11 +277,15 @@ def _resident_pool_for(
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
-        pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+        pool = pool + [
+            _new_map_actor(plan0, opts, cpu_workers) for _ in range(max(1, size) - len(pool))
+        ]
     if devices > 0:
         want = devices * _cold_start_density(pool)
         if want > len(pool):
-            pool = pool + [_new_map_actor(plan0, opts) for _ in range(want - len(pool))]
+            pool = pool + [
+                _new_map_actor(plan0, opts, cpu_workers) for _ in range(want - len(pool))
+            ]
     registry[sig] = pool
     _pin_pool_key(sig, plan0)
     return pool
@@ -2044,11 +2061,16 @@ class _MapActor:
     It also samples GPU utilization while running so the scheduler can adapt the
     `num_gpus` request on the next run (the feedback half of GPU scheduling)."""
 
-    def __init__(self, plan0: LogicalPlan, write_spec: dict | None = None) -> None:
+    def __init__(
+        self,
+        plan0: LogicalPlan,
+        write_spec: dict | None = None,
+        cpu_workers: int | None = None,
+    ) -> None:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
-        self._plan = _with_inference_workers(_prebuild_factories(plan0))
+        self._plan = _with_inference_workers(_prebuild_factories(plan0), cpu_workers)
         self._write_spec = write_spec
         self._gpu_vram_max: float | None = None
         # Sustained utilization, sampled on a timer for the actor's working window — NOT the
@@ -2211,11 +2233,14 @@ class _MapActor:
 _INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
 
 
-def _with_inference_workers(plan):
-    """Set each map stage's `num_workers` for a GPU inference actor: a GPU stage keeps 1 (one
-    CUDA context), a CPU stage gets `_INFERENCE_CPU_WORKERS` so its decode/preprocess fans
-    across the node's spare cores and stays ahead of the GPU stage — the fix for a fast/small
-    model whose single-threaded decode would otherwise starve the device (util < 50%)."""
+def _with_inference_workers(plan, cpu_workers: int | None = None):
+    """Set each map stage's `num_workers` for a map actor: a GPU stage keeps 1 (one CUDA
+    context), a CPU stage gets `cpu_workers`, defaulting to `_INFERENCE_CPU_WORKERS`.
+
+    The default of 4 exists to feed a *device*: it is what keeps a fast/small model's
+    decode/preprocess ahead of the GPU (util < 50% without it). A CPU-only map/aggregate pool
+    has no device to feed and a whole node to use, so it passes its own width — see
+    `_agg_actor_width`, which measured 1.43x for exactly this reason."""
     import dataclasses
 
     from batcher.plan.logical import MapBatches
@@ -2223,11 +2248,12 @@ def _with_inference_workers(plan):
 
     if isinstance(plan, MapBatches):
         plan = dataclasses.replace(
-            plan, num_workers=1 if plan.num_gpus > 0 else _INFERENCE_CPU_WORKERS
+            plan,
+            num_workers=1 if plan.num_gpus > 0 else (cpu_workers or _INFERENCE_CPU_WORKERS),
         )
     kids = children(plan)
     if kids:
-        return with_children(plan, [_with_inference_workers(c) for c in kids])
+        return with_children(plan, [_with_inference_workers(c, cpu_workers) for c in kids])
     return plan
 
 
@@ -2330,6 +2356,31 @@ def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: i
     return nat.partial_aggregate(group_keys_json, aggregates_json, out)
 
 
+def _agg_actor_width(pool_size: int) -> int:
+    """Threads each actor of a CPU map/aggregate pool should run its UDF with.
+
+    The pool is the stage's whole parallelism, so its actors should between them hold the
+    fleet: `cluster cores / pool size`. Capped by the smallest alive node
+    (`_placeable_node_cores`), because an actor's threads all run in one process on one node
+    and a pool smaller than the node count would otherwise ask a 16-core box for 128 threads.
+
+    This is the lever the earlier arms missed. `_MapActor.__init__` overrides whatever width
+    it is handed with `_with_inference_workers`, so an experiment that widened the *plan* or
+    the Ray *reservation* changed nothing and read as "width does not matter" — it was never
+    varied. Measured here, same pipeline and same 64-actor pool, 4 threads against 16:
+    **1,068 ms against 746 ms**, identical sums. 64 x 16 is 1,024-way on a 1,024-core fleet,
+    which is what the 256-actor arm was reaching for when it stalled.
+
+    Args:
+        pool_size: Actors in the pool.
+
+    Returns:
+        Threads per actor, at least 1.
+    """
+    per_actor = int(_cluster_cores() // max(1, pool_size))
+    return max(1, min(per_actor, int(_placeable_node_cores())))
+
+
 def _agg_actor_pool(plan0: LogicalPlan, workers: int) -> list | None:
     """A session-warm actor pool for a `map_batches -> aggregate` stage, or `None`.
 
@@ -2363,9 +2414,15 @@ def _agg_actor_pool(plan0: LogicalPlan, workers: int) -> list | None:
         if num_gpus:
             return None
         opts = _gpu_options(num_gpus, accelerator_type, resources)
+        size = max(1, workers)
+        width = _agg_actor_width(size)
         sig = _pool_key(plan0, opts)
-        _kill_pool_keys([k for k in _AGG_POOLS if k != sig], _AGG_POOLS)
-        return _resident_pool_for(plan0, opts, max(1, workers), _AGG_POOLS) or None
+        stale = [k for k in _AGG_POOLS if k != sig]
+        if _AGG_POOL_WIDTH and _AGG_POOL_WIDTH[0] != width:
+            stale = list(_AGG_POOLS)  # the live pool's actors are fixed at the old width
+        _kill_pool_keys(stale, _AGG_POOLS)
+        _AGG_POOL_WIDTH[:] = [width]
+        return _resident_pool_for(plan0, opts, size, _AGG_POOLS, cpu_workers=width) or None
     except Exception as exc:  # a pool is an optimisation; never fail the stage for one
         note_suppressed("dist", "acquire the warm pool for a map/aggregate stage", exc)
         return None

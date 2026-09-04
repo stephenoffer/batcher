@@ -33,19 +33,28 @@ class _FakeActor:
 
     def __init__(self, tag: str) -> None:
         self.tag = tag
+        self.cpu_workers: int | None = None
 
 
 @pytest.fixture
 def pooling(monkeypatch):
-    """A clean `_AGG_POOLS`, actor creation stubbed, and every kill recorded."""
+    """A clean `_AGG_POOLS`, actor creation stubbed, and every kill recorded.
+
+    `_AGG_POOL_WIDTH` is reset with it. It is module state that outlives a query by design
+    (an actor's width is fixed in `__init__`, so the pool must notice a fleet that resized),
+    and leaving it set leaks one test's fleet into the next one's eviction decision.
+    """
     import ray
 
     monkeypatch.setattr(M, "_AGG_POOLS", {})
+    monkeypatch.setattr(M, "_AGG_POOL_WIDTH", [])
+    monkeypatch.setattr(M, "_agg_actor_width", lambda size: 4)
     built: list[_FakeActor] = []
     killed: list[_FakeActor] = []
 
-    def new_actor(plan0, opts):
+    def new_actor(plan0, opts, cpu_workers=None):
         actor = _FakeActor(f"a{len(built)}")
+        actor.cpu_workers = cpu_workers
         built.append(actor)
         return actor
 
@@ -181,3 +190,38 @@ def test_a_pool_that_dies_mid_stage_redoes_the_work_on_tasks(pooling):
     assert state == "recovered", "the stage completed on the fallback"
     assert used == ["actor", "task"], "it tried the pool first, then the tasks"
     assert killed == pool and M._AGG_POOLS == {}, "and the dead pool was evicted, not reused"
+
+
+def test_each_actor_is_built_with_the_width_the_fleet_implies(pooling, monkeypatch):
+    """The width is the lever: 4 threads against 16 measured 1,068 ms against 746 ms."""
+    built, _ = pooling
+    monkeypatch.setattr(M, "_agg_actor_width", lambda size: 16)
+
+    M._agg_actor_pool(_prefix(lambda b: b), 3)
+
+    assert [a.cpu_workers for a in built] == [16, 16, 16]
+
+
+def test_a_resized_fleet_rebuilds_the_pool_rather_than_reusing_the_old_width(pooling, monkeypatch):
+    """An actor fixes its width in `__init__`, so a pool built for the old fleet is stale."""
+    built, killed = pooling
+    fn = lambda b: b  # noqa: E731 - one identity, so only the width differs between calls
+    first = M._agg_actor_pool(_prefix(fn), 2)
+
+    monkeypatch.setattr(M, "_agg_actor_width", lambda size: 16)
+    second = M._agg_actor_pool(_prefix(fn), 2)
+
+    assert killed == first, "the old-width actors are killed, not reused"
+    assert [a.cpu_workers for a in second] == [16, 16]
+    assert len(built) == 4
+
+
+def test_an_unchanged_fleet_does_not_rebuild(pooling):
+    """The positive control: without it, the test above passes on a pool that always rebuilds."""
+    built, killed = pooling
+    fn = lambda b: b  # noqa: E731 - same identity, same width, so the pool must be reused
+
+    first = M._agg_actor_pool(_prefix(fn), 2)
+    second = M._agg_actor_pool(_prefix(fn), 2)
+
+    assert first == second and killed == [] and len(built) == 2

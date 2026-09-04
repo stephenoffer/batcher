@@ -330,6 +330,13 @@ partition index. Partition 12 goes to the same process every run, so it meets it
 decoded batches instead of fetching them again. On TPC-H sf100 that is worth 1.4x on a
 compute-heavy user function and 1.6x on a light one, measured warm.
 
+Those workers also size themselves to the cluster. The pool is the stage's whole
+parallelism, so each worker runs your function across `cluster cores / pool size` threads,
+capped by the smallest node so the threads always fit the machine they land on. On a
+1024-core fleet of 16-core nodes a 64-worker pool runs 16 threads each, which is the fleet
+exactly once. Widening it from a fixed 4 threads to that measured a further 1.4x on a
+transcendental-heavy function.
+
 ```python
 import tempfile
 
