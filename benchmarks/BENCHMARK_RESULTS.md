@@ -12,7 +12,7 @@ Same fleet as the entry below — **65 x 16-core / 32 GiB** (1,024 cores), TPC-H
 nothing. Every figure for these pipelines was taken warm. With `BATCHER_SCAN_CACHE_BYTES=0`,
 same query, same 600 M rows, one projected column of `lineitem`:
 
-| pipeline | cache off | cache on |
+| pipeline (pre-fix) | cache off | cache on |
 |---|---:|---:|
 | `scan + sum` — no UDF | **1,009 ms** | 349 ms |
 | `scan + identity UDF + sum` | **2,376 ms** | 2,028 ms |
@@ -37,7 +37,7 @@ Read inside a real Ray task, one partition (10 splits / 10 files / 10 MB project
 |---|---:|---:|---:|
 | native, serial (before) | 1.403 s | 1.249 s | 1.752 s |
 | **native, concurrent (after)** | **0.474 s** | 0.447 s | 0.585 s |
-| PyArrow coalesced dataset scan (the default) | 0.787 s | 0.680 s | 1.165 s |
+| PyArrow coalesced dataset scan (the previous default) | 0.787 s | 0.680 s | 1.165 s |
 | PyArrow concurrent per-split reader | 0.785 s | 0.667 s | 0.928 s |
 
 **Measure it that way or not at all.** Reading the *same* partition with each reader in turn
@@ -68,47 +68,59 @@ was set on a measurement of the same kind, so treat the flip as reversible: `BAT
 restores the PyArrow scan, and the knob is why the earlier finding could be recorded rather than
 argued.
 
-### What this does NOT explain: 1,367 ms of UDF-path overhead
+### What the fix explains, and the 554 ms it does not
 
-From the cold column: an **identity** UDF — a function returning its input column — costs
-**1,367 ms** more than the same scan with no UDF at all (2,376 against 1,009). Same bytes, same
-projection, same partition count. All of it is the difference between the executor a UDF-free
-plan takes and `_map_udf_task` / `_map_agg_task`.
+Re-measured on the *fixed* tree, scan cache off, so the two columns are the same query over
+the same 600 M rows and differ only in this change:
 
-The heavy UDF then adds 995 ms against a floor of **167 ms**: it is 171.5 core-seconds
-(measured single-core at 285.8 ns/row over 600 M rows), so 995 ms is **172 effective cores** of
-1,024 — which is what the 9-11% mean cluster busy in every one of these runs reports.
+| pipeline (cache off) | before | after |
+|---|---:|---:|
+| `scan + sum` — no UDF | 1,009 ms | **789 ms** |
+| `scan + identity UDF + sum` | 2,376 ms | **1,343 ms** |
+| `scan + heavy UDF + sum` | 3,371 ms | **2,157 ms** |
 
-Four levers that look like the answer and are not. Each one moves its own input and
-none of them moves the wall:
+An **identity** UDF — a function returning its input column — cost **1,367 ms** more than the
+same scan with no UDF at all before this change and costs **554 ms** more after it. So most of
+that gap *was* the serial per-file read: a UDF task reads its partition through
+`_read_split_batches`, and it was paying one object-store round trip per file in series while
+the UDF-free path did not. What is left is 554 ms of genuine executor difference between the
+route a UDF-free plan takes and `_map_udf_task` / `_map_agg_task`.
 
-* **`BATCHER_MAP_COMPUTE_WEIGHT`.** "465 tasks x 2.46 CPU = 1,200 CPU asked of a 1,024-core
-  fleet" reads like a stage throttling itself. It is not: `_filled_to_the_fleet` scales whatever
-  it is handed back up to the fleet. Weight 4.0 -> 2.461 CPU/task, 3,265 ms; 1.0 -> 2.100,
-  3,354 ms; 0.25 -> 2.100, 3,392 ms. Same ~1,024 CPU reserved, same 9-10% busy, same wall. The
-  knob moves the input and the fill removes the effect.
-* **`num_workers`.** 2,977 ms default -> 2,835 at 8 -> 2,699 at 16. Thread width inside the task
-  is not the constraint; the tasks are resident and idle, not short of threads.
-* **The per-task share, as a proxy for task concurrency — and the reason it is a bad one.**
-  Pinning every map task to 1.0 CPU instead of the fill's ~2.46 leaves the query where it was:
-  **3,344 ms at 10% mean busy**, against 3,086-3,371 ms on the default. That looks like
-  "concurrency is not the constraint" and it does not show it. The stage has **465 partitions**,
-  and 1,024 cores at 2.46 CPU already hold 416 of them at once, so dropping the share to 1.0
-  raises the resident count from 416 to 465 — 12%, not the 2.5x the per-node packing suggests.
-  A share sweep cannot test concurrency on a stage whose task count is already near the
-  cluster's capacity; only raising `_adaptive_partition_count` can.
-* **The partition count, which is the arm that does move concurrency — the wrong way.** Forcing
-  2,000 partitions at 0.5 CPU each (so every task is resident) takes **6,718 ms**, twice the
-  default's ~3,100-3,400 ms. That reproduces the 2026-09-02 result for a different query and
-  fleet (256/512/1,024 partitions -> 8,237/6,864/7,054 ms), so it is the shape of the curve
-  rather than one bad run. One thing in that arm is **not** understood and should not be read
-  past: `ClusterMonitor` reported a single active node, which is not what 2,000 resident tasks
-  should look like, and nothing here explains it. Treat "more partitions is worse" as measured
-  and the reason for it as open.
+The heavy UDF then adds 814 ms (2,157 - 1,343) against a floor of **167 ms**: the UDF is
+171.5 core-seconds (measured single-core at 285.8 ns/row over 600 M rows), so 814 ms is **211
+effective cores** of 1,024, up from 172. Still a fifth of the fleet, and still the largest
+single term left.
 
-In an isolated task the two phases measure 0.474 s (read) and 0.151 s (`execute_with_udfs`),
-which do not compose into the 2,376 ms the query takes — so what is left to find is contention
-at 416-way fan-out, not a slow phase. That is the next thing worth a session.
+### Three levers on that residue, and what each one actually shows
+
+**Read the baseline column before the arm.** Every sweep below was taken against the *pre-fix*
+default of 3,086-3,371 ms except where marked, and the post-fix default is 2,157 ms — so an arm
+that looked neutral against the old baseline is a regression against the new one. Getting this
+wrong is how the first revision of this entry recorded "task concurrency is not the constraint"
+on an arm that was 55% slower than the default it should have been compared with.
+
+* **`BATCHER_MAP_COMPUTE_WEIGHT` (pre-fix baseline).** "465 tasks x 2.46 CPU = 1,200 CPU asked
+  of a 1,024-core fleet" reads like a stage throttling itself. It is not: `_filled_to_the_fleet`
+  scales whatever it is handed back up to the fleet. Weight 4.0 -> 2.461 CPU/task, 3,265 ms;
+  1.0 -> 2.100, 3,354 ms; 0.25 -> 2.100, 3,392 ms. Same ~1,024 CPU reserved, same 9-10% busy,
+  same wall. The knob moves the input and the fill removes the effect — which is a fact about
+  the code, not about the baseline, so it survives the correction above.
+* **`num_workers` (pre-fix baseline).** 2,977 ms default -> 2,835 at 8 -> 2,699 at 16. Thread
+  width inside the task is not the constraint.
+* **The per-task share and the partition count (post-fix baseline, 2,157 ms).** These are the
+  two that move concurrency, and **both make it worse**. Pinning every task to 1.0 CPU:
+  **3,344 ms**. Forcing 2,000 partitions at 0.5 CPU each so every task is resident:
+  **6,718 ms**, reproducing the 2026-09-02 curve on a different query and fleet
+  (256/512/1,024 partitions -> 8,237/6,864/7,054 ms). So the fill's ~2.46 CPU share is not an
+  over-reservation to be trimmed; it is at or near the right answer, and the stage is *not*
+  short of resident tasks. One thing in the 2,000-partition arm is **not** understood and
+  should not be read past: `ClusterMonitor` reported a single active node, which is not what
+  2,000 resident tasks should look like.
+
+In an isolated task, read and `execute_with_udfs` measure 0.474 s and 0.151 s, which do not
+compose into the wall the query takes at 416-way fan-out. The 554 ms and the 647 ms of
+unrealized compute parallelism are what a next session has to attack, and the four arms above
+say it is not the scheduling knobs.
 
 ### The default flip, and the regression check that nearly went the wrong way
 
@@ -152,11 +164,22 @@ prints in the same `ERR` cell as a failure — worth separating, since one is a 
 harness and the other about the engine.
 
 `udf` moves from **2.1x to 3.3x** against Ray Data. It is still the one shape where Batcher is
-not far ahead, and the decomposition above says why 10x is not available *at this scale*: the
-cold read alone is ~1.0 s against Ray Data's whole 5.7 s query, so 10x would need 569 ms —
-below a floor both engines pay. Closing the remaining 1,367 ms and the 172-of-1,024 cores would
-land near 1.2 s, or ~4.7x. **5x is the honest target on this pipeline, and the read floor is
-what would have to move for more.** The relational shapes are already 7-32x.
+not far ahead, and the decomposition above prices what 10x would take. 10x is 569 ms against
+Ray Data's 5,685 ms, and which side of that line the target falls on depends entirely on
+whether the read is cold:
+
+* **Cold, it is not available.** The UDF-free read alone is 789 ms — above 569 ms, and a floor
+  both engines pay. No amount of executor work gets under it.
+* **Warm, it is arithmetically available.** The worker scan cache answers a repeated query's
+  read in ~350 ms, so the 569 ms target sits *above* the floor rather than below it. Getting
+  there means closing the 554 ms of UDF-path overhead and the 647 ms of unrealized compute
+  parallelism (211 of 1,024 cores) — from 1,716 ms warm today. Neither term is a floor; both
+  are executor work, and the four sweeps above say neither is a scheduling knob.
+
+So the honest statement is not "10x is impossible on this shape" and not "10x is available".
+It is that **a cold sf100 `udf` run cannot reach 10x on this fleet, and a warm one is not
+blocked by any floor** — which makes the 554 ms and the 647 ms worth a session rather than a
+reason to stop. The relational shapes are already 7-32x.
 
 ## The map stage's CPU ask never mentioned the cluster, and a 1,024-core fleet ran a UDF on 300 cores — plus the first head-to-head against Ray Data and Daft on this cluster (2026-09-03)
 
