@@ -47,15 +47,23 @@ def _ray_session():
 
 
 @pytest.fixture(scope="module")
-def splittable(tmp_path_factory) -> str:
-    """Four Parquet files, so the read genuinely fans out and the groups genuinely shuffle."""
+def splittable(cluster_scratch) -> str:
+    """Four Parquet files, so the read genuinely fans out and the groups genuinely shuffle.
+
+    `cluster_scratch`, not `tmp_path_factory`: the corpus has to be readable by the workers
+    that read it. `tmp_path_factory` is driver-local disk, which is invisible from any other
+    node — see `tests/conftest.py::cluster_tmp_path` for the family of failures that causes.
+    Here it did not even surface as the documented `FileNotFoundError`: the read produced no
+    splits a worker could open, and the query **hung** in the shuffle barrier with the cluster
+    idle, which reads as an engine defect rather than as a fixture on the wrong disk.
+    """
     table = pa.table(
         {
             "k": pa.array([i % _KEYS for i in range(_N)], pa.int64()),
             "t": pa.array([(i * 7) % 101 for i in range(_N)], pa.int64()),
         }
     )
-    directory = tmp_path_factory.mktemp("unordered_limit")
+    directory = cluster_scratch("unordered_limit")
     for part in range(4):
         pq.write_table(table, directory / f"p{part}.parquet")
     return str(directory)
