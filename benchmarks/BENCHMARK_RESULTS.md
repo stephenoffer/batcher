@@ -190,16 +190,20 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 
 | pipeline | batcher | ray data | daft | vs ray | vs daft |
 |---|---:|---:|---:|---:|---:|
-| `filter_count` | **166 ms** | 3,561 ms | 1,204 ms | 21.5x | 7.3x |
-| `groupby` | **172 ms** | 5,477 ms | 1,400 ms | 31.8x | 8.1x |
-| `join` | **1,334 ms** | 26,429 ms | 5,364 ms | 19.8x | 4.0x |
-| `udf` | **1,716 ms** | 5,685 ms | n/a¹ | **3.3x** | — |
+| `filter_count` | **166-200 ms** | 3,561 ms | 1,204 ms | 18-21x | 6.0-7.3x |
+| `groupby` | **172-197 ms** | 5,477 ms | 1,400 ms | 28-32x | 7.1-8.1x |
+| `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
+| `udf` | **1,716-1,895 ms** | 5,685 ms | n/a¹ | **3.0-3.3x** | — |
+
+Ranges, not best-of-run, because this fleet's run-to-run spread is about 12% — established
+the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A
+single figure from one sweep would be a number this board cannot reproduce.
 
 ¹ `daft_thunk` declines the `udf` shape (the UDF surfaces diverge), and a declined pipeline
 prints in the same `ERR` cell as a failure — worth separating, since one is a fact about the
 harness and the other about the engine.
 
-`udf` moves from **2.1x to 3.3x** against Ray Data. It is still the one shape where Batcher is
+`udf` moves from **2.1x to 3.0-3.3x** against Ray Data. It is still the one shape where Batcher is
 not far ahead, and the decomposition above prices what 10x would take. 10x is 569 ms against
 Ray Data's 5,685 ms, and which side of that line the target falls on depends entirely on
 whether the read is cold:
