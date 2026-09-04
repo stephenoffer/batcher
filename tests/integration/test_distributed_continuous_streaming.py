@@ -65,10 +65,22 @@ def test_each_micro_batch_is_exactly_one_transaction(cluster_tmp_path):
     src, state, out, ckpt = (cluster_tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
     src.mkdir()
 
+    # One progress record per arrival, with a strictly increasing id — **not** `batch_id ==
+    # batch`. The ids are not consecutive across runs and are not meant to be: when a bounded
+    # source reports itself spent, `engine._checkpoint_drain` records its terminal position
+    # under the *next* batch id and commits it, so an `available_now` run that processes one
+    # micro-batch claims two ids and the next run starts two later (measured: 0, 2, 4). That
+    # marker carries no rows and writes to no sink, which is why the commit count below is
+    # still three — and it is exactly what stops a restart from replaying the whole final
+    # window, so the numbering is the deliberate cost of a correctness property.
+    seen: list[int] = []
     for batch in range(3):
         _land(src, batch)
         query = _stream(src, state, out, ckpt)
-        assert [p.batch_id for p in query.recent_progress] == [batch]
+        ids = [p.batch_id for p in query.recent_progress]
+        assert len(ids) == 1, f"arrival {batch} ran {len(ids)} micro-batches, expected one"
+        seen += ids
+    assert seen == sorted(seen) and len(set(seen)) == 3, f"batch ids must advance: {seen}"
 
     table = deltalake.DeltaTable(str(out))
     # Three arrivals, three micro-batches, three commits — even though several workers

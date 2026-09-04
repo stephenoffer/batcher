@@ -91,10 +91,44 @@ def splittable(cluster_scratch) -> str:
     return str(directory)
 
 
+#: Relative tolerance between the single-node and the distributed float.
+#:
+#: `.claude/rules/python-control-plane.md` states the contract this file is testing: the two
+#: paths agree on the multiset of rows, every column name and every column type **exactly**,
+#: and on a floating-point reduction only *up to reassociation* — `combine` is associative in
+#: exact arithmetic, IEEE addition is not, and the partition count sets the summation order.
+#: Neumaier compensation and Chan's parallel Welford bound that error near the last bits; they
+#: cannot remove it while the partition count is free.
+#:
+#: An **absolute** 9-decimal rounding was used here instead, which is a tolerance that shrinks
+#: as the value grows. It held for the small numbers most of this sweep produces and failed
+#: intermittently on `var` over a global window: 73.056378934 against 73.056378935, a
+#: relative difference of 1.4e-11, from a run that happened to get a different partition
+#: count. That is the documented exception arriving exactly as documented, and a test that
+#: fails on it teaches a reader to disbelieve a red run.
+#:
+#: 1e-9 relative is far tighter than any real divergence this sweep exists to catch: a wrong
+#: group, a dropped row, a decomposition that computes the wrong statistic all move the value
+#: by orders of magnitude, not by its last two bits.
+_FLOAT_RTOL = 1e-9
+
+
+def _close(a, b) -> bool:
+    """Whether two canonicalized cells agree — exactly, except floats (see `_FLOAT_RTOL`)."""
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isclose(a, b, rel_tol=_FLOAT_RTOL, abs_tol=1e-12)
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(_close(x, y) for x, y in zip(a, b, strict=True))
+    return type(a) is type(b) and a == b
+
+
 def _canonical(table: pa.Table, order: str) -> tuple:
     def scalar(value):
+        # Floats are kept at full precision and compared by `_close`; only the two values
+        # whose *identity* is at stake are folded (every NaN is one NaN, -0.0 is 0.0), which
+        # is the engine's own float key identity (`bc_arrow::canon_f64_bits`).
         if isinstance(value, float):
-            return "nan" if math.isnan(value) else (0.0 if value == 0.0 else round(value, 9))
+            return "nan" if math.isnan(value) else (0.0 if value == 0.0 else value)
         if isinstance(value, (list, tuple)):
             return tuple(sorted((scalar(v) for v in value), key=repr))
         if isinstance(value, dict):
@@ -149,7 +183,28 @@ def _agrees(build, order: str) -> None:
     fanned = _canonical(build().collect(distributed=True, num_workers=_WORKERS), order)
     assert fanned[0] == single[0], f"columns {fanned[0]} vs {single[0]}"
     assert fanned[1] == single[1], f"types {fanned[1]} vs {single[1]}"
-    assert fanned[2] == single[2], "the distributed rows differ from the single-node rows"
+    assert len(fanned[2]) == len(single[2]), (
+        f"{len(fanned[2])} distributed rows vs {len(single[2])} single-node rows"
+    )
+    for i, (f, s) in enumerate(zip(fanned[2], single[2], strict=True)):
+        assert _close(f, s), f"row {i} differs: {f} vs {s}"
+
+
+def test_the_float_tolerance_admits_reassociation_and_nothing_more():
+    """A positive control for `_close`, because a tolerance is only worth its false negatives.
+
+    Without this, widening the comparison to admit the documented reassociation is
+    indistinguishable from widening it until nothing can fail — and the whole file's value is
+    that it fails when a distributed path computes the wrong thing.
+    """
+    assert _close(73.056378934, 73.056378935), "the measured reassociation must pass"
+    assert _close(0.0, -0.0)
+    assert not _close(73.056378934, 73.05638), "a 1e-7 relative difference must still fail"
+    assert not _close(1.0, 1.0000001)
+    assert not _close(2.0, 3.0)
+    assert not _close((1.0, 2.0), (1.0, 3.0))
+    assert not _close(1, 1.0), "an int and a float are different column types, not close ones"
+    assert _close("nan", "nan") and not _close("nan", 0.0)
 
 
 @pytest.mark.parametrize("column", ["k", "f", "s"])

@@ -227,7 +227,7 @@ def fleet_derate() -> float:
         exactly as it did. The floor is the reciprocal of the maximum co-tenancy, so the worst
         this can do is stop packing — never refuse to place work.
     """
-    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_device_health
+    from batcher.dist.executors.ray_runtime.fleet_health import cluster_device_health
 
     try:
         records = cluster_device_health()

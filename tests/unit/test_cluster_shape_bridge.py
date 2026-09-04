@@ -26,7 +26,7 @@ from typing import ClassVar
 
 import pytest
 
-from batcher.dist.executors.ray_runtime import hardware_probe as hp
+from batcher.dist.executors.ray_runtime import fleet_health as hp
 from batcher.dist.executors.ray_runtime import scaling
 from batcher.dist.executors.ray_runtime.fabric import shape as shape_mod
 

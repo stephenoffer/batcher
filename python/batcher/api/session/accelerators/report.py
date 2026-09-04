@@ -103,7 +103,7 @@ def _add_fleet_health(fleet: dict) -> None:
     Nodes that answered clean contribute a count; the ones that did not are listed, because
     "which node do I drain" is the reason to run this.
     """
-    from batcher.dist.executors.ray_runtime.hardware_probe import (
+    from batcher.dist.executors.ray_runtime.fleet_health import (
         cluster_device_health,
         unhealthy_nodes,
     )

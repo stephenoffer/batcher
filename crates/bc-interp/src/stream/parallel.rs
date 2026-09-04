@@ -1443,6 +1443,20 @@ pub fn streaming_parallelizes(plan: &RelOp) -> bool {
 /// 100.4 ms against 56.9 ms. The projection itself is over the aggregate's *output*, which is
 /// one row per group and therefore trivial next to the aggregation, so peeling it cannot change
 /// which executor is the right one.
+///
+/// A `Sort` or `Limit` above the aggregate is peeled for the same reason and it is the shape
+/// that matters most in practice: `GROUP BY k ORDER BY count(*) DESC LIMIT n` is how nearly
+/// every analytics leaderboard query is written, and it was the one shape the `Project` peel
+/// could not see. On ClickBench that is q32/q33/q34/q36/q39; q32 (`GROUP BY WatchID, ClientIP`
+/// over ~1 M near-unique groups) ran **60.6 ms streaming against 26.4 ms materializing** with
+/// nothing but this routing changed.
+///
+/// The peel is sound for the same reason it is for a projection: both operators consume the
+/// aggregate's *output*, one row per group, so they are small beside the aggregation whichever
+/// executor runs them — and neither can turn a plan whose cost is the group-by into a plan
+/// whose cost is something else. It is the caller's cardinality test (Kyber's
+/// `_prefers_materializing_aggregate`) that must then read the group count off the
+/// **aggregate**, not off the plan root, since a `Limit` truncates that number.
 #[must_use]
 pub fn materializing_aggregate_is_faster(plan: &RelOp) -> bool {
     fn has_join(op: &RelOp) -> bool {
@@ -1452,8 +1466,13 @@ pub fn materializing_aggregate_is_faster(plan: &RelOp) -> bool {
         op.children().iter().any(|c| has_join(c))
     }
     let mut node = plan;
-    while let RelOp::Project { input, .. } = node {
-        node = input;
+    loop {
+        node = match node {
+            RelOp::Project { input, .. }
+            | RelOp::Sort { input, .. }
+            | RelOp::Limit { input, .. } => input,
+            _ => break,
+        };
     }
     matches!(node, RelOp::Aggregate { group_keys, .. } if !group_keys.is_empty()) && !has_join(plan)
 }
@@ -1487,6 +1506,95 @@ mod tests {
         assert!(
             !streaming_parallelizes(&join(scan(0), scan(0))),
             "a self-join reads source 0 twice, so the streaming executor cannot shard it"
+        );
+    }
+
+    /// `materializing_aggregate_is_faster` sees the aggregate through the row-wise operators
+    /// that read its output, and only through those.
+    ///
+    /// The `Sort`/`Limit` peel is the half that was missing, and the half nearly every
+    /// analytics query needs: `GROUP BY k ORDER BY count(*) DESC LIMIT n` put a `Sort` at the
+    /// root, so the predicate answered "not a grouped aggregate" for the whole ClickBench
+    /// leaderboard family. It must keep refusing a global aggregate and anything with a join.
+    #[test]
+    fn the_aggregate_is_seen_through_project_sort_and_limit() {
+        let scan = || RelOp::Scan { source_id: 0 };
+        let item = |name: &str| bc_ir::ProjectionItem {
+            expr: bc_expr::Expr::Col {
+                name: name.to_string(),
+            },
+            alias: name.to_string(),
+        };
+        let agg = |keys: Vec<bc_ir::ProjectionItem>| RelOp::Aggregate {
+            input: Box::new(scan()),
+            group_keys: keys,
+            aggregates: vec![],
+        };
+        let project = |input: RelOp| RelOp::Project {
+            input: Box::new(input),
+            exprs: vec![item("c")],
+        };
+        let sort = |input: RelOp, limit: Option<usize>| RelOp::Sort {
+            input: Box::new(input),
+            keys: vec![bc_ir::SortKey {
+                expr: bc_expr::Expr::Col { name: "c".into() },
+                descending: true,
+                nulls_first: false,
+            }],
+            limit,
+        };
+        let limit = |input: RelOp| RelOp::Limit {
+            input: Box::new(input),
+            n: 10,
+            offset: 0,
+        };
+
+        let grouped = || agg(vec![item("k")]);
+        assert!(materializing_aggregate_is_faster(&grouped()));
+        assert!(materializing_aggregate_is_faster(&project(grouped())));
+        assert!(
+            materializing_aggregate_is_faster(&sort(grouped(), Some(10))),
+            "GROUP BY k ORDER BY c DESC LIMIT 10 — the shape the Project-only peel missed"
+        );
+        assert!(materializing_aggregate_is_faster(&sort(grouped(), None)));
+        assert!(materializing_aggregate_is_faster(&limit(grouped())));
+        assert!(
+            materializing_aggregate_is_faster(&sort(project(grouped()), Some(10))),
+            "the peels compose in any order the planner emits them"
+        );
+
+        assert!(
+            !materializing_aggregate_is_faster(&sort(agg(vec![]), Some(10))),
+            "a global aggregate has no groups to make the materializing path pay"
+        );
+        assert!(
+            !materializing_aggregate_is_faster(&sort(scan(), Some(10))),
+            "a plain top-N is not an aggregate at all"
+        );
+        assert!(
+            !materializing_aggregate_is_faster(&RelOp::Filter {
+                input: Box::new(grouped()),
+                predicate: bc_expr::Expr::Col { name: "k".into() },
+            }),
+            "a HAVING filter is not peeled — only the operators measured here are"
+        );
+
+        let joined = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(scan()),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["k".into()],
+                right_keys: vec!["k".into()],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![],
+                strategy: bc_ir::JoinStrategy::Hash,
+            }),
+            group_keys: vec![item("k")],
+            aggregates: vec![],
+        };
+        assert!(
+            !materializing_aggregate_is_faster(&sort(joined, Some(10))),
+            "a grouped aggregate under a join is a different plan and was never measured"
         );
     }
 

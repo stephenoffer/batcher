@@ -285,6 +285,22 @@ const SPREAD_MIN: f64 = 0.9;
 /// sample that has not begun to saturate cannot tell "clustered" from "enormous". Both answers
 /// are on the same side of every decision this feeds — the partition path, and a radix width
 /// that is merely wider than it needed to be.
+/// **And floored at the union itself, which is a count rather than a model.** The sample's
+/// rows are rows of the relation, so every key its merged partials hold is a key the relation
+/// holds: `union_groups` is a measured lower bound and an estimate below it is wrong by
+/// construction, whatever the curve says. `estimated_groups` cannot apply this bound — it is
+/// handed the *sum* of the per-morsel counts, which counts a key once per morsel it appears in,
+/// and its own doc records that bounding below by that sum over-partitioned a 100 k-group key
+/// by 2.4x. The union is that same quantity with the double-counting removed, and it is only
+/// available here.
+///
+/// It is not a rounding correction. A **skewed** key defeats both of the estimates above at
+/// once: the common values put every morsel's keys in every other morsel's, so the disjointness
+/// test above fails and the linear read is not taken, while the long tail makes each morsel's
+/// own ratio look like a small domain. ClickBench `GROUP BY URL` over the 1 M-row mirror is
+/// exactly that shape — 275,494 groups, estimated at ~10 k — and the under-read is what routes
+/// it to `chunked_partials`, whose `concat_batches` is a full copy of the relation (11% of the
+/// query) before a partial that does not reduce and a merge over ~700 k partial rows.
 pub(crate) fn estimated_groups_spread(
     sample_rows: usize,
     per_morsel_groups: usize,
@@ -296,11 +312,16 @@ pub(crate) fn estimated_groups_spread(
     if per_morsel_groups == 0 || union_groups == 0 || sample_rows == 0 {
         return saturating;
     }
+    // Measured, not modelled: these keys were seen in rows of this relation.
+    let observed = union_groups.min(total_rows);
     if (union_groups as f64) / (per_morsel_groups as f64) < SPREAD_MIN {
-        return saturating;
+        return saturating.max(observed);
     }
     let linear = (total_rows as f64) * (union_groups as f64) / (sample_rows as f64);
-    saturating.max(linear as usize).min(total_rows)
+    saturating
+        .max(linear as usize)
+        .max(observed)
+        .min(total_rows)
 }
 
 /// Read a sample's partials and say how wide to partition — or `None` to keep the reducing
@@ -895,6 +916,51 @@ mod tests {
             "a 1,000-value domain must not be inflated by the spread correction, got {spread}"
         );
         assert_eq!(spread, estimated_groups(rows, summed, morsels, 59_986_052));
+    }
+
+    /// A **skewed** key defeats both readings at once, and the union is what rescues it.
+    ///
+    /// Hot values put most of every morsel's keys in every other morsel's, so the disjointness
+    /// test fails and the linear read is not taken; the long tail makes each morsel's own ratio
+    /// look like a domain of ten thousand. ClickBench `GROUP BY URL` is this shape: 275,494
+    /// groups in 1 M rows, read as ~10 k. The union of the sample's own partials is 30,000
+    /// keys that were *counted*, so no estimate below it can be right.
+    #[test]
+    fn a_skewed_key_is_floored_at_the_keys_the_sample_actually_held() {
+        let (morsels, per_morsel_rows) = (4usize, 16_384usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = 36_000usize; // ~9,000 distinct per morsel
+        let union = 30_000usize; // heavy overlap: 0.83 of the sum, under SPREAD_MIN
+        let total = 1_000_000usize;
+        assert!(
+            (union as f64) / (summed as f64) < SPREAD_MIN,
+            "the fixture must be on the branch the linear read does not reach"
+        );
+        let base = estimated_groups(rows, summed, morsels, total);
+        assert!(
+            base < union,
+            "the unaided inversion is expected to fall below the counted union, got {base}"
+        );
+        assert_eq!(
+            estimated_groups_spread(rows, summed, union, morsels, total),
+            union,
+            "an estimate below a measured lower bound is wrong however the curve reads"
+        );
+    }
+
+    /// The floor is a *lower* bound and never becomes the answer on its own: where the model
+    /// already reads higher than the union, the model wins.
+    #[test]
+    fn the_union_floor_does_not_lower_a_larger_estimate() {
+        let (morsels, per_morsel_rows, per_morsel_groups) = (61usize, 4096usize, 1024usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * per_morsel_groups;
+        let total = 59_986_052usize;
+        let spread = estimated_groups_spread(rows, summed, summed, morsels, total);
+        assert!(
+            spread > summed,
+            "the clustered read is far above its own union and must stay there, got {spread}"
+        );
     }
 
     /// The correction only ever raises the estimate, and never past one group per row — both

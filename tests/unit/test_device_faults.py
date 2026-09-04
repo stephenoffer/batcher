@@ -371,7 +371,7 @@ def test_an_application_code_still_carries_an_explanation():
 
 
 def test_the_two_lists_stay_separate_in_the_fleet_record(monkeypatch):
-    from batcher.dist.executors.ray_runtime import hardware_probe
+    from batcher.dist.executors.ray_runtime import fleet_health as hardware_probe
 
     monkeypatch.setattr("batcher.carbonite.accel.assess_fleet", lambda: ())
     monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ())

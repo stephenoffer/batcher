@@ -400,18 +400,29 @@ def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -
     projection is over one row per group, so peeling it cannot change the verdict. The Rust
     guard (`materializing_aggregate_is_faster`) peels the same way; the two must agree or the
     hint is discarded by the engine's own shape check.
+
+    A `Sort` and a `Limit` are peeled with it, and that is the shape it matters most for:
+    `GROUP BY k ORDER BY count(*) DESC LIMIT n` is how an analytics leaderboard query is
+    written and the `Project`-only peel could not see any of them. Both operators read the
+    aggregate's output — one row per group — so, exactly like the projection, they are small
+    beside the aggregation whichever executor runs them.
+
+    **The group count is read off the `Aggregate`, not off the plan root**, which is what the
+    added peels force: a `LIMIT 10` above the aggregate makes the root's estimate 10, so
+    estimating the root would refuse every one of the queries this peel exists to admit —
+    silently, and while looking like it had asked the right question.
     """
-    from batcher.plan.logical import Aggregate, Join, Project
+    from batcher.plan.logical import Aggregate, Join, Limit, Project, Sort
 
     node = plan
-    while isinstance(node, Project):
+    while isinstance(node, (Project, Sort, Limit)):
         node = node.input
     if not isinstance(node, Aggregate) or not node.group_keys:
         return False
     if any(isinstance(n, Join) for n in walk(plan)):
         return False
     try:
-        return ctx.estimator.estimate(plan).rows >= MATERIALIZE_AGG_MIN_GROUPS
+        return ctx.estimator.estimate(node).rows >= MATERIALIZE_AGG_MIN_GROUPS
     except Exception:
         return False  # no estimate is not evidence for changing the route
 

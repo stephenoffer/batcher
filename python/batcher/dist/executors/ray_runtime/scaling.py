@@ -414,7 +414,7 @@ def _class_index() -> dict:
     from batcher.dist.executors.ray_runtime.capacity import free_cpus_by_node
     from batcher.dist.executors.ray_runtime.fabric.census import build_census
     from batcher.dist.executors.ray_runtime.fabric.shape import _zone_label
-    from batcher.dist.executors.ray_runtime.hardware_probe import unhealthy_gpus_by_node
+    from batcher.dist.executors.ray_runtime.fleet_health import unhealthy_gpus_by_node
 
     index = build_census(
         _alive_nodes(),
@@ -548,9 +548,7 @@ def cluster_numa_nodes() -> int:
     Returns:
         NUMA domains per worker node, at least 1.
     """
-    from batcher.dist.executors.ray_runtime.hardware_probe import (
-        cluster_hardware_profiles,
-    )
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_hardware_profiles
 
     seen = [c for p in cluster_hardware_profiles() if (c := int(p.get("numa_nodes") or 0)) > 0]
     return min(seen) if seen else 1
@@ -644,13 +642,7 @@ def _cluster_hardware_profile() -> HardwareProfile | None:
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
     gpu_devices = int(sum(c["gpus"] for c in classes))
     from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
-    from batcher.dist.executors.ray_runtime.hardware_probe import (
-        cluster_l3_cache_bytes,
-        cluster_measured_gpu_memory_bytes,
-        cluster_storage_class,
-        cluster_worker_fingerprint,
-        warn_once_if_fleet_is_mixed,
-    )
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes, cluster_measured_gpu_memory_bytes, cluster_storage_class, cluster_worker_fingerprint, warn_once_if_fleet_is_mixed
 
     warn_once_if_fleet_is_mixed()
     return HardwareProfile.for_cluster(
