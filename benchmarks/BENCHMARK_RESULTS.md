@@ -117,6 +117,33 @@ on an arm that was 55% slower than the default it should have been compared with
   should not be read past: `ClusterMonitor` reported a single active node, which is not what
   2,000 resident tasks should look like.
 
+### The open lead: the UDF path plans twice as many splits for the same bytes
+
+`partition_descriptors` instrumented on both routes, same query, same projected column:
+
+| route | partitions | splits planned | splits/partition |
+|---|---:|---:|---:|
+| `scan + sum` — no UDF | 256 | **2,494** | 9-10 |
+| `scan + identity UDF + sum` | 465 | **4,902** | 10-11 |
+
+The UDF route issues **1.97x as many object-store reads for the same data**. That is the
+right order of magnitude to matter for the 554 ms, and `_scan_splits` is where it would come
+from — it coalesces adjacent row-groups to `_SPLIT_TARGET_BYTES` only while the result still
+holds `workers x _SCAN_PREFETCH` splits, and the map stage's partition count is derived from
+*compute* weight, which has nothing to do with what shape the read wants.
+
+**The mechanism is not established, and the arithmetic does not close.** That floor is
+`workers x 32`, so 8,192 for the 256-partition route and 14,880 for the 465-partition one;
+a ~1,700-2,500 coalesced count is below *both*, which should send both routes to the fine
+splits and give both 4,902. One of them does not. Something else in the call — a
+`max_partitions` cap, a different `plan_splits` path, the source object being rebuilt — is
+doing the work, and it was not found.
+
+Do not quote the wall times from that run: it was taken while a full differential suite held
+the cluster at 896 of 1,024 cores, and the same two queries read 9.4 s and 37.4 s there
+against 789 ms and 1,343 ms on a quiet fleet. The split counts are structural and stand; the
+timings beside them are worthless. Re-measure on a quiet cluster before acting on this.
+
 In an isolated task, read and `execute_with_udfs` measure 0.474 s and 0.151 s, which do not
 compose into the wall the query takes at 416-way fan-out. The 554 ms and the 647 ms of
 unrealized compute parallelism are what a next session has to attack, and the four arms above
