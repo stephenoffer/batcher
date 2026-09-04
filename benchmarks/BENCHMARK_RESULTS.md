@@ -257,33 +257,40 @@ Across three consecutive runs of the same query, nearly every sampled worker rep
 disabled and it is not empty — every worker is faithfully caching the partition it just read.
 It is simply never asked for that partition again: the next run hands it a different one.
 
-That also explains why the actor-pool arm changed nothing. Routing the stage through
-`ml.map_batches(..., concurrency=64)` gives it 64 persistent actors and no improvement
-(1,686 ms against 1,672 ms for stateless tasks), because the pool picks the *emptiest* actor
-per partition (`_emptiest_actor`) — load-balanced, not index-stable. Persistence was never the
-missing ingredient; **stable partition-to-worker assignment** is. The UDF-free aggregate has it
-because `flight_aggregate` hands `partition_descriptors` its `fleet_addrs` and then addresses
-reducers by index, so partition *i* meets the same process every run.
+The UDF-free aggregate does not have that problem, and the difference is visible in the code:
+`flight_aggregate` hands `partition_descriptors` its `fleet_addrs` and then addresses reducers
+by index, so partition *i* meets the same process on every run. The map route has no such
+anchor. That makes **stable partition-to-worker assignment** the obvious suspect — and the
+next section is about how the two attempts to test it failed to test it.
 
-That reading said the fix was to make assignment sticky, so an index-addressed actor pool was
-built: `_AffinityQueue` served partition *i* to actor ``i % n`` first and let an actor with an
-empty bucket steal from the longest, so locality was a preference and no actor could idle.
-Seven unit cases pinned the semantics.
+### Two "falsifications" of that mechanism which were not falsifications at all
 
-**It bought nothing and is reverted.** Warm, same query: pool with affinity 1,767 ms, pool
-without it 1,686 ms, stateless tasks 1,752 ms — one band. So *within-pool* assignment is not
-the lever either, which means the pool's actors are evidently not carrying a warm cache from
-one query to the next any more than the tasks are, and "make the assignment stable" does not
-by itself make a distributed map route reuse a decoded batch.
+An earlier revision of this entry recorded that routing the stage onto an actor pool changed
+nothing (1,686 ms against 1,672 for stateless tasks), and then that adding index affinity
+inside the pool changed nothing either (1,767 ms) — both reported as the mechanism being
+wrong. **Neither experiment ran the actor pool.** `ml.map_batches(..., concurrency=64)` was
+used to select it, and for this pipeline shape it does not:
 
-Three mechanisms have now been built and falsified against this one ~600 ms: read/compute
-overlap, actor-vs-task placement, and index affinity within the pool. What survives all three
-is only the pair of *observations*: the UDF-free aggregate gets 2.3x from the scan cache and
-the map route gets none, at `hit_rate 0.0` with tens to hundreds of megabytes resident per
-worker. Whatever connects those two facts is not any of the three things that look obvious
-from here, and the next attempt should establish the connection before building anything —
-starting with whether a map worker process survives between two queries at all, and whether
-the two routes even compute the same cache key for the same splits. Neither has been checked.
+    has_map_batches(plan)         True
+    _is_linear_map_pipeline(plan) False      <- the .agg() breaker
+
+so `_dispatch` takes the `agg_split` branch into `_distributed_map_aggregate`, which runs
+stateless `_map_agg_task`s and never consults `concurrency`. Confirmed by instrumenting
+`_MapActor.run`, which printed **nothing** across three runs. The two arms were the same code
+path measured twice — which is exactly why they agreed to within noise. The agreement was the
+tell, and it was read the wrong way round: as evidence about placement rather than as evidence
+that placement never changed.
+
+An `_AffinityQueue` (partition *i* preferring actor ``i % n``, an actor with an empty bucket
+stealing from the longest so none could idle) was built and unit-tested for this, then
+reverted when it measured flat. It is withdrawn rather than kept as evidence.
+
+So the actor-locality hypothesis is **untested, not refuted**, and `concurrency` is not the
+knob that tests it — reaching `_distributed_map`'s pool needs a plan with no breaker above the
+map. What is established stays: 2.3x from the cache for the UDF-free route against ~0 for the
+map route, at `hit_rate 0.0` with hundreds of megabytes resident per worker, plus exactly one
+genuinely falsified mechanism (read/compute overlap, which was measured on the path it claimed
+to fix).
 
 ### Batching the barrier's completions: built, measured, rejected
 
