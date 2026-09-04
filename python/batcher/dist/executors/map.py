@@ -1418,11 +1418,14 @@ def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
 
     Three things bound it, and each is load-bearing:
 
-    * **Only a `map_batches` stage.** A scan or filter task cannot use a second core for its
-      own partition — its work is the read — so raising its share reserves cores that then sit
-      idle, which on a shared cluster is worse than useless. A UDF task splits its partition
-      across `num_workers = round(share)` (see `_launch`), so the cores it is given are cores
-      it can use.
+    * **Only a `map_batches` stage**, and that is measured rather than argued. A UDF task
+      splits its partition across `num_workers = round(share)` (see `_launch`), so the cores
+      it is given are cores it can use; a scan or filter task's work is the read. Filling
+      every stage instead was tried on the same fleet and moved nothing outside noise —
+      `filter-count` 184 -> 184 ms, `scan-agg` 213 -> 208, `group-by` 1,194 -> 1,167, and the
+      hash join 2,289 -> 2,344 (its probe does not come through this sizing at all; it runs on
+      the shuffle fleet). So the gate costs no throughput and keeps the reservation off a
+      shared cluster's cores where nothing would use them.
     * **Never below the data-derived want.** This only ever scales *up*; a stage whose own
       sizing already meets or exceeds the fleet keeps it.
     * **Never past a node.** `node_cores` still caps each task, so a fill cannot ask for a
