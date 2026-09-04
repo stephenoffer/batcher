@@ -153,6 +153,53 @@ established (it is a plan, counted, not timed) and the speedup as unproven. It i
 because it costs nothing, makes the two routes agree, and a read that issues half the
 requests is the better shape to be in when the object store is the constraint.
 
+### The fan-out was sized for columns the query never reads
+
+`_adaptive_partition_count` takes the max of a *rows* term and a *bytes* term, and the bytes
+term is a memory bound: the count that holds one task's input to `target_bytes_per_task`. It
+was computing that from the source's **own** byte total — every column, whatever the query
+asked for. On sf100 `lineitem` reading one `float64` of sixteen:
+
+| term | value |
+|---|---:|
+| source's reported bytes | 124.8 GB |
+| bytes the query actually reads | 4.8 GB |
+| `target_bytes_per_task` | 268 MB |
+| rows term | 301 |
+| **bytes term** | **465** — and it wins |
+
+So the term meant to be a *bound* was setting the fan-out, 55% above what the rows asked for.
+Forced partition counts on that pipeline, cache off, one session, all answers identical:
+
+| partitions | identity UDF | heavy UDF |
+|---|---:|---:|
+| 64 | 1,427 ms | 1,865 ms |
+| 128 | 1,253 ms | 1,463 ms |
+| 256 | **1,017 ms** | **1,438 ms** |
+| 465 (the default) | 1,510 ms | 2,257 ms |
+
+The default was the worst point measured, and the curve is not flat near it. That is the same
+direction the `_adaptive_partition_count` docstring already records from a different fleet —
+fewer, wider tasks win, because a wider task gets a proportionally wider intra-task pool and a
+quarter of the dispatch — so this is a case of the byte term overriding a conclusion the row
+term had already reached.
+
+`_minus_pruned_columns` subtracts the pruned columns from the reported total, which puts the
+default at **301**: heavy 2,257 -> **1,758 ms**, identity 1,510 -> **1,381 ms**, and on the
+warm competitive board `udf` 1,716-1,895 -> **1,515 ms** at 17% mean / 72% peak cluster busy
+(from 11-14% / 38-46%).
+
+**Two readings of the projection, and the larger wins**, because each is wrong where the other
+is right. *Subtracting* the pruned columns keeps a media source honest — its retained column is
+never modelled, so a `binary` blob whose real bytes dwarf its 36-byte prior keeps whatever
+share of the authoritative total is left — but it assumes the reported total and the width
+model share a unit, and they do not: `Source.statistics()` reports compressed on-disk bytes for
+some formats and decoded logical bytes for others, so the subtraction runs past zero on a
+well-compressed table. *Scaling* by `kept / full` is dimensionless and right in either unit,
+and it is the one that under-counts a media column. Neither can exceed the reported total, so
+the max only ever takes back an over-subtraction. That asymmetry is the point: an OOM guard
+must fail toward more partitions, never fewer.
+
 ### Read/compute overlap inside the task: built, measured, rejected
 
 The compute term has an explanation that fits the number exactly. Within a map task the read
@@ -227,7 +274,7 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 | `filter_count` | **166-200 ms** | 3,561 ms | 1,204 ms | 18-21x | 6.0-7.3x |
 | `groupby` | **172-197 ms** | 5,477 ms | 1,400 ms | 28-32x | 7.1-8.1x |
 | `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
-| `udf` | **1,716-1,895 ms** | 5,685 ms | n/a¹ | **3.0-3.3x** | — |
+| `udf` | **1,515 ms** | 5,685 ms | n/a¹ | **3.8x** | — |
 
 Ranges, not best-of-run, because this fleet's run-to-run spread is about 12% — established
 the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A
@@ -237,7 +284,7 @@ single figure from one sweep would be a number this board cannot reproduce.
 prints in the same `ERR` cell as a failure — worth separating, since one is a fact about the
 harness and the other about the engine.
 
-`udf` moves from **2.1x to 3.0-3.3x** against Ray Data. It is still the one shape where Batcher is
+`udf` moves from **2.1x to 3.8x** against Ray Data. It is still the one shape where Batcher is
 not far ahead, and the decomposition above prices what 10x would take. 10x is 569 ms against
 Ray Data's 5,685 ms, and which side of that line the target falls on depends entirely on
 whether the read is cold:

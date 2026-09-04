@@ -1346,6 +1346,71 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     return n
 
 
+def _minus_pruned_columns(source, plan, total_rows: int, total_bytes: float) -> float:
+    """`total_bytes` less the columns the pushed projection means nobody reads.
+
+    A source's own byte total is the whole relation — every column, whatever the query
+    asked for — and the byte term is a bound on what **one task holds**, which is the
+    *projected* read. Sizing it on the unprojected total shards a narrow query over a wide
+    table as if it read the wide table. Measured on TPC-H sf100 `lineitem`, one `float64`
+    column of sixteen: the source reports 124.8 GB, the read is 4.8 GB, and the byte term
+    came out at 465 partitions against the row term's 301 — so the term that is supposed to
+    be a memory *bound* was setting the fan-out, 55% above what the rows asked for. At 465
+    partitions that pipeline runs in 2,257 ms; at 256 it runs in 1,438 ms.
+
+    Only the **pruned** columns are modelled, and never the retained ones — that is what
+    makes this safe in the one direction that matters. A variable-length column's width is a
+    prior (`plan.types.widths`), and a media column's real bytes can exceed it by orders of
+    magnitude. Subtracting a prior that is too small removes too little, so the result
+    over-states the projected bytes and asks for *more* partitions, which is the direction
+    an OOM guard should fail in. The retained columns are never estimated at all: they keep
+    whatever share of the source's authoritative total is left.
+
+    Args:
+        source: The source being sized, for its schema.
+        plan: The plan being run, for the projection its scan pushes down.
+        total_rows: The source's row count.
+        total_bytes: The source's own reported byte total, all columns.
+
+    Returns:
+        The bytes the projected read is estimated to move, never above the source's own
+        reported total.
+    """
+    from batcher.plan.types.widths import projected_row_bytes, schema_row_bytes
+
+    projection, _predicate = _scan_pushdown(plan)
+    if not projection:
+        return total_bytes
+    try:
+        schema = source.schema()
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "read the source schema for byte sizing", exc)
+        return total_bytes
+    full = schema_row_bytes(schema)
+    if full <= 0:
+        return total_bytes
+    kept = projected_row_bytes(schema, projection)
+    pruned = max(0.0, full - kept)
+    # Two readings of the same projection, and the larger wins, because each is wrong in a
+    # direction the other covers.
+    #
+    # *Subtracting* the pruned columns is what keeps a media source honest: its retained
+    # column is never modelled, so a `binary` blob whose real bytes dwarf its 36-byte prior
+    # keeps whatever share of the authoritative total is left. But it assumes `total_bytes`
+    # and the width model share a unit, and they do not always — `Source.statistics()`
+    # reports *compressed on-disk* bytes for some formats and decoded logical bytes for
+    # others, so the subtraction can run past zero on a well-compressed table.
+    #
+    # *Scaling* by `kept / full` is a dimensionless ratio, so it is right in either unit —
+    # and it is the one that under-counts a media column, because the ratio is computed from
+    # the same priors that under-model it.
+    #
+    # Neither can exceed `total_bytes` (`kept <= full`, `pruned >= 0`), so the max only ever
+    # takes back an over-subtraction. It never asks for fewer partitions than the source's
+    # own total would have.
+    return max(total_bytes * (kept / full), total_bytes - total_rows * pruned)
+
+
 def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
     """Task count implied by the source's *bytes*, not its rows.
 
@@ -1368,6 +1433,8 @@ def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
 
         opt = active_config().optimizer
         total_bytes = _source_total_bytes(source)
+        if total_bytes is not None:
+            total_bytes = _minus_pruned_columns(source, plan, total_rows, total_bytes)
         if total_bytes is None:
             from batcher.kyber import load_learned_stats
             from batcher.kyber.cardinality import CardinalityEstimator
