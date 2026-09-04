@@ -200,6 +200,35 @@ and it is the one that under-counts a media column. Neither can exceed the repor
 the max only ever takes back an over-subtraction. That asymmetry is the point: an OOM guard
 must fail toward more partitions, never fewer.
 
+### And the rows term was clamped to the core count, not to a task width
+
+With the byte term fixed the *rows* term decides, and it clamped at `cluster_cores` — 1,024
+here, so 301 partitions stood. But a task is not a core: `_map_udf_task` sets its intra-task
+`num_workers` from its CPU share, so N tasks of 4 cores and 4N tasks of 1 core buy the same
+threads, and the first buys them with a quarter of the dispatch, descriptor decoding, engine
+setup and worker acquisition. `_adaptive_partition_count`'s own docstring already records that
+from a 128-core fleet: 32 tasks x 4 CPU won at every UDF weight, which is cores/4.
+
+Clamping the rows term to `cluster_cores / _TARGET_TASK_CPUS` (4) puts this fleet at 256. The
+byte term is deliberately **not** clamped — it is a memory bound, and a source needing 4,096
+tasks to keep one task's input under budget must still get them.
+
+The full progression of the `udf` pipeline's fan-out, cache off:
+
+| | partitions | identity | heavy |
+|---|---:|---:|---:|
+| before | 465 | 1,510 ms | 2,257 ms |
+| projection-aware byte term | 301 | 1,381 ms | 1,758 ms |
+| + rows term clamped to a task width | **256** | **1,061 ms** | **1,634 ms** |
+
+**The last step is worth less than it looks on the heavy pipeline, and the entry should say
+so.** Forcing 256 against 301 in paired runs gave 1,345 / 1,382 / 1,438 ms against 1,498 /
+1,662 / 1,758 — every pairing favours the smaller count, but the means are 1,388 against 1,639,
+a ~15% gap whose ranges nearly touch at this fleet's ~12% run-to-run spread. On `identity`
+(1,381 -> 1,061, 23%) it clears that floor; on `heavy` it does not. Both terms are kept because
+all six pairings point the same way and the direction matches a measurement already in the
+file, not because either one is individually decisive. `BATCHER_TARGET_TASK_CPUS` reverses it.
+
 ### Read/compute overlap inside the task: built, measured, rejected
 
 The compute term has an explanation that fits the number exactly. Within a map task the read
@@ -274,7 +303,7 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 | `filter_count` | **166-200 ms** | 3,561 ms | 1,204 ms | 18-21x | 6.0-7.3x |
 | `groupby` | **172-197 ms** | 5,477 ms | 1,400 ms | 28-32x | 7.1-8.1x |
 | `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
-| `udf` | **1,515 ms** | 5,685 ms | n/a¹ | **3.8x** | — |
+| `udf` | **1,236 ms** | 5,685 ms | n/a¹ | **4.6x** | — |
 
 Ranges, not best-of-run, because this fleet's run-to-run spread is about 12% — established
 the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A
@@ -284,7 +313,8 @@ single figure from one sweep would be a number this board cannot reproduce.
 prints in the same `ERR` cell as a failure — worth separating, since one is a fact about the
 harness and the other about the engine.
 
-`udf` moves from **2.1x to 3.8x** against Ray Data. It is still the one shape where Batcher is
+`udf` moves from **2.1x to 4.6x** against Ray Data — 2,779 ms to 1,236 ms on the warm
+board, at 21% mean / 69% peak cluster busy against 10% / 36%. It is still the one shape where Batcher is
 not far ahead, and the decomposition above prices what 10x would take. 10x is 569 ms against
 Ray Data's 5,685 ms, and which side of that line the target falls on depends entirely on
 whether the read is cold:

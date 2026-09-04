@@ -1270,6 +1270,29 @@ def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> t
     return declared_clustering(splits)
 
 
+#: How many cores a map task should be, when there is enough data to choose. The parallelism
+#: term is clamped to `cluster_cores / this` rather than to the core count itself, because a
+#: task is not a core: `_map_udf_task` sets its intra-task `num_workers` from its CPU share,
+#: so N tasks of 4 cores and 4N tasks of 1 core buy the same threads — and the first buys them
+#: with a quarter of the dispatch, descriptor decoding, engine setup and worker acquisition.
+#: The table in `_adaptive_partition_count` measured that on a 128-core fleet (32 tasks x 4 CPU
+#: won at every UDF weight, i.e. cores/4), and it reproduces on this 1,024-core one: forcing
+#: 256 partitions (= 1,024/4) against the 301 the unclamped term asks for runs the sf100 heavy
+#: UDF pipeline in 1,345/1,382 ms against 1,662/1,758 ms.
+_TARGET_TASK_CPUS = max(1, int(os.environ.get("BATCHER_TARGET_TASK_CPUS", "4")))
+
+
+def _widest_useful_fan_out() -> int:
+    """The most tasks worth cutting the *rows* into — the fleet at `_TARGET_TASK_CPUS` wide.
+
+    Only the parallelism term is clamped by this. The byte term is a **memory bound** and
+    must stay free to ask for more (see `_byte_partition_count`): a source that needs 4,096
+    tasks to keep one task's input under budget still gets them, because the alternative is
+    an OOM rather than a slow query.
+    """
+    return max(1, int(_cluster_cores() // _TARGET_TASK_CPUS))
+
+
 def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     """How many tasks to split a map/scan source into — data- and compute-driven.
 
@@ -1339,7 +1362,7 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
         return fallback
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
     by_rows = math.ceil(total / rows_per_cpu)
-    n = max(1, min(by_rows, int(_cluster_cores())))
+    n = max(1, min(by_rows, _widest_useful_fan_out()))
     n = max(n, _byte_partition_count(source, plan, total, hub))
     with contextlib.suppress(Exception):
         n = min(n, max(1, len(source.splits())))  # never more tasks than splits

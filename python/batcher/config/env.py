@@ -75,6 +75,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_FOLD_CHUNK_BYTES": "bytes per chunk in the distributed fold",
     "BATCHER_MIN_TASK_CPU": "floor on the CPU a map task reserves",
     "BATCHER_MAP_COMPUTE_WEIGHT": "compute weight used to size map tasks",
+    "BATCHER_TARGET_TASK_CPUS": "cores a map task should be, capping the row-based fan-out",
     "BATCHER_INFERENCE_CPU_WORKERS": "CPU-side workers feeding an inference stage",
     # --- shuffle transport ----------------------------------------------------------
     "BATCHER_ADVERTISE_HOST": "host a worker advertises for Flight connections",
