@@ -340,6 +340,36 @@ separate a 17% effect from the noise; five put both arms inside 8 ms of each oth
 reader *on* marginally ahead. A regression claim on a short query needs more replicates than a
 speedup claim on a long one, because the fixed cost it is measured against is most of it.
 
+### Multimodal, which is the other shape Daft is built for
+
+The relational board says little about the workload Daft is actually known for, so the
+`multimodal/images` suite's own engine functions were run directly: list a JPEG corpus from
+S3, then decode and resize it to 224x224. 100 images from
+`s3://ray-benchmark-data/profile-pictures/1GiB`, **cold** (the listing and the per-file opens
+are the workload, so there is no warm number worth quoting), every engine returning the same
+aggregate — 100 images, 507,100 bytes, 224x224:
+
+| case | batcher | daft | vs daft |
+|---|---:|---:|---:|
+| `img-list` (list + read bytes) | **1,676 ms** | 4,873 ms | **2.9x** |
+| `img-resize` (decode + resize) | **1,657 ms** | 5,126 ms | **3.1x** |
+
+**Ray Data could not be measured on this path here.** `ray.data.read_binary_files(...)
+.take_all()` over ten 5 KiB objects never returns; a `py-spy` dump has the driver parked in
+`streaming_executor_state.get_output_blocking` indefinitely, on the shared cluster and against
+a fresh `RAY_ADDRESS=local` one alike. That is reported as an environment/engine failure here,
+not as a Batcher result, and it is why the table has two columns.
+
+So on Daft's own ground Batcher is **~3x**, not 10x — the same order as the relational `join`
+(3.8-4.1x) and well below the 7-32x it holds on the other relational shapes.
+
+**A trap in the suite worth knowing before re-running it.** `_list_corpus` memoises per
+*directory*, so a second corpus scale built in the same process silently reuses the first
+one's file list: asked for 1,000 images it returned 100, and the timings went flat and
+implausibly fast (1,000 "images" in 108 ms, which is 9 microseconds an object over S3). The
+row count is the tell, and the fix is a fresh process per scale. Two of the rows in the first
+draft of this section were that artifact.
+
 ### Ray Data and Daft on the same cluster
 
 `benchmarks/cluster/vs_ray_daft.py` could not measure Daft at all — `daft` is not in the worker
