@@ -495,8 +495,58 @@ The warm read alone is 358-403 ms and the best `udf` sweep is 581 ms, so between
 roughly 180-220 ms of transcendental arithmetic on 600 M values that some engine has to do.
 Closing that means overlapping the read with the compute rather than making either faster --
 and read/compute overlap is already recorded below as built, measured and rejected, on a
-pipeline that did not yet have this pool. That is the arm worth re-running, and it is the only
-one left that does not require the user's function to get cheaper.
+pipeline that did not yet have this pool. That was the arm named as worth re-running; the
+entry immediately below re-ran it inside the actor and it is worth nothing warm.
+
+### The last named lever, measured inside the actor: read/compute overlap is worth nothing warm
+
+The entry above closed by naming read/compute overlap as "the only [arm] left that does not
+require the user's function to get cheaper". It is not, and the reason is visible only from
+inside the worker.
+
+Four phases on **one real partition** (2,273,270 rows, one projected column) inside a live
+pool actor at width 16, each run three times warm and the minimum taken:
+
+| phase | warm |
+|---|---:|
+| `t_read` — pull the lazy source to a list | 23 ms |
+| `t_udf_only` — the UDF over those already-read batches | 68 ms |
+| `t_stream` — what `run_agg` does: the UDF over the lazy source | **91 ms** |
+| `t_agg` — `partial_aggregate` over the output | 1 ms |
+
+`t_stream` is `t_read + t_udf_only` to within 1% (91 against 90). **The phases are perfectly
+serial — there is no overlap today at all.** Which sounds like a 23 ms-per-partition
+opportunity and is not one: warm, the read is not I/O. The scan cache answers it from the
+worker's own memory, so it is 23 ms of *CPU* — decode and copy — competing for the same 16
+cores the UDF has already saturated. Overlapping two CPU-bound phases on a saturated node
+moves work in time without removing any. The lever is real, unexploited, and worth
+approximately zero **on a warm board**; on a cold one, where the read is genuinely I/O wait,
+it is the opposite, and that is the case worth building it for.
+
+**Read the first version of this measurement as a warning rather than a result.** Run once
+each in order, it reported `t_read=308 ms`, `t_udf_only=338 ms` and `t_stream=83 ms` — a
+stream that beat both of its own halves, which is not a finding but a physical impossibility.
+The read ran cold (the warm-up called a method `IteratorSource` does not have, so it silently
+did nothing) and the stream ran third, after the scan cache and the engine had both warmed.
+Every number moved by an order of magnitude when each phase was repeated. A phase
+decomposition where the phases run once, in a fixed order, is measuring the order.
+
+#### Where the wall time actually is, by subtraction
+
+One partition costs 92 ms warm (`t_stream + t_agg`). 256 partitions over 64 actors is four
+rounds per actor, so **in-actor work accounts for roughly 368 ms** of a `udf` sweep that
+measures 581-822 ms. The remaining 210-450 ms is dispatch, the barrier, the driver-side
+combine, and stragglers — not the UDF, and not the read.
+
+That residual is the honest remaining target, and it is a subtraction rather than a
+measurement, so it names a budget and not a cause. One specific tension inside it is worth
+recording, because this work created it: `_actor_launch` deals partition `idx` to
+`actors[idx % n]`, which is **static** dealing, and `map_barrier`'s own docstring is explicit
+that static dealing is what lets "one oversized partition hold the barrier open" where dynamic
+dealing gives it to whichever actor went idle. Index-stability is exactly what buys the cache
+hit this route was rebuilt for, so the two goals are in direct opposition here and cannot both
+be had by choosing harder. Anyone taking it further should measure the per-partition
+completion spread first, and treat "stragglers" as a hypothesis until they have.
 
 ### Batching the barrier's completions: built, measured, rejected
 
