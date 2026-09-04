@@ -670,6 +670,64 @@ separate a 17% effect from the noise; five put both arms inside 8 ms of each oth
 reader *on* marginally ahead. A regression claim on a short query needs more replicates than a
 speedup claim on a long one, because the fixed cost it is measured against is most of it.
 
+### The 3x against Daft is a ratio of startup costs, and it decays to 1.6x by 10,000 images
+
+The multimodal entry below records **2.9-3.1x against Daft** at 100 images and warns, in the
+sentence beside it, that "the fixed cost it is measured against is most of it". That warning
+was right and was never acted on. Measured across three scales, **one engine, one case and one
+scale per process** — the memoisation trap that entry documents makes any other arrangement
+report the previous run's file list — decode and resize to 224x224, cold, row counts printed
+because that count is the tell:
+
+| images | batcher | daft | vs daft |
+|---:|---:|---:|---:|
+| 100 | 1,919 ms | 5,919 ms | **3.08x** |
+| 1,000 | 3,107 ms | 6,602 ms | **2.12x** |
+| 10,000 | 12,457-15,694 ms (n=3) | 25,027 ms (n=1) | **1.6-2.0x** |
+
+The scale-10 row reproduces what is on record (1,676 / 5,126 ms there, 1,919 / 5,919 here), so
+this is the same measurement continued rather than a different one.
+
+**The ratio is not a property of the engines, it is a property of the corpus size.** Both
+engines are dominated by fixed cost below 10,000 files: Batcher's is ~1.8 s and Daft's ~5.8 s,
+and dividing one startup by another is what the 3x was. Only at 10,000 does per-image cost
+show through, and there it is roughly 1.0-1.4 ms/image for Batcher against 2.0 ms for Daft.
+
+So the honest claim on Daft's own ground is **1.6-2.0x at 10,000 images and still falling**,
+not ~3x. The existing entry's "So on Daft's own ground Batcher is ~3x" is a statement about a
+507 KB corpus and should not be read as a statement about multimodal work. The 10,000-image
+row is deliberately given as a range: three Batcher runs of the identical case spanned
+12,457-15,694 ms, which is wider than this fleet's usual spread, and Daft has one sample. The
+direction across scales is solid; the third row's exact ratio is not, and a single number
+there would be false precision.
+
+**A caution about extrapolating from two points, paid for here.** From the 100 and 1,000 rows
+alone, Daft's marginal cost fits at 0.76 ms/image against Batcher's 1.32, which predicts Daft
+*overtaking* Batcher and reaching 13.4 s at 10,000. It measured 25.0 s. The two-point fit was
+fitting Daft's startup, not its throughput, and the conclusion it supported was the opposite
+of the truth. Three points were the minimum this question needed and it is not obvious in
+advance that two are too few.
+
+#### The bottleneck that leaves, which is Batcher's and not the harness's
+
+1.40 ms per 5 KiB JPEG is **~640 images/s across 65 nodes**, or about ten per node per second,
+for a decode-and-resize a single core should do in the hundreds. The wall is not decode. It is
+that this corpus is 10,000 separate object-store opens, and the per-file open is the workload
+— the same latency-bound shape the concurrent-reads work at the top of this file addressed for
+Parquet row-groups, on a path that did not get it.
+
+That makes the multimodal target concrete rather than vague: **10x against Daft here needs
+per-image cost to fall several times over**, and the obvious first suspect was that the image
+reader is starved of in-flight requests the way `_native_scan_batches` was starved of
+concurrent row-group reads.
+
+**That suspect is measured and cleared.** `BATCHER_REMOTE_READ_CONCURRENCY` at 256 against its
+default of 32, forwarded to the workers, same 10,000-image case: **12,457 ms against
+12,719 ms**, which is nothing. Whatever bounds this path, it is not that knob's in-flight
+request count, and the Parquet analogy does not transfer. The next step is to find what the
+per-file open actually waits on before proposing another fix — the honest state is a located
+bottleneck with its most plausible cause eliminated, not a diagnosis.
+
 ### Multimodal, which is the other shape Daft is built for
 
 The relational board says little about the workload Daft is actually known for, so the
@@ -690,8 +748,11 @@ aggregate — 100 images, 507,100 bytes, 224x224:
 a fresh `RAY_ADDRESS=local` one alike. That is reported as an environment/engine failure here,
 not as a Batcher result, and it is why the table has two columns.
 
-So on Daft's own ground Batcher is **~3x**, not 10x — the same order as the relational `join`
-(3.8-4.1x) and well below the 7-32x it holds on the other relational shapes.
+So on Daft's own ground Batcher is **~3x** at this corpus size, not 10x — the same order as
+the relational `join` (3.8-4.1x) and well below the 7-32x it holds on the other relational
+shapes. **And ~3x is the wrong number to carry forward**: the entry above re-measures this at
+1,000 and 10,000 images and the ratio falls to 2.12x and then 1.59x, because 100 images is
+almost entirely startup on both sides. Quote 1.6x, or quote the scale with the number.
 
 **A trap in the suite worth knowing before re-running it.** `_list_corpus` memoises per
 *directory*, so a second corpus scale built in the same process silently reuses the first
