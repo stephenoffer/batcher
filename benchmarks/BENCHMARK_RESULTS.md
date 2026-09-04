@@ -265,11 +265,25 @@ missing ingredient; **stable partition-to-worker assignment** is. The UDF-free a
 because `flight_aggregate` hands `partition_descriptors` its `fleet_addrs` and then addresses
 reducers by index, so partition *i* meets the same process every run.
 
-So the remaining ~600 ms is a **scheduling** property, not a read or compute one, and the fix
-is to make the map route's assignment sticky — soft node affinity by partition index, an
-index-addressed actor pool, or a node-local cache instead of a per-process one. All three are
-inside the existing architecture; none is a one-line change, and the second falsified guess
-above is a reminder to measure the chosen one rather than assume it.
+That reading said the fix was to make assignment sticky, so an index-addressed actor pool was
+built: `_AffinityQueue` served partition *i* to actor ``i % n`` first and let an actor with an
+empty bucket steal from the longest, so locality was a preference and no actor could idle.
+Seven unit cases pinned the semantics.
+
+**It bought nothing and is reverted.** Warm, same query: pool with affinity 1,767 ms, pool
+without it 1,686 ms, stateless tasks 1,752 ms — one band. So *within-pool* assignment is not
+the lever either, which means the pool's actors are evidently not carrying a warm cache from
+one query to the next any more than the tasks are, and "make the assignment stable" does not
+by itself make a distributed map route reuse a decoded batch.
+
+Three mechanisms have now been built and falsified against this one ~600 ms: read/compute
+overlap, actor-vs-task placement, and index affinity within the pool. What survives all three
+is only the pair of *observations*: the UDF-free aggregate gets 2.3x from the scan cache and
+the map route gets none, at `hit_rate 0.0` with tens to hundreds of megabytes resident per
+worker. Whatever connects those two facts is not any of the three things that look obvious
+from here, and the next attempt should establish the connection before building anything —
+starting with whether a map worker process survives between two queries at all, and whether
+the two routes even compute the same cache key for the same splits. Neither has been checked.
 
 ### Batching the barrier's completions: built, measured, rejected
 
