@@ -229,6 +229,29 @@ a ~15% gap whose ranges nearly touch at this fleet's ~12% run-to-run spread. On 
 all six pairings point the same way and the direction matches a measurement already in the
 file, not because either one is individually decisive. `BATCHER_TARGET_TASK_CPUS` reverses it.
 
+### Batching the barrier's completions: built, measured, rejected
+
+With the fan-out fixed, a driver profile of the *warm* identity-UDF query said the driver was
+the constraint: 1.14 s wall, of which **0.481 s sat inside 256 `ray.wait` calls** — one per
+partition, against 0.339 s for the whole of the same read with no UDF on it. `combine` was
+0.027 s and task submission 0.16 s, so the wait loop was the term.
+
+`gather_map_results` waits with `num_returns=1`, which charges a raylet round trip to each
+partition. The obvious fix is to drain everything already finished in one call
+(`num_returns=len(refs), timeout=0`) and only block when nothing is ready — the partitions are
+homogeneous and start together, so they should land in bursts.
+
+**They do not.** Re-profiled with the drain in place: `ray.wait` was called **333 times, not
+fewer**, for **0.782 s**, and the query went 1,140 -> 1,585 ms. The call count is the tell and
+it is structural rather than noise — a non-blocking drain that finds nothing costs a call and
+is then followed by the blocking one, so a *trickle* of completions pays two calls per
+partition instead of one. The completions trickle.
+
+So the 0.481 s is mostly the driver legitimately waiting for a stage whose tasks finish one at
+a time, not round-trip overhead to be amortised. Reverted. Anyone attacking the driver term
+next should start by asking why the partitions of a homogeneous stage retire in a trickle at
+all, because that is the assumption this arm falsified.
+
 ### Read/compute overlap inside the task: built, measured, rejected
 
 The compute term has an explanation that fits the number exactly. Within a map task the read
