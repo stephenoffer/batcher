@@ -1,5 +1,111 @@
 # Batcher CPU benchmark results
 
+## The map stage's CPU ask never mentioned the cluster, and a 1,024-core fleet ran a UDF on 300 cores — plus the first head-to-head against Ray Data and Daft on this cluster (2026-09-03)
+
+The cluster is **65 x 16-core / 32 GiB** (1,024 cores, 2.03 TiB), the same fleet the
+2026-09-02 entry above was taken on, and every number here reads TPC-H sf100 from
+`s3://ray-benchmark-data/tpch/parquet` — object storage, so each node's read really is its
+own. Driver on the 16-core head. Cluster CPU is sampled by one `num_cpus=0` actor per node
+(`benchmarks/cluster/cluster_util.ClusterMonitor`) across the query's own window, at 100 ms.
+
+### Batcher against Ray Data and Daft, same pipelines, same cluster, one engine per process
+
+Each engine gets its own driver process, so Daft can carry the `pip` runtime env its
+flotilla workers need without charging the install to anyone else, and no engine inherits
+another's resident actors. Best of two timed runs after a warm-up. **Every engine that ran a
+pipeline agreed with the others on the answer** (row count and the summed measure).
+
+| pipeline | batcher | daft | ray data | vs daft | vs ray data |
+|---|---:|---:|---:|---:|---:|
+| `scan_count` | **0.8 ms** | n/a¹ | 5,829 ms | — | 7,287x |
+| `filter_count` | **173 ms** | 1,231 ms | 3,561 ms | 7.1x | 20.6x |
+| `groupby` (2 keys) | **167 ms** | 1,735 ms | 5,477 ms | 10.4x | 32.8x |
+| `join` + group-by | **1,295 ms** | 4,949 ms | 26,429 ms | 3.8x | 20.4x |
+| `udf` (NumPy per batch) | **2,862 ms** | n/a² | 5,890 ms | — | 2.1x |
+
+¹ Daft's *first* pipeline in a process fails — `No flotilla workers became available within
+120s (64 attempted)` — because its Ray-runner actors are still materializing the runtime env
+that carries `daft` to the workers. The next pipeline's warm-up absorbs it (121 s) and every
+pipeline after that runs. It is a startup artifact, not a capability gap, and it is reported
+rather than retried away because a reader comparing first-query latency should see it.
+² The shared harness marks the UDF surface as diverging between the two engines
+(`benchmarks/cluster/vs_ray_daft.py::daft_thunk`); it is not measured here rather than
+measured wrongly.
+
+`scan_count` is a metadata answer on Batcher — the Parquet footers carry the count — so the
+7,287x is a statement about *planning*, not about scan throughput. The other four rows are
+real work on every engine.
+
+**Ray Data's `join` OOMed under the shared harness** at this scale (`5 worker(s) were killed
+due to the node running low on memory`, then `ActorDiedError` out of `HashShuffleAggregator`)
+and completed only with the explicit `num_partitions=128` the table above uses. Worth knowing
+beside the 20.4x: the gap on that row is partly that the query ran at all.
+
+**`daft` is not in this cluster's worker image**, so its runner cannot start at all under the
+repo's own harness, which pins `pip: None`. That is why `benchmarks/cluster/vs_ray_daft.py`
+reported `ERR` for every Daft pipeline: the failure is the environment, not the engine, and a
+Daft column of `ERR` would have been a false result. Shipping it with
+`runtime_env={"pip": ["daft==0.7.24"]}` is what the table above does.
+
+### The defect: a map stage asks for a fixed slice of any cluster
+
+`_adaptive_task_cpus` gives task *i* `rows_i x weight / rows_per_cpu` CPUs. Summed over the
+partitions that is `total_rows x weight / rows_per_cpu` — **a number that does not mention the
+fleet**. Splitting the source into more partitions does not change it either, because the
+count and the per-task share move inversely, which is why the obvious knobs all fail.
+
+Measured on a 300-pass NumPy UDF over sf100 `orders` (150M rows), whose ask is
+`150M x 4 / 2M` = **300 of 1,024 cores**:
+
+| lever | wall | cluster busy | active nodes |
+|---|---:|---:|---:|
+| default | 3,375 ms | 16.2% | 65/65 |
+| `num_workers` 128 / 256 / 512 | 1,611 / 2,739 / 2,717 ms | 12.1 / 15.5 / 7.7% | 53 / 29 / 30 |
+| partitions forced to 256 / 512 / 1,024 | 8,237 / 6,864 / 7,054 ms | 8.8 / 8.0 / 7.7% | 65/65 |
+| `FLEET_CONCURRENCY` 8 / 16 | 1,212 / 1,189 ms | 14.4 / 14.5% | 65/65 |
+| **the stage's CPU ask raised to the fleet** | **2,382 ms** | **48.6%** | 65/65 |
+| the ask raised to *twice* the fleet | 2,963 ms | 57.2% | 65/65 |
+
+Every node was active in nearly every row, so this was never a placement problem — it is how
+much of each node the stage was allowed to occupy. The last row is why the fix is capped at
+the cluster's own cores: past that it buys CPU busy-ness and loses wall time.
+
+`_filled_to_the_fleet` scales a **UDF** stage's shares up proportionally until they meet the
+cluster, never past what a node can host, and never downward. Only a `map_batches` stage: a
+scan task cannot use a second core for its own partition, so raising its share would reserve
+cores that then sit idle. And the target is the fleet *scaled by the learned packing factor*,
+so the fill cannot undo the one term above it that is measured — a family recorded as leaving
+three quarters of its cores idle is filled to a quarter of the fleet, not to all of it. With
+it, on the default settings and no user configuration:
+
+| | wall | cluster busy |
+|---|---:|---:|
+| before | 3,375 ms | 16.2% |
+| **after** | **2,249 / 2,467 ms** | **45.7 / 48.4%** |
+
+**No OOM.** The fill changes the CPU *reservation*, not the partition count and not the
+per-task memory budget, so what a node holds at once is unchanged. Checked directly on the
+shape that would show it — a UDF holding eight copies of its batch live, over 600M-row
+`lineitem` — which completed in 2,616 ms with the right answer and no killed worker.
+
+### What was NOT fixed, and why the relational shapes are where they are
+
+Out of the box across six shapes, mean cluster CPU is **23.6%**: `distinct` 53%, `group-by`
+38%, `hash join` 21%, `window-dedup` 17%, `scan-agg` 11%, `sort + top-100` 2%. The peaks are
+77-100%, so the cores are reachable; the means are low because these queries are 0.1-2.4 s
+against a 1,024-core fleet reading from object storage, and a large part of each is the read
+and the per-query fixed cost rather than CPU.
+
+That is not a claim that 23.6% is the best available — it is what these shapes measure today,
+and the honest comparison is that **Daft runs the same three relational pipelines at 7.7-10.7%
+and Ray Data at 3.7-20.6%**, so low mean utilization on short S3-backed queries is a property
+of the workload on this fleet rather than of one engine. A target above that needs either
+CPU-bound work (where the fill above now applies) or data the cluster does not have to fetch.
+
+`sort + top-100` at 2% on 7 of 65 nodes is the one row that is *not* under-utilization: the
+top-100 is answered from Parquet statistics and metadata without reading the relation, in
+97 ms. A query that does not need the cluster should not use it.
+
 ## Four things a 64-node fleet does that a 4-node one does not: map one partition per node, funnel every wide aggregate through the driver, fold its combiner tree eight at a time, and mirror every bucket into shared memory for a reader that cannot exist (2026-09-02)
 
 The cluster this was measured on is **65 x 16-core / 32 GiB** (1,024 cores, 2.03 TiB), which is

@@ -1403,7 +1403,35 @@ def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
     The plan-level weight is further scaled by a *measured* per-core busy fraction learned for
     this family (`_learned_weight_factor`): a family that ran CPU-underutilized reserves fewer
     cores next run. Reserving fewer/more cores only changes packing, never the rows a task
-    processes, so the result is identical."""
+    processes, so the result is identical.
+
+    **A UDF stage's shares are then scaled up to fill the fleet**, and without that the ask is
+    a function of the *data alone*. `want` sums to `total_rows x weight / rows_per_cpu` however
+    many partitions the source is cut into — the count and the per-task share move inversely —
+    so a stage asks for the same cores on a four-node cluster and on a sixty-four-node one.
+    Measured on the 64 x 16-core fleet, a 300-pass NumPy UDF over sf100 `orders` (150M rows):
+    the ask is `150M x 4 / 2M` = **300 of 1,024 cores**, the cluster ran at 16.2% busy, and the
+    query took 3,375 ms. Raising only this term to fill the fleet: **2,382 ms at 48.6% busy**,
+    1.42x, with every node active either way. Raising it to *twice* the fleet is worse again
+    (2,963 ms at 57.2%), which is what fixes the cap at the cluster's own cores rather than at
+    a bigger constant — the point is to stop leaving cores idle, not to oversubscribe.
+
+    Three things bound it, and each is load-bearing:
+
+    * **Only a `map_batches` stage.** A scan or filter task cannot use a second core for its
+      own partition — its work is the read — so raising its share reserves cores that then sit
+      idle, which on a shared cluster is worse than useless. A UDF task splits its partition
+      across `num_workers = round(share)` (see `_launch`), so the cores it is given are cores
+      it can use.
+    * **Never below the data-derived want.** This only ever scales *up*; a stage whose own
+      sizing already meets or exceeds the fleet keeps it.
+    * **Never past a node.** `node_cores` still caps each task, so a fill cannot ask for a
+      bundle no node can host.
+
+    The three sizing terms now answer three separate questions, which is why none of them
+    subsumes another: `_adaptive_partition_count` decides how the *rows* are divided, the
+    per-partition `want` keeps the division *skew-proportional*, and the fill decides how much
+    of the *machine* the stage may occupy."""
     from batcher.config import active_config
     from batcher.core.udf import has_map_batches
 
@@ -1411,13 +1439,45 @@ def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
     # Rows one core processes in a reasonable slice — half the breaker target (which sizes
     # a whole multi-core task), so a full target-sized partition asks for ~2 cores.
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
-    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
-    weight *= _learned_weight_factor(plan, hub)
-    shares = []
-    for p in partitions:
-        want = (descriptor_rows(p) * weight) / rows_per_cpu
-        shares.append(round(max(_MIN_TASK_CPU, min(node_cores, want)), 3))
-    return shares
+    is_udf = has_map_batches(plan)
+    weight = _MAP_COMPUTE_WEIGHT if is_udf else 1.0
+    learned = _learned_weight_factor(plan, hub)
+    wants = [(descriptor_rows(p) * weight * learned) / rows_per_cpu for p in partitions]
+    if is_udf:
+        wants = _filled_to_the_fleet(wants, node_cores, learned)
+    return [round(max(_MIN_TASK_CPU, min(node_cores, w)), 3) for w in wants]
+
+
+def _filled_to_the_fleet(wants: list[float], node_cores: float, learned: float) -> list[float]:
+    """`wants`, scaled up so the stage occupies the cluster rather than a slice of it.
+
+    Proportional, so the skew the per-partition sizing encodes survives: a partition with
+    twice its neighbour's rows keeps twice its neighbour's share. The scale is capped by what
+    a node can host, because a share past `node_cores` is a bundle nothing can place — and
+    that cap is also what keeps the fill honest on a fleet with fewer, fatter nodes.
+
+    **The target is the fleet scaled by `learned`, not the whole fleet**, and that is what
+    keeps the fill from undoing the one thing above it that is *measured*. A family recorded
+    as leaving three quarters of its reserved cores idle gets a quarter of the reservation
+    (`_learned_weight_factor`), and filling it back to the fleet afterwards would hand an
+    IO- or GPU-bound stage every core in the cluster to leave idle — the amplifying loop
+    `adaptive_sizing.learned_cpu_weight_factor` documents, run in the other direction. A
+    family with no history reads `1.0` and is filled to the fleet, which is the case the fill
+    was measured on.
+
+    Returns `wants` unchanged when it already meets that target, when the cluster is
+    unreadable, or when there is nothing to scale.
+    """
+    total = sum(wants)
+    if total <= 0.0:
+        return wants
+    target = _cluster_cores() * max(0.0, learned)
+    if target <= 0.0 or total >= target:
+        return wants
+    # Capped at the widest a single task may become, so the scale cannot be spent entirely on
+    # one heavy partition it could not use anyway.
+    scale = min(target / total, node_cores * len(wants) / total)
+    return [w * scale for w in wants]
 
 
 def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: int):
