@@ -1,0 +1,139 @@
+"""The warm pool a `map_batches -> aggregate` stage uses holds ONE pipeline at a time.
+
+`_distributed_map_aggregate` ran stateless tasks, so the partition a worker read was almost
+never the one it had cached; addressing persistent actors by index instead is worth 1.35-2.3x
+warm on TPC-H sf100 (`benchmarks/BENCHMARK_RESULTS.md`). The residency policy is the part
+that needs pinning, and it is not the inference registry's policy.
+
+Two resident models are a feature: each holds the devices it needs and neither can use the
+other's. Two resident CPU aggregate pools are a hazard: they hold general-purpose cores that
+every other stage also wants, and a pool only earns them from the scan cache of the pipeline
+that filled it. Left to accumulate, three pipelines in one session put 960 of 1024 cores under
+reservation and the third stalled at the barrier with `0/256 tasks finished`. So `_AGG_POOLS`
+is its own registry and a second pipeline evicts the first.
+
+These run with no cluster: `_new_map_actor` is the single actor-creation point, so stubbing it
+accounts for every actor the pool would have built.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import batcher as bt
+from batcher.dist.executors import map as M
+
+pytestmark = pytest.mark.unit
+
+pytest.importorskip("ray", reason="the pool registry's teardown calls ray.kill")
+
+
+class _FakeActor:
+    """Stands in for a `_MapActor` handle; only its identity is under test."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+
+@pytest.fixture
+def pooling(monkeypatch):
+    """A clean `_AGG_POOLS`, actor creation stubbed, and every kill recorded."""
+    import ray
+
+    monkeypatch.setattr(M, "_AGG_POOLS", {})
+    built: list[_FakeActor] = []
+    killed: list[_FakeActor] = []
+
+    def new_actor(plan0, opts):
+        actor = _FakeActor(f"a{len(built)}")
+        built.append(actor)
+        return actor
+
+    monkeypatch.setattr(M, "_new_map_actor", new_actor)
+    monkeypatch.setattr(M, "_healthy_actors", lambda pool: list(pool))
+    monkeypatch.setattr(ray, "kill", killed.append)
+    return built, killed
+
+
+def _prefix(fn):
+    """The map prefix `_agg_actor_pool` is called with, built through the public API."""
+    return bt.from_pydict({"a": [1.0, 2.0]}).map_batches(fn, output_columns=["a"])._plan
+
+
+def test_a_cpu_stage_gets_one_actor_per_worker(pooling):
+    """The positive control. Every assertion below is vacuous if nothing is ever pooled."""
+    built, _ = pooling
+    pool = M._agg_actor_pool(_prefix(lambda b: b), 4)
+
+    assert pool is not None and len(pool) == 4
+    assert len(built) == 4, "one actor per worker, built through the one creation point"
+
+
+def test_the_same_pipeline_reuses_its_actors(pooling):
+    """Residency is the whole point: a second run must not rebuild the workers."""
+    built, killed = pooling
+    fn = lambda b: b  # noqa: E731 - one identity, so both calls key the same pool
+    prefix = _prefix(fn)
+
+    first = M._agg_actor_pool(prefix, 3)
+    second = M._agg_actor_pool(_prefix(fn), 3)
+
+    assert first == second, "the same pipeline must meet the same actors"
+    assert len(built) == 3 and killed == [], "no rebuild, no teardown"
+
+
+def test_a_second_pipeline_evicts_the_first(pooling):
+    """The invariant. Accumulating pools is what reserved 960 of 1024 cores and hung."""
+    built, killed = pooling
+
+    first = M._agg_actor_pool(_prefix(lambda b: b), 2)
+    second = M._agg_actor_pool(_prefix(lambda b: b.slice(0, 1)), 2)
+
+    assert len(M._AGG_POOLS) == 1, "at most one CPU aggregate pool is resident"
+    assert killed == first, "the displaced pipeline's actors are killed, not orphaned"
+    assert second is not None and set(second).isdisjoint(first)
+    assert len(built) == 4
+
+
+def test_a_gpu_stage_keeps_the_stateless_task_path(pooling, monkeypatch):
+    """A GPU pool is sized and placed from device measurements; none of that applies here."""
+    built, _ = pooling
+    monkeypatch.setattr(M, "_map_resources", lambda plan: (1.0, True, None, None, {}))
+
+    assert M._agg_actor_pool(_prefix(lambda b: b), 4) is None
+    assert built == []
+
+
+def test_warm_pools_off_keeps_the_stateless_task_path(pooling):
+    """`warm_inference_pools` is the switch that says actors must not outlive a query."""
+    import dataclasses
+
+    from batcher.config import Config
+
+    built, _ = pooling
+    cfg = Config()
+    cfg = dataclasses.replace(
+        cfg, distributed=dataclasses.replace(cfg.distributed, warm_inference_pools=False)
+    )
+    with bt.config_context(cfg):
+        assert M._agg_actor_pool(_prefix(lambda b: b), 4) is None
+    assert built == []
+
+
+def test_a_failure_acquiring_the_pool_falls_back_rather_than_failing_the_stage(
+    pooling, monkeypatch
+):
+    """A pool is an optimisation. Losing it must cost speed, never the query."""
+    monkeypatch.setattr(M, "_map_resources", lambda plan: (_ for _ in ()).throw(RuntimeError("no")))
+
+    assert M._agg_actor_pool(_prefix(lambda b: b), 4) is None
+
+
+def test_releasing_the_warm_pools_frees_the_aggregate_pool_too(pooling):
+    """`release_inference_pools` is the documented way to get the cores back."""
+    _, killed = pooling
+    pool = M._agg_actor_pool(_prefix(lambda b: b), 2)
+
+    M.release_inference_pools()
+
+    assert killed == pool and M._AGG_POOLS == {}

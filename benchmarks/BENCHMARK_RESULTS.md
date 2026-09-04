@@ -318,6 +318,84 @@ The other established numbers stand: 2.3x from the cache for the UDF-free route 
 the map route at `hit_rate 0.0`, and one genuinely falsified mechanism (read/compute overlap,
 measured on the path it claimed to fix).
 
+### Shipped: the aggregate route got the index-stable workers, and the pool that makes it fast deadlocks a cluster if it is allowed to accumulate
+
+The section above named the change and estimated it: give `_distributed_map_aggregate` the
+persistent workers `_distributed_map` already had, so partition `idx` meets the process that
+cached it. Built (`_MapActor.run_agg`, `_agg_actor_pool`, `_launch` dispatching to
+`actors[(idx + retries) % n]`), and measured on the warm decomposition. **Every row is
+route-controlled** — the harness wraps `_agg_actor_pool` and prints what it returned, because
+the two withdrawn experiments in this file were both cases of measuring a path that never ran:
+
+| warm, sf100 `lineitem`, one projected column | stateless tasks | actor pool | route |
+|---|---:|---:|---|
+| `scan + sum` (no map stage, so no pool) | 304-358 ms | 350 ms | `actors=-` |
+| `scan + identity UDF + sum` | 910-1,060 ms | **584 ms** | `actors=64` |
+| `scan + heavy UDF + sum` | 1,422-1,687 ms | **1,017 ms** | `actors=64` |
+
+1.4-1.8x, in line with the 1.36-1.38x the map-only pipeline showed, and reproduced: the heavy
+arm run by itself in its own session came back at 1,057 ms against the 1,017 ms above.
+
+#### The first version of this hung the cluster, and the timing is what found it
+
+The three arms are three different pipelines in one session. Run against `_SESSION_POOLS` —
+the inference registry, which is what "reuse the existing warm pool" naively means — the first
+two arms left their pools alive and the third stalled:
+
+    distributed barrier has waited 120s with 0/256 tasks finished
+    cluster CPU 960/1024 in use ... 1 candidate node(s) have 1 CPU free between them
+
+Two resident models are a feature: each holds the devices its own model needs and neither can
+use the other's. Two resident CPU aggregate pools are the opposite — they hold general-purpose
+cores every other stage also wants, and a pool earns them only from the scan cache of the
+pipeline that filled it. `_pool_key`'s docstring already warns about this hang in its
+same-pipeline form ("the query does not fail; it hangs, with the cluster fully reserved and
+nothing running"); this is the same hazard reached by a different road, and
+`_evict_stale_configurations` does not cover it because for inference the coexistence is
+correct.
+
+So the aggregate pool gets **its own registry (`_AGG_POOLS`) holding one pipeline at a time**:
+a second pipeline evicts the first. The three-arm run then completes clean, with both speedups
+intact — the table above *is* that run. A session that alternates pays a pool rebuild instead
+of deadlocking, which is the right trade for actors that hold nothing but cores.
+
+Worth being explicit that the deadlock was not found by reading the code. It was found because
+the third arm of a benchmark stopped, and the arm that stopped was the one measuring the
+change. A route control tells you the code ran; only running it more than once tells you what
+it does to the machine around it.
+
+#### The board
+
+sf100, `BENCH_PIPES=udf`, each engine its own driver process, measured in one session today,
+four Batcher sweeps (1,069 / 969 / 964 / 803 ms) against one Ray Data sweep.
+Ray Data is re-measured rather than carried forward, because it came in at 5,061 ms today
+against the 5,685 ms this file recorded — comparing a new Batcher number against an old
+competitor number would have booked that 12% as a win.
+
+| pipeline | batcher (before) | batcher (after) | ray data | vs ray (before) | vs ray (after) |
+|---|---:|---:|---:|---:|---:|
+| `udf` | 1,236-1,367 ms | **803-1,069 ms** | 5,061 ms | 3.7-4.1x | **4.7-6.3x** |
+
+The prediction in the section above was "~1,300 ms to ~950 ms, i.e. 4.4x to ~6x, not to 10x."
+The direction and rough size were right and the estimate was optimistic.
+
+#### What it does not reach, and where the rest would have to come from
+
+10x against 5,061 ms is 506 ms. The warm decomposition prices the remainder exactly:
+
+* **350 ms is the read**, warm, with no map stage on it at all. That is 69% of the 506 ms
+  target before the UDF runs, and it is a floor this change does not touch.
+* **The map stage now costs 234 ms on an identity UDF** (584 - 350), which is dispatch,
+  the per-batch Python call, `partial_aggregate`, and 256 barrier completions.
+* **Cluster busy is still 15% mean / 34% peak.** The actors reserve one core each and run the
+  map at the plan's default width, where `_map_agg_task` re-widened its plan per call
+  (`_with_map_workers(plan0, round(shares[idx]))`, about 4). So this change bought locality and
+  gave back per-partition width, and won anyway. Sizing the pool to the *partition* count
+  rather than the worker count — 256 actors, `idx % n` becoming the identity map — is the next
+  thing to measure, and it is a resource decision as much as a speed one.
+
+The relational shapes are unaffected by all of this and remain 18-32x against Ray Data.
+
 ### Batching the barrier's completions: built, measured, rejected
 
 With the fan-out fixed, a driver profile of the *warm* identity-UDF query said the driver was
@@ -446,6 +524,9 @@ not re-measured today), and its `udf` was re-measured today at 5,685 ms:
 | `groupby` | **172-197 ms** | 5,477 ms | 1,400 ms | 28-32x | 7.1-8.1x |
 | `join` | **1,303-1,399 ms** | 26,429 ms | 5,364 ms | 19-20x | 3.8-4.1x |
 | `udf` | **1,236-1,367 ms** | 5,685 ms | n/a¹ | **4.2-4.6x** | — |
+
+**Superseded for `udf` by the actor-pool entry above**: 803-1,069 ms against a Ray Data
+re-measured at 5,061 ms the same day, i.e. 4.7-6.3x. The four relational rows here stand.
 
 Ranges, not best-of-run, because this fleet's run-to-run spread is about 12-20% — established
 the hard way, by a route this work does not touch moving 789 -> 692 ms between two runs. A

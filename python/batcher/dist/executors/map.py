@@ -94,6 +94,20 @@ _INFERENCE_POOLS: contextvars.ContextVar[dict[tuple, list] | None] = contextvars
 # by `release_inference_pools()`; a pool whose actors died is rebuilt on next use.
 _SESSION_POOLS: dict[tuple, list] = {}
 
+# The session-warm pool for a CPU `map_batches -> aggregate` stage (`_agg_actor_pool`),
+# deliberately NOT `_SESSION_POOLS`, and deliberately holding **at most one pipeline**.
+#
+# Two different models are legitimately resident at once — that is the whole point of the
+# inference registry, and each pool holds the devices its own model needs. A CPU aggregate
+# pool is the opposite case: it holds general-purpose cores that every other stage also
+# wants, and it earns them only from the scan cache of the pipeline that filled it. Left to
+# accumulate they starve the cluster rather than sharing it. Measured: three pipelines in one
+# session put 960 of 1024 cores under reservation and the third stalled at the barrier with
+# `0/256 tasks finished` — the hang `_pool_key` warns about, reached by a different road.
+# So a second pipeline evicts the first, and a session that alternates pays a rebuild instead
+# of deadlocking.
+_AGG_POOLS: dict[tuple, list] = {}
+
 # Pins the `fn` objects whose `id()` a live pool's key was built from. Without this the key
 # is a bare address: once a pipeline's model callable is freed (its `Dataset` went out of
 # scope while the warm pool outlived it), CPython may hand that same address to a *different*
@@ -104,14 +118,16 @@ _POOL_KEEPALIVE: dict[tuple, tuple] = {}
 
 
 def release_inference_pools() -> None:
-    """Tear down all session-warm inference actor pools and free their GPUs.
+    """Tear down every session-warm actor pool and free the GPUs and cores they hold.
 
     Warm pools (``distributed.warm_inference_pools``, on by default) keep a model's actors
-    alive across ``collect()`` calls so it loads once per session. Call this to release those
-    GPUs before other GPU work, or when done with inference; it also runs automatically at
-    process exit. A no-op when no pools are warm. The next inference `collect()` rebuilds the
-    pool (paying the one-time load again)."""
+    alive across ``collect()`` calls so it loads once per session, and keep a CPU
+    ``map_batches`` + aggregate stage's workers alive so their scan cache survives the query.
+    Call this to release those resources before other work, or when done; it also runs
+    automatically at process exit. A no-op when no pools are warm. The next `collect()`
+    rebuilds the pool it needs (paying the one-time load again)."""
     _shutdown_pools(_SESSION_POOLS)
+    _shutdown_pools(_AGG_POOLS)
 
 
 # Free any session-warm GPU actors at process exit so a finished batch job never leaves GPUs
@@ -200,6 +216,23 @@ def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
     return (_pipeline_signature(plan0), resources)
 
 
+def _kill_pool_keys(keys: list[tuple], registry: dict) -> None:
+    """Kill and forget every pool `registry` holds under `keys` — the one eviction path.
+
+    Three call sites want this loop with three different predicates (a stale resource
+    request, a whole pipeline, every *other* tenant), and the difference between them is the
+    key list, never the teardown. The copy that had drifted omitted `_unpin_pool_keys`, so it
+    left a `_POOL_KEEPALIVE` entry pinning the callables of every pool it removed.
+    """
+    import ray
+
+    for key in keys:
+        for actor in registry.pop(key, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    _unpin_pool_keys(keys)
+
+
 def _evict_stale_configurations(key: tuple, registry: dict) -> None:
     """Kill any pool for the same pipeline built against a *different* resource request.
 
@@ -207,13 +240,7 @@ def _evict_stale_configurations(key: tuple, registry: dict) -> None:
     hold exactly the devices the new pool needs, so leaving them warm is a deadlock rather
     than a wasted reservation.
     """
-    import ray
-
-    stale = [k for k in registry if k[0] == key[0] and k != key]
-    for k in stale:
-        for actor in registry.pop(k, []):
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
+    _kill_pool_keys([k for k in registry if k[0] == key[0] and k != key], registry)
 
 
 def _resident_pool_for(
@@ -518,15 +545,8 @@ def _evict_pipeline_pools(plan0, registry: dict) -> None:
     (`_pool_key`) — so an eviction that matched only one exact key would leave the other
     configuration's actors alive holding their devices.
     """
-    import ray
-
     sig = _pipeline_signature(plan0)
-    keys = [k for k in list(registry) if k[0] == sig]
-    for key in keys:
-        for actor in registry.pop(key, []):
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
-    _unpin_pool_keys(keys)
+    _kill_pool_keys([k for k in registry if k[0] == sig], registry)
 
 
 def _map_resources(
@@ -2079,6 +2099,38 @@ class _MapActor:
 
         return os.environ.get("BATCHER_ADVERTISE_HOST") or ray.util.get_node_ip_address()
 
+    def run_agg(self, partition: dict, group_keys_json: str, aggregates_json: str):
+        """Map this partition through the UDF prefix and PARTIAL-aggregate it here.
+
+        The actor-resident twin of `_map_agg_task`, and the reason it exists is the scan
+        cache. A stateless task lands wherever Ray has room, so the partition it reads is
+        almost never the one this process cached: instrumented over three consecutive runs of
+        one query, `_map_agg_task` workers reported `hit_rate 0.0` while each held 74-186 MB
+        of cached batches. An actor addressed by ``idx % n`` sees the *same* partition every
+        run, and the counters then show the hit — `pid=124496 idx=36` went `hit_rate 0.0` on
+        run 1 and `0.5` on run 2, across 64 actors. Measured on this route, warm on TPC-H
+        sf100 `lineitem`: a light UDF 910-1,060 ms of tasks against 584 ms of actors, a
+        compute-heavy one 1,422-1,687 ms against 1,017 ms.
+
+        Only the small partial-aggregate state leaves the worker, exactly as in the task
+        form, so the mergeable contract (`partial -> combine -> finalize`) is untouched and
+        the driver's `combine_finalize` is unchanged.
+
+        Unlike `_map_agg_task` this does not re-width the plan per call (`_with_map_workers`):
+        an actor's plan is fixed when it is built, which is the same trade `run` already
+        makes, and is why the pool is sized from the stage's fan-out rather than a share.
+        """
+        from batcher import core
+
+        nat = engine()
+        source = _lazy_partition_source(partition)
+        if source is None:
+            return None
+        out = core.execute_with_udfs(self._plan, [source])
+        if not out or sum(b.num_rows for b in out) == 0:
+            return None
+        return nat.partial_aggregate(group_keys_json, aggregates_json, out)
+
     def run_split(self, addr: str, ticket):
         """Map one prior-stage bucket fetched in place from `(addr, ticket)`, so a
         resident inference pool is fed directly from upstream output instead of waiting
@@ -2277,6 +2329,47 @@ def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: i
     return nat.partial_aggregate(group_keys_json, aggregates_json, out)
 
 
+def _agg_actor_pool(plan0: LogicalPlan, workers: int) -> list | None:
+    """A session-warm actor pool for a `map_batches -> aggregate` stage, or `None`.
+
+    `_distributed_map_aggregate` has always run stateless tasks, which is why this shape gets
+    nothing from the per-process scan cache (see `_MapActor.run_agg`). Reusing the machinery
+    the inference path already has — same builder, same healing, same key — gives it
+    persistent workers without a second pool implementation.
+
+    The *registry* is its own, and holds one pipeline at a time: these actors hold
+    general-purpose cores rather than the devices a model needs, so a second pipeline evicts
+    the first instead of joining it. See `_AGG_POOLS` for what accumulation measured.
+
+    Declined for a GPU stage: those size and place their pool from device measurements
+    (`gpu_aware_pool_default`, `_cold_start_devices`), and none of that reasoning applies to a
+    CPU aggregate. Declined when `warm_inference_pools` is off, which is the switch that says
+    actors must not outlive a query.
+
+    Args:
+        plan0: The map prefix, already single-source-relabelled.
+        workers: The stage's fan-out — one actor per worker.
+
+    Returns:
+        The pool's actors, or `None` to keep the stateless-task path.
+    """
+    from batcher.config import active_config
+
+    if not active_config().distributed.warm_inference_pools:
+        return None
+    try:
+        num_gpus, _wants_pool, _concurrency, accelerator_type, resources = _map_resources(plan0)
+        if num_gpus:
+            return None
+        opts = _gpu_options(num_gpus, accelerator_type, resources)
+        sig = _pool_key(plan0, opts)
+        _kill_pool_keys([k for k in _AGG_POOLS if k != sig], _AGG_POOLS)
+        return _resident_pool_for(plan0, opts, max(1, workers), _AGG_POOLS) or None
+    except Exception as exc:  # a pool is an optimisation; never fail the stage for one
+        note_suppressed("dist", "acquire the warm pool for a map/aggregate stage", exc)
+        return None
+
+
 def _distributed_map_aggregate(above, agg, sources, workers):
     """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
 
@@ -2307,13 +2400,25 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
     sched = _map_scheduling_options(current_envelope(), shares)
-    # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
-    plan_ref = _shared_arg(map_plan)
+    actors = _agg_actor_pool(map_plan, workers)
+    # One object-store copy of the map prefix for the whole stage — see `_shared_arg`. Only
+    # the task form reads it; an actor already holds the plan, so paying the put would be a
+    # serialization of the whole UDF prefix that nothing fetches.
+    plan_ref = None if actors else _shared_arg(map_plan)
+    # Attempts are counted per partition so a *retry* rotates to the next actor: the first
+    # try is index-stable (which is the whole point — the cached partition meets its worker),
+    # and a preempted actor does not get the same partition handed back to it forever.
+    attempts_by_idx: dict[int, int] = {}
 
     def _launch(idx):
-        workers = max(1, round(shares[idx]))
+        if actors:
+            tried = attempts_by_idx.get(idx, 0)
+            attempts_by_idx[idx] = tried + 1
+            actor = actors[(idx + tried) % len(actors)]
+            return actor.run_agg.remote(partitions[idx], gk, aj)
+        task_workers = max(1, round(shares[idx]))
         return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
-            plan_ref, partitions[idx], gk, aj, workers
+            plan_ref, partitions[idx], gk, aj, task_workers
         )
 
     # Fold each partition's partial into a running state **as it lands**, rather than
