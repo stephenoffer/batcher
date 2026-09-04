@@ -728,6 +728,57 @@ request count, and the Parquet analogy does not transfer. The next step is to fi
 per-file open actually waits on before proposing another fix — the honest state is a located
 bottleneck with its most plausible cause eliminated, not a diagnosis.
 
+#### Where the per-image cost is not: fan-out, and the read concurrency knob
+
+Read off the planner, one scale per process (the memoisation trap makes a loop report the
+first prefix's listing — this probe fell into it once and the row count is what caught it):
+
+| files | source splits | adaptive partitions |
+|---:|---:|---:|
+| 100 | 2 | 1 |
+| 1,000 | 16 | 1 |
+| 10,000 | **157** | 1 |
+
+At 10,000 files there are 157 read splits for 65 nodes, so the scale the comparison is drawn
+at is **not** starved of fan-out. The two smaller scales are — 100 files is 2 splits, so at
+most two nodes read — which is worth knowing but is also where fixed cost already dominates,
+so it is not what the ratio turns on. `adaptive_partitions=1` at every scale is a byte-derived
+count meeting 50 MB of JPEGs; the plain image scan does not route through it, but any
+`map_batches` over this corpus would, and one partition for 10,000 files is a trap sitting
+there for the shape that does.
+
+The per-file reads inside a split are already concurrent (`io/base/source.py`'s
+`ThreadPoolExecutor`, bounded by `_REMOTE_READ_CONCURRENCY`), which is why raising that knob
+did nothing.
+
+#### The comparison is not shape-matched, and the attempt to price that was void
+
+Reading the two suite functions against each other: `_bt_decode` calls `.collect()` on the
+decoded image column, which moves 10,000 x 224x224x3 uint8 — about **1.5 GB** — to the driver.
+`_daft_decode` builds the same images and then does `df.select("h", "w").to_pydict()`, so Daft
+computes the decode and returns two integers per row. `_ray_decode`'s `take_all()` ships pixels
+like Batcher's. **Batcher and Ray Data are charged a transfer Daft is not**, and that is a
+property of the harness rather than of the engines.
+
+The obvious way to price it — run Batcher's decode but return one row — **does not work, and
+the number it produced is withdrawn.** `read.images(..., decode=True).agg(n=count())` plans as
+
+    project
+    └─ limit  [n = 1]
+       └─ scan  [source 0]   pushed[max 1 rows]
+
+so the count is answered by a one-row limit pushed into the scan: nothing is decoded and
+almost nothing is read. It reported 4,693 ms, which invites the conclusion that ~8-11 s of the
+recorded time is pixel transfer and Batcher is really ~5x Daft here. That conclusion is not
+supported. The control settles it: the identical query with `decode=False` runs in **4,144 ms
+against 4,213 ms** — a 69 ms difference, because both arms are the same pushed-down limit.
+
+So the recorded **1.6-2.0x at 10,000 images stands as the measured number**, with the caveat
+that the two sides do not return the same thing. Fixing that means changing the suite so every
+engine returns the same shape — a real change to a competitive benchmark, to be made
+deliberately and re-run, not folded in beside a result. Until then no shape-matched multimodal
+ratio exists, and anyone quoting one should say which side shipped the pixels.
+
 ### Multimodal, which is the other shape Daft is built for
 
 The relational board says little about the workload Daft is actually known for, so the
