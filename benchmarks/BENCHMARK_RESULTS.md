@@ -245,20 +245,30 @@ The UDF route re-reads from object storage on every run. That is the whole of th
 sits above the UDF-free read warm, and it is why the driver profile finds the barrier
 genuinely *waiting*: the tasks really are doing S3 reads, warm run or not.
 
-**A hypothesis with an obvious test, not a finding.** The UDF-free aggregate runs on a pinned
-actor fleet (`flight_aggregate` -> `acquire_fleet`), whose processes persist between queries
-and therefore keep their caches; the map route runs stateless Ray tasks, which Ray places
-wherever there is room, so a partition seldom lands on the process that cached it. If that is
-right, routing the same stage onto the actor pool should recover most of the gap —
-`ml.map_batches(..., concurrency=N)` already does exactly that through `_map_resources`, so
-the test needs no new code. Nobody has run it yet; the mechanism above is inferred from the
-ratio, and the ratio is the only part of this section that is measured.
+**The obvious mechanism was tested and is wrong.** The UDF-free aggregate runs on a pinned
+actor fleet whose processes persist between queries and therefore keep their caches, while the
+map route runs stateless Ray tasks that Ray places wherever there is room — so a partition
+seldom lands on the process that cached it. `ml.map_batches(..., concurrency=N)` already routes
+a stage onto an actor pool (`_map_resources`), so the prediction was testable with no new code:
+the pooled run should recover most of the gap. Warm, same query, same fleet:
 
-If it holds, the fix is a routing decision rather than an optimisation: give the map route the
-same fleet affinity the aggregate route has, or make the cache node-local instead of
-process-local. Either is squarely inside the existing architecture, and either would take the
-`udf` board from ~1,300 ms toward the ~350 ms the same read costs the other route — which is
-the difference between 4.5x and 10x against Ray Data on this shape.
+| | wall |
+|---|---:|
+| `scan + sum` — no UDF | **358 ms** |
+| udf via stateless tasks | 1,672 ms |
+| **udf via actor pool (`concurrency=64`)** | **1,686 ms** |
+
+Identical. Actor-versus-task placement is not what the map route is losing, so whatever
+defeats its scan cache is not process affinity, and the next attempt should not start there
+either. Two candidate mechanisms have now been falsified by building them — this one and the
+read/compute overlap above — while the *effect* in the table stays exactly as measured: the
+UDF route re-reads object storage on every run and the UDF-free one does not.
+
+What is still worth trying, in rough order of how much they would settle: instrument the
+worker-side cache directly (hit/miss counters per task, which nothing currently reports, so
+"the cache is missing" is still an inference from a ratio rather than an observation); check
+whether the two routes even produce the same *cache key* for the same splits; and confirm the
+map route's workers live long enough between queries to hold anything at all.
 
 ### Batching the barrier's completions: built, measured, rejected
 
