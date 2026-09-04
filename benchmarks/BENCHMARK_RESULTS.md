@@ -88,6 +88,12 @@ Two levers that look like the answer and are not:
   knob moves the input and the fill removes the effect.
 * **`num_workers`.** 2,977 ms default -> 2,835 at 8 -> 2,699 at 16. Thread width inside the task
   is not the constraint; the tasks are resident and idle, not short of threads.
+* **Task concurrency.** The tasks being resident and idle makes "there are too few of them"
+  the obvious next guess, and it is wrong too. Pinning every map task's share to 1.0 CPU
+  instead of the fill's ~2.46 more than doubles how many Ray can pack per node, and the query
+  does not move: **3,344 ms at 10% mean busy**, against 3,086-3,371 ms on the default. Three
+  levers now — the reservation, the thread width, and the task count — all move their input
+  and none moves the wall.
 
 In an isolated task the two phases measure 0.474 s (read) and 0.151 s (`execute_with_udfs`),
 which do not compose into the 2,376 ms the query takes — so what is left to find is contention
