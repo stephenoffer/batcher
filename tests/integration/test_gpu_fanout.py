@@ -67,6 +67,24 @@ def cluster(tmp_path_factory):
         _temp_dir=str(tmp_path_factory.mktemp("ray")),
     )
     try:
+        # A local Ray that advertises no CPU cannot run a single task, and the fan-out below
+        # asks for `gpu_count=2` on top of that — so every shard pends and the *test* hangs
+        # rather than failing. That is not hypothetical: on a managed workspace whose head is
+        # configured with `num_cpus=0`, `ray.init(address="local", num_cpus=4)` comes back
+        # with `CPU: None`, a one-CPU task pends on `No available node types can fulfill
+        # resource request {'CPU': 1.0}`, and this file burned a 90-second timeout per test
+        # with nothing in the output naming the cause.
+        #
+        # Skipping is right rather than merely convenient: the module's own docstring says it
+        # wants an *isolated local* cluster, and a platform that cannot give it one has not
+        # got a version of this test to run. `just lint-skips` prices it, which is what keeps
+        # an environment skip from quietly becoming permanent.
+        if float(ray.cluster_resources().get("CPU", 0.0)) <= 0:
+            pytest.skip(
+                "this platform's local Ray advertises no CPU, so a fan-out shard would pend "
+                "forever rather than run; the fan-out needs a cluster that schedules",
+                allow_module_level=False,
+            )
         yield
     finally:
         cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
