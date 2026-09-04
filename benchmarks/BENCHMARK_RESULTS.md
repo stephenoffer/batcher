@@ -245,30 +245,31 @@ The UDF route re-reads from object storage on every run. That is the whole of th
 sits above the UDF-free read warm, and it is why the driver profile finds the barrier
 genuinely *waiting*: the tasks really are doing S3 reads, warm run or not.
 
-**The obvious mechanism was tested and is wrong.** The UDF-free aggregate runs on a pinned
-actor fleet whose processes persist between queries and therefore keep their caches, while the
-map route runs stateless Ray tasks that Ray places wherever there is room — so a partition
-seldom lands on the process that cached it. `ml.map_batches(..., concurrency=N)` already routes
-a stage onto an actor pool (`_map_resources`), so the prediction was testable with no new code:
-the pooled run should recover most of the gap. Warm, same query, same fleet:
+**The mechanism, finally observed rather than inferred.** `scan_cache_stats()` already reports
+per-worker hits/misses, so the map task was temporarily instrumented to print its own counters.
+Across three consecutive runs of the same query, nearly every sampled worker reports:
 
-| | wall |
-|---|---:|
-| `scan + sum` — no UDF | **358 ms** |
-| udf via stateless tasks | 1,672 ms |
-| **udf via actor pool (`concurrency=64`)** | **1,686 ms** |
+    CACHESTAT {'hits': 0, 'misses': 5,  'hit_rate': 0.0, 'used_bytes':  92637632}
+    CACHESTAT {'hits': 0, 'misses': 10, 'hit_rate': 0.0, 'used_bytes': 185935928}
+    CACHESTAT {'hits': 1, 'misses': 4,  'hit_rate': 0.2, 'used_bytes':  74424504}
 
-Identical. Actor-versus-task placement is not what the map route is losing, so whatever
-defeats its scan cache is not process affinity, and the next attempt should not start there
-either. Two candidate mechanisms have now been falsified by building them — this one and the
-read/compute overlap above — while the *effect* in the table stays exactly as measured: the
-UDF route re-reads object storage on every run and the UDF-free one does not.
+**Hit rate ~0, and `used_bytes` in the tens to hundreds of megabytes.** The cache is not
+disabled and it is not empty — every worker is faithfully caching the partition it just read.
+It is simply never asked for that partition again: the next run hands it a different one.
 
-What is still worth trying, in rough order of how much they would settle: instrument the
-worker-side cache directly (hit/miss counters per task, which nothing currently reports, so
-"the cache is missing" is still an inference from a ratio rather than an observation); check
-whether the two routes even produce the same *cache key* for the same splits; and confirm the
-map route's workers live long enough between queries to hold anything at all.
+That also explains why the actor-pool arm changed nothing. Routing the stage through
+`ml.map_batches(..., concurrency=64)` gives it 64 persistent actors and no improvement
+(1,686 ms against 1,672 ms for stateless tasks), because the pool picks the *emptiest* actor
+per partition (`_emptiest_actor`) — load-balanced, not index-stable. Persistence was never the
+missing ingredient; **stable partition-to-worker assignment** is. The UDF-free aggregate has it
+because `flight_aggregate` hands `partition_descriptors` its `fleet_addrs` and then addresses
+reducers by index, so partition *i* meets the same process every run.
+
+So the remaining ~600 ms is a **scheduling** property, not a read or compute one, and the fix
+is to make the map route's assignment sticky — soft node affinity by partition index, an
+index-addressed actor pool, or a node-local cache instead of a per-process one. All three are
+inside the existing architecture; none is a one-line change, and the second falsified guess
+above is a reminder to measure the chosen one rather than assume it.
 
 ### Batching the barrier's completions: built, measured, rejected
 
