@@ -95,7 +95,15 @@ Two levers that look like the answer and are not:
   and 1,024 cores at 2.46 CPU already hold 416 of them at once, so dropping the share to 1.0
   raises the resident count from 416 to 465 — 12%, not the 2.5x the per-node packing suggests.
   A share sweep cannot test concurrency on a stage whose task count is already near the
-  cluster's capacity; only raising `_adaptive_partition_count` can, and that is untested here.
+  cluster's capacity; only raising `_adaptive_partition_count` can.
+* **The partition count, which is the arm that does move concurrency — the wrong way.** Forcing
+  2,000 partitions at 0.5 CPU each (so every task is resident) takes **6,718 ms**, twice the
+  default's ~3,100-3,400 ms. That reproduces the 2026-09-02 result for a different query and
+  fleet (256/512/1,024 partitions -> 8,237/6,864/7,054 ms), so it is the shape of the curve
+  rather than one bad run. One thing in that arm is **not** understood and should not be read
+  past: `ClusterMonitor` reported a single active node, which is not what 2,000 resident tasks
+  should look like, and nothing here explains it. Treat "more partitions is worse" as measured
+  and the reason for it as open.
 
 In an isolated task the two phases measure 0.474 s (read) and 0.151 s (`execute_with_udfs`),
 which do not compose into the 2,376 ms the query takes — so what is left to find is contention
