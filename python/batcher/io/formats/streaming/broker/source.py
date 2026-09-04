@@ -323,6 +323,24 @@ class BrokerSource(ABC):
         """
         return f"{self.format_name}:{self.topic}:{_options_fingerprint(self._options)}"
 
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: the topic.
+
+        Distinct from `identity`, which names a *relation* and so folds in the connection
+        fingerprint, because the same topic name on staging and on production is two
+        relations with two sets of statistics. A policy is about the topic: an operator
+        writes "mask `email` on `orders`" without knowing which cluster a given job will
+        point at, and the mask has to hold on both.
+
+        Keying governance on the identity meant it held on neither. `kafka:orders:9f3c…`
+        is a name nobody writes a policy about, so `catalog.governs()` was False and every
+        streaming read of a governed topic ran ungoverned, with nothing raised to say so.
+
+        Returns:
+            The topic, stream, or subscription name.
+        """
+        return self.topic
+
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         """Materialize the stream — only valid for a bounded broker.
 

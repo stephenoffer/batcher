@@ -66,7 +66,7 @@ pub(super) fn build_union_all<'a>(
         .into_iter()
         .zip(heads)
         .flat_map(move |(rest, head)| head.map(Ok).into_iter().chain(rest));
-    let target_for_map = target.clone();
+    let target_for_map = target;
     Ok(Some(Box::new(stream.map(move |b| {
         let b = b?;
         let rows_in = b.num_rows() as u64;

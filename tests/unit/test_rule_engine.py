@@ -79,7 +79,7 @@ def test_many_inapplicable_rules_never_fire():
 
     def mark(_node, _ctx):
         fired["n"] += 1
-        return None
+        return
 
     for i in range(500):
         reg.add(node_rule(f"noop_{i}", Phase.REWRITE, mark, matches=(Window,)))

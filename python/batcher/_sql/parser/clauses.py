@@ -302,6 +302,13 @@ def _select(tr, node) -> Dataset:
             projections, nested = windowing.hoist_nested_windows(projections)
             windows = [*(p for p in projections if tr._is_window(p)), *nested]
         ds, named = tr._aggregate(ds, projections, group, node.args.get("having"), windows, order)
+        # The aggregate has already dropped the input columns, so a sort key spelling a
+        # grouped *expression* (`ORDER BY h %% 4`, or the ordinal that unwraps to it) has
+        # nothing left to resolve against. Retarget both spellings onto the select-list alias,
+        # which is what SQL says they mean. See `_retarget_order_to_grouped_aliases`.
+        if order is not None:
+            order = _retarget_positional_order(order, projections)
+            order = _retarget_order_to_grouped_aliases(order, projections)
         # _agg_map is still live here, so ORDER BY can reference an aggregate
         # (e.g. ORDER BY SUM(x)) by its output column. It stays live until the
         # DISTINCT block below, which may still owe a deferred sort.
@@ -521,6 +528,53 @@ def _retarget_positional_order(order, projections):
         except Exception:  # an out-of-range position keeps its own error, raised later
             continue
         alias = _alias_of(selected)
+        if alias:
+            item.set("this", exp.column(alias))
+    return retargeted
+
+
+def _retarget_order_to_grouped_aliases(order, projections):
+    """Rewrite an ORDER BY term that names a **grouped expression** to that item's alias.
+
+    After `GROUP BY <expr>` the relation holds the group keys and the aggregate outputs and
+    nothing else — the input columns the expression was computed from are gone. So a sort key
+    that still spells the expression cannot resolve, and the query failed with
+    "sort key references unknown column(s)". Three ordinary spellings hit it, and the fourth
+    did not, which is what made it look like a quirk rather than a gap:
+
+        SELECT h %% 4 AS k, min(v) FROM t GROUP BY h %% 4 ORDER BY 1        -- failed
+        SELECT h %% 4 AS k, min(v) FROM t GROUP BY h %% 4 ORDER BY h %% 4   -- failed
+        SELECT h %% 4 AS k, min(v) FROM t GROUP BY 1     ORDER BY 1        -- failed
+        SELECT h %% 4 AS k, min(v) FROM t GROUP BY h %% 4 ORDER BY k        -- worked
+
+    DuckDB accepts all four, and so does the standard: an ORDER BY term matching a select-list
+    item refers to that item's output. The alias spelling worked only because it happened to
+    name a column that survives the aggregate.
+
+    This is [`_retarget_positional_order`]'s argument — "`ORDER BY 1` and `ORDER BY f` are the
+    same request" — applied to the grouped case, plus the structural form the DISTINCT path
+    does not need. Matching is on the rendered SQL of the *unwrapped* item, so `h %% 4` matches
+    `h %% 4` and nothing else; a bare column is left alone because it either survives the
+    aggregate as a group key or is genuinely unresolvable.
+    """
+    if projections is None:
+        return order
+    by_sql: dict[str, str] = {}
+    for p in projections:
+        alias = _alias_of(p)
+        inner = _unwrap_alias(p)
+        # A bare column needs no retargeting: as a group key it survives under its own name,
+        # and otherwise the error it raises is the correct one.
+        if alias and not isinstance(inner, exp.Column):
+            by_sql.setdefault(inner.sql(), alias)
+    if not by_sql:
+        return order
+    retargeted = order.copy()
+    for item in retargeted.expressions:
+        target = item.this
+        if isinstance(target, exp.Column):
+            continue
+        alias = by_sql.get(target.sql())
         if alias:
             item.set("this", exp.column(alias))
     return retargeted

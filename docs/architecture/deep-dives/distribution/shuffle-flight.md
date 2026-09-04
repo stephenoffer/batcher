@@ -172,6 +172,16 @@ per-node memory bounded however wide the cluster gets, so adding nodes adds redu
 than adding contention. Measure it for a given cluster shape with
 `benchmarks/cluster/carbonite/xnode.py`.
 
+That holds while there is enough shuffled volume to divide. It is a statement about
+throughput at a fixed exchange width, and it does not license widening the exchange to match
+the cluster: an exchange of `m` mappers and `r` reducers opens `m x r` streams, so a reducer
+count taken from the node count makes the *coordination* quadratic in the cluster while the
+bytes stay fixed. That is why the reducer count is sized from the data rather than the
+fleet — `aggregate_reducer_count` for an aggregate, whose exchanged volume is the group
+count, and `row_shuffle_reducer_count` for a join, sort or window, whose exchanged volume is
+the rows. Measured on a 64-worker fleet, a 64-group aggregate given one reducer per worker
+spent 302 ms moving a few kilobytes through 4,096 streams, against 91 ms through one.
+
 ## The disk alternative
 
 `distributed.transport` takes three settings. The default, `"auto"`, picks between the

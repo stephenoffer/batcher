@@ -297,7 +297,7 @@ def test_pulsar_drains_with_a_short_timeout_after_the_first_receive():
         def receive(self, timeout_millis):
             self.timeouts.append(timeout_millis)
             if self.left == 0:
-                raise _Timeout()
+                raise _Timeout
             self.left -= 1
             return _Msg()
 

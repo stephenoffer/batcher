@@ -3671,7 +3671,11 @@ class Expr:
     def first(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the first row in `order_by` order (SQL ``first``).
 
-        Equivalent to ``arg_min(order_by)``.
+        Equivalent to ``arg_min(order_by)``, and that equivalence is the precise
+        contract: like ``arg_min``, this **skips rows where the expression is null** and
+        returns the first non-null value. SQL's own ``FIRST(x ORDER BY k)`` does not --
+        it returns whatever sits in the first row, null included -- so the two agree on
+        every column without nulls and differ exactly where one has them.
 
         An explicit `order_by` is **required**: an arrival-order first/last is not
         partition-independent, so it could not stay identical single-node and
@@ -3697,9 +3701,10 @@ class Expr:
     def last(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
 
-        Equivalent to ``arg_max(order_by)``. As with :meth:`first`, an explicit
-        `order_by` is required so the result stays deterministic and mergeable across
-        partitions.
+        Equivalent to ``arg_max(order_by)``, which -- as on :meth:`first` -- means it
+        **skips nulls** where SQL's ``LAST(x ORDER BY k)`` would return one. As with
+        :meth:`first`, an explicit `order_by` is required so the result stays
+        deterministic and mergeable across partitions.
 
         Args:
             order_by: The ordering expression; the value at its last row is returned.
@@ -3929,6 +3934,12 @@ class Expr:
     ) -> WindowExpr:
         """Cumulative (running) sum from the first row to the current one — Polars ``cum_sum``.
 
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
+
         A window expression (one value per row, no row collapse) — use it in
         ``with_columns``/``select``, not in scalar arithmetic or ``filter``. Without
         `order_by` the running order is the row order.
@@ -3955,6 +3966,12 @@ class Expr:
     ) -> WindowExpr:
         """Cumulative (running) minimum up to the current row — Polars ``cum_min``.
 
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
+
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
 
@@ -3979,6 +3996,12 @@ class Expr:
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
         """Cumulative (running) maximum up to the current row — Polars ``cum_max``.
+
+        Nulls are **skipped, not propagated**: a null leaves the running value
+        unchanged, as SQL's window aggregate does and as :meth:`cum_prod` documents.
+        Polars propagates instead, returning null at the null row and for it alone, so
+        the two agree on every column without nulls and differ exactly where one has
+        them.
 
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
@@ -5521,6 +5544,32 @@ class Lit(Expr):
         return out
 
 
+def int_literal(expr: Expr) -> int | None:
+    """The Python `int` a plain integer literal holds, or `None` if it is not one.
+
+    The `bool` check is the whole point and the reason this is shared rather than rewritten
+    per caller: `bool` subclasses `int` in Python, so `isinstance(Lit(True).value, int)` is
+    true and a rule that skips the guard silently treats `WHERE flag = TRUE` as `= 1`. Five
+    Kyber rule families each carried their own copy of this function -- `_int_lit` three
+    times, plus `_int_literal` and `_seconds_literal` -- byte-identical including the guard.
+    Five copies of one subtlety is five chances for four of them to be left behind by a fix.
+
+    Lives beside `Lit` in the neutral `plan` layer rather than in a Kyber helpers module
+    because every caller already imports `plan.expr_ir`, so sharing it adds no import edge --
+    and an edge into `kyber.rules.exprs` would have run that package's `@rule` decorators
+    from two families that do not currently import it, changing rule registration order.
+
+    Args:
+        expr: The expression to inspect.
+
+    Returns:
+        The integer value, or `None` when `expr` is not a plain integer literal.
+    """
+    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+        return expr.value
+    return None
+
+
 @expr_node
 class Binary(IRNode):
     """A binary operation over two sub-expressions."""
@@ -5736,7 +5785,7 @@ class AggExpr:
             {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
-    __slots__ = ("func", "input", "input2", "param")
+    __slots__ = ("func", "input", "input2", "name", "param")
 
     def __init__(
         self,
@@ -5745,10 +5794,16 @@ class AggExpr:
         *,
         input2: Expr | None = None,
         param: float | None = None,
+        name: str | None = None,
     ) -> None:
         """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
         self.input = input
+        # The output column name set by `.alias(...)`, read by `group_by().agg()` when it
+        # names a *positional* aggregate. It is consumed at the API surface and never
+        # reaches `to_ir`, where the name is carried by `AggregateSpec.alias` instead --
+        # which is why the Kyber rules that rebuild an `AggExpr` may drop it safely.
+        self.name = name
         # The second input expression — the ordering key for arg_min/arg_max or the
         # paired column for corr/covar; None for unary and parametric aggregates.
         self.input2 = input2
@@ -5763,7 +5818,35 @@ class AggExpr:
         if self.param is not None:
             args.append(repr(self.param))
         call = f"{self.func}({', '.join(args)})"
-        return call if self.input is None else f"{self.input!r}.{call}"
+        rendered = call if self.input is None else f"{self.input!r}.{call}"
+        return rendered if self.name is None else f"{rendered}.alias({self.name!r})"
+
+    def alias(self, name: str) -> AggExpr:
+        """Name this aggregate's output column — the Polars ``.alias(...)`` spelling.
+
+        ``agg(total=col("x").sum())`` and ``agg(col("x").sum().alias("total"))`` build
+        the same aggregate. The second is what a ported Polars or PySpark script is
+        already written as, and it is the only positional spelling that can name a
+        `count()` (which has no input column to be named after) or two aggregates over
+        one column.
+
+        Args:
+            name: The output column name to bind this aggregate to.
+
+        Returns:
+            A new `AggExpr` naming its output `name`; this one is unchanged.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
+                >>> ds.group_by("g").agg(
+                ...     bt.col("x").sum().alias("total"), bt.count().alias("n")
+                ... ).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'total': [3, 3], 'n': [2, 1]}
+        """
+        return AggExpr(self.func, self.input, input2=self.input2, param=self.param, name=name)
 
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.
@@ -5808,17 +5891,30 @@ class AggExpr:
 
         ``col("x").sum().over(partition_by=["g"])`` computes the per-partition sum
         broadcast to every row (no grouping/row collapse). With `order_by` it becomes
-        a running aggregate; `frame` sets an explicit ``ROWS`` window. Used inside
+        a running aggregate; `frame` sets an explicit window. Used inside
         `with_columns`, which lowers it to the relational `Window` operator. Only the
         aggregate functions (`sum`/`mean`/`min`/`max`/`count`) support `over`.
+
+        **The frame bounds are signed offsets, not PRECEDING/FOLLOWING magnitudes.**
+        Negative precedes the current row, ``0`` is the current row, positive follows,
+        and ``None`` is unbounded in that direction -- so SQL's
+        ``ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`` is ``frame=(-2, 0)``, not
+        ``(2, 0)``. Reading them as magnitudes is not a harmless slip: ``(2, 0)`` is
+        rejected outright, and ``(2, 2)`` is *accepted* as "two following through two
+        following" and quietly answers a different question than the one intended.
+
+        An optional third element chooses the frame units, ``"rows"`` (the default),
+        ``"range"`` or ``"groups"``, which differ exactly when rows tie on the
+        ``order_by`` key: ``"rows"`` counts rows, ``"range"`` and ``"groups"`` treat a
+        run of tied rows as one unit, matching SQL.
 
         Args:
             partition_by: Key expressions whose groups the aggregate is computed within.
                 ``None`` or empty means unpartitioned, over the whole input.
             order_by: Expressions to order rows by, making it a running aggregate.
                 ``None`` or empty leaves the aggregate unordered.
-            frame: An explicit ``ROWS`` frame as ``(preceding, following)`` offsets; ``None`` for
-                the default.
+            frame: ``(start, end)`` signed offsets, optionally with a third units element
+                as ``(start, end, units)``; ``None`` for the default frame.
 
         Examples:
             .. doctest::
@@ -5828,6 +5924,11 @@ class AggExpr:
                 >>> w = bt.col("v").sum().over(partition_by=["g"])
                 >>> ds.with_columns(total=w).sort("v").to_pydict()
                 {'g': ['a', 'a', 'b'], 'v': [1, 2, 10], 'total': [3, 3, 10]}
+
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "v": [1.0, 2.0, 3.0, 4.0]})
+                >>> trailing = bt.col("v").sum().over(order_by=["t"], frame=(-2, 0))
+                >>> ds.with_columns(s=trailing).sort("t").to_pydict()["s"]
+                [1.0, 3.0, 6.0, 9.0]
         """
         from batcher.plan.expr_ir.nodes import WindowExpr
 

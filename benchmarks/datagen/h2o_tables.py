@@ -55,9 +55,14 @@ def build_groupby(scale: float) -> dict[str, pa.Table]:
     rng = np.random.default_rng(_SEED)
     table = pa.table(
         {
-            "id1": _ids(rng, n, k, 3),  # large groups (char)
-            "id2": _ids(rng, n, k, 3),  # small groups (char)
-            "id3": _ids(rng, n, n // k, 10),  # large groups (char)
+            # "large"/"small" follow `groupby-datagen.R`'s vocabulary, which names the
+            # group *size*: K=100 distinct values over N rows is a few large groups, N/K
+            # distinct is many small ones. The comments here previously had id2 and id3
+            # the wrong way round — the data always matched the R script, but this file's
+            # whole claim is that it follows the spec column for column.
+            "id1": _ids(rng, n, k, 3),  # K groups -> large groups (char)
+            "id2": _ids(rng, n, k, 3),  # K groups -> large groups (char)
+            "id3": _ids(rng, n, n // k, 10),  # N/K groups -> small groups (char)
             "id4": pa.array(rng.integers(1, k + 1, size=n), type=pa.int32()),
             "id5": pa.array(rng.integers(1, k + 1, size=n), type=pa.int32()),
             "id6": pa.array(rng.integers(1, n // k + 1, size=n), type=pa.int32()),

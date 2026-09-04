@@ -81,3 +81,33 @@ def test_a_single_core_node_is_left_alone():
 def test_a_grant_that_already_leaves_headroom_is_unchanged():
     """A 15-core grant on 16-core nodes is untouched — no gratuitous thinning."""
     assert _headroom_grant(15.0, [16.0] * 4) == 15.0
+
+
+def test_the_fill_is_thinned_and_the_cluster_is_not_reserved_whole():
+    """The 64 x 16-core fleet, measured: 960 of 1,024 cores, not all 1,024.
+
+    A change reverted on 2026-09-03 removed this thinning wherever the *in-bundle* sliver
+    `scheduling.fleet_task_headroom` leaves is at least a whole core — a grant of eight cores
+    or more — on the reasoning that the sliver can hold a one-core task on its own and the
+    envelope thinning is then a second charge against the worker's rayon width.
+
+    It does not survive measurement. A/B on the 64 x 16-core cluster this repo runs, TPC-H
+    sf100 from S3, three alternating pairs, best of two timed runs after a warm-up:
+
+    | shape | thinned (15 cores/worker) | unthinned (16) |
+    |---|---:|---:|
+    | `scan-agg` | 185 / 191 / 192 ms | 201 / 188 / 198 ms |
+    | `window-dedup` | **542 / 521 / 564 ms** | 719 / 762 / 732 ms |
+
+    `scan-agg` is a wash and `window-dedup` is 1.36x *worse* unthinned — the opposite
+    direction to the sf1000 figure the change was written against, on the same shape. It also
+    puts every core of the cluster inside a placement group, which was observed blocking a
+    second session's fleet from placing at all while the first held the cluster.
+
+    This test is the record: the fill's grant must stay below a node's cores.
+    """
+    node_cpus = [16.0] * 64
+    grant = _headroom_grant(_fill_grant(node_cpus), node_cpus)
+    assert grant == 15.0
+    assert workers_at(node_cpus, grant) == 64
+    assert reserved(node_cpus, grant) == 960.0

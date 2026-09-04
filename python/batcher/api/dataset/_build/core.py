@@ -81,6 +81,18 @@ def build_window(
             # — spelled ``("ntile", n)`` since it takes a count, not a column.
             if len(spec) != 2:
                 raise PlanError(f"window function {alias!r}: ntile takes ('ntile', n)")
+            # A *count*, not a column. Without this check `int()` was handed whatever came
+            # through and an `Expr` answered it via `__trunc__`, so `("ntile", col("v"))` —
+            # the shape someone writes by analogy with every other window function, all of
+            # which do take a column — surfaced as
+            # `TypeError: __trunc__ returned non-Integral (type MathExpr)`: a Python internal
+            # naming neither the function nor the argument.
+            if isinstance(spec[1], bool) or not isinstance(spec[1], (int, float)):
+                raise PlanError(
+                    f"window function {alias!r}: ntile takes a tile *count*, not "
+                    f"{spec[1]!r}. Spell it ('ntile', 4) — ntile divides the partition into "
+                    "n groups and has no column input."
+                )
             specs.append(WindowFuncSpec("ntile", None, alias, int(spec[1]), None))
         elif isinstance(spec, tuple):
             # (func, column) or, for lag/lead, (func, column, offset).

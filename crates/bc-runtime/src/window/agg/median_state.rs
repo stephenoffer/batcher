@@ -74,7 +74,9 @@ impl RunningMedian {
             .expect("balanced heaps are both non-empty")
             .0
              .0;
-        Some((lo + hi) / 2.0)
+        // Overflow-free midpoint: see `agg::median::quickselect_median` — summing two
+        // large finite doubles first would report `inf` for an even-sized frame.
+        Some(f64::midpoint(lo, hi))
     }
 }
 
@@ -112,7 +114,7 @@ mod tests {
             let mut state = RunningMedian::default();
             let mut seen: Vec<f64> = Vec::new();
             for k in 0..21i32 {
-                let v = if descending { -k } else { k } as f64;
+                let v = f64::from(if descending { -k } else { k });
                 state.push(v);
                 seen.push(v);
                 let expected = crate::agg::median::quickselect_median(&mut seen.clone());

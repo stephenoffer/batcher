@@ -170,6 +170,36 @@ class Suite:
             )
         )
 
+    def sql_with_builder(self, name: str, query: str, build: CaseBuilder) -> None:
+        """Register a SQL benchmark whose fanout is built by `build` rather than `sql_case`.
+
+        Some suites need more than the plain SQL fanout — TPC-H also drives Ray Data, which
+        has no SQL surface and so gets a hand-written DataFrame pipeline per query. The
+        temptation is to skip the registrar and call ``REGISTRY.add(Case(...))`` directly,
+        and TPC-H did: which silently left ``ordered_by`` at its default of ``()`` for all
+        22 queries, **18 of which end in an `ORDER BY`**. The multiset gate sorts both sides,
+        so for the whole run of the project's flagship benchmark an engine that skipped the
+        sort would have been reported correct and then timed on the work it did not do.
+
+        So the query stays the argument even when the builder is custom: the order keys are
+        derived from it here, exactly as :meth:`sql` does, and a caller cannot forget them
+        because there is nowhere to forget them.
+
+        Args:
+            name: The case name, unique across the whole registry.
+            query: The SQL the case runs. Used for its ``ORDER BY`` terms.
+            build: The per-engine fanout, replacing :func:`sql_case`.
+        """
+        REGISTRY.add(
+            Case(
+                family=self.family,
+                name=name,
+                dataset=self.dataset,
+                build=build,
+                ordered_by=_keys(query),
+            )
+        )
+
 
 def _keys(query: str | None) -> tuple[tuple[str | int, bool], ...]:
     """`query`'s outermost `ORDER BY` terms, as the frozen tuple `Case` holds."""

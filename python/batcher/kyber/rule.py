@@ -98,6 +98,28 @@ class Rule:
     fn: Callable[[LogicalPlan, OptimizerContext], LogicalPlan]
     matches: frozenset[type] | None = None
     category: RuleCategory = RuleCategory.REWRITE
+    # Run this rule a second time, after JOIN_REORDER, in the driver's cleanup round.
+    #
+    # The phase list is a single forward pass, so a rule only ever sees the plan as it
+    # stands when its own phase runs. That is wrong for a *canonicalization* rule — one that
+    # collapses a shape (two adjacent `Filter`s, two stacked `Project`s) rather than
+    # improving it — because the phases *after* it re-create exactly the shape it collapses:
+    # projection pushdown stacks projections, and join reordering re-parents subtrees so that
+    # filters and projections that were separated become adjacent. The canonicalizer has
+    # already run by then and nothing runs it again, so the redundant operator ships to the
+    # engine.
+    #
+    # Measured across the 99 TPC-DS queries, on plans the optimizer had already declared
+    # final: `merge_adjacent_filters` still fired on 38 of them, `merge_projections` on 30,
+    # `merge_projection_renames` on 13 — **160 operator nodes the optimizer was capable of
+    # removing and did not**. See `optimizer.driver._CLEANUP_NOTE` for the measurement and
+    # for why the round is this declared subset rather than a re-run of every phase.
+    #
+    # Declare it only on a rule that is *contracting* (it never grows the plan) and
+    # semantics-preserving, so running it twice can only help. A SELECTION/ENFORCE rule must
+    # never set it: those make a once-only decision and re-running them corrupts the
+    # telemetry that records what was decided.
+    recanonicalize: bool = False
     # For a node-local rule, the underlying `f(node, ctx) -> node | None`. The driver
     # uses this to fuse consecutive node-local rules into a *single* bottom-up
     # traversal (instead of one traversal per rule); `fn` remains the equivalent
@@ -173,6 +195,7 @@ def plan_rule(
     category: RuleCategory = RuleCategory.REWRITE,
     expr_matches: tuple[type, ...] | None = None,
     expr_ops: tuple[str, ...] | None = None,
+    recanonicalize: bool = False,
 ) -> Rule:
     """Wrap a whole-plan function `fn(plan, ctx) -> plan` as a `Rule`.
 
@@ -190,6 +213,7 @@ def plan_rule(
         category=category,
         expr_matches=frozenset(expr_matches) if expr_matches is not None else None,
         expr_ops=frozenset(expr_ops) if expr_ops is not None else None,
+        recanonicalize=recanonicalize,
     )
 
 
@@ -204,6 +228,7 @@ def node_rule(
     expr_schema_fn: Callable[[Expr, object], Expr] | None = None,
     expr_matches: tuple[type, ...] | None = None,
     expr_ops: tuple[str, ...] | None = None,
+    recanonicalize: bool = False,
 ) -> Rule:
     """Wrap a node-local function `fn(node, ctx) -> node | None` as a `Rule`.
 
@@ -235,4 +260,5 @@ def node_rule(
         expr_schema_fn=expr_schema_fn,
         expr_matches=frozenset(expr_matches) if expr_matches is not None else None,
         expr_ops=frozenset(expr_ops) if expr_ops is not None else None,
+        recanonicalize=recanonicalize,
     )

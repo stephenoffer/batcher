@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from fnmatch import fnmatch
 
 import pytest
 
@@ -45,6 +46,53 @@ def _no_cluster_signal(monkeypatch):
 
 
 _EXCLUDES = list(lifecycle._BUILD_ARTIFACT_EXCLUDES)
+
+#: One representative path per exclude pattern, so every pattern has to say what it is
+#: there to keep out of the upload. Keyed by the pattern; the keys are held against the
+#: production tuple below, which is what makes a newly added pattern fail here rather
+#: than ship unexercised.
+_REGENERABLE_PATH = {
+    "**/target/debug/**": "repo/target/debug/libbc_expr.rlib",
+    "**/target/release/**": "repo/target/release/lib_native.so",
+    "**/docs/_build/**": "repo/docs/_build/html/index.html",
+    "**/.git/**": "repo/.git/objects/ab/cdef0123456789",
+    "**/__pycache__/**": "repo/python/batcher/__pycache__/api.cpython-312.pyc",
+    "**/.pytest_cache/**": "repo/.pytest_cache/v/cache/nodeids",
+    "**/node_modules/**": "repo/docs/ui/node_modules/react/index.js",
+    "**/.venv/**": "repo/.venv/lib/python3.12/site-packages/numpy/__init__.py",
+}
+
+#: Paths the upload exists to ship. No exclude may match one of these -- an over-broad
+#: pattern here does not fail `ray.init`, it produces a `ModuleNotFoundError` on a worker
+#: for a package the driver plainly has, which is the harder failure to read.
+_SHIPPED_PATHS = (
+    "repo/python/batcher/api/dataset/frame.py",
+    "repo/python/batcher/_native.abi3.so",
+    "repo/python/batcher/dist/executors/ray_runtime/lifecycle.py",
+    "repo/crates/bc-expr/src/lib.rs",
+)
+
+
+def test_every_build_artifact_exclude_names_what_it_excludes():
+    """A pattern added to the production tuple must be classified, or this fails."""
+    assert sorted(_REGENERABLE_PATH) == sorted(lifecycle._BUILD_ARTIFACT_EXCLUDES)
+
+
+@pytest.mark.parametrize("pattern", lifecycle._BUILD_ARTIFACT_EXCLUDES)
+def test_each_exclude_matches_the_build_output_it_names(pattern):
+    """The positive control: the pattern actually excludes the thing it was added for.
+
+    A pattern that matches nothing costs nothing to write and silently restores the
+    512 MiB `ray.init` failure it was added to prevent.
+    """
+    assert fnmatch(_REGENERABLE_PATH[pattern], pattern)
+
+
+@pytest.mark.parametrize("pattern", lifecycle._BUILD_ARTIFACT_EXCLUDES)
+@pytest.mark.parametrize("shipped", _SHIPPED_PATHS)
+def test_no_exclude_matches_a_path_the_upload_must_carry(pattern, shipped):
+    """The negative control, and the one with teeth: source is never excluded."""
+    assert not fnmatch(shipped, pattern)
 
 
 def test_self_ship_uploads_a_source_install(monkeypatch):
@@ -94,10 +142,10 @@ def test_self_ship_excludes_build_output_from_the_injected_working_dir(monkeypat
     """
     monkeypatch.setattr(lifecycle, "package_dir", lambda: "/repo/python/batcher")
     excludes = lifecycle._self_ship_runtime_env()["excludes"]
-    for pattern in ("**/target/release/**", "**/target/debug/**", "**/docs/_build/**"):
-        assert pattern in excludes
-    # Source is never excluded — the upload exists to ship it.
-    assert not any("python/batcher" in p for p in excludes)
+    # Every pattern the production tuple carries reaches the env, in order. What each of
+    # them *means* is pinned by the classified pair of tests above.
+    assert excludes == list(lifecycle._BUILD_ARTIFACT_EXCLUDES)
+    assert excludes, "an empty excludes list would pass every containment check"
 
 
 def test_init_kwargs_attach_auto_ships_when_runtime_env_unset(monkeypatch, restore_config):

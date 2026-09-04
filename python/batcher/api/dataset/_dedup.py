@@ -315,9 +315,9 @@ def build_similarity_join(
         .distinct()  # a pair colliding in several bands is still one pair
     )
 
-    scored = candidates.join(
-        left_sigs.select(**{"key_a": Col(_KEY), "vec_a": Col(_VEC)}), on="key_a"
-    ).join(right_sigs.select(**{"key_b": Col(_KEY), "vec_b": Col(_VEC)}), on="key_b")
+    scored = candidates.join(left_sigs.select(key_a=Col(_KEY), vec_a=Col(_VEC)), on="key_a").join(
+        right_sigs.select(key_b=Col(_KEY), vec_b=Col(_VEC)), on="key_b"
+    )
     # The exact cosine over the original vectors, not the signature's estimate: banding
     # decides which pairs are *looked at*, never which ones are *returned*.
     verified = scored.select(

@@ -41,6 +41,14 @@ class GenerateSpec:
             every row that shares it. A throughput win for deterministic decoding over a
             corpus with repeated prompts; leave off when sampling (``temperature > 0``)
             and independent samples for identical prompts are wanted.
+        skip_null_prompts: leave a row whose `prompt_column` is null out of the request
+            entirely, and give it a null output. Off by default, because a null prompt
+            renders as ``""`` and is dispatched (see `_cell`) and that is the behaviour
+            callers have. Turn it on to stop paying for those rows: each one otherwise
+            spends a decode slot on a GPU engine and a billed request on a hosted one, and
+            comes back with a generation nothing downstream can tell from a real answer.
+            Ignored when `template` or `image_column` is set, where the row has an input
+            the prompt column does not describe.
     """
 
     prompt_column: str
@@ -56,6 +64,7 @@ class GenerateSpec:
     finish_reason: bool = False
     logprobs: bool = False
     dedup: bool = False
+    skip_null_prompts: bool = False
 
     @property
     def appended_columns(self) -> list[str]:

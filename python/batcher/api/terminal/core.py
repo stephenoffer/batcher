@@ -8,10 +8,12 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 from __future__ import annotations
 
 import time
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher._internal import events as _events
 from batcher._internal.errors import PlanError
 from batcher._internal.optional import require
 from batcher.api.orchestration import with_auto_config
@@ -27,7 +29,11 @@ from batcher.io.base._layout import FileLayout
 from batcher.io.manifest import WriteManifest
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.resource import StorageLevel
 from batcher.plan.types import logical_bytes
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 __all__ = [
     "_collect",
@@ -46,6 +52,35 @@ __all__ = [
 ]
 
 
+def _shortcut(plan: LogicalPlan, route: str, rows: int, started: float) -> None:
+    """Report a query a shortcut answered without reaching the executor.
+
+    Module level rather than a closure inside each terminal, because these are the fastest
+    paths in the engine -- a `count()` read off a Parquet footer is tens of microseconds --
+    and building a closure object per call to reach a function that usually returns
+    immediately was measurable against exactly the case it describes.
+
+    Args:
+        plan: The plan that was answered.
+        route: Which shortcut answered it; a key of `event_log.SHORTCUT_REASONS`.
+        rows: Rows in the returned answer.
+        started: The `perf_counter` reading from the start of the terminal op.
+    """
+    # The `listening()` check is made *here*, before the import, and that is the whole
+    # reason this function exists rather than the call sites reaching `report_shortcut`
+    # directly. `report_shortcut` makes the same check and returns in 0.5 us, but the
+    # `from batcher.api.terminal.event_log import ...` needed to reach it costs 4.5 us
+    # even against a warm `sys.modules` -- measured, and it made a metadata-answered
+    # `count()` 17% slower with no sink attached at all. Hoisting that import to module
+    # scope would pay it once, but `core` keeps its heavy imports lazy on purpose;
+    # `_internal.events` is layer 0 and stdlib-only, so hoisting *that* one is free.
+    if not _events.listening():
+        return
+    from batcher.api.terminal.event_log import report_shortcut
+
+    report_shortcut(plan, route=route, rows=rows, total_ms=(time.perf_counter() - started) * 1000.0)
+
+
 @with_auto_config
 def _collect(
     plan: LogicalPlan,
@@ -57,7 +92,7 @@ def _collect(
     num_partitions: int | None = None,
     adaptive: bool | str = "auto",
     transport: str = "auto",
-    cache: bool = False,
+    cache: StorageLevel | None = None,
     source_stats: list | None = None,
     backend: str = "cpu",
 ) -> pa.Table:
@@ -80,6 +115,11 @@ def _collect(
     top-N is finite too, but only after the stream ends, which it does not.
     """
     from batcher.io.source import is_bounded
+
+    # Every route out of this function that returns a finished table without reaching the
+    # executor reports through `_shortcut`. See `event_log.report_shortcut`: each of them is
+    # a correct answer to a real query, and each was invisible to every observability sink.
+    started = time.perf_counter()
 
     # A prepared hit answers before any of the routing below runs, which is the point: for a
     # re-issued small query every one of those guards recomputes an answer the entry already
@@ -107,7 +147,9 @@ def _collect(
         )
         hit = _prepared.lookup(prepared_key, sources, active_config())
         if hit is not None:
-            return hit.execute(sources)
+            answer = hit.execute(sources)
+            _shortcut(plan, "prepared", answer.num_rows, started)
+            return answer
 
     if any(not is_bounded(s) for s in sources) and not _is_bounded_peek(plan):
         raise PlanError(
@@ -120,7 +162,9 @@ def _collect(
 
         peeked = list(_iter_batches(plan, sources, columns))
         schema = peeked[0].schema if peeked else _peek_schema(plan)
-        return pa.Table.from_batches(peeked, schema=schema)
+        answer = pa.Table.from_batches(peeked, schema=schema)
+        _shortcut(plan, "streaming_peek", answer.num_rows, started)
+        return answer
     # Collect source statistics once when the metadata-aggregate attempt could use
     # them (a keyless aggregate), so a *missed* attempt doesn't re-read every footer
     # during execution. A non-aggregate collect skips this entirely (the attempt
@@ -142,10 +186,12 @@ def _collect(
             )
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
+        _shortcut(plan, "metadata_aggregate", metadata.num_rows, started)
         return metadata
     # Provably-empty short-circuit: a scan-free empty table (contradiction / limit(0) /
     # empty-side join) when metadata proves zero rows (see `metadata_empty_table`).
     if (empty := metadata_empty_table(plan, sources, source_stats)) is not None:
+        _shortcut(plan, "metadata_empty", empty.num_rows, started)
         return empty
     # GPU backend. `backend="gpu"` forces the GPU for any supported shape (honoring the user past
     # the small-input threshold, but Kyber still routes single-device vs sharded by working-set
@@ -162,6 +208,7 @@ def _collect(
             plan, sources, core.default_hub(), force=(backend == "gpu"), columns=columns
         )
         if gpu_result is not None:
+            _shortcut(plan, "gpu", gpu_result.num_rows, started)
             return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
     # through as tiny handles). Inserted before execution routing so the resulting
@@ -201,7 +248,9 @@ def _collect(
 
             batches = list(stream_limit(plan, sources[0], projection=_pushdown(plan)))
             schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
-            return pa.Table.from_batches(batches, schema=schema)
+            answer = pa.Table.from_batches(batches, schema=schema)
+            _shortcut(plan, "streaming_limit", answer.num_rows, started)
+            return answer
 
     if adaptive:
         from batcher import core
@@ -236,7 +285,23 @@ def _collect(
         partitions = num_partitions or auto_num_partitions(plan, sources, hub)
         # Spill the optimized plan (COUNT(DISTINCT)→COUNT over DISTINCT; derived join keys).
         opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
-        spilled = spill_collect(opt_lp, sources, partitions)
+        # `map_batches` runs in Python and deliberately does not lower to the engine IR, so
+        # the disk-shuffle spill executor cannot run a plan carrying one. It did not *decline*
+        # that plan, though — it entered the executor and raised `NotImplementedError:
+        # map_batches is executed in Python, not lowered to the engine IR` from inside
+        # `to_ir()`, an internal message about a wire contract escaping the public API. So
+        # `collect(spill=True)` was a hard failure for every batch-inference pipeline with a
+        # breaker over it (`map_batches(model).group_by(...).agg(...)` and friends), which is
+        # the workload most likely to ask for bounded memory in the first place.
+        #
+        # Asking before dispatching restores the fallback every other unspillable shape gets.
+        # It does not *give* these pipelines a bounded-memory path — that wants the map prefix
+        # staged to disk and the breaker run over it, the way `dist.executor._stage_map_prefix`
+        # does for the distributed route — and `iter_batches()` remains the bounded way to run
+        # one today.
+        spilled = (
+            None if core.has_map_batches(opt_lp) else spill_collect(opt_lp, sources, partitions)
+        )
         if spilled is not None:
             # This route bypasses `run_relational`, so it must close its own loops — it
             # recorded nothing at all, which made an explicit `spill=True` the one way to run
@@ -263,7 +328,9 @@ def _collect(
         backend=backend,
         cache=cache,
     ):
-        return run_fast(plan, sources, columns, remember_as=prepared_key)
+        answer = run_fast(plan, sources, columns, remember_as=prepared_key)
+        _shortcut(plan, "fast_path", answer.num_rows, started)
+        return answer
 
     # Imported here (not at module load) to keep the layer-import contract
     # simple and avoid importing the engine for pure-Python tooling. `time` is not one of
@@ -284,6 +351,11 @@ def _collect(
 
     ensure_sinks()  # attach the progress bar / dashboard the config asks for (idempotent)
     query_id = start_query_report(query_label(plan), pipeline_signature(plan))
+    # Open the lineage run before execution, so a query that fails still leaves a record of
+    # what it was going to read. A no-op unless `observability.openlineage` names a receiver.
+    from batcher.api.terminal.lineage import emit_run_start
+
+    emit_run_start(query_id, plan, sources)
 
     ctx = core.ExecutionContext(
         columns=columns,
@@ -396,20 +468,83 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     )
 
 
-def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:
+def _cached_rows(
+    plan: LogicalPlan, sources: list[Source], cache: StorageLevel | None
+) -> pa.Table | None:
+    """The cached result for `plan`, or `None` when the dataset is not cached or misses.
+
+    The guard is `cache is None`, not a probe that always runs: an uncached dataset must
+    not pay a signature computation and a dict lookup on every `count()`, and — more
+    importantly — must not be recorded as a cache *miss*, which would drive the hit rate
+    toward zero with queries that never asked to be cached.
+    """
+    if cache is None:
+        return None
+    from batcher.api.executors import cached_result
+
+    return cached_result(plan, sources)
+
+
+def cached_batches(
+    plan: LogicalPlan,
+    sources: list[Source],
+    cache: StorageLevel | None,
+    batch_size: int | None,
+) -> Iterator[pa.RecordBatch] | None:
+    """A cached result as a batch stream, or `None` when there is nothing cached to stream.
+
+    Lets `iter_batches` serve a warm cache. It deliberately does not *populate* the cache:
+    doing so would mean materializing the whole result, which is precisely what a caller
+    reaching for `iter_batches` has asked not to happen — a streaming read of a
+    larger-than-memory result must not be the thing that puts it in memory.
+
+    `batch_size` re-chunks the stored table through Arrow's own chunking, so a cached
+    stream honors the same rebatching an uncached one does.
+
+    Args:
+        plan: The plan whose result is wanted.
+        sources: Its bound sources, in scan order.
+        cache: The dataset's storage level, or `None` when it is not cached.
+        batch_size: Rows per emitted batch, or `None` for the stored chunking.
+
+    Returns:
+        An iterator over the cached result's batches, or `None` on a miss.
+    """
+    hit = _cached_rows(plan, sources, cache)
+    if hit is None:
+        return None
+    return iter(hit.to_batches(max_chunksize=batch_size) if batch_size else hit.to_batches())
+
+
+def _count(
+    plan: LogicalPlan,
+    sources: list[Source],
+    _columns: list[str],
+    cache: StorageLevel | None = None,
+) -> int:
     """Return the number of result rows — from metadata when provable, else a `COUNT(*)`.
 
     Metadata answers a derivable count (`limit(n)`, a global aggregate, empty source,
     row-preserving operators) with no execution. Otherwise a global `COUNT(*)` runs (via
     `global_count_plan`): projection pushdown reads only the filter/key columns and a count
     over a `Filter` fuses into one `count_if` pass, so no result rows are materialized.
+
+    A cached result short-circuits all of that, and is checked first: the rows are already
+    here, so counting them is an attribute read. Nothing below can beat it — the metadata
+    answer is only free when it is derivable, and the `COUNT(*)` re-reads the source.
     """
     from batcher.api.terminal.metadata_answer import global_count_plan, pushed_count
 
+    started = time.perf_counter()
+    hit = _cached_rows(plan, sources, cache)
+    if hit is not None:
+        _shortcut(plan, "cached", 1, started)
+        return hit.num_rows
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
         _record_count_selectivity(plan, sources, answer)
+        _shortcut(plan, "metadata_count", 1, started)
         return answer
     # A source that can count itself, asked only now: the free answers have declined, and
     # the remaining option is to read the relation to count it. One `COUNT(*)` round trip
@@ -417,6 +552,7 @@ def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int
     answer = pushed_count(plan, sources)
     if answer is not None:
         _record_count_selectivity(plan, sources, answer)
+        _shortcut(plan, "pushed_count", 1, started)
         return answer
     if _is_bounded_peek(plan):
         # `global_count_plan` wraps the peek in an aggregate, and an aggregate over an
@@ -444,17 +580,31 @@ def _record_count_selectivity(plan: LogicalPlan, sources: list[Source], count: i
     kyber.record_selectivity(core.default_hub(), plan, sources, count)
 
 
-def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:
+def _is_empty(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> bool:
     """Whether the result has no rows, from metadata when provable, else execute.
 
-    Falls back to a single-row probe (`limit(1)`), which the streaming early-stop
-    reads without scanning the whole source.
+    A cached result answers immediately. Otherwise this falls back to a single-row probe
+    (`limit(1)`), which the streaming early-stop reads without scanning the whole source.
     """
     from batcher.plan.logical import Limit
 
+    started = time.perf_counter()
+    hit = _cached_rows(plan, sources, cache)
+    if hit is not None:
+        _shortcut(plan, "cached", 1, started)
+        return hit.num_rows == 0
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_is_empty(plan, sources, source_stats)
     if answer is not None:
+        # Reported for the same reason `count()`'s metadata answer is: the caller asked a
+        # question and got one, and "no query ran" and "the answer was already known" are
+        # different facts that looked identical from every sink.
+        _shortcut(plan, "metadata_count", 1, started)
         return answer
     # The `limit(1)` probe runs over the same sources, so their stats still apply.
     return _collect(Limit(plan, 1), sources, columns, source_stats=source_stats).num_rows == 0
@@ -831,6 +981,7 @@ def _write(
     sink_kwargs: dict[str, Any] | None = None,
     sink: Any | None = None,
     directory: bool = False,
+    privileges: Sequence[str] = ("INSERT",),
 ) -> WriteManifest:
     """Execute the plan and write the result via the `fmt` sink.
 
@@ -843,8 +994,15 @@ def _write(
     default to `False`, so on a cluster every write — the one terminal whose output size
     is the whole result — ran the read, the transform, and the write on the driver alone.
     """
+    from batcher.api.security._write import authorize_write
     from batcher.io.sink import SINKS, table_sink_kwargs
     from batcher.plan.logical import is_streamable
+
+    # Before anything is executed or created. Every write — batch, streaming, MERGE —
+    # reaches this function, which is why the check lives here rather than in each of
+    # the three callers: an authorization check with three call sites has three ways to
+    # be forgotten. Returns silently unless a `security()` block governs the destination.
+    authorize_write(path, columns, privileges)
 
     distributed = _resolve_distributed(distributed, plan, sources)
 
@@ -1150,30 +1308,54 @@ def _sink_write_partitioned(
     return sink.write_partitioned(table, path, partition_by=partition_by)
 
 
+# Every conversion terminal below takes `cache` and forwards it to `_collect`. It reads as
+# boilerplate and is not: without it, `ds.cache().to_pydict()` never consults the cache and
+# never populates it, so a cached dataset read through anything but `collect()` re-executed
+# its whole plan every time while `cache_stats()` reported neither a hit nor a miss. The
+# marker is on the *dataset*, so it has to reach every terminal that materializes that
+# dataset's result, not just the one that returns it as Arrow.
+
+
 def _to_pydict(
-    plan: LogicalPlan, sources: list[Source], columns: list[str]
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
 ) -> dict[str, list[Any]]:
     """Execute and return the result as a column-oriented dict."""
-    return _collect(plan, sources, columns).to_pydict()
+    return _collect(plan, sources, columns, cache=cache).to_pydict()
 
 
 def _to_pylist(
-    plan: LogicalPlan, sources: list[Source], columns: list[str]
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
 ) -> list[dict[str, Any]]:
     """Execute and return the result as a list of row dicts."""
-    return _collect(plan, sources, columns).to_pylist()
+    return _collect(plan, sources, columns, cache=cache).to_pylist()
 
 
-def _to_pandas(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> Any:
+def _to_pandas(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> Any:
     """Execute and return the result as a pandas `DataFrame` (via Arrow)."""
     require("pandas", feature="Dataset.to_pandas()", provides="pandas", extra="pandas")
-    return _collect(plan, sources, columns).to_pandas()
+    return _collect(plan, sources, columns, cache=cache).to_pandas()
 
 
-def _to_polars(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> Any:
+def _to_polars(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    cache: StorageLevel | None = None,
+) -> Any:
     """Execute and return the result as a Polars `DataFrame` (zero-copy from Arrow)."""
     polars = require("polars", feature="Dataset.to_polars()", provides="polars", extra="polars")
-    return polars.from_arrow(_collect(plan, sources, columns))
+    return polars.from_arrow(_collect(plan, sources, columns, cache=cache))
 
 
 def _show(plan: LogicalPlan, sources: list[Source], columns: list[str], limit: int) -> None:

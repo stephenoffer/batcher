@@ -13,9 +13,9 @@ the simplest shape. The flat "off below 20M rows" is retired; don't restore it.
 `docs/architecture/internals/competitive_architecture.md` is the code-checked scorecard;
 **read it before making a competitive claim, and never restore a claim it retires.** It does
 not currently always win, and the gaps are specific rather than vague: it loses to DuckDB
-single-node above ~10M rows, it has no `StringView`, it cannot express Flink's streaming
-guarantees, and it buys several of its wall-clock wins with 1.4–4.4x more CPU. Say "aiming to"
-and mean it.
+single-node at sf100 (600M rows; the ~10M figure is retired), it has no `StringView`, it cannot
+express Flink's streaming guarantees, and it buys several of its wall-clock wins with 1.4–4.4x
+more CPU. Say "aiming to" and mean it.
 
 ## How to read this contract
 
@@ -138,7 +138,7 @@ Nothing is done until the gate is green. Run what your change touches:
 | Any Python | `just lint-py` → `just lint-layers` → `just lint-structure` → `just build` → `just test-py` |
 | FFI surface or IR tags | **both** of the above (the two sides must move together) |
 | Public API | `just lint-docstrings` + `just docs` |
-| Any test | `just lint-tests` — an ordered result compared unordered, or an assertion true by construction, fails the build |
+| Any test | `just lint-tests` (a check that cannot fail) → `just lint-methodology` (one that can, but was arranged not to) |
 | Docs / agent guidance | `just docs` + `just lint-guardrails` |
 | Anything perf-relevant | `just bench` (+ `bench-ops` / `bench-dist`) |
 | Moved or renamed a file | `just map` + `just lint-guardrails` + `just surface-diff` |

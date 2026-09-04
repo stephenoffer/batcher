@@ -128,6 +128,21 @@ class RateSource:
     def identity(self) -> str:
         return f"rate:{self._rps}:{self._num_rows}"
 
+    def governed_name(self) -> str:
+        """Empty: there is no durable table here to write a policy about.
+
+        A rate generator and a raw socket produce rows that exist nowhere before the query
+        asks for them, so a policy cannot be declared ahead of the first read -- which is
+        what `SecurityCatalog` requires of a table name. Saying so plainly is what lets
+        `governance.mode` refuse or warn about them; naming them ``3.0:100`` or
+        ``localhost:9999`` made them look governable under a name no policy ever uses,
+        which is the one outcome a governed deployment must not have.
+
+        Returns:
+            The empty string.
+        """
+        return ""
+
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         return [WholeSourceSplit(self)]
 
@@ -210,6 +225,21 @@ class SocketSource:
 
     def identity(self) -> str:
         return f"socket:{self._host}:{self._port}"
+
+    def governed_name(self) -> str:
+        """Empty: there is no durable table here to write a policy about.
+
+        A rate generator and a raw socket produce rows that exist nowhere before the query
+        asks for them, so a policy cannot be declared ahead of the first read -- which is
+        what `SecurityCatalog` requires of a table name. Saying so plainly is what lets
+        `governance.mode` refuse or warn about them; naming them ``3.0:100`` or
+        ``localhost:9999`` made them look governable under a name no policy ever uses,
+        which is the one outcome a governed deployment must not have.
+
+        Returns:
+            The empty string.
+        """
+        return ""
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         return [WholeSourceSplit(self)]

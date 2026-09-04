@@ -42,7 +42,7 @@ class _Worker:
 def no_ray_get(monkeypatch):
     """`ray.get` over the stubs' already-resolved values — identity, no cluster."""
     ray = pytest.importorskip("ray")
-    monkeypatch.setattr(ray, "get", lambda refs: list(refs))
+    monkeypatch.setattr(ray, "get", list)
 
 
 def _locality_on(enabled: bool) -> Config:

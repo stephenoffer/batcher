@@ -106,26 +106,23 @@ pub fn partial_aggregate(
             }
             _ => None,
         };
-        let merged = match width_of {
-            Some((keys, parts)) => {
-                let disjoint = crate::agg_par::partitioned_partials(
-                    &owned, &keys, group_keys, aggregates, &agg_jit, parts,
-                )?;
-                // Key-disjoint by construction (see `partitioned_partials`), so the merge is
-                // a concat rather than a regroup.
-                agg::concat_disjoint(&disjoint)?
-            }
-            None => {
-                let mut partials = sample;
-                partials.par_extend(
-                    owned[sample_n..]
-                        .par_iter()
-                        .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
-                        .collect::<Result<Vec<_>, InterpError>>()?
-                        .into_par_iter(),
-                );
-                agg::combine(&partials, &funcs)?
-            }
+        let merged = if let Some((keys, parts)) = width_of {
+            let disjoint = crate::agg_par::partitioned_partials(
+                &owned, &keys, group_keys, aggregates, &agg_jit, parts,
+            )?;
+            // Key-disjoint by construction (see `partitioned_partials`), so the merge is
+            // a concat rather than a regroup.
+            agg::concat_disjoint(&disjoint)?
+        } else {
+            let mut partials = sample;
+            partials.par_extend(
+                owned[sample_n..]
+                    .par_iter()
+                    .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
+                    .collect::<Result<Vec<_>, InterpError>>()?
+                    .into_par_iter(),
+            );
+            agg::combine(&partials, &funcs)?
         };
         partial_to_batch(group_keys, &merged)
     })
@@ -1051,7 +1048,7 @@ mod tests {
             )
             .unwrap(),
             RecordBatch::try_new(
-                schema.clone(),
+                schema,
                 vec![
                     // ... and code 1 here, for the same value.
                     dict_of(

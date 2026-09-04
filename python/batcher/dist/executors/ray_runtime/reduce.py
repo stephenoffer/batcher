@@ -37,6 +37,20 @@ def gather_in_windows(launch: Callable[[Any], Any], items: list[Any], workers: i
     `n_reducers x ceil(sources / shuffle_fan_in)` tasks per level, which at the reducer
     ceiling and a fan-in of 8 is six figures of simultaneously-pending tasks for one level.
 
+    The window **slides**: a new item launches as each result lands, so exactly `window`
+    tasks are outstanding until the work runs out. It was a chunked barrier first — launch
+    `window`, `ray.get` all of them, launch the next `window` — which bounds the queue just
+    as well and serializes the stage behind its slowest task `ceil(len(items) / window)`
+    times over. That is the cost the map side already refuses to pay: `map_barrier` fills
+    its window from a `ray.wait` on one completion, and this function's own docstring calls
+    itself that barrier's reduce-side twin. It was the twin in everything but the pipelining.
+
+    The difference is a straggler's, and it grows with the fan-out. A combiner level is
+    `n_reducers x ceil(sources / shuffle_fan_in)` tasks against a window of
+    `pending_window_factor x workers`, so a 64-worker aggregate over 128 map partitions runs
+    1,024 tasks through a 256-deep window: four barriers where one slow bucket holds 255
+    idle actors, rather than four slots that refill the moment anything finishes.
+
     Results come back in `items` order, so a caller that zips them against its own task list
     is unaffected. `len(items) <= window` launches everything before the first wait, which is
     byte-identical to the un-windowed call.
@@ -54,11 +68,33 @@ def gather_in_windows(launch: Callable[[Any], Any], items: list[Any], workers: i
     window = _reduce_window(workers)
     if len(items) <= window:
         return list(ray.get([launch(item) for item in items]))
-    out: list[Any] = []
-    for start in range(0, len(items), window):
-        chunk = items[start : start + window]
-        out.extend(ray.get([launch(item) for item in chunk]))
-    return out
+    results: list[Any] = [None] * len(items)
+    # `ObjectRef -> the index its result belongs at`, so completion order never reaches the
+    # caller. `ray.wait` reports refs in the order they finished, which is precisely the
+    # order this function exists to hide.
+    at: dict[Any, int] = {}
+    inflight: list[Any] = []
+    nxt = 0
+
+    def _fill() -> None:
+        nonlocal nxt
+        while len(inflight) < window and nxt < len(items):
+            ref = launch(items[nxt])
+            at[ref] = nxt
+            inflight.append(ref)
+            nxt += 1
+
+    _fill()
+    while inflight:
+        done, rest = ray.wait(inflight, num_returns=1)
+        inflight = rest
+        for ref in done:
+            # `ray.get` on the settled ref, so a task failure raises here exactly as it did
+            # from the chunked `ray.get` — this is a pipelining change, not an error-handling
+            # one, and the recovery loops above read the raise.
+            results[at.pop(ref)] = ray.get(ref)
+        _fill()
+    return results
 
 
 def _reduce_window(workers: int) -> int:

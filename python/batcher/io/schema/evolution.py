@@ -14,17 +14,20 @@ operation is a vectorized Arrow kernel (``cast`` / ``nulls`` / column reorder).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import pyarrow as pa
 
 from batcher._internal.errors import SchemaError
+from batcher._internal.logging import get_logger, log_kv
 from batcher.plan.types import promote
 
 __all__ = [
     "SchemaDrift",
     "conform_batch",
     "normalize_batch",
+    "note_dropped_columns",
     "reconcile_batches",
     "schema_drift",
     "unify_schemas",
@@ -243,6 +246,56 @@ def reconcile_batches(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
         return batches
     target = unify_schemas([b.schema for b in batches], mode="union")
     return [normalize_batch(b, target) for b in batches]
+
+
+def note_dropped_columns(batches: list[pa.RecordBatch], *, context: str) -> None:
+    """Warn when reconciliation had to null-fill a column a later batch stopped emitting.
+
+    `reconcile_batches` unions drifting schemas on purpose, and for the case it was built
+    for -- a `map_batches` UDF whose later batches carry *extra* fields, e.g. LLM
+    structured outputs -- that is exactly right: the earlier rows genuinely have no value
+    for a field that did not exist yet.
+
+    The reverse drift is not that. When a column present in an earlier batch is *absent*
+    from a later one, the union keeps the column and fills the later rows with nulls, so a
+    UDF that renames or drops a column returns a full-height table that is mostly null and
+    says nothing about it. Measured on a 40,000-row input across three morsels, a UDF that
+    renamed its output column after the first batch produced a 40,000x2 result in which
+    each column was ~50% null -- a plausible-looking table that is wrong, which is the
+    worst shape this can take.
+
+    It stays a warning rather than an error because the additive case is a supported
+    feature and the two are indistinguishable at the schema level. Readers are deliberately
+    *not* wired to this: a file missing a column is ordinary schema evolution, not a bug.
+
+    Args:
+        batches: The batches about to be reconciled, in the order they were produced.
+        context: What produced them, named in the warning, e.g. ``"map_batches"``.
+    """
+    if len(batches) <= 1:
+        return
+    # The same fast path `reconcile_batches` takes, for the same reason: this runs on
+    # every `map_batches` output list, and the overwhelmingly common case is a stable
+    # schema. A list comparison per batch costs less than building a set per batch, so
+    # the no-drift path allocates nothing.
+    first_names = batches[0].schema.names
+    if all(batch.schema.names == first_names for batch in batches[1:]):
+        return
+    seen: set[str] = set(first_names)
+    dropped: set[str] = set()
+    for batch in batches[1:]:
+        names = set(batch.schema.names)
+        dropped |= seen - names
+        seen |= names
+    if dropped:
+        log_kv(
+            get_logger(__name__),
+            logging.WARNING,
+            "output schema dropped a column between batches; the missing rows are "
+            "null-filled, not removed",
+            context=context,
+            dropped=sorted(dropped),
+        )
 
 
 def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:

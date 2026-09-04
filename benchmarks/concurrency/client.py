@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from concurrency.stats import ClientStats, steady_state
+from envinfo import machine_fingerprint, require_release_build
 from signature import result_signature, signatures_match
 
 if TYPE_CHECKING:
@@ -183,6 +184,14 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """Build an isolated session, run the loop, and print one JSON line of samples."""
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
     args = _parse_args()
     out: dict[str, object] = {"client_id": args.client_id, "error": None}
     try:

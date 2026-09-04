@@ -27,7 +27,7 @@ const DEFAULT_OFFSET: i64 = 33;
 #[inline]
 fn scores(seq: &str, offset: i64) -> impl Iterator<Item = i32> + '_ {
     let off = offset as i32;
-    seq.bytes().map(move |b| b as i32 - off)
+    seq.bytes().map(move |b| i32::from(b) - off)
 }
 
 /// `phred_quality(offset)` → `List<Int32>` of per-base scores.

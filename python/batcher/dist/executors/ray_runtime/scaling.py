@@ -16,13 +16,11 @@ import contextvars
 import math
 
 from batcher._internal.accelerators import (
-    accelerator_units,
     binding_gpu_memory_bytes,
     is_accelerator_node,
 )
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
-from batcher.dist.executors.ray_runtime.fabric.topology import is_preemptible, node_zone
 from batcher.plan.resource import HardwareProfile
 
 
@@ -43,7 +41,7 @@ class _Topology:
     already treats as "assume nameplate".
     """
 
-    __slots__ = ("alive_nodes", "draining", "free_cpus", "resources")
+    __slots__ = ("alive_nodes", "derived", "draining", "free_cpus", "resources")
 
     def __init__(
         self,
@@ -56,6 +54,18 @@ class _Topology:
         self.resources = resources
         self.draining = draining
         self.free_cpus = free_cpus
+        # Memoized O(nodes) projections of the records above — `node_classes()` and
+        # `cluster_shape()`. Collapsing the GCS *reads* into one snapshot left the
+        # *derivations* running once per caller, and there are twelve `node_classes()`
+        # call sites: the pack decision, the node-class selector, `placeable_workers`,
+        # the zone selector, the pending-demand diagnosis, the spot-node set, the
+        # accelerator probes, and the fill-worker sizing. Each rebuilt one dict per node.
+        #
+        # Measured against a synthetic 50,000-node cluster, one query's placement phase
+        # spent 709 ms of its 1.3 s rebuilding the same list. The snapshot fixes the
+        # topology for the length of the scope by construction, so a projection of it is
+        # fixed too, and memoizing changes no value any caller sees.
+        self.derived: dict[str, object] = {}
 
 
 # The topology snapshot in force for the current scheduling phase, if any. A distributed
@@ -289,10 +299,20 @@ def _worker_eligible(nodes: list[dict]) -> list[dict]:
 def _alive_nodes() -> list[dict]:
     """Worker-eligible alive node records (head excluded) — from the active snapshot if any,
     else a `_LIVE_TTL_S`-windowed `ray.nodes()`. Head-excluded so every fan-out sizing agrees
-    with placement."""
+    with placement.
+
+    Memoized inside a scope, because `_worker_eligible` builds two fresh lists of the whole
+    fleet and this is called from the class index, the shape bridge and every node count. The
+    snapshot fixes the node list for the length of the scope, so filtering it twice cannot
+    give two answers.
+    """
     snap = _TOPOLOGY.get()
     if snap is not None:
-        return _worker_eligible(snap.alive_nodes)
+        cached = snap.derived.get("alive_nodes")
+        if cached is None:
+            cached = _worker_eligible(snap.alive_nodes)
+            snap.derived["alive_nodes"] = cached
+        return cached  # type: ignore[return-value]
     return _worker_eligible(_live_alive_nodes())
 
 
@@ -371,9 +391,173 @@ def worker_node_memory_bytes() -> int:
         return 0
 
 
+def _class_index() -> dict:
+    """Node-class key -> the ids of the nodes in that class. One pass, cheap keys.
+
+    The shared half of `node_classes`, `node_class_census` and `fabric.shape.cluster_shape`:
+    the fleet is walked, and classified, exactly once per query. Those three used to make two
+    separate passes over every node record — 240 ms and 170 ms of a single query against a
+    synthetic 100,000-node fleet, which was most of its placement phase.
+
+    The classification itself lives in `fabric.census`, which is pure: it takes the node
+    records and the two side tables rather than reading Ray, so this stays the only place the
+    cluster is read from.
+
+    Memoized for the length of a `topology_scope()`; outside one it is rebuilt live, so the
+    autoscale wait and the worker clamp still see the fleet grow.
+    """
+    snapshot = _TOPOLOGY.get()
+    if snapshot is not None:
+        cached = snapshot.derived.get("class_index")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+    from batcher.dist.executors.ray_runtime.capacity import free_cpus_by_node
+    from batcher.dist.executors.ray_runtime.fabric.census import build_census
+    from batcher.dist.executors.ray_runtime.fabric.shape import _zone_label
+    from batcher.dist.executors.ray_runtime.fleet_health import unhealthy_gpus_by_node
+
+    index = build_census(
+        _alive_nodes(),
+        free_cpus_by_node(),
+        unhealthy_gpus_by_node(),
+        shape_zone=_zone_label,
+    )
+    if snapshot is not None:
+        snapshot.derived["class_index"] = index
+    return index
+
+
+def fleet_census() -> dict:
+    """The fleet's classes and their node ids, for the shape bridge.
+
+    Public within `ray_runtime` because `fabric.shape` needs the same pass this module
+    memoizes, and duplicating the read is exactly what the census exists to stop. Empty when
+    the topology is unreadable, which every caller already treats as "keep your defaults".
+    """
+    try:
+        return _class_index()
+    except Exception as exc:
+        note_suppressed("dist", "read the fleet census", exc)
+        return {}
+
+
+def _class_entry(key) -> dict:
+    """One node-class key rendered as the entry dict every consumer reads.
+
+    Projects the census key down to the fields the placement path asks about — the rack,
+    power domain and device health it also carries are the shape bridge's business.
+    """
+    return {
+        "cpus": key.cpus,
+        "free_cpus": key.free_cpus,
+        "gpus": key.gpus,
+        # Per-node RAM, so a placement check can bound by the resource a bundle reserves
+        # alongside cores. `0.0` when the node advertises no `memory` resource, which callers
+        # read as "do not bound by memory" rather than "this node has none".
+        "memory": key.memory,
+        # Non-GPU accelerators (TPU / Trainium / Gaudi / NPU) Ray doesn't count as `GPU`; lets
+        # the CPU-fleet isolation treat a TPU node as an accelerator node.
+        "accelerators": key.accelerators,
+        "accelerator_type": key.accelerator_type,
+        # The availability zone, and the label key it was read from. Both, because a fleet
+        # pinned to a zone must be selected on the key that actually carries it — a managed
+        # Kubernetes fleet labels `topology.kubernetes.io/zone` and a plain Ray one
+        # `ray.io/availability-zone`, and selecting on the wrong one matches nothing. `("", "")`
+        # on an unlabelled node, which every zone-aware decision reads as "no opinion".
+        "zone_label": key.zone_label,
+        "zone": key.zone,
+        # Whether the node is spot capacity. A reclamation wave takes a whole instance group,
+        # so this is the failure domain a shuffle replica most needs to be placed outside of —
+        # a second copy on another spot node of the same group dies with the first. False on an
+        # unlabelled node, which keeps an unlabelled fleet behaving exactly as it did before.
+        "preemptible": key.preemptible,
+        # The purchase mode and the label key it was read from. Both, for the reason the zone
+        # pair states: a fleet held to on-demand capacity has to be selected on the key that
+        # carries it, and a Karpenter-labelled fleet answers nothing to `ray.io/market-type`.
+        # `("", "")` on an unlabelled node, which capacity-aware placement reads as "this
+        # fleet cannot express the preference" and declines to emit a selector for.
+        "market_label": key.market_label,
+        "market_type": key.market_type,
+        # Schedulable devices, after the health probe's verdicts — carried here rather than
+        # left to the shape bridge because `executor._accelerator_fill_workers` sizes an
+        # accelerator stage on this projection; see its docstring. Equals `gpus` when health
+        # checking is off or telemetry is unreadable.
+        "healthy_gpus": max(0.0, key.gpus - max(0, key.unhealthy_gpus)),
+    }
+
+
+def node_class_census() -> list[dict]:
+    """`node_classes()` grouped: one entry per distinct class, plus a `count`.
+
+    The same records, deduplicated. Every consumer but one asks an *aggregate* question — how
+    many workers fit, is any node wide enough to pack onto, which zone is best, what device
+    models are present — and none of those needs to know which machine is which. A cluster of
+    a hundred thousand nodes is a handful of instance types across a handful of zones, so
+    answering them over classes rather than nodes is what stops the driver's per-query cost
+    growing with the fleet.
+
+    Each entry carries the fields `node_classes()` reports minus `node_id`, plus:
+
+    * `count` — how many nodes are in this class.
+
+    **A consumer that ignores `count` under-counts the fleet**, which is why this is a separate
+    function rather than a changed return shape: an unconverted caller keeps reading
+    `node_classes()` and stays correct, merely slower, instead of silently sizing a fan-out to
+    the number of instance types.
+
+    Returns:
+        One entry per class, or `[]` when the topology is unreadable (the caller then keeps
+        its homogeneous defaults).
+    """
+    try:
+        return [{**_class_entry(key), "count": len(ids)} for key, ids in _class_index().items()]
+    except Exception as exc:
+        note_suppressed("dist", "read the node class census", exc)
+        return []
+
+
+def cluster_numa_nodes() -> int:
+    """NUMA domains on the cluster's *least* partitioned worker shape, at least `1`.
+
+    How finely a node should be tiled into workers. One worker per node was the fan-out for a
+    long time, on the stated grounds that "more workers than nodes can't add CPU parallelism
+    since cores are the limit, but each node-worker saturates its cores via morsel
+    parallelism". Measured on a 4 x 96-core / 2-NUMA cluster at TPC-H sf100, it does not: the
+    profiler reports **60% core utilization** at one worker per node, and splitting each node
+    in two is worth 1.24-1.39x —
+
+    | workers | join | group-by |
+    |---|---|---|
+    | 4 (1/node) | 14,432 ms | 8,771 ms |
+    | 8 (2/node) | **10,369** | **7,067** |
+    | 16 (4/node) | 9,945 | 7,414 |
+
+    — and past two per node it flattens, which is what makes NUMA the rule rather than a
+    tuned constant. A worker is one process holding one set of hash tables and morsels; spread
+    across two memory domains, half its loads are remote. One worker per domain keeps them
+    local, and the measured optimum landing exactly on the domain count is the evidence for
+    reading it that way rather than picking a number.
+
+    The **minimum** across shapes, matching `cluster_l3_cache_bytes`: the grant is uniform
+    across the fleet, so it must be one a less-partitioned node can also host without being
+    split finer than its own topology wants.
+
+    Best-effort, and deliberately `1` on any failure — an unprobeable fleet keeps exactly the
+    one-worker-per-node fan-out it had before this existed.
+
+    Returns:
+        NUMA domains per worker node, at least 1.
+    """
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_hardware_profiles
+
+    seen = [c for p in cluster_hardware_profiles() if (c := int(p.get("numa_nodes") or 0)) > 0]
+    return min(seen) if seen else 1
+
+
 def node_classes() -> list[dict]:
     """Per-alive-node resource class: ``{"node_id", "cpus", "free_cpus", "gpus", "memory",
-    "accelerators", "accelerator_type", "zone_label", "zone", "preemptible"}``.
+    "accelerators", "accelerator_type", "zone_label", "zone", "preemptible", "market_label",
+    "market_type", "healthy_gpus"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
@@ -384,58 +568,36 @@ def node_classes() -> list[dict]:
     `cpus` is the nameplate; `free_cpus` is what is unreserved now (`capacity.free_cpus_by_node`,
     falling back to `cpus`). Conflating "how big is this node" with "what will fit on it" is
     what made a fleet ask for a shape only a completely idle cluster could host.
-    """
-    try:
-        from batcher.dist.executors.ray_runtime.capacity import free_cpus_by_node
 
-        free = free_cpus_by_node()
-        out: list[dict] = []
-        for n in _alive_nodes():
-            if not n.get("Alive", True):
-                continue
-            res = n.get("Resources", {})
-            cpus = float(res.get("CPU", 0.0))
-            if cpus <= 0:
-                continue
-            labels = n.get("Labels", {}) or {}
-            node_id = n.get("NodeID", "")
-            zone_label, zone = node_zone(labels)
-            out.append(
-                {
-                    "node_id": node_id,
-                    "cpus": cpus,
-                    "free_cpus": cpus if free is None else min(cpus, free.get(node_id, cpus)),
-                    "gpus": float(res.get("GPU", 0.0)),
-                    # Per-node RAM, so a placement check can bound by the resource a
-                    # bundle reserves alongside cores. `0.0` when the node advertises no
-                    # `memory` resource, which callers read as "do not bound by memory"
-                    # rather than "this node has none".
-                    "memory": float(res.get("memory", 0.0)),
-                    # Non-GPU accelerators (TPU / Trainium / Gaudi / NPU) Ray doesn't count as
-                    # `GPU`; lets the CPU-fleet isolation treat a TPU node as an accelerator node.
-                    "accelerators": accelerator_units(res),
-                    "accelerator_type": labels.get("ray.io/accelerator-type"),
-                    # The availability zone, and the label key it was read from. Both, because
-                    # a fleet pinned to a zone must be selected on the key that actually
-                    # carries it — a managed Kubernetes fleet labels
-                    # `topology.kubernetes.io/zone` and a plain Ray one
-                    # `ray.io/availability-zone`, and selecting on the wrong one matches
-                    # nothing. `("", "")` on an unlabelled node, which every zone-aware
-                    # decision reads as "no opinion".
-                    "zone_label": zone_label,
-                    "zone": zone,
-                    # Whether the node is spot capacity. A reclamation wave takes a whole
-                    # instance group, so this is the failure domain a shuffle replica most
-                    # needs to be placed outside of — a second copy on another spot node of
-                    # the same group dies with the first. False on an unlabelled node, which
-                    # keeps an unlabelled fleet behaving exactly as it did before.
-                    "preemptible": is_preemptible(labels),
-                }
-            )
-        return out
+    **Prefer `node_class_census()` unless you need `node_id`.** This expands the census back to
+    one entry per node, which is O(nodes) in dict construction and is what every aggregate
+    question here used to pay. The one caller that genuinely needs identity is the shuffle's
+    spot-node set, which places a replica outside a failure domain.
+
+    Grouped by class rather than in the cluster's own node order, which no caller depends on:
+    the readers take a `min`, a `sum`, a tiling count or a set, and the one that zips two lists
+    (`executor._fill_grant`) takes both from this same call.
+    """
+    snapshot = _TOPOLOGY.get()
+    if snapshot is not None:
+        cached = snapshot.derived.get("node_classes")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+    try:
+        out = [
+            {**_class_entry(key), "node_id": node_id}
+            for key, ids in _class_index().items()
+            for node_id in ids
+        ]
     except Exception as exc:
         note_suppressed("dist", "read node classes", exc)
         return []
+    if snapshot is not None:
+        # Memoized separately from `_class_index`: the index is the cheap shared pass, this is
+        # the O(nodes) expansion of it, and a caller that needs identity should pay for it once
+        # per scope rather than once per call. There are twelve call sites.
+        snapshot.derived["node_classes"] = out
+    return out
 
 
 def cluster_hardware_profile() -> HardwareProfile | None:
@@ -480,13 +642,7 @@ def _cluster_hardware_profile() -> HardwareProfile | None:
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
     gpu_devices = int(sum(c["gpus"] for c in classes))
     from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
-    from batcher.dist.executors.ray_runtime.hardware_probe import (
-        cluster_l3_cache_bytes,
-        cluster_measured_gpu_memory_bytes,
-        cluster_storage_class,
-        cluster_worker_fingerprint,
-        warn_once_if_fleet_is_mixed,
-    )
+    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes, cluster_measured_gpu_memory_bytes, cluster_storage_class, cluster_worker_fingerprint, warn_once_if_fleet_is_mixed
 
     warn_once_if_fleet_is_mixed()
     return HardwareProfile.for_cluster(

@@ -144,12 +144,44 @@ def test_a_string_leading_key_is_range_partitionable_too():
     assert supports_spilling_sort(plan, src._sources) is True
 
 
-def test_a_derived_key_is_not():
-    """Not in the source schema, so its type is unknown — stay out of the range partition
-    rather than fail inside it."""
+def test_a_derived_key_the_plan_can_type_is_range_partitionable():
+    """A derived key is not in the *source* schema, but the plan layer can still type it.
+
+    This asserted `False`, on the ground that a key absent from the source schema has an
+    unknown type and the range partitioner must not be handed one it cannot cut. The first
+    half is true and the second half is the right rule; the premise in the middle was not.
+    `available_schema` is the plan's own static type inference — the one `Dataset.schema` is
+    answered from — and it types `n * 2` as `Int64` with no rows and no source read. The
+    predicate now asks it first and falls back to the source schema, which is what
+    `dist.global_window.offsets._key_type_partitionable` had always done for the same
+    question about the same partitioner.
+
+    Declining was not free. A *computed* leading key is materialized into a hidden column
+    below the sort (`plan.logical.hoist_sort_key`) precisely so the partitioner has a column
+    to cut on — and a hidden column is by construction absent from the source schema, so the
+    old rule declined **every** hoisted key and the rewrite could never take effect. So
+    `sort(col("a") + col("b"))` had a distributed path and neither a spilling nor a streaming
+    one: it fell back to the materializing kernel under the very memory envelope the spill
+    exists for. `tests/differential/test_diff_spill_computed_shuffle_keys.py` holds the
+    results equal on both paths.
+    """
     src = bt.from_pydict({"n": [3, 1, 2]})
     plan = src.with_columns(m=bt.col("n") * 2).sort("m")._plan
-    assert supports_spilling_sort(plan, src._sources) is False
+    assert supports_spilling_sort(plan, src._sources) is True
+
+
+def test_a_key_of_a_type_the_partitioner_cannot_cut_is_still_declined():
+    """The rule the test above was reaching for, asserted on a case that actually holds.
+
+    Being unable to *type* the key was never the point — being unable to *cut* it is. A
+    Boolean key is typed perfectly well and has no grid the range partitioner can split, so
+    it must decline; a predicate that answers "whether this path applies" may never raise
+    when the answer is no. Without this, a `False` here could be reached by the predicate
+    becoming uniformly permissive and nothing would notice.
+    """
+    src = bt.from_pydict({"n": [3, 1, 2]})
+    derived_bool = src.with_columns(b=bt.col("n") > 1).sort("b")._plan
+    assert supports_spilling_sort(derived_bool, src._sources) is False
 
 
 def test_a_partitioned_window_can_grace_partition_but_a_global_one_cannot():

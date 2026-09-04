@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
-from batcher.plan.expr_ir import Binary, Cast, Expr, lit, nullif
+from batcher.plan.expr_ir import Binary, Expr, lit, null, nullif
 
 __all__ = [
     "binop_with_null",
@@ -82,11 +82,10 @@ def positional_null(node) -> Expr:
     Returns:
         The typed NULL expression.
     """
-    typed = nullif(lit(1), lit(1))
     parent = node.parent
     if parent is not None and type(parent).__name__ in _STRING_ARG_PARENTS:
-        return Cast(typed, "string")
-    return typed
+        return null("string")
+    return null()
 
 
 #: Binary operators whose result is a *boolean* NULL when either operand is a bare NULL.
@@ -126,7 +125,7 @@ def binop_with_null(tr, node) -> Expr:
         other = tr._scalar(node.expression if left_null else node.this)
         return (null & other) if isinstance(node, exp.And) else (null | other)
     if left_null and right_null:
-        return nullif(lit(1), lit(1))
+        return null()
     # A NULL of the other operand's type: `nullif(x, x)` is NULL for every row and
     # carries `x`'s type, which is what the operator's result type would have been.
     other = tr._scalar(node.expression if left_null else node.this)
@@ -138,26 +137,28 @@ def binop_with_null(tr, node) -> Expr:
 def typed_null(arrow_type) -> Expr:
     """A NULL literal typed to match `arrow_type` (the subquery's output column).
 
-    Built as `NULLIF(1, 1)` (a typed NULL of int) cast to the target type, so the
-    output schema matches DuckDB's — a scalar subquery yields a column of its own
-    type even when it produces no row.
+    The construction itself — a NULL that carries a type when the IR has no untyped null
+    — is `expr_ir.null`, in the neutral `plan` layer, because both front-ends need it and
+    a second copy here is exactly the duplication the layering rules forbid. This function
+    is only the Arrow-type-to-name mapping the SQL side needs on top of it, so the output
+    schema matches DuckDB's: a scalar subquery yields a column of its own type even when
+    it produces no row.
     """
     import pyarrow as pa
 
-    typed = nullif(lit(1), lit(1))
-    if pa.types.is_floating(arrow_type):
-        return Cast(typed, "float64")
+    for predicate, name in (
+        (pa.types.is_floating, "float64"),
+        (pa.types.is_boolean, "bool"),
+        (pa.types.is_date, "date"),
+        (pa.types.is_timestamp, "timestamp"),
+    ):
+        if predicate(arrow_type):
+            return null(name)
     if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
-        return Cast(typed, "string")
-    if pa.types.is_boolean(arrow_type):
-        return Cast(typed, "bool")
-    if pa.types.is_date(arrow_type):
-        return Cast(typed, "date")
-    if pa.types.is_timestamp(arrow_type):
-        return Cast(typed, "timestamp")
-    return typed  # integer (and any other) → the int-typed NULL
+        return null("string")
+    return null()  # integer (and any other) → the int-typed NULL
 
 
 def null_boolean() -> Expr:
-    """A NULL of boolean type. `lit(None)` has no type to give it, so NULLIF supplies one."""
-    return nullif(lit(True), lit(True))
+    """A NULL of boolean type. A bare NULL has no type to give it, so `null` supplies one."""
+    return null("bool")

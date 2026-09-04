@@ -130,11 +130,14 @@ print(fast.explain())
 
 :::{dropdown} The plan, on a session that has never run this query
 ```text
-sort                            est≈2,000 (default)
-  aggregate                     est≈2,000 (default)
-    project                     est≈20,000 (default)
-      filter                    est≈20,000 (default)
-        scan                    est≈200,000 (exact)
+query plan (planned)                                       5 operators
+──────────────────────────────────────────────────────────────────────
+OPERATOR                              ESTIMATE  NOTES
+sort  [total]                          est≈2,000  (default)
+└─ aggregate  [by country · sum]       est≈2,000  (default)
+   └─ project                         est≈20,000  (default)
+      └─ filter  [status = error]     est≈20,000  (default)
+         └─ scan  [source 0]         est≈200,000  (exact)  pushed[status = error]
 ```
 :::
 
@@ -159,16 +162,17 @@ print(run)
 
 :::{dropdown} The full per-operator report
 ```text
- op  kind             rows_in    rows_out        ms      out_kb  backend
-------------------------------------------------------------------------
-  0  sort                   2           2      0.02           0  interp
-  1  aggregate          20000           2      0.07           0  interp
-  2  project            20000       20000      2.03           0  interp+jit
-  3  filter            200000       20000      2.03           0  interp
-  4  scan              200000      200000      0.09        3964  interp
-------------------------------------------------------------------------
+OP  KIND       ROWS IN  ROWS OUT     TIME  OP SHARE       OUT  BACKEND
+──────────────────────────────────────────────────────────────────────
+ 0  sort             2         2     20µs  ░░░░░░  <1%    28 B  interp
+ 1  aggregate   20,000         2     70µs  ▏░░░░░   2%    28 B  interp
+ 2  project     20,000    20,000    2.0ms  ██▉░░░  48%  1.5 MiB  interp+jit
+ 3  filter     200,000    20,000    2.0ms  ██▉░░░  48%  1.5 MiB  interp
+ 4  scan       200,000   200,000     90µs  ▏░░░░░   2%  3.9 MiB  interp
+──────────────────────────────────────────────────────────────────────
 total: 12.58 ms, 2 rows out
-bottleneck: project (op 2), 16% of wall time — compute-bound (project)
+bottleneck: project (op 2), 48% of operator time — compute-bound (project)
+operators: 4.2ms of 12.6ms wall clock (33%); 8.4ms elsewhere (planning, optimization, admission, result assembly)
 ```
 :::
 
@@ -191,8 +195,17 @@ The projection sees 20,000 rows because the filter ran first. And its backend is
 `interp+jit`: the expression was compiled by Cranelift once and reused across every morsel,
 which is a thing that cannot happen to a Python callback.
 
-`run.bottleneck` names the operator that dominated wall time and `run.bottleneck_summary()`
-says whether the run was I/O-bound or compute-bound. That is where you look next.
+`run.bottleneck` names the operator that dominated the engine's own time and
+`run.bottleneck_summary()` says whether the run was I/O-bound or compute-bound. That is
+where you look next.
+
+Read the `operators:` line first, though. `total_ms` is the whole terminal call and the
+operators cover only the engine work inside it; the rest is planning, optimization,
+admission and building the Arrow result. On a query this size a third of the clock is
+operator work, which means the table is worth reading. When that share is a few percent —
+which is the common case on a small query — nothing in the table is what you were waiting
+for, and the fix is fewer, larger calls or a cached plan.
+`RunStats.wall_clock_summary()` is the same line for a script.
 
 ## 6. The estimate was wrong, and the engine noticed
 

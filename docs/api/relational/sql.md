@@ -50,6 +50,8 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} … AS …` and `DROP TABLE` register/unregister a lazy table in the session. |
+| DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO … USING … ON … WHEN …` rebind the target to its new state. |
+| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables` and `information_schema.columns` answer both in ANSI form. All come back as ordinary relations. |
 
 ### WHERE and GROUP BY
 
@@ -177,6 +179,41 @@ print(out.to_pydict())
 `AVG`, `STDDEV`, `VAR`, the quantiles, and a second `COUNT(DISTINCT ...)` over a *different*
 column cannot: an average needs a sum and a count, which one column cannot carry. Those raise
 rather than approximate. Compute them in a separate subquery and join.
+
+#### Which aggregates take a DISTINCT argument
+
+That constraint is about the *other* aggregates in the query. The aggregate wearing the
+`DISTINCT` has a separate and simpler rule: it needs one input column, because the dedup
+replaces that column and there is nothing to redirect otherwise. Every single-input
+aggregate qualifies:
+
+`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `MEDIAN`, `STDDEV_SAMP`, `VAR_SAMP`, `BIT_AND`,
+`BIT_OR`, `BIT_XOR`, `KURTOSIS`, `SKEWNESS`, `APPROX_COUNT_DISTINCT`, `PRODUCT`,
+`ENTROPY`, `MAD`, `ANY_VALUE`, and `QUANTILE_CONT`.
+
+```python
+readings = bt.from_pydict({"site": ["a", "a", "a", "b"], "code": [2, 2, 5, 3]})
+
+out = bt.sql(
+    """
+    SELECT site, BIT_OR(DISTINCT code) AS mask, PRODUCT(DISTINCT code) AS p
+    FROM readings GROUP BY site ORDER BY site
+    """,
+    readings=readings,
+)
+print(out.to_pydict())
+# {'site': ['a', 'b'], 'mask': [7, 3], 'p': [10.0, 3.0]}
+```
+
+Three decline, and they are the *composite* aggregates — each is built from several
+aggregates over more than one input, so no single column carries the dedup: `STDDEV_POP`,
+`VAR_POP`, and `SEM`. So do the two-input aggregates (`CORR`, `COVAR_*`, the `REGR_*`
+family, `ARG_MIN`/`ARG_MAX`). Each raises naming itself, and the rewrite that does work is
+to deduplicate in a subquery first:
+
+```sql
+SELECT site, STDDEV_POP(code) FROM (SELECT DISTINCT site, code FROM readings) GROUP BY site
+```
 
 (subqueries)=
 ### Subqueries
@@ -381,15 +418,10 @@ print(out.to_pydict())
 
 Settings there go in the trailing `STRUCT`, as `ML.PREDICT(MODEL m, TABLE t, STRUCT('score' AS output_column))`.
 
-## Defining tables and views with SQL
+## Statements that change or describe the catalog
 
-`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a **lazy** dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
-
-```python
-s.sql("CREATE VIEW big_events AS SELECT id, amount FROM events WHERE amount > 25")
-print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
-# {'id': [3, 4, 5], 'amount': [30.0, 40.0, 50.0]}
-```
+`CREATE`, `DROP`, `MERGE INTO`, `SHOW TABLES`, `DESCRIBE` and `information_schema` are on
+their own page: see {doc}`SQL statements </api/relational/sql-statements>`.
 
 ## Binding the current dataset
 

@@ -71,8 +71,8 @@ def enforce(
             >>> governed, events = enforce(Scan(0, schema), ["people"], analyst, catalog)
             >>> events[0].masked
             ('ssn',)
-            >>> governed.items[1].expr  # `ssn` is read through the mask, at the scan
-            col('ssn').cast('string').str.mask('X', 0, 4)
+            >>> governed.items[1].expr  # doctest: +ELLIPSIS
+            when(...).otherwise(col('ssn').cast('string').str.mask('X', 0, 4))
 
     Args:
         plan: The plan to govern.

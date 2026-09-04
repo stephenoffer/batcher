@@ -419,6 +419,7 @@ impl Writer {
 }
 
 /// Serialize to little-endian WKB, without an SRID (the portable spelling).
+#[must_use]
 pub fn write_wkb(g: &Geom) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(32 + 16 * g.num_points()),
@@ -429,6 +430,7 @@ pub fn write_wkb(g: &Geom) -> Vec<u8> {
 }
 
 /// Serialize to little-endian EWKB, carrying the SRID when one is set.
+#[must_use]
 pub fn write_ewkb(g: &Geom) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(36 + 16 * g.num_points()),
@@ -440,12 +442,13 @@ pub fn write_ewkb(g: &Geom) -> Vec<u8> {
 
 /// Lowercase hex of the EWKB encoding — the spelling PostGIS's text protocol uses,
 /// and the one a geometry survives being pasted into a SQL client as.
+#[must_use]
 pub fn write_hex_wkb(g: &Geom) -> String {
     let bytes = write_ewkb(g);
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble is < 16"));
-        s.push(char::from_digit((b & 0xf) as u32, 16).expect("nibble is < 16"));
+        s.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble is < 16"));
+        s.push(char::from_digit(u32::from(b & 0xf), 16).expect("nibble is < 16"));
     }
     s
 }
@@ -522,7 +525,7 @@ mod tests {
         let mut g = Geom::new(Geometry::Point(Some(Coord::new_z(1.0, 2.0, 3.0))));
         g.has_z = true;
         roundtrip(g.clone());
-        let back = read_wkb(&write_ewkb(&g.clone().with_srid(3857))).unwrap();
+        let back = read_wkb(&write_ewkb(&g.with_srid(3857))).unwrap();
         assert!(back.has_z);
         assert_eq!(back.srid, 3857);
         assert_eq!(back.coords()[0].z, 3.0);

@@ -69,6 +69,33 @@ class IteratorSource:
         """
         return self._bounded
 
+    @property
+    def node_local(self) -> bool:
+        """Always True — the factory is a callable in *this* process and nowhere else.
+
+        `api.terminal.routing` reads this to decide whether an unknown-size source may be
+        scanned by workers on other machines. A generator has no address another node can
+        resolve: `splits()` returns one `WholeSourceSplit` precisely because a Python
+        iterator cannot be sliced, so distributing this source hands every row to a single
+        remote reader and then ships it back through the driver that produced it. That is
+        the resident-data case `InMemorySource.resident` already declines, arrived at by a
+        different route — the rows are not materialized here, but they still pass through
+        this process on their way anywhere.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import IteratorSource
+                >>> schema = pa.schema([("x", pa.int64())])
+                >>> IteratorSource(lambda: iter([]), schema).node_local
+                True
+
+        Returns:
+            True. A factory is reachable only from the process that holds it.
+        """
+        return True
+
     def schema(self) -> pa.Schema:
         """The schema declared up front — the data is never scanned to infer it.
 

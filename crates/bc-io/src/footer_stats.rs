@@ -531,12 +531,11 @@ fn agrees_on_sort_key(rg: &RowGroupMetaData, sort_key: &mut Option<(i32, bool)>)
         return false;
     };
     let declared = (first.column_idx, first.descending);
-    match sort_key {
-        Some(existing) => *existing == declared,
-        None => {
-            *sort_key = Some(declared);
-            true
-        }
+    if let Some(existing) = sort_key {
+        *existing == declared
+    } else {
+        *sort_key = Some(declared);
+        true
     }
 }
 

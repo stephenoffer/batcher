@@ -59,7 +59,7 @@ def clean_node(monkeypatch):
             "errors": {},
         },
     )
-    monkeypatch.setattr("batcher._internal.hardware.fabric.fabric_error_total", lambda: {})
+    monkeypatch.setattr("batcher._internal.hardware.fabric.fabric_error_total", dict)
     monkeypatch.setattr(
         "batcher._internal.hardware.fabric.rdma_summary",
         lambda: {

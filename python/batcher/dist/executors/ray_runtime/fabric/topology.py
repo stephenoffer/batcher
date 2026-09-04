@@ -29,8 +29,10 @@ from dataclasses import dataclass
 __all__ = [
     "FABRIC_LABEL",
     "LINK_CLASSES",
+    "ON_DEMAND",
     "POWER_ZONE_LABEL",
     "RACK_LABEL",
+    "SPOT",
     "GpuNodeTopology",
     "devices_of_class",
     "domain_groups",
@@ -39,6 +41,7 @@ __all__ = [
     "interconnect_class",
     "is_preemptible",
     "largest_local_domain",
+    "market_type",
     "node_zone",
     "nvlink_domain_size",
     "topology_summary",
@@ -57,6 +60,10 @@ POWER_ZONE_LABEL = "batcher.io/power-zone"
 #: Zone and region labels, most specific first. The Kubernetes topology labels are read before
 #: Ray's own because on a managed cluster they are already set by the cloud provider.
 _ZONE_LABELS = ("topology.kubernetes.io/zone", "ray.io/availability-zone")
+
+#: The same names as a set, for the O(1) membership test the per-node
+#: classification uses before falling into the ordered loop.
+_ZONE_LABEL_SET = frozenset(_ZONE_LABELS)
 _REGION_LABELS = ("topology.kubernetes.io/region", "ray.io/region")
 
 #: Labels naming how a node was purchased. Ray's own key first, then the three the major
@@ -69,8 +76,75 @@ _MARKET_LABELS = (
     "eks.amazonaws.com/capacityType",
     "cloud.google.com/gke-spot",
 )
+
+#: The same names as a set, for the O(1) membership test the per-node
+#: classification uses before falling into the ordered loop.
+_MARKET_LABEL_SET = frozenset(_MARKET_LABELS)
 #: What those labels say when the node can be reclaimed. `"true"` covers GKE's boolean spelling.
 _PREEMPTIBLE_VALUES = frozenset({"spot", "preemptible", "true"})
+#: What they say when it cannot. `"false"` is again GKE's spelling, and it only ever appears
+#: on a fleet where something set `cloud.google.com/gke-spot` explicitly — GKE omits the label
+#: on on-demand nodes rather than setting it false, which is why label *absence* is read as no
+#: opinion below rather than as on-demand.
+_ON_DEMAND_VALUES = frozenset({"on-demand", "on_demand", "ondemand", "regular", "false"})
+
+#: The two market types a node can be classified into. `""` is the third answer and the
+#: default: an unlabelled node has no market type, which is not the same as being on-demand.
+SPOT = "spot"
+ON_DEMAND = "on-demand"
+
+#: Returned unconditionally for a node carrying none of `_MARKET_LABELS`, which on most fleets
+#: is every node. A module constant rather than a fresh tuple so the per-node classification
+#: pass allocates nothing in its common case — the same reason the membership tests exist.
+_NO_MARKET = ("", "")
+
+
+def _market_scan(labels: dict) -> tuple[str, str]:
+    """`(label_key, raw_value)` for the first market label the node carries, else `("", "")`.
+
+    The shared half of `is_preemptible` and `market_type`: one statement of which label keys
+    name a node's purchase mode and in what order they are believed. Restating that order at
+    two call sites is how the two would come to disagree about a fleet.
+    """
+    # The membership test first: an unlabelled node is the common case and the whole fleet is
+    # walked per query, so deciding it in C beats a Python loop over the label names.
+    if not labels.keys() & _MARKET_LABEL_SET:
+        return _NO_MARKET
+    for name in _MARKET_LABELS:
+        value = labels.get(name)
+        if value:
+            return name, str(value).strip().lower()
+    return _NO_MARKET
+
+
+def market_type(labels: dict) -> tuple[str, str]:
+    """`(label_key, market_type)` for a node's purchase mode, or `("", "")` when unlabelled.
+
+    The key comes back with the value for the reason `node_zone` states: a fleet pinned to
+    on-demand capacity has to be selected on the label that actually carries it, and a KubeRay
+    cluster labelled by Karpenter answers nothing to a selector on `ray.io/market-type`.
+
+    The value is normalized to `SPOT` or `ON_DEMAND` so a caller compares against a constant
+    rather than against each provisioner's spelling — `"SPOT"`, `"spot"` and GKE's `"true"` are
+    one answer here. A label carrying a value in neither vocabulary reports the key with an
+    empty value, which reads as "labelled, but not in a way this knows how to use".
+
+    Args:
+        labels: A Ray node record's `Labels` mapping.
+
+    Returns:
+        The matched label key and the normalized market type, both `""` when no market label
+        is present. `("", "")` means *no opinion*, never on-demand.
+    """
+    key, value = _market_scan(labels)
+    if not key:
+        return _NO_MARKET
+    if value in _PREEMPTIBLE_VALUES:
+        return key, SPOT
+    if value in _ON_DEMAND_VALUES:
+        return key, ON_DEMAND
+    return key, ""
+
 
 #: Interconnect tiers, fastest first. The order is the whole contract: a caller ranks candidate
 #: placements by the index of their class, and the specific numbers behind each tier vary by
@@ -139,11 +213,7 @@ def is_preemptible(labels: dict) -> bool:
     Returns:
         True when a market-type label says spot, preemptible, or (GKE's spelling) true.
     """
-    for name in _MARKET_LABELS:
-        value = labels.get(name)
-        if value and str(value).strip().lower() in _PREEMPTIBLE_VALUES:
-            return True
-    return False
+    return market_type(labels)[1] == SPOT
 
 
 def node_zone(labels: dict) -> tuple[str, str]:
@@ -161,6 +231,8 @@ def node_zone(labels: dict) -> tuple[str, str]:
     Returns:
         The matched label key and its value, both `""` when no zone label is present.
     """
+    if not labels.keys() & _ZONE_LABEL_SET:
+        return "", ""
     for name in _ZONE_LABELS:
         value = labels.get(name)
         if value:

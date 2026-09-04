@@ -39,14 +39,20 @@ def _ray_session():
 
 
 @pytest.fixture(scope="module")
-def hive_table(tmp_path_factory) -> str:
+def hive_table(cluster_scratch) -> str:
     """Twelve ``day=`` directories over three ``region`` values and repeating ``g`` values.
 
     Twelve is deliberately above the four-worker fleet: below it the scheduler keeps the
     shuffle rather than trade the layout's parallelism away, so the path under test would
     never run.
+
+    Built under `cluster_scratch` rather than `tmp_path_factory`: a partition-aligned
+    scan is read by the workers themselves, so a driver-local path resolves on the driver
+    and nowhere else. On a multi-node cluster that reads back as `FileNotFoundError` from
+    inside a Ray task, which looks like an engine defect and is not one. See
+    `tests/conftest.py::cluster_scratch`.
     """
-    root = tmp_path_factory.mktemp("hive_aligned")
+    root = cluster_scratch("hive_aligned")
     for day in range(12):
         n = 200 + day
         table = pa.table(
@@ -240,15 +246,21 @@ def test_a_window_partitioned_by_a_non_partition_column_matches_single_node(hive
 
 
 @pytest.fixture(scope="module")
-def delta_table(tmp_path_factory) -> str:
+def delta_table(cluster_scratch) -> str:
     """Six ``day`` partitions written in three appends, so each holds three data files.
 
     A Delta read splits per data *file*, so this is the shape whose co-location comes from
     grouping the splits rather than from the split set being distinct — and it is the shape
     every real lakehouse table has.
+
+    Built under `cluster_scratch` rather than `tmp_path_factory`: a partition-aligned
+    scan is read by the workers themselves, so a driver-local path resolves on the driver
+    and nowhere else. On a multi-node cluster that reads back as `FileNotFoundError` from
+    inside a Ray task, which looks like an engine defect and is not one. See
+    `tests/conftest.py::cluster_scratch`.
     """
     pytest.importorskip("deltalake", reason="deltalake not installed")
-    root = str(tmp_path_factory.mktemp("delta_aligned"))
+    root = str(cluster_scratch("delta_aligned"))
     for append in range(3):
         table = pa.table(
             {
@@ -335,7 +347,7 @@ def test_the_elimination_is_reported_as_a_decision(hive_table):
 
 
 @pytest.fixture(scope="module")
-def awkward_table(tmp_path_factory) -> str:
+def awkward_table(cluster_scratch) -> str:
     """A partitioned table built out of the shapes that break assumptions.
 
     Ten partitions covering: a NULL partition value (Hive writes it as a sentinel directory
@@ -346,7 +358,7 @@ def awkward_table(tmp_path_factory) -> str:
     fleet has workers, or the scheduler keeps its shuffle and the test silently stops covering
     the path it is named for.
     """
-    root = str(tmp_path_factory.mktemp("awkward"))
+    root = str(cluster_scratch("awkward"))
     days = [None, 1, 1, 2, 2, 2, 3, 4, 4, 5, 6, 6, 6, 7, 8, 9]
     table = pa.table(
         {
@@ -419,11 +431,11 @@ def test_a_computed_group_key_beside_the_partition_column_is_still_aligned(awkwa
     assert single == distrib
 
 
-def test_a_string_partition_column_matches_single_node(tmp_path_factory):
+def test_a_string_partition_column_matches_single_node(cluster_scratch):
     """Directory names *are* strings, so a string partition column is the case where the
     typed-value comparison and the raw one agree — worth pinning, because the int case is the
     one where they can differ."""
-    root = str(tmp_path_factory.mktemp("string_part"))
+    root = str(cluster_scratch("string_part"))
     table = pa.table(
         {
             "region": pa.array([f"r{i % 6}" for i in range(120)]),
@@ -468,7 +480,7 @@ def test_count_distinct_grouped_by_a_non_partition_column_matches_single_node(hi
 
 
 @pytest.fixture(scope="module")
-def iceberg_table(tmp_path_factory):
+def iceberg_table(cluster_scratch):
     """Six ``day`` partitions written in three appends: eighteen data files, six partitions."""
     pytest.importorskip("pyiceberg", reason="pyiceberg not installed")
     from pyiceberg.catalog.sql import SqlCatalog
@@ -477,7 +489,7 @@ def iceberg_table(tmp_path_factory):
     from pyiceberg.transforms import IdentityTransform
     from pyiceberg.types import LongType, NestedField
 
-    warehouse = tmp_path_factory.mktemp("ice_dist") / "wh"
+    warehouse = cluster_scratch("ice_dist") / "wh"
     warehouse.mkdir()
     spec = {
         "type": "sql",

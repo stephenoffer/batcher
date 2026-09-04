@@ -12,7 +12,7 @@ import pyarrow as pa
 
 from registry import suite
 
-from .base import sql_fanout, with_native
+from .base import ray_to_arrow, sql_fanout, with_native
 
 if TYPE_CHECKING:
     from context import Context
@@ -45,7 +45,7 @@ def sort_limit(ctx: Context):
             ["l_extendedprice", "l_orderkey", "l_linenumber"],
             descending=[True, False, False],
         )
-        return pa.Table.from_pandas(ordered.limit(100).to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered.limit(100))
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -70,7 +70,7 @@ def sort_string(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_comment"]).sort(["l_comment"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -91,7 +91,7 @@ def sort_string_lowcard(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_shipmode"]).sort(["l_shipmode"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -123,7 +123,33 @@ def sort_string_limit(ctx: Context):
     def ray(rd) -> pa.Table:
         cols = rd.select_columns(["l_comment", "l_orderkey", "l_linenumber"])
         ordered = cols.sort(["l_comment", "l_orderkey", "l_linenumber"])
-        return pa.Table.from_pandas(ordered.limit(100).to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered.limit(100))
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
+
+
+@ordering.case("op-sort-float", ordered_by="l_extendedprice")
+def sort_float(ctx: Context):
+    """Full sort on a single `Float64` key — the one fixed-width type with no narrow range.
+
+    Every other fixed-width case here sorts an integer or a temporal, whose live range is far
+    narrower than its type and whose radix therefore runs three counting passes rather than
+    eight. A float has no such range: its rank spans all 64 bits by construction, so it is the
+    only fixed-width key for which the sort's cost is the *whole* key width.
+
+    That is a different shape, and the suite had no case for it while carrying two multi-key
+    ones. It was measured at **3.15x DuckDB** the first time anybody looked, with the sort
+    falling past both fast paths onto arrow's two-column comparator — exactly the invisibility
+    `op-sort-multikey-narrow` describes, one type over.
+    """
+    sql = "SELECT l_extendedprice FROM lineitem ORDER BY l_extendedprice"
+
+    def pyarrow(t: pa.Table) -> pa.Table:
+        cols = t.select(["l_extendedprice"])
+        return cols.sort_by([("l_extendedprice", "ascending")])
+
+    def ray(rd) -> pa.Table:
+        return ray_to_arrow(rd.select_columns(["l_extendedprice"]).sort(["l_extendedprice"]))
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -149,7 +175,7 @@ def sort_multikey_narrow(ctx: Context):
 
     def ray(rd) -> pa.Table:
         ordered = rd.select_columns(["l_shipdate", "l_suppkey"]).sort(["l_shipdate", "l_suppkey"])
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
@@ -172,6 +198,6 @@ def sort_multikey_wide(ctx: Context):
         ordered = rd.select_columns(["l_partkey", "l_extendedprice"]).sort(
             ["l_partkey", "l_extendedprice"], descending=[True, False]
         )
-        return pa.Table.from_pandas(ordered.to_pandas(), preserve_index=False)
+        return ray_to_arrow(ordered)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)

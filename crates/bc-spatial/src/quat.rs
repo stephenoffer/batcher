@@ -66,6 +66,7 @@ const SLERP_LINEAR_ABOVE: f64 = 1.0 - 1e-9;
 
 impl Quat {
     /// The quaternion with the given components, in `(x, y, z, w)` order.
+    #[must_use]
     pub const fn new(x: f64, y: f64, z: f64, w: f64) -> Self {
         Self { x, y, z, w }
     }
@@ -78,12 +79,14 @@ impl Quat {
     /// A rotation has length one. How far a logged quaternion has drifted from that is
     /// worth measuring directly, which is why this is exposed rather than kept private
     /// to `normalize`.
+    #[must_use]
     pub fn norm(self) -> f64 {
         (self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w).sqrt()
     }
 
     /// The same rotation as a unit quaternion, or `None` when there is no rotation to
     /// recover because every component is zero.
+    #[must_use]
     pub fn normalize(self) -> Option<Self> {
         let n = self.norm();
         // `is_finite` first so a NaN component is rejected by the check that is defined
@@ -98,6 +101,7 @@ impl Quat {
     ///
     /// For a unit quaternion this is the inverse rotation. For a non-unit one it is
     /// not, which is why `inverse` exists separately.
+    #[must_use]
     pub fn conjugate(self) -> Self {
         Self::new(-self.x, -self.y, -self.z, self.w)
     }
@@ -117,6 +121,7 @@ impl Quat {
     /// Uses the two-cross-product form rather than the literal `q * v * q_conj`
     /// sandwich: it is the same result in about half the multiplications, which matters
     /// because this is the function a lidar sweep calls once per point.
+    #[must_use]
     pub fn rotate(self, v: Vec3) -> Option<Vec3> {
         let q = self.normalize()?;
         let qv = Vec3::new(q.x, q.y, q.z);
@@ -129,6 +134,7 @@ impl Quat {
     /// The direction a world-frame measurement travels to reach a sensor frame, and
     /// common enough to deserve its own name rather than an `inverse` call the caller
     /// has to remember to make.
+    #[must_use]
     pub fn inverse_rotate(self, v: Vec3) -> Option<Vec3> {
         self.inverse()?.rotate(v)
     }
@@ -138,6 +144,7 @@ impl Quat {
     /// Computed from `atan2` of the vector and scalar parts rather than from
     /// `2 * acos(w)`, because `acos` loses roughly half its significant digits for the
     /// small angles that dominate real pose data.
+    #[must_use]
     pub fn angle(self) -> Option<f64> {
         let q = self.normalize()?;
         let vec_norm = Vec3::new(q.x, q.y, q.z).norm();
@@ -150,6 +157,7 @@ impl Quat {
     /// This is the geodesic distance on the rotation group and the honest way to say
     /// "how wrong was this orientation estimate". Component-wise differences are not,
     /// because `q` and `-q` are the same rotation.
+    #[must_use]
     pub fn angular_distance(self, other: Self) -> Option<f64> {
         let a = self.normalize()?;
         let b = other.normalize()?;
@@ -183,6 +191,7 @@ impl Quat {
     /// `t` is not clamped. Outside `[0, 1]` this extrapolates along the same great
     /// circle, which is what you want when a measurement's timestamp falls just past
     /// the last pose and is a mistake worth being able to make deliberately.
+    #[must_use]
     pub fn slerp(self, other: Self, t: f64) -> Option<Self> {
         let a = self.normalize()?;
         let b = other.normalize()?;
@@ -218,6 +227,7 @@ impl Quat {
     }
 
     /// The rotation these intrinsic Z-Y-X angles describe.
+    #[must_use]
     pub fn from_euler(e: Euler) -> Self {
         let (sr, cr) = (e.roll * 0.5).sin_cos();
         let (sp, cp) = (e.pitch * 0.5).sin_cos();
@@ -236,6 +246,7 @@ impl Quat {
     /// are not separately determined. This reports roll as zero there and puts the
     /// whole remaining rotation into yaw, which keeps the function single-valued at the
     /// cost of not round-tripping the angles you may have started with.
+    #[must_use]
     pub fn to_euler(self) -> Option<Euler> {
         let q = self.normalize()?;
         // The middle angle first: it is the one that decides whether the other two are
@@ -272,6 +283,7 @@ impl Quat {
     /// A matrix that is not a rotation is not detected. Feeding one in produces a
     /// quaternion that is the nearest rotation in no particular sense.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn from_rotation_matrix(
         m00: f64,
         m01: f64,

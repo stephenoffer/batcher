@@ -345,6 +345,23 @@ class DeltaSource:
                 ref = "latest"
         return f"delta:{self._table_uri}@{ref}"
 
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: the table URI.
+
+        Distinct from `identity`, which names a *relation* and so carries the resolved table
+        *version* — a
+        relation's statistics must not be handed to a different relation. A policy is
+        written about the **table**, before anyone has read it and without knowing which
+        version they will land on. Reading the table name off the identity meant a policy
+        on ``/data/orders`` never fired on a read of it, whose identity is ``/data/orders@7``
+        matched nothing, and an ungoverned read of a governed table raises
+        nothing to say so.
+
+        Returns:
+            The table name a policy is keyed on.
+        """
+        return self._table_uri
+
     def clustering_columns(self) -> tuple[str, ...]:
         """The columns this table's splits will hold constant, from the already-replayed log.
 

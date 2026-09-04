@@ -394,6 +394,37 @@ class MemoryConfig:
     # caching never grows the process without bound. Opt-in per dataset, so this only
     # bounds what an explicitly-cached plan may retain.
     result_cache_max_bytes: int = 256 << 20  # 256 MiB
+    # On-disk byte budget for the result cache's second tier, under `StorageLevel`s that
+    # allow disk. What the memory budget evicts is written here instead of dropped, so a
+    # working set larger than `result_cache_max_bytes` costs a read-back rather than a full
+    # recompute. Scratch, not durable: it lives beside the spill files (`spill_dir`, or the
+    # node's measured local volume), overflows to `spill_remote_uri` when local disk fills,
+    # and is removed at process exit. `0` turns the tier off, which makes every level
+    # behave as `MEMORY_ONLY`.
+    #
+    # Defaults to 4 GiB rather than to zero: the tier costs nothing until something is
+    # demoted (no directory is even created), and a cache whose only answer to a full
+    # budget is to forget is the shape of cache that cannot help the workload that asked
+    # for one. A node with no writable scratch resolves this to no tier at all.
+    result_cache_disk_max_bytes: int = 4 << 30  # 4 GiB
+    # Opt-in *shared* result cache: a store outside this process that a second driver, a
+    # Ray worker, or tomorrow's run can read. `None` (the default) keeps every cached
+    # result process-local. The scheme picks the backend:
+    #
+    #   redis:// · rediss:// · unix://   a server, shared across processes and nodes
+    #   rocksdb://<path> or a bare path  an embedded database, one node, across runs
+    #
+    # A result is written here only when **every** input has a durable identity *and* a
+    # content version (`Source.stats_version`), because a shared entry outlives the run
+    # that made it and a rewritten table would otherwise serve the previous run's rows.
+    # In-memory data therefore never shares, and a source that cannot version itself
+    # declines rather than risking it. A store that is unreachable degrades to recompute.
+    shared_cache_uri: str | None = None
+    # Expiry applied to every shared-cache write, in seconds. The content version in the
+    # key already invalidates an entry when its inputs change, so this bounds staleness
+    # only where that token is coarser than the data — and bounds the store's growth when
+    # nobody configured an eviction policy on it. `0` writes entries without an expiry.
+    shared_cache_ttl_seconds: int = 24 * 60 * 60  # 1 day
     # Local-SSD read-through cache for remote (S3/GCS/Azure) file bytes — the engine's
     # Disk-Cache analog. `None` (default) disables it; set a directory to cache fetched
     # remote files there, byte-bounded to `file_cache_max_bytes` with LRU eviction. It
@@ -661,6 +692,21 @@ class FlowControlConfig:
     # is the actual buffering governor; this only caps how many peers are dialed at once,
     # so a thousand-mapper shuffle still can't open a thousand sockets.
     shuffle_fetch_fan_in: int = 32
+    # Concurrent Flight streams a reducer runs across *all* its peers, and the decoded
+    # bytes those streams may hold between them. Together they replace what the fan-in
+    # settings above were being asked to decide by accident: a hash shuffle cuts one bucket
+    # per reducer out of every mapper, so a cluster of W workers makes W^2 buckets and each
+    # shrinks as it grows -- and one stream per bucket made the transfer's rate a function of
+    # the cluster's width rather than of the link. Measured across one 25 Gbps link, 1.4 GiB
+    # with only the bucket count varying: 4,096 buckets moved at 1,608 MiB/s against 7,470 at
+    # the same total when the stream count landed right. Holding the stream count fixed and
+    # packing buckets into streams by *bytes* is what makes the rate width-independent; the
+    # byte budget is then the gather's real memory bound, where a bucket count is not one.
+    # Both are clamped by the engine rather than validated here (a stream target below 1
+    # and a budget below a megabyte per stream are floored), which is how the neighbouring
+    # fan-in knobs are treated too.
+    gather_streams: int = 48
+    gather_inflight_bytes: int = 768 << 20  # 768 MiB across every stream
     aimd_alpha: int = 1  # additive increase: +1 credit / RTT
     aimd_beta: float = 0.5  # multiplicative decrease on congestion
     backpressure_high: float = 0.70
@@ -1885,6 +1931,41 @@ class DistributedConfig:
     heterogeneous_node_isolation: bool = False
     # The custom resource CPU-only nodes advertise for `heterogeneous_node_isolation`.
     cpu_node_resource: str = "cpu_node"
+    # Place each stage on the capacity its failure model fits: recomputable work on spot,
+    # state-holding work on on-demand.
+    #
+    # A stateless map partition is its own lineage — it re-derives idempotently from a durable
+    # partition descriptor, which is why the map barrier resubmits one after a preemption
+    # instead of failing the stage. A shuffle worker is not: it holds accumulated partial
+    # state and the mapped output its peers will fetch, so reclaiming it costs the stage. On a
+    # mixed fleet those two belong on different capacity, and Ray can say so — `label_selector`
+    # holds a task to nodes carrying a market-type label and `fallback_strategy` names where it
+    # goes when that market is full, so the preference degrades instead of pending.
+    #
+    # Off by default because it is a placement change that can only be measured on a genuinely
+    # mixed spot/on-demand fleet, which no test lane here has. When on, it is still a no-op
+    # unless the live fleet is mixed *and* labelled under one market-type label key
+    # (`fabric.market.capacity_selector` states every gate) — so an unlabelled, single-market,
+    # or single-node cluster is unchanged whatever this says. Result-identical either way:
+    # placement never changes which rows a task processes.
+    capacity_aware_placement: bool = False
+    # Whether each task reports its lifecycle to Ray's dashboard and State API.
+    #
+    # Ray emits a running/finished event per task to the GCS so `ray list tasks`, the Ray
+    # Dashboard and the State API can show it. That is worth paying for at ordinary fan-out and
+    # stops being worth it at Batcher's: a stage of a hundred thousand partitions puts a
+    # hundred thousand events onto a control plane every driver in the fleet shares, to
+    # populate a task table nobody can read at that size. `"auto"` (the default) keeps the
+    # events on for any stage at or below `task_events_fanout_cap` tasks and turns them off
+    # above it; `"always"` and `"never"` pin the answer.
+    #
+    # This is an **observability** trade, not a scheduling one — the tasks run identically
+    # either way, they simply stop appearing in the task table — which is why the default
+    # engages only where the table has already stopped being useful. The cap is a chosen
+    # default rather than a measured breakpoint; Batcher's own progress reporting
+    # (`observe/`) is unaffected, since it reads the engine's event bus and not Ray's.
+    task_events: str = "auto"
+    task_events_fanout_cap: int = 10_000
     # Reserve a shuffle fleet's placement group inside ONE availability zone when the cluster
     # spans several and one of them can host the whole fleet.
     #
@@ -2109,6 +2190,26 @@ class ObservabilityConfig:
     # the host app configured (Batcher owns no exporter). Uses the same measured profile
     # as the event log, so turning it on adds only the span emit, not extra measurement.
     otel_traces: bool = False
+    # Emit an OpenLineage run event per query (START before execution, COMPLETE/FAIL after),
+    # carrying the column-level lineage `governance.lineage` already computes. Off by
+    # default; needs `openlineage_url` (or the standard ``OPENLINEAGE_URL``) to name a
+    # receiver. Batcher owns no client: the event is POSTed to OpenLineage's HTTP transport
+    # off a bounded background queue, so a slow backend costs a dropped event, never latency.
+    openlineage: bool = False
+    # The lineage receiver's base URL, e.g. ``http://marquez:5000``. Empty → read
+    # ``OPENLINEAGE_URL``, which is the variable every other OpenLineage integration in a
+    # platform already sets; a second name meaning the same thing is how the two drift.
+    openlineage_url: str = ""
+    # The namespace jobs and datasets are recorded under. One namespace per environment is
+    # the convention (``prod``, ``staging``), not one per job.
+    openlineage_namespace: str = "batcher"
+    # Bearer token for the receiver. Empty → read ``OPENLINEAGE_API_KEY``. Accepts a
+    # ``env:``/``file:``/``cmd:`` secret reference for the same reason every other
+    # credential here does.
+    openlineage_api_key: str = ""
+    # Per-request timeout, in seconds, for the lineage POST. Bounds how long the drain
+    # thread can be held by an unresponsive receiver; it never bounds a query.
+    openlineage_timeout_s: float = 5.0
     # Directory for event-log documents. Empty → ``$BATCHER_HOME/logs`` (or
     # ``~/.batcher/logs``), resolved at write time so `config` stays free of filesystem I/O.
     event_log_dir: str = ""

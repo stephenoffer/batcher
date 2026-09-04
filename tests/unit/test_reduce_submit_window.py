@@ -267,3 +267,103 @@ def test_an_empty_gather_launches_nothing(monkeypatch):
     from batcher.dist.executors.ray_runtime import gather_in_windows
 
     assert gather_in_windows(lambda i: None, [], workers=4) == []
+
+
+# ---- the window must SLIDE, not step -----------------------------------------------------
+
+
+def _install_serial_ray(monkeypatch):
+    """A `ray` whose `wait` settles exactly one ref per call, in launch order.
+
+    The fake above returns every pending ref from a single `wait`, which is the one shape
+    that cannot tell a sliding window from a chunked barrier: if everything settles at once
+    the two launch identically. Settling one at a time is what makes the refill observable.
+    """
+    exc = types.ModuleType("ray.exceptions")
+
+    class RayError(Exception):
+        pass
+
+    exc.RayError = exc.RayTaskError = exc.RayActorError = RayError
+
+    def wait(pending, num_returns=1, timeout=None):
+        return list(pending[:1]), list(pending[1:])
+
+    ray_mod = types.ModuleType("ray")
+    ray_mod.exceptions = exc
+    ray_mod.get = lambda ref: [r() for r in ref] if isinstance(ref, list) else ref()
+    ray_mod.wait = wait
+    ray_mod.cancel = lambda ref, **kw: None
+    ray_mod.kill = lambda actor: None
+    monkeypatch.setitem(sys.modules, "ray", ray_mod)
+    monkeypatch.setitem(sys.modules, "ray.exceptions", exc)
+
+
+def _trace_gather(monkeypatch, n_items, workers):
+    """Run a windowed gather over `n_items`, returning the interleaved launch/settle log."""
+    _install_serial_ray(monkeypatch)
+    from batcher.dist.executors.ray_runtime import gather_in_windows
+
+    log: list[tuple[str, int]] = []
+
+    def launch(i):
+        log.append(("launch", i))
+
+        def finish(i=i):
+            log.append(("settle", i))
+            return i
+
+        return finish
+
+    out = gather_in_windows(launch, list(range(n_items)), workers=workers)
+    assert out == list(range(n_items)), "order is the contract, whatever completion order was"
+    return log
+
+
+def test_a_windowed_gather_refills_on_each_completion(monkeypatch, narrow_window):
+    """One completion must free exactly one slot — the map barrier's `_fill` behaviour.
+
+    Chunked, the window is a *barrier*: items 0-3 all settle before item 4 is launched, so
+    the stage serializes behind its slowest task once per chunk. Sliding, item 4 launches
+    the moment item 0 lands. The distinguishing observation is where `launch 4` sits
+    relative to `settle 1`, and nothing about the returned results can see the difference —
+    which is why this is asserted on the launch log rather than on the output.
+    """
+    log = _trace_gather(monkeypatch, n_items=12, workers=1)  # window == 4 via `narrow_window`
+
+    assert log[:4] == [("launch", i) for i in range(4)], "the window fills before any wait"
+    launch_4 = log.index(("launch", 4))
+    settle_0 = log.index(("settle", 0))
+    settle_1 = log.index(("settle", 1))
+    assert settle_0 < launch_4, "a slot has to free before it can be refilled"
+    assert launch_4 < settle_1, (
+        "item 4 waited for the whole first chunk to drain — that is a barrier, not a window"
+    )
+
+
+def test_a_windowed_gather_holds_the_window_full_until_the_work_runs_out(
+    monkeypatch, narrow_window
+):
+    """The point of sliding: the stage stays `window`-deep instead of sawtoothing to empty.
+
+    A chunked gather drains to zero outstanding at every chunk boundary, which on a real
+    cluster is `window` idle actors waiting on one straggler. Reconstructing the outstanding
+    count from the log pins that it never drops below the window while items remain.
+    """
+    log = _trace_gather(monkeypatch, n_items=12, workers=1)
+
+    outstanding = 0
+    launched = 0
+    for kind, _ in log:
+        if kind == "launch":
+            outstanding += 1
+            launched += 1
+        else:
+            outstanding -= 1
+        assert outstanding <= 4, "the window is still a bound"
+        # Checked only once the window has filled for the first time and while work remains
+        # unlaunched: the ramp-up legitimately passes through depths 1..3, and the drain at
+        # the end legitimately falls to zero. In between, a settle must be answered by a
+        # refill, so the depth only ever dips to `window - 1` between those two log lines.
+        if 4 <= launched < 12:
+            assert outstanding >= 3, "the pipeline drained while there was work left to launch"

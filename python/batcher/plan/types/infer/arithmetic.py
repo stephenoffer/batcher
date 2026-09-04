@@ -47,11 +47,14 @@ _BINARY_ARITH = frozenset({"add", "sub", "mul", "mod"})
 #: wrong answers above 2^53.
 _MATH_INT_RESULT = frozenset({"bit_count", "factorial"})
 
-#: Unary math functions that keep an integer input integral. `bc_expr` special-cases both
-#: (`(Abs, Int64)` and `(Round, Int64)`) because each is integer-valued on an integer and
-#: DuckDB returns BIGINT for it; promoting to f64 first corrupted values above 2^53.
+#: Unary math functions that keep an integer input integral. `bc_expr` special-cases each
+#: (`(Abs, Int64)`, `(Round, Int64)`, `(Trunc, Int64)`, `(Sign, Int64)`) because each is
+#: integer-valued on an integer and DuckDB returns an integer type for it; promoting to f64
+#: first corrupted values above 2^53.
 #: `floor`/`ceil`/`sqrt` genuinely do yield double there, so they are deliberately absent.
-_MATH_TYPE_PRESERVING = frozenset({"abs", "round"})
+#: `trunc` and `sign` were absent for no reason anyone recorded, and it cost a silent wrong
+#: answer: `trunc(2^53+1)` returned 2^53. `sign` was values-correct but mistyped.
+_MATH_TYPE_PRESERVING = frozenset({"abs", "round", "trunc", "sign"})
 
 #: Binary math functions returning Int64 whatever their operands' types -- the integer arms
 #: of `bc_expr::eval::math::eval_math2`. A GCD or LCM is an integer quantity by definition.
@@ -72,6 +75,45 @@ def _widened_numeric(t: pa.DataType) -> pa.DataType | None:
     return widen(t) if pa.types.is_integer(t) or pa.types.is_floating(t) else None
 
 
+def _alone_as_double(t: pa.DataType) -> pa.DataType:
+    """`t`, with a `null`-typed operand read as Float64 the way the engine reads it.
+
+    ``null`` is not a numeric type, so every rule below that asks `is_integer or
+    is_floating` answered ``None`` for it -- and ``None`` does not stay local. It makes
+    the *whole* projection uncertain, and `Project.available_schema` then reports every
+    column in it as ``null``: one `abs()` over a null-typed column made a neighbouring
+    plain Int64 passthrough advertise as ``null`` in `Dataset.schema`.
+
+    Measured against the engine rather than assumed. A null column carries no numeric
+    content to preserve, so the type-preserving arms have nothing to preserve and the
+    engine's math kernels produce Float64: `abs`, `round`, `sign` and `trunc` over a
+    null-typed column all return `double`, on a populated relation and on an empty one,
+    and so does `round(null, n)`.
+    """
+    return pa.float64() if pa.types.is_null(t) else t
+
+
+def _adopt_null(left: pa.DataType, right: pa.DataType) -> tuple[pa.DataType, pa.DataType]:
+    """`(left, right)` with a `null` operand replaced by the type it adopts.
+
+    This is the engine's own rule, and the one `_arith_promotable` already states for
+    `+`/`-`/`*`: a null operand takes the *other* operand's type, and the arithmetic is
+    then that type's. Substituting Float64 for it instead would be wrong in a way that is
+    easy to miss -- `null // int64` returns **int64** from the engine, and reading the null
+    side as a float would declare `double` for it.
+
+    With null on both sides there is no other operand to adopt, and the engine evaluates
+    the pair as Float64 (`null / null` and `null // null` both return `double`).
+    """
+    if pa.types.is_null(left) and pa.types.is_null(right):
+        return pa.float64(), pa.float64()
+    if pa.types.is_null(left):
+        return right, right
+    if pa.types.is_null(right):
+        return left, left
+    return left, right
+
+
 def mathfunc_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
     """The result type of a unary `MathExpr`.
 
@@ -84,7 +126,7 @@ def mathfunc_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataTyp
         return pa.int64()
     if fn in _MATH_TYPE_PRESERVING:
         operand = infer(expr.input, schema)  # type: ignore[attr-defined]
-        return None if operand is None else _widened_numeric(operand)
+        return None if operand is None else _widened_numeric(_alone_as_double(operand))
     return pa.float64()
 
 
@@ -101,7 +143,7 @@ def math2func_type(expr: object, schema: SchemaRef, infer: InferFn) -> pa.DataTy
         return pa.int64()
     if fn == "round":
         left = infer(expr.left, schema)  # type: ignore[attr-defined]
-        return None if left is None else _widened_numeric(left)
+        return None if left is None else _widened_numeric(_alone_as_double(left))
     return pa.float64()
 
 
@@ -156,6 +198,7 @@ def _int_preserving_div(left: pa.DataType, right: pa.DataType) -> pa.DataType | 
     uncertain: the engine evaluates it as Float64, but that is a fallback rather than a
     derived decimal rule.
     """
+    left, right = _adopt_null(left, right)
     if not _both_numeric(left, right):
         return None
     both_int = pa.types.is_integer(left) and pa.types.is_integer(right)

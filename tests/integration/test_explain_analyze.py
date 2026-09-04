@@ -95,7 +95,7 @@ def test_distributed_run_surfaces_worker_map_metrics(tmp_path):
     try:
         t = pa.table({"k": (np.arange(20_000) % 100).astype("int64"), "v": np.arange(20_000) % 7})
         bt.from_arrow(t).group_by("k").agg(s=col("v").sum()).collect(distributed=True)
-        doc = json.loads(sorted(tmp_path.glob("*.json"))[-1].read_text())
+        doc = json.loads(max(tmp_path.glob("*.json")).read_text())
         assert doc["distributed"] is True
         # The distributed map sub-plan is surfaced as its own measured section (a separate
         # op-id space from the driver tree, not falsely joined into it).
@@ -120,3 +120,41 @@ def test_profiling_does_not_change_result():
 
 def _sorted(d: dict) -> list:
     return sorted(zip(*d.values(), strict=True))
+
+
+def test_explain_names_what_each_operator_does_not_just_its_kind():
+    """The join keys, the group keys, the sort keys, and the predicate reach `explain()`.
+
+    A plan with four joins printed four identical `hash_join` lines, and nothing in the
+    output said which was which. The labels come from the same describer the web dashboard
+    uses for its plan nodes, so the two cannot drift into showing one operator two ways.
+    """
+    orders = bt.from_pydict(
+        {"customer": ["a", "b", "a"], "amount": [1.0, 2.0, 3.0], "status": ["paid", "paid", "open"]}
+    )
+    customers = bt.from_pydict({"customer": ["a", "b"], "region": ["us", "eu"]})
+    query = (
+        orders.filter(col("status") == "paid")
+        .join(customers, on="customer")
+        .group_by("region")
+        .agg(revenue=col("amount").sum())
+        .sort("revenue")
+    )
+    planned = query.explain()
+    assert "[inner on customer]" in planned
+    assert "[by region · sum]" in planned
+    assert "[revenue]" in planned
+    assert "[status = paid]" in planned
+    # And the same labels survive the measured path, which assembles the profile by a
+    # different route (a `ProfileCollector` rather than a direct `build_op_profiles`).
+    measured = query.explain(analyze=True)
+    for label in ("[inner on customer]", "[by region · sum]", "[status = paid]"):
+        assert label in measured, measured
+
+
+def test_the_detail_reaches_the_machine_readable_document_too():
+    """A test asserting a plan property should not have to parse the rendered tree."""
+    ds = bt.from_pydict({"k": ["a", "a", "b"], "v": [1, 2, 3]})
+    doc = json.loads(ds.group_by("k").agg(s=col("v").sum()).explain(analyze=True, format="json"))
+    aggregate = next(op for op in doc["ops"] if op["kind"] == "aggregate")
+    assert aggregate["detail"].startswith("by k")

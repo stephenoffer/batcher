@@ -54,11 +54,13 @@ pub struct DistinctPrefix {
 
 impl DistinctPrefix {
     /// A prefix collector for `target` distinct rows. `target == 0` is satisfied immediately.
+    #[must_use]
     pub fn new(target: usize) -> Self {
         Self { kept: None, target }
     }
 
     /// True once `target` distinct rows are held, so the caller can stop pulling its input.
+    #[must_use]
     pub fn is_satisfied(&self) -> bool {
         self.kept
             .as_ref()
@@ -71,6 +73,7 @@ impl DistinctPrefix {
     }
 
     /// True when nothing has been kept yet.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -93,9 +96,10 @@ impl DistinctPrefix {
         let keys: Vec<ArrayRef> = combined.columns().to_vec();
         let (_ids, _n, group_cols) = assign_groups(&keys, combined.num_rows())?;
         let deduped = RecordBatch::try_new(schema, group_cols)?;
-        self.kept = Some(match deduped.num_rows() > self.target {
-            true => deduped.slice(0, self.target),
-            false => deduped,
+        self.kept = Some(if deduped.num_rows() > self.target {
+            deduped.slice(0, self.target)
+        } else {
+            deduped
         });
         Ok(())
     }
@@ -104,6 +108,7 @@ impl DistinctPrefix {
     ///
     /// `None` rather than an empty batch because the caller owns the schema decision: an
     /// empty input defers to the path that supplies a correctly-typed empty relation.
+    #[must_use]
     pub fn finish(self) -> Option<RecordBatch> {
         self.kept
     }
@@ -187,7 +192,7 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
             || (i64::MAX, i64::MIN),
             |(l1, h1), (l2, h2)| (l1.min(l2), h1.max(h2)),
         );
-    let span_i = (hi as i128) - (lo as i128) + 1;
+    let span_i = i128::from(hi) - i128::from(lo) + 1;
     let Ok(span) = usize::try_from(span_i) else {
         return Ok(None);
     };
@@ -201,7 +206,7 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
         .par_iter()
         .map(|c| {
             let mut w = vec![0u64; words];
-            for &v in c.values().iter() {
+            for &v in c.values() {
                 let i = (v.wrapping_sub(lo)) as usize;
                 w[i >> 6] |= 1u64 << (i & 63);
             }
@@ -310,14 +315,14 @@ pub(crate) fn distinct_state(
         None => {
             for (i, &g) in group_ids.iter().enumerate() {
                 keep.push(i as u32);
-                kept_groups.push(g as i64);
+                kept_groups.push(i64::from(g));
             }
         }
         Some(nulls) => {
             for (i, &g) in group_ids.iter().enumerate() {
                 if nulls.is_valid(i) {
                     keep.push(i as u32);
-                    kept_groups.push(g as i64);
+                    kept_groups.push(i64::from(g));
                 }
             }
         }
@@ -353,7 +358,7 @@ pub(crate) fn flatten_list_state(
     let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
     for row in 0..list.len() {
         let n = (offsets[row + 1] - offsets[row]) as usize;
-        let g = group_ids[row] as i64;
+        let g = i64::from(group_ids[row]);
         elem_groups.extend(std::iter::repeat_n(g, n));
     }
     let elem_groups = Int64Array::from(elem_groups);
@@ -529,7 +534,7 @@ pub(crate) fn bucket_values_into_list(
 ) -> Result<ArrayRef, RuntimeError> {
     let groups = group_ids.values();
     let mut offsets: Vec<i32> = vec![0; num_groups + 1];
-    for &g in groups.iter() {
+    for &g in groups {
         offsets[g as usize + 1] += 1;
     }
     for b in 0..num_groups {
@@ -553,7 +558,7 @@ pub(crate) fn finalize_count_distinct(state: &ArrayRef) -> ArrayRef {
     let list = state.as_list::<i32>();
     let offsets = list.value_offsets();
     let counts: Vec<i64> = (0..list.len())
-        .map(|i| (offsets[i + 1] - offsets[i]) as i64)
+        .map(|i| i64::from(offsets[i + 1] - offsets[i]))
         .collect();
     Arc::new(Int64Array::from(counts))
 }
@@ -767,7 +772,7 @@ mod dense_tests {
                 Some(((s >> 33) % 700) as i64 - 300)
             })
             .collect();
-        let parts = batches(vec![vals.clone()]);
+        let parts = batches(vec![vals]);
         let dense = distinct_dense(&parts).unwrap().unwrap();
         let keys: Vec<ArrayRef> = parts[0].columns().to_vec();
         let (_ids, n, cols) = assign_groups(&keys, parts[0].num_rows()).unwrap();
@@ -884,7 +889,7 @@ mod scratch_timing {
     use std::time::Instant;
 
     #[test]
-    #[ignore]
+    #[ignore = "timing study for the ungrouped COUNT(DISTINCT) path"]
     fn time_ungrouped() {
         let n = 8_000_000usize;
         let card = 5_000_000i64;
@@ -895,7 +900,7 @@ mod scratch_timing {
                 ((s >> 20) % card as u64) as i64
             })
             .collect();
-        let values: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+        let values: ArrayRef = Arc::new(Int64Array::from(vals));
         let gids = vec![0u32; n];
 
         let t = Instant::now();
@@ -936,7 +941,7 @@ mod scratch_timing {
 
     /// Simulate the ungrouped executor path: per-morsel partials (parallel) then combine.
     #[test]
-    #[ignore]
+    #[ignore = "timing study for the ungrouped partial-then-combine pipeline"]
     fn time_ungrouped_pipeline() {
         use crate::agg::{combine_with, finalize, partial, AggCall, AggFunc};
         use arrow::datatypes::{Field, Schema};

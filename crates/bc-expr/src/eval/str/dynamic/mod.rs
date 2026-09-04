@@ -84,8 +84,7 @@ pub(crate) fn eval_str_dynamic(
     }
     let dtype = parts
         .first()
-        .map(|a| a.data_type().clone())
-        .unwrap_or(DataType::Utf8);
+        .map_or(DataType::Utf8, |a| a.data_type().clone());
     // One null row is enough: every null-parameter output row points at the same slot.
     let nulls = new_null_array(&dtype, 1);
     for &row in &null_rows {

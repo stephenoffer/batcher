@@ -9,7 +9,7 @@ import pyarrow.compute as pc
 
 from registry import suite
 
-from .base import sql_fanout, with_native
+from .base import ray_to_arrow, sql_fanout, with_native
 
 if TYPE_CHECKING:
     from context import Context
@@ -37,6 +37,6 @@ def filter_project(ctx: Context):
         out = rd.filter(expr=col("l_extendedprice") > 50000).map_batches(
             project, batch_format="pyarrow"
         )
-        return pa.Table.from_pandas(out.to_pandas(), preserve_index=False)
+        return ray_to_arrow(out)
 
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)

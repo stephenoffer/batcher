@@ -77,6 +77,41 @@ pub const DEFAULT_MORSEL_ROWS: usize = 16_384;
 /// historical row default for narrow data, so nothing changes there.
 pub const DEFAULT_MORSEL_BYTES: usize = 1 << 20; // 1 MiB
 
+/// The Arrow bytes attributable to **this array's own rows**, not to the buffer it is a slice
+/// of.
+///
+/// [`Array::get_array_memory_size`] reports the whole backing allocation, so for a *sliced*
+/// array it returns the parent's size. Every morsel in the engine is such a slice, which makes
+/// that the wrong measure almost everywhere a size decision is made: measured with it, a
+/// relation of `n` morsels over one parent buffer reads as `n` times its real footprint, and
+/// the operators that divide a budget by a size then spill, re-partition, or refuse a query
+/// that fits comfortably.
+///
+/// It lives here because three crates need the same answer and `bc-arrow` is the only one
+/// below all of them: `bc_sketches::stats` sizes `avg_byte_width` from it, `bc_runtime`'s spill
+/// stores report their written volume with it, and `bc_interp::column_bytes` builds the
+/// dictionary-de-duplicating relation measure on top of it. Three private copies is how the
+/// three come to disagree about what a byte is.
+///
+/// Falls back to the buffer size for the exotic nested types arrow cannot slice-measure, which
+/// keeps the old over-estimate rather than reporting zero for data that is really there.
+#[must_use]
+pub fn slice_bytes(array: &ArrayRef) -> u64 {
+    let data = array.to_data();
+    data.get_slice_memory_size()
+        .map_or_else(|_| array.get_array_memory_size() as u64, |b| b as u64)
+}
+
+/// [`slice_bytes`] summed over a batch's columns — the batch's own rows' footprint.
+///
+/// Note what this does *not* do: a dictionary shared between two columns (or between two
+/// batches) is counted once per column that carries it. `bc_interp::column_bytes` is the form
+/// that de-duplicates, and it is the one to reach for when the whole relation is in hand.
+#[must_use]
+pub fn batch_slice_bytes(batch: &RecordBatch) -> u64 {
+    batch.columns().iter().map(slice_bytes).sum()
+}
+
 /// The fixed per-row byte width of a data type, when it is constant regardless of
 /// the data — i.e. the type's values are not variable-length.
 ///
@@ -84,8 +119,13 @@ pub const DEFAULT_MORSEL_BYTES: usize = 1 << 20; // 1 MiB
 /// whose per-row width is data-dependent and must be *measured* (see the
 /// `ColumnStats` average-width path). This is the cheap, allocation-free lower
 /// bound the cost model and morselizer reach for first.
+#[must_use]
 pub fn fixed_width(dt: &DataType) -> Option<usize> {
-    use DataType::*;
+    use DataType::{
+        Boolean, Date32, Date64, Decimal128, Decimal256, Duration, FixedSizeBinary, FixedSizeList,
+        Float16, Float32, Float64, Int16, Int32, Int64, Int8, Interval, Null, Time32, Time64,
+        Timestamp, UInt16, UInt32, UInt64, UInt8,
+    };
     Some(match dt {
         Null => 0,
         Boolean | Int8 | UInt8 => 1,
@@ -117,6 +157,7 @@ pub struct MorselTarget {
 
 impl MorselTarget {
     /// A row-only target (byte bound disabled). The historical default.
+    #[must_use]
     pub fn rows(rows: usize) -> Self {
         Self {
             rows,
@@ -125,11 +166,13 @@ impl MorselTarget {
     }
 
     /// A target bounded by both a row count and a byte budget.
+    #[must_use]
     pub fn new(rows: usize, bytes: usize) -> Self {
         Self { rows, bytes }
     }
 
     /// Whether the byte bound is active (i.e. not the row-only sentinel).
+    #[must_use]
     pub fn byte_bounded(&self) -> bool {
         self.bytes != usize::MAX
     }

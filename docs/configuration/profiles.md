@@ -171,7 +171,7 @@ sbatch --signal=B:USR1@300 --time=04:00:00 run_batcher.sh
 
 ## Tuning the autoscale wait
 
-Out of the box the engine already fills the cluster. It runs one worker per node, gives each an even share of that node's cores, and scales the reducer count with the fan-out. On an autoscaling cluster it also waits, with a bound, for autoscaler-launched nodes before sizing the fan-out, so a big query runs on the grown cluster. That wait auto-enables when Batcher detects an autoscaling cluster, meaning Anyscale, a spot node, or `BATCHER_AUTOSCALE=1`. The recipe below only tunes it. Set `autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
+Out of the box the engine already fills the cluster. It cuts each node into several workers, gives each an even share of that node's cores, and scales the reducer count with the fan-out. On an autoscaling cluster it also waits, with a bound, for autoscaler-launched nodes before sizing the fan-out, so a big query runs on the grown cluster. That wait auto-enables when Batcher detects an autoscaling cluster, meaning Anyscale, a spot node, or `BATCHER_AUTOSCALE=1`. The recipe below only tunes it. Set `autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
 
 ```python
 base = Config()

@@ -352,7 +352,7 @@ fn positive_secs(func: &str, what: &str, secs: Option<f64>) -> Result<f64, ExprE
 /// `width * height`.
 fn length_guard(func: &str, secs: f64, rate: u32) -> Result<usize, ExprError> {
     let n = secs * f64::from(rate);
-    if !(n >= 0.0 && n <= i32::MAX as f64) {
+    if !(n >= 0.0 && n <= f64::from(i32::MAX)) {
         return Err(ExprError::InvalidArgument {
             func: func.to_string(),
             reason: format!(

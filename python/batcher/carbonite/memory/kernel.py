@@ -386,7 +386,7 @@ def _usage_dirs() -> tuple[str, ...]:
     reason — see `_memory_psi`.
     """
     own = _own_cgroup_dirs()
-    return own if own else (cgroup_v2_dirs()[0],)
+    return own or (cgroup_v2_dirs()[0],)
 
 
 def _leafmost_bytes(name: str) -> int | None:

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import ColumnNotFoundError, PlanError
+from batcher._internal.errors import suggestion as _suggestion
 from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.expr_ir import referenced_columns as _referenced_columns
 from batcher.plan.types import infer_type, widen
@@ -136,11 +137,24 @@ def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
     """
     missing = _referenced_columns(expr) - available
     if missing:
+        # The available columns are passed as the structured field and NOT also
+        # inlined into the message. Doing both rendered them twice --
+        # "... available: ['a', 'b'] Available columns: 'a', 'b'" -- and the inlined
+        # copy was the unbounded one: `BatcherError.__str__` truncates the field
+        # ("(+N more)"), where an f-string of `sorted(available)` prints all of them,
+        # so a miss against a wide table buried the actual error under its schema.
+        names = sorted(missing)
         raise ColumnNotFoundError(
-            f"{what} references unknown column(s) {sorted(missing)}; "
-            f"available: {sorted(available)}",
-            column=sorted(missing)[0],
+            f"{what} references unknown column(s) {names}",
+            column=names[0],
+            # The closest match, from the one ranking engine (`_internal.errors.suggest`).
+            # Without it the four highest-traffic misses in the whole API -- a typo in a
+            # `filter`, a `select`, a `sort` key or an `agg` -- printed the schema and left
+            # the reader to diff two similar strings by eye, while `drop`, `rename` and
+            # `group_by` (which go through other call sites) named the intended column.
+            suggestion=_suggestion(names[0], available),
             available=sorted(available),
+            available_label="Available columns",
         )
 
 

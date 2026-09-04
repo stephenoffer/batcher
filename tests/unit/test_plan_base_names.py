@@ -74,7 +74,7 @@ def test_the_aliased_self_join_shape_reaches_the_source_columns():
     assert "key" in ndv_columns(ds._plan)
     assert "quarter" in column_bounds_needed(ds._plan)
     # And nothing prefixed survives into either answer.
-    assert not any(n.startswith("d1__") or n.startswith("d2__") for n in ndv_columns(ds._plan))
+    assert not any(n.startswith(("d1__", "d2__")) for n in ndv_columns(ds._plan))
 
 
 def test_a_group_key_resolves_through_its_alias():

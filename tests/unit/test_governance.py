@@ -69,7 +69,7 @@ def test_a_table_with_no_policy_is_untouched():
 
 def test_a_table_with_no_grant_is_open_for_access():
     """Masks and row filters alone must not lock a table down."""
-    catalog = SecurityCatalog().mask_column(TABLE, "email", lambda c: bt.mask(c))
+    catalog = SecurityCatalog().mask_column(TABLE, "email", bt.mask)
     assert catalog.visible_columns(TABLE, COLUMNS, ANALYST) == COLUMNS
 
 
@@ -110,7 +110,7 @@ def test_a_tag_mask_governs_every_column_carrying_the_tag():
         SecurityCatalog()
         .tag(TABLE, "email", "pii")
         .tag(TABLE, "salary", "pii")
-        .mask_tag("pii", lambda c: bt.mask(c))
+        .mask_tag("pii", bt.mask)
     )
     assert catalog.mask_for(TABLE, "email", ANALYST) is not None
     assert catalog.mask_for(TABLE, "salary", ANALYST) is not None
@@ -124,7 +124,7 @@ def test_an_explicit_column_mask_overrides_the_tag_mask():
     catalog = (
         SecurityCatalog()
         .tag(TABLE, "email", "pii")
-        .mask_tag("pii", lambda c: bt.mask(c))
+        .mask_tag("pii", bt.mask)
         .mask_column(TABLE, "email", explicit)
     )
     assert catalog.mask_for(TABLE, "email", ANALYST) is explicit
@@ -132,9 +132,7 @@ def test_an_explicit_column_mask_overrides_the_tag_mask():
 
 def test_an_exempt_role_reads_the_raw_value():
     catalog = (
-        SecurityCatalog()
-        .tag(TABLE, "email", "pii")
-        .mask_tag("pii", lambda c: bt.mask(c), exempt=["admin"])
+        SecurityCatalog().tag(TABLE, "email", "pii").mask_tag("pii", bt.mask, exempt=["admin"])
     )
     assert catalog.mask_for(TABLE, "email", ADMIN) is None
     assert catalog.mask_for(TABLE, "email", ANALYST) is not None
@@ -189,7 +187,7 @@ def test_an_all_visible_unmasked_table_gets_no_projection():
 
 def test_masking_is_applied_at_the_scan_not_at_the_output():
     """The raw value must never exist above the leaf, or a filter could recover it."""
-    catalog = SecurityCatalog().mask_column(TABLE, "email", lambda c: bt.mask(c))
+    catalog = SecurityCatalog().mask_column(TABLE, "email", bt.mask)
     governed = _govern(catalog, ANALYST)
     assert isinstance(governed, Project)
     assert isinstance(governed.input, Scan)
@@ -198,7 +196,7 @@ def test_masking_is_applied_at_the_scan_not_at_the_output():
 
 
 def test_the_masked_projection_preserves_the_column_order():
-    catalog = SecurityCatalog().mask_column(TABLE, "region", lambda c: bt.mask(c))
+    catalog = SecurityCatalog().mask_column(TABLE, "region", bt.mask)
     governed = _govern(catalog, ANALYST)
     assert [i.alias for i in governed.items] == COLUMNS
 
@@ -209,7 +207,7 @@ def test_enforce_reports_what_it_enforced():
     catalog = (
         SecurityCatalog()
         .grant("analyst", on=TABLE, select=["id", "email"])
-        .mask_column(TABLE, "email", lambda c: bt.mask(c))
+        .mask_column(TABLE, "email", bt.mask)
         .filter_rows(TABLE, lambda _p: Col("region") == "EU", name="own_region")
     )
     _, events = enforce(_scan(), [TABLE], ANALYST, catalog)
@@ -230,7 +228,7 @@ def test_an_ungoverned_table_produces_no_event():
 
 
 def test_an_event_names_columns_and_policies_but_never_values():
-    catalog = SecurityCatalog().mask_column(TABLE, "email", lambda c: bt.mask(c))
+    catalog = SecurityCatalog().mask_column(TABLE, "email", bt.mask)
     (event,) = enforce(_scan(), [TABLE], ANALYST, catalog)[1]
     rendered = str(event)
     assert "ALLOW" in rendered and "email" in rendered

@@ -37,6 +37,7 @@ from batcher.dist.executors.partition_io._sources import (
     read_partition,
     read_partition_descriptor,
     source_pushdown,
+    stage_pushdown,
 )
 from batcher.dist.executors.partition_io.assignment import (
     _balance as _balance,
@@ -86,6 +87,7 @@ __all__ = [
     "sample_probs",
     "source_pushdown",
     "split_hot_bucket",
+    "stage_pushdown",
     "streaming_map_buckets",
     "streaming_partial_aggregate",
     "streaming_topn",

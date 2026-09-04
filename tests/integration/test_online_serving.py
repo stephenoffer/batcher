@@ -56,7 +56,7 @@ def test_a_replica_releases_its_model_when_it_goes_away():
         def close(self):
             closed.append(True)
 
-    deployment = serve_deployment(lambda: _Model(), name="closing", num_replicas=1)
+    deployment = serve_deployment(_Model, name="closing", num_replicas=1)
     replica = deployment.func_or_class()
     replica.__del__()
     assert closed == [True]

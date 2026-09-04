@@ -259,3 +259,36 @@ def test_the_storage_vocabulary_agrees_with_the_io_retry_loop():
         "storage conditions the IO layer retries but the scheduler would not: "
         f"{missed}. Add them to `classify._MARKERS`, or to `io_owned` above with the reason."
     )
+
+
+# --- what the distributed barrier charges a host for -----------------------------------------
+
+
+def test_a_reclaimed_spot_node_is_not_blamed_for_being_reclaimed():
+    """The ledger weights blame by category so a machine is quarantined for being unhealthy
+    rather than for being given work. A preemption is the case that must score zero — the
+    taxonomy's own words are "a planned reclamation says nothing about the node's health" —
+    and the map barrier used to charge every loss as `worker_lost` regardless of cause, so a
+    spot fleet quarantined its own nodes for behaving exactly as spot nodes do."""
+    from batcher.carbonite.resilience.blocklist import _WEIGHTS
+
+    assert _WEIGHTS["preemption"] == 0.0
+    assert _WEIGHTS["worker_lost"] == 1.0
+    # The control: the categories are genuinely weighted apart, so a barrier that classifies
+    # is doing something a barrier that hardcodes one category cannot.
+    assert _WEIGHTS["preemption"] < _WEIGHTS["network"] < _WEIGHTS["worker_lost"]
+
+
+def test_an_unavailable_actor_is_not_a_dead_one():
+    """Ray defines `ActorUnavailableError` as *temporarily* unreachable — restarting, a
+    network blip, or a death not yet reported — and tells callers to ping rather than declare
+    death. A restarting actor is the expected state under the `spot` profile, which is what
+    raises `actor_max_restarts` in the first place."""
+    import batcher.carbonite.resilience.classify as c
+
+    assert c._BY_TYPE["ActorUnavailableError"] == "network"
+    assert c._BY_TYPE["ActorDiedError"] == "worker_lost"
+    # Both stay retryable and neither has to move; only the blame differs.
+    for name in ("network", "worker_lost"):
+        assert c.CATEGORIES[name].retryable
+        assert not c.CATEGORIES[name].must_move

@@ -43,7 +43,7 @@ from batcher.plan.functions.partitioning import (
 from batcher.plan.functions.scalar import gcd, hypot, lcm, nanvl, next_after
 from batcher.plan.functions.temporal import current_date, make_date
 
-__all__ = ["anonymous_scalar"]
+__all__ = ["anonymous_scalar", "known_names"]
 
 
 # --- one table per argument shape -------------------------------------------
@@ -349,6 +349,14 @@ _LIST_PAIR_NEGATED = {
 }
 
 # `f(l, idx)` → gather by a list of 1-based positions (DuckDB's two spellings).
+#: Names this module serves from an `if name ==` branch rather than a table. They are
+#: listed because `known_names` reads the tables, and a name it cannot see is a name the
+#: derived accessor dispatch will serve at the arities *this* module does not -- which is
+#: how `list_slice(l, 2)` came to mean a 0-based offset beside `list_slice(l, 2, 5)`
+#: meaning DuckDB's inclusive 1-based bounds.
+_SLICE_NAMES = frozenset({"list_slice", "array_slice"})
+_BRANCH_NAMES = frozenset({"ord", "constant_or_null", "partition_truncate"}) | _SLICE_NAMES
+
 _LIST_SELECT = frozenset({"list_select", "array_select"})
 
 # `f(v, …)` → a list literal of every argument (DuckDB's list constructors).
@@ -461,7 +469,7 @@ def anonymous_scalar(tr, node):
             return lit(0.0) - getattr(tr._scalar(left).list, negated)(tr._scalar(right))
 
     if len(args) == 3:
-        if name in ("list_slice", "array_slice"):
+        if name in _SLICE_NAMES:
             begin = _const_int_arg(args[1], f"{name}(): begin")
             end = _const_int_arg(args[2], f"{name}(): end")
             return tr._scalar(args[0]).list.slice(begin - 1, max(end - begin + 1, 0))
@@ -576,3 +584,28 @@ def _partition_truncate(tr, value, width):
     if column is not None and (pa.types.is_string(column) or pa.types.is_large_string(column)):
         return tr._scalar(value).str.substr(1, chars)
     return partition_truncate(tr._scalar(value), chars)
+
+
+def known_names() -> frozenset[str]:
+    """Every SQL function name this module's tables claim, normalized as a lookup key.
+
+    Read by the *derived* accessor dispatch (`lowering/accessors.py`) so it can decline a
+    name that is curated here. Declining matters because several of these handlers are
+    **arity-specific**: `list_slice` is served above at three arguments, with DuckDB's
+    inclusive 1-based bounds, and the two-argument form fell through to the derived
+    `.list.slice` -- whose offset is 0-based. One name meaning two different things
+    depending on how many arguments it is written with is worse than the "unknown
+    function" it used to raise.
+
+    Derived from the tables themselves rather than listed again, for the reason the tables
+    exist: a second list is a list that drifts. Over-claiming a name is the safe direction
+    -- the derived dispatch simply declines it, which is what it did before it existed.
+
+    Returns:
+        The claimed names, lowercased with underscores removed.
+    """
+    claimed: set[str] = set()
+    for value in globals().values():
+        if isinstance(value, dict | frozenset | set) and all(isinstance(k, str) for k in value):
+            claimed |= {k.lower().replace("_", "") for k in value}
+    return frozenset(claimed)

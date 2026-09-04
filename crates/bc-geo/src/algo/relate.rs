@@ -20,6 +20,7 @@ use crate::types::{Coord, Geometry, Polygon};
 /// A position on a hole's boundary is on the polygon's boundary, not outside it —
 /// which is what makes `covers` accept a point sitting exactly on the edge of a hole
 /// while `contains` rejects it.
+#[must_use]
 pub fn point_in_polygon(p: Coord, poly: &Polygon) -> PointRing {
     match point_in_ring(p, &poly.exterior) {
         PointRing::Outside => PointRing::Outside,
@@ -42,6 +43,7 @@ pub fn point_in_polygon(p: Coord, poly: &Polygon) -> PointRing {
 /// "Most inside" is the right fold because a geometry is the union of its parts: a
 /// point inside any member is inside the union, and one on a member's boundary is on
 /// the union's boundary only if no other member swallows it.
+#[must_use]
 pub fn point_in_geometry(p: Coord, g: &Geometry) -> PointRing {
     let mut best = PointRing::Outside;
     for poly in g.polygons() {
@@ -83,6 +85,7 @@ pub fn point_in_geometry(p: Coord, g: &Geometry) -> PointRing {
 /// against a polygon's boundary. Locating a point wants the opposite: a ring is
 /// already accounted for by the areal test, and counting it again would report a point
 /// strictly inside a polygon as being on its boundary.
+#[must_use]
 pub fn linear_parts(g: &Geometry) -> Vec<&Vec<Coord>> {
     let mut out = Vec::new();
     fn walk<'a>(g: &'a Geometry, out: &mut Vec<&'a Vec<Coord>>) {
@@ -103,6 +106,7 @@ pub fn linear_parts(g: &Geometry) -> Vec<&Vec<Coord>> {
 /// Each midpoint is strictly interior to a piece that does not cross the boundary, so
 /// one point-in-polygon test per midpoint decides the whole piece. A segment that
 /// crosses nothing yields its own midpoint, so the caller never special-cases it.
+#[must_use]
 pub fn segment_midpoints(a: Coord, b: Coord, other: &Geometry) -> Vec<Coord> {
     let mut ts: Vec<f64> = vec![0.0, 1.0];
     let (dx, dy) = (b.x - a.x, b.y - a.y);
@@ -136,7 +140,7 @@ pub fn segment_midpoints(a: Coord, b: Coord, other: &Geometry) -> Vec<Coord> {
         if w[1] - w[0] <= f64::EPSILON {
             continue;
         }
-        let t = (w[0] + w[1]) / 2.0;
+        let t = f64::midpoint(w[0], w[1]);
         out.push(Coord {
             x: a.x + t * dx,
             y: a.y + t * dy,
@@ -147,7 +151,7 @@ pub fn segment_midpoints(a: Coord, b: Coord, other: &Geometry) -> Vec<Coord> {
         out.push(Coord {
             x: a.x + 0.5 * dx,
             y: a.y + 0.5 * dy,
-            z: (a.z + b.z) / 2.0,
+            z: f64::midpoint(a.z, b.z),
         });
     }
     out
@@ -159,6 +163,7 @@ pub fn segment_midpoints(a: Coord, b: Coord, other: &Geometry) -> Vec<Coord> {
 /// This is the sample set the areal predicates run point-in-polygon over. It is finite
 /// and exact for polygonal inputs — the noding guarantees no piece straddles a
 /// boundary — which is why the predicates built on it do not need an overlay.
+#[must_use]
 pub fn probe_points(g: &Geometry, against: &Geometry) -> Vec<Coord> {
     let mut out = Vec::new();
     g.collect_coords(&mut out);
@@ -178,6 +183,7 @@ pub fn probe_points(g: &Geometry, against: &Geometry) -> Vec<Coord> {
 /// this is the centroid when the centroid is inside, and otherwise a point found by
 /// scanning a horizontal line across the shape — which is what makes it correct for
 /// the crescent-shaped polygons whose centroid falls in the notch.
+#[must_use]
 pub fn interior_point(g: &Geometry) -> Option<Coord> {
     let polys = g.polygons();
     if !polys.is_empty() {
@@ -200,9 +206,9 @@ pub fn interior_point(g: &Geometry) -> Option<Coord> {
     for l in linear_parts(g) {
         if l.len() >= 2 {
             let mid = Coord {
-                x: (l[0].x + l[1].x) / 2.0,
-                y: (l[0].y + l[1].y) / 2.0,
-                z: (l[0].z + l[1].z) / 2.0,
+                x: f64::midpoint(l[0].x, l[1].x),
+                y: f64::midpoint(l[0].y, l[1].y),
+                z: f64::midpoint(l[0].z, l[1].z),
             };
             return Some(mid);
         }
@@ -215,7 +221,7 @@ fn scan_interior(poly: &Polygon) -> Option<Coord> {
     ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     ys.dedup();
     for pair in ys.windows(2) {
-        let y = (pair[0] + pair[1]) / 2.0;
+        let y = f64::midpoint(pair[0], pair[1]);
         let mut xs: Vec<f64> = Vec::new();
         for ring in std::iter::once(&poly.exterior).chain(poly.interiors.iter()) {
             for w in ring.windows(2) {
@@ -227,7 +233,7 @@ fn scan_interior(poly: &Polygon) -> Option<Coord> {
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         for pair in xs.chunks_exact(2) {
             if pair[1] > pair[0] {
-                let c = Coord::new((pair[0] + pair[1]) / 2.0, y);
+                let c = Coord::new(f64::midpoint(pair[0], pair[1]), y);
                 if point_in_polygon(c, poly) == PointRing::Inside {
                     return Some(c);
                 }

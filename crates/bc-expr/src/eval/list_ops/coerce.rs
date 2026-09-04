@@ -72,7 +72,7 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
         other => Err(ExprError::ExpectedType {
             func: func.to_string(),
             want: "a List argument",
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -218,8 +218,8 @@ mod tests {
 
         let a32 = Float32Array::from(raw.clone());
         let b32 = Float32Array::from(other.clone());
-        let a64 = Float64Array::from(raw.iter().map(|&v| v as f64).collect::<Vec<_>>());
-        let b64 = Float64Array::from(other.iter().map(|&v| v as f64).collect::<Vec<_>>());
+        let a64 = Float64Array::from(raw.iter().map(|&v| f64::from(v)).collect::<Vec<_>>());
+        let b64 = Float64Array::from(other.iter().map(|&v| f64::from(v)).collect::<Vec<_>>());
 
         let s32 = accumulate_pair::<Float32Type>(&a32, &b32, 0, 0, 64);
         let s64 = accumulate_pair::<Float64Type>(&a64, &b64, 0, 0, 64);

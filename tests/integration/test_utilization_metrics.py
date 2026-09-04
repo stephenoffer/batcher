@@ -16,7 +16,13 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 
 import batcher as bt
 from batcher import col
-from batcher.observe import metrics_snapshot, prometheus_text, reset_metrics, start_metrics
+from batcher.observe import (
+    metrics_snapshot,
+    prometheus_text,
+    reset_metrics,
+    start_metrics,
+    stop_metrics,
+)
 
 
 @pytest.fixture
@@ -26,15 +32,14 @@ def metrics():
     The detach matters: a subscriber left attached tells the engine that per-query profiles
     are being consumed, which changes what every later test measures.
     """
-    import batcher.observe.metrics as m
-
     start_metrics()
     reset_metrics()
     yield
-    if m._detach is not None:
-        m._detach()
-        m._detach = None
     reset_metrics()
+    # `stop_metrics()` rather than reaching for `metrics._detach` by hand: it also clears the
+    # module-level handle, which is the half a manual detach forgets and which `start_metrics`
+    # reads to decide whether it is already attached.
+    stop_metrics()
 
 
 def _run_a_query() -> None:

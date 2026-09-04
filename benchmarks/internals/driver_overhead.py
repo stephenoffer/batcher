@@ -36,10 +36,15 @@ from __future__ import annotations
 import statistics
 import sys
 import time
+from pathlib import Path
 
 import pyarrow as pa
 
 import batcher as bt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 #: Rows in the probe table. Small on purpose: the driver's per-query cost is fixed work, and
 #: a large table would bury it under worker time without changing it.
@@ -169,6 +174,17 @@ def run(runs: int = 10) -> int:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     return run(int(sys.argv[1]) if len(sys.argv) > 1 else 10)
 
 

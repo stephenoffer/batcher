@@ -632,6 +632,19 @@
       "str": "hello"
     }
   },
+  "make_map": {
+    "e": "make_map",
+    "keys": {
+      "e": "col",
+      "name": "x"
+    },
+    "values": {
+      "e": "lit",
+      "value": {
+        "int": 1
+      }
+    }
+  },
   "make_struct": {
     "e": "make_struct",
     "fields": [

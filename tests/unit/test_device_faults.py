@@ -371,17 +371,17 @@ def test_an_application_code_still_carries_an_explanation():
 
 
 def test_the_two_lists_stay_separate_in_the_fleet_record(monkeypatch):
-    from batcher.dist.executors.ray_runtime import hardware_probe
+    from batcher.dist.executors.ray_runtime import fleet_health
 
     monkeypatch.setattr("batcher.carbonite.accel.assess_fleet", lambda: ())
     monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ())
-    monkeypatch.setattr("batcher.carbonite.accel.device_affinity_summary", lambda: {})
+    monkeypatch.setattr("batcher.carbonite.accel.device_affinity_summary", dict)
     monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: ())
     monkeypatch.setattr(
         "batcher._internal.hardware.faults.xid_application_faults",
         lambda: {"0000:0c:00.0": (13,)},
     )
-    record = hardware_probe._device_health_on_this_worker()
+    record = fleet_health._device_health_on_this_worker()
     assert record["xid_application"] == [13]
     # And it is not a drain reason: the device is fine.
-    assert hardware_probe.unhealthy_nodes(({"node_id": "a", **record},)) == ()
+    assert fleet_health.unhealthy_nodes(({"node_id": "a", **record},)) == ()

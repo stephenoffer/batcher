@@ -39,8 +39,7 @@ def late_string(tmp_path):
     path = tmp_path / "t.csv"
     with open(path, "w") as fh:
         fh.write("k,v\n")
-        for i in range(_ROWS):
-            fh.write(f"{i},{i}\n")
+        fh.writelines(f"{i},{i}\n" for i in range(_ROWS))
         fh.write("999999,not_a_number\n")
     return str(path)
 

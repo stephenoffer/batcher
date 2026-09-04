@@ -35,9 +35,52 @@ _WINDOW_AGGS: dict[str, str] = {
 }
 
 
+#: Window aggregates sqlglot leaves as `Anonymous`, so they never reach `_WINDOW_AGGS`'s
+#: class-name key. The engine computes each of these; only the SQL wiring was missing, and
+#: `product(x) OVER (...)` failed with "unsupported window function: anonymous" beside a
+#: working `ds.window(functions={"w": ("product", "x")})`.
+_ANON_WINDOW_AGGS: dict[str, str] = {"product": "product"}
+
+
+def window_agg(fn) -> tuple[str, object] | None:
+    """The engine tag and value argument for a window aggregate node, or None.
+
+    One resolver, read by the frame decision, the argument hoist and the function mapping,
+    because all three ask the same question and each carried its own partial answer of it.
+
+    Args:
+        fn: The window's function node.
+
+    Returns:
+        A ``(engine_tag, argument_node)`` pair, or None when `fn` is not an aggregate.
+        The argument is None for `count(*)`.
+    """
+    name = type(fn).__name__.lower()
+    if name == "anonymous":
+        tag = _ANON_WINDOW_AGGS.get(str(fn.name).lower())
+        args = list(fn.expressions)
+        return None if tag is None else (tag, args[0] if args else None)
+    tag = _WINDOW_AGGS.get(name)
+    if tag is None:
+        return None
+    arg = fn.this
+    if isinstance(arg, exp.Distinct):
+        # `count(DISTINCT x) OVER (...)`. The engine has a `count_distinct` window kernel;
+        # sqlglot wraps the argument rather than naming a different function, so the
+        # unwrapped read saw a `Distinct` node where a column was expected and the whole
+        # window was refused with "unsupported SQL expression: Distinct".
+        inner = arg.expressions
+        if tag != "count" or len(inner) != 1:
+            return None
+        return ("count_distinct", inner[0])
+    if isinstance(arg, exp.Star):
+        return (tag, None)
+    return (tag, arg)
+
+
 def _is_agg_window(win) -> bool:
     """Whether the window function is an aggregate (frames apply to these only)."""
-    return type(win.this).__name__.lower() in _WINDOW_AGGS
+    return window_agg(win.this) is not None
 
 
 # Positional value functions that pick a frame's first / last / nth row.

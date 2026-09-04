@@ -15,8 +15,9 @@ disappearance of the `CASE`.
 Each family is a separate rule, matched by node type, so a plan that only ever wraps a
 `CASE` in a string function pays for one rule rather than a dispatch over all of them. The
 vocabularies are the null-strict, total ones from `nulls/strictness`: pushing a call that
-can *raise* would move the error from one row set to another, since a vectorized `CASE`
-evaluates every branch and a pushed call evaluates only the branch it lands on.
+can *raise* would move the error from one row set to another, since the outer call sees
+every row of the `CASE`'s result and a pushed one sees only the rows that select its
+branch.
 """
 
 from __future__ import annotations

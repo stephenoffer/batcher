@@ -133,11 +133,11 @@ def test_a_zero_window_yields_nothing_rather_than_dividing_by_it():
 def test_a_dropped_link_puts_a_node_on_the_drain_list():
     # Distinguished from symbol errors on purpose: a drop cost a stage its in-flight
     # transfers, while accumulating symbol errors is a warning about the next one.
-    from batcher.dist.executors.ray_runtime import hardware_probe
+    from batcher.dist.executors.ray_runtime import fleet_health
 
     clean = {"node_id": "a", "quarantined": [], "fabric_errors": {"symbol_errors": 40}}
     dropped = {"node_id": "b", "quarantined": [], "fabric_errors": {"link_downed": 1}}
-    assert [r["node_id"] for r in hardware_probe.unhealthy_nodes((clean, dropped))] == ["b"]
+    assert [r["node_id"] for r in fleet_health.unhealthy_nodes((clean, dropped))] == ["b"]
 
 
 # --- What a shuffle reports about the wire it ran on ---------------------------------------

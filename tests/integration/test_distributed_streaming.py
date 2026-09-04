@@ -34,10 +34,10 @@ def _ids(path: str) -> list[int]:
     return sorted(bt.read(path, format="parquet").to_pydict()["id"])
 
 
-def test_distributed_drain_matches_single_node(tmp_path):
-    src = _splittable_parquet(str(tmp_path / "in.parquet"), 300)
-    single = str(tmp_path / "single")
-    dist = str(tmp_path / "dist")
+def test_distributed_drain_matches_single_node(cluster_tmp_path):
+    src = _splittable_parquet(str(cluster_tmp_path / "in.parquet"), 300)
+    single = str(cluster_tmp_path / "single")
+    dist = str(cluster_tmp_path / "dist")
 
     bt.read(src, format="parquet").write(
         single, format="parquet", trigger=bt.Trigger.available_now()
@@ -51,10 +51,10 @@ def test_distributed_drain_matches_single_node(tmp_path):
     assert _ids(dist) == list(range(300))
 
 
-def test_distributed_drain_with_filter_matches_single_node(tmp_path):
-    src = _splittable_parquet(str(tmp_path / "in.parquet"), 200)
-    single = str(tmp_path / "single")
-    dist = str(tmp_path / "dist")
+def test_distributed_drain_with_filter_matches_single_node(cluster_tmp_path):
+    src = _splittable_parquet(str(cluster_tmp_path / "in.parquet"), 200)
+    single = str(cluster_tmp_path / "single")
+    dist = str(cluster_tmp_path / "dist")
     pred = bt.col("id") % 2 == 0  # a stateless transform fanned across workers
 
     bt.read(src, format="parquet").filter(pred).write(
@@ -67,10 +67,10 @@ def test_distributed_drain_with_filter_matches_single_node(tmp_path):
     assert _ids(single) == _ids(dist) == list(range(0, 200, 2))
 
 
-def test_distributed_drain_returns_streaming_query(tmp_path):
-    src = _splittable_parquet(str(tmp_path / "in.parquet"), 120)
+def test_distributed_drain_returns_streaming_query(cluster_tmp_path):
+    src = _splittable_parquet(str(cluster_tmp_path / "in.parquet"), 120)
     q = bt.read(src, format="parquet").write(
-        str(tmp_path / "o"),
+        str(cluster_tmp_path / "o"),
         format="parquet",
         trigger=bt.Trigger.available_now(),
         distributed=True,
@@ -80,7 +80,7 @@ def test_distributed_drain_returns_streaming_query(tmp_path):
     assert q.last_progress is not None and q.last_progress.num_output_rows == 120
 
 
-def test_distributed_processing_time_trigger_runs_the_micro_batch_on_the_cluster(tmp_path):
+def test_distributed_processing_time_trigger_runs_the_micro_batch_on_the_cluster(cluster_tmp_path):
     """A non-drain distributed stream runs each micro-batch as a cluster-wide epoch.
 
     This used to raise: only `available_now`/`once` could be distributed, and everything
@@ -89,8 +89,8 @@ def test_distributed_processing_time_trigger_runs_the_micro_batch_on_the_cluster
     (`tests/integration/test_distributed_continuous_streaming.py` holds the transaction and
     exactly-once guarantees.)
     """
-    src = _splittable_parquet(str(tmp_path / "in.parquet"), 10)
-    out = str(tmp_path / "o")
+    src = _splittable_parquet(str(cluster_tmp_path / "in.parquet"), 10)
+    out = str(cluster_tmp_path / "o")
     query = bt.read(src, format="parquet").write(
         out,
         format="parquet",
@@ -102,15 +102,15 @@ def test_distributed_processing_time_trigger_runs_the_micro_batch_on_the_cluster
     assert _ids(out) == list(range(10))
 
 
-def test_distributed_checkpointed_stream_resumes_instead_of_reprocessing(tmp_path):
+def test_distributed_checkpointed_stream_resumes_instead_of_reprocessing(cluster_tmp_path):
     """A distributed stream can checkpoint: a re-run resumes rather than redoing the work.
 
     Also previously refused ("per-partition offset coordination is not implemented"). The
     offset log is written between staging an epoch and publishing it, so a second run over
     the same checkpoint finds the work already committed and drains nothing.
     """
-    src = _splittable_parquet(str(tmp_path / "in.parquet"), 10)
-    out, ckpt = str(tmp_path / "o"), str(tmp_path / "ckpt")
+    src = _splittable_parquet(str(cluster_tmp_path / "in.parquet"), 10)
+    out, ckpt = str(cluster_tmp_path / "o"), str(cluster_tmp_path / "ckpt")
 
     first = bt.read(src, format="parquet").write(
         out,

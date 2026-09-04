@@ -40,7 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from context import Context
 from engines import resolve
-from harness import results_match
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
+from harness import order_keys_of, order_violation, results_match
 from suites.standard.tpch import QUERIES
 
 
@@ -65,6 +66,17 @@ def _geomean(xs: list[float]) -> float:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     ap = argparse.ArgumentParser()
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--rounds", type=int, default=3)
@@ -90,6 +102,16 @@ def main() -> int:
             skipped.append(f"{case} (raised: {type(exc).__name__})")
             continue
         ok, why = results_match(out["duckdb"], out["batcher"])
+        # The multiset comparison sorts both sides, so an engine that skipped its `ORDER BY`
+        # would pass it and then be charged only for the work it did. A CPU-cost comparison
+        # is exactly where that matters: the skipped sort is the cost.
+        if ok:
+            keys = order_keys_of(sql)
+            for engine, table in out.items():
+                violation = order_violation(table, keys)
+                if violation is not None:
+                    ok, why = False, f"{engine} {violation}"
+                    break
         if not ok:
             skipped.append(f"{case} (MISMATCH: {why})")
             continue

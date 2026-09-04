@@ -9,7 +9,7 @@ parquet to; dates are compared as timestamps (``sources`` normalizes date column
 
 from __future__ import annotations
 
-from registry import REGISTRY, Case, suite
+from registry import suite
 from suites.standard.tpch_ray import case_with_ray
 
 tpch = suite("tpch", dataset="tpch")
@@ -302,6 +302,4 @@ QUERIES: dict[str, str] = {
 # now covers every query, so the distributed comparator is measured on the whole
 # benchmark rather than the four queries it once had.
 for _name, _query in QUERIES.items():
-    REGISTRY.add(
-        Case(family="tpch", name=_name, dataset="tpch", build=case_with_ray(_name, _query))
-    )
+    tpch.sql_with_builder(_name, _query, case_with_ray(_name, _query))

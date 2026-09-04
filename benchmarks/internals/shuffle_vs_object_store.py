@@ -21,9 +21,14 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 ROWS_PER_BATCH = 16_384
 
@@ -103,6 +108,17 @@ def main(n_partitions: int = 8, n_batches: int = 64) -> int:
     Returns:
         A process exit code, so the caller in `run.py` can return it directly.
     """
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     partitions = [_partition(n_batches, seed=i) for i in range(n_partitions)]
     total_bytes = _nbytes(partitions)
     expected = _checksum(partitions)

@@ -15,6 +15,7 @@ use crate::Geom;
 /// A degenerate box is not returned as a degenerate polygon: a point's envelope is a
 /// point and a horizontal line's is a line, matching PostGIS, because a zero-area
 /// "polygon" breaks every areal predicate downstream.
+#[must_use]
 pub fn envelope(g: &Geom) -> Geometry {
     let Some(b) = g.bbox() else {
         return Geometry::Polygon(Polygon::default());
@@ -59,6 +60,13 @@ pub fn make_envelope(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> GeoResult<Ge
 
 /// The boundary of a geometry: a polygon's rings, a chain's endpoints, nothing for a
 /// point set or a closed chain.
+///
+/// "Nothing" is not one spelling. OGC represents the empty boundary in the type the
+/// operand's boundary *would* have had: a chain's boundary is a point set, so a closed
+/// chain reports `MULTIPOINT EMPTY`; a point set has no lower dimension to fall to, so
+/// a `Point`/`MultiPoint` reports `GEOMETRYCOLLECTION EMPTY`. Both are empty and both
+/// compare equal by area, which is exactly why returning the wrong one is invisible to
+/// every value assertion and shows up only in the column's type.
 pub fn boundary(g: &Geometry) -> Geometry {
     match g {
         Geometry::Polygon(p) => {
@@ -95,7 +103,10 @@ pub fn boundary(g: &Geometry) -> Geometry {
                 .flat_map(|l| [Some(l[0]), Some(l[l.len() - 1])])
                 .collect(),
         ),
-        Geometry::Point(_) | Geometry::MultiPoint(_) => Geometry::MultiPoint(Vec::new()),
+        // The empty set at dimension -1: a point set's boundary has no type of its own
+        // to be empty in, so OGC (and GEOS, and PostGIS) spell it as an empty collection
+        // rather than as an empty MULTIPOINT.
+        Geometry::Point(_) | Geometry::MultiPoint(_) => Geometry::GeometryCollection(Vec::new()),
         Geometry::GeometryCollection(gs) => {
             Geometry::GeometryCollection(gs.iter().map(boundary).collect())
         }
@@ -107,6 +118,7 @@ pub fn boundary(g: &Geometry) -> Geometry {
 /// Degenerate inputs degrade rather than error: fewer than three distinct positions
 /// yield a point or a line, because the hull of two points *is* a line and returning a
 /// zero-area polygon would be a lie an areal predicate would then act on.
+#[must_use]
 pub fn convex_hull(g: &Geom) -> Geometry {
     let mut pts = g.coords();
     pts.retain(|c| !c.is_nan());
@@ -234,6 +246,7 @@ fn dp_recurse(line: &[Coord], first: usize, last: usize, eps: f64, keep: &mut [b
 
 /// Drop consecutive duplicate positions, optionally merging any pair closer than
 /// `tolerance`. Rings stay closed.
+#[must_use]
 pub fn remove_repeated_points(g: &Geometry, tolerance: f64) -> Geometry {
     fn thin(l: &LineString, tol: f64) -> LineString {
         let mut out: Vec<Coord> = Vec::with_capacity(l.len());
@@ -339,6 +352,7 @@ pub fn buffer(g: &Geom, radius: f64, quad_segs: usize) -> GeoResult<Geometry> {
 ///
 /// Exposed so the approximation is measurable rather than a footnote. A caller running
 /// a candidate filter can ignore it; a caller reporting an area can check it and refuse.
+#[must_use]
 pub fn buffer_error(g: &Geom) -> f64 {
     let hull = convex_hull(g);
     let a_hull = crate::algo::measure::area(&hull);
@@ -353,6 +367,7 @@ pub fn buffer_error(g: &Geom) -> f64 {
 ///
 /// Shapefiles want clockwise exteriors, GeoJSON wants counter-clockwise ones, and a
 /// mixed column is what makes a renderer punch holes in the wrong places.
+#[must_use]
 pub fn force_winding(g: &Geometry, exterior_ccw: bool) -> Geometry {
     fn fix(ring: &LineString, want_ccw: bool) -> LineString {
         if ring.len() < 4 || is_ccw(ring) == want_ccw {
@@ -409,6 +424,7 @@ pub fn reverse(g: &Geometry) -> Geometry {
 }
 
 /// Swap x and y in every position — the fix for a lat/lon column loaded as lon/lat.
+#[must_use]
 pub fn flip_coordinates(g: &Geometry) -> Geometry {
     g.map_coords(&mut |c| Coord {
         x: c.y,
@@ -422,6 +438,7 @@ pub fn flip_coordinates(g: &Geometry) -> Geometry {
 /// This is `ST_Collect`, not `ST_Union`: it concatenates. Two adjacent polygons
 /// collected stay two polygons that happen to touch, which is the cheap and lossless
 /// operation, and is what you want before a single `ST_Envelope` or `ST_ConvexHull`.
+#[must_use]
 pub fn collect(a: &Geometry, b: &Geometry) -> Geometry {
     fn parts(g: &Geometry) -> Vec<Geometry> {
         match g {
@@ -550,6 +567,31 @@ mod tests {
         assert_eq!(
             wkt(boundary(&g("POLYGON((0 0, 1 0, 1 1, 0 0))").geometry)),
             "LINESTRING(0 0, 1 0, 1 1, 0 0)"
+        );
+    }
+
+    #[test]
+    fn the_empty_boundary_keeps_the_type_ogc_gives_it() {
+        // Three different empty geometries, and which one you get is the whole content
+        // of the answer: every value-level assertion passes on any of them. GEOS and
+        // PostGIS agree on each of these.
+        for w in ["POINT(1 2)", "MULTIPOINT((0 0), (1 1))"] {
+            assert_eq!(
+                wkt(boundary(&g(w).geometry)),
+                "GEOMETRYCOLLECTION EMPTY",
+                "a point set falls to no lower dimension, so its empty boundary is a \
+                 collection, not an empty MULTIPOINT ({w})"
+            );
+        }
+        assert_eq!(
+            wkt(boundary(&g("LINESTRING(0 0, 1 0, 1 1, 0 0)").geometry)),
+            "MULTIPOINT EMPTY",
+            "a chain's boundary is a point set even when it is empty"
+        );
+        assert_eq!(
+            wkt(boundary(&g("POLYGON EMPTY").geometry)),
+            "MULTILINESTRING EMPTY",
+            "an areal boundary is a line set even when it is empty"
         );
     }
 

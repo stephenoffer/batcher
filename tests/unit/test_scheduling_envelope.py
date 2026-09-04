@@ -740,7 +740,12 @@ def test_fault_options_from_config():
             )
         )
     ):
-        assert fault_options() == {"max_retries": 4, "retry_exceptions": True}
+        opts = fault_options()
+        assert opts["max_retries"] == 4
+        # An **allowlist**, not `True`. `True` retries every application exception, so a
+        # deterministic UDF bug runs `max_retries + 1` times across the fleet before anything
+        # here sees it — the exact failure the recovery loop exists to avoid.
+        assert isinstance(opts["retry_exceptions"], list)
         assert actor_fault_options() == {"max_restarts": 3, "max_task_retries": 2}
 
     with config_context(
@@ -750,6 +755,59 @@ def test_fault_options_from_config():
     ):
         # retry_exceptions omitted when transient retries are off.
         assert fault_options() == {"max_retries": 0}
+
+
+def test_ray_retries_only_the_transient_exception_types():
+    """The allowlist is the retryable half of the shared taxonomy, restricted to what Ray can
+    match — a class, by `isinstance`.
+
+    Asserted in both directions. A deterministic bug must be absent, or the narrowing bought
+    nothing; a transient must be present, or Ray stops retrying what it used to. Narrowing
+    cannot lose a retry either way, because anything Ray declines still reaches
+    `gather_map_results`, which applies the full classifier (messages and cause chains, not
+    just types) — but it can only be *checked* here."""
+    from batcher.dist.executors.ray_runtime.policies import transient_exception_allowlist
+
+    allow = transient_exception_allowlist()
+    assert all(isinstance(t, type) and issubclass(t, BaseException) for t in allow)
+
+    # Present: the transient conditions a rerun genuinely clears.
+    assert MemoryError in allow
+    assert TimeoutError in allow
+    # By base class, since Ray matches instances: the four socket errors are subclasses.
+    assert ConnectionError in allow
+    for sub in (ConnectionResetError, ConnectionRefusedError, BrokenPipeError):
+        assert any(issubclass(sub, t) for t in allow), sub
+
+    # Absent: a deterministic bug fails identically on every worker.
+    for bug in (KeyError, TypeError, ValueError, ZeroDivisionError, AttributeError):
+        assert not any(issubclass(bug, t) for t in allow), bug
+
+
+def test_the_allowlist_agrees_with_the_shared_failure_taxonomy():
+    """`classify` is the one taxonomy the single-node executor and the scheduler share, so an
+    allowlist that disagreed with it would be the second, different retry rule its docstring
+    warns about. Every entry must classify as retryable."""
+    from batcher.carbonite.resilience import is_retryable
+    from batcher.dist.executors.ray_runtime.policies import transient_exception_allowlist
+
+    for exc_type in transient_exception_allowlist():
+        try:
+            instance = exc_type("probe")
+        except Exception:  # a type this test cannot construct is not one to assert about
+            continue
+        assert is_retryable(instance), f"{exc_type.__name__} is allowlisted but not retryable"
+
+
+def test_ray_accepts_the_allowlist():
+    """The positive control: Ray's `retry_exceptions` took only a bool for a long time, and a
+    rejected value would fail every task submission — while both assertions above still pass."""
+    import pytest
+
+    ray = pytest.importorskip("ray")
+    from batcher.dist.executors.ray_runtime.policies import fault_options
+
+    ray.remote(lambda: None).options(**fault_options())
 
 
 # --- GPU tag + utilization feedback loop (B4) -----------------------------------

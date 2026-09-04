@@ -20,6 +20,7 @@ ratio before they leave here.
 from __future__ import annotations
 
 from batcher._internal.logging import note_suppressed
+from batcher.observe.counters import escape_label
 
 __all__ = [
     "NODE_CONDITION_HELP",
@@ -98,7 +99,11 @@ def device_gauges() -> list[str]:
         lines.append(f"# HELP batcher_device_{suffix} {help_text}")
         lines.append(f"# TYPE batcher_device_{suffix} gauge")
         for reading in readings:
-            lines.append(f'batcher_device_{suffix}{{device="{reading[0]}"}} {pull(reading)}')
+            # A device *name* is vendor text ("NVIDIA A100-SXM4-80GB"), read off a driver
+            # this process does not control. One quote in it produces a line no scraper can
+            # parse, and a scraper that cannot parse one line drops the whole exposition.
+            device = escape_label(str(reading[0]))
+            lines.append(f'batcher_device_{suffix}{{device="{device}"}} {pull(reading)}')
     return lines
 
 

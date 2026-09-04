@@ -31,7 +31,7 @@ pub(crate) fn fill_window(
     for part in ordered {
         let mut carried: Option<u32> = None;
         if func == WindowFn::ForwardFill {
-            for &row in part.iter() {
+            for &row in part {
                 carry(values, row, &mut carried, &mut src);
             }
         } else {

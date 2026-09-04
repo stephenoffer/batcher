@@ -34,7 +34,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.io.source import Source
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import LogicalPlan
 
 __all__ = ["keyed_row_shuffle", "scan_rooted_ir"]
@@ -44,12 +44,15 @@ def scan_rooted_ir(node: LogicalPlan) -> str:
     """`node`'s IR with its input replaced by a scan of source 0 — the reduce-side plan.
 
     A reducer holds its bucket as one in-memory relation, so the operator it runs is the
-    plan node re-rooted on that relation. Going through `to_ir()` and swapping the `input`
-    keeps the operator's own encoding in `plan`, where the wire contract lives.
+    plan node re-rooted on that relation. Going through the node's own `shape_ir()` keeps
+    the operator's encoding in `plan`, where the wire contract lives.
+
+    Never by editing `to_ir()`'s result: that dict is **memoized on the node**, so writing an
+    `"input"` into it left the plan's own lowered IR reading this operator's child as a bare
+    `scan(source 0)` for the rest of the process. It also skips lowering the child subtree
+    that is about to be discarded.
     """
-    ir = node.to_ir()
-    ir["input"] = task_scan_ir()
-    return json.dumps(ir)
+    return json.dumps(unary_task_ir(node))
 
 
 def keyed_row_shuffle(

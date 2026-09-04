@@ -466,6 +466,7 @@ fn write_into(out: &mut String, g: &Geometry, has_z: bool) {
 }
 
 /// Render canonical WKT.
+#[must_use]
 pub fn write_wkt(g: &Geom) -> String {
     let mut out = String::with_capacity(16 + 24 * g.num_points());
     write_into(&mut out, &g.geometry, g.has_z);
@@ -473,6 +474,7 @@ pub fn write_wkt(g: &Geom) -> String {
 }
 
 /// Render EWKT — WKT with PostGIS's `SRID=<n>;` prefix when an SRID is set.
+#[must_use]
 pub fn write_ewkt(g: &Geom) -> String {
     if g.srid == 0 {
         return write_wkt(g);

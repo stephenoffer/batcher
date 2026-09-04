@@ -48,6 +48,41 @@ __all__ = ["IncrementalFileSource"]
 _DEFAULT_SUFFIX = {"parquet": ".parquet", "csv": ".csv", "json": ".json"}
 
 
+def _derived_state_dir(path: str, format: str) -> str:
+    """The default durable seen-file directory for watching `path` as `format`.
+
+    `state_dir` had no default, and the argument is keyword-only and required, so the
+    two-argument call this source's own public reader documents —
+    ``bt.read.files_incremental("s3://bucket/incoming/", "parquet")`` — raised
+    ``TypeError: __init__() missing 1 required keyword-only argument: 'state_dir'``.
+    Nothing caught it because the docstring's example carries ``# doctest: +SKIP`` (it
+    names a bucket that does not exist), so the one executable check of the entry point
+    never ran it. The reader's own docstring meanwhile listed ``state_dir=`` among the
+    optional ``opts``.
+
+    A default is safe here only because it is *derived* rather than shared: the digest
+    covers the watched path and the file format, so two queries watching the same
+    directory the same way resume the same store — which is the intent, an Auto Loader
+    stream that survives a restart — while two watching different directories never
+    collide. It is deliberately not a temp directory: a seen-file store that a reboot
+    clears would silently re-ingest the whole directory, which is the exactly-once
+    property this source exists to provide.
+
+    Args:
+        path: The watched directory or glob.
+        format: The registered file format being read.
+
+    Returns:
+        An absolute path under ``$BATCHER_HOME`` (or ``~/.batcher``).
+    """
+    import hashlib
+
+    from batcher._internal.paths import batcher_home
+
+    digest = hashlib.sha256(f"{os.path.abspath(path)}\x1f{format}".encode()).hexdigest()[:16]
+    return str(batcher_home() / "streaming" / "files_incremental" / digest)
+
+
 @SOURCES.register("files_incremental")
 class IncrementalFileSource:
     """A directory watched for new files, ingested exactly once per file.
@@ -59,6 +94,10 @@ class IncrementalFileSource:
             ``"csv"``, ``"json"``, …) — its reader is used to read each new file.
         state_dir: Directory holding the durable seen-file store. Created if
             missing; the store file lives at ``<state_dir>/<format>_seen.sqlite``.
+            Defaults to a stable per-user directory derived from `path` and `format`
+            (see `_derived_state_dir`), so the documented two-argument call works and
+            a restarted query resumes where it left off instead of re-ingesting the
+            whole directory.
         suffix: File suffix to list (default derived from ``format``).
         max_files_per_trigger: Cap on the new files one discovery pass admits, so a
             large backlog drains across many bounded micro-batches (Spark
@@ -109,7 +148,7 @@ class IncrementalFileSource:
         path: str,
         format: str,
         *,
-        state_dir: str,
+        state_dir: str | None = None,
         suffix: str | None = None,
         max_files_per_trigger: int | None = None,
         max_bytes_per_trigger: int | None = None,
@@ -117,7 +156,7 @@ class IncrementalFileSource:
     ) -> None:
         self._path = path
         self._format = format
-        self._state_dir = state_dir
+        self._state_dir = state_dir if state_dir is not None else _derived_state_dir(path, format)
         self._suffix = suffix if suffix is not None else _DEFAULT_SUFFIX.get(format, "")
         # Backpressure (Spark `maxFilesPerTrigger` / Auto Loader `cloudFiles.maxFilesPerTrigger`):
         # cap the new files a single discovery pass admits so a large backlog is drained across
@@ -309,20 +348,29 @@ class IncrementalFileSource:
         filesystems raise from `expand` when nothing matches and some return an empty list;
         only the first was handled, so the other spelling reached `files[0]` and surfaced as
         a bare `IndexError` with no mention of the path or the suffix.
+
+        A directory that does not exist is a *different* condition and says so. Both
+        spellings of "nothing matched" used to collapse onto "no files yet", which tells a
+        user with a typo in their path to keep waiting for files that will never arrive --
+        the one reading where the message sends them the wrong way.
         """
         if self._schema_cache is None:
-            try:
-                files = self._fs.expand(self._path, suffix=self._suffix)
-            except IOError as exc:
-                raise IOError(
-                    f"cannot infer schema: no {self._suffix} files yet under {self._path!r}"
-                ) from exc
+            files = self._expand_for_schema()
             if not files:
                 raise IOError(
                     f"cannot infer schema: no {self._suffix} files yet under {self._path!r}"
                 )
             self._schema_cache = self._reader(files[0]).schema()
         return self._schema_cache
+
+    def _expand_for_schema(self) -> list[str]:
+        """The discovery listing, with a missing path told apart from an empty one."""
+        try:
+            return self._fs.expand(self._path, suffix=self._suffix)
+        except IOError as exc:
+            if not self._fs.exists(self._path):
+                raise IOError(f"cannot infer schema: path {self._path!r} does not exist") from exc
+            return []
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return list(self.iter_batches(projection))
@@ -348,6 +396,19 @@ class IncrementalFileSource:
 
     def identity(self) -> str:
         return f"files_incremental:{self._format}:{self._path}"
+
+    def governed_name(self) -> str:
+        """The watched directory, which is the table a policy is written about.
+
+        `identity` prefixes the format, so parsing the table off it yielded
+        ``parquet:/data/orders`` -- a name nobody writes a policy about. The directory is
+        durable and knowable before the first file lands in it, which is exactly what a
+        policy needs.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none.
+        """
+        return self._path
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One :class:`FileSplit` per new file (locator-only, picklable).

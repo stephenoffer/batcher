@@ -37,6 +37,14 @@ def _nodes(monkeypatch, specs, alive=None):
         for c, g, m in specs
     ]
     monkeypatch.setattr(scaling, "node_classes", lambda: classes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     monkeypatch.setattr(scaling, "alive_node_count", lambda: alive or len(classes))
     # The SPREAD-to-PACK degrade asks how many machines exist, head included — a placement
     # bundle carries no head-excluding resource, so the head is one of them. `node_classes`
@@ -96,7 +104,15 @@ def test_spread_stays_spread_on_a_real_cluster(monkeypatch):
 
 def test_unreadable_topology_keeps_the_preference(monkeypatch):
     """Second-guessing a preference on no evidence is worse than honoring it."""
-    monkeypatch.setattr(scaling, "node_classes", lambda: [])
+    monkeypatch.setattr(scaling, "node_classes", list)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     monkeypatch.setattr(scaling, "alive_node_count", lambda: 0)
     monkeypatch.setattr(scaling, "cluster_node_count", lambda: 0)
     env = SchedulingEnvelope(num_cpus=4.0, n_tasks=8, placement_strategy="PACK")

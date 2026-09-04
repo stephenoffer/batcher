@@ -14,13 +14,17 @@ where it should count a distinct key, or accumulates in the wrong direction, the
 
 from __future__ import annotations
 
+import math
+
 import pyarrow as pa
 import pytest
 
 from batcher.dist.global_window.offsets import (
     OrderedBucketOffsets,
     bucket_order,
+    inject_window_helpers,
     supports_ordered_bucket_offsets,
+    unoffsettable_functions,
 )
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Scan, Window, WindowFuncSpec
@@ -42,7 +46,14 @@ def _window(funcs: list[tuple[str, str | None, str]], descending: bool = False) 
         partition_keys=(),
         order_keys=(SortKeySpec(Col("t"), descending=descending, nulls_first=False),),
         functions=tuple(
-            WindowFuncSpec(func=f, input=None if i is None else Col(i), alias=a, offset=1)
+            WindowFuncSpec(
+                func=f,
+                input=None if i is None else Col(i),
+                alias=a,
+                # `ntile` carries its tile count in `offset`, which every other function
+                # leaves at the lag/lead default of 1.
+                offset=_NTILE_TILES if f == "ntile" else 1,
+            )
             for f, i, a in funcs
         ),
         rank_limit=None,
@@ -88,12 +99,61 @@ def _kernel(rows: list[tuple[int, float | None]], func: str) -> list:
                 val = (sum(acc) / len(acc)) if acc else None
             elif func == "first_value":
                 val = rows[0][1]
+            elif func == "last_value":
+                # Whole-partition, not end-of-peer-group: the engine's `last_value` with no
+                # explicit frame reads the partition's final row, which is what makes it the
+                # one correction that cannot be made until the walk has ended.
+                val = rows[-1][1]
+            elif func == "var":
+                val = _sample_var(acc)
+            elif func == "stddev":
+                var = _sample_var(acc)
+                val = None if var is None else math.sqrt(var)
+            elif func == "row_count":
+                # Rows (null-valued ones included) through the end of this peer group — the
+                # numerator `cume_dist` divides by the relation's total.
+                val = i + 1
+            elif func == "percent_rank":
+                val = 0.0 if n == 1 else (start_rank(rows, start) - 1) / (n - 1)
+            elif func == "cume_dist":
+                val = (i + 1) / n
+            elif func == "ntile":
+                val = None  # positional; written per row below
             else:  # pragma: no cover - the test only asks for the offsettable set
                 raise AssertionError(func)
             for j in range(start, i + 1):
                 out[j] = val
             start = i + 1
+    if func == "ntile":
+        return [_ntile_of(j + 1, n, _NTILE_TILES) for j in range(n)]
     return out
+
+
+#: The tile count every `ntile` case in this file uses, so the oracle and the `Window` spec
+#: cannot disagree about it.
+_NTILE_TILES = 4
+
+
+def _sample_var(values: list[float]) -> float | None:
+    """Sample variance (ddof=1) of `values`, or None below two of them — SQL's `var`."""
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    return sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+
+
+def _ntile_of(row: int, total: int, tiles: int) -> int:
+    """SQL `NTILE`: `total` rows into `tiles` groups, the first `total % tiles` one larger."""
+    base, rem = divmod(total, tiles)
+    head = rem * (base + 1)
+    if row <= head:
+        return -(-row // (base + 1))
+    return rem + -(-(row - head) // max(base, 1))
+
+
+def start_rank(rows, start: int) -> int:
+    """The `rank` of the peer group beginning at index `start` (1-based, ties share it)."""
+    return start + 1
 
 
 def _buckets(rows: list[tuple[int, float | None]], cuts: list[int]):
@@ -118,17 +178,41 @@ _OUT_TYPE = {
     "max": pa.float64(),
     "avg": pa.float64(),
     "first_value": pa.float64(),
+    "last_value": pa.float64(),
+    "var": pa.float64(),
+    "stddev": pa.float64(),
+    "percent_rank": pa.float64(),
+    "cume_dist": pa.float64(),
+    "ntile": pa.int64(),
+    "row_count": pa.int64(),
+}
+
+#: Each helper role's oracle function, so the test asks `_kernel` for exactly the column
+#: `inject_window_helpers` asked the engine for. Read from the injection rather than restated
+#: per function: a helper added there and forgotten here would leave the offset reading a
+#: column the test never built, which is a `KeyError` rather than a silent pass.
+_HELPER_KERNEL = {
+    "sum": "sum",
+    "cnt": "count",
+    "avg": "avg",
+    "rank": "rank",
+    "rows": "row_count",
+    "rn": "row_number",
 }
 
 
 def _offset_answer(win: Window, rows, cuts, func: str, alias: str, descending: bool = False):
-    """Window each bucket alone, run the offsets, and return the rows in global order."""
-    avg_helpers = {}
-    if func == "avg":
-        avg_helpers = {alias: (f"__ws_sum::{alias}", f"__ws_cnt::{alias}")}
+    """Window each bucket alone, run the offsets, and return the rows in global order.
+
+    The helper columns are the ones `inject_window_helpers` actually asks the engine for,
+    read off that function rather than restated here — the previous spelling hard-coded
+    `avg`'s pair and stopped compiling the moment a second function needed helpers, which is
+    the drift this file exists to catch in the engine and had itself.
+    """
+    helpers = inject_window_helpers(win, {"functions": []})
     buckets = _buckets(rows, cuts)
-    offsets = OrderedBucketOffsets(win, avg_helpers)
-    answer: list = []
+    offsets = OrderedBucketOffsets(win, helpers)
+    corrected: list[pa.Table] = []
     for b in bucket_order(len(buckets), descending):
         br = buckets[b]
         if not br:
@@ -138,12 +222,16 @@ def _offset_answer(win: Window, rows, cuts, func: str, alias: str, descending: b
             "v": pa.array([v for _, v in br], pa.float64()),
             alias: pa.array(_kernel(br, func), _OUT_TYPE[func]),
         }
-        for helper, hf in zip(avg_helpers.get(alias, ()), ("sum", "count"), strict=False):
-            cols[helper] = pa.array(_kernel(br, hf), _OUT_TYPE[hf])
-        corrected = offsets.apply(pa.table(cols))
-        assert corrected.column_names == ["t", "v", alias], "helper columns leaked"
-        answer.extend(corrected.column(alias).to_pylist())
-    return answer
+        for role, helper in helpers.get(alias, {}).items():
+            kf = _HELPER_KERNEL[role]
+            cols[helper] = pa.array(_kernel(br, kf), _OUT_TYPE[kf])
+        corrected.append(offsets.apply(pa.table(cols)))
+    # `finalize` closes out the corrections that need the whole relation. It is a no-op for
+    # every function that does not, so the harness calls it unconditionally — which is also
+    # what pins that it *is* a no-op for them.
+    final = offsets.finalize(pa.concat_tables(corrected))
+    assert final.column_names == ["t", "v", alias], "helper columns leaked"
+    return final.column(alias).to_pylist()
 
 
 @pytest.mark.unit
@@ -159,6 +247,16 @@ def _offset_answer(win: Window, rows, cuts, func: str, alias: str, descending: b
         ("max", "v"),
         ("avg", "v"),
         ("first_value", "v"),
+        # The six below are corrected either by a moment combination (`var`, `stddev`) or by
+        # `finalize` over the assembled result, and none of them existed in this algebra
+        # before. They are exactly the shapes a per-bucket run gets confidently wrong: a
+        # `percent_rank` divided by its own bucket's row count is a plausible number.
+        ("var", "v"),
+        ("stddev", "v"),
+        ("last_value", "v"),
+        ("percent_rank", None),
+        ("cume_dist", None),
+        ("ntile", None),
     ],
 )
 @pytest.mark.parametrize("cuts", [[25], [15, 35], [10, 30, 50], [5], [99]])
@@ -236,15 +334,34 @@ def test_the_unoffsettable_functions_are_refused():
     number rather than an error. This is the only thing standing between that and a user.
     """
     assert supports_ordered_bucket_offsets(_window([("row_number", None, "r")]))
+    # Genuinely unoffsettable, on either kind of driver. `lead` reads the bucket the walk has
+    # not reached (where `lag` reads the one behind it, which a bounded boundary exchange
+    # carries); `median` and `count_distinct` need the whole relation at every row; `product`
+    # is excluded on numerical grounds rather than structural ones, and is the member most
+    # likely to be "fixed" by someone who has not read why.
+    for func, arg in [("lead", "v"), ("median", "v"), ("count_distinct", "v"), ("product", "v")]:
+        win = _window([(func, arg, "r")])
+        assert not supports_ordered_bucket_offsets(win), func
+        assert not supports_ordered_bucket_offsets(win, assembled=True), func
+        assert unoffsettable_functions(win, assembled=True) == [func], func
+    # These four *are* offsettable, but only for a driver that holds every bucket before it
+    # returns any row: three divide by the relation's total row count and one is its last
+    # value. Declining them by default is what keeps the streaming driver — which yields
+    # buckets as it goes — from emitting a `percent_rank` divided by one bucket's rows.
     for func, arg in [
-        ("lag", "v"),
-        ("lead", "v"),
         ("last_value", "v"),
         ("ntile", None),
         ("percent_rank", None),
         ("cume_dist", None),
     ]:
-        assert not supports_ordered_bucket_offsets(_window([(func, arg, "r")])), func
+        win = _window([(func, arg, "r")])
+        assert not supports_ordered_bucket_offsets(win), func
+        assert supports_ordered_bucket_offsets(win, assembled=True), func
+        assert unoffsettable_functions(win, assembled=True) == [], func
+    # A function it *does* cover is never named as the culprit. The message this feeds used
+    # to list every function in the window, so a `lag` beside a `row_number` reported both.
+    mixed = _window([("row_number", None, "a"), ("lead", "v", "b")])
+    assert unoffsettable_functions(mixed, assembled=True) == ["lead"]
     # A PARTITION BY has its own (hash) shuffle and must not be routed here.
     win = _window([("row_number", None, "r")])
     assert not supports_ordered_bucket_offsets(
@@ -256,14 +373,40 @@ def test_the_unoffsettable_functions_are_refused():
             rank_limit=None,
         )
     )
-    # Two order keys: there is no single column to range-partition on.
+    # Two order keys ARE accepted: only the LEADING one has to be a plain column, because it
+    # is the only one the range partitioner reads values from. This asserted the opposite,
+    # on the ground that "there is no single column to range-partition on" — but there is,
+    # and all three drivers already cut on `order_keys[0]` alone.
+    #
+    # The bucket argument survives the extra keys: a peer group under a multi-key `ORDER BY`
+    # is a set of rows equal on *every* key, so it sits inside the set of rows equal on the
+    # leading key, which the partitioner puts in one bucket. No peer group straddles a cut,
+    # and an earlier bucket's rows have a strictly smaller leading key so the buckets stay
+    # ordered. Refusing was not conservative: a global window is not a `_split_at`
+    # pass-through, so nothing carried it up and `ORDER BY a, b` **raised** `PlanError` on
+    # distributed data instead of falling back to the materializing kernel.
+    # `tests/differential/test_diff_global_window_split_folds.py` holds the split result equal
+    # to the single-node one for ten functions, `rank` and `dense_rank` among them — the two
+    # that would expose a broken peer group.
     from batcher.plan.logical.aggregate import SortKeySpec
 
-    assert not supports_ordered_bucket_offsets(
+    assert supports_ordered_bucket_offsets(
         Window(
             input=win.input,
             partition_keys=(),
             order_keys=(*win.order_keys, SortKeySpec(Col("v"))),
+            functions=win.functions,
+            rank_limit=None,
+        )
+    )
+    # The relaxation is to the TRAILING keys only. A computed *leading* key has no column for
+    # the partitioner to read, so it is still refused — the control that keeps the assertion
+    # above from being satisfied by a uniformly permissive predicate.
+    assert not supports_ordered_bucket_offsets(
+        Window(
+            input=win.input,
+            partition_keys=(),
+            order_keys=(SortKeySpec(Col("t") + Col("v")), *win.order_keys),
             functions=win.functions,
             rank_limit=None,
         )

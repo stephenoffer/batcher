@@ -1,8 +1,9 @@
-"""Bounded memory: caching a reused branch and spilling under a tight budget.
+"""Bounded memory: caching a reused branch, storage levels, and spilling under a tight budget.
 
 ``cache()`` is an execution hint, not a semantic change: the result is identical with or
-without it. Spilling is the same idea for memory -- under a small budget the engine goes
-out of core rather than failing, and the answer does not change.
+without it, at every storage level and on either tier. Spilling is the same idea for
+memory -- under a small budget the engine goes out of core rather than failing, and the
+answer does not change.
 
     python examples/operations/memory_and_caching.py
 """
@@ -36,9 +37,47 @@ def main() -> None:
     uncached = data.filter(col("v") % 2 == 0).select(t=col("v").sum()).to_pydict()
     assert uncached == total
 
-    # `persist` is the eager sibling: materialize now, reuse later.
+    # `persist` is the Spark spelling of the same marker.
     persisted = data.filter(col("v") > 1900).persist()
     assert persisted.count() == 99
+
+    # A storage level says which media the stored result may occupy. The default,
+    # MEMORY_AND_DISK, demotes to a local disk tier when the memory budget evicts, so a
+    # working set larger than the budget costs a read-back rather than a recompute.
+    # DISK_ONLY never charges the memory budget at all.
+    on_disk = data.group_by("grp").agg(n=bt.count()).cache(bt.StorageLevel.DISK_ONLY)
+    assert on_disk.count() == 20
+    assert on_disk.count() == 20  # the second one is served from the disk tier
+    # Where a result is stored never changes what it is.
+    assert on_disk.to_pydict() == data.group_by("grp").agg(n=bt.count()).to_pydict()
+
+    # `cache_stats()` is how you tell whether the cache is earning its budget. The
+    # counters are lifetime figures for the process, so read a difference across a span
+    # of work rather than an absolute.
+    before = bt.cache_stats()
+    reused = data.filter(col("v") > 1000).cache()
+    reused.collect()  # miss: computed and stored
+    reused.collect()  # hit: served from the cache
+    after = bt.cache_stats()
+    print("cache hits over that span:", after["hits"] - before["hits"])
+    assert after["hits"] - before["hits"] == 1
+
+    # `uncache` (Spark: `unpersist`) gives one result's memory and disk back at a known
+    # moment; `clear_cache()` does it for every cached result at once.
+    reused.uncache()
+    bt.clear_cache()
+    assert bt.cache_stats()["entries"] == 0
+    # Dropping a cached result changes what a query costs, never what it returns.
+    assert reused.count() == 999
+
+    # A terminal that materializes the result fills the cache; count(), is_empty() and
+    # iter_batches() read a warm one but never fill it, because filling it would mean
+    # materializing the result those three exist to avoid materializing.
+    warm = data.filter(col("v") > 1000).cache()
+    warm.collect()
+    hits = bt.cache_stats()["hits"]
+    assert warm.count() == 999
+    assert bt.cache_stats()["hits"] == hits + 1
 
     # Run the same aggregate under a deliberately tight memory budget. The engine spills
     # rather than failing, and the result is unchanged.

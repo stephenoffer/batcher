@@ -113,7 +113,7 @@ def _pairs() -> list[tuple[str, str]]:
     return [(f, t) for f in sorted(AGG_FNS - {"count_star", "approx_top_k"}) for t in _TYPES]
 
 
-@pytest.mark.parametrize(("func", "tname"), _pairs(), ids=lambda v: str(v))
+@pytest.mark.parametrize(("func", "tname"), _pairs(), ids=str)
 def test_a_rejected_pair_is_one_the_engine_cannot_answer(func: str, tname: str) -> None:
     table = pa.table({"g": pa.array([1, 1, 2], pa.int64()), "v": _TYPES[tname]})
     try:
@@ -210,7 +210,7 @@ _WINDOW_REJECTED = [
 ]
 
 
-@pytest.mark.parametrize(("func", "tname"), _WINDOW_REJECTED, ids=lambda v: str(v))
+@pytest.mark.parametrize(("func", "tname"), _WINDOW_REJECTED, ids=str)
 def test_a_window_function_rejects_the_same_domains(func: str, tname: str) -> None:
     from batcher.plan.types.domains import window_domain_error
 

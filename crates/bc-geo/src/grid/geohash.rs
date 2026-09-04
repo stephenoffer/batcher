@@ -75,7 +75,7 @@ pub fn encode(lon: f64, lat: f64, precision: usize) -> GeoResult<String> {
         } else {
             (&mut lat_range, lat)
         };
-        let mid = (range.0 + range.1) / 2.0;
+        let mid = f64::midpoint(range.0, range.1);
         if value >= mid {
             acc = (acc << 1) | 1;
             range.0 = mid;
@@ -107,7 +107,7 @@ pub fn decode_bbox(hash: &str) -> GeoResult<Bbox> {
         for shift in (0..5).rev() {
             let bit = (v >> shift) & 1;
             let range = if even { &mut lon_range } else { &mut lat_range };
-            let mid = (range.0 + range.1) / 2.0;
+            let mid = f64::midpoint(range.0, range.1);
             if bit == 1 {
                 range.0 = mid;
             } else {
@@ -127,7 +127,10 @@ pub fn decode_bbox(hash: &str) -> GeoResult<Bbox> {
 /// The centre of the cell a hash names.
 pub fn decode(hash: &str) -> GeoResult<Coord> {
     let b = decode_bbox(hash)?;
-    Ok(Coord::new((b.xmin + b.xmax) / 2.0, (b.ymin + b.ymax) / 2.0))
+    Ok(Coord::new(
+        f64::midpoint(b.xmin, b.xmax),
+        f64::midpoint(b.ymin, b.ymax),
+    ))
 }
 
 /// The eight cells around `hash`, in the order N, NE, E, SE, S, SW, W, NW.
@@ -143,7 +146,7 @@ pub fn neighbors(hash: &str) -> GeoResult<Vec<String>> {
     let b = decode_bbox(hash)?;
     let precision = hash.len();
     let (w, h) = (b.xmax - b.xmin, b.ymax - b.ymin);
-    let (cx, cy) = ((b.xmin + b.xmax) / 2.0, (b.ymin + b.ymax) / 2.0);
+    let (cx, cy) = (f64::midpoint(b.xmin, b.xmax), f64::midpoint(b.ymin, b.ymax));
     let mut out = Vec::with_capacity(8);
     for (dx, dy) in [
         (0.0, 1.0),

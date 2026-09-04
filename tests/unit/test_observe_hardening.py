@@ -82,6 +82,57 @@ def test_a_failing_sink_cannot_recurse_through_the_logging_bridge(bus, tmp_path)
     assert len(delivered) == 200  # every publish still delivered to the healthy sink
 
 
+def test_a_scrape_does_not_deadlock_when_a_device_probe_raises(monkeypatch, tmp_path):
+    """Regression: `snapshot()` holds the collector lock -> a probe raises -> `note_suppressed`
+    publishes a LOG event -> the bus delivers it to this same collector -> `handle` takes the
+    lock this thread already holds. `threading.Lock` is not reentrant, so the scrape hung.
+
+    It hung *holding* the lock, so every later `QUERY_END` blocked on it too: one flaky driver
+    read took out the metrics endpoint and the event bus with it. The handler that caused it is
+    commented "a scrape must never fail a process", which is exactly right about the intent and
+    was the mechanism of something strictly worse -- a failed scrape returns, a hung one does
+    not.
+
+    **Debug logging is a precondition and the test sets it up itself.** `note_suppressed`
+    records at DEBUG, so the LOG event only reaches the bus when the batcher logger passes
+    DEBUG records; at the default level nothing is published and there is no re-entry. Written
+    without this, the test passed against the unfixed code -- the failure mode
+    `lint-methodology` exists for. It is also what the bug costs in production: the endpoint
+    deadlocks when an operator turns debug logging on, which is exactly when they are already
+    chasing something.
+
+    Driven through a **local** collector rather than the process-wide one in `observe.metrics`,
+    so that a regression *fails* instead of hanging the suite: the wedged worker holds only
+    this collector's lock, and the cleanup below needs no lock at all. Tearing down the global
+    collector would itself block on the lock the hung thread is holding, which is how the first
+    version of this test hung rather than failing.
+    """
+    from batcher._internal.hardware.telemetry import throughput
+    from batcher.observe.collector import _Collector
+
+    blog._applied = None
+    blog.configure(
+        ObservabilityConfig(log_level="DEBUG", console=False, log_file=str(tmp_path / "l"))
+    )
+
+    def _boom():
+        raise RuntimeError("driver went away")
+
+    monkeypatch.setattr(throughput, "device_throughput", _boom)
+
+    collector = _Collector()
+    detach = events.subscribe(collector.handle)
+    done = threading.Event()
+    try:
+        worker = threading.Thread(target=lambda: (collector.snapshot(), done.set()), daemon=True)
+        worker.start()
+        assert done.wait(timeout=30), (
+            "snapshot() did not return: the scrape re-entered the collector's own lock"
+        )
+    finally:
+        detach()
+
+
 def test_reporter_survives_a_failing_sink_under_debug_logging(bus, tmp_path):
     """The same cycle, through the real reporter, which takes a lock while rendering."""
     blog._applied = None
@@ -229,9 +280,14 @@ def test_rendering_survives_a_degenerate_terminal_size(bus, monkeypatch):
     monkeypatch.setattr(
         shutil_mod, "get_terminal_size", lambda *_a, **_k: __import__("os").terminal_size((1, 1))
     )
+    from batcher.observe.console import bar
+    from batcher.observe.theme import detect
+
     reporter = ConsoleReporter(stream=Stream(), live=True)
-    assert reporter._bar(0.5)
-    assert reporter._bar(None)
+    width = reporter._bar_width()
+    palette, glyphs = detect(Stream())
+    assert bar(0.5, width, palette, glyphs, 0)
+    assert bar(None, width, palette, glyphs, 0)
 
 
 def test_ascii_stream_never_emits_a_character_it_cannot_encode(bus):
@@ -448,17 +504,43 @@ def test_a_quiet_query_emits_nothing_to_the_terminal(bus, capsys):
     assert captured.out == "" and captured.err == ""
 
 
+def _fastest(run, samples: int = 7) -> float:
+    """The shortest of `samples` runs of `run`, in seconds.
+
+    Min, not mean: contention, page faults and a cold first pass can only ever *add* time,
+    so the minimum is the least contaminated estimate of the work itself. A single sample
+    on a box this repo documents as routinely carrying three concurrent sessions is a
+    coin-flip, not a measurement.
+    """
+    best = float("inf")
+    for _ in range(samples):
+        started = time.perf_counter()
+        run()
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
 def test_progress_events_do_not_slow_a_stream_measurably(bus):
-    """A sanity bound, not a benchmark: the per-batch publish must not dominate."""
+    """A sanity bound, not a benchmark: the per-batch publish must not dominate.
+
+    This assertion used to be unfalsifiable, in three compounding ways, while reading as a
+    performance guarantee. It took **one** sample of each arm and compared them; it allowed
+    the instrumented arm to be **20x** the baseline, which is not "not measurably"; and its
+    slack term was `+ 0.5` seconds against arms that measure ~0.0005s, so the comparison
+    could not fail on any input whatsoever. It also measured the baseline arm *first*, which
+    handed it the cold-start cost and inflated the very number the bound is a multiple of.
+
+    Measured here: min-of-7 puts the instrumented arm at about **1.3x** the baseline. The
+    bound below is 4x plus 2ms, which leaves ample room for a slow machine while still
+    failing on the regression it exists to catch — a per-row rather than per-batch publish,
+    which costs an order of magnitude.
+    """
     ds = bt.from_pydict({"x": list(range(200_000))})
-    t0 = time.perf_counter()
-    list(ds.iter_batches())
-    baseline = time.perf_counter() - t0
+    stream = lambda: list(ds.iter_batches())  # noqa: E731
+    baseline = _fastest(stream)
     bus.subscribe(ActivityStore().handle)
-    t0 = time.perf_counter()
-    list(ds.iter_batches())
-    observed = time.perf_counter() - t0
-    assert observed < baseline * 20 + 0.5, f"baseline={baseline:.4f}s observed={observed:.4f}s"
+    observed = _fastest(stream)
+    assert observed < baseline * 4 + 0.002, f"baseline={baseline:.4f}s observed={observed:.4f}s"
 
 
 def test_verbose_actually_shows_more_than_normal(bus, tmp_path):

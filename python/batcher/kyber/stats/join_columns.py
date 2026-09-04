@@ -52,18 +52,12 @@ def join_columns(
             paired = keys.get((o.side, o.name))
             if paired is not None:
                 src = _intersect_key_stat(src, paired)
-            out[o.alias] = dataclasses.replace(
-                src.downgrade(Provenance.DEFAULT),
-                null_count=None,
-                ndv=_join_ndv(src.ndv, out_rows),
-                total_sum=None,  # matching duplicates rows, so a recorded sum no longer holds
-                mean=None,
-                # The measured *width* survives — a join changes which rows are present, not
-                # how many bytes one holds — and it is what keeps byte-true memory and
-                # broadcast sizing alive above a join. Frequencies (mcv) do not: a join
-                # re-weights the value distribution by its match multiplicity.
-                mcv=None,
-            )
+            # `ColumnStat.carried_through_join` is the downgrade and these drops in one
+            # construction: the sum and mean no longer hold once matching duplicates rows,
+            # and frequencies (mcv) do not survive a join re-weighting the distribution by
+            # match multiplicity — while the measured *width* does, which is what keeps
+            # byte-true memory and broadcast sizing alive above a join.
+            out[o.alias] = src.carried_through_join(_join_ndv(src.ndv, out_rows))
     return out
 
 

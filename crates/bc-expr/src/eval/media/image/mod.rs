@@ -80,7 +80,7 @@ pub(crate) fn eval_image(
             // Namespaced, because `Decode` alone is a name three namespaces share and the
             // error otherwise reported an image failure without saying it was one.
             func: format!("image.{func:?}"),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -158,7 +158,7 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         .downcast_ref::<GenericBinaryArray<O>>()
         .ok_or_else(|| ExprError::ExpectedBinary {
             func: format!("{func:?}"),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     // Every bytes-out op writes the same container, resolved once for the batch so an
     // unknown format name is one plan error rather than n identical per-row failures.
@@ -285,7 +285,7 @@ pub(super) fn assemble_u8_tensor(n: usize, per_row: usize, rows: Vec<Option<Vec<
 /// `convert("L")` all reduce a pixel through these weights, so they cannot disagree.
 fn rec601([r, g, b]: [u8; 3]) -> u8 {
     // +500 for round-to-nearest on the /1000 divide; the sum maxes at 255000 < u32.
-    ((299 * r as u32 + 587 * g as u32 + 114 * b as u32 + 500) / 1000) as u8
+    ((299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) + 500) / 1000) as u8
 }
 
 /// `decode` → struct `{width, height, channels, mode}` (header read only).
@@ -312,23 +312,20 @@ fn decode_dims<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<Arra
     let mut modes: Vec<&'static str> = Vec::with_capacity(bytes.len());
     let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
     for header in headers {
-        match header {
-            Some((w, h, c, mode)) => {
-                widths.push(w as i32);
-                heights.push(h as i32);
-                channels.push(c);
-                modes.push(mode);
-                valid.push(true);
-            }
-            None => {
-                // A struct's child arrays stay full length; the row's null bit is what
-                // marks it absent, so the placeholders here are never read.
-                widths.push(0);
-                heights.push(0);
-                channels.push(0);
-                modes.push("");
-                valid.push(false);
-            }
+        if let Some((w, h, c, mode)) = header {
+            widths.push(w as i32);
+            heights.push(h as i32);
+            channels.push(c);
+            modes.push(mode);
+            valid.push(true);
+        } else {
+            // A struct's child arrays stay full length; the row's null bit is what
+            // marks it absent, so the placeholders here are never read.
+            widths.push(0);
+            heights.push(0);
+            channels.push(0);
+            modes.push("");
+            valid.push(false);
         }
     }
     let nulls = NullBuffer::from(valid);
@@ -356,7 +353,7 @@ fn to_tensor<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("to_tensor", "width", width)?;
     let h = dim("to_tensor", "height", height)?;
-    let per_row = element_len_guard("to_tensor", (w as u64) * (h as u64) * 3, "bytes")?;
+    let per_row = element_len_guard("to_tensor", u64::from(w) * u64::from(h) * 3, "bytes")?;
     // Decode + resize every row in parallel (this is the training-data hot path:
     // `read.images(decode=True)` lowers to exactly this kernel). Each row yields its
     // own `per_row`-byte RGB8 buffer, or `None` on null/undecodable/wrong-size input.
@@ -389,7 +386,7 @@ fn to_tensor_f32<O: OffsetSizeTrait>(
 
     let w = dim("to_tensor_f32", "width", width)?;
     let h = dim("to_tensor_f32", "height", height)?;
-    let per_row = element_len_guard("to_tensor_f32", (w as u64) * (h as u64) * 3, "floats")?;
+    let per_row = element_len_guard("to_tensor_f32", u64::from(w) * u64::from(h) * 3, "floats")?;
     let hw = (w as usize) * (h as usize);
 
     // Decode+resize in parallel (the hot path), then normalize into the flat child buffer.
@@ -408,7 +405,7 @@ fn to_tensor_f32<O: OffsetSizeTrait>(
                 // `rgb` is HWC RGB8. Normalize each channel; write HWC or CHW.
                 for p in 0..hw {
                     for c in 0..3 {
-                        let x = (rgb[p * 3 + c] as f32) / 255.0;
+                        let x = f32::from(rgb[p * 3 + c]) / 255.0;
                         let v = (x - norm.mean[c]) * norm.inv_std[c];
                         let idx = if norm.channels_first {
                             c * hw + p
@@ -452,7 +449,7 @@ fn center_crop<O: OffsetSizeTrait>(
             return None;
         }
         let img = image::load_from_memory(bytes.value(i)).ok()?.into_rgb8();
-        let (sw, sh) = (img.width() as i64, img.height() as i64);
+        let (sw, sh) = (i64::from(img.width()), i64::from(img.height()));
         // Centered top-left of the crop window (may be negative when the image is smaller).
         let x0 = (sw - w as i64) / 2;
         let y0 = (sh - h as i64) / 2;
@@ -491,7 +488,7 @@ fn to_grayscale<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("to_grayscale", "width", width)?;
     let h = dim("to_grayscale", "height", height)?;
-    let per_row = element_len_guard("to_grayscale", (w as u64) * (h as u64), "pixels")?;
+    let per_row = element_len_guard("to_grayscale", u64::from(w) * u64::from(h), "pixels")?;
 
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
@@ -560,7 +557,11 @@ fn dhash<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, 
 /// hash that varies by machine cannot be stored or compared across runs.
 fn luma(rgb: &[u8], row: usize, col: usize, width: usize) -> u32 {
     let base = (row * width + col) * 3;
-    let (r, g, b) = (rgb[base] as u32, rgb[base + 1] as u32, rgb[base + 2] as u32);
+    let (r, g, b) = (
+        u32::from(rgb[base]),
+        u32::from(rgb[base + 1]),
+        u32::from(rgb[base + 2]),
+    );
     299 * r + 587 * g + 114 * b
 }
 
@@ -595,7 +596,7 @@ fn color_mode(color: image::ColorType) -> (i32, &'static str) {
         Rgba8 | Rgba16 | Rgba32F => (4, "RGBA"),
         // `ColorType` is non-exhaustive, so an unknown variant reports its channel count
         // from the decoder rather than guessing a name.
-        other => (other.channel_count() as i32, "other"),
+        other => (i32::from(other.channel_count()), "other"),
     }
 }
 
@@ -616,13 +617,12 @@ fn decode_rgb_resized(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     use fast_image_resize as fir;
 
     // Stage 1: decode to an RGB8 buffer at some `(sw, sh)` ≥ the target.
-    let (rgb, sw, sh) = match decode_jpeg_scaled(data, w, h) {
-        Some(scaled) => scaled,
-        None => {
-            let img = image::load_from_memory(data).ok()?;
-            let (sw, sh) = (img.width(), img.height());
-            (img.into_rgb8().into_raw(), sw, sh)
-        }
+    let (rgb, sw, sh) = if let Some(scaled) = decode_jpeg_scaled(data, w, h) {
+        scaled
+    } else {
+        let img = image::load_from_memory(data).ok()?;
+        let (sw, sh) = (img.width(), img.height());
+        (img.into_rgb8().into_raw(), sw, sh)
     };
     if sw == 0 || sh == 0 {
         return None;
@@ -698,7 +698,7 @@ pub(crate) fn eval_image_crop(arr: &ArrayRef, bounds: &Bounds<'_>) -> Result<Arr
         ),
         other => Err(ExprError::ExpectedBinary {
             func: "image.crop".to_string(),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -882,7 +882,7 @@ mod tests {
     ///   RAYON_NUM_THREADS=1 cargo test -p bc-expr to_tensor_bench -- --ignored --nocapture
     ///   cargo test -p bc-expr to_tensor_bench -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "throughput study for image->tensor; run with --ignored --nocapture"]
     fn to_tensor_bench() {
         use std::time::Instant;
         let n = 4000usize;
@@ -1562,17 +1562,17 @@ mod tests {
         let row = fsl.value(0);
         let px = row.as_any().downcast_ref::<UInt8Array>().unwrap();
         assert!(
-            (px.value(0) as i32 - 40).abs() < 20,
+            (i32::from(px.value(0)) - 40).abs() < 20,
             "R ~40, got {}",
             px.value(0)
         );
         assert!(
-            (px.value(1) as i32 - 160).abs() < 20,
+            (i32::from(px.value(1)) - 160).abs() < 20,
             "G ~160, got {}",
             px.value(1)
         );
         assert!(
-            (px.value(2) as i32 - 200).abs() < 20,
+            (i32::from(px.value(2)) - 200).abs() < 20,
             "B ~200, got {}",
             px.value(2)
         );

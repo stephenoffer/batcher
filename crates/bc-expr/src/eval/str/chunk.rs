@@ -104,7 +104,7 @@ pub(crate) fn eval_chunk(
     let mut builder = ListBuilder::new(StringBuilder::new());
     // Reused across rows: the byte offset of every character boundary.
     let mut offsets: Vec<usize> = Vec::new();
-    for o in s.iter() {
+    for o in s {
         match o {
             Some(v) => {
                 chunk_row(v, size, overlap, boundary, &mut offsets, builder.values());

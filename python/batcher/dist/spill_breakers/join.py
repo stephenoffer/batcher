@@ -2,6 +2,20 @@
 
 Equal keys hash to the same bucket on both sides, so the union of the per-bucket-pair joins
 is exactly the full join — bounded by one bucket pair rather than the whole build side.
+
+Serves the equi-join and the **ASOF join with `by` keys**, on one argument: an ASOF match only
+ever pairs rows that share a `by` group, so hashing on `by` puts every row that could match a
+given row in that row's own bucket, and each bucket is an independent ASOF join whose union is
+the full result. That is exactly the argument `dist.executor._distributed_asof` already makes
+for the *cluster* — one relation cut into pieces that can be joined independently — and it
+holds identically when the pieces are visited one at a time on disk instead of at once across
+machines. It was made in only one of the two places, so `join_asof(..., by=...)` had a
+distributed path and no bounded-memory one: `collect(spill=True)` and `iter_batches()` both
+built the whole join in memory under the envelope meant to prevent exactly that.
+
+A **keyless** ASOF has no group to hash and is refused. The cluster reaches it by
+range-partitioning on `on` and lending each bucket the boundary row that can match across the
+cut (`_distributed_asof_keyless`), which is a different decomposition, not this one.
 """
 
 from __future__ import annotations
@@ -33,7 +47,20 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.io.source import Source
 from batcher.plan.ir_specs import task_scan_ir
-from batcher.plan.logical import Join
+from batcher.plan.logical import AsofJoin, Join
+
+#: The two node types this path serves, and how to read their equi-keys. An ASOF join's
+#: hashable keys are its `by` columns; its `on` column is an *inequality* and is resolved
+#: inside each bucket by the same kernel the single-node path runs.
+_Joinish = Join | AsofJoin
+
+
+def _equi_keys(join: _Joinish) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(left, right)` key columns to co-partition on."""
+    if isinstance(join, AsofJoin):
+        return tuple(join.left_by), tuple(join.right_by)
+    return tuple(join.left_keys), tuple(join.right_keys)
+
 
 # The grace recursion is `dist.spill.buckets`': same depth bound, same width, same salt as the
 # aggregate's and the window's. Named locally because the reduce below reads them.
@@ -43,18 +70,37 @@ _JOIN_SUB_BUCKETS = GRACE_SUB_BUCKETS
 _SUBBUCKET_SALT = split_salt(0)
 
 
-def supports_spilling_join(join: Join) -> bool:
-    """Whether this join can grace-partition out-of-core: each side must name one source.
+def supports_spilling_join(join: _Joinish) -> bool:
+    """Whether this join can grace-partition out-of-core.
 
-    A side spanning two sources — a join whose operand is itself a join, i.e. any 3+-table
-    query — cannot, and this path used to assert on it rather than decline. Sort and Window
-    already gate this way. `False` falls back to the in-memory join: costs memory, never
-    correctness."""
+    Each side must name one source: a side spanning two sources — a join whose operand is
+    itself a join, i.e. any 3+-table query — cannot, and this path used to assert on it rather
+    than decline. Sort and Window already gate this way.
+
+    An ASOF join additionally needs `by` keys, which are the only thing it can hash on; a
+    keyless one is refused here and reaches the cluster by a different decomposition entirely
+    (see the module docstring). Note this is the *shape* test only — an ASOF join whose `by`
+    keys are present is co-partitionable however its `on`, `direction` or `tolerance` are set,
+    because all three are resolved within a bucket.
+
+    `False` falls back to the in-memory join: costs memory, never correctness."""
+    # A `map_batches` anywhere beneath the breaker makes the plan unserialisable: the operator
+    # runs a Python callable and `to_ir()` raises by design, so every path here that ships the
+    # plan to the engine dies inside `json.dumps`. Answering "yes" and letting the executor
+    # discover that is exactly the shape `test_spill_predicates_never_raise` exists to stop —
+    # `iter_batches()` on `map_batches(...).sort(...)` surfaced as
+    # `NotImplementedError: map_batches is executed in Python, not lowered to the engine IR`.
+    from batcher.core.udf import has_map_batches
+
+    if has_map_batches(join):
+        return False
+    if isinstance(join, AsofJoin) and not join.left_by:
+        return False
     return _single_source(join.left) and _single_source(join.right)
 
 
 def execute_spilling_join(
-    join: Join,
+    join: _Joinish,
     sources: list[Source],
     num_partitions: int = 16,
     spill_dir: str | None = None,
@@ -76,7 +122,7 @@ def execute_spilling_join(
 
 
 def stream_spilling_join(
-    join: Join,
+    join: _Joinish,
     sources: list[Source],
     num_partitions: int = 16,
     spill_dir: str | None = None,
@@ -101,6 +147,7 @@ def stream_spilling_join(
             "right": task_scan_ir(1),
         }
     )
+    left_keys, right_keys = _equi_keys(join)
     n_buckets = _fd_safe(num_partitions)
 
     with spill_scratch("batcher_join_spill_", spill_dir) as store:
@@ -112,7 +159,7 @@ def stream_spilling_join(
         left_handles = _spill_side(
             nat,
             left_ir,
-            list(join.left_keys),
+            list(left_keys),
             sources[left_sid],
             n_buckets,
             store,
@@ -123,7 +170,7 @@ def stream_spilling_join(
         right_handles = _spill_side(
             nat,
             right_ir,
-            list(join.right_keys),
+            list(right_keys),
             sources[right_sid],
             n_buckets,
             store,
@@ -133,8 +180,8 @@ def stream_spilling_join(
         )
 
         key_idx = (
-            _key_indices(left_schema, join.left_keys),
-            _key_indices(right_schema, join.right_keys),
+            _key_indices(left_schema, left_keys),
+            _key_indices(right_schema, right_keys),
         )
         for b in range(n_buckets):
             if left_handles[b] is None and right_handles[b] is None:

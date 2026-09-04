@@ -12,7 +12,6 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use arrow_pyarrow::PyArrowType;
 use bc_ir::{EngineConfig, RelOp};
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 /// The engine's allocator, installed here because this crate is the cdylib every
@@ -108,7 +107,7 @@ fn execute_plan(
             }
         })
         .map_err(errors::interp_to_pyerr)?;
-    let out = rebase_nested_offsets(narrow_output(out, &narrow));
+    let out = bc_interp::coalesce_small_batches(rebase_nested_offsets(narrow_output(out, &narrow)));
     Ok(out.into_iter().map(PyArrowType).collect())
 }
 
@@ -166,7 +165,7 @@ fn execute_plan_metered(
         })
         .map_err(errors::interp_to_pyerr)?;
     let metrics = metrics.with_query(query_watch);
-    let out = rebase_nested_offsets(narrow_output(out, &narrow));
+    let out = bc_interp::coalesce_small_batches(rebase_nested_offsets(narrow_output(out, &narrow)));
     Ok((
         out.into_iter().map(PyArrowType).collect(),
         metrics.to_json(),
@@ -349,6 +348,12 @@ fn register_query(query_id: &str) {
 }
 
 /// Close the registration for `query_id`. Idempotent.
+///
+/// The unconditional `unregister`. `bc_resource::cancel::unregister_token` exists because that
+/// is unsafe when an id can be *reused* — one query's cleanup deregisters another's, leaving it
+/// uncancellable. Safe here only by a property of the caller: `core.runtime.query_scope` mints
+/// `q-<16 hex of uuid4>` per terminal op and a re-entrant scope reuses the active id, so an id
+/// is never live twice. **Change that and the token must be threaded through instead.**
 #[pyfunction]
 fn unregister_query(query_id: &str) {
     bc_resource::cancel::unregister(query_id);
@@ -380,11 +385,11 @@ fn cancel_all_queries() -> usize {
     bc_resource::cancel::cancel_all()
 }
 
-/// Map any engine error into a Python exception. The error hierarchy mapping
-/// (PlanError/ExecutionError/...) is refined once the Python error types exist;
-/// for now everything surfaces as a `RuntimeError` carrying the engine message.
+/// Map any engine error into a Python exception, as `batcher.ExecutionError`.
+///
+/// It was a bare `RuntimeError`, which `except bt.BatcherError` misses; see `errors`.
 pub(crate) fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    errors::execution_error(e.to_string())
 }
 
 /// Distributed map step: aggregate one partition into partial state.

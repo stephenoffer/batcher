@@ -22,11 +22,14 @@ from __future__ import annotations
 
 from batcher.dist.spill.aggregate import _MAX_SPILL_RECURSION as _MAX_SPILL_RECURSION
 from batcher.dist.spill.aggregate import _SUB_BUCKETS as _SUB_BUCKETS
-from batcher.dist.spill.aggregate import _empty_table as _empty_table
 from batcher.dist.spill.aggregate import _peel_to_breaker as _peel_to_breaker
 from batcher.dist.spill.aggregate import _reduce_agg_bucket as _reduce_agg_bucket
 from batcher.dist.spill.aggregate import _split_salt as _split_salt
-from batcher.dist.spill.aggregate import execute_spilling_aggregate, spill_collect
+from batcher.dist.spill.aggregate import (
+    execute_spilling_aggregate,
+    narrow_to_stage,
+    spill_collect,
+)
 from batcher.dist.spill.buckets import (
     BucketWriters,
     regrace,
@@ -46,6 +49,7 @@ __all__ = [
     "BucketWriters",
     "execute_spilling_aggregate",
     "map_projection",
+    "narrow_to_stage",
     "regrace",
     "resident_bytes",
     "spill_collect",

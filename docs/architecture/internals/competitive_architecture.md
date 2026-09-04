@@ -1,8 +1,56 @@
 # Competitive architecture: where Batcher wins, where it loses, and what it must build
 
-**Status:** audit, 2026-07-14; partially re-audited 2026-07-29, 2026-08-01, 2026-08-15 and
-2026-08-16. Every claim below was checked against code, not documentation. Where the docs and the code disagreed, the
+**Status:** audit, 2026-07-14; partially re-audited 2026-07-29, 2026-08-01, 2026-08-15,
+2026-08-16 and 2026-08-25. Every claim below was checked against code, not documentation. Where the docs and the code disagreed, the
 code won and the doc is named as wrong.
+
+**What the 2026-08-25 pass changed — TPC-H sf10 is a win, and JOB is the largest move.**
+Measured as an **A/B against the tree itself**: `HEAD` built in a separate worktree, the new
+build in the main one, two engines on both arms (`batcher,duckdb`) and the same 96-core /
+184 GiB node. Against the figures recorded in the passes below rather than a re-run of `HEAD`,
+two rows would have been credited with drift they did not earn — the operator mix reads 0.740
+in the 2026-08-23 entry and **0.690 on `HEAD` today** — so every number in this pass is a
+same-day pair.
+
+| suite | HEAD | after |
+|---|---:|---:|
+| **TPC-H sf10 (22)** | 1.087 | **0.963 — W** |
+| **JOB (113, real IMDb)** | 1.265 | **1.112**, 34 → 44 wins |
+| TPC-H sf1 (22) | 0.782 | **0.742** |
+| TPC-DS sf1 (99) | 0.945 | 0.947 (total 3,408 → **3,256 ms**) |
+| ClickBench (43) | 0.630 | **0.620** |
+| operator mix (21) | 0.690 | **0.678** |
+| H2O `join` (5) | 0.697 | 0.695 (total 555 → **476 ms**) |
+| H2O `groupby` (10) | 1.006 | 1.025 |
+
+**Two rows below change their verdict, and one of them is this document's oldest reservation.**
+
+* **TPC-H sf10 (60M-row `lineitem`) is no longer a loss.** 1.087x → **0.963x**, suite total
+  2,938 → 2,323 ms, carried per query rather than by a geomean: q9 456 → 233 ms, q13 325 → 174,
+  q5 189 → 122, q3 116 → 87, q4 117 → 96, q10 158 → 139. The `≥100M rows` row keeps its **L**
+  on the sf100 evidence — 600M rows still OOMs q3/q4/q5 and that is untested here — but the
+  sentence locating the boundary *at sf10* is retired.
+
+* **JOB moves further than any other suite: 1.265x → 1.112x, and Batcher's total drops below
+  DuckDB's** (8,131 ms against 8,885). The geomean stays above 1 because it wins the large
+  queries and still loses many small ones — q17f 298 → 75 ms, q10c 185 → 46, q8d 188 → 69,
+  q30a 172 → 106 — so quote both or the row reads as a loss it no longer straightforwardly is.
+  This is the suite the design is aimed at, and it is the one that moved most.
+
+**Why they moved, in one line each** (`benchmarks/BENCHMARK_RESULTS.md` carries the
+measurements): a probe-side bloom that allocated one full-size filter per build shard and merged
+them serially — 34.3 ms against the 31.3 ms parallel hash insert beside it — is now sharded the
+way the heads are and merges nothing; the two fitted constants that existed only to compensate
+for that cost are gone, which is what lets a multi-join spine keep every core instead of
+collapsing to one; an ordered group key now uses the key-disjoint partition its own layout
+already provides instead of gathering the relation into hash buckets; and the group-count
+estimator no longer reads a *clustered* key as a thousand-value domain when it holds fifteen
+million.
+
+**Read JOB's per-query deltas as noise and its total as signal.** 113 queries share one process,
+one learned-stats hub and one memory pool, so a query's time depends on what ran before it: a
+full run shows q25a at 83.7 → 264.5 ms, and run on its own the whole q25 family is *faster* on
+the new build (q25a 135.5 → 72.7, q25b 95.3 → 63.5, q25c 109.5 → 82.7).
 
 **What the 2026-08-16 pass changed.** Re-measured every suite on the same 96-core / 184 GiB
 node, each on a **two-engine** lineup (`batcher,duckdb`) so no third engine's resident memory
@@ -59,8 +107,10 @@ day and 1.51x a week before), ClickBench (0.62x, 30 of 43), JSON (0.25x), the op
 is confirmed:
 
 * **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
-* **Single-node ≥100M rows (vs DuckDB): L** — still L, and the boundary is now located rather
-  than bracketed: TPC-H at sf10 (60M-row `lineitem`) is a loss, where sf1 is 0.78x.
+* **Single-node ≥100M rows (vs DuckDB): L** — still L on the sf100 evidence (600M rows, where
+  q3/q4/q5 OOM), but **the sf10 half of this row is retired**: TPC-H at sf10 (60M-row
+  `lineitem`) is a **win** as of 2026-08-25, 0.963x against 1.087x on the same day's `HEAD`.
+  The sentence below recorded it as a loss and is kept for the history of the number.
   Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
   q13 12.7x, q18 12.5x, q9 11.2x), and those four carry the highest-cardinality group-bys and
   the largest intermediates in the benchmark.
@@ -163,7 +213,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 |---|---|---|---|---|---|---|
 | Small-query latency | **= on a repeated shape** (2x faster), **L on a first-seen one** (2.8x slower — 8 ms of optimizer, twice; ceiling 8) | = | **W** | — | **W** | **W** |
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
-| Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5) | **L** on 6 shapes | — | — | **W** | — |
+| Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5 at sf100) — but the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (722 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
 | Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |
@@ -915,6 +965,74 @@ structural too — fewer passes (converge detection per rule family rather than 
 moving the fixpoint loop out of Python — and neither is a tuning exercise. It remains the
 largest single latency item on the board.
 
+### 9. A small `GROUP BY` pays most of its wall time learning, not aggregating (measured 2026-09-01)
+
+The one relational shape where Batcher loses to DuckDB in-process, and the reason is not the
+aggregation.
+
+Measured on 96 cores, 4M rows, one `int64` key and one `float64` measure, three repetitions
+taking the minimum, **a fresh `Dataset` per repetition** and `collect()` rather than
+`count()` (see the two traps below):
+
+| groups | Batcher | DuckDB | ratio |
+|---|---|---|---|
+| 2 | 59.5 ms | 50.3 ms | 1.18x |
+| 10 | 60.8 ms | 48.1 ms | 1.26x |
+| 100 | 70.8 ms | 47.9 ms | **1.48x** |
+| 1,000 | 76.0 ms | 50.4 ms | **1.51x** |
+| 10,000 | 84.0 ms | 67.1 ms | 1.25x |
+| 100,000 | 91.3 ms | 148.3 ms | 0.62x |
+| 1,000,000 | 92.0 ms | 275.4 ms | **0.33x** |
+
+Read the shape of the two curves before the ratios. Batcher's cost is **nearly flat** --
+59.5 ms to 92.0 ms across five hundred thousand times more groups -- where DuckDB's climbs
+50 ms to 275 ms. That is the mergeable algebra doing what it is for, and it is why the
+crossover exists at all. Holding groups at 100 and varying rows instead, the crossover is
+between 4M and 16M rows: 74.7 ms against 47.6 ms at 4M, and **93.8 ms against 147.6 ms at
+16M**.
+
+**Where the time goes.** Profiling a 100,000-row grouped aggregation (`cProfile`, five
+iterations, cumulative):
+
+| call | share |
+|---|---|
+| `_close_learning_loops` → `learn_column_stats` → `_native.heavy_hitters` | **49%** |
+| `_optimize` → `column_statistics` → `_native.column_stats_full` | 14% |
+| `seed_column_ndv` → `_native.column_ndv` | 7% |
+
+So roughly **70% of a small grouped query is the cross-query learning loop and the
+optimizer's own statistics**, and the aggregation it is timing is the remainder. That is
+not a defect in the aggregate kernel and no amount of work on it would move this number.
+
+**It is, however, the rule in `.claude/rules/performance.md` being broken by its own moat:**
+"Don't add per-query setup cost ... that hurts the small case to help the large one. Make it
+adaptive." The learning loop is already bounded by *columns* -- `learn_column_stats` sketches
+only the columns the estimator can consult, which is what took a 20M-row scan's overhead from
+22.9 s down -- and it is not bounded by *rows*. The adaptive re-optimization loop next to it
+is (`api/adaptive/gating.py`), for exactly this reason.
+
+**Recorded rather than changed.** `api/terminal/_metadata.py` and `core/stats.py` were both
+another session's uncommitted work at the time of measurement, and that work
+(`_sketch_shards`, re-slicing the input so the sketch parallelizes) is aimed at this same
+cost. A second edit there would collide with it.
+
+**Two measurement traps, both of which inflate Batcher, both hit before the numbers above
+were believed.** They are recorded because anyone re-running this will hit them:
+
+1. **`count()` is answered from metadata.** A sort does not change the row count, so
+   `ds.sort(...).count()` never executes the sort -- the first run of this probe reported a
+   4M-row sort in **0.2 ms**. Materialize with `collect()`.
+2. **The result cache serves repetitions 2..n.** A min-of-three over one `Dataset` measures a
+   cache hit; it reported a 4M-row full sort at 43 ms against DuckDB's 608 ms. Build a fresh
+   `Dataset` each repetition so the source identity differs.
+
+**Every other shape measured here Batcher wins**, verified equal-result on the same Arrow
+input: filter 0.24x, high-cardinality group-by 0.41x, distinct 0.20x, sort+limit 0.78x, full
+sort 0.14x, string group-by 0.42x. So did every string and expression case -- `upper` 0.06x,
+`contains` 0.12x, `replace` 0.03x, `split`+`len` 0.11x, `regexp_extract` 0.43x, three-term
+arithmetic 0.18x, `CASE WHEN` 0.15x -- with the outputs checked element-for-element against
+DuckDB rather than assumed.
+
 ## Claims to retire
 
 These are asserted in the repo and contradicted by its own code.
@@ -997,6 +1115,148 @@ optimization if something mechanically proves it agrees with the oracle.** Keep 
 JIT differential tests, and treat a comment that explains *why* two implementations must match as
 load-bearing code, not commentary.
 
+
+### 10. `sort().limit(n)` costs a whole scan; DuckDB's costs about 40% of one (measured 2026-09-01)
+
+Batcher wins the two shapes either side of this one and loses this one, which is what makes it
+worth writing down rather than folding into a general "sorting is fine".
+
+Release build, 2,000,000 rows, six columns, local Parquet, min of five runs, DuckDB at
+`PRAGMA threads=8`:
+
+| Shape | Batcher | DuckDB | Ratio |
+|---|---|---|---|
+| bare scan, all columns | 64.2 ms | 165.5 ms | **0.39x** |
+| full sort, all columns | 95.9 ms | 419.1 ms | **0.23x** |
+| `ORDER BY x LIMIT 100`, all columns | 70.1 ms | 42.2 ms | **1.66x** |
+| `ORDER BY x LIMIT 100`, one column | 16.5 ms | 13.1 ms | 1.26x |
+
+Every top-N figure in this section is a **cold** one -- the first execution of that shape in
+the process -- which is the only case the learned bound below cannot help. On the 40-column
+table the same query is 5.22x cold and **1.87x warm**.
+
+The plan is not the problem. `explain()` shows the limit fused into the sort and pushed into
+the scan -- `sort [top 100 by x]` over `scan ... pushed[top 100 by x]` -- so the optimizer is
+doing what it should.
+
+What the numbers say is narrower and is about *cost relative to a scan*. Batcher's top-N costs
+essentially what materializing the whole relation costs; DuckDB's costs a fraction of it. Over
+1,000,000 rows at three widths:
+
+| Columns | Batcher top-N | vs its own scan | DuckDB top-N | vs its own scan |
+|---|---|---|---|---|
+| 2 | 45.9 ms | 2.49x | 15.3 ms | 0.78x |
+| 10 | 87.1 ms | 1.12x | 41.8 ms | 0.44x |
+| 40 | 361.3 ms | 1.05x | 167.2 ms | 0.39x |
+
+So the gap is not a fixed overhead and it does not close as the query gets bigger: at ten
+columns and above, Batcher pays a full materialization for a hundred rows and DuckDB pays
+about 40% of one.
+
+**Batcher's side of it is not an inference, and it is a statement about the *first* run of a
+shape rather than about the engine.** That distinction was missing from this section until
+2026-09-02 and it inverted the conclusion, so it is worth stating carefully.
+
+The engine's own counters, over the 40-column table. A full scan and a first `LIMIT 100`
+report the same figures; the *second* `LIMIT 100` of the same shape does not:
+
+| | rows scanned | bytes scanned | rows returned |
+|---|---|---|---|
+| full scan | 1,000,000 | 320,000,000 | 1,000,000 |
+| `ORDER BY x LIMIT 100`, first run | 1,000,000 | 320,000,000 | 100 |
+| `ORDER BY x LIMIT 100`, second run | **100** | **32,000** | 100 |
+
+**Ten thousand times fewer bytes materialized, from one previous execution.** The mechanism is
+`kyber/learned_tuning/topn_bound.py`, which records the k-th best value a top-N returned and
+seeds the next run of the same shape with it as a predicate the scan can push down. A stale
+bound cannot return a wrong answer -- every row it removes is strictly worse than every row it
+keeps -- so the only failure is too few survivors, which the caller detects by counting and
+answers by re-running unseeded.
+
+An earlier revision of this section proposed late materialization as "the shape of a fix" that
+"needs no further measurement". That was wrong twice over: the engine already solves this, by
+a different and arguably better mechanism, and the proposal was made without checking whether
+it was already solved. The learned bound is the cross-run half of the moat doing exactly what
+the moat is for, on the shape this section had written off.
+
+**What the bound does not fix, which is the finding that survives.** Wall time falls 3.5x with
+it (1,286 ms to 363 ms) where materialized bytes fall 10,000x, and Batcher is still 1.87x
+DuckDB warm. So after the I/O is gone the residual cost is *not* materialization, and the
+remaining gap is somewhere this section has not measured -- evaluating the seeded predicate
+across every row group, or per-file overhead. That is the open question, not the byte count.
+
+**The other half of the explanation was hypothesized, tested and rejected**, and that is
+recorded because the hypothesis is the obvious one and someone will have it again. The guess was that DuckDB
+late-materializes -- reads the sort key, picks the surviving row ids, then fetches only those
+rows' remaining columns -- which predicts its top-N is roughly *flat* in the projected width.
+It is not: 15.3 -> 41.8 -> 167.2 ms as the width goes 2 -> 10 -> 40, growing at much the same
+rate as Batcher's. Whatever DuckDB is doing costs a stable ~40% of its own scan rather than
+avoiding the columns altogether. So the asymmetry is real and measured on both sides, and
+only *Batcher's* half of it has a mechanism attached: DuckDB's remains unidentified, and
+nothing here should be read as saying otherwise.
+
+Worth keeping in proportion. The same sweep has Batcher at 0.23x on a full sort, 0.31x on
+`DISTINCT`, 0.34x on `COUNT(DISTINCT)` and 0.36x on a self-join. The only other losses were
+`GROUP BY` shapes, and following them up folded them into section 9 rather than adding a
+finding: **Batcher's `GROUP BY` is nearly flat in cardinality and DuckDB's is not.**
+
+Over 2,000,000 rows, the same key drawn as an integer and as a string:
+
+| Key | Groups | Batcher | DuckDB | Ratio |
+|---|---|---|---|---|
+| int | 10 | 26.3 ms | 12.0 ms | 2.20x |
+| string | 10 | 30.4 ms | 11.7 ms | 2.59x |
+| int | 1,000 | 25.3 ms | 10.9 ms | 2.33x |
+| string | 1,000 | 34.1 ms | 11.9 ms | 2.86x |
+| int | 200,000 | 46.6 ms | 94.5 ms | **0.49x** |
+| string | 200,000 | 61.6 ms | 143.9 ms | **0.43x** |
+
+Batcher goes 26 ms to 47 ms across four orders of magnitude of group count; DuckDB goes 12 ms
+to 95 ms. That is section 9 again at a different scale, and the two together say what the
+floor is made of. It is **flat in the group count and not flat in the row count**: ~25 ms
+here at 2M rows against ~60 ms in section 9 at 4M, which is what a floor made of
+`heavy_hitters` and `column_stats_full` should do, since both walk the column. Calling it a
+fixed per-query cost would be wrong and would point at the wrong fix -- it is per-row work
+that the group count does not change, sitting under an aggregation that scales better than
+DuckDB's.
+
+The string key is worth naming only to rule it out. It adds 4-15 ms over the integer key at
+matched cardinality and does not change the shape of either curve, so the 2.54x on a
+string-keyed `GROUP BY` in the sweep was the fixed overhead with a modest string cost on top,
+not a string-hashing problem. Reporting it as one would have sent someone to the wrong file.
+
+A second sweep, run to see whether top-N was one of many losses or one of few, says few. Same
+release build, 2,000,000 rows, seven columns including a string and a timestamp, row counts
+checked against DuckDB's before any time was reported:
+
+| Shape | Batcher vs DuckDB |
+|---|---|
+| `ORDER BY g, x` | **0.23x** |
+| `replace()` | **0.25x** |
+| `upper()` + `length()` | **0.27x** |
+| `split_part()` | 0.33x |
+| `CASE WHEN` | 0.42x |
+| `regexp_extract()` | 0.46x |
+| `sum() OVER (PARTITION BY)` | 0.48x |
+| semi-join (`EXISTS`) | 0.49x |
+| `GROUP BY` two keys | 0.52x |
+| `median()` | 0.72x |
+| `UNION ALL` | 0.99x |
+| `sum/avg/min/max` | 1.03x |
+| `stddev()` | 1.40x |
+| `GROUP BY ... HAVING` | 1.51x |
+
+Batcher wins twelve of the fourteen, several by 3-4x, and the two it loses are the two that
+return almost nothing -- `stddev` returns one row and the `HAVING` returns 2,412. Both are
+19 ms against 13 ms, which is the floor above and not a property of either operator.
+
+That is the useful conclusion from twenty-six measured shapes across the two sweeps: apart
+from top-N, **every shape Batcher loses is a small result, and every one of them is the same
+floor.** There is no scattered set of slow operators to go and optimize. There is one
+cost, it is the learning loop and the optimizer's own statistics, and section 9 already says
+where it lives.
+
+
 ## The roadmap that would make the claim true
 
 In dependency order. (1) and (2) are the ones that change what Batcher *is*.
@@ -1075,7 +1335,29 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
 Until 1–2 land, the defensible positioning is narrower than the current one, and *still strong*:
 
 > The fastest **distributed** Arrow engine, with an optimizer that learns across runs — beating
-> Ray Data by 50–450×, Spark by 13–197×, and Polars at most shapes; on a single node it wins below
-> ~10M rows and cedes to DuckDB above it.
+> Ray Data by 50–450×, Spark by 13–197×, and Polars at most shapes; on a single node it wins to
+> at least 60M rows and cedes to DuckDB at sf100.
 
 That is a claim the benchmarks in this repo actually support.
+
+**The single-node half of that sentence said "wins below ~10M rows and cedes to DuckDB above
+it" until 2026-09-01.** It was stale against this file's own body, which retired the sf10 half
+of that row on 2026-08-25: TPC-H at sf10 is a 60M-row `lineitem` and it is a **win** at 0.963x.
+The loss is at sf100 — 600M rows, with q3/q4/q5 OOM — so the crossover is somewhere between
+60M and 600M rows and is not near 10M.
+
+One instance is left standing and is named here so it is not mistaken for agreement.
+`docs/benchmarks/methodology.md` still calls above-10M "the regime the project concedes it
+loses in"; it was uncommitted in another session's tree when this was written and is theirs
+to correct. The quoted one-line summary earlier in *this* file is deliberate and stays --
+the sf10 retirement note says so explicitly, keeping the sentence for the history of the
+number. What changed is the closing *recommendation*, which is advice about what to say now
+rather than a record of what was once measured.
+
+A fresh four-shape check at 16M rows on the 96-core node agrees, and is recorded because it
+was run to test the retired sentence rather than to support it: `ORDER BY` 0.14x, filter
+0.27x, join 0.35x, and a 100-group `GROUP BY` at 2.40x. Three decisive wins and one loss, and
+the loss is the low-cardinality `GROUP BY` floor of sections 9 and 10 rather than anything
+about scale. Batcher's position *improves* with size across those shapes -- filter goes 1.22x
+at 1M to 0.49x at 4M to 0.27x at 16M -- which is the opposite of what the old sentence
+predicts.

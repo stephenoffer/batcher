@@ -70,7 +70,12 @@ fn drain_within_budget(
     let mut out = Vec::new();
     for batch in stream {
         let batch = batch?;
-        held += batch.get_array_memory_size() as u64;
+        // Slice-aware ([`crate::column_bytes`]), not `get_array_memory_size`: the morsels a
+        // streaming source yields are slices of a shared parent, and the parent-buffer measure
+        // charges every one of them the whole parent. That does not merely mis-report here — it
+        // is the difference between running and returning `MemoryBudgetExceeded` for a query
+        // that fits, because this counter is the check.
+        held += crate::column_bytes(batch.columns());
         if held as usize > budget {
             // `out` is dropped on the way out, so the bail releases what it accumulated.
             return Err(InterpError::MemoryBudgetExceeded {
@@ -118,12 +123,12 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                     // grow only with the group count. Counting keys alone let the one shape
                     // that OOMs here — few groups, huge per-group value lists — read as
                     // kilobytes and sail past the check.
-                    let state_bytes = merged
-                        .group_columns
-                        .iter()
-                        .chain(merged.states.iter().flatten())
-                        .map(|c| c.get_array_memory_size() as u64)
-                        .sum::<u64>();
+                    let state_bytes = crate::column_bytes(
+                        merged
+                            .group_columns
+                            .iter()
+                            .chain(merged.states.iter().flatten()),
+                    );
                     // The streaming aggregate folds in memory. A group count too large for the
                     // envelope is exactly the case the materializing executor spills, so hand the
                     // query back rather than OOM where it would have survived.
@@ -307,11 +312,12 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                 let held = crate::batch_bytes(&probed);
                 let full = ops::parallel_distinct(&probed)?;
                 let distinct_rows: usize = full.iter().map(|b| b.num_rows()).sum();
-                let out = match distinct_rows > *k {
-                    false => full,
-                    true => bc_runtime::agg::distinct_prefix(&probed, *k)?
+                let out = if distinct_rows <= *k {
+                    full
+                } else {
+                    bc_runtime::agg::distinct_prefix(&probed, *k)?
                         .into_iter()
-                        .collect(),
+                        .collect()
                 };
                 if let (Some(m), Some(id)) = (ctx.meter, id) {
                     m.breaker(
@@ -340,13 +346,14 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                     "the streaming distinct does not spill",
                 )?;
                 let (rows_in, held) = (crate::count_rows(&batches), crate::batch_bytes(&batches));
-                match batches.is_empty() {
-                    true => (Vec::new(), rows_in, held),
-                    false => (
+                if batches.is_empty() {
+                    (Vec::new(), rows_in, held)
+                } else {
+                    (
                         ops::parallel_distinct_on(&batches, keys, order)?,
                         rows_in,
                         held,
-                    ),
+                    )
                 }
             };
             // Nothing reached the operator at all: defer, so the oracle supplies the

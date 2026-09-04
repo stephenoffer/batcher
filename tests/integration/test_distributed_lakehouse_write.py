@@ -18,8 +18,8 @@ import pytest
 import batcher as bt
 
 
-def _src(tmp_path) -> tuple[str, int, int]:
-    src = str(tmp_path / "src")
+def _src(cluster_tmp_path) -> tuple[str, int, int]:
+    src = str(cluster_tmp_path / "src")
     os.makedirs(src)
     import pyarrow.parquet as pq
 
@@ -35,15 +35,15 @@ def _src(tmp_path) -> tuple[str, int, int]:
 
 
 @pytest.mark.integration
-def test_delta_distributed_write_matches_single_node(tmp_path):
+def test_delta_distributed_write_matches_single_node(cluster_tmp_path):
     pytest.importorskip("deltalake")
-    src, rows, total = _src(tmp_path)
+    src, rows, total = _src(cluster_tmp_path)
 
     def write(out: str, **kw) -> None:
         bt.read.parquet(f"{src}/*.parquet").filter(bt.col("a") >= 50).write.delta(out, **kw)
 
-    single = str(tmp_path / "d_single")
-    dist = str(tmp_path / "d_dist")
+    single = str(cluster_tmp_path / "d_single")
+    dist = str(cluster_tmp_path / "d_dist")
     write(single)
     write(dist, distributed=True, num_workers=3)
 
@@ -56,10 +56,10 @@ def test_delta_distributed_write_matches_single_node(tmp_path):
 
 
 @pytest.mark.integration
-def test_delta_distributed_partitioned_write(tmp_path):
+def test_delta_distributed_partitioned_write(cluster_tmp_path):
     pytest.importorskip("deltalake")
-    src, _rows, _total = _src(tmp_path)
-    out = str(tmp_path / "d_part")
+    src, _rows, _total = _src(cluster_tmp_path)
+    out = str(cluster_tmp_path / "d_part")
     bt.read.parquet(f"{src}/*.parquet").write.delta(
         out, partition_by=["r"], distributed=True, num_workers=3
     )
@@ -71,14 +71,14 @@ def test_delta_distributed_partitioned_write(tmp_path):
 
 
 @pytest.mark.integration
-def test_iceberg_distributed_write_and_append(tmp_path):
+def test_iceberg_distributed_write_and_append(cluster_tmp_path):
     pytest.importorskip("pyiceberg")
     from batcher.io.catalog import resolve_catalog
 
-    src, rows, total = _src(tmp_path)
-    wh = str(tmp_path / "wh")
+    src, rows, total = _src(cluster_tmp_path)
+    wh = str(cluster_tmp_path / "wh")
     os.makedirs(wh)
-    cat = {"type": "sql", "uri": f"sqlite:///{tmp_path}/c.db", "warehouse": f"file://{wh}"}
+    cat = {"type": "sql", "uri": f"sqlite:///{cluster_tmp_path}/c.db", "warehouse": f"file://{wh}"}
     resolve_catalog(cat).create_namespace("ns")
 
     def q():

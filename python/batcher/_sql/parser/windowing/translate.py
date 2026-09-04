@@ -17,6 +17,7 @@ from batcher._sql.parser.windowing.frame import (
     _resolve_frame,
     _window_order,
     _window_partition,
+    window_agg,
 )
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import lit
@@ -504,20 +505,36 @@ def _ignore_nulls_func(win, fn, order):
 #: Window functions whose first argument is a *value* the engine reads per row. Each takes
 #: a materialized column, so an argument that is any other expression has to be computed
 #: into one first.
-_VALUE_ARG_FUNCS = frozenset(
-    {
-        "sum",
-        "avg",
-        "min",
-        "max",
-        "count",
-        "lag",
-        "lead",
-        "firstvalue",
-        "lastvalue",
-        "nthvalue",
-    }
-)
+#:
+#: Derived from `_WINDOW_AGGS` rather than listed beside it, because the two describe the
+#: same set and a hand-written copy had already drifted: it named `sum`/`avg`/`min`/`max`/
+#: `count` and omitted `bool_and`/`bool_or`/the `bit_*` family/`stddev`/`variance`/`median`,
+#: all of which take a value argument just as much. So `sum(a + b) OVER (...)` was hoisted
+#: and answered while `bool_or(a > 0) OVER (...)` was refused with "window aggregate
+#: supports a single plain column argument only" — and a predicate is the *only* thing
+#: anyone passes `bool_or`, so the one shape that matters was the one that failed.
+#:
+#: The positional value functions are not aggregates and so are not in `_WINDOW_AGGS`; they
+#: are added here because they read a value per row for the same reason.
+_POSITIONAL_VALUE_FUNCS = frozenset({"lag", "lead", "firstvalue", "lastvalue", "nthvalue"})
+_VALUE_ARG_FUNCS = frozenset(_WINDOW_AGGS) | _POSITIONAL_VALUE_FUNCS
+
+
+def _set_window_argument(fn, replacement) -> None:
+    """Put `replacement` where the window function's value argument was.
+
+    Not always `fn.set("this", ...)`: an `Anonymous` call carries its arguments in
+    `expressions` and its *name* in `this`, so writing `this` renamed the function, and
+    `count(DISTINCT x)` keeps its argument one level down inside the `Distinct`.
+    """
+    if type(fn).__name__.lower() == "anonymous":
+        fn.set("expressions", [replacement])
+        return
+    inner = fn.this
+    if isinstance(inner, exp.Distinct):
+        inner.set("expressions", [replacement])
+        return
+    fn.set("this", replacement)
 
 
 def hoist_window_args(tr, ds: Dataset, projections) -> Dataset:
@@ -572,8 +589,9 @@ def hoist_window_args(tr, ds: Dataset, projections) -> Dataset:
             fn = win.this
             if type(fn).__name__.lower() == "ignorenulls":
                 fn = fn.this
-            if type(fn).__name__.lower() in _VALUE_ARG_FUNCS:
-                arg = fn.this
+            agg = window_agg(fn)
+            if agg is not None or type(fn).__name__.lower() in _POSITIONAL_VALUE_FUNCS:
+                arg = agg[1] if agg is not None else fn.this
                 # `sum(flag) OVER (…)` over a boolean column: SQL sums the TRUEs, the
                 # window kernels take numbers. Widening it here is the same rule the
                 # GROUP BY path applies (`grouping._numeric_reduction`); without it the
@@ -581,7 +599,7 @@ def hoist_window_args(tr, ds: Dataset, projections) -> Dataset:
                 reshaped = _reshaped_window_argument(tr, p, fn, arg)
                 if reshaped is not None:
                     arg = reshaped
-                    fn.set("this", arg)
+                    _set_window_argument(fn, arg)
                 # `count(*)`/`count()` has no value argument, and a plain column is
                 # already what the window operator wants.
                 if arg is not None and not isinstance(arg, (exp.Column, exp.Star)):
@@ -592,7 +610,7 @@ def hoist_window_args(tr, ds: Dataset, projections) -> Dataset:
                     name = f"__bc_warg{tr._win_arg_n}"
                     tr._win_arg_n += 1
                     computed[name] = tr._scalar(arg)
-                    fn.set("this", exp.column(name))
+                    _set_window_argument(fn, exp.column(name))
             for key in list(win.args.get("partition_by") or []):
                 if not isinstance(key, exp.Column):
                     hoist_key(key)
@@ -650,18 +668,19 @@ def _window_func(win, order):
             raise PlanError(f"ntile(n) requires n >= 1, got {buckets}")
         return ("ntile", buckets)
 
-    if name in _WINDOW_AGGS:
+    agg = window_agg(fn)
+    if agg is not None:
         # No ORDER BY → whole-partition aggregate; ORDER BY present → running
         # (cumulative) aggregate over the ordered partition (RANGE frame).
-        arg = fn.this
+        tag, arg = agg
         # COUNT(*) OVER (...) → count of a non-null constant = count of rows.
-        if name == "count" and (arg is None or isinstance(arg, exp.Star)):
+        if tag == "count" and arg is None:
             return ("count", lit(1))
         if not isinstance(arg, exp.Column):
             raise NotImplementedError(
                 "window aggregate supports a single plain column argument only"
             )
-        return (_WINDOW_AGGS[name], arg.name)
+        return (tag, arg.name)
 
     value = {
         "lag": "lag",

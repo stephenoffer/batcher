@@ -11,7 +11,8 @@ from 10,000 to 10,000,000 rows.
 This module is the escape hatch, off by default (`execution.fast_path`). It runs the same
 optimized plan through the same `core.execute_local` the ordinary path calls, so the result
 is identical by construction. What it gives up is **adaptivity and observability**, and the
-gate below exists to make sure it only gives them up where they cannot matter.
+gate below exists to make sure it only gives them up where they cannot matter. It no longer
+gives up the cross-query learning loop; see the entry on that below.
 
 What it does not do, and why each is safe under `eligible`:
 
@@ -25,19 +26,27 @@ What it does not do, and why each is safe under `eligible`:
 `Profile assembly, the event log, the event bus`
     Pure observability. The trade is explicit: a fast-path query does not appear in
     `explain(analyze=True)`, the dashboard, or the JSON event log.
-`Every write side of the learned-stats loop`
-    **This is the real cost.** Two things go: `_close_learning_loops` (the measured output
-    cardinality, the filter's measured selectivity, the per-column distinct-count and
-    quantile sketches) and the per-operator `ExecMetrics` that calibrate the cost model — the
-    engine call passes `feedback=None`. Recording the metrics alone was a quarter of what
-    this path had left to spend, and keeping half a feedback loop is a worse contract than
-    keeping none: it is harder to reason about which estimates are stale.
+`The pressure half of the learned-stats loop, and only that half`
+    The measured flap rate and the envelope's high-water mark go, because this path takes no
+    resource decision to report on: it consults no `PressureMonitor` and holds no
+    `ResourceManager`, so there is nothing to record that would not be invented.
 
-    The *read* side is untouched. `_optimize` still consults learned stats and column NDV, so
-    a fast-path query plans exactly as well as an ordinary one — it just does not improve the
-    next one. The intra-query adaptive loop is already disabled below 20M rows
-    (`api/adaptive/gating.py`), so only the cross-query half is at stake, but that half is
-    the moat and turning this on is opting out of it.
+    **Everything the run measured about the data and the plan is still recorded.** The
+    per-operator `ExecMetrics` that calibrate the cost model, the measured output
+    cardinality, the filter's measured selectivity, and the per-column distinct-count and
+    quantile sketches all close through `run.close_plan_learning_loops` and
+    `learn_column_stats` — the same functions the ordinary path calls, not a second copy.
+
+    This is a change from how the path first shipped, and the reason is worth stating: the
+    orchestration skip and the learning trade were bundled, so the whole cross-query moat was
+    the price of not paying Carbonite admission on a query too small to need it. They are
+    independent. Admission is skipped because `eligible` bounds the input below any envelope
+    it could have defended; that argument says nothing about whether the run should be
+    *measured*. Splitting them keeps the moat and costs back only what recording costs.
+
+    The *read* side was never affected: `_optimize` consults learned stats and column NDV, so
+    a fast-path query plans exactly as well as an ordinary one — and now improves the next one
+    too.
 
 The plan is still optimized, through Kyber's ordinary plan cache, so plan *quality* is
 unchanged; only the measurement that would sharpen the next plan is skipped.
@@ -59,6 +68,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.plan.resource import StorageLevel
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -89,7 +99,7 @@ def eligible(
     adaptive: bool,
     spill: bool,
     backend: str,
-    cache: bool,
+    cache: StorageLevel | None,
 ) -> bool:
     """Whether `plan` may take the fast path — cheap, structural, and conservative.
 
@@ -104,12 +114,19 @@ def eligible(
         adaptive: Whether stage-boundary re-optimization was resolved on.
         spill: Whether the caller asked for an out-of-core run.
         backend: The requested execution backend.
-        cache: Whether the caller asked for the result to be cached.
+        cache: The storage level the caller asked the result to be cached at, if any.
 
     Returns:
         `True` when the query may skip the orchestration.
     """
-    if not active_config().execution.fast_path:
+    cfg = active_config()
+    if not cfg.execution.fast_path:
+        return False
+    # The fast path skips the reporting hooks entirely, which is fine for a counter but not
+    # for a governance artifact: a lineage record with a hole in it is worse than none,
+    # because the hole is invisible. Declining here costs the orchestration skip only for
+    # deployments that opted into lineage emission.
+    if cfg.observability.openlineage:
         return False
     # Each of these routes to a different executor, and the fast path is the single-node
     # in-memory one. `cache` is orchestration in its own right (`api.executors`).
@@ -192,18 +209,31 @@ def run_fast(
     Returns:
         The result table — the same rows, names and types the ordinary path returns.
     """
+    import time
+
     from batcher import core
     from batcher.api._join_helpers import _empty_result_schema
-    from batcher.api.orchestration.run import _execute_in_memory, _optimize
+    from batcher.api.orchestration.run import (
+        _execute_in_memory,
+        _optimize,
+        close_plan_learning_loops,
+    )
     from batcher.api.orchestration.stages import resolve_sources
+    from batcher.api.terminal._metadata import learn_column_stats
 
-    # The hub is still handed to `_optimize`: it *reads* learned stats and column NDV to
-    # plan, and dropping that would cost plan quality, which this path must never do. Only
-    # the write side is off.
+    started = time.perf_counter()
+    # The hub is handed to `_optimize`, which *reads* learned stats and column NDV to plan,
+    # and to the engine and the close-out below, which *write* what this run measured. Both
+    # halves of the loop run here — see the module docstring for why they are not the price
+    # of skipping the orchestration.
     ctx = core.ExecutionContext(columns=columns, hub=core.default_hub(), profile=None)
-    opt, logical_opt, _decisions = _optimize(plan, sources, ctx)
+    opt, logical_opt, decisions = _optimize(plan, sources, ctx)
     resolved = resolve_sources(sources, opt, ctx)
-    table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved, feedback=None)
+    table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
+    learn_column_stats(ctx.hub, resolved.batches, sources, plan, resolved.complete)
+    close_plan_learning_loops(
+        plan, logical_opt, ctx, sources, table.num_rows, decisions, started=started
+    )
     if remember_as is not None:
         from batcher.api.orchestration.prepared import Prepared, remember
 
@@ -218,6 +248,9 @@ def run_fast(
                 empty_schema=_empty_result_schema(plan, columns),
                 config=active_config(),
                 source_refs=(),
+                # Held so the replay can close the same learning loops this run just did.
+                plan=plan,
+                decisions=tuple(decisions),
             ),
         )
     return table

@@ -87,7 +87,7 @@ pub(crate) fn eval_seq(
             return Err(ExprError::ExpectedType {
                 func: format!("seq.{}", name_of(func)),
                 want: "a Utf8 argument",
-                got: other.to_string(),
+                got: crate::error::type_name(other),
             })
         }
     };
@@ -97,7 +97,7 @@ pub(crate) fn eval_seq(
         .ok_or_else(|| ExprError::ExpectedType {
             func: format!("seq.{}", name_of(func)),
             want: "a Utf8 argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
 
     match func {

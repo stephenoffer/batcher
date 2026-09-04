@@ -86,7 +86,7 @@ pub(crate) fn eval_lcs_length(la: &ListArray, ra: &ListArray) -> Result<ArrayRef
             }
             std::mem::swap(&mut previous, &mut current);
         }
-        out.append_value(previous[inner.len()] as f64);
+        out.append_value(f64::from(previous[inner.len()]));
     }
     Ok(Arc::new(out.finish()))
 }

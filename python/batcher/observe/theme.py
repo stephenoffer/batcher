@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from typing import TextIO
 
 __all__ = ["Glyphs", "Palette", "detect"]
@@ -114,11 +115,10 @@ class Palette:
 def detect(stream: TextIO | None = None) -> tuple[Palette, Glyphs]:
     """The palette and glyph set appropriate for `stream` and the environment.
 
-    Honors the conventions terminals actually publish: ``NO_COLOR`` disables color
-    (no-color.org), ``FORCE_COLOR``/``CLICOLOR_FORCE`` enable it against a pipe,
-    ``COLORTERM=truecolor|24bit`` advertises 24-bit, and ``TERM`` carries the 256-color and
-    dumb-terminal signals. Unicode is taken from the stream's own encoding rather than
-    guessed, so a `LANG=C` terminal gets the ASCII forms instead of mojibake.
+    Honors the conventions terminals actually publish — see `_color_depth` for the
+    precedence and for the two specs it follows exactly. Unicode is taken from the stream's
+    own encoding rather than guessed, so a `LANG=C` terminal gets the ASCII forms instead of
+    mojibake.
 
     Args:
         stream: The output stream to inspect; defaults to `sys.stderr`.
@@ -127,18 +127,70 @@ def detect(stream: TextIO | None = None) -> tuple[Palette, Glyphs]:
         A ``(Palette, Glyphs)`` pair for the detected capabilities.
     """
     stream = stream if stream is not None else sys.stderr
-    env = os.environ
-    term = env.get("TERM", "")
-    if env.get("NO_COLOR") is not None or term == "dumb":
-        depth = 0
-    elif env.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
-        depth = 24
-    elif "256" in term:
-        depth = 8
-    elif env.get("FORCE_COLOR") or env.get("CLICOLOR_FORCE"):
-        depth = 24
-    else:
-        depth = 4 if term else 0
+    depth = _color_depth(os.environ)
     encoding = (getattr(stream, "encoding", "") or "").lower()
-    unicode_ok = "utf" in encoding and term != "dumb"
+    unicode_ok = "utf" in encoding and os.environ.get("TERM", "") != "dumb"
     return Palette(depth), Glyphs(unicode=unicode_ok)
+
+
+#: Terminals that advertise nothing but are known to render 24-bit color. Read from
+#: ``TERM_PROGRAM``, which is what each of them actually sets.
+_TRUECOLOR_PROGRAMS = frozenset(
+    {"iterm.app", "wezterm", "vscode", "hyper", "ghostty", "warpterminal"}
+)
+#: ``TERM`` values that imply truecolor without a ``COLORTERM``.
+_TRUECOLOR_TERMS = ("kitty", "alacritty", "contour", "wezterm")
+#: What each ``FORCE_COLOR`` level means, following the convention Node's ecosystem set.
+_FORCE_LEVELS = {"0": 0, "false": 0, "1": 4, "2": 8, "3": 24, "true": 24, "": 24}
+
+
+def _color_depth(env: Mapping[str, str]) -> int:
+    """Bits of color `env` says the terminal has: 0, 4, 8, or 24.
+
+    Ordered by how *explicit* each signal is, because that is the only ordering that lets a
+    user override a wrong guess. ``NO_COLOR`` and ``FORCE_COLOR`` are deliberate statements
+    and win; ``COLORTERM`` is the terminal advertising itself; ``TERM``/``TERM_PROGRAM`` are
+    inference from what the terminal calls itself.
+
+    Two conventions are followed to the letter rather than approximately, because getting
+    them nearly right is worse than not implementing them — a user who sets one and does not
+    get what it promises has no way to tell a bug from a policy:
+
+    * ``NO_COLOR`` disables color when set **to a non-empty value** (no-color.org). An empty
+      ``NO_COLOR=`` does not, which is what lets a wrapper script unset the variable for a
+      child by exporting it empty.
+    * ``FORCE_COLOR`` enables color against a pipe, and ``FORCE_COLOR=0`` **disables** it.
+      Treating any value as "on" is the common mistake, and it turns the one variable people
+      use to *suppress* color in CI into one that forces it.
+
+    Args:
+        env: The environment mapping to read.
+
+    Returns:
+        The color depth in bits: 0 (none), 4 (16-color), 8 (256-color), or 24 (truecolor).
+    """
+    term = env.get("TERM", "")
+    if term == "dumb":
+        return 0
+    if env.get("NO_COLOR"):
+        return 0
+    forced = env.get("FORCE_COLOR")
+    if forced is not None:
+        return _FORCE_LEVELS.get(forced.lower(), 24)
+    if env.get("CLICOLOR_FORCE"):
+        return 24
+    if env.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+        return 24
+    # Windows Terminal and ConEmu render truecolor and set no TERM at all under cmd.exe,
+    # so without these the whole Windows story degrades to monochrome.
+    if env.get("WT_SESSION") or env.get("ConEmuANSI", "").upper() == "ON":
+        return 24
+    if env.get("TERM_PROGRAM", "").lower() in _TRUECOLOR_PROGRAMS:
+        return 24
+    if any(name in term for name in _TRUECOLOR_TERMS):
+        return 24
+    if "256" in term:
+        return 8
+    if env.get("TERM_PROGRAM", "").lower() == "apple_terminal":
+        return 8
+    return 4 if term else 0

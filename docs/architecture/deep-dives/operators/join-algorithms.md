@@ -300,10 +300,13 @@ print(inner.explain())
 
 :::{dropdown} The `explain()` output, and the strategy it chose
 ```text
-sort                            est≈3 (default)
-  hash_join                     est≈3 (default)
-    scan                        est≈3 (exact)
-    scan                        est≈3 (exact)
+query plan (planned)                          4 operators
+─────────────────────────────────────────────────────────
+OPERATOR                       ESTIMATE  NOTES
+sort  [id]                        est≈3  (default)
+└─ hash_join  [inner on id]       est≈3  (default)
+   ├─ scan  [source 0]            est≈3  (exact)
+   └─ scan  [source 1]            est≈3  (exact)
 
 decisions:
   - [kyber/selection] join build side: left≈3 right≈3 [exact] → broadcast

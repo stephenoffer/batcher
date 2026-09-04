@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same, assert_same_for_query
 
 
 @pytest.fixture
@@ -48,7 +48,10 @@ def tables(duck):
 def test_sql_vs_duckdb(duck, tables, query):
     emp, dept = tables
     out = bt.sql(query, emp=emp, dept=dept).collect()
-    assert_same(out, duck.sql(query))
+    # Four of these queries end in `ORDER BY`; `assert_same_for_query` compares those
+    # positionally and the rest as multisets, so an ordered case cannot be checked with the
+    # order thrown away. The fixture's sort keys are all distinct, so the order is total.
+    assert_same_for_query(out, duck.sql(query), query)
 
 
 @pytest.mark.parametrize(

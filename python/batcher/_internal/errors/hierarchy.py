@@ -305,14 +305,29 @@ class BackpressureAbort(ResourceError):
     """Execution was aborted because backpressure could not be relieved."""
 
 
-class ExecutionError(BatcherError):
+class ExecutionError(BatcherError, RuntimeError):
     """An operator failed at runtime (raised by the engine / Core).
+
+    Also a `RuntimeError`, which is what Python spells "this failed while running" and what
+    the engine's own failures arrived as before they were typed. Every unclassified
+    `InterpError` crossing the FFI becomes one of these, so the commonest runtime failure
+    there is -- a value that will not cast -- was a bare `RuntimeError` that
+    ``except bt.BatcherError`` did not catch.
+
+    The three deliberate non-conversions noted at the top of this module do not apply here,
+    and the difference is measurable rather than a matter of taste: they exist because the
+    tree holds thirty-odd narrow ``except OSError``/``except ValueError`` guards around
+    third-party filesystem and parsing calls, any of which could silently swallow a real
+    Batcher failure. There is exactly **one** ``except RuntimeError`` in the whole control
+    plane and it wraps `asyncio.get_running_loop`, which cannot raise this.
 
     Examples:
         .. doctest::
 
             >>> from batcher._internal.errors import BatcherError, ExecutionError
             >>> issubclass(ExecutionError, BatcherError)
+            True
+            >>> issubclass(ExecutionError, RuntimeError)
             True
     """
 
@@ -557,6 +572,7 @@ def unknown_value(
     label: str | None = None,
     hint: str = "",
     doc: str = "",
+    suggestion: str = "",
 ) -> BatcherError:
     """Build the canonical "you named something that does not exist" error.
 
@@ -573,6 +589,12 @@ def unknown_value(
         label: The alternatives' lead-in. Defaults to ``"Available <kind>s"``.
         hint: A next action.
         doc: A documentation path, attached as an exception note.
+        suggestion: A rendered ``Did you mean ...?`` sentence to use instead of the
+            edit-distance guess, for a caller that *knows* the answer. The guess is a
+            fallback for when nobody does: a caller holding a synonym table has a better
+            answer than character distance can reach, and leaving the guess in front of it
+            prints a wrong one first (``'database'`` drew "did you mean 'webdataset'" while
+            the caller knew it was ``'sql'``).
 
     Returns:
         An instance of `error`, ready to raise.
@@ -593,7 +615,7 @@ def unknown_value(
     # message with `unknown_message` here would print each of them twice.
     return error(
         f"Unknown {kind} {name!r}.",
-        suggestion=_suggestion(name, pool) if isinstance(name, str) else "",
+        suggestion=suggestion or (_suggestion(name, pool) if isinstance(name, str) else ""),
         available=pool,
         available_label=label or f"Available {kind}s",
         hint=hint,
@@ -629,27 +651,75 @@ def unknown_value(
 # failure with an obvious programmatic answer — raise the envelope, or re-plan so the
 # non-spillable operator is not on the path — and it only ever reaches a caller who set a
 # ceiling to begin with, so it earns a type rather than a message to match on.
-try:
-    from batcher._native import (
-        FatalShuffleError,
-        MemoryBudgetExceededError,
-        PlanTooDeepError,
-        QueryCancelledError,
-        RetryableShuffleError,
-    )
-except ImportError:
+# **Defined here, not imported from the extension.** These five used to be declared in Rust
+# with `create_exception!`, which builds a type whose base is `RuntimeError` — and such a
+# type cannot be re-parented afterwards, because `__bases__` assignment refuses on a layout
+# mismatch. So in every *built* install all five were `RuntimeError` subclasses and none of
+# them was a `BatcherError`: `except bt.BatcherError` did not catch a cancelled query, a
+# memory-budget refusal, a shuffle failure, or an over-deep plan, while the paragraph above
+# and the published documentation both said it did.
+#
+# The pure-Python fallbacks below the old `except ImportError` had the right bases, so the
+# contract held exactly when the engine was *absent* — which is why the unit suite, which
+# runs without it, never saw the gap. `bc_py::errors` now looks these up by name on the
+# error path and raises them, so there is one definition and it is this one.
 
-    class RetryableShuffleError(TransportError):  # type: ignore[no-redef]
-        """A shuffle fetch failed transiently (unreachable/idle peer) — recompute + retry."""
 
-    class FatalShuffleError(TransportError):  # type: ignore[no-redef]
-        """A shuffle fetch failed fatally (decode/protocol/auth) — retrying cannot help."""
+class RetryableShuffleError(TransportError):
+    """A shuffle fetch failed transiently (unreachable/idle peer) — recompute + retry.
 
-    class PlanTooDeepError(PlanError):  # type: ignore[no-redef]
-        """The plan nests deeper than the native stack can deserialize."""
+    Examples:
+        .. doctest::
 
-    class QueryCancelledError(ExecutionError):  # type: ignore[no-redef]
-        """The query was cancelled; it stopped at the next morsel boundary."""
+            >>> from batcher._internal.errors import BatcherError, RetryableShuffleError
+            >>> issubclass(RetryableShuffleError, BatcherError)
+            True
+    """
 
-    class MemoryBudgetExceededError(ResourceError):  # type: ignore[no-redef]
-        """An operator that cannot spill needs more than the configured memory budget."""
+
+class FatalShuffleError(TransportError):
+    """A shuffle fetch failed fatally (decode/protocol/auth) — retrying cannot help.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import BatcherError, FatalShuffleError
+            >>> issubclass(FatalShuffleError, BatcherError)
+            True
+    """
+
+
+class PlanTooDeepError(PlanError):
+    """The plan nests deeper than the native stack can deserialize.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import PlanError, PlanTooDeepError
+            >>> issubclass(PlanTooDeepError, PlanError)
+            True
+    """
+
+
+class QueryCancelledError(ExecutionError):
+    """The query was cancelled; it stopped at the next morsel boundary.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import ExecutionError, QueryCancelledError
+            >>> issubclass(QueryCancelledError, ExecutionError)
+            True
+    """
+
+
+class MemoryBudgetExceededError(ResourceError):
+    """An operator that cannot spill needs more than the configured memory budget.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.errors import MemoryBudgetExceededError, ResourceError
+            >>> issubclass(MemoryBudgetExceededError, ResourceError)
+            True
+    """

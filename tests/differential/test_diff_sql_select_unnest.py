@@ -21,7 +21,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _harness import assert_same
+from _harness import assert_same_for_query
 
 pytestmark = pytest.mark.differential
 
@@ -61,7 +61,9 @@ def tables(duck):
     ],
 )
 def test_select_unnest_matches_duckdb(tables, duck, query):
-    assert_same(bt.sql(query, **tables).collect(), duck.sql(query))
+    # One case ends in `ORDER BY v DESC`, over the distinct values 10/20/30, so the order
+    # is total and comparing it positionally is what the query actually asked for.
+    assert_same_for_query(bt.sql(query, **tables).collect(), duck.sql(query), query)
 
 
 def test_unaliased_unnest_takes_duckdbs_column_name(tables, duck):

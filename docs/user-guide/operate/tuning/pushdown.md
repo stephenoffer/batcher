@@ -83,9 +83,12 @@ print(plan.select("country", "amount").explain())
 ```
 
 ```text
-project                         est≈3 (default)
-  filter                        est≈3 (default)
-    scan                        est≈5 (exact) pushed[country IN (US, CA) AND amount > 15]
+query plan (planned)                                                                                 3 operators
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+OPERATOR                                          ESTIMATE  NOTES
+project                                              est≈3  (default)
+└─ filter  [country IN (US, CA) AND amount > 15]     est≈3  (default)
+   └─ scan  [source 0]                               est≈5  (exact)  pushed[country IN (US, CA) AND amount > 15]
 ```
 
 The `pushed[...]` note is what the plan *offered* the source. Each backend then applies
@@ -104,9 +107,12 @@ print(rolled.explain())
 ```
 
 ```text
-filter                          est≈1 (default)
-  aggregate                     est≈3 (learned)
-    scan                        est≈5 (exact)
+query plan (planned)                      3 operators
+─────────────────────────────────────────────────────
+OPERATOR                          ESTIMATE  NOTES
+filter  [total > 15]                 est≈1  (default)
+└─ aggregate  [by country · sum]     est≈3  (learned)
+   └─ scan  [source 0]               est≈5  (exact)
 ```
 
 Here the filter is about summed totals rather than scanned rows, so there is nothing to

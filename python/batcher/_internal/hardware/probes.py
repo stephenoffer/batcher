@@ -11,7 +11,17 @@ re-export list.
 from __future__ import annotations
 
 from batcher._internal.accelerators import reset_accelerator_probes
-from batcher._internal.hardware import cache, cgroup, isa, memory, nvml, profile, storage, topology
+from batcher._internal.hardware import (
+    cache,
+    cgroup,
+    cpu,
+    isa,
+    memory,
+    nvml,
+    profile,
+    storage,
+    topology,
+)
 from batcher._internal.hardware.amd import reset_amd_probe
 from batcher._internal.hardware.engine import detected as engine_detected
 from batcher._internal.hardware.fabric.rdma import reset_fabric_probes
@@ -42,7 +52,11 @@ _MEMOIZED = (
     (topology, ("numa_node_count", "cpus_per_numa_node", "physical_core_count")),
     (storage, ("device_class",)),
     # The NVML handshake, not a reading: telemetry itself is deliberately never cached.
-    (nvml, ("_nvml",)),
+    # `host_pid` is the exception and was missing here. It is a reading — this process's PID
+    # as the *host* kernel numbers it, parsed out of `/proc/self/sched` — and every per-process
+    # NVML attribution is compared against it. A test faking the host PID namespace, which is
+    # the whole reason the probe exists, kept reading whatever the first call returned.
+    (nvml, ("_nvml", "host_pid")),
     # What the engine reported about its own CPU. Memoized for the same reason the `/sys`
     # probes are, and resettable for one more: a test that substitutes a stub engine in
     # `sys.modules` would otherwise keep reading the real one's answers. The allocator
@@ -67,6 +81,14 @@ def reset_hardware_probes() -> None:
             if clear is not None:
                 clear()
     profile._reset_profile()
+    # `cpu.cpu_contention` samples on a 50 ms window into a module-level slot rather than an
+    # `lru_cache`, so it is not in `_MEMOIZED` and was reset by nothing here. That is the same
+    # kind of reading as the TTL-sampled cgroup probes listed above, and it is reset for the
+    # same reason: a test that stubs `os.getloadavg` or the cgroup counters runs in well under
+    # 50 ms, so without this it is answered from whatever the previous caller measured. The
+    # test suite has its own teardown fixture for it (`tests/conftest._isolate_cpu_probe`),
+    # which is a different point in time and does not make this hook's promise true.
+    cpu.reset_cpu_probe()
     reset_accelerator_probes()
     # AMD memoizes its device *identity* (the card names present at first probe) for the same
     # reason NVML memoizes its handshake. It has always exposed `reset_amd_probe`, and this hook

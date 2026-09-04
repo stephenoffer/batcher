@@ -547,27 +547,27 @@ fn a_range_join_over_a_dictionary_agrees_with_the_decoded_oracle() {
 
 /// A dictionary of **floats** must still obey the engine's one float-identity contract.
 ///
-/// This is the combination `keys::contains_float` does not see. Its `_ => false` arm catches
+/// This is the combination `keys::contains_float` used not to see. Its catch-all arm swallowed
 /// `Dictionary(_, Float64)`, justified by a comment saying dictionaries are decoded at the FFI
-/// boundary — true today, and exactly the assumption Proposal 3 removes. Without
+/// boundary — true then, and exactly the assumption Proposal 3 removes. Without
 /// canonicalization `-0.0` and `0.0` are distinct keys, so a `GROUP BY` splits one group in two
 /// and a join drops matches: the silent wrong-answer `keys.rs` exists to prevent, and the one
 /// its module docs say has already happened here once.
 ///
 /// Every NaN must likewise collapse to one group, and must not collapse with a number.
 ///
-/// **What this does and does not currently prove.** It passes today, and the honest reason is
-/// that the group key is a bare `Col`, which `Expr::eval` decodes at the leaf
-/// (`eval::dispatch::decode_dict`) before any grouping happens — so `assign_groups`' dictionary
-/// fast path is not reached by this plan, and the values that arrive are already canonicalized
-/// as ordinary floats. That makes `assign_groups`' dictionary path *doubly* unreachable from a
-/// query: decoded once at the FFI boundary and again at the `Col` leaf.
+/// **What this proves, and where the load-bearing proof lives.** This test passes for a reason
+/// weaker than it looks: the group key is a bare `Col`, which `Expr::eval` decodes at the leaf
+/// (`eval::dispatch::decode_dict`) before any grouping happens, so `assign_groups`' dictionary
+/// path is not reached by this plan at all. It is an end-to-end guard that the *query* answer is
+/// right, not evidence about the key path.
 ///
-/// It is kept as a **tripwire for the change that is coming**, not as evidence about a path it
-/// does not exercise. The moment a dictionary is preserved far enough to reach
-/// `keys::canonicalize_float_keys` as a key, `contains_float`'s `_ => false` arm returns false
-/// for it, no canonicalization happens, and this test goes red on the group count. Which is
-/// exactly when someone needs to know.
+/// The key path is pinned directly, at the layer that owns the policy, by
+/// `keys::tests::canonicalize_folds_float_dictionary_to_value_identity` in `bc-runtime`: it
+/// hands a float dictionary — two spellings of zero, two NaN patterns, one ordinary value under
+/// two codes — straight to `canonicalize_float_keys` and asserts the group count matches the
+/// decoded oracle. That is the test that goes red if the `Dictionary` arm is removed, and it
+/// needs no plan, no FFI boundary and no `Col` leaf to do it.
 #[test]
 fn a_float_dictionary_follows_the_engines_float_identity() {
     // Two spellings of zero and two NaN bit patterns, plus ordinary values. The decoded
@@ -592,12 +592,11 @@ fn a_float_dictionary_follows_the_engines_float_identity() {
         .iter()
         .map(|&v| {
             let pos = distinct.iter().position(|d| d.to_bits() == v.to_bits());
-            match pos {
-                Some(p) => p as i32,
-                None => {
-                    distinct.push(v);
-                    (distinct.len() - 1) as i32
-                }
+            if let Some(p) = pos {
+                p as i32
+            } else {
+                distinct.push(v);
+                (distinct.len() - 1) as i32
             }
         })
         .collect();

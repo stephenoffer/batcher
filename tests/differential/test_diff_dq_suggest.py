@@ -4,6 +4,11 @@ A suggestion is only useful if it is true of the data, and only *safe* if it sto
 the bounds that are true today by coincidence. So these tests pin both halves: everything
 proposed holds when validated against the same relation, and the proposals that would age
 badly — a range read off an observed minimum and maximum — are not made at all.
+
+**The oracle here is `ds.dq.validate()` applied to the suggestion's own input**, not DuckDB:
+`suggest()` has no equivalent in another engine, and the property that matters is internal
+consistency — a constraint this proposes must be one the same relation passes. That makes
+the two halves of `dq` check each other, so a bug would have to exist in both to hide.
 """
 
 from __future__ import annotations
@@ -65,7 +70,7 @@ def test_no_range_is_read_off_an_observed_minimum_and_maximum():
 def test_a_signed_column_gets_no_sign_constraint():
     ds = bt.from_pydict({"pnl": [1.0, -2.0, 3.0]})
     names = ds.dq.suggest().validate().violations
-    assert not any(n.startswith("positive(") or n.startswith("non_negative(") for n in names)
+    assert not any(n.startswith(("positive(", "non_negative(")) for n in names)
 
 
 def test_a_float_column_is_asked_to_stay_finite():

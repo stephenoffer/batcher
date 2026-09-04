@@ -138,7 +138,12 @@ mod tests {
         let c = test_col(&[Some("ATGGC"), Some("AT"), Some(""), None]);
         assert_eq!(
             strs(&translate(&c, None, false).unwrap()),
-            vec![Some("M".into()), Some("".into()), Some("".into()), None]
+            vec![
+                Some("M".into()),
+                Some(String::new()),
+                Some(String::new()),
+                None
+            ]
         );
     }
 
@@ -175,7 +180,7 @@ mod tests {
         let short = test_col(&[Some("A")]);
         assert_eq!(
             strs(&translate(&short, Some(2), false).unwrap()),
-            vec![Some("".into())]
+            vec![Some(String::new())]
         );
     }
 

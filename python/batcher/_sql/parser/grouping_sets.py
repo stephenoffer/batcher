@@ -15,6 +15,7 @@ from sqlglot import expressions as exp
 from batcher._sql.parser.clauses import _is_order_all, _order_all
 from batcher._sql.parser.core_utils import _alias_of, _row_window
 from batcher.api.dataset import Dataset
+from batcher.api.multi_group import cube_levels, rollup_levels, stack_levels
 from batcher.plan.expr_ir import col
 
 
@@ -48,20 +49,20 @@ def _grouping_factors(group) -> list[list[list]]:
     set of levels is the Cartesian product of the factors (so `GROUP BY ROLLUP(a),
     ROLLUP(b)` yields the product of the two rollups), which is what `itertools.
     product` over these factors produces.
-    """
-    import itertools
 
+    What a `ROLLUP` and a `CUBE` expand *to* is `api.multi_group`'s `rollup_levels` and
+    `cube_levels` — the same functions `ds.rollup(...)`/`ds.cube(...)` expand with, so the
+    two front-ends cannot disagree about which levels a multi-level GROUP BY has. They are
+    generic in the level item, so they take sqlglot grouping expressions here and column
+    names there.
+    """
     factors: list[list[list]] = []
     if group.expressions:  # plain items — present in every level
         factors.append([list(group.expressions)])
     for r in group.args.get("rollup") or ():
-        cols = list(r.expressions)
-        factors.append([cols[:i] for i in range(len(cols), -1, -1)])
+        factors.append([list(level) for level in rollup_levels(tuple(r.expressions))])
     for cu in group.args.get("cube") or ():
-        cols = list(cu.expressions)
-        factors.append(
-            [list(c) for k in range(len(cols), -1, -1) for c in itertools.combinations(cols, k)]
-        )
+        factors.append([list(level) for level in cube_levels(tuple(cu.expressions))])
     for gs in group.args.get("grouping_sets") or ():
         factors.append([_grouping_set_members(m) for m in gs.expressions])
     return factors or [[[]]]
@@ -99,13 +100,17 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
         for e in level:
             every.setdefault(_grouping_key(e), e)
 
-    datasets = [
-        tr.select(_grouping_level_node(node, {_grouping_key(e): e for e in level}, every))
-        for level in levels
-    ]
-    out = datasets[0]
-    for d in datasets[1:]:
-        out = out.union(d, distinct=False)
+    # `stack_levels`, not a chain of `Dataset.union`: each level is translated separately, so
+    # each arrives bound to its own copy of the source list, and unioning them binds one
+    # relation once per level. See its docstring -- that is what stops plan-level subplan
+    # reuse seeing the levels as one shared subtree. `ds.rollup(...)` stacks through the same
+    # function, so the two front-ends produce the same plan for the same query.
+    out = stack_levels(
+        [
+            tr.select(_grouping_level_node(node, {_grouping_key(e): e for e in level}, every))
+            for level in levels
+        ]
+    )
 
     if order is not None:
         out = _order_union(tr, out, order, node.expressions)
@@ -291,9 +296,21 @@ def _null_inactive_refs(node, inactive: dict, typed_null) -> None:
 
     Aggregate arguments are deliberately skipped: `sum(x)` at a level that rolls `x` up
     still sums the underlying rows. Only the *grouped* reference goes to NULL.
+
+    That skip is checked on `node` itself and not only on its children, because the
+    projection loop above hands this function the select item *whole* — and a select item
+    is very often an aggregate. `SELECT s, max(s) ... GROUP BY ROLLUP(s)` arrived here as
+    `MAX(s)`, whose only child is the rolled-up key, so the argument was NULLed and the
+    item became `MAX(NULLIF(MAX(s), MAX(s)))` — a nested aggregate the translator then
+    lowered into an outer aggregate over the inner one's internal alias, failing with
+    ``aggregate 'a' references unknown column(s) ['__agg0']``. Every ROLLUP/CUBE/GROUPING
+    SETS query aggregating over one of its own grouping keys (`sum(i) ... ROLLUP(i)`,
+    `count(s) ... CUBE(s)`) could not run.
     """
     from batcher._sql.parser.expressions.aggregates import is_agg_node
 
+    if is_agg_node(node):
+        return
     for child in list(node.iter_expressions()):
         if is_agg_node(child):
             continue

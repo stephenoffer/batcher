@@ -35,7 +35,7 @@ These read one file, a directory, or a glob from local disk or object storage:
 | {py:meth}`bt.read.hdf5(path) <batcher.api.io_namespace.reader.Reader.hdf5>` | HDF5 file(s) | `hdf5` |
 | {py:meth}`bt.read.zarr(path) <batcher.api.io_namespace.reader.Reader.zarr>` | a Zarr store | `zarr` |
 | {py:meth}`bt.read.logs(path, pattern=None) <batcher.api.io_namespace.reader.Reader.logs>` | line-delimited logs; `pattern=` for grok extraction | |
-| {py:meth}`bt.read.files_incremental(path) <batcher.api.io_namespace.reader.Reader.files_incremental>` | incrementally discover new files under `path` | |
+| {py:meth}`bt.read.files_incremental(path, format) <batcher.api.io_namespace.reader.Reader.files_incremental>` | incrementally discover new files under `path` | |
 | {py:meth}`bt.read.table(name) <batcher.api.io_namespace.reader.Reader.table>` | any registered non-file source by name (escape hatch) | |
 
 ### Lakehouse tables

@@ -145,7 +145,7 @@ def test_catalog_byte_size_zero_is_none() -> None:
 def test_catalog_byte_size_unknown_dialect() -> None:
     """A dialect with no size catalog (trino here) yields None without a query."""
     called = []
-    catalog_byte_size(lambda sql: called.append(sql), "trino", "t")
+    catalog_byte_size(called.append, "trino", "t")
     assert called == []
 
 

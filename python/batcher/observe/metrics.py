@@ -30,6 +30,7 @@ from typing import Any
 from batcher._internal import events
 from batcher.observe.accelerators.gauges import accelerator_gauges
 from batcher.observe.collector import _Collector
+from batcher.observe.counters import escape_label
 from batcher.observe.node_metrics import (
     NODE_CONDITION_HELP,
     device_gauges,
@@ -171,16 +172,6 @@ def metrics_snapshot() -> dict[str, Any]:
     return _collector.snapshot()
 
 
-def _escape_label(value: str) -> str:
-    """Escape a label value for the Prometheus text format.
-
-    Constraint names carry the characters the format reserves — a regex constraint's name
-    embeds the pattern, quotes and backslashes included — and an unescaped one produces a
-    line no scraper can parse, silently dropping the whole exposition.
-    """
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
-
-
 def prometheus_text() -> str:
     """The same counters rendered in the Prometheus text exposition format.
 
@@ -226,17 +217,25 @@ def prometheus_text() -> str:
         out.append("# HELP batcher_query_errors_total Failed queries by exception type")
         out.append("# TYPE batcher_query_errors_total counter")
         for error, count in snap["queries"]["failed_by_error"].items():
-            out.append(f'batcher_query_errors_total{{error="{_escape_label(error)}"}} {count}')
+            out.append(f'batcher_query_errors_total{{error="{escape_label(error)}"}} {count}')
 
-    out.append("# HELP batcher_query_duration_ms Query wall time in milliseconds")
-    out.append("# TYPE batcher_query_duration_ms histogram")
+    # Seconds, and named for it. Prometheus's naming conventions ask for base units, and a
+    # histogram is where the deviation costs most: `histogram_quantile` returns a value in
+    # the bucket's unit, so a panel plotting it was labelling milliseconds as seconds unless
+    # its author noticed. The buckets are the same boundaries, expressed in the unit the
+    # series claims. `metrics_snapshot()` keeps its millisecond keys -- it is a plain dict
+    # with its own documented shape, and this convention is Prometheus's.
+    out.append("# HELP batcher_query_duration_seconds Query wall time")
+    out.append("# TYPE batcher_query_duration_seconds histogram")
     cumulative = 0
     for edge, count in snap["queries"]["duration_ms_buckets"].items():
         cumulative = max(cumulative, count)
-        out.append(f'batcher_query_duration_ms_bucket{{le="{edge}"}} {cumulative}')
-    out.append(f'batcher_query_duration_ms_bucket{{le="+Inf"}} {snap["queries"]["total"]}')
-    out.append(f"batcher_query_duration_ms_sum {snap['queries']['duration_ms_total']}")
-    out.append(f"batcher_query_duration_ms_count {snap['queries']['total']}")
+        le = float(edge) / 1000
+        out.append(f'batcher_query_duration_seconds_bucket{{le="{le}"}} {cumulative}')
+    out.append(f'batcher_query_duration_seconds_bucket{{le="+Inf"}} {snap["queries"]["total"]}')
+    total_seconds = snap["queries"]["duration_ms_total"] / 1000.0
+    out.append(f"batcher_query_duration_seconds_sum {total_seconds}")
+    out.append(f"batcher_query_duration_seconds_count {snap['queries']['total']}")
 
     # The per-operator series and the process-wide work totals — CPU, spill volume, real
     # block-device I/O, faults, preemption — all of which the engine already measured per
@@ -271,7 +270,7 @@ def prometheus_text() -> str:
         out.append("# TYPE batcher_malformed_rows_by_source_total counter")
         for source, dropped in snap["skipped"]["malformed_rows_by_source"].items():
             out.append(
-                f'batcher_malformed_rows_by_source_total{{source="{_escape_label(source)}"}} '
+                f'batcher_malformed_rows_by_source_total{{source="{escape_label(source)}"}} '
                 f"{dropped}"
             )
 
@@ -288,24 +287,25 @@ def prometheus_text() -> str:
         out.append("# HELP batcher_dq_constraint_violations_total Violations by constraint")
         out.append("# TYPE batcher_dq_constraint_violations_total counter")
         for name, stats in snap["data_quality"]["by_constraint"].items():
-            label = f'{{constraint="{_escape_label(name)}"}}'
+            label = f'{{constraint="{escape_label(name)}"}}'
             out.append(f"batcher_dq_constraint_violations_total{label} {stats['violations']}")
 
     if snap["recovery"]:
         out.append("# HELP batcher_recovery_total Fault-tolerance actions by kind")
         out.append("# TYPE batcher_recovery_total counter")
         for event_name, count in sorted(snap["recovery"].items()):
-            out.append(f'batcher_recovery_total{{event="{event_name}"}} {count}')
+            label = escape_label(event_name)
+            out.append(f'batcher_recovery_total{{event="{label}"}} {count}')
     counter("inference_batches_total", snap["inference"]["batches_total"], "Inference batches run")
     counter("inference_rows_total", snap["inference"]["rows_total"], "Rows through inference")
     counter(
-        "inference_latency_ms_total",
-        snap["inference"]["latency_ms_total"],
+        "inference_latency_seconds_total",
+        snap["inference"]["latency_ms_total"] / 1000.0,
         "Cumulative inference batch latency",
     )
     counter(
-        "inference_blocked_ms_total",
-        snap["inference"]["blocked_ms_total"],
+        "inference_blocked_seconds_total",
+        snap["inference"]["blocked_ms_total"] / 1000.0,
         "Cumulative worker time blocked on input",
     )
     gpu_devices = snap["gpu"]["devices"]
@@ -313,12 +313,14 @@ def prometheus_text() -> str:
         out.append("# HELP batcher_gpu_utilization_percent Current GPU utilization by device")
         out.append("# TYPE batcher_gpu_utilization_percent gauge")
         for device, stats in gpu_devices.items():
-            out.append(f'batcher_gpu_utilization_percent{{device="{device}"}} {stats["util_pct"]}')
+            label = escape_label(str(device))
+            out.append(f'batcher_gpu_utilization_percent{{device="{label}"}} {stats["util_pct"]}')
         out.append("# HELP batcher_gpu_memory_used_bytes Current GPU memory in use by device")
         out.append("# TYPE batcher_gpu_memory_used_bytes gauge")
         for device, stats in gpu_devices.items():
+            label = escape_label(str(device))
             out.append(
-                f'batcher_gpu_memory_used_bytes{{device="{device}"}} {stats["mem_used_bytes"]}'
+                f'batcher_gpu_memory_used_bytes{{device="{label}"}} {stats["mem_used_bytes"]}'
             )
     out.extend(device_gauges())
     # The deep per-device series: link throughput and derate, clock headroom, codec engines,

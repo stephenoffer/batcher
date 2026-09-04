@@ -25,7 +25,8 @@ how it splits, and what pushes down. Start there before you read the prose.
 | {doc}`/integrations/warehouses/index` | 3 | Snowflake, BigQuery, and Databricks |
 | {doc}`/integrations/lakehouse/index` | 3 | Delta Lake, Apache Iceberg, and Apache Hudi |
 | {doc}`/integrations/databases/index` | 3 | SQL databases over one URI, plus MongoDB and Elasticsearch |
-| {doc}`/integrations/compute/index` | 3 | Ray, PyTorch, and Hugging Face |
+| {doc}`/integrations/compute/index` | 5 | Ray, PyTorch, Hugging Face, MLflow, and batch schedulers |
+| {doc}`/integrations/observability/index` | 2 | Prometheus and Grafana, and OpenLineage |
 
 ## See also
 
@@ -44,4 +45,5 @@ warehouses/index
 lakehouse/index
 databases/index
 compute/index
+observability/index
 ```

@@ -15,12 +15,14 @@ from batcher.dist.fleet._fleet import (
     acquire_fleet,
     borrows_session_fleet,
     current_fleet,
+    held_placement_group,
     release_fleet,
     release_session_fleet,
     release_session_lease,
     reset_fleet,
     session_fleet_lease,
     set_fleet,
+    yield_session_fleet,
 )
 from batcher.dist.fleet.eviction import evict_plan, fleet_actors_for_eviction
 from batcher.dist.fleet.query import maybe_spawn_query_fleet
@@ -35,6 +37,7 @@ __all__ = [
     "current_fleet",
     "evict_plan",
     "fleet_actors_for_eviction",
+    "held_placement_group",
     "maybe_spawn_query_fleet",
     "release_fleet",
     "release_session_fleet",
@@ -42,4 +45,5 @@ __all__ = [
     "reset_fleet",
     "session_fleet_lease",
     "set_fleet",
+    "yield_session_fleet",
 ]

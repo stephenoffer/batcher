@@ -28,12 +28,43 @@ def _fmt_ms(er: EngineResult) -> str:
     return f"{er.ms:.1f}"
 
 
+#: Printed in a ratio cell whose two timings exist but must not be divided, because at
+#: least one of them belongs to a result that failed the correctness gate.
+NOT_COMPARABLE = "n/c"
+
+
+def _ratio(b: EngineResult, other: EngineResult, status: str = "OK") -> str:
+    """The ``b/<engine>`` cell — or a refusal, when the division would assert something false.
+
+    ``compare()`` deliberately times an engine even when its result disagreed with the
+    oracle, because "how fast is the wrong answer" is real diagnostic signal. Dividing the
+    two is a different act: a ratio is the suite's claim, and printing one for a row the
+    gate rejected states that claim anyway. The status column says ``FAILED`` right beside
+    it, which is enough in a terminal and is not enough anywhere else — a number and its
+    disqualification travel separately the moment either is copied into a document, and
+    ``docs/benchmarks/methodology.md`` promises a reader that a query whose result does not
+    match "contributes no number".
+
+    So the timings stay (they are still printed in the ``*_ms`` columns) and the ratio is
+    withheld. The check is per engine rather than per row because ``correct`` is set per
+    engine: one comparator disagreeing, or one engine failing the sort-order check, must not
+    void the ratios of the engines that agreed.
+    """
+    if b.correct is False or other.correct is False or status in ("DIVERGENT", "DEGENERATE"):
+        return NOT_COMPARABLE
+    if not b.ms or not other.ms:
+        return "-"
+    return f"{b.ms / other.ms:.2f}x"
+
+
 def print_table(results: list[CompareResult], engines: list[str]) -> None:
     """Print an aligned table: query | per-engine ms | batcher/<engine> ratios | status.
 
     Columns are driven by ``engines`` (the resolved lineup), so the table adapts to
     whatever single-node or multi-node engines were selected. A ``b/<engine>`` ratio
-    is shown for every comparator when Batcher is in the lineup.
+    is shown for every comparator when Batcher is in the lineup — except where the
+    correctness gate rejected one of the two results, which prints ``n/c`` (see
+    :func:`_ratio`).
     """
     has_batcher = "batcher" in engines
     comparators = [e for e in engines if e != "batcher"]
@@ -48,8 +79,7 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
         if has_batcher:
             b = r.engines.get("batcher", EngineResult())
             for e in comparators:
-                ce = r.engines.get(e, EngineResult())
-                cells.append(f"{b.ms / ce.ms:.2f}x" if b.ms and ce.ms else "-")
+                cells.append(_ratio(b, r.engines.get(e, EngineResult()), r.status))
         cells.append(r.status)
         rows.append(cells)
 
@@ -79,6 +109,17 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
         print()
         for r in notes:
             print(f"[{r.status}] {r.name}: {r.note}")
+
+    # Say what the refusal means, but only when one is on screen — an unexplained `n/c`
+    # reads as a missing timing, which is the one thing it is not.
+    if any(NOT_COMPARABLE in row for row in rows):
+        print()
+        print(
+            f"{NOT_COMPARABLE} = not comparable: the timings are shown but the ratio is "
+            "withheld. The row's status says why — FAILED is a defect, DIVERGENT a recorded\n"
+            "      semantic difference, DEGENERATE an agreement between results carrying no "
+            "information (the engines agree; nothing was compared)."
+        )
 
 
 # --------------------------------------------------------------------------- #

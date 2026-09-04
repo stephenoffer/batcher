@@ -31,6 +31,72 @@ canonicalization in `keys.rs`, so the fast path and the encoder agree on group i
 The fast paths exist because that per-row encode is the difference between a group-by that
 keeps up with DuckDB and one that doesn't.
 
+### How a key of several columns is hashed
+
+A composite key has to become one hash per row, and there are two ways to arrange that loop.
+Row-major builds a hasher for each row and writes every column's value into it. Column-major
+seeds one hash per row, then makes a single pass per *column*, folding that column's values
+into the running hashes.
+
+Batcher does the second, which is also what DuckDB and Polars do. Each pass streams two
+contiguous slices with the column count fixed outside the loop, so there is no hasher state to
+spill and no walk over a column list per row.
+
+The larger reason for the arrangement is what happens when the group table resizes. A resize
+rehashes every entry the table already holds, and what an entry holds is a *representative row
+index* — so rehashing means reading that row back out of every key column, one random access
+each into an array as large as the relation. Keeping the hashes live turns that into a single
+array read, which is why they are materialized for the whole assignment rather than computed
+and discarded per row.
+
+Storing the hash inside the table entry instead looks strictly better and is not: it removes
+the array, but it quadruples the entry, and past a few hundred thousand groups the wider table
+costs more cache than the free rehash saves. That was built and measured before it was
+discarded.
+
+The table is also sized from the input rather than from a constant. It starts small, because an
+analytical `GROUP BY` is usually low-cardinality and sizing at the row count allocates a control
+array orders of magnitude too large. Once that initial capacity fills, the groups-per-row density
+observed so far projects the final group count, and one reserve replaces the doubling cascade
+that a near-unique key would otherwise pay.
+
+Together those two decisions are worth 1.4x to 6.2x on composite integer keys with many groups,
+and 1.07x to 1.12x on the low-cardinality shape the small initial capacity was tuned for. They
+have to ship together: the presize on its own is a slight loss at low cardinality, and the
+column-major hash is what pays that back. The measurements are in
+`docs/architecture/internals/competitor_technique_review.md`.
+
+None of it is visible in the query. A composite key is grouped by the same `group_by`, returns
+the same rows, and takes whichever path the *data* selects: the two aggregates below are spelled
+identically and reach different implementations, because the first key's value ranges multiply
+to something small enough to index directly and the second's do not.
+
+```python
+import batcher as bt
+from batcher import col
+
+sales = bt.from_pydict(
+    {
+        "region": [1, 1, 2, 2, 1, 2],
+        "channel": [10, 20, 10, 20, 10, 10],
+        # Sparse ids: the product of the three ranges leaves the dense budget behind.
+        "sku": [910_003, 910_003, 720_017, 910_003, 720_017, 910_003],
+        "amount": [5.0, 3.0, 2.0, 8.0, 1.0, 4.0],
+    }
+)
+
+# Two narrow keys: a mixed-radix index into a direct map, no hashing at all.
+dense = sales.group_by("region", "channel").agg(total=col("amount").sum())
+print(dense.sort("region", "channel").to_pydict())
+# {'region': [1, 1, 2, 2], 'channel': [10, 20, 10, 20], 'total': [6.0, 3.0, 6.0, 8.0]}
+
+# The same query with a sparse third key: hashed, one pass per column.
+hashed = sales.group_by("region", "channel", "sku").agg(total=col("amount").sum())
+print(hashed.sort("region", "channel", "sku").to_pydict())
+# Six groups rather than four: both `channel = 10` groups split, their rows
+# holding different skus.
+```
+
 ### When the key arrives sorted
 
 Sorted input makes equal keys adjacent, so a row's group is decided by comparing it with the

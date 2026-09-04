@@ -39,24 +39,40 @@ def _np() -> Any:
 
 
 def _array_to_arrow(arr: Any) -> pa.Array:
-    if arr.ndim == 1:
-        return pa.array(arr)
-    if arr.ndim == 2:
-        width = int(arr.shape[1])
-        flat = pa.array(arr.reshape(-1))
-        return pa.FixedSizeListArray.from_arrays(flat, width)
-    # Rank >= 2 per row: keep the full shape as a fixed-shape-tensor column.
-    from batcher.io.formats.ml.tensor import to_tensor_column
+    """One `.npy` array as an Arrow column, by the engine's single set of rank rules.
 
-    return to_tensor_column(arr)
+    This used to restate those rules — 1-D scalar, ``(n, dim)`` fixed-size list, deeper a
+    tensor column — which `io.interop.numpy_to_column` already owned for `bt.from_numpy`,
+    `from_torch` and `from_tf`. The two were byte-identical on every shape either handled,
+    checked before the swap rather than assumed, and had already drifted on the shapes only
+    one of them did: a complex or 0-d array produced a pyarrow dtype *number* here where the
+    same array in memory named the conversion that fixes it.
+
+    Delegating removes the second copy rather than syncing it, which is the only way two
+    statements of the same rule stay equal.
+
+    The mask handling `numpy_to_column` also brings is inert on this path, and deliberately
+    left unmentioned elsewhere: NumPy's own format cannot carry a mask. ``np.save`` refuses a
+    masked array outright, and ``np.savez`` accepts one but stores only its data, so a
+    ``.npy``/``.npz`` file never holds a mask for this reader to keep.
+    """
+    from batcher.io.interop import numpy_to_column
+
+    return numpy_to_column(arr)
 
 
 def _header_schema(fh: IO[Any]) -> pa.Schema | None:
     """The Arrow schema of a ``.npy`` file from its header alone, or None if unreadable.
 
-    The type comes from one synthetic row pushed through `_array_to_arrow` — the *same*
+    The type comes from one synthetic row pushed through `_columns_for_array` — the *same*
     mapping the read uses — so the advertised schema cannot drift from the batches. A
     dtype the mapping cannot handle simply returns None and the caller loads the file.
+
+    Going through the whole mapping rather than its single-column tail is what keeps that
+    promise for a compound dtype: a structured file's rows are its *fields*, so a schema
+    built here as one ``data`` column described a table the read would never produce, and
+    the mismatch surfaced as ``KeyError: 'Field "data" does not exist in schema'`` rather
+    than as anything about the file.
     """
     from batcher.io.stats.free_counts import npy_header_shape_dtype
 
@@ -67,7 +83,8 @@ def _header_schema(fh: IO[Any]) -> pa.Schema | None:
     np = _np()
     try:
         probe = np.zeros((1, *shape[1:]), dtype=dtype)
-        return pa.schema([pa.field("data", _array_to_arrow(probe).type)])
+        columns = _columns_for_array(probe)
+        return pa.schema([pa.field(name, col.type) for name, col in columns.items()])
     except Exception:
         return None
 
@@ -75,9 +92,29 @@ def _header_schema(fh: IO[Any]) -> pa.Schema | None:
 def _table_from_npy_handle(fh: IO[Any]) -> pa.Table:
     np = _np()
     loaded = np.load(fh, allow_pickle=False)
-    if hasattr(loaded, "files"):  # .npz archive
+    if hasattr(loaded, "files"):  # .npz archive: each member is one named column
         return pa.table({k: _array_to_arrow(loaded[k]) for k in loaded.files})
-    return pa.table({"data": _array_to_arrow(loaded)})
+    return pa.table(_columns_for_array(loaded))
+
+
+def _columns_for_array(arr: Any) -> dict[str, pa.Array]:
+    """The columns a single stored array becomes: its fields if compound, else ``data``.
+
+    A **structured** ``.npy`` is a saved record array — what ``np.rec.array`` and
+    ``np.genfromtxt`` produce, and what most scientific binary dumps are — so it is a table,
+    and becomes one column per field: the same reading `bt.from_numpy` gives it. It used to
+    reach Arrow whole and fail the file with ``Unsupported numpy type 20``, a message naming
+    neither the fields it held nor the fact that they were the columns being asked for.
+
+    Only the single-array file expands. An ``.npz`` member keeps its archive key as its
+    column name, because two structured members could name the same field and expanding them
+    would silently drop one; a structured member there raises through `_array_to_arrow`
+    instead, which now names the type and the fix.
+    """
+    from batcher.io.interop import structured_to_columns
+
+    fields = structured_to_columns(arr)
+    return fields if fields is not None else {"data": _array_to_arrow(arr)}
 
 
 @SOURCES.register("numpy")

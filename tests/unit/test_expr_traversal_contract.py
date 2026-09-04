@@ -282,3 +282,39 @@ def test_every_declared_child_is_reachable_from_the_kids_table():
         "these declared sub-expressions are not yielded by `_EXPR_KIDS`, so the "
         f"optimizer cannot see the columns they read: {sorted(unreachable)}"
     )
+
+
+def test_an_unregistered_node_breaks_projection_merging(monkeypatch) -> None:
+    """What the contract above is actually protecting, demonstrated rather than asserted.
+
+    The tests above check *registration*. This one checks the consequence, because a
+    contract test that nobody can connect to a symptom is a rule people route around.
+
+    `MakeMap` shipped registered nowhere. `referenced_columns` was never at risk -- it
+    reads the node's declarative `child()` metadata, not these tables -- so column pruning
+    stayed correct, and an earlier account of this defect that said pruning could drop a
+    needed column was wrong. What breaks is `transform_expr_up`, which visits an
+    unregistered node and does not descend: any rewrite that substitutes columns silently
+    skips the ones inside it.
+
+    Merging two stacked projections is enough. The merge rewrites the outer names and
+    leaves the inner ones pointing at columns that no longer exist -- loudly, which is the
+    better of the two failure modes it could have had.
+    """
+    import batcher as bt
+    from batcher import col
+    from batcher._internal.errors import ColumnNotFoundError
+    from batcher.plan.expr_ir.nodes import MakeMap
+
+    data = bt.from_pydict({"ks": [["a", "b"]], "vs": [[1, 2]]})
+    query = lambda d: (  # noqa: E731 - one expression, used twice, named for the diff
+        d.select(a=col("ks"), b=col("vs")).select(m=bt.map_from_arrays(col("a"), col("b")))
+    )
+
+    assert query(data).collect().to_pydict() == {"m": [[("a", 1), ("b", 2)]]}
+
+    # The negative control. Without it this test passes for any node, registered or not.
+    monkeypatch.delitem(_EXPR_KIDS, MakeMap)
+    monkeypatch.delitem(_EXPR_REBUILD, MakeMap)
+    with pytest.raises(ColumnNotFoundError, match=r"unknown column"):
+        query(data).collect()

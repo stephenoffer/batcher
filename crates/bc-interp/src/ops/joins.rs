@@ -562,8 +562,7 @@ fn empty_output(
         let dt = batches
             .first()
             .and_then(|b| b.column_by_name(&col.name))
-            .map(|c| c.data_type().clone())
-            .unwrap_or(arrow::datatypes::DataType::Null);
+            .map_or(arrow::datatypes::DataType::Null, |c| c.data_type().clone());
         fields.push(Field::new(&col.alias, dt.clone(), true));
         columns.push(arrow::array::new_empty_array(&dt));
     }
@@ -761,7 +760,7 @@ mod tests {
             .step_by(700)
             .map(|s| left.slice(s, (700).min(nl as usize - s)))
             .collect();
-        let r_morsels = vec![right.clone()];
+        let r_morsels = vec![right];
 
         for p in [1usize, 3, 8] {
             for k in [3usize, 50, 500, 10_000] {

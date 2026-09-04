@@ -257,10 +257,27 @@ def test_live_of_a_process_that_never_distributed_is_none():
 
 @pytest.fixture
 def ui():
+    """A UI server, with metrics collection detached again on the way out.
+
+    Serving `/metrics` or `/api/metrics` calls `start_metrics()` for you -- deliberately, so a
+    first scrape does not come back empty -- which subscribes the collector to the event bus.
+    That is right in a process someone is scraping and wrong to leave behind in a test:
+    `events.listening()` is global state the engine reads to decide whether optional work is
+    worth doing, so a test that fetches a metrics route switches that work on for every test
+    after it in the same process, and makes any later assertion about an *unobserved* engine
+    unable to fail. `test_device_link_and_gds.py::test_nothing_is_probed_when_nobody_is_listening`
+    is the assertion that catches it.
+    """
+    from batcher.observe import reset_metrics, stop_metrics
+
     server = UIServer(ActivityStore(), port=0)
     server.start()
-    yield server
-    server.stop()
+    try:
+        yield server
+    finally:
+        server.stop()
+        reset_metrics()
+        stop_metrics()
 
 
 def _fetch(server: UIServer, path: str, **kwargs) -> tuple[int, dict, bytes]:

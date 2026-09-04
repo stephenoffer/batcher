@@ -8,59 +8,20 @@ bounds peak memory. `aggregate` and `dist.spill_breakers` are the operators that
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pyarrow as pa
 
-from batcher.carbonite.spill import TieredSpillStore
-from batcher.config import active_config
+from batcher.carbonite.spill.scratch import make_store, scratch_dir
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import logical_bytes, one_batch
 
-
-def _work_dir(spill_dir: str | None, prefix: str) -> tuple[str, bool]:
-    """Resolve the local scratch dir for a spill, and whether we own it (rmtree it).
-
-    An explicit `spill_dir` is caller-owned (not removed). Otherwise, if the config
-    sets `MemoryConfig.spill_dir`, create a unique per-query subdir *under* that root
-    (so striping onto fast/large disks is honored and rmtree only ever removes our
-    own subdir — never a shared root). With neither, fall back to the node's measured
-    local scratch volume, and to a system tempdir only when there is none.
-
-    That last step matters on a GPU node, where a system tempdir is an overlay on the
-    container root — commonly under 100 GB and shared with the image and every other
-    tenant — while the several terabytes of local NVMe the node ships with are mounted
-    under a provider-specific name. Spilling to the tempdir there fails with `ENOSPC`
-    beside unused storage, and the failure looks like an undersized query rather than a
-    misplaced directory.
-    """
-    from batcher._internal.site import local_scratch_root
-
-    if spill_dir is not None:
-        return spill_dir, False
-    root = active_config().memory.spill_dir or local_scratch_root()
-    if root:
-        os.makedirs(root, exist_ok=True)
-        return tempfile.mkdtemp(prefix=prefix, dir=root), True
-    return tempfile.mkdtemp(prefix=prefix), True
-
-
-def _make_store(work_dir: str) -> TieredSpillStore:
-    """A tiered spill store for `work_dir`, configured from the active `Config`.
-
-    Local NVMe by default; overflows to `MemoryConfig.spill_remote_uri` once the
-    local budget is exhausted, so an out-of-core query survives a full local disk.
-    Spilled batches are compressed with the configured codec.
-    """
-    mem = active_config().memory
-    return TieredSpillStore(
-        work_dir,
-        remote_uri=mem.spill_remote_uri,
-        local_budget_bytes=mem.spill_local_budget_bytes,
-        compression=mem.spill_compression,
-    )
+#: The scratch-directory and store construction both this path and the result cache's
+#: disk tier need, defined once in `carbonite.spill.scratch`. Aliased under the private
+#: names this module's callers already import rather than re-implemented here: `dist` may
+#: import `carbonite`, and a second copy of the volume-selection rule is exactly the
+#: copy-paste `.claude/rules/architecture.md` forbids between subsystems.
+_work_dir = scratch_dir
+_make_store = make_store
 
 
 # Byte target the out-of-core partition phase feeds the engine at once. A source's

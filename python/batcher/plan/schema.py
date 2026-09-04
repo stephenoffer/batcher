@@ -16,7 +16,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import did_you_mean
 
-__all__ = ["SchemaRef", "placeholder_schema", "suggest_columns"]
+__all__ = ["SchemaRef", "column_name", "placeholder_schema", "suggest_columns"]
 
 
 def placeholder_schema(names: list[str]) -> pa.Schema:
@@ -67,6 +67,60 @@ def suggest_columns(name: str, available: list[str]) -> str:
     if not matches:
         return ""
     return f"; did you mean {' or '.join(repr(n) for n in matches)}?"
+
+
+def column_name(value: object, *, arg: str, api: str) -> str:
+    """`value` as a column *name*, or a `PlanError` saying what to pass instead.
+
+    Twenty-five public methods take a column name as a string — ``ds.sum("v")``,
+    ``ds.with_watermark("ts", ...)``, ``ds.session_window("ts", ...)`` — and a caller
+    arriving from Polars reaches for ``ds.sum(col("v"))`` instead. Every one of them then
+    did the same thing: tested ``value not in ds.columns``, which evaluates ``Expr.__eq__``
+    against each name, builds an expression, and asks it for a truth value. The error the
+    user saw was ``the truth value of an Expr is ambiguous; use & | ~ to combine
+    predicates`` — a message about boolean operators, from a call that used none, naming
+    neither the method nor the argument.
+
+    An expression is refused rather than accepted because these methods are the ones an
+    expression genuinely cannot express: the name is a *key* the operator looks up in a
+    schema (a watermark's event-time column, a session's ordering column), not a value to
+    compute. Where a derived value is meaningful, compute it first with ``with_columns``
+    and pass the new name.
+
+    Args:
+        value: What the caller passed.
+        arg: The parameter's name, for the message (e.g. ``"time_col"``).
+        api: The method's name, for the message (e.g. ``"with_watermark"``).
+
+    Returns:
+        `value` unchanged, once it is known to be a string.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.schema import column_name
+            >>> column_name("ts", arg="time_col", api="with_watermark")
+            'ts'
+    """
+    if isinstance(value, str):
+        return value
+    from batcher._internal.errors import PlanError
+    from batcher.plan.expr_ir.core import Expr
+
+    if isinstance(value, Expr):
+        named = getattr(value, "name", None)
+        hint = (
+            f" — pass {named!r}"
+            if isinstance(named, str) and named
+            else " — pass the column's name"
+        )
+        raise PlanError(
+            f"{api}(): {arg} must be a column name, not an expression{hint}. This "
+            "argument names a column the operator looks up in the schema, so a computed "
+            "expression has nothing to look up; derive it with with_columns(...) first "
+            "and pass the new name."
+        )
+    raise PlanError(f"{api}(): {arg} must be a column name (str), not {type(value).__name__}")
 
 
 @dataclass(frozen=True, slots=True)

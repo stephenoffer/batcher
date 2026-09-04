@@ -34,8 +34,8 @@ VECTOR = pa.list_(pa.float32(), 3)
 # (name, Batcher builder, the DuckDB query over the same values as a plain LIST)
 CASES = [
     ("get", lambda: col("e").list.get(0), "SELECT k, e[1] r FROM t ORDER BY k"),
-    ("first", lambda: col("e").list.first(), "SELECT k, list_first(e) r FROM t ORDER BY k"),
-    ("last", lambda: col("e").list.last(), "SELECT k, list_last(e) r FROM t ORDER BY k"),
+    ("first", col("e").list.first, "SELECT k, list_first(e) r FROM t ORDER BY k"),
+    ("last", col("e").list.last, "SELECT k, list_last(e) r FROM t ORDER BY k"),
     ("slice", lambda: col("e").list.slice(0, 2), "SELECT k, e[1:2] r FROM t ORDER BY k"),
     (
         "position",

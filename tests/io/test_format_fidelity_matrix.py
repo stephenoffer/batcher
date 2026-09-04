@@ -146,9 +146,17 @@ TYPE_ONLY: dict[tuple[str, str], str] = {
 }
 
 #: (format, type) -> what the format does to the values. These are format limits, not bugs.
+#:
+#: `("csv", "string")` used to be here, reading "CSV cannot distinguish an empty string from
+#: a null". That was not a format limit and this table is only for format limits: quoting
+#: distinguishes them, the writer already emitted `""` for an empty string and a bare field
+#: for NULL, and DuckDB reads that back exactly. It was a *reader* default
+#: (`strings_can_be_null`), so every NULL in a text column came back as `""` from a file
+#: Batcher had itself written. Recorded as a property of CSV, it made the defect
+#: unfindable -- which is the risk this table carries, and the reason an entry has to say
+#: what the *format* cannot do rather than what the reader currently does not.
 LOSSY: dict[tuple[str, str], str] = {
     ("csv", "float64"): "CSV has no NaN literal — NaN is written empty and reads back null",
-    ("csv", "string"): "CSV cannot distinguish an empty string from a null — null reads as ''",
     ("csv", "decimal"): "CSV is untyped text — a decimal is inferred back as a double",
     ("json", "float64"): "JSON has no NaN literal — NaN reads back null",
     ("json", "float_infinities"): "JSON has no Infinity literal — +-inf reads back null",

@@ -19,11 +19,13 @@ from batcher.config import Config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rules.relational.windows import (
+    _PREFIX_STABLE_RANKING,
     _order_key_ids,
     push_topn_into_unpartitioned_ranking_window,
     transpose_adjacent_windows,
 )
 from batcher.plan.expr_ir import Col
+from batcher.plan.ir_tags import WINDOW_RANKING
 from batcher.plan.logical import Limit, Scan, Sort, SortKeySpec, Window, WindowFuncSpec
 from batcher.plan.schema import SchemaRef
 
@@ -56,14 +58,31 @@ def _window(inp, *, partition=(), order=("a",), func="row_number", alias="r", fi
 
 
 def test_transpose_orders_independent_windows_by_spec(scan, ctx):
-    """Two independent windows are swapped into canonical spec order."""
+    """Two independent windows are swapped into canonical spec order, under a `Project`.
+
+    The projection is the correction, not decoration. `Window.available_columns()` is
+    `input.available_columns() + [aliases]`, so whichever node ends up outermost contributes
+    its aliases last — and swapping the nodes therefore transposes the *output columns* too.
+    The rule's own docstring recorded the gap without seeing it: the aliases must be disjoint
+    "so the column **set** above the pair is unchanged either way", and a set is not an order.
+    `with_columns(a=rank().over(...), b=sum().over(...))` came back as `g, v, b, a`.
+
+    So this asserts both halves: the swap happened (which is what lets
+    `collapse_adjacent_windows` merge equal specs), and the columns above the pair are exactly
+    what they were (which is what makes the rule semantics-preserving).
+    """
     inner = _window(scan, partition=("g",), alias="r1")
     outer = _window(inner, partition=(), alias="r2")
+    before = outer.available_columns()
+
     out = transpose_adjacent_windows(outer, ctx)
     assert out is not None
-    # The partition-free spec sorts first, so it must end up innermost.
-    assert isinstance(out, Window) and out.functions[0].alias == "r1"
-    assert isinstance(out.input, Window) and out.input.functions[0].alias == "r2"
+    assert out.available_columns() == before, "the rewrite transposed the output columns"
+
+    # The partition-free spec sorts first, so it must end up innermost, beneath the `Project`.
+    swapped = out.input
+    assert isinstance(swapped, Window) and swapped.functions[0].alias == "r1"
+    assert isinstance(swapped.input, Window) and swapped.input.functions[0].alias == "r2"
 
 
 def test_transpose_is_a_fixpoint_in_canonical_order(scan, ctx):
@@ -102,15 +121,43 @@ def test_topn_refuses_a_partitioned_window(scan, ctx):
     assert push_topn_into_unpartitioned_ranking_window(plan, ctx) is None
 
 
-@pytest.mark.parametrize("func", ["percent_rank", "cume_dist", "ntile"])
+@pytest.mark.parametrize("func", sorted(WINDOW_RANKING - _PREFIX_STABLE_RANKING))
 def test_topn_refuses_partition_size_dependent_ranking(scan, ctx, func):
     """These divide by the partition's row count, so truncating changes their value.
 
     They live in `WINDOW_RANKING` alongside `row_number`, which is exactly why the rule
     keeps its own narrower `_PREFIX_STABLE_RANKING` set rather than reusing that one.
+
+    Derived from the two production sets rather than hand-listed, so a *new* ranking
+    function lands on one side or the other of this pair of tests the day it is added.
+    Hand-listing the three that exist today is how a fourth ships with the rule silently
+    truncating its input.
     """
     plan = Limit(_window(scan, func=func), n=5)
     assert push_topn_into_unpartitioned_ranking_window(plan, ctx) is None
+
+
+@pytest.mark.parametrize("func", sorted(_PREFIX_STABLE_RANKING))
+def test_topn_fires_for_every_prefix_stable_ranking(scan, ctx, func):
+    """The other side of the partition: each of these must actually gain the top-N."""
+    plan = Limit(_window(scan, func=func), n=5)
+    rewritten = push_topn_into_unpartitioned_ranking_window(plan, ctx)
+    assert rewritten is not None, f"{func} is prefix-stable but the rule declined it"
+    window = rewritten.input if isinstance(rewritten, Limit) else rewritten
+    assert isinstance(window, Window)
+    assert isinstance(window.input, Sort) and window.input.limit == 5
+
+
+def test_every_ranking_function_is_classified_by_the_rule():
+    """`_PREFIX_STABLE_RANKING` must be a subset of the vocabulary it filters.
+
+    A typo or a rename there fails open: `_prefix_stable_ranking` simply stops matching,
+    the rule quietly never fires, and every test above still passes because they all
+    assert on functions the set does name.
+    """
+    assert _PREFIX_STABLE_RANKING <= WINDOW_RANKING, (
+        f"not ranking functions: {sorted(_PREFIX_STABLE_RANKING - WINDOW_RANKING)}"
+    )
 
 
 def test_topn_refuses_an_aggregate_window(scan, ctx):

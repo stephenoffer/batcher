@@ -43,6 +43,19 @@ pub(super) fn group_columns(
     reps: Vec<u32>,
     num_rows: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // The identity short-circuit below is only sound because `reps` is strictly increasing and
+    // bounded by `num_rows` — that is what makes `reps.len() == num_rows` imply `0..num_rows`.
+    // An assigner that handed ids out in some other order would take the short-circuit and
+    // return the *ungathered* key columns: right length, wrong rows, no error. Checked here
+    // rather than trusted, because every producer of a packed key reimplements the loop.
+    debug_assert!(
+        reps.windows(2).all(|w| w[0] < w[1]),
+        "group representatives must be strictly increasing (first-seen row order)"
+    );
+    debug_assert!(
+        reps.last().is_none_or(|&r| (r as usize) < num_rows),
+        "a group representative must be a row of this batch"
+    );
     if reps.len() == num_rows {
         return Ok(keys.to_vec());
     }
@@ -536,6 +549,12 @@ where
     let mut table: HashTable<(T::Native, u32)> =
         HashTable::with_capacity(group_table_capacity(num_rows));
     let mut null_gid: Option<u32> = None;
+    // **No `GroupGrowth` here, and that is measured rather than an oversight.** Presizing this
+    // table from the observed density is a 0.80-0.93x *regression* across 500 to 660,000
+    // groups, because the entry is `(key, group_id)` — sixteen bytes, four times the composite
+    // path's — so a table sized for the final group count scatters every probe from row zero,
+    // where doubling into it keeps the live set compact for most of the pass. See
+    // `competitor_technique_review.md` item 26.
     for i in 0..num_rows {
         if a.is_null(i) {
             let gid = *null_gid.get_or_insert_with(|| {
@@ -832,7 +851,7 @@ fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32
     for i in 0..num_rows {
         let mut k = 0u64;
         for (j, bytes) in byte_cols.iter().enumerate() {
-            k |= (bytes[i] as u64) << (8 * j);
+            k |= u64::from(bytes[i]) << (8 * j);
         }
         keys.push(k);
     }
@@ -909,7 +928,7 @@ where
         }
         let mut key = (len as u64) << 56;
         for (j, &b) in v.iter().enumerate() {
-            key |= (b as u64) << (8 * j);
+            key |= u64::from(b) << (8 * j);
         }
         out.push(key);
     }
@@ -940,7 +959,7 @@ where
         let v = &data[lo..hi];
         let mut buf = [0u8; 16];
         buf[0] = v.len() as u8;
-        buf[1..1 + v.len()].copy_from_slice(v);
+        buf[1..=v.len()].copy_from_slice(v);
         out.push(u128::from_le_bytes(buf));
     }
     Some(out)
@@ -962,29 +981,33 @@ fn dense_multi_span(
     cols: &[&Int64Array],
     num_rows: usize,
 ) -> Option<(Vec<i64>, Vec<usize>, usize)> {
+    let budget = num_rows
+        .saturating_mul(DENSE_SPAN_ROW_FACTOR)
+        .clamp(1024, DENSE_SPAN_MAX);
     let mut lows = Vec::with_capacity(cols.len());
     let mut spans: Vec<usize> = Vec::with_capacity(cols.len());
+    // The running product is checked against the budget **inside** the loop, so a key that
+    // cannot be dense stops scanning at the column that proves it. This pass reads every row
+    // of every key column and is the one part of the decision that is never free, so on the
+    // shapes that decline — a high-cardinality composite key, which is exactly where the hash
+    // path below is already the expensive one — it is the difference between paying for one
+    // column and paying for all of them. The columns scanned before the exit are the same
+    // ones, in the same order, so an eligible key still yields identical `lows` and `spans`.
+    let mut total: usize = 1;
     for c in cols {
         // Folded over the value slice rather than through `value(i)`, so the min/max pass
-        // vectorizes. It runs over every row of every key column before the grouping does,
-        // which makes it the one part of this decision that is never free.
+        // vectorizes.
         let values: &[i64] = c.values().as_ref();
         let (lo, hi) = values[..num_rows]
             .iter()
             .fold((i64::MAX, i64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        let span = usize::try_from(hi as i128 - lo as i128 + 1).ok()?;
+        let span = usize::try_from(i128::from(hi) - i128::from(lo) + 1).ok()?;
+        total = total.checked_mul(span)?;
+        if total > budget {
+            return None;
+        }
         lows.push(lo);
         spans.push(span);
-    }
-    let mut total: usize = 1;
-    for &s in &spans {
-        total = total.checked_mul(s)?;
-    }
-    let budget = num_rows
-        .saturating_mul(DENSE_SPAN_ROW_FACTOR)
-        .clamp(1024, DENSE_SPAN_MAX);
-    if total > budget {
-        return None;
     }
     // Row-major strides: the last column varies fastest.
     let mut strides = vec![1usize; cols.len()];
@@ -1029,37 +1052,96 @@ fn dense_multi_ids(
             *$out = *slot;
         }};
     }
-    match cols {
-        [a, b] => {
-            // Zipped, not indexed: iterating the two value slices together with the output
-            // elides the per-row bounds check on all three, which the index form re-emits
-            // because nothing proves `i` is in range for each of them independently.
-            let (la, lb) = (lows[0], lows[1]);
-            let (sa, sb) = (strides[0], strides[1]);
-            let rows = &a.values()[..num_rows];
-            let other = &b.values()[..num_rows];
-            for (row, ((x, y), out)) in rows
-                .iter()
-                .zip(other.iter())
-                .zip(group_ids.iter_mut())
-                .enumerate()
-            {
-                let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
-                assign!(out, idx, row);
-            }
+    if let [a, b] = cols {
+        // Zipped, not indexed: iterating the two value slices together with the output
+        // elides the per-row bounds check on all three, which the index form re-emits
+        // because nothing proves `i` is in range for each of them independently.
+        let (la, lb) = (lows[0], lows[1]);
+        let (sa, sb) = (strides[0], strides[1]);
+        let rows = &a.values()[..num_rows];
+        let other = &b.values()[..num_rows];
+        for (row, ((x, y), out)) in rows
+            .iter()
+            .zip(other.iter())
+            .zip(group_ids.iter_mut())
+            .enumerate()
+        {
+            let idx = x.wrapping_sub(la) as usize * sa + y.wrapping_sub(lb) as usize * sb;
+            assign!(out, idx, row);
         }
-        _ => {
-            let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
-            for (row, out) in group_ids.iter_mut().enumerate() {
-                let mut idx = 0usize;
-                for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
-                    idx += v[row].wrapping_sub(low) as usize * stride;
-                }
-                assign!(out, idx, row);
+    } else {
+        let values: Vec<&[i64]> = cols.iter().map(|c| c.values().as_ref()).collect();
+        for (row, out) in group_ids.iter_mut().enumerate() {
+            let mut idx = 0usize;
+            for ((v, &low), &stride) in values.iter().zip(lows).zip(strides) {
+                idx += v[row].wrapping_sub(low) as usize * stride;
             }
+            assign!(out, idx, row);
         }
     }
     (group_ids, reps)
+}
+
+/// Multiplier for [`combine_hash`]'s mixing step — DuckDB's `CombineHashScalar` constant.
+const COMBINE_MUL: u64 = 0xd6e8_feb8_6659_fd93;
+
+/// Starting value each row's composite hash folds its columns into.
+const COMBINE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Avalanche one key value into a well-distributed 64-bit hash.
+///
+/// SplitMix64's finalizer: five shift/multiply/xor steps, no state and no table, and it
+/// avalanches every input bit across the whole word. That matters more here than raw speed,
+/// because `hashbrown` reads the **top seven bits** as its SIMD control tag and the low bits
+/// as the bucket index, so a mixer that leaves either end correlated with the key turns a
+/// probe into a linear scan.
+#[inline(always)]
+fn mix_key(v: i64) -> u64 {
+    let mut x = v as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Fold one more column's hash into a row's running composite hash.
+///
+/// Order-dependent by construction — `a` is re-mixed before `b` is xored in — so
+/// `(1, 2)` and `(2, 1)` are different keys, and two columns holding equal values do not
+/// cancel to zero the way a bare xor would.
+#[inline(always)]
+fn combine_hash(a: u64, b: u64) -> u64 {
+    (a ^ (a >> 32)).wrapping_mul(COMBINE_MUL) ^ b
+}
+
+/// Per-row hashes of a null-free composite `Int64` key, one **column at a time**.
+///
+/// The probe loop this feeds used to hash row-major: construct an `ahash` hasher, walk the
+/// column list writing each value into it, finish it — per row. This does the same work
+/// column-major instead, one tight pass per column over a contiguous `&[i64]`. It is the
+/// shape DuckDB (`TightLoopCombineHash`) and Polars (`vec_hash_combine`) both use, and each
+/// pass streams two slices with no hasher state to spill, no bounds check, and no indirect
+/// call through a column list — the column count is loop-invariant rather than re-walked per
+/// row.
+///
+/// The hashes stay live for the whole assignment, which is the larger half of the win: the
+/// table's rehash closure fires on every growth step, and without them it has to re-read the
+/// representative row out of *every* key column, one random access each into `8 x num_rows`
+/// bytes. With them it is a single array read.
+///
+/// The `8 x num_rows` this costs is deliberate and is less than the neighbouring paths already
+/// spend — `assign_groups_packed` materializes a `u128` per row, and the `RowConverter` path a
+/// whole encoded row. Storing the hash in the table entry instead was **built and measured**,
+/// and it loses: it removes the array but quadruples the entry (4 bytes to 16), and past a few
+/// hundred thousand groups the wider table costs more cache than the free rehash saves. See
+/// `competitor_technique_review.md` item 26.
+fn hash_columns_i64(values: &[&[i64]], num_rows: usize) -> Vec<u64> {
+    let mut hashes = vec![COMBINE_SEED; num_rows];
+    for v in values {
+        for (h, &x) in hashes.iter_mut().zip(&v[..num_rows]) {
+            *h = combine_hash(*h, mix_key(x));
+        }
+    }
+    hashes
 }
 
 fn assign_groups_int64_multi(
@@ -1067,8 +1149,6 @@ fn assign_groups_int64_multi(
     group_keys: &[ArrayRef],
     num_rows: usize,
 ) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
-    use std::hash::{BuildHasher, Hasher};
-
     // Dense composite fast path: when every column's value range is small enough that the
     // *product* of the ranges fits the span budget, the composite key is a mixed-radix
     // index into a direct map — no hashing, no per-row equality walk over the columns.
@@ -1097,28 +1177,38 @@ fn assign_groups_int64_multi(
     // against 12.3**, a 1.7x regression on the commoner shape. Two cached loads beat building
     // a key. Restoring the delegation needs a cardinality signal to gate it on, which is not
     // available here before the probe loop has run.
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    // Hash a row's composite key by folding each column's raw value into one hasher —
-    // no per-row allocation (unlike encoding a key tuple), the same values the equality
-    // check compares.
-    let hash_row = |i: usize| -> u64 {
-        let mut h = state.build_hasher();
-        for c in cols {
-            h.write_i64(c.value(i));
-        }
-        h.finish()
-    };
-    let eq_rows = |a: usize, b: usize| -> bool { cols.iter().all(|c| c.value(a) == c.value(b)) };
+    //
+    // Those figures predate the hash now stored in the entry, which removes most of what the
+    // packing was for: the rep-row read still happens, but only once a full 64-bit hash has
+    // matched, rather than on every tag collision. Re-measure before reviving the idea.
 
+    // Raw value slices for the equality check. `Int64Array::value(i)` re-reads the array's
+    // offset and re-checks its bounds on every access, and a probe makes `cols.len()` of them
+    // against the representative row and as many again against the probe row.
+    let values: Vec<&[i64]> = cols.iter().map(|c| &c.values()[..num_rows]).collect();
+    let eq_rows = |a: usize, b: usize| -> bool { values.iter().all(|v| v[a] == v[b]) };
+
+    // The entry carries the row's hash beside its group id, which pays for itself twice. The
+    // table's rehash closure — which fires on every growth step, and which previously had to
+    // re-read the representative row out of *every* key column, one random access each into
+    // `8 x num_rows` bytes — becomes the identity. And a probe compares the full 64-bit hash
+    // before `eq_rows`, so the scattered per-column reads happen only on a real candidate
+    // rather than on `hashbrown`'s 1-in-128 tag collisions.
+    let hashes = hash_columns_i64(&values, num_rows);
     let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
     let mut group_ids = Vec::with_capacity(num_rows);
+    // A near-unique composite key is the shape this path is least able to size for, and the
+    // one the doubling cascade costs most. `GroupGrowth` extrapolates the final group count
+    // from the density seen so far and reserves once. It is a pure allocation hint — see its
+    // own docs.
+    let mut probe = GroupGrowth::new(num_rows);
     for i in 0..num_rows {
-        let hash = hash_row(i);
+        let hash = hashes[i];
         let gid = match table.entry(
             hash,
             |&g| eq_rows(reps[g as usize] as usize, i),
-            |&g| hash_row(reps[g as usize] as usize),
+            |&g| hashes[reps[g as usize] as usize],
         ) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
@@ -1129,6 +1219,10 @@ fn assign_groups_int64_multi(
             }
         };
         group_ids.push(gid);
+        if let Some(extra) = probe.extra_capacity(i, reps.len()) {
+            reps.reserve(extra);
+            table.reserve(extra, |&g| hashes[reps[g as usize] as usize]);
+        }
     }
 
     let num_groups = reps.len();
@@ -1200,16 +1294,15 @@ where
     let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
         let value: &[u8] = a.value(i).as_ref();
-        let code = match ids.get(value) {
-            Some(&code) => code,
-            None => {
-                if ids.len() == RANK_MAX_DISTINCT {
-                    return None; // too many distinct values for ranking to pay
-                }
-                let code = ids.len() as i64;
-                ids.insert(value, code);
-                code
+        let code = if let Some(&code) = ids.get(value) {
+            code
+        } else {
+            if ids.len() == RANK_MAX_DISTINCT {
+                return None; // too many distinct values for ranking to pay
             }
+            let code = ids.len() as i64;
+            ids.insert(value, code);
+            code
         };
         codes.push(code);
     }
@@ -1426,7 +1519,7 @@ fn pack_u128_keys(group_keys: &[ArrayRef], widths: &[usize], num_rows: usize) ->
             Int64 => {
                 let values = a.as_primitive::<Int64Type>().values();
                 for (slot, &v) in packed.iter_mut().zip(values.iter()) {
-                    *slot |= ((v as u64) as u128) << shift;
+                    *slot |= u128::from(v as u64) << shift;
                 }
             }
             Utf8 => pack_bytes_column(&mut packed, a.as_string::<i32>(), shift),
@@ -1628,13 +1721,12 @@ mod tests {
         let mut reps: Vec<u32> = Vec::new();
         let mut ids = Vec::with_capacity(vals.len());
         for (i, v) in vals.iter().enumerate() {
-            match seen.iter().position(|s| s == v) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(*v);
-                    reps.push(i as u32);
-                }
+            if let Some(g) = seen.iter().position(|s| s == v) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(*v);
+                reps.push(i as u32);
             }
         }
         (ids, seen.len(), reps)
@@ -1903,14 +1995,14 @@ mod tests {
     /// Keys 0..999: dense, so the direct-map path runs.
     #[test]
     fn dense_keys_match_reference() {
-        let vals: Vec<Option<i64>> = (0..4000).map(|i| Some((i % 1000) as i64)).collect();
+        let vals: Vec<Option<i64>> = (0..4000).map(|i| Some(i64::from(i % 1000))).collect();
         check_i64(vals);
     }
 
     /// Negative keys exercise the `min` offset.
     #[test]
     fn dense_negative_keys_match_reference() {
-        let vals: Vec<Option<i64>> = (0..2000).map(|i| Some((i % 51) as i64 - 25)).collect();
+        let vals: Vec<Option<i64>> = (0..2000).map(|i| Some(i64::from(i % 51) - 25)).collect();
         check_i64(vals);
     }
 
@@ -1923,7 +2015,7 @@ mod tests {
     /// A huge, sparse range exceeds the span budget and falls back to the hash path.
     #[test]
     fn sparse_keys_fall_back_and_match_reference() {
-        let vals: Vec<Option<i64>> = (0..500).map(|i| Some(i as i64 * 1_000_003)).collect();
+        let vals: Vec<Option<i64>> = (0..500).map(|i| Some(i64::from(i) * 1_000_003)).collect();
         check_i64(vals);
     }
 
@@ -1944,7 +2036,7 @@ mod tests {
                 if i % 7 == 0 {
                     None
                 } else {
-                    Some((i % 13) as i64)
+                    Some(i64::from(i % 13))
                 }
             })
             .collect();
@@ -1977,12 +2069,11 @@ mod tests {
         let mut seen: Vec<(i64, i64)> = Vec::new();
         let mut ids = Vec::with_capacity(rows.len());
         for r in rows {
-            match seen.iter().position(|s| s == r) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(*r);
-                }
+            if let Some(g) = seen.iter().position(|s| s == r) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(*r);
             }
         }
         (ids, seen.len())
@@ -2007,7 +2098,7 @@ mod tests {
     #[test]
     fn dense_two_int_keys_match_reference() {
         let rows: Vec<(i64, i64)> = (0..3000)
-            .map(|i| ((i % 7) as i64, (i % 11) as i64))
+            .map(|i| (i64::from(i % 7), i64::from(i % 11)))
             .collect();
         check_multi(rows);
     }
@@ -2016,7 +2107,7 @@ mod tests {
     #[test]
     fn dense_two_int_keys_negative_match_reference() {
         let rows: Vec<(i64, i64)> = (0..2000)
-            .map(|i| ((i % 5) as i64 - 2, (i % 9) as i64 - 4))
+            .map(|i| (i64::from(i % 5) - 2, i64::from(i % 9) - 4))
             .collect();
         check_multi(rows);
     }
@@ -2025,7 +2116,7 @@ mod tests {
     #[test]
     fn sparse_two_int_keys_fall_back_and_match_reference() {
         let rows: Vec<(i64, i64)> = (0..500)
-            .map(|i| (i as i64 * 7919, (i % 3) as i64))
+            .map(|i| (i64::from(i) * 7919, i64::from(i % 3)))
             .collect();
         check_multi(rows);
     }
@@ -2042,7 +2133,7 @@ mod tests {
         let vals: Vec<i32> = (0..1000).map(|i| i % 37).collect();
         let arr: ArrayRef = Arc::new(Int32Array::from(vals.clone()));
         let (ids, n, _) = assign_groups(&[arr], vals.len()).unwrap();
-        let as_i64: Vec<Option<i64>> = vals.iter().map(|&v| Some(v as i64)).collect();
+        let as_i64: Vec<Option<i64>> = vals.iter().map(|&v| Some(i64::from(v))).collect();
         let (want_ids, want_n, _) = reference(&as_i64);
         assert_eq!(ids, want_ids);
         assert_eq!(n, want_n);
@@ -2054,12 +2145,11 @@ mod tests {
         let mut seen: Vec<&str> = Vec::new();
         let mut ids = Vec::with_capacity(vals.len());
         for v in vals {
-            match seen.iter().position(|s| s == v) {
-                Some(g) => ids.push(g as u32),
-                None => {
-                    ids.push(seen.len() as u32);
-                    seen.push(v);
-                }
+            if let Some(g) = seen.iter().position(|s| s == v) {
+                ids.push(g as u32)
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(v);
             }
         }
         (
@@ -2164,12 +2254,11 @@ mod tests {
         let mut seen: Vec<(&str, &str)> = Vec::new();
         let mut want_ids = Vec::new();
         for (f, s) in flags.iter().zip(&stat) {
-            match seen.iter().position(|p| p == &(*f, *s)) {
-                Some(g) => want_ids.push(g as u32),
-                None => {
-                    want_ids.push(seen.len() as u32);
-                    seen.push((f, s));
-                }
+            if let Some(g) = seen.iter().position(|p| p == &(*f, *s)) {
+                want_ids.push(g as u32)
+            } else {
+                want_ids.push(seen.len() as u32);
+                seen.push((f, s));
             }
         }
         assert_eq!(ids, want_ids);
@@ -2419,6 +2508,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Group ids for an arbitrary-width composite `Int64` key, computed the slow obvious way.
+    fn reference_wide(rows: &[Vec<i64>]) -> (Vec<u32>, usize) {
+        let mut seen: Vec<&Vec<i64>> = Vec::new();
+        let mut ids = Vec::with_capacity(rows.len());
+        for r in rows {
+            if let Some(g) = seen.iter().position(|s| *s == r) {
+                ids.push(g as u32);
+            } else {
+                ids.push(seen.len() as u32);
+                seen.push(r);
+            }
+        }
+        (ids, seen.len())
+    }
+
+    /// The composite-integer **hash** path must agree with the oracle at every column count.
+    ///
+    /// The two-column tests above are not enough for it: the hash is now built one column at
+    /// a time, folding each column into a running per-row value, so the column count is the
+    /// variable that decides whether the fold is applied the right number of times and in the
+    /// right order. A combine step that dropped or double-counted a column would still group
+    /// two-column keys correctly and would corrupt every wider one.
+    ///
+    /// `spread` pushes each column's value range past the dense-map budget so these take the
+    /// hash path rather than the mixed-radix direct map; `dense_wide_int_keys_match_reference`
+    /// covers the other branch.
+    #[test]
+    fn wide_int_keys_on_the_hash_path_match_reference() {
+        for ncols in 2..=6usize {
+            let rows: Vec<Vec<i64>> = (0..4000i64)
+                .map(|i| {
+                    (0..ncols as i64)
+                        .map(|c| ((i + c) % (7 + c)) * 100_003)
+                        .collect()
+                })
+                .collect();
+            let cols: Vec<ArrayRef> = (0..ncols)
+                .map(|c| {
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r[c]).collect::<Vec<_>>(),
+                    )) as ArrayRef
+                })
+                .collect();
+            let (ids, n, out) = assign_groups(&cols, rows.len()).unwrap();
+            let (want_ids, want_n) = reference_wide(&rows);
+            assert_eq!(ids, want_ids, "{ncols} columns: group ids");
+            assert_eq!(n, want_n, "{ncols} columns: group count");
+            assert_eq!(out.len(), ncols);
+            assert_eq!(out[0].len(), want_n);
+        }
+    }
+
+    /// The same widths through the dense mixed-radix map, so the column-count sweep covers
+    /// both branches of the composite-integer decision rather than only the one it reaches
+    /// by default.
+    #[test]
+    fn dense_wide_int_keys_match_reference() {
+        for ncols in 2..=5usize {
+            let rows: Vec<Vec<i64>> = (0..4000i64)
+                .map(|i| (0..ncols as i64).map(|c| (i + c) % (3 + c)).collect())
+                .collect();
+            let cols: Vec<ArrayRef> = (0..ncols)
+                .map(|c| {
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r[c]).collect::<Vec<_>>(),
+                    )) as ArrayRef
+                })
+                .collect();
+            let (ids, n, _out) = assign_groups(&cols, rows.len()).unwrap();
+            let (want_ids, want_n) = reference_wide(&rows);
+            assert_eq!(ids, want_ids, "{ncols} columns: group ids");
+            assert_eq!(n, want_n, "{ncols} columns: group count");
+        }
+    }
+
+    /// `dense_multi_span` stops scanning at the column that proves the key cannot be dense.
+    ///
+    /// The decision it returns is what the grouping is held to elsewhere; this pins the
+    /// *early exit* itself, because the exit is invisible in a result — a key that declines
+    /// after one column and one that declines after four produce identical group ids, and
+    /// only the columns scanned differ. Asserted on the returned spans, which an exit
+    /// truncates.
+    #[test]
+    fn dense_multi_span_stops_at_the_column_that_blows_the_budget() {
+        let n = 2048;
+        let narrow = Int64Array::from((0..n as i64).map(|i| i % 4).collect::<Vec<_>>());
+        // Alone, this column's range is far past any budget, so the product cannot recover.
+        let wide = Int64Array::from((0..n as i64).map(|i| i * 1_000_003).collect::<Vec<_>>());
+
+        // Wide column first: the scan gives up having measured exactly one column.
+        assert!(dense_multi_span(&[&wide, &narrow, &narrow], n).is_none());
+        // Narrow columns only: every column is measured and the key is eligible.
+        let (lows, strides, span) = dense_multi_span(&[&narrow, &narrow, &narrow], n)
+            .expect("three narrow columns fit the budget");
+        assert_eq!(lows.len(), 3);
+        assert_eq!(strides, vec![16, 4, 1]);
+        assert_eq!(span, 64);
+        // And an eligible prefix followed by a wide column still declines.
+        assert!(dense_multi_span(&[&narrow, &wide], n).is_none());
     }
 
     /// `GroupGrowth` must stay inert for the low-cardinality shape `group_table_capacity`

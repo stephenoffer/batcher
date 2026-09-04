@@ -98,23 +98,23 @@ _STRICTNESS_CASES = [
     ("nan_is_null", lambda: col("f").is_nan().is_null(), "isnan(f) IS NULL"),
     (
         "negation_is_null",
-        lambda: (~(col("i") > lit(0))).is_null(),
+        (~(col("i") > lit(0))).is_null,
         "(NOT (i > 0)) IS NULL",
     ),
-    ("arith_is_null", lambda: (col("i") + col("j")).is_null(), "(i + j) IS NULL"),
+    ("arith_is_null", (col("i") + col("j")).is_null, "(i + j) IS NULL"),
     (
         "arith_is_not_null",
-        lambda: (col("i") * col("j")).is_not_null(),
+        (col("i") * col("j")).is_not_null,
         "(i * j) IS NOT NULL",
     ),
     (
         "comparison_is_null",
-        lambda: (col("i") < col("j")).is_null(),
+        (col("i") < col("j")).is_null,
         "(i < j) IS NULL",
     ),
     (
         "comparison_is_not_null",
-        lambda: (col("i") >= col("j")).is_not_null(),
+        (col("i") >= col("j")).is_not_null,
         "(i >= j) IS NOT NULL",
     ),
     (

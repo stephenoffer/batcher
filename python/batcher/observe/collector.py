@@ -21,6 +21,7 @@ from batcher.observe.counters import (
     StreamCounters,
     WorkCounters,
     WriteCounters,
+    as_number,
 )
 from batcher.observe.node_metrics import node_conditions
 
@@ -124,17 +125,20 @@ class _Collector:
             elif kind == events.QUERY_START:
                 self.queries_active += 1
             elif kind == events.PROGRESS:
-                self.stream_rows_total += int(fields.get("rows", 0))
-                self.stream_bytes_total += int(fields.get("bytes", 0))
+                # `as_number`, not a bare `int`: the bus is best-effort and a sink that
+                # raises is now detached after three strikes, so a publisher passing `None`
+                # where a number was documented would cost the whole metrics export.
+                self.stream_rows_total += int(as_number(fields.get("rows")))
+                self.stream_bytes_total += int(as_number(fields.get("bytes")))
             elif kind == events.LOG:
                 self._log_counts[str(fields.get("level", "INFO"))] += 1
             elif kind == events.PARTITION:
                 self.partitions_done_total += 1
             elif kind == events.INFER:
                 self.infer_batches_total += 1
-                self.infer_rows_total += int(fields.get("rows", 0))
-                self.infer_latency_ms_total += float(fields.get("latency_ms", 0.0))
-                self.infer_blocked_ms_total += float(fields.get("blocked_ms", 0.0))
+                self.infer_rows_total += int(as_number(fields.get("rows")))
+                self.infer_latency_ms_total += as_number(fields.get("latency_ms"))
+                self.infer_blocked_ms_total += as_number(fields.get("blocked_ms"))
             elif kind == events.SKIPPED:
                 count = int(fields.get("count", 0))
                 self.skipped_total += count
@@ -192,7 +196,17 @@ class _Collector:
             entry["failed"] += 1
 
     def _record_gpu(self, fields: dict[str, Any]) -> None:
-        """Fold one GPU sample in as a per-device gauge. Assumes the lock is held."""
+        """Fold one GPU sample in as a per-device gauge. Assumes the lock is held.
+
+        Ignores a `GPU` event that carries no reading. The kind is not only used for
+        utilization samples — `dist.gpu.device_read` reports a scan's transfer path on it —
+        and reading `util_pct` off one of those with a `0` default invented a device named
+        `gpu0` sitting at 0% with 0 bytes of VRAM, which then rendered as
+        `batcher_gpu_utilization_percent`. A monitoring system cannot tell that from a real
+        idle device, so the fabricated zero is worse than the missing series.
+        """
+        if not events.is_gpu_sample(fields):
+            return
         device = str(fields.get("device", fields.get("actor", "gpu0")))
         util = float(fields.get("util_pct", 0.0))
         self.gpu_util_pct_max = max(self.gpu_util_pct_max, util)
@@ -231,13 +245,34 @@ class _Collector:
                 self._buckets[edge] += 1
 
     def snapshot(self) -> dict[str, Any]:
-        """A consistent, deep-copied view of every counter. Assumes nothing about callers."""
+        """A consistent, deep-copied view of every counter. Assumes nothing about callers.
+
+        **Every reading is taken before the lock, and the two that were not deadlocked the
+        scrape.** `node_conditions` and `window_snapshot` read the *hardware*, and both wrap
+        their probes in `except Exception: note_suppressed(...)` so a scrape can never fail on
+        a driver that has gone away. `note_suppressed` publishes a LOG event; the bus delivers
+        it synchronously to every sink; this collector is a sink, and `handle` takes
+        `self._lock` -- which this thread is already holding, on a plain `threading.Lock`.
+
+        So a probe raising during a scrape did not degrade the scrape, it hung the thread
+        forever, still holding the lock that every query's `QUERY_END` needs. The `# pragma:
+        no cover - a scrape must never fail a process` comment on that handler is exact about
+        its intent and was the mechanism of something worse: a failed scrape returns, a hung
+        one does not, and it takes the engine's event bus down with it.
+
+        Hoisting them is the whole fix and it needs no new machinery, because it is what the
+        six readings above already do -- each of those owns its own lock and is read outside
+        this one for the same reason.
+        """
         operators = self.work.operators()
         totals = self.work.totals()
         rows_scanned, bytes_scanned = self.work.scanned()
         resources = self.resources.snapshot()
         streaming = self.streams.snapshot()
         writes = self.writes.snapshot()
+        # Hardware reads, and the ones that can log. Never move these inside the lock.
+        device_window = window_snapshot()
+        node = node_conditions()
         with self._lock:
             ok = self.queries_total - self.queries_failed
             return {
@@ -331,7 +366,7 @@ class _Collector:
                     # of repeated snapshots still cannot tell a steadily half-fed device from
                     # one alternating between saturated and idle. Empty and flagged unsampled
                     # unless sampling was turned on, so nothing here invents a quiet fleet.
-                    "window": window_snapshot(),
+                    "window": device_window,
                 },
-                "node": node_conditions(),
+                "node": node,
             }

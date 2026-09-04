@@ -177,6 +177,58 @@ def _usage_columns(engine: object, n: int, reported: list | None = None, order: 
             "order. Pass usage=False to skip token accounting for this engine."
         )
         raise BackendError(msg)
+    _reject_unpaired_usage(engine, pairs)
     prompt = [p[0] if p else None for p in pairs]
     completion = [p[1] if p else None for p in pairs]
     return pa.array(prompt, type=pa.int64()), pa.array(completion, type=pa.int64())
+
+
+def _reject_unpaired_usage(engine: object, pairs: list) -> None:
+    """Raise, naming the engine and the shape, before `p[0]` does it in a language nobody reads.
+
+    The channel's contract is one ``(prompt_tokens, completion_tokens)`` pair per request. The
+    row *count* is guarded above; the shape was not, and the three ways it goes wrong were
+    measured rather than reasoned about.
+
+    **A three-element tuple is the one that corrupts silently, and it is why this checks the
+    length rather than catching the exceptions.** `p[0]`/`p[1]` take the first two of whatever
+    they are given, so an engine reporting ``(total, prompt, completion)`` — an ordering nothing
+    warns against — wrote the *total* into `prompt_tokens` for every row and raised nothing:
+    measured at ``[999, 999]`` against real prompt lengths of ``[12, 34]``. A cost report then
+    sums a column that is confidently wrong. (The other ordering, ``(prompt, completion,
+    total)``, happens to give the right two and is equally unchecked — which is worse, not
+    better: whether the numbers are right depends on an ordering the contract never states.)
+
+    The other two are loud but anonymous. A dict — the shape the OpenAI-style APIs return, so
+    the likeliest mistake anyone writing an engine makes, because it is what their provider
+    handed them — fails with a bare ``KeyError: 0``. A string fails with ``IndexError`` or, once
+    Arrow sees it, ``Could not convert '1' with type str``. Neither names the engine, the
+    channel, or the contract.
+
+    Args:
+        engine: The engine that reported, named in the message.
+        pairs: The reported values, already length-checked against the row count.
+
+    Raises:
+        BackendError: If any reported value is not a two-element sequence of numbers.
+    """
+    for value in pairs:
+        if value is None:
+            continue
+        pair = isinstance(value, (tuple, list)) and len(value) == 2
+        if pair and all(v is None or isinstance(v, int) for v in value):
+            continue
+        from batcher._internal.errors import BackendError
+
+        shape = type(value).__name__
+        hint = (
+            " A dict is what the OpenAI-shaped APIs return; report"
+            ' `(usage["prompt_tokens"], usage["completion_tokens"])` instead.'
+            if isinstance(value, dict)
+            else ""
+        )
+        raise BackendError(
+            f"{type(engine).__name__} reported token usage as {shape}, but the usage channel "
+            f"takes one (prompt_tokens, completion_tokens) pair of integers per request."
+            f"{hint} Pass usage=False to skip token accounting for this engine."
+        )

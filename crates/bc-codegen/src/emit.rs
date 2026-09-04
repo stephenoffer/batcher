@@ -152,7 +152,10 @@ impl Codegen<'_, '_> {
                 Literal::Int(x) => (self.b.ins().iconst(types::I64, *x), ScalarTy::I64),
                 Literal::Float(x) => (self.b.ins().f64const(*x), ScalarTy::F64),
                 // A date literal is its i32 day count, widened to the i64 date operand.
-                Literal::Date(d) => (self.b.ins().iconst(types::I64, *d as i64), ScalarTy::Date32),
+                Literal::Date(d) => (
+                    self.b.ins().iconst(types::I64, i64::from(*d)),
+                    ScalarTy::Date32,
+                ),
                 // A timestamp literal is its i64 microsecond instant.
                 Literal::Timestamp(t) => (self.b.ins().iconst(types::I64, *t), ScalarTy::TsUs),
                 _ => unreachable!("validated in analyze"),
@@ -328,7 +331,7 @@ impl Codegen<'_, '_> {
                 }
             }
             Expr::Math { func, input } => {
-                use bc_expr::MathFunc::*;
+                use bc_expr::MathFunc::{Abs, Ceil, Floor, Sqrt, Trunc};
                 let (v, vt) = self.emit_typed(input);
                 match func {
                     // `abs`: float -> fabs; int -> select(x < 0, 0 - x, x), with i64::MIN
@@ -360,6 +363,10 @@ impl Codegen<'_, '_> {
                             unreachable!("validated in analyze")
                         }
                     },
+                    // `trunc` on an integer is the identity — truncating an integer yields
+                    // that integer — so it must NOT round-trip through f64, which drops the
+                    // low bit above 2^53. Mirrors the interpreter's `(Trunc, Int64)` arm.
+                    Trunc if vt == ScalarTy::I64 => (v, ScalarTy::I64),
                     // floor/ceil/sqrt/trunc operate on f64; promote an int input to
                     // f64 first, exactly as the interpreter's `cast` does.
                     Floor | Ceil | Sqrt | Trunc => {
@@ -481,8 +488,8 @@ impl Codegen<'_, '_> {
                 _ => ScalarTy::I64,
             },
             Expr::Math { func, input } => match func {
-                // `abs` preserves the input type; the rest produce f64.
-                MathFunc::Abs => self.case_ty(input),
+                // `abs` and `trunc` preserve the input type; the rest produce f64.
+                MathFunc::Abs | MathFunc::Trunc => self.case_ty(input),
                 _ => ScalarTy::F64,
             },
             // Two-arg math (pow/atan2) always produces f64.
@@ -515,7 +522,7 @@ impl Codegen<'_, '_> {
     }
 
     fn emit_iarith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Div, Mod, Mul, Sub};
         match op {
             Add => self.b.ins().iadd(l, r),
             Sub => self.b.ins().isub(l, r),
@@ -527,7 +534,7 @@ impl Codegen<'_, '_> {
     }
 
     fn emit_farith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Div, Mod, Mul, Sub};
         match op {
             Add => self.b.ins().fadd(l, r),
             Sub => self.b.ins().fsub(l, r),
@@ -544,7 +551,7 @@ impl Codegen<'_, '_> {
     }
 
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
         use cranelift_codegen::ir::condcodes::IntCC;
         let cc = match op {
             Eq => IntCC::Equal,

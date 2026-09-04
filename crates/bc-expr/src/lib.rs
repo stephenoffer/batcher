@@ -24,6 +24,7 @@ use serde::Deserialize;
 mod analyze;
 mod error;
 mod select;
+mod subset;
 mod supertype;
 pub use error::ExprError;
 pub use select::ConjunctOrder;
@@ -421,6 +422,23 @@ pub enum Expr {
     /// `Struct` with the named fields, each field's value being the per-row value of
     /// its sub-expression. The read-side counterpart is `StructField`.
     MakeStruct { fields: Vec<NamedExpr> },
+
+    /// Map construction (SQL `map(keys, values)` / Spark `map_from_arrays`) — each row
+    /// pairs a `List` of keys with a `List` of values into one Arrow `Map` entry.
+    ///
+    /// The read side (`Expr::Map`, i.e. `map_keys`/`map_values`/`map_entries`/`element_at`)
+    /// has always worked on a `Map` column that arrived from Arrow; without this there was
+    /// no way to *build* one in an expression, so every `map_*` call on a constructed map
+    /// failed on its **argument** rather than on the function. That is why one missing
+    /// constructor blocked the whole family.
+    ///
+    /// Three inputs are rejected rather than coerced, matching DuckDB, because each has a
+    /// plausible wrong answer that a silent implementation would return instead:
+    /// a **null key** (Arrow map keys are non-nullable), a **duplicate key** (keeping the
+    /// last is a guess), and **lists of different lengths** (truncating to the shorter one
+    /// silently drops data). A null value is fine, and a null *list* on either side yields a
+    /// null map, which is what DuckDB's `map(NULL, NULL)` returns.
+    MakeMap { keys: Box<Expr>, values: Box<Expr> },
 
     /// A unary math function over a numeric sub-expression.
     Math {

@@ -287,7 +287,11 @@ In descending order of evidence:
 
 1. **Adaptive worker width.** Measured 6% on ClickBench and reproduced on TPC-H, with a
    clear owner (Carbonite) and no machine-specific constant if it is measured rather than
-   guessed.
+   guessed. **Read the 2026-09-02 entry at the end of this file before acting on this.** A
+   *fixed* narrower width is settled and it loses: 0.667 -> 0.849 on the operator suite at
+   width 16, because the sorts and dedups want every worker as much as the filters want
+   fewer. What remains is a per-shape rule, and its wall-clock prize is smaller than a
+   single-shape sweep suggests; the CPU prize is not.
 2. **Dictionary-native operators.** Not for the byte savings, which are 11%, but because the
    current 5x-14x cliff on dictionary-encoded input is a real defect for anyone reading
    Parquet. Group-by, filter, join and sort would each need an encoded fast path.
@@ -692,3 +696,67 @@ and *that term does not exist across nodes* -- each node brings its own bandwidt
 mergeable algebra plus per-node bandwidth is an argument for node-scaling being **better** than
 this curve, not worse, with the network shuffle as the new cost to pay. That remains an
 argument, not a measurement, until it is run on a real cluster.
+
+## The narrow-width recommendation is refuted at suite level (2026-09-02)
+
+The "what would actually close the gap" list above ranks **adaptive worker width** first, on
+6% measured across ClickBench. This pass took that further and it did not survive: a *fixed*
+narrower width is much worse on the operator suite, and the microbenchmarks that said
+otherwise were unrepresentative in a way worth naming.
+
+### What the microbenchmarks said
+
+Sweeping `execution.parallelism` over a filter and a group-by, 6 M rows, wall/CPU in ms:
+
+| width | filter+proj | group-by 1 K | join+agg | distinct | arith |
+|--:|---|---|---|---|---|
+| 1 | 22.01 / 21.9 | 38.82 / 38.8 | 88.05 / 88.0 | 30.03 / 30.0 | 13.64 / 13.6 |
+| 8 | 7.70 / 26.3 | 8.95 / 51.3 | 15.58 / 99.0 | 8.58 / 28.6 | 6.19 / 16.6 |
+| **16** | **6.73 / 30.0** | **5.89 / 53.0** | **11.40 / 124.9** | **7.89 / 38.7** | **5.97 / 27.0** |
+| 64 | 7.86 / 87.2 | 7.95 / 168.0 | 13.44 / 495.5 | 9.28 / 158.3 | 6.46 / 102.4 |
+| 96 | 7.84 / 205.0 | 9.81 / 500.1 | 15.29 / 769.6 | 9.18 / 291.9 | 6.61 / 160.6 |
+
+Every shape peaks at 16, and the CPU at the default width is **3-7x** what the optimum
+spends. Across input sizes the optimum barely moves -- 16-32 from 1 M to 24 M rows -- which
+reads like a property of the machine rather than of the work, and that reading is what made
+the case look strong.
+
+### What the suite said
+
+`benchmarks/run.py --benchmark operators`, 21 cases, `BATCHER_EXECUTION_PARALLELISM` the only
+variable, geomean of `b/duckdb`:
+
+| width | geomean | the shapes that decide it |
+|--:|--:|---|
+| **default (64)** | **0.667** | -- |
+| 32 | 0.692 | `sort-string` 140 -> 165 ms, `sort-multikey-wide` 61 -> 71 ms |
+| 16 | 0.849 | `sort-string` 140 -> **280 ms**, `sort-multikey-wide` 61 -> **128 ms**, `dedup-keyed-unordered` 60 -> 85 ms |
+
+The sorts, the dedups and the window functions genuinely use every worker, and they lose more
+at a narrow width than the filters and group-bys gain. `bc_arrow::operator_cores` -- physical
+cores plus a third of the SMT siblings -- is the better answer of the three, and nothing here
+argues for moving it.
+
+### What this changes about the ranked list
+
+**A fixed width is settled: do not narrow it.** What the microbenchmarks measured is real, and
+it is the *per-shape* optimum: a filter wants 16 and a full sort wants 64+, on the same
+machine, on the same data. So the remaining opportunity is genuinely adaptive -- a width chosen
+per plan from what the plan does -- and its prize is bounded by the difference between the
+per-shape optimum and 64, not by the 16-vs-64 gap a single-shape sweep suggests. On the four
+filter/group-by shapes that is 1.08x-1.35x of wall time; on the sorts it is nothing, because
+they already want the full width.
+
+The CPU column is the part that is *not* refuted and is worth more than the wall clock here:
+at the default width the operator mix burns 3-7x the CPU its wall time needs, which is the
+`1.4-4.4x more CPU` `CLAUDE.md` names, measured wider and worse. A shape-aware width would buy
+that back without costing wall time, and that -- not the wall-clock win -- is the case for
+building it.
+
+### The measurement trap, stated plainly
+
+Two shapes (a filter and a group-by) agreed with each other, agreed across five input sizes,
+and agreed on both wall time and CPU. That is four kinds of corroboration and it was still
+the wrong conclusion, because every one of them was inside the same family of shapes. The
+suite disagreed on the first try. **Sweep a parameter on the suite before believing what it
+does to a microbenchmark**, however consistent the microbenchmark looks.

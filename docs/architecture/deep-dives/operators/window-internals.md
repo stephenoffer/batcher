@@ -212,10 +212,13 @@ present.
 
 :::{dropdown} Why the plan has two `window` nodes
 ```text
-sort                            est≈3 (exact)
-  window                        est≈3 (exact)
-    window                      est≈3 (exact)
-      scan                      est≈3 (exact)
+query plan (planned)                              4 operators
+─────────────────────────────────────────────────────────────
+OPERATOR                           ESTIMATE  NOTES
+sort  [ts]                            est≈3  (exact)
+└─ window  [by user · rank]           est≈3  (exact)
+   └─ window  [by user · sum]         est≈3  (exact)
+      └─ scan  [source 0]             est≈3  (exact)
 ```
 
 The three functions do not share one `(partition, order)` spec, so they cannot share one node.

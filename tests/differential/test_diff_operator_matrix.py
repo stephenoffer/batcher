@@ -469,12 +469,74 @@ def test_every_path_agrees_with_the_oracle(op, shape):
 #: `repartitioned_sparse` asks for far more partitions than some shapes have rows, so most
 #: come back empty. An operator that mishandles an empty partial — by skipping the merge, or
 #: by seeding an identity that is wrong for it — passes every dense test and fails here.
+#: `cached` and `cached_evicted` run the operator through `Dataset.cache()` and return the
+#: **second** collect, which is the one served from the store rather than computed. The
+#: cache is a path that can return the wrong *rows* — a mis-keyed entry serves another
+#: query's result, and nothing raises — and it had no coverage against the operator table
+#: at all. What existed pinned the cache mechanism (levels, stats, terminals, uncache) on a
+#: single three-row `group_by`, so every operator's interaction with storing and reloading
+#: its result was untested. `cached_evicted` additionally shrinks the budget to nothing
+#: between the two collects, so the entry is evicted and the answer comes back through the
+#: disk tier's encode/decode rather than from the memory copy — the round trip is where a
+#: type or a null would be lost, and it is per-operator by nature.
 _SCHEDULINGS = {
     "spill_partitioned": lambda ds: ds.collect(spill=True, num_partitions=3),
     "adaptive": lambda ds: ds.collect(adaptive=True),
     "repartitioned": lambda ds: ds.repartition(4).collect(),
     "repartitioned_sparse": lambda ds: ds.repartition(64).collect(),
+    "cached": lambda ds: _second_collect(ds, evict=False),
+    "cached_evicted": lambda ds: _second_collect(ds, evict=True),
 }
+
+
+def _second_collect(ds, *, evict: bool):
+    """`ds.cache()` collected twice, returning the copy the store served.
+
+    Args:
+        ds: The dataset to run.
+        evict: Drop the memory entry between the two collects, so the second is answered
+            from the disk tier rather than from the resident table.
+
+    Returns:
+        The second collect's table.
+    """
+    from batcher.carbonite.cache import result_cache
+
+    warm = ds.cache()
+    warm.collect()
+    if evict:
+        # `evict_to_free` sheds by keep-value and demotes what it sheds, which is the path
+        # a real budget takes; `clear()` would drop the entry outright and make the second
+        # collect a plain recompute, testing nothing the first one did not.
+        store = result_cache()
+        store.evict_to_free(store.used_bytes)
+    return warm.collect()
+
+
+def test_the_cached_schedulings_are_actually_on_the_paths_they_name():
+    """A positive control for the two cache arms above.
+
+    Without this the 540 cases they contribute could all be plain recomputes -- if the
+    second collect stopped hitting the store, or the disk tier were off so an eviction
+    dropped the entry instead of demoting it, every one of them would still pass while
+    testing nothing the uncached arm does not. That failure is invisible in the output,
+    which is exactly the shape `just lint-methodology` exists to catch.
+    """
+    from batcher.carbonite.cache import reset_result_cache, result_cache
+
+    def deltas(*, evict: bool) -> dict[str, int]:
+        reset_result_cache()
+        store = result_cache()
+        _second_collect(bt.from_arrow(INPUTS["base"]).filter(bt.col("v") > 3), evict=evict)
+        return store.stats()
+
+    plain = deltas(evict=False)
+    assert plain["hits"] == 1, "the second collect recomputed instead of reading the store"
+
+    evicted = deltas(evict=True)
+    assert evicted["demotions"] == 1, "eviction dropped the entry rather than demoting it"
+    assert evicted["promotions"] == 1, "the second collect did not come back off the disk tier"
+    assert evicted["disk_hits"] == 1
 
 
 @pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))
@@ -667,6 +729,38 @@ def test_sort_paths_agree_on_every_ordering(shape, key, descending, nulls_first)
     oracle = plan.collect()
     assert_tables_equal(plan.collect(spill=True), oracle, ordered=True)
     assert_tables_equal(_stream(plan), oracle, ordered=True)
+
+
+@pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))
+@pytest.mark.parametrize(("descending", "nulls_first"), ORDERINGS)
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+@pytest.mark.parametrize("key", ["k", "g"])
+def test_the_sort_contract_holds_under_every_scheduling(
+    scheduling, shape, key, descending, nulls_first
+):
+    """The replanning and repartitioning paths must sort too, not merely return the rows.
+
+    `test_the_replanning_and_repartitioning_paths_agree_too` runs the four schedulings over
+    `UNORDERED_OPS` only, and it compares with `assert_tables_equal`, which is
+    order-independent. So no test asked whether a **sort** survives them -- and these are the
+    four paths most likely to break one: `repartitioned` splits the input before the operator,
+    `spill_partitioned` forces a bucket count the data-sized default would not pick, and
+    `adaptive` exists to arrive at a *different plan* than the one-shot one did.
+
+    That is not a hypothetical shape of bug. `CLAUDE.md` cites `sort(descending=True)`
+    returning unsorted data under spill, with every gate green, as the reason the
+    cross-product matters.
+
+    Asserted with `assert_sort_contract`, never row-by-row against `collect()`. Which of two
+    rows tied on the key comes first is a free choice, and a different partitioning is
+    entitled to break ties differently: comparing `to_pydict()` across these schedulings
+    reports 96 of 160 combinations as violations, all of them the comparison's fault and none
+    the engine's.
+    """
+    table = INPUTS[shape]
+    plan = bt.from_arrow(table).sort(bt.col(key), descending=descending, nulls_first=nulls_first)
+    out = _SCHEDULINGS[scheduling](plan)
+    assert_sort_contract(out, table, key=key, descending=descending, nulls_first=nulls_first)
 
 
 # --- the assertions themselves, tested ----------------------------------------------

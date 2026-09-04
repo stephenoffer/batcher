@@ -12,6 +12,7 @@ exercise) apart from the pure decision code.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import logging
 
@@ -37,6 +38,51 @@ class AdaptiveResult:
     stages: int
 
 
+#: How many staged loops this call is nested inside, so nothing re-enters the loop without
+#: bound.
+#:
+#: The staged loop executes each stage through `run_relational`, which routes a distributed
+#: plan through `orchestration.stages.execute_distributed` — the very place that decides
+#: "this optimized plan needs staging". Unbounded, that decision is reachable from *inside*
+#: staging, and its final stage is the whole residual plan, so a plan the loop could not cut
+#: re-entered the loop on itself: `RecursionError`, not a `PlanError`, on
+#: `test_diff_exists_mixed_correlation`. A `ContextVar` rather than a module global so
+#: concurrent queries in one process (the `concurrency/` benchmarks' shape) do not see each
+#: other's flag.
+#:
+#: A **depth** rather than a boolean, because one re-entry is not the pathology — unbounded
+#: re-entry is, and forbidding the first also forbids the one case that makes progress. The
+#: loop chooses its cuts from the plan the caller wrote; Kyber then re-optimizes each stage,
+#: and eager aggregation rewrites a final stage `Aggregate(Join(a, b))` into
+#: `Aggregate(Join(b, Aggregate(a)))` — a breaker beneath a join that the loop had already
+#: decided it did not need to cut, and that `dist._dispatch` has no one-shot path for. That
+#: is a *new* breaker, strictly below the root, so staging it materializes something and the
+#: residual shrinks; re-entering on it terminates. Measured on a four-table star join with an
+#: aggregate over it (`test_distributed_multi_table_join_matches_single_node[disk]`), which
+#: raised `PlanError` on the disk transport while the same query ran on Flight.
+#:
+#: The bound is what keeps the recorded failure impossible rather than merely unlikely: even
+#: an optimizer rewrite that did *not* make progress can only spend this budget and then get
+#: the `PlanError` the caller would have got anyway.
+_STAGED_RUN_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "batcher_staged_run_depth", default=0
+)
+
+#: Staged loops one query may nest. One outer loop plus one re-entry for an optimizer-
+#: introduced breaker is the whole shape that occurs; anything deeper is a rewrite loop.
+_MAX_STAGED_DEPTH = 2
+
+
+def in_staged_run() -> bool:
+    """Whether this call is already inside the staged loop."""
+    return _STAGED_RUN_DEPTH.get() > 0
+
+
+def staged_depth_exhausted() -> bool:
+    """Whether re-entering the staged loop is no longer allowed for this call."""
+    return _STAGED_RUN_DEPTH.get() >= _MAX_STAGED_DEPTH
+
+
 def execute_adaptive(
     plan: LogicalPlan,
     sources: list[Source],
@@ -45,6 +91,7 @@ def execute_adaptive(
     distributed: bool = False,
     num_workers: int | None = None,
     transport: str = "auto",
+    force_structural: bool = False,
 ) -> AdaptiveResult:
     """Run a plan with stage-boundary re-optimization.
 
@@ -85,6 +132,7 @@ def execute_adaptive(
             distributed=distributed,
             num_workers=num_workers,
             transport=transport,
+            force_structural=force_structural,
         )
 
     from batcher._internal.logging import get_logger
@@ -104,6 +152,7 @@ def execute_adaptive(
                 distributed=distributed,
                 num_workers=num_workers,
                 transport=transport,
+                force_structural=force_structural,
             )
         except _worker_loss_errors() as exc:
             # The fleet lost a worker holding a cross-stage intermediate. The failed
@@ -153,11 +202,50 @@ def _execute_adaptive(
     distributed: bool = False,
     num_workers: int | None = None,
     transport: str = "auto",
+    force_structural: bool = False,
     _fault_inject_stage=None,
 ) -> AdaptiveResult:
     """The adaptive stage loop (one attempt). `_fault_inject_stage` is a test hook
     invoked with the live fleet after each intermediate stage, to exercise cross-stage
     worker loss."""
+    token = _STAGED_RUN_DEPTH.set(_STAGED_RUN_DEPTH.get() + 1)
+    try:
+        return _staged_loop(
+            plan,
+            sources,
+            hub,
+            force_structural=force_structural,
+            distributed=distributed,
+            num_workers=num_workers,
+            transport=transport,
+            _fault_inject_stage=_fault_inject_stage,
+        )
+    finally:
+        _STAGED_RUN_DEPTH.reset(token)
+
+
+def _staged_loop(
+    plan: LogicalPlan,
+    sources: list[Source],
+    hub,
+    *,
+    distributed: bool = False,
+    num_workers: int | None = None,
+    transport: str = "auto",
+    force_structural: bool = False,
+    _fault_inject_stage=None,
+) -> AdaptiveResult:
+    """The loop itself, with `_STAGED_RUN_DEPTH` already raised by `_execute_adaptive`.
+
+    `force_structural` says staging is the *only* execution route for this plan, so every
+    breaker qualifies rather than only the ones `_worth_staging` judges informative. It is
+    set by `orchestration.stages._stage_if_optimization_requires_it`, which knows something
+    this loop cannot see: the plan **Kyber produced** from these sources has no one-shot
+    distributed path even though the plan handed in here does. Without it that re-entry
+    would ask `_worth_staging`, which reads the hub — so whether the query ran would depend
+    on what previous runs had learned, which is the cross-run flakiness this whole path
+    exists to remove.
+    """
     from batcher import kyber
 
     srcs = list(sources)
@@ -241,7 +329,7 @@ def _execute_adaptive(
             # The exception is a distributed plan the one-shot dispatcher cannot route at
             # all, where staging is the only execution path rather than an optimization.
             # There every breaker qualifies, exact or not.
-            structural = distributed and requires_staging(plan)
+            structural = distributed and (force_structural or requires_staging(plan))
             # A union the aggregate above it maps into one shuffle must not be staged, at
             # either setting: staging it concatenates every branch on the driver — the exact
             # materialization the fused path exists to avoid — and leaves the aggregate

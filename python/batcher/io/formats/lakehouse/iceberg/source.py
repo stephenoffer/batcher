@@ -213,14 +213,22 @@ class IcebergSource:
         if rows is None:
             return None  # a filtered / merge-on-read source: the manifest overstates it
 
+        from batcher.io.formats.lakehouse.iceberg.puffin import (
+            statistics_ndv,
+            with_statistics_ndv,
+        )
         from batcher.io.stats import manifest_statistics
 
+        # Distinct counts the table publishes as Puffin statistics. Read here rather than
+        # left on the floor: without them a first query against someone else's table plans
+        # its joins on a Selinger guess, which is the estimate an ANALYZE exists to replace.
+        ndv = statistics_ndv(self._table(), self._snapshot_id)
         manifest = self._manifest()
         if manifest is not None:
             stats = manifest_statistics(manifest)
             if stats is not None:
-                return stats
-        return SourceStatistics(row_count=rows, exact_rows=True)
+                return with_statistics_ndv(stats, ndv)
+        return with_statistics_ndv(SourceStatistics(row_count=rows, exact_rows=True), ndv)
 
     def _manifest(self) -> pa.Table | None:
         """The snapshot's per-file manifest, read once per source.
@@ -290,6 +298,22 @@ class IcebergSource:
         catalog = _catalog_key(self._catalog)
         row_filter = f"|{self._row_filter}" if self._row_filter is not None else ""
         return f"iceberg:{catalog}:{self._identifier}@{ref}{row_filter}"
+
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: the table identifier.
+
+        Distinct from `identity`, which names a *relation* and so carries the catalog,
+        the snapshot and any row filter -- one relation's statistics must not be handed
+        to another. A policy is written about the **table**, before anyone has read it
+        and without knowing which snapshot they will land on. Reading the table name off
+        the identity meant a policy on ``db.orders`` never fired on a read of it, whose
+        identity is ``iceberg:rest:db.orders@1234``, so a governed table was read
+        ungoverned with nothing raised to say so.
+
+        Returns:
+            The table identifier a policy is keyed on.
+        """
+        return self._identifier
 
     def splits(
         self,

@@ -31,6 +31,21 @@ _KNOWN_ABSENT = frozenset(
         "MXC500",
         "MXC550",
         "aws-neuron-core",
+        # Apple Silicon. Ray labels these, and the table carries no row for any of them: the
+        # spec fields are datacenter-part facts (discrete VRAM, its bandwidth, an SM count),
+        # and a unified-memory SoC has no honest value for them. Unknown is the right answer.
+        "Apple-Silicon",
+        "M1",
+        "M1-Max",
+        "M1-Pro",
+        "M1-Ultra",
+        "M2",
+        "M2-Max",
+        "M2-Pro",
+        "M2-Ultra",
+        "M3",
+        "M3-Max",
+        "M3-Pro",
     }
 )
 

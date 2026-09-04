@@ -56,7 +56,7 @@ pub(crate) fn try_dict_compare(
     right: &Expr,
     batch: &RecordBatch,
 ) -> Result<Option<ArrayRef>, ExprError> {
-    use BinaryOp::*;
+    use BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
 
     if !matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
         return Ok(None);
@@ -101,7 +101,7 @@ pub(crate) fn try_scalar_binary(
     right: &Expr,
     batch: &RecordBatch,
 ) -> Result<Option<ArrayRef>, ExprError> {
-    use BinaryOp::*;
+    use BinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Mul, Ne, Sub};
     use DataType::{Float64, Int64};
 
     // Only arithmetic and comparison broadcast cleanly and share the array path's
@@ -307,7 +307,7 @@ fn float_scalar_cmp(
 
 /// The comparison read from the other side — `a < b` is `b > a`, and so on.
 fn mirror_cmp(op: BinaryOp) -> BinaryOp {
-    use BinaryOp::*;
+    use BinaryOp::{Ge, Gt, Le, Lt};
     match op {
         Lt => Gt,
         Le => Ge,
@@ -325,7 +325,7 @@ fn mirror_cmp(op: BinaryOp) -> BinaryOp {
 // unordered-or-greater compare replaces with one instruction.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn float_cmp_bits<T: PartialOrd + Copy>(values: &[T], lit: T, op: BinaryOp) -> BooleanBuffer {
-    use BinaryOp::*;
+    use BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
     let n = values.len();
     match op {
         Lt => BooleanBuffer::collect_bool(n, |i| values[i] < lit),
@@ -339,7 +339,10 @@ fn float_cmp_bits<T: PartialOrd + Copy>(values: &[T], lit: T, op: BinaryOp) -> B
 }
 
 pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use BinaryOp::*;
+    use BinaryOp::{
+        Add, AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
+        Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
+    };
     // SQL-style implicit numeric promotion: mixed Int64/Float64 operands are
     // promoted to Float64 so `qty * price` (int × float) works as expected.
     //
@@ -372,7 +375,7 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
     {
         use arrow::datatypes::DataType::{Date32, Int64};
         match (op, l.data_type(), r.data_type()) {
-            (Add, Date32, Int64) | (Sub, Date32, Int64) => {
+            (Add | Sub, Date32, Int64) => {
                 return date32_offset_days(&l, &r, matches!(op, Sub));
             }
             (Add, Int64, Date32) => return date32_offset_days(&r, &l, false),
@@ -1092,7 +1095,7 @@ mod scalar_path_tests {
                 &str_col,
                 vec![
                     Literal::Str("1-URGENT".into()),
-                    Literal::Str("".into()),
+                    Literal::Str(String::new()),
                     Literal::Str("zzz".into()),
                 ],
             ),
@@ -1446,8 +1449,8 @@ mod dict_path_tests {
             &[
                 Literal::Str("b".into()),
                 Literal::Str("a".into()),
-                Literal::Str("zzz".into()), // sorts after every entry
-                Literal::Str("".into()),    // sorts before every entry
+                Literal::Str("zzz".into()),  // sorts after every entry
+                Literal::Str(String::new()), // sorts before every entry
             ],
         );
     }

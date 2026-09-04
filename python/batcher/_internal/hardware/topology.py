@@ -151,11 +151,23 @@ def physical_core_count() -> int:
     fan-out, where the second sibling of a saturated core contributes almost nothing while
     still halving the cache each thread sees.
 
+    **Capped by [`available_cpu_count`], which is the whole reason that function exists.** The
+    sibling walk narrows `/sys` by the affinity mask, and a *cpuset* pin does appear there — but
+    a **CFS bandwidth quota does not**. A pod pinned to nothing and throttled to 4 cores has all
+    96 host CPUs in its mask, so the walk reported the host's 48 physical cores for a process
+    that may use 4. That is the exact over-subscription `available_cpu_count` was written to
+    prevent, reintroduced on the path compute-bound fan-out is sized from; and because this
+    figure is fingerprint material (`profile.fingerprint`), it also gave two containers with
+    different quotas on one host the same machine key, blending their learned coefficients.
+
+    The cap only ever *lowers* the answer. On a machine with no quota it is inert, so the SMT
+    collapse above is unchanged wherever it was already right.
+
     Falls back to the logical count when the sibling files are absent, which keeps the
     pre-existing behavior on any platform that does not publish them.
 
     Returns:
-        The usable physical core count, at least 1.
+        The usable physical core count, at least 1 and never above the CPU budget.
     """
     from batcher._internal.hardware.cpu import available_cpu_count
 
@@ -173,4 +185,4 @@ def physical_core_count() -> int:
         if allowed is not None:
             siblings &= allowed
         cores.add(frozenset(siblings) if siblings else frozenset({cpu_id}))
-    return max(1, len(cores)) if cores else logical
+    return min(logical, max(1, len(cores))) if cores else logical

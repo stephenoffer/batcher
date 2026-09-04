@@ -89,8 +89,8 @@ pub(crate) fn align_decimals_for_cmp(
         let scale = *s1.max(s2);
         // Integer-digit budget on each side is `precision - scale`; the common precision
         // is the larger budget plus the common scale.
-        let int_digits = (*p1 as i16 - *s1 as i16).max(*p2 as i16 - *s2 as i16);
-        let precision = ((int_digits + scale as i16).clamp(1, 38)) as u8;
+        let int_digits = (i16::from(*p1) - i16::from(*s1)).max(i16::from(*p2) - i16::from(*s2));
+        let precision = ((int_digits + i16::from(scale)).clamp(1, 38)) as u8;
         let common = Decimal128(precision, scale);
         return Ok((cast(l, &common)?, cast(r, &common)?));
     }
@@ -224,6 +224,6 @@ pub(crate) fn as_bool<'a>(arr: &'a ArrayRef, op: &str) -> Result<&'a BooleanArra
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| ExprError::ExpectedBoolean {
             op: op.to_string(),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })
 }

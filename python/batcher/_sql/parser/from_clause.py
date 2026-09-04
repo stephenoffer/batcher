@@ -15,7 +15,7 @@ import pyarrow as pa
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser import udf
+from batcher._sql.parser import statements, udf
 from batcher._sql.parser.ai_functions import ai_table, is_ai_source
 from batcher._sql.parser.joins import and_conjuncts as _and_conjuncts
 from batcher._sql.parser.joins import asof_join, is_asof, outer_theta_join, swap_on_sides
@@ -397,6 +397,13 @@ def _split_join_on(on, left_cols=None, right_cols=None):
 
 
 def _table(tr, node) -> Dataset:
+    # FROM information_schema.tables / .columns — the ANSI catalog views, answered from the
+    # same registry `SHOW TABLES` reads. Before the lookup below, which has no entry for
+    # them and would report `unknown table 'tables'`.
+    catalogued = statements.information_schema_table(tr, node)
+    if catalogued is not None:
+        return _apply_tablesample(catalogued, node)
+
     # A PIVOT / UNPIVOT modifier reshapes the table. sqlglot attaches it as `pivots`;
     # it maps onto the relational `Dataset.pivot` / `unpivot` the engine already has, so
     # it is applied rather than rejected. Deferred until after the base relation is
@@ -444,6 +451,7 @@ def _table(tr, node) -> Dataset:
     else:
         name = _resolve_table_name(tr, node.name)
         ds = tr._registry[name]
+    ds = alias_columns(ds, node)
     ds = _apply_tablesample(ds, node)
     return _apply_pivots(ds, pivots) if pivots else ds
 
@@ -585,3 +593,43 @@ def _apply_tablesample(ds: Dataset, node) -> Dataset:
     if size is not None:
         return ds.sample(n=int(size))
     return ds
+
+
+def alias_columns(ds: Dataset, node) -> Dataset:
+    """Apply a table alias's column list — the SQL-standard ``AS t(a, b)`` rename.
+
+    ``FROM (SELECT ...) AS c_orders(c_custkey, c_count)`` renames the relation's output
+    columns positionally, left to right, and is how the standard lets a derived table name
+    a column the inner query left unnamed. TPC-H q13 is written that way and could not run:
+    its inner ``count(o_orderkey)`` kept its derived name and the outer ``GROUP BY c_count``
+    failed to resolve. The same list is legal on a plain table (``FROM t AS x(a, b)``) and
+    on a CTE (``WITH s(a, b) AS ...``), and none of the three were applied.
+
+    Fewer aliases than columns renames a prefix and leaves the rest, which is what DuckDB
+    and PostgreSQL both do. More aliases than columns is an error in both, and here.
+
+    Args:
+        ds: The relation the alias is attached to.
+        node: The sqlglot node carrying the alias (a `Table`, `Subquery`, or `CTE`).
+
+    Returns:
+        The relation with its leading columns renamed, or `ds` unchanged when the alias
+        names no columns.
+
+    Raises:
+        PlanError: If the alias names more columns than the relation has.
+    """
+    alias = node.args.get("alias") if getattr(node, "args", None) else None
+    columns = alias.args.get("columns") if alias is not None else None
+    if not columns:
+        return ds
+    names = [c.name for c in columns]
+    current = list(ds.columns)
+    if len(names) > len(current):
+        raise PlanError(
+            f"column alias list names {len(names)} column(s) "
+            f"({', '.join(names)}) but the relation has {len(current)} "
+            f"({', '.join(current)})"
+        )
+    mapping = {old: new for old, new in zip(current, names, strict=False) if old != new}
+    return ds.rename(mapping) if mapping else ds

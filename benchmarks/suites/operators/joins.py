@@ -37,7 +37,12 @@ def join_agg(ctx: Context):
         lineitem, orders = ctx.table("lineitem"), ctx.table("orders")
 
         def pyarrow() -> pa.Table:
-            joined = lineitem.join(
+            # Both sides projected, not just the right. PyArrow has no optimizer, so a
+            # column it is handed is a column it carries: joining the full 16-column
+            # `lineitem` made it gather 13 columns nothing downstream reads, while every
+            # SQL engine's planner projected to three. That is a handicap the comparator
+            # cannot remove for itself, and one that flatters Batcher.
+            joined = lineitem.select(["l_orderkey", "l_extendedprice", "l_discount"]).join(
                 orders.select(["o_orderkey", "o_orderpriority"]),
                 keys="l_orderkey",
                 right_keys="o_orderkey",

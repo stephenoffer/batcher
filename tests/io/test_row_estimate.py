@@ -24,8 +24,7 @@ def _write_csv(path, n_rows: int, *, header: bool = True) -> None:
     with open(path, "w") as f:
         if header:
             f.write("id,name,value\n")
-        for i in range(n_rows):
-            f.write(f"{i},name_{i},{i * 3}\n")
+        f.writelines(f"{i},name_{i},{i * 3}\n" for i in range(n_rows))
 
 
 def test_estimate_is_close_on_a_uniform_file(tmp_path) -> None:

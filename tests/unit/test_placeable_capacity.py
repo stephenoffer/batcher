@@ -35,6 +35,14 @@ def _nodes(monkeypatch, specs):
         for c, g, m in specs
     ]
     monkeypatch.setattr(scaling, "node_classes", lambda: classes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
 
 
 def test_counts_per_node_not_cluster_total(monkeypatch):
@@ -45,7 +53,15 @@ def test_counts_per_node_not_cluster_total(monkeypatch):
 
 
 def test_unreadable_topology_reports_unknown(monkeypatch):
-    monkeypatch.setattr(scaling, "node_classes", lambda: [])
+    monkeypatch.setattr(scaling, "node_classes", list)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     assert capacity.placeable_workers(4.0) is None
 
 

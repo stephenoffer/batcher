@@ -29,13 +29,19 @@ import functools
 import os
 import shutil
 import statistics
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 
 import batcher as bt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 #: Output shapes, as ``(label, ds.write kwargs)``. `files` is filled in per run from the
 #: row count, since a fixed row cap would mean a different file count at each scale.
@@ -145,6 +151,17 @@ def _rows_written(dest: str, fmt: str) -> int:
 
 
 def main() -> None:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=4_000_000)
     parser.add_argument("--formats", default="parquet,csv,json,arrow")

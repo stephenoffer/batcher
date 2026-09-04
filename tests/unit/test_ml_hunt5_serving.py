@@ -42,7 +42,7 @@ def test_serving_udf_feeds_model_a_real_tensor_and_stays_aligned() -> None:
             # A vectorized model does real array math — impossible on an object array.
             return {"y": f.astype(np.float64) @ np.ones(3)}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["f"])()
+    udf = serving_udf(_Client, input_columns=["f"])()
     out = udf(batch)
 
     assert seen["kind"] == "f"  # a real float matrix, not an object array

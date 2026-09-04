@@ -58,6 +58,11 @@ class ProfileCollector:
     # rendered. Filled by the conductor beside `physical_ops`, since only it holds the
     # `PhysicalPlan` the projections and predicates live on.
     source_pushdown: dict[int, str] = field(default_factory=dict)
+    # Per `op_id`, what that operator does in its own terms (join keys, group keys, sort
+    # keys, predicate), already rendered. Filled by the conductor for the same reason
+    # `source_pushdown` is: rendering an IR node lives in `observe`, which this layer may
+    # not import.
+    node_details: dict[int, str] = field(default_factory=dict)
 
     def record_usage(self, doc: dict[str, Any] | None) -> None:
         """Fold one `ExecMetrics.query` block in, summing with anything already recorded.
@@ -75,7 +80,11 @@ class ProfileCollector:
         """Assemble the collected planned + measured facts into a `QueryProfile`."""
         ir = self.optimized_ir or {}
         ops = build_op_profiles(
-            ir, self.physical_ops, self.metric_ops or None, self.source_pushdown
+            ir,
+            self.physical_ops,
+            self.metric_ops or None,
+            self.source_pushdown,
+            self.node_details,
         )
         worker_ops: tuple[OpProfile, ...] = ()
         # Folded into a local rather than into `self.usage`: assembling a profile is a read,
@@ -111,6 +120,7 @@ def build_op_profiles(
     physical_ops: Sequence[PhysicalOp] = (),
     metric_ops: Sequence[Mapping[str, Any]] | None = None,
     pushdown: Mapping[int, str] | None = None,
+    details: Mapping[int, str] | None = None,
 ) -> tuple[OpProfile, ...]:
     """Join the planned `PhysicalOp`s and measured `ExecMetrics` dicts by `op_id`.
 
@@ -124,6 +134,8 @@ def build_op_profiles(
         metric_ops: Measured `ExecMetrics` dicts, or None for a planned-only profile.
         pushdown: Per `op_id`, what the plan handed to that scan's source, already
             rendered. Absent for every non-scan operator.
+        details: Per `op_id`, what that operator does in its own terms — join keys, group
+            keys, sort keys, predicate — already rendered.
 
     Returns:
         One `OpProfile` per operator, in plan pre-order.
@@ -138,6 +150,7 @@ def build_op_profiles(
         provenance = str(p.properties.provenance) if p is not None else ""
         algorithm = p.algorithm if p is not None and p.algorithm else ""
         pushed = (pushdown or {}).get(op_id, "")
+        detail = (details or {}).get(op_id, "")
         m = measured.get(op_id)
         if m is None:
             out.append(
@@ -148,6 +161,7 @@ def build_op_profiles(
                     est_rows=est_rows,
                     provenance=provenance,
                     algorithm=algorithm,
+                    detail=detail,
                     pushed=pushed,
                 )
             )
@@ -160,6 +174,7 @@ def build_op_profiles(
                 est_rows=est_rows,
                 provenance=provenance,
                 algorithm=algorithm or ("spill" if m.get("spilled") else ""),
+                detail=detail,
                 pushed=pushed,
                 measured=True,
                 rows_in=int(m.get("rows_in", 0)),

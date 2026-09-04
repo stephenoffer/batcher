@@ -89,7 +89,7 @@ pub(crate) fn eval_audio(
             // Namespaced, because `Decode` alone is a name three namespaces share and the
             // error otherwise reported an audio failure as an image one.
             func: format!("audio.{func:?}"),
-            got: other.to_string(),
+            got: crate::error::type_name(other),
         }),
     }
 }
@@ -204,7 +204,7 @@ fn eval_audio_sized<O: OffsetSizeTrait>(
         .downcast_ref::<GenericBinaryArray<O>>()
         .ok_or_else(|| ExprError::ExpectedBinary {
             func: format!("{func:?}"),
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     // The rate-independent ops fall through to `eval_waveform`, which is the *same*
     // implementation the waveform path uses — so a level measure cannot mean one thing on
@@ -263,7 +263,7 @@ fn mel_spectrogram_col<O: OffsetSizeTrait>(
         }
         let decoded = decode_pcm(bytes.value(i))?;
         let signal = resample_signal(&decoded.samples, decoded.sample_rate, p.rate);
-        let (mel, _frames) = mel_spectrogram(&signal, p.rate as f64, p.n_fft, p.hop, p.n_mels);
+        let (mel, _frames) = mel_spectrogram(&signal, f64::from(p.rate), p.n_fft, p.hop, p.n_mels);
         Some(mel)
     });
 
@@ -285,7 +285,7 @@ fn mfcc_col<O: OffsetSizeTrait>(
         }
         let decoded = decode_pcm(bytes.value(i))?;
         let signal = resample_signal(&decoded.samples, decoded.sample_rate, p.rate);
-        let (out, _frames) = mfcc(&signal, p.rate as f64, p.n_fft, p.hop, p.n_mels, n_mfcc);
+        let (out, _frames) = mfcc(&signal, f64::from(p.rate), p.n_fft, p.hop, p.n_mels, n_mfcc);
         Some(out)
     });
     Ok(build_f32_list_column(rows))
@@ -437,21 +437,18 @@ fn decode_meta<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<Arra
     let (mut frames, mut dur) = (Vec::new(), Vec::new());
     let mut valid = Vec::with_capacity(bytes.len());
     for d in decoded {
-        match d {
-            Some(a) => {
-                rate.push(a.sample_rate as i32);
-                chans.push(a.channels as i32);
-                frames.push(a.samples.len() as i64);
-                dur.push(a.samples.len() as f64 / a.sample_rate.max(1) as f64);
-                valid.push(true);
-            }
-            None => {
-                rate.push(0);
-                chans.push(0);
-                frames.push(0);
-                dur.push(0.0);
-                valid.push(false);
-            }
+        if let Some(a) = d {
+            rate.push(a.sample_rate as i32);
+            chans.push(a.channels as i32);
+            frames.push(a.samples.len() as i64);
+            dur.push(a.samples.len() as f64 / f64::from(a.sample_rate.max(1)));
+            valid.push(true);
+        } else {
+            rate.push(0);
+            chans.push(0);
+            frames.push(0);
+            dur.push(0.0);
+            valid.push(false);
         }
     }
     let fields = vec![
@@ -545,11 +542,11 @@ pub(super) fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
     use dasp_interpolate::sinc::Sinc;
     use dasp_signal::{self as signal, Signal};
 
-    let want = (samples.len() as u128 * dst as u128).div_ceil(src as u128) as usize;
+    let want = (samples.len() as u128 * u128::from(dst)).div_ceil(u128::from(src)) as usize;
     let sinc = Sinc::new(dasp_ring_buffer::Fixed::from([0.0f32; 64]));
     let sig = signal::from_iter(samples.iter().copied());
     let mut out: Vec<f32> = sig
-        .from_hz_to_hz(sinc, src as f64, dst as f64)
+        .from_hz_to_hz(sinc, f64::from(src), f64::from(dst))
         .until_exhausted()
         .collect();
     // Sinc rounding can overshoot or (with warm-up) fall a few samples short of the exact

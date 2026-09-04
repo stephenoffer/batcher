@@ -264,7 +264,7 @@ class RedisSink(BulkSink):
                 f"redis write needs a {self.key_field!r} column to key each row; this row "
                 f"has {sorted(row)}. Name the key column with key_field=."
             )
-        prefix = self.prefix if self.prefix else (f"{path}:" if path else "")
+        prefix = self.prefix or (f"{path}:" if path else "")
         return f"{prefix}{row[self.key_field]}"
 
     def _apply(self, rows: list[dict[str, Any]], path: str) -> None:

@@ -56,7 +56,7 @@ def eight_devices(monkeypatch):
     monkeypatch.setattr(scope, "device_telemetry", lambda: telemetry)
     monkeypatch.setattr(device_links, "_nvml", lambda: _FakeNvml(uuids))
     monkeypatch.setattr(device_links, "_device_count", lambda nv: nv.nvmlDeviceGetCount())
-    cpus = {i: tuple(range(0, 48)) if i < 4 else tuple(range(48, 96)) for i in range(8)}
+    cpus = {i: tuple(range(48)) if i < 4 else tuple(range(48, 96)) for i in range(8)}
     monkeypatch.setattr(
         device_links,
         "device_cpu_affinity",
@@ -107,7 +107,7 @@ def test_a_worker_given_one_device_sees_it_as_ordinal_zero(monkeypatch, eight_de
 def test_devices_named_by_uuid_are_resolved(monkeypatch, eight_devices):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-6,GPU-1")
     assert device_links.visible_device_indices() == (6, 1)
-    assert affinity.feeder_cpus_for_device(1) == tuple(range(0, 48))
+    assert affinity.feeder_cpus_for_device(1) == tuple(range(48))
 
 
 def test_an_unresolvable_entry_truncates_the_list_as_cuda_does(monkeypatch, eight_devices):

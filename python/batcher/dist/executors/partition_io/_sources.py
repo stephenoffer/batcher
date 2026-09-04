@@ -25,6 +25,7 @@ import pickle
 import pyarrow as pa
 
 from batcher._internal.errors import ExecutionError
+from batcher._internal.logging import note_suppressed
 from batcher.dist.executors.partition_io.assignment import (
     assign_clustered_splits,
     assign_splits,
@@ -49,8 +50,20 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
     analysis can't run (e.g. an opaque `MapBatches` node) — the worker then reads
     everything and the engine's operators filter/project, which is still correct.
 
-    **Pass the whole operator sub-tree, not just its map prefix** — see
-    `consumer_pushdown`, which is what most shuffle operators want.
+    **Pass the whole operator sub-tree, not just its map prefix**, and index by that
+    source's *own* id rather than relabelling it to 0 first. What narrows a read is the
+    operator above the scan, so a prefix asked on its own requires every column it has —
+    and for a join that is the whole fact table. Measured on a 13-column left joined to a
+    2-column dimension and projected to three outputs: the whole plan reads `['c3', 'k']`,
+    the join node asked directly reads `['c3', 'k']`, and each side's prefix asked alone
+    reads all thirteen. That is the dominant IO of the query, on every worker.
+
+    Kyber prunes a `Join`'s own `output` list, so the join node carries the narrowing even
+    though no `Project` sits below it — which is why the operator is the right thing to ask
+    and its side is not. The out-of-core join already did this (`map_projection(join, sid)`);
+    the distributed one did not, so the same query read two columns spilled and thirteen
+    distributed. `consumer_pushdown` exists for the shuffle operators whose narrowing
+    context has to be re-parented instead.
     """
     try:
         from batcher.kyber.rules.projections import (
@@ -61,8 +74,69 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
         projection = required_columns_per_source(plan).get(source_id)
         predicate = required_predicates_per_source(plan).get(source_id)
         return projection, predicate
-    except Exception:
+    except Exception as exc:
+        # Recorded, not swallowed. `(None, None)` is the safe answer -- read everything and
+        # let the operator filter -- but it silently reproduces the exact defect this
+        # function was written to fix, and the docstring above measures that defect: the
+        # same query read two columns spilled and thirteen distributed. A plan shape the
+        # analysis cannot walk would put every distributed read back to thirteen with
+        # nothing to show for it but a slower query.
+        #
+        # Quiet in practice, which is what makes it worth logging: measured across
+        # project/filter/aggregate/sort/window/union and a `map_batches` pipeline, this
+        # path does not fire.
+        note_suppressed("dist", "compute the source pushdown for a partitioned read", exc)
         return None, None
+
+
+def stage_pushdown(
+    above: list[LogicalPlan], operator: LogicalPlan, source_id: int
+) -> tuple[list[str] | None, dict | None]:
+    """`source_pushdown` for a whole distributed stage: the operator *and* what sits above it.
+
+    A pass-through breaker narrows nothing by itself. A sort emits every column it is given
+    and a window emits those plus its function aliases, so asking either one (or its map
+    prefix) what the read needs correctly answers "all of them". What narrows the read is the
+    projection **above** the breaker — and the dispatcher is holding it, in `above`, to
+    re-apply on the driver once the stage lands.
+
+    So the stage's read was as wide as the table while single-node's was as wide as the query:
+    measured on a 13-column table, `df.sort("k").select("k", "c3")` reads 2 columns single-node
+    and read all 13 on every worker, and the windowed equivalent the same. The rows come back
+    correct either way, which is why nothing caught it — the cost is entirely in what crosses
+    storage and the shuffle, multiplied by the fan-out.
+
+    Rebuilding `above` over `operator` reconstructs exactly the sub-plan this stage computes,
+    so the answer is Kyber's own, keyed on the source's real id. Falls back to the operator
+    alone if the rebuild cannot be done, which is never wrong — only wider.
+
+    **Its out-of-core counterpart is `dist.spill.narrow_to_stage`, and the two are not
+    duplicates** — they answer the same question for consumers that need different things, and
+    collapsing one into the other would reintroduce a bug. This returns a projection for the
+    *source read*, which is safe to express in source columns alone: the per-task plan then
+    computes whatever it derives from them. `narrow_to_stage` instead rewrites the plan, so its
+    projection sits directly beneath the breaker and the breaker re-validates its keys against
+    it — which means it must additionally keep every column the plan *derived*, or a breaker
+    keyed on a `with_columns` output raises `ColumnNotFoundError`. Same rule, two obligations.
+
+    Args:
+        above: The operators stacked above `operator`, outermost first (the dispatcher's own
+            ordering, the one `_apply_above` consumes).
+        operator: The breaker this stage runs.
+        source_id: The source whose read is being narrowed.
+
+    Returns:
+        The `(projection, predicate)` pair for that source.
+    """
+    import dataclasses
+
+    plan: LogicalPlan = operator
+    try:
+        for node in reversed(above):
+            plan = dataclasses.replace(node, input=plan)
+    except Exception:  # pragma: no cover - a node that does not take `input`
+        plan = operator
+    return source_pushdown(plan, source_id)
 
 
 def consumer_pushdown(

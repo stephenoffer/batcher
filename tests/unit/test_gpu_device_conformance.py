@@ -35,7 +35,9 @@ import pytest
 import batcher as bt
 from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
+from batcher.core.gpu_plan.backend import Unsupported
 from batcher.core.gpu_plan.execute import run_chain
+from batcher.plan.expr_ir.fn_names import MATH_FNS
 
 pytestmark = pytest.mark.unit
 
@@ -85,14 +87,66 @@ def test_no_math_function_is_reached_by_a_device_only_method():
     assert all(isinstance(v, str) for v in _MATH_FNS.values())
 
 
-@pytest.mark.parametrize(
-    "fn",
-    ["sqrt", "exp", "ln", "log10", "log2", "sin", "cos", "tan", "sinh", "cosh", "tanh",
-     "ceil", "floor", "trunc", "abs", "cbrt", "degrees", "radians", "rint"],
-)  # fmt: skip
+#: The math functions the device tier does not translate. Each needs a host-side
+#: construction neither backend dispatches to a device (a SWAR popcount, a per-row table,
+#: a `libm` special function), so falling back to the CPU engine is the cheaper answer --
+#: `scalar_fns` states the reason per function. Declining is the *contract* here, not a
+#: gap: `.claude/rules/device-tier.md` #2 says decline rather than approximate.
+DECLINED_MATH_FNS = frozenset({"bit_count", "factorial", "gamma", "lgamma"})
+
+#: Everything else in the engine's math vocabulary, derived rather than hand-listed. This
+#: used to be a list of nineteen names against a vocabulary of thirty-five, so `round`,
+#: `sign`, `even` and the six reciprocal/inverse-circular functions -- the members whose
+#: translations are *least* obvious, and the ones `scalar_fns` documents as traps -- were
+#: the ones shipping unexercised.
+TRANSLATED_MATH_FNS = tuple(sorted(MATH_FNS - DECLINED_MATH_FNS))
+
+#: Inputs for the functions whose domain `NUMBERS` leaves. An out-of-domain argument is not
+#: a harder case here, it is an unreadable one: both sides return NaN, NaN compares unequal
+#: to itself, and the case fails while the two backends agree to the last bit.
+_UNIT_INTERVAL = pa.table({"x": pa.array([1.0, 0.5, -0.5, None, -1.0], pa.float64())})
+_AT_LEAST_ONE = pa.table({"x": pa.array([1.0, 4.0, 2.5, None, 9.0], pa.float64())})
+_MATH_DOMAIN = {
+    "acos": _UNIT_INTERVAL,
+    "asin": _UNIT_INTERVAL,
+    "atanh": _UNIT_INTERVAL,
+    "acosh": _AT_LEAST_ONE,
+}
+
+
+def test_every_math_function_is_translated_or_declined():
+    """The per-function half of the vocabulary contract.
+
+    `test_gpu_vocabulary_contract` classifies the ``math`` *tag*, which is one entry for
+    thirty-five functions -- so a function added to `MATH_FNS` with no translation is
+    invisible to it. This is the check that makes such a function fail here instead.
+    """
+    assert set(TRANSLATED_MATH_FNS) | DECLINED_MATH_FNS == set(MATH_FNS)
+    assert not set(TRANSLATED_MATH_FNS) & DECLINED_MATH_FNS
+
+
+@pytest.mark.parametrize("fn", TRANSLATED_MATH_FNS)
 def test_a_unary_math_function_matches_the_engine(be, fn):
+    table = _MATH_DOMAIN.get(fn, NUMBERS)
+    ds = bt.from_arrow(table).select(out=getattr(col("x"), fn)())
+    _assert_matches_engine(ds, table, be)
+
+
+@pytest.mark.parametrize("fn", sorted(DECLINED_MATH_FNS))
+def test_a_declined_math_function_declines_instead_of_guessing(be, fn):
+    """The other half of contract #2: a decline, never a plausible wrong number.
+
+    An `Unsupported` sends the stage to the CPU engine. Anything else -- a value, or a
+    bare `AttributeError` -- is the failure this whole module was written after: the unary
+    math table reported the *backend* as broken because a missing method raised the wrong
+    exception type, and thirty-one functions took that path on every real device.
+    """
     ds = bt.from_arrow(NUMBERS).select(out=getattr(col("x"), fn)())
-    _assert_matches_engine(ds, NUMBERS, be)
+    spec = gpu_plan_ops(ds._plan)
+    if spec is None:
+        return  # declined a step earlier, at plan match — equally a fallback to the CPU
+    with pytest.raises(Unsupported, match=fn):
+        run_chain(NUMBERS, spec[1], be)
 
 
 # --- the window reductions avoid the keyword cuDF does not have -------------------------------

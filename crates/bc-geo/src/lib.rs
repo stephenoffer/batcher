@@ -49,6 +49,7 @@ pub fn from_wkb(bytes: &[u8]) -> GeoResult<Geom> {
 }
 
 /// Serialize a geometry to WKB, the storage encoding.
+#[must_use]
 pub fn to_wkb(g: &Geom) -> Vec<u8> {
     codec::wkb::write_wkb(g)
 }

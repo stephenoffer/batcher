@@ -259,8 +259,7 @@ class MetadataHub:
                 f"{type(op_id).__name__} {op_id!r}.",
                 hint="Operator ids are the plan-local integers on a PhysicalPlan's ops.",
             )
-        out = [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
-        return out
+        return [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
 
     def op_stats_by_kind(self, hw_fingerprint: str | None = None) -> dict[str, list[dict]]:
         """Operator feedback measured on **one machine class**, bucketed by operator `kind`.

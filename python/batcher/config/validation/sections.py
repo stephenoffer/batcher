@@ -3,40 +3,35 @@
 Pure: each takes its section and raises `ConfigError` on the first bad value. The order
 here follows the order the sections appear on `Config`, so a reader looking for "what
 constrains `flow_control.aimd_beta`" has exactly one place to look, and adding a tunable
-has exactly one place to touch.
+has exactly one place to touch. The `distributed` section is the exception: it is large
+enough to have its own module, and `run_checks` calls into it in section order like the
+rest.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import validate_accelerator
 from batcher.config.config import VERBOSITY_LEVELS
 from batcher.config.fault_tolerance import validate_fault_tolerance
-from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, RESILIENCE_PROFILES
-from batcher.config.validation.gpu import check_gpu_packing
+from batcher.config.validation.check import check as _check
+from batcher.config.validation.distributed import check_distributed
 
 if TYPE_CHECKING:
     from batcher.config.config import (
         Config,
-        DistributedConfig,
         ExecutionConfig,
         FlowControlConfig,
+        GovernanceConfig,
         MemoryConfig,
         MetadataConfig,
         ObservabilityConfig,
         OptimizerConfig,
         PIDConfig,
-        ShuffleTlsConfig,
     )
 
 __all__ = ["run_checks"]
-
-
-def _check(cond: bool, msg: str) -> None:
-    if not cond:
-        raise ConfigError(msg)
 
 
 def run_checks(cfg: Config) -> None:
@@ -48,13 +43,14 @@ def run_checks(cfg: Config) -> None:
     """
     _check_memory(cfg.memory)
     _check_execution(cfg.execution)
-    _check_distributed(cfg.distributed)
+    check_distributed(cfg.distributed)
     _check_flow_control(cfg.flow_control)
     _check_optimizer(cfg.optimizer)
     validate_accelerator(cfg.accelerator)
     validate_fault_tolerance(cfg.fault_tolerance)
     _check_pid(cfg.pid)
     _check_metadata(cfg.metadata)
+    _check_governance(cfg.governance)
     _check_observability(cfg.observability)
 
 
@@ -79,9 +75,16 @@ def _check_memory(m: MemoryConfig) -> None:
         f"memory.streaming_state_max_bytes must be >= 0, got {m.streaming_state_max_bytes}",
     )
     _check(
-        m.result_cache_max_bytes >= 0 and m.file_cache_max_bytes >= 0,
+        m.result_cache_max_bytes >= 0
+        and m.file_cache_max_bytes >= 0
+        and m.result_cache_disk_max_bytes >= 0,
         "memory result/file cache budgets must be >= 0, got "
-        f"{m.result_cache_max_bytes}, {m.file_cache_max_bytes}",
+        f"{m.result_cache_max_bytes}, {m.file_cache_max_bytes}, "
+        f"{m.result_cache_disk_max_bytes}",
+    )
+    _check(
+        m.shared_cache_ttl_seconds >= 0,
+        f"memory.shared_cache_ttl_seconds must be >= 0, got {m.shared_cache_ttl_seconds}",
     )
     _check(
         m.spill_bucket_max_bytes > 0,
@@ -137,169 +140,6 @@ def _check_execution(e: ExecutionConfig) -> None:
         e.skew_min_bucket_rows >= 0 and e.skew_min_bucket_bytes >= 0,
         "execution.skew_min_bucket_{rows,bytes} must be >= 0, got "
         f"{e.skew_min_bucket_rows}, {e.skew_min_bucket_bytes}",
-    )
-
-
-def _check_distributed(d: DistributedConfig) -> None:
-    """Every distributed tunable: failure budgets, placement, and the shuffle's TLS."""
-    _check_distributed_faults(d)
-    _check_distributed_placement(d)
-    check_gpu_packing(d)
-    _check_shuffle_tls(d.tls)
-
-
-def _check_distributed_faults(d: DistributedConfig) -> None:
-    """Retry budgets, backoff, timeouts, and shuffle replication.
-
-    Retries and restarts may be zero (a fleet that never retries is a legitimate choice),
-    but an *attempt* count may not: zero attempts means the work never runs at all, which
-    is a misconfiguration rather than a policy.
-    """
-    _check(
-        d.task_max_retries >= 0,
-        f"distributed.task_max_retries must be >= 0, got {d.task_max_retries}",
-    )
-    _check(
-        d.actor_max_restarts >= 0,
-        f"distributed.actor_max_restarts must be >= 0, got {d.actor_max_restarts}",
-    )
-    _check(
-        d.actor_max_task_retries >= 0,
-        f"distributed.actor_max_task_retries must be >= 0, got {d.actor_max_task_retries}",
-    )
-    _check(
-        d.recovery_max_attempts >= 1,
-        f"distributed.recovery_max_attempts must be >= 1, got {d.recovery_max_attempts}",
-    )
-    _check(
-        d.recovery_backoff_base_s >= 0,
-        f"distributed.recovery_backoff_base_s must be >= 0, got {d.recovery_backoff_base_s}",
-    )
-    _check(
-        d.drain_lead_s >= 0,
-        f"distributed.drain_lead_s must be >= 0, got {d.drain_lead_s}",
-    )
-    _check(
-        d.flight_idle_timeout_s > 0,
-        f"distributed.flight_idle_timeout_s must be positive, got {d.flight_idle_timeout_s}",
-    )
-    _check(
-        d.flight_keepalive_s is None or d.flight_keepalive_s > 0,
-        f"distributed.flight_keepalive_s must be positive or None, got {d.flight_keepalive_s}",
-    )
-    _check(
-        d.placement_timeout_s > 0,
-        f"distributed.placement_timeout_s must be positive, got {d.placement_timeout_s}",
-    )
-    _check(
-        d.cluster_connect_timeout_s >= 0,
-        f"distributed.cluster_connect_timeout_s must be >= 0, got {d.cluster_connect_timeout_s}",
-    )
-    _check(
-        d.autoscale_wait_s >= 0 or d.autoscale_wait_s == AUTOSCALE_WAIT_AUTO,
-        f"distributed.autoscale_wait_s must be >= 0 (or {AUTOSCALE_WAIT_AUTO} for auto), "
-        f"got {d.autoscale_wait_s}",
-    )
-    _check(
-        d.autoscale_poll_s > 0,
-        f"distributed.autoscale_poll_s must be positive, got {d.autoscale_poll_s}",
-    )
-    _check(
-        d.autoscale_stall_s >= 0,
-        f"distributed.autoscale_stall_s must be >= 0, got {d.autoscale_stall_s}",
-    )
-    _check(
-        d.fleet_max_attempts >= 1,
-        f"distributed.fleet_max_attempts must be >= 1, got {d.fleet_max_attempts}",
-    )
-    _check(
-        d.speculation_max_backups >= 0,
-        f"distributed.speculation_max_backups must be >= 0, got {d.speculation_max_backups}",
-    )
-    _check(
-        d.shuffle_replication >= 1,
-        f"distributed.shuffle_replication must be >= 1 (1 = no replica), "
-        f"got {d.shuffle_replication}",
-    )
-    _check(
-        d.resilience in RESILIENCE_PROFILES,
-        f"distributed.resilience must be one of {sorted(RESILIENCE_PROFILES)}, "
-        f"got {d.resilience!r}",
-    )
-    _check(
-        d.skew_join_salt >= -1,
-        f"distributed.skew_join_salt must be >= -1 (-1 = never salt, 0 = salt on measured "
-        f"skew, >0 = force this fan-out), got {d.skew_join_salt}",
-    )
-    _check(
-        0.0 <= d.skew_join_fraction <= 1.0,
-        f"distributed.skew_join_fraction must be in [0, 1], got {d.skew_join_fraction}",
-    )
-
-
-def _check_distributed_placement(d: DistributedConfig) -> None:
-    """Transport choice, speculation thresholds, and how tasks spread across the cluster."""
-    _check(
-        d.transport in {"auto", "flight", "disk"},
-        f"distributed.transport must be one of {{'auto', 'flight', 'disk'}}, got {d.transport!r}",
-    )
-    _check(
-        d.on_read_error in {"error", "skip"},
-        f"distributed.on_read_error must be one of {{'error', 'skip'}}, got {d.on_read_error!r}",
-    )
-    _check(
-        d.speculation_straggler_factor >= 1.0,
-        f"distributed.speculation_straggler_factor must be >= 1, "
-        f"got {d.speculation_straggler_factor}",
-    )
-    _check(
-        0.0 < d.speculation_min_finished_frac <= 1.0,
-        f"distributed.speculation_min_finished_frac must be in (0, 1], "
-        f"got {d.speculation_min_finished_frac}",
-    )
-    _check(
-        d.session_fleet_idle_s >= 0,
-        f"distributed.session_fleet_idle_s must be >= 0, got {d.session_fleet_idle_s}",
-    )
-    _check(
-        d.object_store_memory_bytes is None or d.object_store_memory_bytes > 0,
-        f"distributed.object_store_memory_bytes must be positive or None, "
-        f"got {d.object_store_memory_bytes}",
-    )
-    _check(
-        d.map_partition_multiplier >= 1,
-        f"distributed.map_partition_multiplier must be >= 1 (1 = one partition per worker), "
-        f"got {d.map_partition_multiplier}",
-    )
-    _check(
-        d.max_pending_tasks >= 0,
-        f"distributed.max_pending_tasks must be >= 0 (0 = derive), got {d.max_pending_tasks}",
-    )
-    _check(
-        d.pending_window_factor >= 1,
-        f"distributed.pending_window_factor must be >= 1, got {d.pending_window_factor}",
-    )
-    _check(
-        d.map_spread in {"auto", "always", "never"},
-        f"distributed.map_spread must be one of {{'auto', 'always', 'never'}}, "
-        f"got {d.map_spread!r}",
-    )
-    _check(
-        d.runtime_bloom_join in (True, False, "auto"),
-        "distributed.runtime_bloom_join must be True, False, or 'auto', "
-        f"got {d.runtime_bloom_join!r}",
-    )
-    _check(
-        d.map_spread_node_cap >= 1,
-        f"distributed.map_spread_node_cap must be >= 1, got {d.map_spread_node_cap}",
-    )
-    _check(
-        d.map_spread_pack_share > 0,
-        f"distributed.map_spread_pack_share must be positive, got {d.map_spread_pack_share}",
-    )
-    _check(
-        d.map_inflight_depth >= 1,
-        f"distributed.map_inflight_depth must be >= 1, got {d.map_inflight_depth}",
     )
 
 
@@ -432,6 +272,44 @@ def _check_metadata(md: MetadataConfig) -> None:
     )
 
 
+#: The only values `governance.mode` may take. Enforcement reads it by equality
+#: (`== "off"`, `== "strict"`) and treats everything else as `advisory`, so an unrecognized
+#: value does not fail -- it *downgrades*, which is the one direction a security control
+#: must never move on its own.
+GOVERNANCE_MODES = ("off", "advisory", "strict")
+
+
+def _check_governance(g: GovernanceConfig) -> None:
+    """Reject a governance setting that cannot be honored, rather than honoring less of it.
+
+    Both checks here exist because this section fails **open**. `_refuse_ungoverned_read`
+    selects on `mode == "off"` and `mode == "strict"` and lets every other string fall
+    through to the advisory warning, so ``mode="Strict"`` -- a capitalization, not even a
+    typo -- is accepted by config, reported nowhere, and silently turns a deployment that
+    refuses ungoverned reads into one that logs them and proceeds. A wrong value for a
+    security switch has to be an error at the point it is set; there is no later point
+    where anything notices.
+
+    `default_deny` is the same failure one step further along: it is declared, documented
+    in `docs/configuration/options.md`, and read by nothing at all, so setting it grants a
+    deny-by-default catalog that does not exist. Until something implements it, refusing
+    the value is the only honest answer -- silently ignoring a request to deny more is
+    strictly worse than saying it is unavailable.
+    """
+    _check(
+        g.mode in GOVERNANCE_MODES,
+        f"governance.mode must be one of {', '.join(map(repr, GOVERNANCE_MODES))}, got "
+        f"{g.mode!r}. Enforcement treats an unrecognized mode as 'advisory', so this would "
+        f"have downgraded a strict deployment to warnings instead of refusals.",
+    )
+    _check(
+        not g.default_deny,
+        "governance.default_deny is not implemented: no code path reads it, so setting it "
+        "True would leave every table a grant does not mention readable, exactly as False "
+        "does. Restrict access with explicit grants and governance.mode='strict' instead.",
+    )
+
+
 def _check_observability(ob: ObservabilityConfig) -> None:
     """Verbosity, log level, progress, and log-file rotation.
 
@@ -482,35 +360,3 @@ def _valid_verbosity(value: object) -> bool:
     if text.isdigit():
         return 0 <= int(text) < len(VERBOSITY_LEVELS)
     return text in names
-
-
-def _check_shuffle_tls(t: ShuffleTlsConfig) -> None:
-    """With TLS on, the server identity and trust root must all be present.
-
-    The only *combination* check in this module, and the reason it exists: a
-    half-configured deployment must fail at config time, not at its first fetch, when the
-    fleet is already up and the failure looks like a network fault.
-    """
-    if not t.enabled:
-        return
-    _check(
-        bool(t.ca_cert_path),
-        "distributed.tls.enabled requires ca_cert_path (the peer trust root)",
-    )
-    _check(
-        bool(t.server_cert_path) and bool(t.server_key_path),
-        "distributed.tls.enabled requires server_cert_path and server_key_path",
-    )
-    _check(
-        not t.require_client_auth or bool(t.ca_cert_path),
-        "distributed.tls.require_client_auth (mTLS) requires ca_cert_path to verify "
-        "client certificates against",
-    )
-    _check(
-        bool(t.client_cert_path) == bool(t.client_key_path),
-        "distributed.tls client_cert_path and client_key_path must be set together",
-    )
-    _check(
-        bool(t.server_name),
-        "distributed.tls.enabled requires server_name (the peer certificate SAN)",
-    )

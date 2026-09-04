@@ -26,6 +26,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 /// `decimal(12,4)` and `decimal(12, 4)` resolve. Matching is case-sensitive on the type
 /// name (the control plane lowercases before it reaches the wire) but a timezone keeps
 /// its case, since `UTC` and `America/New_York` are case-sensitive identifiers.
+#[must_use]
 pub fn dtype_from_name(name: &str) -> Option<DataType> {
     if let Some(fixed) = fixed_dtype(name) {
         return Some(fixed);

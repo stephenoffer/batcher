@@ -52,6 +52,7 @@ impl Default for KllSketch {
 impl KllSketch {
     /// Create an empty sketch. Larger `k` → smaller rank error (~`1/k`) and more
     /// memory; `k=200` gives roughly ~1% error.
+    #[must_use]
     pub fn new(k: usize) -> Self {
         assert!(k >= 8, "k must be >= 8");
         let mut s = Self {
@@ -92,19 +93,23 @@ impl KllSketch {
     }
 
     /// Number of values seen.
+    #[must_use]
     pub fn count(&self) -> u64 {
         self.n
     }
 
     /// True if no (non-NaN) value has been added.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
 
     /// Exact minimum / maximum seen (`None` if empty).
+    #[must_use]
     pub fn min(&self) -> Option<f64> {
         (self.n > 0).then_some(self.min)
     }
+    #[must_use]
     pub fn max(&self) -> Option<f64> {
         (self.n > 0).then_some(self.max)
     }
@@ -276,6 +281,7 @@ impl KllSketch {
 
     /// Approximate fraction of values ≤ `x`, in `[0, 1]` — i.e. the selectivity of
     /// `col <= x`. Returns 0 for an empty sketch.
+    #[must_use]
     pub fn rank(&self, x: f64) -> f64 {
         if self.n == 0 {
             return 0.0;
@@ -332,6 +338,7 @@ impl KllSketch {
 
     /// Approximate value at quantile `q ∈ [0, 1]` (`None` if empty). `q=0`/`q=1`
     /// return the exact min/max.
+    #[must_use]
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.n == 0 {
             return None;
@@ -345,6 +352,7 @@ impl KllSketch {
     /// the retained items, instead of rebuilding and re-sorting per call. Order is
     /// preserved (output `i` is the quantile for `qs[i]`). This is what an
     /// equi-depth histogram (many quantiles off one sketch) should use.
+    #[must_use]
     pub fn quantiles(&self, qs: &[f64]) -> Vec<Option<f64>> {
         if self.n == 0 {
             return vec![None; qs.len()];
@@ -397,6 +405,7 @@ impl KllSketch {
     }
 
     /// Convenience: the median.
+    #[must_use]
     pub fn median(&self) -> Option<f64> {
         self.quantile(0.5)
     }
@@ -426,6 +435,7 @@ impl KllSketch {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on truncated
     /// or otherwise malformed input. The rng is reset to its default seed.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         let k = c.u64()? as usize;
@@ -920,7 +930,7 @@ mod tests {
         for i in 0..50_000u64 {
             s.add(((i * 2_654_435_761) % 100_000) as f64);
         }
-        let qs: Vec<f64> = (0..=20).map(|i| i as f64 / 20.0).collect();
+        let qs: Vec<f64> = (0..=20).map(|i| f64::from(i) / 20.0).collect();
         let batch = s.quantiles(&qs);
         for (q, got) in qs.iter().zip(batch) {
             assert_eq!(got, s.quantile(*q), "disagreement at q = {q}");

@@ -36,6 +36,7 @@ from batcher.kyber.rules.exprs.guards import (
     register_schema_leaf_rule,
 )
 from batcher.plan.expr_ir import Binary, Expr, Lit
+from batcher.plan.expr_ir.core import int_literal
 from batcher.plan.expr_ir.func_nodes import DateFunc
 from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.schema import SchemaRef
@@ -47,12 +48,6 @@ _COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
 #: Outside, the rule declines rather than folding an instant the literal cannot hold.
 _MIN_SECONDS = -62_135_596_800  # 0001-01-01T00:00:00
 _MAX_SECONDS = 253_402_300_799  # 9999-12-31T23:59:59
-
-
-def _seconds_literal(expr: Expr) -> int | None:
-    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    return None
 
 
 def _instant(seconds: int) -> Lit | None:
@@ -72,7 +67,7 @@ def _epoch_comparison(expr: Expr) -> tuple[str, Expr, int] | None:
         (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if isinstance(computed, DateFunc) and computed.fn == "epoch":
-            seconds = _seconds_literal(other)
+            seconds = int_literal(other)
             if seconds is not None:
                 return op, computed.input, seconds
     return None

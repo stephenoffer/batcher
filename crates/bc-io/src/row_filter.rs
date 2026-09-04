@@ -106,7 +106,10 @@ fn lit_array(lit: &Lit, dt: &DataType) -> Option<ArrayRef> {
 /// Floats and decimals are excluded on purpose — see the module docs. Everything admitted
 /// compares by plain arrow kernels in both places.
 fn comparable(dt: &DataType) -> bool {
-    use DataType::*;
+    use DataType::{
+        Boolean, Date32, Date64, Int16, Int32, Int64, Int8, LargeUtf8, UInt16, UInt32, UInt64,
+        UInt8, Utf8,
+    };
     matches!(
         dt,
         Boolean
@@ -245,15 +248,16 @@ pub(crate) fn worth_it_frac(frac: f64) -> bool {
 /// `predicate::float_range_survives`) yields `None` rather than a garbage span.
 fn bounds_f64(stats: &Statistics, unsigned: bool) -> Option<(f64, f64)> {
     let (lo, hi) = match stats {
-        Statistics::Int32(s) if unsigned => {
-            (*s.min_opt()? as u32 as f64, *s.max_opt()? as u32 as f64)
-        }
-        Statistics::Int32(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+        Statistics::Int32(s) if unsigned => (
+            f64::from(*s.min_opt()? as u32),
+            f64::from(*s.max_opt()? as u32),
+        ),
+        Statistics::Int32(s) => (f64::from(*s.min_opt()?), f64::from(*s.max_opt()?)),
         Statistics::Int64(s) if unsigned => {
             (*s.min_opt()? as u64 as f64, *s.max_opt()? as u64 as f64)
         }
         Statistics::Int64(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
-        Statistics::Float(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+        Statistics::Float(s) => (f64::from(*s.min_opt()?), f64::from(*s.max_opt()?)),
         Statistics::Double(s) => (*s.min_opt()?, *s.max_opt()?),
         _ => return None,
     };

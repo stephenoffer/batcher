@@ -21,3 +21,4 @@ python examples/operations/observability.py
 - {doc}`streaming_basics`: the same operators, incrementally.
 - {doc}`/user-guide/operate/tuning/performance`: measuring and tuning a query that is correct but slow.
 - {doc}`/user-guide/operate/running/observability`: what the engine records about a run, and where.
+- {doc}`/integrations/observability/index`: shipping those signals to Prometheus, Grafana, and an OpenLineage catalog.

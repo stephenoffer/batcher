@@ -182,16 +182,25 @@ on small in-memory data serialize before they contend for cores — every grant 
 | Write privileges | **Missing** | Grants cover SELECT. **Writes are ungoverned.** |
 | Revoke | **Missing** | — |
 | Path aliasing | **L** | Policies key on exact path strings, so `s3a://` vs `s3://` evades one |
-| Durable audit sink | **Missing** | `GovernanceConfig.audit_path` is defined; the append-only JSONL sink is not written |
+| Durable audit sink | **Built** | `governance/audit_log.py` appends one JSON line per decision to `GovernanceConfig.audit_path`, owner-only from creation and reopened per record so `logrotate` works. Fails closed: a write that fails raises, on the rule `_emit` already stated for a caller sink. `tests/unit/test_governance_audit_sink.py` |
 
-## SQL surface: 76 of 99 TPC-DS queries plan
+## SQL surface: 99 of 99 TPC-DS queries plan
 
 Not one of the eight dimensions, but it belongs here because "can it express the workload"
 precedes every other question in an evaluation, and because it was an opinion until this pass.
 
 `benchmarks/internals/tpcds_coverage.py` runs all 99 official texts through parse-and-plan
 against the 24 official schemas — both sourced from DuckDB's `tpcds` extension, not written
-from memory. **76 plan.** The 23 that do not are grouped by cause in
+from memory.
+
+**Corrected 2026-08-29: all 99 plan.** The figure below was 76, and the two causes it named
+as the cheapest coverage wins — decimal support (6 queries) and the synthesized join key
+(4 queries) — have both since been fixed, along with the rest. Re-measure with the script
+rather than trusting this paragraph; that is how the 76 came to be stale. The account of the
+23 failures that follows is kept as the record of what *was* wrong and no longer describes
+HEAD.
+
+**76 planned when this was written.** The 23 that do not are grouped by cause in
 `BENCHMARK_RESULTS.md`; the two that matter:
 
 - **Decimal support is the single biggest blocker** (6 queries), and it masquerades as window
@@ -256,11 +265,11 @@ In rough order of evaluation impact:
 2. Run `benchmarks/concurrency/` on a quiet box, before and after Phase 4A.
 3. Wire replication beyond the flat aggregate reduce (Phase 1E), so node loss on a large
    cluster refetches instead of recomputing.
-4. Write privileges, revoke, and the durable audit sink — the three governance cells that read
-   "Missing" and that an auditor asks about first.
+4. Write privileges and revoke — the two governance cells still reading "Missing", and the
+   ones an auditor asks about first. (The third, the durable audit sink, is now built.)
 5. Primary citations for every ⚠️ in this file.
-6. Decimal support, which unblocks 6 TPC-DS queries and is the cheapest coverage win on the
-   list; then the `__jk_` translator defect, which is 4 more.
+6. ~~Decimal support and the `__jk_` translator defect.~~ **Both closed.** See the corrected
+   coverage figure below.
 
 ## See also
 

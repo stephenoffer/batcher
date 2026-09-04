@@ -4,6 +4,11 @@ Split out of `progress` on the seam its author had already marked: everything he
 pure function of a job's accumulated numbers, with no lock, no bus, and no mutation. That
 separation is what lets the folding logic next door stay about *folding*, and it keeps
 either half readable on its own as the event vocabulary grows.
+
+The two number formatters this module used to define were byte-identical copies of the
+console's, which is how the engine came to have three byte formatters that disagreed. They
+are gone; `_internal.humanize` is the one implementation, and `progress` imports it
+directly rather than through here.
 """
 
 from __future__ import annotations
@@ -63,19 +68,3 @@ def _blocked_rising(trend: deque[float]) -> bool:
 def _finding(severity: str, code: str, message: str) -> dict[str, Any]:
     """One diagnostic finding as a plain dict."""
     return {"severity": severity, "code": code, "message": message}
-
-
-def _pct(fraction: float) -> str:
-    """A clamped integer percentage, e.g. ``62%``; ``<1%`` for a small-but-present share."""
-    value = max(fraction, 0.0) * 100
-    if 0 < value < 1:
-        return "<1%"
-    return f"{value:.0f}%"
-
-
-def _count(n: float) -> str:
-    """A compact SI-style count: ``1.2K``, ``3.4M``, ``5.6B``."""
-    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(n) >= limit:
-            return f"{n / limit:.1f}{suffix}"
-    return f"{n:.0f}"

@@ -166,6 +166,7 @@ pub fn to_web_mercator(lon: f64, lat: f64) -> GeoResult<Coord> {
 }
 
 /// Invert `to_web_mercator`.
+#[must_use]
 pub fn from_web_mercator(x: f64, y: f64) -> Coord {
     let lon = (x / crate::proj::geodesy::EARTH_RADIUS_M).to_degrees();
     let lat =

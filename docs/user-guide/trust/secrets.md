@@ -79,7 +79,8 @@ A literal password still works unchanged. This is additive, not a migration.
 
 ## Reaching Vault, KMS, or Secret Manager
 
-Two schemes cover an external key store, and neither links a cloud SDK into the engine.
+Two schemes cover an external key store from anywhere in the engine, including the
+expression layer, and neither links a cloud SDK into it.
 
 **A file, via the platform's own secret delivery.** Vault Agent, the External Secrets
 Operator, and the Kubernetes secrets-store CSI driver all materialize a secret as a file,
@@ -105,6 +106,54 @@ A plan is data and may arrive from somewhere less trusted than the cluster, so l
 name a program to execute would turn a secret reference into arbitrary code execution. The
 argument is passed as an argument, never through a shell, so metacharacters in a reference
 are inert.
+
+### Naming a key store directly
+
+Connector credentials and storage options accept five further schemes that read a key
+store without a helper program. These are the shim most teams write around `cmd:`, written
+once:
+
+| Scheme | Example | Reads |
+|---|---|---|
+| `vault:` | `vault:secret/data/warehouse#password` | HashiCorp Vault KV, v1 or v2 |
+| `aws-sm:` | `aws-sm:prod/warehouse#password` | AWS Secrets Manager |
+| `aws-ssm:` | `aws-ssm:/prod/warehouse/password` | AWS SSM Parameter Store |
+| `gcp-sm:` | `gcp-sm:projects/p/secrets/db-password` | GCP Secret Manager |
+| `azure-kv:` | `azure-kv:https://v.vault.azure.net/secrets/db` | Azure Key Vault |
+
+```python
+# docs: skip
+ds = bt.read.table(
+    "postgres://analytics@warehouse.internal/sales",
+    password="aws-sm:prod/warehouse#password",
+)
+```
+
+The `#key` suffix selects a field when the stored secret is a JSON object, which is what
+the Secrets Manager console writes for anything with more than one field, and which key of
+a Vault path is meant.
+
+**Each of these resolves on the worker that opens the connection, against that machine's
+own identity.** On a distributed query only the reference travels in the split; each
+worker authenticates as itself through an instance profile, an IRSA role, a Workload
+Identity binding, or a Vault Kubernetes login. A node without an identity fails closed
+rather than inheriting the driver's. This is the same property the `env:`/`file:`/`cmd:`
+schemes have, and the reason all of them are references rather than values.
+
+Vault needs no extra package: its read is one authenticated GET. The three cloud stores
+need their vendor SDK, so install `batcher-engine[aws-secrets]`,
+`batcher-engine[gcp-secrets]`, or `batcher-engine[azure-secrets]`.
+
+Vault takes its address from `VAULT_ADDR` and its token from `VAULT_TOKEN`, the same
+variables the Vault CLI reads. With no token set, and `VAULT_K8S_ROLE` set instead,
+Batcher exchanges the pod's projected service account token at `auth/kubernetes/login`,
+which is the route that needs no long-lived credential on any worker.
+
+The expression layer's key references (`aes_encrypt` and friends) resolve in the data
+plane, which deliberately links no cloud SDK, so they keep to `env:`, `file:`, and `cmd:`.
+Point `BATCHER_SECRET_COMMAND` at a helper to reach a key store from there.
+
+### Caching
 
 Key references resolve on a per-batch path, so they are cached for
 `BATCHER_SECRET_TTL_SECONDS` (default 300, `0` disables). Without a cache, a `cmd:` reference

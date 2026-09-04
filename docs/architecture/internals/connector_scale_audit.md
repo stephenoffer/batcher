@@ -211,9 +211,35 @@ shards are never discovered → silent data loss for the process lifetime. When 
 `NextShardIterator` is `None` and the code keeps polling the stale iterator instead of
 following the child shards.
 
+> **Corrected 2026-09-01: fixed, and now tested.** `_shards()` paginates `ListShards`,
+> `_advance` retires a closed shard *and drops the cached listing*, and `_adopt_children`
+> follows the `ParentShardId`/`AdjacentParentShardId` lineage so a reader pinned to a shard
+> set takes over the children of its own drained shards. `_shard_map` keys partitions by the
+> shard's own number rather than its position in the listing, so a checkpointed sequence is
+> never replayed against a different shard.
+>
+> The fix was there and **the half that recovers the data had no test**: the suite covered
+> the `GetRecords` limit, pagination and closed-shard retirement, and named `_adopt_children`
+> only in a comment. `tests/unit/test_kinesis_reshard_adoption.py` pins it as arithmetic over
+> a shard lineage, so it needs no AWS — which is why the original bug survived a green suite.
+> It holds both directions: under-adoption loses the children's records, and over-adoption
+> delivers a *merge* child twice, because such a child has two parents that may sit on two
+> readers which cannot see each other. Ownership is defined as the lowest-numbered parent's
+> reader, a rule each evaluates alone and all agree on. Confirmed discriminating by mutation:
+> removing adoption fails 8 of the 14, taking the highest-numbered parent instead of the
+> lowest fails 3, keeping the stale shard cache fails 2, and adopting before the parent
+> drains fails 1.
+
 **`kafka.py:136-138`** commits the offset at *poll* time, before `streaming_query.py:335`
 processes and writes to the sink. A crash in between loses the batch — at-most-once, not the
 exactly-once the docstring claims.
+
+> **Corrected 2026-09-01: fixed.** The source write-aheads the position it consumed,
+> publishes, and only then moves the group offset (`kafka.py` module docstring;
+> `_commit_delivered`), so the engine's log rather than the broker's is the source of truth.
+> `tests/unit/test_broker_commit_ordering.py::test_offsets_are_not_committed_while_a_batch_is_still_unpublished`
+> pins the ordering, and its sibling pins that a delivered batch is eventually committed —
+> the two halves that fail in opposite directions.
 
 ### The autoloader killer — measured
 
@@ -258,7 +284,7 @@ whenever names are not monotonic, which is the normal case (`part-00000-<uuid>.p
 | `redis.py:120-136` | each of N splits scans the **whole** keyspace and discards non-matching slots (N× the work, not 1/N); one RTT per key for `KEYSLOT`, another for `GET`; `_is_cluster` misdetects a plain client so the RTT path always fires | fatal |
 | `mongo.py:189-200` | boundary discovery via `skip(offset)` — the server walks `offset` docs per boundary; quadratic. Shard/chunk ranges never consulted | fatal |
 | `elasticsearch.py:138-165` | ES\|QL path runs the whole query for the schema, then again for the data, in one split | fatal |
-| `eventhubs.py:104-113` | constructs a consumer **inside** the poll loop and re-seeks to `starting_position` ("-1" = start of stream) every poll — **never advances**; leaks an AMQP link per partition per poll | fatal |
+| ~~`eventhubs.py:104-113`~~ | ~~constructs a consumer **inside** the poll loop and re-seeks to `starting_position` every poll — never advances; leaks an AMQP link per partition per poll~~ **Corrected 2026-09-01: fixed.** Consumers are opened once and kept in `_consumers` across polls, and the position comes from `_resume_from` rather than the configured start. Pinned by `tests/io/test_streaming_cloud_brokers.py`: `test_consumers_are_opened_once_and_reused_across_polls`, `test_a_seek_reopens_the_partition_at_the_checkpointed_offset`, `test_close_releases_every_consumer_and_then_the_client` | fixed |
 | `pubsub.py:71` | one split for the whole subscription; `offset` derived from `hash()` of a string, which is per-process randomized and therefore unstable across workers | fatal |
 | `pulsar.py:112-116` | up to 16,384 sequential blocking `receive()` calls per poll; `batch_receive()` unused | slow |
 | `hbase.py:109-125` | region splits are correct, but projection is applied client-side *after* every column family crosses Thrift; no server-side filter | slow |
@@ -341,8 +367,21 @@ plan is cheap by definition) can pay for two. Same decision, inverted cost. Meas
    three that keep Delta from being the answer at 1M files.
 5. **Iceberg `_table()` memoization** and **`statistics()`** (stop calling
    `inspect.data_files()`; read the manifest through `lakehouse_manifest` like Delta does).
-6. **`eventhubs`** (cannot make progress at all) and **`kinesis`** (silent loss on reshard).
-7. **Metadata-only `schema()`** for the six SQL connectors that currently execute the query.
+6. ~~**`eventhubs`** (cannot make progress at all) and **`kinesis`** (silent loss on reshard).~~
+   **Both closed**, with the corrections recorded against the findings in section 3. Kinesis
+   additionally gained the test its fix was missing.
+7. ~~**Metadata-only `schema()`** for the six SQL connectors that currently execute the
+   query.~~ **Closed** — see "SQL `schema()` no longer runs the query" in section 7. Every
+   relational connector now answers from a zero-row `WHERE 1 = 0` probe
+   (`sql/_common.py::schema_probe`), BigQuery from the read session's own `arrow_schema`, and
+   ConnectorX — which has no metadata-only entry point at all — from that probe applied to a
+   relation the server folds to empty.
+
+**Re-measure before trusting any row in this file.** Four of the seven items above were
+already fixed when this list was last read, and a ledger that reports a fixed bug is not
+merely stale: it sends the next reader to modify correct code, which is the failure
+`.claude/rules/testing.md` warns about under "it will not report a cause it inferred". The
+four were found by reading the connectors, not by a test failing.
 
 ## 7. Added since this audit
 

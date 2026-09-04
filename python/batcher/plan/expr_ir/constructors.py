@@ -7,6 +7,8 @@ free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 
 from __future__ import annotations
 
+from typing import Final
+
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import (
     AggExpr,
@@ -313,19 +315,41 @@ def count() -> AggExpr:
     return AggExpr("count_star", None)
 
 
-def lit(value: int | float | bool | str) -> Lit:
-    """A constant literal expression.
+#: Arrow type names a NULL literal may be given. `lit(None, dtype=...)` validates against
+#: this before building, so a typo raises here rather than deep inside `Cast`.
+_NULL_DTYPES: Final = (
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64", "bool", "string", "date", "time", "timestamp",
+)  # fmt: skip
+
+
+def lit(value: int | float | bool | str | None, dtype: str | None = None) -> Expr:
+    """A constant literal expression, or a typed NULL when `value` is None.
 
     Wraps a Python scalar so it can be combined with column expressions — a default
     in ``when(...).otherwise(bt.lit(0))``, an offset like ``bt.col("x") + bt.lit(1)``,
     or a fallback in ``coalesce(col("x"), bt.lit(0))``. Bare Python scalars are
     accepted in most places too; ``lit`` is the explicit form.
 
+    ``lit(None)`` is the NULL literal. The JSON IR has no untyped null — `bc_expr::Literal`
+    carries Int/Float/Bool/Str/Timestamp/Date and nothing else — so a null has to be given
+    a type here, and it is built as ``nullif(1, 1)`` (null on every row, Int64) cast to
+    `dtype`. Without this, ``lit(None)`` raised ``TypeError: unsupported literal type:
+    NoneType`` from inside `to_ir`, so the one spelling every DataFrame user reaches for
+    failed at the point of `collect()` rather than where it was written, while the SQL
+    front-end answered the same ``NULL`` perfectly well through its own private copy of
+    this construction.
+
     Args:
-        value: The constant value (int, float, bool, or str).
+        value: The constant value (int, float, bool, str), or None for a NULL.
+        dtype: Arrow type name for the literal. Required only to type a NULL as
+            something other than Int64; on a non-null value it is an explicit cast.
 
     Returns:
-        An expression that evaluates to ``value`` on every row.
+        An expression that evaluates to `value` on every row.
+
+    Raises:
+        PlanError: If `dtype` is not an Arrow type name a literal can take.
 
     Examples:
         .. doctest::
@@ -334,5 +358,46 @@ def lit(value: int | float | bool | str) -> Lit:
             >>> ds = bt.from_pydict({"x": [1, 2]})
             >>> ds.select(y=bt.col("x") + bt.lit(100)).to_pydict()
             {'y': [101, 102]}
+
+            >>> ds.select(y=bt.lit(None, dtype="string")).to_pydict()
+            {'y': [None, None]}
     """
-    return Lit(value)
+    if dtype is not None and dtype not in _NULL_DTYPES:
+        raise PlanError(
+            f"lit(): unknown dtype {dtype!r}; expected one of {', '.join(_NULL_DTYPES)}"
+        )
+    if value is None:
+        return null(dtype)
+    typed = Lit(value)
+    return typed._cast(dtype, try_cast=False) if dtype is not None else typed
+
+
+def null(dtype: str | None = None) -> Expr:
+    """A NULL literal of `dtype` (Int64 when unspecified) — the neutral spelling of SQL NULL.
+
+    Both front-ends need this and neither can hold it: the IR has no untyped null, so a
+    NULL has to be *constructed* from ``nullif(1, 1)`` and typed. That construction lived
+    only inside the SQL translator, which is why ``bt.lit(None)`` had no answer at all.
+
+    Args:
+        dtype: Arrow type name for the null. Int64 when omitted.
+
+    Returns:
+        An expression that is NULL on every row, typed as `dtype`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.plan.expr_ir import null
+            >>> ds = bt.from_pydict({"x": [1, 2]})
+            >>> ds.select(y=null("float64")).to_pydict()
+            {'y': [None, None]}
+    """
+    if dtype is not None and dtype not in _NULL_DTYPES:
+        raise PlanError(
+            f"null(): unknown dtype {dtype!r}; expected one of {', '.join(_NULL_DTYPES)}"
+        )
+    one = Lit(1)
+    untyped: Expr = NullIf(one, one)
+    return untyped if dtype in (None, "int64") else untyped._cast(dtype, try_cast=False)

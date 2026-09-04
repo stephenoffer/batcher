@@ -13,7 +13,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.constructors import lit, nullif
+from batcher.plan.expr_ir.constructors import lit, nullif, when
 from batcher.plan.expr_ir.core import AggExpr, Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors, _bind_aliases
@@ -506,12 +506,18 @@ class _StrNamespace:
         width = require_int(width, func="str.rpad", arg="width")
         return StrFunc("rpad", self._e, start=width, pattern=fill)
 
-    def zfill(self, width: int) -> StrFunc:
-        """Left-pad with ``'0'`` to ``width`` characters — the numeric-string spelling of ``lpad``.
+    def zfill(self, width: int) -> Expr:
+        """Left-pad with ``'0'`` to ``width`` characters, never truncating.
 
-        A thin specialization of :meth:`lpad` with a ``'0'`` fill, matching the name
-        Python/pandas/Polars users reach for when zero-padding fixed-width codes or ids.
-        A string already ``width`` or longer is returned unchanged.
+        The name Python, pandas and Polars users reach for when zero-padding fixed-width
+        codes or ids, and it keeps their contract: **a string already ``width`` or longer
+        is returned unchanged.**
+
+        That is the one place it parts company with :meth:`lpad`, which is SQL ``LPAD``
+        and *truncates* an over-long input. Delegating to it outright — as this used to —
+        silently shortened exactly the values the method exists to protect: a 12-character
+        account id passed through ``zfill(8)`` came back as its first 8 characters, with
+        no error and no null. Use :meth:`lpad` when you want the SQL behaviour.
 
         Args:
             width: Target character width.
@@ -523,12 +529,13 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["7", "42", "100"]})
+                >>> ds = bt.from_pydict({"s": ["7", "42", "100", "1234567"]})
                 >>> ds.select(bt.col("s").str.zfill(4).alias("r")).to_pydict()
-                {'r': ['0007', '0042', '0100']}
+                {'r': ['0007', '0042', '0100', '1234567']}
         """
         width = require_int(width, func="str.zfill", arg="width")
-        return StrFunc("lpad", self._e, start=width, pattern="0")
+        padded = StrFunc("lpad", self._e, start=width, pattern="0")
+        return when(self.len_chars() >= lit(width)).then(self._e).otherwise(padded)
 
     def contains_any(self, patterns: Iterable[str]) -> Expr:
         """True where the string contains *any* of the literal ``patterns`` (an OR of substrings).
@@ -567,6 +574,11 @@ class _StrNamespace:
     def pad_start(self, width: int, fill: str = " ") -> StrFunc:
         """Left-pad to ``width`` — the Polars ``pad_start`` spelling of :meth:`lpad`.
 
+        Unlike Polars', this **truncates** an input already longer than `width`, because
+        it is :meth:`lpad` and SQL ``LPAD`` truncates. Polars returns the input unchanged.
+        Reach for :meth:`zfill` when you want the never-truncate behaviour with a ``'0'``
+        fill, or guard the width yourself.
+
         Args:
             width: Target character width.
             fill: Pad character, defaulting to a space.
@@ -586,6 +598,11 @@ class _StrNamespace:
 
     def pad_end(self, width: int, fill: str = " ") -> StrFunc:
         """Right-pad to ``width`` — the Polars ``pad_end`` spelling of :meth:`rpad`.
+
+        Unlike Polars', this **truncates** an input already longer than `width`, because
+        it is :meth:`rpad` and SQL ``RPAD`` truncates. Polars returns the input unchanged.
+        Reach for :meth:`zfill` when you want the never-truncate behaviour with a ``'0'``
+        fill, or guard the width yourself.
 
         Args:
             width: Target character width.
@@ -645,8 +662,11 @@ class _StrNamespace:
     def slice(self, offset: int, length: int | None = None) -> StrFunc:
         """0-based substring — the Polars ``str.slice`` spelling over :meth:`substr` (1-based).
 
+        A negative ``offset`` counts back from the end, so ``slice(-3, 2)`` takes the
+        third-and-second-to-last characters.
+
         Args:
-            offset: 0-based start index.
+            offset: 0-based start index; negative counts back from the end.
             length: Number of characters; to the end when ``None``.
 
         Returns:
@@ -659,9 +679,19 @@ class _StrNamespace:
                 >>> ds = bt.from_pydict({"s": ["hello"]})
                 >>> ds.select(r=bt.col("s").str.slice(1, 3)).to_pydict()
                 {'r': ['ell']}
+
+                >>> ds.select(r=bt.col("s").str.slice(-3, 2)).to_pydict()
+                {'r': ['ll']}
         """
         offset = require_int(offset, func="str.slice", arg="offset")
-        return self.substr(offset + 1, length)
+        # Only a *non-negative* offset shifts by one to reach `substr`'s 1-based
+        # indexing. A negative offset is already end-relative and means the same
+        # position in both spellings -- `substr` resolves it as `n + offset + 1`,
+        # which is exactly the 0-based `n + offset` this method promises. Adding one
+        # to it moved every negative slice one character towards the end, so
+        # `slice(-3, 2)` on "abcdef" silently returned "ef" instead of "de", and
+        # `slice(-1)` wrapped past the end to return the *whole* string.
+        return self.substr(offset + 1 if offset >= 0 else offset, length)
 
     def ljust(self, width: int, fill: str = " ") -> StrFunc:
         """Left-justify to ``width`` (pad right) — pandas' ``str.ljust`` (see :meth:`rpad`).
@@ -745,6 +775,11 @@ class _StrNamespace:
     def is_alpha(self) -> Expr:
         """True where the string is non-empty and all letters (pandas ``str.isalpha``).
 
+        "Letter" is the Unicode property, not the ASCII range: ``"ábç"`` and ``"日本"``
+        are alphabetic, as they are to pandas. Matching ``[A-Za-z]`` instead reads the
+        same on every ASCII example -- including a doctest -- and silently reports every
+        accented or non-Latin word as non-alphabetic.
+
         Returns:
             A Boolean expression, true for all-alphabetic strings.
 
@@ -752,30 +787,43 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["abc", "ab1"]})
+                >>> ds = bt.from_pydict({"s": ["abc", "ab1", "ábç"]})
                 >>> ds.select(r=bt.col("s").str.is_alpha()).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, True]}
         """
-        return self.regexp_matches("^[A-Za-z]+$")
+        return self.regexp_matches(r"^\p{Alphabetic}+$")
 
     def is_numeric(self) -> Expr:
-        """True where the string is non-empty and all digits (pandas ``str.isnumeric``).
+        """True where the string is non-empty and every character is a Unicode number.
+
+        Unicode number means general category ``N`` -- the ASCII digits, but also
+        superscripts (``"²"``), vulgar fractions (``"½"``) and other scripts' digits.
+        Restricting it to ``[0-9]`` reports every one of those as non-numeric.
+
+        This is *nearly* pandas ``str.isnumeric`` and the gap is stated rather than
+        papered over, the way :meth:`is_upper` states its own: pandas also accepts
+        characters whose Unicode *Numeric_Type* is numeric while their category is a
+        letter, such as the CJK numeral ``"一"``. That property is not expressible as a
+        regex character class, so ``"一"`` is false here and true in pandas.
 
         Returns:
-            A Boolean expression, true for all-digit strings.
+            A Boolean expression, true for all-numeric strings.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["123", "12a"]})
+                >>> ds = bt.from_pydict({"s": ["123", "12a", "½"]})
                 >>> ds.select(r=bt.col("s").str.is_numeric()).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, True]}
         """
-        return self.regexp_matches("^[0-9]+$")
+        return self.regexp_matches(r"^\p{N}+$")
 
     def is_alnum(self) -> Expr:
         """True where the string is non-empty and all letters or digits (pandas ``str.isalnum``).
+
+        Unicode-aware in both halves, for the reasons given on :meth:`is_alpha` and
+        :meth:`is_numeric`.
 
         Returns:
             A Boolean expression, true for all-alphanumeric strings.
@@ -784,11 +832,11 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["ab12", "ab 12"]})
+                >>> ds = bt.from_pydict({"s": ["ab12", "ab 12", "áb1"]})
                 >>> ds.select(r=bt.col("s").str.is_alnum()).to_pydict()
-                {'r': [True, False]}
+                {'r': [True, False, True]}
         """
-        return self.regexp_matches("^[A-Za-z0-9]+$")
+        return self.regexp_matches(r"^[\p{Alphabetic}\p{N}]+$")
 
     def is_space(self) -> Expr:
         """True where the string is non-empty and all whitespace (pandas ``str.isspace``).
@@ -1323,7 +1371,9 @@ class _StrNamespace:
                 {'r': ['one two']}
         """
         n = require_int(n, func="str.truncate_words", arg="n", minimum=1)
-        return self.regexp_extract(r"^(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
+        # Unanchored: the leftmost match begins at the first non-space, so leading
+        # whitespace is skipped rather than defeating the match and returning "".
+        return self.regexp_extract(r"(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
 
     def has_url(self) -> StrFunc:
         """True where the text contains an HTTP(S) URL.
@@ -2161,6 +2211,10 @@ class _StrNamespace:
     def first_word(self) -> StrFunc:
         """The first whitespace-separated token.
 
+        Leading whitespace is skipped, as it is by ``str.split()``. Anchoring the match
+        at ``^`` instead makes a string that merely *starts* with a space report no first
+        word at all -- and indented text is the common case, not the corner one.
+
         Returns:
             A Utf8 expression of the first word.
 
@@ -2168,11 +2222,11 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello big world"]})
+                >>> ds = bt.from_pydict({"s": ["hello big world", "   indented text"]})
                 >>> ds.select(r=bt.col("s").str.first_word()).to_pydict()
-                {'r': ['hello']}
+                {'r': ['hello', 'indented']}
         """
-        return self.regexp_extract(r"^\S+", 0)
+        return self.regexp_extract(r"\S+", 0)
 
     def slugify(self) -> StrFunc:
         """Lowercase and hyphenate into a URL/identifier-safe slug.
@@ -2351,6 +2405,11 @@ class _StrNamespace:
     def last_word(self) -> StrFunc:
         """The last whitespace-separated token.
 
+        Trailing whitespace is skipped, as it is by ``str.split()``. Requiring the token
+        to sit flush against ``$`` -- the mirror of the mistake :meth:`first_word`
+        documents -- makes every line with a trailing space or newline report no last
+        word, which is most lines read out of a text file.
+
         Returns:
             A Utf8 expression of the final word.
 
@@ -2358,11 +2417,11 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello big world"]})
+                >>> ds = bt.from_pydict({"s": ["hello big world", "trailing space  "]})
                 >>> ds.select(r=bt.col("s").str.last_word()).to_pydict()
-                {'r': ['world']}
+                {'r': ['world', 'space']}
         """
-        return self.regexp_extract(r"\S+$", 0)
+        return self.regexp_extract(r"(\S+)\s*$", 1)
 
     def is_url(self) -> StrFunc:
         """True where the whole string is a single HTTP(S) URL.
@@ -2657,6 +2716,12 @@ class _StrNamespace:
         identical, 0.0 nothing in common) based on matching characters and transpositions.
         The go-to metric for **entity resolution / record linkage** on short strings like
         names, where an edit distance is too coarse.
+
+        One case defies the "1.0 identical" reading and it is the one an empty column
+        hits: **two empty strings score 0.0**, not 1.0. That is what DuckDB answers, and
+        agreeing with it matters more here than the definition does -- a linkage score
+        that disagrees on the empty row is a different metric, not a rounding difference.
+        Guard empty strings yourself if you want them to match.
 
         Args:
             target: The literal string to score against.
@@ -4252,9 +4317,14 @@ _STR_ALIASES: dict[str, tuple[str, ...]] = {
     "title": (
         "initcap",
         "Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.",
-        '{"s": ["hello world"]}',
+        '{"s": ["hello world", "x1y2"]}',
         'bt.col("s").str.title()',
-        "{'r': ['Hello World']}",
+        "{'r': ['Hello World', 'X1y2']}",
+        "The name is pandas', the semantics are :meth:`initcap`'s, and they part company\n"
+        'on one rule: pandas treats a **digit** as a word boundary, so ``"x1y2"`` becomes\n'
+        '``"X1Y2"`` there and ``"X1y2"`` here, and ``"123abc"`` becomes ``"123Abc"``\n'
+        "there and is unchanged here. This follows SQL ``initcap`` (PostgreSQL, DuckDB),\n"
+        "for which a digit is an ordinary word character.",
     ),
     "escape_regex": (
         "regexp_escape",

@@ -56,6 +56,57 @@ An `Int32` overflow that would have wrapped in another engine does not wrap here
 the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it
 differs slightly from a `Float32` engine's answer, and it is the more accurate of the two.
 
+Widening moves the overflow boundary; it does not remove it. Scalar integer arithmetic
+**wraps** at the edge of `Int64`, silently, the way Rust and Polars do:
+
+```python
+big = bt.from_pydict({"x": [2**63 - 1]})
+print(big.select(r=bt.col("x") + 1).to_pydict()["r"])
+```
+
+That is deliberate rather than an oversight. The Cranelift JIT compiles `+` to a machine
+`iadd`, which wraps, and the interpreter is required to be bit-for-bit identical to the
+compiled tier on every expression it supports. An interpreter that raised where the JIT
+wrapped would make the same query answer differently depending on whether it compiled.
+
+Reductions do not inherit the convention, because nothing forces them to match a compiled
+kernel. `sum` over an `Int64` column raises rather than wrapping, and `cum_prod` returns
+`Float64` for an integer input for the same reason:
+
+```python
+try:
+    big.agg(total=bt.col("x").sum()).to_pydict()
+except Exception as exc:
+    print(type(exc).__name__)
+```
+
+Whether it raises depends on the total, not on the order the rows arrive in. A column whose
+large values cancel sums cleanly, even though adding them left to right passes outside
+`Int64` on the way:
+
+```python
+cancels = bt.from_pydict({"x": [2**62, 2**62, -(2**62), -(2**62)]})
+print(cancels.agg(total=bt.col("x").sum()).to_pydict()["total"])
+```
+
+That distinction matters more than it looks. How a table is split into batches, and across
+how many machines, is a scheduling decision. If a running total decided the outcome, the
+same query would succeed on one node and fail across several, on identical data.
+
+One limit remains, and it is worth knowing before you rely on the guarantee. Each partition
+is summed into its own `Int64` before the partitions are merged, so a partition whose *own*
+total exceeds `Int64` still raises, even when the totals across partitions would cancel. Row
+order inside a partition never decides anything. How the rows are divided between partitions
+still can, in that one case.
+
+So the rule to carry is: an integer *expression* can wrap, an integer *aggregate* cannot.
+If a column's values approach `2**63` and the arithmetic matters, cast before computing —
+`Float64` for magnitude, `decimal(38, s)` when the digits have to be exact.
+
+```python
+print(big.select(r=bt.col("x").cast("float64") + 1).to_pydict()["r"])
+```
+
 :::{warning}
 A schema assertion copied from a pandas or Spark test fails on the type *name*, and it
 reads as a data bug when it is not one. `int32` in the file is `int64` in the
@@ -354,6 +405,30 @@ print(ds.dtypes[:3])
 Because these are plan-derived, they are also the fastest way to catch a schema mistake:
 a bad `select` or a missing `output_columns` on a UDF fails here, before a single row is
 read.
+
+### The declared schema is what an empty result is made of
+
+The declared types are not only for inspection. A query that matches no rows has no data to
+take its types from, so the engine builds the empty result out of this same schema. A filter
+matching nothing still returns properly typed columns rather than null ones.
+
+The schema is all or nothing, so one column the control plane cannot type costs the whole
+projection its types and every column reports `null`. If `schema` says `null` for a column
+you know is typed, the cause is usually a different expression in the same `select`. A
+column carrying no type of its own, such as an all-null column read from JSON, adopts the
+type of whatever you combine it with; alone, a numeric function reads it as a double.
+
+```python
+src = bt.from_arrow(
+    pa.table({"v": pa.array([1.5, 2.5], pa.float64()), "u": pa.array([None, None], pa.null())})
+)
+nothing = src.filter(bt.col("v") > 100).select(total=bt.col("v").abs())
+print(nothing.schema, nothing.collect().schema, sep=" | ")
+# total: double | total: double
+print(src.select(adopts=bt.col("u") + bt.col("v"), alone=bt.col("u").abs()).schema)
+# adopts: double
+# alone: double
+```
 
 ## Nested types
 

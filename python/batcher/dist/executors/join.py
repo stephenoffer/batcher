@@ -191,8 +191,11 @@ def _shuffle_join(
 
     join_ir = reducer_ir if reducer_ir is not None else json.dumps(_join_reducer_ir(join))
 
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # Asked of the JOIN, keyed by each side's own source id: a side's prefix asked alone
+    # requires every column it has, because what narrows the read is the join's pruned
+    # `output` list above it. See `source_pushdown`.
+    left_proj, left_pred = source_pushdown(join, left_sid)
+    right_proj, right_pred = source_pushdown(join, right_sid)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -394,15 +397,10 @@ def _distributed_join_aggregate(
     driver (the dispatcher's fallback would collect it there). Forces the co-partition
     shuffle (never broadcast, whose range-split would scatter a group across chunks).
     """
-    agg_ir = agg.to_ir()
-    reducer_ir = json.dumps(
-        {
-            "op": "aggregate",
-            "input": _join_reducer_ir(join),
-            "group_keys": agg_ir["group_keys"],
-            "aggregates": agg_ir["aggregates"],
-        }
-    )
+    # The aggregate's own shape over the join bucket. Through `shape_ir()`, never a
+    # hand-listed field set: a field added to `Aggregate` would otherwise cross on the batch
+    # path and be silently dropped on this one.
+    reducer_ir = json.dumps({**agg.shape_ir(), "input": _join_reducer_ir(join)})
     return _shuffle_join(
         above,
         join,
@@ -488,8 +486,11 @@ def broadcast_probe_join(
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     join_ir = json.dumps(reducer_ir)
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # Asked of the JOIN, keyed by each side's own source id: a side's prefix asked alone
+    # requires every column it has, because what narrows the read is the join's pruned
+    # `output` list above it. See `source_pushdown`.
+    left_proj, left_pred = source_pushdown(node, left_sid)
+    right_proj, right_pred = source_pushdown(node, right_sid)
 
     # Materialize the build side once on the driver, then fall back to a shuffle join if
     # it is empty OR its *actual* size exceeds the broadcast threshold — a runtime guard

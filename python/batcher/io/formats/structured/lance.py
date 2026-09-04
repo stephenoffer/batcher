@@ -277,7 +277,7 @@ class LanceSink:
             manifest: Every file the write produced, merged across shards.
             path: The dataset root that was written.
         """
-        return None
+        return
 
     def write_partitioned(
         self,

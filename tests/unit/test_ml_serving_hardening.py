@@ -156,7 +156,7 @@ def test_serving_udf_splits_to_the_server_max_batch_size() -> None:
             seen.append(len(inputs["x"]))
             return {"y": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"], max_batch_size=4)()
+    udf = serving_udf(_Client, input_columns=["x"], max_batch_size=4)()
     out = udf(_batch(10))
 
     assert seen == [4, 4, 2]  # never exceeds the server's declared window
@@ -173,7 +173,7 @@ def test_serving_udf_pipelines_requests_in_flight() -> None:
             barrier.wait()  # only completes if a second request overlaps this one
             return {"y": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"], max_batch_size=1, pipeline_depth=2)()
+    udf = serving_udf(_Client, input_columns=["x"], max_batch_size=1, pipeline_depth=2)()
     # Serially this deadlocks until the barrier times out and raises BrokenBarrierError.
     out = udf(_batch(2))
 
@@ -189,7 +189,7 @@ def test_serving_udf_keeps_a_single_request_when_the_batch_fits() -> None:
             seen.append(len(inputs["x"]))
             return {"y": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"], max_batch_size=64)()
+    udf = serving_udf(_Client, input_columns=["x"], max_batch_size=64)()
     udf(_batch(8))
 
     assert seen == [8]
@@ -207,7 +207,7 @@ def test_serving_udf_replaces_an_output_column_the_batch_already_has() -> None:
         def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             return {"x": inputs["x"] * 2, "y": inputs["x"] + 1}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"], output_columns=["x", "y"])()
+    udf = serving_udf(_Client, input_columns=["x"], output_columns=["x", "y"])()
     out = udf(_batch(4))
 
     assert out.schema.names == ["x", "id", "y"]  # x replaced in place, y appended
@@ -230,7 +230,7 @@ def test_serving_udf_retries_a_transient_backend_failure(monkeypatch: pytest.Mon
                 raise ConnectionError("server restarting")
             return {"y": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: _Flaky(), input_columns=["x"], retries=2)()
+    udf = serving_udf(_Flaky, input_columns=["x"], retries=2)()
     out = udf(_batch(2))
 
     assert len(calls) == 3
@@ -247,7 +247,7 @@ def test_serving_udf_retry_exhaustion_raises_backend_error(
         def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             raise ConnectionError("refused")
 
-    udf = serving_udf(lambda: _Dead(), input_columns=["x"], retries=1)()
+    udf = serving_udf(_Dead, input_columns=["x"], retries=1)()
     with pytest.raises(BackendError):
         udf(_batch(2))
 
@@ -264,7 +264,7 @@ def test_serving_udf_does_not_retry_a_programming_error(
             calls.append(1)
             raise TypeError("bad shape")
 
-    udf = serving_udf(lambda: _Bug(), input_columns=["x"], retries=3)()
+    udf = serving_udf(_Bug, input_columns=["x"], retries=3)()
     with pytest.raises(TypeError):
         udf(_batch(2))
     assert calls == [1]
@@ -731,7 +731,7 @@ def test_serving_rejects_a_non_numeric_input_column_by_name():
         def predict(self, inputs):
             return {"out": np.array([1])}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["text"], output_columns=["out"])()
+    udf = serving_udf(_Client, input_columns=["text"], output_columns=["out"])()
     batch = pa.record_batch({"text": ["a", "b"]})
     with pytest.raises(BackendError, match="text"):
         udf(batch)
@@ -744,7 +744,7 @@ def test_serving_accepts_a_numeric_input_column():
         def predict(self, inputs):
             return {"out": inputs["x"] * 2}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"], output_columns=["out"])()
+    udf = serving_udf(_Client, input_columns=["x"], output_columns=["out"])()
     out = udf(pa.record_batch({"x": [1, 2, 3]}))
     assert out.column("out").to_pylist() == [2, 4, 6]
 
@@ -765,7 +765,7 @@ def test_serving_udf_closes_the_backend_connection_when_the_worker_is_done() -> 
         def close(self) -> None:
             closed.append(1)
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"])()
+    udf = serving_udf(_Client, input_columns=["x"])()
     udf(_batch(4))
     assert not closed  # not released while the worker is still serving batches
     udf.close()
@@ -777,5 +777,5 @@ def test_serving_udf_close_is_a_no_op_for_a_client_that_needs_no_teardown() -> N
         def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             return {"y": inputs["x"]}
 
-    udf = serving_udf(lambda: _Client(), input_columns=["x"])()
+    udf = serving_udf(_Client, input_columns=["x"])()
     udf.close()  # must not raise

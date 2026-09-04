@@ -61,14 +61,26 @@ def _commits(path) -> int:
     return len(deltalake.DeltaTable(str(path)).history())
 
 
-def test_each_micro_batch_is_exactly_one_transaction(tmp_path):
-    src, state, out, ckpt = (tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
+def test_each_micro_batch_is_exactly_one_transaction(cluster_tmp_path):
+    src, state, out, ckpt = (cluster_tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
     src.mkdir()
 
+    # One progress record per arrival, with a strictly increasing id — **not** `batch_id ==
+    # batch`. The ids are not consecutive across runs and are not meant to be: when a bounded
+    # source reports itself spent, `engine._checkpoint_drain` records its terminal position
+    # under the *next* batch id and commits it, so an `available_now` run that processes one
+    # micro-batch claims two ids and the next run starts two later (measured: 0, 2, 4). That
+    # marker carries no rows and writes to no sink, which is why the commit count below is
+    # still three — and it is exactly what stops a restart from replaying the whole final
+    # window, so the numbering is the deliberate cost of a correctness property.
+    seen: list[int] = []
     for batch in range(3):
         _land(src, batch)
         query = _stream(src, state, out, ckpt)
-        assert [p.batch_id for p in query.recent_progress] == [batch]
+        ids = [p.batch_id for p in query.recent_progress]
+        assert len(ids) == 1, f"arrival {batch} ran {len(ids)} micro-batches, expected one"
+        seen += ids
+    assert seen == sorted(seen) and len(set(seen)) == 3, f"batch ids must advance: {seen}"
 
     table = deltalake.DeltaTable(str(out))
     # Three arrivals, three micro-batches, three commits — even though several workers
@@ -78,8 +90,8 @@ def test_each_micro_batch_is_exactly_one_transaction(tmp_path):
     assert _ids(out) == sorted(i for b in range(3) for i in range(b * 1000, b * 1000 + 30))
 
 
-def test_a_replayed_micro_batch_adds_no_rows_and_no_transaction(tmp_path):
-    src, state, out, ckpt = (tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
+def test_a_replayed_micro_batch_adds_no_rows_and_no_transaction(cluster_tmp_path):
+    src, state, out, ckpt = (cluster_tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
     src.mkdir()
     _land(src, 0)
     _stream(src, state, out, ckpt)
@@ -92,7 +104,7 @@ def test_a_replayed_micro_batch_adds_no_rows_and_no_transaction(tmp_path):
     assert _commits(out) == before_commits
 
 
-def test_an_interrupted_epoch_is_replayed_not_lost(tmp_path):
+def test_an_interrupted_epoch_is_replayed_not_lost(cluster_tmp_path):
     """A crash between discovery and the commit must not swallow the files.
 
     Discovery used to mark a file seen the moment it was *listed*, so a query that died
@@ -101,7 +113,7 @@ def test_an_interrupted_epoch_is_replayed_not_lost(tmp_path):
     """
     from batcher.io.formats.streaming.autoloader import IncrementalFileSource
 
-    src, state = tmp_path / "src", tmp_path / "state"
+    src, state = cluster_tmp_path / "src", cluster_tmp_path / "state"
     src.mkdir()
     _land(src, 0)
 
@@ -118,10 +130,11 @@ def test_an_interrupted_epoch_is_replayed_not_lost(tmp_path):
     assert IncrementalFileSource(str(src), "parquet", state_dir=str(state)).discover() == []
 
 
-def test_distributed_result_matches_single_node(tmp_path):
-    src, state_d, state_s = tmp_path / "src", tmp_path / "sd", tmp_path / "ss"
-    dist_out, single_out = tmp_path / "dist", tmp_path / "single"
-    ck_d, ck_s = tmp_path / "ckd", tmp_path / "cks"
+def test_distributed_result_matches_single_node(cluster_tmp_path):
+    src = cluster_tmp_path / "src"
+    state_d, state_s = cluster_tmp_path / "sd", cluster_tmp_path / "ss"
+    dist_out, single_out = cluster_tmp_path / "dist", cluster_tmp_path / "single"
+    ck_d, ck_s = cluster_tmp_path / "ckd", cluster_tmp_path / "cks"
     src.mkdir()
     for batch in range(2):
         _land(src, batch, files=4)
@@ -135,7 +148,7 @@ def test_distributed_result_matches_single_node(tmp_path):
     assert _ids(dist_out) == _ids(single_out)
 
 
-def test_distributed_streaming_aggregate_merges_worker_partials(tmp_path):
+def test_distributed_streaming_aggregate_merges_worker_partials(cluster_tmp_path):
     """A streaming aggregation fans out as `partial` and merges with `combine`.
 
     Each worker aggregates only its share of the epoch and returns a partial state — small,
@@ -143,7 +156,7 @@ def test_distributed_streaming_aggregate_merges_worker_partials(tmp_path):
     answer must be the one a single node computes, because it is the same mergeable operator
     (`partial → combine → finalize`), not a second implementation of it.
     """
-    src, state, out, ckpt = (tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
+    src, state, out, ckpt = (cluster_tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
     src.mkdir()
     _land(src, 0, files=4)
 
@@ -159,7 +172,7 @@ def test_distributed_streaming_aggregate_merges_worker_partials(tmp_path):
     )
 
 
-def test_a_continuous_stream_spans_arrivals_and_stops_on_demand(tmp_path):
+def test_a_continuous_stream_spans_arrivals_and_stops_on_demand(cluster_tmp_path):
     """One long-running query, several epochs — an idle moment is not the end of a stream.
 
     This is what makes it *continuous* rather than a drain re-run by hand: the query stays
@@ -167,7 +180,7 @@ def test_a_continuous_stream_spans_arrivals_and_stops_on_demand(tmp_path):
     its own transaction.
     """
 
-    src, state, out, ckpt = (tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
+    src, state, out, ckpt = (cluster_tmp_path / n for n in ("src", "state", "tbl", "ckpt"))
     src.mkdir()
     _land(src, 0, files=2)
 
@@ -203,16 +216,16 @@ def _wait_for(predicate, timeout: float = 30.0) -> None:
     raise AssertionError("timed out waiting for the stream to make progress")
 
 
-def test_distributed_streaming_to_iceberg_is_refused_not_downgraded(tmp_path):
+def test_distributed_streaming_to_iceberg_is_refused_not_downgraded(cluster_tmp_path):
     """Iceberg has no transaction-id check, so a replay there would duplicate rows."""
-    src, state = tmp_path / "src", tmp_path / "state"
+    src, state = cluster_tmp_path / "src", cluster_tmp_path / "state"
     src.mkdir()
     _land(src, 0, files=1)
 
     ds = bt.read.files_incremental(str(src), "parquet", state_dir=str(state))
     with pytest.raises(PlanError, match="transaction-id check"):
         ds.write(
-            str(tmp_path / "ice"),
+            str(cluster_tmp_path / "ice"),
             format="iceberg",
             trigger=bt.Trigger.processing_time(0),
             distributed=True,

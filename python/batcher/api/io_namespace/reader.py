@@ -1764,7 +1764,12 @@ class Reader:
         Args:
             path: Directory or glob to watch for new files.
             file_format: Underlying format of those files (e.g. ``"parquet"``, ``"json"``).
-            opts: ``state_dir=`` for the durable seen-file store,
+            opts: ``state_dir=`` for the durable seen-file store — which files have
+                already been ingested. It defaults to a stable directory under
+                ``$BATCHER_HOME`` derived from `path` and `file_format`, so a restarted
+                query resumes rather than re-ingesting the directory; set it explicitly
+                to keep the bookkeeping beside the data (a lakehouse layout) or to run
+                two independent streams over one directory. Also
                 ``max_files_per_trigger=`` / ``max_bytes_per_trigger=`` for backpressure,
                 and any further options forwarded to the underlying file reader.
 

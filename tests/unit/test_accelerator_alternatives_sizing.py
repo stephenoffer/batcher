@@ -162,6 +162,14 @@ def _recommend(monkeypatch, model_gb, nodes):
         __import__("sys").modules, "ray", types.SimpleNamespace(is_initialized=lambda: True)
     )
     monkeypatch.setattr(scaling, "node_classes", lambda: nodes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     return accel.recommend_accelerator_type(model_gb)
 
 

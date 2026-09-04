@@ -69,7 +69,16 @@ def _exact_bounds(stat: ColumnStat) -> bool:
     return stat.provenance is Provenance.EXACT and stat.min is not None and stat.max is not None
 
 
-@rule(name="skip_sort_of_single_row", phase=Phase.REWRITE, matches=(Sort,))
+@rule(
+    name="skip_sort_of_single_row",
+    phase=Phase.REWRITE,
+    matches=(Sort,),
+    # The exact row count this is gated on can only be *established* by the pushdown and
+    # join-order phases that run after REWRITE — an aggregate that becomes provably
+    # single-row, a limit that becomes exact. 9 of the 99 TPC-DS queries, 9 sorts, each a
+    # pipeline breaker. See `Rule.recanonicalize`.
+    recanonicalize=True,
+)
 def skip_sort_of_single_row(node: Sort, ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a `Sort` whose input is provably no larger than one row.
 

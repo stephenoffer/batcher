@@ -1426,10 +1426,17 @@ def test_distributed_global_window_matches_single_node(cluster_tmp_path, transpo
         assert single.schema == dist.schema
         assert rowset(single) == rowset(dist)
 
-    # A global window outside the offsettable set (`lag` reads rows its bucket does not
-    # hold) still has no distributed path; it must raise, not quietly fall back to one node.
+    # A global window outside the offsettable set still has no distributed path; it must
+    # raise, not quietly fall back to one node.
+    #
+    # The control is `lead`, not `lag`. A global `lag` used to be the example here and now
+    # routes — its source rows are the bounded set immediately behind it, which the ordered
+    # buckets carry across their cut (`dist/global_window/boundary.py`). `lead` reads the
+    # bucket the offset walk has not reached, so no rolling tail carries it. This is the same
+    # move `ed4b39ce` made in `tests/unit/test_dist_routing_without_ray.py`, which is the
+    # other place a table of "what cannot be distributed" outlived the gap it described.
     with pytest.raises(PlanError):
-        bt.read.parquet(path).with_columns(p=col("v").shift(1).over(order_by="v")).collect(
+        bt.read.parquet(path).with_columns(p=bt.lead(col("v"), 1).over(order_by="v")).collect(
             distributed=True, num_workers=4, transport=transport
         )
 
@@ -1614,11 +1621,26 @@ def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(cluster_tm
         assert rowset(single) == rowset(dist)  # VALUES, not just row counts
 
 
-def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(cluster_tmp_path):
-    """With staging explicitly disabled, a breaker-under-breaker must FAIL, never compute.
+def test_an_unsound_one_shot_shape_never_returns_wrong_values(cluster_tmp_path):
+    """With staging explicitly disabled, a breaker-under-breaker must not compute *wrongly*.
 
-    Silently evaluating the inner plan per partition is the wrong-answer bug above; refusing
-    is the only safe one-shot answer, and the error says how to fix it.
+    Silently evaluating the inner plan once per partition is the wrong-answer bug the cases
+    above enumerate, and it is the thing that must never happen. Refusing used to be the only
+    safe answer available, so this test asserted the `PlanError`.
+
+    It is no longer the only one. `orchestration.stages._stage_if_optimization_requires_it`
+    asks the staging question of the plan **Kyber produced**, so a shape the one-shot
+    dispatcher cannot route is staged even when the caller passed `adaptive=False` — which is
+    what the refusal's own message always told the caller to do. Asserting the raise now
+    pins the weaker of the two guarantees, and would fail the moment the engine got better at
+    the query rather than worse at it.
+
+    So the claim is the invariant instead: the answer equals the single-node answer. A
+    per-partition evaluation would return a different one, which is exactly what a raise was
+    standing in for. The refusal is still checked, on a shape that genuinely has no
+    decomposition — see the `lead` control in
+    `test_distributed_global_window_matches_single_node` — so "refusals are still visible"
+    keeps its own coverage rather than riding on this test.
     """
     import pyarrow.parquet as pq
 
@@ -1629,10 +1651,15 @@ def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(cluste
     path = str(cluster_tmp_path / "m.parquet")
     pq.write_table(t, path, row_group_size=1_000)
 
-    with pytest.raises(PlanError, match="stage by stage"):
-        bt.read.parquet(path).limit(100).group_by("k").agg(n=count()).collect(
-            distributed=True, num_workers=4, transport="disk", adaptive=False
-        )
+    def build():
+        return bt.read.parquet(path).limit(100).group_by("k").agg(n=count())
+
+    single = build().collect(distributed=False)
+    dist = build().collect(distributed=True, num_workers=4, transport="disk", adaptive=False)
+    assert single.schema == dist.schema
+    assert _norm(single) == _norm(dist)
+    # The shape really is the unsound one: 100 rows kept globally, not 100 per partition.
+    assert sum(r["n"] for r in dist.to_pylist()) == 100
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
@@ -1792,12 +1819,13 @@ def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(clust
     )
     run(unioned.group_by("k").agg(m=count()).filter(col("m") > 0).sort("k"))
 
-    # The aggregate over the union cannot feed a join, even against a plain scan.
-    with pytest.raises(PlanError, match="no path for this plan shape"):
+    # The aggregate over the union feeds a join only stage by stage, so with staging off
+    # the one-shot dispatcher refuses -- and says which of the two it is.
+    with pytest.raises(PlanError, match="runs this plan shape stage by stage"):
         run(unioned.group_by("k").agg(m=count()).join(scan_side, on="k"))
 
-    # ...nor a second aggregate.
-    with pytest.raises(PlanError, match="no path for this plan shape"):
+    # ...and the same for a second aggregate beneath the first.
+    with pytest.raises(PlanError, match="runs this plan shape stage by stage"):
         run(unioned.group_by("k").agg(m=count()).group_by("m").agg(c=count()))
 
     # Materializing between the two clears it, which is the documented workaround.

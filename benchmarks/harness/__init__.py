@@ -35,31 +35,51 @@ from .compare import (
     rowsets_match,
     to_rowset,
 )
+from .divergences import KNOWN_DIVERGENCES, Divergence, explain
 from .names import canonical_column_name, canonical_names
 from .order import OrderKey, order_keys_of, order_violation
 from .report import RESULT_PREFIX, emit_result, print_table, run_isolated
+from .summary import (
+    Summary,
+    case_ratios,
+    format_repeats,
+    format_summary,
+    format_unstable,
+    geomean,
+    summarize,
+)
 
 __all__ = [
     "FLOAT_ATOL",
     "FLOAT_RTOL",
     "GRID_ATOL",
+    "KNOWN_DIVERGENCES",
     "RESULT_PREFIX",
     "ROUND_DECIMALS",
     "CompareResult",
+    "Divergence",
     "EngineResult",
     "OrderKey",
     "RowSet",
+    "Summary",
     "bench",
     "canonical_column_name",
     "canonical_names",
+    "case_ratios",
     "column_classes",
     "compare",
     "emit_result",
+    "explain",
+    "format_repeats",
+    "format_summary",
+    "format_unstable",
+    "geomean",
     "order_keys_of",
     "order_violation",
     "print_table",
     "results_match",
     "rowsets_match",
     "run_isolated",
+    "summarize",
     "to_rowset",
 ]

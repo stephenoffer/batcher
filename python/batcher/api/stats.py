@@ -12,12 +12,15 @@ is a fact, not a guess.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from batcher._internal.humanize import byte_size, display_width, duration_ms, pad, percent, plural
 from batcher._internal.mathx import safe_div
 from batcher._internal.optional import require
 from batcher.plan.profile import QueryUsage
+from batcher.plan.profile.render.cells import share_bar
 
 if TYPE_CHECKING:
     from batcher.plan.profile import QueryProfile
@@ -244,21 +247,28 @@ class RunStats:
         Returns:
             A short multi-line summary, ready to print or log.
         """
-        spill = f", {self.spill_count} operator(s) spilled" if self.spill_count else ""
+        spill = f", {plural(self.spill_count, 'operator')} spilled" if self.spill_count else ""
         lines = [
-            f"wall time: {self.total_ms:.2f} ms across {len(self.ops)} operator(s)",
+            f"wall time: {self.total_ms:.2f} ms across {plural(len(self.ops), 'operator')}",
             f"rows: {self.rows_in:,} read -> {self.rows_out:,} out"
-            f", peak output {self.peak_memory_bytes / 1e6:.1f} MB{spill}",
+            f", peak output {byte_size(self.peak_memory_bytes)}{spill}",
             self.bottleneck_summary(),
         ]
+        wall = self.wall_clock_summary()
+        if wall:
+            lines.append(wall)
         # Only when the platform reported it. A line reading "0.0 cores busy" on a host that
         # cannot measure CPU time would say the query was idle, which is the opposite of
         # "unmeasured" and exactly the misreading the zero convention exists to prevent.
         if self.usage.measured:
             lines.append(
                 f"machine: {self.usage.cpu_ms:.1f} ms CPU"
-                f" ({self.usage.cores_busy:.1f} core(s) busy)"
-                f", {self.usage.peak_rss_bytes / 1e6:.1f} MB resident growth"
+                f" ({self.usage.cores_busy:.1f} cores busy)"
+                + (
+                    f", {byte_size(self.usage.peak_rss_bytes)} resident growth"
+                    if self.usage.peak_rss_bytes
+                    else ""
+                )
             )
         actionable = [f for f in self.findings if f.get("severity") in ("critical", "warning")]
         if actionable:
@@ -378,40 +388,114 @@ class RunStats:
         """One line naming the dominant operator and whether the run is I/O- or
         compute-bound — the triage Ray users do by hand from ``ds.stats()`` logs.
 
-        The share is against wall time for a sequential run, and against the **total
-        operator time** when the operators overlapped. A pipelined stage chain runs its
-        stages concurrently on their own threads, so their times legitimately sum past the
-        wall clock; dividing by wall time there produced shares like "325%", which reads as
-        a bug rather than as concurrency. Naming which denominator was used keeps the two
-        readings from being confused for each other.
+        The share is against **total operator time**, always, and the line says so. Two
+        denominators were in use before: wall time for a run whose stages did not overlap,
+        and operator time for one whose did. Both were defensible in isolation and together
+        they were not, because neither matches what the per-operator table above shows and
+        because wall time is not the operators' denominator in the first place: it includes
+        planning, optimization, admission and result assembly, which on a short query is
+        most of it. The same operator therefore appeared as "71%" in the table and "4% of
+        wall time" here. `wall_clock_summary` reports the split that reading actually needs.
+
+        Returns:
+            One line naming the operator, its share, and the boundedness call.
         """
         b = self.bottleneck
         if b is None:
             return "no operators executed"
         busy = sum(o.elapsed_ms for o in self.ops)
-        overlapped = busy > self.total_ms
-        basis = busy if overlapped else self.total_ms
-        share = (b.elapsed_ms / basis * 100.0) if basis else 0.0
-        of = "of operator time (stages overlap)" if overlapped else "of wall time"
+        share = (b.elapsed_ms / busy * 100.0) if busy else 0.0
         kind = "I/O-bound (read dominates)" if b.kind == "scan" else f"compute-bound ({b.kind})"
         spill = " — SPILLED to disk" if self.spilled else ""
-        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% {of} — {kind}{spill}"
+        return f"bottleneck: {b.kind} (op {b.op_id}), {share:.0f}% of operator time — {kind}{spill}"
+
+    def wall_clock_summary(self) -> str:
+        """How the wall clock divides between the operators and everything else.
+
+        The half of a run no per-operator table can show. A query that spends 200 µs in its
+        operators and 40 ms getting there is not an operator problem, and until this line
+        existed the only evidence of that was a bottleneck percentage that looked broken.
+
+        Stages that overlap can sum past the wall clock, which is concurrency rather than
+        an error; the line says so instead of reporting a negative remainder.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
+                >>> _ = ds.collect()
+                >>> ds.stats().wall_clock_summary().startswith("operators:")
+                True
+
+        Returns:
+            One line, or ``""`` when nothing was measured.
+        """
+        busy = sum(o.elapsed_ms for o in self.ops)
+        if not self.total_ms:
+            return ""
+        share = percent(busy / self.total_ms)
+        if busy > self.total_ms:
+            return (
+                f"operators: {duration_ms(busy)} of {duration_ms(self.total_ms)} wall clock "
+                f"({share}) — stages overlapped, so operator time sums past the clock"
+            )
+        head = (
+            f"operators: {duration_ms(busy)} of {duration_ms(self.total_ms)} wall clock ({share})"
+        )
+        rest = self.total_ms - busy
+        if rest <= 0:
+            return head
+        return (
+            f"{head}; {duration_ms(rest)} elsewhere "
+            "(planning, optimization, admission, result assembly)"
+        )
 
     def __str__(self) -> str:
-        header = (
-            f"{'op':>3}  {'kind':<12}{'rows_in':>12}{'rows_out':>12}"
-            f"{'ms':>10}{'out_kb':>12}  backend"
-        )
-        lines = [header, "-" * len(header)]
-        for o in self.ops:
-            lines.append(
-                f"{o.op_id:>3}  {o.kind:<12}{o.rows_in:>12}{o.rows_out:>12}"
-                f"{o.elapsed_ms:>10.2f}{o.result_bytes // 1024:>12}  "
-                f"{o.backend}{' [spill]' if o.spilled else ''}"
-            )
-        lines.append("-" * len(header))
-        lines.append(f"total: {self.total_ms:.2f} ms, {self.rows} rows out")
+        """The per-operator table, then the totals, then anything worth acting on.
+
+        Column widths come from the data and the padding is display-width-correct
+        (`_internal.humanize`), so a long operator kind or a stage named in a
+        double-width script shifts nothing to its right. The size column reports bytes in
+        binary units rather than the integer kilobytes it used to: ``result_bytes // 1024``
+        floors every operator under a mebibyte to ``0``, which on a small query made the
+        whole column read zero and told a reader the run produced nothing.
+        """
+        share_basis = sum(o.elapsed_ms for o in self.ops)
+        head = ["OP", "KIND", "ROWS IN", "ROWS OUT", "TIME", "OP SHARE", "OUT", "BACKEND"]
+        rows = [
+            [
+                str(o.op_id),
+                o.kind,
+                f"{o.rows_in:,}",
+                f"{o.rows_out:,}",
+                duration_ms(o.elapsed_ms),
+                _share_cell(o.elapsed_ms, share_basis),
+                byte_size(o.result_bytes),
+                o.backend + (" [spill]" if o.spilled else ""),
+            ]
+            for o in self.ops
+        ]
+        widths = [
+            max(display_width(cell) for cell in (head[c], *(r[c] for r in rows)))
+            for c in range(len(head))
+        ]
+        aligned = ("right", "left", "right", "right", "right", "left", "right", "left")
+
+        def line(cells: Sequence[str]) -> str:
+            return "  ".join(
+                pad(cell, width, align=side)
+                for cell, width, side in zip(cells, widths, aligned, strict=True)
+            ).rstrip()
+
+        body = [line(head), *(line(r) for r in rows)]
+        rule = "\u2500" * max(display_width(text) for text in body)
+        lines = [body[0], rule, *body[1:], rule]
+        lines.append(f"total: {self.total_ms:.2f} ms, {plural(self.rows, 'row')} out")
         lines.append(self.bottleneck_summary())
+        wall = self.wall_clock_summary()
+        if wall:
+            lines.append(wall)
         # Only warnings and criticals are printed. An `info` finding is context for someone
         # already investigating, and printing it under every healthy run is how a reader
         # learns to skip this section — which costs them the one that mattered.
@@ -423,6 +507,16 @@ class RunStats:
                 lines.append(f"  [{finding.get('severity')}] {finding.get('title')}")
                 lines.append(f"      {finding.get('action')}")
         return "\n".join(lines)
+
+
+def _share_cell(elapsed_ms: float, basis: float) -> str:
+    """One operator's share of the run, as a bar and a percentage.
+
+    The bar is what makes the column scannable: a list of percentages has to be read value
+    by value, while a column of bars shows the distribution at a glance.
+    """
+    share = elapsed_ms / basis if basis else 0.0
+    return f"{share_bar(share, 6, True)} {pad(percent(share), 4, align='right')}"
 
 
 def _findings(profile: QueryProfile) -> list[dict[str, object]]:

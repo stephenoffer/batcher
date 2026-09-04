@@ -197,11 +197,13 @@ pub fn segmentize(g: &Geometry, max_len: f64) -> GeoResult<Geometry> {
 ///
 /// Asymmetric on purpose, like PostGIS `ST_ClosestPoint`: it returns a point *on the
 /// first geometry*, which is what a snap-to-road or snap-to-boundary step needs.
+#[must_use]
 pub fn closest_point(g: &Geometry, other: &Geometry) -> Option<Geometry> {
     closest_pair(g, other).map(|(p, _)| Geometry::Point(Some(p)))
 }
 
 /// The two-point line joining the closest positions of two geometries.
+#[must_use]
 pub fn shortest_line(a: &Geometry, b: &Geometry) -> Option<Geometry> {
     closest_pair(a, b).map(|(p, q)| Geometry::LineString(vec![p, q]))
 }
@@ -318,6 +320,7 @@ fn closest_between(x: Elem, y: Elem) -> (Coord, Coord) {
 /// Unlike a centroid, which can fall outside a crescent or in a hole, this is always
 /// *on* the geometry. It is what you label a shape with, and what you use as a
 /// representative point for a spatial join that must not miss.
+#[must_use]
 pub fn point_on_surface(g: &Geometry) -> Option<Geometry> {
     crate::algo::relate::interior_point(g).map(|c| Geometry::Point(Some(c)))
 }

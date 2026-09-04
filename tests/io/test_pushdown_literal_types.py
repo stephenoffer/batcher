@@ -65,19 +65,54 @@ def pushed(tmp_path_factory, table):
     return bt.read.parquet(root)
 
 
+#: Sentinel for "the engine refused this comparison", so a decline is a *value* the test
+#: can assert on rather than control flow that removes the test from the run.
+_DECLINED = object()
+
+
+def _answer(dataset, build, column):
+    """The rows `dataset` returns for this predicate, or `_DECLINED` if it refuses.
+
+    Only `RuntimeError` is treated as a decline: that is what the FFI raises for every one
+    of the 48 unsupported pairs here, while a `ColumnNotFoundError`, a `PlanError` or an
+    `AssertionError` means something else broke and must reach the report as a failure.
+    """
+    try:
+        return sorted(dataset.filter(build(bt.col(column))).to_pydict()["n"])
+    except RuntimeError:
+        return _DECLINED
+
+
 @pytest.mark.parametrize("column", sorted(_COLUMNS))
 @pytest.mark.parametrize("literal", sorted(_LITERALS))
 @pytest.mark.parametrize("op", ["eq", "gt"])
 def test_pushdown_answers_exactly_what_the_engine_answers(pushed, table, column, literal, op):
     value = _LITERALS[literal]
     build = (lambda c: c == value) if op == "eq" else (lambda c: c > value)
-    try:
-        wanted = sorted(bt.from_arrow(table).filter(build(bt.col(column))).to_pydict()["n"])
-    except Exception:
-        pytest.skip("the engine itself declines this comparison; pushdown is not the subject")
-    # No `pytest.raises` anywhere: an Arrow kernel error here IS the failure being guarded
-    # against, and letting it propagate names the offending pair in the test id.
-    assert sorted(pushed.filter(build(bt.col(column))).to_pydict()["n"]) == wanted
+
+    # 48 of the 98 pairs are comparisons the engine declines outright (`bo > 'b'`). This
+    # used to `pytest.skip` on them, which is the wrong shape twice over: it threw away the
+    # only interesting half of the contract — that pushdown must decline *exactly where the
+    # engine does*, never silently answer a comparison the engine refuses — and it did so
+    # behind a bare `except Exception`, so an engine regression on a pair that works today
+    # would have quietly removed it from the run instead of failing. `lint-skips` reads
+    # module-level guards by design and cannot see a skip taken mid-body, so nothing would
+    # have reported the loss.
+    #
+    # Both paths are therefore run and their *verdicts* compared. Measured on this tree:
+    # all 48 decline on both sides and the other 50 answer on both sides.
+    wanted = _answer(bt.from_arrow(table), build, column)
+    got = _answer(pushed, build, column)
+    if wanted is _DECLINED:
+        assert got is _DECLINED, (
+            f"the engine declines {column} vs {literal!r} but the pushdown path answered "
+            f"{got!r} — a scan that evaluates a term the engine itself refuses is the "
+            f"silently-wrong answer this file exists to catch"
+        )
+        return
+    # No `pytest.raises` anywhere on the answering half: an Arrow kernel error there IS the
+    # failure being guarded against, and letting it propagate names the pair in the test id.
+    assert got == wanted
 
 
 @pytest.mark.parametrize(

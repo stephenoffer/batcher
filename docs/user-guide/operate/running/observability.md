@@ -7,7 +7,7 @@ of that bus:
 
 | Surface | What it is for | Default |
 | --- | --- | --- |
-| Terminal progress bar | watching a query run, interactively | on in a real terminal |
+| {doc}`Terminal progress bar <terminal>` | watching a query run, interactively | on in a real terminal |
 | Structured logs | what the engine decided, and why | `WARNING` and above |
 | Web dashboard | plans, per-operator timings, throughput, live logs | off ({py:func}`bt.start_ui() <batcher.start_ui>`) |
 | JSON event log | the durable per-query artifact, on disk | on |
@@ -79,56 +79,10 @@ makes the precedence unambiguous, which is why it is the default rather than `"W
 
 ## The terminal
 
-In an interactive terminal, a query renders a live status line carrying the spinner,
-operator, progress bar, rows, throughput, a throughput sparkline, elapsed time, and an ETA
-when one can be known:
-
-```text
-⠹  filter            streaming     ▕████████████▋░░░░░░░░░░░▏  62%   241.6K rows   1.0M/s  ▁▃▅▆██▇  238ms  ETA 143ms
-```
-
-When it finishes, the line collapses to one aligned summary:
-
-```text
-✔  filter            383.5K rows  ·  400ms  ·  959.9K rows/s
-✘  join              PlanError: unknown column 'nope'
-```
-
-Three details worth knowing, because they are deliberate:
-
-- **The bar advances in eighth-cells**, giving it eight times the resolution of its width,
-  which is what makes it read as motion rather than as stepping blocks.
-- **Live row counts only exist on the streaming path.** {py:meth}`iter_batches <batcher.Dataset.iter_batches>` surfaces each Arrow
-  batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
-  the profile at the end, so its bar shows an indeterminate sweep and its counts appear in the
-  summary line.
-- **Nothing is invented.** With no row estimate, the bar shows an honest indeterminate
-  sweep instead of a fabricated percentage, and the ETA is omitted rather than guessed.
-  That is the common case, because Kyber leaves an operator unbudgeted whenever the source
-  size is unknown.
-
-Rendering degrades by detected capability rather than assuming one. Color falls back from
-truecolor to 256-color to 16-color to none, and block-drawing falls back to ASCII.
-`NO_COLOR`, `FORCE_COLOR`/`CLICOLOR_FORCE`,
-`COLORTERM`, and `TERM=dumb` are all honored, and the ASCII forms are chosen so a `LANG=C`
-terminal gets readable output rather than mojibake.
-
-This is **automatic and self-suppressing**. Batcher renders escape codes only into a real
-TTY that has not asked for plain output, so a script whose output you redirect to a file,
-or that runs under CI, gets no bar and no control characters. Set it explicitly when you
-need to:
-
-```python
-import batcher as bt
-from batcher.config import ObservabilityConfig, active_config, set_config
-
-set_config(active_config().replace(
-    observability=ObservabilityConfig(progress="off")   # "auto" | "on" | "off"; None derives it
-))
-```
-
-`progress="on"` forces rendering, which helps inside a pseudo-terminal your tooling owns.
-`"off"` disables it entirely. The `NO_COLOR` and `TERM=dumb` conventions are honored.
+In an interactive terminal a query renders a live status line naming the phase it is in, and
+collapses to one aligned summary when it finishes. {doc}`The terminal <terminal>` covers
+what each field means, how the display degrades on a terminal that cannot draw it, and when
+it suppresses itself.
 
 ## Logs
 
@@ -184,16 +138,34 @@ practice of carrying their unit, so the field is `duration_ms` rather than `dura
 number's meaning never depends on surrounding prose.
 
 ```text
-14:19:25  INFO     kyber        join reorder  tables=3 cost=1.25 note="two words"
+14:19:25  INFO     kyber        join reorder  tables=3 cost=1.25 note="two words" query_id=20240502-141925-000003
 ```
 
 ```json
-{"time": "2024-05-02T14:19:25Z", "level": "INFO", "logger": "batcher.kyber",
- "message": "join reorder", "fields": {"tables": 3, "cost": 1.25}}
+{"time": "2024-05-02T14:19:25.412Z", "level": "INFO", "logger": "batcher.kyber",
+ "message": "join reorder", "query_id": "20240502-141925-000003", "pid": 41207,
+ "thread": "MainThread", "fields": {"tables": 3, "cost": 1.25}}
 ```
 
 That is why the same record is greppable at the terminal *and* queryable in your log
 platform without anyone re-parsing prose.
+
+Four fields are attached for you rather than by the call site:
+
+`query_id` names the query in flight, read from the ambient scope when the record is
+formatted rather than passed in — so a plain `logger.warning` deep inside a subsystem is
+correlated too. It is the same id the {doc}`event log <observability>` document, the plan
+DAG, and the dashboard row use, which is what makes a log line joinable to the plan and the
+profile that describe the same run.
+
+`time` is RFC 3339 in UTC. Log platforms reject a local-time, comma-separated stamp and
+fall back to ingest time, which silently reorders a stream whose whole value is its order.
+
+`pid` and `thread` are what make a distributed stream readable: the same subsystem logs
+from the driver and from every worker into one index.
+
+An exception is carried as `exc_type` and `exc_message` alongside the formatted traceback,
+so you can alert on a class of failure instead of matching a regex against a sentence.
 
 The `log_level` also drives the Rust data plane's tracing, so raising it to `DEBUG` reveals
 the engine's per-operator work, not only the Python control plane's.
@@ -374,6 +346,34 @@ set_config(active_config().replace(
 This needs the `otel` extra, `pip install 'batcher-engine[otel]'`, plus a provider the host
 app sets up. It reuses the same measured profile as the event log, so enabling it adds the
 span emit and no extra measurement.
+
+The spans carry real timestamps. Emission happens after the query has finished, so the
+query span is placed over the interval the query actually occupied and each operator span
+is given its measured duration — a waterfall ranks the operators by length, the same
+ranking the `OP SHARE` column shows in
+{doc}`explain(analyze=True) </user-guide/operate/tuning/explain-plans>`.
+
+What is deliberately *not* reconstructed is where each operator sat inside that interval.
+The profile records a duration per operator and no start offset, so every operator span
+begins at the query's start. Laying them out end to end would look more like a waterfall
+and would be an invention, and on the streaming executor, where operators genuinely
+interleave, a wrong one.
+
+A query that raises produces a span too, with the exception recorded on it and the span
+status set to `ERROR`. Without it the one class of run you most want to find in a trace
+backend would be the only class that was never there, and a latency histogram built from
+these spans would silently exclude every timeout.
+
+| Attribute | On | Meaning |
+| --- | --- | --- |
+| `batcher.query_id` | query | the id shared with the event log, the dashboard, and every log record from the run |
+| `batcher.rows`, `batcher.total_ms` | query | what the query returned and how long it took |
+| `batcher.bottleneck.kind`, `.op_id` | query | the dominant operator, so a backend can group by it |
+| `batcher.cores_busy`, `batcher.cpu_ms`, `batcher.peak_rss_bytes` | query | what the run cost the machine; filter on `batcher.cores_busy < 2` to find queries that failed to parallelize |
+| `batcher.ok` | query | `false` on a failed query; absent on a successful one |
+| `batcher.op.kind`, `.rows_in`, `.rows_out`, `.elapsed_ms` | operator | the same per-operator facts `explain(analyze=True)` prints |
+| `batcher.op.spill_bytes` | operator | present only when the operator spilled, because a 1 GiB spill and a 100 GiB one are the same boolean |
+| `batcher.op.scope` | operator | `driver` or `worker`, distinguishing the driver tree from the distributed map sub-plan |
 
 ## See also
 

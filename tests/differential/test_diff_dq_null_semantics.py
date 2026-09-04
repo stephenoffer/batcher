@@ -13,7 +13,10 @@ where the wrong answer is a quiet one rather than an exception:
 - the three terminals are three readings of one predicate, so `validate` must count
   exactly what `drop` removes and `quarantine` must partition without losing a row.
 
-That last one carries the most weight. `validate`, `drop` and `quarantine` each consult
+**The oracle here is the three terminals against each other**, not DuckDB: `ds.dq` is a
+Batcher API with no SQL equivalent, so what stands in for a second engine is that `validate`,
+`drop` and `quarantine` are three readings of one predicate and must agree. That last one
+carries the most weight. `validate`, `drop` and `quarantine` each consult
 `_provably_clean`, a metadata shortcut that can answer "nothing violates this" from
 footer statistics without reading a row. A shortcut that is wrong does not raise — it
 returns clean data and an empty reject set, which is exactly what a passing contract

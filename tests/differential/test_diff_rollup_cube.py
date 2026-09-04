@@ -13,6 +13,7 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same
+from batcher._internal.errors import ColumnNotFoundError
 
 
 @pytest.fixture
@@ -96,8 +97,15 @@ def test_a_subtotal_row_is_distinguishable_by_its_null_key(sales):
 
 
 def test_an_unknown_key_is_rejected_by_name(sales):
-    with pytest.raises(Exception, match="not a column"):
+    # Asserted on the offending name and the structured fields rather than on a phrasing.
+    # The rendered sentence is for people and may be reworded -- it since gained a "did you
+    # mean", which is what broke the old `match="not a column"` -- while `column` and
+    # `available` are the contract a caller builds on.
+    with pytest.raises(ColumnNotFoundError) as caught:
         bt.from_arrow(sales).rollup("regionn").agg(n=bt.col("amount").sum())
+    assert caught.value.column == "regionn"
+    assert "regionn" in str(caught.value)
+    assert "region" in caught.value.available
 
 
 def test_rollup_without_an_aggregate_says_so(sales):

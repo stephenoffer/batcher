@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from batcher.core.streaming.folds.running import _AggFold
 from batcher.core.streaming.folds.shared import (
+    StreamingTail,
     _read,
     _rebatch,
     check_agg_state_bounded,
@@ -31,6 +32,7 @@ __all__ = [
     "_EPOCH",
     "_EVICTED_META",
     "_WATERMARK_META",
+    "StreamingTail",
     "_AggFold",
     "_WindowKey",
     "_WindowedAggFold",

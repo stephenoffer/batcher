@@ -143,7 +143,7 @@ pub(crate) fn eval_str(
             .downcast_ref::<StringArray>()
             .ok_or_else(|| ExprError::ExpectedString {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
+                got: crate::error::type_name(arr.data_type()),
             })?;
 
     let out: ArrayRef = match func {
@@ -470,7 +470,7 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len()),
                 s.len(),
             );
-            for o in s.iter() {
+            for o in s {
                 // A null input, an absent path, or a value of the wrong shape all yield a
                 // null list rather than an empty one, keeping "no answer" distinct from
                 // "an empty object/array", which is a real and different fact.
@@ -543,7 +543,7 @@ pub(crate) fn eval_str(
         }
         StrFunc::Crc32 => Arc::new(
             s.iter()
-                .map(|o| o.map(|v| crc32fast::hash(v.as_bytes()) as i64))
+                .map(|o| o.map(|v| i64::from(crc32fast::hash(v.as_bytes()))))
                 .collect::<Int64Array>(),
         ),
         StrFunc::MimeType => Arc::new(
@@ -619,7 +619,7 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len()),
                 s.len(),
             );
-            for o in s.iter() {
+            for o in s {
                 match o {
                     Some(v) => {
                         // An empty delimiter splits into individual characters (DuckDB
@@ -673,7 +673,7 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len() * n),
                 s.len(),
             );
-            for o in s.iter() {
+            for o in s {
                 match o {
                     Some(v) => {
                         let tokens: Vec<&str> = v.split_whitespace().collect();
@@ -737,7 +737,7 @@ pub(crate) fn eval_str(
             // One list per row; match volume per row is unknown, so pre-size only the
             // outer offset buffer and let the inner value builder grow as matches land.
             let mut builder = ListBuilder::with_capacity(StringBuilder::new(), s.len());
-            for o in s.iter() {
+            for o in s {
                 match o {
                     Some(v) => {
                         if group == 0 {
@@ -771,7 +771,7 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len()),
                 s.len(),
             );
-            for o in s.iter() {
+            for o in s {
                 match o {
                     Some(v) => {
                         if v.is_empty() {
@@ -814,7 +814,7 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len()),
                 s.len(),
             );
-            for o in s.iter() {
+            for o in s {
                 match o {
                     Some(v) => {
                         for part in uri_path::parse_path(v) {
@@ -840,7 +840,7 @@ pub(crate) fn eval_str(
             // comparing a prefix, and a silent prefix comparison would answer a
             // caller's bug with a plausible number.
             let mut out = Vec::with_capacity(s.len());
-            for o in s.iter() {
+            for o in s {
                 match o {
                     None => out.push(None),
                     Some(v) => match uri_path::hamming(v, target) {
@@ -950,7 +950,7 @@ fn compress_rows(
             None => b.append_null(),
             Some(v) => match func {
                 StrFunc::Compress => {
-                    b.append_value(compress::compress(v, codec).expect("codec validated above")?)
+                    b.append_value(compress::compress(v, codec).expect("codec validated above")?);
                 }
                 // A frame that will not decode is a null row, not a failed batch.
                 _ => match compress::decompress(v, codec).expect("codec validated above") {
@@ -1162,7 +1162,7 @@ fn soundex(v: &str) -> String {
             _ => None,
         }
     }
-    let first = match v.chars().find(|c| c.is_ascii_alphabetic()) {
+    let first = match v.chars().find(char::is_ascii_alphabetic) {
         Some(c) => c.to_ascii_uppercase(),
         None => return "0000".to_string(),
     };
@@ -1309,7 +1309,7 @@ fn eval_bytes(
         StrFunc::Crc32 => Arc::new(
             bytes
                 .iter()
-                .map(|o| o.map(|v| crc32fast::hash(v) as i64))
+                .map(|o| o.map(|v| i64::from(crc32fast::hash(v))))
                 .collect::<Int64Array>(),
         ),
         StrFunc::XxHash64 => Arc::new(
@@ -1342,12 +1342,12 @@ fn hex_upper(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(
-            char::from_digit((b >> 4) as u32, 16)
+            char::from_digit(u32::from(b >> 4), 16)
                 .unwrap_or('0')
                 .to_ascii_uppercase(),
         );
         out.push(
-            char::from_digit((b & 0x0f) as u32, 16)
+            char::from_digit(u32::from(b & 0x0f), 16)
                 .unwrap_or('0')
                 .to_ascii_uppercase(),
         );
@@ -1361,8 +1361,8 @@ fn hex_upper(bytes: &[u8]) -> String {
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
     }
     out
 }
@@ -1477,7 +1477,7 @@ fn map_str_checked(
 ) -> Result<StringArray, ExprError> {
     use arrow::array::{Array, StringBuilder};
     let mut b = StringBuilder::with_capacity(s.len(), s.value_data().len());
-    for o in s.iter() {
+    for o in s {
         match o {
             Some(v) => match f(v) {
                 Some(r) => b.append_value(r),
@@ -1553,7 +1553,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
     for &b in bytes {
-        hash ^= b as u64;
+        hash ^= u64::from(b);
         hash = hash.wrapping_mul(PRIME);
     }
     hash
@@ -1701,7 +1701,7 @@ fn regexp_replace_with(s: &StringArray, re: &regex::Regex, rep: &str, global: bo
     let mut locs = re.capture_locations();
     let mut out = String::new();
     let mut b = StringBuilder::with_capacity(s.len(), s.value_data().len());
-    for row in s.iter() {
+    for row in s {
         let Some(hay) = row else {
             b.append_null();
             continue;
@@ -1874,7 +1874,7 @@ mod tests {
     /// Manual throughput check (ignored). Run:
     ///   cargo test -p bc-expr dict_str_bench -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "throughput study for dictionary-encoded string kernels; run with --ignored"]
     fn dict_str_bench() {
         use super::{eval_str, try_dict_str};
         use crate::{Expr, StrFunc};

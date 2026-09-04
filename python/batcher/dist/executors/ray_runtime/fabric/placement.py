@@ -306,7 +306,7 @@ def _without_unhealthy(records: tuple[GpuNodeTopology, ...]) -> tuple[GpuNodeTop
 
     if not records or not active_config().accelerator.health.enabled:
         return records
-    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_device_health
+    from batcher.dist.executors.ray_runtime.fleet_health import cluster_device_health
 
     condemned = {r["node_id"] for r in cluster_device_health() if r.get("quarantined")}
     if not condemned:

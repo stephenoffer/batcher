@@ -91,10 +91,10 @@ SCALAR = [
     ("is_positive", lambda: bt.col("x").is_positive(), "x > 0"),
     ("is_negative", lambda: bt.col("x").is_negative(), "x < 0"),
     ("is_zero", lambda: bt.col("x").is_zero(), "x = 0"),
-    ("arcsin", lambda: (bt.col("x") / 10).arcsin(), "asin(x / 10)"),
+    ("arcsin", (bt.col("x") / 10).arcsin, "asin(x / 10)"),
     ("arctan", lambda: bt.col("x").arctan(), "atan(x)"),
-    ("arctanh", lambda: (bt.col("x") / 10).arctanh(), "atanh(x / 10)"),
-    ("arccosh", lambda: (bt.col("x") + 10).arccosh(), "acosh(x + 10)"),
+    ("arctanh", (bt.col("x") / 10).arctanh, "atanh(x / 10)"),
+    ("arccosh", (bt.col("x") + 10).arccosh, "acosh(x + 10)"),
 ]
 
 

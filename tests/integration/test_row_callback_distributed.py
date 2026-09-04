@@ -25,8 +25,29 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 
 @pytest.fixture(scope="module", autouse=True)
 def _ray_session():
+    """A cluster, plus this module serialized **by value** so its callbacks reach a worker.
+
+    The row callbacks below are module-level functions, and cloudpickle sends those by
+    *reference* — module name plus qualname. A worker then imports
+    `test_row_callback_distributed`, which is not on its path, and every task dies with
+    `ModuleNotFoundError` before the callback runs. It is invisible on a single-node Ray,
+    where the worker is the same interpreter, and it is the same trap
+    `benchmarks/engines/ray.py` recorded for its module-level pipelines.
+
+    Registering the module for pickle-by-value makes cloudpickle ship the function bodies,
+    which is what a test defining its own UDFs needs and what an in-function closure would
+    have got for free. It must be registered on **`ray.cloudpickle`**: Ray vendors its own
+    copy, and the registry is per-module, so registering with the top-level `cloudpickle`
+    changes nothing and the tests fail exactly as before.
+    """
+    import sys
+
+    from ray import cloudpickle
+
     started = init_test_ray(2)
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
     yield
+    cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
     shutdown_test_ray(started)
 
 

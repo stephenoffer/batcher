@@ -223,6 +223,11 @@ fn take_fixed_size_binary_parallel(
     indices: &UInt32Array,
 ) -> FixedSizeBinaryArray {
     let width = arr.value_length() as usize;
+    debug_assert!(
+        width > 0,
+        "a zero-width value would make every chunk boundary the same byte offset; \
+         `take_fixed_width_parallel` guards this"
+    );
     let src = arr.value_data();
     // `value_data` is the whole underlying buffer, while `value(i)` reads at
     // `(offset + i) * width` — so a **sliced** array's first row does not start at byte zero.

@@ -35,7 +35,7 @@ pub(crate) fn eval_convert_timezone(
         .ok_or_else(|| ExprError::ExpectedType {
             func: "convert_timezone".into(),
             want: "a Timestamp argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
 
     let out: TimestampMicrosecondArray = ts

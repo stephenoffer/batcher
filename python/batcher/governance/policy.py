@@ -19,7 +19,16 @@ from dataclasses import dataclass, field
 from batcher.governance.principal import Principal
 from batcher.plan.expr_ir import Expr
 
-__all__ = ["ColumnMask", "Grant", "RowFilter", "TagMask"]
+__all__ = ["PRIVILEGES", "ColumnMask", "Denial", "Grant", "RowFilter", "TagMask"]
+
+#: The privileges a `Grant` or `Denial` can carry, spelled as SQL spells them — the
+#: same four names Snowflake and Unity Catalog use, so a policy ported from either
+#: reads the same here.
+#:
+#: ``SELECT`` is the only one that takes columns. The other three act on whole rows,
+#: so there is no such thing as inserting half a row, and a column list against one of
+#: them is rejected at declaration rather than silently widened to the table.
+PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
 #: A column mask: given the column's expression, return the expression to read instead.
 MaskFn = Callable[[Expr], Expr]
@@ -34,12 +43,17 @@ def _frozen(roles: Iterable[str]) -> frozenset[str]:
 
 @dataclass(frozen=True, slots=True)
 class Grant:
-    """`role` may `SELECT` `columns` of `table` (all columns when `columns` is None).
+    """`role` holds `privilege` on `columns` of `table` (all columns when `columns` is None).
 
-    The presence of *any* grant on a table switches that table to deny-by-default: a
-    principal then sees exactly the union of the columns its roles are granted. A table
-    with no grant at all is ungoverned for access (though it may still carry masks and
-    row filters), so installing a catalog does not silently lock out every query.
+    The presence of *any* grant on a table switches that table to deny-by-default for
+    **every** privilege: a principal then holds exactly the union of what its roles are
+    granted, privilege by privilege. A table with no grant at all is ungoverned for access
+    (though it may still carry masks and row filters), so installing a catalog does not
+    silently lock out every query.
+
+    Granting one privilege therefore does not confer another. A role given ``INSERT``
+    cannot ``DELETE``, which is the whole reason to grant ``INSERT`` rather than "write":
+    a load job can add today's data and cannot drop yesterday's.
 
     Examples:
         .. doctest::
@@ -50,15 +64,92 @@ class Grant:
             ['order_id', 'total']
             >>> Grant("admin", "orders").columns is None  # every column
             True
+            >>> Grant("loader", "orders", privilege="INSERT").privilege
+            'INSERT'
     """
 
     role: str
     table: str
     columns: frozenset[str] | None = None
+    #: One of `PRIVILEGES`. Defaults to ``"SELECT"`` so every grant written before
+    #: write privileges existed keeps meaning exactly what it meant.
+    privilege: str = "SELECT"
 
     def __post_init__(self) -> None:
         if self.columns is not None:
             object.__setattr__(self, "columns", frozenset(self.columns))
+        object.__setattr__(self, "privilege", normalize_privilege(self.privilege, self.columns))
+
+
+@dataclass(frozen=True, slots=True)
+class Denial:
+    """`role` is refused `privilege` on `columns` of `table`, whatever it was granted.
+
+    The counterpart to `Grant`, and the reason a catalog needs one: grants union across a
+    principal's roles, so a principal holding both ``analyst`` and ``auditor`` sees
+    everything either role sees. There is no way to express "everything except `salary`"
+    by granting, and enumerating the complement breaks the moment a column is added to the
+    table. A denial says it directly, and **wins over every grant**, which is the same
+    precedence SQL Server's ``DENY`` and Unity Catalog's ``DENY`` have.
+
+    A denial with ``columns=None`` refuses the privilege on the whole table.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import Denial
+            >>> deny = Denial("contractor", "employees", columns={"salary"})
+            >>> deny.privilege, sorted(deny.columns)
+            ('SELECT', ['salary'])
+    """
+
+    role: str
+    table: str
+    columns: frozenset[str] | None = None
+    #: One of `PRIVILEGES`.
+    privilege: str = "SELECT"
+
+    def __post_init__(self) -> None:
+        if self.columns is not None:
+            object.__setattr__(self, "columns", frozenset(self.columns))
+        object.__setattr__(self, "privilege", normalize_privilege(self.privilege, self.columns))
+
+
+def normalize_privilege(privilege: object, columns: frozenset[str] | None) -> str:
+    """`privilege` as one of `PRIVILEGES`, uppercased, or a `PlanError` naming the fix.
+
+    Checked at declaration rather than at the read, because every wrong value here fails
+    *open*: a policy stored under ``"select"`` or ``"WRITE"`` matches no privilege the
+    engine ever asks about, so it governs nothing while looking installed.
+
+    Args:
+        privilege: The privilege the policy names.
+        columns: The columns it names, used only to reject a column list on a
+            row-level privilege.
+
+    Returns:
+        The canonical uppercase spelling.
+
+    Raises:
+        PlanError: If `privilege` is not one of `PRIVILEGES`, or a column list was given
+            for a privilege that acts on whole rows.
+    """
+    from batcher._internal.errors import PlanError, unknown_value
+
+    if not isinstance(privilege, str):
+        raise unknown_value(PlanError, "privilege", privilege, PRIVILEGES, label="Known privileges")
+    folded = privilege.strip().upper()
+    if folded not in PRIVILEGES:
+        raise unknown_value(PlanError, "privilege", privilege, PRIVILEGES, label="Known privileges")
+    if columns is not None and folded != "SELECT":
+        raise PlanError(
+            f"A column list was given for the {folded} privilege, which acts on whole rows.",
+            hint=(
+                "Column-level policy applies to SELECT only. Drop the column list to "
+                f"govern {folded} on the whole table."
+            ),
+        )
+    return folded
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +166,8 @@ class ColumnMask:
             >>> from batcher import col
             >>> from batcher.governance import ColumnMask, Redact
             >>> policy = ColumnMask("customers", "ssn", Redact(show_last=4))
-            >>> policy.mask(col("ssn"))
-            col('ssn').cast('string').str.mask('X', 0, 4)
+            >>> policy.mask(col("ssn"))  # doctest: +ELLIPSIS
+            when(...).otherwise(col('ssn').cast('string').str.mask('X', 0, 4))
     """
 
     table: str

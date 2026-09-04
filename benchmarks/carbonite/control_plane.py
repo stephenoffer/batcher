@@ -24,7 +24,13 @@ Two axes are reported:
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 
 def _time_us(fn, n: int) -> float:
@@ -153,6 +159,17 @@ def bench_ticket_rendering() -> None:
 
 
 def main() -> None:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     bench_single_node()
     bench_distributed_credits()
     bench_cache_eviction()

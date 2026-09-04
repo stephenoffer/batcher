@@ -131,3 +131,30 @@ def test_a_constant_false_conjunct_still_empties_the_side(duck, tables):
         bt.from_arrow(right).filter(lit(False) & col("k").is_not_null()), on="k", how="inner"
     )
     assert got.collect().num_rows == 0
+
+
+def test_the_local_join_type_list_still_matches_the_engine():
+    """The list above is a hand-written copy of `plan.logical.join.JOIN_TYPES`, so it can
+    fall behind it silently.
+
+    Nothing here would fail if a seventh join type were added: the parametrized tests would
+    keep running over six, report green, and cover the new one nowhere. A hand-maintained
+    copy of a production contract is exactly the shape that decays without anyone touching
+    the file, and a *differential* suite is the worst place for it, because this is where a
+    join's correctness against DuckDB is actually established.
+
+    Kept as a copy rather than imported, deliberately: the local list is ordered, which
+    keeps the parametrize ids stable and readable, and it pairs positionally with the SQL
+    mapping beside it. This asserts the two stay in step instead, and names the mapping too
+    -- a new join type needs a spelling there as well, and a `KeyError` raised from inside a
+    parametrized case is a worse way to find that out.
+    """
+    from batcher.plan.logical.join import JOIN_TYPES as ENGINE_JOIN_TYPES
+
+    assert set(JOIN_TYPES) == set(ENGINE_JOIN_TYPES), (
+        "this file's join-type list has fallen behind the engine's; the difference is "
+        f"{set(ENGINE_JOIN_TYPES).symmetric_difference(JOIN_TYPES)}"
+    )
+    assert set(DUCK_JOIN) == set(ENGINE_JOIN_TYPES), (
+        "every join type needs a SQL spelling here, or the oracle cannot be asked about it"
+    )

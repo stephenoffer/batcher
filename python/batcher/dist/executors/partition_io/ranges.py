@@ -120,12 +120,28 @@ def range_partitionable(dtype: pa.DataType) -> bool:
     that cost the most: a fixed-width key over a wide payload is the canonical large-sort
     shape, and refusing it here meant the whole relation had to fit one node.
 
+    **Temporal and decimal keys are in, and were the second-most expensive omission.** A
+    `Date`, `Timestamp`, `Time`, `Duration` or `Decimal` column has an order-preserving numeric
+    backing (days, ticks, unscaled units), which is what both the sampler and the Rust router
+    read — measured directly against `sample_key_grid` + `bucketize`, not inferred. Only
+    `Boolean` genuinely raises `NonNumericRangeKey` of the types anyone sorts by.
+
     It is a function rather than a `frozenset` beside each caller for the reason this module
     exists: every `supports_spilling_*` predicate is answering the same question about the
     same two primitives, and when they each spelled it out they drifted. The global-window
     predicate never grew the type test its sort sibling had, so a `rank()` over a Boolean
     column collected fine and raised a bare Rust `RuntimeError` the moment the same plan was
     streamed.
+
+    **And then they drifted the other way, which is the more expensive direction and the
+    harder one to see.** The distributed sort found this function too narrow for a temporal
+    key and widened it *at its own call site*
+    (`dist.executor._range_partitionable_sort_key`) rather than here, so a distributed
+    ``ORDER BY <timestamp>`` worked while the out-of-core sort of the same key declined to
+    spill and a global window ordered by it had no distributed path at all — the canonical
+    time-series shape, refused by the two paths that exist because the relation does not fit.
+    Nothing failed; each predicate simply answered a question it was asked and no test asked
+    both. A widening belongs here, where every caller gets it.
 
     Args:
         dtype: The Arrow type of the leading sort/order key.
@@ -142,10 +158,14 @@ def range_partitionable(dtype: pa.DataType) -> bool:
             (True, False)
             >>> range_partitionable(pa.binary()), range_partitionable(pa.binary(10))
             (True, True)
+            >>> range_partitionable(pa.timestamp("us")), range_partitionable(pa.decimal128(10, 2))
+            (True, True)
     """
     return (
         pa.types.is_integer(dtype)
         or pa.types.is_floating(dtype)
+        or pa.types.is_temporal(dtype)
+        or pa.types.is_decimal(dtype)
         or grid_kind_of(dtype) != "numeric"
     )
 
@@ -494,7 +514,15 @@ def split_hot_bucket(parts: list, hot_bucket: int, subs: int, sub: int) -> list:
     return out
 
 
-def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, descending: bool):
+def plan_hot_split(
+    grids,
+    boundaries: list,
+    n_buckets: int,
+    nulls_first: bool,
+    descending: bool,
+    *,
+    single_key: bool = True,
+):
     """Decide whether one dominant key should be spread across several buckets, and how.
 
     A range partition must keep equal keys together, because the result is the ordered
@@ -511,6 +539,22 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
     order. Nothing about the relation changes: the same rows come back, in the same key
     order, with ties in the same order as before.
 
+    **That argument holds only when the leading key is the whole sort key**, which is what
+    `single_key` records. Rows sharing the hot value tie on the *leading* key; they do not
+    necessarily tie on the sort. Spread across sub-buckets and concatenated in mapper order,
+    rows a secondary key would have ordered come back in mapper order instead — the relation
+    is mis-sorted, not merely tie-broken differently. Measured on TPC-H q7
+    (`ORDER BY supp_nation, cust_nation, l_year`, whose leading key holds two values over
+    millions of rows and is therefore always hot): single-node returns the four rows in key
+    order, and the distributed run returned `(GERMANY, FRANCE, 1996)` before
+    `(GERMANY, FRANCE, 1995)`. The suite reported it as
+    `not ordered by 'l_year' ASC: row 2 is 1996 before 1995`, and it was `OK` single-node —
+    a distributed-only wrong answer on a query that asked for an order.
+
+    So a multi-key sort keeps the unsplit partition and pays the imbalance, exactly as a
+    descending one does below: a slower sort beats a wrong one, and nothing in the result
+    tells the caller it was wrong.
+
     Declined for a **descending** sort (see the comment on that branch — the layout is not
     yet right on the Flight reduce), on a key whose boundaries carry a NaN (no total order to
     isolate a value within), and when the hot value would share its bucket with the nulls,
@@ -523,6 +567,8 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
         n_buckets: The bucket count the caller sized the shuffle for.
         nulls_first: Whether nulls sort before non-nulls.
         descending: Whether the driver concatenates buckets high to low.
+        single_key: Whether the sort has exactly one key. The split is only order-preserving
+            when it does; see above.
 
     Returns:
         `(boundaries, logical_buckets, hot_bucket, subs)`, or `None` to partition as usual.
@@ -540,6 +586,9 @@ def plan_hot_split(grids, boundaries: list, n_buckets: int, nulls_first: bool, d
     # on one transport and not the other would be worse than none. So a descending sort keeps
     # the unsplit partition and pays the imbalance, which costs time and never an answer.
     if descending:
+        return None
+    # A secondary key orders rows that the hot split would hand back in mapper order.
+    if not single_key:
         return None
     hot = hot_key_share(grids)
     if hot is None or hot[1] * max(1, n_buckets) < _HOT_SPLIT_OVERLOAD:

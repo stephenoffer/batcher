@@ -149,6 +149,13 @@ removes its directory, `spill_scratch` removes a work directory it allocated and
 operator-configured one alone, and the file cache evicts least-recently-used entries to stay
 under its byte budget.
 
+A remote file larger than the whole file-cache budget is never admitted. Caching it would
+evict every other entry and then, with nothing else left to drop, the entry itself, so the
+budget cannot be exceeded by a single file. The read goes straight to the object store
+instead, and `file_cache_max_bytes` bounds the volume as stated rather than approximately.
+Concurrent readers that miss the same file share one download rather than each fetching a
+copy.
+
 Two cases survive a crash by design. The streaming checkpoint is durable on purpose, and
 `prune_state` bounds it by deleting snapshots older than the last commit. A spill directory
 orphaned by a killed process is swept by name on the next run, which is what the pid in

@@ -26,7 +26,7 @@ from typing import ClassVar
 
 import pytest
 
-from batcher.dist.executors.ray_runtime import hardware_probe as hp
+from batcher.dist.executors.ray_runtime import fleet_health as hp
 from batcher.dist.executors.ray_runtime import scaling
 from batcher.dist.executors.ray_runtime.fabric import shape as shape_mod
 
@@ -84,7 +84,11 @@ def test_the_head_is_not_part_of_the_fleet_shape(fake_ray):
         _node("w2", 64.0, memory=256 << 30),
     ]
     shape = shape_mod.cluster_shape()
-    assert [n.node_id for n in shape.nodes] == ["w1", "w2"]
+    # Asserted as figures rather than as an id list: the shape is a census of node *classes*,
+    # so the two identical workers are one entry of multiplicity two and carry no ids. The
+    # figures are the stronger statement anyway — a head counted here would put 4 cores and
+    # 8 GiB into `binding_*`, which is exactly the damage the exclusion exists to prevent.
+    assert shape.node_count == 2
     assert shape.total_cores == 128
     assert shape.binding_cpu_cores == 64
     assert shape.binding_memory_bytes == 256 << 30
@@ -100,13 +104,17 @@ def test_a_draining_node_is_not_part_of_the_fleet_shape(fake_ray, monkeypatch):
     ]
     monkeypatch.setattr(scaling, "draining_node_ids", lambda: frozenset({"doomed"}))
     shape = shape_mod.cluster_shape()
-    assert [n.node_id for n in shape.nodes] == ["w1"]
+    assert shape.node_count == 1
+    assert shape.total_cores == 64
+    assert shape.binding_memory_bytes == 256 << 30
 
 
 def test_a_head_only_cluster_still_produces_a_shape(fake_ray):
     """Survivors-or-nothing: a single-node run is its head and has to be described."""
     fake_ray.records = [_node("head", 8.0, memory=32 << 30, head=True)]
-    assert [n.node_id for n in shape_mod.cluster_shape().nodes] == ["head"]
+    shape = shape_mod.cluster_shape()
+    assert shape.node_count == 1
+    assert shape.total_cores == 8
 
 
 @pytest.mark.parametrize(
@@ -167,7 +175,9 @@ def test_an_unrecognized_model_reports_unknown_rather_than_a_guess(fake_ray):
 
 def test_a_node_with_no_schedulable_cores_holds_no_share(fake_ray):
     fake_ray.records = [_node("w1", 16.0), _node("coreless", 0.0)]
-    assert [n.node_id for n in shape_mod.cluster_shape().nodes] == ["w1"]
+    shape = shape_mod.cluster_shape()
+    assert shape.node_count == 1
+    assert shape.total_cores == 16
 
 
 def test_the_shape_is_stable_across_reads_of_an_unchanged_cluster(fake_ray):
@@ -209,11 +219,14 @@ def test_quarantined_devices_reach_the_shape(fake_ray, monkeypatch):
         lambda: ({"node_id": "sick", "quarantined": ["GPU-a", "GPU-b"], "degraded": ["GPU-b"]},),
     )
     shape = shape_mod.cluster_shape()
-    by_id = {n.node_id: n for n in shape.nodes}
+    # Keyed on the health figure rather than the node id, because that figure is part of what
+    # separates the two classes — a node with a quarantined device never merges into one
+    # without. Same discrimination the id gave, expressed in the census.
+    by_health = {n.unhealthy_gpus: n for n in shape.nodes}
+    assert shape.node_count == 2
     # Deduplicated: a device is routinely reported as both quarantined and degraded.
-    assert by_id["sick"].unhealthy_gpus == 2
-    assert by_id["sick"].healthy_gpus == 6
-    assert by_id["well"].unhealthy_gpus == 0
+    assert by_health[2].healthy_gpus == 6
+    assert set(by_health) == {0, 2}
     assert shape.total_gpus == 16
     assert shape.healthy_gpus == 14
     assert shape.exchange_width("gpu") == 14

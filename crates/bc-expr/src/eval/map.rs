@@ -44,7 +44,7 @@ pub(crate) fn eval_map(
         .ok_or_else(|| ExprError::ExpectedType {
             func: format!("{func:?}"),
             want: "a Map or Struct argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         })?;
     match func {
         MapFunc::MapKeys => Ok(list_of(
@@ -96,7 +96,7 @@ fn struct_field(
         MapFunc::MapValues => Err(ExprError::ExpectedType {
             func: "map_values".into(),
             want: "a Map argument (a struct's values need not share one type)",
-            got: fields.data_type().to_string(),
+            got: crate::error::type_name(fields.data_type()),
         }),
         // Same reason `map_values` refuses: the entries of a `Struct<a: Int, b: Utf8>`
         // would need `Struct<key: Utf8, value: ???>`, and there is no honest `value`
@@ -105,7 +105,7 @@ fn struct_field(
         MapFunc::MapEntries => Err(ExprError::ExpectedType {
             func: "map_entries".into(),
             want: "a Map argument (a struct's values need not share one type)",
-            got: fields.data_type().to_string(),
+            got: crate::error::type_name(fields.data_type()),
         }),
         MapFunc::ElementAt => {
             let name = match key {
@@ -129,7 +129,10 @@ fn struct_field(
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "element_at".into(),
                     want: "a field this struct has",
-                    got: format!("no field {name:?} in {}", fields.data_type()),
+                    got: format!(
+                        "no field {name:?} in {}",
+                        crate::error::type_name(fields.data_type())
+                    ),
                 })?;
             Ok(merge_parent_nulls(child, fields.nulls()))
         }
@@ -219,6 +222,19 @@ fn element_at(map: &MapArray, key: Option<&Literal>) -> Result<ArrayRef, ExprErr
 }
 
 /// Extract field `name` from a `Struct` column, propagating struct-level nulls.
+/// The struct's field names for an error message, truncated so a wide struct cannot
+/// bury the error under its own schema (the same cap the control plane's
+/// `candidate_list` applies to available columns).
+fn field_name_list(s: &StructArray) -> String {
+    const MAX: usize = 12;
+    let names: Vec<&str> = struct_fields(s).iter().map(|f| f.name().as_str()).collect();
+    if names.len() <= MAX {
+        names.join(", ")
+    } else {
+        format!("{}, (+{} more)", names[..MAX].join(", "), names.len() - MAX)
+    }
+}
+
 pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, ExprError> {
     // An all-null column types as `Null`. That is a real type rather than an error — it is
     // what `SELECT NULL AS x`, an all-`None` column and a left join that matched nothing
@@ -232,14 +248,17 @@ pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, 
         return Err(ExprError::ExpectedType {
             func: "struct.field".into(),
             want: "a Struct argument",
-            got: arr.data_type().to_string(),
+            got: crate::error::type_name(arr.data_type()),
         });
     }
     let s = arr.as_struct();
     let child = s
         .column_by_name(name)
         .cloned()
-        .ok_or_else(|| ExprError::UnknownColumn(name.to_string()))?;
+        .ok_or_else(|| ExprError::UnknownField {
+            field: name.to_string(),
+            available: field_name_list(s),
+        })?;
     // A null struct row makes the extracted field null too.
     if s.null_count() > 0 {
         let mask = is_null(s)?;
@@ -447,5 +466,50 @@ mod tests {
     fn a_non_struct_column_is_still_a_typed_error() {
         let arr: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
         assert!(eval_struct_field(&arr, "a").is_err());
+    }
+
+    /// A struct with the named fields, one row.
+    fn struct_of(names: &[&str]) -> ArrayRef {
+        let fields: Vec<(Arc<arrow::datatypes::Field>, ArrayRef)> = names
+            .iter()
+            .map(|n| {
+                let f = Arc::new(arrow::datatypes::Field::new(*n, DataType::Int64, true));
+                let a: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1]));
+                (f, a)
+            })
+            .collect();
+        Arc::new(StructArray::from(fields))
+    }
+
+    /// The message must name the *field* and list the ones that exist. It used to reuse
+    /// `UnknownColumn` and read "unknown column: zz", which points at a top-level column
+    /// that was never the problem.
+    #[test]
+    fn a_missing_field_names_the_field_and_the_ones_that_exist() {
+        let arr = struct_of(&["alpha", "beta"]);
+        let err = eval_struct_field(&arr, "zz").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no field `zz`"), "{msg}");
+        assert!(msg.contains("alpha, beta"), "{msg}");
+        assert!(!msg.contains("unknown column"), "{msg}");
+    }
+
+    /// A wide struct must not bury the error under its own schema -- the same cap the
+    /// control plane's `candidate_list` applies to available columns.
+    #[test]
+    fn a_wide_struct_truncates_its_field_list() {
+        let names: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let err = eval_struct_field(&struct_of(&refs), "zz").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("(+18 more)"), "{msg}");
+        assert!(!msg.contains("c12"), "{msg}");
+    }
+
+    /// The field list is the struct's own, not the batch's columns.
+    #[test]
+    fn an_existing_field_is_still_returned() {
+        let arr = struct_of(&["alpha", "beta"]);
+        assert_eq!(eval_struct_field(&arr, "alpha").unwrap().len(), 1);
     }
 }

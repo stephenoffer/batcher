@@ -22,7 +22,7 @@ from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Expr, StrFunc, StrFuncDyn, lit, when
 
-__all__ = ["const_int", "const_str", "str_call"]
+__all__ = ["const_bool", "const_float", "const_int", "const_str", "str_call"]
 
 #: Which `StrFunc` slot each parameter fills, and whether it is text or an integer.
 _TEXT_SLOTS = ("pattern", "replacement")
@@ -51,6 +51,30 @@ def const_int(node) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def const_float(node) -> float | None:
+    """The Python float a node denotes, or None when it is not a numeric literal.
+
+    Sibling of `const_int`, and negative literals fold the same way. An integer literal
+    reads as a float: SQL's `2` is a perfectly good argument to a parameter typed `float`,
+    and refusing it would make `image_adjust_brightness(i, 2)` an error next to
+    `image_adjust_brightness(i, 2.0)` working.
+    """
+    if isinstance(node, exp.Neg):
+        inner = const_float(node.this)
+        return None if inner is None else -inner
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return float(node.this)
+        except ValueError:
+            return None
+    return None
+
+
+def const_bool(node) -> bool | None:
+    """The Python bool a node denotes, or None when it is not a boolean literal."""
+    return node.this if isinstance(node, exp.Boolean) else None
 
 
 def str_call(tr, fn: str, value, **params: Any) -> Expr:

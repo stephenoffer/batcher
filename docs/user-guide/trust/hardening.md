@@ -102,7 +102,50 @@ long-running process cannot keep acting on a token that lapsed hours ago.
 
 For a fleet where a submitter authenticates users and hands tokens to workers, use
 `HmacTokenVerifier` (standard library only, key resolvable as `env:`/`file:`). For an
-existing identity provider, use `JwtVerifier` against its JWKS endpoint.
+existing identity provider, use `JwtVerifier`.
+
+Name the issuer and let Batcher find its keys, rather than looking up a JWKS URL and
+pasting it into another config file:
+
+```python
+# docs: skip
+import batcher as bt
+from batcher.governance.authn import JwtVerifier
+
+bt.set_verifier(
+    JwtVerifier.from_issuer(
+        "https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher"
+    )
+)
+```
+
+`from_issuer` reads the provider's OIDC metadata at
+`<issuer>/.well-known/openid-configuration` and binds to the `jwks_uri` it publishes. A
+provider that does not publish metadata still works: pass `jwks_url` to the constructor
+directly.
+
+Both the metadata and the key set are cached per process, and each worker on a distributed
+query fetches for itself against its own network path to the provider. That matters for
+more than latency. A key set shipped from the driver would be the driver vouching for the
+issuer, which is the trust hop the verifier exists to remove, and it would make the
+identity provider a hard dependency of every query rather than of every five minutes.
+
+Signature algorithms default to asymmetric only. That default is load-bearing: allowing
+`HS256` alongside `RS256` is the algorithm-confusion attack, where an attacker signs a
+token with the public key used as an HMAC secret.
+
+**Set the issuer and the audience.** Both default to empty and both are then skipped, and
+what that costs is a property of how the large identity providers are deployed: they publish
+one key set across many tenants and many applications. A valid signature proves which key
+set signed the token, never who it was minted for. So with `iss` unchecked a token from
+another tenant of the same provider verifies, and with `aud` unchecked a token minted for
+another application of the same tenant verifies. Both are real tokens, correctly signed,
+issued to somebody else and replayed at you.
+
+`from_issuer` sets the issuer for you. Nothing can guess the audience, so pass it. Leaving
+either unset stays legal, because a deployment mid-migration may not know its audience yet,
+and raises a `SecurityWarning` naming the check that was skipped and what verifies without
+it.
 
 ```{warning}
 This is a deployment control, not a security boundary. Code inside the engine's process can
@@ -132,6 +175,7 @@ hardened = cfg.replace(
         cfg.execution,
         udf_isolation="strict",
         udf_memory_limit_bytes=8 * 1024**3,
+        udf_cpu_limit_seconds=300,
         udf_timeout_s=600.0,
     )
 )
@@ -141,9 +185,12 @@ print(hardened.execution.udf_isolation)
 
 `udf_memory_limit_bytes` becomes an `RLIMIT_AS` on the child, so a runaway allocation
 raises `MemoryError` in the guilty worker instead of drawing the kernel's OOM killer onto
-whatever else is on the box. `udf_timeout_s` bounds a wedged UDF, which otherwise hangs the
-query with no error at all. If a UDF needs a variable the allowlist drops, name it in
-`execution.udf_env_allowlist` rather than turning isolation off.
+whatever else is on the box. `udf_cpu_limit_seconds` becomes an `RLIMIT_CPU`, which bounds
+a UDF that is spinning rather than allocating, and does so in the kernel so the driver does
+not have to be watching. `udf_timeout_s` bounds a wedged UDF by wall clock, which otherwise
+hangs the query with no error at all. The two ceilings answer different failures, so a
+strict deployment usually wants both. If a UDF needs a variable the allowlist drops, name
+it in `execution.udf_env_allowlist` rather than turning isolation off.
 
 ```{warning}
 This is defense in depth, not a sandbox, and the difference matters. A UDF is arbitrary
@@ -229,6 +276,48 @@ questions about its values, and `min`/`max` are two of those values outright.
 This happens automatically. It is worth knowing because it is a reason to *use* the
 `security()` block even for a pipeline that only writes.
 
+## Know what a partial mask does to a short value
+
+`Redact` reveals the first or last few characters of a value, which is the "card ending 1234"
+pattern. A value no longer than what the policy reveals is masked **completely** rather than
+returned as it is.
+
+That case is not rare. A masking policy is usually written about names, postcodes, national
+identifiers and country codes, and many of the values in such a column are shorter than the
+four characters a card policy reveals:
+
+```python
+import batcher as bt
+from batcher.governance import Redact
+
+people = bt.from_pydict(
+    {"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]}
+)
+masked = people.select(
+    name=Redact(show_first=1)(bt.col("name")),
+    postcode=Redact(show_last=3)(bt.col("postcode")),
+)
+print(masked.to_pydict())
+```
+
+```text
+{'name': ['AXXXXXXXX', 'BX', 'LX'], 'postcode': ['XXXXX2AA', 'XXX', 'XX']}
+```
+
+`EC1` and `N1` are no longer than the three characters the postcode policy reveals, so they
+come back fully masked. `Bo` and `Li` are longer than the single character the name policy
+reveals, so they keep their initial.
+
+Two things follow when you write a policy:
+
+- Choose `show_first` and `show_last` against the *shortest* values you expect, not the
+  longest. Revealing four characters of a column whose median value is five characters is a
+  policy that mostly discloses.
+- Masking is length-preserving, so the output still tells a reader how long the value was.
+  Where the length itself is sensitive, reach for {py:class}`Pseudonymize
+  <batcher.governance.Pseudonymize>` or {py:class}`Nullify <batcher.governance.Nullify>`
+  instead.
+
 ## Checklist
 
 Before a deployment that matters, complete the following:
@@ -242,6 +331,7 @@ Before a deployment that matters, complete the following:
 1. Pass every key and credential by reference.
 1. Confirm the `MetadataHub` backend's access controls match the data it will hold
    statistics about.
+1. Size every partial mask against the shortest values in its column, not the longest.
 
 ## Requirements and limitations
 

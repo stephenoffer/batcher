@@ -88,7 +88,7 @@ def test_a_batch_that_cannot_shrink_far_enough_still_reports_the_failure():
         def __call__(self, batch):
             raise RuntimeError("CUDA out of memory. Tried to allocate 1 row")
 
-    pool = InferencePool(lambda: _AlwaysFails(), num_workers=1, target_batch_rows=4)
+    pool = InferencePool(_AlwaysFails, num_workers=1, target_batch_rows=4)
     with pytest.raises(RuntimeError, match="out of memory"):
         list(pool.run(iter([_batch([1, 2, 3, 4])])))
 
@@ -102,7 +102,7 @@ def test_a_non_memory_error_is_not_retried_as_one():
             type(self).calls += 1
             raise ValueError("column 'y' is missing")
 
-    pool = InferencePool(lambda: _Broken(), num_workers=1, target_batch_rows=4)
+    pool = InferencePool(_Broken, num_workers=1, target_batch_rows=4)
     with pytest.raises(ValueError, match="missing"):
         list(pool.run(iter([_batch([1, 2, 3, 4])])))
     assert _Broken.calls == 1, f"retried a non-memory error {_Broken.calls} times"

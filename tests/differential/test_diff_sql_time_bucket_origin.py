@@ -10,8 +10,12 @@ do. A width that does not put every boundary on a different instant, silently:
 
 A whole week of rows lands in the neighbouring bucket, so a time-series aggregate reports
 the wrong totals against the wrong periods and nothing raises. Rather than answer on a
-shifted grid, a misaligned width is now refused — the same choice already made for
-``INTERVAL 1 MONTH``, and for the same reason.
+shifted grid, a misaligned width is refused.
+
+A *calendar* width is a different problem and no longer shares that answer. A month is not
+a number of microseconds at all, so it never had a `WindowStart` width to misalign; it is
+bucketed on the **month index** instead, which reproduces DuckDB's 2000-01 origin exactly
+and needs nothing to divide evenly.
 
 The first group pins that every *aligned* width still agrees with DuckDB exactly, so the
 guard cannot be satisfied by simply refusing more.
@@ -70,6 +74,51 @@ def test_the_refusal_names_a_width_that_works():
     bt.sql(f"SELECT time_bucket(INTERVAL 6 HOUR, {_TS}) AS r").collect()
 
 
-def test_calendar_widths_are_still_refused():
-    with pytest.raises(NotImplementedError):
-        bt.sql(f"SELECT time_bucket(INTERVAL 1 MONTH, {_TS}) AS r").collect()
+@pytest.mark.parametrize(
+    "width",
+    ["1 MONTH", "2 MONTH", "3 MONTH", "6 MONTH", "1 QUARTER", "1 YEAR", "2 YEAR"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        _TS,
+        "DATE '2024-01-31'",
+        # Before the 2000-01 origin, where a truncating month index rounds toward zero and
+        # puts the row in the *next* bucket up. Only a floored one lands where DuckDB does.
+        "DATE '1999-07-04'",
+        "DATE '1970-01-01'",
+        "TIMESTAMP '1987-11-30 23:59:59'",
+    ],
+)
+def test_calendar_widths_match_duckdb(duck, width, value):
+    """Calendar widths used to be refused; they are answered on the month index now.
+
+    A month is not a number of microseconds, so `WindowStart` genuinely cannot express one
+    — the refusal was right for the mechanism it had. Bucketing the *month index* instead
+    needs no width that divides anything, and it reproduces DuckDB's 2000-01 origin exactly,
+    including on the far side of it.
+    """
+    query = f"SELECT time_bucket(INTERVAL {width}, {value}) AS r"
+    assert_same(bt.sql(query).collect(), duck.sql(query))
+
+
+@pytest.mark.parametrize("value", ["DATE '2024-01-31'", _TS])
+@pytest.mark.parametrize("width", ["1 DAY", "6 HOUR", "1 MONTH", "1 YEAR"])
+def test_a_bucket_keeps_the_type_it_was_given(duck, width, value):
+    """Bucketing a DATE yields a DATE in DuckDB; it used to widen to a timestamp here.
+
+    The value was right and the *type* was not, which is the failure mode that survives an
+    order-independent comparison: a `GROUP BY time_bucket(...)` key silently stopped being
+    joinable against the date column it came from.
+    """
+    query = f"SELECT time_bucket(INTERVAL {width}, {value}) AS r"
+    expected_type = duck.execute(query).arrow().read_all().schema.field("r").type
+    actual = bt.sql(query).collect()
+    assert actual.schema.field("r").type == expected_type
+    assert_same(actual, duck.sql(query))
+
+
+@pytest.mark.parametrize("width", ["0 MONTH", "-1 MONTH", "0 DAY"])
+def test_a_non_positive_width_is_refused_with_a_reason(width):
+    with pytest.raises(NotImplementedError, match="positive"):
+        bt.sql(f"SELECT time_bucket(INTERVAL {width}, {_TS}) AS r").collect()

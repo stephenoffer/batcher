@@ -46,6 +46,7 @@ from batcher._internal.errors.suggest import (
     absent_error,
     candidate_list,
     did_you_mean,
+    public_members,
     suggestion,
     unknown_message,
 )
@@ -81,6 +82,7 @@ __all__ = [
     "absent_error",
     "candidate_list",
     "did_you_mean",
+    "public_members",
     "require_float",
     "require_int",
     "suggestion",

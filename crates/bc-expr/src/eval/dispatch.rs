@@ -5,14 +5,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::kernels::boolean;
-use arrow::compute::kernels::zip::zip;
 use arrow::compute::{is_not_null, is_null};
 
 use crate::eval::binary::{eval_binary, try_dict_compare, try_scalar_binary};
+use crate::eval::branch::{eval_case, eval_coalesce};
 use crate::eval::cast::cast_expr;
-use crate::eval::coerce::{as_bool, coerce_numeric};
+use crate::eval::coerce::as_bool;
 use crate::eval::generate::eval_sequence;
 use crate::eval::geo::eval_geo;
 use crate::eval::in_list::eval_in_list;
@@ -22,9 +22,7 @@ use crate::eval::list::{
 };
 use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
 use crate::eval::map::{eval_map, eval_struct_field};
-use crate::eval::math::{
-    eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
-};
+use crate::eval::math::{eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2};
 use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bounds};
 use crate::eval::spatial::eval_spatial;
@@ -109,32 +107,7 @@ impl Expr {
             Expr::Case {
                 branches,
                 otherwise,
-            } => {
-                // Fold from the default upward: later branches are overridden by
-                // earlier ones (first matching WHEN wins).
-                let mut acc = otherwise.eval(batch)?;
-                for branch in branches.iter().rev() {
-                    let mask_arr = branch.when.eval(batch)?;
-                    let mask = as_bool(&mask_arr, "case")?;
-                    // SQL CASE semantics: a WHEN that evaluates to NULL is *not*
-                    // taken (it falls through to ELSE), matching DuckDB. `zip` would
-                    // otherwise let a null mask pick the THEN branch, so collapse a
-                    // null mask element to false (true only where value AND valid).
-                    let mask = match mask.nulls() {
-                        Some(n) => BooleanArray::new(mask.values() & n.inner(), None),
-                        None => mask.clone(),
-                    };
-                    let then = branch.then.eval(batch)?;
-                    // `zip` requires matching branch types; coerce Int64/Float64
-                    // (and decimal) to a common numeric type the way COALESCE and
-                    // the binary ops do, so a `when(...).then(0).otherwise(x)` over a
-                    // float column (or `clip`/`fill_nan`) doesn't error on a mixed
-                    // int/float literal.
-                    let (then, acc_c) = coerce_numeric(&then, &acc)?;
-                    acc = zip(&mask, &then.as_ref(), &acc_c.as_ref())?;
-                }
-                Ok(acc)
-            }
+            } => eval_case(branches, otherwise, batch),
             Expr::Str {
                 func,
                 input,
@@ -370,6 +343,10 @@ impl Expr {
             Expr::ListTransform { input, func } => eval_list_transform(&input.eval(batch)?, func),
             Expr::ListFilter { input, pred } => eval_list_filter(&input.eval(batch)?, pred),
             Expr::MakeStruct { fields } => eval_make_struct(fields, batch),
+            Expr::MakeMap { keys, values } => crate::eval::map_ops::make_map::eval_make_map(
+                &keys.eval(batch)?,
+                &values.eval(batch)?,
+            ),
             Expr::ListJoin { input, separator } => eval_list_join(&input.eval(batch)?, separator),
             Expr::Math { func, input } => {
                 let arr = input.eval(batch)?;
@@ -491,19 +468,37 @@ impl Expr {
                 let list = require_list(&arr, "list.slice")?;
                 use arrow::array::AsArray;
                 let list = list.as_list::<i32>();
-                rebuild_list(list, |s, e| {
+                rebuild_list(list, |s, e, out| {
                     // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
-                    // otherwise overflows the `+` before the `.min(e)` clamp — panicking
-                    // in debug and wrapping to a giant `usize` (capacity overflow) in
-                    // release. `list.slice(3, i64::MAX)` must clamp to the list end.
-                    let begin = (s as i64).saturating_add((*offset).max(0)).min(e as i64) as usize;
-                    let end = match length {
-                        Some(l) => {
-                            (begin as i64).saturating_add((*l).max(0)).min(e as i64) as usize
-                        }
-                        None => e,
+                    // otherwise overflows the `+` before the clamp — panicking in debug
+                    // and wrapping to a giant `usize` (capacity overflow) in release.
+                    // `list.slice(3, i64::MAX)` must clamp to the list end.
+                    let len = (e - s) as i64;
+                    // A negative offset counts back from the end of *this row's* list,
+                    // matching `str.slice` and the Polars spelling this method mirrors.
+                    // It is resolved *before* the clamp, which is what makes an offset
+                    // reaching past the front yield an empty window rather than the
+                    // list's head: `slice(-10, 2)` on six elements is empty, exactly as
+                    // Python's `l[-10:-8]` is. Clamping the offset to zero first (the
+                    // previous `(*offset).max(0)`) silently returned the wrong end of
+                    // the list for every negative offset — so `slice(-1)` returned the
+                    // whole list, and the `.list.tail` guidance, which points straight
+                    // at `slice(-n, n)`, was wrong for every input.
+                    let start_rel = if *offset < 0 {
+                        len.saturating_add(*offset)
+                    } else {
+                        *offset
                     };
-                    (begin..end).map(|k| k as u32).collect()
+                    let end_rel = match length {
+                        Some(l) => start_rel.saturating_add((*l).max(0)),
+                        None => len,
+                    };
+                    // Clamped independently, so `end_rel < start_rel` (a window that
+                    // ends before it begins) collapses to an empty range rather than
+                    // underflowing the `usize` cast.
+                    let begin = s + start_rel.clamp(0, len) as usize;
+                    let end = s + end_rel.clamp(0, len) as usize;
+                    out.extend((begin..end).map(|k| k as u32));
                 })
             }
         }

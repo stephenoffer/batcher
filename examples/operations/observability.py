@@ -51,15 +51,37 @@ def main() -> None:
     assert query.to_pydict() == result
     disable_logging()
 
+    # One JSON object per record, for a log shipper. Each carries the `query_id` of the
+    # query in flight -- the same id the event-log document and the dashboard row use, so a
+    # log line can be joined to the plan and the profile that describe the same run.
+    with option_context("observability.log_format", "json"):
+        assert query.to_pydict() == result
+
     # Progress reporting off, for a script whose output is parsed by something else.
     # The option takes 'auto' / 'on' / 'off' (or None), not a bool.
     with option_context("observability.progress", "off"):
         assert query.to_pydict() == result
 
-    # The plan and its estimates, which is where you look when a query is slow.
+    # The plan and its estimates, which is where you look when a query is slow. The
+    # operator column is a tree: the spine says what feeds what, and the last input of
+    # each operator closes its branch.
     plan = query.explain()
     print(plan)
     assert "aggregate" in plan
+    assert "OPERATOR" in plan and "ESTIMATE" in plan
+
+    # `explain(analyze=True)` runs it and adds what was measured: the estimate against the
+    # actual, which way it missed, and each operator's share of the engine's own time.
+    measured = query.explain(analyze=True)
+    print(measured)
+    assert "actual=" in measured and "OP SHARE" in measured
+
+    # Read this line before the table. `total_ms` is the whole terminal operation, and the
+    # operators cover only the engine call inside it -- on a query this small almost all of
+    # the wall clock is planning, optimization and result assembly, and nothing in the table
+    # is what you were waiting for.
+    print(stats.wall_clock_summary())
+    assert stats.wall_clock_summary().startswith("operators:")
 
     # Profiling a plan reports per-operator detail.
     profile = ds.profile()

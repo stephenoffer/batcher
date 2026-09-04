@@ -50,6 +50,16 @@ class _RecordingSource:
 
 @pytest.fixture
 def recording_bigquery(monkeypatch):
+    # Register the real family first. `SOURCES` registers the database/warehouse formats
+    # lazily, on the first lookup that misses (`Registry.complete`), and that hook is
+    # one-shot. Patching an entry in before it has run leaves the hook still armed, so the
+    # first lookup inside the test runs it and `SOURCES.add("bigquery", ...)` collides with
+    # the stand-in — `BatcherError: A source named 'bigquery' is already registered`.
+    #
+    # It passed whenever some earlier test in the same process had already completed the
+    # registry, which is why this only failed when the file was run on its own or early in
+    # a chunk. Completing it here makes the fixture independent of what ran before it.
+    SOURCES.complete()
     _RecordingSource.last_kwargs = {}
     monkeypatch.setitem(SOURCES._items, "bigquery", _RecordingSource)
     return _RecordingSource

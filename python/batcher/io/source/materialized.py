@@ -30,6 +30,12 @@ class MaterializedSource:
     __slots__ = ("_files", "_schema", "_work_dir")
     bounded = True
 
+    #: The disk twin of `dist.fleet.FlightMaterializedSource`, and ephemeral for the same
+    #: reason: the backing IPC files are this query's, `cleanup()` removes them, and no later
+    #: query can name them. A statistic filed under this source's key is unreadable by
+    #: construction.
+    ephemeral = True
+
     def __init__(
         self,
         files: list[tuple[str, int]],

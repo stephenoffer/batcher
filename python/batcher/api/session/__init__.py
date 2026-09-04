@@ -9,39 +9,36 @@ catalog), `admin` (maintenance and streaming control), `versions`, and `accelera
 
 Everything funnels through `_scan`, the single place a `Source` becomes a
 `Dataset` and therefore the single place the governance rewrite can be enforced.
+
+The public names resolve lazily (PEP 562, via `batcher._lazy`), so reaching one of
+these modules does not import the other eight. `_scan` and `_catalog` are private and
+stay eager: they are internal call targets rather than surface, and the modules that
+import them do so by name.
 """
 
 from __future__ import annotations
 
-from batcher.api.session import accelerators as _accelerators
-from batcher.api.session import admin as _admin
-from batcher.api.session import combine as _combine
-from batcher.api.session import frames as _frames
-from batcher.api.session import frameworks as _frameworks
-from batcher.api.session import generate as _generate
-from batcher.api.session import read as _read_mod
-from batcher.api.session import sql as _sql
-from batcher.api.session import versions as _versions
-from batcher.api.session._scan import _scan as _scan
-from batcher.api.session.accelerators import *  # noqa: F403
-from batcher.api.session.admin import *  # noqa: F403  (governed by admin.__all__)
-from batcher.api.session.combine import *  # noqa: F403
-from batcher.api.session.frames import *  # noqa: F403
-from batcher.api.session.frameworks import *  # noqa: F403
-from batcher.api.session.generate import *  # noqa: F403
-from batcher.api.session.read import *  # noqa: F403
-from batcher.api.session.sql import *  # noqa: F403
-from batcher.api.session.sql import _catalog as _catalog
-from batcher.api.session.versions import *  # noqa: F403
+from typing import TYPE_CHECKING
 
-__all__ = [
-    *_accelerators.__all__,
-    *_admin.__all__,
-    *_combine.__all__,
-    *_frames.__all__,
-    *_frameworks.__all__,
-    *_generate.__all__,
-    *_read_mod.__all__,
-    *_sql.__all__,
-    *_versions.__all__,
-]
+from batcher._exports import SESSION_EXPORTS as _SESSION_EXPORTS
+from batcher._exports import SESSION_SHADOWED as _SESSION_SHADOWED
+from batcher._lazy import install as _install
+
+if TYPE_CHECKING:
+    # The declaration of this façade's surface, and the generator's input. Eager only
+    # for type checkers and editors — at runtime `__getattr__` binds these on first touch.
+    from batcher.api.session.accelerators import *  # noqa: F403
+    from batcher.api.session.admin import *  # noqa: F403
+    from batcher.api.session.cache import *  # noqa: F403
+    from batcher.api.session.combine import *  # noqa: F403
+    from batcher.api.session.frames import *  # noqa: F403
+    from batcher.api.session.frameworks import *  # noqa: F403
+    from batcher.api.session.generate import *  # noqa: F403
+    from batcher.api.session.read import *  # noqa: F403
+    from batcher.api.session.sql import *  # noqa: F403
+    from batcher.api.session.versions import *  # noqa: F403
+
+#: The `session` surface, in the order the eager façade declared it.
+__all__ = list(_SESSION_EXPORTS)
+
+__getattr__, __dir__ = _install(__name__, _SESSION_EXPORTS, shadowed=_SESSION_SHADOWED)

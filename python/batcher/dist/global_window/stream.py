@@ -29,13 +29,13 @@ from batcher.dist.executor import _relabel_single_source
 from batcher.dist.global_window.offsets import (
     OrderedBucketOffsets,
     bucket_order,
-    inject_avg_helpers,
+    inject_window_helpers,
 )
 from batcher.dist.spill import _fd_safe, map_projection
 from batcher.dist.spill.buckets import spill_scratch
 from batcher.dist.spill_breakers import iter_ordered_buckets, stage_and_partition
 from batcher.io.source import Source
-from batcher.plan.ir_specs import task_scan_ir
+from batcher.plan.ir_specs import unary_task_ir
 from batcher.plan.logical import Window
 
 __all__ = ["stream_spilling_global_window"]
@@ -62,13 +62,13 @@ def stream_spilling_global_window(
     # function rewrites (the scanned input, and the functions list `avg` appends to) before
     # touching them — mutating the cached structures would corrupt every later use of the
     # same plan.
-    win_ir = dict(window.to_ir())
-    win_ir["input"] = task_scan_ir()
-    win_ir["functions"] = list(win_ir["functions"])
+    # `unary_task_ir` builds the window's shape fresh (never the memoized `to_ir()` dict),
+    # so `inject_window_helpers` below may append to `functions` in place.
+    win_ir = unary_task_ir(window)
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; they are read back per bucket and dropped before
     # the rows are yielded, so the output schema is unchanged.
-    avg_helpers = inject_avg_helpers(window, win_ir)
+    helpers = inject_window_helpers(window, win_ir)
     win_json = json.dumps(win_ir)
 
     with spill_scratch("batcher_winstream_", spill_dir) as store:
@@ -86,7 +86,7 @@ def stream_spilling_global_window(
         # Process buckets in *global sort order* (reversed for descending) so the running
         # offsets accumulate correctly. `handles`, not `n_buckets`: `stage_and_partition`
         # sizes the split from the staged bytes, so the bucket count is decided there.
-        offsets = OrderedBucketOffsets(window, avg_helpers)
+        offsets = OrderedBucketOffsets(window, helpers)
         for b in bucket_order(len(handles), desc):
             if handles[b] is None:
                 continue

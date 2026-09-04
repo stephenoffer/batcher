@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import os
+import posixpath
 from typing import Any
 
 import pyarrow as pa
@@ -48,6 +49,7 @@ __all__ = [
     "FileBytesCache",
     "FileSystem",
     "LocalFileSystem",
+    "canonical_path",
     "get_file_cache",
     "local_path",
     "prune_empty_dirs",
@@ -453,6 +455,66 @@ def _split_authority(uri: str) -> tuple[str, str]:
         return uri, ""
     slash = uri.find("/", marker + 3)
     return (uri, "") if slash < 0 else (uri[:slash], uri[slash:])
+
+
+def canonical_path(path: str) -> str:
+    """Return the one spelling of `path` that every equivalent spelling maps to.
+
+    The same object has many URIs. ``s3a://`` is the Hadoop spelling of ``s3://``,
+    ``S3://`` differs only in case, ``bucket//key`` and ``bucket/./key`` and
+    ``bucket/tmp/../key`` all name ``bucket/key``, and a trailing slash names the same
+    directory as no trailing slash. Anything that keys on the *string* — a governance
+    policy, a cache entry, a residency rule — treats those as different objects unless
+    something folds them together first.
+
+    That is a correctness problem for a cache and a security problem for a policy: a
+    rule written about ``s3://vault/pii.parquet`` does not fire on a read of
+    ``s3a://vault/pii.parquet``, so the alias is a bypass. This is the single function
+    that decides the answer, so the reader and the policy cannot disagree about it.
+
+    Only the scheme and the path shape are normalized. The authority — bucket, account,
+    container, and any ``user@host`` — is left byte-for-byte alone: case *is* significant
+    in an S3 key and in an ABFS container, and folding it would merge two real objects.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.filesystem import canonical_path
+            >>> canonical_path("s3a://vault/pii.parquet")
+            's3://vault/pii.parquet'
+            >>> canonical_path("S3://vault//a/./b/../pii.parquet")
+            's3://vault/a/pii.parquet'
+            >>> canonical_path("/data/customers/")
+            '/data/customers'
+
+    Args:
+        path: A local path or a URI, in any accepted spelling.
+
+    Returns:
+        The canonical spelling. A non-string, or a string with no scheme and no path
+        shape to fold, is returned unchanged.
+    """
+    if not isinstance(path, str) or not path:
+        return path
+    scheme, sep, _ = path.partition("://")
+    if not sep:
+        # A local path. `normpath` folds `//`, `.` and `..`, and drops a trailing
+        # slash — but it also rewrites "" to "." and "" is what an ungovernable
+        # source is named, so preserve the empty answer rather than inventing a name.
+        return os.path.normpath(path) if path else path
+    lowered = scheme.lower()
+    canonical_scheme = _SCHEME_ALIASES.get(lowered, lowered)
+    rest = path[len(scheme) :]
+    authority, tail = _split_authority(f"{canonical_scheme}{rest}")
+    if not tail:
+        return authority
+    # posixpath, not os.path: an object-store key is always `/`-separated regardless of
+    # the platform the query runs on, so the local separator must not leak into a name a
+    # policy is matched against. The leading run of slashes is collapsed first because
+    # POSIX leaves a *two*-slash prefix implementation-defined and `normpath` preserves
+    # it — so `s3://b//key` would survive as a second spelling of `s3://b/key`.
+    folded = posixpath.normpath("/" + tail.lstrip("/"))
+    return authority if folded == "/" else f"{authority}{folded}"
 
 
 #: Query options `S3FileSystem.__init__` accepts, with the coercion each needs. Anything

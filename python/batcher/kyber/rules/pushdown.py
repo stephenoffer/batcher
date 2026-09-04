@@ -21,6 +21,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.zonemap_pruning import implied_by_bounds
 from batcher.kyber.stats.constants import constant_value
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit, referenced_columns, remap_columns
@@ -220,7 +221,7 @@ def _equi_key_pair(
 
 
 @rule(name="infer_join_predicates", phase=Phase.PUSHDOWN, matches=(Join,))
-def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+def infer_join_predicates(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
     """Mirror a constant key-constraint across an inner join's equi-key pairs.
 
     For `A ⋈ B ON a.k = b.k`, the keys are equal on every surviving (matched) row,
@@ -235,6 +236,28 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     unmatched rows, so a key constraint does not transfer). The added predicate is a
     superset of what the join already enforces, so the result is unchanged; the
     presence check makes the rule idempotent.
+
+    Idempotent is not the same as *confluent*, and this rule was the second and larger
+    half of a cycle whose first half was fixed in `infer_join_predicate_from_constant_key`
+    below. A mirrored conjunct the target's own bounds already prove prunes nothing there,
+    and `drop_filter_conjunct_implied_by_zonemap` exists precisely to delete such a
+    conjunct — so this rule added it, that rule removed it, and the PUSHDOWN phase never
+    settled: `infer -> push -> merge -> drop -> infer`. **29 of the 99 TPC-DS queries** ran
+    the whole `fixpoint_iterations` budget that way (q64 and q72 hit 63 and 61 iterations),
+    logging "phase did not reach a fixpoint" each time. Results stayed correct — every rule
+    is semantics-preserving — but the plan a query got depended on where the iteration cap
+    happened to land, and the optimizer paid twenty-odd extra whole-plan passes for it.
+
+    So the target is consulted before mirroring, through `zonemap_pruning.implied_by_bounds`
+    — which decides with the *same* oracle the deleting rule decides with, so the two cannot
+    disagree about what "already implied" means.
+
+    The trade is real and worth stating, because the guard is not free: it walks the target's
+    subtree asking the estimator at each level. Planning all 99 TPC-DS queries cold measures
+    **27s against 33s** without it, and the queries that were cycling gain the most — q80
+    1.5s against 2.4s, q64 2.8s against 3.5s, q5 0.9s against 1.5s (each planned once in a
+    fresh process). A query that never cycled pays for the walk and gets nothing back: q14
+    is ~4% slower. Net, and on the tail especially, closing the cycle wins.
     """
     if node.join_type != "inner":
         return None
@@ -243,11 +266,11 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
         left_cons = _column_constraints(node.left, lk)
         if left_cons:
-            new_right, added = _add_inferred(new_right, rk, left_cons, lk)
+            new_right, added = _add_inferred(new_right, rk, left_cons, lk, ctx)
             changed = changed or added
         right_cons = _column_constraints(node.right, rk)
         if right_cons:
-            new_left, added = _add_inferred(new_left, lk, right_cons, rk)
+            new_left, added = _add_inferred(new_left, lk, right_cons, rk, ctx)
             changed = changed or added
     if not changed:
         return None
@@ -326,10 +349,18 @@ def infer_join_predicate_from_constant_key(node: Join, ctx: OptimizerContext) ->
             if constant_value(ctx.estimator.estimate(target).columns.get(target_key)) == value:
                 continue
             equality = [Binary("eq", Col(source_key), Lit(value))]
+            # `ctx` also applies the general "already implied by the target's bounds" test
+            # in `_add_inferred`. The `constant_value` check above is the *narrow* proof
+            # (both sides pinned to one value by constant propagation) and does not cover
+            # every way `drop_filter_conjunct_implied_by_zonemap` can prove the same
+            # equality — a column whose EXACT bounds are `[v, v]` with no nulls, say. That
+            # residue kept four TPC-DS queries oscillating after the broader
+            # `infer_join_predicates` half of the cycle was closed; deciding both halves
+            # with the deleting rule's own oracle closes it.
             if to_left:
-                new_left, added = _add_inferred(new_left, target_key, equality, source_key)
+                new_left, added = _add_inferred(new_left, target_key, equality, source_key, ctx)
             else:
-                new_right, added = _add_inferred(new_right, target_key, equality, source_key)
+                new_right, added = _add_inferred(new_right, target_key, equality, source_key, ctx)
             changed = changed or added
     if not changed:
         return None
@@ -470,10 +501,31 @@ def _sole_constrained_column(conj: Expr) -> str | None:
 
 
 def _add_inferred(
-    target: LogicalPlan, target_key: str, constraints: list[Expr], source_key: str
+    target: LogicalPlan,
+    target_key: str,
+    constraints: list[Expr],
+    source_key: str,
+    ctx: OptimizerContext | None = None,
 ) -> tuple[LogicalPlan, bool]:
-    """Add each `constraints` conjunct, rephrased onto `target_key`, to `target` —
-    unless an identical conjunct is already present. Returns `(plan, changed)`."""
+    """Add each `constraints` conjunct, rephrased onto `target_key`, to `target`.
+
+    A conjunct is skipped when it is already present verbatim, and — given `ctx` — when the
+    target's own column bounds already prove it true of every row. The second test is what
+    keeps the rule *confluent*: such a conjunct prunes nothing, and
+    `drop_filter_conjunct_implied_by_zonemap` deletes it on the next pass, so adding it
+    starts a cycle the PUSHDOWN fixpoint cannot escape.
+
+    Args:
+        target: The join side to constrain.
+        target_key: The key column on `target` the constraints are rephrased onto.
+        constraints: `key OP literal` conjuncts proven on the *other* side.
+        source_key: The key column those constraints are phrased in.
+        ctx: The optimizer context, for the estimator. Omitted by a caller that has
+            already proven the target does not imply the constraint by other means.
+
+    Returns:
+        The (possibly filtered) target, and whether anything was added.
+    """
     current = split_conjuncts(target.predicate) if isinstance(target, Filter) else []
     # A set of canonical (memoized) keys, not a list of IR dicts: dicts are unhashable, so
     # the "already present?" test was a linear scan with a full dict comparison per step.
@@ -483,6 +535,8 @@ def _add_inferred(
         for c in constraints
         if expr_key(remapped := remap_columns(c, {source_key: target_key})) not in existing
     ]
+    if fresh and ctx is not None:
+        fresh = [c for c in fresh if not implied_by_bounds(target, target_key, c, ctx)]
     if not fresh:
         return target, False
     if isinstance(target, Filter):

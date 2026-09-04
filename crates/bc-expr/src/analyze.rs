@@ -168,6 +168,11 @@ impl Expr {
             // existed.
             Expr::Cast { .. }
             | Expr::Case { .. }
+            // `MakeMap` raises on a row's *values* — a null key, a duplicate key, or key
+            // and value lists of different lengths — so it is fallible in the strongest
+            // sense this predicate cares about: whether reordering a conjunct ahead of it
+            // could stop an error that should be raised.
+            | Expr::MakeMap { .. }
             | Expr::Date { .. }
             // A geo function raises on a *caller* error (a negative radius, an
             // unsupported EPSG code) rather than on a row's value, so it would qualify
@@ -302,6 +307,35 @@ impl Expr {
                 };
                 own.saturating_add(input.eval_cost())
             }
+            // Every condition is evaluated; exactly **one** body is, per row. That is what
+            // `eval::branch` now does, so summing the bodies would price a `CASE` at what
+            // it used to cost rather than what it costs — and this number decides both the
+            // conjunct order and, through `eval_over`, whether a branch is worth gathering
+            // for. A four-arm `CASE` over regexes would otherwise read as the flat 50 the
+            // wildcard gave it, cheaper than the single `regexp_extract` inside it.
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                let conditions = branches
+                    .iter()
+                    .fold(0u32, |acc, b| acc.saturating_add(b.when.eval_cost()));
+                let body = branches
+                    .iter()
+                    .map(|b| b.then.eval_cost())
+                    .max()
+                    .unwrap_or(0)
+                    .max(otherwise.eval_cost());
+                1u32.saturating_add(conditions).saturating_add(body)
+            }
+            // Unlike `CASE`, how many arguments a row walks is a property of the *data*:
+            // a row whose every argument is null pays for all of them. Nothing static
+            // bounds that below the sum, so the sum is what it is priced at — an
+            // over-estimate keeps an expensive `COALESCE` behind cheaper conjuncts, where
+            // an under-estimate would run it first over every row.
+            Expr::Coalesce { inputs } => inputs
+                .iter()
+                .fold(1u32, |acc, e| acc.saturating_add(e.eval_cost())),
             _ => 50,
         }
     }
@@ -447,6 +481,13 @@ impl Expr {
             Expr::Spatial { args, .. } => args.iter().for_each(visit),
             Expr::MakeTemporal { args, .. } => args.iter().for_each(visit),
             Expr::MakeStruct { fields } => fields.iter().for_each(|f| visit(&f.value)),
+            // Both operands are read, so a column referenced only by the value list must
+            // not be pruned away — the failure mode here is a missing column at execution,
+            // not a wrong answer.
+            Expr::MakeMap { keys, values } => {
+                visit(keys);
+                visit(values);
+            }
             Expr::Case {
                 branches,
                 otherwise,

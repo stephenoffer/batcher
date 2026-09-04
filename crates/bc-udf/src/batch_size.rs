@@ -32,6 +32,7 @@ const INTEGRAL_CLAMP: f64 = 5.0;
 impl BatchSizeController {
     /// Create a controller targeting `target_latency_ms`, keeping the batch size in
     /// `[min_rows, max_rows]`, starting from `initial_rows`.
+    #[must_use]
     pub fn new(
         target_latency_ms: f64,
         min_rows: usize,
@@ -55,6 +56,7 @@ impl BatchSizeController {
     }
 
     /// The current target batch size in rows.
+    #[must_use]
     pub fn current_rows(&self) -> usize {
         (self.current.round() as usize).clamp(self.min_rows, self.max_rows)
     }

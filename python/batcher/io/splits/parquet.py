@@ -108,6 +108,12 @@ _MAX_CACHED_ROW_GROUPS = max(1, int(os.environ.get("BATCHER_FOOTER_CACHE_ROW_GRO
 
 _FOOTERS = FileMetaCache(_MAX_CACHED_ROW_GROUPS)
 
+#: Planned splits per `(file identity, target size, predicate)`. Weighed by split count, the
+#: same way `_FOOTERS` is weighed by row groups and for the same reason: what makes this
+#: resident is how finely a file was cut, not how many files there are. Bounded at the same
+#: figure, since one split per row group is the finest cut this produces.
+_SPLITS = FileMetaCache(_MAX_CACHED_ROW_GROUPS)
+
 
 def _read_footer(path: str, fs: Any | None = None):
     import pyarrow.parquet as pq
@@ -310,18 +316,61 @@ def parquet_row_group_splits(
     # The cached footer avoids re-reading the metadata here AND on the worker that later
     # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`,
     # which also explains why `fs` is worth threading down from a caller that has one.
+    #
+    # The *splits* are cached too, and separately, because the footer cache only removes the
+    # I/O. Everything below it — decoding `.statistics` per row-group per predicate column,
+    # building the manifest, packing the runs — is pure Python over the file's physical
+    # layout, and it is redone on every query even though its inputs (an identified file, a
+    # predicate, a target size) cannot have changed. On TPC-H sf1000 that is 49,000 row
+    # groups across 1,000 files: **666 ms of driver time per query, with all 65 nodes idle**,
+    # since no task can be submitted until the last split exists. Measured as 22% of a
+    # 4.5-second `scan + group-by`, and a larger share of every smaller query.
+    identity = file_identity(path, fs)
+    key = None
+    if identity is not None:
+        key = (identity, target_size, _predicate_key(predicate))
+        hit = _SPLITS.get(key)
+        if hit is not None:
+            # A fresh list of shared, frozen splits: `RowGroupSplit` is immutable, but the
+            # list is not, and every caller here goes on to balance and slice it.
+            return list(hit)
+
     meta = _parquet_footer(path, fs)
     targets = list(range(meta.num_row_groups))
     if predicate is not None:
         targets = _surviving_row_groups(meta, predicate)
         if not targets:
+            if key is not None:
+                _SPLITS.put(key, (), weight=1)
             return []  # provably no matching row in this file — do not create a task for it
 
     sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
     rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
     runs = _pack(targets, sizes, target_size)
     # Carry the footer-derived row count so balancing never re-opens the file.
-    return [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]
+    splits = [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]
+    if key is not None:
+        _SPLITS.put(key, tuple(splits), weight=max(1, len(splits)))
+    return splits
+
+
+def _predicate_key(predicate: dict | None) -> str:
+    """A stable cache key for a pushed-down predicate, or `""` for none.
+
+    The predicate is the JSON IR, so it serializes; `default=repr` covers a node carrying a
+    value JSON has no encoding for (a `Decimal`, a date) rather than raising. A predicate
+    that cannot be keyed at all returns a value unequal to any other, which costs a cache
+    miss and never a wrong hit -- the direction that matters, since a stale hit here would
+    prune row groups against the wrong filter and silently lose rows.
+    """
+    if predicate is None:
+        return ""
+    try:
+        import json
+
+        return json.dumps(predicate, sort_keys=True, default=repr)
+    except Exception:
+        return f"<unkeyable {id(predicate)}>"
 
 
 def _pack(targets: list[int], sizes: list[int], target_size: int | None) -> list[list[int]]:
@@ -389,31 +438,48 @@ def _row_group_manifest(meta: Any, columns: list[str]) -> pa.Table | None:
         return None
 
     n = meta.num_row_groups
-    data: dict[str, Any] = {
-        "path": [str(i) for i in range(n)],
-        "num_records": [meta.row_group(i).num_rows for i in range(n)],
-    }
-    for name, index in wanted.items():
-        lows: list[Any] = []
-        highs: list[Any] = []
-        nulls: list[int | None] = []
-        for i in range(n):
-            stats = meta.row_group(i).column(index).statistics
+    # ONE pass over the row groups, not one per column. `meta.row_group(i)` reads the footer
+    # metadata for the group, and the loop below used to ask for it `1 + len(wanted)` times per
+    # group — once for `num_records` and again inside every column's own loop. On a 16-column
+    # file with seven predicate columns that is eight passes to read what one pass has in hand.
+    #
+    # The row-group handle is the part worth hoisting and the statistics are not: measured on
+    # 196 row groups of `lineitem`, eight passes of `meta.row_group(i)` cost 0.9 ms against
+    # 0.1 ms for one, while reading `.statistics` and decoding `.min`/`.max` cost 6.9 ms and is
+    # unavoidable — the bounds are what the caller asked for. So this removes the pass count,
+    # not the decode.
+    records: list[int] = []
+    lows: dict[str, list[Any]] = {name: [] for name in wanted}
+    highs: dict[str, list[Any]] = {name: [] for name in wanted}
+    nulls: dict[str, list[int | None]] = {name: [] for name in wanted}
+    for i in range(n):
+        group = meta.row_group(i)
+        records.append(group.num_rows)
+        for name, index in wanted.items():
+            stats = group.column(index).statistics
             if stats is None or not getattr(stats, "has_min_max", False):
-                lows.append(None)
-                highs.append(None)
-                nulls.append(None)
+                lows[name].append(None)
+                highs[name].append(None)
+                nulls[name].append(None)
                 continue
             low, high = stats.min, stats.max
             # A NaN bound is unordered; treat it as "unknown", which keeps the row-group.
             if _is_nan(low) or _is_nan(high):
                 low = high = None
-            lows.append(low)
-            highs.append(high)
-            nulls.append(stats.null_count if getattr(stats, "has_null_count", False) else None)
-        data[f"min.{name}"] = lows
-        data[f"max.{name}"] = highs
-        data[f"null_count.{name}"] = nulls
+            lows[name].append(low)
+            highs[name].append(high)
+            nulls[name].append(
+                stats.null_count if getattr(stats, "has_null_count", False) else None
+            )
+
+    data: dict[str, Any] = {
+        "path": [str(i) for i in range(n)],
+        "num_records": records,
+    }
+    for name in wanted:
+        data[f"min.{name}"] = lows[name]
+        data[f"max.{name}"] = highs[name]
+        data[f"null_count.{name}"] = nulls[name]
     try:
         return pa.table(data)
     except (pa.ArrowInvalid, pa.ArrowTypeError):

@@ -1,6 +1,6 @@
-"""The result cache: a memory-bounded LRU of materialized Arrow results.
+"""The result cache: a memory-bounded, cost-aware store of materialized Arrow results.
 
-Pins the storage-memory contract — bounded bytes, LRU eviction, the size guard, and
+Pins the storage-memory contract — bounded bytes, cost-aware eviction, the size guard, and
 the pressure ladder that yields cache RAM back to execution — without the engine.
 """
 
@@ -34,7 +34,7 @@ def test_lru_eviction_keeps_within_budget():
     store.put("a", _table(100))
     store.put("b", _table(100))
     store.get("a")  # touch "a" → "b" is now least-recently-used
-    store.put("c", _table(100))  # over budget → evict the LRU ("b")
+    store.put("c", _table(100))  # over budget → evict the lowest keep-value ("b")
     assert store.get("a") is not None
     assert store.get("c") is not None
     assert store.get("b") is None  # evicted
@@ -210,3 +210,59 @@ def test_cache_store_stats_hit_rate():
     assert s["hits"] == 1 and s["misses"] == 1
     assert s["hit_rate"] == 0.5
     assert CacheStore(1).stats()["hit_rate"] == 0.0  # cold
+
+
+def test_a_stale_hot_entry_does_not_freeze_the_cache_against_the_live_working_set():
+    # Without GDSF's inflation term the keep-value is frequency-with-no-aging, and the
+    # store freezes: a result hammered during warmup outranks every later arrival
+    # permanently, because a fresh entry has zero hits and is therefore always the
+    # cheapest victim of the very `put` that admitted it. The live working set then
+    # misses forever while the cache serves whatever got hot first.
+    #
+    # This asserts the outcome (the working set eventually gets served) rather than the
+    # mechanism, so it stays true if the ranking is re-derived a different way.
+    one = _table(100)
+    store = CacheStore(max_bytes=3 * one.nbytes)  # room for ~3 entries
+
+    store.put("warmup", _table(100), cost=1.0)
+    for _ in range(200):
+        store.get("warmup")
+
+    # The workload moves on entirely: a 3-key set, re-read, that fits the budget on its own.
+    keys = ["w0", "w1", "w2"]
+    for _round in range(2000):
+        for key in keys:
+            if store.get(key) is None:
+                store.put(key, _table(100), cost=1.0)
+
+    assert "warmup" not in store, "a cold entry still pins the budget: the ranking cannot age"
+    resident = [key for key in keys if key in store]
+    assert resident == keys, f"the live working set is still being evicted on arrival: {resident}"
+
+
+def test_the_eviction_clock_never_outranks_a_resident_entry():
+    # The inflation term is a floor, and it stays one only because of an invariant the
+    # code relies on to skip a `max`: no resident entry may rank *below* the clock. Break
+    # it and the clock walks backwards on the next eviction, re-opening exactly the
+    # window the term exists to close. Checked after every operation of a randomized
+    # workload rather than on one hand-built sequence, because the shapes that would
+    # break it are the ones nobody thinks to write down.
+    import random
+
+    random.seed(7)
+    store = CacheStore(max_bytes=8 * _table(100).nbytes)
+    keys = [f"k{i}" for i in range(12)]
+    evicted_at_least_once = False
+    for _ in range(3000):
+        key = random.choice(keys)
+        if store.get(key) is None:
+            size = random.choice([50, 100, 400])
+            store.put(key, _table(size), cost=random.choice([0.0, 0.1, 5.0]))
+        evicted_at_least_once = evicted_at_least_once or store._clock > 0.0
+        below = [k for k, e in store._entries.items() if e.value() < store._clock]
+        assert not below, f"{below} rank below the eviction clock {store._clock}"
+
+    assert evicted_at_least_once, "nothing was ever evicted, so the scenario proves nothing"
+
+    store.clear()
+    assert store._clock == 0.0, "an emptied store still prices admissions against a dead generation"

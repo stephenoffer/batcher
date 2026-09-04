@@ -267,7 +267,7 @@ class Clipper(Preprocessor):
             >>> from batcher.ml.preprocessors import Clipper
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 1000.0]})
             >>> Clipper("x", upper=0.8).fit_transform(ds).to_pydict()["x"][-1]
-            203.2000000000002
+            203.20000000000016
 
     Args:
         columns: The numeric columns to clamp (replaced in place).

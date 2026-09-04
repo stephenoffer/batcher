@@ -25,6 +25,19 @@ from batcher.plan.expr_ir import (
 from batcher.plan.expr_ir.core import _wrap
 from batcher.plan.expr_ir.nodes import Greatest, Least
 
+__all__ = [
+    "all_horizontal",
+    "any_horizontal",
+    "count_horizontal",
+    "fold_horizontal",
+    "max_horizontal",
+    "mean_horizontal",
+    "min_horizontal",
+    "product_horizontal",
+    "reduce_horizontal",
+    "sum_horizontal",
+]
+
 
 def sum_horizontal(*exprs: IntoExpr) -> Expr:
     """Row-wise sum across the given columns, treating nulls as 0 (Polars ``sum_horizontal``).

@@ -254,7 +254,7 @@ fn bounded(
 fn scale_channels(img: &mut image::RgbaImage, f: impl Fn(f32) -> f32) {
     for px in img.pixels_mut() {
         for c in 0..3 {
-            px.0[c] = f(px.0[c] as f32).clamp(0.0, 255.0).round() as u8;
+            px.0[c] = f(f32::from(px.0[c])).clamp(0.0, 255.0).round() as u8;
         }
     }
 }
@@ -276,9 +276,9 @@ fn mean_luma(img: &image::RgbaImage) -> f32 {
 /// Interpolate each pixel between its grey and its colour: `0` grayscale, `1` identity.
 fn saturate(img: &mut image::RgbaImage, f: f32) {
     for px in img.pixels_mut() {
-        let grey = rec601([px.0[0], px.0[1], px.0[2]]) as f32;
+        let grey = f32::from(rec601([px.0[0], px.0[1], px.0[2]]));
         for c in 0..3 {
-            px.0[c] = (grey + (px.0[c] as f32 - grey) * f)
+            px.0[c] = (grey + (f32::from(px.0[c]) - grey) * f)
                 .clamp(0.0, 255.0)
                 .round() as u8;
         }
@@ -294,7 +294,7 @@ fn unsharp(img: &mut image::RgbaImage, amount: f32) {
     let blurred = image::imageops::fast_blur(img, 1.0);
     for (px, soft) in img.pixels_mut().zip(blurred.pixels()) {
         for c in 0..3 {
-            let sharp = px.0[c] as f32 + amount * (px.0[c] as f32 - soft.0[c] as f32);
+            let sharp = f32::from(px.0[c]) + amount * (f32::from(px.0[c]) - f32::from(soft.0[c]));
             px.0[c] = sharp.clamp(0.0, 255.0).round() as u8;
         }
     }

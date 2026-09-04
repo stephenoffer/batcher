@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from tools.audit.context import Context, Finding, build_context
 from tools.audit.dead import detect_dead_python, detect_dead_rust
+from tools.audit.methodology import detect_methodology
 from tools.audit.production import detect_production
 from tools.audit.silent import detect_near_duplicate, detect_stub, detect_swallowed
 from tools.audit.testing import detect_test_quality
@@ -26,5 +27,6 @@ DETECTORS = {
     "stub": detect_stub,
     "near-duplicate": detect_near_duplicate,
     "test-quality": detect_test_quality,
+    "methodology": detect_methodology,
     "production": detect_production,
 }

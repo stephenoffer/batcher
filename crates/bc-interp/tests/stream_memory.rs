@@ -202,9 +202,7 @@ fn peak_memory_streaming_vs_materializing() {
     );
     assert!(
         l < f * 2,
-        "streaming peak must not scale with input size: {} -> {}",
-        f,
-        l
+        "streaming peak must not scale with input size: {f} -> {l}"
     );
 }
 

@@ -24,6 +24,12 @@ Streaming tensors into a training loop, and a shard per DDP rank.
 Datasets in with no copy; model ids that load once per worker.
 :::
 
+:::{grid-item-card} {octicon}`package;1.1em` MLflow
+:link: /integrations/compute/mlflow
+:link-type: doc
+Score a `models:/` reference directly; resolved on the worker, against its own credentials.
+:::
+
 :::{grid-item-card} {octicon}`server;1.1em` Batch schedulers
 :link: /integrations/compute/schedulers
 :link-type: doc
@@ -39,4 +45,5 @@ ray
 schedulers
 pytorch
 huggingface
+mlflow
 ```

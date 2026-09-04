@@ -49,6 +49,11 @@ def native_merge(
     set is a delta rather than a bulk load, so the cost is bounded by the size of the
     update and not of the table.
 
+    The write is authorized before the change set is materialized. This path does not go
+    through `api.terminal.core._write`, which is where every other write is authorized —
+    the format's own client performs the merge — so without this it was a hole in write
+    governance shaped exactly like the targets an enterprise deployment cares about most.
+
     Args:
         source: The change set.
         target: The table being merged into.
@@ -61,8 +66,13 @@ def native_merge(
         A `WriteManifest` of the data files the merge wrote.
 
     Raises:
+        AccessDeniedError: If a `security()` block governs `target` and the principal does
+            not hold every privilege the clauses exercise.
         PlanError: If `fmt` has no native merge, or the clauses use a shape it cannot run.
     """
+    from batcher.api.security._write import authorize_write, merge_privileges
+
+    authorize_write(target, source.columns, merge_privileges(clauses))
     if fmt == "delta":
         from batcher.api.merge.delta_native import merge_into_delta
 

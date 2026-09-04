@@ -179,7 +179,7 @@ mod tests {
                 out.push((k.value(i).to_bits(), rn.value(i), s.value(i)));
             }
         }
-        out.sort();
+        out.sort_unstable();
         out
     }
 

@@ -2994,6 +2994,7 @@ class DatasetML:
         finish_reason: bool = False,
         logprobs: bool = False,
         dedup: bool = False,
+        skip_null_prompts: bool = False,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -3050,6 +3051,11 @@ class DatasetML:
                 row that repeats it — a throughput win for deterministic decoding over a
                 corpus with duplicate prompts. Leave off when sampling and an independent
                 draw per row is wanted.
+            skip_null_prompts: Leave a row whose `prompt_column` is null out of the request
+                and give it a null output, instead of sending it as ``""``. Off by default;
+                turn it on to stop spending a decode slot (GPU engine) or a billed request
+                (hosted engine) on a row that has no prompt. Ignored when `template` or
+                `image_column` is set.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -3097,6 +3103,7 @@ class DatasetML:
             finish_reason=finish_reason,
             logprobs=logprobs,
             dedup=dedup,
+            skip_null_prompts=skip_null_prompts,
         )
         # Order must match GenerateSpec.appended_columns: output, usage, finish_reason, logprob.
         appended = [

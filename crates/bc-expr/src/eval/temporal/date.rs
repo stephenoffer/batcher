@@ -117,10 +117,10 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "isodow".into(),
                     want: "an Int32 day-of-week kernel result",
-                    got: part.data_type().to_string(),
+                    got: crate::error::type_name(part.data_type()),
                 })?;
         let out: Int64Array = (0..dow.len())
-            .map(|i| (!dow.is_null(i)).then(|| dow.value(i) as i64 + 1))
+            .map(|i| (!dow.is_null(i)).then(|| i64::from(dow.value(i)) + 1))
             .collect();
         return Ok(Arc::new(out));
     }
@@ -142,12 +142,12 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                 .ok_or_else(|| ExprError::ExpectedType {
                     func: "century/decade/millennium".into(),
                     want: "an Int32 year kernel result",
-                    got: years.data_type().to_string(),
+                    got: crate::error::type_name(years.data_type()),
                 })?;
         let out: Int64Array = (0..y.len())
             .map(|i| {
                 (!y.is_null(i)).then(|| {
-                    let yr = y.value(i) as i64;
+                    let yr = i64::from(y.value(i));
                     match func {
                         DateFunc::Century => (yr - 1).div_euclid(100) + 1,
                         DateFunc::Decade => yr.div_euclid(10),
@@ -249,7 +249,7 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                         let first_this = NaiveDate::from_ymd_opt(y, mo, 1)?;
                         Some((first_next - first_this).num_days())
                     }
-                    DateFunc::IsoYear => Some(d.iso_week().year() as i64),
+                    DateFunc::IsoYear => Some(i64::from(d.iso_week().year())),
                     _ => unreachable!("matched is_leap_year/days_in_month/iso_year above"),
                 }
             })
@@ -307,17 +307,17 @@ pub(crate) fn eval_date_trunc(arr: &ArrayRef, unit: &str) -> Result<ArrayRef, Ex
         let midnight = |nd: NaiveDate| nd.and_hms_opt(0, 0, 0);
         let out = match unit {
             "millennium" | "millenium" => midnight(NaiveDate::from_ymd_opt(
-                (d.year() as i64).div_euclid(1000) as i32 * 1000,
+                i64::from(d.year()).div_euclid(1000) as i32 * 1000,
                 1,
                 1,
             )?)?,
             "century" => midnight(NaiveDate::from_ymd_opt(
-                (d.year() as i64).div_euclid(100) as i32 * 100,
+                i64::from(d.year()).div_euclid(100) as i32 * 100,
                 1,
                 1,
             )?)?,
             "decade" => midnight(NaiveDate::from_ymd_opt(
-                (d.year() as i64).div_euclid(10) as i32 * 10,
+                i64::from(d.year()).div_euclid(10) as i32 * 10,
                 1,
                 1,
             )?)?,
@@ -331,7 +331,7 @@ pub(crate) fn eval_date_trunc(arr: &ArrayRef, unit: &str) -> Result<ArrayRef, Ex
             "month" => midnight(NaiveDate::from_ymd_opt(d.year(), d.month(), 1)?)?,
             // ISO week starts Monday; step back to the most recent Monday.
             "week" => {
-                let back = d.weekday().num_days_from_monday() as i64;
+                let back = i64::from(d.weekday().num_days_from_monday());
                 midnight(d.checked_sub_signed(chrono::Duration::try_days(back)?)?)?
             }
             "day" => d.and_hms_opt(0, 0, 0)?,
@@ -432,7 +432,7 @@ pub(crate) fn eval_date_offset(
                         return None;
                     }
                     offset
-                        .shift_scalar(&DataType::Date32, a.value(i) as i64, 1)
+                        .shift_scalar(&DataType::Date32, i64::from(a.value(i)), 1)
                         .map(|d| d as i32)
                 })
                 .collect();
@@ -492,8 +492,8 @@ pub(crate) fn add_months(dates: &ArrayRef, months: &ArrayRef) -> Result<ArrayRef
                         return None;
                     }
                     // Checked: a far-out Date32 must not panic `NaiveDate + Duration`.
-                    let d =
-                        epoch.checked_add_signed(chrono::Duration::try_days(a.value(i) as i64)?)?;
+                    let d = epoch
+                        .checked_add_signed(chrono::Duration::try_days(i64::from(a.value(i)))?)?;
                     shift(d, m.value(i)).map(|nd| (nd - epoch).num_days() as i32)
                 })
                 .collect();

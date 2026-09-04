@@ -6,6 +6,7 @@ here to keep `dataset.py` focused on the public `Dataset` surface.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -150,12 +151,36 @@ def _as_str_list(value: str | list[str] | None) -> list[str]:
 
 
 def _broadcast(flag: bool | list[bool], n: int, name: str) -> list[bool]:
-    """Expand a single bool to `n`, or validate a list of the right length."""
+    """Expand a single bool to `n`, or validate a list of bools of the right length.
+
+    The shape is checked here, at the API edge, because every wrong shape used to be
+    reported somewhere unhelpful. A *string* is the worst of them: it is iterable, so
+    `sort("a", descending="maybe")` measured `len("maybe")` and answered "descending list
+    has 5 entries but there are 1 keys" -- a sentence about a list the caller never wrote.
+    A non-sequence fell through to a bare `TypeError: object of type 'int' has no len()`,
+    and a list of non-bools got all the way to the engine, which rejected it as "malformed
+    plan IR: invalid type: string, expected a boolean" -- an IR diagnostic for a typo in a
+    keyword argument.
+    """
     if isinstance(flag, bool):
         return [flag] * n
-    if len(flag) != n:
-        raise PlanError(f"{name} list has {len(flag)} entries but there are {n} keys")
-    return list(flag)
+    # `str` is checked before `Iterable` on purpose: it satisfies the protocol, and
+    # iterating it is exactly the misreading above.
+    if isinstance(flag, str) or not isinstance(flag, Iterable):
+        raise PlanError(
+            f"{name} must be a bool, or a list of bools with one entry per sort key; "
+            f"got {type(flag).__name__} {flag!r}"
+        )
+    values = list(flag)
+    if len(values) != n:
+        raise PlanError(f"{name} list has {len(values)} entries but there are {n} keys")
+    bad = [v for v in values if not isinstance(v, bool)]
+    if bad:
+        raise PlanError(
+            f"{name} must contain only bools, one per sort key; got {bad[0]!r} "
+            f"({type(bad[0]).__name__})"
+        )
+    return values
 
 
 # Both empty-result helpers now live in neutral `plan`, so `api`, `dist`, and `core` share

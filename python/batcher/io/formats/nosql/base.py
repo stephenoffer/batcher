@@ -317,6 +317,22 @@ class ScanSource(ABC):
             f"{connection_fingerprint(self._fingerprint_material())}"
         )
 
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: this store's own locator.
+
+        Distinct from `identity`, which names a *relation* and so folds in a
+        `connection_fingerprint` -- the same table on staging and on production must not
+        share one statistics entry. A policy is the other thing: it is written before the
+        first read, by someone who has to be able to **type the name**. A fingerprint is a
+        sha256 of the connection options, so keying governance on the identity meant a
+        policy on this connector could not be written at all: every read was ungoverned and
+        nothing said so.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none to name.
+        """
+        return self._identity_suffix()
+
     def _fingerprint_material(self) -> dict[str, Any]:
         """The connection kwargs as they should be fingerprinted; `_conn_kwargs` by default.
 

@@ -113,7 +113,7 @@ fn a_bare_op_deserializes_with_no_optional_keys() {
             Some("TTAGGCCAT".into()),
             Some("ttaggccat".into()),
             Some("NACGT".into()),
-            Some("".into()),
+            Some(String::new()),
             None,
         ]
     );

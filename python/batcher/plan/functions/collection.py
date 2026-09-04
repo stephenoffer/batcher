@@ -1,7 +1,8 @@
-"""Collection-construction free functions (`struct`, `named_struct`, `sequence`).
+"""Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`).
 
 `struct`/`named_struct` build a `MakeStruct` node — the construction counterpart of
-the `.struct.field` read accessor; `sequence` builds a per-row integer list. `struct`
+the `.struct.field` read accessor; `map_from_arrays` is the same counterpart for the
+`.map` accessors; `sequence` builds a per-row integer list. `struct`
 takes ``name=expr`` keywords (Pythonic); `named_struct` takes alternating name/value
 positional arguments (SQL ``named_struct``).
 """
@@ -10,7 +11,15 @@ from __future__ import annotations
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
-from batcher.plan.expr_ir.nodes import Col, MakeStruct, Sequence
+from batcher.plan.expr_ir.nodes import Col, MakeMap, MakeStruct, Sequence
+
+__all__ = [
+    "element",
+    "map_from_arrays",
+    "named_struct",
+    "sequence",
+    "struct",
+]
 
 #: The reserved column name the list higher-order ops bind each element to. Must
 #: match the Rust `eval/list_hof.rs` ELEMENT constant.
@@ -40,6 +49,42 @@ def struct(**fields: IntoExpr) -> Expr:
     if not fields:
         raise PlanError("struct() requires at least one field")
     return MakeStruct([(name, _wrap(value)) for name, value in fields.items()])
+
+
+def map_from_arrays(keys: IntoExpr, values: IntoExpr) -> Expr:
+    """Build a map column by pairing a list of keys with a list of values.
+
+    This is the construction counterpart of the ``.map`` read accessors, and the name is
+    Spark's. SQL spells it ``map(keys, values)`` (DuckDB) or ``map_from_arrays`` (Spark);
+    both reach this node. The Python name avoids ``map`` because that is a builtin.
+
+    Three inputs raise rather than being coerced, matching DuckDB, because each has a
+    plausible wrong answer instead: a null key (Arrow map keys are non-nullable), a
+    duplicate key (keeping first or last is a guess), and key/value lists of different
+    lengths (truncating silently drops data). A null *value* is fine, and a null list on
+    either side yields a null map.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"k": [["a", "b"]], "v": [[1, 2]]})
+            >>> m = ds.select(bt.map_from_arrays(bt.col("k"), bt.col("v")).alias("m"))
+            >>> m.to_pydict()["m"]
+            [[('a', 1), ('b', 2)]]
+
+            >>> keys = m.select(bt.col("m").map.keys().alias("ks"))
+            >>> keys.to_pydict()["ks"]
+            [['a', 'b']]
+
+    Args:
+        keys: A list column (or literal list) of map keys, one list per row.
+        values: A list column of the matching values, the same length per row as `keys`.
+
+    Returns:
+        An expression producing a ``Map`` column.
+    """
+    return MakeMap(_wrap(keys), _wrap(values))
 
 
 def named_struct(*args: object) -> Expr:

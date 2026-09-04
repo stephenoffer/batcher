@@ -48,7 +48,7 @@ lz4_flex = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA timezone database for `convert_timezone` (DST-aware tz conversion).
 chrono-tz = { version = "0.10", default-features = false }
-serde_json = "1"
+serde_json = { workspace = true }
 # Cryptographic / non-cryptographic hashes for the `md5`/`sha1`/`sha256`/`crc32`/
 # `xxhash64` string functions (all pure-Rust). Differential-tested vs DuckDB where it
 # has the same function (md5/sha1/sha256), fixture-tested otherwise (crc32/xxhash64).

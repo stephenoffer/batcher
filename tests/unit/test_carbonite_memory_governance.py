@@ -184,7 +184,7 @@ def test_the_ladder_survives_an_inverted_soft_hard_config() -> None:
 
 def test_the_ladder_is_monotone_in_usage() -> None:
     mon = _monitor(soft=0.85, hard=0.90)
-    levels = [mon._classify(u / 100) for u in range(0, 101)]
+    levels = [mon._classify(u / 100) for u in range(101)]
     assert levels == sorted(levels), "a fuller box must never classify as calmer"
     assert levels[0] is PressureLevel.NORMAL
     assert levels[-1] is PressureLevel.CRITICAL

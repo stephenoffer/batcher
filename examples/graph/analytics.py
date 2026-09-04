@@ -30,7 +30,13 @@ def social_graph() -> bg.Graph:
 def diagnose_before_spending(g: bg.Graph) -> None:
     """The cheap numbers that say which expensive algorithms are worth running."""
     print("--- one row of diagnostics ---")
-    print(bg.summarize(g).to_pydict())
+    summary = bg.summarize(g).to_pydict()
+    print(summary)
+    # The fixture is stated in `social_graph`'s docstring: 9 nodes, 9 edges, one isolated.
+    # A diagnostic that silently disagrees with its own input is worse than no diagnostic.
+    assert summary["nodes"] == [9] and summary["edges"] == [9]
+    assert summary["isolated"] == [1] and summary["directed"] == [True]
+    assert summary["average_degree"] == [2.0], "2 * 9 edges / 9 nodes"
 
     print("--- degree, both directions and weighted ---")
     table = (
@@ -40,12 +46,32 @@ def diagnose_before_spending(g: bg.Graph) -> None:
         .join(bg.weighted_degree(g), on="node", how="left")
         .sort("node")
     )
-    print(table.to_pydict())
+    degrees = table.to_pydict()
+    print(degrees)
+    # Degree must be the two directions summed, for every node, or one of the three is wrong.
+    for node, deg, into, out in zip(
+        degrees["node"], degrees["degree"], degrees["in_degree"], degrees["out_degree"], strict=True
+    ):
+        assert deg == into + out, f"{node}: degree {deg} != {into} in + {out} out"
+    assert sum(degrees["in_degree"]) == sum(degrees["out_degree"]) == 9, "one per edge"
+    # The c->d edge carries weight 3, so weighted degree exceeds plain degree exactly there.
+    weighted = dict(zip(degrees["node"], degrees["weighted_degree"], strict=True))
+    plain = dict(zip(degrees["node"], degrees["degree"], strict=True))
+    assert {n for n in plain if weighted[n] > plain[n]} == {"c", "d"}
 
     print("--- the degree distribution is the shape of the graph ---")
-    print(bg.degree_distribution(g).to_pydict())
-    print("average degree:", round(bg.average_degree(g), 4))
-    print("isolated:", bg.isolated_nodes(g).to_pydict()["node"])
+    distribution = bg.degree_distribution(g).to_pydict()
+    print(distribution)
+    assert sum(distribution["nodes"]) == 9, "the distribution must account for every node"
+    average = bg.average_degree(g)
+    print("average degree:", round(average, 4))
+    # The distribution and the average are two views of one quantity; derive one from the
+    # other rather than printing both and hoping.
+    total = sum(d * n for d, n in zip(distribution["degree"], distribution["nodes"], strict=True))
+    assert abs(total / 9 - average) < 1e-12
+    isolated = bg.isolated_nodes(g).to_pydict()["node"]
+    print("isolated:", isolated)
+    assert isolated == ["lonely"], "the fixture has exactly one isolated node"
 
     print("--- density, reciprocity, assortativity ---")
     print(
@@ -60,9 +86,17 @@ def diagnose_before_spending(g: bg.Graph) -> None:
 def find_the_pieces(g: bg.Graph) -> None:
     """Components first: nothing path-based means anything across them."""
     print("--- components ---")
-    print(bg.connected_components(g).sort("node").to_pydict())
-    print(bg.component_sizes(g).to_pydict())
-    print("connected as a whole:", bg.is_connected(g))
+    components = bg.connected_components(g).sort("node").to_pydict()
+    print(components)
+    sizes = bg.component_sizes(g).to_pydict()
+    print(sizes)
+    # Three pieces — the main cluster, the self-loop at x, and `lonely` — so the graph is
+    # not connected, and the sizes must partition the node set exactly.
+    assert sum(sizes["nodes"]) == 9 and sorted(sizes["nodes"], reverse=True) == [7, 1, 1]
+    assert len(set(components["component"])) == len(sizes["component"]) == 3
+    connected = bg.is_connected(g)
+    print("connected as a whole:", connected)
+    assert connected is False, "three components cannot be connected"
 
     biggest = bg.largest_component(g)
     print("largest component:", biggest.num_nodes(), "nodes,", biggest.num_edges(), "edges")
@@ -101,8 +135,17 @@ def rank_the_nodes(g: bg.Graph) -> None:
 def measure_cohesion(g: bg.Graph) -> None:
     """Triangles, clustering, and whether the communities found are real."""
     print("--- triangles ---")
-    print(bg.triangles(g).sort("a", "b", "c").to_pydict())
-    print(bg.triangle_count(g).sort("node").to_pydict())
+    found_triangles = bg.triangles(g).sort("a", "b", "c").to_pydict()
+    print(found_triangles)
+    per_node = bg.triangle_count(g).sort("node").to_pydict()
+    print(per_node)
+    # Every triangle contributes to exactly three nodes' counts, so the two views must
+    # reconcile — the classic place an off-by-one in a triangle enumerator hides.
+    assert sum(per_node["triangles"]) == 3 * len(found_triangles["a"])
+    for a, b, c in zip(
+        found_triangles["a"], found_triangles["b"], found_triangles["c"], strict=True
+    ):
+        assert len({a, b, c}) == 3, "a triangle needs three distinct nodes"
 
     print("--- clustering, locally and globally ---")
     cc = bg.clustering_coefficient(g).sort("node").to_pydict()
@@ -113,9 +156,16 @@ def measure_cohesion(g: bg.Graph) -> None:
     print("--- communities, and whether they mean anything ---")
     found = bg.label_propagation(g)
     print(found.sort("node").to_pydict())
-    print("modularity of the partition:", round(bg.modularity(g, found), 4))
+    partition_q = bg.modularity(g, found)
+    print("modularity of the partition:", round(partition_q, 4))
     everyone = found.select("node", community=bt.lit(0))
-    print("modularity of one big community:", round(bg.modularity(g, everyone), 4))
+    trivial_q = bg.modularity(g, everyone)
+    print("modularity of one big community:", round(trivial_q, 4))
+    # Putting everything in one community is the degenerate partition and its modularity is
+    # 0 by definition — which is the number that makes the other one interpretable, and the
+    # reason this section says "whether they mean anything".
+    assert abs(trivial_q) < 1e-9, f"the one-community partition must score 0, got {trivial_q}"
+    assert -1.0 <= partition_q <= 1.0
 
 
 def measure_distance(g: bg.Graph) -> None:
@@ -124,15 +174,32 @@ def measure_distance(g: bg.Graph) -> None:
     seeds = bt.from_pydict({"node": ["a"]})
 
     print("--- hop distance from 'a' ---")
-    print(bg.bfs(undirected, seeds).sort("depth", "node").to_pydict())
-    print(
-        "2-hop neighbourhood:", sorted(bg.k_hop_neighbors(undirected, seeds, 2).to_pydict()["node"])
-    )
-    print("reachable at all:", sorted(bg.reachable_from(undirected, seeds).to_pydict()["node"]))
-    print("diameter (lower bound from 'a'):", bg.diameter_estimate(undirected, seeds))
+    hops = bg.bfs(undirected, seeds).sort("depth", "node").to_pydict()
+    print(hops)
+    assert hops["node"][0] == "a" and hops["depth"][0] == 0, "the seed is at depth 0"
+    assert hops["depth"] == sorted(hops["depth"]), "BFS visits in non-decreasing depth"
+    two_hop = sorted(bg.k_hop_neighbors(undirected, seeds, 2).to_pydict()["node"])
+    print("2-hop neighbourhood:", two_hop)
+    reachable = sorted(bg.reachable_from(undirected, seeds).to_pydict()["node"])
+    print("reachable at all:", reachable)
+    # Each of these is a strictly wider view of the same traversal, so they have to nest.
+    depth_of = dict(zip(hops["node"], hops["depth"], strict=True))
+    assert set(two_hop) == {n for n, d in depth_of.items() if 0 < d <= 2}
+    assert set(reachable) == set(depth_of)
+    assert "lonely" not in reachable, "an isolated node is reachable from nothing"
+    diameter = bg.diameter_estimate(undirected, seeds)
+    print("diameter (lower bound from 'a'):", diameter)
+    assert diameter == max(hops["depth"]), "the estimate from one source is its deepest hop"
 
     print("--- weighted distance respects the weights ---")
-    print(bg.shortest_path_lengths(g, seeds).sort("distance", "node").to_pydict())
+    weighted_paths = bg.shortest_path_lengths(g, seeds).sort("distance", "node").to_pydict()
+    print(weighted_paths)
+    costs = dict(zip(weighted_paths["node"], weighted_paths["distance"], strict=True))
+    assert costs["a"] == 0.0
+    # The section's claim, checked: `d` is two hops from `a` but the c->d edge costs 3, so
+    # its weighted distance is 4 and not 2. An implementation ignoring `weight=` would
+    # print 2 here and look perfectly reasonable.
+    assert costs["d"] == 4.0, f"the weight-3 edge must be paid for, got {costs['d']}"
 
     print("--- harmonic centrality, estimated from two sources ---")
     est = bg.harmonic_centrality(undirected, bt.from_pydict({"node": ["a", "f"]}))

@@ -68,12 +68,14 @@ impl FnOperator {
     }
 
     /// Mark the operator stateful (cannot be parallelized across workers).
+    #[must_use]
     pub fn with_stateful(mut self, stateful: bool) -> Self {
         self.stateful = stateful;
         self
     }
 
     /// Declare a preferred batch size in rows (e.g. a GPU operator).
+    #[must_use]
     pub fn with_preferred_rows(mut self, rows: usize) -> Self {
         self.preferred_rows = Some(rows);
         self

@@ -231,8 +231,7 @@ def _lsf_slots_here(node_name: str, slot_hosts: tuple[str, ...]) -> int:
     for host, count in zip(mcpu[::2], mcpu[1::2], strict=False):
         if count.isdigit() and (host == node_name or host.split(".", 1)[0] == short):
             return int(count)
-    hits = sum(1 for h in slot_hosts if h == node_name or h.split(".", 1)[0] == short)
-    return hits
+    return sum(1 for h in slot_hosts if h == node_name or h.split(".", 1)[0] == short)
 
 
 # --- Grid Engine (SGE / UGE / Altair Grid Engine) -------------------------------------------
@@ -321,9 +320,7 @@ def condor_job() -> SchedulerJob:
     return SchedulerJob(
         kind="htcondor",
         job_id=f"{cluster}.{proc}" if cluster else cluster,
-        gpus_per_node=(gpus if gpus > 0 else 0)
-        or _int_attr(ad, "RequestGpus")
-        or visible_device_count(),
+        gpus_per_node=(max(0, gpus)) or _int_attr(ad, "RequestGpus") or visible_device_count(),
         cpus_per_node=_int_attr(ad, "RequestCpus"),
         # A slot is what this process was given, so the request *is* the per-task grant. It is
         # the only core figure HTCondor publishes anywhere, and a pool without cgroup

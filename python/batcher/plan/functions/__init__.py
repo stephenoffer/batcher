@@ -24,7 +24,13 @@ from batcher.plan.functions.aggregate import (
     sum,
     var,
 )
-from batcher.plan.functions.collection import element, named_struct, sequence, struct
+from batcher.plan.functions.collection import (
+    element,
+    map_from_arrays,
+    named_struct,
+    sequence,
+    struct,
+)
 
 # The geospatial family re-exports through its own curated `__all__` rather than being
 # restated here. It is 113 names across nine modules, and spelling them out in this
@@ -171,6 +177,7 @@ __all__ = [
     "log",
     "make_date",
     "make_timestamp",
+    "map_from_arrays",
     "mask",
     "max",
     "max_horizontal",

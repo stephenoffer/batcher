@@ -296,11 +296,15 @@ pub(super) fn stream_sample_n(
 
 /// Bytes currently held by a top-N fold: the carried survivors plus the buffered round.
 fn held_bytes(carried: &Option<RecordBatch>, buf: &[RecordBatch]) -> u64 {
-    carried
-        .iter()
-        .chain(buf.iter())
-        .map(|b| b.get_array_memory_size() as u64)
-        .sum()
+    // `buf` holds the round's incoming morsels, which are slices of a shared parent — see
+    // [`crate::column_bytes`] for why the parent-buffer measure multiplies that by the morsel
+    // count and pushes a fold that fits into a budget error.
+    crate::column_bytes(
+        carried
+            .iter()
+            .chain(buf.iter())
+            .flat_map(RecordBatch::columns),
+    )
 }
 
 /// One top-N round: the carried survivors (first, so ties resolve toward the earlier row) ahead of

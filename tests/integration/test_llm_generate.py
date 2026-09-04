@@ -36,7 +36,7 @@ def test_prompt_template_builds_from_columns():
     )
 
     def factory():
-        return lambda prompts: list(prompts)  # echo the rendered prompt
+        return list  # echo the rendered prompt
 
     out = list(
         llm_generate(
@@ -186,7 +186,7 @@ def test_usage_columns_appended_when_engine_reports():
 def test_usage_columns_null_when_engine_silent():
     # An engine that reports no usage → null token columns (still appended on usage=True).
     def factory():
-        return lambda prompts: list(prompts)
+        return list
 
     out = list(llm_generate(_batches(["a", "b"]), factory, prompt_column="q", usage=True))
     t = pa.Table.from_batches(out)

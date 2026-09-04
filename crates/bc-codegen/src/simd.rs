@@ -11,7 +11,8 @@
 //! The subset (see [`simd_ty`](crate::simd_ty)) is exactly the ops whose per-lane
 //! result is bit-for-bit identical to the scalar [`Codegen`](crate::emit::Codegen):
 //!
-//! * `Col` (`I64`/`F64`) and `Lit` (`Int`/`Float`) leaves.
+//! * `Col` (`I64`/`F64`, and `Date32`/`TsUs` for comparison) and `Lit`
+//!   (`Int`/`Float`/`Date32`/`TsUs`) leaves.
 //! * Integer `Add`/`Sub`/`Mul` (two's-complement wrap is per-lane identical) and
 //!   float `Add`/`Sub`/`Mul`/`Div` (IEEE per-lane identical).
 //! * Comparisons (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`) over numeric operands — the big
@@ -19,19 +20,32 @@
 //!   semantics the scalar path uses.
 //! * `Not` of a boolean sub-result, and exact numeric `Cast` (`i64 -> f64`, or a
 //!   no-op).
+//! * `And`/`Or` of two boolean sub-results — a bitwise `band`/`bor` over canonical
+//!   masks, which is bit-identical to the interpreter's *non-Kleene* `and`/`or`
+//!   because this tier only ever sees a null-free batch. The Kleene validity ABI owns
+//!   the nullable case, and `eval` falls back to it when a referenced column has
+//!   nulls, since a compound predicate is not null-propagating.
+//! * A comparison between two operands of the *same* temporal type (`Date32`,
+//!   `TsUs`), which runs on the i64 lanes the column already loads as — Arrow orders
+//!   both by integer value. Arithmetic on a temporal operand is not admitted.
 //!
-//! Excluded (they stay on the scalar [`Codegen`] / interpreter): `And`/`Or` (the
-//! Kleene validity ABI owns nullable compound predicates), integer `Div`/`Mod`
+//! Excluded (they stay on the scalar [`Codegen`] / interpreter): integer `Div`/`Mod`
 //! (scalarized `sdiv`/`srem`, can trap), float `Mod` (an `fmod` libcall), `Math`/
-//! `Math2` (libm libcalls), `Case`, and temporal operands. A scalar remainder loop
-//! handles the rows past the last full `lanes*unroll` step.
+//! `Math2` (libm libcalls), and `Case`. A scalar remainder loop handles the rows past
+//! the last full `lanes*unroll` step.
+//!
+//! Keep this list in step with [`simd_ty`](crate::simd_ty), which is the code that
+//! decides. It is the validator, not this comment, that admits an expression — so a
+//! docstring understating the subset invites someone to "add" support that is already
+//! here, and one overstating it invites a parity assumption the emitter does not honour.
 //!
 //! # Boolean lanes
 //!
 //! A boolean sub-result is an `I64xL` **canonical mask** — all-ones for true,
 //! all-zeros for false — the form `icmp`/`fcmp` produce. `Not` is `bnot` (flips a
 //! canonical mask to the other canonical value); the only boolean sources are
-//! comparisons and `Not`, so every boolean lane stays canonical. The mask is
+//! comparisons, `Not`, and `And`/`Or` (`band`/`bor` of two canonical masks is itself
+//! canonical), so every boolean lane stays canonical. The mask is
 //! converted to consecutive `0`/`1` bits in the Arrow bitmask only at the store site
 //! (in `compile_simd`).
 
@@ -154,7 +168,7 @@ impl SimdCodegen<'_, '_> {
                 // instant — each splat to an i64 lane to compare against the matching
                 // temporal column (loaded as sign-extended / native i64).
                 Literal::Date(d) => {
-                    let s = self.b.ins().iconst(types::I64, *d as i64);
+                    let s = self.b.ins().iconst(types::I64, i64::from(*d));
                     (
                         self.b.ins().splat(vec_ty(ScalarTy::I64, self.lanes), s),
                         ScalarTy::Date32,
@@ -258,7 +272,7 @@ impl SimdCodegen<'_, '_> {
     /// excludes integer `Div`/`Mod`); two's-complement wrap is per-lane identical
     /// to the scalar `iadd`/`isub`/`imul`, so parity holds.
     fn emit_iarith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Mul, Sub};
         match op {
             Add => self.b.ins().iadd(l, r),
             Sub => self.b.ins().isub(l, r),
@@ -270,7 +284,7 @@ impl SimdCodegen<'_, '_> {
     /// Float vector arithmetic. `Add`/`Sub`/`Mul`/`Div` are IEEE per-lane identical
     /// to the scalar path; `Mod` (an `fmod` libcall) is excluded by `simd_ty`.
     fn emit_farith(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Add, Div, Mul, Sub};
         match op {
             Add => self.b.ins().fadd(l, r),
             Sub => self.b.ins().fsub(l, r),
@@ -288,7 +302,7 @@ impl SimdCodegen<'_, '_> {
     /// steps per lane, so the vector path is bit-for-bit identical to the interpreter and to
     /// the scalar JIT — not bare IEEE, and not the raw-bit order that split `-0.0` from `0.0`.
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
-        use bc_expr::BinaryOp::*;
+        use bc_expr::BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
         let cc = match op {
             Eq => IntCC::Equal,
             Ne => IntCC::NotEqual,

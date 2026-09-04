@@ -416,8 +416,10 @@ def _ndjson(rows: int = 5, *, bad_at: tuple[int, ...] = (2,)) -> str:
     """An NDJSON file of `rows` records, with the ones at `bad_at` replaced by non-JSON."""
     p = tempfile.mktemp(suffix=".jsonl")
     with open(p, "w") as f:
-        for i in range(1, rows + 1):
-            f.write("<html>not json</html>\n" if i in bad_at else f'{{"a": {i}}}\n')
+        f.writelines(
+            "<html>not json</html>\n" if i in bad_at else f'{{"a": {i}}}\n'
+            for i in range(1, rows + 1)
+        )
     return p
 
 
@@ -474,8 +476,7 @@ def test_json_on_bad_lines_survives_to_a_byte_range_split() -> None:
 
     p = tempfile.mktemp(suffix=".jsonl")
     with open(p, "w") as f:
-        for i in range(1, 20001):
-            f.write("nope\n" if i % 500 == 0 else f'{{"a": {i}}}\n')
+        f.writelines("nope\n" if i % 500 == 0 else f'{{"a": {i}}}\n' for i in range(1, 20001))
 
     splits = SOURCES.get("json")(p, on_bad_lines="skip").splits(100_000)
     assert len(splits) > 1, "the file must actually subdivide for this to test anything"
@@ -489,8 +490,7 @@ def test_json_split_carries_the_on_error_policy_it_used_to_drop() -> None:
 
     p = tempfile.mktemp(suffix=".jsonl")
     with open(p, "w") as f:
-        for i in range(200_000):
-            f.write(f'{{"a": {i}}}\n')
+        f.writelines(f'{{"a": {i}}}\n' for i in range(200_000))
 
     splits = SOURCES.get("json")(p, on_error="skip").splits(100_000)
     assert len(splits) > 1

@@ -359,6 +359,25 @@ pub(crate) fn finalize_corr(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError
 /// Sample skewness (adjusted Fisher–Pearson, matching DuckDB):
 /// `g1·√(n(n−1))/(n−2)` where `g1 = m3 / m2^1.5` and `mk` are the population central
 /// moments. Null when n < 3 or the variance is zero.
+///
+/// # A stated divergence from the oracle, on a zero-variance group
+///
+/// Every value equal makes `m2 = 0` and the ratio `m3/m2^1.5` a `0/0`. **This returns NULL;
+/// DuckDB's `skewness` returns `NaN`.** That is a real differential difference on a shape that
+/// is not exotic at all — a constant column is ordinary — so it is written down here rather
+/// than left for someone to discover as a failing test.
+///
+/// It is chosen for **internal consistency**, because DuckDB is not consistent with itself
+/// here: fed the same constant column its `kurtosis` returns NULL while its `skewness` returns
+/// NaN, and [`finalize_kurtosis`] below takes the same `m2 <= 0.0` branch this does. Matching
+/// the oracle on skewness would therefore mean making Batcher's two moment aggregates disagree
+/// with each other about what an undefined moment is, to reproduce a disagreement inside the
+/// oracle. NULL — "there is no value" — is also the better answer for the callers that reach
+/// for these: a drift check or a feature selector treats NULL as missing and NaN as a number
+/// that poisons a comparison.
+///
+/// Pinned by `tests/differential/test_diff_moment_zero_variance.py`, which asserts the
+/// divergence deliberately rather than tolerating it.
 pub(crate) fn finalize_skewness(state: &[ArrayRef]) -> Result<ArrayRef, RuntimeError> {
     moment_finalize(state, |n, m2, m3, _m4| {
         if n < 3.0 || m2 <= 0.0 {
@@ -477,9 +496,9 @@ mod tests {
     /// distributed), even split across an uneven chunk boundary at a large offset.
     #[test]
     fn covar_corr_merge_equals_whole() {
-        let x: Vec<f64> = (0..97).map(|i| 1000.0 + (i as f64) * 0.5).collect();
+        let x: Vec<f64> = (0..97).map(|i| 1000.0 + f64::from(i) * 0.5).collect();
         let y: Vec<f64> = (0..97)
-            .map(|i| 1000.0 - (i as f64) * 0.3 + (i % 7) as f64)
+            .map(|i| 1000.0 - f64::from(i) * 0.3 + f64::from(i % 7))
             .collect();
         let g = vec![0u32; x.len()];
         let whole = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
@@ -529,7 +548,7 @@ mod tests {
     /// skewness/kurtosis stable at a large offset and mergeable across chunks.
     #[test]
     fn moments_merge_equals_whole() {
-        let x: Vec<f64> = (0..120).map(|i| 1000.0 + ((i * 7) % 13) as f64).collect();
+        let x: Vec<f64> = (0..120).map(|i| 1000.0 + f64::from((i * 7) % 13)).collect();
         let g = vec![0u32; x.len()];
         let whole = moment_state(&f64s(&x), &g, 1, AggFunc::Skewness).unwrap();
         let bounds = [0usize, 17, 60, 120];
@@ -593,8 +612,8 @@ mod tests {
     /// finite.
     #[test]
     fn corr_survives_moments_whose_product_overflows() {
-        let x: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
-        let y: Vec<f64> = (1..=5).map(|i| i as f64 * 1e120).collect();
+        let x: Vec<f64> = (1..=5).map(|i| f64::from(i) * 1e120).collect();
+        let y: Vec<f64> = (1..=5).map(|i| f64::from(i) * 1e120).collect();
         let g = vec![0u32; x.len()];
         let st = covar_state(&f64s(&x), &f64s(&y), &g, 1).unwrap();
         // The guard the fix exists for: the product really does overflow here.
@@ -633,12 +652,12 @@ mod tests {
         // 1e6 values whose true variance is exactly known, offset far enough that a naive
         // sum drops bits on every addition.
         let n = 200_000;
-        let values: Vec<f64> = (0..n).map(|i| 1e9 + (i % 2) as f64).collect();
+        let values: Vec<f64> = (0..n).map(|i| 1e9 + f64::from(i % 2)).collect();
         let g = vec![0u32; values.len()];
         let st = moment_state(&f64s(&values), &g, 1, AggFunc::Skewness).unwrap();
         let m2 = st[2].as_primitive::<Float64Type>().value(0);
         // Half the values are 1e9 and half 1e9+1, so Σ(x-x̄)² is exactly n/4.
-        let expected = n as f64 / 4.0;
+        let expected = f64::from(n) / 4.0;
         assert!(
             (m2 - expected).abs() / expected < 1e-9,
             "M2 {m2} differs from the exact {expected}"

@@ -529,7 +529,7 @@ class Session:
             return statements.create(self, ast, tables)
         if isinstance(ast, exp.Drop):
             return statements.drop(self, ast)
-        if isinstance(ast, (exp.Insert, exp.Delete, exp.Update)):
+        if isinstance(ast, (exp.Insert, exp.Delete, exp.Update, exp.Merge)):
             return statements.dml(self, ast, tables)
         ds = self._translate(ast, tables)
         self._remember(key, bound, ds)

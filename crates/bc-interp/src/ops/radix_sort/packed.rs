@@ -1,13 +1,14 @@
-//! LSD radix sort for fixed-width integer / temporal / float sort keys.
+//! The **composite** packed key: several sort columns narrowed into one integer.
 //!
-//! A full sort (no `LIMIT`) on an integer, temporal, or float column is O(n·w) by radix
-//! (w = key bytes) versus the comparison sort's O(n log n) — a real win on the wide
-//! inputs the external (spilling) sort generates run-by-run, and on the per-range sorts
-//! of the parallel sample-sort. This is a *drop-in* permutation builder: it returns the
-//! same relation a stable sort would, identical to `arrow::compute::sort_to_indices`.
-//! Floats use an order-preserving bit transform matching arrow's `total_cmp`; a column
-//! with a `NaN` (no single numeric position), a string/boolean key, a multi-key sort, or
-//! a top-N returns `None` and the caller falls back to the comparison sort.
+//! A multi-key `ORDER BY` has no single-column fast path — [`super::radix_sort_indices`] takes
+//! one array — so it would otherwise fall to a row-encoded or comparator sort. This module
+//! measures each key's *live* range, packs the tuple into one word when the ranges fit, and
+//! sorts that word. Two budgets: a `u64` the counting sort orders, and a `u128` that carries its
+//! own row position and is sorted directly.
+//!
+//! The ordering itself is not restated here. Every rank comes from [`super::ranks`], and a
+//! float's extremes are found by comparing [`super::float_rank`], so this module knows how to
+//! *arrange* keys and nothing about how to order them.
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -18,234 +19,51 @@ use arrow::array::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, TimeUnit};
 
-/// Above this row count the float radix declines (its random-scatter key array no longer
-/// fits cache and it loses to the comparison sort). Sized to ~L2: a `u64` key array of
-/// 2^18 rows is 2 MiB. Large float sorts arrive here only per-range (parallel sample-sort)
-/// or per-run (spill) — both below this — so a whole-array serial float sort never radixes.
-const FLOAT_RADIX_MAX_ROWS: usize = 1 << 18;
-
-/// Build the sort permutation by LSD radix, or `None` if the key type is unsupported.
-///
-/// Only called for a full sort (the caller gates on `limit.is_none()`). Nulls are
-/// grouped first/last per `opts.nulls_first` in input order; non-null rows are sorted
-/// by an order-preserving `u64` transform of the key (sign-flipped for signed types,
-/// bit-inverted for descending). The sort is stable, so equal keys keep input order.
-pub(crate) fn radix_sort_indices(values: &ArrayRef, opts: SortOptions) -> Option<UInt32Array> {
-    let keys = ordered_keys(values)?;
-    let n = values.len();
-
-    // Split row indices into null and non-null (both in input order → stable).
-    let nulls = values.nulls();
-    let mut null_idx: Vec<u32> = Vec::new();
-    let mut live_idx: Vec<u32> = Vec::with_capacity(n);
-    for i in 0..n {
-        if nulls.is_some_and(|nb| nb.is_null(i)) {
-            null_idx.push(i as u32);
-        } else {
-            live_idx.push(i as u32);
-        }
-    }
-
-    // Already in order — a constant key, a time-ordered scan, a re-sort by the key the data is
-    // already clustered on — means the permutation is the identity, because a stable sort leaves
-    // an ordered input alone. Checking costs one comparison per row when it holds and, since
-    // `all` short-circuits, about two when it does not; the eight counting passes it replaces
-    // cost far more than that even on a key whose bytes are constant enough to skip most of them.
-    // Restricted to a null-free column so the identity claim covers the whole output rather than
-    // the live rows alone.
-    if nulls.is_none() && is_ordered(&keys, opts.descending) {
-        return Some(UInt32Array::from(live_idx));
-    }
-
-    let live_sorted = lsd_radix(live_idx, &keys, opts.descending);
-
-    let mut out: Vec<u32> = Vec::with_capacity(n);
-    if opts.nulls_first {
-        out.extend_from_slice(&null_idx);
-        out.extend_from_slice(&live_sorted);
-    } else {
-        out.extend_from_slice(&live_sorted);
-        out.extend_from_slice(&null_idx);
-    }
-    Some(UInt32Array::from(out))
-}
-
-/// Order-preserving `u64` key per row (ascending order of the original values). Null
-/// slots get an arbitrary key (their indices are handled separately). `None` for any
-/// type radix does not support, so the caller falls back to the comparison sort.
-fn ordered_keys(values: &ArrayRef) -> Option<Vec<u64>> {
-    // Signed ints map to order-preserving u64 by flipping the sign bit after widening
-    // to i64 (widening preserves order); unsigned widen directly.
-    macro_rules! signed {
-        ($arr:ty) => {{
-            let a = values.as_any().downcast_ref::<$arr>()?;
-            (0..a.len())
-                .map(|i| ((a.value(i) as i64) as u64) ^ (1u64 << 63))
-                .collect()
-        }};
-    }
-    macro_rules! unsigned {
-        ($arr:ty) => {{
-            let a = values.as_any().downcast_ref::<$arr>()?;
-            (0..a.len()).map(|i| a.value(i) as u64).collect()
-        }};
-    }
-    // IEEE-754 floats map to an order-preserving u64 matching arrow's `total_cmp`:
-    // negatives bit-invert, non-negatives flip only the sign bit. This places `-0.0`
-    // just below `+0.0` exactly as arrow's comparison sort does (so the value sequences
-    // agree bit-for-bit). NaN has no single numeric position, so a column containing one
-    // bails to the comparison sort (`None`) — keeping the radix path exactly arrow-equal.
-    //
-    // Float radix wins only on **cache-fitting** inputs: the LSD passes scatter by a
-    // random key byte, so once the key array spills L2 it thrashes and loses badly to
-    // the comparison sort (a 2M-row serial radix measured ~4× *slower*). It is reached
-    // on cache-sized work — the parallel sample-sort's per-range sorts and the spill
-    // runs — so above `FLOAT_RADIX_MAX_ROWS` it declines and the caller's comparison
-    // sort (or, for a large input, the parallel sample-sort) takes over.
-    macro_rules! float {
-        ($arr:ty) => {{
-            let a = values.as_any().downcast_ref::<$arr>()?;
-            if a.len() > FLOAT_RADIX_MAX_ROWS {
-                return None;
-            }
-            let nulls = values.nulls();
-            let mut keys = Vec::with_capacity(a.len());
-            for i in 0..a.len() {
-                let v = a.value(i) as f64;
-                if !nulls.is_some_and(|nb| nb.is_null(i)) && v.is_nan() {
-                    return None;
-                }
-                let b = v.to_bits();
-                keys.push(if b >> 63 == 1 { !b } else { b | (1u64 << 63) });
-            }
-            keys
-        }};
-    }
-    let keys: Vec<u64> = match values.data_type() {
-        DataType::Float32 => float!(Float32Array),
-        DataType::Float64 => float!(Float64Array),
-        DataType::Int8 => signed!(Int8Array),
-        DataType::Int16 => signed!(Int16Array),
-        DataType::Int32 => signed!(Int32Array),
-        DataType::Int64 => signed!(Int64Array),
-        DataType::UInt8 => unsigned!(UInt8Array),
-        DataType::UInt16 => unsigned!(UInt16Array),
-        DataType::UInt32 => unsigned!(UInt32Array),
-        DataType::UInt64 => unsigned!(UInt64Array),
-        // Temporal types are physically signed integers (days / millis / micros …).
-        DataType::Date32 => signed!(Date32Array),
-        DataType::Date64 => signed!(Date64Array),
-        DataType::Timestamp(TimeUnit::Second, _) => signed!(TimestampSecondArray),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => signed!(TimestampMillisecondArray),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => signed!(TimestampMicrosecondArray),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => signed!(TimestampNanosecondArray),
-        _ => return None,
-    };
-    Some(keys)
-}
-
-/// The `k` best **non-null** row indices of a fixed-width key, in sorted order, or `None` for a
-/// type with no order-preserving `u64` encoding.
-///
-/// The same encoding [`ordered_keys`] builds for the radix, fed to a bounded heap instead of a
-/// counting sort: ranking is what a `LIMIT` needs and ordering the other `n - k` rows is what it
-/// does not. Reads the value buffer once, sequentially, and touches the heap only for a row that
-/// beats the worst kept so far.
-///
-/// Unlike the radix this does **not** decline on a NaN or on a large float column. Both of those
-/// limits are properties of the counting sort — an unrepresentable numeric position and a random
-/// scatter that leaves cache — and neither applies to a sequential scan against a heap. See
-/// [`float_rank`] for why a NaN needs no special case here.
-pub(super) fn top_k_live(values: &ArrayRef, descending: bool, k: usize) -> Option<Vec<u32>> {
-    let ranks = ranks(values, descending)?;
-    Some(super::heap_select_k(values.len(), values.nulls(), k, |i| {
-        ranks[i]
-    }))
-}
-
-/// An order-preserving `u64` per row: ordering these integers orders the rows, exactly as a
-/// stable sort under `descending` would. `None` for a type with no such encoding.
-///
-/// Null slots carry whatever their (unread) payload encodes to; every caller places nulls
-/// itself, because null ordering is `nulls_first`'s business rather than the key's.
-pub(super) fn ranks(values: &ArrayRef, descending: bool) -> Option<Vec<u64>> {
-    let n = values.len();
-    // One arm per concrete primitive: this path exists to read a typed values slice
-    // sequentially, which a `dyn Array` accessor would give up.
-    macro_rules! encode {
-        ($arr:ty, $conv:expr) => {{
-            let a = values.as_any().downcast_ref::<$arr>()?;
-            let v = a.values();
-            let conv = $conv;
-            let mut out = Vec::with_capacity(n);
-            out.extend((0..n).map(|i| {
-                let r: u64 = conv(v[i]);
-                if descending {
-                    !r
-                } else {
-                    r
-                }
-            }));
-            Some(out)
-        }};
-    }
-    // Signed widen to `i64` then flip the sign bit; unsigned widen directly; floats take the
-    // order-preserving bit transform. Identical rankings to [`ordered_keys`], by construction.
-    macro_rules! signed {
-        ($arr:ty, $t:ty) => {
-            encode!($arr, |x: $t| ((x as i64) as u64) ^ (1u64 << 63))
-        };
-    }
-    macro_rules! unsigned {
-        ($arr:ty, $t:ty) => {
-            encode!($arr, |x: $t| x as u64)
-        };
-    }
-    match values.data_type() {
-        DataType::Int8 => signed!(Int8Array, i8),
-        DataType::Int16 => signed!(Int16Array, i16),
-        DataType::Int32 => signed!(Int32Array, i32),
-        DataType::Int64 => signed!(Int64Array, i64),
-        DataType::UInt8 => unsigned!(UInt8Array, u8),
-        DataType::UInt16 => unsigned!(UInt16Array, u16),
-        DataType::UInt32 => unsigned!(UInt32Array, u32),
-        DataType::UInt64 => unsigned!(UInt64Array, u64),
-        DataType::Float32 => encode!(Float32Array, |x: f32| float_rank(x as f64)),
-        DataType::Float64 => encode!(Float64Array, float_rank),
-        DataType::Date32 => signed!(Date32Array, i32),
-        DataType::Date64 => signed!(Date64Array, i64),
-        DataType::Timestamp(TimeUnit::Second, _) => signed!(TimestampSecondArray, i64),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => signed!(TimestampMillisecondArray, i64),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => signed!(TimestampMicrosecondArray, i64),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => signed!(TimestampNanosecondArray, i64),
-        _ => None,
-    }
-}
-
-/// An order-preserving `u64` for a float: ordering these integers is exactly `f64::total_cmp`.
-///
-/// Negatives bit-invert, non-negatives flip only the sign bit. That is the standard IEEE-754
-/// total-order transform, and it needs no NaN case because it *is* total: a negative NaN inverts
-/// below `-∞` and a positive one lands above `+∞`, which is where `total_cmp` puts them and
-/// therefore where arrow's comparison sort does. (The counting sort declines on a NaN instead,
-/// but for a reason that belongs to the counting sort — see [`ordered_keys`].) Sort keys reaching
-/// here have normally been through `bc_arrow::canon_float_array` already, which collapses every
-/// NaN to the positive quiet one and `-0.0` to `0.0`; agreeing with `total_cmp` on the raw bits
-/// means the ranking is right either way.
-#[inline]
-fn float_rank(v: f64) -> u64 {
-    let b = v.to_bits();
-    if b >> 63 == 1 {
-        !b
-    } else {
-        b | (1u64 << 63)
-    }
-}
-
+use super::{float_rank, is_ordered, ranks};
 /// Columns a composite packed key will consider. Past this the per-column rank passes cost
 /// more than the comparison sort they replace, and a key that wide has almost certainly
 /// exhausted the bit budget anyway.
 const PACKED_MAX_KEYS: usize = 8;
+
+/// Bits a packed key may use while its row position still fits beside it in a `u64`.
+///
+/// Both tiers carry the position *inside* the word, so the only question either asks is which
+/// word is wide enough. The counting sort that used to own the `u64` tier is gone from this
+/// module: with the position packed in, a `Vec<u64>` sorts directly, and pdqsort over 8-byte
+/// words beats `lsd_radix` at every width measured. On 15 concurrent 400 K-row ranges:
+///
+/// | packed key | pack + counting sort | word sort carrying the position |
+/// |---:|---:|---:|
+/// | 26 bits | 40.8 ms | **20.1 ms** (`u64`) |
+/// | 32 bits | 38.5 ms | **17.0 ms** (`u64`) |
+/// | 40 bits | 49.8 ms | **28.3 ms** (`u128`) |
+/// | 48 bits | 72.3 ms | **27.4 ms** (`u128`) |
+/// | 64 bits | 93.8 ms | **30.5 ms** (`u128`) |
+///
+/// The gap widens with the key because the counting sort adds a pass per byte while the
+/// comparison sort's cost is flat in the width. That is why a key between 33 and 64 bits — which
+/// fits a `u64` but leaves no room for a position — goes to the `u128` tier rather than back to
+/// the counting sort: the wider word is cheaper than the extra passes.
+///
+/// `lsd_radix` is untouched and still owns the **single-key** path, where there is no position to
+/// carry and the key is the whole word.
+const PACKED_U64_WITH_POSITION_BITS: u32 = 64 - ROW_POSITION_BITS;
+
+/// Bits a packed key may use once it needs a `u128` — 128 less the 32 the row position takes.
+///
+/// The wide tier exists for the one shape the `u64` budget cannot reach and the row encoder is
+/// worst at: **a float beside another key**. A float's rank is 56 bits on `l_extendedprice` and
+/// 64 in the worst case, so it never fits a `u64` beside anything, and a two-key sort is below
+/// `bc_arrow::row_sort::MIN_KEYS_FOR_ROW_ENCODING` as well — so `ORDER BY <int>, <float>` fell
+/// all the way to arrow's `lexsort_to_indices` over three columns of comparator dispatch.
+/// Measured on 15 concurrent 400 K-row ranges of `l_partkey DESC, l_extendedprice`: that
+/// three-column comparison sort **98.3 ms**, the packed `u128` **41.3 ms**.
+///
+/// The row position rides in the low 32 bits rather than in a `(key, row)` tuple beside it. That
+/// is what keeps the record 16 bytes instead of the 24 a `(u128, u32)` pads to, and it makes the
+/// tie-break free: sorting the words ascending already resolves rows equal on every key to
+/// ascending row number, which is the input order the `u64` tier's stable counting sort gives.
+const PACKED_U128_BITS: u32 = 96;
 
 /// Rows below which the composite pack is not worth its passes; the comparison sort answers.
 ///
@@ -328,10 +146,13 @@ pub(crate) fn packed_multi_sort_indices(
         }
         let w = FieldWidth::measure(v, *o)?;
         total_bits = total_bits.checked_add(w.bits)?;
-        if total_bits > 64 {
+        if total_bits > PACKED_U128_BITS {
             return None;
         }
         widths.push(w);
+    }
+    if total_bits > PACKED_U64_WITH_POSITION_BITS {
+        return packed_wide_sort_indices(vals, opts, &widths, total_bits, n);
     }
 
     // Most-significant first: column 0 owns the top `bits[0]` of the used width, so an integer
@@ -347,8 +168,91 @@ pub(crate) fn packed_multi_sort_indices(
     if is_ordered(&packed, false) {
         return Some(UInt32Array::from(idx));
     }
-    Some(UInt32Array::from(lsd_radix(idx, &packed, false)))
+    // The packed key is one `u64` per row, so the composite sort gets natural-run detection on
+    // exactly the same terms the single-key radix does — and it is the shape that wants it
+    // most, since a multi-key `ORDER BY` whose leading key is the one the data is clustered on
+    // is the commonest partly-ordered sort there is. Kept in front of the word sort rather than
+    // dropped with the counting sort: pdqsort exploits a run far less than a merge does, and on
+    // a 400 K-row range of ten sorted runs the word sort alone measured no faster than on random
+    // input (21.1 ms against 19.8 ms), so the detection is still doing the work here.
+    let sorted = crate::ops::run_sort::run_aware_sort(&idx, &packed, false, |part| {
+        position_word_sort(part, &packed)
+    })
+    .unwrap_or_else(|| position_word_sort(idx, &packed));
+    Some(UInt32Array::from(sorted))
 }
+
+/// The permutation that sorts `idx` by `keys`, by ordering one `u64` per row that holds the key
+/// in its high bits and the row's **position in `idx`** in its low [`ROW_POSITION_BITS`].
+///
+/// Requires every key to fit [`PACKED_U64_WITH_POSITION_BITS`], which is what the caller's
+/// dispatch guarantees.
+///
+/// The tie-break is the row's position in `idx`, not its row number, so ties keep whatever order
+/// `idx` gave them — the input order the counting sort this replaces gave for free.
+///
+/// **At today's call sites the two spellings are equivalent, and no test distinguishes them.**
+/// `idx` is `0..n` here, and `run_aware_sort` hands the fallback a contiguous *slice* of it
+/// (`merge_runs`: `fallback(idx[r.start..r.end].to_vec())`), so a part is ascending too and a
+/// row-number tie-break would order ties identically. That was checked rather than assumed:
+/// rewriting this to pack the row number leaves all 17 composite tests green. The position form
+/// is kept because it makes the function's contract independent of its caller, at one indexed
+/// read per row — the same trade [`super::pair_sort_indices`] makes for the same reason.
+fn position_word_sort(idx: Vec<u32>, keys: &[u64]) -> Vec<u32> {
+    let mut words: Vec<u64> = idx
+        .iter()
+        .enumerate()
+        .map(|(pos, &row)| (keys[row as usize] << ROW_POSITION_BITS) | pos as u64)
+        .collect();
+    words.sort_unstable();
+    words
+        .into_iter()
+        .map(|w| idx[(w & u64::from(u32::MAX)) as usize])
+        .collect()
+}
+
+/// The same composite key when it needs more than a `u64`: packed into a `u128` that carries its
+/// own row position, and sorted as a plain `Vec<u128>`.
+///
+/// Called only from [`packed_multi_sort_indices`], with widths that function has already measured
+/// and a `total_bits` it has already held to [`PACKED_U128_BITS`].
+///
+/// Same shape as the narrow tier — key in the high bits, row position in the low
+/// [`ROW_POSITION_BITS`], sort the words — in twice the word, for a key that leaves no room for a
+/// position in a `u64`.
+///
+/// One thing differs, and it is a limitation rather than a choice: `run_aware_sort` and
+/// [`is_ordered`] both read `&[u64]`, so a `u128` key gets neither. An already-ordered input is
+/// still cheap (pdqsort detects it), a partly-ordered one is not merged. Giving those two a
+/// `u128` form is the obvious next step if a partly-ordered wide composite sort ever shows up as
+/// a cost; nothing has measured one.
+fn packed_wide_sort_indices(
+    vals: &[ArrayRef],
+    opts: &[SortOptions],
+    widths: &[FieldWidth],
+    total_bits: u32,
+    n: usize,
+) -> Option<UInt32Array> {
+    if n > u32::MAX as usize {
+        return None;
+    }
+    let mut packed: Vec<u128> = (0..n as u128).collect();
+    let mut shift = total_bits + ROW_POSITION_BITS;
+    for (w, (v, o)) in widths.iter().zip(vals.iter().zip(opts)) {
+        shift -= w.bits;
+        w.write(v, *o, shift, &mut packed)?;
+    }
+    packed.sort_unstable();
+    Some(UInt32Array::from(
+        packed
+            .into_iter()
+            .map(|p| (p & u128::from(u32::MAX)) as u32)
+            .collect::<Vec<u32>>(),
+    ))
+}
+
+/// Low bits of a wide packed key reserved for the row's own position, making the tie-break free.
+const ROW_POSITION_BITS: u32 = 32;
 
 /// Rows sampled to reject an over-wide key before the exact width scan reads the whole column.
 const PACKED_PROBE_ROWS: usize = 4_096;
@@ -369,19 +273,28 @@ fn prefix_could_fit(vals: &[ArrayRef], opts: &[SortOptions], n: usize) -> bool {
             return false;
         };
         bits += w.bits;
-        if bits > 64 {
+        if bits > PACKED_U128_BITS {
             return false;
         }
     }
     true
 }
 
-/// Key types the composite pack admits: the integers and the temporals, i.e. exactly the arms
-/// [`ranks`] encodes without a float's total-order question.
+/// Key types the composite pack admits: exactly the arms [`ranks`] encodes.
+///
+/// Floats used to be excluded, on the argument that "their ranks span the whole `u64`, so a float
+/// key could never fit beside another one". The first half is true and the second stopped being
+/// true when the budget grew to 128 bits: a float measures 56 bits on `l_extendedprice` and 64 in
+/// the worst case, which leaves room for an integer beside it. The other half of that argument —
+/// that admitting a float would restate Batcher's NaN and `-0.0` ordering here — is answered by
+/// never restating it: this path ranks through [`ranks`], and [`value_extreme_rows`] finds a
+/// float's extremes by comparing [`float_rank`] itself rather than by comparing `f64`s.
 fn is_packable_key(t: &DataType) -> bool {
     matches!(
         t,
-        DataType::Int8
+        DataType::Float32
+            | DataType::Float64
+            | DataType::Int8
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
@@ -438,7 +351,15 @@ impl FieldWidth {
     }
 
     /// Or this field's value for every row into `packed` at `shift`.
-    fn write(&self, v: &ArrayRef, o: SortOptions, shift: u32, packed: &mut [u64]) -> Option<()> {
+    ///
+    /// Generic over the packed word so one statement of the encoding serves both budgets — the
+    /// `u64` the counting sort orders and the `u128` that carries its own row position. A second
+    /// copy for the wider word is exactly the duplication that lets two paths drift on a null's
+    /// placement or a descending key's complement.
+    fn write<W>(&self, v: &ArrayRef, o: SortOptions, shift: u32, packed: &mut [W]) -> Option<()>
+    where
+        W: Copy + From<u64> + core::ops::Shl<u32, Output = W> + core::ops::BitOrAssign,
+    {
         if self.bits == 0 {
             return Some(());
         }
@@ -451,14 +372,14 @@ impl FieldWidth {
                     } else {
                         r[i] - self.low + self.live_offset
                     };
-                    *out |= f << shift;
+                    *out |= W::from(f) << shift;
                 }
             }
             // No null to place: every row takes the live encoding, which lets the loop stream
             // the rank slice with no per-row null check.
             _ => {
                 for (out, &rank) in packed.iter_mut().zip(&r) {
-                    *out |= (rank - self.low) << shift;
+                    *out |= W::from(rank - self.low) << shift;
                 }
             }
         }
@@ -521,7 +442,31 @@ fn value_extreme_rows(v: &ArrayRef) -> Option<(usize, usize)> {
             }
         }};
     }
+    // A float's extremes are found by comparing [`float_rank`], not by comparing `f64` — `<` on
+    // an `f64` is not a total order (every comparison with a NaN is false, so a fold over `<`
+    // silently keeps whatever it started with), and reaching for `total_cmp` instead would be a
+    // second statement of the ordering sitting next to the one `ranks` uses. Comparing the rank
+    // is the same function, so the two cannot disagree.
+    macro_rules! float_extremes {
+        ($arr:ty) => {{
+            let a = v.as_any().downcast_ref::<$arr>()?;
+            let vals = a.values();
+            let rank_at = |i: usize| float_rank(vals[i] as f64);
+            let live = |i: &usize| !v.nulls().is_some_and(|nb| nb.is_null(*i));
+            (0..vals.len())
+                .filter(live)
+                .fold(None, |best, i| match best {
+                    None => Some((i, i)),
+                    Some((lo, hi)) => Some((
+                        if rank_at(i) < rank_at(lo) { i } else { lo },
+                        if rank_at(i) > rank_at(hi) { i } else { hi },
+                    )),
+                })
+        }};
+    }
     match v.data_type() {
+        DataType::Float32 => float_extremes!(Float32Array),
+        DataType::Float64 => float_extremes!(Float64Array),
         DataType::Int8 => extremes!(Int8Array),
         DataType::Int16 => extremes!(Int16Array),
         DataType::Int32 => extremes!(Int32Array),
@@ -551,244 +496,6 @@ fn bits_for(card: u128) -> u32 {
         (128 - (card - 1).leading_zeros()).min(65)
     }
 }
-
-/// Whether the order-preserving keys are already non-decreasing (non-increasing for
-/// `descending`), i.e. the sort has nothing to do.
-fn is_ordered(keys: &[u64], descending: bool) -> bool {
-    keys.windows(2).all(|w| {
-        if descending {
-            w[0] >= w[1]
-        } else {
-            w[0] <= w[1]
-        }
-    })
-}
-
-/// Stable least-significant-byte-first radix sort of `idx` by `keys[idx]`. Eight
-/// 256-bucket counting-sort passes (one per byte of the u64 key); a pass whose byte
-/// is constant across the input is skipped. `descending` inverts the key so an
-/// ascending radix yields descending order.
-fn lsd_radix(mut idx: Vec<u32>, keys: &[u64], descending: bool) -> Vec<u32> {
-    let n = idx.len();
-    if n <= 1 {
-        return idx;
-    }
-    let key = |i: u32| {
-        let k = keys[i as usize];
-        if descending {
-            !k
-        } else {
-            k
-        }
-    };
-    let mut buf = vec![0u32; n];
-    for shift in (0..64).step_by(8) {
-        let mut count = [0usize; 257];
-        for &i in &idx {
-            let b = ((key(i) >> shift) & 0xff) as usize;
-            count[b + 1] += 1;
-        }
-        // All keys share this byte → this pass is the identity (stable), skip it.
-        if count[1..].contains(&n) {
-            continue;
-        }
-        for k in 0..256 {
-            count[k + 1] += count[k];
-        }
-        for &i in &idx {
-            let b = ((key(i) >> shift) & 0xff) as usize;
-            buf[count[b]] = i;
-            count[b] += 1;
-        }
-        std::mem::swap(&mut idx, &mut buf);
-    }
-    idx
-}
-
-#[cfg(test)]
-mod ordered_shortcut_tests {
-    use std::sync::Arc;
-
-    use arrow::compute::{sort_to_indices, take};
-
-    use super::*;
-
-    /// An already-ordered key must radix to the identity, and that has to be checked against
-    /// arrow's own sort rather than against `0..n` — the claim is that the permutation is
-    /// unchanged, and only the comparison sort can say what the permutation should be.
-    #[test]
-    fn an_ordered_column_radixes_to_itself() {
-        let ascending: ArrayRef = Arc::new(Int64Array::from((0..5_000i64).collect::<Vec<_>>()));
-        let constant: ArrayRef = Arc::new(Int64Array::from(vec![7i64; 5_000]));
-        let descending_vals: ArrayRef =
-            Arc::new(Int64Array::from((0..5_000i64).rev().collect::<Vec<_>>()));
-        let mut unordered: Vec<i64> = (0..5_000i64).collect();
-        unordered.swap(0, 4_999);
-        let unordered: ArrayRef = Arc::new(Int64Array::from(unordered));
-
-        for values in [ascending, constant, descending_vals, unordered] {
-            for descending in [false, true] {
-                let opts = SortOptions {
-                    descending,
-                    nulls_first: false,
-                };
-                let got = radix_sort_indices(&values, opts).expect("Int64 is radix-sortable");
-                let want = sort_to_indices(values.as_ref(), Some(opts), None).unwrap();
-                let g = take(values.as_ref(), &got, None).unwrap();
-                let w = take(values.as_ref(), &want, None).unwrap();
-                assert_eq!(g.as_ref(), w.as_ref(), "descending={descending}");
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{Int32Array, Int64Array, UInt32Array as U32, UInt64Array};
-    use arrow::compute::{sort_to_indices, take};
-
-    use super::*;
-
-    #[test]
-    fn matches_arrow_float_with_nulls_signs_and_zeros() {
-        // Finite floats spanning negatives, ±0.0, ±inf, ties, and nulls — the radix
-        // float key must sort identically to arrow's comparison sort. (NaN bails to the
-        // comparison sort and is covered by `nan_present_bails`.)
-        let v: ArrayRef = Arc::new(Float64Array::from(vec![
-            Some(5.5),
-            None,
-            Some(-3.25),
-            Some(5.5),
-            Some(0.0),
-            Some(-0.0),
-            Some(f64::NEG_INFINITY),
-            Some(f64::INFINITY),
-            None,
-            Some(-3.25),
-            Some(1e308),
-        ]));
-        assert_radix_matches_arrow(v);
-        let f32v: ArrayRef = Arc::new(Float32Array::from(vec![
-            Some(2.0f32),
-            Some(-1.0),
-            None,
-            Some(0.0),
-            Some(-0.0),
-            Some(f32::INFINITY),
-        ]));
-        assert_radix_matches_arrow(f32v);
-    }
-
-    #[test]
-    fn nan_present_bails_to_comparison_sort() {
-        // A column with a NaN is not radix-sortable (no single numeric position), so the
-        // builder returns None and the caller uses arrow's comparison sort.
-        let v: ArrayRef = Arc::new(Float64Array::from(vec![
-            Some(1.0),
-            Some(f64::NAN),
-            Some(2.0),
-        ]));
-        assert!(radix_sort_indices(&v, SortOptions::default()).is_none());
-    }
-
-    /// Radix and arrow's comparison sort must produce the **same sorted column** for
-    /// every option combination (the relation is identical even if a tie permutation
-    /// differs — both are valid stable sorts here). Checks the value sequence after
-    /// gathering, across signs, nulls, ties, ascending/descending, nulls first/last.
-    fn assert_radix_matches_arrow(values: ArrayRef) {
-        for descending in [false, true] {
-            for nulls_first in [false, true] {
-                let opts = SortOptions {
-                    descending,
-                    nulls_first,
-                };
-                let radix = radix_sort_indices(&values, opts).expect("supported type");
-                let arrow = sort_to_indices(&values, Some(opts), None).unwrap();
-                let r = take(values.as_ref(), &radix, None).unwrap();
-                let a = take(values.as_ref(), &arrow, None).unwrap();
-                assert_eq!(
-                    r.as_ref(),
-                    a.as_ref(),
-                    "desc={descending} nulls_first={nulls_first}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn matches_arrow_signed_with_nulls_and_ties() {
-        let v: ArrayRef = Arc::new(Int32Array::from(vec![
-            Some(5),
-            None,
-            Some(-3),
-            Some(5),
-            Some(0),
-            None,
-            Some(i32::MIN),
-            Some(i32::MAX),
-            Some(-3),
-        ]));
-        assert_radix_matches_arrow(v);
-    }
-
-    #[test]
-    fn matches_arrow_unsigned() {
-        let v: ArrayRef = Arc::new(UInt64Array::from(vec![
-            Some(10u64),
-            Some(0),
-            None,
-            Some(u64::MAX),
-            Some(10),
-            Some(7),
-        ]));
-        assert_radix_matches_arrow(v);
-    }
-
-    #[test]
-    fn matches_arrow_int64_full_range() {
-        let v: ArrayRef = Arc::new(Int64Array::from(vec![
-            Some(0i64),
-            Some(-1),
-            Some(1),
-            Some(i64::MIN),
-            Some(i64::MAX),
-            None,
-            Some(-1),
-        ]));
-        assert_radix_matches_arrow(v);
-    }
-
-    #[test]
-    fn matches_arrow_all_nulls_and_empty() {
-        assert_radix_matches_arrow(Arc::new(Int32Array::from(vec![None, None, None])) as ArrayRef);
-        assert_radix_matches_arrow(
-            Arc::new(Int32Array::from(Vec::<Option<i32>>::new())) as ArrayRef
-        );
-    }
-
-    #[test]
-    fn unsupported_type_returns_none() {
-        // Strings/booleans have no fixed-width radix key, so the builder declines and the
-        // caller uses arrow's comparison sort. (Floats are now supported — see the float
-        // tests; a NaN-bearing float column declines via `nan_present_bails`.)
-        let s: ArrayRef = Arc::new(arrow::array::StringArray::from(vec!["a", "b"]));
-        assert!(radix_sort_indices(&s, SortOptions::default()).is_none());
-        let b: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![true, false]));
-        assert!(radix_sort_indices(&b, SortOptions::default()).is_none());
-    }
-
-    #[test]
-    fn stable_keeps_input_order_for_ties() {
-        // Distinct payload via index lets us see the tie order: equal keys must keep
-        // ascending input index (the stable property a stable arrow sort also gives).
-        let v: ArrayRef = Arc::new(U32::from(vec![7u32, 7, 7, 7]));
-        let idx = radix_sort_indices(&v, SortOptions::default()).unwrap();
-        assert_eq!(idx.values(), &[0, 1, 2, 3]);
-    }
-}
-
 #[cfg(test)]
 mod packed_multi_key_tests {
     use super::*;
@@ -836,6 +543,20 @@ mod packed_multi_key_tests {
         }
     }
 
+    fn desc() -> SortOptions {
+        SortOptions {
+            descending: true,
+            nulls_first: true,
+        }
+    }
+
+    fn nulls_last() -> SortOptions {
+        SortOptions {
+            descending: false,
+            nulls_first: false,
+        }
+    }
+
     /// Deterministic pseudo-random values, so a failure is reproducible.
     fn spread(n: usize, modulus: i64, seed: u64) -> Vec<i64> {
         let mut x = seed | 1;
@@ -849,6 +570,32 @@ mod packed_multi_key_tests {
             .collect()
     }
 
+    /// Values spread across the **whole** `i64` range, so one column alone measures ~64 bits and
+    /// two of them cannot share even the wide budget. `spread`'s `rem_euclid` caps a column at
+    /// its modulus, which is what these tests need to be *inside* the budget; this is what they
+    /// need to be outside it.
+    fn full_width(n: usize, seed: u64) -> Vec<i64> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                x as i64
+            })
+            .collect()
+    }
+
+    /// A `l_extendedprice`-shaped float: positive, bounded, and two decimal places, whose *rank*
+    /// range is ~56 bits — too wide for the `u64` budget beside anything, and the shape the
+    /// `u128` tier exists for.
+    fn prices(n: usize, seed: u64) -> Vec<f64> {
+        spread(n, 10_404_850, seed)
+            .into_iter()
+            .map(|c| (c + 90_100) as f64 / 100.0)
+            .collect()
+    }
+
     // Above `PACKED_PROBE_ROWS`, so every case exercises the prefix probe as well as the
     // exact width scan.
     const N: usize = 6_000;
@@ -857,6 +604,122 @@ mod packed_multi_key_tests {
     fn a_packed_multi_sort_equals_the_row_encoded_one() {
         let a: ArrayRef = Arc::new(Int64Array::from(spread(N, 2_000, 7)));
         let b: ArrayRef = Arc::new(Int64Array::from(spread(N, 1_500, 11)));
+        check(vec![a, b], vec![asc(), asc()]);
+    }
+
+    /// A float beside an integer, in **both** budgets, against the oracle.
+    ///
+    /// `small` is a float whose whole live range is a hundred integers, so its rank measures ~50
+    /// bits and the pair still packs into one `u64` — the counting-sort tier. `wide` is
+    /// `l_extendedprice`-shaped at ~56 bits, which no `u64` holds beside anything, so it can only
+    /// have come back from the `u128` tier. Both must equal the row-encoded permutation exactly:
+    /// a float's ordering is the one thing this path could restate and get subtly wrong, and
+    /// `oracle` is arrow's own comparison sort over the same columns.
+    #[test]
+    fn a_float_beside_an_integer_matches_the_oracle() {
+        let i: ArrayRef = Arc::new(Int64Array::from(spread(N, 200_000, 67)));
+        let small: ArrayRef = Arc::new(Float64Array::from(
+            spread(N, 100, 61)
+                .into_iter()
+                .map(|v| v as f64)
+                .collect::<Vec<_>>(),
+        ));
+        let wide: ArrayRef = Arc::new(Float64Array::from(prices(N, 61)));
+        check(vec![i.clone(), small.clone()], vec![asc(), asc()]);
+        check(vec![i.clone(), wide.clone()], vec![asc(), asc()]);
+        check(vec![wide.clone(), i.clone()], vec![asc(), asc()]);
+        // `op-sort-multikey-wide` itself: a descending integer over an ascending float.
+        check(vec![i, wide], vec![desc(), asc()]);
+    }
+
+    /// The `u128` tier under everything that makes a packed field hard: nulls at both ends, a
+    /// descending key, and negative floats whose ranks bit-invert.
+    #[test]
+    fn a_key_too_wide_for_one_word_still_matches_the_oracle() {
+        let signed: Vec<Option<f64>> = prices(N, 71)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| match i % 11 {
+                0 => None,
+                1 => Some(-v),
+                2 => Some(0.0),
+                _ => Some(v),
+            })
+            .collect();
+        let f: ArrayRef = Arc::new(Float64Array::from(signed));
+        let i: ArrayRef = Arc::new(Int64Array::from(
+            spread(N, 300, 73)
+                .into_iter()
+                .enumerate()
+                .map(|(r, v)| if r % 13 == 0 { None } else { Some(v) })
+                .collect::<Vec<_>>(),
+        ));
+        for fo in [asc(), desc(), nulls_last()] {
+            for io in [asc(), desc(), nulls_last()] {
+                check(vec![i.clone(), f.clone()], vec![io, fo]);
+                check(vec![f.clone(), i.clone()], vec![fo, io]);
+            }
+        }
+    }
+
+    /// A **partly ordered** composite key, which is the input `run_aware_sort` sits in front of
+    /// and the one the word sort's position tie-break has to be right about: the runs it hands
+    /// the sort are not `0..n`, so a `(key, row)` tie-break would order tied rows by row number
+    /// while the oracle orders them by their place in the run.
+    ///
+    /// Ten ascending runs of the leading key with a random second key, so every run is long
+    /// enough for the detection to fire and ties inside it are dense.
+    #[test]
+    fn a_partly_ordered_composite_key_matches_the_oracle() {
+        let mut lead: Vec<i64> = Vec::with_capacity(N);
+        for r in 0..10 {
+            let mut run = spread(N / 10, 40, 79 + r as u64);
+            run.sort_unstable();
+            lead.extend(run);
+        }
+        lead.resize(N, 39);
+        let a: ArrayRef = Arc::new(Int64Array::from(lead));
+        let b: ArrayRef = Arc::new(Int64Array::from(spread(N, 6, 83)));
+        for ao in [asc(), desc()] {
+            for bo in [asc(), desc()] {
+                check(vec![a.clone(), b.clone()], vec![ao, bo]);
+            }
+        }
+    }
+
+    /// The narrow tier ends where the row position stops fitting beside the key in a `u64`, and
+    /// both sides of that line must agree with the oracle. 30 bits is inside it; 34 is not and
+    /// falls to the `u128` tier, which is the transition most likely to be got wrong because
+    /// nothing about the *result* changes across it.
+    #[test]
+    fn both_sides_of_the_word_boundary_match_the_oracle() {
+        let narrow_a: ArrayRef = Arc::new(Int64Array::from(spread(N, 1 << 15, 89)));
+        let narrow_b: ArrayRef = Arc::new(Int64Array::from(spread(N, 1 << 15, 97)));
+        let wide_a: ArrayRef = Arc::new(Int64Array::from(spread(N, 1 << 17, 101)));
+        let wide_b: ArrayRef = Arc::new(Int64Array::from(spread(N, 1 << 17, 103)));
+        check(vec![narrow_a, narrow_b], vec![asc(), desc()]);
+        check(vec![wide_a, wide_b], vec![asc(), desc()]);
+    }
+
+    /// Two keys of ~45 bits each — the shape `shapes_outside_the_budget_decline` used to hold as
+    /// a decline, because 90 bits does not fit a `u64`. It fits 96, so it must now come back, and
+    /// come back right.
+    #[test]
+    fn a_pair_between_the_two_budgets_is_admitted_not_declined() {
+        let a: ArrayRef = Arc::new(Int64Array::from(
+            (0..N as i64)
+                .map(|i| i.wrapping_mul(1_000_000_007))
+                .collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(Int64Array::from(
+            (0..N as i64)
+                .map(|i| i.wrapping_mul(999_999_937))
+                .collect::<Vec<_>>(),
+        ));
+        assert!(
+            packed_multi_sort_indices(&[a.clone(), b.clone()], &[asc(), asc()]).is_some(),
+            "90 bits is inside the 96-bit budget"
+        );
         check(vec![a, b], vec![asc(), asc()]);
     }
 
@@ -984,29 +847,23 @@ mod packed_multi_key_tests {
     }
 
     /// The declines, so a shape outside the budget reaches the comparison sort rather than a
-    /// wrong answer: two full-width columns, a float key, a string key, and a short input.
+    /// wrong answer: two full-width columns, two floats, a string key, and a short input.
+    ///
+    /// The boundary these hold is [`PACKED_U128_BITS`], not the 64 bits it used to be. Two keys
+    /// of ~45 bits each are now *inside* the budget and are covered by
+    /// `a_key_too_wide_for_one_word_still_matches_the_oracle`; what is outside it is a pair that
+    /// cannot share 96 bits however the widths fall.
     #[test]
     fn shapes_outside_the_budget_decline() {
-        let wide0: ArrayRef = Arc::new(Int64Array::from(
-            (0..N as i64)
-                .map(|i| i.wrapping_mul(1_000_000_007))
-                .collect::<Vec<_>>(),
-        ));
-        let wide1: ArrayRef = Arc::new(Int64Array::from(
-            (0..N as i64)
-                .map(|i| i.wrapping_mul(999_999_937))
-                .collect::<Vec<_>>(),
-        ));
+        let wide0: ArrayRef = Arc::new(Int64Array::from(full_width(N, 1_000_000_007)));
+        let wide1: ArrayRef = Arc::new(Int64Array::from(full_width(N, 999_999_937)));
         assert!(packed_multi_sort_indices(&[wide0, wide1], &[asc(), asc()]).is_none());
 
-        let f: ArrayRef = Arc::new(Float64Array::from(
-            spread(N, 100, 61)
-                .into_iter()
-                .map(|v| v as f64)
-                .collect::<Vec<_>>(),
-        ));
+        // Two floats: ~56 bits each, so they fit neither budget however they are arranged.
+        let f0: ArrayRef = Arc::new(Float64Array::from(prices(N, 61)));
+        let f1: ArrayRef = Arc::new(Float64Array::from(prices(N, 63)));
+        assert!(packed_multi_sort_indices(&[f0, f1], &[asc(), asc()]).is_none());
         let i: ArrayRef = Arc::new(Int64Array::from(spread(N, 100, 67)));
-        assert!(packed_multi_sort_indices(&[f, i.clone()], &[asc(), asc()]).is_none());
 
         let s: ArrayRef = Arc::new(arrow::array::StringArray::from(
             (0..N).map(|k| format!("v{k:04}")).collect::<Vec<_>>(),
@@ -1025,26 +882,16 @@ mod packed_multi_key_tests {
     /// of the sample.
     #[test]
     fn a_narrow_prefix_with_a_wide_tail_still_declines() {
+        let wide_a = full_width(N, 1_000_000_007);
+        let wide_b = full_width(N, 999_999_937);
         let a: ArrayRef = Arc::new(Int64Array::from(
             (0..N as i64)
-                .map(|i| {
-                    if i < 5_000 {
-                        i % 8
-                    } else {
-                        i.wrapping_mul(1_000_000_007)
-                    }
-                })
+                .map(|i| if i < 5_000 { i % 8 } else { wide_a[i as usize] })
                 .collect::<Vec<_>>(),
         ));
         let b: ArrayRef = Arc::new(Int64Array::from(
             (0..N as i64)
-                .map(|i| {
-                    if i < 5_000 {
-                        i % 8
-                    } else {
-                        i.wrapping_mul(999_999_937)
-                    }
-                })
+                .map(|i| if i < 5_000 { i % 8 } else { wide_b[i as usize] })
                 .collect::<Vec<_>>(),
         ));
         assert!(prefix_could_fit(
@@ -1058,16 +905,8 @@ mod packed_multi_key_tests {
     /// And it must reject the shape it exists for, without reading past the sample.
     #[test]
     fn a_wide_prefix_rejects_before_the_exact_scan() {
-        let a: ArrayRef = Arc::new(Int64Array::from(
-            (0..N as i64)
-                .map(|i| i.wrapping_mul(1_000_000_007))
-                .collect::<Vec<_>>(),
-        ));
-        let b: ArrayRef = Arc::new(Int64Array::from(
-            (0..N as i64)
-                .map(|i| i.wrapping_mul(999_999_937))
-                .collect::<Vec<_>>(),
-        ));
+        let a: ArrayRef = Arc::new(Int64Array::from(full_width(N, 1_000_000_007)));
+        let b: ArrayRef = Arc::new(Int64Array::from(full_width(N, 999_999_937)));
         assert!(!prefix_could_fit(&[a, b], &[asc(), asc()], N));
     }
 

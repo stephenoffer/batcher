@@ -434,6 +434,175 @@ def stream_topn(
         yield from result.to_batches(max_chunksize=batch_size)
 
 
+def stream_sample_n(
+    sample,
+    source: Source,
+    batch_size: int | None = None,
+    *,
+    projection: list[str] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Fixed-count `sample(n=)` over a streaming source, with memory bounded by `n`.
+
+    The same mergeable shape as `stream_topn`, and for the same reason. `sample(n=)` keeps the
+    `n` smallest-hash rows of the whole relation, so a row among the global `n` smallest is
+    among the `n` smallest of any subset containing it — which makes the running set of `n`
+    closed under adding a batch, and re-applying the operator to (running + batch) select
+    exactly the global answer. `bc_interp::ops::reshape::sample_n_batches` breaks hash ties by
+    row *content*, so the answer does not depend on how the input was split, and the fold
+    converges on the collected result rather than on some valid sample of the same size.
+
+    **The node's own IR is re-applied verbatim, and the seed is why.** A `Sample` built with
+    `seed=None` bakes a fresh seed at plan-build; a driver that re-derived the node instead of
+    carrying `shape_ir()` would sample against a different seed each round and never converge.
+    This is also why the validation for it has to hold the seed fixed — comparing two
+    default-seeded plans shows a disagreement that is not a defect.
+
+    Rounds rather than per-batch merging, for `stream_topn`'s reason: merging on every batch
+    re-reads and re-samples the running `n` rows once per batch, so a small source batch
+    against a large `n` pays more for the merge than for the rows it contributed. A round
+    buffers until it holds several times `n`, which bounds the merge overhead while leaving
+    peak memory at `n` plus one round.
+    """
+    nat = engine()
+
+    sample_ir = json.dumps({**sample.shape_ir(), "input": {"op": "scan", "source_id": 0}})
+    input_ir = json.dumps(sample.input.to_ir())
+    n = sample.n
+
+    running: list[pa.RecordBatch] = []
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    round_rows = max(n * _TOPN_MERGE_RATIO, active_config().execution.morsel_rows)
+    cfg_json = active_config().engine_config_json()
+
+    def merge(buffered: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+        rows = [b for b in nat.execute_plan(input_ir, [buffered], cfg_json) if b.num_rows]
+        merged = running + rows
+        if not merged:
+            return running
+        return [b for b in nat.execute_plan(sample_ir, [merged], cfg_json) if b.num_rows]
+
+    for batch in _read(source, projection):
+        if batch.num_rows == 0:
+            continue
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        if pending_rows >= round_rows:
+            running = merge(pending)
+            pending, pending_rows = [], 0
+    if pending:
+        running = merge(pending)
+
+    if not running:
+        return
+    result = pa.Table.from_batches(running)
+    if batch_size is None:
+        yield from result.to_batches()
+    else:
+        yield from result.to_batches(max_chunksize=batch_size)
+
+
+def stream_distinct_on(
+    distinct,
+    source: Source,
+    batch_size: int | None = None,
+    *,
+    projection: list[str] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Keyed dedup (`DISTINCT ON`) over a streaming source, bounded by the key count.
+
+    `stream_distinct` cannot serve this shape and declines it for a real reason: it folds
+    through `Distinct.as_aggregate`, and a **keyed** dedup is not a group-by — its surviving
+    row carries columns the key does not determine, so folding them with per-column aggregates
+    would build a row that was never in the input. That is why the router excluded
+    `plan.keys` outright, and why the shape materialized.
+
+    What it *is* is mergeable in its own right. The survivor per key is the minimum under
+    `order` (or the first seen when `order` is empty), and min is associative and commutative
+    — so re-applying the operator to (running + batch) keeps exactly the row it would have
+    kept over the concatenation. The running set holds one row per key, so peak memory is the
+    key cardinality rather than the relation, which is the same bound `stream_aggregate` has.
+
+    The node's own `shape_ir()` is re-applied verbatim rather than rebuilt, so `keys`, `order`
+    and a fused `limit` all cross unchanged — a field added to `Distinct` reaches this driver
+    without anyone remembering it, which is the property that seam exists for.
+    """
+    nat = engine()
+
+    dedup_ir = json.dumps({**distinct.shape_ir(), "input": {"op": "scan", "source_id": 0}})
+    input_ir = json.dumps(distinct.input.to_ir())
+
+    running: list[pa.RecordBatch] = []
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    round_rows = active_config().execution.morsel_rows
+    cfg_json = active_config().engine_config_json()
+
+    def merge(buffered: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+        rows = [b for b in nat.execute_plan(input_ir, [buffered], cfg_json) if b.num_rows]
+        merged = running + rows
+        if not merged:
+            return running
+        return [b for b in nat.execute_plan(dedup_ir, [merged], cfg_json) if b.num_rows]
+
+    for batch in _read(source, projection):
+        if batch.num_rows == 0:
+            continue
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        if pending_rows >= round_rows:
+            running = merge(pending)
+            pending, pending_rows = [], 0
+    if pending:
+        running = merge(pending)
+
+    if not running:
+        return
+    result = pa.Table.from_batches(running)
+    if batch_size is None:
+        yield from result.to_batches()
+    else:
+        yield from result.to_batches(max_chunksize=batch_size)
+
+
+def stream_row_index(row_id, batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+    """Number `batches` with one running counter — `with_row_index` over a stream.
+
+    The counter is the whole implementation, and the reason it is *sound* is the interesting
+    part. A row index is a **position**, so `RowId` is not partition-independent and the
+    router's peeling loop correctly refuses it: run per partition, every partition restarts at
+    zero. The distributed path pays for that with `preserve_order` and a driver-side assembly
+    over contiguous, source-ordered split runs.
+
+    A stream has the property those mechanisms exist to reconstruct: batches arrive in the
+    input's own row order. So a running counter numbers exactly the rows `collect()` numbers,
+    and needs neither. The caller is responsible for the premise — it passes batches from an
+    `is_streamable` input, which admits only row-wise operators over a scan, so nothing below
+    can reorder or re-batch the input out from under the counter.
+
+    The index is prepended and its field is explicitly non-nullable, because
+    `RowId.available_columns()` puts the alias first and the engine emits a counter that is
+    never null. A streamed batch disagreeing on either would not `concat` with a collected one
+    — a divergence in schema rather than in values, which is the kind that surfaces far from
+    its cause.
+
+    Args:
+        row_id: The `RowId` node, for its `alias` and `offset`.
+        batches: The input's batches, in the input's row order.
+
+    Yields:
+        Each batch with the index column prepended.
+    """
+    index = row_id.offset
+    for batch in batches:
+        column = pa.array(range(index, index + batch.num_rows), type=pa.int64())
+        index += batch.num_rows
+        yield pa.RecordBatch.from_arrays(
+            [column, *batch.columns],
+            schema=pa.schema([pa.field(row_id.alias, pa.int64(), nullable=False), *batch.schema]),
+        )
+
+
 def stream_keyed_state(
     node,
     source: Source,

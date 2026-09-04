@@ -19,7 +19,7 @@ differently produce different relations from the same query.
 | LSD radix | a single fixed-width key, a full sort, no `NaN` in the column, floats only up to 2^18 rows | `ops/radix_sort.rs` |
 | Composite radix | several keys, all integer or temporal, whose measured value ranges fit one `u64` between them | `ops/radix_sort.rs` |
 | Stable byte-key sort | a `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary` key | `ops/byte_sort.rs` |
-| Parallel sample-sort | above 2^17 rows, a full sort, leading key of type float / integer / temporal / text / binary | `ops/sample_sort.rs` |
+| Parallel sample-sort | above 2^17 rows, a full sort, leading key of type float / integer / temporal / text / binary | `ops/sample_sort/` |
 | External merge sort | the input exceeds the memory envelope | `ops/external_sort.rs` |
 
 ```text
@@ -63,6 +63,45 @@ So every path appends the **original row index as a final ascending key**. Ties 
 input order, a deterministic total order and exactly what a stable sort yields. The slice a
 parallel range sorts is always gathered in ascending original-row order, so a slice-local `0..n`
 index preserves the input's relative order of tied rows within it.
+
+## Natural runs come first
+
+Real data is often already partly in order: files each written sorted, an append-only log, a
+`UNION ALL` of sorted sources, a re-sort by the key a scan is clustered on. Before either radix
+path runs, `ops/run_sort.rs` finds the key's maximal ordered **runs**, sorts only what lies between
+them, and merges pairwise in `log2(k)` parallel rounds — `is_ordered` is its degenerate case.
+
+Detection is nearly free when there are no runs to find, which is what lets it run
+unconditionally. The technique is DuckDB's, whose in-memory sort is
+`vergesort(begin, end, less, fallback = ska_sort)`. Vergesort does not walk the input looking
+for runs, it **strides**: it jumps `n / log2(n)` positions ahead, asks which way the pair there
+is ordered, and only then expands outward to the run's limits. Failing to find a run therefore
+costs about `3 * log2(n)` comparisons over the whole input, sixty-odd on six million rows. So the
+engine *proves* the ordering on the rows in hand rather than trusting a plan-level declaration: a
+false declaration is a wrong answer, while a proof that finds nothing is a rounding error.
+
+**Stability is where this departs from vergesort, and it has to.** Vergesort feeds `std::sort`,
+which is unstable, so it reverses any non-ascending run; reversing a run holding two equal keys
+would emit the later row first. A descending run is therefore exploited here only when it is
+**strictly** descending, which makes its reversal tie-free. Two further gates hand the input back
+untouched: above sixty-four runs, and when the runs cover less than half the rows.
+
+Measured on six million rows with a `float64` payload, two builds differing only in whether
+detection runs:
+
+| key structure | detection off | detection on | |
+|---|---|---|---|
+| random (the control) | 36.1 ms | 34.2 ms | 1.06x |
+| strictly descending | 23.6 ms | 17.8 ms | **1.32x** |
+| two sorted halves concatenated | 23.1 ms | 18.4 ms | **1.26x** |
+
+Read the control row first: random input is unchanged, which is what makes the check safe on
+every sort. Then the ceiling — a fully sorted key costs 18.3 ms and that is almost entirely the
+payload gather, so the run shapes landing at 18.4-21.7 ms say this collects most of what was
+available and the rest is the gather, not the ordering. Detection sees the runs of whatever
+slice it is handed, and above 2^17 rows the sample-sort range-routes first, so each range holds
+rows from every run and the runs inside it are shorter — which is why sixty-four sorted parts
+measure at parity while two do not.
 
 ## Path 1: radix (single fixed-width key, full sort)
 
@@ -217,7 +256,7 @@ fill the cores:
 
 ## Path 4: parallel sample-sort
 
-`ops/sample_sort.rs`, above 2^17 rows, for a full sort with a float, integer, temporal, text,
+`ops/sample_sort/`, above 2^17 rows, for a full sort with a float, integer, temporal, text,
 or binary leading key.
 
 Sample ~8,192 rows to estimate quantile boundaries, range-partition the rows by the leading key,
@@ -442,7 +481,8 @@ about.
 - `crates/bc-interp/src/ops/radix_sort.rs`: the LSD radix path, and the composite key packed from measured ranges
 - `crates/bc-interp/src/ops/byte_sort.rs`: the stable byte-key permutation (text and binary)
 - `crates/bc-runtime/src/byte_key.rs`: the one reading of a byte-key column, shared by the sort and the range partitioner
-- `crates/bc-interp/src/ops/sample_sort.rs`: the parallel sample-sort
+- `crates/bc-interp/src/ops/sample_sort/`: the parallel sample-sort
+- `crates/bc-interp/src/ops/run_sort.rs`: natural-run detection, shared by the two radix paths
 - `crates/bc-interp/src/ops/external_sort.rs`: the spilling k-way merge
 - `crates/bc-runtime/src/gather/`: the bulk `take`/`concat` fills. `mod.rs` holds the byte layouts and `fixed.rs` the fixed-width ones
 

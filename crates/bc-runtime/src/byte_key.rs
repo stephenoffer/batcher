@@ -62,6 +62,7 @@ pub trait ByteKeys {
 /// accepted two of the five, the parallel sample-sort read that same short list and so declined
 /// the rest to a serial sort, and the distributed range partitioner read a third copy. A type
 /// added to one and not the others is not a compile error anywhere.
+#[must_use]
 pub fn is_byte_key(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -241,7 +242,7 @@ mod tests {
                 "fixed_size_binary",
                 Arc::new(
                     FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                        values.iter().map(|v| v.map(|b| b.to_vec())),
+                        values.iter().map(|v| v.map(<[u8]>::to_vec)),
                         2,
                     )
                     .expect("uniform width"),

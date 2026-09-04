@@ -173,12 +173,46 @@ def _elide(text: str) -> str:
     return text[: _PUSHED_MAX_CHARS - 1].rstrip() + "…"
 
 
+def detail_labels(ir: dict | None) -> dict[int, str]:
+    """Per `op_id`, what that operator does in its own terms, for `explain()`.
+
+    The join type and keys, the group keys and aggregates, the sort keys, the filter
+    predicate. `explain()` printed none of it, so a plan with four joins printed four
+    identical `hash_join` lines and the reader had no way to tell which was which — the
+    first question anyone asks of a join tree. Every comparable engine prints it
+    (Postgres's ``Hash Cond:``, Spark's ``[id#3 = id#7]``, DuckDB's key list).
+
+    Reuses `observe.dag.describe`, which is the same function the web dashboard labels its
+    plan nodes with, rather than growing a second describer: two of them would drift within
+    a release and show the same operator two ways, which is the failure that makes a reader
+    stop trusting both.
+
+    Args:
+        ir: The optimized plan IR, walked in the pre-order that assigns `op_id`.
+
+    Returns:
+        A mapping from `op_id` to its label; operators with nothing worth naming are absent.
+    """
+    if not ir:
+        return {}
+    from batcher.observe.dag.describe import describe
+    from batcher.plan.profile import walk_ir
+
+    labels: dict[int, str] = {}
+    for op_id, (_depth, node) in enumerate(walk_ir(ir)):
+        text = describe(str(node.get("op", "")), node)
+        if text:
+            labels[op_id] = _elide(text)
+    return labels
+
+
 def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
     prof.physical_ops = opt.ops
     prof.source_pushdown = pushdown_labels(opt)
+    prof.node_details = detail_labels(opt.ir)
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -478,7 +512,7 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
         plan, sources=sources, hub=hub, source_stats=source_stats
     )
     return QueryProfile(
-        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt)),
+        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir)),
         decisions=(
             *build_side_decisions(decisions),
             *_io_throughput_decisions(sources, hub),
@@ -514,8 +548,16 @@ def run_profiled(
     import time
 
     from batcher import core
+    from batcher._internal import events
     from batcher.api import executors
     from batcher.api.terminal.core import _resolve_distributed
+    from batcher.api.terminal.event_log import (
+        pipeline_signature,
+        query_label,
+        report_failure,
+        start_query_report,
+        write_event_log,
+    )
     from batcher.io.source import is_bounded
     from batcher.plan.profile import ProfileCollector
 
@@ -527,6 +569,19 @@ def run_profiled(
             "has an unbounded source."
         )
     collector = ProfileCollector()
+    # `explain(analyze=True)` and `stats()` run the query for real, and neither was reported
+    # as one: no `query_start`, no `query_end`, no span, and nothing counted in
+    # `batcher_queries_total`. The `RESOURCE` readings Carbonite published during the run
+    # were worse than absent -- they carried no query id, and `observe.store` drops an event
+    # naming no live query by design, so they were assembled and then discarded.
+    #
+    # Announced here rather than in the two callers because this is the funnel both take,
+    # and skipped when the caller already announced one: the parameter has always existed
+    # for that case, so a future caller that mints its own id must not be double-counted.
+    announced = ""
+    if not query_id:
+        query_id = start_query_report(query_label(plan), pipeline_signature(plan))
+        announced = query_id
     # Pass plan + sources so the size-aware "auto" decision matches `collect()`. Resolving
     # with neither hit `resolve_distributed`'s `sources is None -> True` fall-through, forcing
     # every profiled run to distribute on a multi-node cluster — measuring a path a small
@@ -534,8 +589,32 @@ def run_profiled(
     distributed = _resolve_distributed("auto", plan, sources)
     ctx = core.ExecutionContext(columns=columns, hub=core.default_hub(), profile=collector)
     t0 = time.perf_counter()
-    table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    try:
+        # Makes the id ambient, which is what attributes the subsystems' own events -- the
+        # Carbonite readings above, and every scheduling decision `dist` publishes -- to this
+        # run instead of to nothing.
+        with events.query_scope(query_id):
+            table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    except BaseException as exc:
+        # A profiled run that raises must close out too, or it leaves a row reading
+        # "running" in the dashboard for a query that has already failed.
+        if announced:
+            report_failure(announced, total_ms=(time.perf_counter() - t0) * 1000.0, exc=exc)
+        raise
     total_ms = (time.perf_counter() - t0) * 1000.0
+    if announced:
+        # The same funnel `collect()` closes through, so the stages, the archived document,
+        # the spans and the lineage run are identical for a query that was explained and one
+        # that was collected. Assembling the profile twice is the cost, and it is the right
+        # trade on the one path whose entire purpose is measurement.
+        write_event_log(
+            collector,
+            total_ms=total_ms,
+            rows=table.num_rows,
+            query_id=announced,
+            plan=plan,
+            sources=sources,
+        )
     # The soft memory envelope the run was admitted against, so the profile can report peak
     # memory as a fraction of budget (the >80% memory-utilization target). Best-effort.
     budget = 0

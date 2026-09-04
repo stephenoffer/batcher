@@ -105,7 +105,13 @@ def _crossover_step(
             )
             for name in (below, above)
         }
-    except Exception:  # pragma: no cover - a decision test must never break a query
+    except Exception as exc:  # pragma: no cover - a decision test must never break a query
+        # Best-effort, but not invisible. A store that has started refusing reads makes
+        # every plan silently fall back to its shipped default, and the two look identical
+        # from outside: plans that used to improve across runs quietly stop, with nothing
+        # anywhere saying why. That is what `note_suppressed` exists to separate, and it is
+        # what the two recording sites below already do.
+        note_suppressed("kyber", "read the learned crossover buckets for invalidation", exc)
         return None
     xover = _crossover_of(fits.get(below), fits.get(above), None)
     if xover is None or xover <= 0.0:

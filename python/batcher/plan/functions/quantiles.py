@@ -16,6 +16,17 @@ from __future__ import annotations
 from batcher.plan.expr_ir.core import AggExpr, Expr
 from batcher.plan.functions.aggregate import _as_column
 
+__all__ = [
+    "approx_median",
+    "approx_n_unique",
+    "approx_quantile",
+    "histogram",
+    "iqr",
+    "q1",
+    "q3",
+    "quantile",
+]
+
 
 def quantile(column: str | Expr, q: float) -> AggExpr:
     """Exact ``q``-quantile of a column (``q`` in ``[0, 1]``; ``0.5`` is the median).

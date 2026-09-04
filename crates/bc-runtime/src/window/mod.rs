@@ -358,12 +358,11 @@ pub(crate) fn window_serial(
         // row); `vec![0u32; n]` is a zeroed allocation the kernel hands over a page at a time.
         // The reduce-and-broadcast below is unchanged, and with one group it is exactly the
         // whole-column aggregate this shape asks for.
-        let (group_ids, num_groups) = match partition_keys.is_empty() {
-            true => (vec![0u32; num_rows], 1usize),
-            false => {
-                let (g, n, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
-                (g, n)
-            }
+        let (group_ids, num_groups) = if partition_keys.is_empty() {
+            (vec![0u32; num_rows], 1usize)
+        } else {
+            let (g, n, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
+            (g, n)
         };
         return funcs
             .iter()
@@ -979,12 +978,7 @@ fn rank(
                     part.len(),
                     &chunks,
                     0i64,
-                    |acc, pos| {
-                        Ok(match starts[pos] {
-                            true => pos as i64 + 1,
-                            false => acc,
-                        })
-                    },
+                    |acc, pos| Ok(if starts[pos] { pos as i64 + 1 } else { acc }),
                     |a, b| if b == 0 { a } else { b },
                     Ok,
                     &boundary,
@@ -1264,9 +1258,10 @@ fn running_numeric_i64(
                     &chunks,
                     (0i128, 0i64),
                     |(s, c), pos| {
-                        Ok(match arr.is_valid(part[pos]) {
-                            true => (s + arr.value(part[pos]) as i128, c + 1),
-                            false => (s, c),
+                        Ok(if arr.is_valid(part[pos]) {
+                            (s + i128::from(arr.value(part[pos])), c + 1)
+                        } else {
+                            (s, c)
                         })
                     },
                     |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2),
@@ -1281,7 +1276,7 @@ fn running_numeric_i64(
             let (mut sum, mut cnt, mut gs) = (0i128, 0i64, 0usize);
             for pos in 0..part.len() {
                 if arr.is_valid(part[pos]) {
-                    sum += arr.value(part[pos]) as i128;
+                    sum += i128::from(arr.value(part[pos]));
                     cnt += 1;
                 }
                 if peer_boundary(part, order_rows, pos) {
@@ -1314,9 +1309,9 @@ fn running_numeric_i64(
                 |acc, pos| {
                     Ok(match (arr.is_valid(part[pos]), acc) {
                         (false, a) => a,
-                        (true, None) => Some(arr.value(part[pos]) as i128),
+                        (true, None) => Some(i128::from(arr.value(part[pos]))),
                         (true, Some(a)) => {
-                            let v = arr.value(part[pos]) as i128;
+                            let v = i128::from(arr.value(part[pos]));
                             Some(match func {
                                 WindowFn::Sum => a + v,
                                 WindowFn::Min => a.min(v),
@@ -1918,7 +1913,7 @@ mod tests {
         assert_eq!(
             {
                 let mut s = vec![rn[0], rn[1]];
-                s.sort();
+                s.sort_unstable();
                 s
             },
             vec![1, 2]

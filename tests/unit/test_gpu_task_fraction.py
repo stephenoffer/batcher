@@ -257,12 +257,12 @@ def _health(devices: int, quarantined: int = 0, degraded: int = 0) -> tuple[dict
 
 def test_a_healthy_or_unprobed_fleet_packs_exactly_as_before(monkeypatch) -> None:
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: _health(8),
     )
     assert fleet_derate() == 1.0
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health", lambda: ()
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health", lambda: ()
     )
     assert fleet_derate() == 1.0, "no telemetry is not a reason to stop packing"
 
@@ -271,7 +271,7 @@ def test_one_sick_device_in_a_large_fleet_barely_moves_the_cotenancy(monkeypatch
     # A large fleet always has a sick device somewhere. Disabling packing fleet-wide for one of
     # five hundred would make the feature evaporate on exactly the clusters it exists for.
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: _health(500, degraded=1),
     )
     assert fleet_derate() == pytest.approx(499 / 500)
@@ -279,7 +279,7 @@ def test_one_sick_device_in_a_large_fleet_barely_moves_the_cotenancy(monkeypatch
 
 def test_a_widely_degraded_fleet_packs_less(monkeypatch) -> None:
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: _health(8, degraded=4),
     )
     assert fleet_derate() == pytest.approx(0.5)
@@ -289,7 +289,7 @@ def test_quarantined_devices_count_on_neither_side(monkeypatch) -> None:
     # A fleet is not penalized for correctly taking a broken board out of rotation: a shard
     # cannot land on a quarantined device, so it is not a device the share must be safe on.
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: _health(8, quarantined=4),
     )
     assert fleet_derate() == 1.0
@@ -298,7 +298,7 @@ def test_quarantined_devices_count_on_neither_side(monkeypatch) -> None:
 def test_the_derate_never_falls_low_enough_to_refuse_placement(monkeypatch) -> None:
     """The worst this can do is stop packing; it must never report a fleet as unplaceable."""
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: _health(8, degraded=8),
     )
     assert fleet_derate() == pytest.approx(1.0 / MAX_COTENANTS)
@@ -309,6 +309,6 @@ def test_a_failing_health_probe_does_not_fail_the_fan_out(monkeypatch) -> None:
         raise RuntimeError("ray is down")
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health", _boom
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health", _boom
     )
     assert fleet_derate() == 1.0

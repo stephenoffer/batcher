@@ -412,6 +412,54 @@ def _sizing_rows(node, sources) -> float | None:
     return rows if rows is not None and rows > 0 else None
 
 
+#: Groups a reducer must expect before *another* reducer is worth creating.
+#:
+#: `aggregate_reducer_count` floors its count at the worker count so no worker sits out the
+#: reduce, which is right whenever there is work to hand each of them and wrong when there is
+#: not. A bucket is one Flight stream out of every mapper, so `w` reducers over `w` mappers is
+#: `w^2` streams; when the partial state does not divide into that many meaningful pieces the
+#: exchange is paying a quadratic coordination cost to move a few kilobytes per stream.
+#:
+#: Measured on the project cluster (4 x 96-core workers, 64M rows, warm, median of 7, every
+#: case correctness-checked by row count) — current behaviour against the count this bound
+#: produces:
+#:
+#: | groups | workers | floored at `workers` | bounded | speedup |
+#: |---|---|---|---|---|
+#: | 64 | 64 | 302 ms | 89 ms (1 reducer) | 3.40x |
+#: | 200,000 | 8 | 461 ms | 416 ms (4) | 1.11x |
+#: | 200,000 | 16 | 442 ms | 389 ms (4) | 1.14x |
+#: | 200,000 | 64 | 348 ms | 244 ms (4) | 1.42x |
+#: | 1,000,000 | 64 | 880 ms | 435 ms (20) | 2.02x |
+#:
+#: 50,000 is where those optima sit and it is deliberately a round number, because the curve
+#: is broad — at a million groups on 64 workers, 8 reducers and 20 both measured 435-440 ms
+#: against 880 ms floored. It is a bound on the *floor* only, so the high-cardinality rule
+#: (`ceil(rows / target_rows_per_task)`) still sets the count whenever it asks for more, and
+#: the case the floor was added for is untouched: 5M groups on 8 workers wants
+#: `min(8, 5e6 // 50,000) = 8`, exactly as before.
+_MIN_GROUPS_PER_REDUCER = 50_000
+
+
+def _busy_floor(floor: int, rows: float) -> int:
+    """`floor`, lowered to the reducers this many groups can actually keep busy.
+
+    The floor exists so no worker sits out the reduce; this bounds it by whether there is
+    anything for the extra workers to do. Never returns less than 1, so an aggregate with
+    almost no groups still has a reducer.
+
+    Args:
+        floor: The caller's floor — the worker count, at the real call site.
+        rows: The learned or estimated group count.
+
+    Returns:
+        The effective floor, at least 1 and never above `floor`.
+    """
+    # `int(rows) // _MIN` is already <= `int(rows)`, so this subsumes the `min(floor, rows)`
+    # cap this replaced — a 4-group aggregate reaches 1 rather than 4.
+    return max(1, min(floor, int(rows) // _MIN_GROUPS_PER_REDUCER))
+
+
 def aggregate_reducer_count(agg, base_reducers: int, floor: int = 1, sources=None) -> int:
     """Reducer count for a keyed aggregate, sized by its LEARNED output cardinality.
 
@@ -420,7 +468,9 @@ def aggregate_reducer_count(agg, base_reducers: int, floor: int = 1, sources=Non
     is therefore the wrong number in *both* directions, and the group count is what fixes it.
 
     Too many, at the low end: a 60M-row to 4-group aggregate does not need one reducer per
-    worker each fetching from every mapper (a near-empty all-to-all), it needs one.
+    worker each fetching from every mapper (a near-empty all-to-all), it needs one. Reaching
+    that answer at the real call site is `_busy_floor`'s job, not the group count's — see
+    below.
 
     Too few, at the high end, which is the one that breaks scaling. One reducer per worker
     fixes the reduce fan-out to the *cluster*, so each reducer's group table grows with the
@@ -442,9 +492,16 @@ def aggregate_reducer_count(agg, base_reducers: int, floor: int = 1, sources=Non
     against a 4 M-row target asks for 2 reducers, which on an 8-worker cluster sat six
     workers out and made the reduce *slower* the more workers were added — measured on a
     9-node cluster at 0.65 s (2 workers), 1.05 s (4) and 4.47 s (8), against a map barrier
-    that scaled normally over the same runs. The floor is itself capped by `rows`, so the
-    low-cardinality trim above still reaches 1 for an aggregate that really does produce
-    fewer groups than there are workers — that near-empty all-to-all is real.
+    that scaled normally over the same runs.
+
+    That floor is itself bounded by `_busy_floor`, because "no worker sits idle" is only
+    worth buying when there is work to hand each of them. Capping it at `rows` — which is
+    what this did first — does not do that: a 64-group aggregate on a 64-worker cluster reads
+    as `min(64, 64)` and gets one Flight stream per mapper per reducer to move a handful of
+    rows, which is the near-empty all-to-all the paragraph above says it avoids. It measured
+    302 ms against 89 ms for the single reducer the doc promised, on the project cluster. The
+    high-cardinality rule is unaffected: it enters the same `max`, so it still sets the count
+    whenever it asks for more than the floor does.
 
     A cold signature falls back to Kyber's *estimated* group count
     (`_estimated_rows`) so a first run at scale is still sized by cardinality rather
@@ -459,7 +516,7 @@ def aggregate_reducer_count(agg, base_reducers: int, floor: int = 1, sources=Non
     # `rows` is a learned EMA and therefore a float; the floor is capped by it, so it must be
     # truncated to an int or the whole count becomes a float and `partition_batches` — whose
     # `num_partitions` is a Rust `usize` — raises at the FFI boundary on the worker.
-    want = max(1, math.ceil(rows / target), min(floor, int(rows)))
+    want = max(1, math.ceil(rows / target), _busy_floor(floor, rows))
     cap = active_config().distributed.max_shuffle_partitions
     return min(want, cap) if cap > 0 else want
 

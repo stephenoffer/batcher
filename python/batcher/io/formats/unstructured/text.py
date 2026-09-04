@@ -388,6 +388,23 @@ class TextSource:
             return f"{base}#enc={self._encoding}"
         return base
 
+    def governed_name(self) -> str:
+        """The table a governance policy is written about: the path the text is read from.
+
+        Distinct from `identity`, which names a *relation* and so carries the read *mode* and
+        any non-default encoding — a
+        relation's statistics must not be handed to a different relation. A policy is
+        written about the **table**, before anyone has read it and without knowing which
+        version they will land on. Reading the table name off the identity meant a policy
+        on ``/data/logs`` never fired on a text read at all, in either mode matched nothing, and
+        an ungoverned read of a governed table raises
+        nothing to say so.
+
+        Returns:
+            The table name a policy is keyed on.
+        """
+        return self._path
+
     def splits(
         self, target_size: int | None = None, projection: list[str] | None = None
     ) -> list[Split]:

@@ -42,7 +42,13 @@ import argparse
 import io
 import math
 import struct
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 # One weights-table unit is ~0.2 ns/row, fixed by an entry already in that file:
 # `regexp_matches` is 48.0 units and measures 9.5 ns/row net of a bare projection. The
@@ -231,6 +237,17 @@ def _report(title: str, timings: dict[str, float]) -> None:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description="Per-row cost of each media expression")
     parser.add_argument(
         "--budget",

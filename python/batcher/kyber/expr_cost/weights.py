@@ -439,8 +439,10 @@ def own_cost(expr: Expr) -> float:
         # Lowered to a hash-set probe; a handful of values stays a compare chain.
         return min(6.0, 1.0 + 0.3 * len(expr.values))
     if isinstance(expr, Case):
-        # Every branch condition and its result are evaluated (no short-circuit); the
-        # per-branch selection itself is what is counted here.
+        # The *selection* only: one masked pick per branch over the column. What the
+        # branches themselves cost is folded in by `raw_expr_cost`, which caps them at
+        # the dearest single arm because the data plane evaluates one arm per row
+        # (`bc_expr::eval::branch`).
         return 0.5 * (len(expr.branches) + 1)
     if isinstance(expr, MathExpr):
         return _MATH_COST.get(expr.fn, _MATH_DEFAULT)

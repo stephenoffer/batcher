@@ -11,9 +11,15 @@ name: CI
 # failed to import survived five days with every gate green. The integration step below closes
 # that; keep this comment honest against the steps if you change them.
 #
-# Heavy optional backends (ray/torch/tensorflow/gpu) are not installed, so tests needing them
-# skip via `importorskip`. That hole is real and intentional — `just lint-skips` ratchets its
-# size so it cannot grow unnoticed.
+# Heavy optional backends (torch/tensorflow/gpu) are not installed in `gate`, so tests needing
+# them skip via `importorskip`. That hole is real and intentional — `just lint-skips` ratchets
+# its size so it cannot grow unnoticed.
+#
+# **Ray is no longer part of that hole.** The `distributed` job below installs it and runs
+# every Ray-gated suite, because `dist/` is 34k lines that the gate never executed: a green
+# CI said nothing whatsoever about the distributed path, and every defect in it was found by
+# a person, in a recorded cluster run, after the fact. See that job for why one runner is
+# enough to exercise it.
 
 on:
   push:
@@ -111,4 +117,101 @@ jobs:
       # prevents is the one that wastes the most time to diagnose.
       - name: Integration tests (no coverage instrumentation)
         run: pytest tests/integration -q --timeout=300
+        timeout-minutes: 30
+
+  distributed:
+    name: Distributed (Ray) ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    # Independent of `gate` on purpose. This suite is slower, and a Rust clippy warning
+    # should not withhold the answer to "does the distributed path still work" — nor should
+    # a distributed failure delay the lint feedback everyone reads first.
+    #
+    # Sharded because these suites are genuinely slow: each one stands up its own Ray
+    # cluster, and a single job running all 59 files risks hitting a wall-clock limit, which
+    # reports as a red build that says nothing about the code. Four shards keep each job
+    # bounded and make a timeout mean "this shard is slow" rather than "the lane is broken".
+    strategy:
+      # One shard's failure must not cancel the other three. A cancelled job is not evidence
+      # about the job it was cancelled for.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install engine + dev dependencies + Ray
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev,ray]'
+
+      - name: Build engine into the environment
+        run: just build
+
+      # One runner is enough, and that is a property of the architecture rather than a
+      # compromise. `dist/` distributes across *processes*: Ray schedules tasks, splits are
+      # pickled to workers, and bulk batches move between them over Arrow Flight, bypassing
+      # the object store. Every one of those boundaries exists between two processes on one
+      # machine exactly as it does between two machines. What a single runner cannot see is
+      # network partition, cross-AZ latency, and heterogeneous hardware — real gaps, and far
+      # narrower than "none of it ever runs".
+      #
+      # The file list is computed, never hardcoded: a hardcoded list silently stops covering
+      # files added after it was written, which is the failure mode where the suite keeps
+      # passing while covering less. The count is asserted non-zero for the same reason —
+      # a glob that matches nothing runs nothing and reports success.
+      - name: Collect this shard's Ray-gated suites
+        id: suites
+        run: |
+          all=$(grep -rl 'importorskip("ray"' tests/ | sort)
+          total=$(printf '%s\n' "$all" | wc -l)
+          echo "found $total Ray-gated test files in total"
+          if [ "$total" -lt 40 ]; then
+            echo "::error::expected at least 40 Ray-gated suites, found $total —" \
+                 "the detection pattern has drifted and this lane would test almost nothing"
+            exit 1
+          fi
+          # Round-robin rather than contiguous blocks: files are sorted by name, so
+          # contiguous blocks would put every test_distributed_* file in one shard and leave
+          # another with almost nothing.
+          files=$(printf '%s\n' "$all" | awk "NR % 4 == ${{ matrix.shard }} % 4" | tr '\n' ' ')
+          count=$(printf '%s' "$files" | wc -w)
+          echo "shard ${{ matrix.shard }} runs $count files"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::this shard selected no files; the sharding arithmetic is wrong"
+            exit 1
+          fi
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      # RAY_ADDRESS=local makes each run start its own cluster rather than attaching to a
+      # shared one. `--timeout` is not optional: a hung distributed test is indistinguishable
+      # from a slow one, and without a per-test limit it wedges the job until the runner's own
+      # timeout kills it with no indication of which test was at fault.
+      - name: Distributed tests
+        env:
+          RAY_ADDRESS: local
+          RAY_DEDUP_LOGS: "0"
+        run: pytest ${{ steps.suites.outputs.files }} -q --timeout=600 -p no:randomly
+        timeout-minutes: 45
+
+      # The invariant the whole distributed design rests on: a result must be identical
+      # whether produced on one node or many. On shard 1 only, and last, so a failure here
+      # reads as what it is — a mergeability defect — rather than as one more red test.
+      - name: Single-node equals distributed
+        if: matrix.shard == 1
+        env:
+          RAY_ADDRESS: local
+        run: pytest tests/differential -q -k "distributed" --timeout=600
         timeout-minutes: 30

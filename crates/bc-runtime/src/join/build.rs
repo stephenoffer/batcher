@@ -21,7 +21,7 @@
 //! (descending-row) order, every probe walks it in the same order, and the join emits the same
 //! rows in the same sequence. The `seq == par` oracle sees no difference; only the clock does.
 
-use bc_sketches::{BloomFilter, Mergeable};
+use bc_sketches::BloomFilter;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use rayon::prelude::*;
@@ -34,7 +34,7 @@ use super::JoinKeys;
 /// *bucketed* join — which already builds one table per bucket inside a `par_iter`, each bucket
 /// a fraction of the build — on the single-shard path, so this never nests a parallel build
 /// inside a parallel one.
-const PARALLEL_BUILD_MIN_ROWS: usize = 1 << 14; // 16,384 — one morsel
+pub(super) const PARALLEL_BUILD_MIN_ROWS: usize = 1 << 14; // 16,384 — one morsel
 
 /// Cap on shards. Past this the tables get too small to amortize their own allocation, and the
 /// probe's shard indirection starts to cost more than the build saves.
@@ -78,7 +78,7 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
     right_null: &[bool],
     shards: usize,
     bloom: Option<BloomFilter>,
-) -> (Vec<HashTable<u32>>, Vec<u32>, Option<BloomFilter>, bool) {
+) -> (Vec<HashTable<u32>>, Vec<u32>, Vec<BloomFilter>, bool) {
     // `partition_side` carries the hash itself as the partition's key, so it is computed once
     // here and reused by both the insert below and the bloom — the serial build hashed each
     // row exactly once too.
@@ -102,6 +102,9 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
             let mut shard_bloom = bloom
                 .as_ref()
                 .map(|b| BloomFilter::new(b.num_bits(), b.num_hashes()));
+            // Sized for this shard alone (see `JoinTable::bloom`): the caller passes a
+            // prototype already scaled to `right_rows / shards`, so the shards together hold
+            // the bits the one merged filter held and nothing is combined afterwards.
             for &(hash, abs) in rows {
                 if let Some(b) = shard_bloom.as_mut() {
                     b.add_hash(hash);
@@ -138,15 +141,16 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
         right_rows,
         unique,
     );
+    let __t = std::time::Instant::now();
     let mut heads = Vec::with_capacity(shards);
-    let mut merged = bloom;
+    let mut blooms = Vec::with_capacity(if bloom.is_some() { shards } else { 0 });
     for (shard_heads, _, shard_bloom) in built {
-        if let (Some(m), Some(s)) = (merged.as_mut(), shard_bloom.as_ref()) {
-            m.merge(s);
+        if let Some(b) = shard_bloom {
+            blooms.push(b);
         }
         heads.push(shard_heads);
     }
-    (heads, next, merged, unique)
+    (heads, next, blooms, unique)
 }
 
 /// Thread collected `(row, next)` chain links into the absolute-indexed `next` array.
@@ -166,10 +170,77 @@ pub(super) fn stitch_chain(
     if unique {
         return Vec::new();
     }
-    let mut next = vec![u32::MAX; right_rows];
-    for (row, nxt) in links {
-        next[row as usize] = nxt;
+    let links: Vec<(u32, u32)> = links.into_iter().collect();
+    if links.len() < PARALLEL_STITCH_MIN_LINKS || rayon::current_num_threads() < 2 {
+        let mut next = vec![u32::MAX; right_rows];
+        for (row, nxt) in links {
+            next[row as usize] = nxt;
+        }
+        return next;
     }
+    stitch_chain_parallel(links, right_rows)
+}
+
+/// Links below which the serial loop wins — the bucketing pass and the rayon fan-out cost
+/// more than they save while `next` still fits cache.
+const PARALLEL_STITCH_MIN_LINKS: usize = 1 << 18;
+
+/// Links per bucketing chunk. Large enough to amortize the per-chunk bucket vectors, small
+/// enough that the pool stays fed.
+const STITCH_CHUNK_LINKS: usize = 1 << 16;
+
+/// [`stitch_chain`] across every core — same array, same values, no serial pass.
+///
+/// Two costs made the serial version the largest single phase of a duplicate-keyed join, and
+/// both scale with the *build* relation rather than with the links: a `vec![u32::MAX; rows]`
+/// memset (59 MB for TPC-H sf10 q13's 14.8M-row `orders` build) and then one random write per
+/// link into it (13.3M cache misses). Measured at **127-172 ms**, against a 20 ms probe.
+///
+/// Bucketing the links by row range first turns both into per-range work: each worker memsets
+/// and scatters into a range small enough to stay resident, and no two workers touch the same
+/// cell. The result is the identical array — a row appears at most once as a link source (it
+/// is prepended exactly once), so the writes never collide and their order cannot matter.
+fn stitch_chain_parallel(links: Vec<(u32, u32)>, right_rows: usize) -> Vec<u32> {
+    let parts = rayon::current_num_threads()
+        .min(MAX_SHARDS)
+        .next_power_of_two()
+        .clamp(2, MAX_SHARDS);
+    let range_len = right_rows.div_ceil(parts).max(1).next_power_of_two();
+    let shift = range_len.trailing_zeros();
+    let nranges = right_rows.div_ceil(range_len);
+
+    // One pass over the links: every chunk buckets its own links by destination range.
+    let bucketed: Vec<Vec<Vec<(u32, u32)>>> = links
+        .par_chunks(STITCH_CHUNK_LINKS)
+        .map(|chunk| {
+            let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nranges];
+            for &(row, nxt) in chunk {
+                buckets[(row as usize) >> shift].push((row, nxt));
+            }
+            buckets
+        })
+        .collect();
+
+    let mut next: Vec<u32> = Vec::with_capacity(right_rows);
+    next.spare_capacity_mut()[..right_rows]
+        .par_chunks_mut(range_len)
+        .enumerate()
+        .for_each(|(r, slice)| {
+            for cell in slice.iter_mut() {
+                cell.write(u32::MAX);
+            }
+            let base = r << shift;
+            for chunk in &bucketed {
+                for &(row, nxt) in &chunk[r] {
+                    slice[row as usize - base].write(nxt);
+                }
+            }
+        });
+    // SAFETY: the loop above writes every element of `0..right_rows` — each range chunk fills
+    // its whole slice with `u32::MAX` before scattering into it, and the chunks tile the range
+    // exactly (`par_chunks_mut` over a slice of length `right_rows`). No element is left
+    // uninitialized, so the vector is a valid `Vec<u32>` of this length.
+    unsafe { next.set_len(right_rows) };
     next
 }
 
@@ -191,6 +262,46 @@ mod tests {
 
     /// One key per row, no duplicates — 50,000 rows, also inside the window.
     const BIG: i64 = 50_000;
+
+    /// The parallel stitch must produce the identical `next` array, including the slots no
+    /// link touches (which the probe reads as "chain ends here").
+    ///
+    /// The links are deliberately shuffled and span every row range, because the parallel path
+    /// buckets them by destination and a bucketing mistake shows up only when a link's row is
+    /// far from its position in the vector.
+    #[test]
+    fn the_parallel_stitch_reproduces_the_serial_one() {
+        for rows in [
+            PARALLEL_STITCH_MIN_LINKS * 2,
+            PARALLEL_STITCH_MIN_LINKS * 2 + 7919,
+        ] {
+            // A deterministic shuffle: step by a stride coprime with `rows`, so every row is a
+            // link source exactly once and the vector order bears no relation to the row order.
+            let links: Vec<(u32, u32)> = (0..rows)
+                .map(|i| {
+                    let row = (i * 7919 + 13) % rows;
+                    (row as u32, (rows - row) as u32)
+                })
+                .collect();
+            let mut serial = vec![u32::MAX; rows];
+            for &(row, nxt) in &links {
+                serial[row as usize] = nxt;
+            }
+            assert_eq!(
+                stitch_chain_parallel(links.clone(), rows),
+                serial,
+                "the bucketed stitch must write exactly what the serial loop writes"
+            );
+            // And the entry point agrees with itself either side of its own threshold.
+            assert_eq!(stitch_chain(links, rows, false), serial);
+        }
+    }
+
+    /// A unique build allocates nothing at all — the probe never reads `next`.
+    #[test]
+    fn a_unique_build_stitches_no_chain() {
+        assert!(stitch_chain([(0u32, 1u32)], 1_000_000, true).is_empty());
+    }
 
     #[test]
     fn the_test_is_actually_on_the_sharded_flat_path() {

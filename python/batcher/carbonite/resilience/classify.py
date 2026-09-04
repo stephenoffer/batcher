@@ -358,7 +358,15 @@ _BY_TYPE: dict[str, str] = {
     "OutOfMemoryError": "host_oom",  # Ray's memory monitor killing a task under node pressure
     "NodePreemptedError": "preemption",
     "ActorDiedError": "worker_lost",
-    "ActorUnavailableError": "worker_lost",
+    # Ray draws a line here that is worth keeping: `ActorDiedError` is a *confirmed* death,
+    # while `ActorUnavailableError` means the actor is **temporarily** unreachable — it is
+    # restarting, the network hiccuped, or it died and nothing has reported that yet — and
+    # Ray's own guidance is to keep pinging rather than to declare it gone. Under the `spot`
+    # resilience profile a restarting actor is the *expected* state, since that profile is
+    # what raises `actor_max_restarts`, so scoring it as a death made a fleet blame itself
+    # for recovering. `network` says the same thing about retrying (retryable, no need to
+    # move) at half the blame, which is the honest weight for evidence this ambiguous.
+    "ActorUnavailableError": "network",
     "WorkerCrashedError": "worker_lost",
     "NodeDiedError": "worker_lost",
     "LocalRayletDiedError": "worker_lost",

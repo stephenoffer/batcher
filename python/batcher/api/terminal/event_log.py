@@ -45,6 +45,7 @@ __all__ = [
     "pipeline_signature",
     "query_label",
     "report_failure",
+    "report_shortcut",
     "report_stream",
     "start_query_report",
     "write_event_log",
@@ -68,7 +69,7 @@ def event_log_collector() -> ProfileCollector | None:
     from batcher.config import active_config
 
     obs = active_config().observability
-    if not (obs.event_log or obs.otel_traces or events.listening()):
+    if not (obs.event_log or obs.otel_traces or obs.openlineage or events.listening()):
         return None
     return ProfileCollector()
 
@@ -104,7 +105,8 @@ def start_query_report(label: str, signature: str = "") -> str:
     same one `write_event_log` later stamps on the profile and the on-disk document, so the
     live view and the archived artifact refer to the query by one name.
 
-    Returns `""` when no sink is attached, which is the default. Minting an id costs a
+    Returns `""` when no sink is attached and lineage emission is off, which is the
+    default. Minting an id costs a
     `strftime` and a `getpid`, and this runs on every terminal op — so the common case,
     where nobody is watching, must not pay for a name nothing will ever read.
 
@@ -116,8 +118,13 @@ def start_query_report(label: str, signature: str = "") -> str:
         The query id, to hand back to `write_event_log`, or `""` if nothing is listening.
     """
     from batcher._internal import events
+    from batcher.api.terminal.lineage import openlineage_enabled
 
-    if not events.listening():
+    # Lineage emission consumes the id too: without this the START event minted its own
+    # placeholder and the COMPLETE event used the one `write_event_log` allocated, so the
+    # two halves of one run reached the backend as two unrelated runs. `events.listening()`
+    # is checked first so the common case still costs one attribute read.
+    if not (events.listening() or openlineage_enabled()):
         return ""
     query_id = _query_id(next(_counter))
     events.publish(
@@ -180,11 +187,12 @@ def write_event_log(
     from batcher._internal import events
     from batcher._internal.logging import get_logger
     from batcher._internal.paths import open_private
+    from batcher.api.terminal.lineage import emit_run_complete, openlineage_enabled
     from batcher.api.terminal.otel import emit_query_spans, otel_enabled
     from batcher.config import active_config
 
     cfg = active_config().observability
-    if not (cfg.event_log or events.listening() or otel_enabled()):
+    if not (cfg.event_log or events.listening() or otel_enabled() or openlineage_enabled()):
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
     seq = next(_counter)
@@ -215,6 +223,7 @@ def write_event_log(
             get_logger("api").debug("event-log write failed", exc_info=True)
     # The emitter is itself a no-op unless OTel is enabled and a provider is configured.
     emit_query_spans(profile)
+    emit_run_complete(profile, plan, sources)
 
 
 def _is_udf_pipeline(plan: object) -> bool:
@@ -288,7 +297,7 @@ def query_label(plan: object) -> str:
 
 
 def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException) -> None:
-    """Close a failed query out on the event bus, recording the exception's message.
+    """Close a failed query out on the event bus and in the trace, recording the exception.
 
     Args:
         query_id: The id `start_query_report` returned, or None if none was announced.
@@ -296,6 +305,8 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
         exc: The exception that ended the query.
     """
     from batcher._internal import events
+    from batcher.api.terminal.lineage import emit_run_failure
+    from batcher.api.terminal.otel import emit_failure_span
 
     if not query_id:
         return
@@ -306,6 +317,99 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
         total_ms=total_ms,
         rows=0,
         error=f"{type(exc).__name__}: {exc}",
+        profile=None,
+    )
+    # A failed query used to reach the bus and nothing else: `emit_query_spans` runs off a
+    # profile, and a query that raised has none. So the one class of run an operator most
+    # wants to find in a trace backend was the only class that was never in it, and a
+    # latency histogram built from these spans silently excluded every timeout.
+    emit_failure_span(query_id, total_ms, exc)
+    emit_run_failure(query_id, exc)
+
+
+#: What each answered-without-executing route did, as a phrase a reader can act on.
+#:
+#: Carried on the `QUERY_END` event and rendered on the console summary. The route is the
+#: whole point of reporting these at all: a `sum()` that took 0.2 ms because it was read off
+#: a Parquet footer and one that took 0.2 ms because the data was already resident are very
+#: different facts about a system, and neither is distinguishable from "no query ran".
+SHORTCUT_REASONS = {
+    "metadata_aggregate": "answered from source statistics, no scan",
+    "metadata_count": "row count read from metadata, no scan",
+    "metadata_empty": "provably empty, no scan",
+    "pushed_count": "counted by the source, no rows transferred",
+    "cached": "served from the cached result",
+    "prepared": "replayed a prepared plan",
+    "fast_path": "small-query fast path",
+    "gpu": "ran on the device tier",
+    "streaming_limit": "stopped reading once the limit was met",
+    "streaming_peek": "bounded peek off a streaming source",
+}
+
+
+def report_shortcut(plan: object, *, route: str, rows: int, total_ms: float) -> None:
+    """Report a query that a shortcut answered without reaching the executor.
+
+    Six routes through `_collect` return a finished table before the instrumentation the
+    ordinary path runs under: a prepared-plan replay, a bounded peek off a streaming source,
+    a keyless aggregate answered from source statistics, a provably-empty result, the device
+    tier, and the opt-in small-query fast path. Each is a correct answer to a real query and
+    each was **invisible to every sink at once** -- the console printed no line, the
+    dashboard showed no row, the OTel exporter emitted no span, and `batcher_queries_total`
+    did not count it. A job built out of `agg()` over a statistics-bearing source therefore
+    reported that it had run no queries at all, which is the shape of wrongness that reads
+    as healthy.
+
+    It also hid the optimization from the person it benefits. A shortcut that fires is worth
+    saying out loud, and there was no way to find out that one had.
+
+    Deliberately *not* routed through `start_query_report` plus `write_event_log`: there is
+    no profile to assemble, because there are no operators and no measured stages. This
+    announces and closes the query in one pair of events, so a progress bar cannot be left
+    spinning on a query that has already returned.
+
+    The plan is taken rather than a rendered label so that *both* the label and the pipeline
+    signature are computed behind the `listening()` guard. Signing a plan hashes its shape,
+    and these routes are the cheapest paths in the engine -- a `count()` read off a Parquet
+    footer -- so paying for one at a call site that will usually discard it would put a real
+    cost on the fastest thing Batcher does.
+
+    Args:
+        plan: The `LogicalPlan` that was answered.
+        route: Which shortcut answered it; a key of `SHORTCUT_REASONS`.
+        rows: Rows in the returned answer.
+        total_ms: Wall time from the start of the terminal op.
+
+    Returns:
+        None.
+    """
+    from batcher._internal import events
+
+    if not events.listening():
+        return
+    query_id = _query_id(next(_counter))
+    reason = SHORTCUT_REASONS.get(route, route)
+    label = query_label(plan)
+    events.publish(
+        events.QUERY_START,
+        query_id=query_id,
+        name=label,
+        label=label,
+        stage=reason,
+        # The signature is what groups repeated runs into one pipeline in the dashboard.
+        # Without it every shortcut-answered query is its own singleton -- and a `count()`
+        # in a loop, which is exactly the shape these routes serve, is the case where that
+        # grouping matters most.
+        signature=pipeline_signature(plan),
+    )
+    events.publish(
+        events.QUERY_END,
+        query_id=query_id,
+        ok=True,
+        total_ms=total_ms,
+        rows=rows,
+        shortcut=route,
+        note=reason,
         profile=None,
     )
 

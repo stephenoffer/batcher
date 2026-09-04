@@ -82,10 +82,10 @@ def test_image_decode_distributed_equals_single_node():
     assert np.array_equal(s, d)
 
 
-def test_download_distributed_equals_single_node(tmp_path):
+def test_download_distributed_equals_single_node(cluster_tmp_path):
     paths = []
     for i in range(6):
-        p = tmp_path / f"f{i}.bin"
+        p = cluster_tmp_path / f"f{i}.bin"
         p.write_bytes(f"content-{i}".encode())
         paths.append(str(p))
     ds = bt.from_pydict({"id": list(range(6)), "url": paths})

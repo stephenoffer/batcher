@@ -169,14 +169,10 @@ def declared_row_count(src: Source) -> int | None:
     Returns:
         The declared row count, or `None`.
     """
-    fn = getattr(src, "row_count", None)
-    if not callable(fn):
-        return None
-    try:
-        n = fn()
-    except Exception:  # pragma: no cover - a source that cannot count itself
-        return None
-    return int(n) if n is not None else None
+    from batcher.plan.source_stats import declared
+
+    rows = declared(src, "row_count")
+    return None if rows is None else int(rows)
 
 
 def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table | None:

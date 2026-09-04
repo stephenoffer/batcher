@@ -29,7 +29,7 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.exprs.guards import is_float, is_integer, nullable, schema_rule
 from batcher.kyber.rules.leaf_rewrite import node_expr_rule, rewrite_node, safe_expr
 from batcher.plan.expr_ir import Expr, Lit
-from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, Math2Expr, MathExpr
+from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, Math2Expr, MathExpr, int_literal
 from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.logical import Filter, LogicalPlan, Project
 from batcher.plan.schema import SchemaRef
@@ -50,13 +50,6 @@ __all__ = [
     "nan_check_on_integer_to_false",
     "xor_of_self_to_zero",
 ]
-
-
-def _int_lit(expr: Expr) -> int | None:
-    """The Python int a literal holds, or ``None`` if it is not an integer literal."""
-    if isinstance(expr, Lit) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    return None
 
 
 def _is_zero(expr: Expr) -> bool:
@@ -131,7 +124,7 @@ def _mul_zero(expr: Expr, schema: SchemaRef | None) -> Expr:
         for value, other in ((expr.left, expr.right), (expr.right, expr.left)):
             if (
                 _is_zero(other)
-                and _int_lit(other) is not None
+                and int_literal(other) is not None
                 and is_integer(value, schema)
                 and not nullable(value, schema)
                 and safe_expr(value)
@@ -160,7 +153,7 @@ def _mod_one(expr: Expr, schema: SchemaRef | None) -> Expr:
     if (
         isinstance(expr, Binary)
         and expr.op == "mod"
-        and _int_lit(expr.right) == 1
+        and int_literal(expr.right) == 1
         and is_integer(expr.left, schema)
         and not nullable(expr.left, schema)
         and safe_expr(expr.left)
@@ -336,9 +329,9 @@ def hypot_with_zero_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> Lo
 
 def _gcd_zero(expr: Expr) -> Expr:
     if isinstance(expr, Math2Expr) and expr.fn == "gcd":
-        if _int_lit(expr.right) == 0:
+        if int_literal(expr.right) == 0:
             return MathExpr("abs", expr.left)
-        if _int_lit(expr.left) == 0:
+        if int_literal(expr.left) == 0:
             return MathExpr("abs", expr.right)
     return expr
 
@@ -359,9 +352,9 @@ def gcd_with_zero_to_abs(node: Filter | Project, _ctx: OptimizerContext) -> Logi
 
 def _lcm_one(expr: Expr) -> Expr:
     if isinstance(expr, Math2Expr) and expr.fn == "lcm":
-        if _int_lit(expr.right) == 1:
+        if int_literal(expr.right) == 1:
             return MathExpr("abs", expr.left)
-        if _int_lit(expr.left) == 1:
+        if int_literal(expr.left) == 1:
             return MathExpr("abs", expr.right)
     return expr
 
@@ -411,7 +404,7 @@ def _fold_int_math2(fn: str):
 
     def leaf(expr: Expr) -> Expr:
         if isinstance(expr, Math2Expr) and expr.fn == fn:
-            left, right = _int_lit(expr.left), _int_lit(expr.right)
+            left, right = int_literal(expr.left), int_literal(expr.right)
             if left is not None and right is not None:
                 if fn == "gcd":
                     return Lit(gcd(left, right))
@@ -454,7 +447,7 @@ def _fold_shift_op(op: str):
 
 def _fold_shift_impl(expr: Expr, op: str) -> Expr:
     if isinstance(expr, Binary) and expr.op == op:
-        left, right = _int_lit(expr.left), _int_lit(expr.right)
+        left, right = int_literal(expr.left), int_literal(expr.right)
         if left is not None and right is not None and 0 <= right < 64:
             value = left << right if op == "shl" else left >> right
             if -(2**63) <= value < 2**63:

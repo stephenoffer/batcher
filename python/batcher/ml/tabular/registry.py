@@ -48,6 +48,12 @@ class TabularAdapter(Protocol):
     methods: tuple[str, ...]
     #: File suffixes that identify a saved model of this framework.
     suffixes: tuple[str, ...]
+    #: URI scheme prefixes this framework owns, e.g. ``("models:/",)``. Checked before the
+    #: suffix, because a registry URI has no meaningful file extension.
+    uri_schemes: tuple[str, ...]
+    #: Whether `load` takes the URI as written. A framework with its own resolver (a model
+    #: registry) must never be handed a file the loader copied out from under it.
+    handles_uri: bool
     #: The feature-matrix precision this framework should be fed by default.
     default_dtype: str
 
@@ -82,6 +88,8 @@ class BaseAdapter:
     name = ""
     methods: tuple[str, ...] = ("predict",)
     suffixes: tuple[str, ...] = ()
+    uri_schemes: tuple[str, ...] = ()
+    handles_uri: bool = False
     #: Top-level module names whose classes belong to this framework.
     modules: tuple[str, ...] = ()
     # float32 is the boosters' own internal precision, so building float64 doubles the
@@ -197,7 +205,11 @@ def _load_adapters() -> None:
     the imports costs a `sys.modules` lookup once they are cached, which is what "idempotent"
     should have meant here.
     """
-    from batcher.ml.tabular import boosters, estimators  # noqa: F401  (registration import)
+    from batcher.ml.tabular import (  # noqa: F401  (registration import)
+        boosters,
+        estimators,
+        mlflow_model,
+    )
 
 
 def get_adapter(framework: str) -> TabularAdapter:
@@ -256,6 +268,12 @@ def detect_framework(model: Any) -> str:
     """
     _load_adapters()
     if isinstance(model, str):
+        # A scheme is checked first and is decisive. `models:/churn/3` has no extension at
+        # all, and `runs:/<id>/model` ends in something that is not a suffix any framework
+        # claims, so suffix detection cannot see either.
+        for adapter in FRAMEWORKS.values():
+            if any(model.startswith(scheme) for scheme in adapter.uri_schemes):
+                return adapter.name
         suffix = model.rsplit(".", 1)[-1].lower() if "." in model else ""
         for adapter in FRAMEWORKS.values():
             if suffix in adapter.suffixes:
@@ -274,9 +292,52 @@ def detect_framework(model: Any) -> str:
     # error even told the caller to pass `framework="sklearn"`, which then worked.
     if any(hasattr(model, name) for name in _DUCK_TYPED_SCORERS):
         return "sklearn"
+    deep = _deep_learning_route(model)
+    if deep is not None:
+        raise PlanError(deep)
     raise PlanError(
         f"cannot tell which ML framework {type(model).__name__} belongs to, and it has none of "
         f"{list(_DUCK_TYPED_SCORERS)}. Pass framework= explicitly (one of {sorted(FRAMEWORKS)})."
+    )
+
+
+#: Deep-learning model roots that reach `ds.ml.predict` by mistake, with the entry point that
+#: actually runs each. Keyed by the module a model's class is defined in.
+#:
+#: Keras is deliberately absent. A Keras model carries a ``predict`` method, so it is claimed
+#: by the duck-typed scikit-learn route above and scores correctly; an entry here would be a
+#: branch nothing can reach, describing a refusal that does not happen.
+_DEEP_LEARNING_ROUTES: dict[str, tuple[str, str]] = {
+    "torch": ("a PyTorch nn.Module", "batcher.ml.torch_predictor(model, input_columns=[...])"),
+    "transformers": ("a HuggingFace model", "ds.ml.infer('<model id>')"),
+}
+
+
+def _deep_learning_route(model: Any) -> str | None:
+    """The message pointing a deep-learning model at the entry point that runs it, or `None`.
+
+    `ds.ml.predict` scores a *tabular* model: it assembles a feature matrix and calls one of
+    `_DUCK_TYPED_SCORERS`. A `torch.nn.Module` has none of those methods -- its entry point is
+    ``__call__`` -- so it fell to the generic refusal, which told the caller to pass
+    ``framework=`` and listed six names none of which is torch. Every one of them then fails
+    further in, so the one actionable sentence in the error led somewhere that does not work.
+
+    Naming `torch_predictor` instead costs one dict lookup on a path that is already raising,
+    and it is the difference between an error a user can act on and one they cannot. Detection
+    is by defining module, the same rule `BaseAdapter.owns` uses, so checking it imports
+    nothing.
+    """
+    root = type(model).__module__.split(".")[0]
+    route = _DEEP_LEARNING_ROUTES.get(root)
+    if route is None:
+        return None
+    what, entry_point = route
+    return (
+        f"{type(model).__name__} is {what}, which ds.ml.predict does not score: it builds a "
+        f"feature matrix and calls one of {list(_DUCK_TYPED_SCORERS)}, and a deep model's "
+        f"entry point is its forward. Use {entry_point} instead, which loads the model once "
+        f"per worker and runs whole batches on the device. ds.ml.predict covers the tabular "
+        f"frameworks {sorted(FRAMEWORKS)}."
     )
 
 
@@ -300,7 +361,10 @@ def load_model(source: Any, framework: str) -> Any:
     if not isinstance(source, str):
         return source
     adapter = get_adapter(framework)
-    path = _localize(source)
+    # A framework with its own resolver gets the URI as written. Copying a model registry's
+    # `models:/name/3` to a temp file would strip exactly the indirection that makes it
+    # useful, and there is no single file at the other end of it to copy.
+    path = source if getattr(adapter, "handles_uri", False) else _localize(source)
     try:
         return adapter.load(path)
     except PlanError:

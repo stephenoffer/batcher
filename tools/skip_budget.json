@@ -1,12 +1,39 @@
 {
-  "gated": {
-    "batcher": 152,
-    "batcher._native": 3223,
-    "duckdb": 2805,
-    "other": 749,
-    "polars": 11,
-    "ray": 252,
-    "torch": 55
+  "doc_blocks": {
+    "share": 0.216,
+    "skipped": 387,
+    "total": 1792
   },
+  "gated": {
+    "batcher": {
+      "share": 0.0098,
+      "tests": 195
+    },
+    "batcher._native": {
+      "share": 0.2275,
+      "tests": 4535
+    },
+    "duckdb": {
+      "share": 0.1975,
+      "tests": 3937
+    },
+    "other": {
+      "share": 0.057,
+      "tests": 1136
+    },
+    "polars": {
+      "share": 0.0016,
+      "tests": 32
+    },
+    "ray": {
+      "share": 0.0178,
+      "tests": 354
+    },
+    "torch": {
+      "share": 0.0032,
+      "tests": 63
+    }
+  },
+  "total_tests": 19930,
   "unconditionally_skipped": 0
 }

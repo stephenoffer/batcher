@@ -63,8 +63,22 @@ _LIST_FLOAT_REDUCE = frozenset(
         "max_abs",
     }
 )
-# Reductions that preserve the (numeric) element type: `sum` alongside `min`/`max`.
-_LIST_ELEMENT_REDUCE = frozenset({"sum", "min", "max"})
+# Reductions that preserve the element type, whatever it is. An ordering comparison is
+# defined for every element type the engine carries, so `min`/`max` over a String list is a
+# String and over a Date list a Date (verified against the engine for int, float, string,
+# bool, date32 and timestamp elements).
+_LIST_ORDER_REDUCE = frozenset({"min", "max"})
+
+# `sum` preserves the element type only while that type is *numeric*. It reads as `min`'s
+# and `max`'s sibling and is not one: there is no such thing as adding two strings here, so
+# the engine coerces the elements and returns Double. Classifying it with them declared
+# `string` for a `List<String>` sum that the engine returns as `double` -- worse than an
+# uncertain answer, because a confident wrong one is what a caller plans against. It also
+# made the *same query* return two different types: `Project.available_schema` types an
+# empty result, so a filter that matched nothing produced `v: string` where a filter that
+# matched produced `v: double`. Measured: String, Boolean, Timestamp and Null elements all
+# sum to Double; Date raises; Int64 and Float64 are preserved.
+_LIST_NUMERIC_SUM = frozenset({"sum"})
 
 
 def list_operand(expr: object) -> Expr:
@@ -95,10 +109,15 @@ def listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None
     if fn in _LIST_FLOAT_REDUCE:
         return pa.float64()  # always double, whatever the element width
-    if fn in _LIST_ELEMENT_REDUCE:
-        # `sum`/`min`/`max` preserve the element type (already widened at the scan leaf):
-        # summing/minning an Int list yields Int64, a Float list yields Float64.
+    if fn in _LIST_ORDER_REDUCE:
+        # `min`/`max` preserve the element type (already widened at the scan leaf).
         return list_element_type(input_t)
+    if fn in _LIST_NUMERIC_SUM:
+        element = list_element_type(input_t)
+        if element is None:
+            return None
+        numeric = pa.types.is_integer(element) or pa.types.is_floating(element)
+        return element if numeric else pa.float64()
     if fn in ("normalize", "log_softmax"):
         # Rescale each element (unit L2 norm, or the log-domain distribution) -> List<Float64>.
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None
@@ -116,14 +135,30 @@ def struct_field_type(struct_t: pa.DataType | None, field: str) -> pa.DataType |
     return struct_t.field(idx).type if idx >= 0 else None
 
 
-def mapfunc_type(fn: str, map_t: pa.DataType | None) -> pa.DataType | None:
-    """The Arrow type a `map` accessor function produces over `map_t`."""
-    if map_t is not None and pa.types.is_struct(map_t) and fn == "map_keys":
-        # `.struct.keys()` is the same node as `.map.keys()` — a struct is a keyed
-        # container and the kernel answers both — but its keys come from the *type*, so
-        # they are always text. Without this arm the whole `.struct.keys()` column
-        # declared `null` while producing `List<Utf8>`.
-        return pa.list_(pa.string())
+def mapfunc_type(fn: str, map_t: pa.DataType | None, key: object = None) -> pa.DataType | None:
+    """The Arrow type a `map` accessor function produces over `map_t`.
+
+    `key` is the literal lookup an `element_at` carries. It is only consulted for a
+    **struct** input, where the answer is a named field's type rather than the container's
+    uniform value type.
+    """
+    if map_t is not None and pa.types.is_struct(map_t):
+        # A struct is a keyed container and the same kernel answers both namespaces, so
+        # `.struct.keys()`/`.struct.get()` arrive here as `.map` nodes.
+        if fn == "map_keys":
+            # A struct's keys come from the *type*, so they are always text. Without this
+            # the whole `.struct.keys()` column declared `null` while producing
+            # `List<Utf8>`.
+            return pa.list_(pa.string())
+        if fn == "element_at" and isinstance(key, str):
+            # `.struct.get(name)` is documented as the subscript spelling of
+            # `.struct.field(name)` -- it is what ``s["x"]`` lowers to -- and the two built
+            # different nodes, of which only `StructField` was typed. So the *same* field
+            # projection declared `string` written one way and nothing at all written the
+            # other, which cost every column in the projection its type. Answered by the
+            # helper `StructField` already uses, so the two spellings cannot drift again.
+            return struct_field_type(map_t, key)
+        return None
     if map_t is None or not pa.types.is_map(map_t):
         return None
     if fn == "map_keys":

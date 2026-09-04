@@ -90,7 +90,7 @@ def test_the_first_division_is_sized_from_the_error_that_caused_it() -> None:
 
     def _run(descriptor):
         seen.append(len(descriptor["splits"]))
-        return None
+        return
 
     run_subdivided(
         {"splits": list(range(64))},
@@ -107,7 +107,7 @@ def test_with_no_cause_the_division_is_the_configured_default() -> None:
 
     def _run(descriptor):
         seen.append(len(descriptor["splits"]))
-        return None
+        return
 
     run_subdivided({"splits": list(range(64))}, _run, parts=2, rounds=1)
     assert seen == [32, 32]
@@ -123,7 +123,7 @@ def test_a_piece_that_overflows_again_is_re_measured_from_its_own_failure() -> N
         if not failed_once["done"]:
             failed_once["done"] = True
             raise _overflow(4_000, 1_000)
-        return None
+        return
 
     run_subdivided({"splits": list(range(64))}, _run, parts=2, rounds=3)
     # First division by the caller's default (no cause), then the failed 32-split piece is

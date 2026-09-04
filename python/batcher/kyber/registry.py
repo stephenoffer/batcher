@@ -42,6 +42,10 @@ class RuleRegistry:
         # every time and re-inverted ~700 rules across 7 phases on every query. Measured on a
         # point-lookup shape: 7 of 8 lookups missed, and the 64-entry memo was thrashing.
         self._phase_cache: dict[Phase, list[Rule]] | None = None
+        # The cleanup round's rule list, built on demand and dropped by `add` alongside the
+        # phase partition. Held for the same reason: `expr_dispatch.expr_type_index` memoizes
+        # on `id(rules)`, so a fresh list per query would miss that memo every time.
+        self._recanonicalize_cache: list[Rule] | None = None
 
     def add(self, rule_obj: Rule) -> Rule:
         """Register a rule under its unique name.
@@ -83,6 +87,7 @@ class RuleRegistry:
         # Registration order is run order, so a late `add` must be able to change a phase's
         # sequence. Dropping the partition is what keeps `by_phase` honest about that.
         self._phase_cache = None
+        self._recanonicalize_cache = None
         return rule_obj
 
     def rule(
@@ -96,6 +101,7 @@ class RuleRegistry:
         expr_schema: Callable | None = None,
         expr_matches: tuple[type, ...] | None = None,
         expr_ops: tuple[str, ...] | None = None,
+        recanonicalize: bool = False,
     ) -> Callable[
         [Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None]],
         Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None],
@@ -117,6 +123,7 @@ class RuleRegistry:
                     expr_schema_fn=expr_schema,
                     expr_matches=expr_matches,
                     expr_ops=expr_ops,
+                    recanonicalize=recanonicalize,
                 )
             )
             return fn
@@ -149,6 +156,28 @@ class RuleRegistry:
         self._phase_cache = by_phase
         return by_phase
 
+    def recanonicalize_rules(self) -> list[Rule]:
+        """The rules the driver re-runs in its post-JOIN_REORDER cleanup round.
+
+        Every rule that declared `recanonicalize=True`, in registration order. See
+        `Rule.recanonicalize` for what earns the flag and `optimizer.driver` for where the
+        round runs.
+
+        Memoized, and the memo is dropped by `add`, for the same reason `by_phase` is: the
+        **identity** of the returned list is load-bearing, because the driver's expression
+        dispatch memoizes a rule list's type inversion on `id(rules)`.
+
+        Returns:
+            The cleanup rules, which the caller must treat as read-only — the list is shared
+            with every other caller and with the next query.
+        """
+        cached = self._recanonicalize_cache
+        if cached is not None:
+            return cached
+        selected = [r for r in self._rules if r.recanonicalize]
+        self._recanonicalize_cache = selected
+        return selected
+
 
 DEFAULT_REGISTRY = RuleRegistry()
 
@@ -163,6 +192,7 @@ def rule(
     expr_schema: Callable | None = None,
     expr_matches: tuple[type, ...] | None = None,
     expr_ops: tuple[str, ...] | None = None,
+    recanonicalize: bool = False,
 ):
     """Register a node-local rule into the default registry (see `RuleRegistry.rule`).
 
@@ -180,6 +210,7 @@ def rule(
         expr_schema=expr_schema,
         expr_matches=expr_matches,
         expr_ops=expr_ops,
+        recanonicalize=recanonicalize,
     )
 
 

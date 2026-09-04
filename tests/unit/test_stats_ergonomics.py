@@ -13,7 +13,13 @@ import pytest
 
 from batcher._internal import events
 from batcher.api.stats import OpStat, RunStats
-from batcher.observe import metrics_snapshot, prometheus_text, reset_metrics, start_metrics
+from batcher.observe import (
+    metrics_snapshot,
+    prometheus_text,
+    reset_metrics,
+    start_metrics,
+    stop_metrics,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -109,7 +115,7 @@ def test_empty_run_has_no_bottleneck_and_does_not_raise():
 
 def test_repr_shows_the_table_not_the_dataclass_fields():
     text = repr(_stats())
-    assert "rows_out" in text
+    assert "ROWS OUT" in text
     assert not text.startswith("RunStats(ops=")
 
 
@@ -122,7 +128,7 @@ def test_summary_reports_time_rows_and_spill():
     text = _stats().summary()
     assert text.startswith("wall time:")
     assert "1,000 read -> 10 out" in text
-    assert "1 operator(s) spilled" in text
+    assert "1 operator spilled" in text
 
 
 def test_to_dict_is_json_encodable_and_has_the_totals():
@@ -164,15 +170,14 @@ def clean_metrics():
     The detach matters: a bus subscriber left attached tells the engine that per-query
     profiles are being consumed, which silently changes behavior for every later test.
     """
-    import batcher.observe.metrics as m
-
     start_metrics()
     reset_metrics()
     yield
-    if m._detach is not None:
-        m._detach()
-        m._detach = None
     reset_metrics()
+    # `stop_metrics()` rather than reaching for `metrics._detach` by hand: it also clears the
+    # module-level handle, which is the half a manual detach forgets and which `start_metrics`
+    # reads to decide whether it is already attached.
+    stop_metrics()
 
 
 def test_metrics_snapshot_shape(clean_metrics):
@@ -317,10 +322,12 @@ def test_prometheus_text_exposes_the_counters(clean_metrics):
 def test_prometheus_text_emits_a_well_formed_histogram(clean_metrics):
     events.publish(events.QUERY_END, query_id="q1", name="q", ok=True, total_ms=12.5, rows=0)
     text = prometheus_text()
-    assert "# TYPE batcher_query_duration_ms histogram" in text
-    assert 'batcher_query_duration_ms_bucket{le="+Inf"} 1' in text
-    assert "batcher_query_duration_ms_sum 12.5" in text
-    assert "batcher_query_duration_ms_count 1" in text
+    assert "# TYPE batcher_query_duration_seconds histogram" in text
+    assert 'batcher_query_duration_seconds_bucket{le="+Inf"} 1' in text
+    # 12.5 ms is 0.0125 s: the buckets and the sum move together, or the mean a
+    # backend derives from them is wrong by a factor of a thousand.
+    assert "batcher_query_duration_seconds_sum 0.0125" in text
+    assert "batcher_query_duration_seconds_count 1" in text
 
 
 def test_prometheus_every_sample_line_has_a_numeric_value(clean_metrics):
@@ -474,13 +481,22 @@ def test_overlapping_stages_do_not_report_a_share_above_100_percent():
         rows=100,
     )
     line = stats.bottleneck_summary()
-    assert "70%" in line, line
-    assert "operator time (stages overlap)" in line
+    assert "70% of operator time" in line, line
+    # Concurrency is reported as concurrency, on its own line, rather than by switching the
+    # denominator under the reader: 100 ms of operator time inside a 40 ms wall clock is a
+    # fact about overlap, not a share to be renormalized away.
+    assert "stages overlapped" in stats.wall_clock_summary()
 
 
-def test_a_sequential_run_still_reports_against_wall_time():
-    """The wall-clock reading is the right one when nothing overlapped, and must not be
-    silently replaced by the operator-time one."""
+def test_a_sequential_run_reports_the_wall_clock_split_separately():
+    """One denominator for the bottleneck, always, and the wall clock accounted beside it.
+
+    Two denominators — wall time when stages were sequential, operator time when they
+    overlapped — meant the same operator read "71%" in the per-operator table and "4% of
+    wall time" one line below it. The share is now always of operator time, and the wall
+    clock's own division is `wall_clock_summary`'s job, because on a short query most of it
+    belongs to planning and result assembly rather than to any operator.
+    """
     stats = RunStats(
         ops=(
             OpStat(0, "scan", 100, 100, 20.0, 0, False, ""),
@@ -490,4 +506,6 @@ def test_a_sequential_run_still_reports_against_wall_time():
         rows=50,
     )
     line = stats.bottleneck_summary()
-    assert "30% of wall time" in line, line
+    assert "60% of operator time" in line, line
+    wall = stats.wall_clock_summary()
+    assert "50ms of 100ms wall clock" in wall and "50ms elsewhere" in wall

@@ -202,7 +202,7 @@ fn grouped_i64(
         let mut sum = vec![0i128; num_groups];
         for (i, &g) in group_ids.iter().enumerate() {
             if arr.is_valid(i) {
-                sum[g as usize] += arr.value(i) as i128;
+                sum[g as usize] += i128::from(arr.value(i));
                 cnt[g as usize] += 1;
             }
         }
@@ -227,20 +227,30 @@ fn grouped_i64(
         WindowFn::Sum => {
             let overflowed = Cell::new(false);
             reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, v| {
-                match a.checked_add(v) {
-                    Some(s) => s,
-                    None => {
-                        overflowed.set(true);
-                        a
-                    }
+                if let Some(s) = a.checked_add(v) {
+                    s
+                } else {
+                    overflowed.set(true);
+                    a
                 }
             });
             if overflowed.get() {
-                return Err(RuntimeError::SumOverflow);
+                // The *running* total overflowed, which is a fact about the order the rows
+                // arrived in rather than about the answer. Re-reduce in `i128` and narrow
+                // once, so a partition errors only when its true sum will not fit — see
+                // [`crate::agg::promote_wide`] for the argument, and the `Avg` branch above
+                // for the same accumulator used for a closely related reason.
+                let mut wide = vec![0i128; num_groups];
+                for (i, &g) in group_ids.iter().enumerate() {
+                    if arr.is_valid(i) {
+                        wide[g as usize] += i128::from(arr.value(i));
+                    }
+                }
+                acc = crate::agg::narrow_wide(wide)?;
             }
         }
-        WindowFn::Min => reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, v| a.min(v)),
-        WindowFn::Max => reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, v| a.max(v)),
+        WindowFn::Min => reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, b| a.min(b)),
+        WindowFn::Max => reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, b| a.max(b)),
         // Any other function keeps the first value it saw, as before.
         _ => reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, _| a),
     }
@@ -258,7 +268,7 @@ fn grouped_f64(
     let mut cnt = vec![0i64; num_groups];
     match func {
         WindowFn::Sum | WindowFn::Avg => {
-            reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, v| a + v)
+            reduce_groups(arr, group_ids, &mut acc, &mut cnt, |a, v| a + v);
         }
         // Total-order min/max so NaN is greatest (matching aggregate MIN/MAX, ORDER BY,
         // and DuckDB); `f64::min`/`f64::max` silently drop NaN so `MAX OVER ()` returned
@@ -372,5 +382,33 @@ mod tests {
             f64s(&out),
             vec![4611686018427387904.0, 4611686018427387904.0]
         );
+    }
+
+    /// A whole-partition window `SUM` must not depend on the order rows reach the reducer.
+    /// `{2^62, 2^62, -2^62, -2^62}` sums to 0; before the wide re-reduce it errored on any
+    /// order that put the two positives first, so `sum(x) OVER (PARTITION BY k)` could fail
+    /// on exactly the data it should have summed to zero.
+    #[test]
+    fn a_partition_sum_that_fits_succeeds_in_every_row_order() {
+        const M: i64 = 1 << 62;
+        for order in [[M, M, -M, -M], [M, -M, M, -M], [-M, -M, M, M]] {
+            let values: ArrayRef = Arc::new(Int64Array::from(order.to_vec()));
+            let out = grouped_i64(WindowFn::Sum, &[0u32; 4], 1, &values)
+                .unwrap_or_else(|e| panic!("{order:?} failed: {e:?}"));
+            let out = out.as_primitive::<Int64Type>();
+            for row in 0..4 {
+                assert_eq!(out.value(row), 0, "order {order:?} row {row}");
+            }
+        }
+    }
+
+    /// The re-reduce widens the accumulator, not the result: a partition whose true sum
+    /// exceeds `i64` still errors rather than wrapping.
+    #[test]
+    fn a_partition_sum_past_i64_still_errors() {
+        const M: i64 = 1 << 62;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![M, M, M, M]));
+        let r = grouped_i64(WindowFn::Sum, &[0u32; 4], 1, &values);
+        assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
     }
 }

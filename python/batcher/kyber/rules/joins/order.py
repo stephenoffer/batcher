@@ -35,6 +35,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, RuleCategory, plan_rule
+from batcher.kyber.rules.joins.order_budget import search_pair_budget
 from batcher.kyber.rules.joins.order_residual import (
     bind_residuals,
     hoistable_filter,
@@ -45,7 +46,6 @@ from batcher.kyber.rules.joins.order_search import (
     ColRef,
     SrcRef,
     _needed_cols,
-    _rebuild_dp,
     _rebuild_dphyp,
     _rebuild_greedy,
 )
@@ -118,12 +118,25 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     # this phase and does not run again, so reorder must carry the pruning itself.
     needed = _needed_cols(required, edges) | residual_refs(residuals)
     leaves = [_prune_leaf(visit(leaf), i, needed) for i, leaf in enumerate(leaves)]
-    # Bushy-tree DP: exhaustive up to `_MAX_EXHAUSTIVE_LEAVES`, connected-subset DP
-    # for larger sparse graphs, greedy fallback.
-    if len(leaves) <= _MAX_EXHAUSTIVE_LEAVES:
-        dp = _rebuild_dp(leaves, edges, required, ctx, residuals)
-    else:
-        dp = _rebuild_dphyp(leaves, edges, required, ctx, residuals)
+    # Bushy-tree DP over connected subsets, greedy fallback. The exhaustive O(3ⁿ) DP is
+    # *not* on this path at any size: it enumerates all 2ⁿ subsets and all 3ⁿ splits, then
+    # discards the disconnected ones only after trying to build a join for each, while
+    # `_rebuild_dphyp` grows connected subsets outward and never creates the rest. On a
+    # sparse graph (the shape real queries have) that is the difference between O(3ⁿ) and
+    # O(n²) — a six-join plan spent 72% of its whole runtime in the exhaustive DP, and an
+    # extra join level nearly doubled the query's control-plane cost. The two return the
+    # same optimum, which is what `tests/unit/test_dphyp_join_order.py` pins across 120
+    # random graphs, so this buys the speed without moving the plan.
+    #
+    # How much of that DP the query may afford is not a constant: `search_pair_budget` prices
+    # the region as written and grants a share of it back as search. That is what makes the
+    # decision adapt without a knob -- a 15-leaf star over a thousand rows stops searching
+    # after 512 pairs instead of 114,688 (25.5 s of planning for a query that runs in
+    # milliseconds), while the same shape over a volume that justifies it still reaches the
+    # same ceiling it could reach before. The budget takes search away from queries that
+    # cannot repay it; it takes none from a query that can.
+    budget = search_pair_budget(top, ctx)
+    dp = _rebuild_dphyp(leaves, edges, required, ctx, residuals, budget)
     return dp if dp is not None else _rebuild_greedy(leaves, edges, required, ctx, residuals)
 
 

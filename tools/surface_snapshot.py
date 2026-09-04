@@ -31,6 +31,22 @@ The five surfaces are the ones where a silent change is both plausible and costl
 
 A changed surface is not automatically wrong — adding a rule *should* change it. The
 point is that the change becomes visible and deliberate rather than discovered later.
+
+**What this cannot see, written down because it has already been leaned on too hard.**
+`public_api` and `expressions` record the *names* a module exports, not what those names
+are bound to. So a refactor that leaves every name in place while rebinding one to a
+different object reports EMPTY. That is not hypothetical: during the lazy-re-export
+change, `bt.read` resolved to `api.session.read` (a plain function) instead of the reader
+namespace, so `bt.read.parquet(...)` raised `AttributeError` while `bt.read(path)` still
+worked — and this tool reported "SURFACE DIFF EMPTY — no observable change" across it,
+because both objects are callable and the name was still there.
+
+So an empty diff means *rule order, IR tags, format registry, FFI signatures and the name
+sets are unchanged*. It does not mean the objects behind those names are the same ones.
+For a refactor that could rebind a public name, prove that separately — dump
+`(type, __module__, __qualname__)` for every name in `batcher.__all__` from a
+`git archive HEAD` sandbox and diff it against the working tree, which is the check that
+did catch the case above.
 """
 
 from __future__ import annotations

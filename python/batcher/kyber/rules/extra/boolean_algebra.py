@@ -149,11 +149,31 @@ def _rewrite_node(node: LogicalPlan, leaf) -> LogicalPlan | None:
 # --- annihilators -----------------------------------------------------------
 
 
+def _droppable(expr: Expr) -> bool:
+    """Whether a *boolean operand* may be removed from the expression around it.
+
+    `_safe` alone is not enough, and the difference is the whole point: it asks whether
+    evaluating `expr` can raise, where the error these rewrites were erasing came from the
+    **operator**, not the operand. `col("i") AND col("i")` is invalid -- `and` is defined on
+    booleans and `i` is Int64 -- and every one of the rules below happily rewrote it to
+    `col("i")`, answering an Int64 column from a boolean operator while `col("i") AND
+    col("j")`, the identical mistake, still raised. Six shapes succeeded or failed depending
+    on which rule happened to match, and four of them returned a column whose type the plan's
+    own `available_schema` declared as boolean.
+
+    So a dropped operand must also be *provably a boolean*. A bare `Col` is not: its type is
+    unknown here, which costs the fold on `bool_col AND FALSE` and is the right trade -- the
+    module's contract is that a rewrite preserves the query's value **and** whether it
+    errors, and no optimization is worth answering an invalid query.
+    """
+    return _safe(expr) and _bool_valued(expr)
+
+
 def _and_false(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "and":
-        if _is_false(expr.right) and _safe(expr.left):
+        if _is_false(expr.right) and _droppable(expr.left):
             return Lit(False)
-        if _is_false(expr.left) and _safe(expr.right):
+        if _is_false(expr.left) and _droppable(expr.right):
             return Lit(False)
     return expr
 
@@ -177,9 +197,9 @@ def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> Log
 
 def _or_true(expr: Expr) -> Expr:
     if isinstance(expr, Binary) and expr.op == "or":
-        if _is_true(expr.right) and _safe(expr.left):
+        if _is_true(expr.right) and _droppable(expr.left):
             return Lit(True)
-        if _is_true(expr.left) and _safe(expr.right):
+        if _is_true(expr.left) and _droppable(expr.right):
             return Lit(True)
     return expr
 
@@ -206,7 +226,7 @@ def _and_idem(expr: Expr) -> Expr:
     if (
         isinstance(expr, Binary)
         and expr.op == "and"
-        and _safe(expr.left)
+        and _droppable(expr.left)
         and _key(expr.left) == _key(expr.right)
     ):
         return expr.left
@@ -232,7 +252,7 @@ def _or_idem(expr: Expr) -> Expr:
     if (
         isinstance(expr, Binary)
         and expr.op == "or"
-        and _safe(expr.left)
+        and _droppable(expr.left)
         and _key(expr.left) == _key(expr.right)
     ):
         return expr.left
@@ -263,7 +283,7 @@ def _absorbs(x: Expr, compound: Expr, inner_op: str) -> bool:
     return (
         isinstance(compound, Binary)
         and compound.op == inner_op
-        and _safe(x)
+        and _droppable(x)
         and _safe(compound)
         and (_key(x) == _key(compound.left) or _key(x) == _key(compound.right))
     )

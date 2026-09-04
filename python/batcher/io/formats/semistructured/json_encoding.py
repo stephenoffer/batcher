@@ -19,7 +19,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.io.filesystem import resolve_filesystem
-from batcher.io.formats.semistructured.json_vector import ndjson_vectorized
+from batcher.io.formats.semistructured.json_vector import ndjson_vectorized, render_for_fallback
 
 __all__ = [
     "_JSON_POOL_SIZE",
@@ -135,15 +135,23 @@ def _ndjson_bytes(table: pa.Table) -> bytes:
     * the exact stdlib encoder handles what is left when a float is present, because
       pandas' ``to_json`` rounds floats to ``double_precision`` decimal places;
     * pandas' C encoder handles the rest, and catches the leaves the stdlib one raises on
-      (timestamp/decimal/bytes).
+      (decimal/bytes).
 
     Ordering the vectorized path first is what removed the writer's exact-or-fast choice:
     a table carrying a float anywhere used to fall to the per-row stdlib encoder at
     0.06 Mrow/s, and now takes the same path a float-free table does.
+
+    "All producing the same values" was not true of a temporal column and is what
+    `render_for_fallback` is for. Only *some* column has to decline for the whole table to
+    fall back, so a timestamp beside a decimal took the pandas encoder and came out as a bare
+    number — the same column, in the same query, serialized one way or the other depending on
+    which other columns were present. That encoder also wrote every duration as `0`. Both are
+    settled in one place before either fallback sees the table.
     """
     vectorized = ndjson_vectorized(table)
     if vectorized is not None:
         return vectorized
+    table = render_for_fallback(table)
     if _schema_has_float(table.schema):
         try:
             return _table_to_ndjson_exact(table)

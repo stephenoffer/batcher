@@ -19,6 +19,7 @@ from batcher.plan.types.footprint import (
     total_retained_bytes,
 )
 from batcher.plan.types.infer import infer_type
+from batcher.plan.types.ipc import table_from_ipc, table_to_ipc
 from batcher.plan.types.lattice import promote, widen
 from batcher.plan.types.registry import (
     CAST_DTYPES,
@@ -49,6 +50,8 @@ __all__ = [
     "resolve_dtype",
     "retained_bytes",
     "schema_row_bytes",
+    "table_from_ipc",
+    "table_to_ipc",
     "total_logical_bytes",
     "total_retained_bytes",
     "widen",

@@ -36,6 +36,7 @@ from .policies import (
     runtime_bloom_join,
     skew_join_salt,
     speculation_policy,
+    task_event_options,
 )
 from .readiness import await_autoscale
 from .reduce import gather_in_windows, run_bucket_reduce
@@ -52,6 +53,8 @@ from .scheduling import (
     create_worker_placement,
     current_envelope,
     fleet_actor_options,
+    fleet_task_headroom,
+    fleet_task_options,
     placement_actor_options,
     release_placement,
     reset_scheduling_envelope,
@@ -79,6 +82,8 @@ __all__ = [
     "execute_metered",
     "fault_options",
     "fleet_actor_options",
+    "fleet_task_headroom",
+    "fleet_task_options",
     "gather_in_windows",
     "gather_map_results",
     "is_recoverable_task_failure",
@@ -99,6 +104,7 @@ __all__ = [
     "shuffle_partitions",
     "skew_join_salt",
     "speculation_policy",
+    "task_event_options",
     "task_options",
     "topology_scope",
     "worker_node_memory_bytes",

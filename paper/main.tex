@@ -76,9 +76,10 @@ executors, and the recovered results remain equivalent across five injected work
 configurations. To separate execution from storage effects, DuckDB is measured both on its
 native compressed representation and on the same Arrow input consumed by \sys{}. On identical
 Arrow input, \sys{} is faster on every suite for which that controlled comparison is available,
-by $2.8$--$26\times$; with DuckDB's native store, the comparison reverses on TPC-H at sf10.
-These results suggest that storage representation and storage statistics account for a
-substantial part of the remaining single-node gap, rather than execution kernels alone.
+by $2.8$--$26\times$; against DuckDB's native store it leads seven of the nine relational suites
+in the harness, including TPC-H at both scale factors. These results suggest that storage
+representation and storage statistics account for a substantial part of the remaining
+single-node gap, rather than execution kernels alone.
 
 The evaluation also exposes costs that headline latency does not capture. On TPC-H sf1,
 \sys{} uses $1.86\times$ the CPU while achieving $0.78\times$ the wall time, using
@@ -86,9 +87,10 @@ $2.4\times$ as many effective cores. In the measured fault-injection environment
 replication makes recovery more expensive than recomputation. Conversely, the shared
 operators drain a streaming backlog at $3.2\times$ Spark Structured Streaming, and repeated
 execution converges toward steady-state performance by the third run in a control experiment
-that separates most cache-warming effects. \sys{} remains $1.29\times$ behind DuckDB on the
-Join Order Benchmark, and its streaming and storage subsystems provide weaker guarantees than
-mature specialized systems. Taken together, the results support mergeability as a practical
+that separates most cache-warming effects. \sys{} remains $1.11\times$ behind DuckDB on the
+Join Order Benchmark's geomean --- while completing all 113 queries in less total time than
+DuckDB, winning the large ones and losing many small ones --- and its streaming and storage
+subsystems provide weaker guarantees than mature specialized systems. Taken together, the results support mergeability as a practical
 unifying constraint while identifying the cases where that constraint is insufficient or
 costly.
 \end{abstract}
@@ -122,7 +124,7 @@ costly.
   title={Relational\\{\scriptsize\mdseries TPC-H sf1, one 96-vCPU node}},
 ]
 \addplot[draw=okBlue, fill=okSky!60]
-  coordinates {(1.27,store) (2.33,polars) (2.86,daft) (3.91,duck)};
+  coordinates {(1.53,store) (2.83,polars) (3.07,daft) (4.29,duck)};
 \draw[draw=pfigGray, dashed, line width=0.7pt] (axis cs:1,store) -- (axis cs:1,duck);
 \end{axis}
 % ---- Panel B: AI pipelines -------------------------------------------------
@@ -144,8 +146,9 @@ node, correctness-gated and summarized by geometric mean. Right: GPU data pipeli
 8$\times$T4 against Ray Data, with decode and inference represented as operators in the same
 logical plan as the surrounding relational work. The DuckDB native-store bar includes the
 benefit of DuckDB's compressed physical representation, while the same-Arrow bar isolates the
-execution comparison more directly. At sf10 the native-store result reverses; \cref{sec:eval-opmix}
-and \cref{sec:limitations} examine the evidence for attributing much of that gap to physical
+execution comparison more directly. At sf10 the native-store margin narrows to
+$1.14\times$ but stays in \sys{}'s favour; \cref{sec:eval-opmix}
+and \cref{sec:limitations} examine the evidence for attributing much of what remains to physical
 data representation and storage statistics.}
 \label{fig:headline}
 \end{figure*}
@@ -779,16 +782,23 @@ attribute the full gap to any one mechanism.
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 Baseline & \bx{} & wins & \bx{} & wins \\
 \midrule
-DuckDB (native store)              & \win \textbf{0.79} & \win 16/22 & \loss 1.29 & \loss 8/22 \\
-DuckDB (same Arrow)$^*$            & \win \textbf{0.26} & \win \textbf{22/22} & --- & --- \\
-Polars~\cite{polars}               & \win \textbf{0.43} & \win 21/22 & \win \textbf{0.37} & \win 18/22 \\
-Daft~\cite{daft}$^\dagger$         & \win \textbf{0.35} & \win \textbf{20/20} & \win \textbf{0.42} & \win 16/20 \\
+DuckDB (native store)              & \win \textbf{0.66} & \win 20/22 & \win \textbf{0.87} & \win 12/22 \\
+DuckDB (same Arrow)$^*$            & \win \textbf{0.23} & \win \textbf{22/22} & --- & --- \\
+Polars~\cite{polars}               & \win \textbf{0.35} & \win 21/22 & \win \textbf{0.26} & \win 19/22 \\
+Daft~\cite{daft}$^\dagger$         & \win \textbf{0.33} & \win \textbf{20/20} & \win \textbf{0.30} & \win 19/20 \\
 Spark~\cite{armbrust2015sparksql}$^\ddagger$ & 0.041 & 22/22 & 0.074 & 22/22 \\
 \bottomrule
 \end{tabular}
 \caption{TPC-H, all 22 queries, correctness-gated, one 96-vCPU node; \bx{} below 1.00 means
-\sys{} is faster. Suite totals (ms), sf1 / sf10: \sys{} 472 / 3{,}707; DuckDB 594 / 2{,}038;
-Polars 1{,}173 / 9{,}914; Daft 1{,}152 / 8{,}680; Spark 14{,}555 / 57{,}781. $^*$DuckDB
+\sys{} is faster. Re-measured 2026-08-25; \sys{} now leads every baseline at \emph{both} scale
+factors, sf10 having crossed from $1.29$ to $0.87$. Suite totals (ms), sf1 / sf10: \sys{}
+438 / 2{,}557; DuckDB 657 / 2{,}472; Polars 1{,}318 / 10{,}998; Daft 1{,}272 / 9{,}678; Spark
+14{,}555 / 57{,}781 (carried from the earlier run --- this node has no JVM, so the Spark column
+was not re-measured, and no claim in this paper rests on it). The sf1 lineup is five engines and
+the sf10 lineup four, the same-Arrow configuration being dropped there for the reason in
+$^*$; the lineup is part of the measurement, since each engine's resident working set
+perturbs the others', and a two-engine run of the same sf10 queries reads $0.96$ rather than
+$0.87$. $^*$DuckDB
 executing the same zero-copy Arrow \sys{} is given, not a compressed store it was allowed to
 build first; not reported at sf10, because over Arrow views DuckDB's planner has no storage
 statistics to order a many-way join with. $^\dagger$Daft covers 20 queries in this adapter; q6 and q15 do not pass the harness
@@ -863,21 +873,27 @@ that path right in that implementation too.
 \toprule
 Suite & Queries & geomean \bx{} & wins \\
 \midrule
-JSON (semi-structured)   & 5   & \win \textbf{0.25}$\times$ & \win 5/5 \\
-ClickBench~\cite{clickbench}$^\dagger$ & 43 & \win \textbf{0.64}$\times$ & \win 28/43 \\
-Operator mix             & 19  & \win \textbf{0.65}$\times$ & 12/19 \\
-TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.79}$\times$ & \win 16/22 \\
-H2O.ai \texttt{join}     & 5   & \win \textbf{0.93}$\times$ & 3/5 \\
-TPC-DS~\cite{tpcds} sf1  & 98  & \win \textbf{0.96}$\times$ & 38/98 \\
+JSON (semi-structured)   & 5   & \win \textbf{0.24}$\times$ & \win 5/5 \\
+ClickBench~\cite{clickbench}$^\dagger$ & 43 & \win \textbf{0.59}$\times$ & \win 30/43 \\
+Operator mix             & 21  & \win \textbf{0.68}$\times$ & 11/21 \\
+H2O.ai \texttt{join}     & 5   & \win \textbf{0.70}$\times$ & \win 5/5 \\
+TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.74}$\times$ & \win 19/22 \\
+TPC-DS~\cite{tpcds} sf1  & 98  & \win \textbf{0.89}$\times$ & \win 43/98 \\
+TPC-H sf10               & 22  & \win \textbf{0.96}$\times$ & 9/22 \\
 \midrule
-H2O.ai \texttt{groupby}  & 10  & \loss 1.19$\times$ & \loss 4/10 \\
-TPC-H sf10               & 22  & \loss 1.29$\times$ & \loss 8/22 \\
-Join Order~\cite{leis2015goodjoin} & 109 & \loss 1.29$\times$ & \loss 35/109 \\
+H2O.ai \texttt{groupby}  & 10  & \loss 1.03$\times$ & \loss 4/10 \\
+Join Order~\cite{leis2015goodjoin} & 109 & \loss 1.11$\times$ & 44/109 \\
 \bottomrule
 \end{tabular}
 \caption{Every relational suite in the harness against DuckDB's \emph{native compressed
-store} --- the harder of the two bars --- on one 96-vCPU node, ordered by result; six of nine
-go to \sys{}. On identical Arrow input, the like-for-like execution bar, \emph{every suite
+store} --- the harder of the two bars --- on one 96-vCPU node, ordered by result; \textbf{seven
+of nine} go to \sys{}. Re-measured 2026-08-25 on a two-engine (\sys{}, DuckDB) lineup, which
+this harness treats as part of the measurement: a third engine's resident working set perturbs
+the timings, so every figure in this column comes from the same lineup. TPC-H sf10 crosses to a
+win in this pass (from $1.29\times$), and JOB moves further than any other suite (from
+$1.29\times$); on JOB \sys{}'s suite total is now \emph{below} DuckDB's, 8{,}131\,ms against
+8{,}885, while its geomean has not yet crossed --- it wins the large queries and still loses many
+small ones. On identical Arrow input, the like-for-like execution bar, \emph{every suite
 that can run it is a win}: JSON $0.039\times$ (5/5), ClickBench $0.072\times$
 (\textbf{43/43}), H2O \texttt{groupby} $0.089\times$ (\textbf{10/10}), H2O \texttt{join}
 $0.244\times$ (\textbf{5/5}), TPC-H $0.256\times$ (\textbf{22/22}), the operator mix
@@ -893,9 +909,10 @@ cases.}
 \end{table}
 
 \cref{tab:tpch} reports TPC-H and \cref{tab:breadth} every relational suite in the
-harness. \sys{} leads DuckDB's \emph{compressed native store} at sf1 --- a storage
-engine \emph{and} an execution engine against an execution engine alone --- and trails
-it at sf10. That boundary is not a uniform degradation, and locating it matters. Of thirteen shapes
+harness. \sys{} leads DuckDB's \emph{compressed native store} at both scale factors --- a
+storage engine \emph{and} an execution engine against an execution engine alone --- though the
+margin narrows from $0.74\times$ at sf1 to $0.96\times$ at sf10, so the scaling behaviour behind
+that narrowing is still what the rest of this subsection is about. Of thirteen shapes
 whose cost can be tracked across the two scales, nine cost \emph{less} than ten times as much
 for ten times the rows; four are superlinear and carry the loss between them, and they are the
 benchmark's two highest-cardinality group-bys (q13, q18), its largest intermediate (q9) and
@@ -1157,15 +1174,19 @@ generality of the measurements.
 \paragraph{Storage is the largest open gap, and it is structural.} \sys{} owns no
 storage format: Arrow is the only columnar representation any operator sees, which
 forecloses a compressed, dictionary-encoded, zone-mapped store and a German-string
-layout~\cite{neumann2020umbra} in one stroke. Three results above reflect that decision --- TPC-H at sf10 ($1.29\times$), the H2O group-by ($1.19\times$), and the string
-sorts that lose even on identical input --- and closing it needs a plan's logical type
+layout~\cite{neumann2020umbra} in one stroke. Two results above still reflect that decision ---
+the H2O group-by ($1.03\times$) and the string sorts that lose even on identical input --- and it
+also accounts for the narrowing rather than the disappearance of the sf10 margin, which crossed
+into \sys{}'s favour once the scheduling defects in \cref{sec:eval-tpch} were removed but is the
+suite's smallest lead. Closing the rest needs a plan's logical type
 separated from a morsel's physical one, an architectural change rather than a kernel
 one. The scan path is a second, independent term: \sys{}'s Parquet decode costs
 $1.7$--$3.0\times$ DuckDB's CPU, which places it in the Arrow Rust decoder rather than
 in anything specific to this engine.
 
 \paragraph{The learned loop does not yet improve the benchmark most sensitive to estimation error.} The Join
-Order Benchmark remains $1.29\times$ behind, and the mechanism this paper argues should
+Order Benchmark remains $1.11\times$ behind on geomean --- improved from $1.29\times$, and now
+completing all 113 queries in less total time than DuckDB --- and the mechanism this paper argues should
 close it is inert on the shape that matters: the key a measured cardinality is filed
 under and the key the estimator reads back disagree for the commonest aggregate shape,
 so the loop writes a true row count that nothing consumes. The defect also exposes a broader calibration issue: correcting the key alone makes the engine \emph{slower}
@@ -1337,15 +1358,17 @@ result-equivalent physical choices across executions without changing query sema
 
 Performance depends strongly on what is held constant. On identical Arrow input, \sys{} is
 faster than DuckDB on every suite for which that comparison is available in the harness. When
-DuckDB uses its native compressed representation and storage statistics, the result reverses
-for TPC-H at sf10. The controlled operator experiments indicate that physical representation
+DuckDB uses its native compressed representation and storage statistics, \sys{} leads seven of
+the nine relational suites, and its margin at TPC-H sf10 narrows to the smallest of them. The
+controlled operator experiments indicate that physical representation
 explains a substantial part of that difference, especially for strings and dictionary-encoded
 keys, but the current evaluation does not justify reducing all remaining system-level
 differences to storage alone.
 
 The costs are equally important. On TPC-H sf1, lower latency comes with $1.86\times$ the CPU
 consumption and $2.4\times$ the effective core use. The Join Order Benchmark remains
-$1.29\times$ behind. Streaming is implemented as a micro-batch driver with materially weaker
+$1.11\times$ behind on geomean, though \sys{} now finishes all 113 of its queries in less total
+time than DuckDB. Streaming is implemented as a micro-batch driver with materially weaker
 state and fault-tolerance guarantees than Flink-class systems, and replication does not improve
 recovery in the environment measured here. These are not peripheral caveats; they identify the
 work required to test whether the mergeability-first design remains compelling as storage,

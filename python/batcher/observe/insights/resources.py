@@ -158,15 +158,50 @@ def spilled_operators(
     ]
 
 
-def idle_cpu(_profile: dict[str, Any], ops: list[dict[str, Any]], total_ms: float) -> list[Insight]:
+def _whole_run_utilization(profile: dict[str, Any]) -> float | None:
+    """Cores busy over the whole run, as a share of the machine, or `None` if unmeasured.
+
+    `QueryUsage.cores_busy` is `cpu_ms / wall_ms` for the *entire* execution, and its own
+    docstring says it is "the one figure a per-operator utilization ratio cannot be summed
+    into". That is not a style preference here, it is the difference between a true finding
+    and a false one: the per-operator hardware fields hold **only on a materializing
+    executor** (`api.stats.RunStats.usage`), and the streaming executor is the default. There
+    each operator reports `cpu_ms == elapsed_ms` -- one thread's accounting -- beside a
+    `threads` count of the whole pool, so the derived `cpu_util` is ~`1 / threads` whatever
+    the query did.
+
+    Measured on a 10 M-row `GROUP BY` over 100 groups: the operators reported `cpu_util`
+    0.016, so this rule announced "CPU 2% utilized" for a query whose process burned 177 ms
+    of CPU in 14.3 ms of wall clock -- **12 cores**, and `usage.cores_busy` said so. A
+    diagnostic that fires on essentially every streaming query trains its reader to ignore
+    the one reading that matters, which is the same failure the `_MEMORY_TIGHT` note above
+    exists to avoid.
+    """
+    usage = profile.get("usage") or {}
+    cores_busy = float(usage.get("cores_busy", 0.0))
+    if cores_busy <= 0:
+        return None  # platform reported nothing; fall back to the per-operator ratio
+    from batcher._internal.hardware import available_cpu_count
+
+    cores = available_cpu_count()
+    return cores_busy / cores if cores else None
+
+
+def idle_cpu(profile: dict[str, Any], ops: list[dict[str, Any]], total_ms: float) -> list[Insight]:
     """Idle cores are only a finding when the run was long enough for it to matter."""
     if total_ms < _TRIVIAL_MS:
         return []
-    weighted = [op for op in ops if float(op.get("cpu_util", 0.0)) > 0 and op.get("elapsed_ms")]
-    if not weighted:
-        return []
-    held = sum(float(op["elapsed_ms"]) for op in weighted)
-    util = sum(float(op["cpu_util"]) * float(op["elapsed_ms"]) for op in weighted) / held
+    util = _whole_run_utilization(profile)
+    if util is None:
+        # No whole-run reading. The per-operator ratio is all there is, and on a
+        # materializing executor -- the only tier that populates it -- it is sound.
+        weighted = [op for op in ops if float(op.get("cpu_util", 0.0)) > 0 and op.get("elapsed_ms")]
+        if not weighted:
+            return []
+        held = sum(float(op["elapsed_ms"]) for op in weighted)
+        util = sum(float(op["cpu_util"]) * float(op["elapsed_ms"]) for op in weighted) / held
+    else:
+        weighted = [op for op in ops if op.get("elapsed_ms")]
     if util >= _CPU_IDLE:
         return []
 

@@ -176,7 +176,7 @@ impl KeyFilter {
         };
         // `i128` because `hi - lo` overflows `i64` on the extremes, and a span that wide is
         // refused rather than wrapped into a small one.
-        let span = (hi as i128 - lo as i128 + 1) as u128;
+        let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
         let rows = a.len() - a.null_count();
         if span <= dense_span_budget(rows) {
             return Some(Self::dense(a, lo, hi, span));
@@ -190,7 +190,7 @@ impl KeyFilter {
         let mut distinct = 0usize;
         let mut set = |v: i64| {
             // In range by construction: `lo <= v <= hi` for every non-null build key.
-            let offset = (v as i128 - lo as i128) as usize;
+            let offset = (i128::from(v) - i128::from(lo)) as usize;
             let word = &mut bits[offset >> 6];
             let mask = 1u64 << (offset & 63);
             distinct += usize::from(*word & mask == 0);
@@ -248,7 +248,7 @@ impl KeyFilter {
         if key < self.lo || key > self.hi {
             return false;
         }
-        let offset = (key as i128 - self.lo as i128) as usize;
+        let offset = (i128::from(key) - i128::from(self.lo)) as usize;
         self.keys.contains(key, offset)
     }
 
@@ -277,11 +277,13 @@ impl KeyFilter {
     }
 
     /// Distinct build keys held — the ceiling on how many probe keys can survive the filter.
+    #[must_use]
     pub fn distinct_keys(&self) -> usize {
         self.distinct
     }
 
     /// The build keys' `[min, max]`.
+    #[must_use]
     pub fn bounds(&self) -> (i64, i64) {
         (self.lo, self.hi)
     }
@@ -467,7 +469,7 @@ mod tests {
     /// shape the filter is most valuable on.
     #[test]
     fn a_large_low_cardinality_build_side_is_digested() {
-        let keys: Vec<Option<i64>> = (0..500_000).map(|i| Some((i % 8) as i64)).collect();
+        let keys: Vec<Option<i64>> = (0..500_000).map(|i| Some(i64::from(i % 8))).collect();
         let f = filter_of(keys).expect("low-cardinality sides must digest");
         assert_eq!(f.distinct_keys(), 8);
         assert_eq!(

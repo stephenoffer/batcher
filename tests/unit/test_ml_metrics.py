@@ -547,8 +547,8 @@ def test_average_precision_of_a_single_tie_group_is_the_prevalence() -> None:
 @pytest.mark.parametrize(
     ("builder", "oracle"),
     [
-        (roc_auc, lambda y, s: skm.roc_auc_score(y, s)),
-        (average_precision, lambda y, s: skm.average_precision_score(y, s)),
+        (roc_auc, skm.roc_auc_score),
+        (average_precision, skm.average_precision_score),
         (gini_coefficient, lambda y, s: 2 * skm.roc_auc_score(y, s) - 1),
     ],
 )

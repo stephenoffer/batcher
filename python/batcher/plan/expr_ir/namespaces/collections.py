@@ -10,7 +10,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.core import Expr, Lit, _wrap
+from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
     ListContains,
@@ -164,59 +164,84 @@ class _JsonNamespace:
         return StrFunc("json_extract_string", self._e, pattern=path)
 
     def extract_int(self, path: str) -> StrFunc:
-        """Read the value at a JSON path as an integer (→ Int64); null if absent or non-integral.
+        """Read the value at a JSON path as an integer (→ Int64), casting as DuckDB does.
+
+        This is DuckDB's ``json_extract(...)::BIGINT`` cast, not a type test. A JSON
+        **float is rounded** to nearest (ties to even), and a JSON **bool** reads as
+        ``1``/``0``. Null comes back only for a leaf that has no numeric reading at all --
+        a string, an array, an object, a JSON ``null`` -- for an absent path, for
+        malformed JSON, or for a value outside ``Int64``'s range.
+
+        Use :meth:`type_of` first if you need to *reject* a non-integer rather than
+        round it.
 
         Args:
             path: A JSONPath, e.g. ``"$.a.b"``.
 
         Returns:
-            A new Int64 expression, or null if absent or non-integral.
+            A new Int64 expression, or null as described above.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"j": ['{"a": {"b": 7}}', "{}"]})
+                >>> ds = bt.from_pydict(
+                ...     {"j": ['{"a": {"b": 7}}', '{"a": {"b": 7.5}}', "{}"]}
+                ... )
                 >>> ds.select(bt.col("j").json.extract_int("$.a.b").alias("r")).to_pydict()
-                {'r': [7, None]}
+                {'r': [7, 8, None]}
         """
         return StrFunc("json_extract_int", self._e, pattern=path)
 
     def extract_float(self, path: str) -> StrFunc:
-        """Read the value at a JSON path as a float (→ Float64); null if absent or non-numeric.
+        """Read the value at a JSON path as a float (→ Float64), casting as DuckDB does.
+
+        This is DuckDB's ``json_extract(...)::DOUBLE`` cast, so a JSON **bool** reads as
+        ``1.0``/``0.0``. Null comes back for a string, array, object or JSON ``null``
+        leaf, for an absent path, and for malformed JSON.
 
         Args:
             path: A JSONPath, e.g. ``"$.price"``.
 
         Returns:
-            A new Float64 expression, or null if absent or non-numeric.
+            A new Float64 expression, or null as described above.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"j": ['{"p": 3.5}', "{}"]})
+                >>> ds = bt.from_pydict({"j": ['{"p": 3.5}', '{"p": true}', "{}"]})
                 >>> ds.select(bt.col("j").json.extract_float("$.p").alias("r")).to_pydict()
-                {'r': [3.5, None]}
+                {'r': [3.5, 1.0, None]}
         """
         return StrFunc("json_extract_float", self._e, pattern=path)
 
     def extract_bool(self, path: str) -> StrFunc:
-        """Read the value at a JSON path as a boolean (→ Boolean); null if absent or non-boolean.
+        """Read the value at a JSON path as a boolean (→ Boolean), casting as DuckDB does.
+
+        This is DuckDB's ``json_extract(...)::BOOLEAN`` cast, so a JSON **number** reads
+        as ``n != 0`` -- the numeric ``0``/``1`` flag a great many documents use. Null
+        comes back for a string (even ``"true"``), an array, an object or a JSON ``null``
+        leaf, for an absent path, and for malformed JSON.
+
+        Use :meth:`type_of` first if you need to *reject* a non-boolean rather than
+        coerce it.
 
         Args:
             path: A JSONPath, e.g. ``"$.active"``.
 
         Returns:
-            A new Boolean expression, or null if absent or non-boolean.
+            A new Boolean expression, or null as described above.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"j": ['{"active": true}', "{}"]})
+                >>> ds = bt.from_pydict(
+                ...     {"j": ['{"active": true}', '{"active": 1}', '{"active": "true"}', "{}"]}
+                ... )
                 >>> ds.select(bt.col("j").json.extract_bool("$.active").alias("r")).to_pydict()
-                {'r': [True, None]}
+                {'r': [True, True, None, None]}
         """
         return StrFunc("json_extract_bool", self._e, pattern=path)
 
@@ -546,7 +571,7 @@ class _MapNamespace:
         """
         return self.keys().list.len()
 
-    def contains(self, key: object) -> Expr:
+    def contains(self, key: str | int | float | bool) -> Expr:
         """Whether each row's map holds ``key`` (DuckDB ``map_contains``; → Boolean).
 
         Composed from :meth:`keys`, so it answers null for a null map and ``False`` for an
@@ -571,7 +596,7 @@ class _MapNamespace:
         """
         return self.keys().list.contains(key)
 
-    def get(self, key: object) -> MapFunc:
+    def get(self, key: str | int | float | bool) -> MapFunc:
         """Look up the value for a literal ``key`` in each row's map; null if absent.
 
         SQL ``element_at``. ``key`` is a plan-time literal, not an expression.
@@ -739,7 +764,7 @@ class _ListNamespace:
         """
         return ListPosition(self._e, value)
 
-    def intersect(self, other: Any) -> ListSet:
+    def intersect(self, other: IntoExpr) -> ListSet:
         """The distinct elements present in both this list and ``other`` (→ List).
 
         Spark ``array_intersect``, in this list's order.
@@ -760,7 +785,7 @@ class _ListNamespace:
         """
         return ListSet("array_intersect", self._e, _wrap(other))
 
-    def concat(self, other: Any) -> ListSet:
+    def concat(self, other: IntoExpr) -> ListSet:
         """This list's elements followed by ``other``'s, keeping duplicates (→ List).
 
         DuckDB ``list_concat``. Unlike :meth:`union` this does not deduplicate or reorder,
@@ -784,7 +809,7 @@ class _ListNamespace:
         """
         return ListSet("array_concat", self._e, _wrap(other))
 
-    def gather(self, indices: Any) -> ListSet:
+    def gather(self, indices: IntoExpr) -> ListSet:
         """Take each row's elements at the positions `indices` names (→ list).
 
         The operation that makes :meth:`arg_sort` usable. `arg_sort` hands back the positions
@@ -816,7 +841,7 @@ class _ListNamespace:
         """
         return ListSet("array_gather", self._e, _wrap(indices))
 
-    def has_all(self, other: Any) -> Expr:
+    def has_all(self, other: IntoExpr) -> Expr:
         """Whether every element of ``other`` is present in this list (→ Boolean).
 
         DuckDB ``list_has_all``. An empty ``other`` is trivially contained, so the result
@@ -845,7 +870,7 @@ class _ListNamespace:
         """
         return self.intersect(_wrap(other)).list.len() == _wrap(other).list.n_unique()
 
-    def has_any(self, other: Any) -> Expr:
+    def has_any(self, other: IntoExpr) -> Expr:
         """Whether this list shares any element with ``other`` (→ Boolean).
 
         DuckDB ``list_has_any``. The two share an element exactly when their intersection
@@ -875,7 +900,7 @@ class _ListNamespace:
         other_expr = _wrap(other)
         return (self.intersect(other_expr).list.len() + other_expr.list.len() * 0) > 0
 
-    def difference(self, other: Any) -> ListSet:
+    def difference(self, other: IntoExpr) -> ListSet:
         """The distinct elements in this list but not in ``other`` (→ List).
 
         Spark ``array_except``, in this list's order.
@@ -896,7 +921,7 @@ class _ListNamespace:
         """
         return ListSet("array_except", self._e, _wrap(other))
 
-    def union(self, other: Any) -> ListSet:
+    def union(self, other: IntoExpr) -> ListSet:
         """The distinct elements in either this list or ``other`` (→ List).
 
         Spark ``array_union``: this list's distinct elements followed by the new ones
@@ -918,7 +943,7 @@ class _ListNamespace:
         """
         return ListSet("array_union", self._e, _wrap(other))
 
-    def add(self, other: Any) -> ListZip:
+    def add(self, other: IntoExpr) -> ListZip:
         """Element-wise sum of this vector and ``other`` (→ List<Float64>).
 
         The embedding-math primitive: combine two embedding columns, or add a bias
@@ -941,7 +966,7 @@ class _ListNamespace:
         """
         return ListZip("list_add", self._e, _wrap(other))
 
-    def subtract(self, other: Any) -> ListZip:
+    def subtract(self, other: IntoExpr) -> ListZip:
         """Element-wise difference ``this - other`` (→ List<Float64>).
 
         Mean-center an embedding by subtracting a centroid, or take a difference vector.
@@ -963,7 +988,7 @@ class _ListNamespace:
         """
         return ListZip("list_subtract", self._e, _wrap(other))
 
-    def multiply(self, other: Any) -> ListZip:
+    def multiply(self, other: IntoExpr) -> ListZip:
         """Element-wise (Hadamard) product of this vector and ``other`` (→ List<Float64>).
 
         Gate or weight an embedding per dimension (e.g. a learned feature mask). Same
@@ -1011,7 +1036,7 @@ class _ListNamespace:
 
         return (self.l2_norm() - Lit(1.0)).abs() < Lit(tolerance)
 
-    def angular_distance(self, other: Any) -> Expr:
+    def angular_distance(self, other: IntoExpr) -> Expr:
         """Normalized angle between two vectors, in ``[0, 1]`` — ``acos(cosine) / pi``.
 
         Unlike ``1 - cosine_similarity``, this is a true metric (it satisfies the triangle
@@ -1075,7 +1100,7 @@ class _ListNamespace:
         """
         return self.dot(self._e)
 
-    def transform(self, func: Any) -> ListTransform:
+    def transform(self, func: IntoExpr) -> ListTransform:
         """Apply ``func`` to every element, preserving list lengths (→ List).
 
         DuckDB ``list_transform`` / Polars ``list.eval``. ``func`` is an expression over
@@ -1116,7 +1141,7 @@ class _ListNamespace:
 
         return self.filter(element().is_not_null())
 
-    def filter(self, predicate: Any) -> ListFilter:
+    def filter(self, predicate: IntoExpr) -> ListFilter:
         """Keep the elements where ``predicate`` is true (→ List).
 
         DuckDB ``list_filter``. ``predicate`` is an expression over ``element()`` (the
@@ -1293,7 +1318,7 @@ class _ListNamespace:
         """
         return ListFunc("flatten", self._e)
 
-    def dot(self, other: Any) -> ListBinary:
+    def dot(self, other: IntoExpr) -> ListBinary:
         """Dot product with another vector column, paired element-wise (→ Float64).
 
         The unnormalized similarity score. Both vectors must have the same length.
@@ -1314,7 +1339,7 @@ class _ListNamespace:
         """
         return ListBinary("dot", self._e, _wrap(other))
 
-    def jaccard(self, other: Any) -> ListBinary:
+    def jaccard(self, other: IntoExpr) -> ListBinary:
         """The fraction of positions where this list and `other` hold the same value.
 
         Over two `str.minhash` signatures this is the unbiased estimator of the two
@@ -1340,7 +1365,7 @@ class _ListNamespace:
         """
         return ListBinary("jaccard", self._e, _wrap(other))
 
-    def multiset_overlap(self, other: Any) -> ListBinary:
+    def multiset_overlap(self, other: IntoExpr) -> ListBinary:
         """How many of this list's elements `other` accounts for, counting repeats (→ Float64).
 
         The clipped multiset intersection size ``Σ min(count_here(v), count_there(v))``. It
@@ -1369,7 +1394,7 @@ class _ListNamespace:
         """
         return ListBinary("multiset_overlap", self._e, _wrap(other))
 
-    def lcs_length(self, other: Any) -> ListBinary:
+    def lcs_length(self, other: IntoExpr) -> ListBinary:
         """The length of the longest common subsequence of the two lists (→ Float64).
 
         The one overlap measure that reads *order*. :meth:`multiset_overlap` cannot tell
@@ -1406,7 +1431,7 @@ class _ListNamespace:
         """
         return ListBinary("lcs_length", self._e, _wrap(other))
 
-    def cosine_similarity(self, other: Any) -> ListBinary:
+    def cosine_similarity(self, other: IntoExpr) -> ListBinary:
         """Cosine similarity with another vector column, in ``[-1, 1]`` (→ Float64).
 
         The standard embedding-similarity score for retrieval / RAG; null if either
@@ -1429,7 +1454,7 @@ class _ListNamespace:
         """
         return ListBinary("cosine_similarity", self._e, _wrap(other))
 
-    def cosine_distance(self, other: Any) -> Expr:
+    def cosine_distance(self, other: IntoExpr) -> Expr:
         """Cosine distance ``1 - cosine_similarity`` to another vector column (→ Float64).
 
         The common nearest-neighbour ranking metric for embeddings: 0 for identical
@@ -1452,7 +1477,7 @@ class _ListNamespace:
         """
         return 1.0 - ListBinary("cosine_similarity", self._e, _wrap(other))
 
-    def l2_distance(self, other: Any) -> ListBinary:
+    def l2_distance(self, other: IntoExpr) -> ListBinary:
         """Euclidean (L2) distance to another vector column (→ Float64).
 
         The metric for nearest-neighbour vector search. Both vectors must have the
@@ -1474,7 +1499,7 @@ class _ListNamespace:
         """
         return ListBinary("l2_distance", self._e, _wrap(other))
 
-    def l1_distance(self, other: Any) -> ListBinary:
+    def l1_distance(self, other: IntoExpr) -> ListBinary:
         """Manhattan (L1) distance to another vector column (→ Float64).
 
         The sum of absolute per-element differences ``Σ|aᵢ - bᵢ|`` — the metric some
@@ -1497,7 +1522,7 @@ class _ListNamespace:
         """
         return ListBinary("l1_distance", self._e, _wrap(other))
 
-    def hamming_distance(self, other: Any) -> ListBinary:
+    def hamming_distance(self, other: IntoExpr) -> ListBinary:
         """Number of positions where two vectors differ (→ Float64).
 
         The distance for **binary or quantized embeddings** (each element ``0``/``1`` or a

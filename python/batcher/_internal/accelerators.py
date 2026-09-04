@@ -89,6 +89,11 @@ _GIB = 1 << 30
 #: the vocabulary lives, so node classification and pool sizing agree on what counts as one.
 ACCELERATOR_RESOURCE_NAMES = ("TPU", "neuron_cores", "HPU", "NPU")
 
+#: The same names as a set, for the membership test below. A fleet classification walks every
+#: node in the cluster, and at a hundred thousand nodes the four `dict.get` calls per node this
+#: replaces were a measurable share of the pass.
+_ACCELERATOR_RESOURCE_SET = frozenset(ACCELERATOR_RESOURCE_NAMES)
+
 
 def accelerator_units(resources: dict[str, float] | None) -> float:
     """Total non-GPU accelerator units a node's Ray `Resources` advertises (`0.0` for none).
@@ -105,7 +110,13 @@ def accelerator_units(resources: dict[str, float] | None) -> float:
     """
     if not resources:
         return 0.0
-    return max((float(resources.get(n, 0.0)) for n in ACCELERATOR_RESOURCE_NAMES), default=0.0)
+    # Almost every node advertises none of these, and `keys() & set` decides that in C rather
+    # than with four Python-level lookups and a generator. Identical answer either way: with no
+    # name present the max over "not there" is `0.0`.
+    present = resources.keys() & _ACCELERATOR_RESOURCE_SET
+    if not present:
+        return 0.0
+    return max((float(resources.get(n, 0.0)) for n in present), default=0.0)
 
 
 def is_accelerator_node(node_class: dict) -> bool:

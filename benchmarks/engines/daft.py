@@ -14,6 +14,7 @@ import os
 import pyarrow as pa
 
 from .base import Engine, Rename, SqlRunner
+from .partitioned import parquet_handle
 
 # Whether this run is the distributed (multi-node) tier. Daft defaults to its LOCAL
 # native runner, so without this it would answer on the driver's cores while Batcher
@@ -56,6 +57,30 @@ def _ensure_runner() -> None:
     _runner_selected = True
 
 
+def _frame(table: pa.Table):
+    """A Daft frame over `table`, partitioned — never a bare `daft.from_arrow`.
+
+    `daft.from_arrow(table)` produces a **single partition**, and a partition is Daft's unit
+    of parallelism, so a whole-table frame runs its aggregates and joins far narrower than
+    the box allows. Measured on this machine, Daft 0.7.24, a two-key group-by with two
+    aggregates over 4M rows:
+
+        from_arrow (1 partition)  319.0 ms
+        read_parquet (16 files)    51.2 ms   -> 6.2x
+
+    This is the identical bug `engines/ray.py`'s module docstring documents for
+    `ray.data.from_arrow`, and it was fixed there and not here — while Daft sits in the
+    *default* single-node lineup, so every Daft column in every default run carried it.
+
+    The mechanism now lives in `engines/partitioned.py` so the two adapters share one
+    definition — a fix written as prose in one file did not propagate to the file beside it,
+    which is exactly how this survived.
+    """
+    import daft
+
+    return daft.read_parquet(parquet_handle(table, "daft"))
+
+
 class DaftEngine(Engine):
     name = "daft"
     tier = "multi"
@@ -66,10 +91,8 @@ class DaftEngine(Engine):
         return importlib.util.find_spec("daft") is not None
 
     def handle(self, table: pa.Table):
-        import daft
-
         _ensure_runner()
-        return daft.from_arrow(table)
+        return _frame(table)
 
     def read_parquet(self, uri: str):
         import daft
@@ -81,7 +104,7 @@ class DaftEngine(Engine):
         import daft
 
         _ensure_runner()
-        frames = {name: daft.from_arrow(tbl) for name, tbl in tables.items()}
+        frames = {name: _frame(tbl) for name, tbl in tables.items()}
         # Current Daft: named DataFrames are passed to daft.sql as bindings.
         return lambda query: daft.sql(query, **frames).to_arrow()
 

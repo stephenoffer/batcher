@@ -367,8 +367,10 @@ _MANAGED: dict[str, str] = {
     "convert_dtypes": "Columns are already Arrow-typed. Change types with ds.cast({...}).",
     "checkpoint": "Materialize and reuse a result with ds.cache().",
     "localCheckpoint": "Materialize and reuse a result with ds.cache().",
-    "unpersist": "Caching is scoped to the plan; there is no manual unpersist.",
-    "storageLevel": "Batcher manages spill and caching; there is no storage level to set.",
+    "storageLevel": (
+        "Not a property to read: pass the level in, as ds.cache('disk_only') or "
+        "ds.persist('memory_only'). bt.cache_stats() reports what the cache holds."
+    ),
     "hint": (
         "The optimizer (Kyber) chooses join strategy and build side; inspect it with ds.explain()."
     ),

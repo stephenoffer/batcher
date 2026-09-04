@@ -282,6 +282,14 @@ def test_a_mixed_fleet_keeps_the_pooled_bucket(monkeypatch):
             {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_TESLA_T4"},
         ],
     )
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     import ray
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
@@ -294,6 +302,14 @@ def test_a_mixed_fleet_keeps_the_pooled_bucket(monkeypatch):
             {"cpus": 8.0, "gpus": 4.0, "accelerator_type": "NVIDIA_A100"},
             {"cpus": 8.0, "gpus": 8.0, "accelerator_type": "NVIDIA_A100"},
         ],
+    )
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
     )
     assert accelerators.cluster_accelerator_type() == "NVIDIA_A100"
 

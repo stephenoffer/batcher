@@ -345,6 +345,18 @@ On `.str`: `.to_lowercase()` / `.to_uppercase()` / `.to_titlecase()` (Polars, fo
 `.len_bytes()` (for `len`/`octet_length`), `.strip_chars(chars=None)` /
 `.strip_chars_start(...)` / `.strip_chars_end(...)` (for `trim`/`lstrip`/`rstrip`), and
 `.head(n)` / `.tail(n)` / `.slice(offset, length=None)` (for `left`/`right`/`substr`).
+A negative `offset` counts back from the end, so `.slice(-3, 2)` on `"abcdef"` gives
+`"de"`, and an offset reaching past the front yields an empty string rather than the
+head. {py:meth}`.list.slice(offset, length=None) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.slice>` indexes the same way, which is what makes
+`.list.slice(-n, n)` the tail of each list.
+
+On `.dt`: {py:meth}`.truncate(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.truncate>` (and its `.floor` alias), `.ceil(unit)` and `.round(unit)` all take
+one vocabulary: the long names `year`/`quarter`/`month`/`week`/`day`/`hour`/`minute`/
+`second` (plus `millennium`/`century`/`decade`/`millisecond`/`microsecond` for `truncate`),
+and the duration spellings {py:meth}`offset_by <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.offset_by>` takes, such as `"1mo"` or `"mo"`. As in `offset_by`,
+`mo` is months and `m` is minutes. A unit carrying a multiplier other than one, such as
+`"5d"`, is rejected rather than floored to `"1d"`, because truncation reaches a calendar
+boundary and cannot express a bucket width.
 
 On `.dt`: `.weekday()` (for `isodow`), `.ordinal_day()` (for `dayofyear`),
 `.to_string(fmt)` (for `strftime`), `.date()` / `.month_start()` (for `truncate(...)`),

@@ -220,9 +220,24 @@ pub(crate) fn spilling_hash_join_streaming(
     Ok((out, spill_bytes))
 }
 
-/// A relation's in-memory footprint, without concatenating it.
+/// A relation's payload size, without concatenating it — the quantity [`grace_fanout`] has to
+/// divide by the budget.
+///
+/// **Slice-aware, and it has to be.** This feeds one decision: how many buckets the grace join
+/// splits into so that each *materialized* bucket fits the envelope. A bucket is written to a
+/// spill store and read back as its own relation, so the size that matters is the rows'
+/// payload. The batches arriving here are morsels — `RecordBatch::slice`s sharing a parent
+/// buffer — and `get_array_memory_size` charges each slice the whole parent, so it reported a
+/// side as many times its real size and fanned the join out into that many times too many
+/// buckets. That is the pathology `ops::mixed_spill::cs_partitions` names: thousands of spill
+/// files each receiving shards too small to write efficiently, on the queries that spill.
+///
+/// The sibling defect in the out-of-core sort's run accounting is
+/// `ops::external_sort::run_bytes`. Both measure with [`crate::batch_bytes`], the engine's one
+/// slice- and dictionary-aware footprint — the same figure Carbonite sized `budget` from, so
+/// the numerator and the denominator of this division are finally in the same units.
 fn side_bytes(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.get_array_memory_size()).sum()
+    crate::batch_bytes(batches) as usize
 }
 
 /// How many ways a grace join fans out, from the **larger** of its two sides.
@@ -644,7 +659,19 @@ pub(crate) fn broadcast_join_streaming(
     let tuning = bc_arrow::RuntimeTuning::default();
     let build_key_cols = ops::columns_by_name(build, build_keys)?;
     let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
-    let Some(table) = join::BroadcastProbe::new(
+    // `over_any_build`, not `new`: the row ceiling `new` applies compares a flat probe against
+    // the *partitioned radix* join, and that is not the comparison this caller is making. Kyber
+    // has already chosen `Broadcast`, so the only alternative here is [`broadcast_join`] — which
+    // builds **the same single flat table over the same build side** and probes it in row-range
+    // chunks. Declining therefore buys no cache locality whatsoever; all it buys is the
+    // `ops::materialize` the caller falls back to, a serial concatenation of the *probe* side,
+    // which is the largest relation in the query.
+    //
+    // Measured on TPC-H sf10 `lineitem ⋈ orders` (60M probe, 15M build, 8% over the ceiling):
+    // see `benchmarks/BENCHMARK_RESULTS.md`. This is the same argument `over_any_build`'s own
+    // docstring makes for the fused-aggregate path, applied to the caller that pays the larger
+    // copy.
+    let Some(table) = join::BroadcastProbe::over_any_build(
         &build_key_cols,
         ops::map_join_type(join_type),
         probe_rows,
@@ -1001,9 +1028,12 @@ mod tests {
             for r in 0..b.num_rows() {
                 let cells: Vec<String> = cols
                     .iter()
-                    .map(|c| match c.is_null(r) {
-                        true => "∅".to_string(),
-                        false => c.value(r).to_string(),
+                    .map(|c| {
+                        if c.is_null(r) {
+                            "∅".to_string()
+                        } else {
+                            c.value(r).to_string()
+                        }
                     })
                     .collect();
                 rows.push(cells.join("|"));

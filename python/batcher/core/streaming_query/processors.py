@@ -86,7 +86,17 @@ class AggregateProcessor:
     a streaming write with a bare `NotImplementedError` about the IR.
     """
 
-    __slots__ = ("_agg", "_cap", "_emitted", "_fold", "_keyed", "_map", "_previous", "_update_only")
+    __slots__ = (
+        "_agg",
+        "_cap",
+        "_emitted",
+        "_fold",
+        "_keyed",
+        "_map",
+        "_previous",
+        "_tail",
+        "_update_only",
+    )
 
     def __init__(
         self,
@@ -94,9 +104,13 @@ class AggregateProcessor:
         *,
         update_only: bool = False,
         run_batch: Callable[[pa.RecordBatch], list[pa.RecordBatch]] | None = None,
+        tail: tuple = (),
     ) -> None:
-        from batcher.core.streaming import streaming_state_budget
+        from batcher.core.streaming import StreamingTail, streaming_state_budget
 
+        # The row-wise operators the query asked for *above* the fold. Applied to each
+        # emitted snapshot, which is what the batch plan computes over the whole input.
+        self._tail = StreamingTail(tail)
         self._map = run_batch
         # With a map in front, the fold's input schema is whatever the UDF returns, which
         # is knowable only once it has returned something. See `_folded`.
@@ -138,6 +152,11 @@ class AggregateProcessor:
         if result is None:
             return []
         self._emitted = True
+        # The tail runs before the `update` diff, so "which rows changed" is asked of the
+        # rows the sink actually receives rather than of the pre-projection aggregate.
+        result = self._tail.apply(result)
+        if result is None:  # a HAVING filter left nothing this trigger
+            return []
         if not self._update_only:
             return [result]
         return self._changed_rows(result)
@@ -205,6 +224,12 @@ class AggregateProcessor:
         if schema is None:  # an opaque input (a UDF) — nothing to type the empty batch from
             return []
         result = empty_global_aggregate(self._agg, schema.arrow)
+        if result is None:
+            return []
+        # The identity row is a fold result like any other, so the tail applies to it as
+        # well -- otherwise an empty stream emits the *unprojected* row and disagrees with
+        # `collect()` on the very shape this fallback exists to keep in agreement.
+        result = self._tail.apply(result)
         return [result] if result is not None else []
 
     def _previous_bytes(self) -> int:
@@ -447,7 +472,7 @@ def make_processor(
         Distinct,
         TransformWithState,
         is_streamable,
-        streaming_fold_target,
+        split_streaming_tail,
     )
 
     if isinstance(plan, TransformWithState):
@@ -471,8 +496,10 @@ def make_processor(
             "state the watermark bounds, or distinct() with no subset when the whole row is "
             "the key."
         )
-    if isinstance(plan, (Aggregate, Distinct)):
-        fold = streaming_fold_target(plan)
+    split = split_streaming_tail(plan)
+    if split is not None or isinstance(plan, (Aggregate, Distinct)):
+        fold = split[1] if split is not None else None
+        tail = split[0] if split is not None else ()
         if fold is None:
             raise PlanError(
                 f"a streaming {type(plan).__name__.lower()} needs a breaker-free input "
@@ -486,9 +513,18 @@ def make_processor(
         if output_mode == OutputMode.APPEND:
             from batcher.core.streaming import _window_key
 
-            key = _window_key(plan) if isinstance(plan, Aggregate) else None
-            if isinstance(plan, Aggregate) and plan.watermark is not None and key is not None:
-                return WindowedAggregateProcessor(plan, key, source)
+            key = _window_key(fold) if isinstance(fold, Aggregate) else None
+            if isinstance(fold, Aggregate) and fold.watermark is not None and key is not None:
+                if tail:
+                    raise PlanError(
+                        "output_mode='append' on a windowed streaming aggregation cannot "
+                        "carry work above the aggregate yet: a closed window is emitted "
+                        f"once and never revised, so the {type(tail[-1]).__name__.lower()} "
+                        "above it would have to be applied to a partial result. Use "
+                        "output_mode 'complete'/'update', which re-emit the whole snapshot, "
+                        "or compute the derived columns downstream of the sink."
+                    )
+                return WindowedAggregateProcessor(fold, key, source)
             raise PlanError(
                 "output_mode='append' on a streaming aggregation needs a watermark and a "
                 "windowed group key — an event-time window is the only thing a watermark "
@@ -502,7 +538,10 @@ def make_processor(
         # the aggregate's *input* precisely so the UDF runs in Python and the fold sees
         # mapped batches. Without it the fold would try to lower a `MapBatches` node.
         return AggregateProcessor(
-            agg, update_only=output_mode == OutputMode.UPDATE, run_batch=run_batch
+            agg,
+            update_only=output_mode == OutputMode.UPDATE,
+            run_batch=run_batch,
+            tail=tail,
         )
     if is_streamable(plan):
         if output_mode != OutputMode.APPEND:

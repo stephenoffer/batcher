@@ -80,6 +80,22 @@ The count is a ceiling. `partition_descriptors` returns the smaller of it and th
 
 Finer map partitions do not dilute skew, which is the usual reason given for many-tasks-per-executor. They divide the *input*, and a shuffle's imbalance lives in its hash buckets. That is the next section.
 
+How many buckets there are in the first place is a data question, not a cluster one. An aggregate exchanges *partial state*, whose size is the group count rather than the scanned input, so `adaptive_sizing/sizing.py::aggregate_reducer_count` sizes its reduce from the learned (or, on a cold signature, estimated) number of groups: `ceil(groups / optimizer.target_rows_per_task)` keeps each reducer's hash table bounded as the data grows, which is what stops a fixed cluster going superlinear.
+
+That count is floored at the worker count, because a bucket is reduced by exactly one worker and fewer buckets than workers idles the rest. The floor is then itself bounded by whether the groups can keep those workers busy: below `_MIN_GROUPS_PER_REDUCER` (50,000) groups per reducer, another reducer buys a column of the `mappers x reducers` stream matrix and no more work. Without that second bound a 64-group aggregate on a 64-worker fleet opened 4,096 Flight streams to move a few kilobytes, which is the near-empty all-to-all the cardinality sizing exists to prevent, reached through the floor instead of through the count. Measured on the project cluster, warm, median of seven, every case checked against DuckDB:
+
+| groups | workers | floored at `workers` | bounded by work |
+|---|---|---|---|
+| 64 | 64 | 302 ms | 91 ms (1 reducer) |
+| 200,000 | 64 | 348 ms | 249 ms (4) |
+| 1,000,000 | 64 | 880 ms | 434 ms (20) |
+
+A raw-row shuffle gets no such trim, and `row_shuffle_reducer_count` says so explicitly: a join, sort or window exchanges the rows themselves, so every input row lands in some bucket and there is no low-cardinality case where fewer buckets means less work. There the data-derived count may only *raise* the fan-out above one bucket per worker, never lower it.
+
+The *reduce* side is bounded the same way and for a different reason. A bucket is reduced by the one worker it hashes to (`bucket % workers`), so anything launched past the worker count is a task sitting in Ray's scheduler that cannot start, and `max_shuffle_partitions` permits 2,048 buckets. `dist/executors/ray_runtime/reduce.py::gather_in_windows` therefore keeps at most `distributed.pending_window_factor` times the worker count outstanding, `distributed.max_pending_tasks` overriding it when set.
+
+That window **slides**: one completion launches one new task, exactly as `map_barrier` fills from a `ray.wait`. Stepping it a chunk at a time bounds the queue just as well and serializes the stage behind its slowest task once per chunk, which matters most where the fan-out is a product of two of them. A combiner level is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, so a 64-worker aggregate over 128 map partitions runs 1,024 tasks through a 256-deep window: four barriers where one slow bucket holds 255 idle actors, against four slots that refill the moment anything finishes. Results are returned in submission order either way, so nothing above this sees which shape it is.
+
 ## Skew
 
 Two mechanisms handle skew, and they're separate.

@@ -27,6 +27,7 @@ pub enum Orientation {
 }
 
 /// Twice the signed area of the triangle `a b c`, positive when counter-clockwise.
+#[must_use]
 pub fn cross(a: Coord, b: Coord, c: Coord) -> f64 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
@@ -37,6 +38,7 @@ pub fn cross(a: Coord, b: Coord, c: Coord) -> f64 {
 /// determinant is trustworthy whenever its magnitude exceeds the accumulated rounding
 /// error of the four products, and that covers essentially every non-degenerate input.
 /// Only inside the bound is the slower exact path taken.
+#[must_use]
 pub fn orientation(a: Coord, b: Coord, c: Coord) -> Orientation {
     let detleft = (b.x - a.x) * (c.y - a.y);
     let detright = (b.y - a.y) * (c.x - a.x);
@@ -91,11 +93,13 @@ fn split(a: f64) -> (f64, f64) {
 }
 
 /// The Euclidean distance between two positions (planar, ignoring z).
+#[must_use]
 pub fn dist(a: Coord, b: Coord) -> f64 {
     (a.x - b.x).hypot(a.y - b.y)
 }
 
 /// The squared Euclidean distance — the comparison form, with no square root.
+#[must_use]
 pub fn dist2(a: Coord, b: Coord) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
@@ -104,6 +108,7 @@ pub fn dist2(a: Coord, b: Coord) -> f64 {
 
 /// The point on segment `ab` nearest to `p`, and the parameter `t ∈ [0,1]` at which
 /// it sits. A degenerate segment (`a == b`) yields `a` at `t = 0`.
+#[must_use]
 pub fn closest_on_segment(p: Coord, a: Coord, b: Coord) -> (Coord, f64) {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;
@@ -122,11 +127,13 @@ pub fn closest_on_segment(p: Coord, a: Coord, b: Coord) -> (Coord, f64) {
 }
 
 /// The distance from `p` to segment `ab`.
+#[must_use]
 pub fn point_segment_distance(p: Coord, a: Coord, b: Coord) -> f64 {
     dist(p, closest_on_segment(p, a, b).0)
 }
 
 /// True when `p` lies on segment `ab` (collinear and within the bounding box).
+#[must_use]
 pub fn on_segment(p: Coord, a: Coord, b: Coord) -> bool {
     orientation(a, b, p) == Orientation::Collinear
         && p.x >= a.x.min(b.x)
@@ -141,6 +148,7 @@ pub fn on_segment(p: Coord, a: Coord, b: Coord) -> bool {
 /// endpoint counts, because OGC `intersects` is closed: two polygons sharing an edge
 /// do intersect, and a version of this that treated touching as disjoint would make
 /// every adjacent-parcel query return nothing.
+#[must_use]
 pub fn segments_intersect(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bool {
     let o1 = orientation(p1, p2, q1);
     let o2 = orientation(p1, p2, q2);
@@ -162,6 +170,7 @@ pub fn segments_intersect(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bool {
 /// crossing. Deciding this from orientations alone keeps it exact — the crossing *point*
 /// is computed in floating point and generally lands on neither segment, so locating it
 /// afterwards with `on_segment` would report a crossing that is plainly there as absent.
+#[must_use]
 pub fn segments_cross_properly(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bool {
     let o1 = orientation(p1, p2, q1);
     let o2 = orientation(p1, p2, q2);
@@ -177,6 +186,7 @@ pub fn segments_cross_properly(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bo
 ///
 /// `None` for parallel, collinear, or non-intersecting segments — the overlay code
 /// handles collinear overlap separately because it produces a segment, not a point.
+#[must_use]
 pub fn segment_intersection(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> Option<Coord> {
     let r = (p2.x - p1.x, p2.y - p1.y);
     let s = (q2.x - q1.x, q2.y - q1.y);
@@ -198,6 +208,7 @@ pub fn segment_intersection(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> Optio
 }
 
 /// The smallest distance between two segments, 0 when they intersect.
+#[must_use]
 pub fn segment_segment_distance(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> f64 {
     if segments_intersect(p1, p2, q1, q2) {
         return 0.0;
@@ -225,6 +236,7 @@ pub enum PointRing {
 /// answers inside-or-outside and is *arbitrary* on the boundary — which is precisely
 /// the case that distinguishes `contains` from `covers`, so collapsing it would make
 /// the two predicates indistinguishable.
+#[must_use]
 pub fn point_in_ring(p: Coord, ring: &[Coord]) -> PointRing {
     if ring.len() < 3 {
         return PointRing::Outside;

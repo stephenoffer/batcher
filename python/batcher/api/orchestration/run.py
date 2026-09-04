@@ -13,6 +13,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
+from batcher.api.orchestration import phases
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
     distributed_hardware,
@@ -40,16 +41,6 @@ _log = get_logger("api.run")
 #: `None` default cannot express it: `None` is the meaningful value the fast path passes to
 #: turn metric recording off, so the two would be indistinguishable.
 _HUB = object()
-
-
-def _phase(name: str, seconds: float) -> None:
-    """Record one contract-loop phase timing (stats, Kyber, Carbonite, Core) at DEBUG.
-
-    On the `batcher.api.run` logger these follow the one `log_level` setting, and the phase
-    and duration are structured fields, so "where did the control plane spend its time" is
-    answerable without re-parsing text.
-    """
-    log_kv(_log, logging.DEBUG, "run phase", phase=name, seconds=round(seconds, 3))
 
 
 def _log_decisions(opt, decisions, verdict, *, distributed: bool) -> None:
@@ -235,6 +226,7 @@ def _optimize(plan, sources, ctx, *, hardware=None):
     from batcher import kyber
     from batcher.api.terminal._metadata import seed_column_ndv
 
+    phases.begin("collect_source_stats")
     mark = time.perf_counter()
     # Reuse the conductor's already-collected stats when present: the metadata-answer
     # attempt for a missed count()/is_empty() collected them, so a terminal op reads each
@@ -244,8 +236,9 @@ def _optimize(plan, sources, ctx, *, hardware=None):
         if ctx.source_stats is not None
         else collect_source_stats(sources, ctx.hub, need_columns=column_bounds_needed(plan))
     )
-    _phase("collect_source_stats", time.perf_counter() - mark)
+    phases.record("collect_source_stats", time.perf_counter() - mark)
 
+    phases.begin("kyber.optimize_full")
     mark = time.perf_counter()
     # No file footer carries a distinct count, so without this seeding a query's *first*
     # run orders its joins blind.
@@ -256,7 +249,7 @@ def _optimize(plan, sources, ctx, *, hardware=None):
     result = kyber.optimize_full(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats, hardware=hardware
     )
-    _phase("kyber.optimize_full", time.perf_counter() - mark)
+    phases.record("kyber.optimize_full", time.perf_counter() - mark)
     return result
 
 
@@ -383,6 +376,42 @@ def record_cardinality_outcome(hub, plan, sources, out_rows: int) -> None:
     kyber.record_selectivity(hub, plan, sources, out_rows)
 
 
+def close_plan_learning_loops(
+    plan, logical_opt, ctx, sources, out_rows: int, decisions, *, started: float
+) -> None:
+    """The learning loops that read only the *plan and its data* — no resource manager.
+
+    Measured output cardinality, the filter's measured selectivity, and the conductor's
+    per-run tuning feedback. Split out from `_close_resident_free_loops` so a path that
+    makes **no resource decision** can still close them: `fast_path` skips Carbonite
+    admission and sizing by construction, so it has no `rm` to report a flap rate from and
+    no envelope high-water mark to publish — but everything here it measured just as truly
+    as the ordinary path did, and dropping it was what made "no cross-query learning" the
+    price of skipping the orchestration. The two are independent, and this is the seam.
+
+    Args:
+        plan: The pre-optimization plan — the identity the learners key on.
+        logical_opt: The optimized logical plan the run executed.
+        ctx: The execution context carrying the hub to record into.
+        sources: The plan's bound sources, for the selectivity denominator.
+        out_rows: Rows the run actually produced.
+        decisions: The optimizer's per-join build-side decisions.
+        started: `time.perf_counter()` at the start of the run, for the wall time.
+    """
+    from batcher.api.tuning import record_run_feedback, total_source_rows
+
+    record_cardinality_outcome(ctx.hub, plan, sources, out_rows)
+    record_run_feedback(
+        ctx.hub,
+        plan,
+        logical_opt,
+        decisions,
+        out_rows=out_rows,
+        input_rows=total_source_rows(sources),
+        wall_ms=(time.perf_counter() - started) * 1000.0,
+    )
+
+
 def _close_resident_free_loops(
     plan, logical_opt, ctx, rm, sources, out_rows: int, decisions, *, started: float
 ):
@@ -405,18 +434,7 @@ def _close_resident_free_loops(
     that oscillates under memory pressure, and it was being recorded only on the path that
     did *not* hit pressure.
     """
-    from batcher.api.tuning import record_run_feedback, total_source_rows
-
-    record_cardinality_outcome(ctx.hub, plan, sources, out_rows)
-    record_run_feedback(
-        ctx.hub,
-        plan,
-        logical_opt,
-        decisions,
-        out_rows=out_rows,
-        input_rows=total_source_rows(sources),
-        wall_ms=(time.perf_counter() - started) * 1000.0,
-    )
+    close_plan_learning_loops(plan, logical_opt, ctx, sources, out_rows, decisions, started=started)
     _record_flap_rate(ctx.hub, rm)
     # The envelope's high-water mark, the spill volume and the cache's hit rate, onto the
     # bus — read here for the same reason the flap rate is, and only here: at admission none
@@ -525,9 +543,10 @@ def _run_relational_scoped(
             kyber.record_execution(ctx.hub, plan, 0)
             return empty, decisions
 
+    phases.begin("carbonite.validate")
     mark = time.perf_counter()
     rm, verdict, must_spill = _admit(opt, decisions, ctx, distributed=distributed)
-    _phase("carbonite.validate", time.perf_counter() - mark)
+    phases.record("carbonite.validate", time.perf_counter() - mark)
 
     if distributed:
         result = execute_distributed(
@@ -539,7 +558,7 @@ def _run_relational_scoped(
             opt,
             decisions,
             materialize=materialize,
-            phase=_phase,
+            phase=phases.record,
             started=started,
         )
         return result, decisions
@@ -552,7 +571,10 @@ def _run_relational_scoped(
     # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
     # plan's peak state are concurrent on this path, so what matters is their sum.
     if must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt):
+        phases.begin("core.execute.spilled")
+        mark = time.perf_counter()
         spilled = spill_to_disk(logical_opt, sources, ctx, rm, opt, verdict)
+        phases.record("core.execute.spilled", time.perf_counter() - mark)
         if spilled is not None:
             _close_resident_free_loops(
                 plan, logical_opt, ctx, rm, sources, spilled.num_rows, decisions, started=started
@@ -584,7 +606,10 @@ def _run_relational_scoped(
             # As in `spill_to_disk`: this path runs unmetered engine dispatches, so the
             # whole-phase reading is the only account of what it cost.
             watch = UsageStopwatch()
+            phases.begin("core.execute.spilled")
+            mark = time.perf_counter()
             spilled = spill_collect(logical_opt, sources, parts)
+            phases.record("core.execute.spilled", time.perf_counter() - mark)
             if spilled is not None:
                 if ctx.profile is not None:
                     ctx.profile.record_usage(watch.finish())
@@ -599,7 +624,13 @@ def _run_relational_scoped(
                     started=started,
                 )
                 return spilled, decisions
+        # The phase a reader came for. Everything recorded above it is *planning*, so the
+        # log could say the control plane spent 23 ms deciding and not whether the engine
+        # then ran for 2 ms or two minutes. See `orchestration.phases`.
+        phases.begin("core.execute")
+        mark = time.perf_counter()
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
+        phases.record("core.execute", time.perf_counter() - mark)
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started

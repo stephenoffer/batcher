@@ -29,7 +29,17 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.bloom_index import BloomIndex
-from batcher.plan.expr_ir import Binary, Expr, InList, IsNotNull, IsNull, Lit, Not
+from batcher.plan.expr_ir import (
+    Binary,
+    Col,
+    Expr,
+    InList,
+    IsNotNull,
+    IsNull,
+    Lit,
+    Not,
+    remap_columns,
+)
 from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS, LEFT_DRIVEN_JOINS
 from batcher.plan.logical import (
     Distinct,
@@ -37,6 +47,7 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
+    Project,
     Sample,
     Sort,
     Union,
@@ -48,7 +59,7 @@ from batcher.plan.stats import (
     mismatched_exactness,
 )
 
-__all__ = ["propagate_empty_relation", "zonemap_prune_filter"]
+__all__ = ["implied_by_bounds", "propagate_empty_relation", "zonemap_prune_filter"]
 
 # A predicate's decidability against known column bounds: provably keeps every row
 # (True), provably keeps none (False), or undecidable from metadata (None).
@@ -485,4 +496,90 @@ def _decide(op: str, cmin, cmax, lit, no_nulls: bool) -> bool | None:
         if cmin == cmax == lit:
             return _FALSE
         return _TRUE if ((lit < cmin or lit > cmax) and no_nulls) else None
+    return None
+
+
+#: How far `implied_by_bounds` follows a column down before giving up. A plan deep enough
+#: to exceed this is one where the descent's cost stops being worth the cycle it prevents,
+#: and stopping early only means a conjunct is added that may later be dropped — the
+#: pre-existing behaviour, never a wrong answer.
+_IMPLIED_TRACE_DEPTH = 24
+
+
+def implied_by_bounds(
+    target: LogicalPlan, target_key: str, conj: Expr, ctx: OptimizerContext
+) -> bool:
+    """Whether any relation `conj` can be pushed down to already proves it of every row.
+
+    Not just `target`'s own statistics, and that distinction is the whole point. An
+    inferred conjunct does not stay where it is put: `predicate_pushdown` and
+    `push_filter_through_project` sink it toward the scan, and
+    `drop_filter_conjunct_implied_by_zonemap` deletes it at whatever depth the bounds
+    decide it. Testing only the level it is *added* at therefore answers a different
+    question from the one that governs whether it survives — measured on TPC-DS q39, where
+    `inv_warehouse_sk = 1` was undecidable over the join side's `Project` and provable one
+    level down over the `Scan`, so the conjunct was added, pushed, dropped, and inferred
+    again for the whole iteration budget.
+
+    So the column is followed down the same path `_column_constraints` follows it up:
+    through row-preserving operators, through a projection that merely renames it, and into
+    the originating side of an inner join, re-phrased at each step, asking the same oracle
+    the deleting rule asks. Anything else (a computed projection, an aggregate, a non-inner
+    join) stops the descent, exactly as it stops pushdown.
+
+    Args:
+        target: The join side the conjunct would be attached to.
+        target_key: The column of `target`'s output that `conj` constrains.
+        conj: The candidate conjunct, already phrased on `target_key`.
+        ctx: The optimizer context, for the estimator.
+
+    Returns:
+        True if some reachable relation's bounds prove `conj` true of all its rows, so
+        adding it would prune nothing and only start an add/drop cycle.
+    """
+    node: LogicalPlan | None = target
+    name, expr = target_key, conj
+    for _ in range(_IMPLIED_TRACE_DEPTH):
+        if node is None:
+            return False
+        if _predicate_status(expr, ctx.estimator.estimate(node)) is True:
+            return True
+        if isinstance(node, (Filter, Sort, Limit, Sample, Distinct)):
+            node = node.input
+            continue
+        if isinstance(node, Project):
+            src = _rename_source(node, name)
+            if src is None:
+                return False
+            node, expr, name = node.input, remap_columns(expr, {name: src}), src
+            continue
+        if isinstance(node, Join) and node.join_type == "inner":
+            step = _follow_join_output(node, name)
+            if step is None:
+                return False
+            node, src = step
+            expr, name = remap_columns(expr, {name: src}), src
+            continue
+        return False
+    return False
+
+
+def _rename_source(node: Project, alias: str) -> str | None:
+    """The input column `alias` is a pure rename of, or None if it is computed or absent.
+
+    A *computed* projection stops the descent for the same reason it stops pushdown: the
+    conjunct is phrased on the output column, and there is no input column to re-phrase it
+    onto.
+    """
+    for item in node.items:
+        if item.alias == alias:
+            return item.expr.name if isinstance(item.expr, Col) else None
+    return None
+
+
+def _follow_join_output(node: Join, alias: str) -> tuple[LogicalPlan, str] | None:
+    """The child relation and source column an inner join's output `alias` comes from."""
+    for o in node.output:
+        if o.alias == alias:
+            return (node.left if o.side == "left" else node.right), o.name
     return None

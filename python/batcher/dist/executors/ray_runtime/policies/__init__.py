@@ -29,6 +29,8 @@ from ._faults import (
     runtime_bloom_join,
     skew_join_salt,
     speculation_policy,
+    task_event_options,
+    transient_exception_allowlist,
 )
 
 # The leading `_`-prefixed names are private to the package but re-exported deliberately:
@@ -54,4 +56,6 @@ __all__ = [
     "runtime_bloom_join",
     "skew_join_salt",
     "speculation_policy",
+    "task_event_options",
+    "transient_exception_allowlist",
 ]

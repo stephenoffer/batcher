@@ -79,6 +79,14 @@ def _clamp(monkeypatch, nodes, workers, num_cpus, num_gpus=0.0):
     # `placeable_workers` imports `node_classes` from `scaling` at call time, so patching it
     # here reaches both the clamp and the capacity check.
     monkeypatch.setattr(scaling, "node_classes", lambda: nodes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     monkeypatch.setattr(
         scaling,
         "cluster_topology",
@@ -142,6 +150,14 @@ def test_cpu_fleet_isolation_triggers_on_a_pure_tpu_plus_cpu_cluster(monkeypatch
         {"cpus": 32.0, "gpus": 0.0, "accelerators": 0.0, "accelerator_type": None},
     ]
     monkeypatch.setattr(scaling, "node_classes", lambda: nodes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     # 8 single-core workers fit on the 32 CPU-only cores, keeping them off the 16 TPU-node cores.
     assert scaling.cpu_only_can_host(8, 1.0) is True
     # 40 would need the TPU node's cores too, so the restriction is dropped (don't under-provision).
@@ -153,4 +169,12 @@ def test_a_pure_cpu_cluster_still_gets_no_isolation(monkeypatch):
 
     nodes = [{"cpus": 16.0, "gpus": 0.0, "accelerators": 0.0, "accelerator_type": None}]
     monkeypatch.setattr(scaling, "node_classes", lambda: nodes)
+    # The census view derives from the same stub, so a consumer reading either seam sees
+    # one fleet. `count: 1` keeps these fixtures one node per entry, which is what they
+    # describe; the weighting itself is pinned in `test_node_class_census.py`.
+    monkeypatch.setattr(
+        scaling,
+        "node_class_census",
+        lambda: [{**entry, "count": 1} for entry in scaling.node_classes()],
+    )
     assert scaling.cpu_only_can_host(4, 1.0) is False  # nothing to keep off → no restriction

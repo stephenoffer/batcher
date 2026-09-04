@@ -559,15 +559,12 @@ async fn read_parquet_async(
                     let Some(meta) = row_groups.get(rg) else {
                         continue;
                     };
-                    match row_filter::estimate(pred, meta, &col_index) {
-                        Some(f) => {
-                            weighted += f * meta.num_rows() as f64;
-                            rows += meta.num_rows() as f64;
-                        }
-                        None => {
-                            usable = false;
-                            break;
-                        }
+                    if let Some(f) = row_filter::estimate(pred, meta, &col_index) {
+                        weighted += f * meta.num_rows() as f64;
+                        rows += meta.num_rows() as f64;
+                    } else {
+                        usable = false;
+                        break;
                     }
                 }
                 usable && rows > 0.0 && !row_filter::worth_it_frac(weighted / rows)

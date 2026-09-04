@@ -57,7 +57,7 @@ def test_a_sorted_declared_file_is_recognized(tmp_path) -> None:
 
 
 def test_two_files_ordered_across_the_boundary_are_recognized(tmp_path) -> None:
-    pq.write_table(_table(range(0, 500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
+    pq.write_table(_table(range(500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
     pq.write_table(
         _table(range(500, 1000)), str(tmp_path / "b.parquet"), sorting_columns=_ASCENDING
     )
@@ -142,7 +142,7 @@ def test_descending_files_ordered_across_the_boundary_are_recognized(tmp_path) -
 
 def test_files_disagreeing_about_direction_are_refused(tmp_path) -> None:
     """One file ascending and one descending is not one ordering."""
-    pq.write_table(_table(range(0, 500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
+    pq.write_table(_table(range(500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
     pq.write_table(
         _table(range(999, 499, -1)), str(tmp_path / "b.parquet"), sorting_columns=_DESCENDING
     )
@@ -156,13 +156,13 @@ def test_files_each_sorted_but_out_of_order_are_refused(tmp_path) -> None:
     pq.write_table(
         _table(range(500, 1000)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING
     )
-    pq.write_table(_table(range(0, 500)), str(tmp_path / "b.parquet"), sorting_columns=_ASCENDING)
+    pq.write_table(_table(range(500)), str(tmp_path / "b.parquet"), sorting_columns=_ASCENDING)
 
     assert _sorted_by(tmp_path) == ()
 
 
 def test_a_mix_of_declared_and_undeclared_files_is_refused(tmp_path) -> None:
-    pq.write_table(_table(range(0, 500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
+    pq.write_table(_table(range(500)), str(tmp_path / "a.parquet"), sorting_columns=_ASCENDING)
     pq.write_table(_table(range(500, 1000)), str(tmp_path / "b.parquet"))
 
     assert _sorted_by(tmp_path) == ()
@@ -212,8 +212,17 @@ def test_the_claim_reaches_the_planner(tmp_path) -> None:
 
 
 def _ops(ds) -> list[str]:
-    """The optimized plan's operators, outermost first, read out of `explain()`."""
-    return [line.strip().split()[0] for line in ds.explain().strip().splitlines()]
+    """The optimized plan's operators, outermost first, read out of `explain()`.
+
+    `explain()` renders a table: a title line, a rule, an ``OPERATOR ...`` column header,
+    then one row per operator with `└─`/`├─`/`│` tree glyphs marking depth. Both have to be
+    stripped, and stripping the glyphs is the half that matters -- taking the first token of
+    a raw line yields `"└─"` for every nested operator, so a membership assertion about any
+    operator below the root reads false whether or not the operator is there.
+    """
+    lines = ds.explain().strip().splitlines()
+    header = next(i for i, line in enumerate(lines) if line.startswith("OPERATOR"))
+    return [line.strip().lstrip("└├─│ ").split()[0] for line in lines[header + 1 :]]
 
 
 def test_a_resort_matching_a_proved_descending_source_is_deleted(tmp_path) -> None:

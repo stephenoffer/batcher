@@ -45,9 +45,9 @@ def _ray_session():
 
 
 @pytest.fixture(scope="module")
-def split_source(tmp_path_factory):
+def split_source(cluster_scratch):
     """A genuinely splittable source: several Parquet files, several row-groups each."""
-    d = tmp_path_factory.mktemp("split")
+    d = cluster_scratch("split")
     rng = np.random.default_rng(11)
     for i in range(4):
         pq.write_table(
@@ -115,9 +115,9 @@ def test_distributed_fraction_sample_still_matches(split_source):
 
 
 @pytest.fixture(scope="module")
-def bands(tmp_path_factory):
+def bands(cluster_scratch):
     """A small build side — the canonical range-join shape (events against a few bands)."""
-    d = tmp_path_factory.mktemp("bands")
+    d = cluster_scratch("bands")
     pq.write_table(
         pa.table({"lo": [0, 500, 1_000, 1_500], "tier": ["a", "b", "c", "d"]}),
         d / "bands.parquet",
@@ -154,9 +154,9 @@ def test_distributed_range_join_every_inequality(split_source, bands, op):
 
 
 @pytest.mark.integration
-def test_distributed_band_join_two_conditions(split_source, tmp_path_factory):
+def test_distributed_band_join_two_conditions(split_source, cluster_scratch):
     """Two inequalities (an interval containment) — the IEJoin shape."""
-    d = tmp_path_factory.mktemp("intervals")
+    d = cluster_scratch("intervals")
     pq.write_table(
         pa.table({"lo": [0, 400, 900], "hi": [300, 800, 1_400], "tier": ["a", "b", "c"]}),
         d / "iv.parquet",

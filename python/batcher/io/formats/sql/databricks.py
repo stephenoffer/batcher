@@ -278,6 +278,22 @@ class DatabricksSource:
         )
         return f"databricks-wh:{fingerprint}:{self.query}"
 
+    def governed_name(self) -> str:
+        """The Databricks table, when one was named rather than a query.
+
+        Distinct from `identity`, which names a *relation*: it folds in a
+        `connection_fingerprint` so the same table on staging and on production cannot share
+        one statistics entry. A policy is the other thing. It is written before the first
+        read by someone who has to be able to **type the name**, and a fingerprint is a
+        sha256 of the connection options -- so keying governance on the identity meant a
+        policy on this connector could not be written at all. Every read was ungoverned, and
+        nothing said so.
+
+        Returns:
+            The table name a policy is keyed on, or ``""`` when there is none.
+        """
+        return self.table or ""
+
     def splits(
         self,
         target_size: int | None = None,

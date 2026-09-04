@@ -61,9 +61,14 @@ directly above the scan.
 ### b. Join order and build side
 The smaller side should be the build side. Check the `decisions:` block for the
 `[kyber/selection] join build side: ...` line and its `[exact|learned|default]`
-provenance — `default` means Kyber guessed. Kyber reorders joins by DP up to
-`optimizer.join_dp_max_tables` (12) and greedily up to `greedy_max_tables` (25); past 25
-there is no reordering at all, so hand-order the joins yourself. Broadcast kicks in under
+provenance — `default` means Kyber guessed. Kyber reorders joins by DP over connected subsets of the
+join graph, with a greedy fallback, and decides how hard to search per query: it prices
+the join region and grants a share of that estimated cost back as search time
+(`kyber/rules/joins/order_budget.py`). So a query too cheap to repay the search takes the
+greedy order by design — that is not a knob you need to set, and
+`optimizer.join_dp_max_tables` / `greedy_max_tables` are read by nothing. If a large
+query is still getting a poor order, the cardinalities feeding the cost model are the
+thing to look at, not the search. Broadcast kicks in under
 `optimizer.broadcast_max_bytes` (4 MiB).
 
 ### c. Do not `collect()` a large result

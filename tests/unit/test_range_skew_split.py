@@ -192,6 +192,29 @@ def test_a_descending_sort_is_not_split(nulls_first):
     assert plan_hot_split(grids, boundaries, 16, nulls_first, False) is not None
 
 
+@pytest.mark.parametrize("nulls_first", [False, True])
+def test_a_multi_key_sort_is_not_split(nulls_first):
+    """A hot value's rows tie on the LEADING key, which is not the same as tying on the sort.
+
+    The split spreads them across sub-buckets and the driver concatenates those in mapper
+    order, so a secondary key that would have ordered them is overruled by which mapper read
+    the row. That is a mis-sorted relation, not a different tie-break.
+
+    Found on TPC-H q7 (`ORDER BY supp_nation, cust_nation, l_year`): its leading key holds
+    two values over millions of rows, so it is always hot, and the distributed run returned
+    `(GERMANY, FRANCE, 1996)` before `(GERMANY, FRANCE, 1995)` while the single-node run was
+    correct. Pinned here because the split is otherwise entirely reasonable and the failure
+    is invisible to any assertion on the row multiset.
+    """
+    parts = _skewed()
+    grids = _grids(parts, sample_probs(16, len(parts)))
+    boundaries = merge_boundaries(grids, 16)
+    assert plan_hot_split(grids, boundaries, 16, nulls_first, False, single_key=False) is None
+    # The control: the same skew, one key, still splits — so this test can tell the guard
+    # from a split that simply stopped happening.
+    assert plan_hot_split(grids, boundaries, 16, nulls_first, False, single_key=True) is not None
+
+
 def test_the_engine_sorts_ties_stably_in_both_directions():
     """The fact the reversal above rests on, checked against the engine rather than assumed —
     getting it backwards is invisible to any assertion on keys or on the row multiset."""

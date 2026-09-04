@@ -55,14 +55,11 @@ pub(crate) fn jaccard_utf8(
             let (li, ri) = (ls + k, rs + k);
             // A null element on either side is a disagreement, matching the numeric branch,
             // where a null cannot equal anything.
-            let eq = match (left_str, right_str) {
-                (Some(l), Some(r)) => {
-                    !l.is_null(li) && !r.is_null(ri) && l.value(li) == r.value(ri)
-                }
-                _ => {
-                    let (l, r) = (lv.as_string::<i64>(), rv.as_string::<i64>());
-                    !l.is_null(li) && !r.is_null(ri) && l.value(li) == r.value(ri)
-                }
+            let eq = if let (Some(l), Some(r)) = (left_str, right_str) {
+                !l.is_null(li) && !r.is_null(ri) && l.value(li) == r.value(ri)
+            } else {
+                let (l, r) = (lv.as_string::<i64>(), rv.as_string::<i64>());
+                !l.is_null(li) && !r.is_null(ri) && l.value(li) == r.value(ri)
             };
             agree += usize::from(eq);
         }

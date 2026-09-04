@@ -46,6 +46,7 @@ impl Default for DDSketch {
 impl DDSketch {
     /// Create an empty sketch with relative accuracy `alpha ∈ (0, 1)` (e.g. 0.01
     /// for 1%). Smaller `alpha` → tighter buckets and more memory.
+    #[must_use]
     pub fn new(alpha: f64) -> Self {
         assert!(
             alpha > 0.0 && alpha < 1.0,
@@ -66,24 +67,29 @@ impl DDSketch {
     }
 
     /// Number of values seen.
+    #[must_use]
     pub fn count(&self) -> u64 {
         self.n
     }
 
     /// True if no (non-NaN) value has been added.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
 
     /// Exact minimum / maximum seen (`None` if empty).
+    #[must_use]
     pub fn min(&self) -> Option<f64> {
         (self.n > 0).then_some(self.min)
     }
+    #[must_use]
     pub fn max(&self) -> Option<f64> {
         (self.n > 0).then_some(self.max)
     }
 
     /// The configured relative accuracy `α`.
+    #[must_use]
     pub fn relative_accuracy(&self) -> f64 {
         self.alpha
     }
@@ -132,6 +138,7 @@ impl DDSketch {
     /// Approximate value at quantile `q ∈ [0, 1]` (`None` if empty). `q=0`/`q=1`
     /// return the exact min/max; otherwise the result is within relative error
     /// `α` of the true quantile, and always inside the observed `[min, max]`.
+    #[must_use]
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.n == 0 {
             return None;
@@ -162,7 +169,7 @@ impl DDSketch {
             return Some(self.bounded(0.0));
         }
         // Then positive buckets, ascending.
-        for (&i, &c) in self.positive.iter() {
+        for (&i, &c) in &self.positive {
             cum += c;
             if cum as f64 > target {
                 return Some(self.bounded(self.value_of(i)));
@@ -194,6 +201,7 @@ impl DDSketch {
     }
 
     /// Convenience: the median.
+    #[must_use]
     pub fn median(&self) -> Option<f64> {
         self.quantile(0.5)
     }
@@ -217,6 +225,7 @@ impl DDSketch {
     /// `KllSketch::rank` are), so `rank(max) == 1.0` and `rank(< min) == 0.0`
     /// exactly. Without that clamp `selectivity_gt = 1 - rank` carries a non-zero
     /// floor no predicate can ever clear, which biases the optimizer's cost model.
+    #[must_use]
     pub fn rank(&self, x: f64) -> f64 {
         if self.n == 0 {
             return 0.0;
@@ -240,7 +249,7 @@ impl DDSketch {
             // x ≥ 0: every negative and every zero is ≤ x.
             below += self.negative.values().sum::<u64>();
             below += self.zeros;
-            for (&i, &c) in self.positive.iter() {
+            for (&i, &c) in &self.positive {
                 let upper = self.upper_bound_of(i);
                 if upper <= x {
                     below += c;
@@ -293,6 +302,7 @@ impl DDSketch {
     /// `[pos_len: u64]{[index: i32][count: u64]}×pos_len`
     /// `[neg_len: u64]{[index: i32][count: u64]}×neg_len`.
     /// `gamma`/`ln_gamma` are derived from `alpha` on load.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         // Exact wire size: 5×8 header + per map (u64 len + entries×(i32+u64)) — one allocation.
         let entries = self.positive.len() + self.negative.len();
@@ -304,7 +314,7 @@ impl DDSketch {
         out.extend_from_slice(&self.max.to_le_bytes());
         for map in [&self.positive, &self.negative] {
             out.extend_from_slice(&(map.len() as u64).to_le_bytes());
-            for (&i, &c) in map.iter() {
+            for (&i, &c) in map {
                 out.extend_from_slice(&i.to_le_bytes());
                 out.extend_from_slice(&c.to_le_bytes());
             }
@@ -314,6 +324,7 @@ impl DDSketch {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on truncated
     /// or otherwise malformed input.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         let alpha = c.f64()?;
@@ -325,7 +336,7 @@ impl DDSketch {
         let min = c.f64()?;
         let max = c.f64()?;
         let mut maps: [BTreeMap<i32, u64>; 2] = [BTreeMap::new(), BTreeMap::new()];
-        for map in maps.iter_mut() {
+        for map in &mut maps {
             let len = c.u64()? as usize;
             for _ in 0..len {
                 let i = c.i32()?;
@@ -408,10 +419,10 @@ impl Mergeable for DDSketch {
         if other.n == 0 {
             return;
         }
-        for (&i, &c) in other.positive.iter() {
+        for (&i, &c) in &other.positive {
             *self.positive.entry(i).or_insert(0) += c;
         }
-        for (&i, &c) in other.negative.iter() {
+        for (&i, &c) in &other.negative {
             *self.negative.entry(i).or_insert(0) += c;
         }
         self.zeros += other.zeros;
@@ -455,19 +466,19 @@ mod tests {
             (0..5_000)
                 .map(|i| if i % 2 == 0 { 2.0 } else { 8.0 })
                 .collect(),
-            (0..5_000).map(|i| (i % 5 + 1) as f64).collect(), // five distinct values
-            (0..5_000).map(|i| -((i % 5 + 1) as f64)).collect(), // all negative
-            (0..5_000).map(|i| (i % 11) as f64 - 5.0).collect(), // spanning zero
+            (0..5_000).map(|i| f64::from(i % 5 + 1)).collect(), // five distinct values
+            (0..5_000).map(|i| -f64::from(i % 5 + 1)).collect(), // all negative
+            (0..5_000).map(|i| f64::from(i % 11) - 5.0).collect(), // spanning zero
         ];
         for values in cases {
             let mut sketch = DDSketch::new(0.01);
             for &v in &values {
                 sketch.add(v);
             }
-            let lo = values.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             for step in 0..=100 {
-                let q = step as f64 / 100.0;
+                let q = f64::from(step) / 100.0;
                 let got = sketch.quantile(q).expect("non-empty");
                 assert!(
                     got >= lo && got <= hi,
@@ -486,7 +497,7 @@ mod tests {
                 sketch.add(c);
             }
             for step in 0..=20 {
-                let q = step as f64 / 20.0;
+                let q = f64::from(step) / 20.0;
                 assert_eq!(sketch.quantile(q), Some(c), "q={q} on constant {c}");
             }
         }
@@ -578,7 +589,7 @@ mod tests {
     fn rank_at_max_is_one() {
         let mut d = DDSketch::new(0.01);
         for i in 1..=100 {
-            d.add(i as f64);
+            d.add(f64::from(i));
         }
         assert_eq!(d.rank(100.0), 1.0, "rank at the maximum must be exactly 1");
         assert_eq!(d.rank(1.0e9), 1.0);
@@ -587,7 +598,7 @@ mod tests {
         // Signed data: the same must hold on the negative side.
         let mut e = DDSketch::new(0.01);
         for i in -50..=50 {
-            e.add(i as f64);
+            e.add(f64::from(i));
         }
         assert_eq!(e.rank(50.0), 1.0);
         assert_eq!(e.rank(-50.0 - 1e-9), 0.0);
@@ -604,10 +615,10 @@ mod tests {
     fn rank_respects_relative_accuracy() {
         for alpha in [0.01, 0.05] {
             // Signed data spanning zero, plus a Pareto tail.
-            let mut vals: Vec<f64> = (-500..=500).map(|i| i as f64 * 0.37).collect();
+            let mut vals: Vec<f64> = (-500..=500).map(|i| f64::from(i) * 0.37).collect();
             for i in 1..=2_000u32 {
-                vals.push(10.0 / (i as f64 / 2_000.0).powf(1.5)); // heavy tail
-                vals.push(-3.0 / (i as f64 / 2_000.0).powf(1.2));
+                vals.push(10.0 / (f64::from(i) / 2_000.0).powf(1.5)); // heavy tail
+                vals.push(-3.0 / (f64::from(i) / 2_000.0).powf(1.2));
             }
             let mut d = DDSketch::new(alpha);
             for &v in &vals {
@@ -617,7 +628,7 @@ mod tests {
             let frac_le = |t: f64| vals.iter().filter(|&&v| v <= t).count() as f64 / n;
 
             let mut probes: Vec<f64> = vec![-1e6, -1_000.0, -1.0, -0.001, 0.0, 0.001, 1.0, 1e6];
-            probes.extend((0..40).map(|i| d.quantile(i as f64 / 40.0).unwrap()));
+            probes.extend((0..40).map(|i| d.quantile(f64::from(i) / 40.0).unwrap()));
 
             let mut prev = 0.0;
             probes.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -651,9 +662,9 @@ mod tests {
     #[test]
     fn quantile_relative_error_within_alpha() {
         for alpha in [0.01, 0.05] {
-            let mut vals: Vec<f64> = (1..=5_000).map(|i| i as f64 * 0.11).collect();
+            let mut vals: Vec<f64> = (1..=5_000).map(|i| f64::from(i) * 0.11).collect();
             for i in 1..=2_000u32 {
-                vals.push(10.0 / (i as f64 / 2_000.0).powf(1.5));
+                vals.push(10.0 / (f64::from(i) / 2_000.0).powf(1.5));
             }
             let mut d = DDSketch::new(alpha);
             for &v in &vals {
@@ -663,7 +674,7 @@ mod tests {
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
             for i in 1..100 {
-                let q = i as f64 / 100.0;
+                let q = f64::from(i) / 100.0;
                 let k = (q * (sorted.len() - 1) as f64).round() as usize;
                 let got = d.quantile(q).unwrap();
                 // ±1 rank of slack for the 0-based index convention; the assertion

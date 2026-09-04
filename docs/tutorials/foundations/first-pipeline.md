@@ -132,11 +132,14 @@ you can see whether the optimizer pushed the filter down to the scan and which c
 survived pruning.
 
 ```text
-sort                            est≈2,000 (default)
-  aggregate                     est≈2,000 (default)
-    project                     est≈20,000 (default)
-      filter                    est≈20,000 (default)
-        scan                    est≈200,000 (exact)
+query plan (planned)                                       5 operators
+──────────────────────────────────────────────────────────────────────
+OPERATOR                              ESTIMATE  NOTES
+sort  [revenue]                        est≈2,000  (default)
+└─ aggregate  [by region · sum]        est≈2,000  (default)
+   └─ project                         est≈20,000  (default)
+      └─ filter  [status = paid]      est≈20,000  (default)
+         └─ scan  [source 0]         est≈200,000  (exact)  pushed[status = paid]
 ```
 
 That example is from {doc}`optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`, which is the

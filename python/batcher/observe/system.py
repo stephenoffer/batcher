@@ -5,12 +5,18 @@ context every number elsewhere in the dashboard is relative to: a 400ms aggregat
 something different on 4 cores than on 96, and a spill verdict means nothing without the
 memory budget it was measured against.
 
-**Reports what it can actually see.** CPU count comes from `_internal.hardware`, which
-already resolves cgroup quotas and affinity masks rather than trusting `os.cpu_count()` —
-so a container limited to 2 cores reports 2, not the host's 96. Memory and GPU come from
-optional dependencies; when they are absent the field is `None` and the panel says
-"unknown" instead of guessing. A dashboard that invents a number is worse than one that
-admits a gap, because the gap is at least actionable.
+**Reports what it can actually see.** Every CPU and memory figure comes from
+`_internal.hardware`, which resolves cgroup quotas and affinity masks rather than trusting
+`os.cpu_count()` or the host's RAM — so a container limited to 2 cores and 8 GiB reports
+those, not the host's 96 and 184. The core count always did; the memory total and the
+physical-core count did not, and read `psutil` (or `SC_PHYS_PAGES`) directly, which report
+the *host*. A panel pairing a cgroup-aware core count with a host memory total describes a
+machine nobody is running on, and the memory budget is the very figure this module's own
+spill verdict has to be read against.
+
+GPU inventory still comes from an optional dependency; when it is absent the field is
+`None` and the panel says "unknown" instead of guessing. A dashboard that invents a number
+is worse than one that admits a gap, because the gap is at least actionable.
 
 Sampled fresh on request rather than cached: the live memory figure is the point, and the
 static fields cost nothing to re-read.
@@ -23,7 +29,13 @@ import platform
 import sys
 from typing import Any
 
-from batcher._internal.hardware import available_cpu_count, gpu_inventory, hardware_profile
+from batcher._internal.hardware import (
+    available_cpu_count,
+    gpu_inventory,
+    hardware_profile,
+    machine_memory_bytes,
+    physical_core_count,
+)
 from batcher._internal.native import engine_or_none
 
 __all__ = ["system_snapshot"]
@@ -81,32 +93,52 @@ def _host() -> dict[str, Any]:
 def _memory() -> tuple[int | None, int | None]:
     """``(total, available)`` RAM in bytes, or ``(None, None)`` when unobservable.
 
+    `total` is the **binding ceiling this process runs under** — `machine_memory_bytes`,
+    which is `min(host RAM less reserved hugepages, memory.max, memory.high, a scheduler's
+    grant, RLIMIT_AS)`. It used to be `psutil.virtual_memory().total`, which is the host's
+    RAM: on an 8 GiB pod of a 184 GiB node the panel reported 184, beside a core count that
+    correctly said 2.
+
+    `available` stays live from `psutil`, because nothing at this layer publishes a
+    cgroup-aware "available" (Carbonite's `memory.probe` does, and `observe` must not import
+    a subsystem). It is clamped to `total` so the pair cannot report more free memory than
+    the process is allowed to hold, which is what a host reading beside a cgroup ceiling
+    would otherwise do.
+
     `psutil` is a declared dependency but documented as optional at runtime, so this
     degrades rather than raising — the dashboard must not be the thing that fails on a
     stripped-down install.
     """
+    total = machine_memory_bytes() or None
+    available: int | None = None
     try:
         import psutil
 
         virtual = psutil.virtual_memory()
-        return int(virtual.total), int(virtual.available)
+        available = int(virtual.available)
+        if total is None:
+            total = int(virtual.total)
     except Exception:  # pragma: no cover - psutil absent or unreadable
-        try:
-            pages = os.sysconf("SC_PHYS_PAGES")
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            return int(pages * page_size), None
-        except (ValueError, OSError, AttributeError):
-            return None, None
+        if total is None:
+            try:
+                pages = os.sysconf("SC_PHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                total = int(pages * page_size)
+            except (ValueError, OSError, AttributeError):
+                total = None
+    if total is not None and available is not None:
+        available = min(available, total)
+    return total, available
 
 
 def _physical_cpus() -> int | None:
-    """Physical core count, or None. Distinguishes real cores from SMT siblings."""
-    try:
-        import psutil
+    """Physical cores backing the CPUs this process may use, or `None` when unreadable.
 
-        return psutil.cpu_count(logical=False)
-    except Exception:  # pragma: no cover - psutil absent
-        return None
+    From `_internal.hardware`, for the same reason the logical count is: `psutil.cpu_count`
+    counts the host's cores, so it ignored both a cpuset pin and a CFS bandwidth quota and
+    reported 48 for a process budgeted 4.
+    """
+    return physical_core_count() or None
 
 
 def _runtime() -> dict[str, Any]:

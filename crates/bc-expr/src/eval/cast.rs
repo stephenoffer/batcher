@@ -290,13 +290,13 @@ fn parse_string_to_bool(arr: &ArrayRef, try_cast: bool) -> Result<ArrayRef, Expr
     match arr.data_type() {
         DataType::Utf8 => {
             let a = arr.as_string::<i32>();
-            for o in a.iter() {
+            for o in a {
                 push(o)?;
             }
         }
         DataType::LargeUtf8 => {
             let a = arr.as_string::<i64>();
-            for o in a.iter() {
+            for o in a {
                 push(o)?;
             }
         }

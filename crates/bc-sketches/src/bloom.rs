@@ -21,15 +21,22 @@ use crate::{hash_one, Mergeable};
 #[derive(Clone, PartialEq, Eq)]
 pub struct BloomFilter {
     bits: Vec<u64>,  // bit array, packed 64 bits per word
-    num_bits: u64,   // logical bit count (>= 64; a multiple of 64)
+    num_bits: u64,   // logical bit count (>= 64; always a power of two)
     num_hashes: u32, // hash functions per key (>= 1)
 }
 
 impl BloomFilter {
-    /// A bloom with `num_bits` bits (rounded up to a multiple of 64) and `num_hashes`
+    /// A bloom with `num_bits` bits (rounded up to a power of two) and `num_hashes`
     /// hash functions. Prefer [`with_params`](Self::with_params) for a target error.
+    /// The bit count is rounded up to a **power of two**, which is what lets [`Self::positions`]
+    /// reduce a candidate index with a mask instead of `%`. A 64-bit remainder by a runtime
+    /// divisor is a hardware division — tens of cycles — and it is paid `num_hashes` times for
+    /// every key added *and* every key tested, on the two hottest loops a join filter has. The
+    /// rounding costs at most 2x the bits, which only lowers the false-positive rate, and the
+    /// filter is already the smallest structure in a join by an order of magnitude.
+    #[must_use]
     pub fn new(num_bits: u64, num_hashes: u32) -> Self {
-        let num_bits = num_bits.max(64).div_ceil(64) * 64;
+        let num_bits = num_bits.max(64).next_power_of_two();
         Self {
             bits: vec![0; (num_bits / 64) as usize],
             num_bits,
@@ -53,6 +60,7 @@ impl BloomFilter {
     /// Both integers bracketing the real optimum are evaluated and the one needing fewer bits
     /// wins, so the filter meets its target rate at the smallest size that can. Clamps to sane
     /// minimums so a tiny or empty build side still yields a usable (if generous) filter.
+    #[must_use]
     pub fn with_params(expected_items: u64, fp_rate: f64) -> Self {
         let n = expected_items.max(1) as f64;
         let p = fp_rate.clamp(1e-6, 0.5);
@@ -74,11 +82,11 @@ impl BloomFilter {
     /// cannot achieve it at any size, and is reported as infinitely expensive so the caller
     /// picks the other candidate.
     fn bits_for(n: f64, p: f64, k: u32) -> f64 {
-        let root = p.powf(1.0 / k as f64);
+        let root = p.powf(1.0 / f64::from(k));
         if root >= 1.0 {
             return f64::INFINITY;
         }
-        -(k as f64) * n / (1.0 - root).ln()
+        -f64::from(k) * n / (1.0 - root).ln()
     }
 
     /// Add a pre-hashed key.
@@ -95,6 +103,7 @@ impl BloomFilter {
 
     /// Whether a pre-hashed key *may* be present: `false` is definitive (never
     /// added); `true` may be a false positive.
+    #[must_use]
     pub fn contains_hash(&self, hash: u64) -> bool {
         Self::positions(hash, self.num_bits, self.num_hashes)
             .all(|(word, bit)| self.bits[word] & (1u64 << bit) != 0)
@@ -105,10 +114,12 @@ impl BloomFilter {
         self.contains_hash(hash_one(key))
     }
 
+    #[must_use]
     pub fn num_bits(&self) -> u64 {
         self.num_bits
     }
 
+    #[must_use]
     pub fn num_hashes(&self) -> u32 {
         self.num_hashes
     }
@@ -125,14 +136,18 @@ impl BloomFilter {
     fn positions(hash: u64, num_bits: u64, num_hashes: u32) -> impl Iterator<Item = (usize, u32)> {
         let h1 = hash;
         let h2 = (hash >> 32) | 1; // odd → full period
-        (0..num_hashes as u64).map(move |i| {
-            let pos = h1.wrapping_add(i.wrapping_mul(h2)) % num_bits;
-            ((pos / 64) as usize, (pos % 64) as u32)
+                                   // `num_bits` is a power of two by construction ([`Self::new`], and [`Self::from_bytes`]
+                                   // refuses anything else), so the reduction is a mask rather than a division.
+        let mask = num_bits - 1;
+        (0..u64::from(num_hashes)).map(move |i| {
+            let pos = h1.wrapping_add(i.wrapping_mul(h2)) & mask;
+            ((pos >> 6) as usize, (pos & 63) as u32)
         })
     }
 
     /// Serialize to bytes for shipping across the FFI / to distributed workers.
     /// Layout: `num_bits` (u64 LE), `num_hashes` (u32 LE), then the packed words.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + self.bits.len() * 8);
         out.extend_from_slice(&self.num_bits.to_le_bytes());
@@ -144,6 +159,7 @@ impl BloomFilter {
     }
 
     /// Reconstruct a bloom from [`to_bytes`](Self::to_bytes); `None` if malformed.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 12 {
             return None;
@@ -155,9 +171,14 @@ impl BloomFilter {
         // `contains_hash`'s `.all()` is vacuously true and the filter matches every
         // key — a silently unsound join filter rather than a decode error. `new()`
         // clamps it away, so only a corrupt or foreign blob can carry it here.
+        // `num_hashes == 0` aside, the power-of-two check is the other unsoundness guard: it is
+        // what [`Self::positions`]'s mask assumes, and a blob carrying anything else would have
+        // every index folded into the low bits of the array — a filter that reports `false` for
+        // keys it holds, which is the one thing a bloom may never do.
         if num_bits == 0
             || num_hashes == 0
-            || num_bits % 64 != 0
+            || !num_bits.is_power_of_two()
+            || num_bits < 64
             || words.len() != (num_bits / 64) as usize * 8
         {
             return None;
@@ -286,7 +307,7 @@ mod tests {
             (50_000, 0.05),
         ] {
             let f = BloomFilter::with_params(n, p);
-            let k = f.num_hashes() as f64;
+            let k = f64::from(f.num_hashes());
             let analytic = (1.0 - (-k * n as f64 / f.num_bits() as f64).exp()).powf(k);
             assert!(
                 analytic <= p * 1.000_001,

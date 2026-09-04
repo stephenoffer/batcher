@@ -30,7 +30,8 @@ come and go.
 | {doc}`Reading query plans <tuning/explain-plans>` | The plan and the measured profile, and how to find the expensive operator |
 | {doc}`Best practices <tuning/best-practices>` | Patterns for pipelines that stay fast |
 | {doc}`Reading a very large table <tuning/large-tables>` | Plan-time pruning, sampled estimates, and how the work is divided |
-| {doc}`Observability <running/observability>` | Progress, structured logs, and the web dashboard |
+| {doc}`Observability <running/observability>` | The one event channel, structured logs, the dashboard, and the metrics export |
+| {doc}`The terminal <running/terminal>` | What a query prints while it runs, and the one line it leaves behind |
 | {doc}`Troubleshooting <running/troubleshooting>` | The common failures, by symptom |
 | {doc}`GPU fleets <running/gpu-fleets>` | Power budgets, fabric-aware placement, device health, residency |
 | {doc}`Diagnose a slow GPU stage <running/gpu-diagnosis>` | Why a GPU stage was slow, when the answer is not in the plan |

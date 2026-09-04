@@ -90,10 +90,13 @@ print(left.join(right, on="k").group_by("k").agg(s=bt.sum("w")).explain())
 
 :::{dropdown} The plan, and the decision the coefficients drove
 ```text
-aggregate                       est≈2,000 (default)
-  hash_join                     est≈20,000 (default)
-    scan                        est≈20,000 (exact)
-    scan                        est≈1,000 (exact)
+query plan (planned)                                   4 operators
+──────────────────────────────────────────────────────────────────
+OPERATOR                             ESTIMATE  NOTES
+aggregate  [by region · sum]          est≈2,000  (default)
+└─ hash_join  [inner on customer]    est≈20,000  (default)
+   ├─ scan  [source 0]               est≈20,000  (exact)
+   └─ scan  [source 1]                est≈1,000  (exact)
 
 decisions:
   - [kyber/selection] join build side: left≈1,000 right≈20,000 [exact] → swap build→left + broadcast
@@ -183,9 +186,10 @@ image / audio / video     500.0    (media decode: estimated, not measured)
 The media functions are costed high on purpose. That is what makes Kyber push a filter
 *below* an image decode rather than above it.
 
-`Case` costs `0.5 × (branches + 1)` because the engine's `CASE` does not short-circuit. It
-evaluates every branch over every row and selects. `Aliased` costs 0, because it is
-transparent in the IR.
+`Case` costs `0.5 × (branches + 1)` for the selection itself, one masked pick per branch.
+The branches on top of that are charged at the dearest single arm rather than the sum,
+because the engine evaluates one arm per row. `Aliased` costs 0, because it is transparent
+in the IR.
 
 ### The JIT divisor
 
@@ -257,10 +261,58 @@ entire `op_stats` history on every {py:meth}`collect() <batcher.Dataset.collect>
 `kyber/rules/joins/order.py` dispatches on leaf count:
 
 - fewer than 3 leaves: skip (a two-way join is the build-side rule's business)
-- up to 12: exhaustive subset DP, bushy trees, O(3ⁿ)
-- above 12: DPccp-style connected-subgraph DP, bailing above 20 leaves or 200,000 pairs
+- otherwise: a DPccp-style connected-subgraph DP over bushy trees, bounded by a per-query
+  search budget rather than by a fixed cap
 - on a bail, or a disconnected graph: greedy. Start from the smallest leaf, repeatedly add
   the connected leaf minimizing the incremental cost
+
+### How hard to search is itself a decision
+
+The search budget is set per query by `kyber/rules/joins/order_budget.py`, in the unit the DP
+already counts: *evaluated join pairs*, a candidate split that gets built, estimated and
+costed. A pair costs the planner ~150 us, measured across sixteen configurations spanning 6 to
+14 leaves on star and chain graphs, with no trend in leaf count or graph density.
+
+Neither of the axes a fixed cap can use predicts the right answer. Leaf count does not predict
+search *work*, because density decides it: measured over 1,000 rows, a 14-leaf chain evaluates
+455 pairs and a 14-leaf star evaluates 53,248 — the same leaf count and 117 times the work. And
+no static number predicts what a better order is *worth*, because that depends entirely on the
+data: a 15-leaf star over a thousand rows spent 25.5 s searching for an order whose best and
+worst cases are microseconds apart, while the same shape over a petabyte would repay far more
+searching than any cap allows.
+
+So the budget is a share of the region's own estimated execution cost. Kyber prices the join
+region as written, converts that to seconds through a measured ~1.7e-10 seconds per cost unit,
+grants a tenth of it back as search time, and divides by the measured cost of a pair. The
+result is clamped to `[512, 200000]` pairs. The floor covers the full search for every star up
+to 8 leaves and every chain past 15, so small queries keep the plans they already get. The
+ceiling is the same number as the flat cap it replaces, so no query that could afford a search
+before gets a smaller one now — what changed is that the ceiling has to be earned, and only a
+query estimated to run for minutes earns it.
+
+Density is triaged before any of it is spent. The DP knows its connected-subset count before it
+costs anything, and evaluated pairs run about 4 to 7 times that count across every density
+measured, so a graph too dense to search within budget declines immediately instead of spending
+the budget to discover the same thing and handing the answer to greedy regardless.
+
+Measured effect on planning time, over 1,000 rows with the plan cache off, A/B against the
+flat cap on one tree:
+
+| join graph | leaves | flat cap  | budgeted | speedup |
+|------------|-------:|----------:|---------:|--------:|
+| star       |     12 |  1.849 s  | 0.017 s  |  108x   |
+| star       |     13 |  4.821 s  | 0.019 s  |  249x   |
+| star       |     14 | 10.368 s  | 0.023 s  |  454x   |
+| star       |     15 | 23.992 s  | 0.025 s  |  973x   |
+| chain      |     12 |  0.042 s  | 0.043 s  |  1.0x   |
+| chain      |     15 |  0.085 s  | 0.077 s  |  1.1x   |
+
+The two halves of that table are the point. Sparse graphs, which is the shape real queries
+have, are unchanged to within noise and keep the plans they had. What the budget removes is
+the search a dense graph could never repay.
+
+Join order is semantics-preserving, so none of this can change a result. It changes only how
+much of the driver's time is spent choosing one.
 
 The DP recurrence adds only *this join's* op cost to the two halves' already-accumulated
 costs. Using the full recursive `cost()` would re-walk and double-count children, penalizing
@@ -268,9 +320,10 @@ deep subtrees super-linearly.
 
 :::{note}
 `optimizer.join_dp_max_tables` (12) and `greedy_max_tables` (25) are declared and validated,
-but the rule reads its own module constants (`_MAX_EXHAUSTIVE_LEAVES = 12`, `_MAX_DP_LEAVES
-= 20`, `_MAX_DP_PAIRS = 200_000`). Setting the config knobs changes nothing today. Greedy
-also has no upper leaf bound, so there is no table count above which reordering stops.
+but the rule does not read them, so setting either changes nothing. They predate the search
+budget above, which answers the question they were meant to answer and answers it per query
+rather than per session. Greedy also has no upper leaf bound, so there is no table count above
+which reordering stops.
 :::
 
 ## Limits

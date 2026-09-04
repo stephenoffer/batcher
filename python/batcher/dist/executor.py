@@ -91,6 +91,18 @@ from batcher.plan.visitor import scanned_source_ids
 
 __all__ = ["execute_distributed", "resolve_worker_fanout"]
 
+#: Cores the automatic fan-out aims to give each worker (see `_numa_sliced` for the
+#: measurement). It is a *pipeline* figure, not a hardware one: a worker gathers one shuffle
+#: bucket and then computes it, so what the fleet needs is enough workers for those two
+#: phases to overlap across the node's cores. The NUMA domain count still floors it.
+_TARGET_WORKER_CORES = 24
+
+#: Cores below which slicing a node further stops being worth a process. A worker carries a
+#: Flight server, its own hash tables and its own share of the shuffle's buckets, so a fleet
+#: of two-core workers pays that fixed cost many times over for parallelism the cores cannot
+#: deliver. Slicing is declined outright rather than reduced, leaving the coarser fan-out.
+_MIN_WORKER_CORES = 8
+
 
 def resolve_worker_fanout(num_workers: int | None) -> int:
     """The worker fan-out for a distributed stage the caller did not size explicitly.
@@ -242,6 +254,18 @@ def execute_distributed(
         # cluster, the share still pulls the grant back up, just never past the headroom.
         if fill is not None and not by_device and share > 0:
             share = _headroom_grant(share, _worker_node_cpus())
+        elif fill is None and share > 0:
+            # The explicit-`num_workers` path, which had no placeability check at all.
+            # `_even_cpu_share` divides *nameplate* cores by the worker count, so
+            # `num_workers=32` on a 384-core cluster asks for 32 bundles of 12 — the entire
+            # cluster — however much of it another job is already holding. Every benchmark
+            # and integration test in this repo pins `num_workers`, so this is the common
+            # path, not a corner, and it is the one that had no co-tenant awareness.
+            #
+            # `_placeable_grant` is the same thinning `_cluster_fill_workers` already applies
+            # on the automatic path, and it is a documented no-op on an idle cluster — so a
+            # single-tenant run keeps the grant it had, byte for byte.
+            share = _placeable_grant(share, _worker_node_cpus())
         if share > num_cpus:
             envelope = (
                 dataclasses.replace(envelope, num_cpus=share)
@@ -356,6 +380,46 @@ def _worker_node_cpus() -> list[float]:
     return [c for node in node_classes() if (c := float(node["cpus"])) > 0]
 
 
+def _schedulable_devices(node: dict) -> float:
+    """Devices on `node` that are safe to place work on.
+
+    `healthy_gpus` is the census's device count after the health probe's verdicts; it is
+    absent only for a caller holding an older projection, where the nameplate count is the
+    behaviour that was already in force.
+    """
+    reported = node.get("healthy_gpus")
+    if reported is None:
+        reported = node.get("gpus") or 0.0
+    return max(0.0, float(reported))
+
+
+def _within_power_budget(workers: int, num_gpus: float, classes: list[dict]) -> int:
+    """`workers` clamped to what the configured power budget can actually run.
+
+    Reuses Carbonite's `devices_within_budget` rather than restating the arithmetic, so the
+    count a stage is granted and the counter-offer a refusal reports stay one number. A no-op
+    when no budget is configured or the fleet's device model is unrecognized, which is the
+    default — so this only ever engages where an operator has said what the rack can draw.
+
+    A fleet mixing device models has no single draw figure, so the clamp declines rather than
+    pricing every device as whichever model happened to be listed first — which would
+    under-count a fleet of small parts and over-count one of large parts, and the second is
+    the direction that clamps a rack.
+    """
+    devices = workers * max(num_gpus, 1e-9)
+    try:
+        from batcher.carbonite.accel.power import devices_within_budget
+
+        models = {n.get("accelerator_type") for n in classes if n.get("accelerator_type")}
+        if len(models) != 1:
+            return workers
+        allowed = devices_within_budget(next(iter(models)), max(1, round(devices)))
+    except Exception as exc:  # pragma: no cover - a budget hint never fails a fan-out
+        note_suppressed("dist", "apply the power budget to the accelerator fan-out", exc)
+        return workers
+    return max(1, min(workers, int(allowed / max(num_gpus, 1e-9))))
+
+
 def _accelerator_fill_workers(num_gpus: float) -> tuple[int, float] | None:
     """The device-filling fan-out for a stage that needs `num_gpus` accelerators per worker.
 
@@ -371,29 +435,45 @@ def _accelerator_fill_workers(num_gpus: float) -> tuple[int, float] | None:
     host, which keeps one worker placeable on every accelerator node the way the core-shaped
     grant does. Nodes with no device host nothing — they cannot run this stage at all.
 
+    **The devices counted are the healthy ones.** Carbonite's `gpu_envelope` clamps a GPU
+    grant to the devices that exist, the devices the power budget can run, and the devices
+    that pass the health verdicts — and this function then *replaces* that `n_tasks`, so
+    counting nameplate devices here silently discarded two of those three ceilings and placed
+    actors on quarantined hardware. A device rarely fails by disappearing: it stays present
+    reporting uncorrectable ECC errors, or clamped to a fraction of its clock, and a fan-out
+    sized by the count keeps feeding it. `healthy_gpus` is the census's own post-verdict
+    figure and equals `gpus` whenever health checking is off or telemetry is unreadable, so an
+    unprobed fleet is sized exactly as it was.
+
+    The power ceiling is reapplied afterwards, through the same `devices_within_budget`
+    Carbonite uses rather than a second rule here: a rack whose busway cannot power every slot
+    does not trip a breaker, it clamps every device in the zone, which reads as the whole rack
+    getting slower for no visible reason.
+
     Args:
         num_gpus: Devices one worker holds. `0` or less means this is not an accelerator
             stage and the core-shaped fill is the right one.
 
     Returns:
         `(workers, num_cpus)`, or `None` when this is not an accelerator stage, the fleet has
-        no devices, the topology is unreadable, or the answer is a single worker — in every
-        one of those the caller's existing sizing is already correct.
+        no healthy devices, the topology is unreadable, or the answer is a single worker — in
+        every one of those the caller's existing sizing is already correct.
     """
     if num_gpus <= 0:
         return None
     try:
         from batcher.dist.executors.ray_runtime.scaling import node_classes
 
+        classes = node_classes()
         nodes = [
-            (float(n["cpus"]), int(float(n["gpus"]) // num_gpus))
-            for n in node_classes()
-            if float(n.get("gpus") or 0.0) >= num_gpus and float(n["cpus"]) > 0
+            (float(n["cpus"]), int(_schedulable_devices(n) // num_gpus))
+            for n in classes
+            if _schedulable_devices(n) >= num_gpus and float(n["cpus"]) > 0
         ]
         hosts = [(cores, held) for cores, held in nodes if held > 0]
         if not hosts:
             return None
-        workers = sum(held for _, held in hosts)
+        workers = _within_power_budget(sum(held for _, held in hosts), num_gpus, classes)
         if workers <= 1:
             return None
         # Floored to a whole core so the grant is a number Ray can actually reserve, and at
@@ -428,14 +508,86 @@ def _cluster_fill_workers() -> tuple[int, float] | None:
         node_cpus = _worker_node_cpus()
         if len(node_cpus) <= 1:
             return None
-        num_cpus = _headroom_grant(_fill_grant(node_cpus), node_cpus)
-        workers = sum(max(1, int(c // num_cpus)) for c in node_cpus)
+        # The fan-out comes from the cluster's *shape*; the per-worker ask is then thinned
+        # until the gang is placeable. Deriving the count from the thinned grant instead is
+        # what let a busy cluster invert this function: `_placeable_grant` accepts any grant
+        # tiling into *at least* the wanted number of slots, so mid-query — when the fleet
+        # this query is about to borrow is itself holding the cores — a 47-core grant thinned
+        # to 2, and `sum(96 // 2)` then reported **192 workers of 2 cores** where the shape
+        # asked for 8 of 47. Measured on TPC-H sf100: 25.5s that way against 10.4s at the
+        # shape's own fan-out, on the default path, because `num_workers=N` skips this branch
+        # entirely and never saw it.
+        shape = _numa_sliced(_fill_grant(node_cpus))
+        workers = sum(max(1, int(c // shape)) for c in node_cpus)
+        num_cpus = _headroom_grant(_placeable_grant(shape, node_cpus), node_cpus)
         return workers, num_cpus
     except Exception as exc:
         # Same reason as the accelerator fill above: a topology read that fails quietly halves
         # a large cluster's fan-out and leaves nothing to attribute it to.
         note_suppressed("dist", "read the cluster topology for the fan-out", exc)
         return None
+
+
+def _numa_sliced(grant: float) -> float:
+    """`grant`, cut into as many workers per node as the fleet can keep busy.
+
+    Two separate constraints set this, and only one of them is about memory.
+
+    **The floor is NUMA.** A worker is one process holding one set of hash tables and
+    morsels, so spanning two memory domains makes half its loads remote. `_fill_grant`
+    prefers the fattest worker a node can host, which on a homogeneous cluster is the whole
+    node, and that was measured wrong on this 4 x 96-core / 2-NUMA fleet: the profiler
+    reported 60% core utilization at one worker per node, and two workers per node was worth
+    **1.39x on a hash join and 1.24x on a high-cardinality group-by** at TPC-H sf100. The
+    fleet must never be cut coarser than the domain count.
+
+    **What actually decides the optimum is shuffle pipelines, not locality.** A worker
+    gathers one shuffle bucket and then computes it, and a Ray actor runs one call at a
+    time, so a worker alternates between network-bound and CPU-bound with nothing filling
+    the gaps. More workers means more of those pipelines overlapping, which is why the
+    optimum sits below the NUMA slice rather than at it. That measurement — "flattening past
+    two per node" — was taken before `bc-transport`'s gather was reworked to keep its rate
+    flat in the bucket count (`BENCHMARK_RESULTS.md`, 2026-08-29), which is precisely the
+    cost that used to punish a wider fan-out. The policy was never re-derived afterwards.
+
+    Re-measured on the same fleet at TPC-H sf100, forcing the fan-out, best of four, each
+    case correctness-checked against the driver — wall time and *mean cluster CPU*:
+
+    | case | 8 workers | 16 workers | 32 workers |
+    |---|---|---|---|
+    | hash join + group-by | 10,022 ms / 27% | **8,990 ms / 37%** | 7,676 ms / 35% |
+    | distinct | 8,843 ms / 32% | **7,599 ms / 49%** | 6,973 ms / 57% |
+    | group-by, 20M groups | 6,900 ms / 25% | **5,561 ms / 49%** | 5,476 ms / 59% |
+    | scan + group-by | 923 ms / 34% | 773 ms / 43% | 632 ms / 45% |
+
+    Sixteen — two workers per NUMA domain, 24 cores each — is where the wall time is best
+    or within noise of it on every shape, and it roughly doubles the share of the cluster
+    the query actually uses. Past it the extra workers keep raising *utilization* while the
+    join gets slower, which is the shape of a fan-out paying for itself in coordination.
+
+    So the target is a **cores-per-worker figure** (`_TARGET_WORKER_CORES`), floored at the
+    domain count so the memory-locality result above is never given up, and a no-op on any
+    node too small to slice — a 16-core node still hosts one worker, exactly as before.
+
+    Args:
+        grant: The per-worker core grant `_fill_grant` chose.
+
+    Returns:
+        The grant, divided by the slice count this fleet should use.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import cluster_numa_nodes
+
+    try:
+        domains = max(1, int(cluster_numa_nodes()))
+    except Exception as exc:
+        # An unprobeable fleet keeps one worker per node, which is what it had before.
+        note_suppressed("dist", "read the worker NUMA topology for the fan-out", exc)
+        return grant
+    # Never coarser than the memory domains, never finer than the core target asks for.
+    slices = max(domains, round(grant / _TARGET_WORKER_CORES))
+    if slices <= 1 or grant < slices * _MIN_WORKER_CORES:
+        return grant
+    return max(1.0, float(int(grant // slices)))
 
 
 def _headroom_grant(grant: float, node_cpus: list[float]) -> float:
@@ -454,6 +606,11 @@ def _headroom_grant(grant: float, node_cpus: list[float]) -> float:
     could release. Observed on a 16 x 16-core cluster running TPC-H sf100: q1-q15 pass, then
     q16 hangs indefinitely with `256.0/256.0 CPU (256.0 reserved in placement groups)` and one
     `_map_udf_task` pending on `{'CPU': 0.5}` — while q16 run on its own finishes in 3.2s.
+
+    This thins the **auto** fan-out only: an explicit `num_workers=N` skips
+    `_cluster_fill_workers` and sizes its grant from `_even_cpu_share`, which tiles a node
+    exactly. `ray_runtime.scheduling.fleet_task_headroom` covers that path, by leaving the
+    sliver *inside* each bundle rather than outside it.
 
     Thinning **preserves the worker count**, exactly as `_placeable_grant` does: it returns the
     largest grant no bigger than `grant` that still tiles to as many workers while leaving a
@@ -520,6 +677,13 @@ def _fill_grant(node_cpus: list[float]) -> float:
     workers). `[32, 64]` keeps 32, because a 64-core grant would strand the 32-core node
     entirely — a third of the cluster, far past the tolerance. `[16, 32, 32]` keeps 16 for
     the same reason. A homogeneous cluster has one candidate and is unchanged.
+
+    This is the cluster's **nameplate shape** and nothing else. It used to return
+    `_placeable_grant(chosen, ...)` — the shape already thinned against whatever was free at
+    that instant — and the caller then counted workers from it, so on a busy cluster the count
+    was derived from a grant chosen for a different question. The two are separated now: the
+    caller takes the count from this, and asks `_placeable_grant` for the per-worker CPU
+    figure.
     """
     candidates = sorted({max(1.0, float(int(c))) for c in node_cpus if c > 0}, reverse=True)
     if not candidates:
@@ -536,7 +700,7 @@ def _fill_grant(node_cpus: list[float]) -> float:
             if occupied(grant) >= _FILL_STRAND_TOLERANCE * best:
                 chosen = grant
                 break
-    return _placeable_grant(chosen, node_cpus)
+    return chosen
 
 
 def _placeable_grant(grant: float, node_cpus: list[float]) -> float:
@@ -692,7 +856,14 @@ def _is_splittable_source(source: Source) -> bool:
 
     try:
         splits = source.splits()
-    except Exception:
+    except Exception as exc:
+        # Recorded, not swallowed. Returning False here is right -- a source that cannot
+        # enumerate its splits must not be handed to workers -- but it routes the query to
+        # `_single_node` *without* passing `_unsupported`, so the loud refusal four functions
+        # below never fires. A broken splitter and a genuinely unsplittable source then look
+        # identical from the outside: the query returns the right rows, on one node, forever.
+        # That is the distinction `note_suppressed` exists to keep observable.
+        note_suppressed("dist", f"enumerate splits for {type(source).__name__}", exc)
         return False
     return bool(splits) and not (len(splits) == 1 and isinstance(splits[0], WholeSourceSplit))
 
@@ -1054,6 +1225,40 @@ def _is_broadcastable_global_window(window: Window) -> bool:
     )
 
 
+def _global_window_reason(window: Window) -> str:
+    """Why this global (no `PARTITION BY`) window has no distributed decomposition.
+
+    A global window has one partition over every row, so it has no per-partition seam to cut
+    along. Two things stand in for one: `OVER ()` with no ordering at all is a whole-relation
+    aggregate and broadcasts, and an *ordered* one range-partitions into ordered buckets and
+    corrects each by an offset (`dist/global_window/offsets.py`). A function that reads rows
+    its own bucket does not hold fits neither.
+
+    Args:
+        window: The global window that matched no branch.
+
+    Returns:
+        A reason naming the functions at fault, for `_unsupported`'s message.
+    """
+    from batcher.dist.global_window.offsets import (
+        supports_ordered_bucket_offsets,
+        unoffsettable_functions,
+    )
+
+    if supports_ordered_bucket_offsets(  # pragma: no cover - claimed by the caller
+        window, assembled=True
+    ):
+        return "a global window"
+    culprits = unoffsettable_functions(window, assembled=True)
+    named = ", ".join(culprits) if culprits else "this ordering"
+    return (
+        f"a global window (no PARTITION BY) over {named} — each ordered bucket would have to "
+        "read rows it does not hold, in an order the window kernel does not return them in, "
+        "so there is no offset that recovers the global value. Add a PARTITION BY (which "
+        "gives the shuffle a key), or materialize this stage and window it single-node"
+    )
+
+
 def _distributed_global_window(
     above: list[LogicalPlan], window: Window, sources: list[Source], workers: int, transport: str
 ) -> pa.Table:
@@ -1124,6 +1329,12 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
     `None` from either the schema or the inference means "not certain", and the sound answer
     there is to leave routing exactly as it was — this may only ever *withhold* distribution
     on a key it is sure about.
+
+    The type test itself is `range_partitionable`'s and nothing more. It used to add
+    ``is_decimal(dtype) or is_temporal(dtype) or`` in front of it, which is how the *other*
+    two callers of that predicate came to refuse a timestamp key this one accepts: the sort
+    fixed its own answer instead of the shared one, and the out-of-core sort and the global
+    window kept declining a key the partitioner routes perfectly well.
     """
     schema = sort.input.available_schema()
     if schema is None:
@@ -1135,68 +1346,37 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
         return True
     from batcher.dist.executors.partition_io import range_partitionable
 
-    return pa.types.is_decimal(dtype) or pa.types.is_temporal(dtype) or range_partitionable(dtype)
+    return range_partitionable(dtype)
 
 
 def _hoist_computed_sort_key(sort: Sort):
-    """Rewrite `ORDER BY <expr>, …` so the LEADING key is a plain column.
+    """`plan.logical.hoist_sort_key` in the `(node, drop_projection)` shape this dispatcher
+    stacks onto `above`.
 
-    Returns `(sort', drop_key)` — a sort over a `Project` that materializes the computed
-    leading key as a hidden column, plus the `Project` that drops it again — or `None` when
-    the leading key is already a column (the common case, left byte-identical).
-
-    The distributed sort range-partitions on the leading key's *values*, which it can only
-    read from a column, so `df.sort(col("a") + col("b"))` had no distributed path at all.
-    Only the leading key is hoisted: the rest are evaluated by each reducer's local sort,
-    which needs no column. `hoist_computed_keys` owns the materialization itself, shared
-    with the window's partition keys.
+    The rewrite itself lives in the neutral `plan` layer because the *spilling* breakers need
+    the identical one: `collect(spill=True)` cuts a sort into the same ordered pieces the
+    cluster does, on the same range partitioner, and declined a computed leading key purely
+    because the hoist was private to this file. A query that distributed then failed to spill.
     """
-    from batcher.plan.logical import SortKeySpec, hoist_computed_keys, project_columns
+    from batcher.plan.logical import hoist_sort_key, project_columns
 
-    key = sort.keys[0]
-    hoisted = hoist_computed_keys(sort.input, [key.expr], prefix="__sort_key")
+    hoisted = hoist_sort_key(sort)
     if hoisted is None:
         return None
-    with_key, (hidden,) = hoisted
-
-    columns = sort.input.available_columns()
-    rewritten = dataclasses.replace(
-        sort,
-        input=with_key,
-        keys=(
-            SortKeySpec(hidden, descending=key.descending, nulls_first=key.nulls_first),
-            *sort.keys[1:],
-        ),
-    )
-    return rewritten, project_columns(rewritten, columns)
+    rewritten, keep = hoisted
+    return rewritten, project_columns(rewritten, keep)
 
 
 def _hoist_computed_window_keys(window: Window):
-    """Rewrite `PARTITION BY <expr>, …` so every partition key is a plain column.
+    """`plan.logical.hoist_window_keys` in the `(node, drop_projection)` shape this dispatcher
+    stacks onto `above`. See `_hoist_computed_sort_key` for why the rewrite is shared."""
+    from batcher.plan.logical import hoist_window_keys, project_columns
 
-    Returns `(window', drop_keys)` — the window over a `Project` that materializes each
-    computed partition key as a hidden column, plus the `Project` that drops those columns
-    again — or `None` when every partition key is already a column.
-
-    The distributed window hash-shuffles rows by the partition keys' column *positions*
-    (`executors/window.py` resolves each key with `cols.index(k.name)`), so a computed key
-    such as `partition_by=[col("v") % 4]` could not be shuffled on and the whole query had
-    no distributed path. This is the window's half of the same rewrite the sort already
-    used, sharing `hoist_computed_keys` rather than restating it.
-
-    The dropped set is the window's ORIGINAL output — its input columns plus the function
-    aliases — so the hidden keys vanish and nothing else does.
-    """
-    from batcher.plan.logical import hoist_computed_keys, project_columns
-
-    hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+    hoisted = hoist_window_keys(window)
     if hoisted is None:
         return None
-    with_keys, keys = hoisted
-
-    output = window.available_columns()
-    rewritten = dataclasses.replace(window, input=with_keys, partition_keys=keys)
-    return rewritten, project_columns(rewritten, output)
+    rewritten, keep = hoisted
+    return rewritten, project_columns(rewritten, keep)
 
 
 def _staged_aggregate_over_join(
@@ -1458,9 +1638,12 @@ def _dispatch(
     # row set than single-node. Only `workers x (k + n)` rows ever reach the driver, never
     # the whole source.
     #
-    # `hub=None`: the per-worker plan is truncated, so its row count must not be learned
-    # as the source's cardinality. A `map_batches` prefix returned above, so the pipeline
-    # here is pure scan/filter/project/unnest.
+    # The per-worker plan is truncated, so its row count is not the source's cardinality.
+    # `_record_source_rows` refuses a plan that resizes its input
+    # (`plan.logical.preserves_source_row_count`), so the hub is passed for what it is good
+    # for here — seeding the partition count from a past run — without teaching it that a
+    # billion-row table holds `workers x (k + n)` rows. A `map_batches` prefix returned
+    # above, so the pipeline here is pure scan/filter/project/unnest.
     limit_split = _split_at(plan, Limit)
     if limit_split is not None:
         above, lim = limit_split
@@ -1471,7 +1654,7 @@ def _dispatch(
                 from batcher.dist.executors.map import _distributed_map
 
                 per_worker = Limit(input=base, n=offset + n, offset=0)
-                table = _distributed_map(per_worker, sources, workers, None, preserve_order=True)
+                table = _distributed_map(per_worker, sources, workers, hub, preserve_order=True)
                 table = table.slice(offset, n)
                 return table if not above else _apply_above(above, table)
 
@@ -1492,7 +1675,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                table = _distributed_map(rowid.input, sources, workers, None, preserve_order=True)
+                table = _distributed_map(rowid.input, sources, workers, hub, preserve_order=True)
                 index = pa.array(
                     range(rowid.offset, rowid.offset + table.num_rows), type=pa.int64()
                 )
@@ -1516,8 +1699,9 @@ def _dispatch(
     # and breaks hash ties by row *content*, so no `preserve_order` is needed here (unlike
     # the `Limit` path above): the result does not depend on how the input was split.
     #
-    # `hub=None`: the per-worker plan is truncated to `n` rows, so its row count must not be
-    # learned as the source's cardinality.
+    # The per-worker plan is truncated to `n` rows, so its row count is not the source's
+    # cardinality — `_record_source_rows` declines a plan that resizes its input, so the hub
+    # is passed only for the learned partition sizing it also carries.
     sample_split = _split_at(plan, Sample)
     if sample_split is not None:
         above, sample = sample_split
@@ -1526,7 +1710,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                partials = _distributed_map(sample, sources, workers, None)
+                partials = _distributed_map(sample, sources, workers, hub)
                 # `sample` innermost: the global n-smallest of the union of the partials,
                 # then whatever the user stacked above it.
                 return _apply_above([*above, sample], partials)
@@ -1545,17 +1729,17 @@ def _dispatch(
         # all. Reached only when `_partition_local_chain` holds, which is what keeps a `Limit`
         # in the chain out.
         #
-        # `hub=None` deliberately: what comes back is one row per group, and learning that as
-        # the *source's* cardinality would teach the optimizer that a thousand-partition table
-        # holds a thousand rows. The distributed `LIMIT` path above withholds it for the same
-        # reason.
+        # What comes back is one row per group, which is not the source's cardinality —
+        # learning it as one would teach the optimizer that a thousand-partition table holds
+        # a thousand rows. `_record_source_rows` refuses an `Aggregate` on exactly that
+        # ground, so the hub is passed here for its learned partition sizing alone.
         if _single_source(agg.input):
             aligned = _partition_aligned_aggregate(agg, sources, workers, hub)
             if aligned:
                 from batcher.dist.executors.map import _distributed_map
 
                 _note_exchange_eliminated("aggregate", aligned)
-                table = _distributed_map(agg, sources, workers, None, cluster_by=aligned)
+                table = _distributed_map(agg, sources, workers, hub, cluster_by=aligned)
                 return table if not above else _apply_above(above, table)
         # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
         # user `distinct().agg(...)`) must be caught BEFORE the map/shuffle aggregate path:
@@ -1814,15 +1998,16 @@ def _dispatch(
         if _single_source(distinct.input) and not _has_breaker(distinct.input):
             # The table's layout already groups the duplicates: every row that could be a
             # duplicate of another is in the same directory, hence on the same worker. Dedup
-            # per partition and concatenate -- see `_partition_aligned_aggregate` for why the
-            # hub is withheld (the output is one row per key, not the source's row count).
+            # per partition and concatenate. The output is one row per key rather than the
+            # source's row count, which `_record_source_rows` declines to learn as one --
+            # see `_partition_aligned_aggregate`.
             aligned = _partition_aligned_distinct(distinct, sources, workers, hub)
             if aligned:
                 from batcher.dist.executors.map import _distributed_map
 
                 _note_exchange_eliminated("distinct", aligned)
 
-                table = _distributed_map(distinct, sources, workers, None, cluster_by=aligned)
+                table = _distributed_map(distinct, sources, workers, hub, cluster_by=aligned)
                 return table if not above else _apply_above(above, table)
             from batcher.dist.executors.distinct import _distributed_distinct
 
@@ -1852,7 +2037,13 @@ def _dispatch(
         if _single_source(window.input) and not _has_breaker(window.input):
             if _is_broadcastable_global_window(window):
                 return _distributed_global_window(above, window, sources, workers, transport)
-            if not window.partition_keys and supports_ordered_bucket_offsets(window):
+            if not window.partition_keys and supports_ordered_bucket_offsets(
+                # Both distributed drivers concatenate every bucket before returning, so
+                # the corrections that need the relation's total row count are open to
+                # them; the single-node streaming driver yields as it goes and is not.
+                window,
+                assembled=True,
+            ):
                 if transport == "flight":
                     from batcher.dist.global_window import execute_global_window_flight
 
@@ -1871,13 +2062,12 @@ def _dispatch(
 
                     _note_exchange_eliminated("window", aligned)
 
-                    # The hub is passed here where the aggregate and dedup paths withhold it,
-                    # and the difference is the operator's row arithmetic: a window emits one
-                    # row per input row, so what comes back IS the source's (post-filter) row
-                    # count and is the same measurement any other map pipeline records. An
-                    # aggregate returns one row per group, which learned as a source
-                    # cardinality would teach the optimizer that a thousand-partition table
-                    # holds a thousand rows.
+                    # A window emits one row per input row, so unlike an aggregate or a dedup
+                    # its output is a measurement of the relation beneath it -- and when that
+                    # relation is an unfiltered scan, of the source itself.
+                    # `_record_source_rows` decides which of those it is; the comment this
+                    # replaced asserted the post-filter count *was* the source's, which it is
+                    # not, and the recording was made on that basis.
                     table = _distributed_map(window, sources, workers, hub, cluster_by=aligned)
                     return table if not above else _apply_above(above, table)
                 hoisted = _hoist_computed_window_keys(window)
@@ -1904,6 +2094,14 @@ def _dispatch(
                 return _distributed_window(
                     above, window, sources, workers, hub, metrics_out, materialize=materialize
                 )
+            # A global window none of the three branches above claimed. Named here rather
+            # than left to the generic "unsupported operator combination" at the bottom,
+            # because that message sends the reader looking for the wrong thing: the
+            # *operator* is supported, and what is missing is a decomposition for these
+            # particular functions. Say which ones, and say what a caller can do about it —
+            # the query has a perfectly good single-node answer, and the raise exists only
+            # to stop it being taken silently on distributed data.
+            return _unsupported(plan, sources, _global_window_reason(window))
 
     # UNION: distribute each branch independently, then concatenate (+ dedup).
     union_split = _split_at(plan, Union)
@@ -2152,20 +2350,36 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
         # A join over a multi-source operand HAS a distributed path — the staged one. The
         # caller reached here only by forcing `adaptive=False`, so say that rather than
         # implying the operator is missing.
-        hint = (
-            "this shape distributes stage by stage (a join whose operand spans two sources, "
-            "or a pipeline breaker beneath another breaker); it was disabled by an explicit "
-            '`adaptive=False`. Re-run with `adaptive=True` (or the default `"auto"`). '
-            "Running it in one shot would evaluate the inner plan once per partition and "
-            "return wrong values, so it is refused rather than computed."
-            if requires_staging(plan)
-            else "File/extend the distributed operator, or run with distributed=False "
-            "to force single-node explicitly."
-        )
+        #
+        # The whole sentence branches, not just the tail. It used to open with "distributed
+        # execution has no path for this plan shape (an unsupported operator combination)"
+        # and *then* explain that the shape distributes stage by stage after all — a headline
+        # that contradicted its own remedy, and the exact implication the comment above says
+        # not to make. A reader who stopped at the first clause, which is where a reader
+        # stops, concluded their query could not be distributed at all.
+        if requires_staging(plan):
+            # Deliberately does NOT assert *why* staging is not carrying this shape. Two
+            # different callers arrive here and `_unsupported` cannot tell them apart: one
+            # forced `adaptive=False`, and one is already staging but has a sub-stage with no
+            # decomposition of its own -- which is what `batcher.graph`'s eleven refusing
+            # algorithms hit (an aggregate over a `union` feeding another breaker). An earlier
+            # draft of this message told the second caller to "re-run with `adaptive=True`",
+            # which they already had, and that is a worse failure than saying less.
+            raise PlanError(
+                "distributed execution runs this plan shape stage by stage (a join whose "
+                "operand spans two sources, or a pipeline breaker beneath another breaker), "
+                "and it did not stage here. If you passed `adaptive=False`, re-run without "
+                'it (the default is `"auto"`). Otherwise staging is already on and some '
+                "stage of this plan has no distributed decomposition; materializing the "
+                "intermediate (`bt.from_arrow(...collect())`) is the workaround. Running it "
+                "in one shot would evaluate the inner plan once per partition and return "
+                "wrong values, so it is refused rather than computed."
+            )
         raise PlanError(
             "distributed execution has no path for this plan shape "
             f"({reason}); refusing to silently fall back to single-node on distributed "
-            f"data. {hint}"
+            "data. File/extend the distributed operator, or run with distributed=False "
+            "to force single-node explicitly."
         )
     _warn_accelerator_stage_falls_back(plan, reason)
     return _single_node(plan, sources)
@@ -2271,8 +2485,14 @@ def _distributed_asof(
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     asof_ir = json.dumps(_asof_reducer_ir(asof))
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # Asked of the ASOF node, keyed by each side's own source id. A side's prefix asked on
+    # its own is typically a bare scan, which requires every column it has: what narrows the
+    # read is the operator above it, whose `output` list Kyber has already pruned. The
+    # equi-join paths reach the same answer either by asking the join (the disk shuffle) or
+    # by pre-projecting each side (`flight_join._project_join_side`); this one did neither,
+    # so an ASOF over a wide table read every column of it on every worker.
+    left_proj, left_pred = source_pushdown(asof, left_sid)
+    right_proj, right_pred = source_pushdown(asof, right_sid)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -2578,8 +2798,9 @@ def _distributed_asof_keyless(
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     asof_ir = json.dumps(_asof_reducer_ir(asof))
-    left_proj, left_pred = source_pushdown(left_plan, 0)
-    right_proj, right_pred = source_pushdown(right_plan, 0)
+    # See `_distributed_asof`: asked of the node, keyed by each side's own source id.
+    left_proj, left_pred = source_pushdown(asof, left_sid)
+    right_proj, right_pred = source_pushdown(asof, right_sid)
 
     work_dir = distributed_work_dir("batcher_asofk_")
     try:

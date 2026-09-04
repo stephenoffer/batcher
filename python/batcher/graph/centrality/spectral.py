@@ -12,16 +12,9 @@ import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
 from batcher.graph._graph import DST, NODE, SRC, WEIGHT, Graph
-from batcher.graph._iterate import iterate, max_abs_change
+from batcher.graph._iterate import check_iterations, iterate, max_abs_change
 
 __all__ = ["eigenvector_centrality", "hits", "katz_centrality"]
-
-
-def _check_iterations(max_iterations: int, tolerance: float) -> None:
-    if max_iterations < 1:
-        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
-    if tolerance < 0.0:
-        raise PlanError(f"tolerance must be non-negative, got {tolerance}")
 
 
 def _power_iteration(
@@ -113,7 +106,7 @@ def eigenvector_centrality(
             >>> len(out.to_pydict()["node"])
             3
     """
-    _check_iterations(max_iterations, tolerance)
+    check_iterations(max_iterations, tolerance)
     return _power_iteration(
         g,
         "eigenvector_centrality",
@@ -169,7 +162,7 @@ def katz_centrality(
     """
     if attenuation <= 0.0:
         raise PlanError(f"attenuation must be positive, got {attenuation}")
-    _check_iterations(max_iterations, tolerance)
+    check_iterations(max_iterations, tolerance)
     return _power_iteration(
         g,
         "katz_centrality",
@@ -208,7 +201,7 @@ def hits(g: Graph, *, max_iterations: int = 100, tolerance: float = 1e-6) -> Dat
             >>> out.to_pydict()["node"][0]
             0
     """
-    _check_iterations(max_iterations, tolerance)
+    check_iterations(max_iterations, tolerance)
     nodes = g.nodes().cache()
     if nodes.count() == 0:
         return nodes.select(**{NODE: bt.col(NODE), "hub": bt.lit(0.0), "authority": bt.lit(0.0)})

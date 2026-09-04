@@ -109,3 +109,39 @@ def test_a_timestamp_column_still_reads_its_epoch_out(duck):
     sql = "SELECT epoch_ms(ts) AS r FROM t"
     duck.register("t", table)
     assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        # Each of these is an integer expression that is not a bare integer *column*, which
+        # is all the syntactic check could see. Every one silently took the extract branch
+        # and returned a meaningless number where DuckDB builds a timestamp.
+        "n * 1000",
+        "n + 0",
+        "CAST(n AS BIGINT)",
+        "abs(n)",
+        "-n",
+        "COALESCE(n, 0)",
+    ],
+)
+def test_an_epoch_expression_builds_a_timestamp_like_duckdb(duck, arg):
+    """Not just a bare column: any expression whose *type* is an integer count.
+
+    The construct-or-extract choice is a question about the argument's type, so it is asked
+    of the type — `plan.types.infer_type`, the same analysis `Dataset.schema` is answered
+    from — rather than of the shape of the SQL that produced it. Listing integer-shaped
+    syntax was always going to be an incomplete list, and it was.
+    """
+    table = pa.table({"n": pa.array([_EPOCH_SECONDS], type=pa.int64())})
+    sql = f"SELECT epoch_ms({arg}) AS r FROM t"
+    duck.register("t", table)
+    assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))
+
+
+def test_a_timestamp_expression_still_reads_its_epoch_out(duck):
+    """The other branch must not be widened by accident: a *derived* timestamp extracts."""
+    table = pa.table({"ts": pa.array([_INSTANT], type=pa.timestamp("us"))})
+    sql = "SELECT epoch_ms(CAST(ts AS TIMESTAMP)) AS r FROM t"
+    duck.register("t", table)
+    assert_same(bt.sql(sql, t=table).collect(), duck.sql(sql))

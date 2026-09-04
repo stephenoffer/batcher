@@ -32,7 +32,7 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir.walk import referenced_columns
 from batcher.plan.expr_rewrite import expr_key
-from batcher.plan.logical import Limit, LogicalPlan, Sort, Window
+from batcher.plan.logical import Limit, LogicalPlan, Sort, Window, project_columns
 
 __all__ = ["push_topn_into_unpartitioned_ranking_window", "transpose_adjacent_windows"]
 
@@ -100,9 +100,28 @@ def transpose_adjacent_windows(node: Window, _ctx: OptimizerContext) -> LogicalP
     Beyond that a window only appends columns -- it never adds, drops, or reorders rows
     -- so two independent ones commute exactly.
 
+    **The swapped pair is wrapped in a `Project` restoring the original column order**, and
+    that is not tidiness. The two conditions above establish that the column *set* is
+    unchanged, and a set is not an order: `Window.available_columns()` is
+    `input.available_columns() + [aliases]`, so whichever node ends up outer contributes its
+    aliases last. Swapping therefore transposes the output columns as well as the nodes.
+    `with_columns(a=rank().over(...), b=sum().over(...))` came back as ``g, v, b, a`` where
+    both the unoptimized plan and SQL's ``SELECT *, a, b`` say ``g, v, a, b`` — every value
+    correct, in the wrong columns' positions.
+
+    That is a semantics-*changing* rewrite from a rule that must be semantics-preserving, and
+    it was invisible for the ordinary reason: the differential harness compared results as
+    row multisets with the column names sorted, so an output permutation was the one property
+    it could not see.
+
+    The `Project` does not cost the rule its purpose. `collapse_adjacent_windows` matches a
+    `Window` over a `Window`, and the pair is still directly stacked beneath the projection,
+    so bringing equal specs together still lets it delete one.
+
     Only strictly decreasing swaps are performed, which is what makes this terminate: a
     swap happens only when the inner spec sorts after the outer, so the fixpoint cannot
-    cycle a pair back and forth.
+    cycle a pair back and forth. The wrapper does not reopen that: the rule matches a
+    `Window`, and on the swapped pair the guard above now holds, so it fires once.
     """
     inner = node.input
     if not isinstance(inner, Window):
@@ -113,7 +132,8 @@ def transpose_adjacent_windows(node: Window, _ctx: OptimizerContext) -> LogicalP
         return None  # overlapping aliases: swapping would change which one wins
     if _spec_key(inner) <= _spec_key(node):
         return None  # already in canonical order; swapping would not terminate
-    return dataclasses.replace(inner, input=dataclasses.replace(node, input=inner.input))
+    swapped = dataclasses.replace(inner, input=dataclasses.replace(node, input=inner.input))
+    return project_columns(swapped, node.available_columns())
 
 
 #: The ranking functions whose value for a row depends only on the rows *ahead* of it

@@ -248,6 +248,82 @@ pub(crate) fn estimated_groups(
     (seen as usize).clamp(floor.min(total_rows), total_rows)
 }
 
+/// Disjointness above which the sample's morsels are taken to cover *different* keys.
+///
+/// A morsel that shares almost none of its keys with the others is evidence the key is spread
+/// across the relation rather than drawn from a small domain, and the two readings of the same
+/// `(rows, groups)` ratio differ by orders of magnitude. Set high because the correction it
+/// gates is a large one: only a sample whose morsels genuinely barely overlap should take it.
+const SPREAD_MIN: f64 = 0.9;
+
+/// [`estimated_groups`], told **also** how many distinct keys the sample held in total.
+///
+/// The coupon-collector inversion behind `estimated_groups` reads one morsel's ratio as a
+/// property of the key's *domain*, which is right only when a morsel's rows are drawn from that
+/// domain uniformly. A **clustered** key breaks that assumption completely, and TPC-H's
+/// `l_orderkey` is the canonical example: four rows per key laid out in key order, so a
+/// 4,096-row morsel holds 1,024 distinct keys and the inversion concludes the whole relation
+/// holds about **1,050** of them. It holds 15,000,000 — an under-read of four orders of
+/// magnitude, and it is not a rounding problem but a modelling one: "4,096 rows kept 1,024" is
+/// exactly what a 1,050-value domain looks like too.
+///
+/// What separates the two is whether the sampled morsels keep the *same* keys or different
+/// ones. A small domain has every morsel holding nearly all of it, so the sample's union is far
+/// below the sum of its morsels' counts; a clustered key has each morsel covering its own
+/// stretch, so the union *is* the sum. When the morsels are that disjoint the domain cannot be
+/// as small as the inversion says, and the count instead scales with the rows — so the sample's
+/// own distinct-per-row rate, read forward to the whole relation, is the estimate.
+///
+/// It costs the decision it feeds, not a rounding error: at sf10 the under-read routed a
+/// 15M-group aggregate to `chunked_partials`, whose merge then re-grouped ~59M partial rows.
+/// Measured on TPC-H q21's decorrelation group-by — 60M rows to 15M groups, four aggregates —
+/// **483 ms on the path the bad estimate chose against 286 ms on the partition path** the
+/// corrected one chooses.
+///
+/// **It over-reads a uniformly-random key with a genuinely huge domain**, and that is the
+/// accepted trade: 60M rows over 15M random keys estimates ~59M rather than 15M, because a
+/// sample that has not begun to saturate cannot tell "clustered" from "enormous". Both answers
+/// are on the same side of every decision this feeds — the partition path, and a radix width
+/// that is merely wider than it needed to be.
+/// **And floored at the union itself, which is a count rather than a model.** The sample's
+/// rows are rows of the relation, so every key its merged partials hold is a key the relation
+/// holds: `union_groups` is a measured lower bound and an estimate below it is wrong by
+/// construction, whatever the curve says. `estimated_groups` cannot apply this bound — it is
+/// handed the *sum* of the per-morsel counts, which counts a key once per morsel it appears in,
+/// and its own doc records that bounding below by that sum over-partitioned a 100 k-group key
+/// by 2.4x. The union is that same quantity with the double-counting removed, and it is only
+/// available here.
+///
+/// It is not a rounding correction. A **skewed** key defeats both of the estimates above at
+/// once: the common values put every morsel's keys in every other morsel's, so the disjointness
+/// test above fails and the linear read is not taken, while the long tail makes each morsel's
+/// own ratio look like a small domain. ClickBench `GROUP BY URL` over the 1 M-row mirror is
+/// exactly that shape — 275,494 groups, estimated at ~10 k — and the under-read is what routes
+/// it to `chunked_partials`, whose `concat_batches` is a full copy of the relation (11% of the
+/// query) before a partial that does not reduce and a merge over ~700 k partial rows.
+pub(crate) fn estimated_groups_spread(
+    sample_rows: usize,
+    per_morsel_groups: usize,
+    union_groups: usize,
+    sample_morsels: usize,
+    total_rows: usize,
+) -> usize {
+    let saturating = estimated_groups(sample_rows, per_morsel_groups, sample_morsels, total_rows);
+    if per_morsel_groups == 0 || union_groups == 0 || sample_rows == 0 {
+        return saturating;
+    }
+    // Measured, not modelled: these keys were seen in rows of this relation.
+    let observed = union_groups.min(total_rows);
+    if (union_groups as f64) / (per_morsel_groups as f64) < SPREAD_MIN {
+        return saturating.max(observed);
+    }
+    let linear = (total_rows as f64) * (union_groups as f64) / (sample_rows as f64);
+    saturating
+        .max(linear as usize)
+        .max(observed)
+        .min(total_rows)
+}
+
 /// Read a sample's partials and say how wide to partition — or `None` to keep the reducing
 /// path.
 ///
@@ -317,7 +393,20 @@ pub(crate) fn decide(
     let rows_in: usize = morsels[..n].iter().map(|b| b.num_rows()).sum();
     let total_rows: usize = morsels.iter().map(|b| b.num_rows()).sum();
     if let Some(width) = width_from_sample(&sampled, rows_in, n, total_rows) {
-        let groups = groups_from_sample(&sampled, rows_in, n, total_rows);
+        // How many distinct keys the sample held *in total*, which is what tells a clustered
+        // key from a small domain — see [`estimated_groups_spread`]. It is one merge of the
+        // sample's own partials, which are already in hand and small (the sample is a bounded
+        // fraction of the input), and it is only asked for on the non-reducing branch, where
+        // the answer decides between two shapes that differ by hundreds of milliseconds.
+        let funcs = ops::agg_funcs(aggregates);
+        let union = agg::combine(&sampled, &funcs)
+            .map(|p| p.group_columns.first().map_or(0, |c| c.len()))
+            .unwrap_or(0);
+        let per_morsel: usize = sampled
+            .iter()
+            .map(|p| p.group_columns.first().map_or(0, |c| c.len()))
+            .sum();
+        let groups = estimated_groups_spread(rows_in, per_morsel, union, n, total_rows);
         // The sample says a *morsel* does not reduce — but a morsel is 16,384 rows, and a
         // group count well under that reduces enormously over a whole worker's share. Both
         // readings are right and they choose different shapes, so the group count decides
@@ -422,6 +511,167 @@ pub(crate) fn partials(
     morsels
         .par_iter()
         .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, jit))
+        .collect()
+}
+
+/// Contiguous runs of morsels whose first key column's value ranges do not overlap.
+///
+/// This is the partition the relation already has, for free. `partitioned_aggregate` pays
+/// [`ops::partition_morsels`] — a gather of every row of every column into hash buckets — to
+/// obtain key-disjoint pieces. When the key arrives **ordered**, the pieces are already there:
+/// morsel `i`'s largest key is below morsel `i + 1`'s smallest, so a cut between them separates
+/// the key space exactly as a hash bucket does, and applying it copies nothing at all.
+///
+/// That is the shape of every `GROUP BY` on a clustered key — TPC-H's `l_orderkey`, a lakehouse
+/// table's declared sort key, a time-ordered ingest — and it is where the gather hurts most,
+/// because a key that barely reduces is precisely the one whose gather moves the whole relation.
+/// Measured on 60M rows grouping to 15M on a sorted `Int64` key, `min`/`max` aggregates:
+///
+/// | phase | ms |
+/// |---|---:|
+/// | `partition_morsels` (the gather) | 150 |
+/// | the aggregation itself | 70 |
+///
+/// **Separation is established, never assumed.** The bounds are read off the data with arrow's
+/// `min`/`max`, so an input that merely *claims* an order — a lakehouse `sorted_by` nothing
+/// enforces on write — cannot make this fire. Getting it wrong would not be slow, it would split
+/// one group across two runs and emit it twice, which is why the test is on values rather than
+/// on metadata.
+///
+/// Why the **first** key column alone decides: if run A's first-column maximum is strictly below
+/// run B's first-column minimum, then no composite key can appear in both, whatever the later
+/// columns hold. A tighter test would admit more inputs; this one is sufficient and needs one
+/// column's bounds.
+///
+/// Declines a null-bearing key (`min`/`max` skip nulls, so a null key could sit in two runs and
+/// become two groups) and anything but `Int64` — the analytical key shape after the FFI boundary
+/// widens narrow integers, and the one whose ordering is unambiguous. Returns `None` when fewer
+/// than [`MIN_DISJOINT_RUNS_PER_THREAD`] runs per worker can be cut, which is the low-cardinality
+/// case: one group then spans many morsels, no cut is legal, and the existing paths are right.
+pub(crate) fn key_disjoint_runs(
+    morsels: &[RecordBatch],
+    keys: &[String],
+    workers: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Int64Type};
+
+    let key = keys.first()?;
+    if morsels.len() < 2 {
+        return None;
+    }
+    // One morsel's key bounds, or `None` for a shape this cannot reason about.
+    let bounds_of = |b: &RecordBatch| -> Option<(i64, i64)> {
+        let col = b.column_by_name(key)?;
+        if col.data_type() != &DataType::Int64 || col.null_count() > 0 || col.is_empty() {
+            return None;
+        }
+        let a = col.as_primitive::<Int64Type>();
+        Some((
+            arrow::compute::kernels::aggregate::min(a)?,
+            arrow::compute::kernels::aggregate::max(a)?,
+        ))
+    };
+
+    // Aim for two runs per worker and accept one, so the overshoot below has somewhere to go.
+    let total: usize = morsels.iter().map(|b| b.num_rows()).sum();
+    let target = total
+        .div_ceil(workers.max(1).saturating_mul(MIN_DISJOINT_RUNS_PER_THREAD))
+        .max(1);
+
+    // **Estimate the cut rate before scanning.** Reading every morsel's bounds costs a pass
+    // over the key column — 6 ms on TPC-H sf10's 60M-row `l_orderkey` — and the answer is
+    // usually no. A relation whose morsels arrive interleaved (ten parquet files read in
+    // parallel, say) has a legal cut at well under 1% of its boundaries, where an ordered one
+    // has a cut wherever a group happens not to straddle a morsel edge — for a key with a few
+    // rows per group, most of them. Those two rates are orders of magnitude apart, so a sample
+    // of boundaries separates them without touching the rest of the relation.
+    //
+    // Sampling is sound here because it only decides whether to *look*: the cut points the runs
+    // are actually built from are read off the data in the scan below, never estimated.
+    let boundaries = morsels.len() - 1;
+    // `min` then `max`, never `clamp`: with fewer morsels than the sample wants, `clamp`'s
+    // bounds cross and it panics.
+    let samples = workers.saturating_mul(2).max(8).min(boundaries).max(1);
+    let mut hits = 0usize;
+    for s in 0..samples {
+        let i = s.saturating_mul(boundaries) / samples;
+        if bounds_of(&morsels[i])?.1 < bounds_of(&morsels[i + 1])?.0 {
+            hits += 1;
+        }
+    }
+    // Extrapolate to the whole relation and require comfortably more cuts than runs wanted —
+    // a cut only helps where it falls near a target boundary, so parity would not be enough.
+    if hits.saturating_mul(boundaries) < workers.saturating_mul(2).saturating_mul(samples) {
+        return None;
+    }
+
+    let bounds: Vec<(i64, i64)> = morsels.par_iter().map(bounds_of).collect::<Option<_>>()?;
+
+    // Close a run at the first *legal* cut past its share of the rows: legal means the run's
+    // largest key is strictly below the next morsel's smallest, so no group straddles the cut.
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut start, mut rows, mut hi) = (0usize, 0usize, i64::MIN);
+    for i in 0..morsels.len() {
+        rows += morsels[i].num_rows();
+        hi = hi.max(bounds[i].1);
+        let cuttable = i + 1 < morsels.len() && hi < bounds[i + 1].0;
+        if cuttable && rows >= target {
+            runs.push(start..i + 1);
+            (start, rows, hi) = (i + 1, 0, i64::MIN);
+        }
+    }
+    runs.push(start..morsels.len());
+    (runs.len() >= workers.max(1).max(2)).then_some(runs)
+}
+
+/// Runs *aimed for* per worker — the cut points are then accepted wherever the key allows one,
+/// and the path is taken when at least one run per worker came out.
+///
+/// Aiming at one per worker and demanding one per worker cannot both be met: a run closes at the
+/// first legal cut *past* its share of the rows, so it always overshoots slightly and the count
+/// lands just under the worker count. Aiming at two and accepting one leaves that slack, and
+/// gives rayon something to steal with when the cuts fall unevenly.
+///
+/// The one-per-worker floor is also what keeps this off the low-cardinality group-by: there a
+/// group spans many morsels, almost no cut between them is legal, and the handful of runs that
+/// come out would run the aggregate on a handful of cores.
+const MIN_DISJOINT_RUNS_PER_THREAD: usize = 2;
+
+/// Aggregate each key-disjoint run of morsels independently, and concatenate.
+///
+/// Each run holds every row for the keys inside it and no row for any other, so its partial is
+/// already final — the identical argument [`partitioned_aggregate`] makes about its hash
+/// buckets, reached without the gather. A run of one morsel is aggregated directly; a longer one
+/// aggregates each morsel and merges with `combine`, which is cheap here because it is a merge
+/// *within* a run (a few morsels' worth of groups, cache-resident) rather than across the whole
+/// relation.
+pub(crate) fn disjoint_run_aggregate(
+    morsels: &[RecordBatch],
+    runs: &[std::ops::Range<usize>],
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    jit: &AggJit,
+    funcs: &[agg::AggFunc],
+) -> Result<Vec<RecordBatch>, InterpError> {
+    runs.par_iter()
+        .map(|run| {
+            let partial = match &morsels[run.clone()] {
+                [] => return Ok(None),
+                [only] => ops::eval_partial_jit(only, group_keys, aggregates, jit)?,
+                many => {
+                    let parts: Vec<agg::Partial> = many
+                        .iter()
+                        .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, jit))
+                        .collect::<Result<_, _>>()?;
+                    agg::combine(&parts, funcs)?
+                }
+            };
+            let agg_columns = agg::finalize(funcs, &partial)?;
+            ops::build_agg_batch(group_keys, aggregates, &partial.group_columns, &agg_columns)
+                .map(Some)
+        })
+        .filter_map(|r| r.transpose())
         .collect()
 }
 
@@ -532,10 +782,203 @@ pub(crate) fn partitioned_partials(
 mod tests {
     use super::*;
 
+    /// A morsel of `rows` consecutive keys starting at `from`, each repeated `per` times.
+    fn keyed(from: i64, rows: usize, per: i64) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let k: Vec<i64> = (0..rows as i64).map(|i| from + i / per).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(k))]).expect("batch")
+    }
+
+    /// The runs this cuts must be **key-disjoint**, because that is the entire licence for
+    /// finalizing each one on its own: a key appearing in two runs is emitted as two groups,
+    /// silently. So the property is checked directly on the cut points rather than inferred
+    /// from the ordering they were derived from.
+    #[test]
+    fn every_cut_separates_the_key_space() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+        // 400 morsels of 1,000 rows, four rows per key: most morsel edges fall inside a group,
+        // so the cuts have to be *found* rather than taken at every boundary.
+        let per = 4i64;
+        let morsels: Vec<RecordBatch> = (0..400)
+            .map(|m| keyed(m as i64 * 1_000 / per, 1_000, per))
+            .collect();
+        let keys = vec!["k".to_string()];
+        let runs = key_disjoint_runs(&morsels, &keys, 8).expect("an ordered key yields runs");
+        assert!(
+            runs.len() >= 8,
+            "wanted at least one run per worker, got {}",
+            runs.len()
+        );
+        // The runs tile the morsels exactly, and no key spans two of them.
+        assert_eq!(runs[0].start, 0);
+        assert_eq!(runs[runs.len() - 1].end, morsels.len());
+        let mut last_max: Option<i64> = None;
+        for run in &runs {
+            let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+            for b in &morsels[run.clone()] {
+                let a = b.column(0).as_primitive::<Int64Type>();
+                for i in 0..a.len() {
+                    lo = lo.min(a.value(i));
+                    hi = hi.max(a.value(i));
+                }
+            }
+            if let Some(prev) = last_max {
+                assert!(
+                    prev < lo,
+                    "run starting at {lo} overlaps the previous run ending at {prev}"
+                );
+            }
+            last_max = Some(hi);
+        }
+    }
+
+    /// A key whose morsels interleave has no legal cut, and must be refused rather than cut
+    /// somewhere that splits a group. This is the shape of a relation read from several files
+    /// in parallel, which is what TPC-H's `lineitem` arrives as.
+    #[test]
+    fn an_interleaved_key_yields_no_runs() {
+        // Every morsel spans the whole key range, so no boundary separates anything.
+        let morsels: Vec<RecordBatch> = (0..400).map(|_| keyed(0, 1_000, 1)).collect();
+        assert!(key_disjoint_runs(&morsels, &["k".to_string()], 8).is_none());
+    }
+
+    /// A null in the key is refused: `min`/`max` skip nulls, so a null-keyed row could sit in
+    /// two runs and be emitted as two groups.
+    #[test]
+    fn a_null_key_is_refused() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let morsels: Vec<RecordBatch> = (0..400)
+            .map(|m| {
+                let k: Vec<Option<i64>> = (0..1_000i64)
+                    .map(|i| {
+                        if i == 7 {
+                            None
+                        } else {
+                            Some(m as i64 * 1_000 + i)
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(k))])
+                    .expect("batch")
+            })
+            .collect();
+        assert!(key_disjoint_runs(&morsels, &["k".to_string()], 8).is_none());
+    }
+
     /// Rows a morsel of `m` rows draws from a domain of `d` distinct keys yields, per the
     /// coupon-collector curve [`estimated_groups`] inverts. The oracle for the tests below.
     fn distinct_in(rows: f64, domain: f64) -> f64 {
         domain * (1.0 - (-rows / domain).exp())
+    }
+
+    /// A **clustered** key is the one shape the coupon-collector inversion cannot read, and
+    /// getting it wrong is what routes a 15M-group aggregate to the merge-heavy path. Four
+    /// rows per key laid out in key order: every morsel holds 1,024 distinct keys out of 4,096
+    /// rows, exactly as a 1,050-value domain would — and the morsels share no key, which a
+    /// small domain never does.
+    #[test]
+    fn a_clustered_key_is_not_read_as_a_tiny_domain() {
+        let (morsels, per_morsel_rows, per_morsel_groups) = (61usize, 4096usize, 1024usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * per_morsel_groups;
+        let total = 59_986_052usize;
+        // The bare inversion: four orders of magnitude low, and the reason this test exists.
+        assert!(
+            estimated_groups(rows, summed, morsels, total) < 2_000,
+            "the unaided inversion is expected to under-read a clustered key"
+        );
+        // Disjoint morsels (union == sum) say the domain cannot be that small.
+        let spread = estimated_groups_spread(rows, summed, summed, morsels, total);
+        assert!(
+            (14_000_000..=16_000_000).contains(&spread),
+            "a clustered key must read as ~15M groups, got {spread}"
+        );
+    }
+
+    /// …and a genuinely small domain must still read as small. Every morsel holds nearly the
+    /// whole domain, so the sample's union is far below the sum of its morsels' counts and the
+    /// correction stays out of the way.
+    #[test]
+    fn a_small_domain_is_still_read_as_small() {
+        let (morsels, per_morsel_rows, domain) = (61usize, 4096usize, 1000usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * domain; // every morsel sees all of it
+        let spread = estimated_groups_spread(rows, summed, domain, morsels, 59_986_052);
+        assert!(
+            spread < 2_000,
+            "a 1,000-value domain must not be inflated by the spread correction, got {spread}"
+        );
+        assert_eq!(spread, estimated_groups(rows, summed, morsels, 59_986_052));
+    }
+
+    /// A **skewed** key defeats both readings at once, and the union is what rescues it.
+    ///
+    /// Hot values put most of every morsel's keys in every other morsel's, so the disjointness
+    /// test fails and the linear read is not taken; the long tail makes each morsel's own ratio
+    /// look like a domain of ten thousand. ClickBench `GROUP BY URL` is this shape: 275,494
+    /// groups in 1 M rows, read as ~10 k. The union of the sample's own partials is 30,000
+    /// keys that were *counted*, so no estimate below it can be right.
+    #[test]
+    fn a_skewed_key_is_floored_at_the_keys_the_sample_actually_held() {
+        let (morsels, per_morsel_rows) = (4usize, 16_384usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = 36_000usize; // ~9,000 distinct per morsel
+        let union = 30_000usize; // heavy overlap: 0.83 of the sum, under SPREAD_MIN
+        let total = 1_000_000usize;
+        assert!(
+            (union as f64) / (summed as f64) < SPREAD_MIN,
+            "the fixture must be on the branch the linear read does not reach"
+        );
+        let base = estimated_groups(rows, summed, morsels, total);
+        assert!(
+            base < union,
+            "the unaided inversion is expected to fall below the counted union, got {base}"
+        );
+        assert_eq!(
+            estimated_groups_spread(rows, summed, union, morsels, total),
+            union,
+            "an estimate below a measured lower bound is wrong however the curve reads"
+        );
+    }
+
+    /// The floor is a *lower* bound and never becomes the answer on its own: where the model
+    /// already reads higher than the union, the model wins.
+    #[test]
+    fn the_union_floor_does_not_lower_a_larger_estimate() {
+        let (morsels, per_morsel_rows, per_morsel_groups) = (61usize, 4096usize, 1024usize);
+        let rows = morsels * per_morsel_rows;
+        let summed = morsels * per_morsel_groups;
+        let total = 59_986_052usize;
+        let spread = estimated_groups_spread(rows, summed, summed, morsels, total);
+        assert!(
+            spread > summed,
+            "the clustered read is far above its own union and must stay there, got {spread}"
+        );
+    }
+
+    /// The correction only ever raises the estimate, and never past one group per row — both
+    /// properties the decisions downstream rely on.
+    #[test]
+    fn the_spread_correction_only_raises_and_stays_bounded() {
+        let total = 1_000_000usize;
+        for union in [1usize, 10, 1_000, 40_000, 60_000] {
+            let summed = 61 * 1_000;
+            let rows = 61 * 4_096;
+            let base = estimated_groups(rows, summed, 61, total);
+            let spread = estimated_groups_spread(rows, summed, union, 61, total);
+            assert!(
+                spread >= base,
+                "the correction must never lower the estimate"
+            );
+            assert!(spread <= total, "never more groups than rows");
+        }
     }
 
     /// The estimator must recover the group count a uniform key really produces, because

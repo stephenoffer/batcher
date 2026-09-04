@@ -103,7 +103,7 @@ pub(crate) fn eval_list_simhash(
         .ok_or_else(|| ExprError::ExpectedType {
             func: "simhash".into(),
             want: "a numeric list element",
-            got: list.values().data_type().to_string(),
+            got: crate::error::type_name(list.values().data_type()),
         })?;
 
     let bits = num_bits as usize;

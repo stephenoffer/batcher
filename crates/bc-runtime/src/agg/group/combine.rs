@@ -264,8 +264,28 @@ pub(crate) fn combine_radix_parts(
             // index per output row, and this bucket may hold millions.
             let mut part_of: Vec<u32> = Vec::with_capacity(idx.len());
             let mut row_of: Vec<u32> = Vec::with_capacity(idx.len());
+            // A **cursor**, not a binary search per row. `idx` is globally ascending by
+            // construction: each chunk bins its own contiguous range of global rows in
+            // increasing order, and a bucket's list is those per-chunk runs concatenated in
+            // chunk order (see the counting sort above). So the owning partial only ever
+            // moves forward, and the whole bucket costs `O(idx.len() + parts.len())` instead
+            // of a `partition_point` over `parts.len() + 1` starts for every one of what may
+            // be millions of rows — `workers x groups` of them, which is the term this merge
+            // is already linear in.
+            //
+            // Asserted rather than assumed, in debug only: if a future binning ever emitted a
+            // bucket out of order the cursor would silently attribute rows to the wrong
+            // partial, which reads back as wrong *values* in the merged group rather than as
+            // an error.
+            debug_assert!(
+                idx.windows(2).all(|w| w[0] < w[1]),
+                "a radix bucket's row list must be globally ascending for the cursor below"
+            );
+            let mut p = 0usize;
             for &g in idx {
-                let p = starts.partition_point(|&s| s <= g) - 1;
+                while starts[p + 1] <= g {
+                    p += 1;
+                }
                 part_of.push(p as u32);
                 row_of.push(g - starts[p]);
             }
@@ -530,11 +550,18 @@ pub(crate) fn radix_parallel_default() -> usize {
 ///
 /// # Correctness precondition
 ///
-/// **The caller guarantees that no group key appears in two of `parts`.** This is not
-/// checkable here at any sensible cost, and violating it does not error — it emits the same
-/// key twice, so a `SUM` splits across two output rows. Only pass partials produced by
-/// partitioning one relation on the *whole* group key (`agg_par::partitioned_partials`,
-/// `combine_radix_parts`). When in doubt, call [`combine`]: it is slower and always right.
+/// **The caller guarantees that no group key appears in two of `parts`.** Violating it does
+/// not error — it emits the same key twice, so a `SUM` splits across two output rows, which is
+/// precisely the wrong answer that shows up only at the scale where the partitioning engages.
+/// Only pass partials produced by partitioning one relation on the *whole* group key
+/// (`agg_par::partitioned_partials`, `combine_radix_parts`). When in doubt, call [`combine`]:
+/// it is slower and always right.
+///
+/// The precondition is unaffordable to check in a *release* build, which is the reason it is a
+/// precondition. It is entirely affordable in a debug one — a single `RowConverter` pass over
+/// keys that were going to be concatenated anyway — so [`assert_keys_disjoint`] does check it
+/// there, and the whole Rust suite runs on the debug profile. A caller that gets this wrong now
+/// fails a test by name instead of returning a plausible number.
 ///
 /// The relation returned is the one `combine` would return, in a different group order —
 /// which is unspecified for a hash aggregate, as it already is across worker counts.
@@ -561,10 +588,53 @@ pub fn concat_disjoint(parts: &[Partial]) -> Result<Partial, RuntimeError> {
                 .collect::<Result<_, _>>()
         })
         .collect::<Result<_, _>>()?;
+    #[cfg(debug_assertions)]
+    assert_keys_disjoint(&group_columns);
     Ok(Partial {
         group_columns,
         states,
     })
+}
+
+/// Debug-only proof of [`concat_disjoint`]'s disjointness precondition.
+///
+/// Encodes the already-concatenated group keys once and asserts every row is distinct — which
+/// is exactly the precondition, because each individual partial's keys are distinct by
+/// construction, so a repeat in the concatenation can only be a key shared *across* partials.
+///
+/// Declines silently when the keys cannot be encoded: a `RowConverter` failure means an unusual
+/// key type, and an assertion helper is not the place to turn that into a panic. A global
+/// aggregate has no key column at all, and every partial then names the same (implicit) group,
+/// so disjointness is meaningless rather than violated — it is not a caller this function
+/// serves, and it is skipped rather than failed.
+#[cfg(debug_assertions)]
+fn assert_keys_disjoint(group_columns: &[ArrayRef]) {
+    use arrow::row::{RowConverter, SortField};
+    use std::collections::HashSet;
+
+    let Some(first) = group_columns.first() else {
+        return;
+    };
+    let fields: Vec<SortField> = group_columns
+        .iter()
+        .map(|c| SortField::new(c.data_type().clone()))
+        .collect();
+    let Ok(conv) = RowConverter::new(fields) else {
+        return;
+    };
+    let Ok(rows) = conv.convert_columns(group_columns) else {
+        return;
+    };
+    let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(first.len());
+    for i in 0..first.len() {
+        assert!(
+            seen.insert(rows.row(i).as_ref().to_vec()),
+            "concat_disjoint: group key at row {i} appears in more than one partial. The \
+             partials were not produced by partitioning on the whole group key, so this \
+             concatenation would emit that group twice and split its aggregate across two \
+             output rows. Use `combine` instead."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -589,18 +659,18 @@ mod tests {
         let n = 500;
         let a_int: ArrayRef = Arc::new(Int64Array::from(
             (0..n)
-                .map(|i| (i % 7 != 0).then_some(i as i64))
+                .map(|i| (i % 7 != 0).then_some(i64::from(i)))
                 .collect::<Vec<_>>(),
         ));
         let b_int: ArrayRef = Arc::new(Int64Array::from(
             (0..n)
-                .map(|i| (i % 3 != 0).then_some(-(i as i64)))
+                .map(|i| (i % 3 != 0).then_some(-i64::from(i)))
                 .collect::<Vec<_>>(),
         ));
-        let dense: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+        let dense: ArrayRef = Arc::new(Int64Array::from((0..i64::from(n)).collect::<Vec<_>>()));
         let floats: ArrayRef = Arc::new(Float64Array::from(
             (0..n)
-                .map(|i| (i % 5 != 0).then_some(i as f64 / 4.0))
+                .map(|i| (i % 5 != 0).then_some(f64::from(i) / 4.0))
                 .collect::<Vec<_>>(),
         ));
 

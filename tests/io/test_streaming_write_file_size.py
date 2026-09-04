@@ -128,6 +128,6 @@ def test_a_chunk_lost_after_the_epoch_is_rewritten_on_restart(tmp_path):
     """Resume is per *chunk*, so losing one does not lose the epoch or duplicate the rest."""
     out, ckpt = str(tmp_path / "s"), str(tmp_path / "ck")
     _, expected = _capped_stream(out, ckpt)
-    os.remove(sorted(glob.glob(f"{out}/*.parquet"))[-1])
+    os.remove(max(glob.glob(f"{out}/*.parquet")))
     _, healed = _capped_stream(out, ckpt)
     assert healed == expected

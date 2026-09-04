@@ -145,9 +145,9 @@ def placeable_workers(
         return None
     try:
         from batcher._internal.accelerators import is_accelerator_node
-        from batcher.dist.executors.ray_runtime.scaling import node_classes
+        from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
-        nodes = node_classes()
+        nodes = node_class_census()
     except Exception:
         return None
     if not nodes:
@@ -163,8 +163,7 @@ def placeable_workers(
     # Nameplate, because this answers what the cluster can host rather than what is free
     # right now — the fan-out is sized before the fleet is placed, and a co-tenant that
     # finishes in the meantime must not have shrunk it.
-    total = sum(workers_per_node(node, demand, nameplate=True) for node in nodes)
-    return total
+    return sum(workers_per_node(node, demand, nameplate=True) * node["count"] for node in nodes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,10 +292,10 @@ def describe_pending_demand(demand: Demand) -> str | None:
     Returns:
         The diagnosis, or `None` when the topology reports nothing actionable.
     """
-    from batcher.dist.executors.ray_runtime.scaling import node_classes
+    from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
     try:
-        nodes = node_classes()
+        nodes = node_class_census()
     except Exception as exc:  # pragma: no cover - a diagnosis never fails its caller
         note_suppressed("dist", "read node classes for the demand diagnosis", exc)
         return None
@@ -316,9 +315,10 @@ def describe_pending_demand(demand: Demand) -> str | None:
         # Report against the widest node rather than an arbitrary one: it is the node a
         # reader would compare the ask to, and the one whose shape has to change.
         widest = max(nodes, key=lambda n: float(n.get("cpus", 0.0)))
+        total = sum(n["count"] for n in nodes)
         return (
             f"no node can host one task: this stage asks for {_ask(demand)} per task and the "
-            f"widest of {len(nodes)} node(s) is short on {shortfalls[id(widest)]}, so waiting "
+            f"widest of {total} node(s) is short on {shortfalls[id(widest)]}, so waiting "
             f"cannot schedule it"
         )
 
@@ -363,23 +363,23 @@ def preferred_fleet_zone(workers: int, demand: Demand) -> dict[str, str]:
     Returns:
         `{label_key: zone}` to pin the fleet, or `{}` to leave placement unconstrained.
     """
-    from batcher.dist.executors.ray_runtime.scaling import node_classes
+    from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
     try:
-        nodes = node_classes()
+        nodes = node_class_census()
     except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
         note_suppressed("dist", "read node classes for zone-aware placement", exc)
         return {}
     zoned = [n for n in nodes if n.get("zone")]
-    if len(zoned) < 2 or len({n["zone"] for n in zoned}) < 2:
+    if sum(n["count"] for n in zoned) < 2 or len({n["zone"] for n in zoned}) < 2:
         return {}
     best: tuple[float, str, str] | None = None
     for zone in {n["zone"] for n in zoned}:
         members = [n for n in zoned if n["zone"] == zone]
-        fits = sum(workers_per_node(n, demand) for n in members)
+        fits = sum(workers_per_node(n, demand) * n["count"] for n in members)
         if fits < workers:
             continue
-        free = sum(float(n.get("free_cpus", n.get("cpus", 0.0))) for n in members)
+        free = sum(float(n.get("free_cpus", n.get("cpus", 0.0))) * n["count"] for n in members)
         key = members[0].get("zone_label") or ""
         if key and (best is None or free > best[0]):
             best = (free, key, zone)

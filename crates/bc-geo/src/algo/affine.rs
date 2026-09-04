@@ -14,6 +14,7 @@ use crate::error::{GeoError, GeoResult};
 use crate::types::{Coord, Geometry};
 
 /// Shift every position by `(dx, dy, dz)`.
+#[must_use]
 pub fn translate(g: &Geometry, dx: f64, dy: f64, dz: f64) -> Geometry {
     g.map_coords(&mut |c| Coord {
         x: c.x + dx,
@@ -23,6 +24,7 @@ pub fn translate(g: &Geometry, dx: f64, dy: f64, dz: f64) -> Geometry {
 }
 
 /// Scale every position about the origin.
+#[must_use]
 pub fn scale(g: &Geometry, sx: f64, sy: f64, sz: f64) -> Geometry {
     g.map_coords(&mut |c| Coord {
         x: c.x * sx,
@@ -32,6 +34,7 @@ pub fn scale(g: &Geometry, sx: f64, sy: f64, sz: f64) -> Geometry {
 }
 
 /// Rotate counter-clockwise by `radians` about `(ox, oy)`.
+#[must_use]
 pub fn rotate(g: &Geometry, radians: f64, ox: f64, oy: f64) -> Geometry {
     let (s, c) = radians.sin_cos();
     g.map_coords(&mut |p| {
@@ -48,6 +51,7 @@ pub fn rotate(g: &Geometry, radians: f64, ox: f64, oy: f64) -> Geometry {
 ///
 /// Named the way PostGIS `ST_Affine` names its arguments so a transform matrix can be
 /// carried across from an existing pipeline without re-deriving it.
+#[must_use]
 pub fn affine(g: &Geometry, a: f64, b: f64, d: f64, e: f64, xoff: f64, yoff: f64) -> Geometry {
     g.map_coords(&mut |c| Coord {
         x: a * c.x + b * c.y + xoff,
@@ -89,6 +93,7 @@ pub fn snap_to_grid(
 /// Structural, not numeric: `Geom::has_z` is what decides whether z is written, so the
 /// caller clears that flag alongside calling this. Kept separate because the coordinate
 /// rewrite and the flag live on different types.
+#[must_use]
 pub fn force_2d(g: &Geometry) -> Geometry {
     g.map_coords(&mut |c| Coord {
         x: c.x,
@@ -98,6 +103,7 @@ pub fn force_2d(g: &Geometry) -> Geometry {
 }
 
 /// Set a constant z on every position, making a 2D geometry 3D.
+#[must_use]
 pub fn force_3d(g: &Geometry, z: f64) -> Geometry {
     g.map_coords(&mut |c| Coord { x: c.x, y: c.y, z })
 }

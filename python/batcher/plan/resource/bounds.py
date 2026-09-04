@@ -13,7 +13,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["FeasibilityVerdict", "ResourceBounds", "SchedulingEnvelope"]
+__all__ = [
+    "CAPACITY_ANY",
+    "CAPACITY_ON_DEMAND",
+    "CAPACITY_PREFERENCES",
+    "CAPACITY_SPOT",
+    "FeasibilityVerdict",
+    "ResourceBounds",
+    "SchedulingEnvelope",
+]
+
+#: The three things a plan can say about the capacity its tasks should land on, and the
+#: vocabulary of `SchedulingEnvelope.capacity_preference`.
+#:
+#: Named here, in the neutral layer, because Carbonite chooses one and `dist` translates it,
+#: and neither may import the other. The *meaning* of each — which node labels satisfy it,
+#: what happens when the preferred market is full — belongs to `dist`, which is the only
+#: layer that can see a live fleet; this is only the set of words.
+CAPACITY_ANY = "any"
+CAPACITY_SPOT = "spot"
+CAPACITY_ON_DEMAND = "on_demand"
+CAPACITY_PREFERENCES = frozenset({CAPACITY_ANY, CAPACITY_SPOT, CAPACITY_ON_DEMAND})
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +50,16 @@ class ResourceBounds:
       co-locating its workers (PACK) beats spreading them (SPREAD). Set by Kyber from
       the estimated shuffle volume; consumed by Carbonite to pick a placement strategy
       preference. A pure plan property — the live cluster decides the final strategy.
+    * `materializes` — whether the operator is a **pipeline breaker**: it holds the
+      relation rather than streaming a morsel of it. Kyber already decides this to size
+      `m_max_bytes` (a breaker is budgeted `rows x width`, a streaming operator one
+      morsel), and publishing it is what lets Carbonite tell the two apart without
+      restating the vocabulary — which it cannot import, since the subsystems are
+      independent. It is the difference between work a preemption costs a *resubmission*
+      and work a preemption costs the *stage*: a stateless partition re-derives from its
+      durable descriptor, a breaker's accumulated state does not. `False` is the safe
+      default here for the same reason it is everywhere else in this file — an operator
+      nobody sized reads as streaming, which asks for less rather than more.
     """
 
     m_max_bytes: int
@@ -37,6 +67,7 @@ class ResourceBounds:
     n_max_parallelism: int
     c_cpu_shares: float = 1.0
     prefers_locality: bool = False
+    materializes: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +122,13 @@ class SchedulingEnvelope:
                        internally, so `dist` gang-schedules its actors co-located
                        (STRICT_PACK). Batcher never touches a tensor — the Arrow contract
                        at operator boundaries is unchanged; only placement is affected.
+    * `capacity_preference` — which market the fleet's tasks should land on when the cluster
+                       offers more than one: `"any"` (state nothing), `"spot"` (the work
+                       re-derives from durable inputs, so a reclamation costs a resubmission),
+                       or `"on_demand"` (the work holds state a reclamation would destroy). A
+                       *preference*, like `placement_strategy`: `dist` resolves it against the
+                       live fleet's market labels and emits nothing at all unless the fleet is
+                       genuinely mixed, so it is a no-op on every single-market cluster.
     * `inflight_depth` — per-actor submit-ahead depth for a GPU/inference actor pool: how
                        many partitions one actor may have in flight at once. `1` is the
                        one-at-a-time default; `>1` keeps a GPU fed across the
@@ -127,5 +165,6 @@ class SchedulingEnvelope:
     # preference, no collective co-location.
     placement_strategy: str = "SPREAD"
     prefer_cpu_only_nodes: bool = False
+    capacity_preference: str = "any"
     gpu_collective: bool = False
     inflight_depth: int = 1

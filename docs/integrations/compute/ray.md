@@ -131,7 +131,8 @@ The shuffle is a data plane on the wire.
 
 The rest (retries, straggler speculation, skew salting, adaptive credits) is in
 {doc}`configuration options </configuration/options>`, and the defaults fill a cluster with no
-tuning: one worker per node, an even share of each node's cores, reducer count scaled to workers.
+tuning: each node cut into several workers, an even share of its cores each, reducer count scaled
+to workers.
 
 ## Bringing in a Ray Dataset
 
@@ -234,6 +235,57 @@ capacity labels, since a KubeRay fleet is labelled by whichever provisioner brou
 It is a preference, never an exclusion: an all-spot fleet, or one with no capacity labels at
 all, places its copies exactly as before.
 
+**Each stage can run on the capacity its failure model fits.** A mixed fleet buys the same core
+at two prices with two reliability contracts, and Batcher's execution model already says which
+stages belong on which. A stateless map partition is its own lineage: it re-derives from a durable
+partition descriptor, which is why a preempted one is resubmitted rather than failing the stage.
+A shuffle worker is not, because it holds accumulated partial state and the mapped output its
+peers have yet to fetch. Set `distributed.capacity_aware_placement=True` and Batcher asks Ray for
+spot capacity for the first and on-demand capacity for the second, using a market-type
+`label_selector` paired with a `fallback_strategy` naming where the stage goes when the preferred
+market is full. The fallback is what makes it a preference rather than a way to hang: a fleet
+that wants on-demand and finds none runs on spot instead of pending.
+
+It is off by default and, when on, still emits nothing unless the live fleet is genuinely mixed:
+both market types present, both labelled, and labelled under a single key. On an unlabelled fleet,
+a single-market fleet, or a fleet labelled under two different provisioners' keys, a selector
+would narrow rather than choose, and an unsatisfiable one pends silently. The market type is read
+from `ray.io/market-type` and from the Karpenter, EKS, and GKE capacity labels, the same
+vocabulary the shuffle replica placement uses. Placement never changes which rows a task
+processes, so the results are identical either way; what changes is what a reclamation costs.
+
+```python
+# docs: skip
+import dataclasses
+
+import batcher as bt
+
+base = bt.active_config()
+bt.set_config(
+    base.replace(
+        distributed=dataclasses.replace(base.distributed, capacity_aware_placement=True)
+    )
+)
+
+# The scan and the filter run on spot; the aggregate's shuffle fleet runs on on-demand.
+out = (
+    bt.read.parquet("s3://<your-bucket>/events/")
+    .filter(bt.col("status") == "ok")
+    .group_by("user_id")
+    .agg(events=bt.col("event_id").count())
+    .collect(distributed=True)
+)
+```
+
+**A very wide stage stops reporting each task to the Ray Dashboard.** Ray emits a running and a
+finished event per task to the GCS, which is what puts it in `ray list tasks`, the Dashboard, and
+the State API. Above `distributed.task_events_fanout_cap` tasks in one stage (10,000 by default)
+Batcher turns those events off, because a hundred-thousand-partition stage puts a hundred thousand
+events onto a control plane every driver in the fleet shares, to fill a table nobody can read at
+that size. Set `distributed.task_events="always"` to keep them, or `"never"` to drop them
+everywhere. Batcher's own progress reporting is unaffected, since it reads the engine's event bus
+rather than Ray's.
+
 **A reservation that does not form now says why.** A gang that cannot be satisfied used to fall
 back silently, and the tasks it fell back to ask for the same resources the bundles did — so the
 query would hang at a barrier with nothing anywhere explaining it. Batcher now compares the ask
@@ -254,6 +306,14 @@ nicety: a `map_batches` `fn` with an external side effect (a vector-DB insert, a
 apply it twice. Make the sink an upsert on a stable key and recompute becomes exactly-once. A pure
 transform is already safe.
 :::
+
+**A busy shuffle worker still answers questions.** Each fleet actor runs several shuffle
+calls at once, and a call holds its thread for as long as a stage takes. The worker's
+control-plane methods run in their own threads (a Ray concurrency group), so asking one where
+it is, whether it has seen a preemption notice, or how many bytes it published does not queue
+behind minutes of shuffling. That is a correctness property rather than a latency one: the
+fleet health probe has a ten-second timeout, and the drain check has a reclamation window, so
+a slow answer from a healthy worker used to read as a dead one.
 
 **`resilience="spot"`** hardens the retry and restart budgets as a bundle for a churning cluster.
 Use it rather than tuning six knobs by hand.

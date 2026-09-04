@@ -186,7 +186,7 @@ def test_s2_cells_nest_and_a_parent_covers_its_children():
             cell = _one(bt.st_s2_cell(bt.lit(lon), bt.lit(lat), level))
             assert cell is not None
             assert _one(bt.st_s2_cell_parent(bt.lit(cell), level)) == cell
-            for coarser in range(0, level):
+            for coarser in range(level):
                 direct = _one(bt.st_s2_cell(bt.lit(lon), bt.lit(lat), coarser))
                 derived = _one(bt.st_s2_cell_parent(bt.lit(cell), coarser))
                 assert derived == direct, (

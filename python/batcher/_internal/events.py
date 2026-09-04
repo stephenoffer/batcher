@@ -24,7 +24,7 @@ import contextlib
 import contextvars
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +36,7 @@ __all__ = [
     "LOG",
     "MALFORMED",
     "PARTITION",
+    "PHASE",
     "POOL",
     "PROGRESS",
     "QUERY_END",
@@ -51,6 +52,7 @@ __all__ = [
     "Event",
     "Subscriber",
     "current_query_id",
+    "is_gpu_sample",
     "listening",
     "publish",
     "query_scope",
@@ -73,6 +75,19 @@ STAGE_END = "stage_end"
 PROGRESS = "progress"
 #: A subsystem hand-off worth explaining (see `plan.profile.Decision`).
 DECISION = "decision"
+#: The control plane moved to a new phase of the *current* query. `name` is a short
+#: present-participle label for a person (``optimizing``, ``executing``); ``phase`` is the
+#: stable machine name the DEBUG log uses (``kyber.optimize_full``).
+#:
+#: Deliberately not a `STAGE_START`. A stage is an *operator*, keyed by `op_id`, and the
+#: profile replays every one of them when the query ends; a control-plane phase has no
+#: operator and would collide with operator 0 in the dashboard's timeline. It is also the
+#: only thing that can be reported *while* the slow part is happening: the engine runs
+#: inside Rust and reports nothing until it returns, so between `QUERY_START` and
+#: `QUERY_END` the bus was silent for the entire duration of planning and execution --
+#: measured at 122 ms of a 142 ms query -- and the live progress line said ``running``
+#: throughout, which is the one word that adds nothing.
+PHASE = "phase"
 #: A `batcher.*` log record, bridged onto the bus so the UI shows logs beside metrics.
 LOG = "log"
 
@@ -105,9 +120,16 @@ DQ = "dq"
 #: in the stage, may be None when unknown), ``rows`` (rows this partition produced). `name`
 #: is the stage/operator label. Emit one per partition as it completes.
 PARTITION = "partition"
-#: A GPU utilization / VRAM sample from one actor. Fields: ``device`` (id/name), ``actor``
-#: (actor id), ``util_pct`` (0-100), ``mem_used_bytes``, ``mem_total_bytes``. Emit on a
-#: sampling interval from inside the worker, not only when the pool tears down.
+#: Something a GPU did. The common shape is a utilization / VRAM **sample** from one actor:
+#: ``device`` (id/name), ``actor`` (actor id), ``util_pct`` (0-100), ``mem_used_bytes``,
+#: ``mem_total_bytes``, emitted on a sampling interval from inside the worker rather than only
+#: when the pool tears down.
+#:
+#: It is **not the only shape on this kind**: `dist.gpu.device_read` publishes a
+#: ``event="transfer_path"`` report saying whether a scan reached the device directly, and that
+#: one measures no utilization at all. A fold that reads the sample fields off every `GPU`
+#: event turns such a report into a device at 0% — see [`is_gpu_sample`], which every fold
+#: must gate on.
 GPU = "gpu"
 #: One inference micro-batch completed on a worker. Fields: ``rows``, ``latency_ms``,
 #: ``blocked_ms`` (time the worker waited for its next input — the pipeline-starvation
@@ -306,11 +328,27 @@ class Event:
 #: A sink: called with each `Event`. Must not raise; if it does, it is skipped.
 Subscriber = Callable[[Event], None]
 
+#: Consecutive failures a sink is allowed before it is detached.
+#:
+#: A sink that raises is skipped for that emit and kept — which is right for a transient
+#: failure and wrong for a permanent one. A sink whose stream has been closed raises on
+#: *every* event, and progress is published per morsel, so a single broken sink turned a
+#: query into one DEBUG record per batch: unbounded log noise on the hot path, attributed
+#: to a subsystem that has nothing to do with the failure, and a `publish` that stays
+#: expensive forever because the failing sink is still in the tuple. Three strikes keeps a
+#: sink that blips and removes one that is gone.
+MAX_SINK_FAILURES = 3
+
 # Swapped wholesale under `_lock` rather than mutated, so `publish` can read it without
 # taking the lock at all — the reader sees either the old tuple or the new one, never a
 # half-mutated list. This is what keeps per-batch progress publishing lock-free.
 _subscribers: tuple[Subscriber, ...] = ()
 _lock = threading.Lock()
+
+# Consecutive-failure counts, keyed by the sink's identity. An entry exists only while the
+# sink is both subscribed and currently failing, so this cannot grow without bound and an
+# id cannot be reused: `_subscribers` holds a reference for as long as a count is kept.
+_failures: dict[int, int] = {}
 
 # Re-entrancy guard, per thread. Publishing can re-enter itself: a sink raises, `publish`
 # logs that at DEBUG, the logging bridge turns the record into a LOG event, and that event
@@ -319,6 +357,33 @@ _lock = threading.Lock()
 # failure this module promises cannot happen. The guard makes the nested publish a no-op, so
 # the first failure is still reported and the cycle cannot form.
 _publishing = threading.local()
+
+
+#: The fields that make a `GPU` event a utilization sample. A report on the same kind that
+#: carries none of them measured no utilization, and reading them off it with a `0` default
+#: fabricates an idle device rather than omitting an unknown one.
+_GPU_SAMPLE_FIELDS = ("util_pct", "mem_used_bytes", "mem_total_bytes")
+
+
+def is_gpu_sample(fields: Mapping[str, Any]) -> bool:
+    """Whether a `GPU` event carries a utilization or VRAM reading.
+
+    The `GPU` kind carries more than one shape, and only this one is a measurement. Every fold
+    over it read the sample fields with a `0` default, so a `transfer_path` report — which
+    measures nothing — produced a device at 0% utilization and 0 bytes of VRAM. That is worse
+    than reporting nothing: a flatlined GPU is a signal an operator acts on, and the inference
+    panel turned it into a *critical* "severe under-use" finding on hardware that was busy.
+
+    Tested by shape rather than by the `event` discriminator, so a future report on this kind
+    is handled without a second edit here.
+
+    Args:
+        fields: The event's field mapping.
+
+    Returns:
+        True when at least one reading is present, so the event is worth folding.
+    """
+    return any(name in fields for name in _GPU_SAMPLE_FIELDS)
 
 
 def listening() -> bool:
@@ -357,6 +422,7 @@ def subscribe(sink: Subscriber) -> Callable[[], None]:
         global _subscribers
         with _lock:
             _subscribers = tuple(s for s in _subscribers if s is not sink)
+            _failures.pop(id(sink), None)
 
     return _unsubscribe
 
@@ -442,19 +508,54 @@ def publish(kind: str, *, query_id: str = "", name: str = "", **fields: Any) -> 
         for sink in sinks:
             try:
                 sink(event)
-            except Exception:  # pragma: no cover - a sink must never fail a query
-                _report_sink_failure()
+            except Exception as exc:  # pragma: no cover - a sink must never fail a query
+                _report_sink_failure(sink, exc)
+            else:
+                if _failures:
+                    _failures.pop(id(sink), None)
     finally:
         _publishing.active = False
 
 
-def _report_sink_failure() -> None:
-    """Log a sink exception at DEBUG, without recursing back onto the bus.
+def _report_sink_failure(sink: Subscriber, exc: BaseException) -> None:
+    """Log a sink exception and detach the sink once it has failed `MAX_SINK_FAILURES` times.
 
     Imported lazily and called only on the failure path: `logging` bridges records *onto*
     the bus, so doing this eagerly at module scope would make the two modules mutually
     importable at load time for no benefit.
-    """
-    from batcher._internal.logging import get_logger
 
-    get_logger("observe").debug("event sink raised; skipped", exc_info=True)
+    The detach is the point. A permanently broken sink — a reporter whose stream was closed,
+    a dashboard whose socket is gone — raises on every event, and progress is published per
+    morsel; keeping it produced one DEBUG record per batch forever and left `publish`
+    paying for a sink that can never succeed. The record on the way out is a WARNING,
+    because losing a whole observability surface mid-run is worth knowing about, and it is
+    emitted exactly once.
+
+    Args:
+        sink: The sink that raised.
+        exc: The exception it raised.
+    """
+    from batcher._internal.logging import get_logger, log_kv
+
+    logger = get_logger("observe")
+    key = id(sink)
+    count = _failures.get(key, 0) + 1
+    _failures[key] = count
+    if count < MAX_SINK_FAILURES:
+        logger.debug("event sink raised; skipped", exc_info=True)
+        return
+    global _subscribers
+    with _lock:
+        _subscribers = tuple(s for s in _subscribers if s is not sink)
+        _failures.pop(key, None)
+    import logging as _logging
+
+    log_kv(
+        logger,
+        _logging.WARNING,
+        "event sink detached after repeated failures",
+        sink=type(sink).__name__,
+        failures=count,
+        error=type(exc).__name__,
+        detail=str(exc),
+    )

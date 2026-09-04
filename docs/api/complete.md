@@ -94,6 +94,7 @@ Reference and derive columns, build literals, and branch.
    element
    struct
    named_struct
+   map_from_arrays
    array
 ```
 
@@ -191,6 +192,25 @@ Process-wide counters as plain data, for Prometheus, OpenTelemetry, or a log lin
 .. autofunction:: batcher.observe.prometheus_text
 .. autofunction:: batcher.observe.start_metrics
 .. autofunction:: batcher.observe.reset_metrics
+```
+
+## Result cache
+
+Whole-cache control and measurement, for the results {py:meth}`Dataset.cache <batcher.Dataset.cache>` stores. See {doc}`caching results </user-guide/operate/tuning/caching>`.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   cache_stats
+   clear_cache
+```
+
+```{eval-rst}
+.. autoclass:: batcher.StorageLevel
+   :members:
+   :undoc-members:
 ```
 
 ## Dataset

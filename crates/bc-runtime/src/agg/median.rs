@@ -42,14 +42,14 @@ pub(crate) fn median_state(
         None => {
             for (i, &g) in group_ids.iter().enumerate() {
                 keep.push(i as u32);
-                kept_groups.push(g as i64);
+                kept_groups.push(i64::from(g));
             }
         }
         Some(nulls) => {
             for (i, &g) in group_ids.iter().enumerate() {
                 if nulls.is_valid(i) {
                     keep.push(i as u32);
-                    kept_groups.push(g as i64);
+                    kept_groups.push(i64::from(g));
                 }
             }
         }
@@ -71,7 +71,7 @@ pub(crate) fn listagg_state(
     group_ids: &[u32],
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let groups: Vec<i64> = group_ids.iter().map(|&g| g as i64).collect();
+    let groups: Vec<i64> = group_ids.iter().map(|&g| i64::from(g)).collect();
     bucket_values_into_list(&Int64Array::from(groups), values, num_groups)
 }
 
@@ -216,7 +216,10 @@ pub(crate) fn quickselect_median(v: &mut [f64]) -> f64 {
                 a
             }
         });
-        (lower + *mid) / 2.0
+        // `f64::midpoint`, not `(lower + mid) / 2.0`: the sum of two large finite doubles
+        // overflows to infinity, so the naive form reports `inf` as the median of e.g.
+        // {1e308, 1.7e308} where the true midpoint (and DuckDB's answer) is 1.35e308.
+        f64::midpoint(lower, *mid)
     }
 }
 
@@ -242,7 +245,16 @@ fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
             }
         })
     };
-    lo_val + (hi_val - lo_val) * frac
+    // A convex combination, not `lo + (hi - lo) * frac`. The difference of two large
+    // opposite-signed doubles overflows to infinity, so `quantile_cont(x, 0.25)` over
+    // {-1.7e308, 1.7e308} returned **inf** where the answer is -8.5e307 — which is what DuckDB
+    // returns. This form scales each endpoint by a weight in [0, 1] and never forms their
+    // difference, so a finite input cannot produce an infinite quantile.
+    //
+    // At `frac == 0` the caller has already set `hi_val = lo_val`, so this is exactly `lo_val`;
+    // at `frac == 1` it is exactly `hi_val`. In between it agrees with the subtractive form
+    // wherever that form does not overflow.
+    lo_val * (1.0 - frac) + hi_val * frac
 }
 
 /// Base-2 Shannon entropy per group (DuckDB `entropy`): `-Σ pᵢ·log₂(pᵢ)` over the
@@ -689,11 +701,19 @@ mod tests {
                 om,
                 "median trial {trial} n={n}"
             );
-            // quantile oracle at a few q
+            // Quantile oracle at a few q. The interpolation is the **convex combination**,
+            // matching `quickselect_quantile`; the subtractive `lo + (hi - lo) * frac` this
+            // oracle used to spell disagrees with it in the last ulp on about a quarter of
+            // inputs, and it is the convex form that agrees with DuckDB — measured over 400
+            // random (values, q) pairs, convex matched `quantile_cont` 400/400 and subtractive
+            // 308/400, with no case the other way. This oracle was a restatement of the
+            // implementation, so it moved with it rather than checking it; the external check
+            // is `tests/differential/test_diff_quantile_interpolation.py`.
             for &q in &[0.0, 0.1, 0.25, 0.5, 0.9, 1.0] {
                 let pos = q * (n - 1) as f64;
                 let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
-                let oq = sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64);
+                let frac = pos - lo as f64;
+                let oq = sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
                 assert_eq!(
                     super::quickselect_quantile(&mut v, q),
                     oq,

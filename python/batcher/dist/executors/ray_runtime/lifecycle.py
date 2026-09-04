@@ -648,7 +648,12 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
 
     if core.has_map_batches(plan):
         return _single_node_with_udfs(plan, sources)
-    physical = kyber.optimize(plan)
+    # `sources` and the hub are what make this the *same* plan `collect()` would run.
+    # Without them the estimator has no cardinalities, so every cost-based choice silently
+    # defaults: a 20,000-row/50-row join planned `strategy="hash"` here and
+    # `strategy="broadcast"` on the single-node path, for the identical query. The UDF
+    # branch directly above already passes `sources`; this branch did not.
+    physical = kyber.optimize(plan, sources=sources, hub=core.default_hub())
     resolved = [
         read_source(
             src,

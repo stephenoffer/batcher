@@ -21,13 +21,14 @@ from __future__ import annotations
 import atexit
 import contextlib
 import contextvars
+import logging
 import os
 from collections import deque
 
 import pyarrow as pa
 
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
-from batcher._internal.logging import get_logger, note_suppressed
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
@@ -45,7 +46,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
-from batcher.plan.logical import LogicalPlan, MapBatches
+from batcher.plan.logical import LogicalPlan, MapBatches, preserves_source_row_count
 from batcher.plan.visitor import scanned_source_ids
 
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
@@ -586,6 +587,59 @@ def _resolve_pool_size(spec: object, num_partitions: int, default: int) -> int:
     return int(spec)
 
 
+def _placeable_scheduling(needed_cpus: float) -> dict:
+    """Make room for this stage's tasks against a fleet holding the whole cluster.
+
+    A shuffle fleet reserves every schedulable core (one worker per node, holding that
+    node's cores), and these are plain Ray tasks submitted *outside* that reservation. So
+    the fleet does not slow them down, it makes them unplaceable — measured as
+    `{'CPU': 0.125}: 1+ pending` against `384.0/384.0`, indefinitely, with no error and no
+    timeout.
+
+    Two answers, in order of preference:
+
+    1. **Hand the fleet back** (`yield_session_fleet`) and take the whole cluster. Available
+       whenever nothing is mid-shuffle and no intermediate is published on the actors; the
+       next Flight stage respawns the fleet for the price of one spawn.
+    2. **Run inside the reservation.** A staged query's final scan reads an intermediate
+       *published on those very actors*, so the fleet cannot be released — and that is the
+       shape the deadlock was found on. The bundles keep `fleet_task_headroom` unclaimed for
+       exactly this, so the tasks run beside the actors, on the nodes holding their data.
+
+    Never raises: a stage that cannot be helped is left exactly where it was, and the
+    barrier's own stall reporting says so.
+
+    Args:
+        needed_cpus: The largest single CPU ask among the tasks about to be submitted.
+
+    Returns:
+        Ray `.options(...)` scheduling kwargs, empty when the open cluster can place them.
+    """
+    from batcher.dist.fleet import held_placement_group, yield_session_fleet
+
+    try:
+        if yield_session_fleet(needed_cpus):
+            return {}
+        pg = held_placement_group()
+        if pg is None:
+            return {}
+        from batcher.dist.executors.ray_runtime import fleet_task_options
+
+        opts = fleet_task_options(pg)
+        if opts:
+            log_kv(
+                get_logger("dist"),
+                logging.INFO,
+                "running this stage inside the shuffle fleet's reservation",
+                reason="the cluster's CPU is held by a fleet carrying a published intermediate",
+                needed_cpus=needed_cpus,
+            )
+        return opts
+    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+        note_suppressed("dist", "make room for a task stage beside the fleet", exc)
+        return {}
+
+
 def _distributed_map(
     plan: LogicalPlan,
     sources: list[Source],
@@ -727,12 +781,18 @@ def _distributed_map(
         # partition (packed many-per-core), several cores for a large one. A heavier
         # (skewed) partition therefore gets proportionally more CPU than its peers.
         shares = _adaptive_task_cpus(partitions, plan, hub)
+        # A held shuffle fleet reserves the cluster's whole CPU capacity, and these tasks
+        # are submitted outside it — so they are unplaceable, not merely slow.
+        placeable = _placeable_scheduling(max(shares) if shares else 1.0)
         # Resolve SPREAD vs Ray's locality-aware DEFAULT against the live cluster: SPREAD
         # only where these right-sized (often sub-node) tasks would otherwise pack onto one
         # node and idle the rest, DEFAULT (restoring argument locality) when packing isn't a
         # risk or the cluster is large enough that DEFAULT's balancing suffices. On a
         # heterogeneous cluster this also keeps a CPU-only map fleet off GPU nodes.
-        sched = _map_scheduling_options(env, shares)
+        # `placeable` is empty unless the cluster is full, and then it *replaces* the
+        # SPREAD/DEFAULT choice below: a strategy that cannot be scheduled is not a
+        # placement preference to be balanced against, it is the whole question.
+        sched = placeable or _map_scheduling_options(env, shares)
         plan_ref = _shared_arg(plan0)
         cfg_for = _engine_config_cache()
 
@@ -762,7 +822,7 @@ def _distributed_map(
         # partitions runs several tasks per core, and a cores-derived window would cap
         # its concurrency at a fraction of what the cluster can hold.
         results = gather_map_results(
-            _launch, len(partitions), task_cpus=min(shares) if shares else 1.0
+            _launch, len(partitions), task_cpus=min(shares) if shares else 1.0, stage="map"
         )
 
     if write_spec is not None:
@@ -776,7 +836,7 @@ def _distributed_map(
     for r in results:
         if r:
             batches.extend(r)
-    _record_source_rows(hub, sources[sid], sum(b.num_rows for b in batches))
+    _record_source_rows(hub, sources[sid], plan, sum(b.num_rows for b in batches))
     if not batches:
         # A pipeline whose filter matched nothing still has a schema, and the single-node
         # path returns it. Returning a *column-less* table here made `distributed ==
@@ -789,8 +849,9 @@ def _distributed_map(
     # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
     # rows carry extra fields) to one union schema, so the gather concatenates instead of
     # failing — the same schema-drift tolerance the single-node path gives.
-    from batcher.io.schema.evolution import reconcile_batches
+    from batcher.io.schema.evolution import note_dropped_columns, reconcile_batches
 
+    note_dropped_columns(batches, context="map_batches (distributed)")
     return pa.Table.from_batches(reconcile_batches(batches))
 
 
@@ -850,13 +911,26 @@ def _engine_config_cache():
     return cfg_for
 
 
-def _record_source_rows(hub, source, rows: int) -> None:
+def _record_source_rows(hub, source, plan: LogicalPlan, rows: int) -> None:
     """Persist a run's measured total rows for `source` so the next run's partition count can
     seed from it when the footer count is unknown. Best-effort; never breaks a query.
+
+    **Only when `plan` emits one row per source row.** What is measured here is the plan's
+    output, and writing that down under the *source's* identity claims it is the source's
+    size — true for a projection or a sort, false for everything that resizes. The executor
+    runs plenty that does: a filtered scan, a per-partition `Limit`, a fixed-count `Sample`,
+    a per-partition `Distinct(limit=k)`. Each recorded a number far below the source's real
+    row count, and `_adaptive_partition_count` seeds the *next* run from it — so a
+    billion-row table that once answered a `distinct().limit(10)` came back sized for forty
+    rows, ran on one worker, and recorded a smaller number again. The dispatcher withholds
+    the hub by hand at six call sites to avoid exactly this; `preserves_source_row_count` is
+    that rule stated once, so a call site that forgets is no longer a silent perf cliff.
 
     Noted rather than suppressed: a failed write is indistinguishable from a source that has
     never run, so the partition count silently keeps falling back to the blunt cluster-fill
     worker count on every future run, forever, with nothing saying why."""
+    if not preserves_source_row_count(plan):
+        return
     try:
         from batcher.dist.adaptive_sizing import record_partition_rows
 
@@ -918,12 +992,17 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
     (locality-aware: prefers nodes already holding the task's args, then low utilization).
     An explicit ``STRICT_SPREAD`` envelope preference always forces SPREAD. When the
     envelope asks to stay off GPU nodes, a hard CPU-only node selector is merged in (a
-    no-op unless the cluster opts in and can host the fleet). Returns `{}` for DEFAULT
+    no-op unless the cluster opts in and can host the fleet), and a spot-capacity label
+    selector is merged in on a mixed fleet that opted into capacity-aware placement (a
+    no-op otherwise) — these tasks recompute from their partition descriptor, so a
+    reclamation costs a resubmission rather than the stage. Returns `{}` for DEFAULT
     with no selector. Placement never changes which rows a partition holds, so the result
     is identical for any choice.
     """
     from batcher.config import active_config
-    from batcher.dist.executors.ray_runtime import node_class_selector
+    from batcher.dist.executors.ray_runtime import node_class_selector, task_event_options
+    from batcher.dist.executors.ray_runtime.fabric.market import capacity_selector
+    from batcher.plan.resource import CAPACITY_SPOT
 
     mode = active_config().distributed.map_spread
     if env is not None and env.placement_strategy == "STRICT_SPREAD":
@@ -939,6 +1018,14 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
         sel = node_class_selector(env.prefer_cpu_only_nodes, len(shares), mean_share)
         if sel:
             opts["resources"] = {**opts.get("resources", {}), **sel["resources"]}
+        # These tasks are stateless and idempotent — `gather_map_results` resubmits one whose
+        # worker died, from the same durable partition descriptor — so they are exactly the
+        # work spot capacity is for, whatever the fleet-level envelope says. Asked for by name
+        # rather than read off the envelope, which carries the *shuffle* fleet's preference.
+        opts.update(capacity_selector(CAPACITY_SPOT, workers=len(shares), num_cpus=mean_share))
+    # The widest stage in the engine, and the one whose per-task Ray events cost most. A
+    # no-op below the configured fan-out cap, which ordinary queries never reach.
+    opts.update(task_event_options(len(shares)))
     return opts
 
 
@@ -1316,7 +1403,38 @@ def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
     The plan-level weight is further scaled by a *measured* per-core busy fraction learned for
     this family (`_learned_weight_factor`): a family that ran CPU-underutilized reserves fewer
     cores next run. Reserving fewer/more cores only changes packing, never the rows a task
-    processes, so the result is identical."""
+    processes, so the result is identical.
+
+    **A UDF stage's shares are then scaled up to fill the fleet**, and without that the ask is
+    a function of the *data alone*. `want` sums to `total_rows x weight / rows_per_cpu` however
+    many partitions the source is cut into — the count and the per-task share move inversely —
+    so a stage asks for the same cores on a four-node cluster and on a sixty-four-node one.
+    Measured on the 64 x 16-core fleet, a 300-pass NumPy UDF over sf100 `orders` (150M rows):
+    the ask is `150M x 4 / 2M` = **300 of 1,024 cores**, the cluster ran at 16.2% busy, and the
+    query took 3,375 ms. Raising only this term to fill the fleet: **2,382 ms at 48.6% busy**,
+    1.42x, with every node active either way. Raising it to *twice* the fleet is worse again
+    (2,963 ms at 57.2%), which is what fixes the cap at the cluster's own cores rather than at
+    a bigger constant — the point is to stop leaving cores idle, not to oversubscribe.
+
+    Three things bound it, and each is load-bearing:
+
+    * **Only a `map_batches` stage**, and that is measured rather than argued. A UDF task
+      splits its partition across `num_workers = round(share)` (see `_launch`), so the cores
+      it is given are cores it can use; a scan or filter task's work is the read. Filling
+      every stage instead was tried on the same fleet and moved nothing outside noise —
+      `filter-count` 184 -> 184 ms, `scan-agg` 213 -> 208, `group-by` 1,194 -> 1,167, and the
+      hash join 2,289 -> 2,344 (its probe does not come through this sizing at all; it runs on
+      the shuffle fleet). So the gate costs no throughput and keeps the reservation off a
+      shared cluster's cores where nothing would use them.
+    * **Never below the data-derived want.** This only ever scales *up*; a stage whose own
+      sizing already meets or exceeds the fleet keeps it.
+    * **Never past a node.** `node_cores` still caps each task, so a fill cannot ask for a
+      bundle no node can host.
+
+    The three sizing terms now answer three separate questions, which is why none of them
+    subsumes another: `_adaptive_partition_count` decides how the *rows* are divided, the
+    per-partition `want` keeps the division *skew-proportional*, and the fill decides how much
+    of the *machine* the stage may occupy."""
     from batcher.config import active_config
     from batcher.core.udf import has_map_batches
 
@@ -1324,13 +1442,45 @@ def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
     # Rows one core processes in a reasonable slice — half the breaker target (which sizes
     # a whole multi-core task), so a full target-sized partition asks for ~2 cores.
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
-    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
-    weight *= _learned_weight_factor(plan, hub)
-    shares = []
-    for p in partitions:
-        want = (descriptor_rows(p) * weight) / rows_per_cpu
-        shares.append(round(max(_MIN_TASK_CPU, min(node_cores, want)), 3))
-    return shares
+    is_udf = has_map_batches(plan)
+    weight = _MAP_COMPUTE_WEIGHT if is_udf else 1.0
+    learned = _learned_weight_factor(plan, hub)
+    wants = [(descriptor_rows(p) * weight * learned) / rows_per_cpu for p in partitions]
+    if is_udf:
+        wants = _filled_to_the_fleet(wants, node_cores, learned)
+    return [round(max(_MIN_TASK_CPU, min(node_cores, w)), 3) for w in wants]
+
+
+def _filled_to_the_fleet(wants: list[float], node_cores: float, learned: float) -> list[float]:
+    """`wants`, scaled up so the stage occupies the cluster rather than a slice of it.
+
+    Proportional, so the skew the per-partition sizing encodes survives: a partition with
+    twice its neighbour's rows keeps twice its neighbour's share. The scale is capped by what
+    a node can host, because a share past `node_cores` is a bundle nothing can place — and
+    that cap is also what keeps the fill honest on a fleet with fewer, fatter nodes.
+
+    **The target is the fleet scaled by `learned`, not the whole fleet**, and that is what
+    keeps the fill from undoing the one thing above it that is *measured*. A family recorded
+    as leaving three quarters of its reserved cores idle gets a quarter of the reservation
+    (`_learned_weight_factor`), and filling it back to the fleet afterwards would hand an
+    IO- or GPU-bound stage every core in the cluster to leave idle — the amplifying loop
+    `adaptive_sizing.learned_cpu_weight_factor` documents, run in the other direction. A
+    family with no history reads `1.0` and is filled to the fleet, which is the case the fill
+    was measured on.
+
+    Returns `wants` unchanged when it already meets that target, when the cluster is
+    unreadable, or when there is nothing to scale.
+    """
+    total = sum(wants)
+    if total <= 0.0:
+        return wants
+    target = _cluster_cores() * max(0.0, learned)
+    if target <= 0.0 or total >= target:
+        return wants
+    # Capped at the widest a single task may become, so the scale cannot be spent entirely on
+    # one heavy partition it could not use anyway.
+    scale = min(target / total, node_cores * len(wants) / total)
+    return [w * scale for w in wants]
 
 
 def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: int):

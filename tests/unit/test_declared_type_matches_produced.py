@@ -116,6 +116,70 @@ def test_the_list_higher_order_operations_declare_their_element_type():
     assert _assert_declared_is_produced(ds.select(r=a.list.drop_nulls())) == pa.list_(pa.int64())
 
 
+def test_the_list_join_and_array_literal_declare_what_they_build():
+    """Two more nodes with no arm at all, found the same way as the four above.
+
+    `ListJoin` renders a whole list as one delimited string whatever the element type, and
+    `Array` gathers its arguments into a list whose element type is what they promote to --
+    the same fold `coalesce`/`greatest`/`least` already use, reused rather than restated so
+    the two cannot come to disagree about what ``array(int64, double)`` is.
+    """
+    ds = bt.from_pydict({"i": [1, 2], "f": [1.5, 2.5], "t": ["a", "b"]})
+    i, f, t = col("i"), col("f"), col("t")
+    lists = bt.from_arrow(pa.table({"a": pa.array([["x", "y"], ["z"]], pa.list_(pa.string()))}))
+    assert _assert_declared_is_produced(lists.select(r=col("a").list.join(","))) == pa.string()
+    for expr, want in (
+        (bt.array(i, i), pa.list_(pa.int64())),
+        (bt.array(i, f), pa.list_(pa.float64())),
+        (bt.array(t, t), pa.list_(pa.string())),
+        (bt.array(i), pa.list_(pa.int64())),
+    ):
+        assert _assert_declared_is_produced(ds.select(r=expr)) == want
+
+
+def test_elementwise_list_arithmetic_declares_the_double_list_it_builds():
+    """`ListZip` -- the embedding-math primitive -- said `-> List<Float64>` in its own
+    docstring and had no inference rule, so two Int64 lists added to a column the schema
+    called `null`. The engine folds these in floating point whatever the element width,
+    exactly as `cum_sum`/`diff`/`softmax` do.
+    """
+    ds = bt.from_arrow(
+        pa.table(
+            {
+                "a": pa.array([[1, 2], [3, 4]], pa.list_(pa.int64())),
+                "b": pa.array([[5, 6], [7, 8]], pa.list_(pa.int64())),
+            }
+        )
+    )
+    a, b = col("a"), col("b")
+    for expr in (a.list.add(b), a.list.subtract(b), a.list.multiply(b)):
+        assert _assert_declared_is_produced(ds.select(r=expr)) == pa.list_(pa.float64())
+
+
+def test_struct_get_declares_the_same_type_as_struct_field():
+    """`.struct.get(name)` is documented as the subscript spelling of `.struct.field(name)`
+    and is what ``s["x"]`` lowers to -- but the two build *different* nodes, and only
+    `StructField` was typed. So the same field projection declared `string` written one way
+    and nothing at all written the other, taking every sibling column with it.
+    """
+    ds = bt.from_arrow(
+        pa.table(
+            {
+                "s": pa.array(
+                    [{"x": 1, "y": "p"}, {"x": 2, "y": "q"}],
+                    pa.struct([("x", pa.int64()), ("y", pa.string())]),
+                ),
+                "k": pa.array([1, 2], pa.int64()),
+            }
+        )
+    )
+    for field, want in (("x", pa.int64()), ("y", pa.string())):
+        for expr in (col("s").struct.get(field), col("s").struct.field(field), col("s")[field]):
+            assert _assert_declared_is_produced(ds.select(r=expr)) == want
+    # The sibling column is the reason this matters: the schema is all-or-nothing.
+    assert ds.select(r=col("s").struct.get("y"), k=col("k")).schema.field("k").type == pa.int64()
+
+
 @pytest.mark.parametrize(
     ("left", "right", "op"),
     [
@@ -209,6 +273,56 @@ def test_a_string_times_one_is_refused_rather_than_answered():
     ds = bt.from_pydict({"s": ["a", "b"]})
     with pytest.raises(RuntimeError):
         ds.select(r=col("s") * lit(1)).collect()
+
+
+@pytest.mark.parametrize("column", ["i", "s"])
+def test_the_boolean_identity_rewrite_does_not_fire_for_a_non_boolean_column(column):
+    """`x AND true -> x` is the unguarded sibling of `x * 1 -> x` two tests up.
+
+    Every arithmetic identity in `simplify` guards on the surviving operand's type; the
+    boolean ones did not. `and_kleene` *refuses* a non-Boolean argument, so folding the
+    operator away does not merely retype the column -- it deletes the engine's own error.
+    `col("i").and_(True)` returned `6` and `col("s").and_(True)` returned `"a"`, both
+    declared `bool`.
+    """
+    from batcher.kyber.rules.normalize.simplify import simplify_expressions
+    from batcher.plan.expr_ir import Binary
+
+    ds = bt.from_pydict({"i": [6, 3], "s": ["a", "b"]})
+    plan = ds.select(r=col(column).and_(lit(True)))._plan
+    assert any(isinstance(item.expr, Binary) for item in simplify_expressions(plan).items), (
+        "the `AND true` was dropped from a non-boolean column, which hides the type error"
+    )
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        lambda: col("i").and_(lit(True)),
+        lambda: lit(True).and_(col("i")),
+        lambda: col("i").or_(lit(False)),
+        lambda: lit(False).or_(col("i")),
+    ],
+)
+def test_an_integer_conjoined_with_true_is_refused_rather_than_answered(expr):
+    """All four identity arms, each of which answered the integer back.
+
+    `col("i") & lit(3)` already raised `ExpectedBoolean`; only the spelling whose literal
+    happened to be the identity element escaped it, so the same expression family answered
+    two different ways depending on which constant it was given.
+    """
+    ds = bt.from_pydict({"i": [6, 3]})
+    with pytest.raises(RuntimeError):
+        ds.select(r=expr()).collect()
+
+
+def test_a_boolean_column_still_folds_its_identity():
+    """The guard must not take out the case the rewrite exists for."""
+    ds = bt.from_pydict({"b": [True, False]})
+    for expr in (col("b").and_(lit(True)), col("b").or_(lit(False))):
+        out = ds.select(r=expr)
+        assert _assert_declared_is_produced(out) == pa.bool_()
+        assert out.to_pydict()["r"] == [True, False]
 
 
 def test_a_date_shift_by_zero_is_still_a_date_shift():

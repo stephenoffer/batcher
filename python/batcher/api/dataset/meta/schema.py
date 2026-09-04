@@ -31,8 +31,8 @@ _FAMILIES: dict[str, Callable[[pa.DataType], bool]] = {
     "float": pa.types.is_floating,
     "string": lambda t: pa.types.is_string(t) or pa.types.is_large_string(t),
     "boolean": pa.types.is_boolean,
-    "temporal": lambda t: pa.types.is_temporal(t),
-    "nested": lambda t: pa.types.is_nested(t),
+    "temporal": pa.types.is_temporal,
+    "nested": pa.types.is_nested,
 }
 
 

@@ -7,6 +7,10 @@ however many are free.
 
 * `topology` reads the live cluster into that shape — per-node devices and models, plus the
   rack, fabric, power zone, and availability zone each node sits in.
+* `bundles` says what a gang-scheduled fleet's placement-group bundles select on — its
+  availability zone, and its capacity market.
+* `market` turns the fleet's purchase modes into placement: recomputable work onto spot
+  capacity, state-holding work onto on-demand, with a fallback so neither can pend.
 * `placement` turns it into decisions: gang bundles that keep a collective inside one fabric,
   per-power-zone budgets, and an efficiency order for a heterogeneous fleet.
 * `residency` is where a sovereignty rule reaches the scheduler: the nodes whose region every
@@ -21,6 +25,15 @@ not there.
 
 from __future__ import annotations
 
+from batcher.dist.executors.ray_runtime.fabric.bundles import (
+    fleet_market_selector,
+    fleet_zone_selector,
+)
+from batcher.dist.executors.ray_runtime.fabric.market import (
+    capacity_bundle_selector,
+    capacity_selector,
+    fleet_market_split,
+)
 from batcher.dist.executors.ray_runtime.fabric.placement import (
     CollectivePlacement,
     devices_within_power_budget,
@@ -37,14 +50,17 @@ from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
 from batcher.dist.executors.ray_runtime.fabric.topology import (
     FABRIC_LABEL,
     LINK_CLASSES,
+    ON_DEMAND,
     POWER_ZONE_LABEL,
     RACK_LABEL,
+    SPOT,
     GpuNodeTopology,
     domain_groups,
     fits_one_domain,
     gpu_node_topology,
     interconnect_class,
     largest_local_domain,
+    market_type,
     nvlink_domain_size,
     topology_summary,
 )
@@ -52,18 +68,26 @@ from batcher.dist.executors.ray_runtime.fabric.topology import (
 __all__ = [
     "FABRIC_LABEL",
     "LINK_CLASSES",
+    "ON_DEMAND",
     "POWER_ZONE_LABEL",
     "RACK_LABEL",
+    "SPOT",
     "CollectivePlacement",
     "GpuNodeTopology",
+    "capacity_bundle_selector",
+    "capacity_selector",
     "cluster_shape",
     "devices_within_power_budget",
     "domain_groups",
     "fits_one_domain",
+    "fleet_market_selector",
+    "fleet_market_split",
     "fleet_regions",
+    "fleet_zone_selector",
     "gpu_node_topology",
     "interconnect_class",
     "largest_local_domain",
+    "market_type",
     "nvlink_domain_size",
     "permitted_nodes",
     "plan_collective",

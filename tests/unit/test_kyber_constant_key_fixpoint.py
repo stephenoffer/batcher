@@ -141,6 +141,55 @@ def test_the_rewrite_is_stable_under_the_iteration_cap():
     assert len(plans) == 1, f"plan varies with the iteration cap: {plans}"
 
 
+# --- the same cycle reached through an aggregate ---------------------------------------
+
+
+def test_a_join_against_an_aggregate_over_a_constant_key_reaches_a_fixpoint(caplog):
+    """The guard above keys on a statistic the *aggregate* used to erase.
+
+    `infer_join_predicate_from_constant_key` skips a constant the target side already
+    provably holds — but `constant_value` will not call a column constant without a
+    known-zero null count, and a grouped aggregate dropped its group key's null count
+    outright. So the aggregate's key read as "min == max == 7, nullability unknown", the
+    skip never engaged, and this shape cycled `infer -> push -> merge -> drop -> infer` for
+    the whole iteration budget exactly as the one-row self-join did.
+
+    Fixed in the statistic rather than in either rule: grouping invents no value, so a key
+    the input never held a null of cannot acquire one
+    (`aggregate_columns._grouped_key_null_count`).
+    """
+    table = pa.table({"k": pa.array([7] * 64, pa.int64()), "i": pa.array([3] * 64, pa.int64())})
+    ds = bt.from_arrow(table)
+    with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
+        ds.join(ds.group_by("k").agg(c=col("i").count()), on="k", how="inner").explain()
+    assert _fixpoint_warnings(caplog) == []
+
+
+def test_the_aggregate_join_still_returns_the_right_rows():
+    """The cycle never changed an answer, so closing it must not either."""
+    table = pa.table({"k": pa.array([7] * 4, pa.int64()), "i": pa.array([3] * 4, pa.int64())})
+    ds = bt.from_arrow(table)
+    got = ds.join(ds.group_by("k").agg(c=col("i").count()), on="k", how="inner").collect()
+    # 4 left rows x the single group -> 4, each carrying the group's count of 4.
+    assert got.num_rows == 4
+    assert got.column("c").to_pylist() == [4] * 4
+
+
+def test_a_nullable_aggregate_key_is_unaffected(caplog):
+    """Bracketing: the derivation only pins a key the input proves non-null, so a key that
+    does hold nulls takes the same path it always did."""
+    table = pa.table(
+        {"k": pa.array([7, None] * 32, pa.int64()), "i": pa.array([3] * 64, pa.int64())}
+    )
+    ds = bt.from_arrow(table)
+    with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
+        joined = ds.join(ds.group_by("k").agg(c=col("i").count()), on="k", how="inner")
+        joined.explain()
+    assert _fixpoint_warnings(caplog) == []
+    # A null key never matches, so only the 32 rows with k = 7 survive.
+    assert joined.collect().num_rows == 32
+
+
 # --- the diagnostic itself, and a shape that still cycles ------------------------------
 
 
@@ -190,19 +239,16 @@ def _context(ds):
     )
 
 
-@pytest.mark.xfail(
-    reason="SMOTE's plan still cycles in PUSHDOWN; the constant-key fix above did not cover "
-    "this shape. Correctness is unaffected (every rule is semantics-preserving), but the "
-    "plan depends on the iteration cap and every call burns the whole budget. Reproduces at "
-    "HEAD, and burns whatever cap it is given (8 -> 17, 20 -> 20, 60 -> 60), so it is a "
-    "genuine cycle rather than a plan that merely needs more passes.",
-    strict=True,
-)
 def test_smote_reaches_a_fixpoint(caplog):
-    """A second PUSHDOWN cycle, found by auditing rather than by a failure.
+    """A second PUSHDOWN cycle, found by auditing rather than by a failure — now closed.
 
-    Flips to XPASS the moment someone fixes it, which is the point of recording it here
-    next to the cycle that was fixed.
+    Recorded here as a strict `xfail` while it stood, which is what made it visible the
+    moment it was fixed. It was not the constant-key cycle at all: `push_limit_into_union`
+    caps each union input with a `Limit`, `push_limit_through_project` then rewrites
+    `Limit(Project(x))` to `Project(Limit(x))` in the same phase, and the union rule's
+    "already capped?" guard — which looked only at the immediate input — saw a bare
+    `Project` again and re-capped. The guard now looks through a projection
+    (`identities._caps_rows`), so each input is capped once.
     """
     import numpy as np
 

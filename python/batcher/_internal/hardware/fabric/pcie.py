@@ -81,7 +81,7 @@ _ADDRESS_RE = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
 
 def _parse_gen(raw: str) -> int:
     """PCIe generation from a kernel link-speed string, or `0` when unparseable."""
-    token = raw.split()[0] if raw else ""
+    token = raw.split(maxsplit=1)[0] if raw else ""
     return _GT_TO_GEN.get(token, 0)
 
 

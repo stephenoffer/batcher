@@ -168,11 +168,64 @@ relation's row count. One definition serves join keys, group-by keys, and `DISTI
 sets, so they cannot disagree.
 :::
 
+## Aggregates
+
+A grouped aggregate's row count is the distinct combinations of its group keys, so it shares
+`combine_ndv` with joins and `DISTINCT`. Its *column* statistics are derived separately, in
+`kyber/stats/aggregate_columns.py`, and the distinction that governs them is which outputs
+grouping leaves alone.
+
+A bare-column group key appears verbatim in the output, holding that column's distinct
+values. Grouping invents no value and drops no extreme, so the key's `min` and `max` carry
+through at the child's provenance. The distinct count does not: the number of groups is an
+estimate, and tagging it exact would let `count_distinct` answer from a guess. The frequency
+distribution does not either, because every group is one row.
+
+The null count is the interesting one, because grouping collapses every null key into a
+single group. The input's count is therefore not the output's, but two cases are still
+pinned:
+
+```python
+# docs: skip
+# python/batcher/kyber/stats/aggregate_columns.py
+if src.null_count == 0:
+    return 0                                    # no nulls in, none out, for any key count
+return 1 if len(node.group_keys) == 1 else None  # one key: the nulls are one group
+```
+
+With several keys the group is a tuple, so a null in one key can appear in as many groups as
+there are distinct combinations of the others. That is a lower bound rather than a count, and
+a `ColumnStat` records counts, so nothing is claimed. Only an exact input count is used,
+because a derived count is read by the paths that decide whether a predicate is provably
+true, where a guess does not merely mis-plan, it deletes rows.
+
+Dropping the null count outright, which is what the estimator used to do, cost more than a
+missing statistic. A known-zero null count is what `constant_value` and `_predicate_status`
+require before either will call a key provably constant or a predicate provably true, so an
+aggregate erased a proof its own input carried. A relation joined to an aggregate over its
+own single-valued key then cycled through the pushdown phase: the join-key inference rules
+re-derived a predicate the zone-map rule kept deleting, because neither could see that the
+aggregate's key was already pinned. Every rule involved is semantics preserving, so the
+answers stayed correct, and the only symptoms were a "phase did not reach a fixpoint" warning
+and a plan that depended on `OptimizerConfig.fixpoint_iterations`.
+
+A grouped aggregate's *value* outputs vary by group, so none of them is a constant, but two
+families still carry bounds. `min`, `max`, `avg` and `median` of a column return a value
+inside that column's own range whatever the grouping is. A per-group count lies between one
+and the child's row count, and that upper bound is published only when the child's row count
+is exact: an estimated count can be smaller than the truth, and `zonemap_prune_filter` folds
+a `HAVING count(*) > n` whose bound cannot reach `n` into the empty relation. An estimate may
+choose a plan. It may never decide which rows exist.
+
+A global aggregate is the opposite case. It emits exactly one row, and each output becomes a
+constant column whenever the child's exact statistics determine it, so `count(*)`, `min`,
+`max`, `sum` and `count_distinct` can be answered without reading a row.
+
 ## Sketches
 
 Once a query has run, sketches from `bc-sketches` supersede the constants. They are all
-`Mergeable` with a fixed seed, so a sketch built on partition 3 of worker 7 merges
-identically with one built anywhere else:
+`Mergeable` with a fixed seed, so a sketch built on partition 3 of worker 7 merges with one
+built anywhere else, in any order:
 
 ```rust
 // crates/bc-sketches/src/lib.rs
@@ -294,6 +347,7 @@ a number is actually derived:
 | The estimator | `python/batcher/kyber/stats/estimator.py` |
 | Predicate selectivity | `python/batcher/kyber/stats/selectivity/` |
 | Merging learned column stats into a scan | `python/batcher/kyber/stats/columns.py` |
+| Aggregate output column stats | `python/batcher/kyber/stats/aggregate_columns.py` |
 | `Provenance`, `RelStats`, `ColumnStat` | `python/batcher/plan/stats.py` |
 | The sketches | `crates/bc-sketches/src/` |
 | Cold-start constants | `python/batcher/config/config.py::CardinalityConfig` |

@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError, require_float, require_int
+from batcher._internal.errors import (
+    ColumnNotFoundError,
+    PlanError,
+    require_float,
+    require_int,
+)
 from batcher.api._join_helpers import (
     _as_expr,
     _as_key_expr,
@@ -29,6 +34,7 @@ from batcher.api._join_helpers import (
     _join_output,
     _resolve_join_keys,
 )
+from batcher.api._varargs import flatten_varargs
 from batcher.api.dataset._build import (
     RepartitionSpec,
     build_cast,
@@ -101,7 +107,8 @@ from batcher.plan.logical import (
     asof_tolerance,
     remap_sources,
 )
-from batcher.plan.schema import suggest_columns
+from batcher.plan.resource import StorageLevel
+from batcher.plan.schema import column_name, suggest_columns
 from batcher.plan.streaming import Watermark
 
 if TYPE_CHECKING:
@@ -341,7 +348,7 @@ class Dataset:
         sources: list[Source],
         repartition: RepartitionSpec | None = None,
         watermark: Watermark | None = None,
-        cache: bool = False,
+        cache: StorageLevel | None = None,
     ) -> None:
         """Bind a logical plan to its sources; prefer a session constructor over this."""
         self._plan = plan
@@ -352,9 +359,10 @@ class Dataset:
         # An event-time watermark set by `with_watermark`; carried through
         # breaker-free transforms so the next `group_by().agg()` can attach it.
         self._watermark = watermark
-        # Set by `cache()`: this dataset's collected result is stored in the process
-        # result cache. Deliberately *not* propagated by `_derive` — caching marks
-        # this exact result; a further transform is a new (uncached) result.
+        # Set by `cache()`: the `StorageLevel` this dataset's collected result is stored
+        # at in the process result cache, or `None` for an uncached result. Deliberately
+        # *not* propagated by `_derive` — caching marks this exact result; a further
+        # transform is a new (uncached) result.
         self._cache = cache
 
     # --- introspection -----------------------------------------------------
@@ -561,6 +569,17 @@ class Dataset:
         materializing first. Executing the plan is therefore a side effect of the
         consumer iterating, which makes this a terminal operation.
 
+        **Routed like `collect()`, not like `iter_batches()`.** The protocol takes no
+        execution arguments, so the export has to pick a routing policy, and the two
+        available defaults disagree: `collect()` resolves ``distributed="auto"`` while
+        `iter_batches()` defaults to ``False``. Taking the latter meant that on a
+        multi-node cluster ``pl.DataFrame(ds)`` silently ran single-node while
+        ``pl.DataFrame(ds.collect())`` distributed — the same query, the same cluster, one
+        of them not using it. A caller who wants a specific mode has `iter_batches`; an
+        export that cannot be told has to match the terminal op it stands in for. On one
+        node ``"auto"`` resolves to single-node, so nothing changes there, and it never
+        starts a cluster that was not already connected.
+
         Args:
             requested_schema: A schema capsule the consumer would prefer, per the
                 protocol. Honoured only when it matches; otherwise the stream's own
@@ -569,7 +588,8 @@ class Dataset:
         Returns:
             An ``ArrowArrayStream`` PyCapsule.
         """
-        reader = pa.RecordBatchReader.from_batches(self.schema, self.iter_batches())
+        batches = self.iter_batches(distributed="auto")
+        reader = pa.RecordBatchReader.from_batches(self.schema, batches)
         return reader.__arrow_c_stream__(requested_schema)
 
     def __contains__(self, name: object) -> bool:
@@ -706,17 +726,36 @@ class Dataset:
                 )
         return out
 
-    def cache(self) -> Dataset:
-        """Mark this dataset's result to be cached in memory after it is computed.
+    def cache(self, storage_level: StorageLevel | str | None = None) -> Dataset:
+        """Mark this dataset's result to be cached after it is computed.
 
         The first terminal op (``collect`` and friends) on the returned dataset
-        executes normally and stores its Arrow result in a process-wide,
-        memory-bounded LRU cache keyed by the plan and its inputs; later terminals on
-        an equivalent dataset return the cached result without re-executing. The cache
-        is bounded by ``memory.result_cache_max_bytes`` and yields its memory back to
-        running queries under pressure, so caching never grows the process without
-        bound. Like Spark/Polars ``cache``, it marks *this* result; a further
-        transform is a new, uncached result. Single-node relational results only.
+        executes normally and stores its Arrow result in a process-wide, byte-bounded
+        cache keyed by the plan and its inputs; later terminals on an equivalent dataset
+        return the cached result without re-executing. Eviction is cost-aware rather than
+        purely recent: an expensive, small, often-served result outlives a cheap, large,
+        cold one.
+
+        The memory half is bounded by ``memory.result_cache_max_bytes`` and yields its RAM
+        back to running queries under pressure, so caching never grows the process without
+        bound. What that pressure sheds is written to a local disk tier
+        (``memory.result_cache_disk_max_bytes``) rather than dropped, so a working set
+        larger than the memory budget costs a read-back rather than a full recompute.
+        `storage_level` chooses how far that goes.
+
+        Like Spark and Polars ``cache``, this marks *this* result; a further transform is
+        a new, uncached result. Single-node relational results only.
+
+        A terminal that materializes the result (``collect``, ``to_pydict``, ``to_arrow``,
+        and the framework conversions) is what *fills* the cache. ``count()``,
+        ``is_empty()`` and ``iter_batches()`` are served from a warm one but never fill it,
+        because filling it would mean materializing the very result those three exist to
+        avoid materializing.
+
+        Args:
+            storage_level: Which media the result may occupy — a
+                :class:`~batcher.StorageLevel` or its name. Defaults to
+                ``MEMORY_AND_DISK``.
 
         Returns:
             A new `Dataset` whose first computed result is cached.
@@ -730,14 +769,54 @@ class Dataset:
                 3
                 >>> hot.collect().num_rows  # cache hit
                 3
+                >>> big = bt.from_pydict({"x": [1, 2]}).cache("disk_only")
+                >>> big.collect().num_rows  # never charged against the memory budget
+                2
         """
         return Dataset(
             self._plan,
             self._sources,
             repartition=self._repartition,
             watermark=self._watermark,
-            cache=True,
+            cache=StorageLevel.parse(storage_level),
         )
+
+    def uncache(self) -> Dataset:
+        """Drop this dataset's cached result from both cache tiers, if it is held.
+
+        The counterpart to :meth:`cache`, spelled ``unpersist`` in Spark (both names work
+        here). Caching is otherwise self-managing — the budget evicts, and pressure
+        reclaims — so this is for the case the budget cannot see: a result you know is
+        stale or will not be read again, whose RAM and disk you want back *now* rather
+        than at the next eviction.
+
+        A no-op when nothing is cached under this plan, so it is always safe to call.
+        Returns the dataset so it can sit in a chain; it changes no plan and no result.
+
+        This drops **this process's** copy. An entry in a shared store
+        (``memory.shared_cache_uri``) is left alone, because it belongs to every process
+        reading it and dropping it on their behalf is not a decision one caller should
+        make. Shared entries are keyed by their inputs' content versions, so rewriting the
+        data a result came from already retires it.
+
+        Returns:
+            This same `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2]}).cache()
+                >>> ds.collect().num_rows
+                2
+                >>> ds.uncache().collect().num_rows  # recomputed, not served
+                2
+        """
+        from batcher import carbonite
+        from batcher.api.executors import result_cache_key
+
+        carbonite.result_cache().invalidate(result_cache_key(self._plan, self._sources))
+        return self
 
     def with_watermark(self, time_col: str, lateness: str) -> Dataset:
         """Declare an event-time watermark on `time_col` (Spark ``withWatermark``).
@@ -765,6 +844,7 @@ class Dataset:
         """
         from batcher.plan.functions.temporal import _duration_micros
 
+        time_col = column_name(time_col, arg="time_col", api="with_watermark")
         if time_col not in self._plan.available_columns():
             raise PlanError(f"with_watermark(): unknown column {time_col!r}")
         wm = Watermark(time_col, _duration_micros(lateness, arg="watermark lateness"))
@@ -819,7 +899,8 @@ class Dataset:
         mean. The window sees every input row, as in the SQL subquery it desugars to.
 
         Args:
-            *predicates: Boolean expressions evaluated per row, ANDed together.
+            *predicates: Boolean expressions evaluated per row, ANDed together. A list
+                of them is accepted in place of separate arguments.
             **equals: Column-equals-value shorthands, ANDed with `predicates`.
 
         Returns:
@@ -841,7 +922,7 @@ class Dataset:
                 >>> ds.filter(g="a").to_pydict()
                 {'g': ['a', 'a'], 'x': [1, 3]}
         """
-        conditions = list(predicates)
+        conditions = list(flatten_varargs(predicates))
         for name, value in equals.items():
             self._require_column(name, "filter")
             conditions.append(Col(name) == value)
@@ -873,7 +954,8 @@ class Dataset:
 
         Args:
             *columns: Column names, ``col(...)`` references, aliased expressions, or
-                column selectors.
+                column selectors. A list of them is accepted in place of separate
+                arguments, as Polars and PySpark accept one.
             **named: New column names bound to expressions.
 
         Returns:
@@ -890,6 +972,7 @@ class Dataset:
                 >>> ds.select(bt.exclude("g")).to_pydict()
                 {'x': [1, 2, 3]}
         """
+        columns = flatten_varargs(columns)
         items: list[Projection] = []
         for c in columns:
             if isinstance(c, str):
@@ -927,7 +1010,8 @@ class Dataset:
 
         Args:
             *exprs: Self-naming expressions — column selectors, aliased expressions,
-                or bare ``col(...)`` references.
+                or bare ``col(...)`` references. A list of them is accepted in place of
+                separate arguments.
             **named: Column names bound to expressions (or scalars) to add or replace.
 
         Returns:
@@ -945,6 +1029,7 @@ class Dataset:
                 >>> ds.with_columns(bt.numeric().round(1)).to_pydict()
                 {'a': [1.2], 'b': [5.7], 's': ['x']}
         """
+        exprs = flatten_varargs(exprs)
         positional = self._named_positionals(exprs)
         clashing = sorted(positional.keys() & named.keys())
         if clashing:
@@ -991,7 +1076,8 @@ class Dataset:
         (``"first"``/``"last"``) as the spelling of `nulls_first`.
 
         Args:
-            *keys: The sort keys, as column names or expressions.
+            *keys: The sort keys, as column names or expressions. A list of them is
+                accepted in place of separate arguments.
             descending: Sort descending — one bool for all keys or a per-key list.
             nulls_first: Order nulls first — one bool for all keys or a per-key list.
             by: The pandas spelling of `keys`; a single key or a list of them.
@@ -1016,6 +1102,7 @@ class Dataset:
                 >>> ds.sort(by="x", ascending=False).to_pydict()
                 {'x': [3, 2, 1]}
         """
+        keys = flatten_varargs(keys)
         if by is not None:
             if keys:
                 raise PlanError("sort() takes keys positionally or as `by`, not both")
@@ -1075,7 +1162,9 @@ class Dataset:
             partition_by: Columns or expressions to partition rows by.
             order_by: Ordering keys — names, ``(name, descending)`` tuples, or expressions.
             functions: Output name to a ranking function or an ``(agg, column)`` pair.
-            frame: An explicit ``ROWS`` frame as a ``(start, end)`` offset pair.
+            frame: ``(start, end)`` signed row offsets, optionally with a third
+                units element as ``(start, end, units)`` -- ``"rows"`` (default),
+                ``"range"`` or ``"groups"``.
 
         Returns:
             A new `Dataset` with the window columns appended.
@@ -1521,7 +1610,7 @@ class Dataset:
                 >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
                 {'a': [2, 3], 'd': [4, 6]}
         """
-        from batcher.api.session import _catalog
+        from batcher.api.session.sql import _catalog
 
         session = _catalog if dialect is None else _catalog._with_dialect(dialect)
         return session._run(query, {table_name: self})
@@ -1567,6 +1656,7 @@ class Dataset:
 
         Args:
             *names: Names of the columns to remove, or column selectors matching them.
+                A list is accepted in place of separate arguments.
             columns: The pandas keyword spelling of `names`.
             labels: The older pandas spelling of `columns`.
 
@@ -1592,7 +1682,7 @@ class Dataset:
                 {'a': [1, 2]}
         """
         keyword = _as_opt_str_list(_one_of(columns, labels, "columns", "labels"))
-        targets: tuple[str | Selector, ...] = (*names, *(keyword or ()))
+        targets: tuple[str | Selector, ...] = (*flatten_varargs(names), *(keyword or ()))
         if not targets:
             raise PlanError("drop() requires at least one column name or selector")
         available = self._plan.available_columns()
@@ -2016,6 +2106,7 @@ class Dataset:
                 >>> docs.explode("chunks", outer=True, index="i").to_pydict()
                 {'doc': ['a', 'a', 'b'], 'chunks': ['p', 'q', None], 'i': [0, 1, None]}
         """
+        column = column_name(column, arg="column", api="explode")
         return build_explode(self, column, alias, outer=outer, index=index)
 
     def with_row_index(self, name: str = "index", *, offset: int = 0) -> Dataset:
@@ -2039,6 +2130,7 @@ class Dataset:
         Returns:
             A new `Dataset` with the index column appended.
         """
+        name = column_name(name, arg="name", api="with_row_index")
         return self._derive(RowId(self._plan, name, offset))
 
     def with_random(self, name: str = "random", *, seed: int = 0, normal: bool = False) -> Dataset:
@@ -2240,6 +2332,7 @@ class Dataset:
         """
         from batcher.api.dataset._build import build_session_window
 
+        time_col = column_name(time_col, arg="time_col", api="session_window")
         return build_session_window(self, time_col, gap, partition_by or [], aggs)
 
     def unnest(self, *columns: str) -> Dataset:
@@ -2251,7 +2344,8 @@ class Dataset:
         collide with an existing column.
 
         Args:
-            *columns: The struct columns to expand.
+            *columns: The struct columns to expand. A list is accepted in place of
+                separate arguments.
 
         Returns:
             A new `Dataset` with each struct's fields promoted to columns.
@@ -2264,7 +2358,7 @@ class Dataset:
                 >>> ds.unnest("s").to_pydict()
                 {'a': [1], 'b': [2]}
         """
-        return build_unnest(self, list(columns))
+        return build_unnest(self, list(flatten_varargs(columns)))
 
     def sample(
         self,
@@ -2559,6 +2653,7 @@ class Dataset:
 
         Args:
             *others: The datasets to concatenate; each must share this one's columns.
+                A list of them is accepted in place of separate arguments.
             distinct: Deduplicate the result (UNION) instead of keeping all rows.
 
         Returns:
@@ -2582,6 +2677,7 @@ class Dataset:
         # q5 1.3x, and cost q22 2.0x, q18 2.9x and q14 2.0x -- a net loss, and a loss
         # concentrated in the queries the parallel union had just fixed. Making both work
         # wants CSE to weigh the parallelism it forfeits, which is a cost-model change.
+        others = flatten_varargs(others)
         plans: list[LogicalPlan] = [self._plan]
         sources = list(self._sources)
         for other in others:
@@ -3477,7 +3573,9 @@ class Dataset:
                 >>> bt.from_pydict({"x": [7, 8]}).with_row_count().columns
                 ['index', 'x']
         """
-        return self.with_row_index(name, offset=offset)
+        return self.with_row_index(
+            column_name(name, arg="name", api="with_row_count"), offset=offset
+        )
 
     def vstack(self, other: Dataset) -> Dataset:
         """Stack `other`'s rows below this one — the Polars ``vstack`` spelling of :meth:`union`.
@@ -3540,8 +3638,13 @@ class Dataset:
         """
         return self.except_(other)
 
-    def persist(self) -> Dataset:
+    def persist(self, storage_level: StorageLevel | str | None = None) -> Dataset:
         """Keep this result in the process cache — the Spark ``persist`` spelling of :meth:`cache`.
+
+        Args:
+            storage_level: Which media the result may occupy — a
+                :class:`~batcher.StorageLevel` or its name. Defaults to
+                ``MEMORY_AND_DISK``.
 
         Returns:
             A new `Dataset` whose collected result is cached.
@@ -3552,8 +3655,25 @@ class Dataset:
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1]}).persist().count()
                 1
+                >>> bt.from_pydict({"x": [1]}).persist("memory_only").count()
+                1
         """
-        return self.cache()
+        return self.cache(storage_level)
+
+    def unpersist(self) -> Dataset:
+        """Drop this result from the cache — the Spark ``unpersist`` spelling of :meth:`uncache`.
+
+        Returns:
+            This same `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1]}).persist().unpersist().count()
+                1
+        """
+        return self.uncache()
 
     def coalesce(self, n: int) -> Dataset:
         """Reduce the output to `n` partitions — the Spark ``coalesce`` spelling.
@@ -4818,6 +4938,140 @@ class Dataset:
         )
         return Dataset(node, self._sources + other._sources)
 
+    def lookup_join(
+        self,
+        source: str,
+        *,
+        on: str,
+        schema: dict[str, str] | None = None,
+        how: str = "left",
+        prefix: str = "",
+        cache_size: int = 100_000,
+        cache_ttl: str | None = None,
+        hash_values: bool = False,
+        batch_size: int | None = None,
+        num_workers: int | str = "auto",
+    ) -> Dataset:
+        """Enrich each row from a key-value store, by point lookup rather than by scan.
+
+        The join to reach for when the dimension is far larger than what the data actually
+        touches: a hundred-million-row customer store against a stream that sees ten
+        thousand of them. A broadcast join has to move the whole store and a shuffle join
+        has to sort it, where this asks only for the distinct keys each batch contains.
+        It is Flink's lookup join, and it works unchanged single-node, distributed, and
+        over an unbounded source, because the enrichment is per batch.
+
+        Repeated keys are what make it fast, and they are the norm on a fact stream. Each
+        worker keeps an LRU of what it has looked up, and — the part that matters on a
+        dirty key column — remembers **absences** too, so a key the store does not hold is
+        fetched once rather than once per batch.
+
+        What it gives up is a consistent snapshot: the store is read as it stands when each
+        batch arrives, and `cache_ttl` bounds how stale a cached row may be. Where a
+        point-in-time answer is what you meant, read the dimension as a dataset and use
+        :meth:`join`.
+
+        Args:
+            source: The store URI. ``redis://``, ``rediss://``, or ``unix://`` for Redis;
+                ``rocksdb://<path>`` or a bare path for an embedded RocksDB database.
+            on: The column to look up by. Its values are cast to strings, so any key type
+                joins against a string keyspace.
+            schema: The columns the lookup contributes, as ``{name: dtype}`` using the
+                dtype names :meth:`cast` accepts. Required, because a join's output shape
+                cannot depend on which keys the first batch happened to contain.
+            how: ``"left"`` keeps every row and null-fills the misses; ``"inner"`` drops
+                them.
+            prefix: Prepended to every looked-up column name, for a dimension whose column
+                names collide with this dataset's.
+            cache_size: Entries each worker's lookup cache holds, hits and absences
+                together. ``0`` disables it, which is how you measure what it is buying.
+            cache_ttl: How long a cached entry stays usable (``"30s"``, ``"5m"``). ``None``
+                keeps entries for the life of the worker, which is the right setting for a
+                dimension that does not change during the run.
+            hash_values: Read each Redis key as a hash whose fields are the columns, rather
+                than as a string holding a JSON object. Match how the dimension was written.
+            batch_size: Rows per lookup batch; ``None`` uses the engine default, which is
+                the right choice unless you have measured otherwise. Larger batches mean
+                fewer, bigger round trips **and** cheaper assembly: the per-batch cost is
+                one unit of work per *distinct key in the batch*, so a batch smaller than
+                the distinct-key count pays for the same keys over and over. Setting this
+                to a small value is the one way to make a lookup join slow.
+            num_workers: How many workers issue lookups concurrently. ``"auto"`` fans
+                across local cores, which is what hides the store's latency. The cache is
+                per worker, so this multiplies the round trips for the same distinct keys
+                — the right trade against a store you are waiting on, the wrong one
+                against a store you are close to rate-limiting.
+
+        Returns:
+            A new `Dataset` with the looked-up columns appended.
+
+        Raises:
+            PlanError: If `on` is not a column of this dataset, if `schema` is missing or
+                names an unknown dtype, or if `how` is neither ``"left"`` nor ``"inner"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> orders = bt.from_pydict({"customer": ["c1", "c9"], "total": [10, 20]})
+                >>> enriched = orders.lookup_join(  # doctest: +SKIP
+                ...     "redis://localhost:6379/0",
+                ...     on="customer",
+                ...     schema={"name": "string", "tier": "int64"},
+                ...     prefix="cust_",
+                ... )
+                >>> orders.columns
+                ['customer', 'total']
+        """
+        from batcher.io.lookup import LookupStage, lookup_schema
+
+        if on not in self._plan.available_columns():
+            raise PlanError(
+                f"lookup_join(): unknown column {on!r}",
+                available=self._plan.available_columns(),
+            )
+        if how not in ("left", "inner"):
+            raise PlanError(
+                f"lookup_join(how={how!r}) is not supported",
+                hint=(
+                    "A point-lookup store can answer 'left' (keep every row, null-fill "
+                    "the misses) or 'inner' (drop the misses). A right or outer join "
+                    "would have to enumerate the store, which is the scan a lookup join "
+                    "exists to avoid."
+                ),
+            )
+        # Resolved here to validate the dtype names and to name the output columns; the
+        # *unresolved* mapping is what travels to the worker below. Round-tripping through
+        # `str(field.type)` looked equivalent and is not: `resolve_dtype("timestamp(us)")`
+        # renders as ``timestamp[us]``, which `resolve_dtype` does not parse back, so a
+        # temporal lookup column resolved on the driver and then failed on the worker.
+        resolved = lookup_schema(schema)
+        added = [prefix + field.name for field in resolved]
+        collision = sorted(set(added) & set(self._plan.available_columns()))
+        if collision:
+            raise PlanError(
+                f"lookup_join(): the looked-up column(s) {', '.join(collision)} already "
+                "exist in this dataset",
+                hint="Pass prefix= to disambiguate them.",
+            )
+        return self.map_batches(
+            LookupStage,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            output_columns=list(self._plan.available_columns()) + added,
+            preserves_columns=list(self._plan.available_columns()),
+            fn_constructor_kwargs={
+                "source": source,
+                "on": on,
+                "schema": dict(schema or {}),
+                "how": how,
+                "prefix": prefix,
+                "cache_size": cache_size,
+                "cache_ttl": cache_ttl,
+                "hash_values": hash_values,
+            },
+        )
+
     def group_by(self, *keys: str, **named: Expr) -> GroupBy:
         """Begin a grouped aggregation over the given keys.
 
@@ -4828,7 +5082,8 @@ class Dataset:
         Global aggregation (no keys) is ``ds.group_by().agg(...)``.
 
         Args:
-            *keys: Key columns by name.
+            *keys: Key columns by name. A list is accepted in place of separate
+                arguments.
             **named: Derived key columns bound to expressions.
 
         Returns:
@@ -4842,6 +5097,7 @@ class Dataset:
                 >>> ds.group_by("g").agg(s=bt.col("v").sum()).sort("g").to_pydict()
                 {'g': ['a', 'b'], 's': [4, 2]}
         """
+        keys = flatten_varargs(keys)
         available = set(self._plan.available_columns())
         for k in keys:
             if not isinstance(k, str):
@@ -4850,11 +5106,7 @@ class Dataset:
                     "key a name, e.g. group_by(bucket=col('x') % 10)"
                 )
             if k not in available:
-                cols = sorted(available)
-                raise PlanError(
-                    f"group_by key {k!r} is not a column; available: {cols}"
-                    f"{suggest_columns(k, cols)}"
-                )
+                raise ColumnNotFoundError.of(k, sorted(available), where="in group_by()")
         for alias, expr in named.items():
             if not isinstance(expr, Expr):
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
@@ -4870,7 +5122,8 @@ class Dataset:
         marks a subtotal row.
 
         Args:
-            *keys: The rollup key columns, most significant first.
+            *keys: The rollup key columns, most significant first. A list is accepted
+                in place of separate arguments.
 
         Returns:
             A `MultiLevelGroupBy` to finish with ``.agg(...)``.
@@ -4886,6 +5139,7 @@ class Dataset:
                 >>> ds.rollup("r").agg(n=bt.col("v").sum()).sort("r").to_pydict()
                 {'r': ['e', 'w', None], 'n': [3, 4, 7]}
         """
+        keys = flatten_varargs(keys)
         self._check_group_keys(keys, "rollup")
         return MultiLevelGroupBy(self, keys, rollup_levels(keys))
 
@@ -4897,7 +5151,8 @@ class Dataset:
         overall rows. Costs 2ⁿ levels, so keep `n` small.
 
         Args:
-            *keys: The cube key columns.
+            *keys: The cube key columns. A list is accepted in place of separate
+                arguments.
 
         Returns:
             A `MultiLevelGroupBy` to finish with ``.agg(...)``.
@@ -4913,6 +5168,7 @@ class Dataset:
                 >>> len(ds.cube("a", "b").agg(n=bt.col("v").sum()).to_pydict()["n"])
                 4
         """
+        keys = flatten_varargs(keys)
         self._check_group_keys(keys, "cube")
         return MultiLevelGroupBy(self, keys, cube_levels(keys))
 
@@ -4953,11 +5209,7 @@ class Dataset:
         available = set(self._plan.available_columns())
         for k in keys:
             if not isinstance(k, str) or k not in available:
-                cols = sorted(available)
-                raise PlanError(
-                    f"{what}() key {k!r} is not a column; available: {cols}"
-                    f"{suggest_columns(str(k), cols)}"
-                )
+                raise ColumnNotFoundError.of(k, sorted(available), where=f"in {what}()")
 
     def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:
         """Aggregate over the whole dataset (no grouping).
@@ -4967,7 +5219,9 @@ class Dataset:
         ``ds.agg(bt.sum("x"), bt.mean("y"))`` keeps each source column's name.
 
         Args:
-            *aggs: Self-naming aggregate expressions (e.g. ``bt.sum("x")``).
+            *aggs: Self-naming aggregate expressions (e.g. ``bt.sum("x")``), or ones
+                named by ``.alias(...)``. A list is accepted in place of separate
+                arguments.
             **aggregates: Named aggregate expressions over the whole dataset.
 
         Returns:
@@ -4984,7 +5238,7 @@ class Dataset:
                 >>> ds.agg(bt.sum("x")).to_pydict()
                 {'x': [10]}
         """
-        return self.group_by().agg(*aggs, **aggregates)
+        return self.group_by().agg(*flatten_varargs(aggs), **aggregates)
 
     # --- terminal operations ----------------------------------------------
     def collect(
@@ -5171,7 +5425,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3]}).count()
                 3
         """
-        return _count(self._plan, self._sources, self.columns)
+        return _count(self._plan, self._sources, self.columns, self._cache)
 
     def is_empty(self) -> bool:
         """Whether the result has no rows.
@@ -5190,7 +5444,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1]}).filter(bt.col("x") > 10).is_empty()
                 True
         """
-        return _is_empty(self._plan, self._sources, self.columns)
+        return _is_empty(self._plan, self._sources, self.columns, self._cache)
 
     @property
     def schema(self) -> pa.Schema:
@@ -5228,11 +5482,22 @@ class Dataset:
         """
         return list(self.schema.types)
 
-    def _require_column(self, column: str, op: str) -> None:
-        """Validate that `column` is an output column, else raise `PlanError`."""
+    def _require_column(self, column: str, op: str) -> str:
+        """Validate that `column` is an output column *name*, else raise `PlanError`.
+
+        The type check is not redundant with the membership test below it — it is what
+        makes the membership test reachable. ``column not in available`` evaluates
+        ``Expr.__eq__`` against each name when handed an expression, which builds an
+        expression and then asks it for a truth value, so every scalar terminal answered
+        ``ds.sum(col("v"))`` with *the truth value of an Expr is ambiguous; use & | ~ to
+        combine predicates* — a message about boolean operators, naming neither the method
+        nor the argument, for a call that used none.
+        """
+        column = column_name(column, arg="column", api=op)
         available = self._plan.available_columns()
         if column not in available:
             raise PlanError(f"{op}(): unknown column {_unknown_cols({column}, available)}")
+        return column
 
     def _exec_scalar(self, agg_expr: Expr) -> Any:
         """Execute a single global aggregate and return its one scalar value."""
@@ -5994,6 +6259,12 @@ class Dataset:
         reducer bucket at a time, so the driver never holds the whole distributed
         result — the bounded-memory way to pull a large distributed output.
 
+        On a dataset marked with :meth:`cache`, an already-cached result is streamed
+        straight from the cache. Streaming does not *populate* it: filling the cache means
+        materializing the whole result, which is the one thing a caller reaching for
+        `iter_batches` has asked not to happen. Call a materializing terminal once to warm
+        the cache, and every later stream is served from it.
+
         Args:
             batch_size: Rebatch the output to this many rows; ``None`` keeps engine batches.
             distributed: Fan a top-level breaker across Ray workers (``True``/``"auto"``).
@@ -6011,18 +6282,20 @@ class Dataset:
                 >>> sum(batch.num_rows for batch in ds.iter_batches())
                 3
         """
-        from batcher.api.terminal.core import _resolve_distributed
+        from batcher.api.terminal.core import _resolve_distributed, cached_batches
         from batcher.api.terminal.event_log import pipeline_signature, report_stream
 
-        batches = _iter_batches(
-            self._plan,
-            self._sources,
-            self.columns,
-            batch_size=batch_size,
-            distributed=_resolve_distributed(distributed, self._plan, self._sources),
-            num_workers=num_workers,
-            transport=transport,
-        )
+        batches = cached_batches(self._plan, self._sources, self._cache, batch_size)
+        if batches is None:
+            batches = _iter_batches(
+                self._plan,
+                self._sources,
+                self.columns,
+                batch_size=batch_size,
+                distributed=_resolve_distributed(distributed, self._plan, self._sources),
+                num_workers=num_workers,
+                transport=transport,
+            )
         # Wrapped here, at the single public entry, rather than inside `_iter_batches` —
         # which recurses on the `batch_size` path and would double-count every row.
         yield from report_stream(
@@ -6075,7 +6348,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3]}).to_arrow().num_rows
                 3
         """
-        return _collect(self._plan, self._sources, self.columns)
+        return _collect(self._plan, self._sources, self.columns, cache=self._cache)
 
     def to_pandas(self):
         """Execute the plan and return the result as a pandas `DataFrame`.
@@ -6091,7 +6364,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3]}).to_pandas().shape  # doctest: +SKIP
                 (3, 1)
         """
-        return _to_pandas(self._plan, self._sources, self.columns)
+        return _to_pandas(self._plan, self._sources, self.columns, self._cache)
 
     def to_polars(self):
         """Execute the plan and return the result as a Polars `DataFrame`.
@@ -6107,7 +6380,7 @@ class Dataset:
                 >>> bt.from_pydict({"x": [1, 2, 3]}).to_polars().height  # doctest: +SKIP
                 3
         """
-        return _to_polars(self._plan, self._sources, self.columns)
+        return _to_polars(self._plan, self._sources, self.columns, self._cache)
 
     def to_numpy(self, columns: list[str] | None = None) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: numpy.ndarray}`` dict.
@@ -6179,7 +6452,7 @@ class Dataset:
                 >>> bt.from_pydict({"a": [1, 2], "b": ["x", "y"]}).to_pydict()
                 {'a': [1, 2], 'b': ['x', 'y']}
         """
-        return _to_pydict(self._plan, self._sources, self.columns)
+        return _to_pydict(self._plan, self._sources, self.columns, self._cache)
 
     def to_pylist(self) -> list[dict[str, Any]]:
         """Execute the plan and return the result as a row-oriented list of dicts.
@@ -6198,7 +6471,7 @@ class Dataset:
                 >>> bt.from_pydict({"a": [1, 2], "b": ["x", "y"]}).to_pylist()
                 [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
         """
-        return _to_pylist(self._plan, self._sources, self.columns)
+        return _to_pylist(self._plan, self._sources, self.columns, self._cache)
 
     def to_torch(self, *, columns: list[str] | None = None, batch_size: int | None = None) -> Any:
         """A re-iterable ``torch.utils.data.IterableDataset`` of per-batch tensor dicts.

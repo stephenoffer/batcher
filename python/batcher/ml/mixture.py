@@ -156,10 +156,9 @@ class GaussianMixture:
         responsibilities = {
             f"__bt_r{k}": col(f"__bt_e{k}") / col("__bt_denom") for k in range(self.n_components)
         }
-        ds = ds.with_columns(
+        return ds.with_columns(
             __bt_ll=col("__bt_maxlog") + col("__bt_denom").ln(), **responsibilities
         )
-        return ds
 
     def fit(self, ds: Dataset) -> GaussianMixture:
         """Fit the mixture by expectation-maximization to a local optimum.

@@ -328,3 +328,44 @@ def test_the_vector_ops_an_embedding_dedup_is_built_from_are_priced():
     # Element-wise vector arithmetic is far cheaper than hashing, but still not a scalar.
     assert expr_cost(bt.col("v").list.add(bt.col("v"))) < simhash
     assert expr_cost(bt.col("v").list.add(bt.col("v"))) > expr_cost(bt.col("a") + bt.col("b"))
+
+
+@pytest.mark.unit
+def test_a_case_is_priced_at_one_branch_not_all_of_them():
+    """A row takes one arm, so the cost of a `CASE` must not grow with the arm count.
+
+    The generic "own cost plus every child" fold priced a four-arm `CASE` over regexes at
+    four regexes, which is what the whole *column* costs and not what a *row* costs. The
+    data plane evaluates one arm per row (`bc_expr::eval::branch`), and this number is a
+    per-row multiplier on the operator that carries the expression -- so the over-charge
+    reached join ordering and `split_expensive_filter`'s ranks.
+    """
+    one = bt.when(bt.col("x") > 1).then(bt.col("s").str.regexp_matches("^a")).otherwise(False)
+    four = (
+        bt.when(bt.col("x") > 1)
+        .then(bt.col("s").str.regexp_matches("^a"))
+        .when(bt.col("x") > 2)
+        .then(bt.col("s").str.regexp_matches("^b"))
+        .when(bt.col("x") > 3)
+        .then(bt.col("s").str.regexp_matches("^c"))
+        .otherwise(bt.col("s").str.regexp_matches("^d"))
+    )
+    regex = raw_expr_cost(bt.col("s").str.regexp_matches("^a"))
+    # Three extra conditions are three extra comparisons, not three extra regexes.
+    assert raw_expr_cost(four) - raw_expr_cost(one) < regex
+    # And a single-arm CASE is still dearer than the bare arm it wraps.
+    assert raw_expr_cost(one) > regex
+
+
+@pytest.mark.unit
+def test_a_coalesce_is_still_priced_at_every_argument():
+    """`COALESCE` is the branch form that is *not* capped at one arm.
+
+    How many arguments a row walks is a property of the data -- a row whose every argument
+    is null pays for all of them -- so nothing static bounds it below the sum. Costing the
+    bound is the safe side: it keeps an expensive `COALESCE` behind cheaper conjuncts,
+    where an under-estimate would run it first over every row.
+    """
+    regex = raw_expr_cost(bt.col("s").str.regexp_matches("^a"))
+    two = bt.coalesce(bt.col("s").str.regexp_matches("^a"), bt.col("s").str.regexp_matches("^b"))
+    assert raw_expr_cost(two) > 1.9 * regex

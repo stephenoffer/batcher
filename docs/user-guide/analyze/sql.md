@@ -50,8 +50,12 @@ A query may use:
 - `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (equi-keys; an extra non-equi
   `AND` condition is applied as a filter), `NATURAL JOIN`, and `ASOF JOIN`
 - `UNION` / `INTERSECT` / `EXCEPT`, `WITH` (CTEs), and subqueries
+- Column alias lists on a table, subquery, or CTE — `FROM (SELECT ...) AS t(a, b)`,
+  `WITH t(a, b) AS (...)` — which rename the relation's columns positionally
 - Window functions over any expression, including a computed `PARTITION BY` / `ORDER BY` key such as `date_trunc('month', ts)`, with explicit `ROWS` / `RANGE` / `GROUPS` frames — including `RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING` for a time window
 - `CASE` expressions, `CAST`, and `SIMILAR TO`
+- `INTERVAL` literals, including compound (`'1 day 3 hours'`), fractional
+  (`'1.5 hours'`), clock (`'04:05:06'`) and abbreviated (`'1 mon'`) forms
 - `generate_series(a, b)` / `range(a, b)` in `FROM`, for a generated integer spine
 - `UNNEST`, in the `FROM` clause or written directly in the `SELECT` list
 
@@ -122,6 +126,10 @@ print(out.to_pydict())
 
 Both paths build one logical plan, push it through one optimizer, and execute it on
 one Rust data plane. There is no separate SQL engine.
+
+Every method on the expression accessors is callable from SQL too, under the name of the
+namespace and the method: `col("s").str.slugify()` is `str_slugify(s)`. See
+{doc}`/api/relational/expression-accessors` for the naming rules and the full surface.
 
 (sessions-tables-and-python-functions)=
 
@@ -295,6 +303,56 @@ print(out.to_pydict())
 `ASOF JOIN` drops a left row that matches nothing; `ASOF LEFT JOIN` keeps it with NULL
 right columns.
 
+## Shifting a date or timestamp by an interval
+
+`ts + INTERVAL ...` and `ts - INTERVAL ...` shift an instant. The literal is read into three
+independent components — calendar months, whole days, and exact microseconds — because that
+is what a calendar shift is: a month is not a fixed number of days, and under a time zone
+neither is a day.
+
+Four spellings are accepted, and they compose:
+
+| Form | Example |
+|---|---|
+| A count and a unit | `INTERVAL 3 DAY`, `INTERVAL '2 hours'` |
+| Several terms, added together | `INTERVAL '1 day 3 hours'`, `INTERVAL '2 years 3 months'` |
+| A fractional count | `INTERVAL '1.5 hours'`, `INTERVAL '2.5 weeks'` |
+| A clock, with no unit words | `INTERVAL '04:05:06'` |
+
+Units may be written in full or abbreviated the way PostgreSQL abbreviates them:
+`y`/`yr`/`year`, `mon`/`month`, `quarter`, `decade`, `century`, `millennium`, `w`/`week`,
+`d`/`day`, `h`/`hr`/`hour`, `m`/`min`/`minute`, `s`/`sec`/`second`, `ms`/`millisecond`,
+`us`/`microsecond`. Bare `m` is a **minute** and `mon` is a **month**, as in PostgreSQL.
+
+```python
+import datetime as dt
+
+runs = bt.from_pydict({"started": [dt.datetime(2024, 1, 31, 22, 30)]})
+print(
+    bt.sql(
+        """
+        SELECT started + INTERVAL '1 day 3 hours'   AS shifted,
+               started + INTERVAL '1.5 hours'       AS half_shift,
+               started - INTERVAL '1 mon'           AS last_month
+        FROM runs
+        """,
+        runs=runs,
+    ).to_pydict()
+)
+# {'shifted': [datetime.datetime(2024, 2, 2, 1, 30)],
+#  'half_shift': [datetime.datetime(2024, 2, 1, 0, 0)],
+#  'last_month': [datetime.datetime(2023, 12, 31, 22, 30)]}
+```
+
+A fractional count spills into the next finer component rather than rounding, which is what
+keeps `INTERVAL '1.5 months'` meaning "one month and fifteen days" instead of a flat
+forty-five days that would drift across a month boundary. `INTERVAL '0.25 days'` is six
+hours for the same reason.
+
+A shift by whole days or whole months keeps a `DATE` a `DATE`; one carrying a time
+component widens to `TIMESTAMP`, because a `DATE` cannot hold the hours. See
+[Deliberate differences](#deliberate-differences) for how that compares to DuckDB.
+
 ## Measuring the gap between two timestamps
 
 `date_diff(unit, start, end)` reports how many `unit` boundaries lie between two instants.
@@ -387,6 +445,7 @@ downstream can detect.
 | `ASOF JOIN` on a strict `>` or `<` | The nearest-match key is inclusive. Use `>=` or `<=`. |
 | A negative list-slice bound, `a[-2:]` | Counts back from the end in DuckDB; the underlying slice clamps to the start. Index from the front, or reverse the list first. |
 | A correlated subquery whose correlation is an inequality | An equality correlation decorrelates to a join and is supported; an inequality one is not. |
+| An **inequality** quantified subquery, `x > ALL (...)` / `x >= ANY (...)` | Only the equality forms have a faithful rewrite: `= ANY` is `IN` and `<> ALL` is `NOT IN`, by definition. The tempting `x > ALL (S)` → `x > (SELECT max(c) FROM S)` is wrong when `S` holds a NULL — `max` skips it, so the rewrite answers TRUE where SQL says UNKNOWN, which is a silently wrong row rather than an error. Write the `max`/`min` form yourself, with `AND NOT EXISTS (SELECT 1 FROM S WHERE c IS NULL)` to keep the NULL case. |
 | `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch, DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day (`1 DAY`, `6 HOUR`, `15 MINUTE`), or `date_trunc` for calendar buckets. |
 | Two `UNNEST` calls in one `SELECT` list | SQL zips them into one relation. Unnest one list per query, or use `FROM t, UNNEST(...)` for each. |
 
@@ -409,14 +468,18 @@ Descending list sorts agree with DuckDB, NULLs included. `list_reverse_sort` low
 puts NULLs last, so reversing would lift them to the front, where DuckDB keeps them at the
 back. Both spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
 
-### Known divergences
+(deliberate-differences)=
+### Deliberate differences
 
-One construct returns a result that differs from DuckDB's, and it is tracked as a defect
-rather than intended behavior:
+Three results differ from DuckDB's on purpose. Each is a case where Batcher answers what
+the value means rather than what DuckDB's implementation happens to produce, so expect the
+difference and don't report it as a defect.
 
 | Construct | How it differs |
 |---|---|
-| `epoch_ms` and `to_timestamp(n, scale)` applied to a *column* | The literal forms build a timestamp, as DuckDB does. Given a column the same call reads an epoch count back out instead, because the construct-or-extract choice is made from the argument's syntax rather than its type. Use `to_timestamp(n)` for a second count, which is unambiguous and correct for columns. |
+| `corr(y, x)` where either column is flat | Batcher returns NULL, DuckDB returns NaN. With no variance there is no correlation to report, and NULL is the SQL spelling of "no value" that every aggregate here already uses for an undefined result. PostgreSQL answers NULL too. `regr_r2` follows the same rule, so the family stays consistent. |
+| `jaro_similarity` and `jaro_winkler_similarity` on non-ASCII text | Batcher measures in *characters*, DuckDB in bytes. `jaro_similarity('ünïcödé', 'abc')` is 0.492 here and 0.475 there, because DuckDB counts the seven-character string as eleven bytes. The character reading is the one the algorithm is defined on. ASCII arguments agree exactly. |
+| `DATE + INTERVAL` with a calendar unit | Batcher returns a DATE, DuckDB widens to a TIMESTAMP. The calendar value is the same; cast explicitly if you need DuckDB's type. |
 
 ## See also
 

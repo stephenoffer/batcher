@@ -75,7 +75,7 @@ def test_a_missing_declared_output_is_caught(ds: bt.Dataset) -> None:
 
 def test_an_unknown_input_column_names_the_batch(ds: bt.Dataset) -> None:
     """`serving_udf` builds a callable, so the first batch is the earliest honest moment."""
-    udf = serving_udf(lambda: Good(), input_columns=["nope"])
+    udf = serving_udf(Good, input_columns=["nope"])
     with pytest.raises(ColumnNotFoundError, match=r"input_columns=\['nope'\]"):
         ds.map_batches(udf, output_columns=["x", "y"]).to_pydict()
 

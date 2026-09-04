@@ -24,9 +24,24 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher.api.dataset import Dataset
-from batcher.plan.expr_ir import AggExpr, col
+from batcher.plan.expr_ir import AggExpr, Expr, col
 
 __all__ = ["rewrite_distinct_aggs", "sort_for_ordered_aggs"]
+
+
+def _undecomposable_message(names: list[str]) -> str:
+    """Why these output columns cannot share a query with a DISTINCT aggregate.
+
+    Names the offending *select items* rather than their function tags: an item is what
+    the user has to move into a subquery, and a composite aggregate has no function tag
+    to name in the first place.
+    """
+    return (
+        f"mixing a DISTINCT aggregate with the aggregate(s) {names} in one query is not "
+        "supported: those have no single-column mergeable partial, so they cannot be "
+        "pre-aggregated alongside the DISTINCT dedup. Compute them in a separate subquery"
+    )
+
 
 # Plain aggregates that survive pre-aggregation, as {level-1 partial: level-2 combine}.
 #
@@ -64,8 +79,8 @@ _DECOMPOSABLE = {
 
 
 def rewrite_distinct_aggs(
-    tr, ds: Dataset, group_cols, group_exprs, agg_kwargs: dict[str, AggExpr]
-) -> tuple[Dataset, dict[str, AggExpr]]:
+    tr, ds: Dataset, group_cols, group_exprs, agg_kwargs: dict[str, AggExpr | Expr]
+) -> tuple[Dataset, dict[str, AggExpr | Expr]]:
     """Rewrite a query containing DISTINCT aggregates into an equivalent plain one.
 
     Args:
@@ -73,7 +88,9 @@ def rewrite_distinct_aggs(
         ds: The dataset to aggregate.
         group_cols: Plain column group keys.
         group_exprs: Computed group keys, by output alias.
-        agg_kwargs: Every aggregate in the query, by output name.
+        agg_kwargs: Every aggregate in the query, by output name. A *composite*
+            aggregate (`stddev_pop`, `regr_slope`, `sem`) is an `Expr` over several
+            partials rather than an `AggExpr`, so the values are not all one type.
 
     Returns:
         The dataset to group and the aggregates to apply to it. The caller groups by
@@ -97,20 +114,27 @@ def rewrite_distinct_aggs(
         # Every aggregate is DISTINCT over the same expression: one dedup, then each
         # aggregate reads the deduped column.
         deduped = ds.select(*keys, dv).distinct()
+        composite = sorted(n for n, a in agg_kwargs.items() if not isinstance(a, AggExpr))
+        if composite:
+            raise NotImplementedError(_undecomposable_message(composite))
         return deduped, {
             name: AggExpr(a.func, col(dv), input2=a.input2, param=a.param)
             for name, a in agg_kwargs.items()
         }
 
-    undecomposable = sorted(n for n, a in plain.items() if a.func not in _DECOMPOSABLE)
+    # `isinstance` first, and not `a.func`: a *composite* aggregate — `stddev_pop`,
+    # `regr_slope`, `sem`, anything `build_typed_agg` assembles out of several partials —
+    # lowers to a plain `Expr`, which has no `func` at all. Asking one for its `func` raised
+    # a bare `AttributeError: Expr has no attribute 'func'` out of `Session.sql()`, so a
+    # query mixing `regr_slope(i, j)` with `sum(DISTINCT i)` failed with an internal
+    # traceback where the sibling shape `corr(i, j)` (a binary `AggExpr`) got this message.
+    # A composite has no single-column mergeable partial by construction, which is exactly
+    # what this guard declines, so it belongs on this side of it.
+    undecomposable = sorted(
+        n for n, a in plain.items() if not isinstance(a, AggExpr) or a.func not in _DECOMPOSABLE
+    )
     if undecomposable:
-        funcs = sorted({plain[n].func for n in undecomposable})
-        raise NotImplementedError(
-            f"mixing a DISTINCT aggregate with {funcs} in one query is not supported: "
-            "those have no single-column mergeable partial, so they cannot be "
-            "pre-aggregated alongside the DISTINCT dedup. Compute them in a separate "
-            "subquery"
-        )
+        raise NotImplementedError(_undecomposable_message(undecomposable))
 
     # Level 1: group by the keys PLUS the distinct expression. That grouping dedups `x`
     # implicitly, and each plain aggregate becomes its per-sub-group partial.

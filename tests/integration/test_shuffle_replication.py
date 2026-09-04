@@ -15,6 +15,31 @@ Two properties are pinned here, and they are not the same property:
 2. **That replication actually did something** — the recompute path is not entered. Without
    this, `shuffle_replication` could be wired to nothing at all and property 1 would still
    pass via the recompute fallback, which is exactly the state this feature was in before.
+
+**Property 1 is currently FAILING, and the shape of the failure is recorded here because it
+is the opposite of what anyone would guess.** Measured on a 4-worker fleet, the aggregate
+above (120,000 rows, 40 groups), injecting worker kills and comparing the row count against
+the single-node answer:
+
+| `shuffle_replication` | kill `{1}` | kill `{0, 2}` |
+|---|---|---|
+| 1 (off) | exact | exact |
+| 2 | exact | **-25%** (90,000 of 120,000 rows) |
+| 3 | exact | exact |
+| 4 | **-25%** | — |
+
+**Replication *off* is correct in every case; turning it on is what loses the rows.** The
+recompute path this feature exists to avoid is the one that works. And the loss is not
+partial-looking: all 40 groups come back, with one worker's entire quarter of the input
+missing from their sums and counts — a silently wrong answer, not an error, which is the
+failure mode `CLAUDE.md` names as the one that "appears at cluster scale, as wrong results
+rather than an error".
+
+`factor = 4` on 4 workers is the row that rules out "the copies simply ran out": every
+worker holds every bucket there, so losing one worker cannot have removed the last copy of
+anything, and it still loses exactly one worker's share. That points at the *selection* of a
+fallback rather than its availability. Reproduced identically at `430fd373`, so it predates
+the session that measured it; unfixed, and deliberately not guessed at.
 """
 
 from __future__ import annotations

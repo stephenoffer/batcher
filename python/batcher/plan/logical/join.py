@@ -12,7 +12,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError, require_float
+from batcher._internal.errors import ColumnNotFoundError, PlanError, require_float
 from batcher.plan.ir_tags import ORDERING_COMPARISONS, Op
 from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases
 from batcher.plan.schema import SchemaRef
@@ -264,10 +264,10 @@ class Join(LogicalPlan):
         right_cols = set(self.right.available_columns())
         for k in self.left_keys:
             if k not in left_cols:
-                raise PlanError(f"join left key {k!r} not in left columns {sorted(left_cols)}")
+                raise ColumnNotFoundError.of(k, sorted(left_cols), where="in the join's left key")
         for k in self.right_keys:
             if k not in right_cols:
-                raise PlanError(f"join right key {k!r} not in right columns {sorted(right_cols)}")
+                raise ColumnNotFoundError.of(k, sorted(right_cols), where="in the join's right key")
         if len(self.left_keys) != len(self.right_keys):
             raise PlanError("join requires the same number of left and right keys")
         if self.join_type not in JOIN_TYPES:
@@ -396,9 +396,13 @@ class AsofJoin(LogicalPlan):
         left_cols = set(self.left.available_columns())
         right_cols = set(self.right.available_columns())
         if self.left_on not in left_cols:
-            raise PlanError(f"asof_join left_on {self.left_on!r} not in left columns")
+            raise ColumnNotFoundError.of(
+                self.left_on, sorted(left_cols), where="in asof_join(left_on=...)"
+            )
         if self.right_on not in right_cols:
-            raise PlanError(f"asof_join right_on {self.right_on!r} not in right columns")
+            raise ColumnNotFoundError.of(
+                self.right_on, sorted(right_cols), where="in asof_join(right_on=...)"
+            )
         if len(self.left_by) != len(self.right_by):
             raise PlanError("asof_join requires the same number of left/right `by` keys")
         # The `by` keys are grouped through the same row encoder a hash join keys on, so a
@@ -500,9 +504,13 @@ class RangeJoin(LogicalPlan):
                     f"unknown range op {c.op!r}; expected {sorted(ORDERING_COMPARISONS)}"
                 )
             if c.left_key not in left_cols:
-                raise PlanError(f"range join left key {c.left_key!r} not in left columns")
+                raise ColumnNotFoundError.of(
+                    c.left_key, sorted(left_cols), where="in a range join's left key"
+                )
             if c.right_key not in right_cols:
-                raise PlanError(f"range join right key {c.right_key!r} not in right columns")
+                raise ColumnNotFoundError.of(
+                    c.right_key, sorted(right_cols), where="in a range join's right key"
+                )
         # The engine encodes both sides of a condition with one row converter, so a
         # mismatched pair would surface at execution as an opaque encoder error.
         _validate_key_types(

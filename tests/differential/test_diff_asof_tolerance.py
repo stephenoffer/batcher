@@ -138,6 +138,20 @@ def test_nearest_is_not_pruned_by_the_one_sided_on_bound():
     plan = (
         bt.from_arrow(left).join_asof(bt.from_arrow(right), on="t", direction="nearest").explain()
     )
+    # The absence assertion below needs a positive control, and the control has to be the
+    # *sibling direction* rather than any filter at all. `explain()` is a rendering, not a
+    # contract, so "filter" not appearing proves nothing unless something shows the rule
+    # spells itself that way when it does fire — and a plain `.filter()` on an in-memory
+    # source is absorbed into the scan as `pushed[...]` with no `filter` operator rendered,
+    # so it would have been a control that could never fail. `direction="backward"` is the
+    # shape the bug actually produced: it renders `filter [t ≤ 10]` above the right scan.
+    control = (
+        bt.from_arrow(left).join_asof(bt.from_arrow(right), on="t", direction="backward").explain()
+    )
+    assert "filter" in control, (
+        "control for the assertion below: a one-sided asof bound IS rendered as a `filter` "
+        "operator, so its absence on `nearest` is evidence rather than an artifact"
+    )
     assert "filter" not in plan, plan
 
 

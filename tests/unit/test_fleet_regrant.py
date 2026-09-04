@@ -57,7 +57,7 @@ def _no_ray(monkeypatch):
     import types
 
     fake = types.ModuleType("ray")
-    fake.get = lambda refs: list(refs)  # type: ignore[attr-defined]
+    fake.get = list  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ray", fake)
     return fake
 

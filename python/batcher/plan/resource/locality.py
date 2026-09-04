@@ -129,6 +129,137 @@ def _spread(capacities: Sequence[int], workers: int) -> list[int]:
     return out
 
 
+def _apportion(sizes: Sequence[int], total: int) -> list[int]:
+    """Share `total` out across groups of `sizes` nodes, by largest remainder.
+
+    Integer arithmetic throughout, so the result is exact and never depends on how a float
+    quotient rounded. Ties go to the earlier group, which is what makes this reduce to "the
+    first `total` groups" when every group holds one node.
+
+    Args:
+        sizes: Nodes in each group.
+        total: Workers to share out. Never more than `sum(sizes)` at any call site here, so
+            no group is ever given more workers than it has nodes.
+
+    Returns:
+        The share for each group, in the input order, summing to `total`.
+    """
+    population = sum(sizes)
+    if population <= 0 or total <= 0:
+        return [0] * len(sizes)
+    shares = [total * size // population for size in sizes]
+    remainders = [total * size % population for size in sizes]
+    order = sorted(range(len(sizes)), key=lambda i: (-remainders[i], i))
+    for index in order[: total - sum(shares)]:
+        shares[index] += 1
+    return shares
+
+
+def _spread_census(classes: Sequence[tuple[int, int]], workers: int) -> list[int]:
+    """`_spread` over a census: `(capacity, how many nodes have it)` in, total placed per class.
+
+    The same placement `_spread` computes, at O(classes) instead of O(nodes). A hundred-thousand
+    -node fleet is a handful of instance types across a handful of zones, so the class count is
+    two or three orders of magnitude smaller — and this is the arithmetic behind
+    `ClusterShape.locality_shares`, which the cost model evaluates once per pipeline breaker.
+    Measured on a synthetic 100,000-node fleet, one `locality_shares` call took 106 ms.
+
+    **Identical to `_spread` on the expanded fleet whenever each class's nodes are contiguous
+    in that expansion**, which is how `ClusterShape` expands one. Contiguity is load-bearing
+    rather than incidental: `_spread` hands its remainder to the first `extra` nodes in
+    `(-capacity, index)` order, so two interleaved classes of equal capacity would split that
+    remainder differently from two adjacent ones. `tests/unit/test_locality_census.py` holds
+    this to `_spread` itself over randomized fleets.
+
+    Within one class the per-node placements differ by at most one — `_spread` deals evenly
+    among equal capacities — so the class total is all a caller needs: `divmod(total, count)`
+    recovers the individual placements exactly.
+
+    Args:
+        classes: `(capacity, node count)` per class, in the fleet's own order.
+        workers: Workers to place.
+
+    Returns:
+        Workers placed on each class as a whole, one entry per class, in the input order.
+    """
+    capacities = [max(0, int(capacity)) for capacity, _ in classes]
+    counts = [max(0, int(count)) for _, count in classes]
+    per_node = [0] * len(classes)
+    occupied = sorted(
+        (j for j in range(len(classes)) if capacities[j] > 0 and counts[j] > 0),
+        key=lambda j: (-capacities[j], j),
+    )
+    totals = [0] * len(classes)
+    if workers <= 0 or not occupied:
+        return totals
+
+    def _deal(order: Sequence[int], base: int, extra: int) -> list[int]:
+        """`base` to every node in `order`, then `extra` more shared out across the classes.
+
+        The `extra` are apportioned by node count rather than handed to the first classes in
+        order, and that is the one place a census cannot simply replay what `_spread` did.
+        `_spread` gives its remainder to the first `extra` *nodes* in `(-capacity, index)`
+        order, where `index` is the fleet's own node ordering — which was the node id, and Ray
+        node ids are random. So on a homogeneous fleet the per-node form drew an arbitrary
+        sample of nodes, and a class-contiguous replay of it draws the most clustered sample
+        instead: every worker lands in the first class, which is one rack.
+
+        That is not a neutral difference. It over-states rack locality, and over-stating
+        locality under-charges a shuffle — the direction this module's placement is
+        deliberately biased *against*. Apportioning by node count is the expectation of the
+        arbitrary draw it replaces, so it is unbiased rather than merely different, and on a
+        fleet of single-node classes — every `ClusterShape` built by hand, and any fleet whose
+        machines are all distinguishable — it reduces to exactly "the first `extra`", which is
+        what `_spread` does.
+        """
+        out = [per_node[j] * counts[j] for j in range(len(classes))]
+        for j, share in zip(order, _apportion([counts[j] for j in order], extra), strict=True):
+            out[j] += base * counts[j] + share
+        return out
+
+    remaining = workers
+    active = list(occupied)
+    while active and remaining > 0:
+        base, extra = divmod(remaining, sum(counts[j] for j in active))
+        if base == 0:  # fewer workers than nodes: one each to the largest
+            return _deal(active, 0, remaining)
+        filled = [j for j in active if capacities[j] - per_node[j] <= base]
+        if not filled:  # nobody is capacity-bound: deal the whole remainder out
+            return _deal(active, base, extra)
+        for j in filled:
+            remaining -= (capacities[j] - per_node[j]) * counts[j]
+            per_node[j] = capacities[j]
+        active = [j for j in active if per_node[j] < capacities[j]]
+
+    if remaining > 0:  # over-subscribed: more workers than the fleet has capacity units
+        base, extra = divmod(remaining, sum(counts[j] for j in occupied))
+        return _deal(occupied, base, extra)
+    return [per_node[j] * counts[j] for j in range(len(classes))]
+
+
+def _group_share_census(groups: Sequence[tuple[int, int]], workers: int) -> float:
+    """`_group_share` over `(group_size, how many groups are that size)` pairs.
+
+    The census form of the same sum. A fleet describes itself as classes of identical nodes,
+    so the groups an exchange falls into arrive already counted; expanding them back to one
+    entry per group to sum their squares would put the O(nodes) term back into a figure the
+    cost model reads once per pipeline breaker.
+
+    Args:
+        groups: `(size, multiplicity)` pairs. Groups must partition the fleet.
+        workers: Total workers in the exchange.
+
+    Returns:
+        The share in `[0, 1]`, `0.0` for an empty exchange.
+    """
+    if workers <= 0:
+        return 0.0
+    total = float(workers) ** 2
+    if total <= 0:
+        return 0.0
+    return sum(float(size) ** 2 * multiplicity for size, multiplicity in groups) / total
+
+
 def _group_share(sizes: Sequence[int], workers: int) -> float:
     """Share of a uniform hash exchange whose destination is inside the producer's own group.
 
@@ -144,10 +275,7 @@ def _group_share(sizes: Sequence[int], workers: int) -> float:
     Returns:
         The share in `[0, 1]`, `0.0` for an empty exchange.
     """
-    if workers <= 0:
-        return 0.0
-    total = float(workers) ** 2
-    return sum(float(size) ** 2 for size in sizes) / total if total > 0 else 0.0
+    return _group_share_census([(size, 1) for size in sizes], workers)
 
 
 def _domain_split(node: NodeShape, placed: int, unit: str) -> list[int]:

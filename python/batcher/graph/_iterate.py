@@ -30,6 +30,27 @@ from batcher.api.dataset import Dataset
 __all__ = ["IterationResult", "checkpoint", "iterate"]
 
 
+def check_iterations(max_iterations: int, tolerance: float) -> None:
+    """Validate the convergence parameters every iterative graph algorithm takes.
+
+    Shared rather than repeated: `centrality/rank.py` and `centrality/spectral.py` each
+    carried a byte-identical private copy, and five call sites between them. Two copies of
+    a validation rule is two places to update when a bound changes, and the failure mode is
+    that one algorithm starts accepting an argument its neighbour rejects.
+
+    Args:
+        max_iterations: The iteration cap; must be at least 1.
+        tolerance: The convergence threshold; must be non-negative.
+
+    Raises:
+        PlanError: If either argument is outside its valid range.
+    """
+    if max_iterations < 1:
+        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
+    if tolerance < 0.0:
+        raise PlanError(f"tolerance must be non-negative, got {tolerance}")
+
+
 def checkpoint(state: Dataset) -> Dataset:
     """Cut the lazy plan, so the next round starts from data rather than from a plan.
 

@@ -196,7 +196,7 @@ def _cudf_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]
 
     gdf = cudf.DataFrame.from_arrow(table)
     col_funcs: dict[str, list[str]] = {}
-    for _alias, (col_name, func) in aggs.items():
+    for col_name, func in aggs.values():
         col_funcs.setdefault(col_name, [])
         if func not in col_funcs[col_name]:
             col_funcs[col_name].append(func)

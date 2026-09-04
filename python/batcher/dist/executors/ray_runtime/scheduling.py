@@ -14,6 +14,10 @@ import logging
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.dist.executors.ray_runtime.fabric.bundles import (
+    fleet_market_selector,
+    fleet_zone_selector,
+)
 from batcher.plan.resource import SchedulingEnvelope
 
 # The scheduling grant in force for the current distributed execution. Ambient so it
@@ -68,6 +72,11 @@ def reset_scheduling_envelope(token: contextvars.Token) -> None:
 def task_options(env: SchedulingEnvelope | None) -> dict:
     """Ray `.options(...)`/`ray.remote(...)` resource kwargs from an envelope.
 
+    A market-type `label_selector` (with its `fallback_strategy`) is merged in when the
+    envelope states a capacity preference and the live fleet can express it; see
+    `fabric.market.capacity_selector` for the gates, every one of which fails toward the
+    placement the fleet has today.
+
     `num_gpus` is included only when positive so CPU-only tasks never request a GPU
     (which would make them unschedulable on a GPU-less cluster). `memory` is included
     only when sized (a soft scheduling hint). A `runtime_env` that ships the driver's
@@ -101,6 +110,17 @@ def task_options(env: SchedulingEnvelope | None) -> dict:
         sel = node_class_selector(env.prefer_cpu_only_nodes, env.n_tasks, env.num_cpus)
         if sel:
             opts["resources"] = {**opts.get("resources", {}), **sel["resources"]}
+        # Which capacity this fleet belongs on. A label selector rather than a resource,
+        # because unlike the CPU-only pin this one carries a `fallback_strategy`: a fleet
+        # that wants on-demand capacity and finds none lands on spot instead of pending.
+        # `{}` on every fleet that is not mixed and labelled, which is nearly all of them.
+        from batcher.dist.executors.ray_runtime.fabric.market import capacity_selector
+        from batcher.dist.executors.ray_runtime.policies import task_event_options
+
+        opts.update(
+            capacity_selector(env.capacity_preference, workers=env.n_tasks, num_cpus=env.num_cpus)
+        )
+        opts.update(task_event_options(env.n_tasks))
     rt = worker_runtime_env()
     if rt is not None:
         opts["runtime_env"] = rt
@@ -202,6 +222,34 @@ def worker_runtime_env() -> dict | None:
     _WORKER_RT_ENV = rt
     _WORKER_RT_ENV_SESSION = session
     return _WORKER_RT_ENV
+
+
+def probe_options() -> dict:
+    """Ray remote options for a probe task: no cores, and batcher shipped to the worker.
+
+    Both probes import `batcher` (`_internal.hardware`, `_internal.accelerators`), and a bare
+    `ray.remote` inherits no `runtime_env` — so on a job that does not itself ship the package
+    every probe died with `ModuleNotFoundError`. That is caught per ref and noted at DEBUG, so
+    all a reader saw was the fleet-wide warning below, blaming a mismatched build.
+
+    Every fallback under it is silent: the fan-out stays one worker per node (measured
+    `(4, 95.0)` on a 2-NUMA fleet against `(8, 47.0)` once probed), the broadcast threshold
+    defaults, and a worker's coefficients are filed under the *driver's* machine class.
+    `worker_runtime_env` returns `None` when batcher initialized Ray itself, which is why this
+    was invisible on the default path; `gpu.cudf_probe` already attaches it.
+
+    Best-effort in one more direction than it looks. Resolving the env uploads a package and
+    reads the Ray session, and a probe must never be *prevented* by that — on any failure this
+    degrades to shipping nothing, which is exactly the behaviour before it existed. Without
+    the guard, a caller that substitutes `sys.modules["ray"]` (which the device-health tests
+    do) got the exception instead of the probe and the fleet came back with no records.
+    """
+    try:
+        env = worker_runtime_env() or None
+    except Exception as exc:  # pragma: no cover - a shipping failure must not stop the probe
+        note_suppressed("dist", "resolve the probe runtime_env", exc)
+        env = None
+    return {"num_cpus": 0, "runtime_env": env} if env else {"num_cpus": 0}
 
 
 def _fleet_node_class_resources(env: SchedulingEnvelope | None) -> dict:
@@ -312,10 +360,12 @@ def _gang_fits_one_node(env: SchedulingEnvelope | None, workers: int | None = No
     """
     if env is None:
         return True
-    from batcher.dist.executors.ray_runtime.scaling import node_classes
+    from batcher.dist.executors.ray_runtime.scaling import node_class_census
 
+    # The census, not the per-node list: this takes a maximum over node *shapes*, which is
+    # the same answer however many machines share each shape.
     try:
-        nodes = node_classes()
+        nodes = node_class_census()
     except Exception as exc:  # pragma: no cover - topology read is best-effort
         note_suppressed("dist", "read node classes for the pack decision", exc)
         return True
@@ -440,8 +490,16 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     scheduling rather than hanging — the over-subscription case the autoscaler handles).
 
     On a cluster spanning availability zones the bundles additionally carry a one-zone label
-    selector (`_fleet_zone_selector`), because a shuffle's bytes are billed and delayed by
-    the zone boundary they cross and the bundles are interchangeable.
+    selector (`fabric.bundles.fleet_zone_selector`), because a shuffle's bytes are billed and
+    delayed by the zone boundary they cross and the bundles are interchangeable. On a mixed
+    spot / on-demand fleet they may also carry a market-type selector
+    (`fabric.bundles.fleet_market_selector`), because what this fleet holds — accumulated
+    partial state, and mapped output its peers have yet to fetch — is what a reclamation
+    destroys.
+
+    Both selectors go on the **bundles** rather than on the actors. An actor pinned to a
+    bundle inherits the bundle's node, so a selector on the actor could only contradict a
+    decision already made, and a contradicted actor never schedules.
     """
     if workers <= 1:
         return None
@@ -456,7 +514,7 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     bundles = _collective_bundles(workers, env, node_class) or [
         _bundle(env, node_class) for _ in range(workers)
     ]
-    zone = _fleet_zone_selector(len(bundles), env)
+    zone = {**fleet_zone_selector(len(bundles), env), **fleet_market_selector(len(bundles), env)}
     pg = _reserve(placement_group, bundles, strategy, zone)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:
@@ -516,27 +574,6 @@ def _reserve(placement_group, bundles: list[dict], strategy: str, zone: dict[str
         return placement_group(bundles, strategy=strategy)
 
 
-def _fleet_zone_selector(workers: int, env: SchedulingEnvelope | None) -> dict[str, str]:
-    """The one-zone bundle label selector for this fleet, or `{}`.
-
-    Gated on `distributed.zone_aware_placement` and on the fleet being one whose traffic
-    crosses the zone boundary at all. A GPU collective is excluded: it is already STRICT_PACK
-    onto a single node, so it is inside one zone by construction, and adding a selector to it
-    could only narrow which node that is.
-    """
-    if env is not None and env.gpu_collective:
-        return {}
-    if not active_config().distributed.zone_aware_placement:
-        return {}
-    try:
-        from .capacity import Demand, preferred_fleet_zone
-
-        return preferred_fleet_zone(workers, Demand.from_envelope(env, count=workers))
-    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
-        note_suppressed("dist", "choose an availability zone for the fleet", exc)
-        return {}
-
-
 def _report_placement_timeout(workers: int, env: SchedulingEnvelope | None, strategy: str) -> None:
     """Say why the gang did not form, at the moment the reservation is given up on.
 
@@ -593,15 +630,164 @@ def placement_actor_options(pg, index: int, base: dict | None = None) -> dict:
     return opts
 
 
+#: Fraction of a fleet worker's grant left unclaimed inside its placement-group bundle.
+#:
+#: A fleet bundle reserves a whole node's cores, and the fleet spans every node, so a fleet
+#: holds **100% of the cluster's schedulable CPU**. Anything the same query then runs as
+#: plain Ray tasks is submitted outside that reservation and can never be placed: measured on
+#: a 4x96 cluster as `{'CPU': 0.125}: 1+ pending` against `384.0/384.0`, forever, from a
+#: three-table join whose final stage scans the intermediate the fleet is holding.
+#:
+#: `yield_session_fleet` answers that by handing the fleet back — but it cannot when an
+#: intermediate is *published* on the actors, which is exactly the staged-query case. So the
+#: bundle keeps a sliver the actor does not claim, and a stage that cannot be placed anywhere
+#: else runs there (`fleet_task_options`), co-located with the buckets it is fetching.
+#:
+#: **This is the second half of `dist.executor._headroom_grant`, not a duplicate of it.** That
+#: one thins the *auto* fan-out's grant so each node keeps a core free **outside** the group,
+#: and it is the right answer where it applies. It cannot apply here: an explicit
+#: `num_workers=N` skips `_cluster_fill_workers` entirely and sizes the grant from
+#: `_even_cpu_share`, which tiles the node exactly — the bundles in the reproduction above read
+#: `{'CPU': 96.0}` on 96-core nodes, so the thinning never ran. Every benchmark and integration
+#: test in this repo pins `num_workers`, so that is not a corner. Reserving inside the bundle
+#: instead is reachable from every path and puts the tasks on the data's own nodes.
+#:
+#: An eighth, capped at one core: 1.0 of 96 is a percent of the fleet's nominal grant and
+#: buys a hard bound on a hang. It costs the actor nothing measurable — Ray's CPU figure is a
+#: *reservation*, and the worker's real width comes from the `EngineConfig` it is granted,
+#: not from this number.
+_FLEET_TASK_HEADROOM_MAX = 1.0
+_FLEET_TASK_HEADROOM_SHARE = 8.0
+
+
+def fleet_task_headroom(num_cpus: float) -> float:
+    """CPU left unclaimed in each fleet bundle so the query's own task stages can run.
+
+    Zero for a one-core grant, where there is nothing to spare and the fleet is small enough
+    that it does not hold the cluster anyway.
+
+    Args:
+        num_cpus: The per-worker CPU grant the bundle reserves.
+
+    Returns:
+        The CPU to leave unclaimed, never enough to take the actor below one core.
+    """
+    if num_cpus <= 1.0:
+        return 0.0
+    return min(_FLEET_TASK_HEADROOM_MAX, num_cpus / _FLEET_TASK_HEADROOM_SHARE)
+
+
+def fleet_task_options(pg) -> dict:
+    """Ray `.options(...)` scheduling a task into a held fleet's placement group.
+
+    The last resort for a task stage on a cluster whose CPU is entirely inside that
+    reservation: the bundles keep [`fleet_task_headroom`] free for exactly this, so the
+    tasks run beside the actors instead of pending forever. They also land on the nodes
+    holding the data, which is where a stage reading a published intermediate wants to be.
+
+    Args:
+        pg: The fleet's placement group, or None.
+
+    Returns:
+        Scheduling options for `.options(**opts)`, or `{}` when there is no group.
+    """
+    if pg is None:
+        return {}
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    # `memory: 0` alongside the strategy, and it is not a detail. A bundle's `memory` is a
+    # *scheduling hint* sized from the query's envelope, and it is routinely smaller than a
+    # single task's ask — measured here at 1 MiB per bundle against a task asking for
+    # exactly 1 MiB, so no headroom inside the bundle could ever have fit it, and the CPU
+    # sliver alone left the task pending on memory instead of on cores. Dropping the hint
+    # costs nothing real: the memory that actually bounds a task is Carbonite's envelope,
+    # which the task carries in its engine config and enforces itself.
+    return {
+        "scheduling_strategy": PlacementGroupSchedulingStrategy(placement_group=pg),
+        "memory": 0,
+    }
+
+
+#: How many calls one fleet actor may run at once.
+#:
+#: A shuffle worker gathers a bucket from every peer and then computes it, and a Ray actor
+#: runs one call at a time, so at 1 the worker alternates network-bound and CPU-bound with
+#: nothing filling either gap. Overlapping a few buckets is what lets a node's cores stay
+#: busy through the gathers. Measured on this 4 x 96-core fleet at TPC-H sf100, on top of
+#: the 16-worker fan-out `dist.executor._numa_sliced` chooses, best of four:
+#:
+#: | case | 1 | 4 |
+#: |---|---:|---:|
+#: | hash join + group-by | 8,990 ms | **7,180 ms** |
+#: | distinct | 7,599 ms | **6,547 ms** |
+#: | group-by, 20M groups | 5,561 ms | **5,043 ms** |
+#:
+#: It is small deliberately. Each concurrent call holds its own bucket, so this multiplies
+#: what a worker can have resident — `_FlightWorker._reduce_budget` divides the spill
+#: threshold by exactly this number to keep the memory envelope honest, and a larger value
+#: buys progressively less overlap for proportionally more spilling.
+FLEET_CONCURRENCY = 4
+
+
+def map_slots_per_worker() -> int:
+    """How many map partitions one fleet actor may have in flight at once.
+
+    The reduce side has overlapped its gathers with its compute since `FLEET_CONCURRENCY`
+    landed; the **map** side had not, and it is where a scan-heavy query spends nearly all
+    of its wall time. A map task reads its partition from object storage, folds it, and
+    publishes the buckets, so at one slot per actor a node alternates network-bound and
+    CPU-bound with nothing filling either gap — exactly the shape that constant was
+    introduced to fix, one phase earlier.
+
+    It only bites once the fleet is wide enough that a node's share of the input is small.
+    Measured on a 64 x 16-core cluster at TPC-H sf100 (scan, filter, two-key group-by), the
+    map barrier held the *whole cluster* at 7-14% of its cores while 64 actors each ran one
+    single-threaded read.
+
+    Capped by `FLEET_CONCURRENCY` because that is what the actors were spawned with: a
+    barrier that deals out more slots than `max_concurrency` does not raise the overlap, it
+    queues the surplus inside Ray and hands the assignment back to arrival order, which is
+    the static dealing `map_barrier` exists to avoid. The memory follows the same constant —
+    `_FlightWorker._reduce_budget` already divides the spill threshold by it — so using it
+    here adds no envelope the workers were not already sized for.
+
+    Returns:
+        The number of concurrent map slots to give each actor, at least 1.
+    """
+    return max(1, FLEET_CONCURRENCY)
+
+
 def fleet_actor_options(pg, workers: int) -> list[dict]:
     """Per-worker actor `.options(...)` for a whole fleet, resolving the shared parts once.
 
     `task_options(current_envelope())` reads the live topology (node-class selector) and is
     fleet-uniform, so it is computed a single time here and only the per-bundle index varies
     — turning a W-actor launch from O(workers x nodes) topology reads into one.
+
+    Every actor also gets `max_concurrency = FLEET_CONCURRENCY`, so a worker can overlap the
+    gather of one shuffle bucket with the compute of another. That is a change of assumption
+    as much as of throughput: an actor's methods no longer run strictly one at a time, so
+    anything they keep on `self` has to tolerate being touched by two calls at once.
     """
     base = task_options(current_envelope())
-    return [placement_actor_options(pg, i, base) for i in range(workers)]
+    # The actor claims slightly less than its bundle reserves — see `_FLEET_TASK_HEADROOM_MAX`.
+    # Without a PG there is no bundle to leave room in, so the grant is untouched.
+    if pg is not None:
+        base = dict(base)
+        if isinstance(base.get("num_cpus"), (int, float)):
+            grant = float(base["num_cpus"])
+            base["num_cpus"] = max(1.0, grant - fleet_task_headroom(grant))
+        # The bundle already chose the node, and `create_worker_placement` put this fleet's
+        # capacity preference on the bundles. Leaving the task-shaped selector on the actor
+        # can only contradict that — an actor asking for on-demand on a bundle that landed on
+        # spot never schedules, and a `fallback_strategy` cannot rescue it, because the bundle
+        # is where it has to run.
+        base.pop("label_selector", None)
+        base.pop("fallback_strategy", None)
+    return [
+        {**placement_actor_options(pg, i, base), "max_concurrency": FLEET_CONCURRENCY}
+        for i in range(workers)
+    ]
 
 
 def release_placement(pg) -> None:

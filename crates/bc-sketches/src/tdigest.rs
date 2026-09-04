@@ -46,6 +46,7 @@ impl Default for TDigest {
 impl TDigest {
     /// Create an empty digest with the given `compression` (`δ`, e.g. 100). Must
     /// be ≥ 1; larger values keep more centroids and yield tighter quantiles.
+    #[must_use]
     pub fn new(compression: f64) -> Self {
         assert!(
             compression >= 1.0,
@@ -62,19 +63,23 @@ impl TDigest {
     }
 
     /// Number of values seen.
+    #[must_use]
     pub fn count(&self) -> u64 {
         self.n as u64
     }
 
     /// True if no (non-NaN) value has been added.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.n == 0.0
     }
 
     /// Exact minimum / maximum seen (`None` if empty).
+    #[must_use]
     pub fn min(&self) -> Option<f64> {
         (self.n > 0.0).then_some(self.min)
     }
+    #[must_use]
     pub fn max(&self) -> Option<f64> {
         (self.n > 0.0).then_some(self.max)
     }
@@ -305,6 +310,7 @@ impl TDigest {
     /// flushed into centroids first so the blob fully captures the state.
     /// `[compression: f64][n: f64][min: f64][max: f64][len: u64]`
     /// then `len × ([mean: f64][weight: f64])`.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         // Flush a clone so `&self` stays immutable and the on-wire form is canonical.
         let mut canon = self.clone();
@@ -325,6 +331,7 @@ impl TDigest {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on truncated
     /// or otherwise malformed input.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         let compression = c.f64()?;

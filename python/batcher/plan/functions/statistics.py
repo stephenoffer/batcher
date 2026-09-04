@@ -22,6 +22,26 @@ from batcher.plan.expr_ir import count
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.aggregate import _as_column, covar_pop
 
+__all__ = [
+    "arg_max",
+    "arg_min",
+    "cv",
+    "first",
+    "geometric_mean",
+    "harmonic_mean",
+    "last",
+    "midrange",
+    "non_null_rate",
+    "null_rate",
+    "nunique_ratio",
+    "rms",
+    "sem",
+    "stddev_pop",
+    "value_range",
+    "var_pop",
+    "weighted_mean",
+]
+
 
 def _n(x: Expr) -> Expr:
     """The non-null count of `x` as Float64 — the sample size the ratios divide by."""

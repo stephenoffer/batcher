@@ -37,13 +37,31 @@ posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissio
 
 @pytest.fixture
 def clean_env(monkeypatch: pytest.MonkeyPatch):
-    """An environment carrying a credential, a secret helper, and a legitimate variable."""
+    """An environment carrying a credential, a secret helper, and a legitimate variable.
+
+    The whole environment is snapshotted and put back, not only the five variables set
+    here. `child_initializer` is designed to run in a child and **deletes every variable
+    outside its allowlist**; called in the test process it empties `os.environ` down to
+    that allowlist, and `monkeypatch` can only undo what monkeypatch itself did. The
+    deletions therefore outlived the module and every later test in the same process
+    inherited the scrubbed environment.
+
+    That is not hypothetical and it did not look like this bug when it landed:
+    `tests/unit/test_udf_process_dispatch.py`, running after this file in the same pytest
+    process, spawns a real `forkserver` child — which starts with the parent's environment,
+    so the child's dynamic linker lost the library path this box needs and died importing
+    `batcher.core`. It surfaced as `BrokenProcessPool` inside a UDF dispatch test, naming
+    neither the environment nor this file, and it passed when that file was run alone.
+    """
+    before = dict(os.environ)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "super-secret")
     monkeypatch.setenv("BATCHER_SECRET_COMMAND", "/usr/local/bin/fetch-any-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
-    return None
+    yield
+    os.environ.clear()
+    os.environ.update(before)
 
 
 class TestEnvironmentScrub:

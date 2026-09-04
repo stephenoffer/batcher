@@ -33,7 +33,17 @@ enum Out {
 }
 
 fn output_type(func: GeoFunc) -> Out {
-    use GeoFunc::*;
+    use GeoFunc::{
+        StArea, StAreaSpheroid, StAsBinary, StAsEwkb, StAsEwkt, StAsGeojson, StAsHexWkb, StAsText,
+        StAzimuth, StContains, StContainsExtent, StCoordDim, StCoveredBy, StCovers, StCrosses,
+        StDimension, StDisjoint, StDistance, StDistanceSphere, StDistanceSpheroid, StDwithin,
+        StDwithinSphere, StEquals, StGeometryType, StHasZ, StHausdorffDistance, StIntersects,
+        StIntersectsExtent, StIsClosed, StIsCollection, StIsEmpty, StIsRing, StIsSimple, StIsValid,
+        StIsValidReason, StLength, StLengthSpheroid, StLineLocatePoint, StMaxDistance,
+        StNumGeometries, StNumInteriorRings, StNumPoints, StOverlaps, StPerimeter,
+        StPerimeterSpheroid, StSrid, StTouches, StWithin, StX, StXmax, StXmin, StY, StYmax, StYmin,
+        StZ,
+    };
     match func {
         StX | StY | StZ | StXmin | StYmin | StXmax | StYmax | StArea | StLength | StPerimeter
         | StDistance | StMaxDistance | StHausdorffDistance | StAzimuth | StDistanceSphere
@@ -114,7 +124,11 @@ fn float_of(
     cols: &[ArrayRef],
     i: usize,
 ) -> Result<Option<f64>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{
+        StArea, StAreaSpheroid, StAzimuth, StDistance, StDistanceSphere, StDistanceSpheroid,
+        StHausdorffDistance, StLength, StLengthSpheroid, StLineLocatePoint, StMaxDistance,
+        StPerimeter, StPerimeterSpheroid, StX, StXmax, StXmin, StY, StYmax, StYmin, StZ,
+    };
     let Some(g) = g else { return Ok(None) };
     // The single-position accessors are null unless the geometry really is one point;
     // `ST_X` of a polygon is not its first vertex, it is undefined.
@@ -217,19 +231,20 @@ fn nearest_geodesic(a: &Geom, b: &Geom, spheroid: bool) -> Result<Option<f64>, E
 
 /// The Int64-valued functions.
 fn int_of(func: GeoFunc, g: Option<&Geom>) -> Option<i64> {
-    use GeoFunc::*;
+    use GeoFunc::{
+        StCoordDim, StDimension, StNumGeometries, StNumInteriorRings, StNumPoints, StSrid,
+    };
     let g = g?;
     Some(match func {
-        StDimension => g.geom_type().dimension(),
-        StSrid => g.srid as i64,
+        StDimension => bc_geo::algo::predicate::dimension(&g.geometry),
+        StSrid => i64::from(g.srid),
         StNumPoints => g.num_points() as i64,
         StNumGeometries => g.geometry.num_geometries() as i64,
         StNumInteriorRings => g
             .geometry
             .polygons()
             .first()
-            .map(|p| p.interiors.len() as i64)
-            .unwrap_or(0),
+            .map_or(0, |p| p.interiors.len() as i64),
         StCoordDim => {
             if g.has_z {
                 3
@@ -248,7 +263,12 @@ fn bool_of(
     cols: &[ArrayRef],
     i: usize,
 ) -> Result<Option<bool>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{
+        StContains, StContainsExtent, StCoveredBy, StCovers, StCrosses, StDisjoint, StDwithin,
+        StDwithinSphere, StEquals, StHasZ, StIntersects, StIntersectsExtent, StIsClosed,
+        StIsCollection, StIsEmpty, StIsRing, StIsSimple, StIsValid, StOverlaps, StTouches,
+        StWithin,
+    };
     let Some(a) = g else { return Ok(None) };
     // The single-geometry predicates first; the rest need a second operand.
     match func {
@@ -330,7 +350,7 @@ fn bool_of(
 
 /// The Utf8-valued functions.
 fn text_of(func: GeoFunc, g: Option<&Geom>) -> Option<String> {
-    use GeoFunc::*;
+    use GeoFunc::{StAsEwkt, StAsGeojson, StAsHexWkb, StAsText, StGeometryType, StIsValidReason};
     let g = g?;
     match func {
         StAsText => Some(bc_geo::codec::wkt::write_wkt(g)),

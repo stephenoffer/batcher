@@ -87,7 +87,7 @@ def failure_groups(queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Group on the exception type and message, not the full text: a run id or a row
         # count embedded in the tail would split one cause into many groups.
         message = str(query.get("error") or "Unknown error")
-        key = message.split(" at ")[0][:160]
+        key = message.split(" at ", maxsplit=1)[0][:160]
         entry = groups.setdefault(
             key, {"error": key, "count": 0, "runs": [], "first_wall": None, "last_wall": None}
         )

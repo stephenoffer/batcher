@@ -326,7 +326,7 @@ mod tests {
             match (g, w) {
                 (None, None) => {}
                 (Some(g), Some(w)) => {
-                    assert!((g - w).abs() < 1e-9, "{what}[{i}]: got {g}, want {w}")
+                    assert!((g - w).abs() < 1e-9, "{what}[{i}]: got {g}, want {w}");
                 }
                 _ => panic!("{what}[{i}]: got {g:?}, want {w:?}"),
             }
@@ -384,7 +384,7 @@ mod tests {
     /// every significant digit.
     #[test]
     fn ewm_var_is_stable_against_a_large_offset() {
-        let raw: Vec<f64> = (0..64).map(|i| 1e9 + (i % 7) as f64).collect();
+        let raw: Vec<f64> = (0..64).map(|i| 1e9 + f64::from(i % 7)).collect();
         let values: ArrayRef = Arc::new(Float64Array::from(raw.clone()));
         let ordered = vec![(0..64).collect::<Vec<usize>>()];
         let alpha = 0.3;

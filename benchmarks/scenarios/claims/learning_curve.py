@@ -12,7 +12,18 @@ loop on the identical data in the same process and has no cross-query learning: 
 its curve does is the environmental floor, and only the part of Batcher's curve that
 exceeds it can be attributed to the loop.
 
-Correctness is gated on the first execution of every query before any timing is kept.
+Correctness is gated on the first execution of every query before any timing is kept — and
+the engines are then reset, because that gating execution would otherwise be the cold one the
+curve exists to show. Batcher's plan and prepared caches are cleared per query for the same
+reason; without that, execution 1 is warm for everything except the learned-stats hub.
+
+Read the result knowing what it can and cannot see. Measured on a fresh subprocess per arm,
+the first call is ~300 ms against a ~8 ms steady state and the plan caches account for about
+a tenth of that, so most of this curve is one-time engine initialization rather than either
+learning mechanism — `scenarios/claims/cold_start.py` measures that part directly. And the
+within-query adaptive loop is gated at `_ADAPTIVE_MIN_ROWS_PER_STAGE` (5M rows per pipeline
+breaker), so at the default `--scale 1` (TPC-H `lineitem` = 6,001,215 rows) most queries do
+not reach it at all. Run `--scale 10` or higher to measure that half.
 
 Run:
     python benchmarks/scenarios/claims/learning_curve.py                 # tpch sf1, 6 executions
@@ -36,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from context import Context
 from engines import resolve
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 from harness import results_match
 from suites.standard.tpch import QUERIES
 
@@ -43,6 +55,27 @@ from suites.standard.tpch import QUERIES
 def _geomean(xs: list[float]) -> float:
     xs = [x for x in xs if x > 0 and math.isfinite(x)]
     return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else float("nan")
+
+
+def _reset(engine: str) -> None:
+    """Drop Batcher's per-process plan memoization so execution 1 is genuinely execution 1.
+
+    Batcher memoizes the optimized plan (`kyber.plan_cache`) and the prepared physical plan
+    (`api.orchestration.prepared`). Both survive across `Session.sql` calls in one process,
+    so without clearing them the "cold" execution of the curve is warm for everything except
+    the learned-stats hub — and an A/B that varies a *planner* decision in one process
+    measures the first arm twice.
+
+    A no-op for any engine but Batcher: nothing else here caches across calls, and DuckDB is
+    the control precisely because it does not.
+    """
+    if engine != "batcher":
+        return
+    from batcher.api.orchestration import prepared
+    from batcher.kyber import plan_cache
+
+    plan_cache.clear()
+    prepared.clear()
 
 
 def _curve(run: Any, sql: str, runs: int) -> list[float]:
@@ -56,6 +89,17 @@ def _curve(run: Any, sql: str, runs: int) -> list[float]:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     ap = argparse.ArgumentParser()
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--runs", type=int, default=6)
@@ -78,7 +122,17 @@ def main() -> int:
         if not ok:
             skipped.append(f"{case} (MISMATCH: {why})")
             continue
+        # The correctness gate above already executed each engine once. That execution is
+        # the one carrying almost all of what this benchmark plots — measured on a fresh
+        # subprocess per arm, the first call is ~300 ms against a ~8 ms steady state, and
+        # clearing `kyber.plan_cache` + `api.orchestration.prepared` moves the ratio only
+        # from 40.9x to 37.0x. So the curve was discarding the execution it exists to show
+        # and reporting the remainder as excess over DuckDB.
+        #
+        # `_reset` puts each engine back to a genuinely cold state before the curve starts,
+        # so execution 1 of the curve is execution 1 of the process for that query.
         for n in names:
+            _reset(n)
             curves[n].append(_curve(lambda q, n=n: runners[n](q), sql, args.runs))
 
     print(

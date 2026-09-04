@@ -242,66 +242,64 @@ fn write_into(out: &mut String, g: &Geometry, has_z: bool) {
         _ => "GeometryCollection",
     };
     let _ = write!(out, "{{\"type\":\"{camel}\",");
-    match g {
-        Geometry::GeometryCollection(gs) => {
-            out.push_str("\"geometries\":[");
-            for (i, child) in gs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_into(out, child, has_z);
+    if let Geometry::GeometryCollection(gs) = g {
+        out.push_str("\"geometries\":[");
+        for (i, child) in gs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
             }
-            out.push(']');
+            write_into(out, child, has_z);
         }
-        _ => {
-            out.push_str("\"coordinates\":");
-            match g {
-                Geometry::Point(p) => match p {
-                    // RFC 7946 has no empty-point encoding; `[]` is the convention
-                    // GDAL writes and reads back.
-                    None => out.push_str("[]"),
-                    Some(c) => pos(out, *c, has_z),
-                },
-                Geometry::LineString(l) => pos_list(out, l, has_z),
-                Geometry::Polygon(p) => rings(out, p, has_z),
-                Geometry::MultiPoint(ps) => {
-                    out.push('[');
-                    for (i, p) in ps.iter().flatten().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        pos(out, *p, has_z);
+        out.push(']');
+    } else {
+        out.push_str("\"coordinates\":");
+        match g {
+            Geometry::Point(p) => match p {
+                // RFC 7946 has no empty-point encoding; `[]` is the convention
+                // GDAL writes and reads back.
+                None => out.push_str("[]"),
+                Some(c) => pos(out, *c, has_z),
+            },
+            Geometry::LineString(l) => pos_list(out, l, has_z),
+            Geometry::Polygon(p) => rings(out, p, has_z),
+            Geometry::MultiPoint(ps) => {
+                out.push('[');
+                for (i, p) in ps.iter().flatten().enumerate() {
+                    if i > 0 {
+                        out.push(',');
                     }
-                    out.push(']');
+                    pos(out, *p, has_z);
                 }
-                Geometry::MultiLineString(ls) => {
-                    out.push('[');
-                    for (i, l) in ls.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        pos_list(out, l, has_z);
-                    }
-                    out.push(']');
-                }
-                Geometry::MultiPolygon(ps) => {
-                    out.push('[');
-                    for (i, p) in ps.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        rings(out, p, has_z);
-                    }
-                    out.push(']');
-                }
-                Geometry::GeometryCollection(_) => unreachable!("handled above"),
+                out.push(']');
             }
+            Geometry::MultiLineString(ls) => {
+                out.push('[');
+                for (i, l) in ls.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pos_list(out, l, has_z);
+                }
+                out.push(']');
+            }
+            Geometry::MultiPolygon(ps) => {
+                out.push('[');
+                for (i, p) in ps.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    rings(out, p, has_z);
+                }
+                out.push(']');
+            }
+            Geometry::GeometryCollection(_) => unreachable!("handled above"),
         }
     }
     out.push('}');
 }
 
 /// Render an RFC 7946 geometry object.
+#[must_use]
 pub fn write_geojson(g: &Geom) -> String {
     let mut out = String::with_capacity(24 + 24 * g.num_points());
     write_into(&mut out, &g.geometry, g.has_z);

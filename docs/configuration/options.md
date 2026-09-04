@@ -31,7 +31,7 @@ How work is sized and parallelized.
 | `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
 | `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
 | `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
-| `fast_path` | `False` | Skip the per-query orchestration for small in-memory plans that provably don't need it: run the optimizer (through its plan cache) and the engine, and nothing else. Result-invariant, and narrowly gated to plans that are single-node, CPU, in-memory, free of UDFs, and under a row and node cap. It trades away the **write** side of the cross-query learned-stats loop, so a query answered here never sharpens Kyber's estimates for the next one. Turn it on for a latency-sensitive serving path where the plan shape is already known good. See {doc}`/user-guide/operate/tuning/performance`. |
+| `fast_path` | `False` | Skip the per-query orchestration for small in-memory plans that provably don't need it: run the optimizer (through its plan cache) and the engine, and nothing else. Result-invariant, and narrowly gated to plans that are single-node, CPU, in-memory, free of UDFs, and under a row and node cap. It keeps the cross-query learned-stats loop -- a query answered here still records what it measured -- but gives up observability: it does not appear in `explain(analyze=True)`, the event log, or the dashboard. Turn it on for a latency-sensitive serving path where the plan shape is already known good. See {doc}`/user-guide/operate/tuning/performance`. |
 | `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
@@ -66,7 +66,10 @@ Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes`
 | `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches, and for the disk shuffle's bucket files. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. Scratch on a cluster-shared mount is compressed whatever this says, because the bytes cross a network there. |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
-| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, described in {doc}`/user-guide/operate/tuning/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
+| `result_cache_max_bytes` | `268435456` (256 MiB) | Memory budget for the process-wide result cache backing {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, described in {doc}`/user-guide/operate/tuning/caching`. Cached Arrow results are evicted cost-aware to stay within this, so caching never grows the process without bound. |
+| `result_cache_disk_max_bytes` | `4294967296` (4 GiB) | On-disk budget for the result cache's second tier. What the memory budget evicts is written here instead of dropped, so a working set larger than memory costs a read-back rather than a recompute. Scratch, not durable: it sits beside the spill files and is removed at process exit. `0` turns the tier off, making every {py:class}`StorageLevel <batcher.StorageLevel>` behave as `MEMORY_ONLY`. |
+| `shared_cache_uri` | `None` | Opt-in cross-process result cache. `redis://`, `rediss://`, or `unix://` for a server shared across nodes; `rocksdb://<path>` or a bare path for an embedded database shared across runs on one node. A result is written only when every input has a durable identity **and** a content version, so in-memory data never shares. See {doc}`/user-guide/operate/tuning/caching`. |
+| `shared_cache_ttl_seconds` | `86400` (1 day) | Expiry applied to every shared-cache write. The content version in the key already invalidates an entry when its inputs change, so this bounds staleness where that token is coarser than the data, and bounds the store's growth when nobody configured an eviction policy. `0` writes entries without an expiry. |
 | `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear {py:exc}`ResourceError <batcher.ResourceError>` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
 | `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, not just the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
 | `stall_aware_pressure` | `True` | Let the kernel's memory PSI raise the pressure level, so the engine spills while reclaim is still coping. It can only raise a level, never lower one. |
@@ -82,6 +85,8 @@ Credit-based backpressure for the shuffle, the Carbonite flow-control model.
 | `credit_ceiling_factor` | `4` | Maximum credit window is `default_credits * credit_ceiling_factor`. |
 | `credit_byte_budget` | `268435456` (256 MiB) | Byte ceiling for one shuffle channel's credit window, so wide rows can't buffer GBs even within the count ceiling. |
 | `shuffle_fan_in` | `8` | Maximum inbound streams a shuffle node fans in before the reduce becomes a tree of combiner stages. |
+| `gather_streams` | `48` | Concurrent Flight streams a reducer runs across all its peers, split between them. Holding this fixed is what keeps a shuffle's transfer rate independent of how finely the cluster's width cuts it into buckets. |
+| `gather_inflight_bytes` | `805306368` (768 MiB) | Decoded bytes a gather may hold in flight across every stream. Divided by the stream count, it decides how many buckets one stream asks for at a time. |
 | `aimd_alpha` | `1` | Additive increase: credits added per round trip. |
 | `aimd_beta` | `0.5` | Multiplicative decrease applied on congestion. |
 | `backpressure_high` | `0.70` | Buffer occupancy at which the producer is throttled. |
@@ -177,8 +182,8 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `join_dp_max_tables` | `12` | At or below this many joined tables, use exact DP join ordering. |
-| `greedy_max_tables` | `25` | Above `join_dp_max_tables` and up to this, use the greedy heuristic. |
+| `join_dp_max_tables` | `12` | **No effect.** Declared and validated, but no rule reads it, so setting it changes nothing. Join ordering sizes its own search per query; see {doc}`/architecture/deep-dives/adaptive/cost-model`. |
+| `greedy_max_tables` | `25` | **No effect.** Declared and validated, and read by nothing, as with `join_dp_max_tables`. |
 | `reoptimize_error` | `2.0` | Re-optimize when `abs(actual - estimate) / estimate` exceeds this. |
 | `target_rows_per_task` | `4000000` | Target rows per distributed task; worker fan-out tracks data size, not CPU count. |
 | `fixpoint_iterations` | `8` | Maximum rewrite-phase iterations before bailing. |
@@ -201,9 +206,9 @@ reference). Construct one and swap it onto `Config`:
 ```python
 from batcher import Config, OptimizerConfig
 
-cfg = Config().replace(optimizer=OptimizerConfig(join_dp_max_tables=8))
-print(cfg.optimizer.join_dp_max_tables)
-# 8
+cfg = Config().replace(optimizer=OptimizerConfig(reoptimize_error=1.5))
+print(cfg.optimizer.reoptimize_error)
+# 1.5
 ```
 
 ### optimizer.cardinality
@@ -278,9 +283,9 @@ Where learned statistics (the MetadataHub) live and how fast confidence decays.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `backend` | `"in_process"` | Storage backend: `"in_process"`, `"sqlite"`, `"redis"`, or `"object_storage"`. |
+| `backend` | `"in_process"` | Storage backend: `"in_process"`, `"sqlite"`, `"rocksdb"`, `"redis"`, `"object_storage"`, or `"layered"`. `"sqlite"` is the durable single-node default; `"rocksdb"` is the embedded alternative for a write-heavy loop, where an LSM tree absorbs many small writes that a B-tree would pay a journal write for; `"redis"` and `"object_storage"` share statistics across a cluster, and `"layered"` caches one of those behind a local dict. |
 | `uri` | `None` | Connection or path for a non-in-process backend. |
-| `decay_per_day` | `0.1` | Daily confidence decay for learned stats (roughly a one-week half-life). |
+| `decay_per_day` | `0.1` | **No effect.** Nothing expires: there is no TTL or aging on any backend. Recency comes from smoothing instead; see {doc}`/architecture/deep-dives/adaptive/learned-metadata`. |
 
 These fields are the {py:class}`MetadataConfig <batcher.MetadataConfig>` dataclass
 (the full field list is in the API reference). Construct one and swap it onto
@@ -300,8 +305,8 @@ Whether the row filters and column masks in a {py:class}`SecurityCatalog <batche
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `mode` | `"off"` | `"off"`, `"advisory"`, or `"strict"`. |
-| `default_deny` | `False` | Deny a table no grant mentions, rather than leaving it ungoverned. |
+| `mode` | `"off"` | `"off"`, `"advisory"`, or `"strict"`. Any other value is rejected: enforcement treats an unrecognized mode as `"advisory"`, so an unchecked typo would downgrade a strict deployment to warnings. |
+| `default_deny` | `False` | **Not implemented; setting it `True` raises `ConfigError`.** No code path reads it, so a deny-by-default catalog does not exist. Restrict access with explicit grants and `mode="strict"`. |
 | `audit_path` | `None` | Append every governance decision to this JSONL file. |
 | `require_verified_principal` | `False` | Refuse a principal that was asserted rather than established by a verifier. |
 

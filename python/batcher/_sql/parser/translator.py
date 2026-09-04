@@ -22,6 +22,7 @@ from batcher._sql.parser import (
     from_clause,
     grouping,
     grouping_sets,
+    statements,
     subquery,
     windowing,
 )
@@ -309,7 +310,7 @@ class _Translator:
 
         Referenced once ⇒ left lazy, so predicate/projection pushdown still reaches into it.
         """
-        ds = self.statement(cte.this)
+        ds = from_clause.alias_columns(self.statement(cte.this), cte)
         if _table_ref_count(root, cte.alias) > 1:
             return from_arrow(ds.collect())
         return ds
@@ -453,11 +454,8 @@ class _Translator:
         if isinstance(node, exp.Values):
             # A bare `VALUES (..), (..)` statement is an inline literal relation.
             return from_clause._values_table(node)
-        if isinstance(node, exp.Command) and str(node.this).upper() == "EXPLAIN":
-            # sqlglot does not model EXPLAIN; it parses as a Command carrying the rest
-            # of the query as text. Re-parse it, render the *planned* tree (no
-            # execution), and hand it back as a one-row relation like DuckDB's EXPLAIN.
-            return self._explain(node)
+        if (described := statements.describing_statement(self, node)) is not None:
+            return described
         # A semicolon-separated script parses as one Block. Saying "got Block" tells a
         # user nothing about what they typed, so name the actual cause.
         if type(node).__name__ == "Block":
@@ -471,19 +469,6 @@ class _Translator:
             "EXPLAIN. (CREATE/DROP and the DML statements are dispatched before this "
             "point, so reaching here means the statement form is not supported at all.)"
         )
-
-    def _explain(self, node) -> Dataset:
-        """Translate an ``EXPLAIN [ANALYZE] <query>`` command into a plan relation."""
-        import sqlglot
-
-        text = node.args["expression"].this if node.args.get("expression") else ""
-        analyze = False
-        stripped = text.lstrip()
-        if stripped[:8].upper() == "ANALYZE ":
-            analyze, text = True, stripped[8:]
-        inner = sqlglot.parse_one(text, read="duckdb")
-        plan = self.statement(inner).explain(analyze=analyze)
-        return _as_dataset(pa.table({"explain_key": ["plan"], "explain_value": [plan]}))
 
     def _apply_setop_tail(self, node, ds: Dataset) -> Dataset:
         """Apply a trailing ORDER BY / LIMIT / OFFSET on a set-operation result."""
@@ -633,17 +618,29 @@ class _Translator:
         answers None rather than guessing — so a caller must treat None as "unknown", never
         as a type.
 
+        A query with no `FROM` has no bound scope, but a *constant* expression still has a
+        type — `DATE '2024-01-31'` is a Date32 with or without a relation to read it over.
+        Answering None there sent `time_bucket(INTERVAL 1 MONTH, DATE '...')` down the
+        timestamp branch, so an empty scope is an empty schema here rather than a refusal.
+
         Args:
             expr: A built `Expr`.
 
         Returns:
             The Arrow `DataType`, or None.
         """
-        if self._scope_schema is None:
-            return None
+        import pyarrow as pa
+
+        from batcher.plan.schema import SchemaRef
         from batcher.plan.types.infer import infer_type
 
-        return infer_type(expr, self._scope_schema)
+        schema = self._scope_schema or SchemaRef.from_arrow(pa.schema([]))
+        try:
+            return infer_type(expr, schema)
+        except KeyError:
+            # `SchemaRef.field` raises for a column the scope does not carry — a correlated
+            # outer reference, or a name resolved later. "Unknown" is the sound answer.
+            return None
 
     def column_type(self, node) -> Any | None:
         """The Arrow type of `node` when it is a plain column currently in scope.

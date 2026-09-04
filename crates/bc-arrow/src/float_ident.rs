@@ -43,6 +43,7 @@ pub const CANONICAL_NAN_BITS_F32: u32 = 0x7fc0_0000;
 /// SQL's answer: the zeros compare equal, all NaNs compare equal and greatest, and every
 /// other pair is unchanged. See the module docs.
 #[inline]
+#[must_use]
 pub fn canon_f64(v: f64) -> f64 {
     f64::from_bits(canon_f64_bits(v))
 }
@@ -53,6 +54,7 @@ pub fn canon_f64(v: f64) -> f64 {
 /// alike and all NaNs hash alike, while distinct finite values keep their exact bits and so
 /// stay distinct.
 #[inline]
+#[must_use]
 pub fn canon_f64_bits(v: f64) -> u64 {
     if v.is_nan() {
         CANONICAL_NAN_BITS_F64
@@ -69,12 +71,14 @@ pub fn canon_f64_bits(v: f64) -> u64 {
 /// inside a list/struct is not, so a float leaf can still arrive as `f32` and must fold the
 /// same way.
 #[inline]
+#[must_use]
 pub fn canon_f32(v: f32) -> f32 {
     f32::from_bits(canon_f32_bits(v))
 }
 
 /// Canonical `u32` **bits** for an `f32`. Mirrors [`canon_f64_bits`].
 #[inline]
+#[must_use]
 pub fn canon_f32_bits(v: f32) -> u32 {
     if v.is_nan() {
         CANONICAL_NAN_BITS_F32
@@ -91,6 +95,7 @@ pub fn canon_f32_bits(v: f32) -> u32 {
 /// equal and greater than every number, and `-0.0` compares `Equal` to `0.0` (so which of
 /// the two an extreme returns is first-seen — the rule every other engine applies).
 #[inline]
+#[must_use]
 pub fn float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a.is_nan(), b.is_nan()) {
@@ -142,12 +147,14 @@ pub fn canon_float_array(a: &ArrayRef) -> ArrayRef {
 
 /// Whether `v` is one of the two shapes [`canon_f64`] rewrites: a NaN, or negative zero.
 #[inline]
+#[must_use]
 pub fn needs_canon_f64(v: f64) -> bool {
     v.is_nan() || v.to_bits() == 0x8000_0000_0000_0000
 }
 
 /// [`needs_canon_f64`] for a 32-bit float.
 #[inline]
+#[must_use]
 pub fn needs_canon_f32(v: f32) -> bool {
     v.is_nan() || v.to_bits() == 0x8000_0000
 }

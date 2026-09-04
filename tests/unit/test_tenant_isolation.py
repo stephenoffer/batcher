@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
-from batcher.api.executors import _result_cache_key
+from batcher.api.executors import result_cache_key
 from batcher.config import active_config
 from batcher.plan.source_stats import source_stats_key
 
@@ -95,9 +95,9 @@ class TestResultCacheIsolation:
         """The leak: same query, same source, and the second tenant got the first's rows."""
         plan, sources = plan_and_sources
         with bt.tenant("team-a"):
-            key_a = _result_cache_key(plan, sources)
+            key_a = result_cache_key(plan, sources)
         with bt.tenant("team-b"):
-            key_b = _result_cache_key(plan, sources)
+            key_b = result_cache_key(plan, sources)
         assert key_a != key_b, "two tenants collide on one result-cache entry"
 
     def test_the_same_tenant_still_hits_its_own_cache(self, plan_and_sources) -> None:
@@ -105,8 +105,8 @@ class TestResultCacheIsolation:
         # it needs its own assertion.
         plan, sources = plan_and_sources
         with bt.tenant("team-a"):
-            first = _result_cache_key(plan, sources)
-            second = _result_cache_key(plan, sources)
+            first = result_cache_key(plan, sources)
+            second = result_cache_key(plan, sources)
         assert first == second
 
     def test_an_untenanted_key_is_unchanged(self, plan_and_sources) -> None:
@@ -116,8 +116,8 @@ class TestResultCacheIsolation:
         nothing after it — which is stable, and identical for every un-tenanted caller.
         """
         plan, sources = plan_and_sources
-        assert _result_cache_key(plan, sources) == _result_cache_key(plan, sources)
-        assert _result_cache_key(plan, sources).endswith("|")
+        assert result_cache_key(plan, sources) == result_cache_key(plan, sources)
+        assert result_cache_key(plan, sources).endswith("|")
 
     def test_two_principals_do_not_share_a_governed_result(self, plan_and_sources) -> None:
         """The subtler one, and the reason this is a fix rather than a nicety.
@@ -131,9 +131,9 @@ class TestResultCacheIsolation:
         plan, sources = plan_and_sources
         catalog = bt.SecurityCatalog().grant("analyst", on="/data/t.parquet", select=["v"])
         with bt.security(catalog, bt.Principal("ana", roles=["analyst"])):
-            key_ana = _result_cache_key(plan, sources)
+            key_ana = result_cache_key(plan, sources)
         with bt.security(catalog, bt.Principal("bob", roles=["admin"])):
-            key_bob = _result_cache_key(plan, sources)
+            key_bob = result_cache_key(plan, sources)
         assert key_ana != key_bob, "two principals share one cached governed result"
 
     def test_the_catalog_is_part_of_the_viewer(self, plan_and_sources) -> None:
@@ -144,9 +144,9 @@ class TestResultCacheIsolation:
         permissive = bt.SecurityCatalog().grant("analyst", on="/data/t.parquet")
         restrictive = bt.SecurityCatalog().grant("analyst", on="/data/t.parquet", select=["v"])
         with bt.security(permissive, principal):
-            loose = _result_cache_key(plan, sources)
+            loose = result_cache_key(plan, sources)
         with bt.security(restrictive, principal):
-            tight = _result_cache_key(plan, sources)
+            tight = result_cache_key(plan, sources)
         assert loose != tight
 
 

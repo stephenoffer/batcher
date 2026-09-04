@@ -132,7 +132,7 @@ than a few thousand rows it is not worth thinking about.
 On a query that returns in about a millisecond, the orchestration *is* the cost. Measured on
 a filter over 10,000 in-memory rows with the event log already off, the engine call and the
 Arrow table build together account for roughly a fifth of the query; the rest is admission,
-morsel sizing, pressure classification, and the learned-stats close-out.
+morsel sizing, pressure classification, and profile assembly.
 
 `execution.fast_path` skips all of that for plans that provably don't need it. The plan is
 still optimized, through the same plan cache, and runs through the same engine call, so the
@@ -149,13 +149,19 @@ The path is taken only when the query is single-node, on the CPU backend, reads 
 are already in memory, contains no `map_batches` UDF, and stays under a row and plan-node
 cap. Anything else silently takes the ordinary path, so turning the flag on is always safe.
 
+```{note}
+The fast path keeps the cross-query learning loop. A query answered on it still records its
+measured cardinality, selectivity, per-operator metrics, and column statistics, so it goes on
+sharpening the estimates the optimizer uses next time. What it does not record is the
+*resource* half: it consults no pressure monitor and holds no resource manager, so there is
+no flap rate or envelope high-water mark for it to report.
+```
+
 ```{warning}
-The fast path gives up the **write** side of the cross-query learning loop. A query answered
-on it records no measured cardinality, selectivity, or column statistics, so it never
-sharpens the estimates the optimizer uses next time. Reading learned statistics is
-unaffected, so plan *quality* is the same on the first run. Use it for a latency-sensitive
-serving path where the plan shape is already known good; leave it off while a workload is
-still teaching the optimizer.
+The fast path gives up **observability**. A query answered on it does not appear in
+`explain(analyze=True)`, the JSON event log, or the dashboard, because the profile those read
+is assembled by the orchestration it skips. Use it for a latency-sensitive serving path where
+the plan shape is already known good; leave it off where you need to see what ran.
 ```
 
 ## Morsel-driven execution
@@ -409,15 +415,18 @@ the scan, or that a join was reordered the way you expected.
 print(events.filter(bt.col("status") == "active").select("region", "amount").explain())
 ```
 
-One operator per line, indented by depth, each with its row estimate and where that
+One operator per line as a tree, each with what it does, its row estimate, and where that
 estimate came from: `exact` when the source knows, `learned` from a previous run's
 measurements, `default` from a heuristic. Under `decisions:` are the calls the engine
 made along the way.
 
 ```text
-project                         est≈4 (learned)
-  filter                        est≈4 (learned)
-    scan                        est≈6 (exact) pushed[status = active]
+query plan (planned)                            3 operators
+───────────────────────────────────────────────────────────
+OPERATOR                     ESTIMATE  NOTES
+project                         est≈4  (learned)
+└─ filter  [status = active]    est≈4  (learned)
+   └─ scan  [source 0]          est≈6  (exact)  pushed[status = active]
 
 decisions:
   - [core/io] source read at 40 MB/s (learned)

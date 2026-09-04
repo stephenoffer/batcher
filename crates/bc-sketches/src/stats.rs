@@ -12,20 +12,13 @@ use crate::{HyperLogLog, KllSketch, Mergeable};
 
 /// In-memory Arrow bytes attributable to *this* array's rows.
 ///
-/// [`Array::get_array_memory_size`] reports the whole backing buffer, so for a
-/// **sliced** array — a morsel carved from a larger buffer, which is the common case
-/// in the engine — it returns the parent buffer's size, not the slice's. That would
-/// inflate `avg_byte_width` by the slice ratio (a 10-row slice of a 100k-row buffer
-/// reported ~80 KB/row instead of ~8 B/row), poisoning the cost model's memory /
-/// broadcast sizing. `get_slice_memory_size` counts only the sliced rows' bytes;
-/// fall back to the buffer size for the exotic nested types it does not support.
-fn slice_bytes(array: &ArrayRef) -> u64 {
-    array
-        .to_data()
-        .get_slice_memory_size()
-        .map(|b| b as u64)
-        .unwrap_or_else(|_| array.get_array_memory_size() as u64)
-}
+/// Re-exported from `bc-arrow` rather than restated here. The reason it matters to this crate
+/// specifically: `get_array_memory_size` reports the whole backing buffer, so for a **sliced**
+/// array — a morsel carved from a larger buffer, the common case in the engine — it would
+/// inflate `avg_byte_width` by the slice ratio (a 10-row slice of a 100k-row buffer read as
+/// ~80 KB/row instead of ~8 B/row), poisoning the cost model's memory and broadcast sizing.
+/// The engine has one definition of this measure; see [`bc_arrow::slice_bytes`].
+use bc_arrow::slice_bytes;
 
 /// Cheap, mergeable statistics for one column, computed in a single pass.
 #[derive(Clone)]
@@ -45,6 +38,7 @@ pub struct ColumnStats {
 
 impl ColumnStats {
     /// An empty accumulator, for folding several arrays of one column into one sketch.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             count: 0,
@@ -106,6 +100,7 @@ impl ColumnStats {
     /// It is the *whole-buffer* footprint (values + offsets + validity) divided
     /// by rows, so it slightly over-counts fixed overhead on tiny columns — the
     /// intent is a memory-true estimate, not the logical payload size.
+    #[must_use]
     pub fn avg_byte_width(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -115,16 +110,19 @@ impl ColumnStats {
     }
 
     /// Estimated number of distinct (non-null) values.
+    #[must_use]
     pub fn distinct_estimate(&self) -> f64 {
         self.distinct.estimate()
     }
 
     /// Estimated selectivity of `col <= x` (fraction of rows kept), if numeric.
+    #[must_use]
     pub fn rank(&self, x: f64) -> Option<f64> {
         self.quantiles.as_ref().map(|q| q.rank(x))
     }
 
     /// Approximate value at quantile `q ∈ [0, 1]`, if numeric.
+    #[must_use]
     pub fn quantile(&self, q: f64) -> Option<f64> {
         self.quantiles.as_ref().and_then(|s| s.quantile(q))
     }
@@ -173,12 +171,14 @@ impl ColumnStats {
     /// row fraction. Independent of the literal (the uniform model assigns every
     /// distinct value the same mass). Distinct is guarded to be `>= 1`; the result
     /// is clamped to `[0, 1]` and is 0 for an all-null column.
+    #[must_use]
     pub fn selectivity_eq(&self) -> f64 {
         (self.eq_among_nonnull() * self.nonnull_fraction()).clamp(0.0, 1.0)
     }
 
     /// Estimated fraction of rows kept by `col <= x` — `rank(x)` scaled to a row
     /// fraction. `None` for non-numeric columns.
+    #[must_use]
     pub fn selectivity_le(&self, x: f64) -> Option<f64> {
         let nn = self.nonnull_fraction();
         self.rank(x).map(|r| (r * nn).clamp(0.0, 1.0))
@@ -193,6 +193,7 @@ impl ColumnStats {
     /// exact only when `x` is a value present in the column; for an `x` absent
     /// from the column it slightly under-counts, but it is the standard
     /// uniform-model estimate and keeps `lt <= le`.
+    #[must_use]
     pub fn selectivity_lt(&self, x: f64) -> Option<f64> {
         let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
         self.rank(x)
@@ -204,6 +205,7 @@ impl ColumnStats {
     ///
     /// Note this is **not** `1 - selectivity_le(x)`: null rows satisfy neither
     /// predicate, so `le + gt` sums to the non-null fraction, not to 1.
+    #[must_use]
     pub fn selectivity_gt(&self, x: f64) -> Option<f64> {
         let nn = self.nonnull_fraction();
         self.rank(x)
@@ -213,6 +215,7 @@ impl ColumnStats {
     /// Estimated fraction of rows kept by `col >= x` — the non-null complement of
     /// `selectivity_lt(x)`, scaled to a row fraction. `None` for non-numeric
     /// columns.
+    #[must_use]
     pub fn selectivity_ge(&self, x: f64) -> Option<f64> {
         let (nn, eq) = (self.nonnull_fraction(), self.eq_among_nonnull());
         self.rank(x)
@@ -220,6 +223,7 @@ impl ColumnStats {
     }
 
     /// Fraction of rows that are null: `null_count / count` (0.0 when empty).
+    #[must_use]
     pub fn null_fraction(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -232,6 +236,7 @@ impl ColumnStats {
     /// is the `i / buckets` quantile, so each adjacent pair bounds a bucket
     /// holding ~`1 / buckets` of the rows. `None` for non-numeric columns or
     /// when `buckets == 0`.
+    #[must_use]
     pub fn histogram_boundaries(&self, buckets: usize) -> Option<Vec<f64>> {
         if buckets == 0 {
             return None;
@@ -245,6 +250,7 @@ impl ColumnStats {
     /// Serialize to a byte blob composing the inner sketches. Layout (LE):
     /// `[count: u64][null_count: u64][total_bytes: u64][hll_len: u64][hll…][has_kll: u8]`
     /// and, when the flag is 1, `[kll_len: u64][kll…]`.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.count as u64).to_le_bytes());
@@ -269,6 +275,7 @@ impl ColumnStats {
 
     /// Reconstruct from [`to_bytes`](Self::to_bytes). Returns `None` on truncated
     /// input, an unrecognized flag byte, or a malformed inner sketch.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut pos = 0usize;
 

@@ -67,7 +67,7 @@ def start_distributed_stream(
 
     from batcher import core, kyber
     from batcher.api.streaming._diagnostics import warn_if_state_is_unbounded
-    from batcher.plan.logical import streaming_fold_target
+    from batcher.plan.logical import split_streaming_tail
 
     # A cluster does not make unbounded state bounded — it spreads it over more machines,
     # which buys time and nothing else. The same warning, from the same analysis, so the two
@@ -90,7 +90,9 @@ def start_distributed_stream(
     # `distinct()` IS that aggregate (a group-by over every column), which the single-node
     # processor has always folded and the cluster used to refuse. Both now ask the one
     # neutral predicate, so neither can be handed a node the other would run differently.
-    agg = streaming_fold_target(plan)
+    split = split_streaming_tail(plan)
+    agg = split[1] if split is not None else None
+    tail = split[0] if split is not None else ()
     if agg is None:
         physical = kyber.optimize(plan, sources=sources, hub=core.default_hub())
         plan_ir, projection = physical.to_json(), physical.source_projections.get(0)
@@ -116,6 +118,7 @@ def start_distributed_stream(
             drain=drain,
             should_stop=should_stop,
             agg=agg,
+            tail=tail,
         )
 
     engine = core.StreamingQueryEngine(
@@ -224,6 +227,7 @@ def start_distributed_stream_drain(
     """
     from time import perf_counter, time
 
+    from batcher.api.security._write import required_privileges
     from batcher.api.terminal import _write
 
     t0 = perf_counter()
@@ -236,6 +240,9 @@ def start_distributed_stream_drain(
         distributed=True,
         num_workers=num_workers if num_workers is not None else _drain_workers(sources[0]),
         sink_kwargs=sink_kwargs,
+        # A drain writes whatever mode the sink was configured with. When the sink names
+        # none it is a plain append, which is what a stream does to its destination.
+        privileges=required_privileges(sink_kwargs.get("mode") or "append"),
     )
     rows = manifest.total_rows
     progress = StreamingQueryProgress(

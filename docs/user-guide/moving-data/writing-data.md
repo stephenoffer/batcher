@@ -51,6 +51,37 @@ ds.write.json("output/data.json")
 Use CSV and JSON for interchange with tools that require them. Parquet is faster and
 preserves types, so prefer it for anything that will be read back by Batcher.
 
+CSV is a grid of scalar cells, so it has nowhere to put a list, struct, map, or
+fixed-size-list column. Writing one raises a `SchemaError` naming the column rather than
+letting the underlying writer report a bare type. Flatten the column first with
+`.cast("string")`, or `.list.join(",")` for a list, or write a format that carries it.
+
+JSON has no temporal type, so a date or timestamp column is written as an ISO-8601 string
+at the column's own resolution, the spelling DuckDB and Spark produce. That is true wherever
+the column sits, including inside a struct or a list, and it does not depend on what else
+the table holds.
+
+```python
+import datetime as dt
+
+import batcher as bt
+
+events = bt.from_pydict(
+    {"at": [dt.datetime(2024, 2, 29, 12, 34, 56, 123456)], "amount": [10]}
+)
+print(events.schema.field("at").type)
+# timestamp[us]
+```
+
+Writing that column produces `{"at":"2024-02-29 12:34:56.123456","amount":10}`. The
+microseconds survive, but the *type* does not: Arrow's JSON reader infers a bare date back
+as a timestamp and leaves a sub-second instant as text. Write Parquet, Arrow, or Avro when
+the reader has to get a timestamp column back.
+
+A duration column has no ISO form either writer produces, so JSON and CSV both write its
+integer count in the column's own unit. The unit is not in the output, so record it
+alongside, or cast the column to something self-describing before writing.
+
 ## Other file and database sinks
 
 The write namespace mirrors the reader namespace: every format has a typed writer,

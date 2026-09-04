@@ -183,7 +183,9 @@ def test_gather_reraises_a_broken_runtime_env_instead_of_blaming_workers(monkeyp
         return lambda: _raise(RuntimeEnvSetupError("bad runtime_env"))
 
     with pytest.raises(RuntimeEnvSetupError):
-        gather_map_results(submit, 2, RecoveryPolicy(max_attempts=3), on_lost=lost.append)
+        gather_map_results(
+            submit, 2, RecoveryPolicy(max_attempts=3), on_lost=lambda idx, _exc: lost.append(idx)
+        )
     assert lost == []  # no healthy worker was blamed
 
 
@@ -313,3 +315,42 @@ def test_a_sink_sees_a_resubmitted_partition_exactly_once(monkeypatch):
     )
     assert sorted(seen) == [0, 1, 2]
     assert calls[1] == 2
+
+
+def test_the_gather_hands_on_lost_the_failure_that_lost_the_partition(monkeypatch):
+    """`map_barrier` charges the blame ledger with the failure's own category, so the barrier
+    has to be *given* the failure. It used to record a hardcoded `worker_lost` for every loss,
+    which meant a reclaimed spot node was blamed as heavily as a crashed one — on the fleet
+    where reclamation is the expected event.
+
+    Asserted here rather than at the ledger because this is the half that can silently
+    regress: a refactor back to `on_lost(idx)` fails loudly, while one that passes the wrong
+    object would leave every loss classified as whatever that object happens to be.
+    """
+    from batcher.carbonite.resilience import classify_failure
+    from batcher.dist.executors.ray_runtime import gather_map_results
+
+    RayError, _ = install_fake_ray(monkeypatch)
+    seen: list = []
+    calls: collections.Counter = collections.Counter()
+
+    def submit(idx):
+        calls[idx] += 1
+        if calls[idx] == 1:
+            return lambda: _raise(RayError("preempted"))
+        return lambda i=idx: [f"r{i}"]
+
+    out = gather_map_results(
+        submit,
+        1,
+        RecoveryPolicy(max_attempts=3),
+        on_lost=lambda idx, exc: seen.append((idx, exc)),
+    )
+    assert out == [["r0"]]
+    assert len(seen) == 1
+    idx, exc = seen[0]
+    assert idx == 0
+    assert isinstance(exc, BaseException), "the failure itself must reach the blame site"
+    # And it is a failure the taxonomy can actually classify, which is the whole point of
+    # forwarding it: a category the ledger can weight, rather than a hardcoded one.
+    assert classify_failure(exc).name in {"worker_lost", "preemption", "network"}

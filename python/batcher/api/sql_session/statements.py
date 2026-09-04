@@ -86,20 +86,31 @@ def dml(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Da
 
 
 def drop(session: Session, ast: Any) -> Dataset:
-    """Handle ``DROP TABLE [IF EXISTS] name`` — unregister the table.
+    """Handle ``DROP TABLE [IF EXISTS] name[, name...]`` — unregister the tables.
+
+    The parser reports the targets in ``args["tables"]``, a list, because ``DROP`` takes a
+    comma-separated set. Older parsers put a single target on ``ast.this`` instead and left
+    that list absent, so both shapes are read: dropping one name through a parser that only
+    fills the list would otherwise raise `AttributeError` on ``None``.
 
     Args:
-        session: The session whose catalog loses the name.
+        session: The session whose catalog loses the names.
         ast: The parsed ``DROP`` statement.
 
     Returns:
-        A one-row relation naming what was dropped.
+        A relation naming what was dropped, one row per name.
 
     Raises:
         PlanError: No such table, and ``IF EXISTS`` was not given.
     """
-    name = ast.this.name
-    if not bool(ast.args.get("exists")) and name not in session._tables:
-        raise PlanError(f"no table {name!r} to drop")
-    session._unbind(name)
-    return session._as_dataset(pa.table({"dropped": pa.array([name], pa.string())}))
+    targets = list(ast.args.get("tables") or ([ast.this] if ast.this is not None else []))
+    names = [t.name for t in targets]
+    if not names:
+        raise PlanError("DROP TABLE names no table")
+    if not bool(ast.args.get("exists")):
+        for name in names:
+            if name not in session._tables:
+                raise PlanError(f"no table {name!r} to drop")
+    for name in names:
+        session._unbind(name)
+    return session._as_dataset(pa.table({"dropped": pa.array(names, pa.string())}))

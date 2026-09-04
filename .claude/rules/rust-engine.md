@@ -120,9 +120,21 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 
 ## Sketches and transport
 
-- `bc-sketches` (HLL / KLL / Count-Min / ColumnStats) are all `Mergeable` with a
-  fixed seed so partition-built sketches merge identically. Kyber consumes them for
-  cardinality/quantile estimates. Keep them deterministic and mergeable.
+- `bc-sketches` (HLL / KLL / Count-Min / ColumnStats) are all `Mergeable` with a fixed
+  seed. Kyber consumes them for cardinality/quantile estimates. Keep them deterministic
+  and mergeable — but **"merge identically" is only true of some of them**, and the line
+  runs where the algorithm does. HyperLogLog, Count-Min and Bloom fold by register-wise
+  max, cell-wise sum and bitwise OR, so any merge order reaches a bit-identical state, and
+  `ColumnStats`' min/max/count/ndv fold the same way. KLL, TDigest and `FrequentItems`
+  **do not**: their merge compacts, re-clusters or evicts, which is order-sensitive by
+  construction, so a reduce that takes partials in a different order returns a different
+  answer — as does `ColumnStats`' quantile grid, which is a KLL. Measured over 39 seeds and
+  three merge orders, the worst *rank* disagreement was 0.0097 for KLL at k=200 and 0.0050
+  for TDigest at compression 100, which is the ~2/k the algorithm already promises rather
+  than a defect; `FrequentItems` reorders its tail the same way, which is what a
+  Misra-Gries counter does when two summaries meet. `crates/bc-sketches/tests/merge_order.rs` pins both halves. Do not write a test
+  asserting a quantile sketch merges to an identical state, and do not set out to "fix"
+  the fact that it does not.
 - `bc-transport` is the Arrow Flight data-plane shuffle with **credit-based flow
   control** (Carbonite model: 1 credit = 1 batch slot; producer blocks at 0). The
   data plane bypasses the Ray object store entirely — do not route bulk batches

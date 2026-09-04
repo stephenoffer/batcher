@@ -1,7 +1,8 @@
 """Plan transforms and predicates over `LogicalPlan` trees.
 
 `remap_sources` shifts every `Scan.source_id` (used when appending a right side's
-sources after the left's); `is_streamable` reports whether a plan is
+sources after the left's) and `share_sources` renumbers several branches onto one source
+list, giving one relation one slot; `is_streamable` reports whether a plan is
 partition-independent (only row-wise operators, no pipeline breaker);
 `empty_result_schema` types a zero-batch result; `hoist_computed_keys` and
 `project_columns` materialize a computed shuffle key as a hidden column and project it
@@ -11,12 +12,13 @@ away again, which is what gives an expression-keyed sort or window a distributed
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import TypeVar
 
 import pyarrow as pa
 
 from batcher.plan.expr_ir import Col, Expr, Lit
-from batcher.plan.logical.aggregate import Sort
+from batcher.plan.logical.aggregate import Sort, SortKeySpec
 from batcher.plan.logical.base import LogicalPlan
 from batcher.plan.logical.join import Join
 from batcher.plan.logical.relational import (
@@ -30,19 +32,29 @@ from batcher.plan.logical.relational import (
     Scan,
     Union,
 )
-from batcher.plan.logical.reshape import Unnest, Unpivot
-from batcher.plan.schema import placeholder_schema
+from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
+from batcher.plan.schema import SchemaRef, placeholder_schema
+
+#: A bound source object. `plan` is layer 1 and cannot name `io.source.Source` (layer 2),
+#: and does not need to: `share_sources` only ever compares sources by identity.
+_S = TypeVar("_S")
 
 __all__ = [
     "constant_column_literal",
     "empty_result_schema",
     "hoist_computed_keys",
+    "hoist_sort_key",
+    "hoist_window_keys",
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
     "passthrough_renames",
+    "preserves_source_row_count",
     "project_columns",
+    "rebuild_over_scan",
     "remap_sources",
+    "share_sources",
+    "split_streaming_tail",
     "streaming_fold_target",
 ]
 
@@ -184,20 +196,76 @@ def remap_sources(plan: LogicalPlan, offset: int) -> LogicalPlan:
     Used when joining two datasets: the right side's sources are appended after
     the left's, so its scans must point past them.
 
+    Args:
+        plan: The plan to rewrite.
+        offset: The amount to add to every `source_id`.
+
+    Returns:
+        A copy of `plan` whose scans point past `offset` earlier sources.
+    """
+    return _rewrite_source_ids(plan, lambda sid: sid + offset)
+
+
+def share_sources(
+    branches: Sequence[tuple[LogicalPlan, Sequence[_S]]],
+) -> tuple[list[LogicalPlan], list[_S]]:
+    """Put several branches on one source list, giving the *same* source one slot.
+
+    `Dataset.union` concatenates its inputs' source lists, because in general two
+    unioned datasets are unrelated and a source that appears in both is two relations
+    that merely compare equal. This is the narrower operation for the callers that can
+    prove otherwise -- the grouping levels of a `ROLLUP`/`CUBE`/`GROUPING SETS`, which
+    are the *same* query over the *same* relations, differing only in what they group by.
+    Concatenating there binds one relation once per level (a five-level rollup over three
+    tables takes fifteen slots for three relations), and that alone is enough to stop
+    plan-level common-subplan reuse recognizing the levels as sharing a subtree, so every
+    level re-reads and re-joins the whole input.
+
+    Sameness is **object identity**, never equality: two sources that compare equal may
+    still be two independent handles, and merging those would change which relation a
+    scan reads. Identity is the only test a caller can hand over without also handing
+    over what its sources mean.
+
+    Args:
+        branches: Each branch's plan paired with the source list its scans index.
+
+    Returns:
+        The branches' plans rewritten onto one merged source list, and that list.
+    """
+    merged: list[_S] = []
+    slot_of: dict[int, int] = {}
+    plans: list[LogicalPlan] = []
+    for plan, sources in branches:
+        mapping: dict[int, int] = {}
+        for index, source in enumerate(sources):
+            slot = slot_of.get(id(source))
+            if slot is None:
+                slot = len(merged)
+                slot_of[id(source)] = slot
+                merged.append(source)
+            mapping[index] = slot
+        moved = any(index != slot for index, slot in mapping.items())
+        plans.append(_rewrite_source_ids(plan, mapping.__getitem__) if moved else plan)
+    return plans, merged
+
+
+def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> LogicalPlan:
+    """Return a copy of `plan` with every `Scan.source_id` passed through `renumber`.
+
     Only `Scan` carries a `source_id`; every other node is rebuilt generically with
     its remapped children by `transform_up`, so a new node type needs no edit here.
     The import is function-local because `plan.visitor` imports this module.
     """
     from batcher.plan.visitor import transform_up
 
-    def shift(node: LogicalPlan) -> LogicalPlan:
+    def move(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Scan):
             # `replace`, not a fresh `Scan`: the source key is this scan's identity and
             # rebuilding without it would silently return the plan to the collided key.
-            return dataclasses.replace(node, source_id=node.source_id + offset)
+            return dataclasses.replace(node, source_id=renumber(node.source_id))
         return node
 
-    return transform_up(plan, shift)
+    return transform_up(plan, move)
 
 
 def empty_result_schema(plan: LogicalPlan, names: list[str]) -> pa.Schema:
@@ -265,6 +333,45 @@ def is_partition_independent(node: LogicalPlan) -> bool:
     return isinstance(node, (Filter, Project, Unnest, Unpivot))
 
 
+def preserves_source_row_count(node: LogicalPlan) -> bool:
+    """Whether `node`'s output holds exactly one row per row of the source it scans.
+
+    The question a *measurement* has to ask before it is written down as a fact about the
+    source. `dist.executors.map` records the rows a distributed run produced under the
+    source's identity, so the next run can size its partition count from a measured total
+    instead of the blunt cluster-fill worker count. That is only a fact about the source when
+    the plan that produced it neither drops rows nor adds them.
+
+    It routinely does not. The same executor runs a per-partition `Distinct(limit=k)` (at most
+    `workers x k` rows out of a billion-row table), a filtered scan, a fixed-count `Sample`,
+    and a per-partition `Limit` — each of which recorded its own tiny output as the source's
+    size. The next run then seeded from that, sized itself to one partition, and ran the whole
+    query on one worker; the run after that recorded a smaller number still. The dispatcher
+    already withholds the hub by hand at six call sites for exactly this reason, with a
+    paragraph of comment at each; this is that rule stated once, where a new caller gets it
+    without knowing the history.
+
+    `Sort`, `Window` and `RowId` qualify (they reorder or widen, never resize). `Filter`,
+    `Limit`, `Sample`, `Distinct`, `Aggregate`, `Unnest`, `Unpivot`, `Join`, `Union` and an
+    opaque `MapBatches` do not.
+
+    Args:
+        node: The root of the per-partition plan whose output was measured.
+
+    Returns:
+        True when the measured row count is also the scanned source's row count.
+    """
+    from batcher.plan.logical.window import Window
+
+    while True:
+        if isinstance(node, Scan):
+            return True
+        if isinstance(node, (Project, Sort, Window, RowId)):
+            node = node.input
+            continue
+        return False
+
+
 def project_columns(plan: LogicalPlan, columns: Sequence[str]) -> Project:
     """A `Project` over `plan` selecting exactly `columns`, unchanged and in order.
 
@@ -279,6 +386,67 @@ def project_columns(plan: LogicalPlan, columns: Sequence[str]) -> Project:
         A `Project` whose output columns are `columns`.
     """
     return Project(input=plan, items=tuple(Projection(alias=c, expr=Col(c)) for c in columns))
+
+
+def hoist_sort_key(sort: Sort) -> tuple[Sort, tuple[str, ...]] | None:
+    """Rewrite `ORDER BY <expr>, ...` so the LEADING key is a plain column.
+
+    Returns `(sort', keep)` — the sort over a `Project` that materializes the computed
+    leading key as a hidden column, plus the column names the result should carry (the
+    original ones, so the hidden key is dropped) — or `None` when the leading key is already
+    a column, which is the overwhelmingly common case and stays byte-identical.
+
+    Every path that cuts a sort into ordered pieces range-partitions on the leading key's
+    *values*, which it can only read from a column. Only the leading key is hoisted: the rest
+    are evaluated by each piece's local sort, which needs no column.
+
+    Args:
+        sort: The sort to rewrite. Must carry at least one key.
+
+    Returns:
+        `(sort', keep)`, or `None` when no hoist is needed.
+    """
+    key = sort.keys[0]
+    hoisted = hoist_computed_keys(sort.input, [key.expr], prefix="__sort_key")
+    if hoisted is None:
+        return None
+    with_key, (hidden,) = hoisted
+    keep = tuple(sort.input.available_columns())
+    rewritten = dataclasses.replace(
+        sort,
+        input=with_key,
+        keys=(
+            SortKeySpec(hidden, descending=key.descending, nulls_first=key.nulls_first),
+            *sort.keys[1:],
+        ),
+    )
+    return rewritten, keep
+
+
+def hoist_window_keys(window):
+    """Rewrite `PARTITION BY <expr>, ...` so every partition key is a plain column.
+
+    Returns `(window', keep)` — the window over a `Project` that materializes each computed
+    partition key as a hidden column, plus the column names the result should carry — or
+    `None` when every partition key is already a column.
+
+    Every path that cuts a window into per-partition pieces reads the partition keys by
+    column *position*, so a computed key such as `partition_by=[col("v") % 4]` has no such
+    path unless it is materialized first. `keep` is the window's ORIGINAL output — its input
+    columns plus the function aliases — so the hidden keys vanish and nothing else does.
+
+    Args:
+        window: The `Window` node to rewrite.
+
+    Returns:
+        `(window', keep)`, or `None` when no hoist is needed.
+    """
+    hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+    if hoisted is None:
+        return None
+    with_keys, keys = hoisted
+    keep = tuple(window.available_columns())
+    return dataclasses.replace(window, input=with_keys, partition_keys=keys), keep
 
 
 def hoist_computed_keys(
@@ -393,18 +561,118 @@ def streaming_fold_target(plan: LogicalPlan):
     - one carrying a fused `limit`, whose early exit an `Aggregate` cannot express;
     - one over a plan with a pipeline breaker beneath it, which no per-batch fold reaches.
 
+    Answers for a **bare** fold only. A plan carrying row-wise work above the aggregate is a
+    mergeable fold too, but running it needs that tail applied to each snapshot, so it is
+    `split_streaming_tail` that reports it — and this returns None rather than hand a caller
+    that cannot apply a tail a plan that has one.
+
     Args:
         plan: The top-level streaming plan.
 
     Returns:
-        The `Aggregate` to fold, or None when this plan is not a mergeable fold.
+        The `Aggregate` to fold, None when this plan is not a mergeable fold, and None when
+        it is one carrying a tail (see `split_streaming_tail`).
+    """
+    split = split_streaming_tail(plan)
+    # Only a *bare* fold, so this keeps meaning exactly what it did before the tail split
+    # existed: a caller that cannot apply a tail must not be handed a plan that has one.
+    return split[1] if split is not None and not split[0] else None
+
+
+def rebuild_over_scan(nodes: Sequence[LogicalPlan], schema: pa.Schema) -> LogicalPlan:
+    """Re-root a chain of single-input nodes on a fresh `Scan` of `schema`.
+
+    The half that pairs with a split: `split_streaming_tail` (and the distributed
+    dispatcher's `_split_at`) hand back the operators *above* a breaker, and both paths then
+    need to run exactly those operators over the breaker's assembled result. That result is
+    a table, so the chain is re-rooted on a scan of it.
+
+    Shared rather than written twice because the two callers are in packages that may not
+    import each other (`core` folds a stream, `dist` re-applies above a distributed
+    breaker), and a second copy is precisely how the streaming and distributed tails would
+    come to disagree about what "the operators above" means.
+
+    Args:
+        nodes: The chain, outermost first — the order a split returns it in.
+        schema: The assembled result's schema, which the new scan reads.
+
+    Returns:
+        The outermost node of the rebuilt chain, or the bare `Scan` when `nodes` is empty.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import pyarrow as pa
+            >>> from batcher.plan.logical import rebuild_over_scan, split_streaming_tail
+            >>> ds = bt.from_pydict({"k": ["a"], "v": [1]})
+            >>> tail, _ = split_streaming_tail(
+            ...     ds.group_by("k").agg(s=bt.col("v").sum()).select("s")._plan
+            ... )
+            >>> schema = pa.schema([("k", pa.string()), ("s", pa.int64())])
+            >>> rebuilt = rebuild_over_scan(tail, schema)
+            >>> type(rebuilt).__name__
+            'Project'
+    """
+    plan: LogicalPlan = Scan(0, SchemaRef.from_arrow(schema))
+    for node in reversed(list(nodes)):  # innermost (closest to the breaker) first
+        plan = dataclasses.replace(node, input=plan)
+    return plan
+
+
+def split_streaming_tail(plan: LogicalPlan):
+    """The row-wise tail above a streaming plan's mergeable fold, plus that fold.
+
+    The streaming counterpart of what the distributed dispatcher already does with
+    `_split_at` and `_apply_above`: a pipeline breaker is distributed (or folded) on its
+    own, and the row-wise operators *above* it are re-applied to its assembled result.
+    Applying a row-wise node to the fold's full running snapshot is exactly what the batch
+    plan computes over the whole input, because such a node's output for a row depends on
+    that row alone.
+
+    Without this, every shape with post-aggregate work was refused from a streaming sink —
+    ``group_by(k).agg(...).select(...)``, a HAVING filter, and *every* expression over
+    aggregates (``sum(x) / count()``, ``max(v) - min(v)``, `regr_slope`), because those
+    lower to a `Project` over the `Aggregate` rather than to one node. Batch ran all of
+    them; streaming answered "this plan cannot be streamed to a sink", which reads as a
+    missing operator rather than the missing projection it was.
+
+    The tail is exactly `is_partition_independent`, the predicate the distributed path
+    already shares with this one — so a node becomes streamable above a fold at the same
+    moment it becomes safe to run per partition, and there is no second list to drift.
+    `Limit` and `Sort` are deliberately absent from it: neither is row-wise, and on a
+    *running* result neither has a batch meaning to match.
+
+    Args:
+        plan: The top-level streaming plan.
+
+    Returns:
+        ``(tail, aggregate)`` with `tail` outermost-first, or None when this plan is not
+        a mergeable fold. An empty `tail` is the bare-aggregate case.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.plan.logical import split_streaming_tail
+            >>> ds = bt.from_pydict({"k": ["a"], "v": [1]})
+            >>> tail, agg = split_streaming_tail(
+            ...     ds.group_by("k").agg(s=bt.col("v").sum()).select("s")._plan
+            ... )
+            >>> [type(n).__name__ for n in tail], type(agg).__name__
+            (['Project'], 'Aggregate')
     """
     from batcher.plan.logical.aggregate import Aggregate
 
-    if isinstance(plan, Aggregate):
-        return plan if is_streamable(plan.input) else None
-    if isinstance(plan, Distinct):
-        if plan.keys or plan.limit is not None or not is_streamable(plan.input):
+    tail: list[LogicalPlan] = []
+    node = plan
+    while is_partition_independent(node):
+        tail.append(node)
+        node = node.input
+    if isinstance(node, Aggregate):
+        return (tuple(tail), node) if is_streamable(node.input) else None
+    if isinstance(node, Distinct):
+        if node.keys or node.limit is not None or not is_streamable(node.input):
             return None
-        return plan.as_aggregate()
+        return tuple(tail), node.as_aggregate()
     return None

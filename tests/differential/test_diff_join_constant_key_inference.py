@@ -114,3 +114,50 @@ def test_the_rule_actually_fires_and_only_where_it_should(tmp_path):
         assert fired == [], f"a two-valued dimension proves nothing: {fired}"
     finally:
         object.__setattr__(rule, "node_fn", original)
+
+
+# --- the constant reached through a grouped aggregate ----------------------------------
+#
+# A grouped aggregate used to drop its group key's null count, and `constant_value` will not
+# call a column constant without one. So a join against an aggregate over a constant key saw
+# "min == max == 7, nullability unknown", the skip above never engaged, and the PUSHDOWN phase
+# cycled for its whole budget. The fix derives the count instead
+# (`aggregate_columns._grouped_key_null_count`), which pins the key as constant and lets the
+# same inference fire here — so these hold the answers against the oracle on the shapes the
+# newly-visible statistic can now reach.
+#
+# `NUL` carries nulls in the group key on purpose: the derivation treats "no nulls in" and
+# "nulls in" differently, and a mistake in either direction changes which rows a `GROUP BY`
+# emits and which of them a join then matches.
+NUL = pa.table({"k": [7, 7, None, None, 9], "v": [1, 2, 3, 4, 5]})
+
+
+@pytest.mark.differential
+@pytest.mark.parametrize(
+    "query",
+    [
+        # The shape that cycled: a relation joined to an aggregate over its own constant key.
+        "SELECT f.k, f.v, g.c FROM fact f JOIN (SELECT k, count(*) AS c FROM dim GROUP BY k) g "
+        "ON f.k = g.k",
+        # The aggregate on the left, so the mirror runs the other way.
+        "SELECT f.k, f.v, g.c FROM (SELECT k, count(*) AS c FROM dim GROUP BY k) g JOIN fact f "
+        "ON g.k = f.k",
+        # The group key genuinely holds nulls: `GROUP BY` emits one null group, which the
+        # equi-join must then drop. A derivation claiming "no nulls" would keep it.
+        "SELECT g.k, g.c FROM (SELECT k, count(*) AS c FROM nul GROUP BY k) g",
+        "SELECT f.k, f.v, g.c FROM fact f JOIN (SELECT k, count(*) AS c FROM nul GROUP BY k) g "
+        "ON f.k = g.k",
+        # An outer join against the aggregate keeps its unmatched rows, null group included.
+        "SELECT f.k, f.v, g.c FROM fact f LEFT JOIN (SELECT k, count(*) AS c FROM nul GROUP BY k) "
+        "g ON f.k = g.k",
+        # A multi-key group, where a null in one key is not pinned to a single output row.
+        "SELECT g.k, g.label, g.c FROM "
+        "(SELECT k, label, count(*) AS c FROM dim GROUP BY k, label) g",
+        # Counting through the join, so a dropped or duplicated group shows up as a number.
+        "SELECT count(*) AS n, sum(f.v) AS s FROM fact f JOIN "
+        "(SELECT k, count(*) AS c FROM dim GROUP BY k) g ON f.k = g.k",
+    ],
+)
+def test_aggregate_key_inference_preserves_results(duck, star, query):
+    duck.register("nul", NUL)
+    assert_same(bt.sql(query, dim=DIM, fact=FACT, dim2=DIM2, nul=NUL).collect(), duck.sql(query))

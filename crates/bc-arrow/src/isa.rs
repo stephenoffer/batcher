@@ -100,6 +100,7 @@ impl IsaFeatures {
     /// SVE is reported as 16 because its register width is implementation-defined and not
     /// discoverable through this interface — sizing to the guaranteed minimum is the correct
     /// conservative answer.
+    #[must_use]
     pub fn vector_bytes(&self) -> usize {
         if self.avx512f {
             64
@@ -119,6 +120,7 @@ impl IsaFeatures {
     /// license-frequency penalty, and every Skylake-derived part (which has it at its worst)
     /// lacks the bit. Treat a `true` here as "worth benchmarking the 512-bit override on this
     /// host", never as "the engine should widen automatically".
+    #[must_use]
     pub fn avx512_is_cheap(&self) -> bool {
         self.avx512f && self.avx512vpopcntdq
     }
@@ -127,6 +129,7 @@ impl IsaFeatures {
     ///
     /// Deliberately coarse: it names the dispatch tier a kernel would pick, not the full
     /// feature vector, so it stays comparable across hosts in an aggregated metric.
+    #[must_use]
     pub fn tier(&self) -> &'static str {
         if self.avx512f {
             "avx512"
@@ -150,6 +153,7 @@ impl IsaFeatures {
     /// Every detected capability by name, sorted, for reporting.
     ///
     /// Sorted so two hosts' lists diff cleanly and a golden test can pin one.
+    #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         for (present, name) in [

@@ -13,17 +13,16 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.kyber.rules.exprs.numeric import _int_lit
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Expr, MathExpr
-from batcher.plan.expr_ir.core import Math2Expr
+from batcher.plan.expr_ir.core import Math2Expr, int_literal
 from batcher.plan.logical import Filter, LogicalPlan, Project
 
 __all__ = ["round_with_zero_digits"]
 
 
 def _round_zero_digits(expr: Expr) -> Expr:
-    if isinstance(expr, Math2Expr) and expr.fn == "round" and _int_lit(expr.right) == 0:
+    if isinstance(expr, Math2Expr) and expr.fn == "round" and int_literal(expr.right) == 0:
         return MathExpr("round", expr.left)
     return expr
 

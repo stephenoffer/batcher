@@ -54,8 +54,13 @@ ray = ["ray[default]>=2.9"]
 # Optional fallback backends + benchmark oracles (NOT part of the core engine).
 polars = ["polars>=1.0"]
 duckdb = ["duckdb>=1.0"]
-# Pluggable MetadataHub backends.
+# Pluggable MetadataHub backends, and the shared result-cache backends behind the same
+# two drivers: `redis` covers both the cluster-shared statistics store and the shared
+# result cache, `rocksdb` covers the embedded ones. `rocksdict` rather than `python-rocksdb`
+# because it ships prebuilt wheels for every platform the engine targets, where the latter
+# needs a local RocksDB toolchain to install at all.
 redis = ["redis>=5"]
+rocksdb = ["rocksdict>=0.3"]
 # One extra that covers every object store the filesystem façade routes to fsspec: S3,
 # GCS, Azure (`adlfs` — `az://`, and the fallback for `abfs://` when pyarrow is built
 # without its native Azure backend), and HTTP(S) presigned URLs (`aiohttp`). Without adlfs
@@ -64,6 +69,13 @@ cloud = ["fsspec", "s3fs", "gcsfs", "adlfs", "aiohttp"]
 # OpenTelemetry span export (observability.otel_traces). Only the API is needed to emit;
 # the host app owns the SDK + OTLP exporter that ships spans to its collector.
 otel = ["opentelemetry-api>=1.20"]
+# --- Key stores for a secret reference (io.secret_backends) ---
+# `vault:` needs nothing: Vault's KV read is one authenticated GET, answered with urllib,
+# and this module is in the import path of every connector. The cloud stores need their
+# vendor SDK, imported only when that scheme is actually used.
+aws-secrets = ["boto3>=1.34"]
+gcp-secrets = ["google-cloud-secret-manager>=2.16"]
+azure-secrets = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
 tensorflow = ["tensorflow>=2.15"]
@@ -133,6 +145,10 @@ xgboost = ["xgboost>=2"]
 lightgbm = ["lightgbm>=4"]
 catboost = ["catboost>=1.2"]
 onnx = ["onnxruntime>=1.17"]
+# Scoring a model straight out of an MLflow registry by URI (`ds.ml.predict` with a
+# `models:/` or `runs:/` reference). The pyfunc flavor covers every logged model, so one
+# adapter serves sklearn/XGBoost/LightGBM/PyTorch alike.
+mlflow = ["mlflow>=2.9"]
 sklearn = ["scikit-learn>=1.3", "joblib>=1.3"]
 # --- Local model runtimes for an exported deep model (batcher.ml.*_predictor) ---
 # `onnx` above covers the ONNX graph path, and TensorRT with it: TensorRT is reached as an
@@ -224,7 +240,7 @@ docs = [
     "sphinx-copybutton>=0.5",
 ]
 all = [
-    "batcher-engine[ray,polars,duckdb,redis,cloud,torch,tensorflow]",
+    "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow]",
     "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
     "batcher-engine[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
 ]

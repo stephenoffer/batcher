@@ -71,6 +71,7 @@ from batcher.plan.logical import (
 from batcher.plan.source_stats import SourceStatistics, source_stats_key
 from batcher.plan.stats import (
     ColumnStat,
+    LazyColumns,
     Provenance,
     RelStats,
     SortOrder,
@@ -1049,7 +1050,12 @@ class StatsEstimator:
         # removes/duplicates rows but invents no value); never EXACT. The output row
         # count caps each carried-forward `ndv`, so a join above a join still knows its
         # key distinct counts (see `col_prop.join_columns`).
-        columns = col_prop.join_columns(node, left, right, rows)
+        # Deferred: join ordering prices thousands of candidate joins and reads only
+        # `.rows` from each, so propagating every output column's statistics for a
+        # candidate that loses is work nothing ever looks at. `LazyColumns` builds them on
+        # the first read, which for a surviving plan is the moment the level above asks for
+        # its key statistics.
+        columns = LazyColumns(lambda: col_prop.join_columns(node, left, right, rows))
         return RelStats(rows, provenance, columns)
 
     def _join_rows(self, node: Join, left: RelStats, right: RelStats) -> tuple[float, Provenance]:

@@ -30,13 +30,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import sys
 import threading
 import time
+from pathlib import Path
 
 import batcher as bt
 from batcher.config import active_config, set_config
 from sources import tables as src
 from suites.standard.tpch import QUERIES
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 # Join shapes that isolate one cost each: the join alone, the join plus a payload gather, and
 # the join plus a grouped aggregate. Subtracting them attributes the time.
@@ -192,6 +198,17 @@ def cmd_mem(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--scale", type=float, default=10.0)
     p.add_argument("--repeat", type=int, default=3)

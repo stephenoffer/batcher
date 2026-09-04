@@ -225,6 +225,7 @@ pub fn rhumb_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f6
 /// including one spanning a hemisphere, where projecting to a plane first and taking
 /// the shoelace area is wrong by an unbounded factor. Sign is dropped: the caller asked
 /// for an area.
+#[must_use]
 pub fn ring_area_m2(ring: &[Coord]) -> f64 {
     if ring.len() < 3 {
         return 0.0;
@@ -248,6 +249,7 @@ pub fn ring_area_m2(ring: &[Coord]) -> f64 {
 }
 
 /// The geodesic area of a whole geometry in square metres, holes subtracted.
+#[must_use]
 pub fn geodesic_area_m2(g: &crate::types::Geometry) -> f64 {
     crate::types::measurement(
         g.polygons()

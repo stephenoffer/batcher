@@ -47,7 +47,7 @@ def test_a_list_of_files_still_reads_exactly_those(two_runs):
 
 def test_a_file_named_twice_is_read_once(two_runs):
     a, _ = two_runs
-    one = sorted(os.path.join(a, f) for f in os.listdir(a) if f.endswith(".parquet"))[0]
+    one = min(os.path.join(a, f) for f in os.listdir(a) if f.endswith(".parquet"))
     # The directory already covers the file, so naming both must not double its rows.
     assert _values(bt.read.parquet([a, one])) == [1, 2]
 

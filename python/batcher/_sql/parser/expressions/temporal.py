@@ -8,17 +8,18 @@ Each entry is a name a migrating DuckDB or Spark query types (`strptime`, `to_ti
 `epoch_ms`, `make_timestamp`, `time_bucket`) mapped onto the engine node that already
 implements it. Nothing here invents a semantic: where DuckDB's answer depends on a session
 time zone (`to_timestamp` returns TIMESTAMPTZ, `make_timestamptz`) the instant is the same
-but the rendering is not, and where the bucket origin is a calendar unit rather than a
-fixed width (`time_bucket(INTERVAL 1 MONTH, ...)`) the call is refused rather than answered
-with an epoch-aligned bucket that is off by DuckDB's 2000-01-01 origin.
+but the rendering is not, and a calendar bucket width
+(`time_bucket(INTERVAL 1 MONTH, ...)`) is answered on the *month index* rather than on an
+epoch-aligned microsecond width, which no number of microseconds can express.
 """
 
 from __future__ import annotations
 
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.expressions.lowering.buckets import time_bucket
 from batcher.plan.expr_ir import Binary, Cast, Expr, lit
-from batcher.plan.expr_ir.func_nodes import DateOffset, WindowStart
+from batcher.plan.expr_ir.func_nodes import DateOffset
 from batcher.plan.functions.temporal import (
     current_timestamp,
     from_epoch,
@@ -88,28 +89,6 @@ _JAVA_PATTERN = [
 # day that *contains* the instant, which is a half-day later.)
 _JULIAN_EPOCH = 2440588.0
 
-# `time_bucket` widths, in microseconds, for the fixed-length interval units. MONTH and
-# larger are absent on purpose: DuckDB aligns calendar buckets to 2000-01-01, which an
-# epoch-aligned width cannot express.
-_BUCKET_MICROS = {
-    "DAY": MICROS_PER_DAY,
-    "HOUR": 3_600_000_000,
-    "MINUTE": 60_000_000,
-    "SECOND": 1_000_000,
-    "MILLISECOND": 1_000,
-    "MICROSECOND": 1,
-}
-
-# DuckDB anchors `time_bucket` at 2000-01-03 00:00:00, not at the Unix epoch; that is
-# 10,959 days later. `WindowStart` is epoch-anchored, so the two agree only when the bucket
-# width divides the gap between the origins evenly — which is why the units above looked
-# correct: 1 DAY, 2 HOUR and 5 MINUTE all do. A width that does not (2 DAY, 7 DAY) puts
-# every boundary on the wrong instant, silently: `time_bucket(INTERVAL 2 DAY, DATE
-# '2021-01-01')` answered 2021-01-01 where DuckDB answers 2020-12-31, and a whole week's
-# rows land in the neighbouring bucket. Such a width is refused, the same way MONTH already
-# is, rather than answered with a shifted grid.
-_BUCKET_ORIGIN_MICROS = 10_959 * MICROS_PER_DAY
-
 
 def temporal_function(tr, node) -> Expr | None:
     """Translate a temporal construction call, or None when the name is not one of them."""
@@ -138,7 +117,7 @@ def temporal_function(tr, node) -> Expr | None:
         return None
 
     if isinstance(node, exp.DateBin):  # time_bucket(INTERVAL n unit, ts)
-        return _time_bucket(tr, node)
+        return time_bucket(tr, node)
 
     built = _spark_temporal(tr, node)
     if built is not None:
@@ -421,22 +400,40 @@ def _unix_to_time(tr, node) -> Expr:
     if key not in _SCALE_UNIT:
         raise NotImplementedError(f"epoch scale {key} is not supported; use 0 (seconds), 3, 6 or 9")
     unit = _SCALE_UNIT[key]
-    if _is_integer_literal(node.this) or _is_integer_column(tr, node.this):
-        return from_epoch(tr._scalar(node.this), unit)
-    return getattr(tr._scalar(node.this).dt, _UNIT_EPOCH_METHOD[unit])()
+    value = tr._scalar(node.this)
+    if _reads_as_integer(tr, value, node.this):
+        return from_epoch(value, unit)
+    return getattr(value.dt, _UNIT_EPOCH_METHOD[unit])()
 
 
-def _is_integer_column(tr, node) -> bool:
-    """True when `node` is a column the plan says is an integer.
+def _reads_as_integer(tr, value: Expr, node) -> bool:
+    """Whether `epoch_ms`'s argument is a count to build from, rather than a time to read.
 
-    `epoch_ms(n)` on an integer *column* is the constructor just as much as on an integer
-    literal, and reading the AST alone cannot tell: the column reference looks the same
-    either way, so it took the extraction reading and answered 0 for every row.
+    Asked of the argument's *inferred type*, not of its syntax. The syntactic reading — a
+    bare integer literal, or a bare column the scope calls an integer — could not see past
+    either one: `epoch_ms(n * 1000)`, `epoch_ms(n + 0)`, `epoch_ms(abs(n))` and
+    `epoch_ms(CAST(n AS BIGINT))` all took the *extraction* branch on an integer column and
+    silently returned a meaningless number where DuckDB builds a timestamp. Inference
+    answers all four, because it is the same analysis `Dataset.schema` is answered from
+    rather than a second statement of what an integer expression looks like.
+
+    The syntactic check survives only as the fallback for when inference is uncertain
+    (`None`), so the behavior can improve but never regress.
+
+    Args:
+        tr: The translator, for its scope types.
+        value: The built argument expression.
+        node: The argument's AST node, for the fallback.
+
+    Returns:
+        True to read the argument as an epoch count.
     """
     import pyarrow as pa
 
-    t = tr.column_type(node)
-    return t is not None and pa.types.is_integer(t)
+    inferred = tr.expr_type(value)
+    if inferred is not None:
+        return pa.types.is_integer(inferred) or pa.types.is_floating(inferred)
+    return _is_integer_literal(node)
 
 
 def _is_integer_literal(node) -> bool:
@@ -450,27 +447,12 @@ def _is_integer_literal(node) -> bool:
     return False
 
 
-def _time_bucket(tr, node) -> Expr | None:
-    """`time_bucket(INTERVAL n unit, ts)` → the start of the bucket containing each row."""
-    interval = node.this
-    if not isinstance(interval, exp.Interval):
-        return None
-    unit = (interval.text("unit") or "DAY").upper().removesuffix("S")
-    micros = _BUCKET_MICROS.get(unit)
-    if micros is None:
-        return None
-    width = int(interval.this.name) * micros
-    if width <= 0:
-        return None
-    if _BUCKET_ORIGIN_MICROS % width:
-        raise NotImplementedError(
-            f"time_bucket(INTERVAL {interval.this.name} {unit}, ...) is not supported: "
-            "buckets here start from the Unix epoch, DuckDB starts them from 2000-01-03, "
-            "and this width does not divide the gap — every boundary would land on a "
-            "different instant. Use a width that divides a day evenly (1 DAY, 6 HOUR, "
-            "15 MINUTE), or date_trunc for calendar buckets"
-        )
-    return WindowStart(tr._scalar(node.expression), width)
+def _epoch_cell(value: Expr, micros: int) -> Expr:
+    """Which `micros`-wide cell of the epoch grid `value` falls in."""
+    epoch_us = Cast(value, "timestamp").dt.epoch_us()
+    if micros == 1:
+        return epoch_us
+    return Binary("floor_div", epoch_us, lit(micros))
 
 
 #: Fixed-width `date_diff` units, in microseconds.
@@ -512,14 +494,6 @@ _DIFF_FIELD = {"DECADE": "decade", "ISOYEAR": "iso_year"}
 #: readings agree everywhere except across the year-1 boundary, which is exactly the kind
 #: of divergence a plausible answer hides.
 _DIFF_YEAR_SCALE = {"CENTURY": 100, "MILLENNIUM": 1000}
-
-
-def _epoch_cell(value: Expr, micros: int) -> Expr:
-    """Which `micros`-wide cell of the epoch grid `value` falls in."""
-    epoch_us = Cast(value, "timestamp").dt.epoch_us()
-    if micros == 1:
-        return epoch_us
-    return Binary("floor_div", epoch_us, lit(micros))
 
 
 def _date_diff(tr, node) -> Expr:

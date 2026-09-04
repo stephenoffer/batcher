@@ -28,14 +28,20 @@ import argparse
 import datetime as _dt
 import os
 import shutil
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 import pyarrow as _pa
 
 import batcher as bt
 from batcher.config import option_context
 from batcher.io.formats.streaming.checkpoint import state_store
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from envinfo import machine_fingerprint, require_quiet_box, require_release_build
 
 #: Rows per micro-batch. One group per row, so the state grows by this much every epoch —
 #: the high-cardinality shape a changelog exists for.
@@ -133,6 +139,17 @@ def _windowed(checkpoint: str, epochs: int, interval: int, keys: int = 200) -> i
 
 def main() -> None:
     """Measure both checkpoint policies across a range of run lengths and print a table."""
+    # Refuse to time a dev-profile engine: it is 8-60x slower, so a number taken from one
+    # compares an unoptimized Batcher against release competitors. `BENCH_ALLOW_DEBUG_BUILD=1`
+    # overrides deliberately.
+    require_release_build()
+    # Print the machine before any number: a timing is only reproducible beside the
+    # box that produced it, and this file's own history has ratios quoted across four
+    # different machines as if they were comparable.
+    print(machine_fingerprint())
+    # ...and refuse a contended one: a neighbour's load is not a fact about any
+    # engine. `BENCH_ALLOW_BUSY_BOX=1` overrides.
+    require_quiet_box()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--epochs",

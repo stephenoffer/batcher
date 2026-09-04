@@ -146,8 +146,24 @@ try:
     ds.select("nope").to_pydict()
 except bt.BatcherError as exc:
     print(type(exc).__name__, "-", exc)
-# PlanError - projection 'nope' references unknown column(s) ['nope']; available: ['x', 'y']
+# ColumnNotFoundError - projection 'nope' references unknown column(s) ['nope'] Available columns: 'x', 'y'
 ```
+
+A near miss on a real column names the one you meant, whichever verb you typed it into:
+
+```python
+try:
+    ds.filter(bt.col("yy") > 1).to_pydict()
+except bt.ColumnNotFoundError as exc:
+    print(exc)
+# filter references unknown column(s) ['yy'] Did you mean 'y'? Available columns: 'x', 'y'
+```
+
+The available columns are truncated rather than listed in full, so a miss against a
+400-column table does not bury the error under the schema it is complaining about. When you
+want the whole list, it is on the exception as `.available` -- along with `.column`,
+`.suggestion` and `.hint`, which is what a script should read. The rendered sentence is for
+people and may be reworded; the fields are the contract.
 
 Catch a narrower type when you want to react differently. The catchable types are all
 reachable as `bt.<Name>`:

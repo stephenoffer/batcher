@@ -341,6 +341,7 @@ pub(crate) fn analyze(
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
         Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
         Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),
+        Expr::MakeMap { .. } => Err(CodegenError::Unsupported("map construction".into())),
         Expr::ListJoin { .. } => Err(CodegenError::Unsupported("list join".into())),
         Expr::Math { func, input } => {
             use bc_expr::MathFunc::*;
@@ -355,9 +356,15 @@ pub(crate) fn analyze(
                 // matching the interpreter's `eval_math`. Integer `abs(i64::MIN)` saturates
                 // to i64::MAX in both tiers (see `emit.rs` / `eval/math.rs`).
                 Abs => Ok(inner),
-                // floor/ceil/sqrt/trunc always produce f64 (ints are promoted to
-                // f64 first, exactly as the interpreter does via `cast`).
-                Floor | Ceil | Sqrt | Trunc => Ok(ScalarTy::F64),
+                // `trunc` preserves the input type for the same reason `abs` does: truncating an
+                // integer yields that integer. Promoting to f64 first agreed with the
+                // interpreter but both were wrong above 2^53, where the promotion loses the
+                // low bit — the tiers matched each other and neither matched arithmetic.
+                Trunc => Ok(inner),
+                // floor/ceil/sqrt genuinely do produce f64 (ints are promoted to
+                // f64 first, exactly as the interpreter does via `cast`), and DuckDB
+                // returns DOUBLE for them too.
+                Floor | Ceil | Sqrt => Ok(ScalarTy::F64),
                 // The transcendentals lower to a libm libcall (see
                 // `libm_unary_symbol`); the int input is promoted to f64 first,
                 // exactly as the interpreter does, so the result is f64.

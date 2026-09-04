@@ -81,12 +81,12 @@ class XGBoostAdapter(BaseAdapter):
             return super().output_width(model, method, n_features)
         classes = _xgboost_num_class(model)
         if method == "contrib":
-            return (n_features + 1) * (classes if classes > 1 else 1)
+            return (n_features + 1) * (max(1, classes))
         if method == "leaf":
             rounds = _xgboost_rounds(model)
-            return None if rounds is None else rounds * (classes if classes > 1 else 1)
+            return None if rounds is None else rounds * (max(1, classes))
         if method in ("predict", "raw"):
-            return classes if classes > 1 else 1
+            return max(1, classes)
         return super().output_width(model, method, n_features)
 
     def predict(self, model: Any, matrix: np.ndarray, method: str, options: dict[str, Any]) -> Any:

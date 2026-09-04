@@ -104,6 +104,12 @@ def test_relational_explain_is_byte_identical() -> None:
     The fallback branch only triggers on a `map_batches` plan; a lowerable plan must render
     exactly as this string.
 
+    The layout is a box-drawing tree with fixed-width columns, and it is byte-stable across
+    terminal widths *for this plan*: the numeric columns are sized from their own content and
+    the operator column is capped at the widest label, so nothing here depends on the window
+    it was rendered in. A plan wide enough to need truncating does depend on it, which is why
+    this fixture is small.
+
     The filter's estimate reads 3 rather than the 1 this test originally captured, and 3 is the
     number of rows the filter actually keeps. Two changes got it there. `explain()` used to plan
     *without* per-source statistics, so it showed a different plan than `collect()` runs and every
@@ -123,11 +129,19 @@ def test_relational_explain_is_byte_identical() -> None:
     The scan carries a `pushed[...]` note because the plan hands `a > 1` to the source to
     apply for itself. It says what was *offered*, not what the source did with it — an
     in-memory source ignores it entirely, and the `Filter` above is kept regardless.
+
+    Each operator also carries a bracketed description of what *it* does — the group keys
+    and aggregates, the predicate, the source. Without it a plan with four joins printed
+    four identical `hash_join` lines, which is the first question anyone asks of a join
+    tree. It is the same describer the web dashboard labels its plan nodes with, so the
+    two cannot drift into showing the same operator two ways.
     """
     expected = (
-        "aggregate                       est≈3 (default)\n"
-        "  filter                        est≈3 (default)\n"
-        "    scan                        est≈4 (exact) pushed[a > 1]"
+        "query plan (planned)                          3 operators\n" + "\u2500" * 57 + "\n"
+        "OPERATOR                 ESTIMATE  NOTES\n"
+        "aggregate  [by a \u00b7 sum]     est\u22483  (default)\n"
+        "\u2514\u2500 filter  [a > 1]          est\u22483  (default)\n"
+        "   \u2514\u2500 scan  [source 0]      est\u22484  (exact)  pushed[a > 1]"
     )
     assert _relational_plan().explain() == expected
 

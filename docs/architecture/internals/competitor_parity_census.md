@@ -1113,6 +1113,50 @@ family: `map(...)` has no constructor, which is what blocks ten Spark names at o
 fail on the *argument*, not the function). That is the next wave's highest-value single
 item.
 
+**Re-probed 2026-09-01, and the paragraph above is wrong in the way it warns about.** Every
+claim below was run through `bt.sql`, not read:
+
+* **The map constructor exists.** ``SELECT map_from_arrays([1,2],['a','b'])`` returns
+  ``[(1, 'a'), (2, 'b')]``. `map_keys`, `map_values` and `map_entries` all run. So the ten
+  names do **not** fail on the argument; six of them fail on the *function*, and four
+  already work.
+* **The remaining family is six, not ten**: `map_concat`, `map_from_entries`, `map_filter`,
+  `map_zip_with`, `transform_keys`, `transform_values`.
+* **Lambdas are not the blocker either.** ``list_transform([1,2], x -> x+1)`` and
+  ``list_filter([1,2], x -> x>1)`` both run, so `map_filter`, `map_zip_with`,
+  `transform_keys` and `transform_values` are a *wiring* gap over a mechanism that exists,
+  not a design gap. That makes them cheaper than this entry has been claiming, not dearer.
+* **`map_concat` is *not* a composition of existing kernels, and the check that says so is
+  the oracle.** The composition
+
+  ```sql
+  SELECT map_from_arrays(list_concat(map_keys(m1), map_keys(m2)),
+                         list_concat(map_values(m1), map_values(m2)))
+  ```
+
+  returns ``[(1, 'a'), (2, 'b'), (3, 'c')]`` for two maps with **disjoint** keys, which is
+  what made it look finished. On *overlapping* keys it raises: `map_from_arrays` refuses a
+  duplicate key ("map keys must be unique"), while DuckDB's
+  ``map_concat(MAP([1],['a']), MAP([1],['b']))`` returns ``{1: 'b'}`` -- it merges, keeping
+  the last. So the composition is not `map_concat`; it is `map_concat` for the one input
+  shape nobody writes it for.
+
+  What is actually missing is a **dedup-keeping-last over two aligned lists**, which no
+  kernel here provides. That is the real item, it is smaller than "a map family", and it
+  would close `map_from_entries` at the same time -- DuckDB refuses duplicates there, which
+  the current constructor already does, so `map_from_entries` needs only the entry-list
+  unzip. Recording this rather than the composition because the composition was written
+  into this file first and only then run against DuckDB, which is the wrong order.
+* **`time_bucket` and `generate_series` already run** and are listed as open in entry 6.
+* Re-probed and **complete, with no gaps**: the string/regex family
+  (`regexp_split_to_array`, `translate`, `levenshtein`, `jaro_similarity`) and the temporal
+  family (`date_diff`, `last_day`, `make_date`, `to_timestamp`). `list_reduce` and `row`
+  remain missing.
+
+Three of this section's own entries were stale, which is the third time this file has
+recorded that about itself. The instruction below is therefore not boilerplate: **probe
+before working from any line here.**
+
 **Re-check this list against the code before working from it.** On 2026-07-30 two of its six
 entries were already closed — entry 5's `ds.rollup`/`cube`/`grouping_sets` had shipped in
 `api/multi_group.py`, and entry 1 was closed the same day — and the same pass found three of

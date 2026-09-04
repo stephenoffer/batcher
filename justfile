@@ -124,6 +124,13 @@ surface-save path="/tmp/batcher-surface.json":
 surface-diff path="/tmp/batcher-surface.json":
     python tools/surface_snapshot.py --diff {{path}}
 
+# Regenerate the lazy re-export routing tables (`python/batcher/_exports.py`). The three
+# public facades — `batcher`, `batcher.api`, `batcher.api.session` — resolve their names
+# through it, so `import batcher` costs 5 ms instead of 545. Run after adding or renaming
+# a public name; `tests/unit/test_lazy_exports.py` fails when the committed table is stale.
+gen-exports:
+    python tools/gen_lazy_exports.py
+
 # Regenerate MAP.md — the file-level index of what every module is for. It is derived
 # from each module's own docstring and each crate's manifest, so it cannot drift; run
 # this after adding, moving, or re-documenting a module. `--check` runs in CI.
@@ -134,6 +141,12 @@ map:
 # *wrong* way to share between them — this is what catches it.
 lint-duplication:
     python tools/lint_duplication.py
+
+# The installed engine must not predate the Rust it is supposed to contain. Nothing else
+# catches a stale `_native.abi3.so`: it passes every lint gate, `just docs`, and most of
+# `test-py`, so the suite goes green while validating an engine that does not match the tree.
+lint-build-freshness:
+    python tools/lint_build_freshness.py
 
 # The agent-facing docs (CLAUDE.md, .claude/rules, .claude/skills) must stay TRUE: every path
 # and `just` recipe they name has to exist. Guidance pointing at a file that is not there is
@@ -177,6 +190,20 @@ lint-rule-order:
 lint-tests:
     python tools/lint_tests.py
 
+# Gates that report a success they did not measure. `lint-tests` catches the test that
+# CANNOT fail; this catches the neighbouring, harder case — the test, example or benchmark
+# that can fail but has been arranged so that it does not. Every finding here runs real
+# code, takes real time, and turns green, so reading the output cannot tell it from a
+# working check. First run found 18 (11 high): three SQL differentials comparing an
+# `ORDER BY` result order-blind, two parametrizes over a directory walk that would have
+# turned 510 executed examples into zero tests without failing anything, seven examples
+# asserting nothing, a `pytest.skip` hiding 48 of one test's 98 cases behind a bare
+# `except`, and two absence-assertions with no positive control. It also carries one
+# RATCHET (`benchmark-unguarded-build`, 60) rather than gating on it — a permanently-red
+# gate is one everybody learns to walk past, which is what `skip_budget.json` became.
+lint-methodology:
+    python tools/lint_methodology.py
+
 # Codebase-health report: dead code, near-duplicates, swallowed errors, do-nothing bodies,
 # tests that cannot fail, and ordered results asserted order-independently. A *report*, not a
 # gate — every detector is a heuristic, so the output is triage. Drives the
@@ -212,6 +239,10 @@ example-library:
 docs:
     python tools/example_library.py --check
     sphinx-build -b doctest docs docs/_build/doctest
+    # The doctest builder prints its failures and exits 0, so without this the recipe walks
+    # past them into the HTML build and reports success. Two stale examples got through two
+    # consecutive `just docs` runs that way.
+    python tools/check_doctests.py docs/_build/doctest/output.txt
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
 

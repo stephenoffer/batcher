@@ -19,7 +19,9 @@ and its lineage-recovery contract without a circular import.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
+import threading
 from collections import deque
 from concurrent import futures
 from typing import TYPE_CHECKING
@@ -31,7 +33,6 @@ from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
 from batcher.carbonite.transfer.codec import resolve_codec
 from batcher.kyber.cost.fabric import measured_fabric_gbps
-from batcher.plan.types import total_logical_bytes
 
 if TYPE_CHECKING:
     from batcher.config.config import ShuffleTlsConfig
@@ -156,9 +157,16 @@ def _use_plan(plan_id: int | None) -> None:
     A fleet actor is shared by every query in the session — including, once several
     pipelines run at once, by two queries interleaving calls on it. So the fence cannot
     live in the actor's own state the way it did when a worker served one query at a
-    time: each call carries the id of the query making it. Ray runs an actor's tasks one
-    at a time, so setting it at method entry is sufficient. `None` means a caller that
+    time: each call carries the id of the query making it. `None` means a caller that
     predates the plumbing — keep the actor's spawn-time id.
+
+    Setting it at method entry is sufficient, and the reason is the `ContextVar` rather
+    than Ray's scheduling. This used to rest on "Ray runs an actor's tasks one at a time",
+    which stopped being true when the fleet took a `max_concurrency`
+    (`scheduling.FLEET_CONCURRENCY`) — several calls now run in different threads of the
+    actor's executor. A `ContextVar` is per-context, so each of those threads carries its
+    own value and one query's id cannot retarget another's tickets. A plain module global
+    here would have become a silent cross-query corruption the moment the concurrency rose.
     """
     if plan_id is not None:
         set_current_plan_id(plan_id)
@@ -221,7 +229,13 @@ def _combine_sources(session, gk, aj, sources, replicas=None):
 try:
     import ray
 
-    @ray.remote
+    #: Threads reserved for the worker's control-plane methods, kept out of the pool the
+    #: shuffle's data methods share. Two rather than one so a probe cannot queue behind the
+    #: single other probe already running; far below `FLEET_CONCURRENCY`, because none of
+    #: them does any work worth parallelizing.
+    _CONTROL_THREADS = 2
+
+    @ray.remote(concurrency_groups={"control": _CONTROL_THREADS})
     class _FlightWorker:
         """A Ray actor hosting a Carbonite `ShuffleSession` for one worker slot.
 
@@ -229,6 +243,30 @@ try:
         Carbonite-granted credit window, and reads co-located buckets straight from
         the local store (no loopback). Map/reduce supply opaque partials/partition
         functions; the session is operator-agnostic.
+
+        **The control-plane methods run in their own threads.** A worker takes
+        `max_concurrency = FLEET_CONCURRENCY` and its data methods hold a thread for as long
+        as a shuffle stage takes, so with the whole actor sharing one pool a one-line
+        question queued behind minutes of `map_publish`. That is not a latency nuisance, it
+        is a correctness hazard, because three callers read a slow answer as a *dead worker*
+        or a *missed deadline*:
+
+        * `fleet._fleet` probes every actor's `addr` under a 10-second timeout to decide the
+          warm fleet is still healthy — a saturated worker times out and is discarded.
+        * The drain loop asks `is_draining` at each stage boundary to move a spot worker's
+          output before reclamation. An answer that arrives after the reclamation window has
+          closed is the same as no answer.
+        * The map barrier reads `published_bucket_bytes` to size the reduce against measured
+          skew, on the critical path between the two phases.
+
+        Ray's concurrency groups give those methods their own threads, so the answer is
+        never behind the work it is asking about. Only *reads* are moved, plus `set_grant`,
+        which is two attribute writes on a session already reached from several threads —
+        the split changes which thread touches `self`, never how many, since the actor has
+        been concurrent since it took a `max_concurrency` (see `_use_plan`).
+
+        `concurrency_groups` cannot be passed through `.options()`, so it is stated here
+        rather than in `fleet_actor_options` beside the rest of the actor's grant.
         """
 
         def __init__(
@@ -249,6 +287,7 @@ try:
             port_range: tuple[int, int] | None = None,
             credit_ceiling: int = 0,
             prefer_fabric: bool = False,
+            concurrency: int = 1,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
@@ -281,12 +320,19 @@ try:
             from batcher.carbonite.policies import shuffle_store_cap
             from batcher.config import active_config
 
+            # The gather's shape and its memory bound: how many concurrent Flight streams
+            # this reducer runs across its peers, and the decoded bytes they may hold
+            # between them. Set here rather than left to the engine default so an operator
+            # can trade the two off in one place, as with every other transport tunable.
+            _fc = active_config().flow_control
             nat.set_flight_transport_config(
                 idle_timeout_ms,
                 keepalive_ms,
                 connections_per_peer,
                 compression,
                 shuffle_store_cap(active_config()),
+                _fc.gather_streams,
+                _fc.gather_inflight_bytes,
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
@@ -382,11 +428,25 @@ try:
                 )
             # The driver's EngineConfig (this worker process can't see the driver's
             # config_context), used for every local execute_plan on this actor.
-            self._engine_config = engine_config
-            # Bytes this mapper published per reducer bucket on its last `map_publish`,
-            # so the driver can place each reducer where its bucket is concentrated
-            # (locality-aware scheduling). Overwritten each map; read after the barrier.
+            # How many of this actor's methods may run at once (`fleet_actor_options` sets
+            # the matching `max_concurrency`). It is set before the grant below because it
+            # *divides this worker's memory*: the shipped spill threshold is what one
+            # operation may hold, and this many of them can be resident together. See
+            # `_reduce_budget` and `_share_of_envelope`.
+            self._concurrency = max(1, int(concurrency))
+            self._set_grant_config(engine_config)
+            # Bytes this mapper published per reducer bucket, so the driver can place
+            # each reducer where its bucket is concentrated (locality-aware scheduling).
+            #
+            # Accumulated across **every** map call of the current plan, not overwritten by
+            # the last one. A worker maps more than one partition whenever the shuffle asks
+            # for more of them than there are workers (`map_partitions`), which is the
+            # ordinary case, so overwriting reported one partition's bytes as the whole
+            # worker's and the placement was decided on a fraction of the data. Keyed by
+            # plan id so a warm fleet does not carry one query's figures into the next.
             self._bucket_bytes: dict[int, int] = {}
+            self._bucket_bytes_plan: int | None = None
+            self._bucket_lock = threading.Lock()
             # `ExecMetrics` documents from the sub-plans this worker has run, waiting for
             # the driver to drain them (`drain_metrics`). Bounded: a fleet actor outlives
             # the query that spawned it, and a driver on a path that never drains would
@@ -394,6 +454,7 @@ try:
             # for a *sample* — calibration wants observations, not all of them.
             self._metrics: deque[str] = deque(maxlen=_METRICS_BUFFER)
 
+        @ray.method(concurrency_group="control")
         def addr(self) -> str:
             return self.session.addr
 
@@ -426,6 +487,7 @@ try:
                 self._metrics.append(metrics_json)
             return batches
 
+        @ray.method(concurrency_group="control")
         def drain_metrics(self) -> list[str]:
             """Hand the driver every `ExecMetrics` document collected since the last drain.
 
@@ -445,6 +507,7 @@ try:
             self._metrics.clear()
             return out
 
+        @ray.method(concurrency_group="control")
         def set_grant(self, credits: int, engine_config: str) -> None:
             """Re-grant this worker for the query about to borrow it.
 
@@ -463,8 +526,9 @@ try:
             reliably while the fleet it replaces is still being reaped).
             """
             self.session.set_credits(credits)
-            self._engine_config = engine_config
+            self._set_grant_config(engine_config)
 
+        @ray.method(concurrency_group="control")
         def is_draining(self) -> bool:
             """Whether this worker has seen a spot-preemption notice (reclamation
             imminent). The driver consults this at a stage boundary to migrate the
@@ -474,11 +538,107 @@ try:
 
             return preemption_monitor().is_draining()
 
-        def published_bucket_bytes(self) -> dict[int, int]:
-            """Bytes published per reducer bucket on this mapper's last `map_publish`
-            (for locality-aware reducer placement)."""
-            return dict(self._bucket_bytes)
+        def _set_grant_config(self, engine_config: str) -> None:
+            """Install `engine_config` and derive the per-operation share once.
 
+            Both figures change together and only on a (re-)grant, so `_map_config` is
+            computed here rather than per map call: a shuffle's map stage is
+            `workers x map_partition_multiplier` calls, and re-parsing the config in each of
+            them is work on the hot path for a value that cannot have moved.
+            """
+            self._engine_config = engine_config
+            self._map_config = self._share_of_envelope(engine_config)
+
+        def _share_of_envelope(self, engine_config: str) -> str:
+            """The engine config a **map** call runs under: the envelope, divided by concurrency.
+
+            `_reduce_budget` below divides the shipped spill threshold for exactly this
+            reason, and states it: the envelope is what *one* operation may hold, so a worker
+            running several at once has to give each a share or the fleet's peak memory is
+            multiplied by the concurrency. The map side was outside that argument only
+            because it was not concurrent — `map_barrier` dealt one partition per actor at a
+            time. It now deals `map_slots_per_worker()`, so a mapper's streaming partial
+            state is as multiplied as a reducer's bucket, and gets the same share.
+
+            The reduce reads the *shipped* config and divides the budget it takes out of it,
+            so the two never divide the same number twice.
+
+            Args:
+                engine_config: The grant's engine config JSON, as shipped by the driver.
+
+            Returns:
+                The engine config JSON with `memory_budget_bytes` cut to this operation's
+                share, or the config unchanged when there is nothing to divide (an unbounded
+                budget, or a single-slot actor).
+            """
+            if self._concurrency <= 1:
+                return engine_config
+            budget, _sdir, _codec = _reduce_spill_opts(engine_config)
+            if budget <= 0:
+                return engine_config
+            cfg = json.loads(engine_config)
+            cfg["memory_budget_bytes"] = max(1, budget // self._concurrency)
+            return json.dumps(cfg)
+
+        def _reduce_budget(self) -> tuple[int, str | None, str | None]:
+            """This worker's spill envelope, divided by the operations it runs at once.
+
+            The shipped `memory_budget_bytes` is what **one** reduce may hold before it
+            starts spilling, sized by the driver from the worker's share of its node's RAM.
+            A worker that overlaps several reduces holds that many buckets at the same time,
+            so the per-operation threshold has to be the worker's share divided by them —
+            otherwise raising the concurrency quietly multiplies the fleet's peak memory by
+            it, which is an OOM on the busiest node rather than a slower query.
+
+            Dividing here rather than in `engine_config_json` keeps the two figures doing
+            their own jobs: the envelope stays the honest per-worker *reservation* Ray packs
+            nodes with, and only the spill threshold — the one thing the concurrency
+            actually changes — is scaled. An unbounded budget (`0`) stays unbounded, since
+            there is nothing to divide.
+            """
+            budget, sdir, codec = _reduce_spill_opts(self._engine_config)
+            if budget > 0 and self._concurrency > 1:
+                budget = max(1, budget // self._concurrency)
+            return budget, sdir, codec
+
+        def _record_bucket_bytes(self, sizes: dict[int, int]) -> None:
+            """Fold one map call's per-bucket byte counts into this plan's running totals.
+
+            Locked because a worker may map several partitions at once, and a read-modify-
+            write of a shared dict is not atomic under a threaded actor executor. The lock
+            is held for a dict update per bucket, never across the publish itself.
+            """
+            with self._bucket_lock:
+                plan = current_plan_id()
+                if plan != self._bucket_bytes_plan:
+                    self._bucket_bytes = {}
+                    self._bucket_bytes_plan = plan
+                for r, nbytes in sizes.items():
+                    self._bucket_bytes[r] = self._bucket_bytes.get(r, 0) + nbytes
+
+        @ray.method(concurrency_group="control")
+        def published_bucket_bytes(self) -> dict[int, int]:
+            """Bytes this mapper published per reducer bucket, over the whole map phase.
+
+            Summed across every partition this worker mapped for the current plan — see
+            `__init__` for why the last one alone is the wrong figure. Read by the driver
+            after the map barrier, so every contributing call has already returned.
+            """
+            with self._bucket_lock:
+                return dict(self._bucket_bytes)
+
+        @ray.method(concurrency_group="control")
+        def set_shm_peers(self, has_peer: bool) -> None:
+            """Record whether another worker process shares this worker's node.
+
+            Only the driver can know this: it is the one holding every worker's advertised
+            address, and two workers share a node exactly when those addresses' hosts match.
+            Set once per fleet, right after the addresses are collected. See
+            `ShuffleSession._shm_mirror_ok` for what it turns off and what that is worth.
+            """
+            self.session.set_shm_peers(has_peer)
+
+        @ray.method(concurrency_group="control")
         def node_id(self) -> str:
             """The Ray node this worker's actor landed on — for locality routing and
             observing how well the placement group spread the fleet."""
@@ -510,6 +670,7 @@ try:
             parts = [int(p) for p in str(ticket).split("/")]
             self.session.release(ShuffleTicket(*parts))
 
+        @ray.method(concurrency_group="control")
         def partition_count(self) -> int:
             """How many buckets this worker still holds.
 
@@ -550,7 +711,15 @@ try:
             # mapped output — the #1 distributed memory peak. Mergeable: the folded
             # per-chunk partials equal one partial over the whole partition.
             partial = streaming_partial_aggregate(
-                nat, map_ir, gk, aj, iter_partition_descriptor(partition), self._engine_config
+                nat,
+                map_ir,
+                gk,
+                aj,
+                iter_partition_descriptor(partition),
+                self._map_config,
+                # The buffer the driver drains after its barrier. Without it this map side
+                # measured every chunk and discarded all of it.
+                on_metrics=self._metrics.append,
             )
             if n_keys == 0:
                 buckets = [[partial]]
@@ -560,16 +729,21 @@ try:
             # only mean a lost worker, never a legitimately empty bucket — the clean
             # signal the recompute loop keys on. Record each bucket's bytes for
             # locality-aware reducer placement.
-            self._bucket_bytes = {}
+            sizes: dict[int, int] = {}
             for r in range(n_reducers):
                 bucket = buckets[r] if r < len(buckets) else []
-                self.session.publish(_ticket(stage_base, src, r, epoch), bucket)
-                # `nbytes`, deliberately, where the memory guards nearby use
+                # `publish` returns the byte count it had to compute anyway; asking
+                # `total_logical_bytes` again here walked every bucket a **second** time,
+                # under the GIL, on a worker running several map calls at once. Sampled on a
+                # worker mid-query, that walk was 8.4% of the process's Python time.
+                #
+                # It is the *logical* size, deliberately, where the memory guards nearby use
                 # `plan.types.retained_bytes`: this figure predicts what a reducer will
                 # *pull over the wire*, and Arrow IPC writes only the rows a batch
                 # addresses. A window's pinned parent costs this worker memory (which the
                 # store's own cap governs) but costs the transfer nothing.
-                self._bucket_bytes[r] = total_logical_bytes(bucket)
+                sizes[r] = self.session.publish(_ticket(stage_base, src, r, epoch), bucket)
+            self._record_bucket_bytes(sizes)
             return self.session.addr
 
         def replicate_buckets(
@@ -647,7 +821,7 @@ try:
                 (addr, _ticket(stage_base, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(mapper_addrs)
             ]
-            budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
+            budget, _sdir, _codec = self._reduce_budget()
             if budget > 0:
                 # Bounded reduce: never assemble the whole bucket in RAM (a high-cardinality
                 # bucket would OOM the in-memory fold). Stage each mapper's partial to disk
@@ -671,7 +845,7 @@ try:
             from batcher.dist.shuffle_io import read_ipc
 
             nat = engine()
-            budget, sdir, codec = _reduce_spill_opts(self._engine_config)
+            budget, sdir, codec = self._reduce_budget()
             work = _reduce_work_dir("bc_flight_reduce_", sdir)
             try:
                 paths, unreachable = self.session.gather_to_files(sources, work, replicas=replicas)
@@ -764,6 +938,30 @@ try:
             nat = engine()
             running = _combine_sources(self.session, gk, aj, sources, replicas)
             return None if running is None else nat.combine_finalize(gk, aj, [running])
+
+        def combine_finalize_publish(
+            self, gk, aj, sources, replicas=None, reducer_id=0, result_stage=_RESULT_STAGE
+        ):
+            """Like `combine_finalize_fetch`, but PUBLISH the bucket and return a handle.
+
+            The tree root's twin of `reduce_fetch_publish`, and the reason the two now exist
+            in parallel is that the flat reduce could keep its output on the workers and the
+            tree could not — so an aggregate wide enough to need a combiner tree, which is
+            every aggregate on a fleet past `shuffle_fan_in` workers, pulled its whole result
+            back through the driver. On a group-by whose output is large that is a serial
+            single-node stage in the middle of a distributed query, and it does not shrink as
+            workers are added: measured on a 150M-group `GROUP BY` at TPC-H sf100, the query
+            flattened at ~7.5s from 16 workers to 64 while the flat-reduce arm below it was
+            still scaling.
+
+            Returns `("ok", handle)` so it composes with `_publish_result`'s empty-bucket
+            rule — an empty bucket publishes nothing and yields no handle, which is a hang
+            rather than a wrong answer if it is ever skipped.
+            """
+            out = self.combine_finalize_fetch(gk, aj, sources, replicas)
+            return self._publish_result(
+                "ok", None if out is None else [out], reducer_id, result_stage
+            )
 
         def _gather_and_run(self, plan_ir, addrs, reducer_id, epochs, replicas, stage):
             """Fetch this reducer's bucket from every mapper, concatenate, run `plan_ir`.
@@ -1029,7 +1227,7 @@ try:
                 (addr, _ticket(stage_base + 1, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
-            budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
+            budget, _sdir, _codec = self._reduce_budget()
             if budget > 0:
                 # Bounded join reduce: never assemble both whole sides in RAM. A skewed or
                 # high-cardinality bucket would OOM the in-memory gather + build (the flight
@@ -1114,7 +1312,7 @@ try:
             from batcher.dist.spill_breakers.join import reduce_join_paths_spilling
 
             nat = engine()
-            budget, sdir, _codec = _reduce_spill_opts(self._engine_config)
+            budget, sdir, _codec = self._reduce_budget()
             spec = json.loads(join_ir)
             left_keys = list(spec.get("left_keys", []))
             right_keys = list(spec.get("right_keys", []))
@@ -1294,6 +1492,12 @@ try:
                 self._engine_config,
                 gk,
                 aj,
+                # Same buffer `_run` fills, drained by the driver after its barrier. Without
+                # it this actor measured every chunk it joined and discarded all of it.
+                on_metrics=self._metrics.append,
+                # This worker's own per-operation grant, so the bound tracks the fan-out and
+                # the actor's concurrency instead of a fixed share of the node.
+                output_budget=self._reduce_budget()[0],
             )
             if not publish:
                 return out
@@ -1513,6 +1717,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
         current_envelope,
         fleet_actor_options,
     )
+    from batcher.dist.executors.ray_runtime.scheduling import FLEET_CONCURRENCY
 
     dc = active_config().distributed
     adaptive = dc.adaptive_credits
@@ -1597,6 +1802,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             port_range,
             ceiling,
             dc.prefer_fabric_interface,
+            FLEET_CONCURRENCY,
         )
         for i in range(workers)
     ]

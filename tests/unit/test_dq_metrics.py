@@ -21,6 +21,7 @@ from batcher.observe.metrics import (
     prometheus_text,
     reset_metrics,
     start_metrics,
+    stop_metrics,
 )
 
 pytestmark = pytest.mark.unit
@@ -28,10 +29,27 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _fresh_counters():
+    """Counters on and reset, and the collector *detached* again on the way out.
+
+    `reset_metrics` alone zeroes the counters and leaves the collector subscribed, and
+    `events.listening()` is global state the engine reads to decide whether optional work is
+    worth doing at all. Without the `stop_metrics` below, this fixture switched that work on
+    for every test running after it in the same process.
+
+    That is not hypothetical here.
+    `test_device_link_and_gds.py::test_nothing_is_probed_when_nobody_is_listening` asserts the
+    *absence* of a GDS probe when nothing is subscribed; once this fixture had run, something
+    was always listening, so that assertion could no longer fail. It passed in file order,
+    where it runs first, and failed only under a reversed run -- which is how it was found. An
+    assertion that quietly stops being able to fail is worse than a missing one, because the
+    suite still reports it as covered. The same reasoning, and the same fix, as the
+    `collecting` fixture in `test_metrics_exposition.py`.
+    """
     start_metrics()
     reset_metrics()
     yield
     reset_metrics()
+    stop_metrics()
 
 
 def _publish(name: str, *, violations: int, ok: bool, rows: int = 100, **extra) -> None:

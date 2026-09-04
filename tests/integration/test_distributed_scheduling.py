@@ -139,6 +139,14 @@ def test_fleet_spawn_failure_releases_placement_group(monkeypatch):
 
     monkeypatch.setattr("batcher.dist.flight_worker.spawn_flight_workers", _fake_spawn)
     monkeypatch.setattr("batcher.dist.executors.ray_runtime.release_placement", released.append)
+    # `ray.wait`, not `ray.get`. `_spawn_fleet_with_addrs` gained a bounded wait for the
+    # workers' Flight addresses — the fix for an unplaceable actor hanging the query on
+    # `ray.get` forever — so the address collection this test injects a failure into no
+    # longer goes through `ray.get` at all. Patching only `get` left `ray.wait` to reject
+    # the fake refs with `TypeError: wait() expected a list of ray.ObjectRef`, which the
+    # `pytest.raises(RuntimeError)` below then failed on: the test was asserting the guard
+    # while never reaching it.
+    monkeypatch.setattr(ray, "wait", _boom)
     monkeypatch.setattr(ray, "get", _boom)
     monkeypatch.setattr(ray, "kill", killed.append)
 
@@ -155,12 +163,16 @@ def test_gpu_autoscale_requests_gpu_bundles(monkeypatch):
     # nodes it cannot run on.
     import ray.autoscaler.sdk as sdk
 
-    from batcher.dist.executors.ray_runtime import scaling
+    # `request_autoscale`/`release_autoscale` live in `autoscale_request`, not in `scaling`.
+    # They were moved there and this test kept calling them through `scaling`, so it failed
+    # with `AttributeError` rather than by checking anything — the coupling
+    # `.claude/rules/concurrent-agents.md` calls out as following the name, not the file.
+    from batcher.dist.executors.ray_runtime import autoscale_request
 
     captured: list = []
     monkeypatch.setattr(sdk, "request_resources", lambda **kw: captured.append(kw))
 
-    scaling.request_autoscale(4, target_gpus=2.0)
+    autoscale_request.request_autoscale(4, target_gpus=2.0)
     try:
         assert captured, "request_resources must be called"
         last = captured[-1]
@@ -168,7 +180,7 @@ def test_gpu_autoscale_requests_gpu_bundles(monkeypatch):
         gpus = sum(b.get("GPU", 0) for b in (last.get("bundles") or []))
         assert gpus >= 2, "a GPU query must request GPU bundles from the autoscaler"
     finally:
-        scaling.release_autoscale()
+        autoscale_request.release_autoscale()
     # Releasing the last scope drops the floor (no GPU bundles requested at rest).
     assert captured[-1].get("num_cpus") == 0
     assert not captured[-1].get("bundles")
@@ -185,6 +197,14 @@ def test_clamp_workers_bounded_by_gpu_capacity(monkeypatch):
     monkeypatch.setattr(
         scaling, "cluster_topology", lambda: {"nodes": 2, "cpus": 16.0, "gpus": 2.0}
     )
+    # `clamp_workers` gained a second bound after this test was written: `placeable_workers`
+    # asks what a *single node* can host, read from the live cluster rather than from the
+    # topology stubbed above. On a real GPU-less fleet that answers 0, so the assertion below
+    # measured that and not the GPU arithmetic it names. `None` is the function's own "no
+    # per-node constraint known", which leaves the topology term as the binding one.
+    from batcher.dist.executors.ray_runtime import capacity
+
+    monkeypatch.setattr(capacity, "placeable_workers", lambda *a, **k: None)
     # 16 cores would fit 8 one-core workers, but only 2 GPUs ⇒ clamp to 2.
     assert scaling.clamp_workers(8, num_cpus=1.0, num_gpus=1.0) == 2
     # CPU-only stage: 16 cores / 2 each = 8, GPUs irrelevant.

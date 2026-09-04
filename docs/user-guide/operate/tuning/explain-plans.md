@@ -39,19 +39,30 @@ print(query.explain())
 
 :::{dropdown} The plan it prints
 ```text
-sort                            est≈1 (default)
-  aggregate                     est≈1 (default)
-    hash_join                   est≈3 (default)
-      scan                      est≈3 (exact)
-      filter                    est≈1 (default)
-        scan                    est≈6 (exact) pushed[status = paid]
+query plan (planned)                                               6 operators
+──────────────────────────────────────────────────────────────────────────────
+OPERATOR                              ESTIMATE  NOTES
+sort  [revenue]                          est≈1  (default)
+└─ aggregate  [by region · sum]          est≈1  (default)
+   └─ hash_join  [inner on customer]     est≈2  (default)
+      ├─ scan  [source 1]                est≈3  (exact)
+      └─ filter  [status = paid]         est≈1  (default)
+         └─ scan  [source 0]             est≈6  (exact)  pushed[status = paid]
 
 decisions:
   - [kyber/selection] join build side: left≈1 right≈3 [default] → swap build→left + broadcast
 ```
 :::
 
-Read it inside out: the leaves run first. Four things to look at.
+Read it inside out: the leaves run first, and the spine shows what feeds what. A `├─`
+means the operator above it has another input below; a `└─` means this is the last one.
+On a join that is the whole question, so it is drawn rather than left to be counted out of
+an indent. Five things to look at.
+
+The **bracketed description** after each operator says what *that* operator does: the join
+type and its keys, the group keys and aggregates, the sort keys, the predicate, the source.
+Without it a plan with four joins prints four identical `hash_join` lines, and "which join
+is this one" is the first question anyone asks of a join tree.
 
 The **tree shape** is the optimized plan, not the one you typed. `filter` sits directly
 above the `orders` scan, below the join, so the predicate was pushed down. If you write a
@@ -91,14 +102,20 @@ print(q.explain())
 :::{dropdown} Cold, then warm
 ```text
 --- cold
-aggregate                       est≈1 (default)
-  filter                        est≈1 (default)
-    scan                        est≈6 (exact) pushed[status = paid]
+query plan (planned)                                                3 operators
+───────────────────────────────────────────────────────────────────────────────
+OPERATOR                               ESTIMATE  NOTES
+aggregate  [by customer · count_star]     est≈1  (default)
+└─ filter  [status = paid]                est≈1  (default)
+   └─ scan  [source 0]                    est≈6  (exact)  pushed[status = paid]
 
 --- after one run
-aggregate                       est≈3 (learned)
-  filter                        est≈3 (default)
-    scan                        est≈6 (exact) pushed[status = paid]
+query plan (planned)                                                3 operators
+───────────────────────────────────────────────────────────────────────────────
+OPERATOR                               ESTIMATE  NOTES
+aggregate  [by customer · count_star]     est≈3  (learned)
+└─ filter  [status = paid]                est≈4  (default)
+   └─ scan  [source 0]                    est≈6  (exact)  pushed[status = paid]
 
 decisions:
   - [core/io] source read at 6 MB/s (learned)
@@ -120,34 +137,60 @@ print(query.explain(analyze=True))
 
 :::{dropdown} The annotated plan, with the summary and the decision log
 ```text
-sort                            est≈2 actual=2 (1.0x)  0.0ms (0%)  cpu=93%  out=28B  interp
-  aggregate                     est≈2 actual=2 (1.0x)  0.0ms (1%)  cpu=100%  out=28B  rss+256KB  interp
-    hash_join                   est≈3 actual=4 (1.3x)  0.1ms (2%)  cpu=100%  out=76B  rss+1.0MB  interp
-      filter                    est≈3 actual=4 (1.3x)  0.2ms (3%)  cpu=100%  out=84B  rss+1.5MB  interp
-        scan                    est≈6 actual=6 (1.0x)  0.0ms (1%)  cpu=100%  out=126B  rss+126B  interp
-      scan                      est≈3 actual=3 (1.0x)  0.0ms (0%)  cpu=89%  out=33B  interp
+query plan (measured)                                                                6 operators  ·  2 rows  ·  44ms
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+OPERATOR                                ESTIMATE    ACTUAL   MISS   TIME     OP SHARE  NOTES
+▶ sort  [revenue]                          est≈2  actual=2  exact   14µs  ▎░░░░░   3%  interp
+▶ └─ aggregate  [by region · sum]          est≈2  actual=2  exact  316µs  ████░░  65%  interp
+▶    └─ hash_join  [inner on customer]     est≈4  actual=4  exact   10µs  ░░░░░░   2%  interp
+▶       ├─ filter  [status = paid]         est≈4  actual=4  exact  146µs  █▉░░░░  30%  interp
+▶       │  └─ scan  [source 0]             est≈6  actual=6  exact    1µs  ░░░░░░  <1%  interp  pushed[status = paid]
+        └─ scan  [source 1]                est≈3  actual=3  exact    1µs  ░░░░░░  <1%  interp
 
-total: 6.19 ms, 2 rows out
-bottleneck: filter (op 3), 3% of wall time — compute-bound (filter)
-cpu utilization: 99% of cores (target >90%), peak memory 1.5MB (0% of budget, target >80%) — cores saturated
+where the time went
+  operators       485µs     1%  of 44ms
+  elsewhere        44ms    99%  planning, optimization, admission, FFI crossing, result assembly
+
+total: 44.13 ms, 2 rows out
+bottleneck: aggregate (op 1), 64% of operator time — compute-bound (aggregate)
+cpu utilization: 100% of cores (target >90%) — cores saturated
+machine: GenuineIntel/16c/64GiB/l3=32MiB/nvme [a2f5aeb968ef]
 
 decisions:
-  - [kyber/selection] join build side: left≈3 right≈3 [default] → broadcast
+  - [kyber/selection] join build side: left≈4 right≈3 [default] → broadcast
   - [carbonite/admission] feasible
+  - [carbonite/resources] memory pressure NORMAL, envelope 0% used at peak
 ```
 :::
 
 Every field on an operator line, and what it is telling you:
 
-| Field | Reads as | What it means |
+| Column | Reads as | What it means |
 | --- | --- | --- |
-| `est≈N (source)` | `(exact)`, `(learned)`, `(default)` | where the row estimate came from: real metadata, a measured run, or a heuristic |
-| `est≈N actual=M (Kx)` | `1.0x` is perfect | the estimation error; a wild ratio is the root cause of most bad join orders |
-| `0.2ms (3%)` | share of wall time | which operator the query is actually spending itself on |
-| `cpu=100%` | core utilization | whether that operator saturated the cores it was given |
-| `out=84B`, `rss+1.5MB` | bytes out, peak memory | the operator's footprint |
-| `spill` | present or absent | the operator went out of core, so the constraint is memory, not CPU |
-| `interp` / `jit` | the backend | `interp` on a hot arithmetic expression means the JIT fell back |
+| `▶` | present or absent | the operator is on the *critical path*: the hottest chain from the root down. Drawn only when the plan branches, because on a straight chain every operator is on it, and a legend below the table says so wherever it appears. |
+| `OPERATOR` | a tree, then `[detail]` | the optimized plan. The spine says what feeds what; a `└─` is a last input. The bracket says what the operator does: join type and keys, group keys and aggregates, sort keys, predicate. |
+| `ESTIMATE` | `est≈N` | the rows Kyber planned for, with its provenance in `NOTES` when the plan was not run. |
+| `ACTUAL` | `actual=N` | the rows the operator really produced. |
+| `MISS` | `exact`, `3.4x over`, `5000.0x under` | how far the estimate missed, and **which way**. `over` means the plan expected more rows than arrived. An estimate below one row is compared against one row rather than against itself: a row count is a count, so a selectivity that underflowed down a chain of predicates has no usable denominator, and dividing by it printed fifteen digits of an artifact. A genuine miss, however large, is still reported in full. |
+| `TIME` | `268µs`, `54ms`, `1m03s` | wall time in the operator. Sub-millisecond work is reported in microseconds rather than rounded to `0.0ms`, which used to make the fastest steps look unmeasured. |
+| `OP SHARE` | a bar and a percentage | the operator's share of **total operator time**, so the column ranks operators against each other. The wall clock's own division is the `where the time went` block. |
+| `NOTES` | conditional clauses | strategy (`broadcast`), backend (`interp` / `jit`), `spill 2.0 GiB`, `rss+…`, `pushed[…]`, `PAGING(…)`, `contended(…)`. Each appears only when it has something to say. |
+
+Below the table:
+
+`where the time went` splits the wall clock between the operators and everything else —
+planning, optimization, admission, the crossing into the Rust engine, and assembling the
+Arrow result. On a small query that remainder is usually most of it, and it is the number
+worth acting on. On a large one it should be a rounding error; if it is not, the plan is
+not where your time is going.
+
+`bottleneck` names the operator that owns the most operator time. `cpu utilization` grades
+the run against core saturation and, when a budget is known, peak memory against it.
+`machine` names the hardware, which is what makes two profiles comparable.
+
+`what to look at` appears only when something is worth acting on: an estimate that missed
+by 4x or more, an operator that spilled, or one the machine was paging against. Each entry
+says what happened and what to do about it.
 
 The estimation error is the one to read first. A `(0.01x)` on a join input means the
 optimizer planned for 100 rows and got 10,000, and the fix for that is upstream (stale
@@ -159,6 +202,51 @@ a type it does not support and handed the batch back to the interpreter.
 On real data these numbers are wall-clock, so they move between runs. Compare shapes and
 ratios, not milliseconds, and never gate a test on one of these timings.
 :::
+
+## Large plans
+
+A generated plan — a `_sql` query over a wide star schema, a union of eighty partitions, a
+pipeline built by a loop — routinely runs to hundreds of operators. Printing all of them
+costs the reader the thing they came for, so past roughly two dozen operators
+`explain(analyze=True)` changes shape in three ways.
+
+It names the hot operators first, before the tree:
+
+```text
+hot operators (top 5 of 143 measured)
+  aggregate (op 1)                200ms  ███▌░░  57%  100 rows
+  hash_join (op 2)                 50ms  ▉░░░░░  14%  200 rows
+  scan (op 4)                      30ms  ▋░░░░░   9%  10 rows
+  scan (op 5)                      15ms  ▎░░░░░   4%  10 rows
+  scan (op 6)                      10ms  ▎░░░░░   2%  10 rows
+```
+
+It marks the critical path with `▶`: the chain from the root that descends, at every
+branch, into whichever side holds the most time beneath it. On a deep join tree that is the
+answer to "which side is costing me", and no per-operator column can give it — both sides
+look individually modest while one of them carries the run.
+
+And it folds subtrees that cannot contain the answer:
+
+```text
+▶       │  ├─ scan              est≈10   actual=10   exact  3.8ms  ░░░░░░   1%  interp
+        │  ├─ … 17 more
+  17 operators folded: subtrees under 1% of operator time. explain(format="json") lists every one.
+```
+
+Indentation stops growing past ten levels, and a `⋯` in place of the outermost ancestor
+bars says where it stopped. A long pipeline of chained `with_columns` and `filter` calls is
+a *deep* plan rather than a wide one, and the spine costs three columns per level: left
+unbounded it consumed the whole operator column, so the part of each row that survived
+truncation was the indentation and the part discarded was the operator's name. The nearest
+ancestors are the ones kept, because those are the branches a reader is still resolving.
+
+A run of consecutive cold siblings collapses into one line rather than one line each,
+because seventeen `… 1 operator folded` markers are exactly as long as the seventeen rows
+they replaced. Nothing on the critical path is ever folded, no root is ever folded, and
+nothing is folded at all without measurements to judge coldness by — a plan explained
+without `analyze=True` prints in full, because there is no basis for calling any of it
+cold. When you want every operator regardless, `format="json"` always carries all of them.
 
 ## stats(): the same measurements as a table
 
@@ -172,22 +260,29 @@ print(query.stats())
 
 :::{dropdown} The per-operator table
 ```text
- op  kind             rows_in    rows_out        ms      out_kb  backend
-------------------------------------------------------------------------
-  0  sort                   2           2      0.01           0  interp
-  1  aggregate              4           2      0.02           0  interp
-  2  hash_join              4           4      0.02           0  interp
-  3  filter                 6           4      0.03           0  interp
-  4  scan                   6           6      0.01           0  interp
-  5  scan                   3           3      0.00           0  interp
-------------------------------------------------------------------------
-total: 2.93 ms, 2 rows out
-bottleneck: filter (op 3), 1% of wall time — compute-bound (filter)
+OP  KIND       ROWS IN  ROWS OUT  TIME  OP SHARE       OUT  BACKEND
+───────────────────────────────────────────────────────────────────
+ 0  sort             2         2   4µs  ▎░░░░░   4%   28 B  interp
+ 1  aggregate        4         2  82µs  ████▋░  77%   28 B  interp
+ 2  hash_join        4         4   3µs  ▎░░░░░   3%   76 B  interp
+ 3  filter           6         4  18µs  █░░░░░  17%   84 B  interp
+ 4  scan             6         6   1µs  ░░░░░░  <1%  126 B  interp
+ 5  scan             3         3   1µs  ░░░░░░  <1%   33 B  interp
+───────────────────────────────────────────────────────────────────
+total: 2.92 ms, 2 rows out
+bottleneck: aggregate (op 1), 77% of operator time — compute-bound (aggregate)
+operators: 108µs of 2.9ms wall clock (4%); 2.8ms elsewhere (planning, optimization, admission, result assembly)
 ```
 :::
 
 That table is one run, so on a query this small the bottleneck line can name a
 different operator each time; it earns its keep on data where one operator dominates.
+
+The `operators:` line is the same accounting `explain(analyze=True)` prints, and on a query
+this small it is the important one: 108 microseconds of operator work inside a 2.9
+millisecond call means nothing in the table is what you are waiting for. Read it before you
+read the table, and call `RunStats.wall_clock_summary()` directly when a script needs the
+same split.
 
 :::{note}
 `stats()` raises {py:exc}`BackendError <batcher.BackendError>` on a `map_batches` / ML pipeline, which runs outside the
@@ -263,7 +358,7 @@ Two of those readings change what you should do, so `explain(analyze=True)` prin
 the operator's line, and only when they're present:
 
 ```text
-aggregate    est≈1,000 actual=1,000  842.1ms (91%) cpu=11%  out=64KB  interp  PAGING(31,204 major faults)
+▶ aggregate   est≈1,000  actual=1,000  exact  842ms  █████▌  91%  interp  PAGING(31,204 major faults)
 ```
 
 `PAGING` means the kernel was fetching back memory the process already believed it held. It
@@ -301,11 +396,17 @@ process-wide counters could honestly be attributed to.
 
 Run `explain(analyze=True)` and go down the tree once:
 
+- Read `where the time went` first. If the operators are a small share of the wall clock,
+  nothing in the tree is what you are waiting for, and the fix is upstream of the engine:
+  fewer, larger calls, or a cached plan.
+- Read `what to look at`. It appears only when there is something to act on.
+- Follow the `▶` marks. On a branching plan that chain is where the time is.
 - Is the filter below the join? If not, the optimizer could not see through something.
-- Is `est` within an order of magnitude of `actual` at every level? If not, fix the
-  estimate before you touch anything else.
+- Does `MISS` read `exact` at every level? A `10.0x over` on a join input means the
+  optimizer planned for ten times the rows that arrived, and the fix for that is upstream
+  (stale statistics, a predicate on a column with no stats) rather than in the join.
 - Did the build side get chosen the way you would have chosen it?
-- Does the bottleneck operator say `spilled`? Then it is memory, not CPU.
+- Does the bottleneck operator say `spill`? Then it is memory, not CPU.
 - Does a hot expression say `interp` where you expected `jit`?
 
 Then, and only then, start changing the query.

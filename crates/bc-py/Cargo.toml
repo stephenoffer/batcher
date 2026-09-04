@@ -29,8 +29,10 @@ mimalloc.workspace = true
 # before spilling a hash table to disk. `default-features = false` keeps the `local_dynamic_tls`
 # model the workspace pins — see the `mimalloc` note in the root manifest for why a dlopen'd
 # cdylib must not use `initial-exec` TLS. Same version the wrapper already links, so this adds
-# no code to the build, only a header surface.
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+# no code to the build, only a header surface. `v2` matches the line the workspace pins — see
+# that note for the thread-lifecycle crash 3.x has; the two must agree or cargo's feature
+# unification silently links 3.x anyway.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended", "v2"] }
 pyo3.workspace = true
 rayon.workspace = true
 serde_json.workspace = true

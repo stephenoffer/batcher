@@ -167,13 +167,15 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             // The distinct-set state's per-group list length IS the distinct count.
             AggFunc::CountDistinct => finalize_count_distinct(&state[0]),
             AggFunc::Median => finalize_median(&state[0])?,
-            AggFunc::Quantile(permille) => finalize_quantile(&state[0], permille as f64 / 1000.0)?,
+            AggFunc::Quantile(permille) => {
+                finalize_quantile(&state[0], f64::from(permille) / 1000.0)?
+            }
             // array_agg: the collected per-group list IS the result, except a non-null
             // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
             AggFunc::ListAgg => finalize_list_agg(&state[0])?,
             AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
             AggFunc::ApproxQuantile(permille) => {
-                finalize_approx_quantile(&state[0], permille as f64 / 1000.0)
+                finalize_approx_quantile(&state[0], f64::from(permille) / 1000.0)
             }
             AggFunc::Mode => counted::finalize_mode(state)?,
             AggFunc::NLength(p) => {
@@ -194,14 +196,32 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             AggFunc::Entropy => finalize_entropy(&state[0])?,
             AggFunc::Mad => finalize_mad(&state[0])?,
             AggFunc::QuantileDisc(permille) => {
-                finalize_quantile_disc(&state[0], permille as f64 / 1000.0)?
+                finalize_quantile_disc(&state[0], f64::from(permille) / 1000.0)?
             }
             AggFunc::ApproxTopK(k) => counted::finalize_top_k(state, k as usize)?,
             AggFunc::KurtosisPop => finalize_kurtosis_pop(state)?,
             // The compensation is added back exactly once, at the end.
             AggFunc::KahanSum => finalize_kahan(&state[0], &state[1])?.remove(0),
-            // All other functions' state IS their output.
-            _ => state[0].clone(),
+            // These functions' state IS their output — a scalar accumulator folded by the
+            // same associative op the partial used, so `finalize` is the identity.
+            //
+            // **Listed rather than wildcarded, and the `state_arity` docstring says why.**
+            // A variant that needs a finalize step and reaches a `_` arm does not fail: it
+            // returns its raw partial state as the answer — a count where a mean was asked
+            // for, a sketch where a quantile was. `partial`/`merge_state` above are both
+            // exhaustive; this was the one step of the three that was not.
+            AggFunc::CountStar
+            | AggFunc::Count
+            | AggFunc::Sum
+            | AggFunc::Min
+            | AggFunc::Max
+            | AggFunc::BoolAnd
+            | AggFunc::BoolOr
+            | AggFunc::Product
+            | AggFunc::BitAnd
+            | AggFunc::BitOr
+            | AggFunc::BitXor
+            | AggFunc::AnyValue => state[0].clone(),
         });
     }
     Ok(out)

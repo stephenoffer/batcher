@@ -54,8 +54,8 @@ The fields worth knowing:
 
 | Field | Meaning |
 |---|---|
-| `cpu.time_ms_total` | CPU milliseconds summed across every worker thread. |
-| `cpu.execution_ms_total` | Wall milliseconds spent inside the engine, planning excluded. |
+| `cpu.time_ms_total` | CPU milliseconds summed across every worker thread. Exported to Prometheus as `batcher_cpu_seconds_total`, in seconds. |
+| `cpu.execution_ms_total` | Wall milliseconds spent inside the engine, planning excluded. Exported as `batcher_execution_seconds_total`. |
 | `cpu.cores_busy` | The two above divided: mean cores kept busy. |
 | `cpu.involuntary_context_switches_total` | Times the scheduler preempted the engine, which is contention for cores this process was told it had. |
 | `memory.peak_rss_bytes_max` | The largest resident-set growth any one query forced. |

@@ -315,12 +315,17 @@ def _scalar_function(tr, node):
         ml = _UNARY_ML.get(node.name.lower())
         if ml is not None and len(node.expressions) == 1:
             return getattr(tr._scalar(node.expressions[0]), ml)()
-    if isinstance(node, exp.Anonymous) and node.name.lower() == "date_part":
+    if isinstance(node, exp.Anonymous) and node.name.lower() in ("date_part", "datepart"):
         # `date_part('unit', ts)` — the field-name spelling of EXTRACT. sqlglot keeps
-        # it Anonymous (unit literal first, then the temporal argument).
+        # it Anonymous (unit literal first, then the temporal argument). `datepart` is
+        # DuckDB's (and T-SQL's) one-word spelling of the same function, verified to
+        # return the identical value; without the alias it raised "unknown function"
+        # beside a working `date_part`.
         args = node.expressions
         if len(args) != 2 or not (isinstance(args[0], exp.Literal) and args[0].is_string):
-            raise NotImplementedError("date_part(unit, ts): unit must be a string literal")
+            raise NotImplementedError(
+                f"{node.name.lower()}(unit, ts): unit must be a string literal"
+            )
         part = args[0].this.lower()
         composite = _EXTRACT_COMPOSITE.get(part)
         if composite is not None:

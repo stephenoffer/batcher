@@ -113,6 +113,7 @@ fn is_probe_driven(join_type: JoinType) -> bool {
 /// first paying to materialize the build side**. The conditions are the module's: a
 /// probe-driven join type, `Int64` key columns, and a build that stays under the cache-radix
 /// cliff.
+#[must_use]
 pub fn streaming_supported(
     join_type: JoinType,
     key_types: &[&arrow::datatypes::DataType],
@@ -130,6 +131,7 @@ pub fn streaming_supported(
 /// ceiling is a **cost** comparison against the partitioned radix join, and a caller whose real
 /// alternative is something else entirely is not entitled to that answer (the same distinction
 /// [`BroadcastProbe::over_any_build`] draws for the fused-aggregate path).
+#[must_use]
 pub fn streaming_shape_supported(
     join_type: JoinType,
     key_types: &[&arrow::datatypes::DataType],
@@ -245,6 +247,15 @@ impl BroadcastProbe {
             shape,
             join_type,
         })
+    }
+
+    /// Heap bytes the built table holds — head slots, chain array and probe filter.
+    ///
+    /// A caller that keeps several of these resident (the streaming executor prepares one per
+    /// join before it runs anything) needs this to budget them; the build *relation* it
+    /// already measures is only about half of what a large join holds.
+    pub fn heap_bytes(&self) -> usize {
+        self.table.heap_bytes()
     }
 
     /// Whether `probe_keys` present the same key shape the table was built for.

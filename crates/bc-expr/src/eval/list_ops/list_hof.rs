@@ -57,7 +57,7 @@ pub(crate) fn eval_list_filter(list: &ArrayRef, pred: &Expr) -> Result<ArrayRef,
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| ExprError::ExpectedBoolean {
             op: "list.filter".into(),
-            got: mask_arr.data_type().to_string(),
+            got: crate::error::type_name(mask_arr.data_type()),
         })?;
 
     let offsets = l.value_offsets();

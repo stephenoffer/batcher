@@ -75,9 +75,20 @@ def test_catalog_lists_no_missing_skills() -> None:
     cited = {
         token
         for token in re.findall(r"`([a-z][a-z0-9-]+)`", _catalog_text())
-        if token.startswith(("add-", "migrate-", "run-", "write-", "build-", "debug-"))
+        if token.startswith(
+            (
+                "add-",
+                "migrate-",
+                "run-",
+                "write-",
+                "build-",
+                "debug-",
+                "apply-",
+                "manage-",
+                "validate-",
+            )
+        )
         or token in {"optimize-a-slow-query", "read-and-write-data"}
-        or token.startswith(("apply-", "manage-", "validate-"))
     }
     missing = sorted(cited - known)
     assert not missing, (

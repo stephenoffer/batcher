@@ -181,6 +181,20 @@ def fused_union_ids(plan: LogicalPlan) -> set[int]:
     a union under a sort or a limit still stages exactly as it did, because nothing above it
     can absorb it and its staged result is what gives that operator a single source to
     distribute over.
+
+    **The same exclusion was tried for a join under an aggregate and reverted.** The
+    dispatcher does fuse that shape (`execute_join_flight(..., fused_agg=...)`, one round
+    instead of two), so the reasoning above appears to carry over — but the decision has to
+    be taken on the plan the *dispatcher* sees, and this loop holds the plan before Kyber
+    rewrites it. Eager aggregation puts an `Aggregate` back on a join side, which has no
+    one-shot path, so excluding the join left the loop with nothing to cut and a residual
+    that raised `PlanError` (a four-table star joined then grouped, previously returning
+    three rows). Re-asking `requires_staging` on a locally re-optimized plan does not fix it:
+    that probe lacks the collected source statistics the eager-aggregation gate needs, so it
+    optimizes to a different plan than the stage will and answers "no". And the exclusion was
+    measured worth nothing once the fan-out and reduce-concurrency fixes landed — TPC-H sf100
+    `lineitem join orders`, 7,475 ms with against 7,407 ms without. A union has no rewrite
+    that puts a breaker under it, which is why this half stands.
     """
     fused: set[int] = set()
 

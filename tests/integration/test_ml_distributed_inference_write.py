@@ -42,18 +42,18 @@ class _Embedder:
         return pa.RecordBatch.from_pydict({"x": x, "vec": [[float(v), float(v) + 1.0] for v in x]})
 
 
-def _source(tmp_path, rows: int = 64):
-    path = str(tmp_path / "in.parquet")
+def _source(cluster_tmp_path, rows: int = 64):
+    path = str(cluster_tmp_path / "in.parquet")
     bt.from_pydict({"x": list(range(rows))}).write.parquet(path)
     return bt.read(path)
 
 
-def test_distributed_inference_write_matches_the_single_node_write(tmp_path):
-    out_dist = str(tmp_path / "dist")
-    out_local = str(tmp_path / "local")
+def test_distributed_inference_write_matches_the_single_node_write(cluster_tmp_path):
+    out_dist = str(cluster_tmp_path / "dist")
+    out_local = str(cluster_tmp_path / "local")
 
-    _source(tmp_path).map_batches(_Embedder).write.parquet(out_dist, distributed=True)
-    _source(tmp_path).map_batches(_Embedder).write.parquet(out_local)
+    _source(cluster_tmp_path).map_batches(_Embedder).write.parquet(out_dist, distributed=True)
+    _source(cluster_tmp_path).map_batches(_Embedder).write.parquet(out_local)
 
     got = bt.read(out_dist, format="parquet").collect().sort_by("x")
     want = bt.read(out_local, format="parquet").collect().sort_by("x")
@@ -61,7 +61,7 @@ def test_distributed_inference_write_matches_the_single_node_write(tmp_path):
     assert got.num_rows == 64
 
 
-def test_the_inference_write_takes_the_streaming_path_not_a_driver_collect(tmp_path):
+def test_the_inference_write_takes_the_streaming_path_not_a_driver_collect(cluster_tmp_path):
     """The proof that rows do not transit the driver: `_distributed_write_plan` is what runs,
     and it hands back a manifest of locators rather than a table."""
     from batcher.dist.executors import write as write_mod
@@ -76,8 +76,8 @@ def test_the_inference_write_takes_the_streaming_path_not_a_driver_collect(tmp_p
 
     write_mod._distributed_write_plan = _spy
     try:
-        _source(tmp_path).map_batches(_Embedder).write.parquet(
-            str(tmp_path / "spied"), distributed=True
+        _source(cluster_tmp_path).map_batches(_Embedder).write.parquet(
+            str(cluster_tmp_path / "spied"), distributed=True
         )
     finally:
         write_mod._distributed_write_plan = real
@@ -86,9 +86,11 @@ def test_the_inference_write_takes_the_streaming_path_not_a_driver_collect(tmp_p
     assert seen["manifest"].files, "no data files were written by the workers"
 
 
-def test_an_inference_write_that_filters_everything_still_commits_a_readable_output(tmp_path):
-    out = str(tmp_path / "empty")
-    _source(tmp_path).filter(bt.col("x") < 0).map_batches(_Embedder).write.parquet(
+def test_an_inference_write_that_filters_everything_still_commits_a_readable_output(
+    cluster_tmp_path,
+):
+    out = str(cluster_tmp_path / "empty")
+    _source(cluster_tmp_path).filter(bt.col("x") < 0).map_batches(_Embedder).write.parquet(
         out, distributed=True
     )
     assert bt.read(out, format="parquet").collect().num_rows == 0

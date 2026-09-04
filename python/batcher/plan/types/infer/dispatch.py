@@ -25,6 +25,7 @@ from batcher.plan.types.infer.collections import (
     mapfunc_type,
     struct_field_type,
 )
+from batcher.plan.types.infer.geospatial import geofunc_type, spatialfunc_type
 from batcher.plan.types.infer.scalars import datefunc_type, make_temporal_type, strfunc_type
 from batcher.plan.types.lattice import promote
 from batcher.plan.types.media import audiofunc_type, imagefunc_type, videofunc_type
@@ -64,7 +65,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.func_nodes import ListTransform, MakeTemporal
+    from batcher.plan.expr_ir.func_nodes import GeoFunc, ListTransform, MakeTemporal, SpatialFunc
     from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
@@ -80,6 +81,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         ListSet,
         ListSimhash,
         ListSlice,
+        ListZip,
         MapFunc,
         Strftime,
         StrFunc,
@@ -88,11 +90,13 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     )
     from batcher.plan.expr_ir.namespaces.sequence import SeqFunc
     from batcher.plan.expr_ir.nodes import (
+        Array,
         Case,
         Col,
         Greatest,
         HashRows,
         Least,
+        ListJoin,
         MakeStruct,
         NullIf,
         Sequence,
@@ -127,6 +131,20 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.int64()  # a 64-bit digest, whatever the inputs' types
     if isinstance(expr, (Coalesce, Greatest, Least)):
         return _fold_promote(infer_type(e, schema) for e in expr.inputs)
+    if isinstance(expr, Array):
+        # `array(a, b, ...)` gathers its arguments into one list per row, so the element
+        # type is what they promote to -- the same fold `Coalesce`/`Greatest`/`Least` use
+        # one line up, and reused rather than restated so the two cannot disagree about
+        # what `array(int64, utf8)` is. Verified against the engine: int+float -> double,
+        # int+string -> string, int+null -> int64.
+        element = _fold_promote(infer_type(e, schema) for e in expr.elements)
+        return None if element is None else pa.list_(element)
+    if isinstance(expr, ListJoin):
+        # `list.join(sep)` renders a whole list as one delimited string, whatever the
+        # element type -- a `List<Int64>` joins to `"1,2"` exactly as a `List<Utf8>` joins
+        # to `"a,b"`. The node had no arm at all, so every projection containing one
+        # reported `null` for all of its columns.
+        return pa.string()
     if isinstance(expr, NullIf):
         # `nullif(a, b)` is `a` with the matching rows nulled — the output type is
         # the left operand's type (verified: unaffected by the right operand).
@@ -166,8 +184,21 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.bool_()
     if isinstance(expr, ListPosition):
         return pa.int64()  # 1-based index of the first match, 0 if absent
+    if isinstance(expr, GeoFunc):
+        return geofunc_type(expr.fn)
+    if isinstance(expr, SpatialFunc):
+        return spatialfunc_type(expr.fn)
     if isinstance(expr, ListBinary):
         return pa.float64()  # pairwise reduction over two list columns
+    if isinstance(expr, ListZip):
+        # Element-wise `list_add`/`list_subtract`/`list_multiply` -- the embedding-math
+        # primitive. The engine computes these in floating point whatever the operands'
+        # element widths, exactly as `cum_sum`/`diff`/`softmax` do, so two Int64 lists add
+        # to `List<Double>`. The node's own docstring has said so since it was written; the
+        # rule was simply never implemented, and a projection carrying one declared `null`
+        # for every column in it.
+        left = list_element_type(infer_type(expr.left, schema))
+        return pa.list_(pa.float64()) if left is not None else None
     if isinstance(expr, (ListSlice, ListSet)):
         # Sub-range / set-op of a list: the element type is unchanged.
         return as_list_type(infer_type(list_operand(expr), schema))
@@ -183,7 +214,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     if isinstance(expr, StructField):
         return struct_field_type(infer_type(expr.input, schema), expr.field)
     if isinstance(expr, MapFunc):
-        return mapfunc_type(expr.fn, infer_type(expr.input, schema))
+        return mapfunc_type(expr.fn, infer_type(expr.input, schema), expr.key)
     if isinstance(expr, Sequence):
         return pa.list_(pa.int64())  # `sequence` always yields a List<Int64> series
     if isinstance(expr, MakeTemporal):

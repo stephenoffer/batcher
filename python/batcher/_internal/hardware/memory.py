@@ -150,27 +150,42 @@ def swap_configured() -> bool:
     which kind of node they are on. Making the engine choose is a throughput trade in the
     direction of spilling more, so it wants a benchmark rather than an argument.
 
-    Reads the cgroup's own swap allowance first where one is published, because a container
-    with host swap can still be denied it (`memory.swap.max = 0`, which is what Kubernetes
-    writes) — and there the host's swap partitions are present and irrelevant.
+    Reads the cgroup's own swap allowance where one is published, because a container with
+    host swap can still be denied it (`memory.swap.max = 0`, which is what Kubernetes writes)
+    — and there the host's swap partitions are present and irrelevant.
+
+    **The tightest allowance in the cgroup ancestry binds**, exactly as it does for the CPU
+    quota in [`cfs_quota_count`]: cgroup v2 enforces `memory.swap.max` at every level, so a
+    leaf granting swap under an ancestor denying it gets none. This used to stop at the first
+    file it could read, which made the answer depend on the order `cgroup_v2_dirs` happens to
+    return — and it was being iterated in the *opposite* order to the one its comment claimed,
+    so an ancestor's ``max`` masked a leaf's ``0`` and the process was told it had a soft
+    landing it did not have. Taking the minimum removes the ordering question rather than
+    correcting it.
 
     Returns:
         True when swap is available to this process; False when it demonstrably is not, and on
         any platform that cannot report it — the conservative reading, since it selects the
         earlier-spill policy.
     """
-    for base in reversed(cgroup_v2_dirs()):  # leaf-most first: our own slice is what binds
+    allowances: list[int] = []
+    for base in cgroup_v2_dirs():
         try:
             with open(os.path.join(base, "memory.swap.max")) as f:
                 raw = f.read().strip()
         except OSError:
             continue
         if raw == "max":
-            break  # unlimited by the cgroup — fall through to whether the host has any
+            continue  # this level imposes no cap of its own; a tighter ancestor still may
         try:
-            return int(raw) > 0
+            allowances.append(int(raw))
         except ValueError:
             continue
+    if allowances:
+        return min(allowances) > 0
+    # No level published a numeric cap: every readable one said `max`, or none was readable.
+    # Both fall through to whether the host has any swap at all, which is the only remaining
+    # evidence and the answer this gave before any cgroup was consulted.
     try:
         with open("/proc/swaps") as f:
             # A header line is always present; a swapless machine has nothing after it.

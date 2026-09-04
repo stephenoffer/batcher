@@ -23,7 +23,10 @@ use super::{f64_at, geom_at, i64_at, row_result, str_at, ScalarOut};
 
 /// True when this dispatcher owns `func`.
 pub(super) fn handles(func: GeoFunc) -> bool {
-    use GeoFunc::*;
+    use GeoFunc::{
+        GeohashDecodeLat, GeohashDecodeLon, GeohashEncode, StGeohash, StHexBin, StHexCenterX,
+        StHexCenterY, StQuadkey, StS2Cell, StS2CellParent, StTileX, StTileY, StUtmEpsg, StUtmZone,
+    };
     matches!(
         func,
         StGeohash
@@ -45,7 +48,10 @@ pub(super) fn handles(func: GeoFunc) -> bool {
 
 /// Evaluate a grid function over `rows` rows of `cols`.
 pub(super) fn eval(func: GeoFunc, cols: &[ArrayRef], rows: usize) -> Result<ArrayRef, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{
+        GeohashDecodeLat, GeohashDecodeLon, GeohashEncode, StGeohash, StHexCenterX, StHexCenterY,
+        StQuadkey,
+    };
     let mut out = match func {
         StGeohash | GeohashEncode | StQuadkey => {
             ScalarOut::Text(StringBuilder::with_capacity(rows, rows * 12))
@@ -62,7 +68,7 @@ pub(super) fn eval(func: GeoFunc, cols: &[ArrayRef], rows: usize) -> Result<Arra
                 out.push_str(s.as_deref());
             }
             GeohashDecodeLon | GeohashDecodeLat | StHexCenterX | StHexCenterY => {
-                out.push_f64(float_row(func, cols, i)?)
+                out.push_f64(float_row(func, cols, i)?);
             }
             _ => out.push_i64(int_row(func, cols, i)?),
         }
@@ -79,7 +85,7 @@ fn lonlat(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<(f64, f64
 }
 
 fn text_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<String>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{GeohashEncode, StGeohash, StQuadkey};
     Ok(match func {
         StGeohash => {
             let Some(g) = geom_at(&cols[0], i, func)? else {
@@ -119,7 +125,7 @@ fn text_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<String>
 }
 
 fn float_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<f64>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{GeohashDecodeLat, GeohashDecodeLon, StHexCenterX, StHexCenterY};
     Ok(match func {
         GeohashDecodeLon | GeohashDecodeLat => {
             let Some(h) = str_at(&cols[0], i, func)? else {
@@ -146,7 +152,7 @@ fn float_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<f64>, 
 }
 
 fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, ExprError> {
-    use GeoFunc::*;
+    use GeoFunc::{StHexBin, StS2Cell, StS2CellParent, StTileX, StTileY, StUtmEpsg, StUtmZone};
     Ok(match func {
         StTileX | StTileY => {
             let Some((lon, lat)) = lonlat(func, cols, i)? else {
@@ -204,13 +210,13 @@ fn int_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<i64>, Ex
             let Some(lon) = f64_at(&cols[0], i, func)? else {
                 return Ok(None);
             };
-            row_result(crs::utm_zone(lon), func)?.map(|z| z as i64)
+            row_result(crs::utm_zone(lon), func)?.map(i64::from)
         }
         StUtmEpsg => {
             let Some((lon, lat)) = lonlat(func, cols, i)? else {
                 return Ok(None);
             };
-            row_result(crs::utm_epsg(lon, lat), func)?.map(|e| e as i64)
+            row_result(crs::utm_epsg(lon, lat), func)?.map(i64::from)
         }
         other => unreachable!("{other:?} is not an integer-valued grid function"),
     })

@@ -292,9 +292,9 @@ def test_sort_emits_exactly_the_engines_columns(build, be):
         lambda: col("v").sign(),
         lambda: col("v").exp(),
         lambda: col("v").log10(),
-        lambda: col("s").str.upper(),
-        lambda: col("s").str.lower(),
-        lambda: col("s").str.len(),
+        col("s").str.upper,
+        col("s").str.lower,
+        col("s").str.len,
         lambda: col("s").str.contains("a"),
         lambda: col("s").str.starts_with("a"),
         lambda: col("s").str.ends_with("c"),
@@ -363,20 +363,20 @@ def test_string_operations_match_cpu_engine(build, be):
 @pytest.mark.parametrize(
     "expr",
     [
-        lambda: col("t").dt.year(),
-        lambda: col("t").dt.month(),
-        lambda: col("t").dt.day(),
-        lambda: col("t").dt.hour(),
-        lambda: col("t").dt.quarter(),
+        col("t").dt.year,
+        col("t").dt.month,
+        col("t").dt.day,
+        col("t").dt.hour,
+        col("t").dt.quarter,
         # the engine numbers the week from Sunday; both backends number it from Monday
-        lambda: col("t").dt.dayofweek(),
-        lambda: col("t").dt.dayofyear(),
+        col("t").dt.dayofweek,
+        col("t").dt.dayofyear,
         # ...and `week` is the ISO week, which is a calculation rather than an attribute, and
         # which fills a null timestamp with zero instead of propagating it
-        lambda: col("t").dt.week(),
-        lambda: col("t").dt.is_leap_year(),
-        lambda: col("t").dt.days_in_month(),
-        lambda: col("t").dt.epoch(),
+        col("t").dt.week,
+        col("t").dt.is_leap_year,
+        col("t").dt.days_in_month,
+        col("t").dt.epoch,
         # `lpad`/`rpad` TRUNCATE as well as pad; `rjust`/`ljust` only ever pad
         lambda: col("s").str.lpad(6, "0"),
         lambda: col("s").str.rpad(6, "0"),
@@ -384,7 +384,7 @@ def test_string_operations_match_cpu_engine(build, be):
         # SQL `position` is 1-based and reports 0 for "not found"; `find` is 0-based and -1
         lambda: col("s").str.position("o"),
         lambda: col("s").str.right(2),
-        lambda: col("s").str.initcap(),
+        col("s").str.initcap,
         # the fixed-duration truncations, which are a floor
         lambda: col("t").dt.truncate("day"),
         lambda: col("t").dt.truncate("hour"),

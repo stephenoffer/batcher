@@ -272,7 +272,7 @@ def test_an_amd_node_enumerates_its_devices(drm, monkeypatch):
     from batcher._internal import accelerators
 
     _card(drm, 0, product_name="AMD Instinct MI300X", mem_info_vram_total=str(192 * (1 << 30)))
-    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    monkeypatch.setattr(accelerators, "_nvml_inventory", list)
     accelerators._gpu_inventory_probe.cache_clear()
     try:
         inventory = accelerators.gpu_inventory()
@@ -297,7 +297,7 @@ def test_an_amd_fault_reaches_the_problem_list_through_the_shared_row_keys(drm, 
         ras={"umc": (3, 1)},
         hwmon={"temp1_input": "99000", "temp1_crit": "100000"},
     )
-    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    monkeypatch.setattr(accelerators, "_nvml_inventory", list)
     accelerators._gpu_inventory_probe.cache_clear()
     try:
         problems = accelerator_problems()
@@ -478,7 +478,7 @@ def test_the_partition_reaches_the_report_row(drm, monkeypatch):
         current_compute_partition="CPX",
         current_memory_partition="NPS4",
     )
-    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    monkeypatch.setattr(accelerators, "_nvml_inventory", list)
     accelerators._gpu_inventory_probe.cache_clear()
     try:
         (row,) = device_rows()
@@ -515,7 +515,7 @@ def test_the_report_s_power_envelope_sums_both_vendors(drm, monkeypatch):
         mem_info_vram_total=str(192 * (1 << 30)),
         hwmon={"power1_average": "540000000", "power1_cap": "750000000"},
     )
-    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    monkeypatch.setattr(accelerators, "_nvml_inventory", list)
     accelerators._gpu_inventory_probe.cache_clear()
     try:
         power = report().get("power") or {}

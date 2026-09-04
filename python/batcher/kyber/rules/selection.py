@@ -91,6 +91,17 @@ SORT_MERGE_MIN_ROWS = 50_000_000.0
 # leaves the row floor exactly as it was.
 _SORT_MERGE_MEMORY_SHARE = 6.0
 
+#: How far over the replication budget a *bounded* build side must be before the bandit
+#: stops offering the broadcast arm at all (see `_admissible_arms`).
+#:
+#: Not 1.0, deliberately. At the budget itself the byte estimate and the executor's
+#: measurement routinely disagree in both directions, and being wrong there is cheap — the
+#: decline costs about a budget's worth of driver reading. The arm is only withheld where
+#: the estimate would have to be off by more than this factor for broadcast to be viable,
+#: which is the range where exploring it buys nothing and costs a full driver-side read of
+#: the build relation.
+_BROADCAST_ARM_MARGIN = 4.0
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class BuildSideDecision:
@@ -188,7 +199,22 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
     smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
-    smb = ctx.hardware.memory_bytes / _SORT_MERGE_MEMORY_SHARE
+    # Both sort-merge floors are per-*task* quantities compared against whole-relation
+    # estimates, so on a cluster they have to be scaled by the fan-out the join will actually
+    # be cut into. A co-partition shuffle hashes one bucket per reducer, so a reducer's build
+    # is `build_bytes / workers` — but the guard reads the *whole* build against *one node's*
+    # memory. On a sixteen-worker cluster that declares a build sixteen times larger than it
+    # is, and steers a join whose real per-reducer hash table fits comfortably into the
+    # bounded-memory merge instead: the same 7x penalty `_SORT_MERGE_MEMORY_SHARE` was
+    # written to prevent, arrived at from the other direction.
+    #
+    # This is the same correction `_broadcast_max_bytes` already applies to the other
+    # threshold on this rule, and for the same reason — a threshold sized to one machine is
+    # not the threshold for a cluster. It cannot mis-steer a broadcast join, which decides
+    # above this and never reaches the sort-merge branch.
+    fanout = max(1, ctx.hardware.worker_count)
+    smr *= fanout
+    smb = ctx.hardware.memory_bytes * fanout / _SORT_MERGE_MEMORY_SHARE
     plan, decisions = adaptive_build_side(
         plan,
         ctx.estimator,
@@ -198,14 +224,21 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
         sort_merge_min_bytes=smb,
     )
     # Arms the bandit may range over, per join. Sort-merge is withheld from any join whose
-    # build side comfortably fits memory — see `_admissible_arms`.
-    admissible = {d.signature: _admissible_arms(d, smb) for d in decisions if d.signature}
+    # build side comfortably fits memory, and broadcast from any whose build side is far
+    # over the replication budget — see `_admissible_arms`.
+    admissible = {
+        d.signature: _admissible_arms(d, smb, max_bytes) for d in decisions if d.signature
+    }
     plan = _apply_learned_strategies(plan, ctx.hub, admissible)
     ctx.notes["build_side_decisions"] = decisions
     return plan
 
 
-def _admissible_arms(decision: BuildSideDecision, sort_merge_min_bytes: float) -> tuple[str, ...]:
+def _admissible_arms(
+    decision: BuildSideDecision,
+    sort_merge_min_bytes: float,
+    broadcast_max_bytes: float = 0.0,
+) -> tuple[str, ...]:
     """The strategy arms the bandit may explore for this join.
 
     All three arms emit the identical relation, so admissibility is never about
@@ -219,12 +252,42 @@ def _admissible_arms(decision: BuildSideDecision, sort_merge_min_bytes: float) -
     discounted evidence expires, so an arm is re-explored roughly every
     `1/(1-_ARM_DISCOUNT)` runs. Paying a 10x run that often to re-confirm what the memory
     gate already establishes structurally is regret the bandit cannot recover — exploring
-    is only free when the arm might win. The two arms that might (hash, broadcast) are
-    always offered.
+    is only free when the arm might win.
+
+    **Broadcast is withheld by the same rule, from the other end.** It cannot win on a
+    build side far over `broadcast_max_bytes`: the executor's own measured re-check
+    (`dist.flight_broadcast._materialize_build_side`) declines the strategy and the join
+    falls back to the co-partition shuffle, so the arm's whole contribution is the driver
+    work spent finding that out. Measured on TPC-H sf100 `lineitem ⋈ orders` over 8
+    workers, where the build is ~3 GB against a 140 MiB budget: the exploring run took
+    **23.5 s against 11.7 s** on the hash arm, and 10.2 s of that was the driver reading
+    the build side single-node before declining.
+
+    The margin (`_BROADCAST_ARM_MARGIN`) is what keeps this an admissibility rule rather
+    than a second copy of the decision. A build *near* the budget is exactly the case the
+    static byte estimate gets wrong in both directions, and it is cheap to be wrong about,
+    so the bandit keeps it. What is withheld is only the range where the estimate would
+    have to be wrong by more than `_BROADCAST_ARM_MARGIN` for the arm to be viable.
+
+    Args:
+        decision: The build-side decision this join's arms are being chosen for.
+        sort_merge_min_bytes: Build bytes above which a hash table strains memory.
+        broadcast_max_bytes: The replication budget the executor will re-check against.
+            `0` (the default, for callers outside the rule) withholds nothing.
+
+    Returns:
+        The arms the bandit may range over for this join.
     """
-    if decision.build_bytes > sort_merge_min_bytes or not decision.build_measured:
-        return JOIN_ARMS
-    return tuple(a for a in JOIN_ARMS if a != "sort_merge")
+    arms = JOIN_ARMS
+    if not (decision.build_bytes > sort_merge_min_bytes or not decision.build_measured):
+        arms = tuple(a for a in arms if a != "sort_merge")
+    if (
+        broadcast_max_bytes > 0
+        and decision.build_measured
+        and decision.build_bytes > broadcast_max_bytes * _BROADCAST_ARM_MARGIN
+    ):
+        arms = tuple(a for a in arms if a != "broadcast")
+    return arms
 
 
 def _apply_learned_strategies(

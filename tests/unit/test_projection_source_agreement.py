@@ -128,10 +128,17 @@ def test_the_optimizer_still_prunes_unread_columns_end_to_end():
 
     counted = _count_over(ds._plan)
     opt2, _, _ = kyber.optimize_full(counted, sources=ds._sources, hub=None, source_stats=None)
-    # A COUNT(*) consumes no projected column, so `e` — and with it `email` — is pruned
-    # away entirely. What remains is the filter's `region` plus the one item the pruned
-    # projection has to keep in order to emit rows to count.
-    assert set(opt2.source_projections[0]) == {"id", "region"}
+    # A COUNT(*) consumes no projected column, so `e` — and with it `email` — is pruned away
+    # entirely, and the emptied projection is then dropped rather than kept holding one item.
+    # All that is left to read is the filter's own `region`.
+    #
+    # This used to be `{"id", "region"}`: the projection survived as a one-item passthrough,
+    # so `id` was read for nothing. Dropping it needs *two* rewrites in sequence — the column
+    # prune that empties the projection, then the collapse that removes it — and the second
+    # one runs in a phase the first has already passed. The optimizer's post-FUSION
+    # canonicalization round (`kyber.optimizer.facade.Optimizer._run_cleanup`) is what now
+    # runs it, so this asserts one fewer column off the scan, not a weaker property.
+    assert set(opt2.source_projections[0]) == {"region"}
 
 
 def test_a_source_that_reads_nothing_still_hands_the_engine_a_schema():

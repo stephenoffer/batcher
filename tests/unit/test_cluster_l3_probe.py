@@ -117,6 +117,7 @@ def test_the_binding_minimum_is_taken_across_shapes(monkeypatch):
             ]
         ),
         ["a", "b"],
+        ("shape-a", "shape-b"),
     )
     assert len(profiles) == 2
     monkeypatch.setattr(hp, "cluster_hardware_profiles", lambda: profiles)
@@ -138,6 +139,7 @@ def test_a_shape_reporting_zero_cache_does_not_drag_the_min_to_zero(monkeypatch)
             ]
         ),
         ["a", "b"],
+        ("shape-a", "shape-b"),
     )
     monkeypatch.setattr(hp, "cluster_hardware_profiles", lambda: profiles)
     assert hp.cluster_l3_cache_bytes() == 16 * 1024 * 1024
@@ -163,6 +165,7 @@ def test_a_failing_shape_does_not_discard_the_shapes_that_answered(monkeypatch):
             ]
         ),
         ["good", "stale"],
+        ("good", "stale"),
     )
     assert len(profiles) == 1
     monkeypatch.setattr(hp, "cluster_hardware_profiles", lambda: profiles)
@@ -193,7 +196,8 @@ def test_a_wholly_unprobeable_fleet_says_so_once(monkeypatch, caplog):
     monkeypatch.setattr(hp, "_UNPROBEABLE_WARNED", False)
     monkeypatch.setattr(hp, "_PROFILES_BY_TOPOLOGY", {})
     monkeypatch.setattr(hp, "_FAILED_ATTEMPTS", {})
-    monkeypatch.setattr(hp, "_probe_representatives", lambda ray, reps: ())
+    monkeypatch.setattr(hp, "_PENDING_BY_TOPOLOGY", {})
+    monkeypatch.setattr(hp, "_probe_representatives", lambda ray, reps, signature: ())
 
     # A transient miss stays quiet: this is the cold-start case, and it is the common one.
     with caplog.at_level(logging.WARNING, logger="batcher.dist"):
@@ -269,6 +273,7 @@ def _install_fleet(monkeypatch, fleet):
     monkeypatch.setitem(sys.modules, "ray", fleet)
     monkeypatch.setattr(hp, "_PROFILES_BY_TOPOLOGY", {})
     monkeypatch.setattr(hp, "_FAILED_ATTEMPTS", {})
+    monkeypatch.setattr(hp, "_PENDING_BY_TOPOLOGY", {})
     monkeypatch.setattr(hp, "_UNPROBEABLE_WARNED", False)
 
 

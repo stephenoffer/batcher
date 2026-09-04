@@ -332,8 +332,8 @@ fn value_range_bounds(
     let sign: i128 = if search.order.descending { -1 } else { 1 };
     let delta = |b: FrameBound| -> i128 {
         match b {
-            FrameBound::Preceding(k) => -sign * sat_i64(k) as i128,
-            FrameBound::Following(k) => sign * sat_i64(k) as i128,
+            FrameBound::Preceding(k) => -sign * i128::from(sat_i64(k)),
+            FrameBound::Following(k) => sign * i128::from(sat_i64(k)),
             _ => 0,
         }
     };
@@ -385,6 +385,33 @@ pub(super) fn frame_half_open(frame: Frame, pos: usize, len: usize) -> (usize, u
         FrameBound::UnboundedFollowing => n,
     };
     (lo.clamp(0, n) as usize, hi_excl.clamp(0, n) as usize)
+}
+
+/// Debug-only guard that a frame's edges never move backwards as `pos` advances.
+///
+/// Every sliding kernel in [`super`] is a FIFO over `[a, b)`: it admits rows up to the new `b`
+/// and retires rows up to the new `a`, and it never un-admits or re-admits. That is only a
+/// correct evaluation of the frame because both edges are non-decreasing — the property this
+/// module's header states and the bound arithmetic is written to preserve. An edge that went
+/// backwards would not fail; the accumulator would simply keep rows the frame no longer covers,
+/// and the column would come back plausible and wrong, for one shape of one frame type.
+///
+/// So it is asserted where it is relied upon rather than only where it is produced: the
+/// producers are five `match` arms over three unit systems, and a future bound only has to be
+/// non-monotone once to break every kernel at once. Compiled out entirely in release.
+#[inline(always)]
+pub(crate) fn debug_check_monotone(_prev: &mut (usize, usize), _a: usize, _b: usize) {
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            _a >= _prev.0 && _b >= _prev.1,
+            "frame edges must be non-decreasing in the row position (was {:?}, now {:?}); the \
+             sliding kernels cannot retract a row they have already admitted",
+            _prev,
+            (_a, _b)
+        );
+        *_prev = (_a, _b);
+    }
 }
 
 /// Build whatever a partition's frame needs beyond the row position: peer groups for a
@@ -561,7 +588,7 @@ mod tests {
         let keys: Vec<Option<i64>> = (0..40)
             .map(|i| if i % 7 == 3 { None } else { Some((i * 3) % 29) })
             .collect();
-        let mut sorted: Vec<Option<i64>> = keys.clone();
+        let mut sorted: Vec<Option<i64>> = keys;
         sorted.sort();
         let offsets = [
             FrameBound::UnboundedPreceding,
@@ -571,9 +598,10 @@ mod tests {
             FrameBound::UnboundedFollowing,
         ];
         for descending in [false, true] {
-            let ordered: Vec<Option<i64>> = match descending {
-                false => sorted.clone(),
-                true => sorted.iter().rev().copied().collect(),
+            let ordered: Vec<Option<i64>> = if !descending {
+                sorted.clone()
+            } else {
+                sorted.iter().rev().copied().collect()
             };
             for &start in &offsets {
                 for &end in &offsets {

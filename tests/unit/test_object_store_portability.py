@@ -15,6 +15,7 @@ those platforms and invisible on AWS, GCS and Azure, which is why they survived:
 
 from __future__ import annotations
 
+import pyarrow.fs as pafs
 import pytest
 
 import batcher.io.filesystem as fsmod
@@ -96,14 +97,35 @@ def test_a_secret_containing_a_separator_survives_the_uri_fold(monkeypatch):
     fsmod._resolve_uri_fs.cache_clear()
 
 
-@pytest.mark.parametrize(
-    "scheme", ["oss", "cos", "cosn", "obs", "oci", "swift", "lakefs", "adl", "s3n"]
-)
+#: Derived from the production set, and from the alias table beside it, rather than retyped.
+#: The hand-written list named nine of nineteen, under a test called *every*.
+_OBJECT_STORE_URI_SCHEMES = sorted(set(fsmod._OBJECT_STORE_SCHEMES) | set(fsmod._SCHEME_ALIASES))
+
+
+@pytest.mark.parametrize("scheme", _OBJECT_STORE_URI_SCHEMES)
 def test_every_object_store_scheme_writes_in_place_rather_than_copying(scheme):
-    # `atomic_rename=False` is what stops a write becoming temp-write plus a full server-side
-    # object copy — which is what a scheme missing from this set silently costs.
-    canonical = fsmod._SCHEME_ALIASES.get(scheme, scheme)
-    assert canonical in fsmod._OBJECT_STORE_SCHEMES or scheme in fsmod._OBJECT_STORE_SCHEMES
+    """`atomic_rename=False` is what stops a write becoming temp-write plus a server-side copy.
+
+    Asserted through `_wrap_user_filesystem`, which is what actually turns the scheme set
+    into the flag. The previous form asserted `canonical in _OBJECT_STORE_SCHEMES` for a
+    scheme drawn from a hand-written subset of that very set -- true by construction, and it
+    would have kept passing if `_wrap_user_filesystem` stopped reading the set at all.
+    """
+    wrapped = fsmod._wrap_user_filesystem(f"{scheme}://bucket/key", pafs.LocalFileSystem())
+    assert wrapped._atomic_rename is False, (
+        f"`{scheme}://` writes would become temp-write plus a full server-side object copy"
+    )
+
+
+def test_a_local_path_keeps_atomic_rename():
+    """The control, and the reason the parametrization above is not vacuous.
+
+    Every case there asserts `is False`. If `_wrap_user_filesystem` returned a filesystem
+    with `atomic_rename` unset or always false, all nineteen would pass while testing
+    nothing. A local path must come back the other way.
+    """
+    wrapped = fsmod._wrap_user_filesystem("/tmp/x", pafs.LocalFileSystem())
+    assert wrapped._atomic_rename is True
 
 
 def test_the_legacy_hadoop_s3_spelling_takes_the_native_backend():

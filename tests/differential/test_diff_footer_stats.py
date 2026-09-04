@@ -113,15 +113,42 @@ def test_all_null_column_count_is_zero(duck, tmp_path):
     assert_same(got, want)  # 0, answered from footer null_count == row_count
 
 
-def test_float_nan_min_max_matches_duckdb(duck, tmp_path):
-    # A NaN in the column must not corrupt min()/max(); the footer path drops a NaN
-    # bound and the result still equals DuckDB (executed or metadata, both correct).
+def test_float_nan_min_max_declines_the_footer_and_matches_executed_duckdb(duck, tmp_path):
+    """A NaN column must decline the footer shortcut, and then agree with DuckDB's engine.
+
+    This is the one place in this file where DuckDB cannot be quoted as a single oracle,
+    because **DuckDB disagrees with itself** on the same three values:
+
+        SELECT max(f) FROM (VALUES (1.0),('nan'),(3.0)) t(f)  -> nan   (executed)
+        SELECT max(f) FROM 'nan.parquet'                      -> 3.0   (from the footer)
+
+    Its executed answer is the semantics it defines everywhere else: `'nan' > 3.0` is true,
+    and `ORDER BY f DESC` puts NaN first. Its Parquet answer is the footer's min/max, which
+    the Parquet specification requires writers to compute with NaN *excluded* — so reading
+    those bounds as the column's extremes silently answers a different question.
+
+    Batcher takes the executed semantics on both paths, which is why `metadata_aggregate_table`
+    must return `None` here rather than hand back a bound it knows is NaN-free. The assertion
+    is therefore against DuckDB's executed answer over the same values, not against its scan
+    of the file.
+    """
     path = str(tmp_path / "nan.parquet")
     pq.write_table(pa.table({"f": pa.array([1.0, float("nan"), 3.0], type=pa.float64())}), path)
     ds = bt.read.parquet(path)
-    got = ds.agg(lo=col("f").min(), hi=col("f").max()).collect()
-    want = duck.sql(f"SELECT min(f) AS lo, max(f) AS hi FROM '{path}'")
+    query = ds.agg(lo=col("f").min(), hi=col("f").max())
+    assert metadata_aggregate_table(query._plan, ds._sources) is None, (
+        "a NaN makes the footer's min/max the extremes of a different column"
+    )
+    got = query.collect()
+    want = duck.sql(
+        "SELECT min(f) AS lo, max(f) AS hi "
+        "FROM (VALUES (1.0::DOUBLE), ('nan'::DOUBLE), (3.0::DOUBLE)) t(f)"
+    )
     assert_same(got, want)
+    # The divergence itself, pinned: a change on either side that made the two agree would
+    # otherwise leave the paragraph above describing a state of the world that had moved.
+    from_file = duck.sql(f"SELECT max(f) AS hi FROM '{path}'").fetchall()
+    assert from_file == [(3.0,)], "DuckDB's Parquet path no longer reads max() off the footer"
 
 
 def test_count_distinct_not_answered_from_footer(duck, tmp_path):

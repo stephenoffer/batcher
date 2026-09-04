@@ -54,6 +54,7 @@ def llm_udf(
     finish_reason: bool = False,
     logprobs: bool = False,
     dedup: bool = False,
+    skip_null_prompts: bool = False,
 ) -> type:
     """A **load-once class UDF** that appends an LLM-generated column to each batch.
 
@@ -97,6 +98,11 @@ def llm_udf(
             every row that repeats it — a throughput win for deterministic decoding over a
             corpus with duplicate prompts. Leave off when sampling and you want an
             independent draw per row even for identical prompts.
+        skip_null_prompts: leave a row whose `prompt_column` is null out of the request
+            and give it a null output, instead of sending it as ``""``. Off by default;
+            turn it on to stop spending a decode slot (GPU engine) or a billed request
+            (hosted engine) on a row that has no prompt. Ignored when `template` or
+            `image_column` is set.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
@@ -116,6 +122,7 @@ def llm_udf(
         finish_reason=finish_reason,
         logprobs=logprobs,
         dedup=dedup,
+        skip_null_prompts=skip_null_prompts,
     )
 
     class _LlmGenerate:
@@ -160,6 +167,7 @@ def llm_generate(
     finish_reason: bool = False,
     logprobs: bool = False,
     dedup: bool = False,
+    skip_null_prompts: bool = False,
     num_workers: int = 1,
     target_batch_rows: int | None = None,
 ) -> Iterator[pa.RecordBatch]:
@@ -216,6 +224,11 @@ def llm_generate(
         dedup: run each distinct prompt through the engine only once and copy its result to
             the rows that repeat it. A throughput win for deterministic decoding over a
             corpus with duplicate prompts; leave off for independent samples per row.
+        skip_null_prompts: leave a row whose `prompt_column` is null out of the request
+            and give it a null output, instead of sending it as ``""``. Off by default;
+            turn it on to stop spending a decode slot (GPU engine) or a billed request
+            (hosted engine) on a row that has no prompt. Ignored when `template` or
+            `image_column` is set.
         num_workers: how many engines to build **in this process** and run batches
             across. Leave at ``1`` for a GPU-resident engine: each worker calls
             `engine_factory` again, so ``2`` loads two full copies of the weights onto
@@ -246,6 +259,7 @@ def llm_generate(
         finish_reason=finish_reason,
         logprobs=logprobs,
         dedup=dedup,
+        skip_null_prompts=skip_null_prompts,
     )
     if num_workers <= 1 and target_batch_rows is None:
         # The documented default: one engine, the caller's batches, in order. No pool,
@@ -302,23 +316,43 @@ def _generate_batch(
     from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 
     requests = _build_requests(spec, batch)
-    # Collapse identical prompts to distinct requests when asked (`dedup`); the engine then
-    # runs each once and its result is copied to every row that shared it.
-    uniques, inverse = _dedup_requests(requests) if spec.dedup else (requests, None)
-    order = _length_sorted_order(uniques)
-    with usage_sink().capture(), finish_reason_sink().capture(), logprob_sink().capture():
-        generated = list(engine([uniques[i] for i in order]))
-        reported = _Reported(
-            usage=usage_sink().collected(),
-            reasons=finish_reason_sink().collected(),
-            logprobs=logprob_sink().collected(),
+    # A row with no prompt at all never reaches the engine (see `_prompted_rows`). The
+    # pipeline below runs on the prompted rows only and the results are scattered back, so
+    # everything between here and the scatter is unchanged and unaware.
+    prompted = _prompted_rows(spec, batch)
+    live = requests if prompted is None else [requests[i] for i in prompted]
+
+    if not live:
+        outputs: list = [None] * len(requests)
+        row_reported = _Reported(
+            usage=[None] * len(requests) if spec.usage else None, reasons=None, logprobs=None
         )
-    if len(generated) != len(order):
-        raise _count_mismatch(engine, len(generated), len(order))
-    # Undo the length-sort (dispatch → unique order), then fan uniques back out to rows.
-    unique_outputs = _restore_order(generated, order)
-    outputs = _fan_out(unique_outputs, inverse)
-    row_reported = _row_reported(engine, reported, order, inverse, spec)
+    else:
+        # Collapse identical prompts to distinct requests when asked (`dedup`); the engine then
+        # runs each once and its result is copied to every row that shared it.
+        uniques, inverse = _dedup_requests(live) if spec.dedup else (live, None)
+        order = _length_sorted_order(uniques)
+        with usage_sink().capture(), finish_reason_sink().capture(), logprob_sink().capture():
+            generated = list(engine([uniques[i] for i in order]))
+            reported = _Reported(
+                usage=usage_sink().collected(),
+                reasons=finish_reason_sink().collected(),
+                logprobs=logprob_sink().collected(),
+            )
+        if len(generated) != len(order):
+            raise _count_mismatch(engine, len(generated), len(order))
+        # Undo the length-sort (dispatch → unique order), then fan uniques back out to rows.
+        unique_outputs = _restore_order(generated, order)
+        outputs = _fan_out(unique_outputs, inverse)
+        row_reported = _row_reported(engine, reported, order, inverse, spec)
+        if prompted is not None:
+            n = len(requests)
+            outputs = _scatter(outputs, prompted, n)
+            row_reported = _Reported(
+                usage=_scatter(row_reported.usage, prompted, n),
+                reasons=_scatter(row_reported.reasons, prompted, n),
+                logprobs=_scatter(row_reported.logprobs, prompted, n),
+            )
 
     arrays = [_output_column(outputs, spec)]
     # Everything is already in row order (order un-applied, uniques fanned out), so the
@@ -329,6 +363,60 @@ def _generate_batch(
     # into the column you read, or a second pass over the default `response`, produced two
     # columns of one name that `to_pydict()` and every expression disagree about.
     return append_columns(batch, dict(zip(spec.appended_columns, arrays, strict=True)))
+
+
+def _prompted_rows(spec: GenerateSpec, batch: pa.RecordBatch) -> list[int] | None:
+    """Row indices that carry a prompt, or `None` when every row does (the common case).
+
+    Empty unless `skip_null_prompts` is set. A null prompt cell renders as ``""`` and is
+    dispatched — `requests._cell`'s documented behaviour, pinned end to end by
+    `tests/unit/test_llm_template.py`, so it stays the default. This is the opt-out, for the
+    two costs that behaviour carries; the first is the one that reaches an invoice:
+
+    * the row **spent a generation**. On `vllm_engine` that is a decode slot; on the hosted
+      engines it is a billed request per null row, for a prompt that was never there.
+    * the answer came back indistinguishable from a real one. The engine returns *something*
+      for an empty prompt, so `response` held a plausible generation and nothing downstream
+      could separate "the model said this" from "there was nothing to ask".
+
+    Skipping them makes the output null instead, which is what `_output_column` already
+    documents for a row the engine could not generate for.
+
+    Only the unambiguous case is claimed, even with the flag on. A `template` builds the
+    prompt from other columns, so a null there is a null *field* and the `_cell` rendering
+    stands; an `image_column` means the image is the input and the text is a caption that may
+    legitimately be absent. Either one present, and every row is treated as prompted.
+
+    Args:
+        spec: The generation spec.
+        batch: The batch about to be dispatched.
+
+    Returns:
+        The indices to dispatch, or `None` to dispatch every row unchanged.
+    """
+    if not spec.skip_null_prompts:
+        return None
+    if spec.template is not None or spec.image_column is not None:
+        return None
+    column = batch.column(spec.prompt_column)
+    if column.null_count == 0:
+        return None
+    return [i for i, valid in enumerate(column.is_valid().to_pylist()) if valid]
+
+
+def _scatter(values: list | None, positions: list[int], total: int) -> list | None:
+    """`values` placed back at `positions` in a `total`-length row of nulls.
+
+    The inverse of the `[requests[i] for i in prompted]` narrowing above. `None` in, `None`
+    out, so a channel the spec never asked for stays absent rather than becoming a column of
+    nulls.
+    """
+    if values is None:
+        return None
+    out: list = [None] * total
+    for value, position in zip(values, positions, strict=True):
+        out[position] = value
+    return out
 
 
 def _dedup_requests(requests: list) -> tuple[list, list[int]]:

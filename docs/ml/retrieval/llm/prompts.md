@@ -2,6 +2,43 @@
 
 Building the input, and reading a conversation column back out.
 
+## Rows with no prompt
+
+A null in `prompt_column` renders as empty text and is sent to the engine like any other
+row. That costs something: a decode slot on a GPU engine, and a billed request on a hosted
+one. The answer that comes back is also indistinguishable from a real one, because an engine
+given an empty prompt still generates something.
+
+Pass `skip_null_prompts=True` to leave those rows out of the request and give them a null
+output instead:
+
+```python
+import batcher as bt
+
+
+def echo():
+    return lambda prompts: [p.upper() for p in prompts]
+
+
+rows = bt.from_pydict({"prompt": ["summarize this", None]})
+kept = rows.ml.generate(echo, prompt_column="prompt", skip_null_prompts=True)
+print(kept.to_pydict()["response"])
+# ['SUMMARIZE THIS', None]
+```
+
+Every appended column follows, so the token counts, the finish reason, and the
+log-probabilities are null on that row too and a cost report sums only what was generated.
+
+It is off by default, so an existing pipeline's output does not change under it. It applies
+to the prompt column itself: with a `template` the prompt is built from other columns, so a
+null *field* renders as empty text and the row is still sent, because the row does have a
+prompt. Filtering is always available and needs no flag:
+
+```python
+# docs: skip
+answered = ds.filter(bt.col("question").is_not_null()).ml.generate(engine, prompt_column="question")
+```
+
 ## Building prompts from columns
 
 When the prompt is more than a single column, pass a `template`, which is a `str.format`

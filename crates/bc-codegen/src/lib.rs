@@ -451,13 +451,15 @@ impl CompiledExpr {
                     .downcast_ref::<Int64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 DataType::Float64 => arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // Date32 is an i32 day-count buffer; the generated code loads it at a
                 // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
                 DataType::Date32 => arr
@@ -465,15 +467,16 @@ impl CompiledExpr {
                     .downcast_ref::<Date32Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
-                DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                    arr.as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap()
-                        .values()
-                        .as_ptr() as *const u8
-                }
+                DataType::Timestamp(TimeUnit::Microsecond, None) => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ptr()
+                    .cast::<u8>(),
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -491,12 +494,12 @@ impl CompiledExpr {
         match self.result_ty {
             ScalarTy::I64 => {
                 let mut out = vec![0i64; n];
-                run(p, nargs, n, &col_ptrs, out.as_mut_ptr() as *mut u8);
+                run(p, nargs, n, &col_ptrs, out.as_mut_ptr().cast::<u8>());
                 Ok(Arc::new(finish_primitive::<Int64Type>(out, validity)))
             }
             ScalarTy::F64 => {
                 let mut out = vec![0f64; n];
-                run(p, nargs, n, &col_ptrs, out.as_mut_ptr() as *mut u8);
+                run(p, nargs, n, &col_ptrs, out.as_mut_ptr().cast::<u8>());
                 Ok(Arc::new(finish_primitive::<Float64Type>(out, validity)))
             }
             ScalarTy::Bool => {
@@ -542,13 +545,15 @@ impl CompiledExpr {
                     .downcast_ref::<Int64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 DataType::Float64 => arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // Date32 is an i32 day-count buffer; the generated code loads it at a
                 // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
                 DataType::Date32 => arr
@@ -556,15 +561,16 @@ impl CompiledExpr {
                     .downcast_ref::<Date32Array>()
                     .unwrap()
                     .values()
-                    .as_ptr() as *const u8,
+                    .as_ptr()
+                    .cast::<u8>(),
                 // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
-                DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                    arr.as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap()
-                        .values()
-                        .as_ptr() as *const u8
-                }
+                DataType::Timestamp(TimeUnit::Microsecond, None) => arr
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ptr()
+                    .cast::<u8>(),
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -576,7 +582,7 @@ impl CompiledExpr {
             let mut v = vec![1u8; n];
             if arr.null_count() != 0 {
                 for (i, slot) in v.iter_mut().enumerate() {
-                    *slot = arr.is_valid(i) as u8;
+                    *slot = u8::from(arr.is_valid(i));
                 }
             }
             valid_arrays.push(v);
@@ -690,7 +696,9 @@ impl ColumnSet {
 /// is not lowered via a libcall (handled elsewhere or left to the interpreter).
 /// Keeping this map in one place keeps `analyze` and `emit_typed` in sync.
 pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str> {
-    use bc_expr::MathFunc::*;
+    use bc_expr::MathFunc::{
+        Acos, Asin, Atan, Cos, Cosh, Exp, Ln, Log10, Log2, Sin, Sinh, Tan, Tanh,
+    };
     Some(match func {
         Ln => "log",
         Log10 => "log10",
@@ -718,7 +726,7 @@ pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str>
 /// not a single libm call (`Round`, which takes a digit count, stays on the
 /// interpreter).
 pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static str> {
-    use bc_expr::Math2Func::*;
+    use bc_expr::Math2Func::{Atan2, Gcd, Hypot, Lcm, NextAfter, Pow, Round};
     Some(match func {
         Pow => "pow",
         Atan2 => "atan2",
@@ -900,7 +908,7 @@ mod tests {
         assert_parity(&range("d1"), &batch);
 
         // Nullable date: null-propagating comparison and Kleene compound over nulls.
-        assert_parity(&bin(BinaryOp::Ge, col("dn"), mid.clone()), &batch);
+        assert_parity(&bin(BinaryOp::Ge, col("dn"), mid), &batch);
         assert_parity(&range("dn"), &batch);
     }
 
@@ -997,7 +1005,7 @@ mod tests {
             )
         };
         assert_parity(&range("t1"), &batch);
-        assert_parity(&bin(BinaryOp::Ge, col("tn"), mid.clone()), &batch);
+        assert_parity(&bin(BinaryOp::Ge, col("tn"), mid), &batch);
         assert_parity(&range("tn"), &batch);
 
         // A non-microsecond timestamp column is not in the supported subset: the JIT
@@ -1340,6 +1348,11 @@ mod tests {
             math(MathFunc::Ceil, col("c")),
             math(MathFunc::Trunc, col("c")),
             math(MathFunc::Floor, col("a")),
+            // `trunc` over an *integer* column. This list covered trunc-over-float and
+            // floor-over-int but never trunc-over-int, which is the one combination where the
+            // two tiers could disagree about the result *type* — and where an f64 round-trip
+            // silently loses the low bit above 2^53.
+            math(MathFunc::Trunc, col("a")),
             // abs: float -> Float64, int -> Int64 (type preserved).
             math(MathFunc::Abs, col("c")),
             math(MathFunc::Abs, col("a")),
@@ -1880,7 +1893,7 @@ mod tests {
     /// interpreter. We also assert bit-for-bit parity inside the bench so it can
     /// never silently measure wrong code.
     #[test]
-    #[ignore]
+    #[ignore = "timing study: compiled JIT eval vs interpreter, steady-state per batch"]
     fn bench_jit_vs_interpreter() {
         use bc_expr::{CaseBranch, MathFunc};
         use std::time::Instant;
@@ -2862,5 +2875,106 @@ mod tests {
                 assert_eq!(&jit, &oracle, "force_scalar mismatch n={n} for {e:?}");
             }
         }
+    }
+
+    /// Whether the vector path admits `op`, stated here so it can be checked.
+    ///
+    /// An exhaustive `match`: adding a variant to [`bc_expr::BinaryOp`] stops this compiling
+    /// until someone classifies it, and the prose subset at the top of `simd.rs` is what to
+    /// update beside it.
+    ///
+    /// That prose had already drifted. It listed `And`/`Or` and temporal comparison as
+    /// *excluded* long after `simd_ty` began admitting both, and nothing in this crate could
+    /// see the difference — the emitter was right, the tests passed, and only the sentence
+    /// describing the tier was wrong. For a tier whose entire contract is bit-for-bit
+    /// agreement with the interpreter, a misdescribed subset is how someone comes to
+    /// "add" support that is already here, or reasons that a compound predicate falls back
+    /// to the oracle when it does not.
+    fn simd_admits(op: BinaryOp) -> bool {
+        use BinaryOp::{
+            AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
+            Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
+        };
+        match op {
+            // Comparisons over numeric or same-type temporal operands - the filter win.
+            Eq | Ne | Lt | Le | Gt | Ge => true,
+            // Integer wrap and IEEE float, both per-lane identical to the scalar path.
+            BinaryOp::Add | Sub | Mul => true,
+            // Float division only; the integer form is excluded with `Mod` below.
+            Div => true,
+            // Bitwise `band`/`bor` over two canonical masks, on a null-free batch.
+            And | Or => true,
+            // Scalarized `sdiv`/`srem` can trap; float `Mod` is an `fmod` libcall.
+            Mod | FloorDiv => false,
+            // Not numeric lanes: strings, integer bit twiddling, calendar arithmetic.
+            Concat | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | AddMonths => false,
+        }
+    }
+
+    /// Operands that give `op` its best chance of the vector path, so a `false` below means
+    /// "declined by design" rather than "asked with the wrong types".
+    fn simd_operands(op: BinaryOp) -> (Expr, Expr) {
+        match op {
+            // Boolean ops need boolean sub-results, which only a comparison produces here.
+            BinaryOp::And | BinaryOp::Or => (
+                bin(BinaryOp::Lt, col("a"), lit_i(0)),
+                bin(BinaryOp::Gt, col("b"), lit_i(0)),
+            ),
+            // Integer `/` is excluded by design, so ask with the float column instead.
+            BinaryOp::Div => (col("c"), col("c")),
+            _ => (col("a"), col("b")),
+        }
+    }
+
+    #[test]
+    fn the_documented_simd_binary_subset_is_what_simd_ty_admits() {
+        const ALL: [BinaryOp; 21] = [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Mod,
+            BinaryOp::FloorDiv,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Concat,
+            BinaryOp::BitAnd,
+            BinaryOp::BitOr,
+            BinaryOp::BitXor,
+            BinaryOp::ShiftLeft,
+            BinaryOp::ShiftRight,
+            BinaryOp::AddMonths,
+        ];
+        let batch = make_batch(64, 7);
+        let mut admitted_count = 0;
+        for op in ALL {
+            let (left, right) = simd_operands(op);
+            let expr = bin(op, left, right);
+            let mut cols = ColumnSet::default();
+            let admitted =
+                analyze(&expr, &batch, &mut cols).is_ok() && simd_ty(&expr, &cols).is_some();
+            admitted_count += usize::from(admitted);
+            assert_eq!(
+                admitted,
+                simd_admits(op),
+                "{op:?}: simd_ty admits it = {admitted}, but this table says {}. \
+                 Update the table AND the subset list at the top of simd.rs.",
+                simd_admits(op)
+            );
+        }
+        // A positive control: if `analyze` or `simd_ty` ever started declining everything,
+        // every row above would agree with a table of all-`false` and this test would pass
+        // while proving nothing.
+        assert_eq!(
+            admitted_count, 12,
+            "expected 12 admitted binary ops: 6 comparisons, 3 integer/float arithmetic, \
+             float `Div`, and `And`/`Or`"
+        );
     }
 }

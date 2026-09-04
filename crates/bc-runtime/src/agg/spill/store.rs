@@ -21,6 +21,7 @@ use arrow::datatypes::Schema;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::CompressionType;
+use bc_arrow::batch_slice_bytes;
 
 use crate::error::RuntimeError;
 
@@ -50,7 +51,7 @@ impl SpillCodec {
     /// Unknown names fall back to `Auto` (the datatype-aware policy) rather than
     /// erroring, so a newer control plane never breaks an older engine.
     pub fn from_config_str(name: Option<&str>) -> Self {
-        match name.map(|s| s.to_ascii_lowercase()).as_deref() {
+        match name.map(str::to_ascii_lowercase).as_deref() {
             Some("none") => Self::None,
             Some("lz4") => Self::Lz4,
             Some("zstd") => Self::Zstd,
@@ -99,7 +100,10 @@ impl SpillCodec {
     /// or IP address (4–32 bytes, does not) — and compressing a schema because it carries a
     /// 16-byte UUID would break this policy's "never a regression" property.
     fn carries_blobs(dt: &arrow::datatypes::DataType) -> bool {
-        use arrow::datatypes::DataType::*;
+        use arrow::datatypes::DataType::{
+            Binary, BinaryView, Dictionary, FixedSizeBinary, FixedSizeList, LargeBinary, LargeList,
+            LargeListView, LargeUtf8, List, ListView, Map, RunEndEncoded, Struct, Union,
+        };
         match dt {
             LargeBinary | Binary | BinaryView | LargeUtf8 => true,
             FixedSizeBinary(width) => *width >= MIN_FIXED_SIZE_BLOB,
@@ -129,6 +133,7 @@ impl SpillCodec {
     /// gathered bucket the same way, and it should reach the same answer rather than a
     /// second one. Restating the policy is how a blob-bearing gather goes out uncompressed
     /// while the identical rows are compressed on the spill path beside it.
+    #[must_use]
     pub fn write_options(self, schema: &Schema) -> IpcWriteOptions {
         let base = IpcWriteOptions::default();
         let codec = match self {
@@ -287,6 +292,7 @@ pub struct MemSpillStore {
 }
 
 impl MemSpillStore {
+    #[must_use]
     pub fn new(partitions: usize) -> Self {
         let n = partitions.max(1);
         Self {
@@ -312,13 +318,7 @@ impl SpillStore for MemSpillStore {
     fn partition_bytes(&self, partition: usize) -> u64 {
         self.parts
             .get(partition)
-            .map(|batches| {
-                batches
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .sum()
-            })
-            .unwrap_or(0)
+            .map_or(0, |batches| batches.iter().map(batch_slice_bytes).sum())
     }
 }
 
@@ -619,6 +619,7 @@ impl DiskSpillStore {
 impl DiskSpillStore {
     /// Rows written to `partition`, so a caller streaming it through
     /// [`DiskSpillStore::open_reader`] can make the same check `read` and `drain` make.
+    #[must_use]
     pub fn partition_rows(&self, partition: usize) -> u64 {
         self.rows_per_partition.get(partition).copied().unwrap_or(0)
     }
@@ -696,9 +697,9 @@ impl SpillStore for DiskSpillStore {
             .expect("writer just created")
             .write(batch)
             .map_err(|e| classify_spill_arrow(e, &dir(), bytes_written))?;
-        // Count the logical volume spilled (in-memory size, codec-independent) so the
-        // control plane can size spill scratch from a measured magnitude, not a bool.
-        let n = batch.get_array_memory_size() as u64;
+        // The logical volume spilled: codec-independent, and slice-aware because the IPC
+        // writer serializes the sliced rows. See `bc_arrow::batch_slice_bytes`.
+        let n = batch_slice_bytes(batch);
         self.bytes_written += n;
         if let Some(slot) = self.bytes_per_partition.get_mut(partition) {
             *slot += n;

@@ -35,8 +35,28 @@ def _offset_array(length: int, start: int) -> pa.Array:
     return pa.StringArray.from_buffers(length, shifted, values, None, 0)
 
 
-def test_pyarrow_still_corrupts_nonzero_offsets() -> None:
-    """The upstream defect the sink works around. Delete the workaround when this fails."""
+#: The oldest pyarrow `pyproject.toml` declares support for. The workaround below is
+#: required for as long as *any* version in that range corrupts the round trip, so this is
+#: what decides whether it can go -- not whichever version happens to be installed here.
+SUPPORTED_FLOOR = (16,)
+
+
+def test_the_workaround_is_still_required_at_the_supported_floor() -> None:
+    """Why `_rebase_offsets` still exists, stated as the two facts it depends on.
+
+    The defect was reproduced on pyarrow 19.0.1 and is fixed by 23.0.1, so on a current
+    install the round trip below comes back clean. That does **not** retire the workaround:
+    `pyproject.toml` declares `pyarrow>=16`, and a user on 19 gets NUL bytes with the right
+    row count and no error. The sink cannot ask which defect its reader has.
+
+    So this test asserts what is actually true on the installed version, and fails when the
+    *floor* moves past the fix -- which is the event that makes the workaround dead code.
+    """
+    assert SUPPORTED_FLOOR < (20,), (
+        "the declared pyarrow floor has passed the release that fixed nonzero-offset IPC; "
+        "delete `_offset_base`/`_rebase_offsets` and their calls in `arrow_ipc.py`"
+    )
+
     array = _offset_array(848, 16_000)
     array.validate(full=True)  # the array itself is valid Arrow
     assert array.to_pylist()[:3] == WORDS[:3]  # and reads correctly in memory
@@ -47,15 +67,19 @@ def test_pyarrow_still_corrupts_nonzero_offsets() -> None:
         writer.write_batch(batch)
     restored = ipc.open_stream(sink.getvalue()).read_all().column("s")
 
-    # The row count survives, which is what makes this silent. The values do not: they
-    # come back as NUL bytes here, and as invalid UTF-8 (a raising `to_pylist`) for other
-    # offsets, so the assertion is that they differ rather than that they raise.
+    # The row count survives either way, which is what made the old behaviour silent.
     assert len(restored) == len(array)
     try:
-        corrupt = restored.to_pylist()
+        round_tripped = restored.to_pylist()
     except UnicodeDecodeError:
-        return
-    assert corrupt != array.to_pylist()
+        return  # an unfixed pyarrow, corrupting loudly enough to raise
+    if tuple(int(part) for part in pa.__version__.split(".")[:1]) >= (20,):
+        assert round_tripped == array.to_pylist(), (
+            "this pyarrow was expected to have the fix; if it does not, the version "
+            "boundary in this test is wrong"
+        )
+    else:
+        assert round_tripped != array.to_pylist(), "the defect this workaround exists for"
 
 
 def test_rebase_normalizes_only_what_needs_it() -> None:

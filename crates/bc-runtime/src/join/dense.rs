@@ -49,11 +49,30 @@ const PARALLEL_BUILD_MIN_ROWS: usize = 1 << 16;
 const MAX_PARTS: usize = 64;
 
 /// A direct-indexed map from an integer key to its chain head.
+///
+/// The slots are held as **power-of-two-sized chunks** rather than one flat `Vec`, and that
+/// is a performance property rather than a layout detail. One `vec![EMPTY; span]` is a single
+/// serial act: mimalloc either hands back a recycled block and memsets it (measured **48 ms**
+/// for the 228 MB map TPC-H sf10's `orders.o_orderkey` needs) or hands back fresh pages that
+/// the scatter then faults in one at a time (**80 ms** in the same measurement, moved from one
+/// phase to the other). Either way it is the join's sequential prefix, and it dwarfed the
+/// probe it exists to serve — 65-118 ms against a 20 ms probe.
+///
+/// Cut into chunks, each worker allocates *and* zeroes *and* faults in only the range it owns,
+/// so all three costs run on every core. Lookup pays one extra indirection through a
+/// pointer array small enough to stay in L1 (64 entries), and the chunk index is a shift
+/// because the chunk length is a power of two.
 pub(super) struct DenseHeads {
-    /// The key that slot 0 stands for; a key `k` lives at `k - lo`.
+    /// The key that slot 0 stands for; a key `k` lives at slot `k - lo`.
     lo: i64,
-    /// `map[k - lo]` is the head build row **plus one** for key `k`, or [`EMPTY`].
-    map: Vec<u32>,
+    /// Slots in `chunk_len`-sized pieces: slot `s` is `chunks[s >> shift][s & mask]`.
+    chunks: Vec<Vec<u32>>,
+    /// `log2(chunk_len)`.
+    shift: u32,
+    /// `chunk_len - 1`.
+    mask: usize,
+    /// Total slots — the last chunk is short when `span` is not a multiple of `chunk_len`.
+    span: usize,
 }
 
 /// What a dense build produces — exactly the three things [`super::JoinTable`] needs to
@@ -142,14 +161,15 @@ impl DenseHeads {
         if span > u32::MAX as usize {
             return None;
         }
-        let (map, links) = if rows >= PARALLEL_BUILD_MIN_ROWS && rayon::current_num_threads() > 1 {
+        let (heads, links) = if rows >= PARALLEL_BUILD_MIN_ROWS && rayon::current_num_threads() > 1
+        {
             Self::fill_parallel(keys, null, lo, span)
         } else {
             Self::fill_serial(keys, null, lo, span)
         };
         let unique = links.is_empty();
         Some(DenseBuild {
-            heads: Self { lo, map },
+            heads,
             links,
             unique,
         })
@@ -160,12 +180,7 @@ impl DenseHeads {
     /// This is the definition the parallel fill must reproduce, and the oracle the tests below
     /// compare against — a key's chain is its build rows in descending order, headed by the
     /// last row seen.
-    fn fill_serial(
-        keys: &[i64],
-        null: &[bool],
-        lo: i64,
-        span: usize,
-    ) -> (Vec<u32>, Vec<(u32, u32)>) {
+    fn fill_serial(keys: &[i64], null: &[bool], lo: i64, span: usize) -> (Self, Vec<(u32, u32)>) {
         let rows = null.len();
         let mut map = vec![EMPTY; span];
         // Chain links for repeated keys, collected rather than written through a
@@ -186,7 +201,9 @@ impl DenseHeads {
             }
             *slot = i as u32 + 1;
         }
-        (map, chain)
+        // One chunk covering the whole span: the same lookup arithmetic serves both fills.
+        let chunk_len = span.max(1).next_power_of_two();
+        (Self::from_chunks(lo, span, chunk_len, vec![map]), chain)
     }
 
     /// The same fill, spread across cores — **bit-identical** to [`Self::fill_serial`].
@@ -202,47 +219,63 @@ impl DenseHeads {
     /// the *large* surrogate-key joins (`lineitem ⋈ orders` at TPC-H sf10 builds 15,000,000
     /// rows into a 60,000,000-slot map), so leaving it serial capped the whole join at one core
     /// while the probe beside it already scaled across ninety-six.
-    fn fill_parallel(
-        keys: &[i64],
-        null: &[bool],
-        lo: i64,
-        span: usize,
-    ) -> (Vec<u32>, Vec<(u32, u32)>) {
+    fn fill_parallel(keys: &[i64], null: &[bool], lo: i64, span: usize) -> (Self, Vec<(u32, u32)>) {
         let parts = rayon::current_num_threads()
             .min(MAX_PARTS)
             .next_power_of_two()
             .clamp(2, MAX_PARTS);
-        // Every slot lies in `0..span`, so `slot / range_len` is always a valid part index.
-        let range_len = span.div_ceil(parts).max(1);
+        // A power-of-two chunk, so the chunk index is a shift in the probe's hot path.
+        let chunk_len = chunk_len_for(span, parts);
+        let shift = chunk_len.trailing_zeros();
+        let nchunks = span.div_ceil(chunk_len);
         let slot_of = |i: usize| (keys[i] - lo) as u32;
+        // Every slot lies in `0..span`, so `slot >> shift` is always a valid chunk index.
         let buckets =
-            radix::partition_side(slot_of, null, parts, |slot| (*slot as usize) / range_len);
+            radix::partition_side(slot_of, null, nchunks, |slot| (*slot as usize) >> shift);
 
-        // `alloc_zeroed`: the map arrives empty from the OS (see `EMPTY`), so the only writes
-        // are the build rows themselves, made by the worker that owns their range.
-        let mut map = vec![EMPTY; span];
-        let chains: Vec<Vec<(u32, u32)>> = map
-            .par_chunks_mut(range_len)
+        // Allocate, zero and scatter **per chunk, on the worker that owns it**. Each of the
+        // three used to be serial (see [`DenseHeads`]); none of them is now.
+        let (chunks, chains): (Vec<Vec<u32>>, ChainLinks) = buckets
+            .into_par_iter()
             .enumerate()
-            .zip(buckets.par_iter())
-            .map(|((p, slice), rows_here)| {
-                let base = p * range_len;
+            .map(|(p, rows_here)| {
+                let base = p << shift;
+                let mut cells = vec![EMPTY; chunk_len.min(span - base)];
                 let mut chain: Vec<(u32, u32)> = Vec::new();
-                for &(slot, abs) in rows_here {
-                    let cell = &mut slice[slot as usize - base];
+                for (slot, abs) in rows_here {
+                    let cell = &mut cells[slot as usize - base];
                     if *cell != EMPTY {
                         chain.push((abs, *cell - 1));
                     }
                     *cell = abs + 1;
                 }
-                chain
+                (cells, chain)
             })
-            .collect();
+            .unzip();
         // The link *vector's* order is immaterial — `build::stitch_chain` writes each
-        // `next[row]`, and a row appears in exactly one range — so a flat concatenation is
-        // enough. What must be preserved is each key's chain, and disjoint ranges plus
-        // ascending rows within a range already guarantee it.
-        (map, chains.concat())
+        // `next[row]`, and a row appears in exactly one chunk — so a flat concatenation is
+        // enough. What must be preserved is each key's chain, and disjoint chunks plus
+        // ascending rows within a chunk already guarantee it.
+        (
+            Self::from_chunks(lo, span, chunk_len, chunks),
+            chains.concat(),
+        )
+    }
+
+    /// The slot key `k` would occupy, or `None` when it is outside the mapped range.
+    #[inline(always)]
+    fn slot_of(&self, k: i64) -> Option<usize> {
+        let idx = usize::try_from(k.checked_sub(self.lo)?).ok()?;
+        (idx < self.span).then_some(idx)
+    }
+
+    /// Heap bytes the map holds — the slot chunks, which is all of it.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|c| c.capacity() * std::mem::size_of::<u32>())
+            .sum::<usize>()
+            + self.chunks.capacity() * std::mem::size_of::<Vec<u32>>()
     }
 
     /// The chain head for probe key `k`, or `None` when no build row carries it.
@@ -250,12 +283,32 @@ impl DenseHeads {
     pub(super) fn head(&self, k: i64) -> Option<u32> {
         // A probe key outside the build's range simply has no build row — the same answer
         // the hash table gives, reached without a lookup.
-        let idx = k.checked_sub(self.lo)?;
-        let slot = *self.map.get(usize::try_from(idx).ok()?)?;
+        let idx = self.slot_of(k)?;
+        let slot = self.chunks[idx >> self.shift][idx & self.mask];
         // `then`, not `then_some`: the latter evaluates its argument eagerly, and `slot - 1`
         // underflows on the empty slot this is testing for.
         (slot != EMPTY).then(|| slot - 1)
     }
+
+    /// Assemble the chunked map from its pieces.
+    fn from_chunks(lo: i64, span: usize, chunk_len: usize, chunks: Vec<Vec<u32>>) -> Self {
+        Self {
+            lo,
+            chunks,
+            shift: chunk_len.trailing_zeros(),
+            mask: chunk_len - 1,
+            span,
+        }
+    }
+}
+
+/// One `(row, next)` chain-link list per map chunk, before they are concatenated.
+type ChainLinks = Vec<Vec<(u32, u32)>>;
+
+/// Slots per chunk, given the span and the worker count: a power of two (so the chunk index
+/// is a shift) that cuts `span` into at least `parts` pieces.
+fn chunk_len_for(span: usize, parts: usize) -> usize {
+    span.div_ceil(parts).max(1).next_power_of_two()
 }
 
 /// `(lo, span)` for the non-null keys when the range is worth direct-mapping, else `None`.
@@ -325,7 +378,16 @@ mod tests {
             let (smap, mut slinks) = DenseHeads::fill_serial(&keys, &null, lo, span);
             let (pmap, mut plinks) = DenseHeads::fill_parallel(&keys, &null, lo, span);
 
-            assert_eq!(smap, pmap, "every slot must hold the same chain head");
+            // Slot-by-slot through the lookup the probe uses, because the two fills lay the
+            // slots out differently on purpose — one flat piece against one piece per worker —
+            // and it is the *answer* that has to be identical, not the arrangement.
+            for k in (lo - 1)..=(lo + span as i64) {
+                assert_eq!(
+                    smap.head(k),
+                    pmap.head(k),
+                    "every key must find the same chain head (k={k})"
+                );
+            }
             // The link vector's order is immaterial (see `fill_parallel`); the set is not.
             slinks.sort_unstable();
             plinks.sort_unstable();

@@ -30,6 +30,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Expr
+from batcher.plan.functions.collection import map_from_arrays
 
 __all__ = ["map_function", "map_subscript"]
 
@@ -51,6 +52,20 @@ def map_function(tr, node) -> Expr | None:
         if isinstance(name, (exp.Literal, exp.Identifier)):
             return tr._scalar(node.this).struct.get(name.name)
         return None
+    if isinstance(node, exp.Map) or (
+        isinstance(node, exp.Anonymous) and node.name.lower() == "map_from_arrays"
+    ):
+        # `map(keys, values)` (DuckDB) and `map_from_arrays(keys, values)` (Spark) are the
+        # same constructor. sqlglot gives the first a typed `exp.Map` whose operands are
+        # `keys`/`values`; the Spark spelling arrives anonymous.
+        if isinstance(node, exp.Map):
+            keys, values = node.args.get("keys"), node.args.get("values")
+        else:
+            args = list(node.expressions)
+            keys, values = (*args, None, None)[:2]
+        if keys is None or values is None:
+            return None
+        return map_from_arrays(tr._scalar(keys), tr._scalar(values))
     if isinstance(node, exp.MapKeys):
         # `map_values` arrives as `exp.Anonymous` and the anonymous table serves it;
         # `map_keys` gets a typed node, so without this branch it raises "unsupported SQL

@@ -25,9 +25,18 @@ rather than converge to one.
 | `REWRITE` | to fixpoint | algebraic rewrites (e.g. redundant-distinct removal) |
 | `PUSHDOWN` | to fixpoint | predicate, projection, and limit pushdown; column pruning |
 | `JOIN_REORDER` | once | cost-based multi-table join ordering |
-| `FUSION` | once | operator and top-N fusion |
+| `FUSION` | to fixpoint | operator and top-N fusion |
+| *canonicalization round* | to fixpoint | the contracting rewrites, run once more |
 | `SELECTION` | once | physical algorithm choice (join build side) |
 | `ENFORCE` | once | distribution/exchange enforcement and validation |
+
+The canonicalization round exists because the pipeline is a single forward pass. A rule that
+collapses a shape, such as folding two adjacent filters into one conjunction, runs early and
+then never sees the plan again — but pushdown, join reordering, and fusion all re-create that
+shape after it has run. The round re-applies exactly those contracting rewrites once the
+plan's structure has settled, so the engine is not handed an operator the optimizer already
+knew how to remove. See {doc}`internals/kyber` for what qualifies a rule to take part and why
+the round must sit before `SELECTION`.
 
 ## What the passes do
 
@@ -108,10 +117,17 @@ ds = ds.sort("score", descending=True).limit(100)  # fused into top-N
 
 Join order dominates the cost of a multi-table query, because the wrong order
 materializes a large intermediate that a better order never builds. Kyber reorders
-joins cost-based, minimizing the estimated intermediate sizes. The search is exact
-dynamic programming at or below `optimizer.join_dp_max_tables` tables, 12 by default,
-and a greedy heuristic up to `optimizer.greedy_max_tables`, 25 by default. Beyond that
-count, exhaustive search stops paying for itself and Kyber leaves the order alone.
+joins cost-based, minimizing the estimated intermediate sizes, using dynamic
+programming over connected subsets of the join graph and falling back to a greedy
+builder when the graph is too large or too dense to search.
+
+How hard Kyber searches is decided per query rather than by a fixed table count. The
+optimizer prices the join region, grants a share of that estimated cost back as search
+time, and spends it in units of candidate join pairs. A query too cheap to repay the
+search stops early and takes the greedy order, and a query large enough to repay far
+more searching gets it. See
+{doc}`Cost model </architecture/deep-dives/adaptive/cost-model>` for the measurements
+behind the budget.
 
 ```python
 result = table_a.join(table_b, on="key").join(table_c, on="key")

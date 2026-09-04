@@ -48,6 +48,107 @@ Pytest markers (declare them): `unit`, `differential`, `integration`, `property`
 Property tests (`hypothesis`) are encouraged for algebraic invariants
 (merge associativity, encode/decode round-trips, optimizer idempotence).
 
+## The two gates, and the difference between them
+
+Both are mechanical and both are blocking. They catch adjacent failures and it is worth
+knowing which is which, because the second is the one that survives review.
+
+`just lint-tests`
+    A test that **cannot fail**: an ordered result compared with an order-independent
+    helper, an assertion true by construction (`assert len(x) >= 0`), a test that asserts
+    nothing at all.
+
+`just lint-methodology`
+    A test, example or benchmark that **can** fail but has been arranged so that it does
+    not — so it reports a property nobody checked. Everything it finds runs real code,
+    takes real time, and turns green, which is why reading the output cannot distinguish
+    it from a working check. What it found on its first run, all since fixed:
+
+    - three SQL differential tests comparing an outermost-`ORDER BY` result with
+      `assert_same`, which sorts both sides;
+    - two `parametrize`s over a directory walk with nothing asserting it found anything —
+      `tests/docs/test_examples.py` collects **510 executed example scripts** that way, and
+      a moved directory turns all 510 into zero tests with the run still green;
+    - seven `examples/` scripts running to completion asserting nothing, one of which
+      printed `None` three times under the heading "each node summarizes its neighbours";
+    - one test turning an engine failure into `pytest.skip` behind a bare
+      `except Exception`, hiding 48 of its own 98 cases — and `lint-skips` reads
+      module-level guards by design, so a mid-body skip is invisible to it;
+    - two assertions that a token is *absent* from `explain()` output, with nothing
+      anywhere proving that token ever appears.
+
+The last shape is the one that decays without anyone touching it. When `plan/profile/render/`
+turned `explain()` into a table with a header and tree glyphs, a helper that parsed it with
+`line.strip().split()[0]` began returning `['query', '────', 'OPERATOR', 'sort', '└─']`.
+One exact-equality assertion failed loudly, which is how it was found.
+
+**An earlier revision of this paragraph claimed the `assert "sort" not in _ops(ds)` beside it
+had become a tautology. That was asserted without being checked, and it is false.** The
+broken parser still returned the *root* operator's name correctly — only *nested* operators
+collapsed to `'└─'` — and the sort in that test is the root when it is present at all. Run
+both ways, the assertion passes on a source whose `sorted_by` metadata makes the sort
+eliminable and fails on one without it, so it discriminated exactly the two states it exists
+to tell apart.
+
+Keep the rule and correct the reasoning. The hazard was **latent, not realized**: the same
+helper feeding an assertion about any operator *below* the root would have silently become a
+tautology, because no nested operator's name survived the parse. That is the case a positive
+control catches. So an absence assertion needs one — something showing the token appears when
+it should — or it is only a claim about the renderer. And a claimed instance of a test that
+cannot fail is itself a claim to be run rather than argued: this one was written into a rules
+file on nothing but a plausible reading of the parser.
+
+### Two things the audit tooling deliberately will not do
+
+**It will not flag a plan shape.** Three "redundant-looking" constructs were raised in one
+day and all three were deliberate, including a `lambda:` that existed purely to defer a name
+lookup and whose removal by a ruff autofix broke `import batcher` for four sessions.
+Apparent redundancy is not evidence of redundancy, and a rule that fires on shape rather
+than behaviour manufactures regressions in proportion to how automatic it is.
+
+**It will not report a cause it inferred.** A controlled change — move one variable, hold
+the rest, watch the behaviour move — earns a *dependency* claim, not a *mechanism* claim.
+"An interposed `Project` blocks predicate pushdown" was backed by exactly such a change and
+was still wrong about the mechanism: pushdown works, and the filter came from
+`runtime_join_filter` in the last phase with nothing left to sink it. Acting on the
+inference would have modified correct code and left the real bug in place. An over-read
+experiment is more dangerous than an unread one, because it arrives with evidence attached.
+
+### A knob that moves is not a knob that tests what you think
+
+`collect(num_partitions=N)` is a **spill** knob. It is the obvious reach when you want to
+show an operator gives the same answer however the work is divided, and it does not show
+that.
+
+Measured here: varying it from 1 to 8 visibly changes physical execution -- a spilled
+300,000-row sort came back in 61 batches against 72, with the timing to match -- and it did
+not move a `LIMIT` over an unordered `group_by` at all. Not at 200 rows, not at 300,000
+(both sides of `MIN_ROWS_TO_SHARD`, which is 4 morsels = 65,536), with spill on or off, from
+an in-memory source or four Parquet files. That shape is precisely the one
+`.claude/rules/python-control-plane.md` records as diverging between a single-node run and a
+two-worker one over four Parquet files: groups 0, 1, 2 against 3, 5, 8.
+
+So a test asserting "the same result at 1, 4 and 8 partitions" is a true statement about
+spilling and says nothing about distribution, while reading exactly like a distributed
+equivalence test. The only thing that tests single-node == distributed is `distributed=True`
+against a real cluster, which CI cannot do and `just lint-skips` prices.
+
+Two further traps sit on either side of this one, and both were walked into in the session
+that wrote this entry:
+
+- **Below `MIN_ROWS_TO_SHARD` nothing shards at all**, so a small fixture makes *every*
+  parallelism knob inert and every such comparison vacuous. A 200-row fixture proves
+  nothing about parallel execution, and the first reading of the measurement above -- "the
+  lever is inert" -- was wrong for exactly that reason before it was re-run at 300,000.
+- **A sweep over many operations at once inherits the weakness of its lever.** 32 graph
+  algorithms were swept for "determinism across partition counts" and all 32 agreed, which
+  looked like a strong result and was worth nothing: one inert lever, 32 vacuous rows. The
+  breadth made it more convincing, not more valid.
+
+The general form: before trusting a comparison across a setting, show the setting changes
+something you can see. If you cannot make the *un*fixed version of the system fail the test,
+the test is not measuring the setting.
+
 ## Correctness before timing
 
 The benchmark harness refuses to time a query whose result doesn't match the oracle

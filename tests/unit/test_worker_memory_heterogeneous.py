@@ -44,7 +44,7 @@ def test_unreadable_topology_falls_back_to_the_average(monkeypatch):
     from batcher.dist import executor as ex
 
     gib = 1 << 30
-    monkeypatch.setattr(ex, "_worker_node_cpus", lambda: [])
+    monkeypatch.setattr(ex, "_worker_node_cpus", list)
     monkeypatch.setattr(ex, "worker_node_memory_bytes", lambda: 64 * gib)
     monkeypatch.setattr(ex, "alive_node_count", lambda: 4)
     from batcher.config import active_config

@@ -56,7 +56,7 @@ pub(super) fn eval_numeric_input(
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| ExprError::ExpectedString {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
+                got: crate::error::type_name(arr.data_type()),
             })?;
 
     let radix = match func {
@@ -120,8 +120,8 @@ fn to_base_unsigned(mut magnitude: u64, radix: u32) -> String {
     let digits: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut out = Vec::new();
     while magnitude > 0 {
-        out.push(digits[(magnitude % radix as u64) as usize]);
-        magnitude /= radix as u64;
+        out.push(digits[(magnitude % u64::from(radix)) as usize]);
+        magnitude /= u64::from(radix);
     }
     out.reverse();
     String::from_utf8(out).unwrap_or_default()

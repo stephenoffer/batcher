@@ -52,9 +52,7 @@ class TestShuffleRecoveryEvents:
     def test_one_recovered_round_publishes_one_recompute(self, bus: list[events.Event]) -> None:
         attempts = iter([("partial", {3}), ("done", None)])
         recomputed: list[set[int]] = []
-        result = ShuffleRecovery(label="join").run(
-            lambda: next(attempts), lambda failed: recomputed.append(failed)
-        )
+        result = ShuffleRecovery(label="join").run(lambda: next(attempts), recomputed.append)
         assert result == "done"
         assert recomputed == [{3}]
 

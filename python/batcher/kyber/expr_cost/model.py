@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from batcher.kyber.expr_cost.jit import JIT_SPEEDUP, jit_compilable
 from batcher.kyber.expr_cost.weights import BINARY_COST, own_cost, sub_exprs
-from batcher.plan.expr_ir import Col, Expr, Lit
+from batcher.plan.expr_ir import Case, Col, Expr, Lit
 
 __all__ = ["expr_cost", "expr_cost_factor", "raw_expr_cost"]
 
@@ -47,11 +47,35 @@ def raw_expr_cost(expr: Expr) -> float:
     cached = expr.__dict__.get("_c_rawcost")
     if cached is not None:
         return cached
-    total = own_cost(expr)
-    for child in sub_exprs(expr):
-        total += raw_expr_cost(child)
+    total = (
+        _case_cost(expr)
+        if isinstance(expr, Case)
+        else own_cost(expr) + sum(raw_expr_cost(child) for child in sub_exprs(expr))
+    )
     expr.__dict__["_c_rawcost"] = total
     return total
+
+
+def _case_cost(expr: Case) -> float:
+    """A `CASE`'s per-row cost: every condition, but only the dearest single branch.
+
+    Summing the branches the way every other node sums its children prices a `CASE` at
+    what the whole *column* costs, not what a *row* costs, and those differ by the branch
+    count. The data plane evaluates one branch per row (`bc_expr::eval::branch`), so a
+    four-arm `CASE` over regexes was priced at four regexes where it runs one — and this
+    number is a multiplier on an operator's per-row cost, so the over-charge propagates
+    into join ordering and into `split_expensive_filter`'s ranks.
+
+    `max` rather than a selectivity-weighted average because nothing here knows which arm
+    a row takes; the dearest arm is the honest upper bound on one row's work, and it stays
+    an *upper* bound, which is the safe side for a cost used to keep expensive work off
+    hot rows. Mirrors `bc_expr::Expr::eval_cost`, deliberately: the two price the same
+    thing and a divergence between them is a bug in whichever moved.
+    """
+    conditions = sum(raw_expr_cost(when) for when, _ in expr.branches)
+    bodies = [raw_expr_cost(then) for _, then in expr.branches]
+    bodies.append(raw_expr_cost(expr.otherwise))
+    return own_cost(expr) + conditions + max(bodies)
 
 
 def expr_cost(expr: Expr, jit_speedup: float = JIT_SPEEDUP) -> float:

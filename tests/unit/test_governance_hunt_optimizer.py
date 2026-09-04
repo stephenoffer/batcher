@@ -106,10 +106,17 @@ def test_optimizer_does_not_hoist_the_mask_above_the_row_filter_or_scan():
     opt = _optimize(user)
     ir = opt.to_ir()
     masks = _find_masks(ir)
-    assert len(masks) == 1
-    # The masked input must be the source `ssn` column (possibly via a folded cast), so the
-    # raw value is consumed only inside the mask, never emitted alongside it.
-    masked_input = masks[0]["input"]
-    while masked_input.get("e") == "cast":
-        masked_input = masked_input["input"]
-    assert masked_input == {"e": "col", "name": "ssn"}
+    # Every mask, not `masks[0]`, and no fixed count. `Redact` with a non-zero reveal lowers
+    # to a conditional -- fully masking a value no longer than what it reveals -- so the plan
+    # legitimately carries one `mask` per branch. A count pinned to 1 was standing in for
+    # "present and not hoisted", which is what the two assertions below check directly, and
+    # checking every branch is stronger than checking the first one.
+    assert masks, "the mask expression was optimized away entirely"
+    for node in masks:
+        masked_input = node["input"]
+        # The masked input must be the source `ssn` column (possibly via a folded cast), so
+        # the raw value is consumed only inside the mask, never emitted alongside it.
+        while masked_input.get("e") == "cast":
+            masked_input = masked_input["input"]
+        assert masked_input == {"e": "col", "name": "ssn"}
+    assert not _ssn_reaches_output_unmasked(ir), "raw ssn reached the output -- a bypass"

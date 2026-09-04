@@ -71,6 +71,7 @@ fn shm_root() -> Option<PathBuf> {
 }
 
 /// Whether a shared-memory transfer directory is usable on this host.
+#[must_use]
 pub fn shm_available() -> bool {
     shm_root().is_some()
 }

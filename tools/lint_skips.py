@@ -20,8 +20,31 @@ deterministic, and does not itself depend on what happens to be installed on the
 running it. It therefore sees *module-level* guards — which is where the structural gates
 live — and deliberately not a `pytest.skip()` reached halfway through a test body.
 
+**The ratchet is on the SHARE, not the raw count** — and that is the whole reason it works.
+
+An absolute-count budget goes stale on every commit that adds tests, which is every commit.
+It did: the budget was written by `5b2508e7` recording ``batcher._native: 3223`` while that
+same commit's tree actually gated **4024**. It was wrong on arrival, so `just lint-skips` has
+returned 1 at every commit since, and a permanently-red gate is one everybody learns to walk
+past. That is the same failure the coverage gate is warned about two recipes down in the
+`justfile` — "a ratchet nobody tightens is not a ratchet" — arriving from the other side: a
+floor set below reality is as useless as a ceiling set above it, because neither can change
+state in response to anything.
+
+The share is the quantity that actually means something. "22.6% of the suite cannot run here"
+is the fact worth defending; "4390 tests" is that fact times however many tests exist this
+week. Adding a hundred CPU tests and a hundred GPU tests leaves the hole the same size and
+must not fail, while a single new gate on a directory conftest cascades to its whole subtree
+and moves the share hard — which is exactly the event this file exists to catch.
+
+Measured on this tree, ordinary growth moves a share by about half a point (`batcher._native`
+went 22.1% -> 22.6% across ~1,300 new tests between `5b2508e7` and `HEAD`), whereas a cascade
+is enormous: `tests/differential` alone is over half the suite. `SHARE_TOLERANCE` therefore
+sits at one point — loose enough that proportional growth never fails, tight enough that no
+real cascade fits under it.
+
 Raising a budget entry is a normal part of adding a test that needs hardware; what must not
-happen silently is the count going up because something *stopped* being reachable.
+happen silently is the *share* going up because something *stopped* being reachable.
 
 Usage:
     python tools/lint_skips.py            # check against the budget
@@ -36,10 +59,24 @@ import ast
 import collections
 import json
 import pathlib
+import re
 import sys
+
+#: How far a dependency's share of the suite may drift above its recorded value before the
+#: gate fails, in share points (0.01 == one percentage point). See the module docstring for
+#: why this is a share and not a count, and for the measurement behind the value.
+SHARE_TOLERANCE = 0.01
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
+DOCS = ROOT / "docs"
+
+#: A fenced ``python`` block under `docs/` opting out of execution. `tests/docs/
+#: test_doc_examples.py` runs every other one, so this marker is the only way a documented
+#: example stops being checked — and it is exactly as invisible as an `importorskip` was
+#: before this file counted them. The policy is sound (a block needing Kafka, a cloud
+#: bucket, a GPU or a real model cannot run in CI); what needs watching is the *share*.
+DOCS_SKIP = "# docs: skip"
 BUDGET_PATH = ROOT / "tools" / "skip_budget.json"
 
 #: Dependencies whose absence is expected and uninteresting to track individually — they are
@@ -143,12 +180,58 @@ def survey() -> tuple[dict[str, int], int, int]:
     return dict(gated), total, dead
 
 
+def _budget(gated: dict[str, int], total: int, dead: int) -> dict:
+    """The budget document: each dependency's share, with the count that produced it.
+
+    The share is what the gate compares; the count and the total are recorded beside it so a
+    reviewer can see what moved without re-running the tool, and so the diff of this file
+    reads as a fact about the suite rather than an opaque number.
+    """
+    doc_skipped, doc_total = doc_blocks()
+    return {
+        "gated": {
+            dep: {"share": round(count / max(1, total), 4), "tests": count}
+            for dep, count in sorted(gated.items())
+        },
+        "total_tests": total,
+        "unconditionally_skipped": dead,
+        "doc_blocks": {
+            "share": round(doc_skipped / max(1, doc_total), 4),
+            "skipped": doc_skipped,
+            "total": doc_total,
+        },
+    }
+
+
+def doc_blocks() -> tuple[int, int]:
+    """``(skipped, total)`` fenced python blocks under `docs/`.
+
+    Counted here rather than in a test of its own because it is the same measurement as the
+    rest of this file — documentation CI executes, versus documentation it does not — and
+    splitting the two would let a reader see half the hole.
+    """
+    block = re.compile(r"```python\n(.*?)```", re.S)
+    skipped = total = 0
+    for path in sorted(DOCS.rglob("*.md")):
+        if "_build" in path.parts:
+            continue
+        for match in block.finditer(path.read_text(encoding="utf-8")):
+            total += 1
+            skipped += match.group(1).lstrip().startswith(DOCS_SKIP)
+    return skipped, total
+
+
 def _render(gated: dict[str, int], total: int, dead: int) -> str:
     width = max((len(k) for k in gated), default=10)
     lines = [f"{'dependency':{width}}  {'tests gated':>11}  {'share':>6}"]
     for dep, count in sorted(gated.items(), key=lambda kv: -kv[1]):
         lines.append(f"{dep:{width}}  {count:>11}  {count / max(1, total):>5.1%}")
     lines.append(f"\n{total} test functions total; {dead} unconditionally skipped")
+    doc_skipped, doc_total = doc_blocks()
+    lines.append(
+        f"{doc_total} fenced python blocks under docs/; {doc_skipped} "
+        f"({doc_skipped / max(1, doc_total):.1%}) marked `# docs: skip`"
+    )
     return "\n".join(lines)
 
 
@@ -163,7 +246,7 @@ def main() -> int:
         print(_render(gated, total, dead))
         return 0
 
-    current = {"gated": gated, "unconditionally_skipped": dead}
+    current = _budget(gated, total, dead)
     if args.update:
         BUDGET_PATH.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
         print(f"lint-skips: budget written to {BUDGET_PATH.relative_to(ROOT)}")
@@ -175,23 +258,46 @@ def main() -> int:
         return 1
 
     budget = json.loads(BUDGET_PATH.read_text())
+    recorded = budget.get("gated", {})
     failures = []
     for dep, count in sorted(gated.items()):
-        allowed = budget.get("gated", {}).get(dep)
-        if allowed is None:
-            failures.append(f"  {dep}: {count} tests gated, not in the budget (new gate)")
-        elif count > allowed:
-            failures.append(f"  {dep}: {count} tests gated, budget {allowed} (+{count - allowed})")
+        entry = recorded.get(dep)
+        share = count / max(1, total)
+        if entry is None:
+            failures.append(
+                f"  {dep}: {count} tests gated ({share:.1%}), not in the budget (new gate)"
+            )
+            continue
+        allowed = entry["share"]
+        if share > allowed + SHARE_TOLERANCE:
+            failures.append(
+                f"  {dep}: {share:.1%} of the suite gated ({count} of {total}), "
+                f"budget {allowed:.1%} +{SHARE_TOLERANCE:.0%} tolerance "
+                f"(+{(share - allowed) * 100:.1f} points)"
+            )
+    recorded_docs = budget.get("doc_blocks")
+    if recorded_docs is not None:
+        doc_skipped, doc_total = doc_blocks()
+        doc_share = doc_skipped / max(1, doc_total)
+        if doc_share > recorded_docs["share"] + SHARE_TOLERANCE:
+            failures.append(
+                f"  docs `# docs: skip`: {doc_share:.1%} of fenced python blocks "
+                f"({doc_skipped} of {doc_total}), budget {recorded_docs['share']:.1%} "
+                f"+{SHARE_TOLERANCE:.0%} tolerance"
+            )
+
     allowed_dead = budget.get("unconditionally_skipped", 0)
     if dead > allowed_dead:
         failures.append(f"  @pytest.mark.skip: {dead}, budget {allowed_dead}")
 
     if failures:
-        print("lint-skips: FAIL — more of the suite became unreachable\n")
+        print("lint-skips: FAIL — a larger share of the suite became unreachable\n")
         print("\n".join(failures))
         print(
-            "\nCI runs on CPU only, so a gated test is a test nobody runs. If the increase is\n"
-            "intended (a new test that genuinely needs hardware), raise the budget:\n"
+            "\nCI runs on CPU only, so a gated test is a test nobody runs. A share that grew\n"
+            "by more than the tolerance is usually a gate that cascaded: check whether a\n"
+            "conftest gained an `importorskip` that now applies to its whole subtree. If the\n"
+            "increase is intended (new tests that genuinely need hardware), re-record it:\n"
             "  python tools/lint_skips.py --update"
         )
         return 1

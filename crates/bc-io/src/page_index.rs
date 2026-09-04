@@ -192,13 +192,13 @@ fn cmp_page(page: &Page, op: CmpOp, lit: &Lit) -> bool {
             };
             let (mn, mx) = if page.unsigned {
                 (
-                    p.min.map(|x| x as u32 as i128),
-                    p.max.map(|x| x as u32 as i128),
+                    p.min.map(|x| i128::from(x as u32)),
+                    p.max.map(|x| i128::from(x as u32)),
                 )
             } else {
-                (p.min.map(|x| x as i128), p.max.map(|x| x as i128))
+                (p.min.map(i128::from), p.max.map(i128::from))
             };
-            range_survives(mn, mx, *v as i128, op)
+            range_survives(mn, mx, i128::from(*v), op)
         }
         (Index::INT64(i), Lit::Int(v)) => {
             let Some(p) = i.indexes.get(ordinal) else {
@@ -206,19 +206,19 @@ fn cmp_page(page: &Page, op: CmpOp, lit: &Lit) -> bool {
             };
             let (mn, mx) = if page.unsigned {
                 (
-                    p.min.map(|x| x as u64 as i128),
-                    p.max.map(|x| x as u64 as i128),
+                    p.min.map(|x| i128::from(x as u64)),
+                    p.max.map(|x| i128::from(x as u64)),
                 )
             } else {
-                (p.min.map(|x| x as i128), p.max.map(|x| x as i128))
+                (p.min.map(i128::from), p.max.map(i128::from))
             };
-            range_survives(mn, mx, *v as i128, op)
+            range_survives(mn, mx, i128::from(*v), op)
         }
         (Index::FLOAT(i), Lit::Float(v)) => {
             let Some(p) = i.indexes.get(ordinal) else {
                 return true;
             };
-            float_range_survives(p.min.map(|x| x as f64), p.max.map(|x| x as f64), *v, op)
+            float_range_survives(p.min.map(f64::from), p.max.map(f64::from), *v, op)
         }
         (Index::DOUBLE(i), Lit::Float(v)) => {
             let Some(p) = i.indexes.get(ordinal) else {
@@ -230,12 +230,7 @@ fn cmp_page(page: &Page, op: CmpOp, lit: &Lit) -> bool {
             let Some(p) = i.indexes.get(ordinal) else {
                 return true;
             };
-            float_range_survives(
-                p.min.map(|x| x as f64),
-                p.max.map(|x| x as f64),
-                *v as f64,
-                op,
-            )
+            float_range_survives(p.min.map(f64::from), p.max.map(f64::from), *v as f64, op)
         }
         (Index::DOUBLE(i), Lit::Int(v)) if int_exact_in_f64(*v) => {
             let Some(p) = i.indexes.get(ordinal) else {

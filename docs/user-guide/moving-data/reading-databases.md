@@ -37,6 +37,30 @@ take their connection as keyword options rather than a path.
 | `read.dynamodb(...)` | A DynamoDB table via native parallel scan segments | AWS DynamoDB |
 | `read.elasticsearch(...)` | An Elasticsearch index via ES\|QL Arrow output | a running Elasticsearch |
 
+## Record arrays
+
+A NumPy *structured* (record) array is a table: one field per column. That is what
+`np.rec.array` and `np.genfromtxt` build, what an HDF5 *compound* dataset stores, and how
+most instrument, simulation, and genomics files record their rows. All three readers give
+it the same reading, one column per field, and a field holding a vector keeps its per-row
+shape rather than being flattened.
+
+```python
+import numpy as np
+
+import batcher as bt
+
+rows = np.array([(1, 2.5), (3, 4.5)], dtype=[("id", "i8"), ("score", "f8")])
+print(bt.from_numpy(rows).to_pydict())
+# {'id': [1, 3], 'score': [2.5, 4.5]}
+```
+
+Saving that array to `.npy` and reading it with {py:meth}`bt.read.numpy <batcher.api.io_namespace.reader.Reader.numpy>` gives the same two
+columns, as does an HDF5 compound dataset read with `bt.read.hdf5(path, dataset=...)`. A
+plain (non-compound) array keeps the layout each reader already used: `.npy` becomes one
+`data` column, and an HDF5 dataset becomes `value` when it is 1-D and `c0`, `c1`, ... when
+it is 2-D.
+
 Each connector needs its service reachable (or its optional extra installed), so
 these are shown but not executed:
 

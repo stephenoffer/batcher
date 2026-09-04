@@ -84,6 +84,11 @@ pub fn partition_by_key_arrays_salted(
     num_partitions: usize,
     salt: u64,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
+    debug_assert!(
+        keys.iter().all(|k| k.len() == batch.num_rows()),
+        "a derived key column shorter than the batch would partition on the wrong rows"
+    );
+    debug_assert!(num_partitions > 0, "a shuffle needs at least one bucket");
     assert!(num_partitions >= 1);
     // Single global bucket → no hashing or gather; the Arc-backed batch is returned
     // as-is (a refcount bump, not a copy). Covers the common non-distributed case.
@@ -159,6 +164,7 @@ where
 /// first/last. A descending sort concatenates buckets high→low, so its "front" bucket is
 /// `n_buckets - 1`.
 fn null_bucket_of(n_buckets: usize, nulls_first: bool, descending: bool) -> u32 {
+    debug_assert!(n_buckets > 0, "a range partition needs at least one bucket");
     let front = if descending { n_buckets - 1 } else { 0 };
     (if nulls_first {
         front
@@ -180,7 +186,13 @@ fn null_bucket_of(n_buckets: usize, nulls_first: bool, descending: bool) -> u32 
 /// bucket `b`'s row indices, ascending, exactly as `bucket_indices(part_of, p)[b]` would
 /// give them. Two allocations, no growth: a histogram fixes every bucket's extent before a
 /// single scatter pass fills it. Every `part_of[i]` must be `< num_partitions`.
+#[must_use]
 pub fn bucket_csr(part_of: &[u32], num_partitions: usize) -> (Vec<u32>, Vec<u32>) {
+    debug_assert!(
+        part_of.iter().all(|&b| (b as usize) < num_partitions),
+        "bucket id out of range: a bucket assignment past `num_partitions` writes outside its \
+         extent and silently reorders another bucket's rows"
+    );
     let mut offsets = vec![0u32; num_partitions + 1];
     for &b in part_of {
         offsets[b as usize + 1] += 1;
@@ -208,7 +220,12 @@ pub fn bucket_csr(part_of: &[u32], num_partitions: usize) -> (Vec<u32>, Vec<u32>
 /// sorts each range) can compose its permutation with these indices and gather the payload
 /// **once**, instead of gathering into buckets and then gathering again to sort. Every
 /// `part_of[i]` must be `< num_partitions`.
+#[must_use]
 pub fn bucket_indices(part_of: &[u32], num_partitions: usize) -> Vec<Vec<u32>> {
+    debug_assert!(
+        part_of.iter().all(|&b| (b as usize) < num_partitions),
+        "bucket id out of range"
+    );
     let n = part_of.len();
     if n < PAR_HASH_MIN_ROWS {
         let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
@@ -270,6 +287,11 @@ fn scatter_into_buckets(
     part_of: &[u32],
     num_partitions: usize,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
+    debug_assert!(
+        part_of.iter().all(|&b| (b as usize) < num_partitions),
+        "bucket id out of range"
+    );
+    debug_assert_eq!(part_of.len(), batch.num_rows(), "one bucket id per row");
     let n = part_of.len();
     // Small input: serial counting sort, one contiguous scatter buffer.
     if n < PAR_HASH_MIN_ROWS {
@@ -347,6 +369,7 @@ fn scatter_into_buckets(
 /// (days / millis / micros / nanos) preserves — so range-partitioning on the backing
 /// gives the same order as the single-node temporal sort. Excludes `Interval`
 /// (month-day-nano is not a single totally-ordered scalar).
+#[must_use]
 pub fn is_temporal_key(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -364,12 +387,11 @@ pub fn is_temporal_key(dt: &DataType) -> bool {
 /// route those through `Int32` first. The result is the canonical integer the sort sample
 /// and the range partition both compare on, so they share one representation.
 pub fn temporal_to_i64(col: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
-    match cast(col, &DataType::Int64) {
-        Ok(a) => Ok(a),
-        Err(_) => {
-            let i32 = cast(col, &DataType::Int32)?;
-            Ok(cast(&i32, &DataType::Int64)?)
-        }
+    if let Ok(a) = cast(col, &DataType::Int64) {
+        Ok(a)
+    } else {
+        let i32 = cast(col, &DataType::Int32)?;
+        Ok(cast(&i32, &DataType::Int64)?)
     }
 }
 
@@ -534,7 +556,7 @@ pub fn range_partition_by_i64_key(
     // still co-located (the clamp is monotonic) — the same guard the f64
     // [`range_partition_by_key_array`] applies.
     let last = (n_buckets - 1) as u32;
-    for b in part_of.iter_mut() {
+    for b in &mut part_of {
         *b = (*b).min(last);
     }
     scatter_into_buckets(batch, &part_of, n_buckets)
@@ -689,7 +711,7 @@ pub fn range_partition_by_byte_key(
     // preserved and equal keys still co-located, mirroring the f64
     // [`range_partition_by_key_array`] guard.
     let last = (n_buckets - 1) as u32;
-    for b in part_of.iter_mut() {
+    for b in &mut part_of {
         *b = (*b).min(last);
     }
     scatter_into_buckets(batch, &part_of, n_buckets)
@@ -913,9 +935,7 @@ pub fn salted_partition_by_keys(
     let mut seen = vec![false; num_partitions];
     for i in 0..n {
         let kh = hasher.hash(i);
-        let is_hot = key_str
-            .map(|s| s.is_valid(i) && hot_keys.contains(s.value(i)))
-            .unwrap_or(false);
+        let is_hot = key_str.is_some_and(|s| s.is_valid(i) && hot_keys.contains(s.value(i)));
         if !is_hot {
             buckets[bucket_of(kh, num_partitions) as usize].push(i as u32);
         } else if replicate {
@@ -949,7 +969,7 @@ pub fn salted_partition_by_keys(
 /// land in the same bucket.
 #[inline]
 fn salted_hash(key_hash: u64, salt: u32) -> u64 {
-    let mut h = key_hash ^ (salt as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut h = key_hash ^ u64::from(salt).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^= h >> 30;
     h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     h ^= h >> 27;
@@ -1224,7 +1244,7 @@ pub(crate) fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
     if num_partitions.is_power_of_two() {
         (hash & (num_partitions as u64 - 1)) as u32
     } else {
-        ((hash as u128 * num_partitions as u128) >> 64) as u32
+        ((u128::from(hash) * num_partitions as u128) >> 64) as u32
     }
 }
 

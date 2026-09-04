@@ -214,6 +214,38 @@ At the dataset level, {py:meth}`ds.shuffle(seed=) <batcher.Dataset.shuffle>`, {p
 {py:meth}`ds.sample_per_group(by, n) <batcher.Dataset.sample_per_group>`, {py:meth}`ds.class_balance(label) <batcher.Dataset.class_balance>`, and {py:meth}`ds.class_weights(label) <batcher.Dataset.class_weights>`
 cover the train-set preparation steps.
 
+## Calling an accessor from SQL
+
+Every method on this page is reachable from SQL, under the name of the namespace and the
+method: `col("s").str.slugify()` is `str_slugify(s)`, `col("i").image.phash()` is
+`image_phash(i)`, and `col("t").dt.quarter_end()` is `dt_quarter_end(t)`. The first
+argument is the value the accessor hangs off, and the rest are the method's own arguments
+in order.
+
+```python
+docs = bt.from_pydict({"title": ["  Quarterly Report: Q3  "], "tags": [["b", "a", "b"]]})
+out = bt.sql(
+    "SELECT str_slugify(str_normalize_whitespace(title)) AS slug, "
+    "str_word_count(title) AS words, "
+    "list_sort(list_distinct(tags)) AS tags FROM d",
+    d=docs,
+)
+print(out.to_pydict())
+# {'slug': ['quarterly-report-q3'], 'words': [3], 'tags': [['a', 'b']]}
+```
+
+The vocabulary is derived from the accessors themselves rather than listed, so a method is
+callable from SQL as soon as it exists. Three rules follow from that:
+
+- A name SQL already means keeps that meaning. `list_unique` is DuckDB's count of distinct
+  elements, not `.list.unique()`; the list itself is `list_distinct`. Where the two
+  conventions differ, SQL follows SQL.
+- A parameter the engine reads while the plan is built, such as an image's target width or
+  a regex pattern, must be a constant in SQL too. Passing a column raises an error naming
+  the parameter.
+- A method taking a set of strings takes them as trailing arguments:
+  `str_contains_any(s, 'alpha', 'beta')`.
+
 ## See also
 
 - {doc}`/api/relational/expressions`: the core `Expr` surface these namespaces extend.

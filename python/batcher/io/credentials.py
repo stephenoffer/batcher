@@ -35,13 +35,16 @@ from typing import Any
 
 from batcher._internal.errors import BackendError
 from batcher._internal.optional import require
+from batcher.io.secret_backends import BACKEND_SCHEMES, resolve_backend_ref
 
 __all__ = ["SECRET_COMMAND_ENV", "is_secret_ref", "resolve_secret", "vend_unity_credentials"]
 
-#: Reference schemes resolved on the machine that opens the connection. The same three the
-#: data plane's own resolver (`bc-secrets`) answers, so one vocabulary covers a connector
-#: password, a storage option, and an expression-level encryption key.
-_SECRET_REF_SCHEMES = ("env:", "file:", "cmd:")
+#: Reference schemes resolved on the machine that opens the connection. The first three are
+#: the ones the data plane's own resolver (`bc-secrets`) answers, so one vocabulary covers a
+#: connector password, a storage option, and an expression-level encryption key. The rest
+#: name a key store directly and are answered by `secret_backends`; the data plane reaches
+#: the same stores through `cmd:`, which is why it needs no matching vocabulary.
+_SECRET_REF_SCHEMES = ("env:", "file:", "cmd:", *BACKEND_SCHEMES)
 
 #: The operator-configured program `cmd:NAME` runs, with `NAME` as its single argument.
 #:
@@ -65,20 +68,21 @@ _SECRET_COMMAND_TIMEOUT_S = 30.0
 
 
 def is_secret_ref(value: str | None) -> bool:
-    """Whether `value` is an ``env:NAME`` / ``file:PATH`` reference rather than a literal."""
+    """Whether `value` is a secret reference (``env:``, ``file:``, ``cmd:``, or a key store)."""
     return isinstance(value, str) and value.startswith(_SECRET_REF_SCHEMES)
 
 
 def resolve_secret(value: str | None, *, what: str = "credential") -> str | None:
-    """Resolve an ``env:``/``file:`` reference to its secret; pass a literal through.
+    """Resolve a secret reference to its secret material; pass a literal through.
 
     Call this where the connection is opened, not where the source is built — see the
     module docstring. `None` and a plain literal are returned unchanged, so a connector
     that has not been migrated, and a user who passes a raw password, both keep working.
 
     Args:
-        value: A literal secret, an ``env:NAME`` / ``file:PATH`` / ``cmd:NAME`` reference,
-            or None.
+        value: A literal secret, None, or a reference — ``env:NAME``, ``file:PATH``,
+            ``cmd:NAME``, or a key store (``vault:``, ``aws-sm:``, ``aws-ssm:``,
+            ``gcp-sm:``, ``azure-kv:``); see `secret_backends`.
         what: What is being resolved, for the error message (e.g. ``"ClickHouse password"``).
 
     Returns:
@@ -102,6 +106,8 @@ def resolve_secret(value: str | None, *, what: str = "credential") -> str | None
         return resolved
     if scheme == "cmd":
         return _from_command(target, what=what, reference=str(value))
+    if f"{scheme}:" in BACKEND_SCHEMES:
+        return resolve_backend_ref(scheme, target, what=what, reference=str(value))
     try:
         return pathlib.Path(target).read_text(encoding="utf-8").strip()
     except OSError as exc:

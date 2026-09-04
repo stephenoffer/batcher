@@ -199,16 +199,18 @@ pub fn asof_join_indices(
             // row `back` may take and the first `fwd` may take; without it, both must step
             // past the whole run of equal keys.
             let back = {
-                let pp = match allow_exact_matches {
-                    true => g.partition_point(|(on, _)| on.row() <= target),
-                    false => g.partition_point(|(on, _)| on.row() < target),
+                let pp = if allow_exact_matches {
+                    g.partition_point(|(on, _)| on.row() <= target)
+                } else {
+                    g.partition_point(|(on, _)| on.row() < target)
                 };
                 (pp > 0).then(|| g[pp - 1].1)
             };
             let fwd = {
-                let pp = match allow_exact_matches {
-                    true => g.partition_point(|(on, _)| on.row() < target),
-                    false => g.partition_point(|(on, _)| on.row() <= target),
+                let pp = if allow_exact_matches {
+                    g.partition_point(|(on, _)| on.row() < target)
+                } else {
+                    g.partition_point(|(on, _)| on.row() <= target)
                 };
                 (pp < g.len()).then(|| g[pp].1)
             };

@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir import Expr, nullif
+from batcher.plan.expr_ir import Expr, nullif, when
 from batcher.plan.functions.security import aes_encrypt, hmac_sha256, mask
 
 __all__ = ["Encrypt", "Nullify", "Pseudonymize", "Redact"]
@@ -51,13 +51,27 @@ class Redact:
     ``Redact(show_last=4)`` masks all but the last four characters — the "card ending
     1234" pattern. Lowers to `mask`; length-preserving, irreversible.
 
+    A value no longer than what the policy reveals is masked **completely**, rather than
+    returned unchanged. Revealing the last four characters of a three-character value is
+    literally consistent — those are its last four characters — and it is a redaction
+    policy handing back the raw value, on exactly the columns where short values are the
+    common case rather than the exception. A name, a postcode, a national ID and a
+    two-letter country code are all shorter than the four characters a card policy
+    reveals. `__post_init__` already refuses a negative count for this reason:
+    under-masking is the one direction a redaction policy must never be wrong in.
+
     Examples:
         .. doctest::
 
             >>> from batcher import col
             >>> from batcher.governance import Redact
-            >>> Redact(show_last=4)(col("card_number"))
-            col('card_number').cast('string').str.mask('X', 0, 4)
+            >>> Redact()(col("ssn"))
+            col('ssn').cast('string').str.mask('X', 0, 0)
+
+            >>> import batcher as bt
+            >>> data = bt.from_pydict({"card": ["4111111111111234", "12"]})
+            >>> data.select(masked=Redact(show_last=4)(col("card"))).to_pydict()["masked"]
+            ['XXXXXXXXXXXX1234', 'XX']
     """
 
     show_first: int = 0
@@ -89,7 +103,20 @@ class Redact:
             )
 
     def __call__(self, column: Expr) -> Expr:
-        return mask(column, show_first=self.show_first, show_last=self.show_last, char=self.char)
+        reveal = self.show_first + self.show_last
+        full = mask(column, show_first=0, show_last=0, char=self.char)
+        if reveal == 0:
+            # Nothing is revealed, so no value can be short enough to escape. Returning the
+            # bare `mask` keeps the expression -- and the per-row work -- exactly what it was
+            # for the full-redaction case, which is the common one and pays nothing here.
+            return full
+        return (
+            when(column.cast("string").str.len_chars() <= reveal)
+            .then(full)
+            .otherwise(
+                mask(column, show_first=self.show_first, show_last=self.show_last, char=self.char)
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)

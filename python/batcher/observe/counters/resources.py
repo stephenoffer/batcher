@@ -97,15 +97,73 @@ class ResourceGauges:
             A list of lines, empty when no reading has arrived.
         """
         out: list[str] = []
+        dropped = 0
         for group, stats in self.snapshot().items():
-            for path, value in _leaves(stats)[:_MAX_SERIES_PER_GROUP]:
+            leaves = _leaves(stats)
+            if len(leaves) > _MAX_SERIES_PER_GROUP:
+                dropped += len(leaves) - _MAX_SERIES_PER_GROUP
+                leaves = leaves[:_MAX_SERIES_PER_GROUP]
+            for path, value in leaves:
                 name = f"batcher_{_identifier(group)}_{path}"
+                # Every other series in the exposition carries a HELP line and these did
+                # not, because the flattening is generic and has no curated text to print.
+                # That is a reason to derive one, not to omit it: a series with no HELP is
+                # blank in Grafana's metric browser and in `promtool check metrics`, so the
+                # readings Carbonite works hardest to produce were the ones an operator
+                # could not identify without reading Batcher's source.
+                out.append(f"# HELP {name} {_help_text(group, path)}")
                 out.append(f"# TYPE {name} gauge")
                 if isinstance(value, str):
                     out.append(f'{name}{{state="{escape_label(value)}"}} 1')
                 else:
                     out.append(f"{name} {value}")
+        if out:
+            # The cardinality cap is right and its silence was not: a `stats()` that grew
+            # past the cap lost series with nothing anywhere saying so, which is
+            # indistinguishable from the resource never having reported them. Exported as
+            # a series rather than logged, because a render runs once per scrape and a log
+            # line per scrape is its own kind of noise.
+            out.append("# HELP batcher_resource_series_dropped Gauges omitted by the per-group cap")
+            out.append("# TYPE batcher_resource_series_dropped gauge")
+            out.append(f"batcher_resource_series_dropped {dropped}")
         return out
+
+
+#: Group names as they read in a sentence. The flattened path supplies the rest, so this
+#: only has to carry what the identifier cannot: what the *group* is.
+_GROUP_PROSE = {
+    "memory": "buffer-pool",
+    "spill": "spill-store",
+    "shuffle": "shuffle-session",
+    "admission": "admission-limiter",
+    "result_cache": "result-cache",
+}
+
+
+def _help_text(group: str, path: str) -> str:
+    """A HELP line for a generically flattened gauge.
+
+    Derived rather than curated, because the flattening is deliberately generic: a
+    resource that grows a field starts being exported without a change here, and a
+    hand-written table would silently fall behind it. The path is already the field's
+    name, so turning it back into words and naming the group it came from says everything
+    a curated line would have, and cannot go stale.
+
+    Args:
+        group: The resource group, e.g. ``"memory"``.
+        path: The flattened field path, e.g. ``"engine_pool_used_bytes"``.
+
+    Returns:
+        A one-line description, with no newline or backslash to escape.
+    """
+    # Both halves go through `_identifier` first. A group name reaches here off an event, so
+    # it is not guaranteed tame -- and a newline or a backslash inside a HELP line does not
+    # cost that one series, it makes the *whole* exposition unparseable, which is the exact
+    # failure `_series.escape_label` exists to prevent one column over.
+    key = _identifier(group)
+    words = _identifier(path).replace("_", " ").strip() or "reading"
+    what = _GROUP_PROSE.get(key, key.replace("_", " "))
+    return f"Current {words} of the {what} (level, not a total)"
 
 
 def _plain(value: Any) -> Any:

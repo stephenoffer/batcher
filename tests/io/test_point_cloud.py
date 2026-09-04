@@ -56,7 +56,7 @@ def _write_ply(path: str, *, binary: bool) -> None:
 @pytest.mark.parametrize(
     ("suffix", "writer"),
     [
-        (".bin", lambda p: _write_bin(p)),
+        (".bin", _write_bin),
         (".pcd", lambda p: _write_pcd(p, binary=False)),
         (".pcd", lambda p: _write_pcd(p, binary=True)),
         (".ply", lambda p: _write_ply(p, binary=False)),

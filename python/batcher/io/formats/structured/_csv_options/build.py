@@ -134,7 +134,22 @@ class CSVReadOptions:
         """
         import pyarrow.csv as pacsv
 
-        kwargs: dict[str, Any] = {"include_columns": include_columns}
+        # An empty field is NULL; a *quoted* empty field is the empty string. This is the
+        # distinction the writer already makes -- it emits `""` for an empty string and a
+        # bare empty field for NULL -- and without these two flags the reader could not read
+        # back what the writer produced: arrow defaults `strings_can_be_null` to False, so
+        # every NULL in a text column came back as `""`, silently, on every CSV Batcher had
+        # itself written. DuckDB and pandas both round-trip it.
+        #
+        # `quoted_strings_can_be_null=False` is what keeps that from over-reaching: with it,
+        # a quoted `"NA"` stays the three-character string and only a *bare* `NA` is a null
+        # token, so quoting is what separates data from a sentinel. Numeric columns are
+        # unaffected either way -- an empty field there was always null.
+        kwargs: dict[str, Any] = {
+            "include_columns": include_columns,
+            "strings_can_be_null": True,
+            "quoted_strings_can_be_null": False,
+        }
         if column_types is not None:
             kwargs["column_types"] = column_types
         if self.null_values is not None:

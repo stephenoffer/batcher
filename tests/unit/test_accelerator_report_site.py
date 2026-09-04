@@ -34,7 +34,7 @@ def _quiet_environment(monkeypatch):
     hosts, so a test asserting "this machine has nothing to say" would otherwise be answered
     by whichever cloud the suite is running on.
     """
-    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
+    monkeypatch.setattr(report_mod, "device_rows", list)
     monkeypatch.setattr("batcher._internal.site.provider.dmi_identity", lambda: ("", "", None))
     for name in ("BATCHER_PROVIDER", "SLURM_JOB_ID", "KUBERNETES_SERVICE_HOST", "RAY_ADDRESS"):
         monkeypatch.delenv(name, raising=False)
@@ -278,7 +278,7 @@ def test_every_silent_condition_becomes_a_sentence_naming_its_device(monkeypatch
 
 
 def test_a_port_that_is_down_is_a_problem_too(monkeypatch):
-    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
+    monkeypatch.setattr(report_mod, "device_rows", list)
     monkeypatch.setattr(
         "batcher._internal.hardware.fabric.rdma_summary",
         lambda: {
@@ -299,5 +299,5 @@ def test_a_port_that_is_down_is_a_problem_too(monkeypatch):
 def test_an_unreadable_node_reports_no_problems_rather_than_failing_a_check(monkeypatch):
     # A check that treats an unreadable node as broken fails a fleet the day a base image
     # stops shipping pynvml.
-    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
+    monkeypatch.setattr(report_mod, "device_rows", list)
     assert report_mod.accelerator_problems() == []

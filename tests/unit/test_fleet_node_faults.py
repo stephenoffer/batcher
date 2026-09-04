@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.dist.executors.ray_runtime.hardware_probe import unhealthy_nodes
+from batcher.dist.executors.ray_runtime.fleet_health import unhealthy_nodes
 
 pytestmark = pytest.mark.unit
 

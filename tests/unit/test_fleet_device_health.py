@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.dist.executors.ray_runtime import hardware_probe
+from batcher.dist.executors.ray_runtime import fleet_health
 
 pytestmark = pytest.mark.unit
 
@@ -34,7 +34,7 @@ def _record(node: str, **kw) -> dict:
 
 def test_a_clean_fleet_has_no_unhealthy_nodes():
     records = (_record("a"), _record("b"))
-    assert hardware_probe.unhealthy_nodes(records) == ()
+    assert fleet_health.unhealthy_nodes(records) == ()
 
 
 @pytest.mark.parametrize(
@@ -49,21 +49,21 @@ def test_a_clean_fleet_has_no_unhealthy_nodes():
 )
 def test_every_fault_class_puts_a_node_on_the_drain_list(fault):
     records = (_record("healthy"), _record("sick", **fault))
-    assert [r["node_id"] for r in hardware_probe.unhealthy_nodes(records)] == ["sick"]
+    assert [r["node_id"] for r in fleet_health.unhealthy_nodes(records)] == ["sick"]
 
 
 def test_an_unprobeable_fleet_reports_nothing_rather_than_health(monkeypatch):
     # Empty from both means "we could not ask", which is why the caller checks the probe's own
     # result rather than reading an empty drain list as a clean bill.
-    monkeypatch.setattr(hardware_probe, "cluster_device_health", lambda: ())
-    assert hardware_probe.unhealthy_nodes() == ()
+    monkeypatch.setattr(fleet_health, "cluster_device_health", lambda: ())
+    assert fleet_health.unhealthy_nodes() == ()
 
 
 def test_no_ray_means_no_probe(monkeypatch):
     import sys
 
     monkeypatch.setitem(sys.modules, "ray", None)
-    assert hardware_probe.cluster_device_health() == ()
+    assert fleet_health.cluster_device_health() == ()
 
 
 def test_the_worker_side_probe_reports_what_only_that_host_can_see(monkeypatch):
@@ -80,7 +80,7 @@ def test_the_worker_side_probe_reports_what_only_that_host_can_see(monkeypatch):
     )
     monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ("GPU-0",))
     monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: ())
-    record = hardware_probe._device_health_on_this_worker()
+    record = fleet_health._device_health_on_this_worker()
     assert record["devices"] == 2
     assert record["quarantined"] == ["GPU-1"]
     assert record["reasons"] == ["xid_79"]
@@ -92,7 +92,7 @@ def test_the_report_carries_the_drain_list(monkeypatch):
 
     report_mod = importlib.import_module("batcher.api.session.accelerators.report")
     monkeypatch.setattr(
-        hardware_probe,
+        fleet_health,
         "cluster_device_health",
         lambda: (_record("good"), _record("bad", quarantined=["GPU-2"], reasons=["ecc"])),
     )
@@ -107,7 +107,7 @@ def test_the_report_omits_health_entirely_off_a_cluster(monkeypatch):
     import importlib
 
     report_mod = importlib.import_module("batcher.api.session.accelerators.report")
-    monkeypatch.setattr(hardware_probe, "cluster_device_health", lambda: ())
+    monkeypatch.setattr(fleet_health, "cluster_device_health", lambda: ())
     fleet: dict = {}
     report_mod._add_fleet_health(fleet)
     assert fleet == {}
@@ -137,7 +137,7 @@ def test_a_gang_bundle_avoids_a_node_with_a_condemned_device(monkeypatch):
     from batcher.dist.executors.ray_runtime.fabric import placement
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: (_record("good"), _record("bad", quarantined=["GPU-2"])),
     )
     with _health_enabled():
@@ -150,7 +150,7 @@ def test_a_degraded_but_working_device_does_not_empty_the_node(monkeypatch):
     from batcher.dist.executors.ray_runtime.fabric import placement
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: (_record("a", degraded=["GPU-1"]), _record("b", degraded=["GPU-0"])),
     )
     with _health_enabled():
@@ -162,7 +162,7 @@ def test_an_unreadable_fleet_is_not_an_unhealthy_one(monkeypatch):
     from batcher.dist.executors.ray_runtime.fabric import placement
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health", lambda: ()
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health", lambda: ()
     )
     with _health_enabled():
         kept = placement._without_unhealthy(_topology("a", "b"))
@@ -175,7 +175,7 @@ def test_a_wholly_condemned_fleet_still_gets_a_placement(monkeypatch):
     from batcher.dist.executors.ray_runtime.fabric import placement
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: (_record("a", quarantined=["x"]), _record("b", quarantined=["y"])),
     )
     with _health_enabled():
@@ -187,7 +187,7 @@ def test_the_probe_is_not_run_when_health_checking_is_off(monkeypatch):
     from batcher.dist.executors.ray_runtime.fabric import placement
 
     monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.hardware_probe.cluster_device_health",
+        "batcher.dist.executors.ray_runtime.fleet_health.cluster_device_health",
         lambda: pytest.fail("probed the fleet with health checking disabled"),
     )
     with _health_enabled(enabled=False):
@@ -202,14 +202,14 @@ def test_the_probe_is_sampled_rather_than_run_per_caller(monkeypatch):
     # round trip on a scheduling path.
     calls = []
     monkeypatch.setattr(
-        hardware_probe, "_probe_fleet_health", lambda: calls.append(1) or (_record("a"),)
+        fleet_health, "_probe_fleet_health", lambda: calls.append(1) or (_record("a"),)
     )
-    hardware_probe.reset_fleet_health()
+    fleet_health.reset_fleet_health()
     for _ in range(10):
-        assert hardware_probe.cluster_device_health() == (_record("a"),)
+        assert fleet_health.cluster_device_health() == (_record("a"),)
     assert len(calls) == 1
-    hardware_probe.reset_fleet_health()
-    hardware_probe.cluster_device_health()
+    fleet_health.reset_fleet_health()
+    fleet_health.cluster_device_health()
     assert len(calls) == 2
 
 
@@ -217,10 +217,10 @@ def test_an_unreadable_fleet_is_not_cached(monkeypatch):
     # A cluster seconds from coming up must not have its unavailability held for half a
     # minute of placement decisions.
     calls = []
-    monkeypatch.setattr(hardware_probe, "_probe_fleet_health", lambda: calls.append(1) or ())
-    hardware_probe.reset_fleet_health()
+    monkeypatch.setattr(fleet_health, "_probe_fleet_health", lambda: calls.append(1) or ())
+    fleet_health.reset_fleet_health()
     for _ in range(3):
-        assert hardware_probe.cluster_device_health() == ()
+        assert fleet_health.cluster_device_health() == ()
     assert len(calls) == 3
 
 
@@ -246,7 +246,7 @@ def test_the_worker_record_says_how_its_host_half_is_placed(monkeypatch):
             "device_share": 0.25,
         },
     )
-    record = hardware_probe._device_health_on_this_worker()
+    record = fleet_health._device_health_on_this_worker()
     assert record["affinity"]["numa_node"] == 1
     assert record["affinity"]["device_share"] == 0.25
 
@@ -316,8 +316,8 @@ def test_one_nodes_failure_does_not_discard_every_other_nodes_health(monkeypatch
         "ray.util.scheduling_strategies",
         __import__("types").SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
     )
-    hardware_probe.reset_fleet_health()
-    records = hardware_probe._probe_fleet_health()
+    fleet_health.reset_fleet_health()
+    records = fleet_health._probe_fleet_health()
     assert [r["node_id"] for r in records] == ["healthy-node"]
 
 
@@ -338,6 +338,6 @@ def test_a_condemned_device_still_reaches_the_drain_list_when_a_sibling_probe_fa
         "ray.util.scheduling_strategies",
         __import__("types").SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
     )
-    hardware_probe.reset_fleet_health()
-    records = hardware_probe._probe_fleet_health()
-    assert [r["node_id"] for r in hardware_probe.unhealthy_nodes(records)] == ["healthy-node"]
+    fleet_health.reset_fleet_health()
+    records = fleet_health._probe_fleet_health()
+    assert [r["node_id"] for r in fleet_health.unhealthy_nodes(records)] == ["healthy-node"]

@@ -223,7 +223,7 @@ def test_streaming_split_drop_last_false_keeps_the_trailing_round():
 
     assert len({len(rank) for rank in kept}) == 1, "ranks must stay balanced"
     # 5 batches of 8: rounds [0,1,2] and the partial [3,4], completed cyclically as [3,4,3].
-    assert kept[0] == list(range(0, 8)) + list(range(24, 32))
+    assert kept[0] == list(range(8)) + list(range(24, 32))
     assert kept[2] == list(range(16, 24)) + list(range(24, 32))
     # Every sample is present at least once — nothing is silently discarded.
     assert set(range(40)).issubset({v for rank in kept for v in rank})
