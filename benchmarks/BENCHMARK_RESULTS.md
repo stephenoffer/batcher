@@ -153,6 +153,40 @@ established (it is a plan, counted, not timed) and the speedup as unproven. It i
 because it costs nothing, makes the two routes agree, and a read that issues half the
 requests is the better shape to be in when the object store is the constraint.
 
+### Read/compute overlap inside the task: built, measured, rejected
+
+The compute term has an explanation that fits the number exactly. Within a map task the read
+and the `fn` run in series, so at any instant only `compute / (read + compute)` of the
+resident tasks are computing — 0.151 / (0.474 + 0.151) = 24%, against the 211 of 1,024
+effective cores measured, which is 21%. Overlapping the two should then have recovered most
+of it.
+
+It was implemented: a chunked path in `core/udf/stream.py` reading chunk *k+1* while chunk
+*k* computes, with the chunk sized to hand every worker thread a coarse batch so
+`apply_udf`'s existing thread strategy ran unchanged on it, plus a lazy `IteratorSource` in
+`_map_udf_task` / `_map_agg_task` so the overlap reached storage rather than an
+already-materialized list. Correctness was fine — 19 equivalence cases (4 UDF shapes x 4
+input sizes, a two-stage chain, nulls, empty) agreed with the materializing path exactly.
+
+**It was 39% slower and is reverted.** Same decomposition, cache off:
+
+| pipeline (cache off) | without overlap | with overlap |
+|---|---:|---:|
+| `scan + sum` — no UDF (untouched) | 692 ms | 676 ms |
+| `scan + identity UDF + sum` | **1,238 ms** | 1,723 ms |
+| `scan + heavy UDF + sum` | **2,147 ms** | 2,373 ms |
+
+A candidate reason, not an established one: chunking pays `apply_udf`'s per-call setup — the
+`rechunk`/`concat_batches` copy, the strategy probe, `reconcile_batches` — once per chunk
+instead of once per partition, and `thread_batch_target` is `total / num_workers` computed on
+the *chunk*, so the coarse batches it exists to produce get smaller as the chunks do. The
+per-call overhead that coarsening amortizes comes back.
+
+**What matters more is what this does to the explanation above.** The 24%-vs-21% arithmetic
+looked like a mechanism and it predicted an intervention that made things worse, so it is not
+one. Serialized read-then-compute may still be *a* term in the 211 cores, but it is not the
+binding one, and the next attempt should not start from it.
+
 In an isolated task, read and `execute_with_udfs` measure 0.474 s and 0.151 s, which do not
 compose into the wall the query takes at 416-way fan-out. The 554 ms and the 647 ms of
 unrealized compute parallelism are what a next session has to attack, and the four arms above
