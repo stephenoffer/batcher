@@ -387,12 +387,37 @@ The direction and rough size were right and the estimate was optimistic.
   target before the UDF runs, and it is a floor this change does not touch.
 * **The map stage now costs 234 ms on an identity UDF** (584 - 350), which is dispatch,
   the per-batch Python call, `partial_aggregate`, and 256 barrier completions.
-* **Cluster busy is still 15% mean / 34% peak.** The actors reserve one core each and run the
-  map at the plan's default width, where `_map_agg_task` re-widened its plan per call
-  (`_with_map_workers(plan0, round(shares[idx]))`, about 4). So this change bought locality and
-  gave back per-partition width, and won anyway. Sizing the pool to the *partition* count
-  rather than the worker count — 256 actors, `idx % n` becoming the identity map — is the next
-  thing to measure, and it is a resource decision as much as a speed one.
+* **Cluster busy is still 12-16% mean / 31-34% peak**, against 21% for the task path it
+  replaced. The obvious reading is that the actors gave back per-partition width, and it is
+  wrong: `_MapActor.__init__` sets a CPU stage to `_INFERENCE_CPU_WORKERS` (4) via
+  `_with_inference_workers`, which is the same width `_map_agg_task` gave itself with
+  `_with_map_workers(plan0, round(shares[idx]))`. What the pool gave back is **count**. It is
+  sized to `workers` (64) while the stage has 256 partitions, so it runs 64 four-wide workers
+  where the task path ran 256, and it won on locality anyway.
+
+  The corrected reading was then tested rather than asserted. Giving each actor the task
+  path's *reservation* — `num_cpus=4` instead of Ray's default 1, same pipeline, same
+  session-fresh pool — measured **1,059 ms against 1,031 ms**, which is nothing. That is what
+  the count reading predicts and the width reading does not: a reservation is bookkeeping for
+  the scheduler, and both forms were already running the map four wide.
+
+  **And sizing the pool to the partition count does not work.** Same script, same session-
+  fresh pool, `256` actors instead of `64` — one per partition, which also makes `idx % n` the
+  identity map. It produced **no result in 19 minutes**, where the 64-actor control arm beside
+  it finished in four, with the cluster sitting at **960 of 1,024 cores reserved** and the log
+  empty. I killed it rather than let it hold a shared fleet to the `timeout`, so **the
+  mechanism is not established** — the two candidates are that 256 single-core actors cannot
+  all place while the scan stage also wants capacity, and that 256 actors x
+  `_INFERENCE_CPU_WORKERS` threads oversubscribes 16-core nodes — and nothing here
+  distinguishes them. What is established is the dependency: **64 actors completes and 256
+  does not**, on this fleet, for this stage. Anyone picking this back up should instrument
+  actor placement before changing the size again.
+
+So the concurrency the pool gives back is real and is **not** recoverable by simply asking for
+more of it. Three arms now say the same thing from different directions: accumulate pools and
+the cluster deadlocks, widen each actor's reservation and nothing moves, size the pool to the
+partitions and the stage stops finishing. The 64-actor pool is where this fleet's map/aggregate
+stage runs, and 803-1,069 ms is what it costs.
 
 The relational shapes are unaffected by all of this and remain 18-32x against Ray Data.
 

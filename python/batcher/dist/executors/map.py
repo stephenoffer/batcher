@@ -2117,8 +2117,9 @@ class _MapActor:
         the driver's `combine_finalize` is unchanged.
 
         Unlike `_map_agg_task` this does not re-width the plan per call (`_with_map_workers`):
-        an actor's plan is fixed when it is built, which is the same trade `run` already
-        makes, and is why the pool is sized from the stage's fan-out rather than a share.
+        an actor's plan is widened once in `__init__` by `_with_inference_workers`, which gives
+        a CPU stage `_INFERENCE_CPU_WORKERS` (4) — the same width the task computed from its
+        share. So the two forms differ in worker *count*, not in per-worker width.
         """
         from batcher import core
 
@@ -2370,6 +2371,50 @@ def _agg_actor_pool(plan0: LogicalPlan, workers: int) -> list | None:
         return None
 
 
+def _gather_with_pool_recovery(gather, actor_launch, task_launch, map_plan, actors):
+    """Run a map/aggregate stage on `actors`, redoing it on stateless tasks if the pool dies.
+
+    This is `_run_warm_pool`'s contract applied to the aggregate route: **a warm pool must
+    never turn a preemption into a failed query**. A stateless task is rescheduled anywhere by
+    Ray, so the route had that property for free before it had a pool; an actor pinned to a
+    preempted node does not, and rotating the partition onto a neighbouring actor only helps
+    while some actor survives.
+
+    Redoing the whole stage is safe rather than merely convenient: a partial is a pure
+    function of its durable partition descriptor, and `gather` folds into a state it creates
+    itself, so the second pass cannot double-count the first pass's partials.
+
+    Args:
+        gather: Runs one full pass with the launcher it is given and returns the folded state.
+        actor_launch: Launcher dispatching partition `idx` to its index-stable actor.
+        task_launch: Launcher submitting partition `idx` as a stateless task.
+        map_plan: The map prefix, used to evict the pool that failed.
+        actors: The pool, or `None`/empty to go straight to tasks.
+
+    Returns:
+        The folded aggregate state, or `None` when every partition was empty.
+    """
+    if not actors:
+        return gather(task_launch)
+    from ray.exceptions import RayError
+
+    try:
+        return gather(actor_launch)
+    except RayError as exc:
+        # WARNING rather than the `note_suppressed` DEBUG the other best-effort paths use:
+        # nothing was suppressed here, the stage was *recomputed*, and a user looking at why
+        # one query took twice as long as the last needs that in the log.
+        log_kv(
+            _log,
+            logging.WARNING,
+            "warm map/aggregate pool lost mid-stage; redoing the stage on stateless tasks",
+            pool_size=len(actors),
+            exc_info=exc,
+        )
+        _evict_pipeline_pools(map_plan, _AGG_POOLS)
+        return gather(task_launch)
+
+
 def _distributed_map_aggregate(above, agg, sources, workers):
     """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
 
@@ -2401,25 +2446,18 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     shares = _adaptive_task_cpus(partitions, agg.input)
     sched = _map_scheduling_options(current_envelope(), shares)
     actors = _agg_actor_pool(map_plan, workers)
-    # One object-store copy of the map prefix for the whole stage — see `_shared_arg`. Only
-    # the task form reads it; an actor already holds the plan, so paying the put would be a
-    # serialization of the whole UDF prefix that nothing fetches.
-    plan_ref = None if actors else _shared_arg(map_plan)
-    # Attempts are counted per partition so a *retry* rotates to the next actor: the first
-    # try is index-stable (which is the whole point — the cached partition meets its worker),
-    # and a preempted actor does not get the same partition handed back to it forever.
-    attempts_by_idx: dict[int, int] = {}
+    # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
+    plan_ref = _shared_arg(map_plan)
 
-    def _launch(idx):
-        if actors:
-            tried = attempts_by_idx.get(idx, 0)
-            attempts_by_idx[idx] = tried + 1
-            actor = actors[(idx + tried) % len(actors)]
-            return actor.run_agg.remote(partitions[idx], gk, aj)
+    def _task_launch(idx):
         task_workers = max(1, round(shares[idx]))
         return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
             plan_ref, partitions[idx], gk, aj, task_workers
         )
+
+    def _actor_launch(idx):
+        """Partition `idx` always goes to the same actor — the point of the pool."""
+        return actors[idx % len(actors)].run_agg.remote(partitions[idx], gk, aj)
 
     # Fold each partition's partial into a running state **as it lands**, rather than
     # holding all of them and folding after the barrier. `combine` is associative and
@@ -2437,19 +2475,28 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # it is also within one. Integer and min/max/count aggregates are unaffected; a caller
     # needing bit-repeatable float sums has the same recourse it always had, which is to fix
     # the partition count.
-    running: list = [None]
+    def _gather(launch):
+        """One pass over every partition, folding partials as they land. Returns the state."""
+        running: list = [None]
 
-    def _fold(_idx, partial):
-        if partial is None:
-            return
-        running[0] = partial if running[0] is None else nat.combine(gk, aj, [running[0], partial])
+        def _fold(_idx, partial):
+            if partial is None:
+                return
+            running[0] = (
+                partial if running[0] is None else nat.combine(gk, aj, [running[0], partial])
+            )
 
-    gather_map_results(
-        _launch, len(partitions), task_cpus=min(shares) if shares else 1.0, sink=_fold
-    )
-    if running[0] is None:
+        # `task_cpus` is the smallest share any of these asks for, so the submit-ahead window
+        # counts units rather than cores.
+        gather_map_results(
+            launch, len(partitions), task_cpus=min(shares) if shares else 1.0, sink=_fold
+        )
+        return running[0]
+
+    state = _gather_with_pool_recovery(_gather, _actor_launch, _task_launch, map_plan, actors)
+    if state is None:
         table = _empty_agg_table(agg)
     else:
-        out = nat.combine_finalize(gk, aj, [running[0]])
+        out = nat.combine_finalize(gk, aj, [state])
         table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
     return table if not above else _apply_above(above, table)

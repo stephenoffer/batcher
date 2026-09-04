@@ -137,3 +137,47 @@ def test_releasing_the_warm_pools_frees_the_aggregate_pool_too(pooling):
     M.release_inference_pools()
 
     assert killed == pool and M._AGG_POOLS == {}
+
+
+def test_no_pool_goes_straight_to_the_stateless_tasks():
+    """The route the change did not touch: no actors, no recovery, no eviction."""
+    used: list[str] = []
+
+    state = M._gather_with_pool_recovery(
+        lambda launch: (used.append(launch), "state")[1], "actor", "task", object(), None
+    )
+
+    assert state == "state" and used == ["task"]
+
+
+def test_a_healthy_pool_never_reaches_the_task_launcher():
+    """The positive control for the test below: without it, "fell back" is unfalsifiable."""
+    used: list[str] = []
+
+    state = M._gather_with_pool_recovery(
+        lambda launch: (used.append(launch), "actors")[1], "actor", "task", object(), ["a"]
+    )
+
+    assert state == "actors" and used == ["actor"]
+
+
+def test_a_pool_that_dies_mid_stage_redoes_the_work_on_tasks(pooling):
+    """A warm pool must never turn a preemption into a failed query (`_run_warm_pool`)."""
+    from ray.exceptions import RayActorError
+
+    prefix = _prefix(lambda b: b)
+    pool = M._agg_actor_pool(prefix, 2)
+    _, killed = pooling
+    used: list[str] = []
+
+    def gather(launch):
+        used.append(launch)
+        if launch == "actor":
+            raise RayActorError  # what a preempted node's actor call actually raises
+        return "recovered"
+
+    state = M._gather_with_pool_recovery(gather, "actor", "task", prefix, pool)
+
+    assert state == "recovered", "the stage completed on the fallback"
+    assert used == ["actor", "task"], "it tried the pool first, then the tasks"
+    assert killed == pool and M._AGG_POOLS == {}, "and the dead pool was evicted, not reused"
