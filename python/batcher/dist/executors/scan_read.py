@@ -4,12 +4,14 @@ Split out of `partition_io` (which owns *partitioning* — assigning splits to w
 because *reading* them is a distinct, throughput-critical concern. The dominant cost of a
 distributed scan is object-store read throughput, so the reader is chosen for speed:
 
-* `_read_split_batches` — the entry point. For uniform Parquet row-group splits it runs an
-  async, coalesced **pyarrow dataset scan** (every assigned row-group read concurrently in
-  C++ with column-chunk coalescing + readahead — ~5x a Python per-split read on a
-  high-latency worker→S3 path, and it *streams* so a worker never materializes its whole
-  partition). Anything else (or any failure building the scan) falls back to a bounded
-  thread-pool prefetch over per-split reads.
+* `_read_split_batches` — the entry point. For uniform Parquet row-group splits it runs the
+  **native Rust reader** (`bc-io`), which groups the splits by file and reads those files'
+  row-groups concurrently, fetching each one's projected column chunks concurrently in turn.
+  Failing that (an unsupported scheme, a read error, `BATCHER_NATIVE_READER=0`) it falls back
+  to an async, coalesced **pyarrow dataset scan** (every assigned row-group read concurrently
+  in C++ with column-chunk coalescing + readahead), and failing *that* to a bounded
+  thread-pool prefetch over per-split reads. All three stream and preserve file order, so
+  which one runs is a throughput decision and never a correctness one.
 
 `_SCAN_PREFETCH` / `_SPLIT_TARGET_BYTES` are read tuning the partitioner also consults, so
 they live here as the single source of truth.
@@ -58,13 +60,24 @@ _BATCH_READAHEAD = max(2, int(os.environ.get("BATCHER_BATCH_READAHEAD", "64")))
 
 
 # Native Rust parquet reader (bc-io via bc_py): decodes parquet over object_store
-# (S3/GCS/Azure/HTTP/local), fetching the projected row-groups concurrently. It MATCHES
-# pyarrow single-node, but under concurrent distributed load (all workers reading at once)
-# object_store's HTTP client trails pyarrow's AWS C++ SDK (~3x on the cluster), so it is
-# OPT-IN for the distributed S3 path (`BATCHER_NATIVE_READER=1`) until that concurrency
-# gap is closed. It still serves direct reads and non-S3 backends; the pyarrow dataset
-# scan (well-tuned: 32 IO threads + readahead) remains the default distributed reader.
-_NATIVE_READER = os.environ.get("BATCHER_NATIVE_READER", "0") not in ("0", "false", "")
+# (S3/GCS/Azure/HTTP/local), fetching the projected row-groups concurrently.
+#
+# This was OPT-IN, on a recorded measurement that it "trails pyarrow's AWS C++ SDK (~3x on
+# the cluster) under concurrent distributed load". That deficit was real and its cause was
+# **this module**, not object_store's HTTP client: `_native_scan_batches` read its per-file
+# windows one after another, so a partition spread over ten files paid ten object-store
+# round trips in series. With those windows read concurrently (`_ordered_concurrent`) the
+# same reader is the fastest of the four on a cold partition read, and end to end on the
+# 65 x 16-core fleet, TPC-H sf100, scan cache off, best of 3, sums identical:
+#
+#     scan + sum          pyarrow 1,076 ms -> native 580 ms   (1.86x)
+#     scan + heavy UDF    pyarrow 3,086 ms -> native 2,168 ms  (1.42x)
+#
+# So it is now the default. The previous default was set on a measurement of the same kind,
+# which is the reason to keep this reversible rather than to trust the new one more:
+# `BATCHER_NATIVE_READER=0` restores the pyarrow dataset scan (well-tuned: 32 IO threads +
+# readahead), and that is the first thing to try if a distributed read regresses.
+_NATIVE_READER = os.environ.get("BATCHER_NATIVE_READER", "1") not in ("0", "false", "")
 
 # Row-groups per native read call. The native reader returns a *materialized* batch list,
 # so reading a whole file at once would buffer the worker's entire partition — defeating
@@ -374,12 +387,34 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
         yield from _prefetch_split_reads(splits, projection, predicate, _SCAN_PREFETCH)
 
 
+def _native_read_depth(units: list[tuple[str, list[int]]]) -> int:
+    """How many native row-group windows to keep in flight, bounded by ROW-GROUPS.
+
+    The per-split reader holds at most `_SCAN_PREFETCH` splits — normally one row-group
+    each — so the same budget expressed in row-groups keeps this path's resident footprint
+    where the pyarrow path's already is, rather than multiplying it by the window size. A
+    partition of one-row-group-per-file (the balanced-assignment shape, and the one that was
+    slow) reads every file at once; a partition of few files x many row-groups reads fewer
+    windows concurrently, because each one already carries `_NATIVE_RG_WINDOW` of them.
+
+    Args:
+        units: The `(uri, row_groups)` windows the read was cut into.
+
+    Returns:
+        The concurrency to hand `_ordered_concurrent`, never below 1.
+    """
+    widest = max((len(window) for _uri, window in units), default=1)
+    return max(1, _SCAN_PREFETCH // max(1, widest))
+
+
 def _native_scan_batches(splits, projection, predicate=None):
     """Read uniform Parquet row-group splits with the native Rust reader, or `None`.
 
-    Groups the splits by file and reads each file's requested row-groups in one native
-    call (which fetches them concurrently). A pushed `predicate` is applied as native
-    row-group pruning — its zone-map-provably-empty groups are never fetched or decoded;
+    Groups the splits by file, cuts each file's requested row-groups into windows, and reads
+    those windows concurrently in file order (`_ordered_concurrent`) — each native call
+    fetching its own window's column chunks concurrently in turn. A pushed `predicate` is
+    applied as native row-group pruning — its zone-map-provably-empty groups are never
+    fetched or decoded;
     the pruning is superset-safe (the engine keeps the `Filter` operator downstream, so a
     non-pushable predicate just reads more rows). Returns `None` (caller falls back to
     pyarrow) when the splits aren't all `RowGroupSplit`s or the native extension/read is
@@ -402,20 +437,50 @@ def _native_scan_batches(splits, projection, predicate=None):
         by_file.setdefault(s.path, []).extend(s.row_groups)
     cols = list(projection) if projection is not None else None
 
+    # Window the row-groups so the worker reads ~one window at a time (bounded memory +
+    # read/compute overlap) instead of materializing its whole partition.
+    units: list[tuple[str, list[int]]] = []
+    for path, rgs in by_file.items():
+        uri = _native_uri(path)
+        ordered = sorted(set(rgs))
+        for i in range(0, len(ordered), _NATIVE_RG_WINDOW):
+            units.append((uri, ordered[i : i + _NATIVE_RG_WINDOW]))
+
+    def _read_window(unit: tuple[str, list[int]]):
+        uri, window = unit
+        batches = _parquet_native.read_row_groups_filtered(uri, window, cols, predicate, batch_rows)
+        if batches is None:  # native unavailable/failed → fall back to pyarrow
+            raise _NativeUnavailable
+        return batches
+
     def _gen():
-        for path, rgs in by_file.items():
-            uri = _native_uri(path)
-            ordered = sorted(set(rgs))
-            # Window the row-groups so the worker streams ~one window at a time (bounded
-            # memory + read/compute overlap) instead of materializing its whole partition.
-            for i in range(0, len(ordered), _NATIVE_RG_WINDOW):
-                window = ordered[i : i + _NATIVE_RG_WINDOW]
-                batches = _parquet_native.read_row_groups_filtered(
-                    uri, window, cols, predicate, batch_rows
-                )
-                if batches is None:  # native unavailable/failed → fall back to pyarrow
-                    raise _NativeUnavailable
-                yield from batches
+        """The windows, read CONCURRENTLY and yielded in file order.
+
+        Each native call already fetches its own window's column chunks concurrently, but
+        the calls themselves used to run one after another — so a partition spread over
+        many files paid a full object-store round trip per file, in series, with the task's
+        reserved cores idle throughout. That is the common shape, not a corner: the
+        partitioner balances a source's splits across tasks, so a task's ten splits are
+        typically ten *different* files.
+
+        Measured inside a real Ray task on the 65-node fleet, one TPC-H sf100 `lineitem`
+        partition (10 splits / 10 files / 10 MB projected), median of 6 partitions per
+        reader, each partition read exactly once by exactly one reader: serial 1.403 s,
+        concurrent 0.474 s (2.96x), against PyArrow's coalesced dataset scan at 0.787 s and
+        its concurrent per-split reader at 0.785 s. This reader went from the slowest of
+        the four to the fastest, on serialization alone.
+
+        Measure it that way or not at all: reading the SAME partition with each reader in
+        turn reports ~9x rather than ~3x, because whichever reader goes first pays the
+        connection setup the rest inherit.
+
+        The win is on a COLD read. `_read_split_batches` caches decoded batches on the
+        worker, so a repeated query re-reads nothing and this path is off its critical path
+        entirely — which is why a warm best-of-N benchmark moves far less. See
+        `benchmarks/BENCHMARK_RESULTS.md` for the cold/warm split.
+        """
+        for batches in _ordered_concurrent(units, _read_window, _native_read_depth(units)):
+            yield from batches
 
     # Probe the first read eagerly so a failure falls back to pyarrow instead of yielding
     # a half-stream; on success, chain the probed batches back in.
@@ -550,17 +615,56 @@ def _prefetch_split_reads(splits, projection, predicate, depth: int, skip_errors
     skipped instead of failing the scan, so one corrupt file/row-group never loses its
     healthy siblings. Off by default — a read failure propagates (fail-fast).
     """
-    if depth <= 1 or len(splits) <= 1:
-        for s in splits:
-            if skip_errors:
-                try:
-                    batches = _split_read(s, projection, predicate)
-                except Exception as e:  # a bad split is skipped, not fatal
-                    _record_skipped(s, e)
+
+    def _on_error(split, exc: Exception) -> bool:
+        if not skip_errors:
+            return False
+        _record_skipped(split, exc)  # a bad split is skipped, not fatal
+        return True
+
+    for batches in _ordered_concurrent(
+        splits, lambda s: _split_read(s, projection, predicate), depth, _on_error
+    ):
+        yield from batches
+
+
+def _ordered_concurrent(units, read_one, depth: int, on_error=None):
+    """Yield ``read_one(unit)`` for each of `units` **in order**, `depth` reads in flight.
+
+    The one definition of "read ahead on a thread pool without reordering" this module has,
+    shared by the per-split pyarrow reader and the native row-group reader. Both are
+    object-store-LATENCY-bound — a single connection sits far below a node's bandwidth and
+    each request waits tens of milliseconds — so what caps throughput is how many requests
+    are outstanding, not how fast any one of them is.
+
+    A FIFO of futures is what keeps the order: a unit is submitted early but only yielded
+    when the reader reaches it, so a caller that assumes file/split order is unaffected.
+    Memory is bounded to at most `depth` in-flight reads, and the next read is submitted
+    *before* the current one is drained so a skipped unit still advances the window.
+
+    `read_one` must release the GIL for the overlap to be real. Both callers do:
+    ``bc_py::read_parquet`` wraps its object-store fetch in ``py.allow_threads``, and
+    PyArrow's readers release it too.
+
+    Args:
+        units: The work items to read, in the order their results must be yielded.
+        read_one: Called on each unit; its return value is yielded.
+        depth: Reads to keep in flight; ``<= 1`` (or a single unit) runs plain sequentially.
+        on_error: Called as ``on_error(unit, exc)`` when a read raises. Returning True
+            skips that unit; returning False (the default when omitted) re-raises.
+
+    Yields:
+        Each unit's `read_one` result, in `units` order.
+    """
+    if depth <= 1 or len(units) <= 1:
+        for unit in units:
+            try:
+                out = read_one(unit)
+            except Exception as exc:
+                if on_error is not None and on_error(unit, exc):
                     continue
-                yield from batches
-            else:
-                yield from _split_read(s, projection, predicate)
+                raise
+            yield out
         return
 
     import collections
@@ -568,25 +672,23 @@ def _prefetch_split_reads(splits, projection, predicate, depth: int, skip_errors
 
     with ThreadPoolExecutor(max_workers=depth) as pool:
         pending: collections.deque = collections.deque()
-        it = iter(splits)
-        for s in _take(it, depth):
-            pending.append((s, pool.submit(_split_read, s, projection, predicate)))
+        it = iter(units)
+        for unit in _take(it, depth):
+            pending.append((unit, pool.submit(read_one, unit)))
         while pending:
-            split, fut = pending.popleft()
-            # Submit the next read BEFORE draining this one so a failed split still
+            unit, fut = pending.popleft()
+            # Submit the next read BEFORE draining this one so a failed unit still
             # advances the prefetch window (keeps the pipeline full under skip).
             nxt = next(it, None)
             if nxt is not None:
-                pending.append((nxt, pool.submit(_split_read, nxt, projection, predicate)))
-            if skip_errors:
-                try:
-                    batches = fut.result()
-                except Exception as e:  # a bad split is skipped, not fatal
-                    _record_skipped(split, e)
+                pending.append((nxt, pool.submit(read_one, nxt)))
+            try:
+                out = fut.result()  # raises if the read failed
+            except Exception as exc:
+                if on_error is not None and on_error(unit, exc):
                     continue
-            else:
-                batches = fut.result()  # raises if the read failed
-            yield from batches
+                raise
+            yield out
 
 
 def _take(it, n: int):

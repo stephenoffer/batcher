@@ -276,6 +276,47 @@ Statistics about the *data* are deliberately not scoped this way. Distinct count
 column widths, and selectivities describe the data and are identical wherever it is read, so
 they are shared across every machine that touches the dataset.
 
+## Reading from object storage in parallel
+
+A distributed scan against S3, GCS, or Azure is bound by request *latency*, not by
+bandwidth. A single connection sits far below what one node can pull, and every request
+waits tens of milliseconds, so what caps throughput is how many reads are outstanding at
+once. Each scan task therefore keeps a bounded window of reads in flight rather than
+fetching its files one after another, and yields the results in file order, so nothing
+downstream can tell the reads overlapped.
+
+The window is bounded rather than unlimited because the reads in flight are also the
+task's memory: at most `BATCHER_SCAN_PREFETCH` reads (32 by default) are outstanding, so a
+task holds a few files' worth of decoded batches and never its whole partition.
+
+This matters most when a task's splits land on many different files, which is the shape the
+balanced split assignment normally produces. The layout you write is what decides that
+shape, and you control it directly:
+
+```python
+import tempfile
+
+wide = bt.from_pydict({"id": list(range(2000)), "amount": [float(i) for i in range(2000)]})
+
+many_files = tempfile.mkdtemp()
+wide.write.parquet(many_files, max_rows_per_file=250)
+
+back = bt.read.parquet(many_files)
+print(back.count(), back.agg(total=bt.col("amount").sum()).to_pydict())
+# 2000 {'total': [1999000.0]}
+```
+
+Very small files are the case to avoid: each one costs a request whose latency the window
+can hide but not remove, and the per-file footer read is pure overhead. Aim for splits of
+tens of megabytes rather than tens of kilobytes, and prefer fewer, larger files when you
+control the writer.
+
+A worker also keeps the batches it decoded, so a repeated query against the same files
+skips both the fetch and the decode. That cache is per worker process and bounded by
+`BATCHER_SCAN_CACHE_FRACTION` of the worker's memory (0.3 by default), or set outright with
+`BATCHER_SCAN_CACHE_BYTES`. It is why a second run of the same query is faster than the
+first, and why a benchmark that reports only its best-of-N is measuring a warm read.
+
 ## Out-of-core spilling
 
 Stateful operators spill to disk when they would exceed the memory envelope, which covers

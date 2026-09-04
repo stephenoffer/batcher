@@ -316,6 +316,40 @@ def _fmt_util(u: dict) -> str:
     return f"{mean:.0f}%/{peak:.0f}%peak {nodes}"
 
 
+def _worker_pip(order: list[str]) -> list[str] | None:
+    """The job runtime env's pip set for a sweep running `order`, or `None` for no install.
+
+    `None` drops the workspace's inherited pip env, which lists a local editable
+    (`batcher-engine`) no index can resolve — the per-worker build hard-fails and no task
+    runs. The cluster base image already carries Batcher's and Ray Data's deps, so both
+    engines want exactly that. (Mirrors `engines/ray.py`; Batcher's own dist path pins
+    `pip: None` the same way.)
+
+    **Daft is the exception, and it is why a Daft column used to read `ERR`.** `daft` is not
+    in this cluster's worker image, so its Ray-runner (flotilla) actors cannot import it and
+    the runner never starts — a failure of the environment, not of the engine, which is a
+    worse thing to print than nothing. Shipping `daft` in the job's runtime env is what makes
+    the column real.
+
+    The install is charged to *every* worker in the job, so it is only applied when Daft is
+    the sole engine in the sweep: adding it to a Batcher or Ray Data sweep would tax an
+    engine that does not need it and make its numbers a measurement of a pip install. That is
+    the same reason `bench_engine` runs engine-major and the recorded head-to-heads give each
+    engine its own driver process — run Daft as `BENCH_ENGINE_ORDER=daft`.
+
+    Args:
+        order: The engines this sweep will run, in order.
+
+    Returns:
+        The pip requirement list for the job's workers, or `None` to install nothing.
+    """
+    if order != ["daft"]:
+        return None
+    import daft
+
+    return [f"daft=={daft.__version__}"]
+
+
 def main() -> int:
     # A dev-profile engine is 8-60x slower, so a ratio taken from one compares an
     # unoptimized Batcher against release Ray and Daft. `BENCH_ALLOW_DEBUG_BUILD=1` overrides.
@@ -335,19 +369,20 @@ def main() -> int:
     pipes = os.environ.get("BENCH_PIPES")
     pipelines = pipes.split(",") if pipes else PIPELINES
 
+    # The sweep order is resolved BEFORE `ray.init`, because which engines run decides the
+    # job's runtime env (see `_worker_pip`) and a job's runtime env cannot be changed after.
+    order = [e for e in os.environ.get("BENCH_ENGINE_ORDER", "").split(",") if e in ENGINES]
+    order = order or list(ENGINES)
+
     import ray
 
     if not ray.is_initialized():
         os.environ.setdefault("RAY_ADDRESS", "auto")
-        # Drop the workspace's inherited pip runtime-env: it lists a local editable
-        # (`batcher-engine`) that no index can resolve, so the per-worker pip build hard-fails
-        # and no task runs. The cluster base env already carries the deps. (Mirrors
-        # `engines/ray.py`; batcher's own dist path pins `pip: None` the same way.)
         ray.init(
             address="auto",
             logging_level="ERROR",
             log_to_driver=False,
-            runtime_env={"pip": None},
+            runtime_env={"pip": _worker_pip(order)},
         )
     print(f"cluster: {ray.cluster_resources().get('CPU')} CPU, {len(ray.nodes())} nodes")
     print(f"TPC-H sf{scale}, best-of-{runs}\n")
@@ -359,8 +394,6 @@ def main() -> int:
     # no other engine's residue on it, and only Batcher has a release hook. Default order
     # puts Batcher first, which is the order every recorded run used; `BENCH_ENGINE_ORDER`
     # rotates it so a reader can bound how much of a margin is ordering rather than engine.
-    order = [e for e in os.environ.get("BENCH_ENGINE_ORDER", "").split(",") if e in ENGINES]
-    order = order or list(ENGINES)
     if order != list(ENGINES):
         print(f"engine sweep order: {' -> '.join(order)} (BENCH_ENGINE_ORDER)")
     by_engine = {eng: bench_engine(eng, ENGINES[eng], pipelines, scale, runs) for eng in order}

@@ -1,5 +1,146 @@
 # Batcher CPU benchmark results
 
+## The native Parquet reader was switched off by default for being 3x slower under distributed load, and the reason was that it read its files one at a time (2026-09-04)
+
+Same fleet as the entry below — **65 x 16-core / 32 GiB** (1,024 cores), TPC-H sf100 read from
+`s3://ray-benchmark-data/tpch/parquet`, driver on the 16-core head, cluster CPU sampled by one
+`num_cpus=0` actor per node (`benchmarks/cluster/cluster_util.ClusterMonitor`) at 100 ms.
+
+### The worker scan cache was hiding the read in every earlier number here
+
+`_read_split_batches` caches decoded batches on the worker, so a warm best-of-N re-reads
+nothing. Every figure for these pipelines was taken warm. With `BATCHER_SCAN_CACHE_BYTES=0`,
+same query, same 600 M rows, one projected column of `lineitem`:
+
+| pipeline | cache off | cache on |
+|---|---:|---:|
+| `scan + sum` — no UDF | **1,009 ms** | 349 ms |
+| `scan + identity UDF + sum` | **2,376 ms** | 2,028 ms |
+| `scan + heavy UDF + sum` | **3,371 ms** | 2,779 ms |
+
+"The read is only 13% of this query" was a statement about a warm cache. Quote the cold column
+when reasoning about where a distributed query's time goes, and the warm one only when the
+question is explicitly about a repeated query.
+
+### The defect: `_native_scan_batches` read its files in series
+
+It groups a task's splits by file and reads each file's row-groups in its own native call.
+Those calls ran **one after another**, so a partition spread over many files paid a full
+object-store round trip per file, in series, with the task's reserved cores idle throughout.
+That is the ordinary shape, not a corner: the balanced split assignment gives a task ten splits
+that are ten different files.
+
+Read inside a real Ray task, one partition (10 splits / 10 files / 10 MB projected), median of
+6 partitions per reader, **each partition read exactly once by exactly one reader**:
+
+| reader | median | min | max |
+|---|---:|---:|---:|
+| native, serial (before) | 1.403 s | 1.249 s | 1.752 s |
+| **native, concurrent (after)** | **0.474 s** | 0.447 s | 0.585 s |
+| PyArrow coalesced dataset scan (the default) | 0.787 s | 0.680 s | 1.165 s |
+| PyArrow concurrent per-split reader | 0.785 s | 0.667 s | 0.928 s |
+
+**Measure it that way or not at all.** Reading the *same* partition with each reader in turn
+reports 9.3x instead of 2.96x, because whichever reader goes first pays connection setup the
+rest inherit. The first version of this measurement did exactly that, and the 9.3x was written
+into a source comment before it was checked.
+
+The fix reuses the FIFO-of-futures window the per-split reader already had — now one shared
+`_ordered_concurrent` instead of two copies — so order is preserved and memory stays bounded.
+The look-ahead is counted in **row-groups**, not windows, so a partition of few files x many
+row-groups holds no more than one of many single-row-group files.
+
+### Which retires the reason the native reader was opt-in
+
+`_NATIVE_READER` defaulted to **off**, and the comment above it recorded why: the native reader
+"MATCHES pyarrow single-node, but under concurrent distributed load object_store's HTTP client
+trails pyarrow's AWS C++ SDK (~3x on the cluster)". That was a real measurement of a real
+deficit — and the deficit was this serialization, not the HTTP client. With the windows read
+concurrently the same reader is now the *fastest* of the four, and end to end on the default
+distributed scan path (cache off, best of 3, identical sums to the last digit):
+
+| | pyarrow default | native, concurrent |
+|---|---:|---:|
+| `scan + sum` | 1,076 ms | **580 ms** (1.86x) |
+
+Being faster in isolation is not the same as being the right default, and the previous default
+was set on a measurement of the same kind, so treat the flip as reversible: `BATCHER_NATIVE_READER=0`
+restores the PyArrow scan, and the knob is why the earlier finding could be recorded rather than
+argued.
+
+### What this does NOT explain: 1,367 ms of UDF-path overhead
+
+From the cold column: an **identity** UDF — a function returning its input column — costs
+**1,367 ms** more than the same scan with no UDF at all (2,376 against 1,009). Same bytes, same
+projection, same partition count. All of it is the difference between the executor a UDF-free
+plan takes and `_map_udf_task` / `_map_agg_task`.
+
+The heavy UDF then adds 995 ms against a floor of **167 ms**: it is 171.5 core-seconds
+(measured single-core at 285.8 ns/row over 600 M rows), so 995 ms is **172 effective cores** of
+1,024 — which is what the 9-11% mean cluster busy in every one of these runs reports.
+
+Two levers that look like the answer and are not:
+
+* **`BATCHER_MAP_COMPUTE_WEIGHT`.** "465 tasks x 2.46 CPU = 1,200 CPU asked of a 1,024-core
+  fleet" reads like a stage throttling itself. It is not: `_filled_to_the_fleet` scales whatever
+  it is handed back up to the fleet. Weight 4.0 -> 2.461 CPU/task, 3,265 ms; 1.0 -> 2.100,
+  3,354 ms; 0.25 -> 2.100, 3,392 ms. Same ~1,024 CPU reserved, same 9-10% busy, same wall. The
+  knob moves the input and the fill removes the effect.
+* **`num_workers`.** 2,977 ms default -> 2,835 at 8 -> 2,699 at 16. Thread width inside the task
+  is not the constraint; the tasks are resident and idle, not short of threads.
+
+In an isolated task the two phases measure 0.474 s (read) and 0.151 s (`execute_with_udfs`),
+which do not compose into the 2,376 ms the query takes — so what is left to find is contention
+at 416-way fan-out, not a slow phase. That is the next thing worth a session.
+
+### The default flip, and the regression check that nearly went the wrong way
+
+Same script, same session conditions, `BATCHER_NATIVE_READER` the only variable:
+
+| pipeline | reader off | reader on | |
+|---|---:|---:|---|
+| `filter_count` (best of 5) | 173 ms | **166 ms** | — |
+| `groupby` (best of 5) | 174 ms | **172 ms** | — |
+| `join` (best of 3) | 1,312 ms | 1,334 ms | within the 1,295-1,399 spread |
+| `udf` (best of 3) | 2,770 ms | **1,716 ms** | **1.61x** |
+
+**At best-of-3 that table said `filter_count` 168 -> 200 and `groupby` 169 -> 197**, which reads
+as a 17% regression on two of five pipelines and was very nearly recorded as one. Both are
+~170 ms queries whose spread across the day's runs is 166-210 ms, so three samples cannot
+separate a 17% effect from the noise; five put both arms inside 8 ms of each other, with the
+reader *on* marginally ahead. A regression claim on a short query needs more replicates than a
+speedup claim on a long one, because the fixed cost it is measured against is most of it.
+
+### Ray Data and Daft on the same cluster
+
+`benchmarks/cluster/vs_ray_daft.py` could not measure Daft at all — `daft` is not in the worker
+image and the harness pinned `pip: None`, so every Daft cell read `ERR`. The job's runtime env
+is now engine-aware (`_worker_pip`): a Daft-only sweep ships `daft`, and a Batcher or Ray Data
+sweep still installs nothing, because charging a pip install to an engine that does not need it
+would be measuring the install. Run it as `BENCH_ENGINE_ORDER=daft`.
+
+sf100, each engine in its own driver process. Batcher and Daft measured today; the Ray Data
+column for the three relational rows is the 2026-09-03 run above (same cluster, same script,
+not re-measured today), and its `udf` was re-measured today at 5,685 ms:
+
+| pipeline | batcher | ray data | daft | vs ray | vs daft |
+|---|---:|---:|---:|---:|---:|
+| `filter_count` | **166 ms** | 3,561 ms | 1,204 ms | 21.5x | 7.3x |
+| `groupby` | **172 ms** | 5,477 ms | 1,400 ms | 31.8x | 8.1x |
+| `join` | **1,334 ms** | 26,429 ms | 5,364 ms | 19.8x | 4.0x |
+| `udf` | **1,716 ms** | 5,685 ms | n/a¹ | **3.3x** | — |
+
+¹ `daft_thunk` declines the `udf` shape (the UDF surfaces diverge), and a declined pipeline
+prints in the same `ERR` cell as a failure — worth separating, since one is a fact about the
+harness and the other about the engine.
+
+`udf` moves from **2.1x to 3.3x** against Ray Data. It is still the one shape where Batcher is
+not far ahead, and the decomposition above says why 10x is not available *at this scale*: the
+cold read alone is ~1.0 s against Ray Data's whole 5.7 s query, so 10x would need 569 ms —
+below a floor both engines pay. Closing the remaining 1,367 ms and the 172-of-1,024 cores would
+land near 1.2 s, or ~4.7x. **5x is the honest target on this pipeline, and the read floor is
+what would have to move for more.** The relational shapes are already 7-32x.
+
 ## The map stage's CPU ask never mentioned the cluster, and a 1,024-core fleet ran a UDF on 300 cores — plus the first head-to-head against Ray Data and Daft on this cluster (2026-09-03)
 
 The cluster is **65 x 16-core / 32 GiB** (1,024 cores, 2.03 TiB), the same fleet the

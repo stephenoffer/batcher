@@ -65,7 +65,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_WEBDATASET_BATCH_BYTES": "payload bytes per WebDataset batch",
     # --- distributed scan / scheduling ---------------------------------------------
     "BATCHER_SPLIT_TARGET_BYTES": "target bytes per scan split",
-    "BATCHER_SCAN_PREFETCH": "scan-task prefetch depth",
+    "BATCHER_SCAN_PREFETCH": "concurrent reads a scan task keeps in flight",
     "BATCHER_SCAN_CACHE_BYTES": "per-worker scan cache size",
     "BATCHER_SCAN_CACHE_FRACTION": "scan cache as a fraction of worker memory",
     "BATCHER_BATCH_READAHEAD": "batches read ahead per scan task",
