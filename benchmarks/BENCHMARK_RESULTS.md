@@ -229,6 +229,37 @@ a ~15% gap whose ranges nearly touch at this fleet's ~12% run-to-run spread. On 
 all six pairings point the same way and the direction matches a measurement already in the
 file, not because either one is individually decisive. `BATCHER_TARGET_TASK_CPUS` reverses it.
 
+### Where the remaining ~600 ms lives: the map route gets no value from the scan cache
+
+The clearest signal left is not a timing but a *ratio*. `_read_split_batches` caches decoded
+batches in the worker **process**, and the two routes benefit from it completely differently.
+All at 256 partitions, sf100, one projected column:
+
+| route | scan cache off | scan cache on | benefit |
+|---|---:|---:|---|
+| `scan + sum` — no UDF | 692-789 ms | **304-339 ms** | **~2.3x** |
+| `scan + identity UDF + sum` | 1,017 ms | 910-1,060 ms | ~1.1x |
+| `scan + heavy UDF + sum` | 1,345-1,438 ms | 1,422-1,687 ms | none, if anything worse |
+
+The UDF route re-reads from object storage on every run. That is the whole of the ~600 ms it
+sits above the UDF-free read warm, and it is why the driver profile finds the barrier
+genuinely *waiting*: the tasks really are doing S3 reads, warm run or not.
+
+**A hypothesis with an obvious test, not a finding.** The UDF-free aggregate runs on a pinned
+actor fleet (`flight_aggregate` -> `acquire_fleet`), whose processes persist between queries
+and therefore keep their caches; the map route runs stateless Ray tasks, which Ray places
+wherever there is room, so a partition seldom lands on the process that cached it. If that is
+right, routing the same stage onto the actor pool should recover most of the gap —
+`ml.map_batches(..., concurrency=N)` already does exactly that through `_map_resources`, so
+the test needs no new code. Nobody has run it yet; the mechanism above is inferred from the
+ratio, and the ratio is the only part of this section that is measured.
+
+If it holds, the fix is a routing decision rather than an optimisation: give the map route the
+same fleet affinity the aggregate route has, or make the cache node-local instead of
+process-local. Either is squarely inside the existing architecture, and either would take the
+`udf` board from ~1,300 ms toward the ~350 ms the same read costs the other route — which is
+the difference between 4.5x and 10x against Ray Data on this shape.
+
 ### Batching the barrier's completions: built, measured, rejected
 
 With the fan-out fixed, a driver profile of the *warm* identity-UDF query said the driver was
