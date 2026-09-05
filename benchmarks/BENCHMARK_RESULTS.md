@@ -670,7 +670,55 @@ separate a 17% effect from the noise; five put both arms inside 8 ms of each oth
 reader *on* marginally ahead. A regression claim on a short query needs more replicates than a
 speedup claim on a long one, because the fixed cost it is measured against is most of it.
 
-### Distributed execution on an image source costs ~120 s per stage, whatever the data size
+### RETRACTED: the "~120 s per stage on an image source" was a cluster-wide condition, not a source property
+
+**The two entries below that attribute a ~120 s per-stage cost to distributed queries over an
+image source are wrong, and this is the control that shows it.** The cost is not specific to
+image sources, to `map_batches`, or to the multimodal path. It applies to every distributed
+Flight aggregate on this cluster at the time those numbers were taken.
+
+Both shapes, back to back **in one process**, wrapping `execute_aggregate_flight` itself:
+
+| aggregate | wall | inside `execute_aggregate_flight` |
+|---|---:|---:|
+| `parquet sum(column05)`, sf100 lineitem | 126,717 ms | 121,332 ms |
+| `images sum(size)`, 100 files | 123,492 ms | 122,133 ms |
+
+The Parquet row is the tell. **That same query measured 358-403 ms earlier the same day**, three
+times, recorded in the routes comparison above. Re-run twice more on its own it came back at
+**126,563 ms and 122,540 ms**, with the correct sum each time. So a query that took a third of
+a second in the morning takes two minutes now, and the image source has nothing to do with it.
+
+What this invalidates, precisely:
+
+* The claim that a distributed image query costs ~120 s per stage **as a property of that
+  path**. Retracted.
+* The 156x and 69x single-node-versus-distributed penalties for multimodal. The single-node
+  sides of those pairs are unaffected (they never touch Ray), but the distributed sides were
+  measured inside this window, so the ratios measure the window and not the path.
+
+What it does **not** invalidate: everything measured before the window, which includes the
+`udf` board (581-822 ms), the actor-width A/B, and the Daft/Batcher scale comparison — all of
+which ran to completion in seconds or low tens of seconds, which this condition makes
+impossible. A run that finishes in 581 ms cannot be paying a 120 s tax.
+
+The cause is not established. It is not another agent's code — every commit in the window is
+this session's, and the `udf` board ran fast *after* the last of them. Dozens of distributed
+jobs were launched from this session over several hours, and `execute_aggregate_flight` stands
+up Flight servers on workers, so leaked servers or exhausted ports
+(`BATCHER_SHUFFLE_PORT_RANGE`) are the obvious suspects — **suspects, on no evidence beyond
+the shape of the symptom.** Deliberately not chased by restarting anything: the cluster is
+shared, other sessions may have work on it, and the instruction for this work is not to do
+anything that might crash it.
+
+**The lesson worth keeping is about the control, not the cluster.** The image-specific finding
+had a clean dependency (one variable moved, correct results both sides), a refuted rival
+hypothesis, and a plausible story about 211,742 objects. What it never had was *the same
+measurement on a different source*. One Parquet arm, which costs one line in the same script,
+would have caught it before it was written down twice. When a number is surprising by two
+orders of magnitude, the first question is whether the baseline still reads what it used to.
+
+### Distributed execution on an image source costs ~120 s per stage, whatever the data size (RETRACTED — see above)
 
 The multimodal numbers in this file are all **single-node**: `_bt_decode` calls `.collect()`
 with no `distributed=True`, and so does Daft's arm. That is a fair comparison and it hides
