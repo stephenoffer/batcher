@@ -311,6 +311,15 @@ can hide but not remove, and the per-file footer read is pure overhead. Aim for 
 tens of megabytes rather than tens of kilobytes, and prefer fewer, larger files when you
 control the writer.
 
+The planner caches too, and on the driver rather than the workers. Reading a Parquet
+dataset's footers to learn its row count, byte size and per-column bounds is what lets a
+`count()` or a `max()` answer without touching a data page, and it costs real time on a wide
+dataset: on a 100-file TPC-H `lineitem` read that aggregation is 237 ms the first time. It is
+held against each file's identity, which is its path, size and modification time, so a second
+query over the same files reuses it in well under a millisecond, while a file rewritten
+underneath you misses and is read again. A file the filesystem cannot stat is never cached,
+because there would be no way to notice it changing.
+
 A worker also keeps the batches it decoded, so a repeated query against the same files
 skips both the fetch and the decode. That cache is per worker process and bounded by
 `BATCHER_SCAN_CACHE_FRACTION` of the worker's memory (0.3 by default), or set outright with

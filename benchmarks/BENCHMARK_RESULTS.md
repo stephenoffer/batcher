@@ -698,6 +698,45 @@ shape a `FileMetaCache` serves.
 (The cold run's 219 s is the fleet/placement-group condition documented above, not a property
 of this path — runs 2-4 in the same process are the steady state.)
 
+#### Shipped: the footer-statistics aggregate is now cached, 237 ms -> 0.2 ms
+
+The gap the entry above identified, filled with the pattern the entry above named.
+`_native_statistics` now holds its `FooterStats` in a `FileMetaCache` keyed by the tuple of
+`file_identity` values for the files it covers, exactly as `io/splits/parquet.py` already holds
+footers (`_FOOTERS`) and planned splits (`_SPLITS`).
+
+Timed at the call site, TPC-H sf100 `lineitem`, 100 files, repeated identical calls:
+
+| call | wall | rows |
+|---|---:|---:|
+| 1 | **236.7 ms** | 600,037,902 |
+| 2 | **0.2 ms** | 600,037,902 |
+| 3 | 0.2 ms | 600,037,902 |
+| 4 | 0.2 ms | 600,037,902 |
+
+**Measured at the call site and deliberately not on the board.** 51-237 ms against a `udf`
+sweep whose run-to-run spread is over 100 ms would be indistinguishable from the fleet, so a
+board A/B would have measured noise and called it a result — the failure mode this file has
+recorded four times. The board number is unchanged within its spread and no claim is made on it.
+
+The viability question was measured rather than assumed, and the assumption would have been
+wrong in the cautious direction: keying on identities means stat-ing every file, and a `HEAD`
+per object across a large list could easily cost more than the aggregation it saves. It costs
+**0 ms for 100 files, none un-stat-able**, because the filesystem answers `get_file_info` from
+the listing the planner has already performed rather than issuing a request per object.
+
+Correctness is the half worth testing, since these statistics answer `count()`, `min()` and
+`max()` *without executing* — a stale row count is a wrong answer delivered instantly.
+`tests/unit/test_footer_stats_cache.py` pins three things: a repeated identical read aggregates
+once (removing the cache lookup fails this test and only this test); **a rewritten file misses**
+and re-aggregates to the new row count; and a file whose identity cannot be established is
+never cached at all, per `file_identity`'s own contract.
+
+This does not reach 10x and does not claim to. It removes the one term in the `udf`
+decomposition that was neither the user's function nor a floor — worth ~50-237 ms of a
+780-890 ms query — and leaves the barrier's ~164 ms and the ~110 ms of driver `ParquetFile`
+opens as the next two.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is

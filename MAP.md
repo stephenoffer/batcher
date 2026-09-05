@@ -2145,7 +2145,7 @@ Splits — independently-readable, picklable slices of a source.
 
 | module | lines | what it is |
 |---|---|---|
-| `columnar_footer.py` | 408 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
+| `columnar_footer.py` | 438 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
 | `file_identity.py` | 221 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
 | `file_listing.py` | 60 | Statistics for a source where one row *is* one file, read from the listing alone. |
 | `file_skipping.py` | 402 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
