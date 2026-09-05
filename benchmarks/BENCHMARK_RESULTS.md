@@ -841,8 +841,9 @@ unchanged at ~538 ms, as it should be — nothing here altered what the workers 
 even a driver that took zero time would land 32 ms short. The remaining distance is no longer
 anywhere on the driver; it is inside `gather_map_results`, which decomposes as ~368 ms of
 irreducible work (23 ms warm read + 68 ms of the user's own UDF per partition, four rounds over
-64 actors) and **~170 ms of barrier** — dispatch and completion handling for 256 partitions, or
-about 0.66 ms each.
+64 actors) and **~170 ms of barrier**. Read that as the gap between the sum of the per-partition work and
+the wall time of running it in four rounds over 64 actors — *not* as a per-completion charge:
+the entry below tests that reading directly and it is wrong.
 
 That is the whole remaining target, and it is worth stating what it is not. It is not
 stragglers: p99 is 508 ms against a last completion of 563 on 256 partitions. It is not the
@@ -851,6 +852,40 @@ actors stalled and 64 x 16 threads already covers the fleet once. It is the per-
 on a path where batching completions has been built, measured and rejected once — which makes
 it a real problem rather than an obvious one, and the honest next step is to profile inside the
 barrier rather than to try a third arrangement of it.
+
+#### Draining the barrier's completions: built, measured, rejected — and it corrects the entry above
+
+The entry above put the last 46 ms inside "the barrier's ~170 ms of dispatch and completion
+handling ... about 0.66 ms each", which invites one obvious fix. `gather_map_results` calls
+`ray.wait(list(inflight), num_returns=1)`, so 256 partitions over 64 actors cost 256 blocking
+round trips for work that lands in bursts of roughly the pool size. Taking a `timeout=0` sweep
+of everything *already* finished after each blocking wait can only reduce the blocking calls
+and never waits on an unfinished partition — deliberately unlike the earlier batched arm, which
+asked the blocking wait for several at once and ended up making **more** calls (333 against
+256) because the extras timed out empty.
+
+Correct (203 barrier/recovery/preemption unit tests, 2,983 dist/map/write/stream/shuffle tests,
+and the distributed route's integration tests all pass) and worth nothing:
+
+| `udf`, sf100 | samples |
+|---|---|
+| blocking wait, one completion per call | 552 / 558 / 623 ms |
+| **plus a `timeout=0` drain of the rest** | **558 / 568 / 594 ms** |
+
+The same range. Reverted.
+
+**And the reason it is worth nothing corrects the framing that produced it.** The profile
+attributes 576 ms of self time to `ray.wait` across 257 calls, and reading that as ~0.66 ms of
+per-call overhead is wrong: those calls *block*. Their self time is dominated by genuinely
+waiting for partitions that are not finished yet, not by round trips to the raylet. Cutting the
+number of calls therefore cuts almost nothing, which is exactly what two independent arms — this
+one and the earlier batching one — have now measured.
+
+So "~170 ms of barrier overhead" should not be read as a removable fixed cost. It is the
+difference between the sum of the per-partition work and the wall time of running it in four
+rounds across 64 actors, which is scheduling and ordering rather than a per-completion charge.
+Whether *any* of it is recoverable is now an open question rather than an assumed yes, and the
+two cheapest theories about it have both been tested and both failed.
 
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
