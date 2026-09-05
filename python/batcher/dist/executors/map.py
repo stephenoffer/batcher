@@ -73,6 +73,26 @@ _MAP_INFLIGHT_MAX = INFERENCE_INFLIGHT_DEPTH_MAX
 # `ray.get(timeout=10)`, but now paid ONCE for the whole pool rather than per actor (see
 # `_healthy_actors`), so a 200-actor pool costs 10s of worst-case probing, not 2000s.
 _POOL_PROBE_TIMEOUT_S = 10.0
+# Bound on the cold-start VRAM probe, which is a *sizing* question and not a correctness one.
+#
+# `_cold_start_density` asks the first actor how much VRAM its loaded model took, so a second
+# actor can be packed onto a device that has room. That answer cannot arrive until the actor
+# is constructed, and an actor is constructed only once the cluster hands it a device — so on
+# a busy fleet the probe waits for capacity, not for a measurement.
+#
+# It used to wait with a bare `ray.get` and no bound. Measured on a 6-GPU cluster, a
+# `read.parquet(...).map_batches(cls, num_gpus=1).collect(distributed=True)` over four shards:
+# **251.5s of a 267.6s query** was this single call, with the actor pool itself doing the work
+# in 3.8s. The pool's own liveness probe 40 lines below is bounded for exactly this reason,
+# and its docstring says why: a probe that blocks "before any work started" is the worst place
+# to spend a timeout.
+#
+# Generous rather than tight, because a legitimate answer here waits on a real model load
+# (ResNet-50-class weights to device), and falling back on a slow-but-working load would
+# switch the packing off for every pipeline with a large model. Past it, `_cold_start_density`
+# returns its documented fallback of 1 — the unpacked configuration — and the measured loop
+# (`recommend_num_gpus`) packs the device on the next run from a real reading.
+_COLD_START_VRAM_PROBE_TIMEOUT_S = 45.0
 
 _log = get_logger("dist")
 
@@ -437,7 +457,20 @@ def _cold_start_density(pool: list) -> int:
     if not pool:
         return 1
     try:
-        return cold_start_actors_per_device(ray.get(pool[0].loaded_vram.remote()))
+        ref = pool[0].loaded_vram.remote()
+        # Bounded: see `_COLD_START_VRAM_PROBE_TIMEOUT_S`. An unbounded wait here does not
+        # make the packing better, it makes the query wait for cluster capacity before any
+        # work is dispatched — and the fallback below is exactly what the measured loop
+        # would have chosen anyway.
+        ready, _ = ray.wait([ref], num_returns=1, timeout=_COLD_START_VRAM_PROBE_TIMEOUT_S)
+        if not ready:
+            _log.debug(
+                "cold-start VRAM probe did not answer within %.0fs; leaving the pool "
+                "unpacked (one actor per device) and letting the measured loop size it",
+                _COLD_START_VRAM_PROBE_TIMEOUT_S,
+            )
+            return 1
+        return cold_start_actors_per_device(ray.get(ready[0]))
     except Exception as exc:  # pragma: no cover - sizing must never break a query
         note_suppressed("dist", "probe the loaded model's VRAM for cold-start packing", exc)
         return 1

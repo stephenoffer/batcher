@@ -111,7 +111,7 @@ def execute_distributed(
     mark = time.perf_counter()
     if prof is not None:
         prof.worker_metrics = worker_metrics
-    collect_source_metadata(ctx.hub, sources)
+    collect_source_metadata(ctx.hub, sources, plan)
     phase("collect_source_metadata", time.perf_counter() - mark)
 
     record_distributed(

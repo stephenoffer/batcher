@@ -65,7 +65,7 @@ class DistributedExecutor:
                 envelope=envelope,
                 hub=ctx.hub,
             )
-            collect_source_metadata(ctx.hub, sources)
+            collect_source_metadata(ctx.hub, sources, plan)
             record_udf_cardinality(ctx.hub, plan, table.num_rows)
             return table
         # Relational distributed result — deterministic and identical to single-node,
@@ -97,7 +97,7 @@ class UdfExecutor:
         )
         schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
-        collect_source_metadata(ctx.hub, sources)
+        collect_source_metadata(ctx.hub, sources, plan)
         record_udf_cardinality(ctx.hub, plan, table.num_rows)
         return table
 
