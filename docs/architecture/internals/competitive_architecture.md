@@ -203,7 +203,12 @@ These are real, and none of the competitors have all of them:
 6. **Adaptive aggregate switching on *measured* reduction ratio** (`bc-interp/src/agg_par.rs`) —
    more principled than a static optimizer estimate.
 7. **Session-warm inference actor pools** — the model loads once per *session*, reused across
-   `collect()`s. Ray Data respawns per execution.
+   `collect()`s. Ray Data respawns per execution. The CPU map/aggregate pool returns its cores
+   after `distributed.session_fleet_idle_s` of no use, under a lease so it cannot fire under a
+   running query, because that pool holds general-purpose cores rather than devices: a
+   finished query held 960 of this cluster's 1,024 CPUs for the life of the driver
+   (`dist/executors/map.py::_arm_agg_idle_release`). GPU/model pools keep their residency,
+   where reloading costs minutes.
 
 ## The scorecard
 

@@ -1173,6 +1173,208 @@ test_distributed_map_byte_bound, test_distributed_map_batches_projection}.py`:
 `.claude/rules/python-control-plane.md` records as allowed, asserted as though it were not.
 That is a decision to surface rather than a bug to silence, and it is left as it is.
 
+### The whole board, measured with the competitor un-starved
+
+With `release_inference_pools()` in the hand-off, every arm of `vs_ray_daft.py` produces a
+number for the first time since the warm map pool landed. TPC-H sf100, best-of-2, each engine
+with the cluster to itself. Daft runs in its own process (`BENCH_ENGINE_ORDER=daft`), because
+the harness only ships the `daft` wheel to the workers when Daft is the sole engine.
+
+| pipeline | batcher | ray data | daft | vs ray | vs daft |
+|---|--:|--:|--:|--:|--:|
+| `scan_count` | 1 ms | 4,920 ms | ERR | 4,358x | - |
+| `filter_count` | 173 ms | 2,966 ms | 1,277 ms | 17.1x | 7.4x |
+| `groupby` | 217 ms | 6,016 ms | 2,494 ms | 27.7x | 11.5x |
+| `join` | 1,457 ms | ERR | 4,825 ms | - | 3.3x |
+| `udf` | 599 ms | 5,422 ms | n/a | 9.1x | - |
+
+Three of those cells are the competitor failing rather than losing, and they are worth naming
+so nobody reads them as speed: Ray Data's `join` died with `ActorDiedError`, and Daft's
+`scan_count` raised a `RuntimeError` inside its own flotilla runner. `udf` has no Daft arm by
+construction (its UDF surface diverges).
+
+**`scan_count` is not a 4,358x win and should not be quoted as one.** Batcher answers it from
+the Parquet footers' row counts; Ray Data reads the column. Both answers are right and they
+are not the same work.
+
+### Where Batcher loses: batch inference, which is Ray Data's home shape
+
+`vs_ray_daft.py` has no arm for either thing these engines are actually chosen for, so
+`benchmarks/cluster/vs_ray_daft_ml.py` adds them: `image_resize` (read a JPEG corpus, decode,
+resize to 224x224, reduce) and `inference` (the same read and preprocessing, then a model
+built once per worker scoring every batch). 10,000 JPEGs from S3, best-of-2:
+
+| pipeline | batcher | ray data | daft | vs ray | vs daft |
+|---|--:|--:|--:|--:|--:|
+| `image_resize` | 10,491 ms | 13,853 ms | ERR | 1.32x | - |
+| `inference` | 10,194 ms | **8,407 ms** | 25,812 ms | **0.82x** | 2.53x |
+
+**Batcher loses batch inference to Ray Data by 1.21x**, and only just wins the decode. The
+utilization columns say why before any profile does: Batcher ran at 5% mean / 41% peak across
+**33 of 65 nodes** on `image_resize` and 7%/92% on 48 nodes for `inference`, against Ray Data's
+10%/100% across 55.
+
+Daft's `image_resize` arm raised a `RuntimeError` in its flotilla runner rather than returning
+a number, so the multimodal head-to-head against Daft is still outstanding.
+
+#### Named: the fan-out is 64 partitions on a 1,024-core fleet, and the row term is why
+
+Instrumented on the same query (`_adaptive_partition_count` and `partition_descriptors`
+wrapped on the driver), 10,000 images, two warm runs:
+
+    run 0: wall=9903ms rows=10000 {'n_parts': 1, 'partitions': 64, 'max_partitions': 1, 'workers': 64}
+    run 1: wall=9840ms rows=10000 {'n_parts': 1, 'partitions': 64, 'max_partitions': 1, 'workers': 64}
+
+`_adaptive_partition_count` returns **1**. Both of its terms are computed on the *encoded*
+input: the row term is `ceil(10,000 / 2,000,000)` = 1, and the byte term is 50 MB of JPEG
+against a 256 MB budget = 1. `partition_descriptors` then floors the count at `workers`, so
+the stage runs as 64 units. Every one of those rows decodes to a 224x224x3 tensor -- 150 KB
+and ~30 MFLOPs of work -- which neither term can see, because a source that *materializes*
+far more than it *stores* is invisible to a model built on stored bytes and tabular rows.
+
+**The split granularity is not the constraint, and that was checked rather than assumed.**
+Sweeping `batch_files` (which sets how many files become one split: 64 gives 157 splits,
+8 gives 1,250) moved neither the partition count nor the wall clock:
+
+| `batch_files` | splits | partitions | wall |
+|---|--:|--:|--:|
+| 64 | 157 | 64 | 9,752 ms |
+| 16 | 625 | 64 | 10,211 ms |
+| 8 | 1,250 | 64 | 9,674 ms |
+
+The count is pinned at `workers` in all three, which is exactly what
+`partition_descriptors`' `max(workers, min(max_partitions, len(splits)))` does with
+`max_partitions=1`.
+
+#### That diagnosis was wrong, and the control that caught it
+
+Forcing the count looked conclusive -- 64 partitions in 10,474 ms against 128 in 4,209 ms,
+a clean 2.5x with a plateau to 256 and a decline past it. It is not a partition-count effect
+at all.
+
+Run the same sweep with the arms **reversed**, and the default arm is slow wherever it sits:
+
+| forced | partitions | ascending order | descending order |
+|---|--:|--:|--:|
+| 1,024 | 1,024 | 5,489 ms | 4,858 ms |
+| 512 | 512 | 4,614 ms | 4,829 ms |
+| 256 | 256 | 4,371 ms | 4,521 ms |
+| 128 | 128 | 4,209 ms | 4,258 ms |
+| **none (the real sizing)** | 64 / **256** | **10,474 ms** | **10,707 ms** |
+
+The last row is the tell: in the reversed run the real sizing produced **256** partitions and
+still took 10,707 ms, while the arm that *forced* 256 took 4,521 ms. **Same count, 2.4x apart.**
+The variable is not the number, it is whether `_adaptive_partition_count` ran at all -- the
+forced arms replaced it outright.
+
+#### The actual cause: 10,000 S3 stats per planning call, thrown away every time
+
+Timed on the driver, same query, three warm runs:
+
+    run 0: wall=11186ms {'adaptive_partition_count': 6139, 'partition_descriptors': 4307, ...}
+    run 1: wall=12111ms {'adaptive_partition_count': 6543, 'partition_descriptors': 4169, ...}
+    run 2: wall=11664ms {'adaptive_partition_count': 5930, 'partition_descriptors': 3999, ...}
+
+**Ten of twelve seconds are driver-side planning**, and none of it is on the cluster. Both calls
+need the source's splits, `MediaSource.splits()` needs every file's size for its byte bound, and
+`_file_sizes` answered from `_size_cache` only when a completed `read()` had filled it --
+otherwise it probed, and **threw the probe away**. So each planning call was a fresh stat storm
+over 10,000 objects, twice per query, forever.
+
+Caching the probe is one line. The same three runs after it:
+
+    run 0: wall= 687ms {'adaptive_partition_count': 4, 'partition_descriptors': 4, ...}
+    run 1: wall= 782ms {'adaptive_partition_count': 5, 'partition_descriptors': 4, ...}
+    run 2: wall= 775ms {'adaptive_partition_count': 4, 'partition_descriptors': 4, ...}
+
+**6,139 ms -> 4 ms and 4,169 ms -> 4 ms; the query goes 11.6 s -> 0.7 s, 15x.** The docstring on
+`_file_sizes` had already measured the per-file stat as "a third of the whole thing" on 100
+files and fixed it for `read()`; the planning path calls the same function and was never
+covered.
+
+#### Rejected: the read-bound fan-out term
+
+The wrong diagnosis came with a change attached -- a third term in
+`_adaptive_partition_count` raising the count to the split count for a source the row and byte
+terms both size at one task. It was written, tested, and is **not shipped**, because with the
+stat cache in place the A/B says it is a regression:
+
+| partitions | run A | run B |
+|---|--:|--:|
+| **64 (the existing sizing)** | **424 ms** | **396 ms** |
+| 157 (the new term) | 800 ms | 575 ms |
+| 256 | 794 ms | 576 ms |
+
+64 wins by 1.4x, in both repetitions. The existing sizing was right and the sweep that seemed
+to condemn it was measuring the storm. Reverted.
+
+#### The result: batch inference goes from a loss to a 10.9x win
+
+Same board, same corpus, best-of-2, after the one-line cache:
+
+| pipeline | before | after | ray data | vs ray before | **vs ray after** |
+|---|--:|--:|--:|--:|--:|
+| `image_resize` | 10,491 ms | **431 ms** | 14,184 ms | 1.32x | **32.94x** |
+| `inference` | 10,194 ms | **741 ms** | 8,094 ms | **0.82x** | **10.92x** |
+
+Utilization moves with it: `inference` runs at **50% mean / 100% peak across all 65 nodes**
+against Ray Data's 18%/57%, where before the fix Batcher sat at 7% mean across 50.
+
+#### Daft's arm, once the harness stops charging one pipeline for the whole fleet
+
+Daft's first pipeline of a sweep died with `No flotilla workers became available within 120s
+(64 attempted)` while its second returned a number. `bench_engine` runs every pipeline once
+untimed, which pays planning and the read -- but not an engine whose *worker startup* has its
+own deadline. Daft's Ray runner spawns flotilla actors on first use and gives up after 120 s,
+so the first pipeline was being charged for the fleet the whole sweep uses, and it read as a
+Daft failure. `_warm_the_fleet` now runs a one-row query per engine before the sweep, untimed.
+Both Daft arms return numbers with it in.
+
+| pipeline | batcher | ray data | daft | vs ray | vs daft |
+|---|--:|--:|--:|--:|--:|
+| `image_resize` | **431 ms** | 14,184 ms | 13,185 ms | **32.94x** | **30.59x** |
+| `inference` | **741 ms** | 8,094 ms | 18,969 ms | **10.92x** | **25.60x** |
+
+Every arm's result signature, which the board now prints on every row rather than only on a
+mismatch, because a cross-process `vs daft` ratio cannot be checked by the in-run comparison:
+
+| pipeline | batcher | ray data | daft | spread |
+|---|--:|--:|--:|--:|
+| `image_resize` | 1,390,793.21 | 1,389,526.0 | 1,390,737.07 | 0.09% |
+| `inference` | 3,142.51 | 3,127.91 | 3,138.94 | 0.46% |
+
+Row counts are 10,000 exactly in all six. The spreads are three independent JPEG stacks
+disagreeing in the last bits, and the second is the first amplified by a network rather than a
+new source of error -- which is why the tolerance is 1% rather than the 0.09% the pixels alone
+would justify.
+
+**The `inference` signature is a check only because it stopped being the predicted class.** A
+random network puts all 10,000 of these face crops in one class whatever the preprocessing, so
+a checksum built on the argmax came back as `3 x rows` from all three engines and proved
+nothing but the row count -- an agreement any engine returning 10,000 of anything would have
+satisfied. Summing the winning activation instead gives a figure that varies per image (32
+distinct values over 32 near-identical inputs) and that an engine reading a different corpus,
+or skipping the resize, cannot reproduce.
+
+The `vs daft` column is computed across processes rather than within one, because the harness
+only ships the `daft` wheel to the workers when Daft is the sole engine in a sweep. Same
+corpus, same cluster, same afternoon, and each engine had the cluster to itself for its whole
+sweep -- which is the discipline `bench_engine` enforces within a run anyway.
+
+**These are the two shapes each competitor is chosen for**, and the decode one is Daft's own
+flagship: a native Rust image column with `download`/`decode`/`resize` fused into the plan.
+
+#### What the cache does not cover yet
+
+`_size_cache` lives on the `MediaSource` instance, so it is warm for the life of a `Dataset`
+and cold for a new one. A script that writes `bt.read.images(...)` inside a loop pays the
+storm once per query rather than once per process, and on this corpus that is the same 6 s.
+The machinery for the cross-instance version already exists -- `io.stats.FileMetaCache` plus
+`file_identity`, which is what the footer-statistics and per-file schema caches in this file
+are built on -- but the key is different in kind: those are keyed by one file's
+`(path, size, mtime_ns)`, and a directory's key has to be the listing itself, which is the
+thing being avoided. Left as the next step rather than guessed at.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
