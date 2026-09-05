@@ -38,6 +38,7 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
+    cluster_topology,
     create_worker_placement,
     current_envelope,
     engine_config_json,
@@ -1078,30 +1079,36 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
 
 def _placeable_node_cores() -> float:
     """Max CPUs a single task may request and still be placeable on every node — the
-    smallest alive node's core count (so a multi-CPU task fits anywhere). Falls back to
-    the driver's cpu count when topology is unavailable."""
-    try:
-        import ray
+    smallest *worker* node's core count (so a multi-CPU task fits anywhere). Falls back to
+    the driver's cpu count when topology is unavailable.
 
-        cores = [
-            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
-        ]
-        cores = [c for c in cores if c > 0]
-        if cores:
-            return float(int(min(cores)))
+    Read from the shared topology snapshot rather than from `ray.nodes()` here, which is a
+    correction as well as a saving. The local read counted the Ray head and the nodes Ray is
+    draining, neither of which a map task is placed on, so a head narrower than the fleet
+    capped every task at the head's width — and it went to the GCS on every call, outside the
+    snapshot (`topology_scope`) and the 50 ms window every other topology reader shares.
+    """
+    try:
+        cores = int(cluster_topology().get("min_node_cpus", 0.0))
     except Exception as exc:
         note_suppressed("dist", "read cluster node CPU counts", exc)
-    return float(available_cpu_count())
+        cores = 0
+    return float(cores) or float(available_cpu_count())
 
 
 def _cluster_cores() -> float:
-    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism)."""
-    try:
-        import ray
+    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism).
 
-        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(available_cpu_count())
-    except Exception:
-        return float(available_cpu_count())
+    Worker-eligible and snapshot-aware, for the reasons on `_placeable_node_cores`: the head's
+    cores are not parallelism this stage can use, and the count is asked for three times per
+    query (the fan-out cap, the fleet fill, the actor width).
+    """
+    try:
+        cores = int(cluster_topology().get("cpus", 0.0))
+    except Exception as exc:
+        note_suppressed("dist", "read cluster CPU capacity", exc)
+        cores = 0
+    return float(cores) or float(available_cpu_count())
 
 
 def _learning_hub(hub=None):

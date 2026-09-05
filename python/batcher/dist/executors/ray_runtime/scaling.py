@@ -368,12 +368,15 @@ def cluster_topology() -> dict:
     # SPREAD-safe per-worker memory ceiling (a grant sized above it would OOM the smallest
     # node it lands on), the hardware fact Carbonite sizes the distributed spill budget from.
     mem = [float(n.get("Resources", {}).get("memory", 0.0)) for n in nodes]
+    cpu = [float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes]
     return {
         "nodes": max(1, len(nodes)),
-        "cpus": sum(float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes),
+        "cpus": sum(cpu),
         "gpus": sum(float(n.get("Resources", {}).get("GPU", 0.0)) for n in nodes),
         "memory": sum(mem),
         "min_node_memory": min((m for m in mem if m > 0), default=0.0),
+        # The smallest worker node's cores: the widest per-task CPU grant that can be placed.
+        "min_node_cpus": min((c for c in cpu if c > 0), default=0.0),
     }
 
 
@@ -641,10 +644,11 @@ def _cluster_hardware_profile() -> HardwareProfile | None:
     worker_count = len(classes)
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
     gpu_devices = int(sum(c["gpus"] for c in classes))
+    from batcher.dist.executors.ray_runtime import hardware_probe as probe
     from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
-    from batcher.dist.executors.ray_runtime.hardware_probe import cluster_l3_cache_bytes, cluster_measured_gpu_memory_bytes, cluster_storage_class, cluster_worker_fingerprint, warn_once_if_fleet_is_mixed
 
-    warn_once_if_fleet_is_mixed()
+    probe.warn_once_if_fleet_is_mixed()
+    measured_vram = probe.cluster_measured_gpu_memory_bytes()
     return HardwareProfile.for_cluster(
         cluster=cluster_shape(),
         cpu_cores=min_cores,
@@ -656,20 +660,20 @@ def _cluster_hardware_profile() -> HardwareProfile | None:
         # an unlabelled node, an unrecognized part, and a MIG instance — where it does not
         # merely report unknown but reports the whole board for a seventh of one. The probe has
         # already been paid for by the cache and fingerprint fields beside it.
-        gpu_memory_bytes=cluster_measured_gpu_memory_bytes() or binding_gpu_memory_bytes(classes),
+        gpu_memory_bytes=measured_vram or binding_gpu_memory_bytes(classes),
         # The binding worker's L3, probed from the workers themselves — Ray's topology omits
         # cache, so this was left `0` and every cluster query fell back to the config broadcast
         # threshold. Cached per topology and best-effort, so an unprobeable cluster is unchanged.
-        l3_cache_bytes=cluster_l3_cache_bytes(),
+        l3_cache_bytes=probe.cluster_l3_cache_bytes(),
         # The machine class anything learned in machine units about this fleet is keyed by.
         # Kyber runs here on the driver, which executes none of the work, so without this the
         # cost coefficients and CPU shares it reads back describe the driver's machine and every
         # worker's measurement is dropped at the reader. `""` on a mixed fleet.
-        fingerprint=cluster_worker_fingerprint(),
+        fingerprint=probe.cluster_worker_fingerprint(),
         # The volume the *workers* spill to. Priced from the driver's own disk, an
         # out-of-core plan on a fleet with network-attached scratch was costed as though it
         # ran on the head node's NVMe.
-        storage_class=cluster_storage_class(),
+        storage_class=probe.cluster_storage_class(),
     )
 
 
