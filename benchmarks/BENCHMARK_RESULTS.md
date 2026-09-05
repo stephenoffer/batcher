@@ -376,7 +376,7 @@ competitor number would have booked that 12% as a win.
 |---|---:|---:|---:|---:|---:|
 | `udf` | 1,236-1,367 ms | **803-1,069 ms** | 5,061 ms | 3.7-4.1x | **4.7-6.3x** |
 
-The fleet-sized actor width below takes this further, to **581-822 ms** and **6.2-8.7x**.
+The fleet-sized actor width below takes this further to **581-822 ms** and **6.2-8.7x**, and the two driver metadata caches after it to **552-623 ms** and **8.1-9.2x**.
 
 The prediction in the section above was "~1,300 ms to ~950 ms, i.e. 4.4x to ~6x, not to 10x."
 The direction and rough size were right and the estimate was optimistic.
@@ -790,6 +790,33 @@ contains this test. The narrower the change feels, the more tempting that is. Th
 carries the third parameter and the file passes; the whole-suite run that caught it is the
 reason to prefer it over a selection when a *signature* changes, since a stale test double is
 invisible to every test that does not use it.
+
+#### The board with both caches in: 8.1-9.2x, and 46 ms from the target
+
+The two metadata caches were each measured at their call site rather than on the board, which
+was right — 51-237 ms against a sweep whose spread exceeds 100 ms is not separable. Together
+they are, because they remove the same ~180-250 ms from every timed run:
+
+| `udf`, sf100 | samples | cluster busy | vs Ray Data (5,061 ms) |
+|---|---|---|---:|
+| index-stable pool, fleet-sized width | 581 / 651 / 724 / 822 ms | 26-36% / 53-62% | 6.2-8.7x |
+| **+ footer-stats and schema caches** | **552 / 558 / 623 ms** | **39-41% / 57-60%** | **8.1-9.2x** |
+
+The range moved down and tightened, and utilization moved up again: the driver is no longer
+spending a fifth of the query on object-store metadata while 1,024 cores wait for it.
+
+**10x is 506 ms and the best sweep is 552 ms — 46 ms short.** That is the closest this shape has
+been and it is worth being precise about what the remainder is rather than rounding it away.
+The floor stands at ~368 ms (23 ms warm read + 68 ms of the user's own UDF per partition, four
+rounds over 64 actors), so the gap between 552 and 506 sits entirely inside the barrier's ~164
+ms of dispatch and completion handling. There is no straggler tail to reclaim — p99 was 508 ms
+against a last completion of 563 on 256 partitions — so what is left is the per-completion cost
+itself, on a path where batching the completions has already been built, measured and rejected
+once.
+
+Recorded as 8.1-9.2x, not as "9.2x": three samples spanning 71 ms on a fleet with this spread
+support a range and not a point, and quoting the best sweep is how a 12-20% fleet becomes a
+claim it cannot reproduce.
 
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
