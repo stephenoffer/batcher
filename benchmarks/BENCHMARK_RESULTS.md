@@ -887,6 +887,48 @@ rounds across 64 actors, which is scheduling and ordering rather than a per-comp
 Whether *any* of it is recoverable is now an open question rather than an assumed yes, and the
 two cheapest theories about it have both been tested and both failed.
 
+#### The last 46 ms is a directory listing, and caching it would trade correctness for the number
+
+Re-profiling the driver with both caches in place, the metadata terms that dominated it are
+gone and exactly one remains:
+
+| driver call | before the caches | now |
+|---|---:|---:|
+| `ray.wait` (blocking on the cluster — not overhead) | 576 ms | 432 ms |
+| `parquet_footer_stats` | 105 ms | **0** |
+| `ParquetFile.__init__` | 106 ms | **0** |
+| `_ArrowFileSystem._list_dir` | 57 ms | **63 ms** |
+| `_native.combine` (255 partials) | 23 ms | 22 ms |
+
+**`_list_dir` is the whole remaining driver term**, one call per query, expanding the glob that
+names the files. And the arithmetic is uncomfortably close: the best board sweep is 552 ms
+against a 506 ms target, so removing 63 ms would land ~490 ms and clear 10x.
+
+**It should not be removed, and the reason is not effort.** The two caches that shipped are safe
+because `file_identity` gives a per-file token — `(path, size, mtime_ns)` — that changes
+whenever the bytes could have, so a rewritten file misses. A *directory* has no such token: the
+only way to learn whether a prefix gained a file is to list it. `files_version` does not help
+here and cannot, by construction — it summarises the version of a file list you already have,
+which is the thing the listing produces.
+
+So a listing cache would be a TTL, and its failure mode is that a file written between two
+queries is silently not read. That is a **wrong answer**, not a slow one, on the engine's most
+common source shape, and `CLAUDE.md` is explicit that a fast wrong answer is a bug. Trading it
+for 46 ms on one benchmark row is the exact shape of decision this file exists to refuse.
+
+Two narrower versions *are* sound and are worth someone's time, neither of which is a
+benchmark-driven change:
+
+* **A manifest-backed source already has the token.** Delta and Iceberg name their files in a
+  snapshot, so the snapshot id is a listing key that changes exactly when the file set does.
+  Caching there is the same argument as `_FOOTERS`, not a TTL.
+* **A user who knows their data is static can say so.** That is a documented option with the
+  cost on the person who understands the lifecycle, rather than a default that quietly changes
+  what a query returns.
+
+That is the honest end of the `udf` line for this session: **8.1-9.2x, with the remaining 46 ms
+sitting behind a correctness trade rather than behind an unfinished optimisation.**
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
