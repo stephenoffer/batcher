@@ -673,13 +673,27 @@ user's UDF nor a floor. Against the 506 ms that 10x needs, a warm sweep at 780 m
 of repeated metadata removed lands near 580 ms — still short, but it is the only lever left
 that is worth what it costs.
 
-**It is a design decision, not a patch, and that is why it is recorded rather than done.**
-Caching a listing and a footer across `collect()` calls means deciding what invalidates it: the
-data behind an object-store prefix can change between two runs, and a stale split plan is a
-*wrong answer*, not a slow one. `BATCHER_FOOTER_CACHE_ROW_GROUPS` already caches within the
-split planner and is what turns 102 opens into 2; extending that lifetime across queries needs
-a TTL or an explicit invalidation contract, and picking one is a correctness question for the
-IO layer rather than a performance tweak to slip in beside a benchmark.
+**Correction to the first version of this paragraph, which called it a design decision.** It
+said caching across `collect()` calls would need a TTL or a new invalidation contract, on the
+reasoning that object-store data can change between runs and a stale split plan is a *wrong
+answer* rather than a slow one. The reasoning is right and the conclusion was wrong, because
+that contract already exists and is documented:
+`io/stats/file_identity.py::file_identity` returns `(path, size, mtime_ns)` — "a token that
+changes whenever `path`'s content could have changed" — and instructs a caller holding `None`
+(un-stat-able) **not** to cache, precisely because it could not then detect a change.
+`FileMetaCache` is keyed on it, and `io/splits/parquet.py` already runs two caches on that
+contract: `_FOOTERS` for footers and `_SPLITS` for planned splits, both process-lifetime and
+both stale-safe by construction. Two of the three metadata caches in this layer exist; the
+footer *statistics* aggregation is the one that does not. That is a gap to fill with an
+established pattern, not a new policy to invent.
+
+The one real subtlety, which is where the work is: the key must be the per-file identities, and
+obtaining them must not cost more stats than the cache saves — a `HEAD` per file over S3 for
+thousands of files would lose. It should not need any: the directory listing that produced the
+URI list already carries each file's size and mtime, so the identities are in hand and the job
+is to thread them through rather than re-stat. `footer_stats(uris)` is otherwise a pure
+function of its input and is called **once per query with the same list**, which is exactly the
+shape a `FileMetaCache` serves.
 
 (The cold run's 219 s is the fleet/placement-group condition documented above, not a property
 of this path — runs 2-4 in the same process are the steady state.)
