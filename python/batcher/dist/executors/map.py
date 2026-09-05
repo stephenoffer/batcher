@@ -123,6 +123,74 @@ _AGG_POOL_WIDTH: list[int] = []
 _POOL_KEEPALIVE: dict[tuple, tuple] = {}
 
 
+# Holds the pending idle-release timer for `_AGG_POOLS` (a list rather than a `global`, like
+# `_AGG_POOL_WIDTH` above). Single-tenancy stopped the pools *accumulating*; it did not stop
+# the one tenant holding the cluster. Measured on the 65-node fleet: after a `udf` query
+# returned, `ray status` reported **960 of 1,024 CPU in use** for as long as the driver
+# process lived -- 64 actors at 16 CPU each -- and a Ray Data run started next in the same
+# process finished its 600,037,902-row map in seconds and then sat at `0/1` on a final
+# aggregate it could not schedule. The cores are earned by the scan cache of the query that
+# filled them, and a query that is not coming keeps earning nothing.
+#
+# So the pool takes the discipline the shuffle's session fleet already has
+# (`dist.fleet._arm_idle_release`), including its knob: `distributed.session_fleet_idle_s`,
+# 30 s. Back-to-back queries never see it -- the timer is cancelled the moment a stage asks
+# for the pool -- and a session that walks away gets its cluster back without knowing
+# `release_inference_pools` exists.
+#
+# **CPU pools only.** A GPU/model pool in `_SESSION_POOLS` is the case where residency is
+# worth the hold: reloading a model costs minutes, and it holds devices whose only other
+# user is another model. This one holds general-purpose cores and reloads a file cache.
+_AGG_IDLE_TIMER: list = []
+# Outstanding uses of `_AGG_POOLS`, for the same reason `dist.fleet` counts leases: "idle"
+# has to mean *no stage is running on the pool*, not *N seconds since one started*. Without
+# it a query longer than the idle window would have its own actors killed underneath it.
+_AGG_IN_USE: list[int] = []
+
+
+def _cancel_agg_idle_release() -> None:
+    """Stop any pending release: the pool is in use, so it is not idle."""
+    while _AGG_IDLE_TIMER:
+        with contextlib.suppress(Exception):
+            _AGG_IDLE_TIMER.pop().cancel()
+
+
+def _release_agg_pool_if_idle() -> None:
+    """The timer's callback. Declines while a stage holds the pool; that stage re-arms."""
+    if not _AGG_IN_USE:
+        _shutdown_pools(_AGG_POOLS)
+
+
+def _arm_agg_idle_release() -> None:
+    """(Re)start the timer that returns the warm CPU map pool's cores once it goes idle."""
+    import threading
+
+    from batcher.config import active_config
+
+    _cancel_agg_idle_release()
+    if not _AGG_POOLS:
+        return
+    idle_s = float(active_config().distributed.session_fleet_idle_s)
+    if idle_s <= 0:
+        return
+    timer = threading.Timer(idle_s, _release_agg_pool_if_idle)
+    timer.daemon = True
+    timer.start()
+    _AGG_IDLE_TIMER.append(timer)
+
+
+@contextlib.contextmanager
+def _agg_pool_in_use():
+    """Hold the warm CPU pool for the length of a stage, then start its idle clock."""
+    _cancel_agg_idle_release()
+    _AGG_IN_USE.append(1)
+    try:
+        yield
+    finally:
+        _AGG_IN_USE.pop()
+        _arm_agg_idle_release()
+
+
 def release_inference_pools() -> None:
     """Tear down every session-warm actor pool and free the GPUs and cores they hold.
 
@@ -132,6 +200,7 @@ def release_inference_pools() -> None:
     Call this to release those resources before other work, or when done; it also runs
     automatically at process exit. A no-op when no pools are warm. The next `collect()`
     rebuilds the pool it needs (paying the one-time load again)."""
+    _cancel_agg_idle_release()
     _shutdown_pools(_SESSION_POOLS)
     _shutdown_pools(_AGG_POOLS)
 
@@ -2511,6 +2580,7 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # partition is sized to one working unit, and this route's unit is a `_agg_actor_width`-wide
     # actor (16 here) rather than the `_TARGET_TASK_CPUS`-wide task the default assumes. When
     # the pool declines, the units really are tasks and the default is right.
+    _cancel_agg_idle_release()  # about to use the pool, so it is not idle
     actors = _agg_actor_pool(map_plan, workers)
     unit_cpus = _agg_actor_width(max(1, workers)) if actors else None
     n_parts = _adaptive_partition_count(sources[sid], agg.input, workers, task_cpus=unit_cpus)
@@ -2572,7 +2642,8 @@ def _distributed_map_aggregate(above, agg, sources, workers):
         )
         return running[0]
 
-    state = _gather_with_pool_recovery(_gather, _actor_launch, _task_launch, map_plan, actors)
+    with _agg_pool_in_use():
+        state = _gather_with_pool_recovery(_gather, _actor_launch, _task_launch, map_plan, actors)
     if state is None:
         table = _empty_agg_table(agg)
     else:

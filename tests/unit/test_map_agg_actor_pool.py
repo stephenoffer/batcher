@@ -225,3 +225,66 @@ def test_an_unchanged_fleet_does_not_rebuild(pooling):
     second = M._agg_actor_pool(_prefix(fn), 2)
 
     assert first == second and killed == [] and len(built) == 2
+
+
+def test_the_warm_pool_gives_its_cores_back_when_the_session_goes_idle(pooling, monkeypatch):
+    """Single-tenancy stopped pools accumulating; it did not stop one holding the cluster.
+
+    Measured on the 65-node fleet: after a `udf` query returned, `ray status` reported 960 of
+    1,024 CPU in use for the life of the driver, and a Ray Data run started next in the same
+    process could not schedule its final aggregate. The pool now takes the shuffle fleet's
+    discipline and its knob (`distributed.session_fleet_idle_s`).
+    """
+    _, killed = pooling
+    pool = M._agg_actor_pool(_prefix(lambda b: b), 2)
+
+    M._arm_agg_idle_release()
+    assert M._AGG_IDLE_TIMER, "a warm pool must have a pending release"
+    M._release_agg_pool_if_idle()  # what the timer calls when it fires
+
+    assert killed == pool and M._AGG_POOLS == {}
+
+
+def test_a_stage_still_running_is_not_released_underneath_itself(pooling):
+    """The lease. A query longer than the idle window must not lose its own actors."""
+    _, killed = pooling
+    M._agg_actor_pool(_prefix(lambda b: b), 2)
+
+    with M._agg_pool_in_use():
+        M._release_agg_pool_if_idle()  # the timer fires mid-stage
+        assert killed == [], "the pool is in use, so it is not idle"
+
+    assert M._AGG_IDLE_TIMER, "leaving the stage re-arms the clock"
+    M._release_agg_pool_if_idle()
+    assert M._AGG_POOLS == {}
+
+
+def test_entering_a_stage_cancels_a_pending_release(pooling):
+    """Back-to-back queries never see the timer at all."""
+    M._agg_actor_pool(_prefix(lambda b: b), 2)
+    M._arm_agg_idle_release()
+
+    with M._agg_pool_in_use():
+        assert not M._AGG_IDLE_TIMER, "the pending release is cancelled on entry"
+
+
+def test_the_idle_release_is_switchable_off(pooling):
+    """`session_fleet_idle_s <= 0` is the existing spelling of 'hold it'."""
+    from batcher.config import Config, DistributedConfig, config_context
+
+    M._agg_actor_pool(_prefix(lambda b: b), 2)
+    cfg = Config().replace(distributed=DistributedConfig(session_fleet_idle_s=0.0))
+    with config_context(cfg):
+        M._arm_agg_idle_release()
+
+    assert not M._AGG_IDLE_TIMER
+
+
+def test_releasing_the_pools_drops_a_pending_timer(pooling):
+    """Nothing should be left ticking against an empty registry."""
+    M._agg_actor_pool(_prefix(lambda b: b), 2)
+    M._arm_agg_idle_release()
+
+    M.release_inference_pools()
+
+    assert not M._AGG_IDLE_TIMER and M._AGG_POOLS == {}

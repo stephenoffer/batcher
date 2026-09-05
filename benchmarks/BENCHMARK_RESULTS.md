@@ -376,7 +376,7 @@ competitor number would have booked that 12% as a win.
 |---|---:|---:|---:|---:|---:|
 | `udf` | 1,236-1,367 ms | **803-1,069 ms** | 5,061 ms | 3.7-4.1x | **4.7-6.3x** |
 
-The fleet-sized actor width below takes this further to **581-822 ms** and **6.2-8.7x**, the two driver metadata caches after it to **552-623 ms** and **8.1-9.2x**, and sizing the row fan-out to the actor width after that to **519-612 ms**, a **9.18x median**.
+The fleet-sized actor width below takes this further to **581-822 ms** and **6.2-8.7x**, the two driver metadata caches after it to **552-623 ms** and **8.1-9.2x**, and sizing the row fan-out to the actor width after that to **519-612 ms**, a **9.18x median**. Sizing the task from a node it can be placed on lands it at **482-658 ms**, and -- measured on a board that now releases Batcher's warm pool before timing the competitor, which it did not before -- a **9.81x median over six runs, best 10.45x**, with Ray Data re-measured on every one of them at 4,905-5,315 ms.
 
 The prediction in the section above was "~1,300 ms to ~950 ms, i.e. 4.4x to ~6x, not to 10x."
 The direction and rough size were right and the estimate was optimistic.
@@ -1028,6 +1028,121 @@ Best sweep 519 ms, **9.75x**.
 **Still not 10x**, which is 506 ms — 13 ms below the best sweep and 46 below the median. What is
 left is the ~368 ms floor of warm read plus the user's own UDF, and a barrier whose per-completion
 cost two arms have now failed to reduce. The fan-out is no longer part of the gap.
+
+#### Re-decomposed at 64 partitions: the tail halved, and the floor is one partition's own work
+
+The decomposition above was taken at 256 partitions, which the change above replaced, so it
+was stale the moment it landed. Re-run on the same instrumented query (driver-side phase
+timers, and a per-partition completion stamp) at 64:
+
+| | 256 partitions | 64 partitions |
+|---|--:|--:|
+| `gather_map_results` | 538 ms | 639 ms |
+| named driver sizing calls | -- | 42 ms |
+| unaccounted driver | -- | 89 ms |
+| instrumented wall | 647 ms | 769 / 687 ms |
+| first partition done | 107 ms | **382 ms** |
+| p50 | 299 ms | 479 ms |
+| p99 | 508 ms | 582 ms |
+| last | 563 ms | 582 ms |
+| **tail (last - p50)** | **264 ms** | **103 ms** |
+
+The instrumented wall runs above a board sweep (519-612 ms at the time) because the timers and
+the per-partition stamps are themselves paid on the driver; read the *shape*, not the total.
+
+Two things move, and both are what making a partition four times larger predicts. The tail
+past the median **more than halves**, 264 ms to 103 ms, which is the term the fan-out change
+was aimed at and is where its 8.82x -> 9.18x came from. And the first completion moves out from
+107 ms to 382 ms, because no partition can finish before its own read and its own UDF.
+
+That second number is the useful one. **382 ms of a 687 ms run is spent before anything can
+possibly be done**, and it is per-partition compute: 9.4M rows read from S3 and twenty NumPy
+passes over them, sixteen threads wide. It is not scheduling, it is not the barrier, and no
+amount of driver work removes it. The named driver sizing calls total 42 ms
+(`_agg_actor_pool` 14, `_adaptive_partition_count` 13, `partition_descriptors` 9,
+`_adaptive_task_cpus` 6) and are the only remaining term this decomposition can name --
+which is what the next entry goes after.
+
+### The `vs_ray` column was not measuring Ray Data at all, and the reason is Batcher's warm pool
+
+Chasing the driver terms above meant re-running the full board, and Ray Data's arm came back
+`TIMEOUT (>180s)` on `udf` -- a shape it had been recorded at 5,061 ms on. Its own progress log
+said what was happening: `ReadFiles 600037902/600037902`, `MapBatches 600037902/600037902`,
+then `HashAggregate(key_columns=(), num_partitions=1): 0/1` with **100 tasks queued** and
+`Active & requested resources: 102.2/1024 CPU` for the whole 180 seconds.
+
+`ray status` from outside the run says the rest: **960.0/1024.0 CPU in use**, and
+`ray list actors --filter state=ALIVE` returns **64 `_MapActor`s** -- 64 x 16 CPU. That is
+Batcher's warm map/aggregate pool, still resident from Batcher's arm of the same sweep, and it
+was holding 94% of the cluster while the competitor tried to schedule against it. The pool is
+freed when the driver process exits, and the board runs all three engines in one process.
+
+The harness already had a hand-off: it calls `release_session_fleet()` between engines, with
+the comment "so the next engine gets the whole cluster". That releases the *shuffle* fleet.
+The warm map pool is a different holding and landed later, and nothing released it.
+
+What this did **not** do is quietly distort a competitor number. A starved arm did not finish,
+so it reported `ERR`; no `vs_ray` ratio was ever computed from one. The cost was measurements,
+not correctness of the ones that exist -- and with the release in
+(`benchmarks/cluster/vs_ray_daft.py`, now calling `release_inference_pools()` beside
+`release_session_fleet()`), Ray Data's `udf` arm comes back at 4,905-5,315 ms over five runs,
+which brackets the 5,061 ms recorded before the warm pool existed. The old baseline stands.
+
+#### Shipped: the warm CPU pool now gives the cluster back when the session goes idle
+
+The harness fix makes the board fair. It does not help the user whose cluster is held by a
+finished query, which is the same defect seen from the other side, and the fix for it already
+exists one directory over: `dist.fleet` releases the shuffle fleet after
+`distributed.session_fleet_idle_s` (30 s) of no use, under a lease count so it can never fire
+under a running query. `_AGG_POOLS` now takes the same discipline and the same knob.
+
+The line between the two registries is deliberate. A GPU/model pool in `_SESSION_POOLS` keeps
+its residency: reloading a model costs minutes and it holds devices whose only other user is
+another model. A CPU aggregate pool holds general-purpose cores and reloads a file cache.
+
+Measured on the 65-node fleet, timing from the moment a `udf` query returned:
+
+| after the query | CPU in use |
+|---|--:|
+| t+2 s | 960.0 / 1024 |
+| t+12 s | 960.0 / 1024 |
+| t+25 s | 960.0 / 1024 |
+| **t+33 s** | **0.0 / 1024** |
+| t+40 s | 0.0 / 1024 |
+
+Back-to-back queries never see it: taking the pool cancels the pending release, so the board's
+own warmup-then-timed sequence is unchanged, and a query longer than the window keeps its own
+workers because the lease declines the release rather than deferring it.
+
+#### The board, measured fairly: 9.81x median on `udf`, and three of six runs past 10x
+
+Six full board runs, each releasing both holdings between engines, TPC-H sf100 `udf`
+(600,037,902 rows, a 20-pass NumPy UDF, then a global sum), best-of-2 per run:
+
+| run | batcher | ray data | ratio | batcher util | ray data util |
+|---|--:|--:|--:|---|---|
+| 1 | 508 ms | 5,092 ms | 10.02x | 44% / 74% peak, 64/65n | 9% / 32% peak, 60/65n |
+| 2 | 547 ms | 5,113 ms | 9.35x | 23% / 55% peak, 65/65n | 9% / 54% peak, 62/65n |
+| 3 | 515 ms | 5,315 ms | 10.32x | 44% / 77% peak, 65/65n | 9% / 42% peak, 62/65n |
+| 4 | 482 ms | 5,039 ms | **10.45x** | 39% / 56% peak, 65/65n | 9% / 31% peak, 64/65n |
+| 5 | 511 ms | 4,905 ms | 9.60x | 44% / 74% peak, 64/65n | 10% / 35% peak, 65/65n |
+| 6 | 658 ms | 4,967 ms | 7.54x | 44% / 76% peak, 65/65n | 10% / 30% peak, 65/65n |
+
+**Median 9.81x, mean 9.55x, best 10.45x**, and the result signatures agree on every run (the
+board withholds the ratio as `n/c` when they do not). Three of the six are at or above 10x.
+
+Read the spread honestly. Batcher's own wall clock ranges 482-658 ms against Ray Data's much
+steadier 4,905-5,315, so the variance in the ratio is almost entirely ours: run 6 at 658 ms ran
+at the same 44%/76% utilization as run 5 at 511 ms, so it is not a different execution shape,
+it is a shared head node. **The claim this supports is "about 10x on this shape", not "always
+10x"** -- one more good run or one more bad one moves the median across the line.
+
+The utilization columns are the part that is not close. Batcher runs 23-44% mean and 55-77%
+peak across 64-65 of the 65 nodes; Ray Data runs 9-10% mean and 30-54% peak across 60-65. Both
+engines reach the whole fleet; they use very different fractions of it while they are there.
+
+Daft has no `udf` arm on this board by construction (`daft UDF surface diverges; covered by
+batcher vs ray for udf`), so its `ERR` on this row is "not applicable" rather than a failure.
 
 ### Locality-preferring dynamic dealing: built, measured, rejected
 

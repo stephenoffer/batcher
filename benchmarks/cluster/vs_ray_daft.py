@@ -260,7 +260,8 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
     confines every engine's residue to its own numbers. Batcher runs first (a clean
     cluster). Batcher runs first, so it is the one engine guaranteed a clean cluster; Ray
     inherits nothing and Daft, running third, inherits Ray's residue as well as its own,
-    because only Batcher has a release hook (`release_session_fleet`). An earlier note here
+    because only Batcher has release hooks (`release_session_fleet` and
+    `release_inference_pools`, both called below). An earlier note here
     claimed "an engine that leaks only ever taxes itself", which is true of the leaker and
     false of whatever runs after it — the ordering favours the system under test, and that
     is worth knowing when reading a `vs_ray`/`vs_daft` column rather than being asserted
@@ -298,13 +299,35 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
         except Exception as e:
             out[name] = {"error": f"{type(e).__name__}: {e}"}
         finally:
-            # Free batcher's warm session fleet so the next engine gets the whole
-            # cluster; a no-op for ray/daft (neither exposes one).
+            # Free batcher's warm session fleet AND its warm map-actor pool so the next
+            # engine gets the whole cluster; a no-op for ray/daft (neither exposes one).
+            #
+            # Both, because they are two different holdings and only one of them used to be
+            # released here. A CPU `map_batches` + aggregate stage keeps its actors alive
+            # across `collect()` calls so their scan cache survives the query
+            # (`distributed.warm_inference_pools`), and on this fleet that is 64 actors at 16
+            # CPU each. Measured with only the fleet released: `ray status` showed
+            # **960 of 1,024 CPU still in use** while the Ray Data arm ran, its `MapBatches`
+            # finished all 600,037,902 rows in seconds, and its final
+            # `HashAggregate(num_partitions=1)` then sat at 0/1 with 100 tasks queued until
+            # the 180 s cap -- recorded as `TIMEOUT`, which reads as a Ray Data result and is
+            # an artifact of the harness.
+            #
+            # What it did *not* do is quietly distort a number: a starved arm did not finish,
+            # so it reported `ERR` rather than a slow time, and no `vs_ray` ratio was ever
+            # computed from one. With this line in, Ray Data's `udf` arm comes back at
+            # 4,905-5,315 ms over five runs, which brackets the 5,061 ms recorded before the
+            # warm pool existed -- so the earlier baseline stands and the starvation cost
+            # measurements rather than corrupting them.
             if eng == "batcher":
                 with contextlib.suppress(Exception):
                     from batcher.dist.fleet import release_session_fleet
 
                     release_session_fleet()
+                with contextlib.suppress(Exception):
+                    from batcher.dist.executors.map import release_inference_pools
+
+                    release_inference_pools()
     return out
 
 

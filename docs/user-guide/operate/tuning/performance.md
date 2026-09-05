@@ -375,20 +375,37 @@ print(scored.agg(total=bt.col("score").sum()).to_pydict())
 Add `distributed=True` to that `agg` and the pool is what runs it. The workers outlive the
 call, so a second `collect()` of the same pipeline reuses them.
 
-Two things are worth knowing before you rely on it. The pool holds **one pipeline at a
-time**: a different `map_batches` function replaces it rather than joining it, because these
-workers hold general-purpose cores that every other stage also wants, and a session that
-alternates between two pipelines pays a rebuild each time rather than reserving the cluster
-twice over. And the whole behavior is under `distributed.warm_inference_pools`, on by
-default; turn it off and every stage runs on stateless tasks that are released as soon as
-they finish, which is what you want when something else needs the cores between queries.
+Three things are worth knowing before you rely on it.
+
+The pool holds **one pipeline at a time**. A different `map_batches` function replaces it
+rather than joining it, because these workers hold general-purpose cores that every other
+stage also wants, and a session that alternates between two pipelines pays a rebuild each
+time rather than reserving the cluster twice over.
+
+The pool **gives its cores back when the session goes idle**, after
+`distributed.session_fleet_idle_s` of no use, which is 30 seconds by default and the same
+setting the shuffle fleet's own idle release reads. A CPU pool this size is most of a
+cluster, and it earns those cores from the scan cache of the query that filled it, so a
+query that is not coming keeps earning nothing. Back-to-back queries never wait for a
+rebuild, because taking the pool cancels the pending release, and a query that runs longer
+than the window keeps its own workers. Measured on a 65-node, 1,024-core cluster: a finished
+`map_batches` and aggregate held 960 cores at 25 seconds after the query returned and 0 at
+33 seconds.
+
+The whole behavior is under `distributed.warm_inference_pools`, on by default. Turn it off
+and every stage runs on stateless tasks released as soon as they finish. To hand the cluster
+to something else immediately, rather than waiting out the idle window, release the pools
+yourself. The call is a no-op when nothing is warm, so it is safe at the end of any script:
 
 ```python
 from batcher.config import Config
+from batcher.dist.executors.map import release_inference_pools
 
-no_residency = Config().distributed.warm_inference_pools
-print(no_residency)
-# True
+cfg = Config()
+print(cfg.distributed.warm_inference_pools, cfg.distributed.session_fleet_idle_s)
+# True 30.0
+
+release_inference_pools()
 ```
 
 ## Out-of-core spilling
