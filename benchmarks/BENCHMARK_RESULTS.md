@@ -670,6 +670,52 @@ separate a 17% effect from the noise; five put both arms inside 8 ms of each oth
 reader *on* marginally ahead. A regression claim on a short query needs more replicates than a
 speedup claim on a long one, because the fixed cost it is measured against is most of it.
 
+### Distributed execution on an image source costs ~120 s per stage, whatever the data size
+
+The multimodal numbers in this file are all **single-node**: `_bt_decode` calls `.collect()`
+with no `distributed=True`, and so does Daft's arm. That is a fair comparison and it hides
+something much worse than the ratio it reports.
+
+Same pipeline, same corpus, one variable moved. A `map_batches` reducing each batch to one row
+over a decoded image scan, `px` identical to the digit on both sides so this is purely
+performance:
+
+| images | single-node | distributed |
+|---:|---:|---:|
+| 100 | 1,522 ms | **237,504 ms** |
+| 1,000 | 3,631 ms | **249,072 ms** |
+| 10,000 | — | **272,092 ms** |
+
+Single-node scales with the data. **Distributed is flat at about four minutes** — 100 images
+and 10,000 images cost the same. That is a fixed cost, not a slow data path, and at 100 images
+it is a **156x penalty for using the cluster**.
+
+It is not the UDF and not the decode. A plain distributed aggregate over the same source, no
+`map_batches` and no decode at all — `read.images(glob).agg(sum("size"))`, 100 images, same
+507,100 bytes both ways:
+
+| | single-node | distributed |
+|---|---:|---:|
+| `sum(size)` | 1,289 ms | **126,694 ms** |
+
+So **one stage costs ~127 s and the two-stage map pipeline costs ~237 s**, which reads as a
+per-stage fixed cost of roughly two minutes that any distributed query on an image source pays.
+
+**The mechanism is not established, and one plausible candidate should not be mistaken for
+it.** The corpus directory holds 211,742 JPEGs and the corpus selects a subset by filename
+prefix, so a listing that pages the whole directory rather than scoping to the prefix would
+cost the same whether 100 or 10,000 files match — which is exactly the invariance measured,
+and would explain a per-worker repeat. That is a hypothesis with a matching signature and
+nothing more: it does not explain why the single-node path, which must also list, takes 1.3 s.
+Anyone taking this on should instrument where a worker's time goes before believing it.
+
+What is established is the dependency, on a controlled change with correct results on both
+sides: **distributed is 69-156x slower than single-node on this shape, and the gap is fixed
+cost rather than throughput.** For a distributed engine that is a defect ahead of any ratio
+against Daft — the multimodal comparison is single-node precisely because the distributed path
+is unusable here, and 10x on this workload is not reachable while a cluster run costs two
+minutes before it reads a byte.
+
 ### The 3x against Daft is a ratio of startup costs, and it decays to 1.6x by 10,000 images
 
 The multimodal entry below records **2.9-3.1x against Daft** at 100 images and warns, in the
