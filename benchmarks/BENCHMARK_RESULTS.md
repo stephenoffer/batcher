@@ -711,6 +711,29 @@ the shape of the symptom.** Deliberately not chased by restarting anything: the 
 shared, other sessions may have work on it, and the instruction for this work is not to do
 anything that might crash it.
 
+#### Narrowed: it is the fleet/placement-group path, and only that
+
+The retraction above says "every distributed Flight aggregate", and that wording is load-bearing
+— it is **not** everything distributed. Re-run immediately afterwards, on the same cluster in
+the same window:
+
+| route | shape | wall |
+|---|---|---:|
+| `_distributed_map_aggregate` (actor pool + Ray tasks) | the `udf` board | **651 ms**, 34% / 58% peak |
+| `execute_aggregate_flight` (fleet + placement group) | `sum(column05)` | **122,540-126,717 ms** |
+
+So the `udf` result this session shipped still reproduces at the top of its recorded 581-822 ms
+range, with utilization better than any earlier sweep. What is degraded is specifically the
+path that calls `acquire_fleet`, which is the only one of the two that spawns a **placement
+group**; the map/aggregate route uses session-warm actors and plain tasks and never asks for
+one. The cluster carries 136 placement-group records (all `REMOVED`) and **14,180 actor records
+of which exactly 2 are ALIVE** — both Ray's own — so nothing is leaked and holding resources,
+and GCS-wide slowness is ruled out by the 651 ms route running through the same GCS.
+
+That is a localization, not a diagnosis: placement-group acquisition is where the time is, and
+why it went from ~0.4 s to ~122 s over a session of roughly a hundred distributed runs is not
+established. Nothing was restarted to find out — the cluster is shared.
+
 **The lesson worth keeping is about the control, not the cluster.** The image-specific finding
 had a clean dependency (one variable moved, correct results both sides), a refuted rival
 hypothesis, and a plausible story about 211,742 objects. What it never had was *the same
