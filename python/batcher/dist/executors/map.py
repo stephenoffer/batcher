@@ -42,6 +42,7 @@ from batcher.dist.executors.ray_runtime import (
     create_worker_placement,
     current_envelope,
     engine_config_json,
+    fleet_task_headroom,
     placement_actor_options,
     release_placement,
 )
@@ -694,6 +695,27 @@ def _resolve_pool_size(spec: object, num_partitions: int, default: int) -> int:
     return int(spec)
 
 
+def _clamped_to_fleet_bundles(shares: list[float], sched: dict) -> list[float]:
+    """`shares`, each capped at what one bundle of the held fleet keeps free for a task.
+
+    Only used on `_placeable_scheduling`'s second answer -- running inside the shuffle
+    fleet's own reservation, which is the shape a staged query's final scan is forced into
+    because its intermediate is published on those actors. The bundles were sized from the
+    query's envelope, not from a node, and each actor claims all but `fleet_task_headroom`
+    of its own, so that headroom is the largest request Ray can place there.
+
+    Returns `shares` unchanged when the group is unreadable, which leaves the stage exactly
+    where it was rather than shrinking it on a guess.
+    """
+    pg = getattr(sched.get("scheduling_strategy"), "placement_group", None)
+    cpus = [float(b.get("CPU", 0.0)) for b in (getattr(pg, "bundle_specs", None) or ())]
+    cpus = [c for c in cpus if c > 0]
+    if not cpus:
+        return shares
+    ceiling = max(_MIN_TASK_CPU, min(fleet_task_headroom(c) for c in cpus))
+    return [min(s, ceiling) for s in shares]
+
+
 def _placeable_scheduling(needed_cpus: float) -> dict:
     """Make room for this stage's tasks against a fleet holding the whole cluster.
 
@@ -909,6 +931,14 @@ def _distributed_map(
         # `placeable` is empty unless the cluster is full, and then it *replaces* the
         # SPREAD/DEFAULT choice below: a strategy that cannot be scheduled is not a
         # placement preference to be balanced against, it is the whole question.
+        if placeable:
+            # Ray checks a task's WHOLE request against a SINGLE bundle, so a share sized to a
+            # node does not merely queue inside an envelope-sized fleet, it raises at submit:
+            # `Cannot schedule _map_udf_task ... {'CPU': 16.0} cannot fit into any bundles ...
+            # [{'CPU': 8.0}, ...]`. The query fails rather than running slowly, which is the
+            # opposite of what this fallback is for. `fleet_task_headroom` is the CPU those
+            # bundles actually keep unclaimed for these tasks, so it is the ceiling.
+            shares = _clamped_to_fleet_bundles(shares, placeable)
         sched = placeable or _map_scheduling_options(env, shares)
         plan_ref = _shared_arg(plan0)
         cfg_for = _engine_config_cache()

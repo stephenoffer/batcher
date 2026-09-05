@@ -1144,6 +1144,35 @@ engines reach the whole fleet; they use very different fractions of it while the
 Daft has no `udf` arm on this board by construction (`daft UDF surface diverges; covered by
 batcher vs ray for udf`), so its `ERR` on this row is "not applicable" rather than a failure.
 
+#### Recorded cluster run: a map task submitted into the fleet's own reservation
+
+Not a timing -- a `ValueError`. `_placeable_scheduling`'s second answer runs a task stage
+inside the held shuffle fleet's placement group, which is the only option when the stage reads
+an intermediate published on those actors. The share is sized by `_adaptive_task_cpus` and
+capped at a node; the bundles are sized from the query's envelope. Ray checks a task's whole
+request against a single bundle, so on any fleet with bundles narrower than a node the submit
+raises rather than queues:
+
+    Cannot schedule _map_udf_task with the placement group because the resource request
+    {'CPU': 16.0, 'memory': 0} cannot fit into any bundles for the placement group,
+    [{'CPU': 8.0, 'memory': 1048576.0}, ... x4]
+
+Shares are now clamped to the narrowest bundle's `fleet_task_headroom` -- the CPU those bundles
+keep unclaimed for exactly these tasks, and therefore the largest request that can be *placed*
+rather than merely accepted. Recorded on the 65-node cluster,
+`tests/integration/{test_distributed_map_aggregate_actors, test_distributed,
+test_distributed_map_byte_bound, test_distributed_map_batches_projection}.py`:
+
+| | failures |
+|---|---|
+| 5e9d1864 (before) | `test_distributed_map_batches_matches_single_node`, `test_distributed_limit_matches_single_node[disk]`, `[flight]` |
+| with the clamp | `test_distributed_limit_matches_single_node[disk]`, `[flight]` |
+
+117 passed against 116. The two that remain are the same pair before and after, and they are a
+`LIMIT` over an unordered relation compared with exact equality -- the divergence
+`.claude/rules/python-control-plane.md` records as allowed, asserted as though it were not.
+That is a decision to surface rather than a bug to silence, and it is left as it is.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
