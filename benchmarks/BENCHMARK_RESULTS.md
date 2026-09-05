@@ -636,6 +636,54 @@ quantified, and none of it is the thing four separate arms have been aimed at.**
 worth opening next are the 204 ms of unaccounted driver work — which is a profile away from
 being named, and nothing in this session has profiled it — and the barrier's own ~164 ms.
 
+#### Named: the driver's unaccounted time is repeated S3 metadata, ~180-250 ms every run
+
+Profiling the driver through a warm sweep (1,139 ms) and setting aside `ray.wait` — 576 ms
+across 257 calls, which *is* the parallel phase and not overhead — what remains is almost
+entirely object-store metadata:
+
+| driver call | self |
+|---|---:|
+| `pyarrow ParquetFile.__init__` | 106 ms |
+| `batcher._native.parquet_footer_stats` | 105 ms |
+| `io/_backend.py::_ArrowFileSystem._list_dir` | 57 ms |
+| `_backend.py::open` | 21 ms |
+| `_native.combine` (255 calls — the incremental fold) | 23 ms |
+
+The fold is 23 ms across 255 partials, so the running combine this file introduced is doing
+its job and is not a term worth touching. The metadata is.
+
+Counting those calls across **four identical runs in one process** shows what does and does not
+amortize:
+
+| run | wall | `ParquetFile.__init__` | `_list_dir` | `parquet_footer_stats` |
+|---|---:|---|---|---|
+| 1 (cold) | 219,199 ms | 102x / 5,809 ms | 1x / 54 ms | 2x / 311 ms |
+| 2 | 891 ms | 2x / 112 ms | 1x / 46 ms | 1x / 95 ms |
+| 3 | 771 ms | 2x / 110 ms | 1x / 21 ms | 1x / 47 ms |
+| 4 | 781 ms | 2x / 110 ms | 1x / 20 ms | 1x / 66 ms |
+
+Caching exists and is working — 102 footer opens on the cold run collapse to 2 — but the
+residue does **not** amortize: two `ParquetFile` opens, one directory listing and one
+`parquet_footer_stats` on **every** run, **~180-250 ms of a 780-890 ms query, 23-28% of the
+wall**, for a query whose source has not changed.
+
+That is the largest single remaining term on this shape and the first one that is neither the
+user's UDF nor a floor. Against the 506 ms that 10x needs, a warm sweep at 780 ms with 200 ms
+of repeated metadata removed lands near 580 ms — still short, but it is the only lever left
+that is worth what it costs.
+
+**It is a design decision, not a patch, and that is why it is recorded rather than done.**
+Caching a listing and a footer across `collect()` calls means deciding what invalidates it: the
+data behind an object-store prefix can change between two runs, and a stale split plan is a
+*wrong answer*, not a slow one. `BATCHER_FOOTER_CACHE_ROW_GROUPS` already caches within the
+split planner and is what turns 102 opens into 2; extending that lifetime across queries needs
+a TTL or an explicit invalidation contract, and picking one is a correctness question for the
+IO layer rather than a performance tweak to slip in beside a benchmark.
+
+(The cold run's 219 s is the fleet/placement-group condition documented above, not a property
+of this path — runs 2-4 in the same process are the steady state.)
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
