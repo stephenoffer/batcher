@@ -590,6 +590,37 @@ trade-off rather than a knob.
 
 For scale: at 733-792 ms this arm would still not reach 10x, which is 506 ms.
 
+### Locality-preferring dynamic dealing: built, measured, rejected
+
+The entry above named this as the next change and described the trade precisely: `idx % n` is
+**static** dealing, which `map_barrier`'s own docstring says lets one oversized partition hold
+the barrier open, while pure dynamic dealing fixes that and throws away the scan-cache locality
+this route was rebuilt for. The change that has both is to take the home actor when it is free
+and yield to an idle one only when the home is busy — so a balanced run keeps the old
+assignment exactly and only a queued one diverges.
+
+Built with the hook the barrier already provides (`gather_map_results`' `on_done`, the thing
+`map_barrier` uses for its idle-actor model), plus a per-actor in-flight count. Correct: the
+distributed route's integration tests pass, and the 13 pool unit tests with them.
+
+| `udf` board, sf100 | samples |
+|---|---|
+| static `idx % n` (shipped) | 581 / 651 / 724 / 822 ms |
+| **locality-preferring dynamic** | 845 / 662 / 652 ms |
+
+The ranges are the same range. Three samples against four and no separation worth a claim, so
+the straggler explanation for the residual is **not supported** — at least not in a form this
+fix reaches. Reverted rather than shipped: it adds an in-flight table, a placement map and a
+barrier callback to buy nothing measurable, and this route's value is the locality the static
+version already has.
+
+Worth being clear about what this does *not* say. It does not show that stragglers are absent,
+only that yielding a partition to an idle actor does not recover time here. The residual named
+above — roughly 210-450 ms of a sweep that is not in-actor work — remains unexplained, and the
+next person should measure the per-partition completion spread directly instead of testing
+another fix against it. That measurement was named as the prerequisite once already and this
+arm skipped it, which is why it is a fourth rejection rather than a third result.
+
 ### Batching the barrier's completions: built, measured, rejected
 
 With the fan-out fixed, a driver profile of the *warm* identity-UDF query said the driver was
