@@ -701,13 +701,25 @@ It is not the UDF and not the decode. A plain distributed aggregate over the sam
 So **one stage costs ~127 s and the two-stage map pipeline costs ~237 s**, which reads as a
 per-stage fixed cost of roughly two minutes that any distributed query on an image source pays.
 
-**The mechanism is not established, and one plausible candidate should not be mistaken for
-it.** The corpus directory holds 211,742 JPEGs and the corpus selects a subset by filename
-prefix, so a listing that pages the whole directory rather than scoping to the prefix would
-cost the same whether 100 or 10,000 files match — which is exactly the invariance measured,
-and would explain a per-worker repeat. That is a hypothesis with a matching signature and
-nothing more: it does not explain why the single-node path, which must also list, takes 1.3 s.
-Anyone taking this on should instrument where a worker's time goes before believing it.
+**The listing hypothesis is measured and refuted.** The corpus directory holds 211,742 JPEGs
+and the corpus selects a subset by filename prefix, so a listing that paged the whole directory
+instead of scoping to the prefix would cost the same for 100 files as for 10,000 — exactly the
+invariance above, and it would explain a per-worker repeat. It is wrong. Running the same steps
+on the driver and inside one ordinary Ray task:
+
+| step | driver | inside a Ray task |
+|---|---:|---:|
+| `read.images(glob)` | 464 ms | 948 ms |
+| `splits()` | 837 ms | 1,055 ms |
+| `row_count()` | <1 ms | <1 ms |
+| the whole `agg(sum(size))`, locally | 689 ms | 964 ms |
+
+A worker computes the entire query in about a second, and the task round trip including
+scheduling is **4.9 s**. So the ~127 s is not the source, not the listing, not the decode and
+not the worker: it is the distributed orchestration around them. Where exactly is still open —
+identifying the route and timing it is the next step, and it wants a quiet head node, because
+each attempt is a two-minute cluster run and several were lost to memory pressure from other
+sessions on this shared 30 GB box.
 
 What is established is the dependency, on a controlled change with correct results on both
 sides: **distributed is 69-156x slower than single-node on this shape, and the gap is fixed
