@@ -15,6 +15,9 @@ from batcher.dist.executors.partition_io._sources import (
     _apply_above as _apply_above,
 )
 from batcher.dist.executors.partition_io._sources import (
+    _compacted_table_for_shipping as _compacted_table_for_shipping,
+)
+from batcher.dist.executors.partition_io._sources import (
     _eager_range_split as _eager_range_split,
 )
 from batcher.dist.executors.partition_io._sources import (

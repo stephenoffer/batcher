@@ -937,7 +937,7 @@ Per-operator distributed executor implementations.
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 120 | Distributed UNION — one shuffle when the branches allow it, else branch by branch. |
 | `window.py` | 61 | Distributed window functions over a disk Arrow-IPC shuffle. |
-| `write.py` | 588 | Distributed write — parallel data-file writers + one driver-side commit. |
+| `write.py` | 589 | Distributed write — parallel data-file writers + one driver-side commit. |
 
 ### `batcher/dist/executors/partition_io/` — 4 · backend
 
@@ -945,7 +945,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 
 | module | lines | what it is |
 |---|---|---|
-| `_sources.py` | 673 | Shared partitioning + post-breaker helpers for the distributed operators. |
+| `_sources.py` | 695 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 348 | How a source's splits are divided among the workers — the three assignment strategies. |
 | `folds.py` | 209 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 619 | Range partitioning: split rows by *value* into globally ordered buckets. |

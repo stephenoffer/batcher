@@ -289,6 +289,28 @@ def _compacted_for_shipping(batch: pa.RecordBatch) -> pa.RecordBatch:
         return batch
 
 
+def _compacted_table_for_shipping(table: pa.Table) -> pa.Table:
+    """`table` rebuilt to own only its own bytes — the `Table` form of
+    `_compacted_for_shipping`, for a shard that is a slice of a larger collected result.
+
+    Same reason and same measurement: a slice serializes as its parent, so N shards of one
+    table each carry the whole table to their worker. `pa.concat_arrays` over a column's
+    chunks copies out just those chunks, which both compacts a slice and combines chunks.
+    """
+    if table.num_rows == 0 or not table.num_columns:
+        return table
+    owned = sum(_owned_bytes(b) for b in table.to_batches()) or 0
+    if owned <= int(table.nbytes * 1.25) + 1024:
+        return table
+    try:
+        return pa.Table.from_arrays(
+            [pa.concat_arrays(col.chunks) if col.num_chunks else col for col in table.columns],
+            schema=table.schema,
+        )
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        return table
+
+
 def _partition_source(
     source: Source,
     workers: int,
