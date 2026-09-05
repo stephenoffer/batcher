@@ -237,6 +237,58 @@ def _slice_rows_evenly(batches: list[pa.RecordBatch], workers: int) -> list[list
     return groups
 
 
+def _owned_bytes(batch: pa.RecordBatch) -> int:
+    """Bytes the batch's buffers actually occupy, counting each buffer once.
+
+    `RecordBatch.nbytes` reports the *logical* size of the rows in view. A slice keeps its
+    parent's buffers and only moves an offset, so a 1/8 slice reports 1/8 of the bytes while
+    still referencing all of them. This reports what is referenced, which is what serializing
+    it will cost. Buffers are de-duplicated by address because columns can share one.
+    """
+    seen: dict[int, int] = {}
+    for col in batch.columns:
+        for buf in col.buffers():
+            if buf is not None:
+                seen[buf.address] = buf.size
+    return sum(seen.values())
+
+
+def _compacted_for_shipping(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """`batch` rebuilt to own only its own bytes, when it is a slice of something larger.
+
+    **A zero-copy slice is cheap in memory and not on the wire.** Ray serializes a task
+    argument through Arrow's buffer set, and a slice's buffer set is its *parent's* — so a
+    table cut into one slice per worker ships the whole table to every one of them, and the
+    amplification is the worker count. Measured on a 147 MiB `FixedSizeList<uint8>` image
+    batch: a 1/8 slice reports `nbytes` of 18.4 MiB and pickles to **147.0 MiB**. Across six
+    partitions that is 882 MiB on the wire for a 147 MiB input, growing with the cluster.
+
+    `pa.concat_arrays([col])` on a sliced array copies out just the slice, which is the whole
+    fix; 13.7 ms for that batch against the 29.0 ms an IPC round-trip costs. Note what does
+    *not* work: `Table.from_batches([slice]).combine_chunks()` returns a batch that still
+    pickles to the full 147 MiB, because combining chunks is not the same as compacting a
+    slice.
+
+    Only paid when it saves something — a batch already owning its buffers is returned
+    untouched, so the whole-batch and single-partition cases copy nothing. Best-effort: any
+    type `concat_arrays` will not rebuild (an odd extension or dictionary array) keeps the
+    slice, which is correct and merely larger.
+    """
+    n = batch.num_rows
+    if n == 0 or not batch.num_columns:
+        return batch
+    # 1.25 rather than 1.0: a compact batch can still carry a little slack (padding, a
+    # shared validity buffer), and copying to reclaim that is not worth a pass over the data.
+    if _owned_bytes(batch) <= int(batch.nbytes * 1.25) + 1024:
+        return batch
+    try:
+        return pa.RecordBatch.from_arrays(
+            [pa.concat_arrays([col]) for col in batch.columns], schema=batch.schema
+        )
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        return batch
+
+
 def _partition_source(
     source: Source,
     workers: int,
@@ -398,7 +450,9 @@ def partition_descriptors(
         batches = list(iter_source(source, projection, predicate))
         groups = _slice_rows_evenly(batches, workers)
         empty = pa.RecordBatch.from_pylist([], schema=proj_schema)
-        return [{"batches": g or [empty]} for g in groups]
+        # Compacted before shipping: these slices become Ray task arguments, and a slice
+        # serializes as its parent. See `_compacted_for_shipping` for the measurement.
+        return [{"batches": [_compacted_for_shipping(b) for b in g] or [empty]} for g in groups]
 
     descriptors: list[dict] = []
     # More partitions than workers only where there are splits to fill them. `assign_splits`

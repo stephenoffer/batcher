@@ -945,7 +945,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 
 | module | lines | what it is |
 |---|---|---|
-| `_sources.py` | 619 | Shared partitioning + post-breaker helpers for the distributed operators. |
+| `_sources.py` | 673 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 348 | How a source's splits are divided among the workers — the three assignment strategies. |
 | `folds.py` | 209 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 619 | Range partitioning: split rows by *value* into globally ordered buckets. |
@@ -2116,7 +2116,7 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 208 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 599 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory.py` | 600 | `InMemorySource` — a relation already materialized as Arrow record batches. |
 | `inmemory_aggregates.py` | 285 | Exact aggregate answers over an immutable in-memory Arrow relation. |
 | `inmemory_stats.py` | 466 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 213 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
