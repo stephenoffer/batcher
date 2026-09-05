@@ -818,6 +818,40 @@ Recorded as 8.1-9.2x, not as "9.2x": three samples spanning 71 ms on a fleet wit
 support a range and not a point, and quoting the best sweep is how a 12-20% fleet becomes a
 claim it cannot reproduce.
 
+#### The decomposition after both caches: the driver is solved, and 10x now needs the barrier
+
+The same phase breakdown, before and after the two metadata caches:
+
+| phase | before | after |
+|---|---:|---:|
+| `gather_map_results` — the whole parallel phase | 532 ms | 538 ms |
+| `_adaptive_partition_count` | 82 ms | **12 ms** |
+| `_agg_actor_pool` | 13 ms | 13 ms |
+| `partition_descriptors` | 6 ms | 7 ms |
+| `_adaptive_task_cpus` | 6 ms | 5 ms |
+| unaccounted driver work | 204 ms | **71 ms** |
+| **driver total** | **311 ms** | **108 ms** |
+| **wall** | **842 ms** | **647 ms** |
+
+`_adaptive_partition_count` fell 82 -> 12 ms without being touched: it consumes the source
+statistics the footer cache now serves, so caching one thing fixed two. The parallel phase is
+unchanged at ~538 ms, as it should be — nothing here altered what the workers do.
+
+**This settles what 10x costs.** 10x is 506 ms and **the parallel phase alone is 538 ms**, so
+even a driver that took zero time would land 32 ms short. The remaining distance is no longer
+anywhere on the driver; it is inside `gather_map_results`, which decomposes as ~368 ms of
+irreducible work (23 ms warm read + 68 ms of the user's own UDF per partition, four rounds over
+64 actors) and **~170 ms of barrier** — dispatch and completion handling for 256 partitions, or
+about 0.66 ms each.
+
+That is the whole remaining target, and it is worth stating what it is not. It is not
+stragglers: p99 is 508 ms against a last completion of 563 on 256 partitions. It is not the
+driver: 108 ms and most of that is Kyber and lowering, not I/O. It is not parallelism: 256
+actors stalled and 64 x 16 threads already covers the fleet once. It is the per-completion cost
+on a path where batching completions has been built, measured and rejected once — which makes
+it a real problem rather than an obvious one, and the honest next step is to profile inside the
+barrier rather than to try a third arrangement of it.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
