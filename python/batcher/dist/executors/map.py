@@ -1319,18 +1319,28 @@ def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> t
 _TARGET_TASK_CPUS = max(1, int(os.environ.get("BATCHER_TARGET_TASK_CPUS", "4")))
 
 
-def _widest_useful_fan_out() -> int:
-    """The most tasks worth cutting the *rows* into — the fleet at `_TARGET_TASK_CPUS` wide.
+def _widest_useful_fan_out(task_cpus: float | None = None) -> int:
+    """The most units worth cutting the *rows* into — the fleet at one unit's width.
+
+    `task_cpus` is how wide one working unit actually is, defaulting to `_TARGET_TASK_CPUS`
+    because a stateless map task reserves about that. **An actor pool is not that width.**
+    `_agg_actor_width` gives a CPU map/aggregate actor `cluster cores / pool size` threads
+    (16 here), so sizing its row fan-out at 4 cuts four times more partitions than there are
+    working units and pays the per-partition dispatch, transfer and fold four times over —
+    measured at 70-79 ms on a sweep whose whole remaining gap to 10x was ~68 ms.
 
     Only the parallelism term is clamped by this. The byte term is a **memory bound** and
     must stay free to ask for more (see `_byte_partition_count`): a source that needs 4,096
     tasks to keep one task's input under budget still gets them, because the alternative is
-    an OOM rather than a slow query.
+    an OOM rather than a slow query. That is what makes widening this safe where forcing the
+    count outright was not: the earlier arm that set the count to the worker width bypassed
+    the bound and quadrupled per-partition memory, and this cannot, because the bound is
+    applied as a `max` after it.
     """
-    return max(1, int(_cluster_cores() // _TARGET_TASK_CPUS))
+    return max(1, int(_cluster_cores() // max(1.0, float(task_cpus or _TARGET_TASK_CPUS))))
 
 
-def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
+def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=None) -> int:
     """How many tasks to split a map/scan source into — data- and compute-driven.
 
     Two independent terms, taken as a **maximum**, because they answer different questions
@@ -1399,7 +1409,7 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
         return fallback
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
     by_rows = math.ceil(total / rows_per_cpu)
-    n = max(1, min(by_rows, _widest_useful_fan_out()))
+    n = max(1, min(by_rows, _widest_useful_fan_out(task_cpus)))
     n = max(n, _byte_partition_count(source, plan, total, hub))
     with contextlib.suppress(Exception):
         n = min(n, max(1, len(source.splits())))  # never more tasks than splits
@@ -2490,7 +2500,13 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     _ensure_ray(workers)
     map_plan, sid = _relabel_single_source(agg.input)
     gk, aj = agg_spec_json(agg)
-    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
+    # The pool is acquired BEFORE the partition count because the count depends on it: a
+    # partition is sized to one working unit, and this route's unit is a `_agg_actor_width`-wide
+    # actor (16 here) rather than the `_TARGET_TASK_CPUS`-wide task the default assumes. When
+    # the pool declines, the units really are tasks and the default is right.
+    actors = _agg_actor_pool(map_plan, workers)
+    unit_cpus = _agg_actor_width(max(1, workers)) if actors else None
+    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers, task_cpus=unit_cpus)
     proj, pred = _scan_pushdown(map_plan)
     # `max_partitions`, not the worker count — see `_distributed_map`'s note: a
     # compute-derived count passed as `workers` sets `_scan_splits`' coalescing floor out of
@@ -2502,7 +2518,6 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
     sched = _map_scheduling_options(current_envelope(), shares)
-    actors = _agg_actor_pool(map_plan, workers)
     # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
     plan_ref = _shared_arg(map_plan)
 

@@ -376,7 +376,7 @@ competitor number would have booked that 12% as a win.
 |---|---:|---:|---:|---:|---:|
 | `udf` | 1,236-1,367 ms | **803-1,069 ms** | 5,061 ms | 3.7-4.1x | **4.7-6.3x** |
 
-The fleet-sized actor width below takes this further to **581-822 ms** and **6.2-8.7x**, and the two driver metadata caches after it to **552-623 ms** and **8.1-9.2x**.
+The fleet-sized actor width below takes this further to **581-822 ms** and **6.2-8.7x**, the two driver metadata caches after it to **552-623 ms** and **8.1-9.2x**, and sizing the row fan-out to the actor width after that to **519-612 ms**, a **9.18x median**.
 
 The prediction in the section above was "~1,300 ms to ~950 ms, i.e. 4.4x to ~6x, not to 10x."
 The direction and rough size were right and the estimate was optimistic.
@@ -991,6 +991,43 @@ per-partition footprint stays under a stated ceiling.
 That is a real design task in `carbonite`/`kyber` terms rather than a knob, and it is the
 honest end of this line: **the remaining 8-19% on `udf` is a partition-sizing policy with a
 memory trade, quantified at 70-79 ms, not an unidentified bottleneck.**
+
+#### Shipped: the row fan-out now knows how wide a working unit is — 8.82x to 9.18x
+
+The entry above named fewer, larger partitions as the lever and recorded it as declined,
+because the arm that tested it forced the count to the worker width and so **bypassed the byte
+bound**, quadrupling per-partition memory on a wide scan. That was the right call about that
+arm and the wrong conclusion about the lever, because the count is
+
+    n = max(1, min(by_rows, _widest_useful_fan_out()))   # parallelism — a preference
+    n = max(n, _byte_partition_count(...))               # memory — a bound, raises only
+
+so changing the **parallelism** term cannot reduce the count below what memory requires. The
+bound is applied after it.
+
+And that term was simply out of date. `_widest_useful_fan_out` is "the fleet at one unit's
+width" and assumed `_TARGET_TASK_CPUS` (4), the width of a stateless map task — but this
+session moved the map/aggregate route onto `_agg_actor_width`-wide actors, 16 on this fleet. It
+was cutting 256 partitions for 64 working units and paying dispatch, transfer and fold on each
+of the extra 192. It now takes the unit's real width, and the route passes the actor width when
+a pool is in play (and nothing when it is not, so every other caller is unchanged).
+
+Verified in effect rather than assumed: `task_cpus=16 rows_cap=64 byte_term=13 n=64 tasks=64
+cpus_each=16.0`. The byte term at 13 is far below 64, so the bound is not binding here and the
+memory safety is intact by construction rather than by luck.
+
+| `udf`, sf100 | n | min | median | mean | max | peak busy | vs Ray Data |
+|---|---:|---:|---:|---:|---:|---|---|
+| 4-wide sizing, 256 partitions | 7 | 552 | 574 | 580 | 623 | 56-61% | 8.82x median |
+| **16-wide sizing, 64 partitions** | 8 | **519** | **552** | **554** | 612 | **80-87%** | **9.18x median** |
+
+**Four of the eight new sweeps fall below the old minimum**, which is a distributional shift
+rather than a lucky sample, and peak cluster busy went from 56-61% to 80-87% on the same work.
+Best sweep 519 ms, **9.75x**.
+
+**Still not 10x**, which is 506 ms — 13 ms below the best sweep and 46 below the median. What is
+left is the ~368 ms floor of warm read plus the user's own UDF, and a barrier whose per-completion
+cost two arms have now failed to reduce. The fan-out is no longer part of the gap.
 
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
