@@ -956,6 +956,42 @@ arithmetic, and the wrong shape — a profile of a query built the way the profi
 rather than the way the benchmark does. When a driver-side cost is the answer, check whether the
 thing being timed constructs its `Dataset` the same way.
 
+#### Where the last ~68 ms actually is: per-partition overhead, and the lever for it is already measured
+
+With the driver corrected out of the picture, the gap is inside the parallel phase: 538 ms of
+`gather_map_results` against a ~364 ms floor (4 rounds x 91 ms of read + UDF per partition on
+64 actors), so **~174 ms is not the work**, and ~68 ms of that is what separates the board's
+574 ms median from the 506 ms target.
+
+Two candidates ruled out without spending a cluster run on either:
+
+* **The submit-ahead window is not throttling actors.** `_pending_window` is
+  `pending_window_factor x (schedulable cores / task_cpus)` with `task_cpus` clamped to 1.0
+  from above, so on 1,024 cores it is at least 1,024, and `min(window, n)` makes it 256. Every
+  partition is submitted before the first wait, each actor holds four queued calls, and none
+  idles for a driver round trip between them. Worth stating because "the window is starving the
+  pool" is the obvious next guess and the code answers it.
+* **It is not the number of `ray.wait` calls.** Two arms have measured that flat.
+
+What is left is per-partition cost: submission (`_actor_method_call`, ~0.27 ms x 320),
+result transfer and msgpack deserialization (~24 ms across 320), and the fold (22 ms across
+255). Spread over 256 partitions that is roughly **0.68 ms each** — and the arithmetic
+matches the one arm that *did* move: collapsing four dealing rounds to one measured
+**70-79 ms**, which is the same term seen from the other side, and is the size of the
+remaining gap.
+
+**So the lever that closes `udf` is fewer, larger partitions, and it is already recorded as
+measured-and-declined.** It was declined for a good reason that has not changed: forcing the
+count to the worker width quadruples per-partition memory, and this file records that shape as
+"an OOM rather than a slow query" on wide multimodal scans. The safe form is not a blanket
+change but a **memory-aware bound on the round count** — keep `_adaptive_partition_count`'s
+data-derived sizing, and let it collapse toward the pool width only while the resulting
+per-partition footprint stays under a stated ceiling.
+
+That is a real design task in `carbonite`/`kyber` terms rather than a knob, and it is the
+honest end of this line: **the remaining 8-19% on `udf` is a partition-sizing policy with a
+memory trade, quantified at 70-79 ms, not an unidentified bottleneck.**
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
