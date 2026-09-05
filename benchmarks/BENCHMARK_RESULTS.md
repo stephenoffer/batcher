@@ -1127,6 +1127,47 @@ against Daft — the multimodal comparison is single-node precisely because the 
 is unusable here, and 10x on this workload is not reachable while a cluster run costs two
 minutes before it reads a byte.
 
+#### Trying to shape-match multimodal natively: it works, it is correct, and it is not the fair arm
+
+The multimodal comparison is not shape-matched — `_bt_decode` `.collect()`s the decoded image
+column (~1.5 GB of pixels to the driver at 10,000 images) where `_daft_decode` computes the
+same decode and returns `select("h", "w")`. Daft decodes; it just does not ship. So the
+apparently obvious fix is to have Batcher decode, reduce per row, and return one row.
+
+Batcher can express that with no new code and no Python UDF: `bt.col("image").list.sum()` runs
+in the engine over the decoded fixed-shape tensor. It is correct — verified against hand
+arithmetic on four 8x8 images (16 x (50+60+70+80) = 4160), plan is `aggregate <- project <-
+scan` with no pushed-down limit so the decode really happens, and at 10,000 images its checksum
+(209,353,320,000) matches what an independent Python UDF computed over the same corpus.
+
+And it is **slower than the arm it was meant to replace**:
+
+| Batcher, 10,000 images, single-node | wall |
+|---|---:|
+| `.collect()` of the decoded column (what the suite times) | 15,694 ms |
+| **`list.sum()` per row, one row returned** | **24,260 ms** |
+| *(Daft, `select("h","w")`)* | *25,027 ms* |
+
+Which refutes the premise rather than fixing the benchmark. Summing 1.5 billion `uint8`
+elements is real work that Daft's `image_height()` — a lookup on the decoded image's shape —
+never performs. Shipping the pixels turns out to be *cheaper* than reducing them, so the
+asymmetry is not the transfer, and removing the transfer does not make the arms equal.
+
+**The gap underneath is expressiveness, and it is worth naming.** Batcher has no cheap way to
+say "perform the decode and tell me how many rows": `agg(count())` is answered by a one-row
+limit pushed into the scan and decodes nothing (4,213 ms against 4,144 ms with decode off), and
+everything that does force the decode costs a full pass over the pixels. Daft gets that for
+free because `image_height()` reads a decoded image's shape. Batcher's decoded column carries
+its shape in the *type*, which is why `_bt_decode` reads `h`/`w` from `d.column("image").type`
+without touching a row — but only after `.collect()` has already moved every pixel.
+
+So a shape-matched multimodal ratio still does not exist, and now the reason is specific:
+making one exists requires changing **both** arms to compute the same thing — for instance both
+reducing the pixels, or both returning dimensions — rather than adjusting Batcher's alone. That
+is a change to a competitive benchmark and belongs in its own pass, run on its own. Until then
+the recorded 1.6-2.0x at 10,000 images stands as the measured number, with the caveat it
+already carries.
+
 ### The 3x against Daft is a ratio of startup costs, and it decays to 1.6x by 10,000 images
 
 The multimodal entry below records **2.9-3.1x against Daft** at 100 images and warns, in the
