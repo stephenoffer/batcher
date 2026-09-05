@@ -590,6 +590,52 @@ trade-off rather than a knob.
 
 For scale: at 733-792 ms this arm would still not reach 10x, which is 506 ms.
 
+### The residual, finally measured: there is no straggler tail, and 10x is now an arithmetic question
+
+Two fixes were tested against a straggler *hypothesis* before anyone measured whether a tail
+existed. It does not. Timing every partition's completion inside the barrier, 256 partitions,
+warm:
+
+    n=256  wall=1,183 ms  first=107  p50=299  p90=453  p99=508  last=563 ms
+
+p99 is 508 ms and the last partition lands at 563 ms — **55 ms behind p99, on 256 partitions.**
+Completions run smoothly from 107 ms onward. That is a healthy fan-out with no tail to chase,
+and it is why both dealing arms bought nothing: they were aimed at a problem that is not there.
+
+What the same measurement does show is that **the last partial arrives at 563 ms and the query
+takes 1,183 ms**, so more than half the wall is outside the parallel phase. Timing the driver
+pieces directly, on a sweep that came in at 842 ms:
+
+| phase | ms | share |
+|---|---:|---:|
+| `gather_map_results` — the whole parallel phase | 532 | 63% |
+| `_adaptive_partition_count` | 82 | |
+| `_agg_actor_pool` | 13 | |
+| `partition_descriptors` | 6 | |
+| `_adaptive_task_cpus` | 6 | |
+| unaccounted driver work (optimize, lower, `combine_finalize`, marshal) | 204 | 24% |
+
+Planning is **107 ms**, which is not the problem and is worth saying because "the driver is
+re-planning every run" is the obvious guess. The unaccounted 204 ms is.
+
+#### What this says about 10x on this shape
+
+10x against Ray Data's 5,061 ms is **506 ms**. The floor underneath it, from the in-actor
+decomposition: one partition is 23 ms of warm read plus 68 ms of the user's own UDF, and 256
+partitions over 64 actors is four rounds, so **~368 ms is irreducible without either more
+concurrency or a cheaper user function.** The barrier costs 532 - 368 = ~164 ms on top of that,
+and the driver another ~204 ms.
+
+So the target is reachable only by removing **both** the 204 ms of driver work and most of the
+164 ms of barrier overhead — about 370 ms of engine time out of an 842 ms query — while the
+UDF and the read stay exactly as they are. It is not reachable by making the parallel phase
+wider: 256 actors stalled, and 64 x 16 threads already covers the fleet once.
+
+That is the honest state of `udf`. **The remaining distance is engine overhead, it is
+quantified, and none of it is the thing four separate arms have been aimed at.** The two terms
+worth opening next are the 204 ms of unaccounted driver work — which is a profile away from
+being named, and nothing in this session has profiled it — and the barrier's own ~164 ms.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is
