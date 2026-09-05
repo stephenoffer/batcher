@@ -331,8 +331,9 @@ A clamped device is derated rather than removed, because the clamp is often your
 working as intended and a power-bound fleet cannot afford to drop the slot. A device reporting
 uncorrectable ECC errors is quarantined outright, whatever it costs in throughput.
 
-Health checking needs `pynvml` on every worker, which is why it is off by default. Without it,
-every device is assumed healthy, exactly as before.
+Health checking needs `pynvml` on every worker, which is why it is off by default. Install it
+with `pip install 'batcher-engine[nvml]'`. Without it, every device is assumed healthy,
+exactly as before.
 
 ```{important}
 Absent telemetry never quarantines anything. A fleet that loses its telemetry keeps
@@ -434,8 +435,8 @@ that is merely busy.
 - Device power, bandwidth, and interconnect figures cover the datacenter accelerators Batcher
   recognizes by model name. An unrecognized model reports unknown, and every decision falls
   back to its prior behavior rather than to a substituted figure.
-- Live telemetry requires `pynvml` and a mounted driver. Without it, power reporting falls back
-  to the modelled draw and health checking is inert.
+- Live telemetry requires `pynvml` (`pip install 'batcher-engine[nvml]'`) and a mounted driver.
+  Without it, power reporting falls back to the modelled draw and health checking is inert.
 - Fabric-aware placement needs node labels. Batcher cannot discover a rack or an RDMA partition
   on its own.
 - MIG instances must already exist. Batcher plans against the profiles a device supports and

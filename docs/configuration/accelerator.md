@@ -133,7 +133,7 @@ print(cfg.accelerator.memory.allocator)
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `enabled` | `False` | Consult live device telemetry before placing accelerator work. Needs `pynvml` on every worker. |
+| `enabled` | `False` | Consult live device telemetry before placing accelerator work. Needs `pynvml` on every worker, from `pip install 'batcher-engine[nvml]'`. |
 | `quarantine_on_ecc` | `True` | Take a device out of rotation when it reports an uncorrectable ECC error. |
 | `max_temperature_c` | `87.0` | Temperature above which a device is treated as degraded. |
 | `quarantine_below_derate` | `0.3` | Derate at or below which a degraded device stops being scheduled. |
