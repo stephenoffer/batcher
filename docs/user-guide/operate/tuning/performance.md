@@ -320,6 +320,11 @@ query over the same files reuses it in well under a millisecond, while a file re
 underneath you misses and is read again. A file the filesystem cannot stat is never cached,
 because there would be no way to notice it changing.
 
+A file's schema is held the same way. Reading it means opening the file, and a strict read
+opens two of them — the first file, whose schema stands for the rest, and the last, checked so
+a column a later file added cannot be dropped without warning. Both are kept against file
+identity, so building a second `Dataset` over the same files opens nothing.
+
 A worker also keeps the batches it decoded, so a repeated query against the same files
 skips both the fetch and the decode. That cache is per worker process and bounded by
 `BATCHER_SCAN_CACHE_FRACTION` of the worker's memory (0.3 by default), or set outright with

@@ -32,7 +32,7 @@ from batcher.io.base._transient import with_retry
 from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.splits import FileSplit, MultiFileSplit, Split, pack_files
-from batcher.io.stats.file_identity import files_version
+from batcher.io.stats.file_identity import FileMetaCache, file_identity, files_version
 from batcher.io.stats.row_estimate import estimate_rows_from_footer_sample
 from batcher.plan.source_stats import SourceStatistics
 
@@ -143,6 +143,13 @@ def _resolve_base_aliases(
             )
         bound[target] = value
     return bound["columns"], bound["n_rows"]
+
+
+#: Per-file schemas, keyed by `(reader class, file identity)`. Entry-weighted: a schema is a
+#: field list, so entries here are the fixed-size records `FileMetaCache` documents, unlike the
+#: footer cache whose entries scale with row-group count. Bounded well above the file counts a
+#: single planning pass touches, since a schema is far smaller than a `FileMetaData`.
+_FILE_SCHEMAS = FileMetaCache(8192)
 
 
 class FileSource(ABC):
@@ -429,8 +436,33 @@ class FileSource(ABC):
             ) from exc
 
     def _file_schema(self, path: str) -> pa.Schema:
-        with self._open(path) as fh:
-            return self._read_schema(fh)
+        """`path`'s schema, read from its metadata and cached against the file's identity.
+
+        `schema()` memoizes on the *source object*, which is rebuilt every time a user writes
+        `bt.read.parquet(uri)`, so a repeated query re-opened the file to re-read a schema that
+        had not changed: two opens per query on the strict path — file 0 for the schema itself
+        and the last file for the dropped-column warning — measured at **58-71 ms each** over
+        S3. That is the same shape as the footer and split caches in `io/splits/parquet.py`
+        and it uses the same contract.
+
+        Keyed by `file_identity` and the concrete reader class: the identity token changes
+        whenever the bytes could have, so a rewritten file misses rather than serving a schema
+        it no longer has, and a file that cannot be stat-ed is read uncached because there
+        would be no way to notice it changing. The class is in the key because one path could
+        in principle be read by two readers, and a `pa.Schema` is immutable, so sharing one
+        between callers is safe.
+        """
+        identity = file_identity(path, self._fs)
+        if identity is None:
+            with self._open(path) as fh:
+                return self._read_schema(fh)
+        key = (type(self), identity)
+        hit = _FILE_SCHEMAS.get(key)
+        if hit is None:
+            with self._open(path) as fh:
+                hit = self._read_schema(fh)
+            _FILE_SCHEMAS.put(key, hit, weight=1)
+        return hit
 
     def schema(self) -> pa.Schema:
         """The source's schema, read from metadata once and cached.

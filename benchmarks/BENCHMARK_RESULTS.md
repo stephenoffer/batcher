@@ -737,6 +737,60 @@ decomposition that was neither the user's function nor a floor — worth ~50-237
 780-890 ms query — and leaves the barrier's ~164 ms and the ~110 ms of driver `ParquetFile`
 opens as the next two.
 
+#### And the other driver term: per-file schemas, two S3 opens per query -> zero
+
+The profile's remaining metadata line was `ParquetFile.__init__`, 2 calls per warm query.
+Tracing them to their call sites shows both are `_file_schema`, reached from the same place:
+
+    1x 71.5ms  io/base/source.py:478 <- source.py:433 <- parquet/source.py:74   (last file's schema)
+    1x 58.1ms  io/base/source.py:628 <- source.py:433 <- parquet/source.py:74   (file 0's schema)
+
+One is `schema()` itself, which in strict mode reads file 0 and lets it stand for the rest; the
+other is the dropped-column warning, which reads the **last** file to check a later file has
+not added a column the read would silently drop. Both are per-file metadata, and `schema()`'s
+own docstring says "read from metadata once and cached" — which is true, and the cache lives on
+the *source object*, which is rebuilt every time a user writes `bt.read.parquet(uri)`. So a
+repeated query re-opened two files over S3 to re-read schemas that had not changed.
+
+Same gap, same fix, same contract: `_file_schema` now holds its result in a `FileMetaCache`
+keyed by `(reader class, file_identity)`. The class is in the key because one path could in
+principle be read by two readers; `pa.Schema` is immutable so sharing one is safe; and a file
+that cannot be stat-ed is read uncached, per `file_identity`'s instruction.
+
+Re-running the same trace with the cache in place:
+
+| | driver `ParquetFile` opens per warm query |
+|---|---:|
+| before | 2 (~130 ms) |
+| **after** | **0** |
+
+Three tests pin it (`tests/unit/test_file_schema_cache.py`): a second read of the same files
+opens nothing, **a rewritten file is re-read** and reports its new columns, and separate
+`Dataset` objects over one file share the read. Removing the cache lookup fails two of the
+three.
+
+**A test of mine was wrong first, and its positive control is what said so.** The fixture
+originally counted `FileSource._read_schema` on the ABC, which every format overrides, so it
+intercepted nothing — the assertion `reads_after_first > 0` ("the first read must actually open
+a file") failed rather than the test passing vacuously. It counts `pq.read_schema` now. An
+absence assertion without a positive control would have reported a working cache on a fixture
+that could not see one.
+
+#### A regression this session shipped, found by the full suite and fixed
+
+`8bc0b826` gave `_new_map_actor` a third parameter (the actor's intra-actor width). A unit test
+stubs that function with a two-argument lambda, so `_resident_pool_for` began raising
+`TypeError` against the stub —
+`test_map_resident_pool_recovery::test_a_repacked_pool_replaces_the_old_one_instead_of_growing_past_it`
+has been red at HEAD since that commit.
+
+It was missed because after the width change only the one new test file was re-run, not the
+`-k "map or pool or dist"` selection that had been run for the commit before it and that
+contains this test. The narrower the change feels, the more tempting that is. The stub now
+carries the third parameter and the file passes; the whole-suite run that caught it is the
+reason to prefer it over a selection when a *signature* changes, since a stale test double is
+invisible to every test that does not use it.
+
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
 The entry above named this as the next change and described the trade precisely: `idx % n` is

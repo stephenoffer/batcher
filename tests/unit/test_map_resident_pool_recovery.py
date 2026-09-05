@@ -135,7 +135,12 @@ def test_a_repacked_pool_replaces_the_old_one_instead_of_growing_past_it(monkeyp
     node = MapBatches.__new__(MapBatches)
     object.__setattr__(node, "fn", _Fn())
     object.__setattr__(node, "input", None)
-    monkeypatch.setattr(mapmod, "_new_map_actor", lambda plan0, opts: f"actor@{opts['num_gpus']}")
+    # Third parameter is the intra-actor width (`cpu_workers`); a GPU pool leaves it None.
+    monkeypatch.setattr(
+        mapmod,
+        "_new_map_actor",
+        lambda plan0, opts, cpu_workers=None: f"actor@{opts['num_gpus']}",
+    )
     monkeypatch.setattr(mapmod, "_healthy_actors", list)
 
     registry: dict = {}
