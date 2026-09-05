@@ -387,6 +387,23 @@ def _resident_pool_for(
 _UNCLAMPED_PARTITIONS = 1 << 30
 
 
+def _explicit_pool_ceiling(concurrency: object) -> int | None:
+    """The largest pool an explicit `concurrency` asks for, or `None` when it is unset.
+
+    `map_batches(concurrency=...)` is either an `int` (a fixed pool) or a `(min, max)` tuple
+    (the autoscaling contract), and the *ceiling* is what the partition count has to cover:
+    a pool that may grow to `max` needs `max` partitions to grow into.
+    """
+    if concurrency is None:
+        return None
+    if isinstance(concurrency, tuple):
+        vals = [int(v) for v in concurrency if isinstance(v, int | float)]
+        return max(vals) if vals else None
+    if isinstance(concurrency, int | float):
+        return int(concurrency)
+    return None
+
+
 def _pool_partition_count(
     workers: int,
     num_gpus: float,
@@ -409,9 +426,19 @@ def _pool_partition_count(
 
     Never below the caller's `workers`, and a partition count only shards, so the merged
     result is identical for any value.
+
+    **An explicit `concurrency` needs the same floor, for the same reason.** Not
+    second-guessing the caller's *pool size* is right; returning `workers` as the *partition*
+    count is not, because `_drive_actor_pool` then clamps the pool to
+    `min(max_size, len(partitions))` and the caller's number is silently reduced to the
+    worker count. Measured on this cluster: `concurrency=6, num_gpus=1` over a 200-shard
+    corpus with `workers=3` produced 3 partitions, so 3 of 6 GPUs ran and the other three sat
+    idle for the whole query — the same causality inversion the paragraph above describes,
+    reached by the one path that had opted out of the fix for it.
     """
-    if concurrency is not None:  # the caller sized their own pool; don't second-guess it
-        return workers
+    explicit = _explicit_pool_ceiling(concurrency)
+    if explicit is not None:  # the caller sized their own pool; give it enough to fill
+        return max(workers, explicit)
     from batcher.ml.gpu import gpu_aware_pool_default
 
     replicas = gpu_aware_pool_default(

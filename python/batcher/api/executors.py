@@ -474,7 +474,14 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         load_gpu_peak_vram(hub, key), actors_per_device=density
     )
     num_gpus = recommend_num_gpus(util, base_gpus, density, vram_cap)
-    if util is None and num_gpus > 0 and model_gb <= 0:
+    # An explicit `concurrency` fixes the pool size, so the cold-start reservation below
+    # cannot buy what it exists to buy. Reserving half a device each does not *add* an
+    # actor when the count is already decided — it packs the actors the caller asked for
+    # onto half as many devices. Measured on a 6-GPU cluster: `concurrency=6, num_gpus=1`
+    # reserved 0.5 each, so six actors filled three GPUs two-deep and the other three sat
+    # idle for the whole query, at 3.0/6.0 GPU with no pending demand.
+    caller_sized_pool = any(getattr(n, "concurrency", None) is not None for n in stages)
+    if util is None and num_gpus > 0 and model_gb <= 0 and not caller_sized_pool:
         # Nothing measured and nothing declared: *reserve* the packable fraction so the
         # cold-start fill has somewhere to put a second actor. Ray fixes an actor's fraction
         # at creation, so a first run that reserved a whole GPU each can never add one

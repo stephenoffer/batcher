@@ -172,7 +172,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 237 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `_varargs.py` | 69 | Sequence flattening for the `Dataset` verbs' varargs positions. |
-| `executors.py` | 580 | Execution strategies and their registry (the conductor's wiring). |
+| `executors.py` | 587 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 813 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 950 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
@@ -931,7 +931,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 828 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 2715 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 2742 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 529 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 702 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
