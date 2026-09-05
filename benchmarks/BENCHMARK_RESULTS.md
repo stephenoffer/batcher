@@ -800,7 +800,7 @@ they are, because they remove the same ~180-250 ms from every timed run:
 | `udf`, sf100 | samples | cluster busy | vs Ray Data (5,061 ms) |
 |---|---|---|---:|
 | index-stable pool, fleet-sized width | 581 / 651 / 724 / 822 ms | 26-36% / 53-62% | 6.2-8.7x |
-| **+ footer-stats and schema caches** | **552 / 558 / 623 ms** | **39-41% / 57-60%** | **8.1-9.2x** |
+| **+ footer-stats and schema caches** | **552 / 558 / 560 / 574 / 579 / 613 / 623 ms** | **22-41% / 56-61%** | **8.1-9.2x** |
 
 The range moved down and tightened, and utilization moved up again: the driver is no longer
 spending a fifth of the query on object-store metadata while 1,024 cores wait for it.
@@ -814,9 +814,15 @@ against a last completion of 563 on 256 partitions — so what is left is the pe
 itself, on a path where batching the completions has already been built, measured and rejected
 once.
 
-Recorded as 8.1-9.2x, not as "9.2x": three samples spanning 71 ms on a fleet with this spread
-support a range and not a point, and quoting the best sweep is how a 12-20% fleet becomes a
+Recorded as 8.1-9.2x, not as "9.2x": quoting the best sweep is how a 12-20% fleet becomes a
 claim it cannot reproduce.
+
+**Extended to seven sweeps after one run came back at 833 ms and put the whole comparison in
+doubt.** Three samples against four is thin, and a single outlier is exactly how a fleet effect
+gets published as a code effect. Seven give 552-623 ms with a median of 574 against the
+pre-cache four at 581-822 with a median of 687: lower *and* far tighter, with every cached sweep
+at or below all but one uncached sweep. The improvement is real; the 833 ms run was one bad
+sample and is included in neither figure because it came from a different harness.
 
 #### The decomposition after both caches: the driver is solved, and 10x now needs the barrier
 
@@ -887,7 +893,7 @@ rounds across 64 actors, which is scheduling and ordering rather than a per-comp
 Whether *any* of it is recoverable is now an open question rather than an assumed yes, and the
 two cheapest theories about it have both been tested and both failed.
 
-#### The last 46 ms is a directory listing, and caching it would trade correctness for the number
+#### CORRECTED: the last 46 ms is NOT a directory listing — the board never pays one
 
 Re-profiling the driver with both caches in place, the metadata terms that dominated it are
 gone and exactly one remains:
@@ -900,9 +906,21 @@ gone and exactly one remains:
 | `_ArrowFileSystem._list_dir` | 57 ms | **63 ms** |
 | `_native.combine` (255 partials) | 23 ms | 22 ms |
 
-**`_list_dir` is the whole remaining driver term**, one call per query, expanding the glob that
-names the files. And the arithmetic is uncomfortably close: the best board sweep is 552 ms
-against a 506 ms target, so removing 63 ms would land ~490 ms and clear 10x.
+**`_list_dir` is the whole remaining driver term in the shape this profile ran** — and that
+shape is not the board's. The profile built a fresh `bt.read.parquet(...)` per run;
+`batcher_thunk` builds its `Dataset` **once** and `run()` only re-collects it, and `_files_cache`
+memoises the glob expansion on the source object. Counting the calls in both shapes settles it:
+
+| per timed collect | `_list_dir` | `footer_stats` |
+|---|---:|---:|
+| board shape (one `Dataset`, re-collected) | **0** | **0** |
+| probe shape (fresh `Dataset` each run) | 1 | 0 (cached) |
+
+So the board pays no listing at all, removing it would not have moved the board, and the
+paragraph below — written on the strength of this profile — reached the wrong conclusion from a
+real measurement of the wrong shape. The listing cost is real for the *fresh-`Dataset`* pattern,
+which is how users actually write code, and it is still not safely cacheable for the reason
+given; but it is **not** what stands between this board and 10x.
 
 **It should not be removed, and the reason is not effort.** The two caches that shipped are safe
 because `file_identity` gives a per-file token — `(path, size, mtime_ns)` — that changes
@@ -926,8 +944,17 @@ benchmark-driven change:
   cost on the person who understands the lifecycle, rather than a default that quietly changes
   what a query returns.
 
-That is the honest end of the `udf` line for this session: **8.1-9.2x, with the remaining 46 ms
-sitting behind a correctness trade rather than behind an unfinished optimisation.**
+So the honest end of the `udf` line is: **8.1-9.2x over seven sweeps** (552 / 558 / 560 / 574 /
+579 / 613 / 623 ms, median 574), and the remaining ~68 ms to the 506 ms target is inside the
+**parallel phase**, not the driver — the board's driver work is smaller still than the 108 ms
+measured in the probe shape, since it pays neither the listing nor the statistics. Two attempts
+at the barrier (batching completions, draining ready completions) have both measured flat, and
+the floor beneath it is ~368 ms of read plus the user's own UDF.
+
+Recorded this way because the first version of this section had the right measurement, the right
+arithmetic, and the wrong shape — a profile of a query built the way the profiler built it
+rather than the way the benchmark does. When a driver-side cost is the answer, check whether the
+thing being timed constructs its `Dataset` the same way.
 
 ### Locality-preferring dynamic dealing: built, measured, rejected
 
