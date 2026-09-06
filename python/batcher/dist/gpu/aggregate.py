@@ -17,6 +17,7 @@ shard's time and nothing else, where the older path abandoned the accelerated ru
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
@@ -343,20 +344,77 @@ def _await_recoveries(results: list) -> list:
     return out
 
 
+#: Combined partial rows above which the fold is worth handing to the engine's own executor
+#: rather than running it through the translator's pandas backend.
+#:
+#: "Small by construction" is true of the fold this path was written for and false of the one a
+#: high-cardinality key produces: six shards of a 5,000,000-group aggregate hand the driver
+#: 30,000,000 rows, not six. Measured on that shape, folding 30 M rows to 5 M groups:
+#: **pandas 3.53 s, the engine's own aggregate 0.39 s -- 9.0x**, and the fold was 61-74% of the
+#: whole GPU query (`_run_shards` 3.13 s against `fold_shards` 4.87 s on `groupby-5M-wide`).
+#: The threshold exists because the engine call costs a plan build and an FFI crossing, which a
+#: six-row fold should not pay; below it the translator's backend is already the cheaper answer.
+_NATIVE_FOLD_MIN_ROWS = 1 << 20
+
+
+def _native_fold(combined: pa.Table, ops: list[dict]) -> pa.Table | None:
+    """`ops` applied to `combined` by the engine's own CPU executor, or `None` on any failure.
+
+    The fold is an ordinary relational chain over an in-memory table -- exactly what the engine
+    is for -- and the driver already holds the engine. Running it through the *device
+    translator's host backend* instead means a 30 M-row group-by executes in pandas, on one
+    core, while a multi-core Rust aggregate sits unused in the same process.
+
+    This is the same route `cpu_shard_partial` takes for a lost GPU shard, for the same reason
+    it gives: the engine is the correctness oracle, so the fold and its substitute answer one
+    question. `nest_ops` is the chain-to-plan direction of the pair that exists precisely so
+    the two forms cannot drift.
+
+    Best-effort by construction: any failure returns `None` and the caller keeps the previous
+    path, so this can only make the fold faster, never different.
+    """
+    import pyarrow as pa
+
+    from batcher._internal.native import engine
+    from batcher.plan.distribution import nest_ops
+
+    try:
+        # The **driver's** config, deliberately, not `ray_runtime.engine_config_json()`.
+        # That one folds in the ambient `SchedulingEnvelope` because it exists to be shipped
+        # into a worker task, and during a GPU query the envelope in force is the *GPU task's*
+        # grant -- a fraction of a CPU. Handing it to a fold that runs here pins rayon to that
+        # sliver: measured 26.3s against 0.43s for the identical fold on the driver's own
+        # config, which is slower than the pandas path this replaces.
+        out = engine().execute_plan(
+            json.dumps(nest_ops(ops)), [combined.to_batches()], active_config().engine_config_json()
+        )
+    except Exception as exc:  # pragma: no cover - the fold must not fail on a fast path
+        note_suppressed("dist", "fold the GPU shards on the engine's executor", exc)
+        return None
+    return pa.Table.from_batches(out) if out else None
+
+
 def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
     """Combine the shards' results, then run whatever sat above the reducer.
 
     For a folded chain this runs on one row per group (or per distinct row, or per top-N entry)
-    per shard — small by construction, which is the whole point of reducing before merging. For
-    a row-local chain `ops` is empty and this is the concatenation itself, in shard order.
+    per shard — small by construction *when the group count is*, which is what
+    `_NATIVE_FOLD_MIN_ROWS` exists to notice when it is not. For a row-local chain `ops` is
+    empty and this is the concatenation itself, in shard order.
 
-    Using the translator's own kernels keeps both halves of the algebra in one implementation.
+    Using the translator's own kernels keeps both halves of the algebra in one implementation,
+    which is why the engine fast path above is a narrow recognition that declines rather than a
+    second implementation of the fold.
     """
     import pyarrow as pa
 
     combined = pa.concat_tables(partials)
     if not ops:
         return combined
+    if combined.num_rows >= _NATIVE_FOLD_MIN_ROWS:
+        native = _native_fold(combined, ops)
+        if native is not None:
+            return native
     import pandas as pd
 
     from batcher.core.gpu_plan import DfBackend
