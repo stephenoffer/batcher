@@ -356,8 +356,25 @@ def _await_recoveries(results: list) -> list:
 #: six-row fold should not pay; below it the translator's backend is already the cheaper answer.
 _NATIVE_FOLD_MIN_ROWS = 1 << 20
 
+#: Free driver RAM, as a multiple of the partials' own bytes, required before the fold is given
+#: to the engine rather than to pandas.
+#:
+#: The engine's aggregate is faster and *hungrier*, and both halves of that are measured. On a
+#: 1,144 MiB partial set of 30,000,000 rows folding to 5,000,000 groups: **pandas 9.08s at
+#: +1,016 MiB, the engine 2.12s at +3,491 MiB** -- 4.3x the speed for 3.4x the peak. A hash
+#: aggregate over 5 M groups builds a table proportional to the group count, and it builds it
+#: per rayon worker.
+#:
+#: That is a good trade with headroom and a bad one without, and the driver is exactly where it
+#: is worst: it is the one process that also holds the query's result, and on a shared box it
+#: sits beside whatever else is resident (here, ~20 GiB of Ray spill workers on a 30 GiB node,
+#: which is what turned this speedup into an OOM kill twice before the gate existed). Below the
+#: multiple the pandas path runs, which is slower and bounded -- the same "decline rather than
+#: risk it" the device tier applies to a shard that will not fit a GPU.
+_NATIVE_FOLD_HEADROOM = 4.0
 
-def _native_fold(combined: pa.Table, ops: list[dict]) -> pa.Table | None:
+
+def _native_fold(partials: list, ops: list[dict], nbytes: int) -> pa.Table | None:
     """`ops` applied to `combined` by the engine's own CPU executor, or `None` on any failure.
 
     The fold is an ordinary relational chain over an in-memory table -- exactly what the engine
@@ -376,8 +393,11 @@ def _native_fold(combined: pa.Table, ops: list[dict]) -> pa.Table | None:
     import pyarrow as pa
 
     from batcher._internal.native import engine
+    from batcher.carbonite.memory.probe import read_available_bytes
     from batcher.plan.distribution import nest_ops
 
+    if read_available_bytes() < nbytes * _NATIVE_FOLD_HEADROOM:
+        return None
     try:
         # The **driver's** config, deliberately, not `ray_runtime.engine_config_json()`.
         # That one folds in the ambient `SchedulingEnvelope` because it exists to be shipped
@@ -385,8 +405,12 @@ def _native_fold(combined: pa.Table, ops: list[dict]) -> pa.Table | None:
         # grant -- a fraction of a CPU. Handing it to a fold that runs here pins rayon to that
         # sliver: measured 26.3s against 0.43s for the identical fold on the driver's own
         # config, which is slower than the pandas path this replaces.
+        # The partials' own batches, not a concatenation of them: `execute_plan` takes a batch
+        # list, so materializing a combined table first would copy every byte of the input for
+        # nothing (1,144 MiB on the shape above) and raise the peak this path is gated on.
+        batches = [b for part in partials for b in part.to_batches()]
         out = engine().execute_plan(
-            json.dumps(nest_ops(ops)), [combined.to_batches()], active_config().engine_config_json()
+            json.dumps(nest_ops(ops)), [batches], active_config().engine_config_json()
         )
     except Exception as exc:  # pragma: no cover - the fold must not fail on a fast path
         note_suppressed("dist", "fold the GPU shards on the engine's executor", exc)
@@ -408,13 +432,13 @@ def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
     """
     import pyarrow as pa
 
+    if ops and sum(p.num_rows for p in partials) >= _NATIVE_FOLD_MIN_ROWS:
+        native = _native_fold(partials, ops, sum(p.nbytes for p in partials))
+        if native is not None:
+            return native
     combined = pa.concat_tables(partials)
     if not ops:
         return combined
-    if combined.num_rows >= _NATIVE_FOLD_MIN_ROWS:
-        native = _native_fold(combined, ops)
-        if native is not None:
-            return native
     import pandas as pd
 
     from batcher.core.gpu_plan import DfBackend
