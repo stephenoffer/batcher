@@ -109,6 +109,62 @@ def _require_release() -> None:
     require_release_build()
 
 
+#: How long to wait for the one-task numpy probe before giving up. Short: the probe runs in
+#: the cluster image's own environment with no `runtime_env`, so it either answers at once or
+#: the cluster is too busy to tell us anything useful.
+_NUMPY_PROBE_TIMEOUT_S = 20.0
+
+
+def _cluster_numpy_major(ray) -> int | None:
+    """The numpy MAJOR version a worker imports, or `None` when it cannot be read.
+
+    Runs with no `runtime_env`, so it is answered by the cluster image itself and costs no
+    environment build -- which is the whole point, since deciding whether to *ask* for one is
+    what it is for.
+    """
+
+    @ray.remote(num_cpus=0)
+    def _probe() -> str:
+        import numpy
+
+        return numpy.__version__
+
+    try:
+        ready, _ = ray.wait([_probe.remote()], timeout=_NUMPY_PROBE_TIMEOUT_S)
+        if not ready:
+            return None
+        return int(str(ray.get(ready[0])).split(".", 1)[0])
+    except Exception:
+        return None
+
+
+def _numpy_pin_needed(ray) -> bool:
+    """Whether the workers need the driver's numpy pinned into a `runtime_env`.
+
+    **A `pip` block is never free, even when every package in it is already installed.** Ray
+    builds a virtualenv for that environment hash and resolves the requirements into it, once
+    per node a task first lands on. Measured on this 6-GPU cluster, a fan-out that touches
+    every node: the same six GPU shards took **168.1s on the first round and 0.3s on the
+    second and third** -- identical tasks, identical data, in one process. All of it was the
+    per-node build, and none of it was compute (the task bodies summed to ~1.7s).
+
+    So the pin is only worth that when it actually protects something. What it protects
+    against is the numpy **1 vs 2** boundary: Ray pickles arrays by module path and numpy 2
+    moved `numpy.core` to `numpy._core`, so a numpy-2 driver against a numpy-1 image kills
+    every actor before user code runs. That is a major-version question, and pinning the
+    driver's *exact* version asked a stricter one -- an image on 2.1.0 under a 2.2.6 driver
+    pickles fine and was paying a full environment build to be told so.
+
+    Returns True when the majors differ or the probe could not reach a conclusion. An
+    inconclusive probe keeps the old behaviour exactly, so this can cost what it cost before
+    but never more, and never introduces a failure the previous version did not have.
+    """
+    import numpy
+
+    theirs = _cluster_numpy_major(ray)
+    return theirs is None or theirs != int(numpy.__version__.split(".", 1)[0])
+
+
 def init_ray(*, env_vars: dict[str, str] | None = None, pip: list[str] | None = None) -> None:
     """Attach to the running cluster *without* shipping the working-tree Batcher.
 
@@ -128,9 +184,16 @@ def init_ray(*, env_vars: dict[str, str] | None = None, pip: list[str] | None = 
 
     if ray.is_initialized():
         return
+    # Attach first with no `pip` block, so the common case never builds an environment.
+    # The pin can only be decided by asking a worker, and asking needs a live connection.
+    base: dict[str, Any] = {"env_vars": env_vars} if env_vars else {}
+    ray.init(address="auto", runtime_env=base, logging_level="ERROR", log_to_driver=False)
+    if not pip and not _numpy_pin_needed(ray):
+        return
     runtime_env: dict[str, Any] = {"pip": worker_pip(pip)}
     if env_vars:
         runtime_env["env_vars"] = env_vars
+    ray.shutdown()
     ray.init(
         address="auto",
         runtime_env=runtime_env,

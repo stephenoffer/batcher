@@ -62,7 +62,9 @@ def _init() -> None:
     With the hook gone, `_CUDF_PIP` installs once per node and Ray Data's GPU map tasks
     find cuDF without per-op runtime_env plumbing.
     """
-    init_ray(pip=_CUDF_PIP, unconditional_hook_strip=True)
+    # `ship_batcher`: this script drives Batcher's own distributed GPU path, so the workers
+    # need the driver's build. See `_ray_env.init_ray` for what its absence costs.
+    init_ray(pip=_CUDF_PIP, unconditional_hook_strip=True, ship_batcher=True)
 
 
 def _gen_shard(path: str, n: int, groups: int, seed: int) -> int:
