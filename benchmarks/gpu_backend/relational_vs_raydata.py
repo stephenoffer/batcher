@@ -39,7 +39,18 @@ _DATA_DIR = os.environ.get("BENCH_RR_DIR", "/mnt/cluster_storage/gpu_relbench")
 _N = int(os.environ.get("BENCH_RR_N", "60000000"))
 _FILES = int(os.environ.get("BENCH_RR_FILES", "16"))
 _GROUPS = int(os.environ.get("BENCH_RR_GROUPS", "1000"))
-_CUDF_PIP = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
+# The pip set the Ray Data + cuDF arm needs on each node. Overridable, and empty is
+# meaningful: `BENCH_RR_PIP=""` says the cluster image already carries cuDF, which skips a
+# per-node venv build entirely.
+#
+# It has to be overridable because the pin is only correct for the image it was written
+# against. Pinning `numpy==1.26.4` on the workers while the driver runs numpy 2 is the exact
+# mismatch `_ray_env.worker_pip` documents as fatal -- Ray pickles arrays by module path, and
+# numpy 2 moved `numpy.core` to `numpy._core`, so every actor dies in its constructor before
+# any user code runs. Measured on this cluster: cuDF 26.06 imports and runs a group-by on a
+# worker under numpy 2.2.6 with no runtime_env at all.
+_CUDF_PIP_DEFAULT = "cudf-cu13==26.6.0,numpy==1.26.4"
+_CUDF_PIP = [r for r in os.environ.get("BENCH_RR_PIP", _CUDF_PIP_DEFAULT).split(",") if r]
 
 
 def _init() -> None:
@@ -81,7 +92,8 @@ def _ensure_data() -> str:
     per = -(-_N // _FILES)
     # An explicit per-task pip overrides the workspace hook's broken default dev-pip (a task with
     # NO runtime_env inherits that default and fails env setup); numpy is all these need.
-    gen = ray.remote(num_cpus=1, runtime_env={"pip": ["numpy==1.26.4"]})(_gen_shard)
+    gen_env = {"pip": _CUDF_PIP} if _CUDF_PIP else {}
+    gen = ray.remote(num_cpus=1, runtime_env=gen_env)(_gen_shard)
     refs = [
         gen.remote(
             os.path.join(_DATA_DIR, f"part-{i:04d}.parquet"), min(per, _N - i * per), _GROUPS, i
