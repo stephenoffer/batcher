@@ -620,9 +620,16 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     // (`checked_add` → `SumOverflow`); the wrapping convention in `eval/binary.rs` exists
     // for JIT parity on scalar arithmetic and deliberately does not extend to reductions.
     // A null row, an empty row, and an all-null row all have no values, hence null.
+    // Unsigned widths belong here too; `UInt64` does not (see `unsigned_sum_is_exact_...`).
     let int_child = matches!(
         list.values().data_type(),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
     );
     if matches!(func, ListFunc::Sum | ListFunc::Mean) && int_child {
         let child = cast(list.values(), &DataType::Int64)?;
@@ -1313,6 +1320,66 @@ mod tests {
         assert_eq!(i64s(&s), vec![Some(big + 2)]);
         // The float path would have produced this instead — pin the difference.
         assert_ne!(i64s(&s)[0].unwrap() as f64, (big as f64 + 2.0) - 1.0);
+    }
+
+    fn u32_lists(rows: &[Option<Vec<Option<u32>>>]) -> ArrayRef {
+        use arrow::array::UInt32Builder;
+        let mut b = ListBuilder::new(UInt32Builder::new());
+        for row in rows {
+            match row {
+                Some(vs) => {
+                    for v in vs {
+                        b.values().append_option(*v);
+                    }
+                    b.append(true);
+                }
+                None => b.append(false),
+            }
+        }
+        Arc::new(b.finish())
+    }
+
+    /// The same exactness, for an **unsigned** child.
+    ///
+    /// `UInt8`/`UInt16`/`UInt32` were missing from the exact-integer arm, so an unsigned list
+    /// summed through the `Float64` view and lost the low bit above 2^53 — the identical bug
+    /// `int_sum_is_exact_above_two_pow_53` pins for the signed widths, and it returned
+    /// `Float64` where the signed column of the same values returned `Int64`. Nothing caught
+    /// it because the FFI boundary widened every unsigned column to `Int64` before a kernel
+    /// could see one, so the arm was unreachable from a query rather than correct.
+    #[test]
+    fn unsigned_sum_is_exact_above_two_pow_53_and_stays_int64() {
+        // 2^53 + 1 as a sum of `u32` values: no single element needs more than 32 bits, so
+        // this is reachable for a `list<uint32>` and is exactly where `f64` starts rounding.
+        let parts: Vec<Option<u32>> = (0..(1u32 << 21) + 1).map(|_| Some(u32::MAX)).collect();
+        let expected: i64 = parts.len() as i64 * u32::MAX as i64;
+        assert!(
+            expected > (1i64 << 53),
+            "the fixture must exceed f64's exact range"
+        );
+        let a = u32_lists(&[Some(parts)]);
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(
+            s.data_type(),
+            &DataType::Int64,
+            "sum of an unsigned child is Int64"
+        );
+        assert_eq!(i64s(&s), vec![Some(expected)]);
+    }
+
+    /// A `uint8` child — the image-pixel case — sums to `Int64`, not `Float64`.
+    #[test]
+    fn uint8_sum_stays_int64() {
+        use arrow::array::UInt8Builder;
+        let mut b = ListBuilder::new(UInt8Builder::new());
+        for v in [250u8, 250, 250, 250] {
+            b.values().append_value(v);
+        }
+        b.append(true);
+        let a: ArrayRef = Arc::new(b.finish());
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(s.data_type(), &DataType::Int64);
+        assert_eq!(i64s(&s), vec![Some(1000)]);
     }
 
     /// `list_avg` keeps a Float64 *result* but must accumulate the total exactly,
