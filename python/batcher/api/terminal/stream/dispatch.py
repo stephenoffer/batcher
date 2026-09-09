@@ -487,7 +487,7 @@ def _iter_batches(
     # aggregate materialized for no reason. Deferring to it also means a future row-wise node
     # is peelable the moment it is classified once, rather than in two places that drift.
     #
-    # `Limit` is deliberately NOT peeled, though `dist.spill._peel_to_breaker` does peel it:
+    # `Limit` is deliberately NOT peeled, though `dist.spill.peel_to_breaker` does peel it:
     # that path re-applies to one materialized table, where a limit is well defined. Here the
     # re-application is per batch, and `LIMIT n` applied per batch would keep n rows from
     # EVERY batch instead of n overall. `Sort` is likewise not peeled — it is a breaker, not

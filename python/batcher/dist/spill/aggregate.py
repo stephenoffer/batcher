@@ -16,7 +16,8 @@ Pipeline (memory bounded by a single source batch + one bucket's partial state):
 Because each group key hashes to exactly one bucket, combining per bucket yields the correct
 global result — identical to the in-memory aggregation, but a group-by over more distinct
 groups than fit in RAM still completes. The scratch plumbing lives in `scratch`; the
-ordering/binary breakers that share it live in `dist.spill_breakers` (sort/join/window).
+ordering/binary breakers that share it live in `dist.spill_breakers` (sort/join/window),
+and `staging` decides which of an operator's inputs must be spilled before it runs.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from batcher.dist.spill.scratch import (
     _iter_spill_morsels,
     map_projection,
 )
+from batcher.dist.spill.staging import peel_to_breaker, stage_breaker_inputs
 from batcher.io.source import Source
 from batcher.plan.expr_ir import col
 from batcher.plan.ir_specs import agg_spec_json
@@ -75,19 +77,6 @@ __all__ = [
 ]
 
 
-def _peel_to_breaker(plan: LogicalPlan) -> LogicalPlan | None:
-    """The spillable breaker under a chain of leading row-wise/limit ops, or `None`.
-
-    Peels `Project`/`Filter`/`Limit` and returns the underlying node if it is a spillable
-    breaker (`Distinct`/`Aggregate`/`Join`/`Sort`/`Window`) — the marker that an operator's
-    input must itself be spilled out-of-core rather than streamed per batch.
-    """
-    node = plan
-    while isinstance(node, (Project, Filter, Limit)):
-        node = node.input
-    return node if isinstance(node, (Distinct, Aggregate, Join, Sort, Window)) else None
-
-
 def spill_collect(
     plan: LogicalPlan, sources: list[Source], num_partitions: int = 16
 ) -> pa.Table | None:
@@ -105,7 +94,7 @@ def spill_collect(
         # out-of-core first and aggregate its bounded result — far cheaper than the
         # value-list spill, and correct (the streaming map path would run the breaker
         # per-batch, which a `DISTINCT`/nested aggregate cannot be).
-        if _peel_to_breaker(plan.input) is not None:
+        if peel_to_breaker(plan.input) is not None:
             inner = spill_collect(plan.input, sources, num_partitions)
             if inner is None:
                 return None
@@ -155,13 +144,48 @@ def spill_collect(
         # them in one bucket -- so it rides the same path rather than a second one.
         # `supports_spilling_join` refuses the keyless form, which needs the range
         # decomposition instead.
+        # A breaker beneath *either side* is spilled first and spliced back as a staged scan
+        # -- see `_stage_breaker_inputs`. `supports_spilling_join` does not catch this: it
+        # asks whether each side names a single source, and `Join(Aggregate(Scan(0)),
+        # Scan(1))` answers yes. Measured on a 30 MiB fixture with 7 groups, the
+        # grace-partitioned join returned **28 rows for 7** -- one per (chunk, group).
         if isinstance(plan, (AsofJoin, Join)):
+            staged = stage_breaker_inputs(plan, sources, num_partitions)
+            if staged is not None:
+                return spill_collect(*staged, num_partitions)
             # A join whose side spans several sources cannot be grace-partitioned (see
             # `supports_spilling_join`); decline so the caller runs it in memory rather
             # than asserting.
             if br.supports_spilling_join(plan):
                 return br.execute_spilling_join(plan, sources, num_partitions)
             return None
+        # A breaker *underneath* the ordering breaker is spilled out-of-core first, and the
+        # sort/window then applies to its bounded result -- the same move the `Aggregate`
+        # branch above makes, for the same reason, and it was missing here.
+        #
+        # This is a wrong-answer bug, not a memory one. `stage_and_partition` runs the
+        # operator's input sub-plan **once per morsel** (`execute_plan(map_ir, [[batch]])`),
+        # which is exactly right for the linear scan/filter/project chain it was written for
+        # and silently wrong for a breaker: each morsel yields a *partial* aggregate, the
+        # partials are range-partitioned and sorted, and nothing ever combines them. Nothing
+        # in the predicate stack caught it — `supports_spilling_sort` asks whether the key
+        # can be range-partitioned and whether the input names one source, and
+        # `Sort(Aggregate(Filter(Scan)))` answers yes to both.
+        #
+        # TPC-H q1 is that shape, and it is the shape most of TPC-H ends in (`GROUP BY ...
+        # ORDER BY ...`). At sf10 under a 2 GiB envelope it returned **1,224 rows where the
+        # answer is 4** — one row per surviving per-morsel partial — with no error, and the
+        # same query uncapped returned 4. A query that gets a different answer for being
+        # short of memory is the worst failure this path can have: the envelope is exactly
+        # what changes between a laptop and a cluster node.
+        #
+        # A join beneath a sort was already safe, by way of `_single_source`: a join spans
+        # two sources, so `supports_spilling_sort` declines it. That is a true guard but an
+        # incidental one, and it does not cover the unary breakers.
+        if isinstance(plan, (Sort, Window)):
+            staged = stage_breaker_inputs(plan, sources, num_partitions)
+            if staged is not None:
+                return spill_collect(*staged, num_partitions)
         # A *computed* shuffle key — `sort(col("a") + col("b"))`,
         # `partition_by=[col("v") % 4]` — is materialized as a hidden column first, exactly
         # as the distributed dispatcher does it and through the same

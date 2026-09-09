@@ -12,6 +12,9 @@ the operator computes from one*:
 - `aggregate` — partition-and-spill aggregation and the `spill_collect` dispatcher. The
   bucket reduce and its recursion live there together, with the caller, because that is what
   keeps them one unit.
+- `staging` — which of an operator's inputs are themselves breakers, and the rewrite that
+  spills them first. Its own module because all three of sort, window and join need the
+  answer and none of them should state it twice.
 
 The import path `batcher.dist.spill` is unchanged: everything either half exposes is
 re-exported here, including the underscore-prefixed names other modules and tests already
@@ -22,7 +25,6 @@ from __future__ import annotations
 
 from batcher.dist.spill.aggregate import _MAX_SPILL_RECURSION as _MAX_SPILL_RECURSION
 from batcher.dist.spill.aggregate import _SUB_BUCKETS as _SUB_BUCKETS
-from batcher.dist.spill.aggregate import _peel_to_breaker as _peel_to_breaker
 from batcher.dist.spill.aggregate import _reduce_agg_bucket as _reduce_agg_bucket
 from batcher.dist.spill.aggregate import _split_salt as _split_salt
 from batcher.dist.spill.aggregate import (
@@ -44,15 +46,18 @@ from batcher.dist.spill.scratch import _iter_spill_morsels as _iter_spill_morsel
 from batcher.dist.spill.scratch import _make_store as _make_store
 from batcher.dist.spill.scratch import _work_dir as _work_dir
 from batcher.dist.spill.scratch import map_projection
+from batcher.dist.spill.staging import peel_to_breaker, stage_breaker_inputs
 
 __all__ = [
     "BucketWriters",
     "execute_spilling_aggregate",
     "map_projection",
     "narrow_to_stage",
+    "peel_to_breaker",
     "regrace",
     "resident_bytes",
     "spill_collect",
     "spill_scratch",
     "split_salt",
+    "stage_breaker_inputs",
 ]

@@ -1028,31 +1028,6 @@ _BREAKER_UNDER_A_SORT = {
 
 
 @pytest.mark.parametrize("shape", sorted(_BREAKER_UNDER_A_SORT))
-@pytest.mark.xfail(
-    reason="A pipeline breaker under a `Sort` that spills emits ONE FULL COPY OF ITS RESULT "
-    "PER STAGING FLUSH, never combined across them. The multiplier is exactly the flush count, "
-    "measured linear over four points (2^19 rows -> 1x, 2^20 -> 2x, 3*2^19 -> 3x, 2^21 -> 4x), "
-    "and the copies' values sum to the correct total (4976.0 + 673.0 == 5649.0). The threshold "
-    "bisects to 524,288 rows, 8 MiB at 16 B/row, so anything under one flush is correct -- "
-    "which is why every other test in this file passes. `group_by` and `distinct` duplicate "
-    "rows; the **window returns the right number of rows with wrong values** (a partition sum "
-    "of 25,147 against the correct 52,902), so that one has no shape tell at all. "
-    "Diagnosis: `spill_collect` routes a top-level `Sort` to the ordered range-partitioning "
-    "breaker whenever `supports_spilling_sort` accepts it, and that predicate inspects only "
-    "`keys[0]` and the *source* schema -- it never looks at what sits between the sort and the "
-    "source. Independent of the bucket envelope (1 GiB `spill_bucket_max_bytes`, so no bucket "
-    "is re-split, reproduces identically) and of the partition count. A `Sort` over a *join*, "
-    "and a sort keyed on a breaker's own output, are both correct -- the latter because a "
-    "derived key is not in the source schema, so the predicate declines and the ordinary "
-    "in-memory sort runs. That is also the shape of the fix: the predicate's own docstring "
-    "calls declining a graceful fallback that 'costs memory, never correctness'. Not fixed "
-    "here -- both the predicate (`dist/spill_breakers/sort.py`) and its call site "
-    "(`dist/spill/aggregate.py`) carry another session's in-flight edits. Reached without "
-    "asking for it: an 8 MiB `max_memory_bytes` reproduces it identically through both "
-    "`collect` and `iter_batches`, which is the path a memory-constrained run takes on its "
-    "own. The in-memory answers are confirmed against DuckDB.",
-    strict=True,
-)
 def test_a_spilling_breaker_under_a_sort_matches_in_memory(shape):
     """The cross-product this file was missing, and the reason the defect survived.
 
@@ -1060,6 +1035,22 @@ def test_a_spilling_breaker_under_a_sort_matches_in_memory(shape):
     *under a sort* — nor at an input large enough to stage twice, which is the other half of
     the trigger. `CLAUDE.md` names that exact shape: a green gate is not a green light,
     because nothing combined an operator with a non-default flag on a non-default path.
+
+    **This was `xfail(strict=True)` and now passes.** The session that wrote it measured the
+    defect precisely — one full copy of the breaker's result per staging flush, a multiplier
+    linear in the flush count over four points, threshold bisected to 524,288 rows (8 MiB at
+    16 B/row) — and deferred the fix because the predicate and its call site both carried
+    another session's in-flight edits. The cause was as diagnosed: `stage_and_partition` runs
+    the sort's input sub-plan once per morsel, so a breaker underneath yields uncombined
+    partials.
+
+    The fix is not the one that write-up proposed, and the difference matters.
+    `supports_spilling_sort` declining would have been correct and unbounded: the sort would
+    fall back to the in-memory kernel under the very envelope the spill exists for, so a
+    high-cardinality `GROUP BY ... ORDER BY` would trade a wrong answer for an OOM. Instead
+    `dist.spill.staging` spills the inner breaker first and splices its result back as a
+    scan, leaving the sort a linear input it can range-partition — correct *and* bounded.
+    Verified out of core at 2.59M groups over 6M rows.
     """
     n = 1_100_000  # more than two 2^19-row staging flushes
     table = pa.table(
