@@ -149,7 +149,82 @@ def _like(x, pattern: str):
         # A pattern of nothing but `%` matches every row it is given, and a null is still not
         # a row it was given: `LIKE` on an unknown is unknown.
         return x.notna().where(x.notna(), None)
-    raise Unsupported(f"like pattern {pattern!r}")
+    return _like_segments(x, prefix, middles, suffix)
+
+
+def _like_segments(x, prefix: str, middles: list[str], suffix: str):
+    """`LIKE 'p%m1%m2%s'` — the general form, as ordered literal tests with no per-row indices.
+
+    The segments must match **in order and without overlapping**, which is what makes the
+    obvious reduction wrong twice over. `contains('a') & contains('b')` accepts `"ba"`, and
+    `startswith('ab') & endswith('ab')` accepts `"ab"` for `LIKE 'ab%ab'`, which needs four
+    characters. Both are fixed here: the anchors are stripped off the string before the middles
+    are searched, and a length test rules out the overlap the anchors alone cannot see.
+
+    Deliberately **not** a regular expression. `%a%b%` is `.*a.*b.*` in three dialects — the
+    engine's Rust, the host backend's Python, and cuDF's — and none of them lets `.` match a
+    newline, while SQL's `%` does. A value carrying a newline would match on the engine and not
+    on the device: a wrong answer, on a device, that a pandas replay of the same regex would
+    reproduce rather than reveal.
+
+    Deliberately not `str.partition` either, which is the natural way to say "the part after
+    the first occurrence" and which **fails on an empty frame** (`cannot construct ChunkedArray
+    from empty vector`). A shard whose filter left no rows is an ordinary occurrence, not an
+    edge case, and it would have declined the whole query to the CPU engine.
+
+    Two middles are the most this can be exact about, and the bound is real rather than
+    conservative: locating the third would need `find` to start from a *per-row* index, which
+    neither library expresses. With two, the first occurrence of the earlier and the last
+    occurrence of the later are the widest placement available, so if any placement satisfies
+    the pattern that one does. Three or more decline to the CPU engine.
+
+    Args:
+        x: The string column.
+        prefix: The literal before the first `%`, possibly empty.
+        middles: The non-empty literals between wildcards, in order.
+        suffix: The literal after the last `%`, possibly empty.
+
+    Returns:
+        A boolean column, null where `x` is null.
+
+    Raises:
+        Unsupported: For three or more literals between wildcards.
+    """
+    if len(middles) > 2:
+        raise Unsupported(f"like with {len(middles)} literals between wildcards")
+    matched = x.notna()
+    if len(x) == 0:
+        # A shard whose filter left nothing is an ordinary occurrence, not an edge case, and
+        # `str.find` on a zero-length Arrow-backed column raises `ArrowInvalid: cannot
+        # construct ChunkedArray from empty vector` rather than returning nothing. Left to
+        # propagate that fails the shard, the fan-out recovers it on the CPU engine, and the
+        # query pays a device round trip plus a recomputation to filter no rows. `notna()` on
+        # an empty column is already the correctly-typed empty boolean answer.
+        return matched
+    if prefix:
+        matched = matched & x.str.startswith(prefix)
+    if suffix:
+        matched = matched & x.str.endswith(suffix)
+    # The anchors and the middles must all fit side by side. Without this, `LIKE 'ab%ab'`
+    # accepts `"ab"`: it starts and ends with `ab` because it *is* `ab`, and the two anchors
+    # would be reading the same two characters.
+    least = len(prefix) + len(suffix) + sum(len(m) for m in middles)
+    if least:
+        matched = matched & (x.str.len() >= least)
+    if not middles:
+        return matched.where(x.notna(), None)
+    # Search between the anchors, not across them. A negative `stop` counts from the end, so
+    # this needs no per-row length — and with the length test above the window is never
+    # inverted for a row that could still match.
+    core = x.str.slice(len(prefix), -len(suffix) if suffix else None)
+    if len(middles) == 1:
+        return (matched & core.str.contains(middles[0], regex=False)).where(x.notna(), None)
+    first, second = middles
+    # The widest placement: the earliest the first segment can sit, and the latest the second
+    # can. Any ordered, non-overlapping pair implies this one, and this one is such a pair.
+    head = core.str.find(first)
+    tail = core.str.rfind(second)
+    return (matched & (head >= 0) & (tail >= head + len(first))).where(x.notna(), None)
 
 
 def _pad(x, width: int, fill: str, *, left: bool):

@@ -162,20 +162,16 @@ def _broadcast_budget_bytes() -> float:
     because a fan-out is only as safe as the device it runs worst on. A mixed fleet planned
     against its largest device is a fleet where the small ones all fail together.
 
-    A fraction of the device's **usable** memory, not of its nameplate capacity. The replicated
-    leaves sit beside this device's own shard, the joins built above them, and the CUDA context
-    — so charging them a share of memory that includes the part nothing may allocate spends a
-    budget twice. Both suppliers report a capacity, and `device_headroom()` is what turns one
-    into the other, once.
+    The arithmetic is `DistributedConfig.device_replication_bytes`, which is where it lives
+    because Kyber needs the same number to decide whether a join broadcasts at all and the two
+    layers may not import each other. Two answers to this question is an out-of-memory on every
+    device at once.
     """
-    from batcher._internal.device_share import device_headroom
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.accelerators import cluster_gpu_memory_gb
 
     dc = active_config().distributed
-    gpu_gb = cluster_gpu_memory_gb() or dc.resolved_gpu_memory_gb()
-    fraction = min(0.9, max(0.0, float(dc.gpu_tree_broadcast_fraction)))
-    return float(gpu_gb) * 1e9 * (1.0 - device_headroom()) * fraction
+    return dc.device_replication_bytes(cluster_gpu_memory_gb() or 0.0)
 
 
 def _cluster_gpu_count() -> int:

@@ -22,6 +22,7 @@ __all__ = [
     "execute_cudf_plan",
     "execute_cudf_union",
     "join_frames",
+    "rehearsal_decline",
     "run_chain",
     "run_join",
     "run_join_frames",
@@ -30,6 +31,61 @@ __all__ = [
     "run_union_frames",
     "union_frames",
 ]
+
+
+def empty_frame(schema: pa.Schema, be: DfBackend):
+    """A zero-row frame with `schema`'s columns and types, on `be`.
+
+    Built through Arrow so the column types are the ones the translator will actually meet: a
+    frame assembled from Python types would give a `date32` column an `object` dtype and make
+    every temporal kernel look untranslatable.
+    """
+    import pyarrow as pa
+
+    return be.from_arrow(pa.Table.from_batches([], schema=schema))
+
+
+def rehearsal_decline(run) -> str | None:
+    """Run a translation on no rows and report an `Unsupported`, or `None` for anything else.
+
+    **The point is to find a decline without a device.** A GPU worker discovers an
+    untranslatable expression by raising `Unsupported` *after* it has been started, been given
+    a shard, and read it — and the caller then tries the next rung of the fallback ladder,
+    which is another worker, which raises the same thing. Measured on this six-T4 fleet at
+    TPC-H sf10: q13 and q16 spent 0.9 s per attempt to be told that `LIKE '%special%requests%'`
+    is not translated, and q7 and q17 spent 1.9 s paying for two attempts, against CPU-engine
+    answers of 0.44 s and 0.26 s. The whole of that was the cost of asking a device a question
+    the driver could answer.
+
+    A rehearsal on zero rows is that question, and it is cheap — a schema walk and an operator
+    replay over empty columns, on the order of a millisecond.
+
+    **Only `Unsupported` is a decline.** Anything else — a `KeyError` from an empty-frame edge
+    case, a library that dislikes a zero-length group-by — means the rehearsal could not reach
+    a conclusion, and the answer to that is to proceed exactly as before. A rehearsal is
+    allowed to save a round trip; it is not allowed to *cause* a fallback.
+
+    It is one-directional in the other sense too: the driver rehearses on **pandas**, whose API
+    is a superset of cuDF's, so a chain that passes here may still decline on a device. That
+    costs what it costs today. Nothing that fails here would have succeeded there.
+
+    Args:
+        run: A zero-argument callable that performs the translation on empty frames.
+
+    Returns:
+        The `Unsupported` reason, or `None` when the chain translated or the rehearsal was
+        inconclusive.
+    """
+    from batcher.core.gpu_plan.backend import Unsupported
+
+    try:
+        run()
+    except Unsupported as exc:
+        return str(exc)
+    except Exception:
+        return None
+    return None
+
 
 _LEFT = "L__"
 _RIGHT = "R__"
@@ -174,19 +230,52 @@ def _equi_join(left, right, join_ir: dict, how: str, be: DfBackend):
     # pairs up two rows an outer join was supposed to report as unmatched. Adding one
     # synthetic key component fixes every join type at once, because the merge then does the
     # rest of the work itself: an inner join drops the rows, an outer keeps them unmatched.
-    lg[_LEFT + _NULL_KEY] = _null_key_marker(lg, lkeys, side=0)
-    rg[_RIGHT + _NULL_KEY] = _null_key_marker(rg, rkeys, side=1)
-    merged = lg.merge(
-        rg,
-        left_on=[*lkeys, _LEFT + _NULL_KEY],
-        right_on=[*rkeys, _RIGHT + _NULL_KEY],
-        how=how,
-    )
+    if _null_free(lg, lkeys) and _null_free(rg, rkeys):
+        # No key column on either side holds a null, so the marker below would be `-1` on every
+        # row of both sides — a constant, matching itself everywhere, unable to change any pair.
+        # Adding it anyway makes the merge hash a **composite** key instead of a single one, on
+        # every join, forever: TPC-H's keys are all non-null, so it is pure cost on every join
+        # in the suite.
+        merged = lg.merge(rg, left_on=lkeys, right_on=rkeys, how=how)
+    else:
+        lg[_LEFT + _NULL_KEY] = _null_key_marker(lg, lkeys, side=0)
+        rg[_RIGHT + _NULL_KEY] = _null_key_marker(rg, rkeys, side=1)
+        merged = lg.merge(
+            rg,
+            left_on=[*lkeys, _LEFT + _NULL_KEY],
+            right_on=[*rkeys, _RIGHT + _NULL_KEY],
+            how=how,
+        )
     cols = {}
     for o in join_ir["output"]:
         src = (_LEFT if o["side"] == "left" else _RIGHT) + o["name"]
         cols[o["alias"]] = merged[src].reset_index(drop=True)
     return be.lib.DataFrame(cols)
+
+
+def _null_free(frame, keys: list[str]) -> bool:
+    """Whether no row of `frame` has a null in any of `keys`.
+
+    Answered from the column's own **null count**, which both libraries carry as metadata on an
+    Arrow-backed column and neither has to scan for. A backend that will not report one answers
+    `False`, which keeps the null-key marker and is the behaviour this path had before.
+
+    The marker is what makes a null key match nothing, and it is correct and necessary — but
+    when neither side has a null it is a constant on both sides, so it cannot change a single
+    pair. What it does instead is turn every merge into a **composite-key** hash join. TPC-H
+    declares no nullable key, so the whole suite paid for it.
+    """
+    for key in keys:
+        column = frame[key]
+        count = getattr(column, "null_count", None)
+        if count is None:
+            # pandas exposes it on the Arrow array behind the column rather than on the Series.
+            array = getattr(column, "array", None)
+            inner = getattr(array, "_pa_array", None)
+            count = getattr(inner, "null_count", None)
+        if count is None or int(count) > 0:
+            return False
+    return True
 
 
 def _null_key_marker(frame, keys: list[str], *, side: int):

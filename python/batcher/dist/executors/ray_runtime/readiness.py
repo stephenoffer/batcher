@@ -128,6 +128,11 @@ def _connect_or_fall_back(ray, workers: int) -> None:
 # ceiling, so a fixed-at-max cluster pays the startup grace ONCE, not per cold query. A wait
 # that grows the cluster lifts it (`_note_reached`), so real scale-up is never pinned stale.
 _reachable_ceiling: float = float("inf")
+#: The same learned bound for devices. Separate from the CPU one because the two are learned
+#: from different evidence and one must not stand in for the other: a CPU-only fleet stalling
+#: at 48 cores says nothing about its GPUs, and a GPU fleet at its maximum says nothing about
+#: how many cores the autoscaler would add.
+_reachable_gpu_ceiling: float = float("inf")
 _ceiling_lock = threading.Lock()
 
 
@@ -138,6 +143,25 @@ def _note_ceiling(best_cpus: int) -> None:
         _reachable_ceiling = min(_reachable_ceiling, float(best_cpus))
 
 
+def _note_gpu_ceiling(best_gpus: float) -> None:
+    """Record that the autoscaler stalled at `best_gpus` devices.
+
+    **A zero is never recorded.** That is the whole reason GPU waits used to learn nothing at
+    all: a fleet whose GPU node has not registered yet reports 0 devices, and capping future
+    requests at 0 would disable the accelerator for the life of the driver on exactly the
+    cluster that was about to have one. A positive stall is different evidence entirely — the
+    fleet showed its devices and stopped there — and refusing to learn from it is what made the
+    docstring's promise ("a fixed cluster pays the startup grace once, not per query") false
+    for every GPU stage: a six-device fleet asked for eight paid the full 12 s grace on *every*
+    query, forever, having already proved on the first one that the eighth device is not coming.
+    """
+    global _reachable_gpu_ceiling
+    if best_gpus <= 0:
+        return
+    with _ceiling_lock:
+        _reachable_gpu_ceiling = min(_reachable_gpu_ceiling, float(best_gpus))
+
+
 def _note_reached(cpus: int) -> None:
     """Lift a stale ceiling once capacity has climbed past it (the cluster grew/recovered)."""
     global _reachable_ceiling
@@ -146,11 +170,20 @@ def _note_reached(cpus: int) -> None:
             _reachable_ceiling = float("inf")
 
 
+def _note_gpus_reached(gpus: float) -> None:
+    """Lift a stale device ceiling once the fleet has grown past it."""
+    global _reachable_gpu_ceiling
+    with _ceiling_lock:
+        if gpus > _reachable_gpu_ceiling:
+            _reachable_gpu_ceiling = float("inf")
+
+
 def _reset_capacity_ceiling() -> None:
-    """Forget the learned ceiling (tests; and any caller that wants a fresh probe)."""
-    global _reachable_ceiling
+    """Forget the learned ceilings (tests; and any caller that wants a fresh probe)."""
+    global _reachable_ceiling, _reachable_gpu_ceiling
     with _ceiling_lock:
         _reachable_ceiling = float("inf")
+        _reachable_gpu_ceiling = float("inf")
 
 
 def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
@@ -180,13 +213,28 @@ def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
         if target_gpus <= 0:
             _note_reached(avail)
         return
+    gpus = float(topo["gpus"])
     with _ceiling_lock:
-        ceiling = _reachable_ceiling
+        ceiling, gpu_ceiling = _reachable_ceiling, _reachable_gpu_ceiling
     if avail > ceiling:
         _note_reached(avail)  # capacity climbed past the old ceiling — it is stale
-    elif target_cpus > ceiling and target_gpus <= 0:
+        ceiling = float("inf")
+    if gpus > gpu_ceiling:
+        _note_gpus_reached(gpus)
+        gpu_ceiling = float("inf")
+    # Short-circuit only when every target this wait is *still short of* has been proven
+    # unreachable. Phrased against what is unsatisfied rather than against the targets, because
+    # a GPU stage passes its device count as `target_cpus` too — so on a 48-core, 6-device fleet
+    # asked for 8 devices the CPU target is already met and `target_cpus > ceiling` is false,
+    # which would leave the whole condition false and the poll loop re-entered on every query.
+    # That is the exact form of the bug being fixed, one level down.
+    cpu_short = avail < target_cpus
+    gpu_short = gpus < target_gpus
+    cpu_hopeless = not cpu_short or target_cpus > ceiling
+    gpu_hopeless = not gpu_short or target_gpus > gpu_ceiling
+    if cpu_hopeless and gpu_hopeless:
         return  # a prior wait proved this is unreachable — don't re-discover it
-    _await_autoscale(target_cpus, avail, target_gpus, float(topo["gpus"]))
+    _await_autoscale(target_cpus, avail, target_gpus, gpus)
 
 
 def _await_autoscale(
@@ -254,8 +302,11 @@ def _await_autoscale(
             stalled = True
             break  # nothing is coming (never started, or grew then stopped)
     # A CPU-only wait that stalled below its target has learned a ceiling; one that reached
-    # (or grew past a stale ceiling) lifts it. GPU waits don't participate — a 0-GPU snapshot
-    # before a GPU node boots must not cap future GPU requests.
+    # (or grew past a stale ceiling) lifts it. The device half is learned separately below,
+    # under the one rule that makes it safe: a **zero** is never recorded, because a 0-GPU
+    # snapshot before a GPU node boots must not cap future GPU requests. Excluding GPU waits
+    # entirely, which is what this did, made the docstring's promise ("a fixed cluster pays the
+    # startup grace once, not per query") false for every GPU stage.
     #
     # A wait cut short by the *lease* has learned nothing about the cluster. It ran out of
     # time, which is a fact about this job, not about how far the autoscaler will go — and
@@ -268,4 +319,12 @@ def _await_autoscale(
             _note_reached(avail)
         elif not truncated:
             _note_ceiling(int(best[0]))
+    # The device half, learned on the same evidence and with the same truncation rule. A zero
+    # is never recorded (see `_note_gpu_ceiling`), which is what makes learning here safe on the
+    # cluster the old GPU exclusion was protecting: one whose GPU node has not registered yet.
+    if target_gpus > 0:
+        if reached or avail_gpus >= target_gpus:
+            _note_gpus_reached(avail_gpus)
+        elif not truncated:
+            _note_gpu_ceiling(best[1])
     return avail

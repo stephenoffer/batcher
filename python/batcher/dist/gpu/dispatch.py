@@ -33,8 +33,55 @@ __all__ = [
     "gpu_join_on_worker",
     "gpu_tree_on_worker",
     "gpu_union_on_worker",
+    "rows_already_on_driver",
     "whole_source_descriptor",
 ]
+
+
+def rows_already_on_driver(source: Source) -> bool:
+    """Whether `source`'s rows are in this process by construction — an in-memory relation.
+
+    The gate on the translator's last-resort "ship the table" path, and it exists because that
+    path was reached by *inference* rather than by asking. `gpu_chain_on_worker` and its
+    siblings return `None` for two unrelated reasons — the source is in-memory and there is
+    nothing to describe, or the dispatch to a worker **failed** — and the caller read both as
+    the first. So a device that ran out of memory on a 15M-row relation was answered by
+    `list(source.read())` on the driver: the whole relation staged in the smallest process in
+    the cluster, which is precisely what the descriptor mechanism exists to avoid.
+
+    It is not a hypothetical. On a 30 GB head node, TPC-H q4 and q14 at sf10 were **SIGKILLed
+    by the kernel** — no traceback, no fallback, the query simply gone — and a join whose device
+    dispatch declined took 6.3 s against the CPU engine's 0.44 s for the same answer.
+
+    Asking directly is cheap and cannot be wrong: a relation with locator splits has its rows in
+    storage, and one with a `WholeSourceSplit` is carrying them.
+
+    Args:
+        source: The relation to classify.
+
+    Returns:
+        True when reading `source` on the driver stages nothing that was not already here.
+        False for anything with real splits, and for a source that cannot be split at all —
+        the conservative answer, since the cost of guessing wrong is an OOM.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.dist.gpu.dispatch import rows_already_on_driver
+            >>> from batcher.io import InMemorySource
+            >>> rows_already_on_driver(InMemorySource([pa.record_batch({"x": [1, 2]})]))
+            True
+    """
+    from batcher.dist.executors.partition_io._sources import _scan_splits
+    from batcher.io.splits import WholeSourceSplit
+
+    try:
+        splits = _scan_splits(source, 1)
+    except Exception as exc:
+        note_suppressed("dist", "ask whether a source's rows are on the driver", exc)
+        return False
+    return len(splits) == 1 and isinstance(splits[0], WholeSourceSplit)
 
 
 def await_gpu_admission(devices: float = 1.0) -> bool:
@@ -147,6 +194,13 @@ def whole_source_descriptor(source: Source, projection: list[str] | None = None)
 def gpu_chain_on_worker(source: Source, ops: list[dict]) -> pa.Table | None:
     """Run a translated chain on one GPU worker that reads `source` itself.
 
+    The read is narrowed to the columns the chain names. `whole_source_descriptor` has taken a
+    projection all along and this call did not pass one, so the single-device path read the
+    relation **whole**: measured on ClickBench, whose `hits` table has 105 columns, every query
+    that reached this rung moved all of them onto one board to answer a two-column question, and
+    took 10.5 s doing it against the CPU engine's 0.07 s. It is the same defect the sharded
+    aggregate had, on the path that is reached when sharding declines.
+
     Args:
         source: The scan's source.
         ops: The bottom-up operator IR chain.
@@ -155,11 +209,12 @@ def gpu_chain_on_worker(source: Source, ops: list[dict]) -> pa.Table | None:
         The chain's result, or `None` when the source cannot be described to a worker or the
         dispatch failed — the caller then ships the table itself, or uses the CPU engine.
     """
-    descriptor = whole_source_descriptor(source)
-    if descriptor is None:
-        return None
+    from batcher.core.gpu_plan.pruning import chain_projection
     from batcher.dist.gpu.tasks import gpu_shard_partial
 
+    descriptor = whole_source_descriptor(source, chain_projection(ops))
+    if descriptor is None:
+        return None
     return _remote(gpu_shard_partial, descriptor, ops)
 
 
@@ -188,12 +243,15 @@ def gpu_join_on_worker(
         The join's result, or `None` when either side cannot be described to a worker or the
         dispatch failed.
     """
-    ldesc = whole_source_descriptor(left)
-    rdesc = whole_source_descriptor(right)
-    if ldesc is None or rdesc is None:
-        return None
+    from batcher.core.gpu_plan.pruning import chain_projection
     from batcher.dist.gpu.tasks import gpu_join_task
 
+    # Each side reads only what its own pre-join chain names. Unnarrowed — which is how this
+    # read — a fact table's every column crosses onto the device to be joined on two of them.
+    ldesc = whole_source_descriptor(left, chain_projection(left_ops))
+    rdesc = whole_source_descriptor(right, chain_projection(right_ops))
+    if ldesc is None or rdesc is None:
+        return None
     return _remote(gpu_join_task, ldesc, rdesc, left_ops, right_ops, join_ir, ops)
 
 
@@ -212,11 +270,15 @@ def gpu_union_on_worker(
         The union's result, or `None` when any input cannot be described to a worker or the
         dispatch failed.
     """
-    descriptors = [whole_source_descriptor(s) for s in sources]
-    if any(d is None for d in descriptors):
-        return None
+    from batcher.core.gpu_plan.pruning import chain_projection
     from batcher.dist.gpu.tasks import gpu_union_task
 
+    descriptors = [
+        whole_source_descriptor(source, chain_projection(chain))
+        for source, chain in zip(sources, input_ops, strict=True)
+    ]
+    if any(d is None for d in descriptors):
+        return None
     return _remote(gpu_union_task, descriptors, input_ops, distinct, ops)
 
 

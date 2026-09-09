@@ -1,5 +1,569 @@
 # Batcher CPU benchmark results
 
+## GPU batch inference vs Ray Data and Daft: 2.4x and 5.4x, not 10x (2026-09-06)
+
+**Fleet.** The same 6 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB each) plus a 30 GiB head node.
+Corpus: 110x110 RGB JPEGs of ~5 KiB on S3. Harness:
+`benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py`.
+
+Every engine builds the identical seeded network, moves it onto a device once per actor, and
+scores the corpus through a pool of one actor per GPU with the same batch size. cupy rather than
+torch, because these workers carry cupy and cuDF and no torch; the scorer is dense matrix
+multiplication either way. Each arm ends in a count and a sum, so no engine is charged a
+transfer the others are not, and the returned checksum gates the timing.
+
+| images | Batcher | Ray Data | Daft | vs Ray | vs Daft |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | **5.99 s** | 10.49 s | 13.24 s | 1.75x | 2.21x |
+| 100,000 | **18.72 s** | 44.19 s | 101.10 s | **2.36x** | **5.40x** |
+
+All three agree: 100,000 rows, checksum spread 0.15% — the JPEG-decoder difference the CPU
+benchmark already measures at 0.09%, amplified by a dense network, not a difference in work.
+
+**It is not 10x, and the reason is that this workload is not about the accelerator.** At
+100,000 images the model accounts for **2.74 s of Batcher's 18.72 s — 15%**. The rest is
+per-object S3 reads, JPEG decode and scheduling, which no device touches and which all three
+engines do on CPUs. A ratio between two engines running the identical kernel on the identical
+devices is a ratio between their IO and their schedulers.
+
+Where the margin actually is: **read + decode + reduce, no model at all, is 1.31 s against Ray
+Data's 11.95 s — 9.1x** (10,000 images, identical checksums). That is the number the inference
+figures are diluted from, and it is the honest form of the claim.
+
+### A GPU stage will not place after an ordinary CPU query, and waits forever
+
+Found while measuring whether Batcher overlaps its read with its inference. Reproducible, fully
+characterized, **not fixed** — the mechanism was not pinned down, and this file already carries
+one entry today about acting on an inferred cause.
+
+One variable: whether an ordinary CPU query ran earlier in the same driver process. Same corpus
+(1,000 images), same GPU query, same fleet.
+
+| arm | result |
+|---|---|
+| the GPU inference query alone | **7.94 s**, 1,000 rows |
+| an ordinary CPU query first, then the identical GPU query | **never places** |
+
+The stalled arm reports, every two minutes and indefinitely:
+
+```
+distributed barrier has waited 120s with 0/6 tasks finished cluster CPU 42/48 in use;
+6 outstanding at 6.144 CPU, 1 GPU, 29.2 GB each, and 1 candidate node(s) have 1 CPU free
+```
+
+What holds the cores is measured rather than guessed — `ray.available_resources()` sampled
+around a CPU query that has already returned its answer:
+
+| moment | free CPU |
+|---|---:|
+| before any query | 48.0 / 48 |
+| immediately after `collect()` returns | **6.0 / 48** |
+| +15 s | 6.0 / 48 |
+| +30 s | 6.0 / 48 |
+| +60 s | 48.0 / 48 |
+
+So the CPU query's fleet is retained for something between 30 and 60 seconds after the query is
+over — reasonable on its own, since the next query would otherwise pay startup — and a GPU stage
+submitted inside that window asks for about six cores per device and can never get them. Two
+things are wrong and they are separable: an **accelerator** task reserving host cores it does not
+use (`_gpu_options` documents zero as the honest request and exists to escape exactly this), and
+a barrier that waits forever rather than degrading when the reservation cannot be met.
+
+It does not show up in the benchmark above because that harness runs one engine per driver
+process. It shows up the moment a real pipeline reads with the CPU engine and then infers, which
+is the ordinary shape.
+
+**Two hypotheses were tested and discarded before this was written.** It is not a leaked
+placement group: `placement_group_table()` reports zero live groups after the CPU query. And the
+GPU pool's actors do ask for zero CPU — `_gpu_options` sets it and `_pool_placement_envelope`
+matches the bundle to it — so the six-core demand is coming from somewhere else, and the
+`_map_agg_task` submission that carries no accelerator options is a candidate rather than a
+conclusion.
+
+### Two harness defects found by disbelieving the first result, both mine
+
+The first version of this benchmark reported Batcher at **0.34x Ray Data** — three times
+*slower*. Both causes were in the harness, and the second is the more instructive.
+
+**The batch format was doing all the work.** Batcher's arm took `batch_format="pyarrow"` and
+called `.to_pylist()`, building one Python list of 36,300 integers per image, while Ray Data's
+arm received a zero-copy tensor block. Same query, same checksum, only the format differing:
+**25.95 s against 1.28 s, 20x.** That single line was the entire reported gap and more.
+
+The trap is that it looks like an engine result. Both arms ran, both returned the right answer,
+and the slower one was slower for a reason a reader would naturally attribute to the engine. The
+fix is not "use the fast format for Batcher" — it is that **both arms must be written the way
+their own documentation writes them**, which for both is an array and not a Python object per
+row. Ray Data's arm had the same defect in a milder form (`list(b["image"])`) and was corrected
+in the same change.
+
+**The width knob was inert.** `BENCH_INFER_FLOPS` scales the network so the balance can be moved
+onto the device, and it was read *inside the actor* — a different process on a different machine,
+which does not inherit the driver's environment. So it silently returned the default, and a
+sweep at x1 and x8 reported the model at 1% of the workload both times. That reads as a finding
+about the corpus and was a finding about the harness. The width is now passed in.
+
+Two smaller ones worth stating because they cost real time: a first attempt to measure the read
+alone used `agg(n=count())`, which Batcher answers from the file listing without opening a file
+— it returned "3,985,702 img/s" and measured nothing. And the workers' cupy is built for CUDA 12
+against a CUDA 13 image, so every arm died on `libnvrtc.so.12` until the staged RAPIDS tree's
+CUDA 12 libraries were put on the workers' library path — for all three engines equally.
+
+## TPC-H on 6 GPUs: the device tier went from 0.41x the CPU engine to 2.89x, and stopped killing the driver (2026-09-06)
+
+**Fleet.** 6 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB each; 48 cores and 6 devices in total)
+plus a 30 GiB CPU-only head node, driver on the head. TPC-H **sf10** read as Parquet from a
+shared NFS mount, so both arms read the same bytes from the same place.
+
+**Both arms run on the same six nodes**, so the wall-clock ratio *is* the cost ratio: nothing is
+rented for one arm that is not rented for the other.
+
+Harness: `benchmarks/gpu_backend/cluster_suite.py`, one child process per query, best of 3 after
+a discarded warm-up, every GPU answer compared against the CPU engine's as a multiset before its
+timing is kept.
+
+### The headline
+
+| | before | after |
+|---|---:|---:|
+| queries that reached a device | 16 / 22 | **18 / 22** |
+| queries faster on the GPU | 3 / 19 | **15 / 21** |
+| speedup, median | 0.41x | **2.13x** |
+| speedup, best | 1.43x | **11.66x** |
+| total wall time over the 21 queries both arms answered | — | **14.62 s CPU → 5.47 s GPU (2.67x)** |
+| the same under `backend="auto"`, which is what a user writes | 1.00x (it used no device at all) | **14.62 s → 5.07 s (2.89x)** |
+| queries that SIGKILLed the driver | 2 | **0** |
+
+The four that still decline (q4, q13, q15, q20) are shapes this tier refuses rather than
+approximates — see "Still open". The *before* column reached 16 by running four of them badly
+enough to kill the driver twice.
+
+Per query, warm (best of 3), `x` is CPU/GPU:
+
+| q | cpu s | gpu s | x | | q | cpu s | gpu s | x |
+|---|---:|---:|---:|---|---|---:|---:|---:|
+| q1 | 0.227 | 0.200 | 1.14 | | q12 | 1.260 | 0.269 | **4.68** |
+| q2 | 0.470 | 0.184 | 2.55 | | q13 | 0.498 | 0.515 | 0.97 |
+| q3 | 0.333 | 0.189 | 1.76 | | q14 | 1.796 | 0.154 | **11.66** |
+| q4 | 0.349 | 0.413 | 0.85 | | q15 | 0.023 | 0.040 | 0.57 |
+| q5 | *CPU arm fails* | 0.748 | — | | q16 | 0.849 | 0.270 | 3.14 |
+| q6 | 0.068 | 0.209 | 0.33 | | q17 | 0.284 | 0.240 | 1.18 |
+| q7 | 0.474 | 0.191 | 2.48 | | q18 | 1.567 | 0.272 | **5.76** |
+| q8 | 0.606 | 0.206 | 2.94 | | q19 | 0.141 | 0.601 | 0.23 |
+| q9 | 0.523 | 0.245 | 2.13 | | q20 | 0.368 | 0.399 | 0.92 |
+| q10 | 1.013 | 0.184 | **5.51** | | q21 | 2.836 | 0.485 | **5.85** |
+| q11 | 0.135 | 0.088 | 1.53 | | q22 | 0.798 | 0.112 | **7.12** |
+
+**Read the ratios, not the third decimal.** Two complete runs of this suite an hour apart put
+q3 at 1.50x and 2.44x and q9 at 1.80x and 1.60x, on an idle fleet, with the same binary. The
+suite total moved 2.14x to 2.24x. Anything under about 1.3x here is noise about a query the
+device neither wins nor loses.
+
+### What was actually wrong, in the order it mattered
+
+**The driver was reading whole relations into itself.** `_translated`'s last rung ships the
+table from the driver, which is correct for an in-memory source and catastrophic for a stored
+one — and it was reached by *inferring* "in-memory" from the rung above returning `None`, which
+that rung also does when a worker dispatch **fails**. So a device that ran out of memory was
+answered by `list(source.read())` on a 30 GiB head node. TPC-H q4 and q14 at sf10 were
+**SIGKILLed by the kernel**: no traceback, no fallback, the query gone. `rows_already_on_driver`
+asks the question instead of inferring it.
+
+**Every reduction was a separate group-by pass.** The translated `aggregate` issued
+`grouped[c].sum()`, then `grouped[c].mean()`, and so on, and each is a full hash group-by on the
+device. q1 has eight reductions and two key labels, so a 10 M-row shard was grouped **ten
+times**: 0.25 s of a 0.40 s shard on a T4, against 0.12 s to read the shard off storage. Fused
+into one `agg` call it is 0.097 s.
+
+**Every join plan was routed as though one device were enough for it.** `is_shardable` asked
+`shard_plan(flatten_ops(...))`, and `flatten_ops` cannot flatten a branch — so a plan containing
+a join answered `False` and the router sized it for a single board whatever the fleet had.
+`ir_divides` answers the whole question: the chain above the outermost branch must fold *and*
+some leaf must be safe to split.
+
+**And the working set it was sized against was the join's output.** The estimate descended the
+reducing nodes and stopped at the first node below them — which is a projection, above the join,
+whose cardinality the estimator is least reliable about. It reported **one row** for q14 and q17
+and ten for q3. `_processed` sums a join's inputs and walks through every single-input node to
+find the branch.
+
+**The replication ceiling was a CPU's L3 cache.** `broadcast_join` asked `adaptive_build_side`
+with no threshold, which resolves to `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)`
+— the 4 MiB fallback. On a 15 GB board that is wrong by three orders of magnitude, and it
+refused the fan-out for build sides of a couple of hundred megabytes.
+
+Raising it needed two guards, and getting the *first* version of them wrong is the useful part
+of this entry. A ceiling only answers "does it fit"; q4 (`orders SEMI lineitem`, 573 K probe rows
+against 30 M build rows) fits a T4 many times over and gains nothing from being split — six
+devices each read thirty million rows and finish when one would have. Measured: **23.1 s**. The
+first rule written for that compared *aggregate bytes* — `probe > build x devices` — and it is
+the wrong objective, because the devices read concurrently: per device the shapes are
+`build + probe/N` against `build + probe`, so replicating is never slower than the single device
+it replaces. That rule then refused q14, whose 0.48 GB build side against a 1.68 GB probe is
+exactly the case the fan-out exists for, and turned **12.4x into a decline**. The rule that
+survives is "the fan-out must divide more than it replicates" (probe > build), with the executor
+separately re-checking that the *measured* build side fits — which is where q12's estimate-driven
+15.4 GB replication against a 4.8 GB budget is caught.
+
+**Pruning narrowed what an operator declared and not what it did.** The module states the rule
+for joins — narrow the output list and the inputs together — and applied it to nothing else. A
+projection above a join carrying an expression nothing upstream reads had that expression
+correctly dropped from the want-set, the join's output correctly narrowed to match, and then
+evaluated it anyway against a frame the column had just been pruned out of. q7 died on
+`column 'c_nationkey' absent from the GPU frame` and q17 on `'p_partkey'` — each after a full
+round trip to a worker *plus* a second to the single-device retry, 1.9 s and 3.2 s against CPU
+answers of 0.46 s and 0.26 s.
+
+**Multi-wildcard `LIKE` was declined.** `LIKE '%special%requests%'` is q13's filter and q16's.
+Translating it has two ways to be silently wrong — the segments must match in order (so
+`contains(a) & contains(b)` accepts `"ba"`) and without overlapping (so `LIKE 'ab%ab'` needs four
+characters) — and a regex spelling has a third: `.` excludes a newline in the engine's Rust, in
+pandas and in cuDF, while SQL's `%` spans one.
+
+**Nothing could say whether a device had run.** `backend="gpu"` falls back silently by design,
+so the only signal is the running time — which is how a tier that has stopped translating
+anything looks identical to one that is merely slow. The ledger in
+`api/terminal/gpu_backend/audit.py` is what turned "22 timings" into "18 reached a device, and
+here is why the other four did not", and it is what found the next two entries.
+
+### And what the fleet was not doing
+
+**No worker had NVML**, so `gpu_inventory()` was empty and *every* device-memory decision sized
+against nothing: no RMM pool was built, an overflowing shard was subdivided blind, and the frame
+cache below had a budget of zero. cuDF and CUDA were both present; `pynvml` simply was not.
+`visible_device_usable_bytes` now falls back to the CUDA runtime's own `cudaMemGetInfo`, which is
+there wherever the device is.
+
+**The node's fabric was re-measured on every query.** `node_collective_env` walks `/sys`,
+enumerates the RDMA devices and prices every device-to-NIC pair — 10 ms on this head node — and
+`gpu_task_options` calls it on every fan-out, twice more when the shards are packed. It
+describes hardware, so it is read once.
+
+### The one that changes the argument
+
+**A decoded shard now stays on the device between queries.** The read is the larger half of a
+device query and the one a repeat need not pay. Measured on a T4 against a 10 M-row shard of
+`lineitem` projected to six columns:
+
+| | cold | warm |
+|---|---:|---:|
+| read the shard onto the device | 0.403 s | **0.0001 s** |
+| filter + eight-way aggregate | 0.161 s | 0.071 s |
+
+The kernel halves too, because it is the RMM pool — which needed the NVML fix to exist at all.
+
+It only pays if the shard comes back to the worker holding it, and Ray places a stateless task
+wherever a device is free: with six shards over six nodes that is one time in six.
+`shard_node_affinity` maps each shard to a node by a digest of *what it reads*, so the mapping
+survives a change in shard count and agrees across driver processes — `hash()` would not, being
+salted per process.
+
+Both are given back on a device out-of-memory, in the process that overflowed, before the
+driver's ladder answers an overflow by re-reading each piece from storage.
+
+### The routing was the last thing in the way, and it was the biggest
+
+Everything above makes the device *faster*. None of it reaches a user who writes
+`backend="auto"`, which is what a user writes — and on this fleet `auto` used the device for
+**nothing at all**. The reason was one line of cost model:
+
+```
+T4 would run this at 0.53x the CPU once the host copy is charged
+(97% of device time is transfer): CPU wins
+```
+
+That verdict was returned for *every* TPC-H query at sf10, including the ones measured at 2.3x.
+The model charges the decoded working set as a host-to-device copy, which is the right model for
+a frame the driver hands a device and the wrong one for this tier: `dist/gpu/device_read.py`
+exists precisely to remove that copy — cuDF decodes Parquet **on the device**, so what crosses
+PCIe is the compressed file, and on a frame-cache hit nothing crosses at all.
+
+The veto now applies only where the host is actually in the path (`io.splits.device`'s
+`reads_on_device`, asked of every scan in the plan). The direction of the conservatism is what
+makes it safe: skipping it wrongly costs a device attempt that falls back to the CPU engine, and
+applying it wrongly costs the accelerator entirely — which is what it had been doing.
+
+### The driver folded the shards in pandas, on one core, next to an idle engine
+
+The fan-out's last step combines each shard's partial on the driver. That was handed to the
+engine's own executor only above 1,048,576 combined rows, on the reasoning that a plan build and
+an FFI crossing are not worth paying for a small fold. Measured, the reverse holds — the
+*pandas* path carries the larger fixed cost, because it constructs a `DfBackend` and converts
+Arrow to pandas and back:
+
+| combined rows | pandas | engine | x |
+|---:|---:|---:|---:|
+| 60 | 3.33 ms | 0.25 ms | 13.2 |
+| 6,000 | 3.68 ms | 0.39 ms | 9.3 |
+| 60,000 | 5.12 ms | 1.13 ms | 4.6 |
+| 240,000 | 15.23 ms | 4.21 ms | 3.6 |
+
+Best of five per point, six shards, group count a quarter of the rows. There was no measured
+size at which pandas won, on an 8-byte key or a 40-byte string one.
+
+**But the interesting failure is the other side of the gate**, because a row count is not what a
+fold costs. ClickBench q12 groups on `SearchPhrase`; six shards hand the driver **783,737 rows**
+— comfortably *under* the threshold — carrying a string key, so those rows are **178 MiB**,
+twenty times what a numeric key of that length would weigh. The fold took **2.63 s of a 3.02 s
+query, 87% of it**, on the wrong side of a gate reading the wrong quantity:
+
+| | before | after |
+|---|---:|---:|
+| cb-q12 total | 3.020 s | **0.436 s** |
+| ... of which the fold | 2.626 s | 0.089 s |
+| cb-q14 total | 3.455 s | **0.521 s** |
+| ... of which the fold | 3.043 s | 0.156 s |
+
+Across the whole ClickBench suite that is 0.54x to **0.92x** forced onto the device, and 0.64x
+to **0.91x** under `auto`. The gate is gone rather than retuned: the engine fold already
+declines to `None` on anything it cannot express, so the caller keeps the pandas answer and the
+widened range cannot change a result, only its cost.
+
+### ClickBench: the device is the wrong tool here, and `auto` nearly says so
+
+43 queries over `hits` at 8 M rows (950 MB of Parquet, 105 columns), same fleet, same harness.
+
+**39 of 43 reached the device and all 39 matched the CPU engine.** The four that did not: two
+are answered from metadata before any backend is chosen, one is a correlated shape the tree
+translator declines, and q28's regex uses a group reference, which this tier declines rather
+than pick between three regex dialects.
+
+The suite totals 0.92x forced and 0.91x under `auto` — parity, not a win, and that is the honest
+answer for this shape. The whole table is 950 MB and most queries are tens of milliseconds of
+CPU work across 48 cores, which a six-way device fan-out cannot dispatch inside. Two queries
+carry almost all of the remaining deficit, and both are shapes where the device materializes
+nearly as much as it reads: **q23** (`SELECT *` filtered by `URL LIKE '%google%'`, 1,620 bytes
+per row against ~40 for its neighbours) costs +1.82 s, and **q32** (`GROUP BY WatchID, ClientIP`
+— a near-unique key, so 8 M groups from 8 M rows) costs +1.16 s. Together they are 2.98 s of a
+3.30 s total loss. Both are shard-side: their folds are now 5 ms and 475 ms.
+
+Two defects surfaced here and are fixed above: seven queries filtered
+`EventDate >= '2013-07-01'` and reached a device only to raise on comparing a `date32` column
+with a Python `str`; and the single-device rung read all **105** columns to answer a two-column
+question, which is what made the eight `COUNT(DISTINCT)` queries take 10.5 s against the CPU
+engine's 0.07 s.
+
+### The crossover learner closes the loop, once, and then stops
+
+q23 is the query `auto` should decline, and nothing above teaches it to — the veto is scoped, the
+size floors are cleared, and the estimator's row count says nothing about a 1,620-byte row. What
+*can* teach it is the thing that is supposed to: Core measures the two backends, Kyber consumes
+the measurement on the next run.
+
+Four consecutive passes over the seven queries, one child process per query, sharing a SQLite
+`MetadataHub` (`BENCH_METADATA_URI`) so the measurements outlive the process that took them:
+
+| pass | `auto` used a device for | total vs CPU |
+|---|---|---:|
+| 1 | q03 q08 q09 q12 q20 q23 q32 | 0.59x |
+| 2 | q03 q08 q09 q12 q20 q32 | **0.85x** |
+| 3 | q03 q08 q09 q12 q20 q32 | 0.86x |
+| 4 | q03 q08 q09 q12 q20 q32 | 0.85x |
+
+These are the **re-run** figures. The first version of this table was taken before the harness
+defect two sections below was found, so every pass in it had the driver's GPU configuration
+silently reverted. It reported 0.58 / 0.83 / 0.82 / 0.84 and the same routing at every pass —
+close enough that the conclusion is unchanged, which is luck rather than method. Numbers taken
+through a harness with a known defect get re-taken, not reasoned about.
+
+It learns q23 — the largest single loser — after one exposure and then holds, which is the
+behaviour to want: it did not oscillate, and it did not give back q08 and q09 at 2.3x and 2.1x.
+It does **not** learn q32, and the reason is structural rather than a tuning miss:
+`learned_gpu_min_rows` clamps to `[default/8, default x 8]`, and q32's row count is above the
+top of that band, so no amount of evidence moves the threshold past it.
+
+**This is off by default and the default is the problem.** `metadata.backend` is `in_process`,
+so a fleet that measures its own devices forgets it when the driver exits. Within a session the
+loop closes; a batch job is one session.
+
+### At sf100 the tier mostly stops engaging, and that is the honest scaling story
+
+Same fleet, same harness, TPC-H **sf100** (40 GB of Parquet, `lineitem` 600 M rows) with two
+timed repeats and a 420 s per-query bound.
+
+| | sf10 | sf100 |
+|---|---:|---:|
+| reached a device | 16 / 22 | **4 / 22** |
+| declines | 6 | **13** |
+| exceeded the per-query bound | 0 | 5 |
+| matched the CPU engine | 16 / 16 | **4 / 4** |
+| total over the queries both arms answered | 2.24x | 1.19x |
+
+The 1.19x is not a win worth quoting: thirteen of the seventeen timed queries declined, so both
+arms ran the same CPU engine and contributed a ratio of ~1.00 each. What the suite actually says
+is the coverage row. The four that ran:
+
+| q | cpu s | gpu s | x |
+|---|---:|---:|---:|
+| q1 | 2.991 | 9.061 | 0.33 |
+| q6 | 1.183 | 3.866 | 0.31 |
+| q7 | 11.622 | 5.089 | **2.28** |
+| q11 | 2.785 | 0.252 | **11.05** |
+
+Two things to take from that split. A query that **reduces before it scales** keeps its win:
+q7 joins and then aggregates, and goes 2.58x at sf10 to 2.28x here — essentially unchanged
+across a tenfold increase, which is the property that matters. A query that **scans all of
+`lineitem`** loses, and loses worse than at sf10 (q1 1.12x to 0.33x, q6 0.33x to 0.31x): six
+devices reading 600 M rows are up against 48 CPU cores reading the same NFS mount, which per
+node is one device against eight cores.
+
+q11's 11.05x is in the table for completeness and should not be quoted. Its sf100 result is
+**zero rows** on both arms — the query's `HAVING` threshold scales with the relation — so the
+ratio is two different ways of finding nothing.
+
+**The declines are the story, and they have one cause.** Every one of the thirteen is a join
+whose fan-out is broadcast-the-build-side, refused at sf100 because the build side no longer
+fits a device — after which `_one_device_is_enough` correctly says one T4 cannot hold the pair
+either. Traced per query, the sequence is identical: the rehearsal passes, `_try_sharded_join`
+declines, the single-device gate declines. q2 and q3 reached a device at sf10 for 2.32x and
+1.50x and decline here for exactly that reason. **A device-side hash-partitioned join is the
+one feature standing between this tier and sf100**, and the sf10 numbers are what it would be
+worth.
+
+Treat sf10 as the measured claim and sf100 as the measured limit. Do not quote the sf100 total
+as a speedup.
+
+### An IO hypothesis that was wrong, recorded so it is not re-run
+
+A shard descriptor carries two or three row groups from each of ~50 different files, and a first
+probe made that look like the bottleneck: reading those splits one call at a time took 0.99 s
+against 0.30 s across eight threads, **3.3x**, and it survived a page-cache control (disjoint
+file sets per worker count, then the sweep repeated with the sets rotated).
+
+It is not a defect, because `device_read._read_parquet` **does not read one call at a time**. It
+hands every split's path and row-group list to a single `cudf.read_parquet`, which fetches them
+concurrently inside one call. The probe's serial arm was a shape the product does not have.
+
+Two things are worth keeping from the detour. The **first** version of the measurement, which
+swept worker counts over the same files in increasing order, reported 6.6x and was entirely the
+NFS page cache warming across the sweep — the same confound this file records for the CPU
+Parquet reader ("whichever reader goes first pays connection setup the rest inherit"). And the
+effect of threading **reverses with the split shape**: on whole-file reads, where cuDF already
+parallelizes row groups inside the call, eight threads made it *worse* (0.84 s to 1.70 s). So an
+unconditional thread pool over splits would have been a regression on the common shape, bought
+with a measurement of a shape that does not occur.
+
+### The device tier's own gate: `gpu_shadow_verify` on hardware
+
+`.claude/rules/device-tier.md` requires a run with `distributed.gpu_shadow_verify=True` on real
+hardware for any change under `core/gpu_plan/`, with the clean result recorded here. Shadow
+verification re-runs every device result on the CPU engine and compares schema first, then
+values — the only oracle for *values* a device has.
+
+Across both suites, 65 queries, 55 of which reached a device:
+
+    verified 55 clean of 55 that reached a device, 65 queries
+
+### The fan-out replicated whichever side the plan put on the right, and that is not the small one
+
+The most valuable defect found here, because it made the device tier get **worse the longer a
+fleet ran** and did it silently, on the path where the user explicitly asked for a GPU.
+
+TPC-H q14 ran at 12.2x on two consecutive suite passes and declined on a third with the same
+binary. The variable was the learned-statistics hub, and the routing is deterministic on either
+side of it — four forced-`backend="gpu"` runs each way. The fan-out splits the probe side and
+copies the build side to every device, and `dist/gpu/join.py` took the build side to be whatever
+the plan put on the **right**:
+
+| hub | probe (split) | build (replicated) | vs the 4.79 GB budget | outcome |
+|---|---|---:|---|---|
+| empty | `lineitem` 60 M | `part` 0.48 GB | fits | fan-out, **12.2x** |
+| two of its own passes | `part` 2 M | `lineitem` **15.36 GB** | 3.2x over | declines |
+
+Nothing guarantees that ordering. Kyber reorders a join's inputs for its own costing, and the
+CPU hash join it reorders for picks its build side at runtime, so left/right carries no promise
+about size — it just happened to hold on the plans this path was written against. It stops
+holding as soon as a fleet learns anything.
+
+**The fix measures both sides and replicates the smaller one**, whichever side holds it. It is
+strictly better than the rule it replaces rather than a different guess: a plan that already had
+the small side on the right is untouched. Only `inner` mirrors — `LEFT_DRIVEN_JOINS` also carries
+`left`, `semi` and `anti`, whose output is driven by left rows, so exchanging their sides changes
+the answer rather than the schedule.
+
+Exchanging the sides is free because the translator builds a join's result explicitly from
+`join_ir["output"]` — one entry per column carrying its `side`, `name` and `alias` — rather than
+from whatever order the underlying `merge` returns. Swapping the key lists and flipping each
+entry's `side` preserves column identity, order and type.
+`tests/differential/test_diff_gpu_join_mirror.py` runs both forms through the executor over
+nulls, duplicates, empty sides and no-match cases and holds each against DuckDB, so the claim
+that this is a scheduling change is checked rather than argued.
+
+What it bought, same fleet, same suite, best of 3:
+
+| | before | after |
+|---|---:|---:|
+| reached a device | 16 / 22 | **18 / 22** |
+| suite total, forced | 2.24x | **2.67x** |
+| suite total, `backend="auto"` | 2.38x | **2.89x** |
+| q12 | declined | **4.68x** |
+| worst query under `auto`, warm hub | 0.36x | **0.92x** |
+
+q12 is the bonus: it was one of the five declines, and it was declining for this reason rather
+than for the missing hash-partitioned join. And against the hub that used to lose q14 the suite
+now reaches **18 of 22** and returns 2.69x under `auto`, with no query losing more than 8%.
+
+One number in that arm reads oddly and is worth stating: with a warm hub q14 shows 1.62x rather
+than 11.66x. The device time is unchanged (0.116 s against 0.154 s); the *CPU* arm got faster,
+1.796 s to 0.188 s, because the learned statistics improved the plan it runs. The ratio fell
+because the baseline improved, which is the loop working on both sides.
+
+### A benchmark harness that reverted the configuration it had just set
+
+`Config()` is a **fresh default**, so `set_config(Config().replace(metadata=...))` swaps one
+section in and silently reverts every other one. The suite did exactly that, immediately after
+`init_gpu_cluster` had set `distributed.gpu_rapids_path` — so every run with a persistent
+statistics hub had that path wiped and the GPU tasks sent back to resolving a cuDF pip block per
+node. Both call sites now build from `active_config()`.
+
+The reason it is here rather than in a commit message: it is invisible in the results. Every
+affected run still produced device timings, still matched the CPU engine, and still showed the
+learner converging — the re-run above lands within 0.02x of the original at every pass. A defect
+that changes nothing you can see is one you only find by reading, and the thing that exposed it
+was chasing a *different* bug the config wipe turned out not to cause.
+
+### The harness was hiding behind its own timeout
+
+Worth recording because it cost more wall-clock than any defect in the tier. The suite runs one
+child process per query with a per-query timeout, and the timeout never fired: a 200-second
+bound let a run report **one query in twenty-three minutes**. `subprocess.run(capture_output=
+True)` hands the child a pipe, the Ray workers and raylet it starts inherit that pipe, and
+`subprocess.run` waits for the pipe to close as well as for the child to exit — so killing the
+child on timeout leaves the parent blocked on a descriptor its grandchildren still hold. The
+child now writes to files and leads its own process group, and the group is what gets killed.
+
+It earned that back immediately: in the definitive run above, q5's failing CPU arm retried for
+the full 180 s and **the suite kept going**, which is the entire reason the design has a child
+process at all.
+
+### What the fleet did to itself while this was measured
+
+Seven GPU nodes were reclaimed and replaced across these runs (`ray status` recorded
+`NodeTerminated` seven times). Every query still returned, and every device result still matched
+the CPU engine. That is the shard-level recovery ladder working — a lost shard is re-run, and a
+shard that will not fit is subdivided — and it is worth recording because it was not staged.
+
+It also makes the *cold* column in these tables unreliable: a cold run that lands while a node is
+being replaced measures the replacement. The warm best-of-3 figures are the ones to read.
+
+### Still open
+
+* **`COUNT(DISTINCT)` has no mergeable partial**, so it cannot fan out. It runs on one device
+  when the read is small enough and on the CPU engine otherwise. A device-side hash shuffle is
+  what it wants, and this tier does not have one.
+* **q19 (0.24x) and q6 (0.33x)** are fixed-cost bound. q6's whole CPU answer is 73 ms; the
+  device path's dispatch alone is more than that. These are the shapes the GPU should decline,
+  and the crossover learner should be the thing that notices.
+* **A large-⋈-large join has no device fan-out at all.** The only one is
+  broadcast-the-build-side, so q4, q12, q13, q15 and q20 decline. That is the single largest
+  remaining feature, and it is what would take q12 from 0.99x to the 2-3x its neighbours get.
+* **q5's CPU arm fails**, reproducibly, with `RetryableShuffleError` out of
+  `_FlightWorker.map_publish_join` — while the *GPU* arm answers it in 0.442 s. That is a defect
+  on the CPU distributed join path, not the device tier, and it is unrelated to everything above.
+  In the definitive run it consumed the whole per-query budget before the harness killed it,
+  which is why the table shows no CPU time for q5; the device figure is from a re-run of q5
+  alone at a 300 s bound.
+
 ## The native Parquet reader was switched off by default for being 3x slower under distributed load, and the reason was that it read its files one at a time (2026-09-04)
 
 Same fleet as the entry below — **65 x 16-core / 32 GiB** (1,024 cores), TPC-H sf100 read from

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1448 Python modules across 213 packages and 284 Rust files across 15 crates.
+Covering 1449 Python modules across 213 packages and 284 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -410,10 +410,11 @@ The opt-in GPU execution backend for supported relational shapes.
 
 | module | lines | what it is |
 |---|---|---|
+| `audit.py` | 121 | What the device tier actually did, per process — the counterpart to the fallback contract. |
 | `failure.py` | 62 | Telling a GPU backend that declined from one that is broken. |
-| `fanout.py` | 202 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
-| `route.py` | 277 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
-| `translate.py` | 257 | Match a plan to a translated GPU execution, from the most specific shape to the general one. |
+| `fanout.py` | 198 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
+| `route.py` | 302 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
+| `translate.py` | 456 | Match a plan to a translated GPU execution, from the most specific shape to the general one. |
 | `verify.py` | 264 | Check the device result against the CPU engine — the device tier's two oracles. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
@@ -963,7 +964,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 698 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
-| `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
+| `readiness.py` | 330 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 197 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 788 | What the live cluster is, and what of it a query may use. |
@@ -1024,15 +1025,15 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 495 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `cudf_probe.py` | 144 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
-| `device_read.py` | 194 | Read a shard onto the device, instead of onto the host and then across the bus. |
-| `dispatch.py` | 294 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `aggregate.py` | 513 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `cudf_probe.py` | 341 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
+| `device_read.py` | 401 | Read a shard onto the device, instead of onto the host and then across the bus. |
+| `dispatch.py` | 356 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
-| `join.py` | 218 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
-| `resources.py` | 402 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
+| `join.py` | 289 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
+| `resources.py` | 514 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
 | `shards.py` | 496 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 426 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 581 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 | `tree.py` | 260 | Fan a whole plan tree out across the cluster's GPUs: split one leaf, replicate the rest. |
 | `union.py` | 208 | Run a translated union across every GPU, by sharding each of its inputs. |
 
@@ -1042,7 +1043,7 @@ Scheduling a GPU stage against the wires, not just the device count.
 
 | module | lines | what it is |
 |---|---|---|
-| `collective_env.py` | 251 | Telling the collective library which wires this node has, instead of letting it guess. |
+| `collective_env.py` | 281 | Telling the collective library which wires this node has, instead of letting it guess. |
 | `placement.py` | 218 | Which devices a multi-device stage gets, and how its shards are dealt across them. |
 
 ### `batcher/dist/reduction/` — 4 · backend
@@ -1155,8 +1156,8 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | `adaptive.py` | 265 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 450 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
 | `exchange.py` | 257 | What a byte costs when the data is on a device, and how wide a stage may fan out before it. |
-| `policy.py` | 513 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
-| `shape.py` | 117 | What Kyber can tell the GPU backend about a plan's *shape*, as opposed to its cost. |
+| `policy.py` | 628 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `shape.py` | 186 | What Kyber can tell the GPU backend about a plan's *shape*, as opposed to its cost. |
 | `sizing.py` | 112 | SELECTION-phase rule — size a GPU inference stage's resources. |
 | `spread.py` | 57 | How many devices a working set that *fits* one device should still be spread across. |
 
@@ -1518,7 +1519,7 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | module | lines | what it is |
 |---|---|---|
 | `affinity.py` | 202 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
-| `allocator.py` | 421 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
+| `allocator.py` | 488 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
 | `amd_health.py` | 79 | The same admission decision, for a vendor NVML cannot see. |
 | `fractional.py` | 374 | Putting several claimants on one device — Carbonite's half of fractional scheduling. |
 | `health.py` | 500 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
@@ -1650,13 +1651,13 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 384 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
-| `backend.py` | 500 | The dataframe-library adapter the GPU translator runs against. |
+| `aggs.py` | 488 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `backend.py` | 535 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
-| `execute.py` | 346 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
-| `exprs.py` | 412 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `execute.py` | 435 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
+| `exprs.py` | 439 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 384 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
-| `pruning.py` | 382 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
+| `pruning.py` | 417 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
 | `scalar_fns.py` | 411 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 411 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 212 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
@@ -1670,9 +1671,9 @@ The translator's *named* vocabularies, one module per family — package façade
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
 | `lists.py` | 449 | List and vector expressions, built from the two primitives both dataframe libraries have. |
-| `operators.py` | 240 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
+| `operators.py` | 306 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
-| `strings.py` | 162 | The string function family — one entry per named function the engine ships. |
+| `strings.py` | 237 | The string function family — one entry per named function the engine ships. |
 
 ### `batcher/core/streaming/` — 3 · subsystem
 
@@ -2132,7 +2133,7 @@ Splits — independently-readable, picklable slices of a source.
 | `base.py` | 244 | The `Split` protocol and the whole-source fallback. |
 | `clustering.py` | 131 | What a split set guarantees about *where equal values live* — the clustering protocol. |
 | `codecs.py` | 109 | Whether a file's compression is one the device can undo, or one that lands back on the CPU. |
-| `device.py` | 157 | Which splits a GPU can read for itself, and the locators it needs to do it. |
+| `device.py` | 214 | Which splits a GPU can read for itself, and the locators it needs to do it. |
 | `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
 | `gds.py` | 211 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
@@ -2307,7 +2308,7 @@ How a plan splits across workers — the neutral algebra both the optimizer and 
 | module | lines | what it is |
 |---|---|---|
 | `mergeable.py` | 406 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
-| `tree_shard.py` | 84 | Which leaf of a multi-way plan tree may be split across workers, and which must be replicated. |
+| `tree_shard.py` | 215 | Which leaf of a multi-way plan tree may be split across workers, and which must be replicated. |
 
 ### `batcher/plan/energy/` — 1 · contract
 
@@ -2640,7 +2641,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3063 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3145 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 182 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |

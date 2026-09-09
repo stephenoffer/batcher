@@ -265,7 +265,7 @@ def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count
 
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.dist.executors.ray_runtime import engine_config_json, speculation_policy
-    from batcher.dist.gpu.resources import gpu_shard_options
+    from batcher.dist.gpu.resources import gpu_shard_options, shard_node_affinity
     from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import cpu_shard_partial, gpu_shard_partial, gpu_task_options
 
@@ -277,6 +277,10 @@ def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count
     # so the packing can only make the run faster or make it subdivide — never make it fail.
     opts, packing = gpu_shard_options(descriptors, schema, gpu_count=gpu_count)
     gpu_task = ray.remote(**opts)(gpu_shard_partial)
+    # Each shard prefers the node that last read it, so the page cache and the worker's device
+    # frame cache are warm for it. A hint only (`soft=True`): the answer does not depend on
+    # where a shard runs, so a busy or departed node costs a miss and nothing else.
+    affinity = shard_node_affinity(descriptors)
     # The *retry* of a shard that did not fit goes back with a whole device. Retrying it on the
     # same share is the one combination with no argument for it: the share is the thing that was
     # just shown to be too small, and the pieces would be divided against it again. Un-packing
@@ -289,6 +293,10 @@ def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count
     report = ShardReport("gpu-chain", len(descriptors), packing=packing)
 
     def _launch(i: int):
+        if affinity:
+            return gpu_task.options(scheduling_strategy=affinity[i]).remote(
+                descriptors[i], shard_ops
+            )
         return gpu_task.remote(descriptors[i], shard_ops)
 
     def _on_failure(i: int, _ref, exc):
@@ -343,18 +351,6 @@ def _await_recoveries(results: list) -> list:
         out[i] = value
     return out
 
-
-#: Combined partial rows above which the fold is worth handing to the engine's own executor
-#: rather than running it through the translator's pandas backend.
-#:
-#: "Small by construction" is true of the fold this path was written for and false of the one a
-#: high-cardinality key produces: six shards of a 5,000,000-group aggregate hand the driver
-#: 30,000,000 rows, not six. Measured on that shape, folding 30 M rows to 5 M groups:
-#: **pandas 3.53 s, the engine's own aggregate 0.39 s -- 9.0x**, and the fold was 61-74% of the
-#: whole GPU query (`_run_shards` 3.13 s against `fold_shards` 4.87 s on `groupby-5M-wide`).
-#: The threshold exists because the engine call costs a plan build and an FFI crossing, which a
-#: six-row fold should not pay; below it the translator's backend is already the cheaper answer.
-_NATIVE_FOLD_MIN_ROWS = 1 << 20
 
 #: Free driver RAM, as a multiple of the partials' own bytes, required before the fold is given
 #: to the engine rather than to pandas.
@@ -422,17 +418,39 @@ def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
     """Combine the shards' results, then run whatever sat above the reducer.
 
     For a folded chain this runs on one row per group (or per distinct row, or per top-N entry)
-    per shard — small by construction *when the group count is*, which is what
-    `_NATIVE_FOLD_MIN_ROWS` exists to notice when it is not. For a row-local chain `ops` is
-    empty and this is the concatenation itself, in shard order.
+    per shard — small by construction *when the group count is*, and not otherwise. For a
+    row-local chain `ops` is empty and this is the concatenation itself, in shard order.
+
+    **The engine folds it whenever it can, at every size.** This gate used to be a combined-row
+    count (1,048,576), on the reasoning that a plan build and an FFI crossing are not worth
+    paying for a six-row fold. Measured, that is backwards: the *pandas* path has the larger
+    fixed cost — building a `DfBackend`, converting Arrow to pandas and back — and it is about
+    3.3 ms flat, against the engine's 0.25 ms. Best of five per point, six shards, group count a
+    quarter of the rows:
+
+    ===========  =============  =============  ======
+    rows          pandas (ms)    engine (ms)    x
+    ===========  =============  =============  ======
+    60                    3.33           0.25   13.2
+    6,000                 3.68           0.39    9.3
+    60,000                5.12           1.13    4.6
+    240,000              15.23           4.21    3.6
+    ===========  =============  =============  ======
+
+    There was no measured size at which pandas won, on either an 8-byte key or a 40-byte string
+    one. What the row count did instead was miss the case it was written for from the other
+    side: **the cost tracks bytes, not rows.** ClickBench q12 folds 783,737 rows — under the
+    threshold — but they carry a `SearchPhrase` string key, so the partials are **178 MiB**,
+    twenty times what a numeric key of that length would be. That fold took 2.6 s of a 3.0 s
+    query, 87% of it, on the wrong side of a gate reading the wrong quantity.
 
     Using the translator's own kernels keeps both halves of the algebra in one implementation,
-    which is why the engine fast path above is a narrow recognition that declines rather than a
-    second implementation of the fold.
+    which is why the engine fast path above stays a narrow recognition that declines to `None`
+    rather than a second implementation of the fold.
     """
     import pyarrow as pa
 
-    if ops and sum(p.num_rows for p in partials) >= _NATIVE_FOLD_MIN_ROWS:
+    if ops:
         native = _native_fold(partials, ops, sum(p.nbytes for p in partials))
         if native is not None:
             return native

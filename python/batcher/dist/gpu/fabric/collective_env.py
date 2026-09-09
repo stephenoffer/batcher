@@ -37,6 +37,7 @@ __all__ = [
     "merge_env",
     "node_collective_env",
     "p2p_disabled",
+    "reset_node_collective_env",
     "socket_ifnames",
 ]
 
@@ -214,16 +215,45 @@ def merge_env(
     return out
 
 
+#: The node's measured fabric, read once. It describes **hardware** — which NIC each device is
+#: rail-aligned with, which pairs can reach each other peer-to-peer, how far a GPUDirect path
+#: would cross — and none of that changes while a process runs.
+#:
+#: Reading it live was not free. It walks `/sys`, enumerates the RDMA devices and prices every
+#: device-to-NIC pair, and it is reached from `gpu_task_options`, which a fan-out calls on
+#: every query — twice when the shards are packed, and again for the admission probe. On a
+#: driver with no device it is a sequence of misses and a subprocess that is not installed,
+#: which is the slowest possible way to learn nothing.
+_NODE_ENV: dict[str, str] | None = None
+
+
+def reset_node_collective_env() -> None:
+    """Forget the measured fabric, so the next call reads the machine again. For tests."""
+    global _NODE_ENV
+    _NODE_ENV = None
+
+
 def node_collective_env() -> dict[str, str]:
-    """The collective environment for the node this call runs on, read live.
+    """The collective environment for the node this call runs on.
 
     The one entry point that touches the machine; everything else is pure. Used by the GPU
     task's `runtime_env` so a worker inherits the node's measured fabric rather than probing
     for it.
 
+    Measured once per process and reused. What it reads is the node's wiring, which is fixed
+    for the life of the process — and the caller is on the critical path of every query.
+
     Returns:
         Variable to value, empty when nothing about the node's fabric could be read.
     """
+    global _NODE_ENV
+    if _NODE_ENV is None:
+        _NODE_ENV = _measure_node_collective_env()
+    return dict(_NODE_ENV)
+
+
+def _measure_node_collective_env() -> dict[str, str]:
+    """Read the node's fabric from the machine. The uncached body of `node_collective_env`."""
     from batcher._internal.hardware.fabric.device_links import gpu_pci_addresses
     from batcher._internal.hardware.fabric.p2p import host_staged_pairs, peer_matrix
     from batcher._internal.hardware.fabric.pcie import PCIE_CLASSES, pcie_class

@@ -212,6 +212,40 @@ def _agg_pool_in_use():
         _arm_agg_idle_release()
 
 
+def reclaim_idle_cpu_pool() -> bool:
+    """Tear down the warm CPU map pool if no stage is using it. True when cores were freed.
+
+    The pool is held for `distributed.session_fleet_idle_s` after a stage finishes so a
+    back-to-back query reuses its scan cache, and a timer returns the cores when the session
+    goes quiet. **The timer was the only way they came back**, and that is a gap rather than a
+    policy: a query that arrives *during* the idle window needs those cores now and has no way
+    to say so, so it waits out a clock that exists to help it.
+
+    That is not a slower query, it is a stopped one, and the arithmetic is what makes it total.
+    Measured here on six 8-core nodes: an ordinary CPU query returns and leaves **42 of 48 cores
+    held**; the next query's map tasks are sized at **6.144 CPU** each against **6.0 free**, so
+    not one of them can be placed and the stage sits at `0/6` until the timer fires. A GPU
+    pipeline that reads with the CPU engine and then infers — the ordinary shape — hit this
+    every time, with every device idle throughout.
+
+    Reclaiming is safe by construction and cheap by comparison: `_AGG_IN_USE` is non-empty for
+    exactly as long as a stage holds the pool, so an idle pool has no work on it, and what is
+    lost is a warm scan cache that the next stage rebuilds. Losing it beats not running.
+
+    **CPU pools only, deliberately.** A warm *GPU* pool holds devices whose model costs minutes
+    to reload, and the same trade does not obviously hold there; a stage blocked on devices is a
+    different measurement and should get its own.
+
+    Returns:
+        True when a pool was shut down, so the caller can retry before reporting a stall.
+    """
+    if _AGG_IN_USE or not _AGG_POOLS:
+        return False
+    _cancel_agg_idle_release()
+    _shutdown_pools(_AGG_POOLS)
+    return True
+
+
 def release_inference_pools() -> None:
     """Tear down every session-warm actor pool and free the GPUs and cores they hold.
 

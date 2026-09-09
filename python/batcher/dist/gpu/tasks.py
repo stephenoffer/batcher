@@ -17,6 +17,7 @@ hand it out, so a fan-out over a hundred shards moves no bulk data through the o
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
@@ -34,10 +35,12 @@ __all__ = [
     "gpu_task_runtime_env",
     "gpu_tree_task",
     "gpu_union_task",
+    "reset_device_warmup",
     "run_shard_chain",
     "run_shard_join",
     "run_shard_tree",
     "run_shard_union",
+    "warm_devices",
 ]
 
 
@@ -58,10 +61,14 @@ def _frame(descriptor: dict, be: DfBackend):
     across the bus; where it cannot, the host reader runs and the table is converted. The two
     produce the same rows by construction — the device path declines rather than approximating
     — so which one ran is a question of speed, and every caller can ignore the difference.
-    """
-    from batcher.dist.gpu.device_read import read_descriptor_on_device
 
-    frame = read_descriptor_on_device(descriptor, be)
+    The device read is served from this worker's frame cache when the same shard, columns and
+    predicate have been read before. Parquet is immutable and the split-to-worker assignment is
+    deterministic, so a repeated query reads nothing: on a T4, 0.12 s of a 0.22 s shard.
+    """
+    from batcher.dist.gpu.device_read import cached_device_frame
+
+    frame = cached_device_frame(descriptor, be)
     if frame is not None:
         return frame if len(frame) else None
     table = _read(descriptor)
@@ -186,14 +193,29 @@ def _measured(run):
     (`is_memory_failure` already reads a `MemoryError` as one) and the real traceback is still
     attached to whatever finally reports it.
     """
+    from batcher.dist.gpu.device_read import clear_device_frame_cache
     from batcher.dist.gpu.shards import device_peak_marker, is_memory_failure
 
     try:
         return run()
     except Exception as exc:
-        marker = device_peak_marker() if is_memory_failure(exc) else ""
-        if not marker:
+        if not is_memory_failure(exc):
             raise
+        # The frame cache is the one part of this worker's device footprint that is pure
+        # optimization, so it is the first thing to give back — and giving it back here, in the
+        # process that overflowed, is far cheaper than the alternative. The driver's ladder
+        # answers an overflow by subdividing the shard and **re-reading each piece from
+        # storage**, so a shard that only failed because the cache was holding a neighbour
+        # would pay several reads to discover that. Retried once, and only when there was
+        # actually something to release.
+        if clear_device_frame_cache():
+            try:
+                return run()
+            except Exception as retry_exc:
+                exc = retry_exc
+        marker = device_peak_marker()
+        if not marker:
+            raise exc
         raise MemoryError(f"{type(exc).__name__}: {exc}{marker}") from exc
 
 
@@ -350,15 +372,148 @@ def gpu_task_runtime_env() -> dict | None:
     from batcher.carbonite.resilience import stability_env
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
+    from batcher.dist.gpu.cudf_probe import cudf_pip_spec, rapids_env_path
     from batcher.dist.gpu.fabric import merge_env, node_collective_env
 
     rt = dict(worker_runtime_env() or {})
-    if active_config().distributed.gpu_backend_cudf and not cluster_has_cudf():
-        rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
     block = {**device_order_env(), **stability_env(), **node_collective_env()}
+    if active_config().distributed.gpu_backend_cudf and not cluster_has_cudf():
+        # A shared mount first, and a pip block only when there is none. The two deliver the
+        # same cuDF and differ by two orders of magnitude in what they cost to deliver it:
+        # measured on a six-T4 fleet, 9.1 s once for the mount against 168 s per node for the
+        # pip resolve. `rapids_env_path` is empty unless a deployment configured a directory
+        # *and* that directory exists, so the fallback is the behaviour this path had before.
+        shared = rapids_env_path()
+        if shared:
+            block["PYTHONPATH"] = _prepend_path(block.get("PYTHONPATH"), shared)
+        else:
+            spec = cudf_pip_spec()
+            if spec:
+                rt["pip"] = spec
     if block:
         rt["env_vars"] = merge_env(rt.get("env_vars"), block)
     return rt or None
+
+
+def _prepend_path(existing: str | None, entry: str) -> str:
+    """`entry` in front of `existing`, without duplicating it.
+
+    Prepended rather than appended so a fleet whose image carries a *different* RAPIDS build
+    still runs the driver's — the two sides unpickling the same partials is the property the
+    fan-out depends on, and a stale image silently winning that race is the failure this
+    ordering prevents.
+    """
+    parts = [p for p in (existing or "").split(os.pathsep) if p and p != entry]
+    return os.pathsep.join([entry, *parts])
+
+
+#: Whether this process has already asked the fleet's devices to warm themselves. Once per
+#: driver: what it pays for — the worker start, the cuDF import and the RMM pool — survives for
+#: the life of the worker (`gpu_worker_reuse` keeps the process), so a second request would
+#: submit tasks that find everything already done.
+_WARMED = False
+
+
+def warm_devices() -> int:
+    """Start the per-worker set-up on every GPU node now, so a query does not wait for it.
+
+    A GPU worker's *first* task pays three fixed costs before it touches a row. Measured on a
+    T4 against one shard of TPC-H `lineitem`: **3.04 s to import cuDF** and **0.30 s to build
+    the RMM pool**, against 0.09 s to read the shard onto the device and 0.02 s to run the
+    kernels. With `gpu_worker_reuse` those are paid once per worker rather than once per shard,
+    which is what makes them worth pre-paying rather than merely amortizing — but until
+    something pays them, they land on the critical path of whichever query is first, and a
+    single-shot job is *always* first.
+
+    So they are moved off it. The driver has real work to do between deciding to use the device
+    and having a shard to send — optimizing the plan, reading Parquet footers, cutting
+    descriptors — and this runs the workers' set-up concurrently with that. Measured on this
+    six-T4 fleet, that driver-side stretch is on the order of a second, so the overlap is not
+    nominal.
+
+    Fire-and-forget by construction: the refs are dropped, nothing is awaited, and a failure is
+    invisible because a warm-up that did not happen costs exactly the latency it was going to
+    save. A shard that lands on a node this never reached simply warms itself, as before.
+
+    **One task per node, pinned.** A hundredth of a device is the share, so it neither blocks a
+    real shard nor holds a board — but a fractional request lets Ray put every one of them on
+    the same node, which would warm one node N times and leave the rest cold. Node affinity is
+    what makes "one per node" true rather than likely.
+
+    **And the same options a shard uses**, `max_calls=0` included. Ray's default for a GPU task
+    is to destroy the worker after each call, so a warm-up that built its own options threw the
+    import away as soon as it finished — leaving the shard to pay it again *after* waiting for
+    the warm-up to release the device. A warm-up that is not reused is strictly worse than
+    none.
+
+    Returns:
+        The number of warm-up tasks submitted; `0` when the fleet has no GPU node, when Ray is
+        not up, or when this process already warmed the fleet.
+    """
+    global _WARMED
+    if _WARMED:
+        return 0
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return 0
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from batcher.dist.executors.ray_runtime.fabric import gpu_node_topology
+
+        nodes = gpu_node_topology()
+        if not nodes:
+            return 0
+        # The **shard task's own options**, with only the device share reduced. Building a
+        # fresh dict here was a bug that made this function worse than useless: it omitted
+        # `max_calls=0`, and Ray's default for a GPU task is to tear the worker down after
+        # every call — so the process that paid the 3 s cuDF import was destroyed the moment it
+        # finished, the next shard imported cuDF again, and the only lasting effect of warming
+        # was that the shard waited three seconds for the warm-up to release the device first.
+        #
+        # Taking the real options also keeps the `runtime_env` identical, which is what lets
+        # Ray's worker pool hand the same process to the shard that follows.
+        opts = dict(gpu_task_options(num_gpus=1.0))
+        opts["num_gpus"] = 0.01
+        opts["max_retries"] = 0
+        for node in nodes:
+            # `soft=True`: a node that has gone away between the topology read and the submit
+            # must not leave an unschedulable task pending against a dead id for the life of
+            # the driver. A warm-up that lands somewhere else is still a warm worker.
+            ray.remote(
+                **opts,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node.node_id, soft=True),
+            )(_warm_worker).remote()
+        _WARMED = True
+        return len(nodes)
+    except Exception as exc:
+        note_suppressed("dist", "warm the fleet's GPU workers", exc)
+        return 0
+
+
+def _warm_worker() -> bool:
+    """On a worker: pay the import and the allocator set-up now, so a real task need not.
+
+    Deliberately does no I/O and touches no data. What it warms is process-level and outlives
+    it: the imported module stays in `sys.modules` and the RMM pool stays bound to the process,
+    so the next task on this worker finds both. It runs `_device()` rather than importing cuDF
+    directly, because that is the function a real shard calls and warming a different path
+    would warm the wrong thing.
+    """
+    try:
+        _device()
+    except Exception:
+        # A node that cannot warm is a node whose first real shard warms itself, or declines —
+        # both of which are the behaviour without this. Nothing here may make a query fail.
+        return False
+    return True
+
+
+def reset_device_warmup() -> None:
+    """Forget that this process warmed the fleet — for tests, and for a driver that reconnects."""
+    global _WARMED
+    _WARMED = False
 
 
 def gpu_task_options(num_gpus: float = 1.0) -> dict:

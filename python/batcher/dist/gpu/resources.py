@@ -42,6 +42,8 @@ __all__ = [
     "fleet_derate",
     "gpu_shard_options",
     "largest_shard_bytes",
+    "reset_shard_affinity",
+    "shard_node_affinity",
     "shard_task_share",
     "share_for_bytes",
     "task_device_tenants",
@@ -400,3 +402,113 @@ def gpu_shard_options(
         descriptors, schema, gpu_count=gpu_count, resident_bytes=resident_bytes
     )
     return gpu_task_options(num_gpus=packing.fraction), packing
+
+
+def shard_node_affinity(descriptors: Sequence[dict]):
+    """A scheduling strategy per shard that sends each one back to the node that last had it.
+
+    Ray places a stateless task wherever a device is free, which is the right default and the
+    wrong one for anything a worker *keeps*. Two things on this path are kept: the operating
+    system's page cache for the files a shard reads, and — since it exists — the worker's
+    decoded **device frame cache**, which holds a shard already on the board. Neither pays
+    unless the shard comes back to the same node, and with six shards over six nodes a random
+    placement returns each one to its own node about one time in six.
+
+    The mapping is a hash of the shard's own **content identity** — the files and row-groups it
+    covers — rather than of its position in the fan-out. Position is not stable: the same
+    relation cut into a different number of shards renumbers all of them, so a query that ran
+    at eight shards would warm nothing for the same query at six. Content is stable by
+    construction, and it also means two different queries whose shard boundaries coincide land
+    together.
+
+    `soft=True` throughout. A node that is busy, drained or gone must cost a cache miss, never a
+    task that cannot be placed: this is a locality *hint*, and the answer is identical wherever
+    the shard runs.
+
+    Args:
+        descriptors: The fan-out's shard descriptors, in submission order.
+
+    Returns:
+        One scheduling strategy per descriptor, or an empty list when the fleet's nodes cannot
+        be read, when Ray is absent, or when any shard will not identify itself — each of which
+        leaves Ray's own placement exactly as it was.
+    """
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    except ImportError as exc:  # the `[ray]` extra is not installed
+        note_suppressed("dist", "import ray for gpu shard affinity", exc)
+        return []
+    nodes = _affinity_nodes()
+    if len(nodes) < 2:
+        # One node places everything in one place already, and zero means the topology is
+        # unreadable. Neither is worth a strategy object per shard.
+        return []
+    out = []
+    for descriptor in descriptors:
+        identity = _shard_identity(descriptor)
+        if identity is None:
+            return []
+        out.append(NodeAffinitySchedulingStrategy(node_id=nodes[identity % len(nodes)], soft=True))
+    return out
+
+
+def _shard_identity(descriptor: dict) -> int | None:
+    """A stable non-negative hash of what a shard reads, or `None` when it cannot be identified.
+
+    `hash()` is deliberately not used: Python salts string hashing per process, so a driver that
+    reconnected would map the same shard to a different node and warm nothing. This has to
+    agree across processes and across runs, so it is a digest of the split identities.
+    """
+    splits = descriptor.get("splits")
+    if not splits:
+        return None
+    try:
+        ids = sorted(str(split.identity()) for split in splits)
+    except Exception as exc:
+        note_suppressed("dist", "identify a shard for node affinity", exc)
+        return None
+    import hashlib
+
+    digest = hashlib.blake2b("\x00".join(ids).encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+#: How long the fleet's device-node list is reused before it is read again. `gpu_node_topology`
+#: is documented as reading live on every call, and it should be — it is what a *sizing*
+#: decision is made against. This is not a sizing decision: it is a placement hint whose only
+#: requirement is that repeated queries agree with each other, and reading `ray.nodes()` for it
+#: puts a GCS round trip on the critical path of every fan-out. Measured on this fleet, the
+#: whole driver-side dispatch of a warm six-shard query is about 0.15 s, so a per-query RPC is
+#: a material share of it.
+#:
+#: Short enough that a node joining or leaving is picked up within a couple of queries, which
+#: is all the correctness this needs: `soft=True` means a stale id costs a cache miss.
+_AFFINITY_TTL_S = 5.0
+_affinity_cache: tuple[float, tuple[str, ...]] = (0.0, ())
+
+
+def _affinity_nodes() -> tuple[str, ...]:
+    """The fleet's GPU node ids, sorted, re-read at most every `_AFFINITY_TTL_S`.
+
+    Sorted so the shard-to-node mapping does not move when the topology is reported in a
+    different order — two drivers that disagree about the order warm different nodes and the
+    cache serves neither.
+    """
+    global _affinity_cache
+    import time
+
+    now = time.monotonic()
+    stamped, nodes = _affinity_cache
+    if nodes and now - stamped < _AFFINITY_TTL_S:
+        return nodes
+    from batcher.dist.executors.ray_runtime.fabric import gpu_node_topology
+
+    nodes = tuple(sorted({node.node_id for node in gpu_node_topology() if node.node_id}))
+    _affinity_cache = (now, nodes)
+    return nodes
+
+
+def reset_shard_affinity() -> None:
+    """Forget the cached node list — for tests, and for a driver that reconnects."""
+    global _affinity_cache
+    _affinity_cache = (0.0, ())

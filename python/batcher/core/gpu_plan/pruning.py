@@ -258,7 +258,8 @@ def _conjoin(preds: list[dict]) -> dict | None:
 
 def _prune(spec: dict, wanted: set[str] | None, out: dict) -> dict:
     """Narrow one node, given what its parent wants of it, recording what its leaves must read."""
-    below = _through_ops(spec["ops"], wanted)
+    ops, below = _through_ops(spec["ops"], wanted)
+    spec = {**spec, "ops": ops}
     kind = spec["kind"]
     if kind == "scan":
         _record_leaf(spec["leaf"], below, out)
@@ -310,46 +311,80 @@ def _record_leaf(leaf: int, wanted: set[str] | None, out: dict) -> None:
         out[leaf] = None if wanted is None else sorted(set(previous) | wanted)
 
 
-def _through_ops(ops: list[dict], wanted: set[str] | None) -> set[str] | None:
-    """Push a want-set down through a bottom-up operator chain, returning what the chain's own
-    input must supply."""
+def _through_ops(ops: list[dict], wanted: set[str] | None) -> tuple[list[dict], set[str] | None]:
+    """Push a want-set down a bottom-up chain, narrowing the operators as it goes.
+
+    Returns the rewritten chain and what its own input must supply. **Both**, because the two
+    cannot come apart — this is the same rule `_prune_join` states for a join's output list, and
+    it applies to every operator that *declares* what it emits.
+
+    An operator whose declaration is narrowed and whose body is not is a missing-column failure
+    on the device. Measured on TPC-H sf10, it was two of them: q7 died on
+    `column 'c_nationkey' absent from the GPU frame` and q17 on `'p_partkey'`, after a full
+    round trip to a worker and then a second one to the single-device retry — 1.9 s and 3.2 s
+    against CPU answers of 0.46 s and 0.26 s. In both cases a projection above a join carried an
+    expression nothing upstream read, the want-set correctly excluded it, the join's output was
+    correctly narrowed, and then the projection evaluated it anyway.
+
+    A chain over a single scan cannot hit this, which is why it went unnoticed: nothing sits
+    above the chain to narrow it, so the top operator is always asked for everything.
+    """
+    narrowed: list[dict] = []
     for op in reversed(ops):
-        wanted = _through_op(op, wanted)
-    return wanted
+        op, wanted = _through_op(op, wanted)
+        narrowed.append(op)
+    narrowed.reverse()
+    return narrowed, wanted
 
 
-def _through_op(op: dict, wanted: set[str] | None) -> set[str] | None:
-    """What one operator's input must supply, given what its output is wanted for."""
+def _through_op(op: dict, wanted: set[str] | None) -> tuple[dict, set[str] | None]:
+    """One operator narrowed to what is wanted of it, and what its own input must supply."""
     kind = op.get("op")
     if kind in _OPAQUE_OPS:
-        return None
+        return op, None
     if kind == "limit":
-        return wanted
+        return op, wanted
     if kind == "project":
         # A projection replaces the frame's columns outright, so only the surviving expressions
         # matter — and their *references*, which are the input's columns rather than the output's.
-        return _refs_of([p["expr"] for p in op["exprs"] if wanted is None or p["alias"] in wanted])
+        # The dropped ones are removed from the operator too: keeping them means evaluating an
+        # expression whose input column this very walk has just decided nobody reads.
+        kept = _kept(op["exprs"], wanted)
+        return {**op, "exprs": kept}, _refs_of([p["expr"] for p in kept])
     if kind == "filter":
         # A filter keeps every column, so it adds its predicate's references to whatever the
         # operators above it wanted.
-        return None if wanted is None else wanted | _refs_of([op["predicate"]])
+        return op, (None if wanted is None else wanted | _refs_of([op["predicate"]]))
     if kind == "sort":
         keys = _refs_of([k["expr"] for k in op["keys"]])
-        return None if wanted is None else wanted | keys
+        return op, (None if wanted is None else wanted | keys)
     if kind == "aggregate":
         # An aggregate replaces its input's columns with the keys and the reductions. Every key
         # is needed (they decide the grouping even when the parent drops one from the output),
-        # and a reduction's input is needed when its alias survives.
+        # and a reduction's input is needed when its alias survives — so a reduction whose alias
+        # does not survive is dropped from the operator for the same reason a projection's
+        # expression is, and with the same consequence if it is not.
+        kept = _kept(op["aggregates"], wanted)
         keys = _refs_of([gk["expr"] for gk in op["group_keys"]])
-        inputs = _refs_of(
-            [
-                a["input"]
-                for a in op["aggregates"]
-                if "input" in a and (wanted is None or a["alias"] in wanted)
-            ]
-        )
-        return keys | inputs
-    return None
+        inputs = _refs_of([a["input"] for a in kept if "input" in a])
+        return {**op, "aggregates": kept}, keys | inputs
+    return op, None
+
+
+def _kept(declared: list[dict], wanted: set[str] | None) -> list[dict]:
+    """The entries of `declared` whose alias survives `wanted`, or all of them.
+
+    "Or all of them" covers two cases and neither is laziness. `wanted is None` means the parent
+    reads everything, so nothing may be dropped. An *empty* result means the parent reads no
+    column of this operator at all — which happens under a `COUNT(*)` — and an operator that
+    emits no column emits no rows either in both dataframe libraries, so the row count the
+    parent is actually counting would be lost. Keeping the declaration whole costs a column
+    nobody reads; narrowing it to nothing costs the answer.
+    """
+    if wanted is None:
+        return list(declared)
+    kept = [d for d in declared if d["alias"] in wanted]
+    return kept or list(declared)
 
 
 def _refs_of(exprs: list) -> set[str]:

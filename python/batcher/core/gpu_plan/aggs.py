@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.core.gpu_plan.backend import Unsupported
+from batcher.core.gpu_plan.backend import Unsupported, call_or_decline
 from batcher.core.gpu_plan.exprs import eval_expr
 from batcher.plan.ir_tags import COUNTING_AGGS
 
@@ -151,7 +151,7 @@ def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
     return normalized
 
 
-def _null_if_empty(series, reduced):
+def _null_if_empty(counts, reduced):
     """`reduced`, nulled for every group that had no non-null value to fold.
 
     The engine's rule, and SQL's: a `sum` over nothing is null, not `0`; a `product` is not `1`;
@@ -168,8 +168,13 @@ def _null_if_empty(series, reduced):
     Counting and masking is the same answer through an operation both libraries have. It is
     what the boolean folds already did, for the same reason — they never had a `min_count` to
     reach for — so this is now one statement rather than two.
+
+    Takes the per-group counts rather than the grouped column, so the caller decides how they
+    were obtained — from the one fused `agg` pass alongside every other reduction, or from a
+    `count()` of its own. Sourcing them here would have made the mask a second full pass over
+    the data for every reduction that needs one.
     """
-    return reduced.where(_call(series, "count") > 0)
+    return reduced.where(counts > 0)
 
 
 def _as_int64(reduced, be: DfBackend):
@@ -191,14 +196,103 @@ def _as_int64(reduced, be: DfBackend):
     return reduced.astype(be.dtype(pa.int64()))
 
 
-def _reduce(grouped, spec: dict, column: str | None, be: DfBackend):
-    """One reduction over the shared `GroupBy`, as a Series indexed by the group key."""
+#: The `GroupBy` methods each reduction family needs. A reduction that needs an empty group
+#: nulled needs `count` beside its own fold, which is why several map to two.
+#:
+#: This table is what makes the aggregate **one pass**. Every reduction used to be issued
+#: separately against the shared `GroupBy` — `grouped[c].sum()`, then `grouped[c].mean()`, and
+#: so on — and each of those is a full hash group-by over the shard on the device. TPC-H q1 has
+#: eight reductions plus two key labels, so a 10 M-row shard was grouped **ten times**: measured
+#: on a T4, 0.25 s of a 0.40 s shard, against 0.12 s to read the shard off storage and 0.03 s to
+#: filter it. Collected into one `agg` call they are one pass and cuDF fuses the reductions
+#: itself.
+_METHODS: dict[str, tuple[str, ...]] = {
+    **{func: (method,) for func, method in _PLAIN.items()},
+    **{func: (method, "count") for func, method in _MIN_COUNT.items()},
+    **{func: (method, "count") for func, method in _BOOL_FOLD.items()},
+    **{func: (method,) for func, method in _SAMPLE_MOMENT.items()},
+    "product": ("prod", "count"),
+}
+
+
+def _fused(grouped, columns: dict[str, list[str]]):
+    """Every reduction the node needs, in one `agg` pass, or `None` to issue them separately.
+
+    `None` is not a failure: it means this backend would not take the fused form, and the
+    caller then reduces column by column exactly as it always did. The two produce identical
+    values by construction — same `GroupBy`, same method names — so this is a scheduling
+    choice, and keeping the unfused path is what makes it safe to take.
+    """
+    if not columns:
+        return None
+    try:
+        return call_or_decline(grouped, "agg", {c: list(m) for c, m in columns.items()})
+    except Unsupported:
+        return None
+
+
+def _series_reader(grouped, fused):
+    """`(column, method) -> Series`, from the fused frame where it is there and the group else.
+
+    One statement of "where does this reduction's raw series come from", so the semantics below
+    are written once and work whether or not the fusion was taken.
+    """
+
+    def read(column: str, method: str):
+        if fused is not None:
+            try:
+                return fused[(column, method)]
+            except (KeyError, TypeError):
+                pass
+        return _call(grouped[column], method)
+
+    return read
+
+
+def _wanted_methods(ir: dict, inputs: list[str | None], sources: dict[str, str]):
+    """`{column: [method, ...]}` — everything one fused `agg` has to compute for this node.
+
+    Deduplicated per column, because `agg({c: ["sum", "sum"]})` is not a request for one
+    reduction twice — it is a frame with a duplicated column, which the reader then cannot
+    address unambiguously. Two aliases over the same `sum(x)` are one computation.
+
+    Returns `{}` when any reduction is outside `_METHODS` (a `quantile`, which takes a
+    parameter no method name carries), so the node falls back to the unfused path whole rather
+    than half-fusing and grouping twice.
+    """
+    want: dict[str, list[str]] = {}
+    for spec, column in zip(ir["aggregates"], inputs, strict=True):
+        func = spec["func"]
+        if func == "count_star":
+            continue
+        methods = _METHODS.get(func)
+        if methods is None or column is None:
+            return {}
+        for method in methods:
+            if method not in want.setdefault(column, []):
+                want[column].append(method)
+    # The label of each normalized group key is another full pass otherwise, and it is needed on
+    # exactly the queries a float key makes most expensive.
+    for source in sources.values():
+        if "first" not in want.setdefault(source, []):
+            want[source].append("first")
+    return want
+
+
+def _reduce(grouped, spec: dict, column: str | None, be: DfBackend, read=None):
+    """One reduction over the shared `GroupBy`, as a Series indexed by the group key.
+
+    `read` sources the raw per-group series for a `(column, method)` pair — from the fused
+    `agg` pass when there was one, and from the `GroupBy` directly otherwise. The semantics
+    below (the null-on-empty rule, the retypings) are the same either way, which is the point
+    of routing both through here.
+    """
     func = spec["func"]
     if func == "count_star":
         return _as_int64(grouped.size(), be)
-    series = grouped[column]
+    read = read or _series_reader(grouped, None)
     if func in _PLAIN:
-        reduced = _call(series, _PLAIN[func])
+        reduced = read(column, _PLAIN[func])
         return _as_int64(reduced, be) if func in _COUNTING else reduced
     if func == "product":
         # The engine (and DuckDB) answer `product` in **double** whatever the input's type,
@@ -208,16 +302,20 @@ def _reduce(grouped, spec: dict, column: str | None, be: DfBackend):
         # double cannot be concatenated with either way.
         import pyarrow as pa
 
-        reduced = _null_if_empty(series, _call(series, "prod"))
+        reduced = _null_if_empty(read(column, "count"), read(column, "prod"))
         return reduced.astype(be.dtype(pa.float64()))
     if func in _MIN_COUNT:
-        return _null_if_empty(series, _call(series, _MIN_COUNT[func]))
+        return _null_if_empty(read(column, "count"), read(column, _MIN_COUNT[func]))
     if func in _BOOL_FOLD:
-        return _null_if_empty(series, _call(series, _BOOL_FOLD[func]))
+        return _null_if_empty(read(column, "count"), read(column, _BOOL_FOLD[func]))
     if func in _SAMPLE_MOMENT:
-        return _call(series, _SAMPLE_MOMENT[func])
+        return read(column, _SAMPLE_MOMENT[func])
     if func == "quantile":
-        return _call(series, "quantile", float(spec["param"]))
+        # The one reduction the fused pass cannot carry: `agg` takes method *names*, and the
+        # quantile to take is a parameter. It is why `_wanted_methods` declines the whole node
+        # rather than half-fusing it, and why this is the only branch that still reaches for
+        # the grouped column itself.
+        return _call(grouped[column], "quantile", float(spec["param"]))
     raise Unsupported(f"aggregate {func}")
 
 
@@ -315,13 +413,19 @@ def aggregate(df, ir: dict, be: DfBackend):
     # `dropna=False`: a null key is a group, exactly as it is in the engine and in SQL.
     # The libraries drop it by default, which silently deletes rows from the answer.
     grouped = df.groupby(keys, sort=False, dropna=False)
+    # Every reduction, and every group label, computed in **one** pass where the backend takes
+    # the fused form. Issuing them one at a time is a full hash group-by per reduction: TPC-H
+    # q1's eight reductions and two labels grouped a 10 M-row shard ten times, which measured
+    # 0.25 s of a 0.40 s shard on a T4 against 0.12 s to read that shard off storage.
+    fused = _fused(grouped, _wanted_methods(ir, inputs, sources))
+    read = _series_reader(grouped, fused)
     columns = {}
     for spec, column in zip(ir["aggregates"], inputs, strict=True):
-        columns[spec["alias"]] = _reduce(grouped, spec, column, be)
+        columns[spec["alias"]] = _reduce(grouped, spec, column, be, read)
     # The un-normalized value each normalized group is labelled by. `sort=False` keeps the
     # groups in first-seen order, and `first()` picks each group's first row, so the label is
     # the one the engine's own first-seen representative would be.
-    labels = {f"__bt_lbl{i}": grouped[src].first() for i, src in enumerate(sources.values())}
+    labels = {f"__bt_lbl{i}": read(src, "first") for i, src in enumerate(sources.values())}
     out = be.lib.DataFrame(columns | labels)
     if not (columns or labels):
         out = be.lib.DataFrame(index=grouped.size().index)

@@ -373,6 +373,28 @@ def _worker_pip(order: list[str]) -> list[str] | None:
     return [f"daft=={daft.__version__}"]
 
 
+def _warm_the_fleet(eng: str) -> None:
+    """Pay an engine's *fleet* startup before the sweep, on a query with no data in it.
+
+    `bench_engine` already runs each pipeline once untimed, which pays planning and the read.
+    It does not help an engine whose worker startup has its own deadline: Daft's Ray runner
+    spawns flotilla actors on first use and gives up on them after 120 s, and on this cluster
+    the first pipeline of a Daft sweep died with `No flotilla workers became available within
+    120s (64 attempted)` while the second -- with the actors up -- returned a number. That is
+    the harness charging one pipeline for the fleet the whole sweep uses, and it reads as a
+    Daft failure.
+
+    Best-effort and untimed: an engine that cannot answer a one-row query here will fail in
+    its own arm with its own error, which is where a reader should see it.
+    """
+    if eng != "daft":
+        return
+    with contextlib.suppress(Exception):
+        import daft
+
+        daft.from_pydict({"x": [1]}).agg(daft.col("x").sum().alias("s")).to_pydict()
+
+
 def main() -> int:
     # A dev-profile engine is 8-60x slower, so a ratio taken from one compares an
     # unoptimized Batcher against release Ray and Daft. `BENCH_ALLOW_DEBUG_BUILD=1` overrides.
@@ -419,6 +441,8 @@ def main() -> int:
     # rotates it so a reader can bound how much of a margin is ordering rather than engine.
     if order != list(ENGINES):
         print(f"engine sweep order: {' -> '.join(order)} (BENCH_ENGINE_ORDER)")
+    for eng in order:
+        _warm_the_fleet(eng)
     by_engine = {eng: bench_engine(eng, ENGINES[eng], pipelines, scale, runs) for eng in order}
 
     h = ("pipeline", "batcher_ms", "ray_ms", "daft_ms", "vs_ray", "vs_daft")

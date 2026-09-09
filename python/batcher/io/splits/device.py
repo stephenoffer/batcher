@@ -39,7 +39,7 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
-__all__ = ["DeviceReadSpec", "device_read_specs"]
+__all__ = ["DeviceReadSpec", "device_read_specs", "reads_on_device"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,3 +155,60 @@ def _device_readable_type(dtype: pa.DataType) -> bool:
         or pa.types.is_date(dtype)
         or pa.types.is_timestamp(dtype)
     )
+
+
+def reads_on_device(source) -> bool:
+    """Whether a device could read `source` for itself rather than through the host.
+
+    The *planning-time* form of `device_read_specs`, which needs a partition's splits and is
+    therefore only answerable once a fan-out has been cut. This asks the same question of the
+    relation, so a cost model can know — before any of that — whether the decoded rows will
+    cross the host link at all.
+
+    It exists because a model that assumes they do reaches the opposite verdict. `kyber.gpu`'s
+    transfer veto charges the whole decoded working set as a host-to-device copy and concluded,
+    on a T4, that **every** TPC-H query would run at 0.53x the CPU with "97% of device time in
+    transfer" — while the same queries measured 2.35x. The premise, not the arithmetic, was
+    stale: this tier's reader decodes Parquet *on the device*, so what crosses is the
+    compressed file and not the frame.
+
+    **It plans the source's splits**, which for Parquet means listing the files and reading
+    their footers. That is not free on a wide table, and it is acceptable here for two reasons:
+    the footers go through the shared identity-keyed cache and are read again moments later by
+    the scan itself, and the caller reaches this only after the size gate has already let the
+    query through — so a small query, which is the one that would least like to pay it, never
+    asks.
+
+    Deliberately optimistic where `device_read_specs` is strict. That function is a
+    correctness gate — a wrong answer if it says yes wrongly — and this one is an input to a
+    *cost* decision whose wrong answers cost a fallback. It answers from the split types alone
+    and does not re-read footers to check codecs and column types, because the executor checks
+    both again before it reads anything.
+
+    Args:
+        source: The relation a scan reads.
+
+    Returns:
+        True when the source's splits are the plain Parquet locators a device reader takes.
+        False for anything else, and whenever the splits cannot be planned — the conservative
+        direction, since `False` only restores the model that was applied before.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.io import InMemorySource
+            >>> from batcher.io.splits.device import reads_on_device
+            >>> reads_on_device(InMemorySource([pa.record_batch({"x": [1]})]))
+            False
+    """
+    from batcher.io.splits.file import FileSplit
+    from batcher.io.splits.parquet import RowGroupSplit
+
+    try:
+        splits = source.splits()
+    except Exception:
+        return False
+    if not splits:
+        return False
+    return all(isinstance(split, (FileSplit, RowGroupSplit)) for split in splits)

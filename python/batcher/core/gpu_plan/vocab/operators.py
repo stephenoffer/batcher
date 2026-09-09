@@ -79,6 +79,14 @@ def eval_binary(ir, df, be, eval_expr):
         return _boolean_bitwise(op, be.column(left, df), be.column(right, df), be)
     if op in _SHIFTS:
         return _shift(op, be.column(left, df), right, be)
+    if op in COMPARISON_OPS:
+        coerced = _temporal_literal(left, right, be)
+        if coerced is not None:
+            left, right = coerced
+            if left is None or right is None:
+                # The engine casts the literal with Arrow, which *nulls* what it cannot parse —
+                # so the comparison is against a null and every row is unknown.
+                return be.null_column(df, "bool")
     if op in COMPARISON_OPS and (be.is_float(left) or be.is_float(right)):
         return compare(op, be.column(left, df), be.column(right, df))
     if op in ("and", "or"):
@@ -238,3 +246,61 @@ def _truncated_mod(left, right, df, be):
     floored = left - (left // right) * right
     differs = ((floored != 0) & ((floored < 0) != (left < 0))).fillna(False)
     return floored - right * differs.astype("int64")
+
+
+#: The two shapes the engine's `Utf8 -> Date32` cast accepts, in the order it tries them: a bare
+#: calendar day, and a datetime whose **date part** is taken. Verified against the engine rather
+#: than assumed — `'2013-07-15 12:30:05' == DATE '2013-07-15'` is `True` there.
+_DATE_LITERAL_FORMATS = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+
+
+def _temporal_literal(left, right, be):
+    """`(left, right)` with a string literal parsed to the temporal column it is compared with.
+
+    `None` when neither side is that pair, so the caller carries on unchanged. Otherwise a pair
+    in which the literal has become a `date`/`datetime` — or `None`, meaning the engine's cast
+    would have produced a null and every row of the comparison is unknown.
+
+    **The engine casts the literal with Arrow, and this reproduces that rather than inventing a
+    parser.** `bc-expr::eval::coerce` casts a `Utf8` operand to the temporal column's exact
+    type; unparseable values become null, which is why `col == 'not-a-date'` is null in the
+    engine and not an error.
+
+    It cannot simply call pyarrow's cast, because **the two Arrow implementations disagree on
+    exactly this** and the difference is silent. Against a `Date32` column, arrow-rs accepts
+    `'2013-07-15 12:30:05'` and takes the date, and Arrow C++ raises `Failed to parse string`.
+    Both accept a bare `'2013-07-15'`, and for `Timestamp` they agree throughout — which is why
+    the timestamp arm *is* pyarrow's cast and the date arm is written out against the shapes
+    the engine was measured accepting.
+
+    This is what ClickBench q36 through q42 need: seven queries whose filter is
+    `EventDate >= '2013-07-01'` over a `date32` column. Untranslated, the comparison reached the
+    device as a date-against-str and raised `TypeError` there — a full round trip to a worker to
+    discover a type mismatch the driver could see.
+    """
+    for column, literal, flipped in ((left, right, False), (right, left, True)):
+        target = be.temporal_type(column)
+        if target is None or not isinstance(literal, str):
+            continue
+        parsed = _parse_temporal(literal, target)
+        return (column, parsed) if not flipped else (parsed, column)
+    return None
+
+
+def _parse_temporal(literal: str, target):
+    """`literal` as the Python value `target` denotes, or `None` when it does not parse."""
+    import datetime as _dt
+
+    import pyarrow as pa
+
+    if pa.types.is_date(target):
+        for fmt in _DATE_LITERAL_FORMATS:
+            try:
+                return _dt.datetime.strptime(literal, fmt).date()
+            except ValueError:
+                continue
+        return None
+    try:
+        return pa.array([literal], pa.string()).cast(target)[0].as_py()
+    except Exception:
+        return None

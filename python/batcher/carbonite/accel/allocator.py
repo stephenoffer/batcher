@@ -32,6 +32,8 @@ with an allocator that succeeds and a stage that then cannot fit its model.
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import threading
 from dataclasses import dataclass
 
@@ -336,7 +338,7 @@ def prepare_device_memory(*, tenants: int = 1) -> bool:
         return settled
 
     cfg = active_config().accelerator
-    plan = plan_allocator(cfg.memory, _visible_device_usable_bytes(cfg.vram_headroom, key))
+    plan = plan_allocator(cfg.memory, visible_device_usable_bytes(cfg.vram_headroom, key))
     applied = configure_device_memory(plan)
     # Deliberately not short-circuited: an RMM plan that was inert (the default) must not stop
     # the PyTorch allocator from being configured, since the two govern different callers.
@@ -345,7 +347,7 @@ def prepare_device_memory(*, tenants: int = 1) -> bool:
     return result
 
 
-def _visible_device_usable_bytes(headroom: float, tenants: int = 1) -> int:
+def visible_device_usable_bytes(headroom: float, tenants: int = 1) -> int:
     """Reservable bytes on the device this process is bound to, or `0` when it cannot tell.
 
     Reads capacity from the local inventory and subtracts what is already resident, so a
@@ -366,7 +368,17 @@ def _visible_device_usable_bytes(headroom: float, tenants: int = 1) -> int:
 
     devices = gpu_inventory()
     if not devices:
-        return 0
+        # NVML is not a RAPIDS dependency and is easy to leave out of a worker image, and
+        # without it the whole inventory is empty — so **every** device-memory decision this
+        # engine makes silently sizes against nothing: no RMM pool is built, the frame cache's
+        # budget is zero, and an overflowing shard is subdivided blind rather than measured.
+        # Measured on a six-T4 fleet, all four at once, on workers that had CUDA and cuDF and
+        # simply no `pynvml`.
+        #
+        # The CUDA runtime knows the same two numbers and is present wherever the device is, so
+        # it answers when NVML cannot. It reports free-and-total for the *bound* device, which
+        # is the pair this function is built out of.
+        return _runtime_usable_bytes(headroom, tenants)
     # Under MPS this process shares one device with its co-tenants, and they all start at
     # once against an empty device: without a declared share each would plan for the whole of
     # it and they would fail together. `mps_client_share` is `1.0` off MPS and wherever the
@@ -419,3 +431,58 @@ def reset_device_allocator() -> None:
         _applied = None
         _statistics_adaptor = None
         _prepared.clear()
+
+
+def _runtime_usable_bytes(headroom: float, tenants: int = 1) -> int:
+    """`visible_device_usable_bytes` from the CUDA runtime, for a host with no NVML.
+
+    `cudaMemGetInfo` is the runtime's own free-and-total for the device this thread is bound to
+    — the same device `CUDA_VISIBLE_DEVICES` gave the process — so it needs neither an index nor
+    a telemetry table. Free rather than total is what makes it equivalent to the NVML path: a
+    co-tenant's resident bytes are already subtracted by the driver.
+
+    Tried through whichever CUDA binding the process happens to have. A GPU worker in this
+    engine has at least one of them by construction — cuDF pulls in RMM and CuPy, and an
+    inference worker has torch — and a process with none has no device either.
+
+    Returns:
+        Reservable bytes, or `0` when no binding can answer, which every caller reads as
+        "unknown" and treats exactly as it treated an empty inventory.
+    """
+    from batcher.carbonite.accel.affinity import mps_client_share
+    from batcher.carbonite.accel.vram import VramPool
+
+    free, total = _runtime_mem_info()
+    if not total:
+        return 0
+    share = min(mps_client_share(), 1.0 / max(1, int(tenants)))
+    pool = VramPool(capacity_bytes=int(total), headroom=headroom, share=share)
+    if not pool.capacity_bytes:
+        return 0
+    # `total - free` is what everything on the board holds, this process included. That is the
+    # same quantity the NVML path reads as `memory_used_bytes`, and it is passed the same way.
+    pool.observe_external(0, int(total) - int(free), own_bytes=0)
+    return pool.usable_bytes(0)
+
+
+def _runtime_mem_info() -> tuple[int, int]:
+    """`(free, total)` device bytes from any available CUDA binding, or `(0, 0)`.
+
+    Ordered by how likely the binding is to already be imported in the process asking, so the
+    common case costs an attribute lookup rather than an import.
+    """
+    import sys
+
+    if (cupy := sys.modules.get("cupy")) is not None:
+        with contextlib.suppress(Exception):
+            return tuple(cupy.cuda.runtime.memGetInfo())
+    if (torch := sys.modules.get("torch")) is not None:
+        with contextlib.suppress(Exception):
+            return tuple(torch.cuda.mem_get_info())
+    for name, read in (
+        ("cupy", lambda m: m.cuda.runtime.memGetInfo()),
+        ("torch", lambda m: m.cuda.mem_get_info()),
+    ):
+        with contextlib.suppress(Exception):
+            return tuple(read(importlib.import_module(name)))
+    return (0, 0)

@@ -342,13 +342,33 @@ def test_like_matches_the_engine_for_the_literal_patterns(pattern, be):
     _assert_matches_engine(ds, table, be)
 
 
-@pytest.mark.parametrize("pattern", ["f_o", "a%b", "%foo%bar%"])
-def test_like_declines_the_patterns_that_need_a_regex_or_a_segment_scan(pattern, be):
-    """These are the cases the engine itself needs more than a substring test for.
+@pytest.mark.parametrize("pattern", ["a%b", "%foo%bar%", "foo%bar", "%foo%bar", "f%oo%bar%"])
+def test_like_matches_the_engine_for_the_multi_segment_patterns(pattern, be):
+    """A pattern with literals on both sides of a wildcard, which used to be declined.
 
-    A regex is the one construction that could not be checked here: the engine compiles Rust's,
-    the host backend Python's and the device cuDF's, and the three disagree on exactly the
-    classes a test over ASCII data would never reach.
+    It is TPC-H q13 and q16 (`LIKE '%special%requests%'`), and declining it cost both of them a
+    full round trip to a device to be told so — 0.9 s each on a T4, twice over for a plan that
+    tries the fan-out and then a single worker. The segments are matched in order and without
+    overlapping, which is checked against the engine here and against DuckDB in
+    `tests/differential/test_diff_gpu_like_segments.py`.
+    """
+    table = _strings()
+    ds = bt.from_arrow(table).select(r=col("s").str.like(pattern))
+    _assert_matches_engine(ds, table, be)
+
+
+@pytest.mark.parametrize("pattern", ["f_o", "%a%b%c%"])
+def test_like_declines_the_patterns_it_cannot_state_exactly(pattern, be):
+    """The two cases left, and neither is arbitrary.
+
+    `_` needs a regex, and a regex is the one construction that could not be checked here: the
+    engine compiles Rust's, the host backend Python's and the device cuDF's, and the three
+    disagree on exactly the classes a test over ASCII data would never reach — including
+    whether `.` spans a newline, which SQL's `%` does.
+
+    Three literals between wildcards needs `find` to start from a *per-row* index to place the
+    third, which neither dataframe library expresses. Two are exact because the first
+    occurrence of the earlier and the last of the later are the widest placement available.
     """
     from batcher.core.gpu_plan.backend import Unsupported
 

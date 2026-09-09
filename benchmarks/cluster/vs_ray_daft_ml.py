@@ -52,7 +52,6 @@ and charging that install to a Batcher or Ray Data sweep would measure a pip ins
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import os
 import sys
@@ -63,7 +62,7 @@ import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vs_ray_daft import _require_release, _worker_pip, bench_engine
+from vs_ray_daft import _require_release, _warm_the_fleet, _worker_pip, bench_engine
 
 from envinfo import machine_fingerprint, require_release_build
 from sources.corpora import image_corpus
@@ -411,28 +410,6 @@ def _util(entry) -> str:
         f"{u.get('mean_busy_pct', 0):.0f}%/{u.get('peak_busy_pct', 0):.0f}%peak "
         f"{int(u.get('active_nodes', 0))}/{int(u.get('total_nodes', 0))}n"
     )
-
-
-def _warm_the_fleet(eng: str) -> None:
-    """Pay an engine's *fleet* startup before the sweep, on a query with no data in it.
-
-    `bench_engine` already runs each pipeline once untimed, which pays planning and the read.
-    It does not help an engine whose worker startup has its own deadline: Daft's Ray runner
-    spawns flotilla actors on first use and gives up on them after 120 s, and on this cluster
-    the first pipeline of a Daft sweep died with `No flotilla workers became available within
-    120s (64 attempted)` while the second -- with the actors up -- returned a number. That is
-    the harness charging one pipeline for the fleet the whole sweep uses, and it reads as a
-    Daft failure.
-
-    Best-effort and untimed: an engine that cannot answer a one-row query here will fail in
-    its own arm with its own error, which is where a reader should see it.
-    """
-    if eng != "daft":
-        return
-    with contextlib.suppress(Exception):
-        import daft
-
-        daft.from_pydict({"x": [1]}).agg(daft.col("x").sum().alias("s")).to_pydict()
 
 
 def main() -> int:
