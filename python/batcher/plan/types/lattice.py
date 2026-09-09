@@ -184,12 +184,15 @@ def widen(dt: pa.DataType) -> pa.DataType:
     layouts normalize to the layout they respell — ``string_view`` to ``string``,
     ``binary_view`` to ``binary``, ``list_view``/``large_list_view`` to ``list`` — and a
     ``run_end_encoded`` column decodes to its value type, exactly as a dictionary does. The
-    widening
-    **recurses into nested types** — a ``struct<a: int32>`` becomes ``struct<a: int64>`` and
-    a ``list<float32>`` becomes ``list<float64>`` — because the boundary widens a narrow
-    numeric at every nesting depth, so a narrow field buried in a struct/list must be
-    predicted widened too or ``Dataset.schema`` would lie (and later arithmetic on the
-    widened engine value would disagree with the inferred narrow type). Booleans and
+    widening **recurses into nested types** — a ``struct<a: int32>`` becomes
+    ``struct<a: int64>`` and a ``list<int32>`` becomes ``list<int64>`` — because the boundary
+    widens a narrow numeric at those depths too, so a narrow field buried in a struct or list
+    must be predicted widened or ``Dataset.schema`` would lie (and later arithmetic on the
+    widened engine value would disagree with the inferred narrow type).
+
+    The one nested type that does **not** widen is a **float** inside a list:
+    ``list<float32>`` and ``fixed_size_list<float32>`` keep their ``float32`` child, because
+    that column is a tensor rather than a numeric column. See `_widen_element`. Booleans and
     strings are unchanged. Idempotent.
 
     The dictionary and ``LargeUtf8`` arms are what make this an actual mirror. Leaving them
@@ -230,13 +233,13 @@ def _widen_nested(dt: pa.DataType) -> pa.DataType:
     if pa.types.is_list(dt) or pa.types.is_large_list(dt):
         vf = dt.value_field
         make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
-        return make(vf.with_type(_widen_nested(vf.type)))
+        return make(vf.with_type(_widen_element(vf.type)))
     if _is(dt, "is_list_view", "is_large_list_view"):
         vf = dt.value_field
-        return pa.list_(vf.with_type(_widen_nested(vf.type)))
+        return pa.list_(vf.with_type(_widen_element(vf.type)))
     if pa.types.is_fixed_size_list(dt):
         vf = dt.value_field
-        return pa.list_(vf.with_type(_widen_nested(vf.type)), dt.list_size)
+        return pa.list_(vf.with_type(_widen_element(vf.type)), dt.list_size)
     if pa.types.is_map(dt):
         return pa.map_(
             dt.key_field.with_type(_widen_nested(dt.key_type)),
@@ -244,3 +247,35 @@ def _widen_nested(dt: pa.DataType) -> pa.DataType:
             dt.keys_sorted,
         )
     return dt
+
+
+def _widen_element(dt: pa.DataType) -> pa.DataType:
+    """`_widen_nested` for a list's element type, where a float leaf keeps its width.
+
+    Mirrors ``bc_py::normalize_list_element``. A list of floats is a *tensor* — an embedding,
+    a decoded image, a feature vector — not a numeric column: the list kernels read an
+    ``f32`` child correctly (the ``arrow.fixed_shape_tensor`` extension column has always
+    handed them one, because the boundary exempts extension columns from widening), and
+    widening it doubles the AI hot path's bytes and forces a cast where the transfer would
+    otherwise be zero-copy.
+
+    Integer elements still widen, because their reason is wrap rather than width: an
+    ``int32`` that later reaches arithmetic overflows where the widened value does not.
+    A ``struct`` reached inside a list reverts to the ordinary rules for the same reason —
+    its fields are addressable and behave like columns.
+    """
+    if pa.types.is_floating(dt):
+        return dt
+    if pa.types.is_dictionary(dt):
+        return _widen_element(dt.value_type)
+    if pa.types.is_list(dt) or pa.types.is_large_list(dt):
+        vf = dt.value_field
+        make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
+        return make(vf.with_type(_widen_element(vf.type)))
+    if _is(dt, "is_list_view", "is_large_list_view"):
+        vf = dt.value_field
+        return pa.list_(vf.with_type(_widen_element(vf.type)))
+    if pa.types.is_fixed_size_list(dt):
+        vf = dt.value_field
+        return pa.list_(vf.with_type(_widen_element(vf.type)), dt.list_size)
+    return _widen_nested(dt)

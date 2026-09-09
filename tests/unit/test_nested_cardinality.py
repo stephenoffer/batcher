@@ -93,6 +93,14 @@ def test_an_explode_is_budgeted_at_its_fanout_not_at_one_morsel():
     3,072,000-row batch — 12 MB against a 1 MiB morsel budget. Budgeting the operator at one
     morsel under-counted it by the fan-out, in the direction that lets admission accept a
     query the node cannot run.
+
+    The threshold below tracks the element width, and it moved once. It was `> 50 *` while the
+    FFI boundary widened this column's `float32` child to `float64`, which budgeted the fixture
+    at 96 MiB for a payload this docstring itself calls 12 MB. With the child left at the width
+    the caller wrote (`bc_py::normalize_list_element`) the same fixture is 48 MiB — nearer the
+    truth, and under a bound that had been calibrated on the doubled figure. What the test is
+    for is unchanged: 48 morsels is not one morsel, and a regression to one-morsel budgeting
+    still fails it by a factor of forty.
     """
     from batcher.config import active_config
     from batcher.kyber.annotate import annotate_ops
@@ -106,7 +114,7 @@ def test_an_explode_is_budgeted_at_its_fanout_not_at_one_morsel():
     scan = next(o for o in ops if o.kind == "Scan")
     # The scan is byte-capped at one morsel; the explode is not, and holds its fan-out.
     assert scan.bounds.m_max_bytes <= cfg.execution.morsel_bytes
-    assert unnest.bounds.m_max_bytes > 50 * cfg.execution.morsel_bytes
+    assert unnest.bounds.m_max_bytes > 40 * cfg.execution.morsel_bytes
 
 
 def test_a_one_to_one_explode_is_still_one_morsel():
