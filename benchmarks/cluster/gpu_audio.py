@@ -221,6 +221,21 @@ def _init() -> None:
     init_batcher_ray()
 
 
+def _torchaudio_available() -> bool:
+    """Whether the driver can import `torchaudio`, checked before anything reaches the cluster.
+
+    A driver-side check, deliberately, and it is a proxy rather than the real question: what
+    matters is whether the *workers* have it. It is the cheap proxy that catches this cluster,
+    where neither has it, and it converts a five-minute run that dies inside a producer actor
+    with `RayTaskError(ModuleNotFoundError)` into one line before Ray is even contacted. A
+    fleet whose driver has torchaudio and whose workers do not still fails the old way; the
+    message below says which side to look at.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("torchaudio") is not None
+
+
 def main() -> int:
     # Refuse a dev-profile engine (8-60x slower) and a contended box (a neighbour's load
     # is not a fact about any engine), and print the machine, because a timing is only
@@ -232,6 +247,16 @@ def main() -> int:
     # negative on the multi-node deployment these scripts are written for.
     require_release_build()
     print(machine_fingerprint())
+    if not _torchaudio_available():
+        print(
+            "SKIP: this benchmark's CPU stage is a `torchaudio` mel-spectrogram and torchaudio "
+            "is not installed. Both engines run the same UDF, so neither can run here and the "
+            "comparison is not a fact about either.\n"
+            "Install it on the driver AND the workers (the cluster image must carry it; a "
+            "`runtime_env` pip set would charge the first engine to touch a node for the "
+            "build, which is how the GPU relational benchmark came to report a 0.21x loss)."
+        )
+        return 0
     cfg = _cfg()
     _init()
     import pyarrow.parquet as pq
