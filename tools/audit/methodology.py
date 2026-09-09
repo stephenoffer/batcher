@@ -1527,6 +1527,33 @@ def _module_file(dotted: str) -> Path | None:
     return package if package.is_file() else None
 
 
+def _import_time_statements(body: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """Every statement in `body` that runs at import time, descending through `if`/`try`.
+
+    A binding does not stop being module-level for sitting inside a guard. The engine defines
+    its Ray actors as ``try: import ray`` / ``@ray.remote class X`` with an ``except
+    ImportError: X = None`` fallback, so `RelayActor` **is** bound on any host with Ray — and
+    a version of this that only walked `tree.body` reported a correct `monkeypatch.setattr`
+    against it as a patch that "applies to nothing". That is the same defect this rule exists
+    to find, turned on itself: a confident wrong answer, and one that pushes the author to
+    weaken a working test.
+
+    Function and class *bodies* are deliberately not descended into — a name bound there is
+    local, which is exactly what the rule is distinguishing from a module-level binding.
+    """
+    for node in body:
+        yield node
+        if isinstance(node, ast.If):
+            yield from _import_time_statements(node.body)
+            yield from _import_time_statements(node.orelse)
+        elif isinstance(node, ast.Try):
+            yield from _import_time_statements(node.body)
+            yield from _import_time_statements(node.orelse)
+            yield from _import_time_statements(node.finalbody)
+            for handler in node.handlers:
+                yield from _import_time_statements(handler.body)
+
+
 def _bound_names(path: Path) -> set[str] | None:
     """`path`'s top-level bindings, or `None` when it re-exports lazily."""
     try:
@@ -1534,7 +1561,7 @@ def _bound_names(path: Path) -> set[str] | None:
     except (SyntaxError, OSError, UnicodeDecodeError):
         return None
     names: set[str] = set()
-    for node in tree.body:
+    for node in _import_time_statements(tree.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name in _LAZY_MARKERS:
                 return None
@@ -1545,10 +1572,6 @@ def _bound_names(path: Path) -> set[str] | None:
             names.add(node.target.id)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             names.update(a.asname or a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.If):  # `if TYPE_CHECKING:` and friends
-            for sub in ast.walk(node):
-                if isinstance(sub, (ast.Import, ast.ImportFrom)):
-                    names.update(a.asname or a.name.split(".")[0] for a in sub.names)
     return names
 
 
