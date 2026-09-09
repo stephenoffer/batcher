@@ -72,7 +72,7 @@ def stream_distributed_pipeline(
     _ensure_ray(workers)
     stages = split_into_resource_stages(plan)
     sid = next(iter(scanned_source_ids(plan)))
-    partitions = partition_descriptors(sources[sid], workers)
+    partitions = partition_descriptors(sources[sid], producer_fanout(stages[0], workers))
     if not partitions:
         return _empty(plan)
 
@@ -132,6 +132,34 @@ def stream_distributed_pipeline(
     return pa.Table.from_batches(batches) if batches else _empty(plan)
 
 
+def producer_fanout(stage, workers: int) -> int:
+    """How wide stage 0 may open: its explicit `concurrency` when it has one, else `workers`.
+
+    Stage 0 reads partitions, so its pool size and the partition count are the same number —
+    which is why both are taken from here, and why an explicit `concurrency` has to reach the
+    *partitioning* and not only the pool. It did not: the fan-out was `workers`, the relational
+    fleet width, and `map_batches(..., concurrency=N)` on the host stage of a streamed pipeline
+    was silently discarded. A caller asking for forty-eight decode actors got sixteen.
+
+    This is the fix `executors.map._pool_partition_count` already made on the non-streamed
+    path, in its own words: "`_drive_actor_pool` then clamps the pool to
+    `min(max_size, len(partitions))` and the caller's number is silently reduced to the worker
+    count". The streaming path inherited the shape and not the fix, so the same public argument
+    meant two different things depending on which path a plan happened to take.
+
+    Args:
+        stage: The first resource stage, carrying its `concurrency` spec.
+        workers: The worker count the run was sized for.
+
+    Returns:
+        The actor and partition count for stage 0, at least 1.
+    """
+    from batcher.dist.executors.map import _explicit_pool_ceiling
+
+    explicit = _explicit_pool_ceiling(getattr(stage, "concurrency", None))
+    return max(1, explicit) if explicit else workers
+
+
 def _pool_bounds(stages, workers: int, num_partitions: int) -> list[tuple[int, int]]:
     """`(start, ceiling)` per stage: how many actors it opens with and may grow to.
 
@@ -140,7 +168,7 @@ def _pool_bounds(stages, workers: int, num_partitions: int) -> list[tuple[int, i
     fed by the Flight hand-off rather than by a partition, so its bounds come from its own
     `concurrency` spec.
     """
-    producers = clamp(num_partitions, 1, workers)
+    producers = clamp(num_partitions, 1, producer_fanout(stages[0], workers))
     bounds = [(producers, producers)]
     bounds.extend(consumer_pool_bounds(stage, workers, num_partitions) for stage in stages[1:])
     return bounds

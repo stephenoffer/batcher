@@ -58,6 +58,7 @@ class _Stage:
     def __init__(self, num_gpus: float) -> None:
         self.num_gpus = num_gpus
         self.accelerator_type = None
+        self.concurrency = None
         self.sub_plan = f"plan-gpu{num_gpus}"
 
 
@@ -116,3 +117,46 @@ def test_no_options_call_when_there_is_nothing_to_apply(monkeypatch, stub_pipeli
 
     assert relay.option_calls == []
     assert len(relay.spawned) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Stage 0's `concurrency` reaches the partitioning, not just the pool
+# --------------------------------------------------------------------------- #
+def test_the_host_stage_honours_an_explicit_concurrency():
+    """`map_batches(..., concurrency=N)` on the host stage was silently discarded.
+
+    Stage 0 reads partitions, so its pool size and the partition count are one number, and
+    that number came from `workers` -- the relational fleet width. On a 192-CPU cluster
+    feeding eight devices, a caller asking for 48 decode actors got 16, and the argument the
+    public API documents as controlling pool size did nothing on this path while doing exactly
+    what it says on the non-streamed one.
+    """
+    assert driver.producer_fanout(_Stage(0.0), workers=16) == 16, "no spec: the fleet width"
+
+    explicit = _Stage(0.0)
+    explicit.concurrency = 48
+    assert driver.producer_fanout(explicit, workers=16) == 48
+
+    smaller = _Stage(0.0)
+    smaller.concurrency = 4
+    assert driver.producer_fanout(smaller, workers=16) == 4, "a smaller ask is also an ask"
+
+    ranged = _Stage(0.0)
+    ranged.concurrency = (2, 32)
+    assert driver.producer_fanout(ranged, workers=16) == 32, "a range needs room to grow into"
+
+
+def test_an_explicit_host_concurrency_reaches_the_pool_bounds(stub_pipeline):
+    """The number has to survive into `_pool_bounds`, which is what sizes the pool."""
+    stages = [_Stage(0.0), _Stage(1.0)]
+    stages[0].concurrency = 48
+    # 48 partitions available, so nothing clamps the ask back down.
+    bounds = driver._pool_bounds(stages, workers=16, num_partitions=48)
+    assert bounds[0] == (48, 48)
+
+
+def test_the_partition_count_still_caps_the_host_pool(stub_pipeline):
+    """An ask larger than the input can supply is still bounded by the partitions."""
+    stages = [_Stage(0.0), _Stage(1.0)]
+    stages[0].concurrency = 48
+    assert driver._pool_bounds(stages, workers=16, num_partitions=6)[0] == (6, 6)
