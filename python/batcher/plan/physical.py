@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from batcher.plan.ids import OpId
+from batcher.plan.ir_tags import Op
 from batcher.plan.resource import ResourceBounds
 from batcher.plan.schema import SchemaRef
 from batcher.plan.stats import ColumnStat, Provenance
@@ -133,6 +134,33 @@ class PhysicalPlan:
             memo.append(json.dumps(self.ir))
         return memo[0]
 
+    def scanned_source_ids(self) -> frozenset[int]:
+        """The `source_id`s this plan's IR actually reads.
+
+        Sources cross the FFI boundary positionally, so a caller keeps every source at its
+        own index while touching only the ones the plan reaches. `plan.visitor` answers the
+        same question for a `LogicalPlan`; this answers it for the lowered IR, which is what
+        the executor is handed and the only form some callers hold.
+
+        It is load-bearing rather than an optimization. The adaptive staging loop
+        (`api.adaptive.staging`) executes a *sub*-plan against the query's full source list,
+        so a stage that scans two tables was handed all six — and reading a source the stage
+        never scans makes it resident, with no projection to narrow it (the pushdown analysis
+        records nothing for a scan the plan does not contain, and an absent entry means "read
+        every column"). On TPC-H q9 at sf10 the first stage read 8.9 GiB where its plan needed
+        2.9 GiB, and the query was OOM-killed.
+
+        The walk is structural — any nested `{"op": "scan", "source_id": n}` — so an IR shape
+        this module does not know about cannot hide a scan from it.
+
+        Returns:
+            Every `source_id` reachable in the IR document. Empty for a plan that scans
+            nothing.
+        """
+        found: set[int] = set()
+        _collect_scans(self.ir, found)
+        return frozenset(found)
+
     def op_budgets(self) -> dict[int, int]:
         """Per-operator spill budgets (bytes) keyed by pre-order `op_id`.
 
@@ -147,3 +175,23 @@ class PhysicalPlan:
         return {
             int(op.op_id): op.bounds.m_max_bytes for op in self.ops if op.bounds.m_max_bytes > 0
         }
+
+
+def _collect_scans(node: Any, found: set[int]) -> None:
+    """Add every `{"op": "scan", "source_id": n}` reachable in `node` to `found`.
+
+    Structural rather than schema-driven: it descends into every dict value and list
+    element, so an IR shape that nests a scan under a key this module has never heard of
+    still reports it. Under-reporting is the failure that matters — a caller skips a source
+    the plan does read — so the walk is deliberately indiscriminate.
+    """
+    if isinstance(node, dict):
+        if node.get("op") == Op.SCAN:
+            source_id = node.get("source_id")
+            if isinstance(source_id, int):
+                found.add(source_id)
+        for value in node.values():
+            _collect_scans(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_scans(value, found)

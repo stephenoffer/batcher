@@ -567,7 +567,7 @@ def _run_relational_scoped(
     # spill estimate, and the input size. The input is the dominant one on a scan-heavy
     # query, because the in-memory path resolves every source to Arrow *before* the engine
     # runs — a 600M-row scan is resident in full even when the query returns four rows.
-    input_bytes = projected_input_bytes(sources, opt.source_projections)
+    input_bytes = projected_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
     # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
     # plan's peak state are concurrent on this path, so what matters is their sum.
     if must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt):

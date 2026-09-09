@@ -18,6 +18,8 @@ import pyarrow as pa
 from batcher._internal.hardware import available_cpu_count
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from batcher.io.source import Source
     from batcher.plan.logical import LogicalPlan
     from batcher.plan.physical import PhysicalPlan
@@ -86,12 +88,22 @@ def partitions_from_physical(opt: PhysicalPlan) -> int | None:
     return _clamp_partitions(max(max(widths), available_cpu_count()))
 
 
-def projected_input_bytes(sources: list[Source], projections: dict[int, list[str]]) -> int:
+def projected_input_bytes(
+    sources: list[Source],
+    projections: dict[int, list[str]],
+    scanned: Collection[int] | None = None,
+) -> int:
     """Bytes the sources would occupy if resolved whole, from metadata alone.
 
     The in-memory path materializes every source before the engine starts, so this is the
     resident cost of *reading*, independent of what the query then computes. It is a row
     count times the projected schema's per-row width: no I/O, no scan.
+
+    `scanned` names the source indices the plan actually reads, and must be passed whenever
+    the plan is a *sub*-plan of the query the source list belongs to — an adaptive stage.
+    `resolve_sources` skips the rest, so counting them here would size the read against
+    tables it will not open. `None` counts every source, which is right when the plan is
+    the whole query.
 
     **An estimated row count counts here, and an exact one is not required.** That is the
     difference between this and `declared_row_count`, whose caller asks "did this read see
@@ -110,6 +122,7 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
     Args:
         sources: The plan's bound sources.
         projections: Pushed column projections, keyed by source index.
+        scanned: The source indices the plan reads, or `None` to count them all.
 
     Returns:
         The total byte estimate, or `0` when any source can offer no row count at all —
@@ -119,6 +132,8 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
 
     total = 0.0
     for i, src in enumerate(sources):
+        if scanned is not None and i not in scanned:
+            continue
         rows = declared_row_count(src)
         if rows is None:
             rows = _estimated_row_count(src)
