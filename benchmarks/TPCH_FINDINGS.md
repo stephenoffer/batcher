@@ -121,7 +121,7 @@ same-input (`duckdb_arrow`) execution comparison degrades as rows grow:
 |-------|-----------|------------------------------------------|
 | sf1 (6M)    | yes | wins **all 21** TPC-H queries, 0.23×–0.79× (1.3×–4.3× faster) |
 | sf10 (60M)  | yes | wins 15 of 21; **loses q1, q9, q10, q16, q18, q19** (1.2×–3.0×) — the aggregate/join-heavy shapes |
-| sf100 (600M)| no (scan) | DuckDB leads 2×–11× on completing queries; Batcher **OOMs on q3/q4/q5** |
+| sf100 (600M)| no (scan) | DuckDB leads 2×–11× on completing queries; **20 of 22 complete, none OOM-killed** (see below) |
 
 sf100 single-node, scan mode, best-of-2 (ms; batcher isolated per-query so one OOM does not
 kill the run):
@@ -133,6 +133,87 @@ kill the run):
 | q12 |  9847 |  881 | 11×  |
 | q19 |  5504 | 1152 | 4.8× |
 | q3 / q4 / q5 | **OOM** | ~1200 | deep 3+-way join trees |
+
+### Update 2026-09-08 — sf100 on a 30 GiB box: the OOMs were the arithmetic, not the engine
+
+The sf100 row above said "OOMs on q3/q4/q5". That is retired: **q3, q4 and q5 all complete,
+and no query is OOM-killed at all.** Four defects were behind it, none of them the
+"intermediate blow-up" the old note attributed it to. One was returning wrong answers rather
+than dying, and the one that mattered most was a cgroup path that made two safety mechanisms
+read `None` in every container.
+
+Measured on this box — 16 cores, 30 GiB, cgroup limit 32 GiB, one process per query against a
+602-file local mirror verified against the canonical TPC-H row counts (`lineitem` 600,037,902).
+Peak is sampled RSS. These are memory figures, not competitive timings: the box is shared and
+was busy, so read the wall clocks as magnitudes only.
+
+| q | peak | q | peak | q | peak |
+|---|---|---|---|---|---|
+| q1 | 1.13 G | q9 | **disk full** | q17 | 8.63 G |
+| q2 | 12.52 G | q10 | 11.55 G | q18 | 11.96 G |
+| q3 | 4.89 G | q11 | 7.22 G | q19 | 1.33 G |
+| q4 | 1.07 G | q12 | 1.02 G | q20 | 5.83 G |
+| q5 | 12.18 G | q13 | 6.33 G | q21 | 9.30 G |
+| q6 | 0.93 G | q14 | 1.53 G | q22 | 4.61 G |
+| q7 | 5.48 G | q15 | 1.48 G | | |
+| q8 | **disk full** | q16 | 7.00 G | | |
+
+**Nothing is OOM-killed.** The two failures are the scratch volume filling, and the engine
+says so rather than dying: `ResourceError: the local spill disk is full ... point
+memory.spill_dir at a larger one`. The 40 GiB mirror left 32 GiB of scratch on the same
+volume, which a five-table sf100 join cannot grace-partition into. Pointed at a volume with
+room, **q8 completes** -- 2 rows, 12.42 GiB peak -- so this is the spill path working and
+running out of disk, not a defect. It is slow there (NFS), which is the honest trade: local
+scratch is fast and finite, and the engine says which one it hit.
+
+What was actually wrong:
+
+1. **A staged query read every source, at full width.** `resolve_sources` read every source
+   bound to the *query*, while the adaptive staging loop hands it a *sub*-plan. Worse than
+   wasted I/O: projection pushdown records a column list only for scans the plan contains, and
+   an absent entry means "read every column", so the sources a stage does not use are exactly
+   the ones it reads widest. TPC-H q9 at sf10 resolved 8.9 GiB where its stage needed 2.9 GiB.
+2. **A breaker under a spilled sort/window/join was never combined.** Those paths stage input
+   by running its sub-plan once per morsel — right for a linear chain, silently wrong for a
+   breaker, whose per-morsel partials nothing then merges. q1 at sf10 under a 2 GiB envelope
+   returned **1,224 rows where the answer is 4**, with no error.
+3. **The spill gate never counted what the in-memory path materializes.** It summed the
+   resident input and the dominant *breaker* state, and Kyber sizes the row-wise operators at
+   zero — correctly, since they retain nothing, and irrelevantly, since the materializing
+   executor holds their output. q4's `Filter`/`Project` over `lineitem` carry 292 M rows and
+   are sized `0.00G`; the gate read 17.83 GiB against a 19.02 GiB budget, said "fits", and the
+   query died at 21.26 GiB. Counted, it routes out of core and answers at **1.06 GiB**.
+4. **Every cgroup path was wrong under a namespace, so both live guards were dead.** This is
+   the one that mattered most, and it does not look like a bug at all. `cgroup_v2_dirs` joins
+   `/sys/fs/cgroup` with the sub-path from `/proc/self/cgroup`; under a cgroup namespace that
+   sub-path is what the *host* sees, while the mount shows the same cgroup at the root, so
+   every constructed path is absent. A missing file yields `None` and the caller moves on,
+   except that `_own_cgroup_dirs` reads a non-empty tuple as proof of a delegated slice and so
+   never falls back to the root. `memory.current` read `None` on a box whose
+   `/sys/fs/cgroup/memory.current` read 19.57 GiB. Two mechanisms failed open in containers,
+   which is where they matter: the live-pressure signal, and the OOM-kill history that is the
+   only *evidence*-based spill trigger. This cgroup reported **91 prior kills** the moment it
+   could be read, and the 0.8 backoff it gates had never once applied. Fixed, the sensed
+   envelope drops 22.42 to 17.94 GiB and **q13 and q18 both complete**: 45 rows at 6.22 GiB
+   and 100 rows at 8.53 GiB, against OOM kills at 21.0 and 19.3.
+
+   `effective_limit_bytes` always worked, because `_tightest` reads the tuple *including* the
+   mount root. Only the consumers that deliberately exclude the root, the usage figures that
+   must describe this workload rather than the box, were affected. That asymmetry is why it
+   reads as absent rather than as wrong.
+
+Still open, and stated as measured rather than diagnosed:
+
+* **q9 exhausts the scratch disk**, and says so: `ResourceError: the local spill disk is full
+  ... point memory.spill_dir at a larger one`. That is the spill path working and running out
+  of room, not a defect: the 40 GiB mirror left 37 GiB of scratch for a five-table sf100 join.
+* **The budget is only as good as the reading behind it.** Three of these four defects were
+  arithmetic in front of a spill path that already worked. Every query that OOM-killed here
+  completes out of core when the gate is forced, at a fraction of the memory. The lesson worth
+  carrying is that an irreversible decision taken from an estimate needs a *measured* term in
+  it, which is what the cgroup fix restores.
+
+**Do not restore the claim that q3/q4/q5 OOM at sf100.**
 
 **Why the gap widens** (structural, not tuning; measured by `perf`):
 

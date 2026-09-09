@@ -213,7 +213,88 @@ class SpillAdvisor:
         """
         if input_bytes <= 0:
             return False
-        return input_bytes + max(0, self.peak_bytes(plan)) > self.hard_budget()
+        widest = self._widest_intermediate(input_bytes, plan)
+        # `2 *`, because the materializing path holds two of these at once, and for the same
+        # reason on both terms. A mergeable operator holds its partials *and* the merged
+        # result while `combine` runs, so its high-water mark is about twice the state
+        # `peak_bytes` reports -- which is the final state. A row-wise operator holds its
+        # input while it builds its output, so at the hand-off both are resident. Neither is
+        # a safety factor; both are facts about how the executor runs.
+        #
+        # It matters because the decision is irreversible. Once the sources are resolved and
+        # the engine is running there is no route back, so an estimate that lands 10% low is
+        # not a slow query, it is a dead process. TPC-H q18's first staged sub-plan -- a
+        # `GROUP BY l_orderkey` over 600 M rows -- estimated 8.94 GiB of input and 8.94 GiB of
+        # state against a 19.92 GiB budget, read 17.88, said "fits", and was OOM-killed at
+        # 19.34 GiB. Doubled, it routes out of core and returns its 100 rows at **7.95 GiB**.
+        #
+        # TPC-H q13 is the row-wise half of the same story. Its `Filter` and `Project` over
+        # `orders` each carry 142.5 M rows and are both live at the hand-off between them;
+        # counting one read 13.75 GiB against a 14.41 GiB budget and fit by 0.66 GiB, where
+        # the query really peaks at 18.50 GiB. Counting both, it routes out of core.
+        #
+        # The cost is real and worth stating: this is the trade the module already names --
+        # over-estimating costs latency, under-estimating costs the process -- taken
+        # deliberately rather than by accident.
+        return input_bytes + 2 * max(0, self.peak_bytes(plan), widest) > self.hard_budget()
+
+    def _widest_intermediate(self, input_bytes: int, plan: PhysicalPlan) -> int:
+        """Bytes of the largest operator *output* the materializing path holds resident.
+
+        `peak_bytes` is the dominant **breaker state**, and that is not the dominant resident
+        term. The in-memory path runs the materializing executor, which holds every
+        operator's full output -- and Kyber sizes the row-wise operators at `m_max_bytes = 0`,
+        correctly, because a `Filter` and a `Project` retain no state. They retain no state
+        and still occupy memory, because their output is materialized before the operator
+        above reads it. So the plan's largest resident object is routinely one that nothing
+        in the envelope arithmetic mentions.
+
+        TPC-H q4 at sf100 is that shape. Its `Filter` and `Project` over `lineitem` carry
+        292,422,301 rows and are both sized `0.00G`; the `Join` above them is sized 2.18 GiB
+        and is the whole of `peak_bytes`. Against a 15.65 GiB input and a 19.02 GiB budget the
+        gate read 17.83 GiB, said "fits", and the query was OOM-killed at 21.26 GiB. Forced
+        out of core the same query peaks at **1.07 GiB** -- so the mistake cost the process,
+        and avoiding it costs a query that was already at the edge of the envelope a run out
+        of core.
+
+        Sized from the *measured* input rather than from `row_size`, which is the estimate
+        that cannot be used here: `row_size` is the operator's unprojected row width (292
+        bytes for that `Filter`, against the ~22 bytes actually read), so multiplying by it
+        over-reads by an order of magnitude and would push every large scan out of core.
+        `input_bytes` already reflects pushed projections, so bytes-per-scanned-row derived
+        from it is the width the reader will really produce.
+
+        It can only ever *add* a spill: the caller takes a `max` against the existing term, so
+        a plan this does not fire on decides exactly as it did before.
+
+        Args:
+            input_bytes: The projected resident input, the same figure the caller sums.
+            plan: The annotated physical plan.
+
+        Returns:
+            The widest intermediate in bytes, or `0` when the plan carries no usable row
+            estimates -- where an absent number must not read as a small one.
+        """
+        scans = [
+            op.properties.est_rows
+            for op in plan.ops
+            if op.kind.lower() == "scan" and op.properties.est_rows == op.properties.est_rows
+        ]
+        # Scans are excluded from the max, and that is not a detail: a scan's output *is*
+        # the resident input, which the caller has already counted, so including it charges
+        # the input twice and reports the widest intermediate as the largest table in the
+        # query. On q4 that read 13.4 GiB where the real widest is 6.5 GiB -- right verdict,
+        # wrong reason, and wrong on any plan where the double-count is what tipped it.
+        above = [
+            op.properties.est_rows
+            for op in plan.ops
+            if op.kind.lower() != "scan" and op.properties.est_rows == op.properties.est_rows
+        ]
+        scan_rows = sum(scans)
+        widest_rows = max(above, default=0.0)
+        if scan_rows <= 0 or widest_rows <= 0:
+            return 0
+        return int(widest_rows * (input_bytes / scan_rows))
 
     def partitions(self, plan: PhysicalPlan) -> int | None:
         """Out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
