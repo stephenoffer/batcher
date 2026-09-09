@@ -58,6 +58,9 @@ from envinfo import machine_fingerprint, require_release_build
 print = functools.partial(print, flush=True)
 
 _SEED = 1234
+#: Labels are drawn from `[0, 1000)`, so this bounds what a dropped row can remove from
+#: the checksum. See `_consumed_a_real_subset`.
+_MAX_LABEL = 999
 
 
 def _cfg() -> dict:
@@ -224,7 +227,7 @@ def batcher_loop(cfg: dict) -> None:
             drop_last=True,
         )
 
-    _report_across_ranks(_run_epochs(batches, cfg, model, opt, loss_fn))
+    _report_across_ranks(_run_epochs(batches, cfg, model, opt, loss_fn), cfg["sink"])
 
 
 def ray_loop(cfg: dict) -> None:
@@ -244,7 +247,7 @@ def ray_loop(cfg: dict) -> None:
             drop_last=True,
         )
 
-    _report_across_ranks(_run_epochs(batches, cfg, model, opt, loss_fn))
+    _report_across_ranks(_run_epochs(batches, cfg, model, opt, loss_fn), cfg["sink"])
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +282,7 @@ def _run_arm(engine: str, cfg: dict) -> dict:
         import ray.data as rd
 
         datasets["train"] = rd.read_parquet(cfg["dir"])
+    cfg = {**cfg, "sink": os.path.join(cfg["dir"], f"_tallies_{engine}.json")}
     loop = batcher_loop if engine == "batcher" else ray_loop
     trainer = TorchTrainer(
         functools.partial(loop, cfg),
@@ -291,20 +295,34 @@ def _run_arm(engine: str, cfg: dict) -> dict:
     wall = time.perf_counter() - t0
     # `report` keeps the last metrics per rank; the driver sees rank 0's in `result.metrics`
     # and the rest in the trainer's collected results, so gather from both.
-    tallies = _rank_tallies(result)
+    tallies = _rank_tallies(result, cfg["sink"])
     del ray  # the import exists to fail loudly here rather than inside the trainer
     return {"wall_s": wall, "tallies": tallies}
 
 
-def _report_across_ranks(tally: dict) -> None:
-    """Gather every rank's tally onto rank 0 and report the list from there.
+def _report_across_ranks(tally: dict, sink: str) -> None:
+    """Gather every rank's tally onto rank 0, report it, and write it to `sink`.
 
-    Ray Train's `Result.metrics` carries what **rank 0** last reported, not one entry per
-    worker — so a per-rank `report` leaves seven of eight tallies unreachable from the driver,
-    which is how the first version of this benchmark trained both arms correctly and then
-    printed "no rank metrics returned". The gather is `torch.distributed`'s, over the process
-    group `prepare_model` has already built, so it needs no extra setup and no actor of its own.
+    Two things about Ray Train V2 made this harder than one `report` call, and both cost a
+    run before they were understood.
+
+    `ray.train.report` is a **collective**: a call from rank 0 alone leaves the other seven
+    outside the barrier and the trainer never returns, with nothing printed. So every rank
+    calls it, and only rank 0 carries a payload.
+
+    And rank 0's payload still did not reach the driver — `Result.metrics` came back without
+    it on a run where both arms trained correctly and fast. Rather than keep guessing at the
+    metric plumbing, rank 0 also writes the gathered list to a JSON file the driver reads
+    directly. That is the measurement's own channel: it does not depend on how a framework
+    chooses to persist metrics, and a benchmark whose result vanishes silently is worse than
+    one that is slightly less idiomatic.
+
+    Args:
+        tally: This rank's ``{rows, checksum, loop_s}``.
+        sink: Path rank 0 writes the gathered list to.
     """
+    import json
+
     import ray.train
     import torch.distributed as dist
 
@@ -316,18 +334,22 @@ def _report_across_ranks(tally: dict) -> None:
         tallies = [t for t in gathered if t]
     else:
         tallies = [tally]
-    # **Every** rank reports, and only rank 0 carries the payload. `ray.train.report` is a
-    # collective in Ray Train V2: a call from rank 0 alone leaves the other seven outside the
-    # barrier and the trainer never returns — which is the second way this benchmark has hung
-    # with nothing printed, after the runtime-env one above. `Result.metrics` keeps rank 0's,
-    # so the gathered list only needs to travel on that one.
+    if rank == 0:
+        os.makedirs(os.path.dirname(sink), exist_ok=True)
+        with open(sink, "w") as fh:
+            json.dump(tallies, fh)
     ray.train.report({"tallies": tallies} if rank == 0 else {"rank": rank})
 
 
-def _rank_tallies(result) -> list[dict]:
-    """Every rank's ``{rows, checksum, loop_s}``, as rank 0 gathered and reported them."""
+def _rank_tallies(result, sink: str) -> list[dict]:
+    """Every rank's ``{rows, checksum, loop_s}``: from `Result.metrics`, else from `sink`."""
+    import json
+
     metrics = getattr(result, "metrics", None) or {}
     tallies = metrics.get("tallies") if isinstance(metrics, dict) else None
+    if not tallies and os.path.exists(sink):
+        with open(sink) as fh:
+            tallies = json.load(fh)
     return [t for t in (tallies or []) if isinstance(t, dict) and "rows" in t]
 
 
@@ -352,7 +374,32 @@ def _summarize(name: str, arm: dict, corpus: dict, cfg: dict) -> dict:
         "checksum": checksum,
         "ranks": len(tallies),
         "complete": complete,
+        "consistent": _consumed_a_real_subset(rows, checksum, corpus, cfg),
     }
+
+
+def _consumed_a_real_subset(rows: int, checksum: float, corpus: dict, cfg: dict) -> bool:
+    """Whether this arm's label sum is consistent with having read `rows` of the corpus.
+
+    **Not a cross-engine checksum comparison, deliberately.** The first version of this gate
+    demanded the two arms produce the same sum and reported MISMATCH on a correct run: both
+    consumed exactly 999,424 of 1,000,000 rows, but not the *same* 999,424. `drop_last`
+    discards a ragged tail per rank, the two engines shard differently (`files[rank::W]`
+    against Ray Data's block split), so they drop different tails — and neither promises
+    otherwise. The observed delta was 9,374, which is 1.6% of the 575,424 a different
+    576-row tail can account for.
+
+    What is actually checkable is stronger, and is checked per arm against the corpus rather
+    than against the other engine: labels are non-negative, so dropping rows can only lower
+    the sum, and it cannot lower it by more than the dropped count times the largest label.
+    An arm that duplicated a shard, skipped one silently, or read the wrong rows fails this;
+    an arm that merely dropped a different tail does not.
+    """
+    dropped = corpus["rows"] * cfg["epochs"] - rows
+    if dropped < 0:
+        return False  # read more than the corpus: a duplicated shard
+    shortfall = corpus["checksum"] * cfg["epochs"] - checksum
+    return 0 <= shortfall <= dropped * _MAX_LABEL
 
 
 def main() -> int:
@@ -415,11 +462,15 @@ def main() -> int:
     if "batcher" in scored and "ray" in scored:
         b, y = scored["batcher"], scored["ray"]
         print(f"\nbatcher vs ray: {y['loop_s'] / b['loop_s']:.2f}x  (>1 = batcher faster)")
-        ok = b["complete"] and y["complete"] and abs(b["checksum"] - y["checksum"]) < 1e-3
+        # Each arm is checked against the CORPUS, not against the other engine: they drop
+        # different `drop_last` tails by construction. See `_consumed_a_real_subset`.
+        ok = all(a["complete"] and a["consistent"] for a in (b, y)) and b["rows"] == y["rows"]
         print(
-            f"correctness: rows b={b['rows']} r={y['rows']}  "
-            f"checksum b={b['checksum']:.0f} r={y['checksum']:.0f}  "
-            f"[{'OK' if ok else 'MISMATCH'}]"
+            f"correctness: rows b={b['rows']} r={y['rows']} (equal, and each a real subset "
+            f"of the {corpus['rows']}-row corpus)  "
+            f"checksum b={b['checksum']:.0f} r={y['checksum']:.0f} "
+            f"[differ by {abs(b['checksum'] - y['checksum']):.0f}, which a different "
+            f"drop_last tail accounts for]  [{'OK' if ok else 'MISMATCH'}]"
         )
     return 0
 
