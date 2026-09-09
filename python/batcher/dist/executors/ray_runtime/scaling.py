@@ -716,6 +716,10 @@ def node_class_selector(prefer_cpu_only: bool, workers: int, num_cpus: float) ->
     the restriction survives spot churn; and because "GPU-absence" cannot be expressed as
     a soft node-label match. It is *additive* to Ray's soft `RAY_scheduler_avoid_gpu_nodes`
     — it makes the exclusion hard, so a CPU shuffle cannot steal an idle GPU node's cores.
+
+    **Which** resource is read off the live cluster (`cpu_only_marker_resource`) rather than
+    assumed to be the configured `cpu_node`, because a managed fleet has already labelled
+    itself under its own name and selecting on an unadvertised one matches nothing.
     """
     if not prefer_cpu_only:
         return {}
@@ -724,7 +728,10 @@ def node_class_selector(prefer_cpu_only: bool, workers: int, num_cpus: float) ->
         return {}
     if not cpu_only_can_host(workers, num_cpus):
         return {}
-    return {"resources": {dc.cpu_node_resource: _CPU_NODE_EPS}}
+    from batcher.dist.executors.ray_runtime.node_markers import cpu_only_marker_resource
+
+    marker = cpu_only_marker_resource(_alive_nodes(), dc.cpu_node_resource)
+    return {"resources": {marker: _CPU_NODE_EPS}}
 
 
 def clamp_workers(
