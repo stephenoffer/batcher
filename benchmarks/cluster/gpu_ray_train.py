@@ -308,15 +308,20 @@ def _report_across_ranks(tally: dict) -> None:
     import ray.train
     import torch.distributed as dist
 
-    world = ray.train.get_context().get_world_size()
+    ctx = ray.train.get_context()
+    world, rank = ctx.get_world_size(), ctx.get_world_rank()
     if world > 1 and dist.is_available() and dist.is_initialized():
         gathered: list[dict | None] = [None] * world
         dist.all_gather_object(gathered, tally)
         tallies = [t for t in gathered if t]
     else:
         tallies = [tally]
-    if ray.train.get_context().get_world_rank() == 0:
-        ray.train.report({"tallies": tallies})
+    # **Every** rank reports, and only rank 0 carries the payload. `ray.train.report` is a
+    # collective in Ray Train V2: a call from rank 0 alone leaves the other seven outside the
+    # barrier and the trainer never returns — which is the second way this benchmark has hung
+    # with nothing printed, after the runtime-env one above. `Result.metrics` keeps rank 0's,
+    # so the gathered list only needs to travel on that one.
+    ray.train.report({"tallies": tallies} if rank == 0 else {"rank": rank})
 
 
 def _rank_tallies(result) -> list[dict]:

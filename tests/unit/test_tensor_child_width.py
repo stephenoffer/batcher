@@ -64,9 +64,52 @@ def test_a_nested_float_list_child_is_predicted_narrow():
 
 @pytest.mark.parametrize("child", [pa.int8(), pa.int32(), pa.uint32()])
 def test_an_integer_list_child_still_widens(child):
-    """The wrap argument is integer-specific, so this arm is unchanged."""
+    """The wrap argument is integer-specific, so this arm is unchanged.
+
+    See `test_a_narrow_integer_element_wraps_which_is_why_it_widens` for the measurement
+    that makes this an argument rather than an assertion.
+    """
     assert widen(pa.list_(child)) == pa.list_(pa.int64())
     assert widen(pa.list_(child, _DIM)) == pa.list_(pa.int64(), _DIM)
+
+
+@pytest.mark.parametrize(
+    ("child", "values", "wrapped", "correct"),
+    [
+        (pa.int32(), [2_000_000_000, 2_000_000_000], -294_967_296, 4_000_000_000),
+        (pa.uint8(), [250, 250], 244, 500),
+    ],
+)
+def test_a_narrow_integer_element_wraps_which_is_why_it_widens(child, values, wrapped, correct):
+    """The reason the integer arm keeps widening, demonstrated rather than asserted.
+
+    The tempting next step after the float exemption is the same one for integers, and the
+    prize is large: a `uint8` image tensor is widened **8x** at the boundary, which a
+    CPU->GPU pipeline then ships over Flight. The reductions all survive a narrow child --
+    `sum`/`mean`/`max` accumulate in `i64` whatever the element width -- and reading only
+    those says the exemption is safe. It is not.
+
+    `list.get(i)` yields a column at the *element's own* width, and two of them in one
+    arithmetic expression wrap at that width. This drives it through the
+    `arrow.fixed_shape_tensor` extension type, which `normalize_batch` passes through
+    untouched, so the narrow child is reachable today without changing anything -- and the
+    same expression through the ordinary widened path gives the right answer.
+
+    Recovering those bytes needs the plan's *logical* type to stay `int64` while the morsel
+    carries `uint8`, which is a type-system change and not a boundary edit.
+    """
+    storage = pa.FixedSizeListArray.from_arrays(pa.array(values).cast(child), len(values))
+    narrow = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(child, [len(values)]), storage)
+    doubled = col("l").list.get(0) + col("l").list.get(1)
+
+    assert (
+        bt.from_arrow(pa.table({"l": narrow})).select(r=doubled).collect().column(0)[0].as_py()
+        == wrapped
+    ), "a narrow element must be shown to wrap, or this test proves nothing"
+    assert (
+        bt.from_arrow(pa.table({"l": storage})).select(r=doubled).collect().column(0)[0].as_py()
+        == correct
+    )
 
 
 def test_a_top_level_float32_column_still_widens():
