@@ -172,13 +172,17 @@ def _build_pools(stages, bounds, credits: int):
         if k == 0:
             spawns.append(_producer_factory(stage, credits, target_rows))
             continue
-        opts = _gpu_options(stage.num_gpus, stage.accelerator_type)
-        cls = (
-            (_MapActor if k == last else RelayActor).options(**opts)
-            if opts
-            else (_MapActor if k == last else RelayActor)
+        cls = _MapActor if k == last else RelayActor
+        spawns.append(
+            _actor_factory(
+                cls,
+                stage,
+                credits,
+                target_rows,
+                terminal=k == last,
+                resources=_gpu_options(stage.num_gpus, stage.accelerator_type),
+            )
         )
-        spawns.append(_actor_factory(cls, stage, credits, target_rows, terminal=k == last))
     pools = [
         [spawn() for _ in range(start)] for spawn, (start, _hi) in zip(spawns, bounds, strict=True)
     ]
@@ -263,9 +267,34 @@ def _producer_factory(stage, credits: int, target_rows: int):
     return spawn
 
 
-def _actor_factory(cls, stage, credits: int, target_rows: int, *, terminal: bool):
+def _actor_factory(
+    cls, stage, credits: int, target_rows: int, *, terminal: bool, resources: dict | None = None
+):
+    """A factory minting one actor of `cls` for `stage`, under `resources` plus the shipping env.
+
+    Both option fragments are applied in **one** `.options(...)` call, on the raw remote class.
+    Applying them in two — the accelerator request when the pool was built, the `runtime_env`
+    when an actor was spawned — raised `AttributeError: 'ActorOptionWrapper' object has no
+    attribute 'options'`, because Ray's `.options()` returns a thin wrapper exposing only
+    `remote`/`bind`. It needed both fragments to be non-empty to fire, so it was invisible
+    until a GPU stage ran on a cluster the user had attached to themselves: `_shipping_options`
+    is empty whenever Batcher started Ray, and `resources` is empty for a CPU-only chain. That
+    is every stage-overlapped CPU->GPU inference pipeline on a real cluster.
+
+    Args:
+        cls: The Ray-remote actor class for this stage.
+        stage: The resource stage this actor runs.
+        credits: The Flight production credit window a relay takes.
+        target_rows: Morsel width, taken from the stage above.
+        terminal: Whether this is the last stage (returns rows instead of republishing).
+        resources: The accelerator `.options(...)` fragment, or `None` for a host stage.
+
+    Returns:
+        A zero-argument callable that spawns one actor.
+    """
+
     def spawn():
-        opts = _shipping_options()
+        opts = {**(resources or {}), **_shipping_options()}
         bound = cls.options(**opts) if opts else cls
         # A terminal consumer returns its rows to the driver, so it runs no Flight server and
         # takes no credit window; a relay republishes and takes both.
