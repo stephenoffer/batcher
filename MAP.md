@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1455 Python modules across 213 packages and 285 Rust files across 15 crates.
+Covering 1454 Python modules across 213 packages and 285 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -481,7 +481,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 326 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 643 | Generalized linear models fitted by iteratively reweighted least squares. |
-| `gpu.py` | 1637 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
+| `gpu.py` | 1631 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 224 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 828 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 367 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
@@ -932,7 +932,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 197 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 828 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 2815 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 2804 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 529 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 709 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 494 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1095,9 +1095,8 @@ The distributed streaming heterogeneous inference pipeline (the GPU-feeding moat
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 361 | Build the stage pools of a streaming inference pipeline and run one query through them. |
-| `morsels.py` | 60 | The pipeline's published-morsel ledger: what is in flight, and what it came from. |
-| `schedule.py` | 622 | The overlap loop: stream partitions through N stage pools, morsel by morsel. |
+| `driver.py` | 349 | Build the stage pools of a streaming inference pipeline and run one query through them. |
+| `schedule.py` | 614 | The overlap loop: stream partitions through N stage pools, morsel by morsel. |
 
 ### `batcher/kyber/` — 3 · subsystem
 

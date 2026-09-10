@@ -1310,11 +1310,6 @@ class SustainedUtilization:
         self._window_end: tuple[float, int] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # The owning actor may run several calls at once (a double-buffered streaming
-        # consumer), and two of them racing here would start two sampler threads — which
-        # double-counts every sample into `_sum`/`_n` and reports a utilization the device
-        # never had.
-        self._lock = threading.Lock()
 
     def _sample_loop(self) -> None:
         while not self._stop.wait(self._interval):
@@ -1327,12 +1322,11 @@ class SustainedUtilization:
 
     def begin_call(self) -> None:
         """Mark the start of a unit of work; starts sampling on the first one."""
-        with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._sample_loop, daemon=True)
-                self._thread.start()
-            if self._window_start is None:
-                self._window_start = (self._sum, self._n)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+            self._thread.start()
+        if self._window_start is None:
+            self._window_start = (self._sum, self._n)
 
     def end_call(self) -> None:
         """Mark the end of a unit of work, closing the window at this instant."""
