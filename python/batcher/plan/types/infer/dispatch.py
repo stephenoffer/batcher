@@ -24,6 +24,7 @@ from batcher.plan.types.infer.collections import (
     listfunc_type,
     mapfunc_type,
     struct_field_type,
+    widened_element_out,
 )
 from batcher.plan.types.infer.geospatial import geofunc_type, spatialfunc_type
 from batcher.plan.types.infer.scalars import datefunc_type, make_temporal_type, strfunc_type
@@ -208,7 +209,9 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     if isinstance(expr, ListTransform):
         return _list_transform_type(expr, schema)
     if isinstance(expr, ListGet):
-        return list_element_type(infer_type(expr.input, schema))
+        # An element that becomes a column widens if it is a narrow integer — the boundary
+        # stopped doing it, so the op that makes the column does. See `widened_element_out`.
+        return widened_element_out(list_element_type(infer_type(expr.input, schema)))
     if isinstance(expr, ListFunc):
         return listfunc_type(expr.fn, infer_type(expr.input, schema))
     if isinstance(expr, StructField):

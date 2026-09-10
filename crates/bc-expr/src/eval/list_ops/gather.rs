@@ -29,6 +29,36 @@ use crate::eval::list::require_list;
 
 use crate::ExprError;
 
+/// Widen a narrow **integer** element that has just become a top-level column.
+///
+/// The FFI boundary leaves a narrow numeric leaf inside a list container at its own width
+/// (`bc_py::normalize_list_element`), because a tensor column's child is a component of one
+/// value rather than a column in its own right — and widening it costs 8x the bytes on the
+/// decoded-image shape that is the whole point of carrying it.
+///
+/// The moment an op *makes* it a column, that reasoning stops holding: `bc_expr`'s
+/// `Add`/`Sub`/`Mul` are `*_wrapping` and `coerce_numeric` short-circuits on identical operand
+/// types, so `l.get(0) + l.get(1)` over an `Int32` child would wrap at 2^31 where the same
+/// expression over a widened list does not. So the three ops that hand an element back as a
+/// column — `list.get` in both its forms, and `list.min`/`list.max` — widen here instead, which
+/// is one cast per *row* rather than one per element, and leaves every observable output type
+/// exactly what it was when the widening happened at the boundary.
+///
+/// Floats are deliberately not touched: they do not wrap, `f32` precision is what a caller
+/// asked for by storing `f32`, and `list.get` has returned a narrow float since the float arm
+/// of that rule landed. `UInt64` is not widened at the boundary either (`Int64` cannot hold it),
+/// so it is not widened here.
+pub(crate) fn widened_element(arr: ArrayRef) -> Result<ArrayRef, ExprError> {
+    use DataType::{Int16, Int32, Int64, Int8, UInt16, UInt32, UInt8};
+    if matches!(
+        arr.data_type(),
+        Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32
+    ) {
+        return Ok(cast(&arr, &Int64)?);
+    }
+    Ok(arr)
+}
+
 /// Take each row's elements at the positions its `indices` row names.
 pub(crate) fn eval_list_gather(
     values: &ListArray,
@@ -112,7 +142,7 @@ pub(crate) fn eval_list_get_dyn(arr: &ArrayRef, index: &ArrayRef) -> Result<Arra
             (pos >= start && pos < end).then_some(pos as u32)
         })
         .collect();
-    Ok(take(list.values().as_ref(), &take_idx, None)?)
+    widened_element(take(list.values().as_ref(), &take_idx, None)?)
 }
 
 pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, ExprError> {
@@ -140,7 +170,7 @@ pub(crate) fn eval_list_get(arr: &ArrayRef, index: i64) -> Result<ArrayRef, Expr
             (pos >= start && pos < end).then_some(pos as u32)
         })
         .collect();
-    Ok(take(list.values().as_ref(), &take_idx, None)?)
+    widened_element(take(list.values().as_ref(), &take_idx, None)?)
 }
 
 #[cfg(test)]

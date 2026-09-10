@@ -169,10 +169,27 @@ fn normalize_to(dt: &DataType) -> Option<DataType> {
 /// itself. The user also got `float64` tensors back from a `float32` corpus, at twice the
 /// bytes, for a loader whose entire job is feeding a device.
 ///
-/// The **integer** arm is deliberately left alone, because its justification is not width but
-/// wrap: an `Int32` child that later reaches arithmetic silently overflows where the widened
-/// column gives the right answer (see [`normalize_to`]). Floats do not wrap; the only
-/// difference is precision, and `f32` precision is what the caller asked for by storing `f32`.
+/// The **integer** arm now behaves the same way, and the wrap argument that kept it widened is
+/// answered where it actually bites rather than by paying for it on every row. That argument is
+/// real: `bc_expr`'s `Add`/`Sub`/`Mul` are `*_wrapping`, and `coerce_numeric` short-circuits on
+/// identical operand types, so an `Int32` column plus an `Int32` column wraps at 2^31 where the
+/// widened pair does not. But an *element* only reaches arithmetic by first becoming a column,
+/// and there are three ops that do that — `list.get`, `list.min` and `list.max`. Each widens a
+/// narrow integer on the way out (`bc_expr::eval::list_ops::gather::widened_element`), so every
+/// type a caller can observe is exactly what it was before this change, and nothing new wraps.
+/// `list.sum`/`avg` already returned `Int64` for every narrow width.
+///
+/// What the widening cost is the same hot path the float arm was measured on, in its integer
+/// spelling: a decoded-image corpus is `FixedSizeList<UInt8>`, and widening its child is **8x**
+/// the bytes. Measured on 4,000 224x224x3 images (0.56 GB) read from Parquet, against the
+/// identical corpus carrying `arrow.fixed_shape_tensor` metadata (already exempt, so it is the
+/// control arm and not a projection): **4.49 GB against 0.56 GB** materialized, 4.75 s against
+/// 2.93 s, and 10.98 GB against 6.28 GB of peak RSS. At cluster scale that is the difference
+/// between a GPU inference actor fitting on a 31 GB node and being OOM-killed by the kernel.
+///
+/// `UInt64` is *not* in the exemption: it is the one width whose widening is not a widening at
+/// all (`Int64` cannot hold it above 2^63), so leaving it on the ordinary path keeps this change
+/// to types where the two arms genuinely agree.
 ///
 /// A `Struct` reached inside a list reverts to the ordinary rules: its fields are addressable
 /// by name (`struct.field("a")`) and behave like columns, so the wrap argument applies to them
@@ -181,6 +198,7 @@ fn normalize_list_element(dt: &DataType) -> Option<DataType> {
     use DataType::*;
     match dt {
         Float16 | Float32 => None,
+        Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32 => None,
         // A dictionary still decodes — the reason there is operator compatibility, not width
         // — but its value type is an element type, so a dictionary of floats decodes narrow.
         Dictionary(_, value) => {
@@ -295,12 +313,14 @@ fn restorable_narrow(dt: &DataType) -> bool {
     }
 }
 
-/// [`restorable_narrow`] for a list element: a float leaf is not widened there, so only an
-/// integer one (or a struct reached through the list) is restorable.
+/// [`restorable_narrow`] for a list element: [`normalize_list_element`] leaves every narrow
+/// numeric leaf at its own width, so only a `UInt64` leaf (or a struct reached through the list)
+/// is restorable — everything else was never widened and must not be recorded as though it was.
 fn restorable_element(dt: &DataType) -> bool {
     use DataType::*;
     match dt {
         Float16 | Float32 => false,
+        Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32 => false,
         List(field) | LargeList(field) | FixedSizeList(field, _) => {
             restorable_element(field.data_type())
         }

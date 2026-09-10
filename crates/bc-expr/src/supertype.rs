@@ -18,7 +18,9 @@
 //! what DuckDB does (`SELECT 1 UNION SELECT 1.5` is `DOUBLE`). When there is no such
 //! type, the answer is `None` and the caller raises a typed error rather than guessing.
 
-use arrow::datatypes::{DataType, TimeUnit};
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, TimeUnit};
 
 /// The widest of two `TimeUnit`s (`Second` < `Millisecond` < `Microsecond` < `Nanosecond`).
 ///
@@ -87,8 +89,9 @@ fn is_float(t: &DataType) -> bool {
 #[must_use]
 pub fn common_supertype(a: &DataType, b: &DataType) -> Option<DataType> {
     use DataType::{
-        Binary, Boolean, Date32, Date64, Decimal128, Decimal256, Dictionary, Duration, Float64,
-        Int64, LargeBinary, LargeUtf8, Null, Time32, Time64, Timestamp, Utf8,
+        Binary, Boolean, Date32, Date64, Decimal128, Decimal256, Dictionary, Duration,
+        FixedSizeList, Float64, Int64, LargeBinary, LargeList, LargeUtf8, List, Null, Time32,
+        Time64, Timestamp, Utf8,
     };
     if a == b {
         return Some(a.clone());
@@ -166,6 +169,36 @@ pub fn common_supertype(a: &DataType, b: &DataType) -> Option<DataType> {
         // Same logical type, wider offsets — always lossless, exactly as int32/int64 widen.
         (Utf8, LargeUtf8) | (LargeUtf8, Utf8) => Some(LargeUtf8),
         (Binary, LargeBinary) | (LargeBinary, Binary) => Some(LargeBinary),
+        // Two lists meet at a list of their elements' supertype. Reachable only since the FFI
+        // boundary stopped widening a narrow numeric list child (`bc_py::normalize_list_element`
+        // — an image tensor is `FixedSizeList<UInt8>` and widening it cost 8x the bytes): before
+        // that, every integer child arrived as `Int64` and a `List<Int32>` could never *meet* a
+        // `List<Int64>`, so the absence of this arm was invisible. It stopped being invisible as
+        // a `UNION` of two Parquet sources whose list children happened to be written at
+        // different widths, which the engine had been reconciling and began refusing.
+        //
+        // The offset width follows the same "wider wins" rule as `Utf8`/`LargeUtf8` beside it.
+        // A `FixedSizeList` keeps its size only when both sides agree on it; two different fixed
+        // shapes are a genuine disagreement about what one value *is*, so they degrade to a
+        // variable list rather than silently picking one.
+        (
+            List(f1) | LargeList(f1) | FixedSizeList(f1, _),
+            List(f2) | LargeList(f2) | FixedSizeList(f2, _),
+        ) => {
+            let element = common_supertype(f1.data_type(), f2.data_type())?;
+            let field = Arc::new(Field::new(
+                f1.name(),
+                element,
+                f1.is_nullable() || f2.is_nullable(),
+            ));
+            Some(match (a, b) {
+                (FixedSizeList(_, n1), FixedSizeList(_, n2)) if n1 == n2 => {
+                    FixedSizeList(field, *n1)
+                }
+                (LargeList(_), _) | (_, LargeList(_)) => LargeList(field),
+                _ => List(field),
+            })
+        }
         // Everything else — an Int64/Utf8 pair, two timestamps in different zones, a
         // struct against a list — has no lossless common type. Say so.
         _ => None,
@@ -176,6 +209,46 @@ pub fn common_supertype(a: &DataType, b: &DataType) -> Option<DataType> {
 mod tests {
     use super::*;
     use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+
+    /// Two lists meet at a list of their elements' supertype.
+    ///
+    /// Only reachable since the FFI boundary stopped widening a narrow numeric list child, so
+    /// the absence of this arm was invisible until a `UNION` of two Parquet sources whose
+    /// `img` columns were written `uint8` and `int64` started being refused.
+    #[test]
+    fn two_lists_meet_at_their_elements_supertype() {
+        use std::sync::Arc;
+
+        use DataType::{FixedSizeList, Float64, Int32, Int64, LargeList, List, UInt8, Utf8};
+        let f = |t: DataType| Arc::new(Field::new("item", t, true));
+
+        assert_eq!(
+            common_supertype(&List(f(Int32)), &List(f(Int64))),
+            Some(List(f(Int64)))
+        );
+        assert_eq!(
+            common_supertype(&List(f(UInt8)), &List(f(Float64))),
+            Some(List(f(Float64)))
+        );
+        // Wider offsets win, exactly as `Utf8`/`LargeUtf8` do.
+        assert_eq!(
+            common_supertype(&List(f(Int32)), &LargeList(f(Int64))),
+            Some(LargeList(f(Int64)))
+        );
+        // A fixed shape survives only when both sides agree on it.
+        assert_eq!(
+            common_supertype(&FixedSizeList(f(UInt8), 3), &FixedSizeList(f(Int32), 3)),
+            Some(FixedSizeList(f(Int64), 3))
+        );
+        assert_eq!(
+            common_supertype(&FixedSizeList(f(UInt8), 3), &FixedSizeList(f(UInt8), 4)),
+            Some(List(f(UInt8)))
+        );
+        // Elements with no common type decline, rather than the containers agreeing anyway.
+        assert_eq!(common_supertype(&List(f(Int64)), &List(f(Utf8))), None);
+        // A list against a non-list is still no common type.
+        assert_eq!(common_supertype(&List(f(Int64)), &Int64), None);
+    }
 
     /// An all-null column adopts whatever it meets, in either operand position. This is
     /// the arm that makes `coalesce(all_null_col, int_col)` and `NULL UNION int` work at

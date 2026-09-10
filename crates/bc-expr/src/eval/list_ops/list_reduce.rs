@@ -241,3 +241,58 @@ pub(crate) fn entropy(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprErro
     }
     Ok(Arc::new(b.finish()))
 }
+
+/// `min`/`max` over a **non-float** list child: gather the exact extreme element per row.
+///
+/// DuckDB's `list_min`/`list_max` are defined on every comparable type and return the *exact*
+/// element. Casting the child to `Float64` — the shared path every other reduction in this
+/// module takes — both nulled non-numeric elements (`list.min(['apple'])` → null) and lost
+/// integer precision above 2^53 (`list.min([2^53+1, 2^53+2])` → 2^53, a value not even in the
+/// list). Floats keep the numeric path, whose NaN / total-order semantics are well-tested.
+///
+/// The result is one of the three places a list *element* becomes a top-level column, so a
+/// narrow integer widens here rather than at the FFI boundary — see
+/// [`super::gather::widened_element`].
+///
+/// `offsets` is the caller's already-materialized offset slice; a null row and an empty row
+/// both yield null, and null elements are ignored rather than propagated.
+pub(crate) fn order_reduce(
+    list: &GenericListArray<i32>,
+    offsets: &[i32],
+    want_min: bool,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::UInt32Array;
+    use arrow::compute::{sort_to_indices, take, SortOptions};
+
+    let child = list.values();
+    // Ascending with nulls last, so non-null values occupy the front in value order: min is
+    // the first non-null, max the last non-null.
+    let opts = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let take_idx: UInt32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) {
+                return None;
+            }
+            let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+            if e == s {
+                return None;
+            }
+            let slice = child.slice(s, e - s);
+            let ord = sort_to_indices(&slice, Some(opts), None).ok()?;
+            let mut valid = ord
+                .values()
+                .iter()
+                .map(|&l| s as u32 + l)
+                .filter(|&g| child.is_valid(g as usize));
+            if want_min {
+                valid.next()
+            } else {
+                valid.next_back()
+            }
+        })
+        .collect();
+    super::gather::widened_element(take(child.as_ref(), &take_idx, None)?)
+}

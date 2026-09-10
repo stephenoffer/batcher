@@ -1,17 +1,25 @@
-"""A tensor column's `float32` child survives the FFI boundary; an `int32` one still widens.
+"""A tensor column's narrow child survives the FFI boundary; the ops that read it still widen.
 
 The boundary widens narrow numerics once so every operator stays on the `int64`/`float64`
-paths, and it recurses into nested types. For a **list of floats** that recursion was pure
+paths, and it recurses into nested types. For a **list of numbers** that recursion was pure
 loss. Such a column is not a numeric column, it is a tensor -- an embedding, a decoded image,
-a feature vector -- and widening its child doubled it and forced a full cast on a path that is
-otherwise zero-copy. Measured on 500,000 x 512 `float32` (1 GB), `iter_batches` took 1,476 ms
-against 0.9 ms for the identical data carrying the `arrow.fixed_shape_tensor` extension type,
-which the boundary has always exempted. 1,189 ms of that is the cast. The caller also got
-`float64` tensors back from a `float32` corpus, at twice the bytes.
+a feature vector -- and widening its child multiplied it and forced a full cast on a path that
+is otherwise zero-copy. Measured on 500,000 x 512 `float32` (1 GB), `iter_batches` took
+1,476 ms against 0.9 ms for the identical data carrying the `arrow.fixed_shape_tensor`
+extension type, which the boundary has always exempted. 1,189 ms of that is the cast.
 
-The **integer** child still widens, and that asymmetry is the point of this file. Its
-justification is not width but wrap: an `int32` element that later reaches arithmetic
-overflows silently, where the widened one gives the right answer. A float does not wrap.
+The float arm landed first and the **integer** arm followed it, because the integer factor is
+worse: a decoded-image corpus is `fixed_size_list<uint8>` and `int64` is **8x** the bytes.
+Measured on 4,000 224x224x3 images read from Parquet, against the same corpus carrying the
+extension metadata as the control: 4.49 GB against 0.56 GB materialized, 4.75 s against 2.93 s.
+
+What kept the integer arm widened for a while is a real hazard rather than caution, and it is
+what `test_a_narrow_integer_element_does_not_wrap_once_it_becomes_a_column` exists to hold:
+`bc_expr`'s `Add`/`Sub`/`Mul` are `*_wrapping` and `coerce_numeric` short-circuits on identical
+operand types, so two narrow elements meeting in one expression wrap at their own width. An
+element only reaches arithmetic by first becoming a *column*, so the three ops that do that --
+`list.get`, `list.min`, `list.max` -- widen there instead. That is one cast per row rather than
+one per element, and every observable output type is what it was before.
 
 Two sides have to agree or `Dataset.schema` lies: `bc_py::normalize_list_element` and
 `plan.types.widen`. Both are asserted here, against each other.
@@ -62,54 +70,76 @@ def test_a_nested_float_list_child_is_predicted_narrow():
     assert widen(pa.list_(pa.list_(pa.float32()))) == pa.list_(pa.list_(pa.float32()))
 
 
-@pytest.mark.parametrize("child", [pa.int8(), pa.int32(), pa.uint32()])
-def test_an_integer_list_child_still_widens(child):
-    """The wrap argument is integer-specific, so this arm is unchanged.
+@pytest.mark.parametrize("child", [pa.int8(), pa.int32(), pa.uint8(), pa.uint32()])
+def test_a_narrow_integer_list_child_is_predicted_narrow(child):
+    """The integer arm followed the float one — see the wrap test below for what pays for it."""
+    assert widen(pa.list_(child)) == pa.list_(child)
+    assert widen(pa.list_(child, _DIM)) == pa.list_(child, _DIM)
 
-    See `test_a_narrow_integer_element_wraps_which_is_why_it_widens` for the measurement
-    that makes this an argument rather than an assertion.
+
+def test_a_uint64_list_child_still_widens():
+    """`uint64` is the one integer width `int64` cannot hold, so its arm is not a widening.
+
+    Leaving it on the ordinary path is what keeps the exemption to types where the two arms
+    genuinely agree: the boundary refuses a `uint64` above `i64::MAX` rather than truncating
+    it, and that refusal is only reachable if the cast is still attempted.
     """
-    assert widen(pa.list_(child)) == pa.list_(pa.int64())
-    assert widen(pa.list_(child, _DIM)) == pa.list_(pa.int64(), _DIM)
+    assert widen(pa.list_(pa.uint64())) == pa.list_(pa.int64())
 
 
 @pytest.mark.parametrize(
-    ("child", "values", "wrapped", "correct"),
+    ("child", "values", "correct"),
     [
-        (pa.int32(), [2_000_000_000, 2_000_000_000], -294_967_296, 4_000_000_000),
-        (pa.uint8(), [250, 250], 244, 500),
+        (pa.int32(), [2_000_000_000, 2_000_000_000], 4_000_000_000),
+        (pa.uint8(), [250, 250], 500),
     ],
 )
-def test_a_narrow_integer_element_wraps_which_is_why_it_widens(child, values, wrapped, correct):
-    """The reason the integer arm keeps widening, demonstrated rather than asserted.
+def test_a_narrow_integer_element_does_not_wrap_once_it_becomes_a_column(child, values, correct):
+    """The reason the integer arm could follow the float one, demonstrated rather than asserted.
 
-    The tempting next step after the float exemption is the same one for integers, and the
-    prize is large: a `uint8` image tensor is widened **8x** at the boundary, which a
-    CPU->GPU pipeline then ships over Flight. The reductions all survive a narrow child --
-    `sum`/`mean`/`max` accumulate in `i64` whatever the element width -- and reading only
-    those says the exemption is safe. It is not.
+    The wrap hazard is real and this test used to pin it: `bc_expr`'s `Add`/`Sub`/`Mul` are
+    `*_wrapping` and `coerce_numeric` short-circuits on identical operand types, so
+    `l.get(0) + l.get(1)` over an `Int32` child wrapped at 2^31 where the widened pair did not.
+    Reading only the reductions said the exemption was safe -- `sum`/`mean`/`max` accumulate in
+    `i64` whatever the element width -- and that reading was incomplete.
 
-    `list.get(i)` yields a column at the *element's own* width, and two of them in one
-    arithmetic expression wrap at that width. This drives it through the
-    `arrow.fixed_shape_tensor` extension type, which `normalize_batch` passes through
-    untouched, so the narrow child is reachable today without changing anything -- and the
-    same expression through the ordinary widened path gives the right answer.
+    What changed is *where* the widening is paid. An element only reaches arithmetic by first
+    becoming a column, and three ops do that: `list.get`, `list.min`, `list.max`. Each widens a
+    narrow integer on the way out, which is one cast per **row** instead of one per element, so
+    the 8x on a `uint8` image tensor is gone and the answer here is unchanged.
 
-    Recovering those bytes needs the plan's *logical* type to stay `int64` while the morsel
-    carries `uint8`, which is a type-system change and not a boundary edit.
+    Both arms are driven, and they must agree: the extension type (which `normalize_batch` has
+    always passed through untouched) and the ordinary storage column now carry the same narrow
+    child, so a divergence between them would mean the escape-point widening fires on only one
+    of the two paths a narrow child can arrive by.
     """
     storage = pa.FixedSizeListArray.from_arrays(pa.array(values).cast(child), len(values))
     narrow = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(child, [len(values)]), storage)
     doubled = col("l").list.get(0) + col("l").list.get(1)
 
-    assert (
-        bt.from_arrow(pa.table({"l": narrow})).select(r=doubled).collect().column(0)[0].as_py()
-        == wrapped
-    ), "a narrow element must be shown to wrap, or this test proves nothing"
-    assert (
-        bt.from_arrow(pa.table({"l": storage})).select(r=doubled).collect().column(0)[0].as_py()
-        == correct
-    )
+    for name, arr in (("extension", narrow), ("storage", storage)):
+        got = bt.from_arrow(pa.table({"l": arr})).select(r=doubled).collect().column(0)[0].as_py()
+        assert got == correct, f"{name} arm wrapped: {got} != {correct}"
+
+
+@pytest.mark.parametrize("child", [pa.int8(), pa.uint8(), pa.int32()])
+def test_every_element_escape_hands_back_int64(child):
+    """`get`/`min`/`max`/`sum` are what turn an element into a column; all four widen.
+
+    Declared *and* executed, because a schema that predicted the narrow type while the engine
+    produced `int64` would be the same lie the boundary mirror exists to prevent.
+    """
+    tbl = pa.table({"l": pa.array([[1, 2, 3]], pa.list_(child))})
+    ds = bt.from_arrow(tbl)
+    for name, expr in (
+        ("get", col("l").list.get(0)),
+        ("min", col("l").list.min()),
+        ("max", col("l").list.max()),
+        ("sum", col("l").list.sum()),
+    ):
+        one = ds.select(v=expr)
+        assert one.schema.field("v").type == pa.int64(), f"{name} declared"
+        assert one.collect().schema.field("v").type == pa.int64(), f"{name} executed"
 
 
 def test_a_top_level_float32_column_still_widens():
@@ -148,13 +178,16 @@ def test_the_engine_returns_a_float32_tensor_unwidened():
     assert out.schema.field("scalar").type == pa.float64()
 
 
-def test_the_engine_still_widens_an_integer_tensor():
-    ds = bt.from_arrow(_tensor_table(pa.int32()))
+def test_the_engine_returns_an_integer_tensor_unwidened():
+    """A `uint8` decoded-image column is the shape this arm was extended for: 8x the bytes."""
+    ds = bt.from_arrow(_tensor_table(pa.uint8()))
     out = ds.collect()
-    assert out.schema.field("feat").type == pa.list_(pa.int64(), _DIM)
+    assert out.schema.field("feat").type == pa.list_(pa.uint8(), _DIM)
+    # The flat column beside it is untouched by this change and still widens.
+    assert out.schema.field("scalar").type == pa.int64()
 
 
-@pytest.mark.parametrize("child", [pa.float32(), pa.int32()])
+@pytest.mark.parametrize("child", [pa.float32(), pa.int32(), pa.uint8()])
 def test_the_declared_schema_matches_what_the_engine_produces(child):
     """`Dataset.schema` must predict what `collect()` returns, or it lies."""
     ds = bt.from_arrow(_tensor_table(child))

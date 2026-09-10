@@ -563,52 +563,20 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return Ok(Arc::new(n.into_iter().collect::<Int64Array>()));
     }
 
-    // `min`/`max` over any non-float child (integers, decimals, strings, bools, dates,
-    // …). DuckDB `list_min`/`list_max` are defined on every comparable type and return
-    // the *exact* element. Casting the child to Float64 both nulled non-numeric elements
-    // (`list.min(['apple'])` → null) and lost integer precision above 2^53
-    // (`list.min([2^53+1, 2^53+2])` → 2^53, a value not even in the list). Only floats stay
-    // on the numeric path below, whose NaN / total-order semantics are well-tested; every
-    // other type gathers the min/max non-null element here, preserving its own type.
+    // `min`/`max` over any non-float child (integers, decimals, strings, bools, dates, …) is
+    // a gather of the exact element rather than a `Float64` reduction — see
+    // `list_ops::list_reduce::order_reduce` for why, and for the widening it applies on the
+    // way out. Only floats fall through to the numeric path below.
     let child_is_float = matches!(
         list.values().data_type(),
         DataType::Float16 | DataType::Float32 | DataType::Float64
     );
     if matches!(func, ListFunc::Min | ListFunc::Max) && !child_is_float {
-        use arrow::array::UInt32Array;
-        use arrow::compute::{sort_to_indices, take, SortOptions};
-        let child = list.values();
-        let want_min = matches!(func, ListFunc::Min);
-        // Ascending with nulls last, so non-null values occupy the front in value order:
-        // min is the first non-null, max the last non-null. Null elements are ignored.
-        let opts = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let take_idx: UInt32Array = (0..list.len())
-            .map(|i| {
-                if list.is_null(i) {
-                    return None;
-                }
-                let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
-                if e == s {
-                    return None;
-                }
-                let slice = child.slice(s, e - s);
-                let ord = sort_to_indices(&slice, Some(opts), None).ok()?;
-                let mut valid = ord
-                    .values()
-                    .iter()
-                    .map(|&l| s as u32 + l)
-                    .filter(|&g| child.is_valid(g as usize));
-                if want_min {
-                    valid.next()
-                } else {
-                    valid.next_back()
-                }
-            })
-            .collect();
-        return Ok(take(child.as_ref(), &take_idx, None)?);
+        return crate::eval::list_ops::list_reduce::order_reduce(
+            list,
+            offsets,
+            matches!(func, ListFunc::Min),
+        );
     }
 
     // Exact integer `sum`/`avg`. The Float64 view below rounds every element to 53

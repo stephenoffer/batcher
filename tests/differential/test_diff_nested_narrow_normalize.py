@@ -36,15 +36,36 @@ def test_nested_struct_narrow_int_widens(duck):
     assert_same(out, duck.sql("SELECT CAST(s.a AS BIGINT) + CAST(s.a AS BIGINT) AS r FROM t"))
 
 
-def test_nested_list_narrow_int_widens(duck):
-    """A narrow int inside a list widens, so list-element arithmetic does not wrap."""
+def test_nested_list_narrow_int_keeps_its_width_but_the_element_still_widens(duck):
+    """A narrow int inside a list keeps its width; the op that makes it a *column* widens it.
+
+    The wrap this file is about is real and unchanged — `2_000_000_000 + 2_000_000_000` must be
+    4e9 and not -294,967,296 — but it is paid one cast per row at `list.get` rather than 8x the
+    bytes on every element of a decoded-image tensor. Both halves are asserted here, because
+    either alone is satisfiable by the behaviour this change replaced: the column stays
+    `int32`, and the arithmetic over it still agrees with DuckDB.
+    """
     t = pa.table({"l": pa.array([[2_000_000_000, 1]], pa.list_(pa.int32()))})
     d = bt.from_arrow(t)
-    assert d.schema.field("l").type == pa.list_(pa.field("item", pa.int64()))
+    assert d.schema.field("l").type == pa.list_(pa.field("item", pa.int32()))
+    assert d.collect().schema.field("l").type.value_type == pa.int32(), "declared must match"
+    got = d.select(r=bt.col("l").list.get(0))
+    assert got.schema.field("r").type == pa.int64(), "the element becomes a column, so it widens"
     out = d.select(r=bt.col("l").list.get(0) + bt.col("l").list.get(0)).collect()
+    assert out.column("r").to_pylist() == [4_000_000_000], "a wrap would give -294967296"
     duck.register("t", t)
     # DuckDB list indexing is 1-based; list.get(0) selects the same (first) element.
     assert_same(out, duck.sql("SELECT CAST(l[1] AS BIGINT) + CAST(l[1] AS BIGINT) AS r FROM t"))
+
+
+def test_a_narrow_int_list_column_matches_duckdbs_own_element_width(duck):
+    """DuckDB is the oracle for the width too, exactly as it is for the float case below."""
+    t = pa.table({"l": pa.array([[1, 2], [3, 4]], pa.list_(pa.int32()))})
+    produced = bt.from_arrow(t).collect()
+    duck.register("t", t)
+    oracle = duck.sql("SELECT l FROM t").arrow().schema.field("l").type.value_type
+    assert produced.schema.field("l").type.value_type == oracle
+    assert_same(produced, duck.sql("SELECT l FROM t"))
 
 
 def test_nested_list_narrow_float_keeps_its_width_like_duckdb(duck):
