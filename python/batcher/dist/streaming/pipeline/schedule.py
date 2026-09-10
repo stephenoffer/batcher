@@ -37,6 +37,7 @@ from collections import deque
 import ray
 
 from batcher.dist.streaming.consumers import take_consumer
+from batcher.dist.streaming.pipeline.morsels import Morsels
 
 __all__ = ["run_streamed"]
 
@@ -50,55 +51,6 @@ def _worker_loss_errors() -> tuple[type[BaseException], ...]:
         return (_ray.exceptions.RayActorError, _ray.exceptions.RayTaskError)
     except Exception:  # pragma: no cover - ray optional
         return ()
-
-
-class _Morsels:
-    """Every published-but-unsettled morsel, and the parent each one came from.
-
-    Small enough to be a dict of dicts and important enough not to be: settling a morsel has
-    to cascade to its parent, and the cascade is where a scheduling bug turns into a memory
-    leak (a morsel nobody releases) or a wrong answer (a morsel released while its subtree is
-    still being recomputed).
-    """
-
-    __slots__ = ("_by_path", "_ids")
-
-    def __init__(self) -> None:
-        self._by_path: dict[tuple, dict] = {}
-        # A stable small integer per path, because a Flight ticket's fields are integers. The
-        # mapping persists for the whole run, so a replayed ancestor is re-issued the *same*
-        # id and therefore republishes under the same tickets — the idempotence the module
-        # docstring depends on.
-        self._ids: dict[tuple, int] = {}
-
-    def id_of(self, path: tuple) -> int:
-        """A stable integer naming `path`, minted once and reused on every replay."""
-        if path not in self._ids:
-            self._ids[path] = len(self._ids)
-        return self._ids[path]
-
-    def add(self, path: tuple, *, holder, ticket, parent: tuple | None) -> None:
-        self._by_path[path] = {
-            "holder": holder,
-            "ticket": ticket,
-            "parent": parent,
-            "pending": None,  # children not yet settled; None until this morsel is consumed
-        }
-
-    def get(self, path: tuple) -> dict | None:
-        return self._by_path.get(path)
-
-    def pop(self, path: tuple) -> dict | None:
-        return self._by_path.pop(path, None)
-
-    def paths_held_by(self, actor) -> list[tuple]:
-        return [p for p, rec in self._by_path.items() if rec["holder"] is actor]
-
-    def paths_under_partition(self, pidx: int) -> list[tuple]:
-        return [p for p in self._by_path if p and p[0] == pidx]
-
-    def __contains__(self, path: tuple) -> bool:
-        return path in self._by_path
 
 
 def run_streamed(
@@ -139,7 +91,7 @@ def run_streamed(
     last = len(pools) - 1
     spawn = list(spawn or [None] * len(pools))
 
-    morsels = _Morsels()
+    morsels = Morsels()
     free = [deque(pool) for pool in pools]
     hosts = [_probe(pool) if k else {} for k, pool in enumerate(pools)]
     ready: list[deque] = [deque() for _ in pools]  # ready[k]: morsels awaiting stage k
@@ -170,6 +122,8 @@ def run_streamed(
         part_attempts=part_attempts,
         max_attempts=max_attempts,
         credits=credits,
+        depth=consumer_depth(),
+        in_flight={},
         plan_id=plan_id,
         last=last,
         results=results,
@@ -212,9 +166,11 @@ class _Context:
         "ceilings",
         "credits",
         "dead",
+        "depth",
         "floors",
         "free",
         "hosts",
+        "in_flight",
         "last",
         "max_attempts",
         "morsels",
@@ -232,6 +188,36 @@ class _Context:
     def __init__(self, **kw) -> None:
         for name, value in kw.items():
             setattr(self, name, value)
+
+
+def consumer_depth() -> int:
+    """Calls one terminal consumer may have outstanding at once — the GPU's double buffer.
+
+    A streamed stage's consumer fetched one morsel over Flight, ran it, and only then fetched
+    the next, so the device idled through every fetch and every Arrow assembly. Measured on the
+    two-stage CPU->GPU pipeline, that idle is 15-20%: Ray Data reaches 2,373 img/s over eight
+    T4s (297 each, and the fused single-stage benchmark measures the same T4s at 285 each) with
+    its devices 80% busy, while this pipeline sat at 73% and 2,023 img/s. Two other candidates
+    were swept flat first -- the decode stage's `concurrency` from 64 to 192, and the credit
+    window from 8 to 64 -- so the fetch/compute serialization is what is left.
+
+    This is the same lever `distributed.map_inflight_depth` is on the *non*-streamed actor-pool
+    path, and it reads the same setting, so a pipeline does not change its depth by changing
+    which executor runs it.
+
+    What overlaps is the **fetch**, not the UDF. The consumer takes `depth` calls at once
+    (`max_concurrency`) but serializes the compute behind a lock (`_MapActor.run_split`),
+    because a `map_batches` class UDF is documented as one instance per actor and a GPU stage
+    deliberately runs on one thread for one CUDA context. So depth costs host memory — `depth`
+    fetched morsels resident instead of one — and not VRAM.
+
+    Measured on the two-stage pipeline at 131,072 images: **2,007 img/s at 73% GPU before,
+    2,232 at 80% after**, against Ray Data's 2,422 at 81%. The device utilization is now the
+    same on both sides, which is the thing this was aimed at.
+    """
+    from batcher.config import active_config
+
+    return max(1, active_config().distributed.map_inflight_depth)
 
 
 def _probe(pool) -> dict:
@@ -375,7 +361,15 @@ def _take(ctx: _Context, k: int, addr: str):
     if not pool:
         return None
     if k == ctx.last:
-        return take_consumer(pool, ctx.hosts[k], addr)
+        # The terminal stage double-buffers: `depth` calls may be outstanding on one consumer,
+        # so the Flight fetch of the next morsel overlaps the forward pass of the current one.
+        # An actor that still has headroom goes straight back into the free list.
+        chosen = take_consumer(pool, ctx.hosts[k], addr)
+        held = ctx.in_flight.get(chosen, 0) + 1
+        ctx.in_flight[chosen] = held
+        if held < ctx.depth:
+            pool.append(chosen)
+        return chosen
     # A relay publishes what it produces, so it is subject to the same window as a producer:
     # one holding `credits` unreleased morsels must not be given more work, or the bound this
     # pipeline advertises would hold at the first hop and nowhere else.
@@ -436,7 +430,15 @@ def _on_work(ctx: _Context, work_inflight: dict, ref, loss_errors) -> None:
                 raise exc
             ctx.ready[k].append((addr, ticket, holder, path, attempts + 1))
         return
-    ctx.free[k].append(actor)
+    if k == ctx.last:
+        held = ctx.in_flight.get(actor, 1) - 1
+        ctx.in_flight[actor] = held
+        # It is already in the free list unless this completion is what freed a slot on a
+        # saturated actor — appending unconditionally would enter it twice per round.
+        if held == ctx.depth - 1:
+            ctx.free[k].append(actor)
+    else:
+        ctx.free[k].append(actor)
     if k == ctx.last:
         ctx.results[path] = out
         _settle(ctx, path)
@@ -515,11 +517,17 @@ def _replace_actor(ctx: _Context, dead_actor, k: int) -> None:
     if dead_actor in ctx.dead:
         return
     ctx.dead.add(dead_actor)
-    with contextlib.suppress(ValueError):
-        ctx.free[k].remove(dead_actor)
+    # A double-buffered consumer can appear in the free list more than once (one entry per
+    # unused slot), so removing a single copy would leave a dead actor schedulable.
+    while True:
+        try:
+            ctx.free[k].remove(dead_actor)
+        except ValueError:
+            break
     with contextlib.suppress(ValueError):
         ctx.pools[k].remove(dead_actor)
     ctx.outstanding.pop(dead_actor, None)
+    ctx.in_flight.pop(dead_actor, None)
     if k < ctx.last:
         _void_published_by(ctx, dead_actor, k)
     factory = ctx.spawn[k]

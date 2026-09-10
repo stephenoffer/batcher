@@ -314,7 +314,8 @@ def _actor_factory(
         stage: The resource stage this actor runs.
         credits: The Flight production credit window a relay takes.
         target_rows: Morsel width, taken from the stage above.
-        terminal: Whether this is the last stage (returns rows instead of republishing).
+        terminal: Whether this is the last stage (returns rows instead of republishing). A
+            terminal actor additionally gets the `max_concurrency` its submit depth needs.
         resources: The accelerator `.options(...)` fragment, or `None` for a host stage.
 
     Returns:
@@ -323,6 +324,17 @@ def _actor_factory(
 
     def spawn():
         opts = {**(resources or {}), **_shipping_options()}
+        if terminal:
+            # The terminal consumer is handed `consumer_depth()` morsels at once so its Flight
+            # fetch overlaps its forward pass; without matching `max_concurrency` Ray would
+            # queue the second call behind the first and the overlap would not exist. Ray
+            # refuses `max_concurrency=1` on an async actor and treats it as the default for a
+            # threaded one, so it is only named when it buys something.
+            from batcher.dist.streaming.pipeline.schedule import consumer_depth
+
+            depth = consumer_depth()
+            if depth > 1:
+                opts["max_concurrency"] = depth
         bound = cls.options(**opts) if opts else cls
         # A terminal consumer returns its rows to the driver, so it runs no Flight server and
         # takes no credit window; a relay republishes and takes both.

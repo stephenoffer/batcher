@@ -506,3 +506,142 @@ def test_a_grown_stage_still_delivers_every_row_exactly_once(loop):
         ceilings=[1, 1, 4],
     )
     assert _values(grown) == _values(fixed)
+
+
+# --- the terminal stage's double buffer ---------------------------------------------------
+def _with_depth(monkeypatch, depth: int) -> None:
+    """Pin `consumer_depth()`, which the loop reads from `distributed.map_inflight_depth`."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "consumer_depth", lambda: depth)
+
+
+def _run_at_depth(loop, monkeypatch, depth: int) -> dict:
+    """Run a one-consumer three-stage pipeline with the terminal submit depth pinned."""
+    _with_depth(monkeypatch, depth)
+    flight = _Flight()
+    return loop(
+        [
+            [_Handle(_Producer(flight, "p0"))],
+            [_Handle(_Relay(flight, "r0", fanout=2))],
+            [_Handle(_Consumer(flight))],
+        ],
+        _partitions([6]),
+        1,
+        4,
+    )
+
+
+def test_a_double_buffered_consumer_still_returns_every_row_exactly_once(loop, monkeypatch):
+    """The property that matters most: depth is a pipelining change, never a result change."""
+    deep = _run_at_depth(loop, monkeypatch, 2)
+    shallow = _run_at_depth(loop, monkeypatch, 1)
+    assert _values(deep) == _values(shallow)
+    assert _values(deep) == sorted((v, i) for v in range(6) for i in range(2))
+
+
+def test_depth_one_leaves_exactly_one_call_outstanding_per_consumer(loop, monkeypatch):
+    """The control: without it, the test above cannot tell a working depth from an ignored one."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    _with_depth(monkeypatch, 1)
+    seen = []
+    real_take = schedule._take
+
+    def _spy(ctx, k, addr):
+        actor = real_take(ctx, k, addr)
+        if k == ctx.last:
+            seen.append(dict(ctx.in_flight))
+        return actor
+
+    monkeypatch.setattr(schedule, "_take", _spy)
+    flight = _Flight()
+    loop(
+        [
+            [_Handle(_Producer(flight, "p0"))],
+            [_Handle(_Relay(flight, "r0", fanout=2))],
+            [_Handle(_Consumer(flight))],
+        ],
+        _partitions([6]),
+        1,
+        4,
+    )
+    assert seen, "the spy never fired, so this test asserts nothing"
+    assert max(max(m.values()) for m in seen) == 1
+
+
+def test_depth_two_lets_a_second_call_start_on_a_busy_consumer(loop, monkeypatch):
+    """The behaviour change itself, on the same fixture the control above uses."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    _with_depth(monkeypatch, 2)
+    peaks = []
+    real_take = schedule._take
+
+    def _spy(ctx, k, addr):
+        actor = real_take(ctx, k, addr)
+        if k == ctx.last and actor is not None:
+            peaks.append(ctx.in_flight[actor])
+        return actor
+
+    monkeypatch.setattr(schedule, "_take", _spy)
+    flight = _Flight()
+    loop(
+        [
+            [_Handle(_Producer(flight, "p0"))],
+            [_Handle(_Relay(flight, "r0", fanout=2))],
+            [_Handle(_Consumer(flight))],
+        ],
+        _partitions([6]),
+        1,
+        4,
+    )
+    assert peaks, "the spy never fired, so this test asserts nothing"
+    assert max(peaks) == 2, "a second morsel must be issued while the first is running"
+
+
+def test_a_saturated_consumer_is_not_offered_a_third_morsel(loop, monkeypatch):
+    """The bound is a bound: `depth` outstanding calls, never `depth + 1`."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    _with_depth(monkeypatch, 2)
+    over = []
+    real_take = schedule._take
+
+    def _spy(ctx, k, addr):
+        actor = real_take(ctx, k, addr)
+        if k == ctx.last and actor is not None and ctx.in_flight[actor] > 2:
+            over.append(ctx.in_flight[actor])
+        return actor
+
+    monkeypatch.setattr(schedule, "_take", _spy)
+    flight = _Flight()
+    loop(
+        [
+            [_Handle(_Producer(flight, "p0"))],
+            [_Handle(_Relay(flight, "r0", fanout=3))],
+            [_Handle(_Consumer(flight))],
+        ],
+        _partitions([8]),
+        1,
+        4,
+    )
+    assert over == []
+
+
+def test_a_double_buffered_consumer_that_is_preempted_still_loses_no_row(loop, monkeypatch):
+    """A dead actor can sit in the free list once per unused slot; every copy must go."""
+    _with_depth(monkeypatch, 2)
+    flight = _Flight()
+    results = loop(
+        [
+            [_Handle(_Producer(flight, "p0"))],
+            [_Handle(_Relay(flight, "r0", fanout=2))],
+            [_Handle(_Consumer(flight, fail_first=2)), _Handle(_Consumer(flight))],
+        ],
+        _partitions([6]),
+        1,
+        4,
+        spawn=[None, None, lambda: _Handle(_Consumer(flight))],
+    )
+    assert _values(results) == sorted((v, i) for v in range(6) for i in range(2))

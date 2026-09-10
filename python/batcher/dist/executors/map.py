@@ -23,6 +23,7 @@ import contextlib
 import contextvars
 import logging
 import os
+import threading
 from collections import deque
 
 import pyarrow as pa
@@ -2312,6 +2313,13 @@ class _MapActor:
         # whose true sustained figure was 13%, and that is above every threshold the packing
         # and submit-depth levers trigger on. The measurement held its own fix shut.
         self._util = _sustained_utilization()
+        # A streamed terminal consumer is given several morsels at once so its Flight fetch
+        # overlaps its forward pass, which means `run_split` can be entered concurrently. The
+        # *fetch* is what should overlap; the UDF must not, because a `map_batches` class UDF
+        # is documented as one instance per actor and a GPU stage deliberately runs on one
+        # thread (`_with_inference_workers` keeps its `num_workers` at 1 for one CUDA
+        # context). This serializes the compute and leaves the fetch outside it.
+        self._compute = threading.Lock()
 
     def run(self, partition: dict, idx: int = 0):
         from batcher import core
@@ -2412,10 +2420,13 @@ class _MapActor:
         rows = process_client().fetch(addr, str(ticket))
         if not rows:
             return None
-        self._util.begin_call()
-        out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
-        self._util.end_call()
-        self._observe_gpu(sample_gpu_vram_fraction())
+        # The fetch above is deliberately outside the lock: overlapping it with another
+        # morsel's forward pass is the whole point of being given more than one at a time.
+        with self._compute:
+            self._util.begin_call()
+            out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
+            self._util.end_call()
+            self._observe_gpu(sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
