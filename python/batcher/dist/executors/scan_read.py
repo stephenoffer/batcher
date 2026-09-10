@@ -20,6 +20,7 @@ they live here as the single source of truth.
 from __future__ import annotations
 
 import collections
+import contextlib
 import functools
 import os
 import threading
@@ -436,6 +437,12 @@ def _native_scan_batches(splits, projection, predicate=None):
     for s in splits:
         by_file.setdefault(s.path, []).extend(s.row_groups)
     cols = list(projection) if projection is not None else None
+    # A row count is not a memory bound. `morsel_rows` of a 147 KB decoded image is 2.4 GB of
+    # decoder working set per read, which is what OOM-killed a GPU inference actor holding a
+    # node's worth of them; the byte cap is a no-op for an ordinary row. See
+    # `_parquet_native.NATIVE_READ_TARGET_BYTES`.
+    with contextlib.suppress(Exception):
+        batch_rows = _parquet_native.native_read_batch(splits[0].schema(), cols, ceiling=batch_rows)
 
     # Window the row-groups so the worker reads ~one window at a time (bounded memory +
     # read/compute overlap) instead of materializing its whole partition.

@@ -97,7 +97,7 @@ class ParquetSource(FileSource):
             return None
         if not self._native_uri_is_addressable(files[0]):
             return None
-        per_file = _parquet_native.read_many(files, projection)
+        per_file = _parquet_native.read_many(files, projection, self.schema())
         if per_file is None:
             return None
         return [
@@ -169,7 +169,13 @@ class ParquetSource(FileSource):
 
         def _read_one(f: str) -> list[pa.RecordBatch] | None:
             # `[]` row-groups = every row-group in the file; the reader prunes from there.
-            batches = _parquet_native.read_row_groups_filtered(f, [], projection, predicate)
+            batches = _parquet_native.read_row_groups_filtered(
+                f,
+                [],
+                projection,
+                predicate,
+                _parquet_native.native_read_batch(self.schema(), projection),
+            )
             if not batches:
                 return batches  # None, or a file pruned away to nothing — both pass through
             # Conform before filtering: the filter is bound against the source's declared
@@ -217,7 +223,7 @@ class ParquetSource(FileSource):
             if self._fs.native_read_target(path) is None:
                 return None
             return self._read_table(path, projection).to_batches()
-        native = _parquet_native.read_one(path, projection)
+        native = _parquet_native.read_one(path, projection, self.schema())
         if native is not None:
             return native
         return self._read_table(path, projection).to_batches()

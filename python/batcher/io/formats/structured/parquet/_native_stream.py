@@ -135,7 +135,13 @@ def iter_windows(path: str, pf: Any, projection: list[str] | None) -> Iterator[p
         An iterator over the file's batches, in row-group order.
     """
     for window in row_group_windows(pf.metadata):
-        batches = _parquet_native.read_row_groups_filtered(path, window, projection, None)
+        batches = _parquet_native.read_row_groups_filtered(
+            path,
+            window,
+            projection,
+            None,
+            _parquet_native.native_read_batch(pf.schema_arrow, projection),
+        )
         if batches is None:
             yield from pf.read_row_groups(window, columns=projection).to_batches()
         else:
