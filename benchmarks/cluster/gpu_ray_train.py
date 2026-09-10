@@ -402,6 +402,60 @@ def _consumed_a_real_subset(rows: int, checksum: float, corpus: dict, cfg: dict)
     return 0 <= shortfall <= dropped * _MAX_LABEL
 
 
+def _engine_order() -> tuple[str, ...]:
+    """Which arm runs first. `BENCH_TRAIN_ORDER=ray,batcher` flips it.
+
+    Exposed because it is the control for `_warm_the_trainer`: if the warm-up ever stops
+    working, the two orders stop agreeing, and that is the only way to tell from the outside.
+    """
+    order = [
+        e for e in os.environ.get("BENCH_TRAIN_ORDER", "").split(",") if e in ("batcher", "ray")
+    ]
+    return tuple(order) if len(order) == 2 else ("batcher", "ray")
+
+
+def _warm_the_trainer(cfg: dict) -> None:
+    """Run a throwaway one-step `TorchTrainer` so neither arm is charged the cold start.
+
+    The `wall_s` this benchmark reports is `trainer.fit()`, and the **first** fit in a process
+    pays for something neither engine owns: Ray Train's controller, the placement group, and
+    eight fresh worker processes importing torch and initializing CUDA. Measured on this fleet
+    at 10M rows, one epoch, the same script run twice with only the arm order changed:
+
+        batcher first:  batcher startup 278.5s, wall 359.0s | ray startup 8.8s, wall 101.4s
+        ray first:      ray startup 276.3s, wall 371.1s | batcher startup 8.5s, wall 92.1s
+
+    The 278 seconds follow the *position*, not the engine. Reported without this warm-up they
+    read as a 3.5x difference in trainer wall time that reverses when you reorder the loop --
+    which is the shape of a benchmark that measures its own harness. The loop times, which is
+    what the ranks time themselves, were unaffected either way (76-78s Batcher, 88-91s Ray).
+
+    One step on one worker is enough: what is being warmed is the worker processes the raylet
+    keeps after a fit, not anything about the data.
+    """
+    import ray.train
+    from ray.train import RunConfig, ScalingConfig
+    from ray.train.torch import TorchTrainer
+
+    def _noop(_cfg: dict) -> None:
+        import torch
+
+        torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu")
+        ray.train.report({"warm": 1})
+
+    t0 = time.perf_counter()
+    try:
+        TorchTrainer(
+            functools.partial(_noop, {}),
+            scaling_config=ScalingConfig(num_workers=cfg["workers"], use_gpu=True),
+            run_config=RunConfig(storage_path=cfg["dir"], name="_warmup"),
+        ).fit()
+    except Exception as exc:
+        print(f"  [warmup] skipped ({type(exc).__name__}: {exc})")
+        return
+    print(f"  [warmup] trainer workers warm in {time.perf_counter() - t0:.1f}s")
+
+
 def main() -> int:
     require_release_build()
     print(machine_fingerprint())
@@ -429,7 +483,8 @@ def main() -> int:
     )
 
     rows: list[dict] = []
-    for engine in ("batcher", "ray"):
+    _warm_the_trainer(cfg)
+    for engine in _engine_order():
         print(f"  [{engine}] training ...")
         try:
             arm = _run_arm(engine, cfg)
