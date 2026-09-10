@@ -212,37 +212,60 @@ def _agg_pool_in_use():
         _arm_agg_idle_release()
 
 
-def reclaim_idle_cpu_pool() -> bool:
-    """Tear down the warm CPU map pool if no stage is using it. True when cores were freed.
+def release_foreign_agg_pools(plan0, needed_cpus: float) -> bool:
+    """Kill warm CPU pools belonging to *other* pipelines when this one cannot place.
 
-    The pool is held for `distributed.session_fleet_idle_s` after a stage finishes so a
-    back-to-back query reuses its scan cache, and a timer returns the cores when the session
-    goes quiet. **The timer was the only way they came back**, and that is a gap rather than a
-    policy: a query that arrives *during* the idle window needs those cores now and has no way
-    to say so, so it waits out a clock that exists to help it.
+    The warm map/aggregate pool keeps a pipeline's actors alive for
+    `distributed.session_fleet_idle_s` so a back-to-back query reuses their scan cache, and a
+    timer returns the cores when the session goes quiet. That is right for a pipeline running
+    again; it is wrong for a **different** pipeline that needs those cores now, and the failure
+    it produced is a self-deadlock rather than a slowdown.
 
-    That is not a slower query, it is a stopped one, and the arithmetic is what makes it total.
-    Measured here on six 8-core nodes: an ordinary CPU query returns and leaves **42 of 48 cores
-    held**; the next query's map tasks are sized at **6.144 CPU** each against **6.0 free**, so
-    not one of them can be placed and the stage sits at `0/6` until the timer fires. A GPU
-    pipeline that reads with the CPU engine and then infers — the ordinary shape — hit this
-    every time, with every device idle throughout.
+    The shape, measured on six 8-core nodes. An ordinary CPU query returns and leaves its pool
+    holding **42 of 48 cores**. The next query — a different pipeline — enters this route,
+    takes the in-use lease, and tries to build its own pool and submit its map tasks at
+    **6.144 CPU each against 6.0 free**. Not one can be placed. And the lease it is holding is
+    exactly what stops the stale pool being reclaimed, so the query waits on cores that only it
+    could release: `0/6 tasks finished`, indefinitely, with every GPU idle. A pipeline that
+    reads with the CPU engine and then infers hit this every time.
 
-    Reclaiming is safe by construction and cheap by comparison: `_AGG_IN_USE` is non-empty for
-    exactly as long as a stage holds the pool, so an idle pool has no work on it, and what is
-    lost is a warm scan cache that the next stage rebuilds. Losing it beats not running.
+    Keyed on the pipeline signature, so a pool this plan would actually reuse is never touched
+    — the lease still protects the current pipeline's own pool, which is what it is for. What a
+    foreign pool loses is a scan cache its next run rebuilds.
 
-    **CPU pools only, deliberately.** A warm *GPU* pool holds devices whose model costs minutes
-    to reload, and the same trade does not obviously hold there; a stage blocked on devices is a
-    different measurement and should get its own.
+    Gated on the cluster genuinely being short, so a query that fits alongside a warm pool
+    leaves it warm and the optimization survives for the case it was written for.
+
+    Args:
+        plan0: The pipeline about to acquire a pool; its own pools are kept.
+        needed_cpus: What this stage needs free before it can place.
 
     Returns:
-        True when a pool was shut down, so the caller can retry before reporting a stall.
+        True when a pool was killed, so the caller can note that it made room.
     """
-    if _AGG_IN_USE or not _AGG_POOLS:
+    if not _AGG_POOLS:
         return False
-    _cancel_agg_idle_release()
-    _shutdown_pools(_AGG_POOLS)
+    sig = _pipeline_signature(plan0)
+    foreign = [k for k in _AGG_POOLS if k[0] != sig]
+    if not foreign:
+        return False
+    try:
+        import ray
+
+        if float(ray.available_resources().get("CPU", 0.0)) >= float(needed_cpus):
+            return False
+    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+        note_suppressed("dist", "read free CPU before releasing a foreign pool", exc)
+        return False
+    _kill_pool_keys(foreign, _AGG_POOLS)
+    log_kv(
+        get_logger("dist"),
+        logging.INFO,
+        "released another pipeline's idle CPU map pool to place this stage",
+        reason="its cores were held for a scan cache this pipeline cannot use",
+        needed_cpus=needed_cpus,
+        pools=len(foreign),
+    )
     return True
 
 
@@ -2705,6 +2728,11 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # actor (16 here) rather than the `_TARGET_TASK_CPUS`-wide task the default assumes. When
     # the pool declines, the units really are tasks and the default is right.
     _cancel_agg_idle_release()  # about to use the pool, so it is not idle
+    # Before taking the lease, hand back any *other* pipeline's warm pool if this stage cannot
+    # place without its cores. The lease below is what protects a running stage's own actors,
+    # and it would otherwise protect a stale pool from a previous query too — which is the
+    # self-deadlock `release_foreign_agg_pools` describes.
+    release_foreign_agg_pools(map_plan, _agg_actor_width(max(1, workers)))
     actors = _agg_actor_pool(map_plan, workers)
     unit_cpus = _agg_actor_width(max(1, workers)) if actors else None
     n_parts = _adaptive_partition_count(sources[sid], agg.input, workers, task_cpus=unit_cpus)

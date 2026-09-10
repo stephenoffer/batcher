@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1454 Python modules across 213 packages and 285 Rust files across 15 crates.
+Covering 1455 Python modules across 213 packages and 285 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -481,7 +481,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 326 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 643 | Generalized linear models fitted by iteratively reweighted least squares. |
-| `gpu.py` | 1631 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
+| `gpu.py` | 1637 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 224 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 828 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 367 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
@@ -1095,8 +1095,9 @@ The distributed streaming heterogeneous inference pipeline (the GPU-feeding moat
 
 | module | lines | what it is |
 |---|---|---|
-| `driver.py` | 349 | Build the stage pools of a streaming inference pipeline and run one query through them. |
-| `schedule.py` | 614 | The overlap loop: stream partitions through N stage pools, morsel by morsel. |
+| `driver.py` | 361 | Build the stage pools of a streaming inference pipeline and run one query through them. |
+| `morsels.py` | 60 | The pipeline's published-morsel ledger: what is in flight, and what it came from. |
+| `schedule.py` | 622 | The overlap loop: stream partitions through N stage pools, morsel by morsel. |
 
 ### `batcher/kyber/` — 3 · subsystem
 
@@ -2065,7 +2066,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `dataset.py` | 700 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
-| `source.py` | 514 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
+| `source.py` | 530 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
 
 ### `batcher/io/formats/unstructured/` — 2 · neutral IO
 
