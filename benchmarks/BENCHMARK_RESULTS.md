@@ -106,20 +106,22 @@ The per-case split is what names the cause. Everything that **won** is a `GROUP 
 that **lost** is an `ORDER BY ... LIMIT` or a window -- `cb-q24` 1.41x, `cb-q26` 1.41x,
 `cb-q25` 1.38x, `tpch-q8` 1.21x, `op-window-lag` 1.07x, `op-sort-multikey-wide` 1.07x.
 
-**The two changes are independent and the split is clean.** Four arms, TPC-H sf1, two engines
-so no third engine's resident memory perturbs it — `BEFORE` (HEAD engine + HEAD control
-plane), `RUSTONLY` (new engine only), `PYONLY` (new control plane only), `AFTER` (both):
+**The two changes are independent and the split is clean.** Four arms across three suites,
+two rounds, minimum per case, two engines so no third engine's resident memory perturbs it —
+`BEFORE` (HEAD engine + HEAD control plane), `RUSTONLY` (the sort change only), `PYONLY` (this
+change only), `AFTER` (both). Each cell is `total ms / b/duckdb geomean`:
 
-| arm | total | b/duckdb |
-|---|---:|---:|
-| BEFORE | 410.7 ms | 0.708 |
-| RUSTONLY | 411.7 ms | 0.714 |
-| PYONLY | 426.1 ms | 0.739 |
-| AFTER | 428.3 ms | 0.746 |
+| suite | BEFORE | RUSTONLY | PYONLY | AFTER |
+|---|---:|---:|---:|---:|
+| operators (23) | 844.5 / 0.636 | **792.4 / 0.628** | 846.3 / 0.654 | 788.2 / 0.632 |
+| ClickBench (43) | 417.5 / 0.801 | **407.3 / 0.777** | 343.1 / 0.713 | 333.6 / 0.697 |
+| TPC-H sf1 (22) | 407.1 / 0.716 | 409.0 / 0.728 | 423.9 / 0.762 | 424.1 / 0.761 |
 
-The sort change is **neutral** on TPC-H (+0.2%, inside the run-to-run spread) and the morsel
-change owns the whole regression. So the two land separately: the sort change ships, this one
-does not.
+The two are additive and neither masks the other. **The sort change is a win on operators
+(-6.2%) and ClickBench (-2.4%) and neutral on TPC-H** (+0.5% total; its geomean moves 0.716 ->
+0.728, which is the run-to-run spread and not a result). **This change owns ClickBench's -17.8%
+and TPC-H's +4.1% alike.** So the two land separately: the sort change ships, this one does
+not.
 
 **`cb-q31` and `cb-q24` read the same rows.** Both are `... FROM hits WHERE SearchPhrase <>
 ''` over the same 1,000,000-row table, both reduce to ~69,000 rows, and they differ only in
@@ -156,11 +158,6 @@ So the state of this is: the width bug is **real and measured at 2.1x** on the s
 governs, the patch is in the entry above, and swept across the board it trades one suite
 against two. It is held rather than shipped, and what it needs first is an answer to why a
 group-by wants few morsels — not another guess at one.
-
-One practical note for whoever picks this up: wiring the projection through the conductor
-takes `api/orchestration/run.py` from 499 to **507** lines, over `lint-structure`'s 500-line
-limit, so landing it means splitting that module as well. The hook caught it, which is the
-system working.
 
 ## A string sort refused a key that settled 99% of its comparisons, and then read every key through a five-arm match — `op-sort-string` 220 ms -> 176 ms, 1.13x DuckDB -> 0.91x (2026-09-11)
 
