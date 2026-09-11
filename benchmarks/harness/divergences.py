@@ -146,6 +146,37 @@ def _validate(entries: tuple[Divergence, ...]) -> tuple[Divergence, ...]:
 KNOWN_DIVERGENCES: tuple[Divergence, ...] = _validate(
     (
         Divergence(
+            case="tpcds-q67",
+            engine="batcher",
+            versus="duckdb",
+            signature="'rk'",
+            verdict="undefined",
+            reason=(
+                "`rk` is `rank() OVER (PARTITION BY i_category ORDER BY sumsales DESC)` and "
+                "`sumsales` is `sum(ss_sales_price*ss_quantity)` under a ROLLUP -- an integer "
+                "derived from a float reduction, which is the one shape this harness's float "
+                "tolerance cannot reach. Measured: of 100 rows, 8 ranks differ while every "
+                "`sumsales` matches to within 1.2e-16 relative (two ulps: 119982.95000000003 "
+                "against 119982.95000000001). Neither engine is wrong -- `combine` is "
+                "associative in exact arithmetic and IEEE addition is not, so the partition "
+                "count decides the last bits, which is the reassociation `.claude/rules/"
+                "python-control-plane.md` states as a bound rather than a defect. Ranking "
+                "*amplifies* it into an integer: one ulp anywhere in a partition shifts every "
+                "rank below it, so row 18 gets 90 against 91 while its own sumsales matches "
+                "**exactly**. Worth knowing before treating this as an engine bug: the "
+                "difference is manufactured by the harness itself. TPC-DS declares "
+                "`ss_sales_price` as `decimal(7,2)` and `ss_quantity` as an integer, so the "
+                "product and its sum are exact in decimal and the ranks would agree -- "
+                "`sources/tables.py::_normalize_types` casts every decimal to float64 'for "
+                "cross-engine parity', and this is what that costs."
+            ),
+            citation=(
+                "scratchpad q67.py, 2026-09-11: 8 of 100 ranks differ, max sumsales "
+                "relative difference 1.2e-16; sources/tables.py::_normalize_types; "
+                ".claude/rules/python-control-plane.md on float reassociation"
+            ),
+        ),
+        Divergence(
             case="tpch-q6",
             engine="polars",
             versus=None,

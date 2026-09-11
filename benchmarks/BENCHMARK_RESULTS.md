@@ -1,5 +1,241 @@
 # Batcher CPU benchmark results
 
+## The board with TPC-DS and scan in it, and where the remaining gap to DuckDB actually is: a flat 2.2 ms of control plane and a widened `int32` (2026-09-11)
+
+Two suites this session had never run, both on a quiet 48-core box, pairwise lineups
+(the README's own warning that the lineup is part of the measurement, and because five
+engines holding TPC-DS sf1 at once was OOM-killed at 71 GB RSS):
+
+| suite | b/duckdb | b/polars | note |
+|---|---:|---:|---|
+| JSON (5) | 0.35 | 0.01 | |
+| **scan (27)** | **0.57** | **0.24** | new |
+| operators (23) | 0.63 | 0.15 | |
+| H2O `join` (5) | 0.66 | 0.51 | |
+| TPC-H sf1 (22) | 0.72 | 0.60 | |
+| ClickBench (43) | 0.78 | 0.44 | |
+| **TPC-DS (99)** | **0.98** | n/a | new — Polars errors on all 99 |
+| H2O `groupby` (10) | 1.01-1.04 | 0.57 | the one suite not won |
+
+**Spark could not be measured at all**: `pyspark` 4.2.0 is installed and there is no JVM on
+this box (`java` is not on `PATH` and `JAVA_HOME` is unset), so `SparkEngine.available()` is
+false and the lineup silently drops it. That is an environment gap, not a result — do not
+read the absence of a Spark column as a win.
+
+### The control plane is a flat ~2.2 ms, and on a small query that is the whole gap
+
+Timed at the FFI boundary itself, so "engine" is the native call and "control" is everything
+else `collect()` does:
+
+| query | wall | engine | control | duckdb |
+|---|---:|---:|---:|---:|
+| `count(*) BY id4` | 4.62 ms | 2.58 | **2.04** | 2.28 |
+| `h2o-gb-q4` (`mean` x3 `BY id4`) | 10.01 ms | 7.74 | **2.26** | 5.25 |
+| `sum,avg BY id3` | 59.30 ms | 56.37 | **2.93** | 78.70 |
+
+The control plane barely grows with the query: it is 44% of a 4.6 ms query and 5% of a 59 ms
+one. **That is why the H2O `groupby` ratios are worst on its smallest queries** — `q4` at
+1.75x-1.94x is the suite's worst ratio and its second-smallest query.
+
+Priced by stubbing each phase and re-timing uninstrumented (cProfile overstates syscall-heavy
+code by ~1.4x here, so it was not trusted):
+
+| phase | cost/query |
+|---|---:|
+| `write_event_log` | 0.30-0.53 ms |
+| `ResourceManager.recommended_config` (adaptive morsel sizing) | 0.35 ms |
+| `_close_learning_loops` | 0.11 ms |
+| `learn_column_stats` | 0.01 ms |
+| **all four together** | **0.80 ms** |
+
+So even removing every one of them leaves `count(*) BY id4` at 3.75 ms against DuckDB's 2.28.
+The rest is plan building, optimization, source resolution and FFI marshalling, and it is
+spread thin — no single item above ~0.1 ms. Three things that looked like levers and are not:
+
+* **Deferring the event-log write to a thread** would save **0.15 ms** of the 0.30, the rest
+  being the render (`_assemble` + `to_dict`) that both the file *and* the event bus consume.
+  Not worth a background writer and its fork-safety problem. `_prune` is already incremental
+  (a previous session took it from 0.184 ms to a popleft), so the obvious target is spent.
+* **Widening `ROUND_COALESCE_SECONDS`.** `carbonite.memory.probe` reads
+  `/sys/fs/cgroup/memory.current` five times per query because its coalescing window is 1 ms
+  while its own comment says the window exists "only wide enough to let the components
+  deciding about one query share a single read" — and a query here is 10-300 ms. Widening it
+  to 50 ms is worth **0.5%** (10.12 -> 10.07 ms). The 20 filesystem reads a `collect()`
+  performs cost 0.347 ms in total, and collapsing the repeats recovers a fraction of that.
+* **`observability.event_log`** defaults to `True` and its own docstring already prices it.
+  Turning it off wins 1% of the suite (1.02 -> 1.01). It is a shipped default and a
+  deliberate one; it was not changed to move a benchmark.
+
+### Where `q4`'s *engine* time goes: it reads 320 MB where DuckDB reads 200
+
+`h2o-gb-q4` is `mean(v1), mean(v2), mean(v3) GROUP BY id4` over 10M rows and 100 groups. In
+the H2O schema `id4`, `v1` and `v2` are **`int32`**; only `v3` is `double`. The FFI boundary
+normalizes narrow numerics to `int64` (`bc_py::normalize_to`, mirrored by
+`plan.types.lattice.widen`), so the engine reads 320 MB where DuckDB reads 200.
+
+Decomposed, the ratio is ~2x on **every** variant, including one that touches no value column
+at all:
+
+| case | batcher | duckdb | ratio |
+|---|---:|---:|---:|
+| `count(*) BY id4` | 4.75 ms | 2.28 | 2.08x |
+| `sum(v1) BY id4` | 5.04 | 2.63 | 1.92x |
+| `mean(v1) BY id4` | 6.15 | 3.19 | 1.93x |
+| `mean(v1,v2,v3) BY id4` (q4) | 10.00 | 5.15 | 1.94x |
+
+A near-constant ratio across a growing amount of work is a fixed cost plus a proportional one,
+which is exactly what the table above says: ~2.2 ms fixed, and an engine that reads 1.6x the
+bytes. **The widening is not free and it is not recoverable downstream** — handing Batcher an
+already-`int64` copy of the table changes nothing (10.17 -> 10.04 ms, it widens either way)
+while DuckDB pays only +6% for the same 60% more bytes, so neither engine is bandwidth-bound
+and the extra bytes are pure loss.
+
+Narrow-type support in the scan and grouping paths is therefore the quantified path to winning
+this suite, and it is a large project rather than a tuning: `widen` is mirrored on both sides
+of the wire contract and `Dataset.schema`, join-key type matching and arithmetic inference all
+read it. ClickBench's `hits` is full of `Int16`/`Int32`, so the same change is worth more
+there than here.
+
+### `tpcds-q72` is 11.96x, and the cause is a 234x cardinality miss
+
+509.4 ms against DuckDB's 42.6 — the largest single gap on the board. `explain(analyze=True)`
+over its 46 operators:
+
+```
+hash_join   est≈11,745,000  actual=11,745,000  exact       144ms  20%
+hash_join   est≈11,745,000  actual=11,745,000  exact       142ms  20%
+hash_join   est≈2,553,584   actual=16,425,000  6.4x under  121ms  17%
+filter      est≈70,233      actual=16,425,000  234x under   42ms   6%
+hash_join   est≈130,786     actual=1,428,130   10.9x under 228ms  31%
+```
+
+The plan builds a **16.4 million row** intermediate where it estimated 70 thousand, then joins
+it down to 1.4M. The selective dimension predicates (`cd_marital_status = 'D'` cutting
+`customer_demographics` to 384k, `hd_buy_potential`, `d1.d_year = 1999`) are applied on the
+*other* side of the spine and join last, so nothing prunes the fact table early. This is a
+join-ordering consequence of the estimate, not a missing rewrite: `derive_join_keys` does
+absorb cross-side equi-conjuncts into real join keys and does drop what it absorbs, so the
+surviving filter is a genuine predicate and not a leftover.
+
+### `scan-sumwide`'s 2.83x does not reproduce off S3
+
+The worst `scan` row is `sumwide` (`SUM(c % 1000)` over all sixteen columns) at 1106.7 ms
+against 390.9. It is **not** the Parquet decoder. Written locally with the same shape — 8.4M
+rows x 16 `int64`, 8 row groups, 1.11 GB:
+
+| | batcher | duckdb | |
+|---|---:|---:|---|
+| 16-column read | 212.0 ms | 672.8 | **0.32x** |
+| 16-column read + sum | 245.1 ms | 280.3 | **0.87x** |
+
+And reading the benchmark's own S3 corpus directly, Batcher wins the wide read too (16 columns
+1212.7 ms against 1353.6, **0.90x**) while losing the narrow one (1 column 376.2 against
+118.0, 3.19x). The suite's `sum1` is 1.00x and its `sumwide` 2.83x, which neither of those
+reproduces — the corpus benchmarks re-read from object storage on every repeat and the earlier
+cases warm what the later ones read, so the ordering of cases is part of the measurement.
+Re-measure a `scan` row in isolation before acting on it.
+
+## H2O `groupby` is the one suite still above DuckDB, its own spread is 1.01-1.04, and four ideas for it that do not work (2026-09-11)
+
+The single-node board has five suites won and one not: H2O `groupby`. Three runs of it on a
+quiet 48-core box, two engines, to separate the suite's noise from its gap:
+
+| | b/duckdb |
+|---|---|
+| run 1 | 1.04 |
+| run 2 | 1.01 |
+| run 3 | 1.02 |
+
+**Batcher's own times are stable to ~2%; DuckDB's are not.** `q10` reads 252.4-331.8 ms across
+the three runs — a 31% swing — which moves that one ratio between 0.89x and 1.15x on its own.
+Any conclusion drawn from a single run of `q10` is a conclusion about the allocator.
+
+Per query, minimum of three, with the rows whose ratio never touches 1.0 marked:
+
+| query | batcher | duckdb | ratio | shape |
+|---|---:|---:|---:|---|
+| q8 | 97.0-102.1 | 70.3-71.0 | **1.37-1.45** | `row_number() OVER (PARTITION BY id6 ORDER BY v3 DESC) <= 2` |
+| q4 | 9.1-9.2 | 5.2-5.3 | **1.73-1.76** | `avg x3 BY id4` (100 groups) |
+| q7 | 64.0-65.6 | 51.2-52.7 | **1.22-1.28** | `max(v1)-min(v2) BY id3` (12-byte string) |
+| q2 | 32.8-32.9 | 26.5-26.6 | **1.24** | `BY id1, id2` (two strings) |
+| q3 | 62.1-63.7 | 53.9-55.2 | **1.15-1.16** | `sum,avg BY id3` |
+| q9 | 41.6-42.1 | 39.7-40.6 | 1.02-1.05 | `corr BY id2, id4` |
+| q10 | 290.8-300.2 | 252.4-331.8 | 0.89-1.15 | `BY id1..id6` — **noise** |
+| q1 | 11.5-11.7 | 14.4-14.5 | 0.80 | won |
+| q5 | 40.8-42.4 | 69.5-70.3 | 0.58-0.61 | won |
+| q6 | 65.5-68.2 | 112.6-120.2 | 0.55-0.58 | won |
+
+**`q8` alone would flip the suite**: at 1.41x it contributes `1.41^0.1 = 1.035` to the geomean,
+so taking it to parity moves 1.02 to about 0.985.
+
+### Where the time is, and three things that do not fix it
+
+`q8` — `perf`, 10M rows, 100,000 partitions: **66% of the operator is moving rows into hash
+buckets and the ranks back out** (`window::parallel::scatter_blocked` 19.5%, two
+`arrow::take` gathers 23.3%, `memmove` 11.1%, `bucket_of_each_row` 9.0%,
+`partition_row_indices` 3.8%) against **9.4% in the window kernel itself**. `q3` and `q10` have
+the same shape one operator over: `ops::repartition`'s gather plus `memmove` is **51%** of q3
+and **66%** of q10.
+
+**1. A parallel bounded selection above the bucketing does not work.** A heap is mergeable, so
+one `groups x k` heap per worker over a contiguous row range, merged by taking the best `k` per
+partition, is exact and skips the bucketing entirely. Built, held to the serial form entry for
+entry at every worker count, and **slower: 105.4 -> 141.0 ms**. The bucketing is not waste — it
+buys a heap that fits cache (70 KB per bucket against 3.2 MB per worker), and the merge adds
+`groups x threads` scattered reads. Varying only the key's cardinality confirms it: a wash at
+100 partitions (112 vs 115 ms), 36% worse at 100,000 (140 vs 103). Recorded on
+`window::topk`'s module doc beside the earlier serial attempt.
+
+**2. The chunking gate is not too tight.** `chunked_partials` ("one partial per worker") would
+avoid the whole-relation gather, and `chunking_pays` refuses it for `id3`/`id6` by a whisker —
+`46 x 100,000` against a ceiling of `0.25 x 10,000,000`, a ratio of 0.46. Sweeping the ceiling
+makes it **worse**, monotonically: q3 62.0 -> 80.3 -> 80.9 -> 80.2 ms and the suite 1.03 ->
+1.12 -> 1.12 -> 1.09 at ceilings 0.25 / 0.50 / 1.00 / 2.00. The tuned constant is right and the
+Partition path is the correct choice at this cardinality.
+
+**3. Removing `chunked_partials`' concatenation buys nothing.** It calls `concat_batches` on
+each worker's share — a physical read and write of every byte — only because
+`eval_partial_jit` takes one batch. Replacing it with a partial per morsel plus a serial
+`combine` inside the worker reaches the same one-table-per-worker state and copies nothing.
+Measured: `q2` 34.27 -> 33.77 ms, `q9` 43.10 -> 43.00, the suite 1.01/1.02 -> 1.02/1.01. About
+1%, inside the suite's own spread.
+
+Two things that reasoning got wrong and the measurement corrected. `q4` and `q1` do **not**
+take this path at all — 100 groups over a 16,384-row morsel reduces enormously, so
+`width_from_sample` sends them down the *reducing* branch and `chunked_partials` is never
+called; the estimate that the copy was "two thirds of the memory traffic" was about a path
+those queries do not use. And where it *is* used (`q2`, `q9`, the 10,000-group band) the copy
+is sequential and bandwidth-friendly while the aggregate's scatter-adds are random, so the
+copy is not what the query is waiting for.
+
+**4. The scatter is already the good version.** `scatter_blocked` splits the output into
+per-core contiguous ranges and binary-searches each bucket for the ascending slice that falls
+in one — every core writes only its own cache-local range. There is no naive scatter to fix.
+
+### What is left, unmeasured
+
+The gather moves the **wide key**: `q3` partitions on a 12-byte string (≈16 B/row with its
+offset) beside an 8-byte value. Partitioning on the *dense group id* instead — `assign_groups`
+once globally, partition a `u32`, regroup the integers per bucket, and gather the representative
+key column once at the end over `groups` rows rather than `rows` — would halve the bytes moved.
+The string is hashed once either way. That is the idea this entry leaves open, and unlike the
+three above it has not been built, so it is a direction and not a result.
+
+### A per-query floor worth knowing about
+
+Traced with an `open`/`unlink` interposer, one `collect()` performs **20 filesystem reads**:
+`/sys/fs/cgroup/memory.current` five times, the NIC's `speed`/`operstate`/`carrier` twice each
+for a single-node aggregate that touches no network, plus `meminfo`, three pressure files and
+six more cgroup files — and writes one event-log JSON and unlinks another. Timed on this box
+that is **0.347 ms per query**, of which the NIC probe is 0.085 ms.
+
+`ROUND_COALESCE_SECONDS` is the reason the same file is read five times: it is **1 ms**, and
+its own comment says it exists "only wide enough to let the components deciding about one
+query share a single read" — but a query here is 10 ms to 300 ms, so the window is one to two
+orders of magnitude narrower than the span it names. 0.35 ms is 3% of `h2o-gb-q4` and would be
+~20% of a 1.6 ms ClickBench query; it is recorded rather than fixed because it flips no suite
+on its own.
+
 ## Measured and NOT shipped: a five-column query over a 105-column table is charged the hundred columns it never reads — a 647-row morsel against the configured 16,384, `cb-q31` 14.4 ms -> 7.3 ms (2026-09-11)
 
 **Read the entry below this one before acting on this one.** The defect is real, the
