@@ -74,6 +74,31 @@ pub fn is_byte_key(dt: &DataType) -> bool {
     )
 }
 
+/// Bytes `[from, from + 8)` of `key` as a big-endian `u64`, zero-padded when the key runs out.
+///
+/// Ordering this integer orders the keys, for every pair whose words differ. The padding is what
+/// makes that true rather than merely usual: a missing byte packs as `0`, no byte is less than
+/// `0`, and a key that runs out is a prefix of the one that does not — which is exactly the
+/// byte-lexicographic rule this module defines. Where the words are *equal* the answer is
+/// unknown (either the keys share a prefix, or one contains a literal NUL where the other
+/// ended) unless [`ByteKeys::exact_pack_width`] has ruled that out, so a caller either checks
+/// that first or falls through to a full comparison.
+///
+/// It lives here rather than beside either of its callers for the reason at the top of this
+/// module: the sort (`bc_interp::ops::byte_sort`) and the range partitioner (`shuffle.rs`) must
+/// agree about what a key is, and a pack is part of that answer. Both replace a `memcmp` with a
+/// register compare on the strength of the paragraph above; neither should be restating it.
+#[must_use]
+#[inline]
+pub fn pack_word(key: &[u8], from: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    if from < key.len() {
+        let take = (key.len() - from).min(8);
+        buf[..take].copy_from_slice(&key[from..from + take]);
+    }
+    u64::from_be_bytes(buf)
+}
+
 impl<T: ByteArrayType> ByteKeys for GenericByteArray<T> {
     fn len(&self) -> usize {
         Array::len(self)

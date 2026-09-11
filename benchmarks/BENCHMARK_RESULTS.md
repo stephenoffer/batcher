@@ -1,5 +1,261 @@
 # Batcher CPU benchmark results
 
+## Measured and NOT shipped: a five-column query over a 105-column table is charged the hundred columns it never reads — a 647-row morsel against the configured 16,384, `cb-q31` 14.4 ms -> 7.3 ms (2026-09-11)
+
+**Read the entry below this one before acting on this one.** The defect is real, the
+diagnosis is not in doubt and the patch works; swept across the whole board it trades one
+suite against two, and it is held for that reason alone. The patch is not in the tree.
+
+ClickBench `cb-q30`, `cb-q31`, `cb-q40` and `cb-q14` were the suite's worst ratios on a quiet
+48-core box -- 2.55x, 2.60x, 2.37x and 1.97x DuckDB -- while `cb-q32`, **the same group-by
+with the `WHERE` removed**, was a win at 0.69x. A filter that removes five rows in six made
+DuckDB 4.2x faster and Batcher 1.1x faster, which is the shape the investigation started from.
+
+### It is not the filter, and it is not the group-by
+
+Split apart, 1,000,000 rows, best of nine:
+
+| | batcher | duckdb | |
+|---|---:|---:|---|
+| `count(*)` | 0.14 ms | 0.47 ms | 0.29x |
+| `count(*) WHERE SearchPhrase <> ''` | 1.06 ms | 1.27 ms | **0.83x** |
+| q32 — group-by, no filter | 15.34 ms | 23.36 ms | **0.66x** |
+| q31 — the same group-by, filtered | 14.20 ms | 4.47 ms | 3.18x |
+
+The filter is a **win** on its own and the group-by is a **win** on its own. Only together do
+they lose, and the group-by costs the same on 170,000 rows as on 1,000,000.
+
+### What it is: the morsel, sized from the table's width rather than the query's
+
+`explain(analyze=True)` attributes 8.4 ms of q31's 13.75 to operators, so ~5 ms is not in any
+operator at all. Timing the same query against progressively narrower copies of the same table
+-- identical rows, identical plan, identical 5 columns read -- makes the cause plain:
+
+| source columns | 5 | 10 | 20 | 40 | 70 | 105 |
+|---|---:|---:|---:|---:|---:|---:|
+| q31 | 6.96 ms | 6.77 | 7.45 | 9.17 | 10.48 | **14.38** |
+
+`+0.075 ms per column the query never reads`. The batches crossing the FFI boundary were
+verified identical in both cases — `(2 batches, 5 columns, 1,000,000 rows)`, the same buffer
+addresses — and so was the plan JSON. **The engine config was not**:
+
+```
+cfg morsel_rows: wide=647  narrow=15420
+```
+
+`carbonite.policies.morsel.planned_row_cap` takes the widest node's `available_schema` and caps
+the morsel's row count so its byte working set fits `morsel_bytes`. That policy exists for
+multimodal columns — a 1080p frame is 5.9 MiB, and a morsel of 16,384 of them is 6,000x the
+budget — and it is right about those. But `available_schema` is what a node *could* produce,
+and under projection pushdown a `Scan` and the `Filter` above it both still report all 105
+columns of `hits` while the morsel that flows through them carries 5. The width came out at
+1,620 B/row against an actual 40, so the morsel came out **25x too small** and every per-morsel
+cost was paid 25 times over.
+
+Switching the policy off confirms it end to end:
+
+| | wide (105 cols) | narrow (5 cols) |
+|---|---:|---:|
+| adaptive morsel sizing on | 15.29 ms | 7.05 ms |
+| adaptive morsel sizing off | **6.75 ms** | 6.68 ms |
+
+### The fix
+
+A morsel can carry exactly two kinds of column, and the width is now taken over their union
+(`_carried_columns`): what a scan **reads**, which is Kyber's `required_columns_per_source`,
+and what a node **introduces** — a name in its own schema that no child has, which is what a
+projection's or an aggregate's output is. Derived columns are kept whatever the sources look
+like, so the decoded-tensor case the policy exists for is charged exactly as before; a column
+no scan reads and nothing computes cannot reach a morsel and is no longer charged for.
+
+Kyber decides what each source supplies and Carbonite sizes the morsel to it; the conductor
+(`api/orchestration/run.py`) wires the two, which is the only layer that may ask both. With the
+projection absent — an unoptimized plan, or a caller that cannot supply it — the full schema is
+used, exactly as before.
+
+Measured after: **wide 7.31 ms, narrow 7.00 ms**, against 14.43 / 7.23 before. The planned cap
+goes 647 -> 15,420, which is the figure the five-column table produces.
+
+## Two queries over the same rows want opposite morsel sizes, and one global knob cannot serve both (2026-09-11)
+
+The entry above narrows the planned morsel width to the columns a query reads, which is
+correct and which `cb-q31` is 2.1x faster for. Swept across the whole board it is **not a
+clean win**, and what it runs into is worth recording because it is a property of the design
+rather than of the patch.
+
+All six single-node suites, before and after, one process per case, five engines, 48-core
+Xeon 8275CL on a quiet box. **The `before` column is also the first full board this machine
+has produced** — `results/LOSS_BACKLOG.md` records a 16-core box and its ratios do not carry
+over, so read this rather than that:
+
+| suite | b/duckdb before | after | total ms |
+|---|---:|---:|---|
+| ClickBench (43) | 0.74 | **0.66** | 417.8 -> 346.6 |
+| operators (23) | 0.64 | 0.64 | 847.9 -> 800.3 |
+| H2O `join` (5) | 0.66 | 0.66 | 510.5 -> 510.1 |
+| JSON (5) | 0.35 | 0.35 | 130.9 -> 132.5 |
+| TPC-H sf1 (22) | 0.73 | 0.77 | 412.5 -> 430.9 |
+| H2O `groupby` (10) | 1.02 | 1.05 | 718.5 -> 729.3 |
+
+Net wall clock is **-90 ms** across the board and the geomean is mixed: one large win, two
+small losses, three unchanged. This repository judges by the per-suite geomean, and two of
+them moving the wrong way is what holds this.
+
+The per-case split is what names the cause. Everything that **won** is a `GROUP BY` --
+`cb-q30` 0.48x, `cb-q40` 0.49x, `cb-q41` 0.51x, `cb-q31` 0.54x, `cb-q18` 0.62x. Everything
+that **lost** is an `ORDER BY ... LIMIT` or a window -- `cb-q24` 1.41x, `cb-q26` 1.41x,
+`cb-q25` 1.38x, `tpch-q8` 1.21x, `op-window-lag` 1.07x, `op-sort-multikey-wide` 1.07x.
+
+**The two changes are independent and the split is clean.** Four arms, TPC-H sf1, two engines
+so no third engine's resident memory perturbs it — `BEFORE` (HEAD engine + HEAD control
+plane), `RUSTONLY` (new engine only), `PYONLY` (new control plane only), `AFTER` (both):
+
+| arm | total | b/duckdb |
+|---|---:|---:|
+| BEFORE | 410.7 ms | 0.708 |
+| RUSTONLY | 411.7 ms | 0.714 |
+| PYONLY | 426.1 ms | 0.739 |
+| AFTER | 428.3 ms | 0.746 |
+
+The sort change is **neutral** on TPC-H (+0.2%, inside the run-to-run spread) and the morsel
+change owns the whole regression. So the two land separately: the sort change ships, this one
+does not.
+
+**`cb-q31` and `cb-q24` read the same rows.** Both are `... FROM hits WHERE SearchPhrase <>
+''` over the same 1,000,000-row table, both reduce to ~69,000 rows, and they differ only in
+what they do next: a two-key `GROUP BY` and an `ORDER BY EventTime, WatchID LIMIT 10`. With
+the 647-row morsel the width bug produced, the group-by is 2.1x slower and the top-N is 1.4x
+faster; with the 16,384-row morsel the correct width allows, it is the other way round. So no
+rule over rows, bytes or cores can size this morsel for both queries -- the quantity that
+decides is the **operator**, and the sizing knob is per query.
+
+**Why each prefers what it does is *not* established here, and two plausible readings are
+already wrong.** The obvious one — "a grouped aggregate pays a hash table per morsel, so 1,546
+morsels pay 25x the fixed cost of 61" — does not survive reading the code:
+`agg_par::chunked_partials` ("one partial per **worker** rather than per morsel") already
+exists for exactly that cost, and `agg_par::decide` routes a *non-reducing* group-by like
+`cb-q31` away from per-morsel partials altogether. `chunking_pays` is `threads * groups <=
+0.25 * rows`, which at 46 threads and ~69,000 near-unique groups over 69,354 rows is false by
+two orders of magnitude — so this shape takes `AggPlan::Partition`.
+
+That is where to look, and it has the right shape without being measured yet:
+`ops::repartition::partition_morsels_with` carries **O(parts x morsels)** work in three
+separate places — a `(Vec<u32>, Vec<u32>)` CSR per morsel, an `ncols x morsels` source pointer
+table, and a per-bucket walk of every morsel's offsets to size the gather. A 25x morsel count
+multiplies all three. Measure that before changing it; this paragraph is a reading of the
+code, not a profile.
+
+What *is* established, on the top-N side, is a dependency rather than a mechanism: 69,000 rows
+at 16,384 a morsel is five morsels across 46 workers, and `explain(analyze=True)` reports
+`cpu utilization: 31% of cores` on that shape. Nothing in `ops::morsel` bounds the morsel
+*count* from below against the worker count — the split is `rows / morsel_rows` and nothing
+else — so a small relation under-parallelizes and a too-small morsel was accidentally
+compensating. That is a real gap independent of anything here.
+
+So the state of this is: the width bug is **real and measured at 2.1x** on the shape it
+governs, the patch is in the entry above, and swept across the board it trades one suite
+against two. It is held rather than shipped, and what it needs first is an answer to why a
+group-by wants few morsels — not another guess at one.
+
+One practical note for whoever picks this up: wiring the projection through the conductor
+takes `api/orchestration/run.py` from 499 to **507** lines, over `lint-structure`'s 500-line
+limit, so landing it means splitting that module as well. The hook caught it, which is the
+system working.
+
+## A string sort refused a key that settled 99% of its comparisons, and then read every key through a five-arm match — `op-sort-string` 220 ms -> 176 ms, 1.13x DuckDB -> 0.91x (2026-09-11)
+
+`op-sort-string` (`ORDER BY l_comment`, 6,001,215 rows of ~27-char text) was the operator
+suite's largest absolute loss: 219.7 / 220.5 ms against DuckDB's 191.5 / 196.7, **1.12-1.15x**.
+Two independent causes, both found by profiling rather than by reasoning about the algorithm,
+and both fixed in `ops/byte_sort.rs`. Everything else in the family is unchanged within noise.
+
+| arm | op-sort-string | vs DuckDB |
+|---|---:|---:|
+| `HEAD` | 219.7 / 220.5 ms | 1.15x / 1.12x |
+| + admission rule | 195.4 / 193.2 ms | 1.02x / 1.01x |
+| + monomorphic key | **177.6 / 175.2 ms** | **0.92x / 0.90x** |
+
+Two rounds, interleaved, one process per case, `--engines batcher,duckdb`, 48-core Xeon
+8275CL on a quiet box. Three `.so`s built from one tree differing only in these hunks.
+
+### 1. The pack was refused on the wrong quantity
+
+`sort_live` carries the key's first eight bytes inline so that a comparison the pack settles
+is a register compare against a sequentially read array instead of two offset lookups and a
+`memcmp`. `prefix_discriminates` decides whether to build it, and the rule was **"at least
+half as many distinct packs as distinct values"**.
+
+Traced with a temporary `eprintln` in `sort_live`, **every one of the sample-sort's thirty
+ranges of `l_comment` was refused**:
+
+```
+sort_live rows=195242 from=0 discriminates=false
+sort_live rows=184621 from=0 discriminates=false
+... 30 of 30
+```
+
+512 sampled rows of one range hold 512 distinct values and only a few hundred distinct
+eight-byte prefixes, because **a range is a narrow lexicographic band** — that is what the
+router made it. Distinctness of ~29% fails a 50% floor. But a few hundred distinct packs over
+512 rows means two rows tie on the pack under 1% of the time: the pack settles ~99% of
+comparisons, and the sort was doing every one of them with `memcmp`.
+
+The rule's own docstring says the question "is not how many distinct packs the sample holds —
+it is whether the packs tie where the values do not", and then measured the first thing. The
+quantity a comparison actually pays for is the **tie probability**, `sum r^2 / m^2` over the
+sample's pack runs. A pack is now admitted when it settles at least half of all pairs, or when
+it ties no more often than the values themselves do (the low-cardinality case, where the pack
+is simply the cheaper way to say the same thing). A constant prefix — every value beginning
+`https://` — is still refused, which is the case the old rule existed for.
+
+**The top-N path keeps the old rule, and that is not an oversight.** `packs_discriminate`
+feeds `top_k_live`, which keeps the rows whose pack is at or below the `k`-th best — so a pack
+that ties half the column hands it half the column as candidates and it abandons the attempt
+at its budget *after* packing every row and filling its heap. That late decline is already
+measured at **146 -> 212 ms** on a shared-prefix column. Cheapening a comparison and narrowing
+a field are different questions, so they are now two functions with two rules;
+`the_sort_gate_and_the_top_n_gate_disagree_where_the_pack_is_coarse_but_useful` pins the shape
+they part on, and holds both to the same permutation.
+
+### 2. The sort read every key through a type-erased match
+
+`bc_runtime::byte_key` offers two spellings on purpose, and its module doc says which is for
+what: the generic `ByteKeys` "so a sort that compares a key `n log n` times monomorphizes and
+pays nothing", and the erased `ByteKeyColumn` enum "so a router that reads each row once can
+dispatch without a generic parameter". `stable_sort_indices_bytes` built a `ByteKeyColumn` and
+handed *that* to the generic sort, so the sort was on the wrong side of the split and every
+key read paid a five-arm match it had already decided. `perf` put `ByteKeyColumn::key` at
+**10.5%** of the operator. Resolving the type once at the entry point and monomorphizing below
+it is worth a further 9%.
+
+### What the profile says now
+
+`perf`, same query, before and after the admission fix: `__memcmp_evex_movbe` **37.8% ->
+28.2%**, with `ByteKeyColumn::key` at 10.5% beside it (removed by the second fix). The residue
+is the range router's own per-row binary search, the output gather (`memmove` 11.3%,
+`take_bytes` 3.5%) and the sort itself.
+
+### Two alternatives measured and not taken
+
+Recorded on `report_the_packed_prefix_alternatives`, because each is the obvious next idea:
+
+**A four-byte key above the row's own position** in one `u64` — no comparator at all, half the
+bytes of the `(u64, u32)` pair — loses **0.26x-0.72x** above a quarter of a million rows. Four
+bytes settle a comparison only while the distinct four-byte prefixes stay comparable to the row
+count; past that the rows sharing a prefix are re-sorted by their real values, which is the
+pointer-chasing sort the pack existed to avoid, now on top of a wasted pass. And a gate cannot
+see this from a sample: 512 rows drawn from 8,000 distinct prefixes are essentially all
+distinct, so a sampled run length reads 1.0 where the true figure is 500.
+`competitor_technique_review.md` item 9 lists "an adaptive-width key" as its one open lead.
+This is that lead, measured.
+
+**Starting the pack past the bytes every live key shares** is worth 2.1x-2.5x on a synthetic
+stemmed column and **nothing on the benchmark**, which is the more useful half. The premise was
+that a sample-sort range is clustered, so its pack is mostly constant; the trace above shows
+its common prefix is **0 or 1 bytes**. A range of a text column is a *band*, not a stem. The
+end-to-end A/B read 216.4 / 218.8 ms against 224.9 / 223.2 — a 2% regression for the pass it
+costs. What was actually wrong in those ranges was the admission rule, which is fix 1.
+
 ## GPU batch inference vs Ray Data and Daft: 2.4x and 5.4x, not 10x (2026-09-06)
 
 **Fleet.** The same 6 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB each) plus a 30 GiB head node.

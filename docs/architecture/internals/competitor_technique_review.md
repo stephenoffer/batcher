@@ -137,7 +137,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued twice.** 2026-08-04: the win is `take`/`filter` (3-13x), not comparison or sort, and only scan-native. 2026-08-25: **the two join rows it was ranked on are now wins** — see item 22 before starting it |
 | 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | **Landed** (`RelOp::Distinct { limit }` + `fuse_limit_into_distinct`) | Was the only *asymptotic* gap; now **13x over DuckDB** on the committed `op-distinct-limit` case |
-| 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; the low-cardinality half **landed** as `split_constant_ranges`; one lead left (the adaptive-width key) |
+| 9 | A faster string `ORDER BY` | DuckDB | **Won as of 2026-09-11** — `op-sort-string` 0.91x on a quiet 48-core box | The low-cardinality half landed as `split_constant_ranges`; the high-cardinality half landed as a tie-probability admission rule plus a monomorphic key read (220 -> 176 ms). The adaptive-width key that was this item's open lead is **measured and closed** — see the backlog entry |
 | 10i | Common **subplan** elimination (signature-matched, plan-level) | DuckDB | **Landed** (`kyber/common_subplan.py` + `api/subplan_reuse.py`) | 1.95x on a shared aggregate feeding both sides of a join |
 | 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Polars (**Spark rejects it too**) | **Done**: SQL lowers it to `with_row_index`; the DataFrame error now names that | Small: SQL portability and an error message, not a capability gap |
 | 10h | Ray Data's positional split family, and its names in the compat table | Ray Data | **Landed** (`split_at_indices` / `split_proportionately`, 63 guidance entries, a migration page) | The last *capability* gap the six-engine sweep found |
@@ -773,6 +773,23 @@ next idea, and each costs a day to re-derive:
    where four bytes collide often enough that the repair pass dominates. A fixed width is
    therefore wrong; an *adaptive* one chosen from the sample `prefix_discriminates` already
    takes is the version worth building, and it is the one open lead this section leaves.
+
+**Closed 2026-09-11, and it was the wrong lead.** Measured on a quiet 48-core box, an adaptive
+four-byte key loses 0.26x-0.72x above a quarter of a million rows and no sample-drawn width can
+rescue it; the full numbers are in `report_the_packed_prefix_alternatives`. The 53% the table
+above attributes to "per-range sort" was real, but its cause was `prefix_discriminates`
+refusing to build the eight-byte pack **at all** on every one of the thirty ranges -- it scored
+pack *distinctness* (~29% within a range, which is a narrow lexicographic band) where the cost
+depends on pack *tie probability* (<1%, so the pack settles ~99% of comparisons). With the rule
+scoring the right quantity, and with the sort no longer reading each key through the
+`ByteKeyColumn` five-arm match it had already resolved, `op-sort-string` is **220 -> 176 ms,
+1.13x DuckDB -> 0.91x**.
+
+The **top-N** path kept the resolution rule, deliberately: `top_k_live` keeps the rows whose
+pack is at or below the `k`-th best, so a pack that ties half the column hands it half the
+column as candidates and it declines at its budget after packing every row — the 146 -> 212 ms
+late decline already recorded on `packed`. Cheapening a comparison and narrowing a field are
+different questions and are now two rules.
 
 **A caveat on all of the above.** These were measured on a 16-core box carrying another
 session's build and test load; single-pass numbers swung as much as 2.3x on the same code, so
@@ -3417,11 +3434,22 @@ implements it, so the next reader can settle it with one grep instead of one day
    performed — rather than a claim about the data. Decide that first; the IR flag, the
    mergeable form and the three executors follow from it, and a session that can run the
    distributed suite is still the right place for them.
-7. **An adaptive-width sort key for the per-range sort (item 9).** Proven
-   permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
-   4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample
-   `prefix_discriminates` already draws. Needs a quiet box: the margin is inside this
-   machine's noise band.
+7. ~~**An adaptive-width sort key for the per-range sort (item 9).**~~ **Closed 2026-09-11,
+   measured on a quiet 48-core box: it does not work, and what was actually wrong was the
+   admission rule beside it.** A 4-byte key loses 0.26x-0.72x above a quarter of a million
+   rows, because four bytes settle a comparison only while the distinct 4-byte prefixes stay
+   comparable to the row count, and past that the repair *is* the pointer-chasing sort the pack
+   existed to avoid. A sample cannot even see this coming: 512 rows drawn from 8,000 distinct
+   prefixes are essentially all distinct, so a sampled run length reads 1.0 where the true
+   figure is 500. The measurement is `report_the_packed_prefix_alternatives` in
+   `ops/byte_sort.rs`, which also buries the adjacent idea of packing past the rows' common
+   prefix (2.1x-2.5x synthetic, **nothing** on the benchmark, because a sample-sort range of a
+   text column has a common prefix of 0-1 bytes -- it is a *band*, not a stem). What the
+   profile found instead: `prefix_discriminates` was refusing a pack that settled 99% of the
+   comparisons in every one of the sort's thirty ranges, because it read pack *distinctness*
+   where the cost depends on pack *tie probability*. Fixing that plus a type-erased key
+   accessor the sort should never have been reading through took `op-sort-string` from
+   **1.13x DuckDB to 0.91x** (220 -> 176 ms). See `BENCHMARK_RESULTS.md`.
 8. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
    string representation. Still the largest and most invasive single-node item — but now
    argued from `take`/`filter` only, and known to lose if adopted anywhere short of
