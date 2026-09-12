@@ -245,6 +245,50 @@ def test_partial_distinct_ndv_floors_the_estimate():
     assert est.estimate(node).rows >= 600.0
 
 
+def test_a_constant_group_key_counts_as_one_group():
+    """`nullif(k, k)` is NULL on every row, so it multiplies the group count by one.
+
+    This is how both front-ends mark a key a `ROLLUP`/`CUBE` level rolls up
+    (`api.multi_group`, and the SQL translator's `grouping_sets`). It is not a `Col`, so
+    before this every level but the finest had an underivable key set and fell to the blunt
+    `0.1 * rows` fallback -- which compounds per key, and is wrong in the direction that
+    makes a level look too big to be worth sharing.
+    """
+    from batcher.api.source_stats import build_estimator
+    from batcher.plan.expr_ir import nullif
+
+    n = 100_000
+    ds = bt.from_pydict({"a": list(range(n)), "b": [i % 7 for i in range(n)], "v": [1] * n})
+
+    def rows(d):
+        # The estimator the execution path builds, so the source's own column statistics
+        # are present -- `b`'s seven values are measured rather than guessed.
+        return build_estimator(list(d._sources), None).estimate(d._plan).rows
+
+    # `b` alone has seven values, and nulling `a` out must not change that.
+    keyed = ds.group_by(b=col("b"), a=nullif(col("a"), col("a"))).agg(s=col("v").sum())
+    assert rows(keyed) == rows(ds.group_by(b=col("b")).agg(s=col("v").sum())) == 7.0
+    assert keyed.collect().num_rows == 7
+
+    # Every key rolled up is the grand-total level: exactly one group.
+    total = ds.group_by(a=nullif(col("a"), col("a")), b=nullif(col("b"), col("b"))).agg(
+        s=col("v").sum()
+    )
+    assert rows(total) == 1.0
+    assert total.collect().num_rows == 1
+
+
+def test_a_constant_group_key_is_not_claimed_for_an_ordinary_nullif():
+    """`nullif(a, b)` over two *different* expressions is not constant and must not read as
+    one group -- the rule is structural equality of the two arms, not the tag."""
+    from batcher.plan.expr_ir import nullif
+
+    n = 1000
+    ds = bt.from_pydict({"a": list(range(n)), "b": list(range(n))})
+    node = ds.group_by(k=nullif(col("a"), col("b"))).agg(c=col("a").count())
+    assert _rows(node) > 1.0
+
+
 def test_a_unique_key_caps_the_join_estimate_at_the_other_sides_rows():
     """A unique key on one side bounds the join's output by the *other* side's rows.
 

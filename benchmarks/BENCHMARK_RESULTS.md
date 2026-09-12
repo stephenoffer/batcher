@@ -1,5 +1,123 @@
 # Batcher CPU benchmark results
 
+## Common-subplan reuse was refusing the shape it exists for, and materializing it at 12x the width when it did not (2026-09-11)
+
+TPC-DS is the suite Batcher is closest to losing (b/duckdb 0.98-0.99), and six of its seven
+worst queries use `ROLLUP`. A `ROLLUP` is lowered as one ordinary `GROUP BY` per level over
+one common input, so the input subtree appears once per level -- exactly what
+`kyber.common_subplan` exists to compute once. On q22, q18, q67 and q80 it was choosing
+**nothing**. Three separate defects, each verified rather than argued.
+
+**1. A constant group key was estimated at 10,000 distinct values instead of 1.** Both
+front-ends mark a rolled-up key with `nullif(k, k)` (`api.multi_group`, and the SQL
+translator's `grouping_sets`). That is not a bare `Col`, so `_estimate_aggregate` could not
+derive the key set and fell to its blunt `rows * 0.1` fallback. Measured on a 100,000-row
+input: `GROUP BY b, nullif(a, a)` with `b` holding seven values estimated **10,000 groups
+against 7**, and the all-rolled-up grand total estimated **10,000 against 1**. Both are now
+exact rather than merely closer -- a constant key multiplies the distinct combinations by
+one, which needs no statistics. `nullif(e, e)` is NULL on every row whatever `e` holds; NaN
+is not the exception it looks like, because the engine's equality is `float_ident`'s key
+identity rather than SQL's (verified on a column holding NaN, -0.0 and NULL: every row came
+back NULL).
+
+**2. The size and cost gates read the plan as written, where a `WHERE` still sits above the
+join tree.** Every join under it is then estimated over *unfiltered* inputs, and the error
+compounds multiplicatively across a multi-way join. Counted on q80's largest repeated
+subtree: as written, **3 filters above every join and none below**, join estimates reaching
+**4.8e12**; after pushdown, **none above and 15 below**, the largest **1.34e5**. The subtree
+as a whole read **1.6e13 rows (1.53 GB)** against **687 rows (66 KB)** -- so the gate
+refused, as too large to hold, a result that is 66 kilobytes. q18's read 6.1e25 against
+1.51e4. The joins are keyed in both forms: this is predicate **placement**, not a cross
+product. (An earlier draft of this entry said comma joins stay cross products until the
+optimizer derives their conditions. That was inferred and is false -- Batcher's SQL
+front-end already emits keyed joins -- and it was corrected by counting filter placement.)
+
+**3. The "is sharing worth it" bar was short by a factor of the appearance count.**
+`model.cost(node)` prices **one** appearance and `total` already counts all of them, so the
+saving is `share * (a-1)`, not `share * (a-1)/a`. Measured directly: `cost(plan)/cost(one)`
+is **2.02, 3.05, 5.14 and 9.45** at 2, 3, 5 and 9 appearances, so the true savings are 0.50,
+0.66, 0.78 and 0.85 where the expression scored 0.247, 0.219, 0.156 and 0.094. The bar got
+**harder the more there was to gain**, which is why the 5- and 9-appearance ROLLUPs were
+refused. The module's own docstring already stated the correct formula.
+
+**Correcting 2 and 3 alone made TPC-DS worse, and that is the useful half of this entry.**
+b/duckdb 0.99 -> 1.02, +675 ms across the suite, and it was two queries: **q18 260 -> 901 ms**
+and **q86 30 -> 151 ms**, against wins of 60 ms on q14 and 40 on q70. Attributed over two
+interleaved rounds: normalize alone cost +124 ms (its one loss being q86), the bar cost a
+further +518 (its one loss being q18).
+
+**4. What they exposed: materializing forfeits the fusion each appearance had with its
+parent, and what that costs is a width.** Embedded, a subtree's consumers prune it through
+projection pushdown; standalone there is no consumer to prune it, so every column it carries
+is built, held for the query, and re-scanned once per appearance. The chosen subtree against
+what the plan reads of it separates the winners from the losers exactly:
+
+| query | carries | plan reads | materialized | before narrowing |
+|---|---:|---:|---|---:|
+| q18 | **133 cols** | 11 | 1.71 MB -> 0.15 MB | +640 ms |
+| q86 | **84 cols** | 3 | 117.28 MB -> 4.25 MB | +118 ms |
+| q80 | 5 | 5 | 0.03 MB | won |
+| q70 | 1 | 1 | 0.00 MB | won |
+| q14 | 6 | 6 | -- | won |
+
+`api.subplan_reuse._narrowed` now materializes only what the plan reads. It does not
+recompute the need: it builds the hypothetical rewrite and asks the optimizer's own
+need-propagation, so the one definition of "which columns does this plan require" stays in
+`kyber.rules.projections`. **It must ask the plan as written, which is the opposite of what
+the gates want**, and walking into that cost a run: pushdown reports a *smaller* need,
+because a column a projection merely passes through stops counting -- but the plan being
+rewritten still names that column above the appearance, so a `Scan` without it does not
+validate. Measured on a shared SELECT carrying an unread column: the pushed form returned
+`['k', 'v']` against `['k', 'v', 'unused']`, the narrower scan raised, and
+`reuse_common_subplans` caught it and declined the reuse **altogether** -- turning a saving
+into nothing at all.
+
+**With all four, TPC-DS sf1, 48-core quiet box, batcher+duckdb pairwise, best of two
+interleaved rounds, all 99 correctness checks passing in every arm:**
+
+| arm | total batcher ms | b/duckdb (r1, r2) |
+|---|---:|---|
+| HEAD | 4014 | 0.99, 0.98 |
+| + normalize + narrowing | 4063 | 0.99, 0.97 |
+| **+ the saving fix (all four)** | **3914** | **0.98, 0.98** |
+
+Per query against HEAD: **q18 258 -> 191**, **q14 145 -> 87**, **q70 124 -> 84**, q86
+26.5 -> 25.9. The middle row is the one worth reading: without the saving fix the two
+biggest wins never qualify, so narrowing on its own is *not* an improvement -- the three
+changes only pay together, which is why none of them was shippable alone.
+
+Every other suite re-measured on the same box and lineup, one interleaved round each, all
+14 arms reporting "All correctness checks passed" and **zero FAILED rows**:
+
+| suite | before | after |
+|---|---:|---:|
+| JSON (5) | 0.36 | 0.35 |
+| operators (23) | 0.61 | 0.61 |
+| scan (27) | 0.62 | 0.65 |
+| H2O `join` (5) | 0.65 | 0.63 |
+| TPC-H sf1 (22) | 0.70 | 0.69 |
+| ClickBench (43) | 0.72 | 0.73 |
+| H2O `groupby` (10) | 1.03 | 1.02 |
+
+`scan` is the only row that moved more than the harness's own single-run digit, and it is
+noise rather than a regression: its cases moved in **both** directions by similar amounts
+(-99, -56, -54 against +90, +89, +77, +61 ms) while the suite's total moved 0.5%
+(8,420 -> 8,464 ms), and the cases that moved most -- `scan-distinct-one_big`,
+`scan-sum1-many_small` -- are single-table reads with no repeated subplan for any of this to
+act on. The same suite is already recorded here as one whose corpus cases warm each other.
+
+Correctness: the **whole differential suite green, 15,755 tests over 19 chunks, 0 failing**.
+
+**Still refused, and correctly:** q22 and q67, whose candidates estimate 1385 MB and 602 MB
+against a 256 MiB budget even after narrowing. Those are real sizes, not artefacts.
+
+**What is still missing, named rather than guessed:** `CostModel` prices recomputation and
+nothing else. Materializing costs a round trip, forfeits fusion, and makes
+`bc_interp::streaming_parallelizes` false, which routes the whole query to the materializing
+executor. Narrowing removes the largest term of that in practice; it does not put the term in
+the model. A candidate whose *rows* are many rather than wide would still be admitted on a
+saving the model overstates.
+
 ## The board with TPC-DS and scan in it, and where the remaining gap to DuckDB actually is: a flat 2.2 ms of control plane and a widened `int32` (2026-09-11)
 
 Two suites this session had never run, both on a quiet 48-core box, pairwise lineups

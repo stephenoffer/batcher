@@ -45,7 +45,16 @@ from batcher.kyber.stats.distribution import (
 from batcher.kyber.stats.selectivity import predicate_selectivity
 from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.metadata.udf_stats import udf_cost_key
-from batcher.plan.expr_ir import Binary, Col, Expr, IsNotNull, IsNull, Lit, referenced_columns
+from batcher.plan.expr_ir import (
+    Binary,
+    Col,
+    Expr,
+    IsNotNull,
+    IsNull,
+    Lit,
+    NullIf,
+    referenced_columns,
+)
 from batcher.plan.expr_rewrite import split_conjuncts
 from batcher.plan.logical import (
     Aggregate,
@@ -888,11 +897,7 @@ class StatsEstimator:
             if learned_rows is not None:
                 return RelStats(float(learned_rows), Provenance.LEARNED, key_cols)
         ndv = _ndvs(child)
-        key_ndvs = [
-            ndv[k.expr.name]
-            for k in node.group_keys
-            if isinstance(k.expr, Col) and k.expr.name in ndv and ndv[k.expr.name] > 0
-        ]
+        key_ndvs = [n for n in (_key_ndv(k.expr, ndv) for k in node.group_keys) if n is not None]
         if len(key_ndvs) == len(node.group_keys):
             # Every key measured: the distinct combinations of the group-key set — the same
             # quantity a join computes for its key set, so the same (damped) combiner.
@@ -1808,6 +1813,62 @@ def _ndvs(stats: RelStats) -> dict[str, float]:
         for name, col in stats.columns.items()
         if col.ndv is not None and col.ndv > 0
     }
+
+
+def _key_ndv(expr: Expr, ndv: dict[str, float]) -> float | None:
+    """The distinct-value count of one GROUP BY key, or `None` when it is not derivable.
+
+    A bare column's count is the measured one. A **constant** key's is exactly one, and
+    deriving that is what makes a multi-level `GROUP BY` estimable at all: a `ROLLUP`
+    level marks each key it rolls up with `nullif(k, k)` (`api.multi_group`, and the SQL
+    translator's `grouping_sets`), which is not a `Col`, so every level but the finest
+    had an underivable key set and fell to the blunt `rows * 0.1` fallback below.
+
+    That fallback is not a small error on this shape, because a rolled-up key contributes
+    it whatever the level's real group count is. Measured on a 100,000-row input:
+    `GROUP BY b, nullif(a, a)` with `b` holding seven values estimated **10,000** groups
+    against 7, and the all-rolled-up grand total estimated 10,000 against **1**. Both are
+    exact after this rule, and they are exact rather than merely closer -- a constant key
+    multiplies the distinct combinations by one, which needs no statistics.
+
+    What that buys is everything sized from a level's group count: the aggregate's own
+    strategy and hash-table budget, and any join ordered above it. It is **not** what
+    unblocked common-subplan reuse on the ROLLUP-heavy TPC-DS queries, which was measured
+    separately and was predicate placement (`kyber.common_subplan`'s `normalize`); this
+    rule alone left those verdicts unchanged.
+
+    Args:
+        expr: One group key's expression.
+        ndv: The child's measured distinct counts by column name.
+
+    Returns:
+        The key's distinct-value count, or `None` when neither rule applies.
+    """
+    if isinstance(expr, Col):
+        measured = ndv.get(expr.name, 0.0)
+        return measured if measured > 0 else None
+    return 1.0 if _is_constant(expr) else None
+
+
+def _is_constant(expr: Expr) -> bool:
+    """Whether `expr` takes the same value on every row, provably and without statistics.
+
+    `nullif(e, e)` is NULL on every row whatever `e` holds: the two arms are the same
+    expression, so the equality that produces the NULL always holds. NaN is not the
+    exception it looks like -- SQL's `NaN = NaN` is false, which would leave NaN rather
+    than NULL, but the engine's equality is the key identity of `bc-arrow/float_ident.rs`,
+    under which NaN equals itself. Verified on a column holding NaN, -0.0 and NULL: every
+    row came back NULL.
+
+    Args:
+        expr: The expression to test.
+
+    Returns:
+        Whether every row takes the same value.
+    """
+    if isinstance(expr, Lit):
+        return True
+    return isinstance(expr, NullIf) and expr.left.to_ir() == expr.right.to_ir()
 
 
 def _derived_from_ndvs(stats: RelStats, names: Iterable[str]) -> Provenance:

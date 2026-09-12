@@ -286,3 +286,109 @@ def test_a_recorded_verdict_is_served_instead_of_re_analyzing():
         subplan_reuse._analyze = original
     assert calls == [], "a plan with a verdict on file must not be analyzed again"
     assert plan is q._plan and len(srcs) == len(q._sources)
+
+
+def _repeated_multiway_join():
+    """A query repeating a multi-way join whose `WHERE` sits above it, as SQL writes it.
+
+    This is the shape the gates were blind to, and it is ordinary SQL rather than a corner:
+    TPC-H and TPC-DS are full of it. Every join is *keyed* in both forms -- what changes is
+    where the selective predicate sits, and therefore what each join is estimated over.
+    """
+    import batcher as bt
+
+    n = 3000
+    sess = bt.Session()
+    for name in "abcd":
+        sess.register(name, bt.from_pydict({"k": list(range(n)), name: list(range(n))}))
+    shared = (
+        "SELECT a.k AS k, a.a AS v FROM a, b, c, d "
+        "WHERE a.k = b.k AND a.k = c.k AND a.k = d.k AND a.a < 10"
+    )
+    return sess.sql(
+        f"SELECT l.k, sum(l.v) AS total FROM ({shared}) l, ({shared}) r "
+        "WHERE l.k = r.k GROUP BY l.k"
+    )
+
+
+def test_a_predicate_above_a_join_tree_makes_the_unoptimized_estimate_useless():
+    """The premise the `normalize` argument rests on, on a plan small enough to check.
+
+    A `WHERE` sits above the join tree as written, so every join under it is estimated over
+    *unfiltered* inputs and the error compounds multiplicatively across a multi-way join.
+    Here the whole query returns ten rows and the plan as written estimates 3.3e7 of them,
+    while the optimized plan estimates ten. Counted the same way on TPC-DS q80's largest
+    repeated subtree: as written, 3 filters above every join and none below, join estimates
+    reaching 4.8e12; after pushdown, none above and 15 below, the largest 1.34e5. The joins
+    are keyed in both forms -- this is predicate *placement*, not a cross product.
+    """
+    from batcher.api.source_stats import build_estimator
+    from batcher.kyber.optimizer.facade import optimize_logical
+
+    q = _repeated_multiway_join()
+    sources = list(q._sources)
+    est = build_estimator(sources, None)
+    plan = _canonical(q)
+
+    # The largest repeated subtree, which is what the gates judge -- not the whole plan,
+    # whose outer aggregate caps the estimate and hides the error the gates actually see.
+    from collections import Counter
+
+    from batcher.plan.visitor import walk
+
+    keyed = [(structural_key(n), n) for n in walk(plan)]
+    appearances = Counter(k for k, _ in keyed if k is not None)
+    root = structural_key(plan)
+    repeated = [n for k, n in keyed if k is not None and appearances[k] >= 2 and k != root]
+    assert repeated, "the two copies of the shared SELECT must be found at all"
+    subtree = max(repeated, key=lambda n: sum(1 for _ in walk(n)))
+    raw_rows = est.estimate(subtree).rows
+    opt_rows = est.estimate(optimize_logical(subtree, sources=sources)).rows
+    assert raw_rows > 1000 * opt_rows, (
+        "the subtree as written must estimate orders of magnitude high; "
+        f"raw {raw_rows:.3g}, optimized {opt_rows:.3g}"
+    )
+    assert opt_rows <= float(q.collect().num_rows) * 100, (
+        f"the optimized estimate must be in the region of the truth; {opt_rows:.3g}"
+    )
+
+
+def test_the_gates_are_asked_about_the_normalized_form():
+    """Bars 3 and 5 must read the form the engine runs, not the plan as written.
+
+    The estimator here answers by *object identity*: anything `normalize` produced is
+    small, anything else is far past any budget. So the only difference between the two
+    calls is which form the gates were shown, which is exactly the contract -- and with
+    `normalize` absent the same candidate is refused.
+    """
+    plan = _canonical(_shared_agg_join())
+    normalized: set[int] = set()
+
+    def normalize(node):
+        # A no-op rewrite returning a *distinct* tree, standing in for the optimizer: what
+        # is under test is which object the gates are handed, not what optimizing does.
+        # Every node of it is marked, because the cost model bar 5 uses walks children.
+        from batcher.plan.visitor import transform_up, walk
+
+        out = transform_up(node, lambda n: n)
+        normalized.update(id(n) for n in walk(out))
+        return out
+
+    class _SmallOnlyWhenNormalized:
+        def estimate(self, node):
+            return type("Stats", (), {"rows": 1000.0 if id(node) in normalized else 1e18})()
+
+        def row_width(self, _node, _default):
+            return 16.0
+
+    est = _SmallOnlyWhenNormalized()
+    assert _call(plan, est) == [], "the un-normalized estimate must refuse the candidate"
+    assert [type(n).__name__ for n in _call(plan, est, normalize=normalize)] == ["Aggregate"]
+
+
+def test_normalize_defaults_to_identity():
+    """Omitting `normalize` must leave every existing caller's behaviour untouched."""
+    plan = _canonical(_shared_agg_join())
+    assert [type(n).__name__ for n in _call(plan)] == [
+        type(n).__name__ for n in _call(plan, normalize=lambda n: n)
+    ]
