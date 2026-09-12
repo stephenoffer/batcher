@@ -11,6 +11,7 @@
 //! than truncating toward zero for anything pre-1970, and answering null rather than
 //! raising when a value names no real instant.
 
+pub(crate) mod civil;
 pub(crate) mod date;
 pub(crate) mod make;
 pub(crate) mod text;

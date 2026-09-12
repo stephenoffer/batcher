@@ -535,7 +535,11 @@ fn packed<A: ByteKeys>(arr: &A, descending: bool) -> Option<Vec<u64>> {
 fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec<u32>> {
     let n = arr.len();
     let nulls = arr.null_buffer();
-    let packs = packed(arr, descending)?;
+    // A key the packed prefix cannot narrow still has a selection: compare the bytes
+    // themselves. See `top_k_by_comparison` for why that beats the caller's full sort.
+    let Some(packs) = packed(arr, descending) else {
+        return Some(top_k_by_comparison(arr, descending, k));
+    };
     let seeds = super::heap_select_k(n, nulls, k, |i| packs[i]);
     // Fewer live rows than `k`: they are all in the answer, so there is no threshold to find.
     let Some(&last) = seeds.last().filter(|_| seeds.len() == k) else {
@@ -548,7 +552,10 @@ fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec
     for (i, &pack) in packs.iter().enumerate() {
         if pack <= threshold && nulls.is_none_or(|nb| nb.is_valid(i)) {
             if candidates.len() == budget {
-                return None; // the prefix separates too little to be worth selecting on
+                // The prefix ties too hard to narrow the field — but that says nothing about
+                // whether the *keys* do, so select on them rather than handing the caller a
+                // full sort.
+                return Some(top_k_by_comparison(arr, descending, k));
             }
             candidates.push(i as u32);
         }
@@ -556,6 +563,48 @@ fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec
     let mut ordered = exact_order(arr, candidates, descending);
     ordered.truncate(k);
     Some(ordered)
+}
+
+/// The `k` best live rows by comparing the key bytes directly, in output order.
+///
+/// The fallback for a key whose packed 8-byte prefix settles nothing — `SearchPhrase`, which is
+/// empty on ~93% of ClickBench's rows; a URL column, where every value starts `https://`; an ISO
+/// timestamp rendered as text. Both decline paths above reach it.
+///
+/// **It exists because declining used to mean a full sort, and a full sort is the wrong shape
+/// for a `LIMIT`.** `stable_sort_indices_bytes` orders all `n` rows in `O(n log n)` string
+/// comparisons to keep `k` of them; a quickselect partitions in `O(n)` expected comparisons and
+/// then orders only the `k` survivors. The caller's gate (`k * TOP_K_SELECT_RATIO <= num_rows`)
+/// already confines this to `k <= n / 2`, where the second is strictly less work.
+///
+/// The survivors are returned **sorted**, which is not incidental: an earlier attempt at a
+/// quickselect here returned them unordered and made `LIMIT 100000` slower (893 -> 1139 ms),
+/// because `parallel_top_n`'s merge relies on each morsel handing back a sorted run. Ordering
+/// `k` rows costs `O(k log k)` and restores that.
+///
+/// Result-identical to the full sort it replaces: the comparator is the same total order
+/// `exact_order` applies — key bytes, then input position — so it selects the same set and
+/// returns it in the same order a stable sort would.
+fn top_k_by_comparison<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Vec<u32> {
+    // Not reachable from `top_k_single_key`, which answers `k == 0` before it gets here — but
+    // the guard below reads `live.len() > k`, and without this a zero `k` would skip the
+    // selection and return *every* live row sorted. Cheap to be right independently.
+    if k == 0 {
+        return Vec::new();
+    }
+    let nulls = arr.null_buffer();
+    let mut live: Vec<u32> = (0..arr.len() as u32)
+        .filter(|&i| nulls.is_none_or(|nb| nb.is_valid(i as usize)))
+        .collect();
+    if live.len() > k {
+        live.select_nth_unstable_by(k - 1, |&a, &b| {
+            let (x, y) = (arr.key(a as usize), arr.key(b as usize));
+            let ord = if descending { y.cmp(x) } else { x.cmp(y) };
+            ord.then_with(|| a.cmp(&b))
+        });
+        live.truncate(k);
+    }
+    exact_order(arr, live, descending)
 }
 
 /// Sort row indices by their actual key bytes, ties by input position — the same total order
@@ -659,6 +708,117 @@ mod ordered_shortcut_tests {
             !packs_discriminate(a.as_any().downcast_ref::<StringArray>().unwrap()),
             "a constant eight-byte prefix settles nothing, whatever the value distinctness"
         );
+    }
+}
+
+#[cfg(test)]
+mod undiscriminating_prefix_tests {
+    use arrow::array::StringArray;
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Ascending and descending, with and without nulls, over the two shapes that make the
+    /// packed prefix useless.
+    fn assert_matches_full_sort(values: Vec<Option<String>>, ks: &[usize]) {
+        let arr: ArrayRef = Arc::new(StringArray::from(values));
+        for &descending in &[false, true] {
+            let opts = SortOptions {
+                descending,
+                nulls_first: false,
+            };
+            let full = stable_sort_indices_bytes(&arr, opts).expect("a Utf8 column sorts");
+            let live: Vec<u32> = full
+                .values()
+                .iter()
+                .copied()
+                .filter(|&i| arr.is_valid(i as usize))
+                .collect();
+            for &k in ks {
+                let got = top_k_live(&arr, descending, k).expect("a Utf8 column selects");
+                let want: Vec<u32> = live.iter().copied().take(k).collect();
+                assert_eq!(got, want, "descending={descending} k={k}");
+            }
+        }
+    }
+
+    /// **A prefix that settles nothing must still select, not fall back to a full sort.**
+    ///
+    /// Every value shares its first nine characters, so `packs_discriminate` refuses the packed
+    /// path outright. The selection that replaces it compares the key bytes, and the property
+    /// asserted is the one that lets it be a cost choice rather than a semantic one: it returns
+    /// exactly the stable sort's first `k` live rows, in the same order.
+    #[test]
+    fn a_constant_prefix_selects_the_same_rows_the_full_sort_would() {
+        let values: Vec<Option<String>> = (0..4_000)
+            .map(|i| Some(format!("000000000{:06}", (i * 7919) % 4_000)))
+            .collect();
+        // The control. Without it this test passes whether or not the fallback exists, because
+        // the packed path would return the same rows — it is the *decline* that is under test,
+        // and a column whose prefix happens to discriminate would never reach it.
+        let arr: ArrayRef = Arc::new(StringArray::from(values.clone()));
+        let column = ByteKeyColumn::new(&arr).expect("a Utf8 column is a byte key");
+        assert!(
+            !packs_discriminate(&column),
+            "fixture no longer declines the packed path, so this test proves nothing"
+        );
+        assert_matches_full_sort(values, &[1, 10, 100, 1_000]);
+    }
+
+    /// The other decline path: the prefix *does* vary, but so many rows tie at the k-th pack
+    /// that the candidate budget overflows. ClickBench's `SearchPhrase` is this shape — empty
+    /// on most rows — so the ties sit exactly where the threshold lands.
+    #[test]
+    fn a_key_that_ties_past_the_candidate_budget_still_selects() {
+        let values: Vec<Option<String>> = (0..8_000)
+            .map(|i| {
+                Some(if i % 10 == 0 {
+                    format!("zz{i:06}")
+                } else {
+                    String::new()
+                })
+            })
+            .collect();
+        // The control for the *other* decline: here the prefix does discriminate, so the path
+        // taken is the candidate-budget overflow rather than the `packs_discriminate` refusal.
+        let arr: ArrayRef = Arc::new(StringArray::from(values.clone()));
+        let column = ByteKeyColumn::new(&arr).expect("a Utf8 column is a byte key");
+        assert!(
+            packs_discriminate(&column),
+            "fixture now declines on the prefix, so it no longer covers the budget path"
+        );
+        assert_matches_full_sort(values, &[1, 10, 100]);
+    }
+
+    /// Nulls are the caller's to place, so the selection must return live rows only — and the
+    /// count it returns is what `top_k_single_key` uses to decide how many null slots to fill.
+    #[test]
+    fn nulls_are_left_to_the_caller_on_the_fallback_path() {
+        let values: Vec<Option<String>> = (0..3_000)
+            .map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(format!("00000000{:06}", (i * 104_729) % 3_000))
+                }
+            })
+            .collect();
+        assert_matches_full_sort(values, &[1, 10, 500]);
+    }
+
+    /// Fewer live rows than `k` is its own arm in both paths, and it must not truncate.
+    #[test]
+    fn fewer_live_rows_than_k_returns_all_of_them() {
+        let values: Vec<Option<String>> = (0..600)
+            .map(|i| {
+                if i % 2 == 0 {
+                    None
+                } else {
+                    Some(format!("000000000{i:04}"))
+                }
+            })
+            .collect();
+        assert_matches_full_sort(values, &[1_000]);
     }
 }
 

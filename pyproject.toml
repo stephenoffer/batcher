@@ -120,7 +120,7 @@ pdf = ["pypdf>=4"]
 # --- Lakehouse (ACID table formats + catalogs) ---
 delta = ["deltalake>=0.18"]
 iceberg = ["pyiceberg>=0.7"]
-hudi = ["hudi>=0.2"]
+hudi = ["hudi>=0.5"]
 delta-sharing = ["delta-sharing>=1.1"]
 # --- SQL / warehouses (single-submission, Arrow-native) ---
 sql = ["adbc-driver-manager>=1.0", "adbc-driver-flightsql>=1.0"]

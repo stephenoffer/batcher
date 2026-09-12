@@ -83,8 +83,11 @@ def _hudi_source(monkeypatch, batches: _CountingBatches):
     monkeypatch.setattr(
         HudiSource,
         "_table",
+        # `read(options=None)` is hudi-rs's snapshot entry point; the stub takes the same
+        # shape so a rename on the real backend fails here rather than passing against a
+        # method the connector no longer calls.
         lambda self: SimpleNamespace(
-            read_snapshot=lambda _filters: batches,
+            read=lambda _options=None: batches,
             get_schema=lambda: _SCHEMA,
         ),
     )
@@ -139,7 +142,7 @@ def test_hudi_file_slice_split_iter_batches_streams(monkeypatch):
         lambda: (
             lambda _uri, options=None: SimpleNamespace(
                 create_file_group_reader_with_options=lambda: SimpleNamespace(
-                    read_file_slice_by_base_file_path=lambda _p: batches
+                    read_file_slice_from_paths=lambda _base, _logs, _options=None: batches
                 )
             )
         ),

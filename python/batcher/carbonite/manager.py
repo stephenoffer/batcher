@@ -277,7 +277,10 @@ class ResourceManager:
         )
 
     def recommend_morsel_target(
-        self, families: Iterable[str] | None = None, plan: object | None = None
+        self,
+        families: Iterable[str] | None = None,
+        plan: object | None = None,
+        carried: frozenset[str] | None = None,
     ) -> tuple[int, int] | None:
         """Scale the per-morsel ``(rows, bytes)`` target down under memory pressure.
 
@@ -300,7 +303,7 @@ class ResourceManager:
         # `classify()`, a pure read: the AIMD round is the one component that *samples* the
         # monitor (advancing its de-escalation average). Sizing a morsel must not.
         return morsel_target(
-            self._config, self._pressure.classify(), self._mem_model, families, plan
+            self._config, self._pressure.classify(), self._mem_model, families, plan, carried
         )
 
     def recommend_parallelism(self) -> int | None:
@@ -324,14 +327,18 @@ class ResourceManager:
         return reduced_core_budget()
 
     def recommended_config(
-        self, families: Iterable[str] | None = None, plan: object | None = None
+        self,
+        families: Iterable[str] | None = None,
+        plan: object | None = None,
+        carried: frozenset[str] | None = None,
     ) -> Config | None:
         """A `Config` with the pressure-scaled morsel target and contention-scaled fan-out,
         or ``None`` to keep the current one. The conductor activates it for the execution
         scope so the adaptation reaches both the in-process engine and the shipped worker
         config. `families` (the plan's operator kinds) narrows the learned width to this
-        plan's own data."""
-        target = self.recommend_morsel_target(families, plan)
+        plan's own data, and `carried` (the columns that can actually flow) narrows the
+        *planned* width to this query's own columns rather than its table's."""
+        target = self.recommend_morsel_target(families, plan, carried)
         parallelism = self.recommend_parallelism()
         if target is None and parallelism is None:
             return None

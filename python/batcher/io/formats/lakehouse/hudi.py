@@ -11,16 +11,28 @@ than pretend.
 
 ## Two things hudi-rs is particular about
 
-**Filter values are strings.** `read_snapshot(filters=[("day", "=", 1)])` raises — hudi-rs
+**Filter values are strings.** `HudiReadOptions(filters=[("day", "=", 1)])` raises — hudi-rs
 takes the value as text and parses it against the column's type. Passing the literal
 through untouched therefore threw on every typed column, and the read fell back to
 unfiltered, so Hudi's partition pruning never once ran. `_hudi_filters` stringifies.
 
-**A filter prunes partitions, not rows.** The filters are evaluated against the partition
-path, so they eliminate whole file slices and nothing finer. That is exactly the pruning
-worth having (it is I/O we never do), and the engine's `Filter` re-checks the rows
-regardless — so a filter on a non-partition column is simply a no-op rather than a wrong
-answer.
+**A filter prunes files, not rows.** The filters eliminate whole file slices -- by the
+partition path, and (as of hudi-rs 0.5) also by a base file's column statistics, so even an
+unpartitioned table skips files a predicate excludes. Nothing finer than a file is removed,
+which is exactly the pruning worth having (it is I/O we never do), and the engine's `Filter`
+re-checks the rows regardless -- so a filter the reader cannot use is a no-op rather than a
+wrong answer.
+
+## The row count does not come from `num_records`
+
+hudi-rs 0.5 exposes `HudiFileSlice.num_records`, and on every slice of a table it returns
+the **table's** total rather than that slice's. Summing it is therefore wrong by a factor of
+the slice count -- measured on a 15-row, three-slice table, `row_count()` returned **45 and
+declared it exact**, which is worse than returning nothing: it is fed to `count()` and to
+Kyber's cardinality. The counts here come from the base files' Parquet footers instead
+(`_parquet_native.footer_stats` / `file_manifest`, one native pass over metadata the reader
+has usually already cached), which is metadata rather than a scan just as the timeline was,
+and is exact per slice.
 
 ## Merge-on-read
 
@@ -56,6 +68,58 @@ def _require_hudi() -> Any:
     return require(
         "hudi", "HudiTable", feature="Hudi read support", provides="hudi-rs", extra="hudi"
     )
+
+
+def _read_options(
+    *,
+    filters: list[Any] | None = None,
+    as_of: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> Any:
+    """A `HudiReadOptions` carrying whatever of these is set, or `None` when none is.
+
+    hudi-rs takes every read modifier -- partition filters, time travel, the incremental
+    window -- through one options object rather than through per-call keyword arguments.
+    Returning `None` for the empty case keeps the plain `table.read()` / `get_file_slices()`
+    call free of an object that would say nothing.
+    """
+    options_cls = require(
+        "hudi", "HudiReadOptions", feature="Hudi read support", provides="hudi-rs", extra="hudi"
+    )
+    if not any((filters, as_of, start, end)):
+        return None
+    options = options_cls(filters=list(filters)) if filters else options_cls()
+    if as_of is not None:
+        options = options.with_as_of_timestamp(as_of)
+    if start is not None:
+        query_type = require(
+            "hudi", "HudiQueryType", feature="Hudi read support", provides="hudi-rs", extra="hudi"
+        )
+        options = options.with_query_type(query_type.Incremental).with_start_timestamp(start)
+        if end is not None:
+            options = options.with_end_timestamp(end)
+    return options
+
+
+def _footer_rows(table_uri: str, relative_paths: list[str]) -> list[int] | None:
+    """Exact rows per base file from its Parquet footer, in `relative_paths` order.
+
+    The replacement for `HudiFileSlice.num_records`, which reports the table total on every
+    slice (see the module docstring). `None` when the footers cannot be read, which leaves
+    the caller to report an unknown count rather than a wrong one.
+    """
+    from batcher.io.formats.structured._parquet_native import file_manifest
+
+    if not relative_paths:
+        return []
+    base = table_uri.rstrip("/")
+    uris = [f"{base}/{rel.lstrip('/')}" for rel in relative_paths]
+    manifest = file_manifest(uris, ["num_records"])
+    if manifest is None or "num_records" not in manifest.column_names:
+        return None
+    counts = manifest.column("num_records").to_pylist()
+    return None if len(counts) != len(uris) else [int(c) for c in counts]
 
 
 _HUDI_OP = {"eq": "=", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
@@ -131,7 +195,10 @@ class HudiFileSliceSplit:
         hudi_table = _require_hudi()
         table = hudi_table(self.table_uri, options=dict(self.options))
         reader = table.create_file_group_reader_with_options()
-        batch = reader.read_file_slice_by_base_file_path(self.base_file_path)
+        # No log files: `splits()` hands a slice back only for a copy-on-write table, and
+        # falls back to a whole-source read the moment any slice carries one (see the
+        # module docstring on merge-on-read).
+        batch = reader.read_file_slice_from_paths(self.base_file_path, [])
         return [batch] if isinstance(batch, pa.RecordBatch) else batch
 
     @staticmethod
@@ -216,9 +283,8 @@ class HudiSource:
             raise BackendError(f"failed to open Hudi table {self._table_uri!r}: {exc}") from exc
 
     def _snapshot(self, table: Any, filters: list[Any]) -> list[pa.RecordBatch]:
-        if self._as_of_instant is not None:
-            return table.read_snapshot_as_of(self._as_of_instant, filters)
-        return table.read_snapshot(filters)
+        options = _read_options(filters=filters, as_of=self._as_of_instant)
+        return table.read(options) if options is not None else table.read()
 
     def _snapshot_batches(self, predicate: dict | None) -> Any:
         """The snapshot's batches as hudi-rs hands them back, partition-pruned where it can.
@@ -250,20 +316,16 @@ class HudiSource:
         table = self._table()
         filters = _hudi_filters(predicate)
         instant = self._as_of_instant
-        for attempt in (
-            lambda: (
-                table.get_file_slices_as_of(instant, filters=filters)
-                if instant is not None
-                else table.get_file_slices(filters=filters)
-            ),
-            lambda: (
-                table.get_file_slices_as_of(instant)
-                if instant is not None
-                else table.get_file_slices()
-            ),
+        for options in (
+            _read_options(filters=filters, as_of=instant),
+            _read_options(as_of=instant),
         ):
             try:
-                return list(attempt())
+                return list(
+                    table.get_file_slices(options)
+                    if options is not None
+                    else table.get_file_slices()
+                )
             except Exception as exc:
                 note_suppressed("io", "list file slices", exc)
                 continue
@@ -307,10 +369,7 @@ class HudiSource:
         """Read rows changed between two Hudi instants as an Arrow table."""
         table = self._table()
         try:
-            if end_instant is not None:
-                batches = table.read_incremental_records(start_instant, end_instant)
-            else:
-                batches = table.read_incremental_records(start_instant)
+            batches = table.read(_read_options(start=start_instant, end=end_instant))
             return pa.Table.from_batches(batches)
         except Exception as exc:
             raise BackendError(
@@ -325,9 +384,11 @@ class HudiSource:
         states outright.
         """
         try:
-            return sum(int(s.num_records) for s in self._file_slices())
+            slices = self._file_slices()
+            counts = _footer_rows(self._table_uri, [s.base_file_relative_path() for s in slices])
         except Exception:
             return None
+        return None if counts is None else sum(counts)
 
     def statistics(self) -> SourceStatistics | None:
         """Exact row count **and the table's partition keys** from the timeline; no scan.
@@ -401,15 +462,17 @@ class HudiSource:
             return [WholeSourceSplit(self)]
         if any(_has_log_files(s) for s in slices):
             return [WholeSourceSplit(self)]
+        paths = [s.base_file_relative_path() for s in slices]
+        rows = _footer_rows(self._table_uri, paths) or [None] * len(paths)
         return [
             HudiFileSliceSplit(
                 self._table_uri,
-                s.base_file_relative_path(),
+                path,
                 dict(self._options),
-                int(s.num_records) if s.num_records is not None else None,
+                count,
                 self._as_of_instant,
             )
-            for s in slices
+            for path, count in zip(paths, rows, strict=True)
         ]
 
 

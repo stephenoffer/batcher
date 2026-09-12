@@ -76,9 +76,20 @@ def test_the_three_doors_agree_on_the_same_array(tmp_path):
 
 @pytest.mark.parametrize("reader", ["npy", "hdf5"])
 def test_a_vector_field_keeps_the_embedding_convention(reader, tmp_path):
-    """A sub-array field is a per-row vector; flattening it would lose the row boundary."""
+    """A sub-array field is a per-row vector; flattening it would lose the row boundary.
+
+    The element stays ``float32``. This asserted ``float64`` until the boundary stopped
+    widening a *list element* — an embedding column is the shape the multimodal path is
+    built on, and widening its child doubles (for ``uint8``, octuples) a payload that
+    usually reaches a UDF without touching a kernel at all. See
+    `bc_py::normalize::normalize_list_element` and `io.source.inmemory._widen_narrow_type`.
+    So the width here is the deliberate behaviour, not an accident to be widened back.
+    """
     ds = _npy(tmp_path, _WITH_VECTOR) if reader == "npy" else _hdf5(tmp_path, _WITH_VECTOR)
-    assert ds.schema.field("emb").type == pa.list_(pa.float64(), 4)
+    assert ds.schema.field("emb").type == pa.list_(pa.float32(), 4)
+    # The declared schema is a promise about what `collect()` returns; a vector field is
+    # exactly where the two used to be able to drift, since only one of them widened.
+    assert ds.collect().schema.field("emb").type == ds.schema.field("emb").type
 
 
 def test_the_npy_schema_is_answered_from_the_header_without_reading_rows(tmp_path):

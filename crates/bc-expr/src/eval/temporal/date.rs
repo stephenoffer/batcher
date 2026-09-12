@@ -257,6 +257,10 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return Ok(Arc::new(out));
     }
 
+    // The date parts a query groups by take the integer-arithmetic path when the type allows.
+    if let Some(fast) = super::civil::extract(func, arr) {
+        return Ok(fast);
+    }
     let part = match func {
         DateFunc::Year => DatePart::Year,
         DateFunc::Month => DatePart::Month,

@@ -33,9 +33,18 @@ def _quiet_environment(monkeypatch):
     The firmware probe is silenced too. It is a real identity source and it answers on most
     hosts, so a test asserting "this machine has nothing to say" would otherwise be answered
     by whichever cloud the suite is running on.
+
+    **And the cluster probe, for the same reason plus one more: another test's fake fleet
+    reaches this one.** `accelerators()` adds a `planning` section whenever
+    `distributed_hardware()` reports a known cluster, and a test earlier in the file order that
+    stands up a fake one left it visible here — `sorted(report)` came back
+    `['backend', 'planning', 'power']`, so this test failed only when run after that one and
+    passed alone. A test asserting an *absence* has to establish the absence rather than
+    inherit it.
     """
     monkeypatch.setattr(report_mod, "device_rows", list)
     monkeypatch.setattr("batcher._internal.site.provider.dmi_identity", lambda: ("", "", None))
+    monkeypatch.setattr("batcher.api.orchestration.sizing.distributed_hardware", lambda: None)
     for name in ("BATCHER_PROVIDER", "SLURM_JOB_ID", "KUBERNETES_SERVICE_HOST", "RAY_ADDRESS"):
         monkeypatch.delenv(name, raising=False)
     from batcher._internal.site import provider

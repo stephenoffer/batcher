@@ -8,6 +8,7 @@ does not change what runs. That decoupling is why you can leave it on in product
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -47,8 +48,18 @@ def main() -> None:
     assert hasattr(bt, "stop_ui")
     assert hasattr(bt, "ui_url")
 
-    # Running the same query again gives the same answer, whether or not anything watched.
-    assert query.to_pydict() == result
+    # Running the same query again gives the same answer, whether or not anything watched:
+    # the same groups and counts exactly, and the same sums to within float reassociation.
+    # `show` above ran a `head` of this query, which records statistics the next run plans
+    # with, so the full run can add its floats in a different order. A floating-point SUM is
+    # identical across executions only up to that order — the engine's stated contract.
+    again = query.to_pydict()
+    assert again["l_shipmode"] == result["l_shipmode"]
+    assert again["lines"] == result["lines"]
+    assert all(
+        math.isclose(a, b, rel_tol=1e-9)
+        for a, b in zip(again["revenue"], result["revenue"], strict=True)
+    )
 
 
 if __name__ == "__main__":

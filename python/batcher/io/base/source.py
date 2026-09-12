@@ -152,6 +152,26 @@ def _resolve_base_aliases(
 _FILE_SCHEMAS = FileMetaCache(8192)
 
 
+def _batch_row_limit(batch: pa.RecordBatch, morsel_rows: int, batch_bytes: int) -> int:
+    """Rows of `batch` that fit in `batch_bytes`, never fewer than one morsel.
+
+    Measured from the batch itself (`RecordBatch.nbytes`, which accounts for slicing and
+    costs a buffer-size read per column, not a pass over the rows) rather than from a
+    per-row width estimated off the schema. The estimate would do for the common case and
+    is badly wrong for the case that matters: a variable-length column contributes a
+    32-byte default, so a table of kilobyte strings would be judged 30x narrower than it is
+    and cut into batches 30x the intended size. The bound exists to cap memory, so it reads
+    the memory.
+
+    The morsel floor keeps a deployment that lowers `execution.read_batch_bytes` from
+    cutting below the unit the engine schedules in.
+    """
+    nbytes = batch.nbytes
+    if nbytes <= batch_bytes or batch.num_rows == 0:
+        return max(morsel_rows, batch.num_rows)
+    return max(morsel_rows, int(batch.num_rows * batch_bytes // nbytes))
+
+
 class FileSource(ABC):
     """Base for a lazy, multi-file, projection-aware source over one format.
 
@@ -456,13 +476,26 @@ class FileSource(ABC):
         if identity is None:
             with self._open(path) as fh:
                 return self._read_schema(fh)
-        key = (type(self), identity)
+        key = (type(self), identity, self._schema_cache_token())
         hit = _FILE_SCHEMAS.get(key)
         if hit is None:
             with self._open(path) as fh:
                 hit = self._read_schema(fh)
             _FILE_SCHEMAS.put(key, hit, weight=1)
         return hit
+
+    def _schema_cache_token(self) -> object:
+        """What besides the file decides the schema `_read_schema` infers from it.
+
+        Empty for a self-describing format — Parquet, ORC, Arrow and Avro carry their schema in
+        the file, so the file's identity is the whole key. A reader whose inference depends on
+        its own options overrides this, because the class and the file are then *not* enough:
+        one CSV file read with `delimiter="\\t"` and again with `delimiter=","` is two
+        different schemas, and keying on the file alone served the first read's schema to the
+        second — silently, with the wrong column count. A token that is too fine only costs a
+        cache miss; one that is too coarse returns a wrong schema.
+        """
+        return ()
 
     def schema(self) -> pa.Schema:
         """The source's schema, read from metadata once and cached.
@@ -964,28 +997,53 @@ class FileSource(ABC):
         into that error while `read()` (which never reaches this on an empty file) returns
         `[]`. One source, two answers is exactly the divergence to avoid.
 
-        It is also where an oversized batch is cut down to a morsel. A reader that parses a
-        whole file into one Arrow chunk — numpy, XML, point clouds, several SQL drivers —
-        emitted that chunk as a *single* RecordBatch of however many rows the file held, and
-        the engine's whole memory model assumes a batch is a morsel: the read-ahead budgets
-        by batch, every operator holds one, and a spill is measured in them. A 100M-row file
-        arriving as one batch defeats all three at once. `RecordBatch.slice` is zero-copy, so
-        the cut is a view over the same buffers and costs nothing for the common case of a
-        reader that already chunks (the loop runs once and yields the batch unchanged).
+        It is also where an oversized batch is cut down. A reader that parses a whole file
+        into one Arrow chunk — numpy, XML, point clouds, several SQL drivers — emitted that
+        chunk as a *single* RecordBatch of however many rows the file held, and the engine's
+        memory model budgets by batch: the read-ahead counts them, every operator holds one,
+        and a spill is measured in them. A 100M-row file arriving as one batch defeats all
+        three at once. `RecordBatch.slice` is zero-copy, so the cut is a view over the same
+        buffers and costs nothing for a reader that already chunks (the loop runs once and
+        yields the batch unchanged).
+
+        **The cut is bounded by bytes, not by the morsel row count, and that distinction is
+        worth a paragraph because it used to be the row count.** The engine re-morselizes
+        every source batch it is handed — `bc_interp::ops::morsel::morselize` splits on
+        `execution.morsel_rows` *and* `execution.morsel_bytes`, zero-copy — so cutting to
+        `morsel_rows` here does not reduce the work downstream by a row. What it does do is
+        multiply the number of `RecordBatch`es crossing the FFI, and each one costs an Arrow
+        C Data Interface import on the GIL-holding thread before the executor may start.
+
+        Measured on TPC-H sf10 `lineitem` (59,986,052 rows, three columns) — the same rows,
+        the same query, the same total CPU, differing only in how the input was presented:
+
+        3,907 batches of 16,384 rows ran in **94.5 ms at 8.3 cores busy**; the same rows as
+        980 batches of 65,536 in **46.5 ms at 15.7**; and as one batch in **31.4 ms at
+        21.8**. Total CPU is flat to within 14% across all three, so what the extra batches
+        buy is serial time — roughly 16 us each — rather than work.
+
+        The native Parquet reader already returns 65,536-row batches sized to
+        `NATIVE_READ_TARGET_BYTES`; the old row cut shredded each of them into four and paid
+        the import four times. So the bound here is `execution.read_batch_bytes` measured
+        against the batch's own `nbytes` — the thing that actually costs memory — and it
+        never cuts below one morsel.
         """
         from batcher.config import active_config
         from batcher.io.schema import conform_batch, normalize_batch
 
         strict = self._schema_mode == "strict"
         target: pa.Schema | None = None
-        # Read once, not per batch: this is the per-batch path of every file read.
-        limit = active_config().execution.morsel_rows
+        # Resolved once with the target schema, not per batch: this is the per-batch path
+        # of every file read.
+        execution = active_config().execution
+        morsel_rows, batch_bytes = execution.morsel_rows, execution.read_batch_bytes
         for b in batches:
             if target is None:
                 target = self.schema()
                 if projection is not None:
                     target = pa.schema([target.field(c) for c in projection])
             out = conform_batch(b, target, path=path) if strict else normalize_batch(b, target)
+            limit = _batch_row_limit(out, morsel_rows, batch_bytes)
             if out.num_rows <= limit:
                 yield out
                 continue

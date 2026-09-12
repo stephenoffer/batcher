@@ -2,6 +2,7 @@
 
 ```{raw} html
 <div class="bt-hero">
+  <img class="bt-hero-logo" src="_static/logo.png" alt="The Batcher logo: a letter B drawn as five horizontal bars sweeping from cyan through electric blue to magenta.">
   <p class="bt-hero-eyebrow">Any data &middot; Any workload &middot; Batch &amp; streaming</p>
   <p class="bt-hero-tagline">One engine for every kind of data, from SQL to models.</p>
   <p class="bt-hero-sub">

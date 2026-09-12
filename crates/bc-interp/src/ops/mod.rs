@@ -1287,6 +1287,52 @@ fn top_k_by_leading_key(
     Ok(Some(UInt32Array::from(candidates)))
 }
 
+/// Rows below which splitting a part further costs more scheduling than it buys work.
+///
+/// A top-N does one bounded selection pass per part, so a part that is only a few thousand
+/// rows is already dominated by the per-part fixed cost (the ORDER BY evaluation, the
+/// min/max bound probe, the candidate gather).
+const TOPN_MIN_SPLIT_ROWS: usize = 4_096;
+
+/// `parts` re-cut so every worker has one, or `None` when it already does.
+///
+/// [`parallel_top_n`] fans out over the parts it is handed, so its width is *the caller's
+/// batching* rather than the machine's. That is fine when the input is a scan's morsels and
+/// wrong when it is a breaker's output: a filter that keeps 69,000 of a million rows hands
+/// the top-N four 16,384-row morsels, which runs a 48-core box on four cores. Re-cutting is
+/// the whole fix, and it is free — `RecordBatch::slice` is a view.
+///
+/// **Result-preserving, and the reason is the tie-break.** The merge below orders candidates
+/// by `(part index, row within part)` — the row's ORIGINAL position — and a finer
+/// *contiguous, in-order* cut of the same sequence encodes the same global order: for any two
+/// rows, the one earlier overall still has the smaller `(part, row)` pair. So the selected
+/// set and its order are unchanged; only how many threads compute it moves.
+fn split_for_workers(parts: &[RecordBatch], workers: usize) -> Option<Vec<RecordBatch>> {
+    if workers <= 1 || parts.len() >= workers {
+        return None;
+    }
+    let total: usize = parts.iter().map(RecordBatch::num_rows).sum();
+    let target = total.div_ceil(workers).max(TOPN_MIN_SPLIT_ROWS);
+    if parts.iter().all(|b| b.num_rows() <= target) {
+        return None; // already at or below the target — nothing to cut
+    }
+    let mut out = Vec::with_capacity(workers + parts.len());
+    for b in parts {
+        let rows = b.num_rows();
+        if rows <= target {
+            out.push(b.clone());
+            continue;
+        }
+        let mut off = 0;
+        while off < rows {
+            let len = target.min(rows - off);
+            out.push(b.slice(off, len));
+            off += len;
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn parallel_top_n(
     parts: &[RecordBatch],
     keys: &[SortKey],
@@ -1295,6 +1341,8 @@ pub(crate) fn parallel_top_n(
     use arrow::array::{UInt32Array, UInt32Builder};
     use rayon::prelude::*;
 
+    let resplit = split_for_workers(parts, rayon::current_num_threads());
+    let parts: &[RecordBatch] = resplit.as_deref().unwrap_or(parts);
     let schema = parts[0].schema();
     // A bound on the first key's cut-off, shared across workers. Once any morsel has produced
     // `k` candidates, a morsel whose entire first-key range is strictly worse than that cannot
@@ -2326,7 +2374,7 @@ mod sort_tests {
         )])
         .unwrap();
         let keys = vec![SortKey {
-            expr: Expr::Col { name: "k".into() },
+            expr: bc_expr::Expr::Col { name: "k".into() },
             descending: false,
             nulls_first: false,
         }];
@@ -2613,6 +2661,102 @@ mod topn_bound_tests {
 }
 
 #[cfg(test)]
+mod topn_resplit_tests {
+    use super::*;
+    use arrow::array::{AsArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+
+    fn batch(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let s: Vec<String> = values.iter().map(|v| format!("v{v:04}")).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(StringArray::from(s)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn keys() -> Vec<SortKey> {
+        vec![SortKey {
+            expr: bc_expr::Expr::Col { name: "k".into() },
+            descending: false,
+            nulls_first: false,
+        }]
+    }
+
+    /// Re-cutting must not move a row. The selection is compared against the *same* function
+    /// on the un-split input, which is the oracle it has to match — and the fixture ties the
+    /// key heavily, because ties are the only place a changed `(part, row)` tie-break could
+    /// show up at all.
+    #[test]
+    fn resplitting_selects_exactly_what_the_unsplit_input_does() {
+        for tie_width in [1i64, 7, 100] {
+            let rows: Vec<i64> = (0..40_000).map(|i| i % tie_width).collect();
+            let one = vec![batch(rows.clone())];
+            let many: Vec<RecordBatch> = rows.chunks(4_000).map(|c| batch(c.to_vec())).collect();
+            for k in [1usize, 10, 500] {
+                let a = parallel_top_n(&one, &keys(), k).expect("one part");
+                let b = parallel_top_n(&many, &keys(), k).expect("many parts");
+                assert_eq!(a.num_rows(), b.num_rows(), "tie_width={tie_width} k={k}");
+                assert_eq!(
+                    a.column(1).as_ref(),
+                    b.column(1).as_ref(),
+                    "tie_width={tie_width} k={k}: the surviving rows differ"
+                );
+            }
+        }
+    }
+
+    /// The control: the fixture really is the shape that re-splits, and the cut is contiguous
+    /// and total. Without this the test above passes whether or not `split_for_workers` fires.
+    #[test]
+    fn a_single_large_part_is_cut_into_contiguous_pieces() {
+        let one = vec![batch((0..40_000).collect())];
+        let split = split_for_workers(&one, 8).expect("one part under eight workers re-splits");
+        assert!(split.len() > 1);
+        assert_eq!(
+            split.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            40_000
+        );
+        let seen: Vec<i64> = split
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+            .collect();
+        assert_eq!(
+            seen,
+            (0..40_000).collect::<Vec<i64>>(),
+            "order must survive"
+        );
+    }
+
+    /// And it declines where cutting would only add scheduling: enough parts already, or
+    /// pieces already at the target.
+    #[test]
+    fn it_declines_when_there_is_nothing_to_gain() {
+        let many: Vec<RecordBatch> = (0..8).map(|i| batch(vec![i; 1_000])).collect();
+        assert!(
+            split_for_workers(&many, 8).is_none(),
+            "one part per worker already"
+        );
+        assert!(
+            split_for_workers(&many, 1).is_none(),
+            "a single worker cannot use more"
+        );
+        let tiny = vec![batch(vec![1; 100])];
+        assert!(
+            split_for_workers(&tiny, 8).is_none(),
+            "below the split floor"
+        );
+    }
+}
+
+#[cfg(test)]
 mod top_k_selection_tests {
     use std::sync::Arc;
 
@@ -2733,18 +2877,30 @@ mod top_k_selection_tests {
 
     /// A key longer than the packed prefix, sharing every one of its first eight bytes, is the
     /// shape the candidate budget exists for: the pack settles nothing, so *every* row is a
-    /// candidate. The selection must decline rather than sort the whole morsel twice.
+    /// candidate.
+    ///
+    /// **This asserted that the selection must *decline* here, and that is no longer the
+    /// contract.** The premise was that declining is cheaper than trying — true while the only
+    /// alternative was a full sort attempted twice, and false once
+    /// `byte_sort::top_k_by_comparison` gave the decline path an `O(n)` selection over the key
+    /// bytes. Measured on 6,000,000 rows of a column whose first nine characters are constant,
+    /// `ORDER BY s LIMIT 10`: **36.0 ms declining to the full sort, 10.5 ms selecting**
+    /// (DuckDB 4.6 ms, so 8.7x -> 2.3x). So what must hold is no longer "it declines" but the
+    /// stronger property that it selects *and is right*: the same rows a stable full sort
+    /// keeps, in the same order.
     #[test]
-    fn a_column_whose_prefix_settles_nothing_declines() {
+    fn a_column_whose_prefix_settles_nothing_still_selects_correctly() {
         let values: ArrayRef = Arc::new(StringArray::from(
             (0..4_000)
                 .map(|i| format!("https://example.com/{i:08}"))
                 .collect::<Vec<_>>(),
         ));
-        assert!(
-            top_k_single_key(&values, SortOptions::default(), 10).is_none(),
-            "a constant eight-byte prefix must fall back to the full sort"
-        );
+        let opts = SortOptions::default();
+        for k in [1usize, 10, 100] {
+            let sel = top_k_single_key(&values, opts, k)
+                .expect("a prefix that settles nothing is selected on its bytes instead");
+            assert_eq!(sel.values(), &stable_full_sort(&values, opts)[..k], "k={k}");
+        }
     }
 
     /// The same shared-prefix column, but few enough rows to stay inside the budget: the

@@ -229,56 +229,61 @@ exclude_patterns = [
 html_theme = "furo"
 html_static_path = ["_static"]
 html_title = "Batcher"
-html_favicon = "_static/favicon.svg"
+html_favicon = "_static/favicon.png"
+html_logo = "_static/logo.png"
 html_css_files = ["custom.css"]
 
-# Professional palette: a confident blue brand on light content, with a permanently
-# dark slate sidebar in both modes (the enterprise-docs look). Dark mode uses lighter
-# brand tints on slate surfaces. Structural styling + animations live in custom.css.
-_BRAND = "#2563eb"  # blue-600 (light mode)
-_BRAND_DARK = "#60a5fa"  # blue-400 (dark mode, on slate)
+# The palette is taken from the logo, whose bars run cyan -> electric blue -> violet ->
+# magenta. Light mode reads its links in the logo's blue, deepened just enough to hold
+# AA contrast on white; dark mode reads them in the logo's cyan end, which is the part of
+# the gradient that stays legible on indigo. The sidebar is a permanent indigo night in
+# both modes, so the logo's glow always sits on the ground it was drawn for. The full
+# gradient, and every structural style and animation, lives in custom.css.
+_BRAND = "#2a3bf4"  # the logo's electric blue, deepened for text on white
+_BRAND_DARK = "#4ed5f9"  # the logo's cyan-sky, for text on indigo
 
-# A dark sidebar, applied in both light and dark mode for a consistent shell.
+# An indigo-night sidebar, applied in both light and dark mode for a consistent shell.
 _SIDEBAR = {
-    "color-sidebar-background": "#0f172a",
-    "color-sidebar-background-border": "#1e293b",
-    "color-sidebar-caption-text": "#94a3b8",
-    "color-sidebar-link-text": "#cbd5e1",
-    "color-sidebar-link-text--top-level": "#f1f5f9",
-    "color-sidebar-item-background--hover": "#1e293b",
-    "color-sidebar-item-expander-background--hover": "#334155",
-    "color-sidebar-search-background": "#0b1120",
-    "color-sidebar-search-background--focus": "#1e293b",
-    "color-sidebar-search-border": "#334155",
-    "color-sidebar-search-foreground": "#e2e8f0",
-    "color-sidebar-search-icon": "#64748b",
-    "color-sidebar-brand-text": "#f1f5f9",
+    "color-sidebar-background": "#0b0d26",
+    "color-sidebar-background-border": "#1b1f4a",
+    "color-sidebar-caption-text": "#9097c8",
+    "color-sidebar-link-text": "#c9cdf0",
+    "color-sidebar-link-text--top-level": "#f2f3ff",
+    "color-sidebar-item-background--hover": "#1b1f4a",
+    "color-sidebar-item-expander-background--hover": "#2a2f66",
+    "color-sidebar-search-background": "#070919",
+    "color-sidebar-search-background--focus": "#1b1f4a",
+    "color-sidebar-search-border": "#2a2f66",
+    "color-sidebar-search-foreground": "#e3e5fa",
+    "color-sidebar-search-icon": "#6b72a8",
+    "color-sidebar-brand-text": "#f2f3ff",
 }
 
 html_theme_options = {
-    # Show the "Batcher" project name as the sidebar brand (a text wordmark that
-    # links home). No logo image — the mark + wordmark are styled in custom.css.
+    # The logo mark sits beside the "Batcher" wordmark, both linking home. custom.css lays
+    # the two out as one row rather than Furo's default stacked, centered block.
     "sidebar_hide_name": False,
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
     "light_css_variables": {
         "color-brand-primary": _BRAND,
         "color-brand-content": _BRAND,
-        "color-admonition-title-background--note": "rgba(37, 99, 235, 0.09)",
+        "color-admonition-title-background--note": "rgba(42, 59, 244, 0.09)",
         **_SIDEBAR,
     },
     "dark_css_variables": {
         "color-brand-primary": _BRAND_DARK,
         "color-brand-content": _BRAND_DARK,
-        "color-background-primary": "#0f172a",
-        "color-background-secondary": "#131c31",
-        "color-background-hover": "#1e293b",
-        "color-background-border": "#243049",
-        "color-foreground-primary": "#e2e8f0",
-        "color-foreground-secondary": "#94a3b8",
-        "color-code-background": "#131c31",
+        "color-background-primary": "#0e1030",
+        "color-background-secondary": "#13163a",
+        "color-background-hover": "#1b1f4a",
+        "color-background-border": "#262b5c",
+        "color-foreground-primary": "#e3e5fa",
+        "color-foreground-secondary": "#9aa0cc",
+        "color-code-background": "#13163a",
+        "color-admonition-title-background--note": "rgba(78, 213, 249, 0.10)",
         **_SIDEBAR,
-        "color-sidebar-background": "#0b1120",  # a touch darker than the content
+        "color-sidebar-background": "#080a1f",  # a touch darker than the content
     },
 }
 

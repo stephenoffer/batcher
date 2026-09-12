@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
+from batcher._internal.logging import note_suppressed
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_PARTITIONS",
+    "carried_columns",
     "declared_row_count",
     "distributed_hardware",
     "partitions_from_physical",
@@ -210,3 +212,49 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
         return None
     inferred = plan.available_schema()
     return None if inferred is None else inferred.arrow.empty_table()
+
+
+def carried_columns(plan) -> frozenset[str] | None:
+    """Column names that can actually flow through `plan`, or `None` when that is unknowable.
+
+    Two kinds of column can reach a morsel, and the union of them is the answer:
+
+    * what a **scan supplies** — Kyber's `required_columns_per_source`, which is the
+      projection analysis the reader's own is derived from;
+    * what a node **introduces** — a name in some node's schema that no source schema
+      carries, which is a derived column (a decoded image tensor, an aggregate's output).
+      These are exactly the ones the width policy exists for, so they stay charged whatever
+      the sources look like.
+
+    **Answered from the plan as given, not from the optimized one**, and that is deliberate
+    twice over. Optimization only ever *removes* columns from a scan, so the unoptimized
+    analysis can only over-count — and over-counting charges a morsel for a column that will
+    not flow, which is the safe direction for a memory bound. Optimizing here to sharpen it
+    also runs the optimizer a second time before the conductor's own call, and
+    `kyber.plan_cache`'s warmup counts executions: doing so made the memo take four runs to
+    settle where it takes two (`test_the_memo_stops_missing_once_there_is_nothing_left_to_learn`).
+    A sizing hint must not move the learning loop.
+
+    `None` on any failure, which restores the previous behaviour of charging every column:
+    this decides what a query *costs*, never what it returns, so a miss must be a cost.
+    """
+    try:
+        from batcher import kyber
+        from batcher.plan.visitor import walk
+
+        supplied: set[str] = set()
+        for names in kyber.required_columns_per_source(plan).values():
+            supplied.update(names)
+        source_names: set[str] = set()
+        node_names: set[str] = set()
+        for node in walk(plan):
+            schema = getattr(node, "available_schema", None)
+            resolved = schema() if callable(schema) else None
+            arrow = getattr(resolved, "arrow", None)
+            if arrow is None:
+                continue
+            (source_names if type(node).__name__ == "Scan" else node_names).update(arrow.names)
+        return frozenset(supplied | (node_names - source_names))
+    except Exception as exc:  # pragma: no cover - a sizing hint must never fail a query
+        note_suppressed("carbonite", "derive carried columns", exc)
+        return None

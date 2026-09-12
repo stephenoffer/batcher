@@ -1297,6 +1297,16 @@ avoiding the columns altogether. So the asymmetry is real and measured on both s
 only *Batcher's* half of it has a mechanism attached: DuckDB's remains unidentified, and
 nothing here should be read as saying otherwise.
 
+**One mechanism on Batcher's side was found and fixed, 2026-09-12, and it is a different
+one from the byte count above.** A *single-key string* top-N selects on the first eight bytes
+packed into a `u64`; when that prefix settles too little -- every value starting `https://`,
+ClickBench's `SearchPhrase`, empty on ~93% of rows -- the selection **declined**, and declining
+meant a full `O(n log n)` comparison sort of every row to keep ten. It now falls back to an
+`O(n)` quickselect over the key bytes instead (`byte_sort::top_k_by_comparison`). On 6,000,000
+rows of a constant-prefix column, `ORDER BY s LIMIT 10` goes **36.0 ms -> 10.5 ms**, 8.73x
+DuckDB -> 2.28x. It does not close the gap and it is not the section's main finding; it removes
+one path on which a `LIMIT` cost strictly more than the sort it was limiting.
+
 Worth keeping in proportion. The same sweep has Batcher at 0.23x on a full sort, 0.31x on
 `DISTINCT`, 0.34x on `COUNT(DISTINCT)` and 0.36x on a self-join. The only other losses were
 `GROUP BY` shapes, and following them up folded them into section 9 rather than adding a
@@ -1409,6 +1419,65 @@ re-running (an ungrouped aggregate that looked serial, an aggregate-count effect
 warm-up ordering, and a cardinality lead that cannot move a query in which operators are 7% of
 the time) are in `benchmarks/BENCHMARK_RESULTS.md` under 2026-09-08.
 
+**Re-measured 2026-09-12, and the barrier is now worth much less than the arithmetic above
+says -- because most of what was attributed to it was not the barrier.** On a 48-core box over
+a local sf10 mirror, the same grouped aggregate cost 419.8 ms: `ParquetSource.read` 234 ms and
+`execute_plan_metered` 228 ms. But the read's batches executed in **46 ms** when handed to the
+engine as one relation, so 182 of that 228 ms was neither read nor execute. It was the
+*number* of `RecordBatch`es: `FileSource._normalize` cut every batch the reader returned down
+to `morsel_rows`, quadrupling what crossed the FFI, and each crossing costs an Arrow C Data
+Interface import on the GIL-holding thread. Bounding that cut by bytes instead
+(`execution.read_batch_bytes`) takes the whole query to **201.3 ms**, and read + execute now
+sum to the wall clock where before they did not.
+
+What that leaves is a *scan-throughput* problem rather than an overlap problem. At 201 ms the
+split is 167 ms of reading against 46 ms of executing, so perfect overlap would buy about 30
+ms, not the 90 the older arithmetic implies. DuckDB answers the same query in 101 ms at 39
+cores busy against Batcher's 14, doing slightly *more* total CPU -- so the gap is parallelism
+in the reader, which `bc_io::rg_concurrency` capped at a flat 16 while the runtime holds
+`usable_cores()` workers. Sizing it to the machine takes a one-column sf10 read from 86.1 ms
+at 12.9 cores to 61.1 ms at 34.9.
+
+So the ordering of this ceiling's remaining work has changed: the reader's parallelism is
+worth more than the `BatchSource` trait, and should be measured out first.
+
+
+### 12. Scalar string and temporal kernels do 1.7-2.9x DuckDB's work per row (measured 2026-09-12)
+
+Invisible until 2026-09-12 because **nothing benchmarked an expression**. The operator mix
+covered aggregation, dedup, joins, ordering, projection and windows; TPC-H and ClickBench
+contain expressions but bury them inside larger plans, where they are a few percent of the
+time. Four new families (`ops-strings`, `ops-setops`, `ops-expressions`, and six join shapes)
+isolate them, and the isolated numbers are not close.
+
+TPC-H sf1 `lineitem`, 6,001,215 rows, two engines, quiet 48-core box. CPU rather than wall
+clock, because that removes the worker-count difference (Batcher schedules `operator_cores()`
+= 32 here, DuckDB 46):
+
+| shape | Batcher CPU | DuckDB CPU | Batcher wall | DuckDB wall |
+|---|---:|---:|---:|---:|
+| `SUM(LENGTH(l_comment))` | 206 ms | 71 ms | 10.9 ms | 2.7 ms |
+| `EXTRACT(YEAR FROM l_shipdate)` grouped | 126 ms | 58 ms | 7.4 ms | 2.1 ms |
+| a four-arm `CASE`, grouped | 461 ms | 276 ms | 20.3 ms | 9.5 ms |
+
+**More threads do not close it**, which is what makes this a kernel finding rather than a
+scheduling one: pinning `execution.parallelism` to 46 moves the geomean of these shapes from
+2.07 to 1.84 and leaves `str-length` at 3.09x.
+
+**And it is not "Batcher calls a slow Arrow kernel".** The same work through pyarrow's compute
+on the same buffers is far slower than Batcher — `str-length` 122.1 ms single-threaded against
+Batcher's 10.9, `LIKE '%requests%'` 482.9 ms against 13.4. Batcher's evaluator is doing well by
+the kernels it has; DuckDB's kernels do less work. `LENGTH` over an ASCII column is an offset
+subtraction rather than a codepoint count, and a civil-date extraction has a division-free
+form. Both are known techniques neither engine invented.
+
+So this is a *closable* ceiling rather than a structural one, unlike 2 and 11 — and it is now
+tracked: `benchmarks/suites/operators/{strings,expressions}.py` fail visibly if it widens.
+
+**One of the three is closed.** `LENGTH` now tests the morsel's own bytes for ASCII once and
+takes each row's length from the offsets: `SUM(LENGTH(l_comment))` goes **10.9 ms -> 5.3 ms**
+(3.96x -> 1.82x), with CPU at 65 ms against DuckDB's 71 — below it, so what remains on that
+shape is worker count rather than work. The temporal and `CASE` rows are untouched.
 
 ## The roadmap that would make the claim true
 

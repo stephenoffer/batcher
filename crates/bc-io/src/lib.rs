@@ -60,6 +60,17 @@ pub use footer_stats::{
 /// row-group's GETs in series — far below the object store's achievable throughput.
 /// Reading this many row-groups at once overlaps their I/O (it plateaus once the network
 /// is saturated). Env-overridable for wider rows / tighter RAM.
+///
+/// **Sized by the machine, not a constant: the decode is CPU-bound once the bytes are local.**
+/// A flat 16 against [`runtime`]'s `usable_cores()` workers capped one large file — TPC-H
+/// `lineitem`, any compacted lake table — at 16 cores however wide the box. Measured on sf10
+/// `lineitem` (490 row-groups, one column, 48-core host): 86.1 ms at 12.9 cores busy with 16,
+/// 75.4 at 23.2 with 32, **61.1 at 34.9 with 46**, no further gain at 64 or 96.
+///
+/// It loosens no memory bound — `read_parquet_async` retains every row-group's batches
+/// regardless — so this caps the transient decode set, not the result. The floor of 16 keeps
+/// a small cgroup quota from serializing a *remote* read, where the concurrency hides latency
+/// rather than spreading CPU.
 fn rg_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
@@ -67,7 +78,7 @@ fn rg_concurrency() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(16)
+            .unwrap_or_else(|| bc_arrow::usable_cores().max(16))
     })
 }
 

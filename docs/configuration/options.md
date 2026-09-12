@@ -25,6 +25,7 @@ How work is sized and parallelized.
 | `parallelism` | `0` | Worker threads. `0` means use all available cores. |
 | `morsel_rows` | `16384` | Rows per morsel (the unit of vectorized, scheduled work). Shipped to the Rust data plane. |
 | `morsel_bytes` | `1048576` (1 MiB) | Byte budget per morsel. A morsel splits at whichever bound (rows or bytes) trips first, so wide/variable-width data stays memory-bounded. Shipped to the data plane. |
+| `read_batch_bytes` | `16777216` (16 MiB) | Byte ceiling on one `RecordBatch` a source hands the engine. The engine re-morselizes whatever it receives, so this exists only to stop a reader that returns a whole file as one batch; it never cuts below one morsel. Lower it to bound a reader's per-batch memory, not to change the unit of work. |
 | `split_bytes` | `134217728` (128 MiB) | Target byte size of one file split, so source readers never materialize a whole large file at once. |
 | `cpus_per_task` | `1.0` | CPU shares requested per distributed Ray task. A heavy native op can ask for more. |
 | `cpu_share_io` | `0.5` | CPU shares a CPU-light / IO-bound distributed stage (scan, filter, project, write) requests. It sits below `1.0` so such tasks pack more than one per core. This is a cold-start prior only. Once a query runs, Kyber overrides it with each operator's measured CPU utilization. Distributed path only. |

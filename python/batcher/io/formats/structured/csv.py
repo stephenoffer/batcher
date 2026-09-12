@@ -256,6 +256,10 @@ class CSVSource(FileSource):
             ),
         }
 
+    def _schema_cache_token(self) -> object:
+        """The read options, since the delimiter, header and quoting decide what is inferred."""
+        return repr(self._options)
+
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         import pyarrow.csv as pacsv
 

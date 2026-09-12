@@ -44,6 +44,17 @@ _WIDEN_NARROW: dict[pa.DataType, pa.DataType] = {
     pa.large_utf8(): pa.utf8(),
 }
 
+# Source types whose widening leaves every *statistic* unchanged, so the statistics passes
+# read them uncast. An integer widening is an order- and equality-preserving injection, so
+# min/max/ndv/null-count/sum/mean/predicate-count are identical either way — while the cast
+# itself is an O(rows) pass per column, charged for every column of the relation by
+# `statistics()`. Floats are deliberately absent: widening is exact for their bounds but
+# changes the accumulation width of `sum`/`mean`. `large_utf8` is absent for the narrower
+# reason that nothing measured it. See `InMemorySource._build_column`.
+_STATS_EXACT_NARROW: frozenset[pa.DataType] = frozenset(
+    {pa.int8(), pa.int16(), pa.int32(), pa.uint8(), pa.uint16(), pa.uint32()}
+)
+
 
 def _unimportable_targets(schema: pa.Schema) -> dict[str, pa.DataType]:
     """Cast targets for the columns arrow-rs's FFI reader cannot import at all.
@@ -234,9 +245,39 @@ class InMemorySource:
         return self._schema
 
     def _build_column(self, name: str) -> pa.ChunkedArray | pa.Array:
-        """Column `name` across all batches as one (narrow-int widened) Arrow column."""
-        chunks = [self._widened(bi, name, b.column(name)) for bi, b in enumerate(self._batches)]
+        """Column `name` across all batches as one Arrow column, for the statistics passes.
+
+        **Widened only where widening can change the answer**, which for an integer is
+        nowhere. Every fact this column is built to produce — min, max, null count, distinct
+        count, sum, mean, the surviving count of a comparison — is invariant under an
+        order- and equality-preserving injection, and `int8/16/32 -> int64` and
+        `uint8/16/32 -> int64` are exactly that; Arrow promotes a narrow column against a
+        wide literal rather than truncating it, so even a predicate against a value outside
+        the narrow range compares correctly. Float widening is *not* in that set: it is
+        exact for bounds but changes the accumulation width of `sum`/`mean`, so a float
+        column keeps the cast.
+
+        This matters because `statistics()` walks **every** column of the relation, so the
+        widening it forced was paid for columns no query reads. Measured on a 12-column
+        10M-row `int32` table with a query naming two of them: the first execution cost
+        **595-757 ms against 49 ms** for the same table already `int64` — a ~12x cold-query
+        penalty that was a cast of ten columns nothing asked for. The read path
+        (`_widened`/`_project`) is untouched and still widens what it hands the engine.
+        """
+        chunks = [
+            b.column(name)
+            if self._stats_skip_widening(name)
+            else self._widened(bi, name, b.column(name))
+            for bi, b in enumerate(self._batches)
+        ]
         return pa.chunked_array(chunks) if len(chunks) > 1 else chunks[0]
+
+    def _stats_skip_widening(self, name: str) -> bool:
+        """Whether `name`'s statistics may be read off the source column, uncast."""
+        target = self._targets.get(name)
+        return (
+            target is not None and self._batches[0].schema.field(name).type in _STATS_EXACT_NARROW
+        )
 
     def column_ndv(self, name: str) -> int | None:
         """EXACT distinct count of `name`'s non-null values, computed once and cached.
