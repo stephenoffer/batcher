@@ -140,6 +140,62 @@ def _ray_filter_agg(rd: Any) -> pa.Table:
     return _scalar("a", mean, _FLOAT64)
 
 
+def _ray_sum1(rd: Any) -> pa.Table:
+    """``SUM(column0 % 1000)`` -- one column of sixteen, so projection pushdown decides it."""
+    import pyarrow.compute as pc
+
+    def part(batch: pa.Table) -> pa.Table:
+        return pa.table({"s": pa.array([pc.sum(_mod(batch.column("column0"), 1000)).as_py()])})
+
+    return _scalar("s", rd.map_batches(part, batch_format="pyarrow").sum("s"))
+
+
+def _ray_sumwide(rd: Any) -> pa.Table:
+    """The same sum over all sixteen columns -- the I/O-bound end of the sweep."""
+    import pyarrow.compute as pc
+
+    def part(batch: pa.Table) -> pa.Table:
+        total = 0
+        for c in COLUMNS:
+            total += pc.sum(_mod(batch.column(c), 1000)).as_py() or 0
+        return pa.table({"s": pa.array([total])})
+
+    return _scalar("s", rd.map_batches(part, batch_format="pyarrow").sum("s"))
+
+
+def _ray_groupby(rd: Any) -> pa.Table:
+    """``GROUP BY column0 % GROUPS`` with a count -- the shuffle Ray Data does natively."""
+    from suites.h2o.join_ray.base import to_arrow
+
+    def key(batch: pa.Table) -> pa.Table:
+        return pa.table({"g": _mod(batch.column("column0"), GROUPS)})
+
+    got = to_arrow(rd.map_batches(key, batch_format="pyarrow").groupby("g").count())
+    return pa.table({"g": got.column("g"), "n": got.column("count()").cast(_INT64)})
+
+
+def _ray_distinct(rd: Any) -> pa.Table:
+    """``COUNT(DISTINCT column0)`` -- Ray Data's own distinct-count aggregate."""
+    from ray.data.aggregate import CountDistinct
+
+    from suites.h2o.join_ray.base import to_arrow
+
+    got = to_arrow(rd.aggregate(CountDistinct("column0")))
+    name = got.schema.names[0]
+    return _scalar("dd", got.column(name)[0].as_py())
+
+
+def _ray_topn(rd: Any) -> pa.Table:
+    """``ORDER BY column0 LIMIT 10`` -- a full sort, which is what Ray Data offers."""
+    got = rd.sort("column0").limit(10)
+    import ray
+
+    tables = [ray.get(r) for r in got.to_arrow_refs()]
+    tables = [t for t in tables if t.num_rows]
+    out = pa.concat_tables(tables, promote_options="default") if tables else pa.table({})
+    return out.select(["column0"])
+
+
 SHAPES: tuple[Shape, ...] = (
     Shape(
         "count",
@@ -154,12 +210,12 @@ SHAPES: tuple[Shape, ...] = (
     Shape(
         "sum1",
         "SELECT SUM(column0 % 1000) AS s FROM t",
-        {"pyarrow": _pa_sum1},
+        {"pyarrow": _pa_sum1, "ray": _ray_sum1},
     ),
     Shape(
         "sumwide",
         "SELECT " + " + ".join(f"SUM({c} % 1000)" for c in COLUMNS) + " AS s FROM t",
-        {"pyarrow": _pa_sumwide},
+        {"pyarrow": _pa_sumwide, "ray": _ray_sumwide},
     ),
     Shape(
         "filter",
@@ -174,16 +230,16 @@ SHAPES: tuple[Shape, ...] = (
     Shape(
         "groupby",
         f"SELECT column0 % {GROUPS} AS g, COUNT(*) AS n FROM t GROUP BY column0 % {GROUPS}",
-        {"pyarrow": _pa_groupby},
+        {"pyarrow": _pa_groupby, "ray": _ray_groupby},
     ),
     Shape(
         "distinct",
         "SELECT COUNT(DISTINCT column0) AS dd FROM t",
-        {"pyarrow": _pa_distinct},
+        {"pyarrow": _pa_distinct, "ray": _ray_distinct},
     ),
     Shape(
         "topn",
         "SELECT column0 FROM t ORDER BY column0 LIMIT 10",
-        {"pyarrow": _pa_topn},
+        {"pyarrow": _pa_topn, "ray": _ray_topn},
     ),
 )

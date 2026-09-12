@@ -3,11 +3,39 @@
 This page compares Batcher and Spark on architecture: where each one re-plans a query, what
 moves the bulk data, and what that means for a single node.
 
+## The measured standing
+
+Spark 4.2 on OpenJDK 17, local mode, 48-core box, `batcher,spark` pairwise, best of five,
+every row correctness-gated. Measured 2026-09-11.
+
+| Suite | b/spark | Cases |
+|---|---:|---:|
+| ClickBench | 0.02 | 39 |
+| operators | 0.03 | 23 |
+| TPC-H sf1 | 0.03 | 22 |
+| H2O `join` | 0.04 | 5 |
+| TPC-DS | 0.05 | 87 |
+| H2O `groupby` | 0.07 | 10 |
+| JSON | 0.01 | 5 |
+| scan | 0.21 | 27 |
+
+Batcher is between 5x and 100x faster on every suite. Read that as the single-node case it
+is: Spark's per-stage machinery is priced for a cluster, and none of it is amortized here.
+`scan` is the closest column because it is the one dominated by reading bytes from S3, which
+both engines pay in full.
+
+Three TPC-DS cases and two ClickBench cases are excluded from those counts because Spark
+disagreed with the result DuckDB and Batcher both produced: `count(*)` aliased as `count1`
+rather than `count_star` (three queries), a timezone rendered as `2013-07-15 19:40:00Z`
+against `12:40:00`, and one row count. The naming differences are cosmetic; they are
+excluded rather than waved through because the gate compares column names.
+
+TPC-DS needs `BENCH_SPARK_DRIVER_MEMORY=12g` on a 92 GiB box. At the default 32g heap the
+pair was OOM-killed.
+
 :::{note}
-This is an architectural comparison rather than a benchmark. Every other page on this site
-carries measurements; this one carries a design argument, and it is labeled so that nothing
-here reads as a speed result. Spark timings will appear here once a run lands in
-`benchmarks/BENCHMARK_RESULTS.md`.
+The section below is an architectural comparison rather than a benchmark, and is labeled so
+that nothing in it reads as a speed result.
 :::
 
 The design difference is specific and testable, which is what makes it worth writing down.

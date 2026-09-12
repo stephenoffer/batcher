@@ -16,6 +16,7 @@ stale, and the reason the join task is cited as often as the groupby one.
 from __future__ import annotations
 
 from registry import suite
+from suites.h2o.join_ray import case_with_ray
 
 join = suite("h2o-join", dataset="h2o-join")
 
@@ -45,5 +46,7 @@ QUERIES: dict[str, str] = {
     ),
 }
 
+# `sql_with_builder`, not `sql`: Ray Data has no SQL surface, so it reported `n/a` on all
+# five questions. `join_ray` supplies the pipeline; the SQL engines are unaffected.
 for _name, _query in QUERIES.items():
-    join.sql(_name, _query)
+    join.sql_with_builder(_name, _query, case_with_ray(_name, _query))
