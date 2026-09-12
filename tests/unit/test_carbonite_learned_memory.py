@@ -13,6 +13,8 @@ byte-identical result either way.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pyarrow as pa
 
 import batcher as bt
@@ -27,6 +29,7 @@ from batcher.carbonite.memory.learned import (
     _upper_quantile,
     learned_memory_model,
 )
+from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies import BudgetingAdmission, DefaultSchedulingPolicy
 from batcher.config import active_config
 from batcher.metadata import MetadataHub
@@ -247,8 +250,24 @@ def test_should_spill_uses_learned_peak():
         assert ResourceManager(hub=hub).should_spill(plan) is True
 
 
-def test_should_spill_cold_never_spills_unsized():
-    assert ResourceManager(hub=_hub()).should_spill(_plan("Aggregate", 0)) is False
+def test_should_spill_cold_never_spills_unsized(monkeypatch):
+    # The OOM-history signal is live: `spill_reason`'s third arm reads the cgroup's
+    # `memory.events` `oom_kill` counter, and an un-sized plan in a container that has ever
+    # been OOM-killed correctly goes out-of-core. So on any box with a non-zero counter --
+    # left there by a neighbour, a previous run, or a benchmark -- this assertion goes red at
+    # HEAD for reasons unrelated to the code under test. Observed exactly that after a stress
+    # run put `oom_kill 2` in the counter. Stub it, the way the sibling test stubs pressure.
+    monkeypatch.setattr(
+        "batcher.carbonite.memory.kernel.kernel_memory_state",
+        lambda: SimpleNamespace(was_oom_killed=False, oom_kills=0),
+    )
+    rm = ResourceManager(hub=_hub())
+    # Live *pressure* is the second such signal and this test read it too: `classify()` falls
+    # through to the PSI stall floor, so a busy box spills an un-sized plan and the assertion
+    # goes red for the neighbour's load. What is under test is the **cold learned model**
+    # declining to guess, so both live readings are pinned and only that is left to vary.
+    monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.NORMAL)
+    assert rm.should_spill(_plan("Aggregate", 0)) is False
 
 
 def test_admission_blends_learned_peak():

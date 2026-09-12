@@ -1695,6 +1695,41 @@ def _connections_per_peer(dc) -> int:
     return max(configured, rails)
 
 
+def _slot_engine_configs(env, workers: int, cfg_json: str, in_group: bool = True) -> list[str]:
+    """One engine config per worker, sized to the node each worker lands on.
+
+    Returns `workers` copies of `cfg_json` for a uniform fleet — the same object, so a
+    thousand-worker homogeneous fleet allocates nothing and ships byte-identical configs.
+
+    For a fleet carrying per-worker grants (`plan.resource.fleet_plan`), each config is rebuilt
+    with that worker's cores and memory. Both are *scheduling* terms: `parallelism` sets how
+    many threads compute a partial and `memory_budget_bytes` sets when it spills, and the
+    mergeable algebra is indifferent to both.
+
+    Dropped with the grant itself when the fleet has no placement group: a worker that is not
+    pinned to the node it was sized for did not get that node's cores either, so a config
+    telling it to open a 24-thread pool and hold 43 GB describes a machine it is not on. See
+    `capacity.slot_actor_options`, which drops the CPU claim for the same reason.
+
+    Args:
+        env: The active scheduling envelope, or `None`.
+        workers: The fleet's width.
+        cfg_json: The driver's uniform engine config.
+        in_group: Whether the fleet holds a placement group pinning each worker to its node.
+
+    Returns:
+        The config each worker should be given, indexed by worker.
+    """
+    if env is None or not env.worker_cpus or not in_group:
+        return [cfg_json] * workers
+    from batcher.dist.executors.ray_runtime import engine_config_json
+
+    return [
+        engine_config_json(num_cpus=env.slot_compute_cpus(i), memory_bytes=env.slot_memory_bytes(i))
+        for i in range(workers)
+    ]
+
+
 def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
     """Gang-schedule `workers` `_FlightWorker` actors in one SPREAD placement group.
 
@@ -1780,15 +1815,22 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
 
         ceiling = ResourceManager().credit_window_ceiling(channels=max(1, workers))
 
-    pg = create_worker_placement(workers, current_envelope())
+    env = current_envelope()
+    pg = create_worker_placement(workers, env)
     # Resolve the fleet-uniform actor options once (they read the live topology), then vary
     # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
     opts = fleet_actor_options(pg, workers)
+    # On a fleet whose nodes are unequal, each worker computes with its OWN node's cores and
+    # spills against its OWN node's RAM. `cfg_json` is the driver's uniform config, which on
+    # such a fleet is the smallest node's — it would pin a 24-core worker to a 4-core rayon
+    # pool and make it spill at the 4-core node's budget. A uniform fleet carries no
+    # per-worker grants, so every worker gets `cfg_json` itself and nothing is rebuilt.
+    cfgs = _slot_engine_configs(env, workers, cfg_json, pg is not None)
     actors = [
         _FlightWorker.options(**opts[i]).remote(
             i,
             credits,
-            cfg_json,
+            cfgs[i],
             adaptive,
             token,
             idle_ms,

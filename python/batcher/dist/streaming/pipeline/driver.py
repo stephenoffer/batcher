@@ -29,6 +29,7 @@ import dataclasses
 import pyarrow as pa
 import ray
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import clamp
 from batcher.config import active_config
 from batcher.dist.executors.map import release_inference_pools
@@ -70,7 +71,7 @@ def stream_distributed_pipeline(
     from batcher.plan.visitor import scanned_source_ids
 
     _ensure_ray(workers)
-    stages = split_into_resource_stages(plan)
+    stages = split_into_resource_stages(plan, fold_leading_scan=fold_leading_scan(plan, workers))
     sid = next(iter(scanned_source_ids(plan)))
     partitions = partition_descriptors(sources[sid], producer_fanout(stages[0], workers))
     if not partitions:
@@ -130,6 +131,76 @@ def stream_distributed_pipeline(
         if out:
             batches.extend(out)
     return pa.Table.from_batches(batches) if batches else _empty(plan)
+
+
+def fold_leading_scan(plan: LogicalPlan, workers: int) -> bool:
+    """Whether a scan with no CPU map above it should run *inside* the accelerator stage.
+
+    Folding is right whenever the read has nowhere better to run: on a homogeneous fleet the
+    hop over Flight buys nothing and costs a serialization of the raw partition, which is what
+    `split_into_resource_stages` documents.
+
+    It is wrong on a heterogeneous one, and by a margin that is easy to miss because nothing
+    fails. Folded, the Parquet decode runs inside the GPU actor — on the accelerator node's own
+    cores, in the accelerator node's own memory, the two resources that stage needs to keep its
+    device fed — while every accelerator-free node in the cluster does nothing at all. Sampled
+    per node through an image-inference run on an 8-GPU / 9-CPU-node fleet: **CPU nodes 2.1%
+    busy, GPU nodes 24.6% CPU and 36.9% device**.
+
+    So: split the scan off exactly when the fleet has accelerator-free nodes with the cores to
+    host it (`cpu_only_can_host`, which is already `False` on a homogeneous or accelerator-less
+    cluster). Everywhere else this returns `True` and nothing changes.
+
+    Args:
+        plan: The pipeline being split, used only to see whether it asks for an accelerator.
+        workers: The worker count the run is sized for.
+
+    Returns:
+        `True` to fold the scan into the stage above it, `False` to give it its own stage.
+    """
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import walk
+
+    if not any(getattr(n, "num_gpus", 0.0) > 0 for n in walk(plan) if isinstance(n, MapBatches)):
+        return True  # no accelerator stage: there is no node class to keep the read off
+    if not _accelerator_stage(_stage_above_scan(plan)):
+        # The read's neighbour is a *host* stage, so folding already puts it on the CPU nodes
+        # -- and splitting it off buys nothing while costing a whole Flight hop for every row
+        # and a read pool sized like the device fleet. Measured on a
+        # `scan -> map(concurrency=64) -> map(num_gpus=1)` pipeline over 256 shards, which is
+        # the ordinary two-stage inference shape: split, the stages come out **[8, 64, 8]** --
+        # eight actors reading 256 shards and republishing to sixty-four that could have read
+        # them directly. The argument for splitting is about which *nodes* run the read, and it
+        # is answered here without the hop.
+        return True
+    try:
+        from batcher.dist.executors.ray_runtime.scaling import cpu_only_can_host
+
+        return not cpu_only_can_host(max(1, workers), active_config().execution.cpu_share_io)
+    except Exception as exc:  # pragma: no cover - a placement courtesy, never a failure
+        note_suppressed("dist", "read the fleet shape before splitting the leading scan", exc)
+        return True
+
+
+def _stage_above_scan(plan: LogicalPlan):
+    """The bottom-most `MapBatches` of a linear chain -- the stage a leading scan feeds."""
+    from batcher.plan.logical import MapBatches, Scan
+
+    node, lowest = plan, None
+    while isinstance(node, MapBatches):
+        lowest, node = node, node.input
+    return lowest if isinstance(node, Scan) else None
+
+
+def _accelerator_stage(node) -> bool:
+    """Whether `node` asks for a device -- a GPU, a named accelerator, or a custom resource."""
+    if node is None:
+        return True  # unknown shape: keep the conservative split
+    return bool(
+        getattr(node, "num_gpus", 0.0) > 0
+        or getattr(node, "accelerator_type", None)
+        or getattr(node, "resources", None)
+    )
 
 
 def producer_fanout(stage, workers: int) -> int:
@@ -198,7 +269,9 @@ def _build_pools(stages, bounds, credits: int):
     for k, stage in enumerate(stages):
         target_rows = consumer_batch_rows(stages[k + 1].sub_plan) if k < last else 0
         if k == 0:
-            spawns.append(_producer_factory(stage, credits, target_rows))
+            spawns.append(
+                _producer_factory(stage, credits, target_rows, _producer_cpu_width(bounds[0][1]))
+            )
             continue
         cls = _MapActor if k == last else RelayActor
         spawns.append(
@@ -286,13 +359,43 @@ def _shipping_options() -> dict:
     return {"runtime_env": env} if env else {}
 
 
-def _producer_factory(stage, credits: int, target_rows: int):
+def _producer_factory(stage, credits: int, target_rows: int, cpu_workers: int):
     def spawn():
         opts = _shipping_options()
         cls = ProducerActor.options(**opts) if opts else ProducerActor
-        return cls.remote(stage.sub_plan, credits, target_rows)
+        return cls.remote(stage.sub_plan, credits, target_rows, cpu_workers)
 
     return spawn
+
+
+def _producer_cpu_width(producers: int) -> int:
+    """Threads each stage-0 producer runs its sub-plan with: its share of the fleet's cores.
+
+    The producer pool is the host stage's whole parallelism, so between them its actors should
+    hold the cluster -- `cluster cores / pool size`, capped by the smallest alive node because
+    an actor's threads all run in one process on one node. That is `_agg_actor_width`, which a
+    CPU map/aggregate pool already sizes itself with, and the argument carries over unchanged.
+
+    It has to be said here because the producer had no such lever at all. Every other pool in
+    the engine sets one -- a device actor gets `_INFERENCE_CPU_WORKERS`, a CPU aggregate pool
+    gets `_agg_actor_width`, a stateless task gets its own CPU share -- and the streamed host
+    stage inherited none of them, so it decoded on one thread per actor. On a fleet with eight
+    times more cores than producers that is seven eighths of the machine left idle, and it is
+    the reason a staged image pipeline never cleared 17% cluster CPU.
+
+    **Whether it helps is a property of the user's function, not of the fleet**, and nothing
+    here can see which. Threads share an interpreter, so a stage that releases the GIL scales
+    and one that does not gets *slower* the wider it goes. Measured on this box, one stage over
+    eight batches, 1 thread against 2/4/8: a PIL JPEG decode went 1.93x / 3.58x / 4.12x, and a
+    NumPy `sort`/`tanh`/`sqrt` pipeline went 1.56x / 0.94x / **0.69x**. Both are ordinary
+    preprocess stages. The fleet share is the right default because these pipelines exist for
+    the decode/tokenize shape, which is the first row; a stage in the second row should be
+    given more *actors* and fewer threads (`concurrency`), which is the lever the user has and
+    this function deliberately does not override.
+    """
+    from batcher.dist.executors.map import _agg_actor_width
+
+    return _agg_actor_width(max(1, producers))
 
 
 def _actor_factory(

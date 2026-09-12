@@ -291,7 +291,9 @@ def _pool_key(node: LogicalPlan) -> object | None:
     return id(node)
 
 
-def split_into_resource_stages(plan: LogicalPlan) -> list[StageSpec] | None:
+def split_into_resource_stages(
+    plan: LogicalPlan, *, fold_leading_scan: bool = True
+) -> list[StageSpec] | None:
     """Split a linear `map_batches` pipeline at **every** resource-class boundary.
 
     This used to split *once*: the CPU prefix, then the first pool-class stage *and everything
@@ -304,13 +306,28 @@ def split_into_resource_stages(plan: LogicalPlan) -> list[StageSpec] | None:
     The grouping rule is that consecutive stateless-CPU maps form one stage — a Flight hop
     between two host transforms costs more than it saves — and every pool-class map (a GPU
     stage, an explicit `concurrency`, or a class UDF that loads a model once) is a stage of
-    its own. A leading scan with no CPU map before the first pool stage is folded *into* that
-    stage rather than becoming a hand-off of its own, for the same reason the single cut used
-    to decline that shape outright: streaming an unprocessed partition over Flight is not worth
-    the hop.
+    its own.
+
+    A leading scan with no CPU map before the first pool stage is folded *into* that stage by
+    default, because streaming an unprocessed partition over Flight is not worth the hop. That
+    argument is about **bytes** and it is right whenever the read has nowhere better to run.
+    On a heterogeneous fleet it is not the whole story: folding puts the scan inside the
+    accelerator actor, so the Parquet decode spends the GPU node's own cores and its own
+    memory — the two things that stage needs to feed its device — while every accelerator-free
+    node in the cluster sits idle. Measured on an 8-GPU / 9-CPU-node fleet running image
+    inference: the CPU nodes ran at **2.1% CPU** for the whole query and the GPU nodes' devices
+    at 37%.
+
+    `fold_leading_scan=False` gives the scan its own host stage instead, so the read runs where
+    there are cores to spare and the accelerator actor does nothing but the model. The caller
+    decides, because the answer depends on the live fleet and this function is a pure statement
+    about plan shape (`cpu_only_can_host` is the predicate `dist` uses).
 
     Args:
         plan: The linear `Scan → map → … → map` plan to split.
+        fold_leading_scan: Fold a scan-only leading group into the stage above it. `False`
+            keeps it as its own host stage — the right choice only when the fleet has
+            accelerator-free nodes for it to run on.
 
     Returns:
         The stages bottom-up, each reading its upstream's published output as source 0, or
@@ -344,9 +361,13 @@ def split_into_resource_stages(plan: LogicalPlan) -> list[StageSpec] | None:
         else:
             groups[-1].append(node)
         current_key = key
-    # A leading scan-only group is not a hand-off worth making — fold it into the stage above,
-    # which then reads the partition itself.
-    if len(groups) > 1 and not any(isinstance(n, MapBatches) for n in groups[0]):
+    # A leading scan-only group is not a hand-off worth making *when the read has nowhere
+    # better to run* — fold it into the stage above, which then reads the partition itself.
+    if (
+        fold_leading_scan
+        and len(groups) > 1
+        and not any(isinstance(n, MapBatches) for n in groups[0])
+    ):
         groups[1] = [*groups[0], *groups[1]]
         del groups[0]
     if len(groups) < 2:

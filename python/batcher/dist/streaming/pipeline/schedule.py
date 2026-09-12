@@ -32,11 +32,18 @@ sitting on the stage below.
 from __future__ import annotations
 
 import contextlib
-from collections import deque
+from collections import Counter, deque
 
 import ray
 
 from batcher.dist.streaming.consumers import take_consumer
+from batcher.dist.streaming.pipeline.recovery import (
+    _grow_stage,
+    _lose_producer,
+    _probe,
+    _probe_addrs,
+    _replace_actor,
+)
 
 __all__ = ["run_streamed"]
 
@@ -140,7 +147,16 @@ def run_streamed(
     spawn = list(spawn or [None] * len(pools))
 
     morsels = _Morsels()
-    free = [deque(pool) for pool in pools]
+    depth = _consumer_depth()
+    # Stage 0 takes whole partitions one at a time (its window is `credits`, and `open` binds
+    # it to exactly one); every stage above takes morsels `depth` at a time, so the free list
+    # holds *slots*, not actors. Filled actor-major so an idle pool round-robins -- every
+    # actor gets its first morsel before any gets its second, the same ordering
+    # `_emptiest_actor` enforces on the non-streamed pool and for the same reason: filling
+    # actor 0 to its depth before actor 1 receives anything leaves the tail of the pool idle
+    # whenever there are fewer morsels in flight than slots.
+    free = [deque(pool) for pool in pools[:1]]
+    free.extend(deque(a for _ in range(depth) for a in pool) for pool in pools[1:])
     hosts = [_probe(pool) if k else {} for k, pool in enumerate(pools)]
     ready: list[deque] = [deque() for _ in pools]  # ready[k]: morsels awaiting stage k
     outstanding: dict = {}  # actor -> published-but-unreleased morsels it holds
@@ -170,6 +186,7 @@ def run_streamed(
         part_attempts=part_attempts,
         max_attempts=max_attempts,
         credits=credits,
+        depth=depth,
         plan_id=plan_id,
         last=last,
         results=results,
@@ -193,14 +210,39 @@ def run_streamed(
         if not waitset:
             _assert_not_stalled(ctx)
             break
-        ref = ray.wait(waitset, num_returns=1)[0][0]
-        if ref in open_inflight:
-            _on_open(ctx, open_inflight, ref, loss_errors)
-        elif ref in publish_inflight:
-            _on_publish(ctx, publish_inflight, ref, loss_errors)
-        else:
-            _on_work(ctx, work_inflight, ref, loss_errors)
+        for ref in _completed(waitset):
+            if ref in open_inflight:
+                _on_open(ctx, open_inflight, ref, loss_errors)
+            elif ref in publish_inflight:
+                _on_publish(ctx, publish_inflight, ref, loss_errors)
+            else:
+                _on_work(ctx, work_inflight, ref, loss_errors)
     return results
+
+
+def _completed(waitset: list) -> list:
+    """Block for the first finished call, then take **every** other one already finished.
+
+    One event per pass was the loop's own throughput ceiling, and it is charged per morsel:
+    each pass re-runs the issue, dispatch and rescale steps and a `ray.wait` over every
+    outstanding call in the pipeline, so a run of 1,562 morsels through two stages pays that
+    round of bookkeeping ~3,100 times no matter how much finished at once. Everything the
+    driver does here is bookkeeping -- the actors are the only things doing work -- so the
+    right size for a pass is "all the news there is", not "one item of it".
+
+    The non-blocking ask comes **first**, and that ordering is the whole cost model. Every
+    `ray.wait` is an RPC to the raylet over the whole outstanding set, so a pass that blocks
+    for one and then asks for the rest pays two of them on every morsel of a busy pipeline.
+    Under load something has almost always finished already, so asking `timeout=0` for
+    everything answers the pass in one RPC and the blocking wait is reached only when the
+    driver genuinely has nothing to do -- which is the one moment its own overhead does not
+    matter.
+    """
+    done, _rest = ray.wait(waitset, num_returns=len(waitset), timeout=0)
+    if done:
+        return done
+    done, _rest = ray.wait(waitset, num_returns=1)
+    return done
 
 
 class _Context:
@@ -212,6 +254,7 @@ class _Context:
         "ceilings",
         "credits",
         "dead",
+        "depth",
         "floors",
         "free",
         "hosts",
@@ -234,18 +277,44 @@ class _Context:
             setattr(self, name, value)
 
 
-def _probe(pool) -> dict:
-    from batcher.dist.streaming.consumers import probe_consumer_hosts
+def _consumer_depth() -> int:
+    """Morsels a stage-`k>0` actor may have in flight at once -- its submit-ahead depth.
 
-    return probe_consumer_hosts(pool)
+    Without it a consumer fetched a morsel over Flight, ran it, returned to the driver, and
+    only then learned about the next one, so a device idled through every fetch and every
+    Arrow assembly. The non-streamed actor pool has had `distributed.map_inflight_depth` for
+    exactly this since it was written; the streamed path, which exists *specifically* to keep
+    a device fed, had no equivalent. Same knob, same envelope adaptation (measured GPU
+    utilization raises it), so the two paths cannot drift.
+
+    Depth 1 restores the historical one-at-a-time behaviour exactly, including the autoscaler
+    signal -- see `_stage_backlog`.
+    """
+    from batcher.dist.executors.map import _actor_inflight_depth
+
+    return _actor_inflight_depth()
 
 
-def _probe_addrs(pool) -> dict:
-    """Each actor's Flight address, fetched once at pool construction rather than per morsel."""
-    try:
-        return dict(zip(pool, ray.get([a.addr.remote() for a in pool]), strict=True))
-    except AttributeError:
-        return {}  # a terminal consumer runs no server of its own and publishes nothing
+def _stage_backlog(ctx: _Context, k: int, depth: int) -> int:
+    """Morsels stage `k` has not started: the driver's queue plus what is queued *on* actors.
+
+    The second term is what makes this depth-safe, and leaving it out is why submit-ahead was
+    landed and reverted once already. The autoscaler grows a stage while it is behind, and
+    read "behind" as `len(ready[k])` -- morsels the driver could not place. At depth 2 there
+    are twice as many slots to place them in, so the queue drained, the stage read as keeping
+    up, and it never grew past its floor: measured on eight T4s, **four of them sat idle at
+    36% while the depth-1 run used all eight at 59%**.
+
+    A morsel sitting in an actor's second slot is not *being worked on*, it is waiting behind
+    the call that is -- backlog held by the actor instead of by the driver. Counting it says
+    so. At depth 1 no actor can hold a second morsel, so this is `len(ready[k])` exactly and
+    nothing about a depth-1 run changes.
+    """
+    if depth <= 1:
+        return len(ctx.ready[k])
+    idle_slots = Counter(ctx.free[k])
+    queued = sum(max(0, depth - idle_slots.get(a, 0) - 1) for a in ctx.pools[k])
+    return len(ctx.ready[k]) + queued
 
 
 # --- issuing work ----------------------------------------------------------------------
@@ -261,6 +330,7 @@ def _start_partitions(ctx: _Context, open_inflight: dict) -> None:
             "desc": desc,
             "seq": 0,
             "outstanding": 0,
+            "inflight": 0,
             "done": False,
             "open": False,
         }
@@ -268,15 +338,42 @@ def _start_partitions(ctx: _Context, open_inflight: dict) -> None:
 
 
 def _issue_publishes(ctx: _Context, publish_inflight: dict) -> None:
-    """Ask each opened producer with window headroom for its next morsel (one at a time)."""
+    """Fill each opened producer's window with `publish_next` calls, up to `credits`.
+
+    **Queued, not one at a time.** A producer used to be asked for morsel *k+1* only after
+    the driver had observed *k* return, so the actor sat idle across a full round of this
+    loop -- a `ray.wait` over every stage's inflight set, then the handler, then the next
+    issue -- between one morsel's work and the next. On a decode stage that gap is paid
+    3,125 times over a 400,000-image run, and it is why the staged form measured 2.1x slower
+    than the fused one at *both* intermediate widths: the cost was per morsel, not per byte.
+    Queueing the whole window instead lets the actor start *k+1* the instant *k* finishes,
+    which is what the credit window was always meant to buy.
+
+    The window is unchanged in size, only in what fills it: a morsel that has been asked for
+    is as resident as one that has been published, so an issued-but-unreturned call counts
+    against `credits` exactly as a published-but-unreleased morsel does. Without that the
+    producer would hold `credits` published morsels *plus* `credits` queued calls' worth of
+    output, doubling the bound this window exists to enforce.
+
+    Queued **`depth` deep, not `credits` deep**, and the difference is the driver's own cost
+    rather than the producer's. Hiding the round-trip needs one call waiting behind the
+    running one; past that, each extra queued call is another `ObjectRef` in the set this loop
+    calls `ray.wait` on every pass. At `credits` (16) over 64 producers that set is a thousand
+    refs, scanned per pass through a raylet RPC, and the scan costs more than the idling it
+    removes. `depth` is the same submit-ahead the consumer stages take, for the same reason.
+    """
     from batcher.carbonite.transfer import ShuffleTicket
 
-    publishing = {p for p, _pidx, _seq, _t in publish_inflight.values()}
     for prod, st in ctx.state.items():
-        has_headroom = st["open"] and not st["done"] and st["outstanding"] < ctx.credits
-        if has_headroom and prod not in publishing:
+        while (
+            st["open"]
+            and not st["done"]
+            and st["inflight"] < ctx.depth
+            and st["outstanding"] + st["inflight"] < ctx.credits
+        ):
             seq = st["seq"]
             st["seq"] += 1
+            st["inflight"] += 1
             ticket = ShuffleTicket(ctx.plan_id, 0, st["pidx"], seq)
             publish_inflight[prod.publish_next.remote(ticket)] = (prod, st["pidx"], seq, ticket)
 
@@ -337,36 +434,18 @@ def _rescale_stages(ctx: _Context) -> None:
     for k in range(1, len(ctx.pools)):
         if ctx.spawn[k] is None or ctx.ceilings[k] <= ctx.floors[k]:
             continue  # a fixed-size stage: nothing was asked for and nothing is done
+        idle_slots = Counter(ctx.free[k])
         action = _autoscale_action(
-            len(ctx.ready[k]),
+            _stage_backlog(ctx, k, ctx.depth),
             len(ctx.pools[k]),
-            len(ctx.free[k]),
+            # Reapable only when *fully* idle -- every slot free -- matching
+            # `_drive_actor_pool`. An actor with one call running and one slot open is busy.
+            sum(1 for a in ctx.pools[k] if idle_slots.get(a, 0) >= ctx.depth),
             ctx.floors[k],
             ctx.ceilings[k],
         )
         if action == "up":
             _grow_stage(ctx, k)
-
-
-def _grow_stage(ctx: _Context, k: int) -> None:
-    """Add one actor to stage `k`, registered exactly as a replacement actor is.
-
-    Best-effort: a cluster with no room refuses the actor, and a stage that cannot grow must
-    keep running at the size it has rather than fail the query over an optimization.
-    """
-    try:
-        fresh = ctx.spawn[k]()
-    except Exception as exc:  # pragma: no cover - depends on live cluster capacity
-        from batcher._internal.logging import note_suppressed
-
-        note_suppressed("dist", "grow a streaming stage pool", exc)
-        return
-    if ctx.alive is not None:
-        ctx.alive.add(fresh)
-    ctx.pools[k].append(fresh)
-    ctx.free[k].append(fresh)
-    ctx.hosts[k].update(_probe([fresh]))
-    ctx.addr_of.update(_probe_addrs([fresh]))
 
 
 def _take(ctx: _Context, k: int, addr: str):
@@ -411,10 +490,10 @@ def _on_publish(ctx: _Context, publish_inflight: dict, ref, loss_errors) -> None
     st = ctx.state.get(prod)
     if st is None:
         return  # the producer was lost between issuing this publish and its completion
+    st["inflight"] -= 1
     if not more:
         st["done"] = True
-        if st["outstanding"] == 0:
-            _recycle(ctx, prod)
+        _maybe_recycle(ctx, prod, st)
         return
     st["outstanding"] += 1
     path = (pidx, seq)
@@ -483,8 +562,7 @@ def _settle(ctx: _Context, path: tuple) -> None:
             st = ctx.state.get(holder)
             if st is not None:
                 st["outstanding"] -= 1
-                if st["done"] and st["outstanding"] == 0:
-                    _recycle(ctx, holder)
+                _maybe_recycle(ctx, holder, st)
             return
         ctx.outstanding[holder] = max(0, ctx.outstanding.get(holder, 0) - 1)
         parent_record = ctx.morsels.get(parent)
@@ -496,105 +574,25 @@ def _settle(ctx: _Context, path: tuple) -> None:
         path = parent  # the parent's subtree is done too: settle it in the same loop
 
 
+def _maybe_recycle(ctx: _Context, prod, st: dict) -> None:
+    """Move `prod` on to the next partition once it is drained **and** quiet.
+
+    Drained is `done` with no published morsel still in use above. Quiet is the half the
+    queued issue loop adds: a `publish_next` still sitting on the actor's queue will return
+    after this, and `_recycle` replaces the producer's state with the next partition's -- so
+    a straggler would file its morsel under the wrong `pidx`, against sequence numbers the
+    new partition is about to reuse. The window empties on its own, since every queued call
+    past the end of a partition returns `False`.
+    """
+    if st["done"] and st["outstanding"] == 0 and st["inflight"] == 0:
+        _recycle(ctx, prod)
+
+
 def _recycle(ctx: _Context, prod) -> None:
     """A producer whose partition is fully drained takes the next one, or goes idle."""
     ctx.state.pop(prod, None)
     if prod not in ctx.dead:
         ctx.free[0].append(prod)
-
-
-def _replace_actor(ctx: _Context, dead_actor, k: int) -> None:
-    """Drop a lost stage-`k` actor, void what it was holding, and spawn a replacement.
-
-    Voiding is the part that matters. A relay's published morsels live on *its* Flight server,
-    so losing the actor loses them — and every morsel derived from them further up. Each one's
-    parent is still held on the stage below (that is why a morsel is held until its subtree
-    finishes), so the repair is to re-queue those parents and let the deterministic replay
-    reproduce the same paths.
-    """
-    if dead_actor in ctx.dead:
-        return
-    ctx.dead.add(dead_actor)
-    with contextlib.suppress(ValueError):
-        ctx.free[k].remove(dead_actor)
-    with contextlib.suppress(ValueError):
-        ctx.pools[k].remove(dead_actor)
-    ctx.outstanding.pop(dead_actor, None)
-    if k < ctx.last:
-        _void_published_by(ctx, dead_actor, k)
-    factory = ctx.spawn[k]
-    if factory is None:
-        return
-    fresh = factory()
-    if ctx.alive is not None:
-        ctx.alive.add(fresh)
-    ctx.pools[k].append(fresh)
-    ctx.free[k].append(fresh)
-    ctx.hosts[k].update(_probe([fresh]))
-    ctx.addr_of.update(_probe_addrs([fresh]))
-
-
-def _void_published_by(ctx: _Context, dead_actor, k: int) -> None:
-    """Forget every morsel a lost relay published and re-queue the parents that produced them."""
-    replay: dict[tuple, tuple] = {}
-    for path in ctx.morsels.paths_held_by(dead_actor):
-        record = ctx.morsels.pop(path)
-        parent = record["parent"]
-        if parent is not None and parent in ctx.morsels:
-            replay[parent] = ()
-    for entry in [e for e in ctx.ready[k + 1] if e[2] is dead_actor]:
-        ctx.ready[k + 1].remove(entry)
-    for parent in replay:
-        record = ctx.morsels.get(parent)
-        if record is None:
-            continue
-        record["pending"] = None
-        holder = record["holder"]
-        ctx.ready[k].append((ctx.addr_of.get(holder), record["ticket"], holder, parent, 0))
-
-
-def _lose_producer(ctx: _Context, dead_producer, *, exc) -> None:
-    """Re-queue a lost producer's whole partition, and forget everything derived from it.
-
-    A producer holds its partition's open iterator, so there is no finer unit to replay than
-    the partition. Every path descended from it starts with the partition index, so the replay
-    regenerates exactly the paths being dropped here and `results` overwrites idempotently.
-    """
-    if dead_producer in ctx.dead:
-        return
-    ctx.dead.add(dead_producer)
-    with contextlib.suppress(ValueError):
-        ctx.free[0].remove(dead_producer)
-    with contextlib.suppress(ValueError):
-        ctx.pools[0].remove(dead_producer)
-    st = ctx.state.pop(dead_producer, None)
-    if st is not None:
-        pidx = st["pidx"]
-        _void_partition(ctx, pidx)
-        ctx.part_attempts[pidx] = ctx.part_attempts.get(pidx, 0) + 1
-        if ctx.part_attempts[pidx] > ctx.max_attempts:
-            raise exc  # a partition that keeps killing its producer is not recoverable
-        ctx.pending_parts.append((pidx, st["desc"]))
-    factory = ctx.spawn[0]
-    if factory is None:
-        return
-    fresh = factory()
-    if ctx.alive is not None:
-        ctx.alive.add(fresh)
-    ctx.pools[0].append(fresh)
-    ctx.free[0].append(fresh)
-
-
-def _void_partition(ctx: _Context, pidx: int) -> None:
-    """Drop every morsel descended from partition `pidx`, wherever it is waiting."""
-    for path in ctx.morsels.paths_under_partition(pidx):
-        record = ctx.morsels.pop(path)
-        holder = record["holder"]
-        if record["parent"] is not None:
-            ctx.outstanding[holder] = max(0, ctx.outstanding.get(holder, 0) - 1)
-    for k in range(1, len(ctx.pools)):
-        for entry in [e for e in ctx.ready[k] if e[3] and e[3][0] == pidx]:
-            ctx.ready[k].remove(entry)
 
 
 def _assert_not_stalled(ctx: _Context) -> None:

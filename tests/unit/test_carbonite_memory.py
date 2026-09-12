@@ -133,7 +133,40 @@ def test_unsized_plan_does_not_spill_on_a_guess(monkeypatch):
         # No Kyber estimate (m_max_bytes == 0) and no measured pressure → don't spill
         # on a guess. The estimate alone can never *prevent* a spill, only add one.
         monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.NORMAL)
+        # And no OOM history, which is the third signal and the one this test forgot. It reads
+        # the **live** cgroup (`memory.events`' `oom_kill`), so on any box that has ever been
+        # OOM-killed -- by a neighbour, by a previous run, by a benchmark -- the advisor
+        # correctly spills an un-sized plan and this assertion goes red for reasons that have
+        # nothing to do with the code under test. Observed here after a stress run left
+        # `oom_kill 2` in the container's counter: two tests in this suite flipped, at HEAD,
+        # for every session on the box, until the container was replaced.
+        monkeypatch.setattr(
+            "batcher.carbonite.memory.kernel.kernel_memory_state",
+            lambda: SimpleNamespace(was_oom_killed=False, oom_kills=0),
+        )
         assert rm.should_spill(_plan_with_peak(0)) is False
+
+
+def test_an_unsized_plan_does_spill_where_the_container_has_been_oom_killed(monkeypatch):
+    """The positive control for the stub above, and the behaviour that stub hides.
+
+    Pinning `was_oom_killed=False` in the test beside this one is only honest if something
+    proves the `True` arm still fires -- otherwise the two tests together say "the OOM signal
+    is ignored", which is the opposite of what the advisor does and of what saved this
+    container from repeating a kill. A worker that was OOM-killed, restarted, and handed the
+    same un-sized plan otherwise walks straight back into the kill, and because the kill is a
+    kernel signal rather than an exception each iteration looks like a fresh cold start.
+    """
+    cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1))
+    with config_context(cfg):
+        rm = ResourceManager()
+        monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.NORMAL)
+        monkeypatch.setattr(
+            "batcher.carbonite.memory.kernel.kernel_memory_state",
+            lambda: SimpleNamespace(was_oom_killed=True, oom_kills=2),
+        )
+        assert rm.should_spill(_plan_with_peak(0)) is True
+        assert "OOM-killed 2 time(s)" in rm.spill_reason(_plan_with_peak(0))
 
 
 def test_unsized_plan_spills_when_memory_pressure_is_measured(monkeypatch):

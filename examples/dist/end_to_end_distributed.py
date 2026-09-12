@@ -76,6 +76,13 @@ def main() -> None:
 
     print("names, types, rows, integers exact; floats agree to the last bits")
 
+    # Batcher keeps the shuffle fleet's actors warm so the *next* query skips the spawn, and
+    # releases them on a timer once they go unused. That warm fleet is a placement-group
+    # reservation of nearly every core, so a script that is finished with Batcher but whose
+    # process keeps running should hand the cluster back rather than let another engine wait
+    # out the timer. It is a no-op when nothing is warm, so it is safe here either way.
+    bt.release_cluster()
+
 
 if __name__ == "__main__":
     main()

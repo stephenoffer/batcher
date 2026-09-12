@@ -31,9 +31,12 @@ from batcher._internal.logging import get_logger, note_suppressed
 __all__ = [
     "Demand",
     "describe_pending_demand",
+    "fleet_task_headroom",
+    "fleet_worker_cpus",
     "free_cpus_by_node",
     "placeable_workers",
     "preferred_fleet_zone",
+    "slot_actor_options",
     "warn_once_if_allocation_is_wider_than_ray",
     "workers_per_node",
 ]
@@ -471,3 +474,122 @@ def warn_once_if_allocation_is_wider_than_ray() -> None:
         ray_nodes,
         "RAY_ADDRESS",
     )
+
+
+#: Fraction of a fleet worker's grant left unclaimed inside its placement-group bundle.
+#:
+#: A fleet bundle reserves a whole node's cores, and the fleet spans every node, so a fleet
+#: holds **100% of the cluster's schedulable CPU**. Anything the same query then runs as
+#: plain Ray tasks is submitted outside that reservation and can never be placed: measured on
+#: a 4x96 cluster as `{'CPU': 0.125}: 1+ pending` against `384.0/384.0`, forever, from a
+#: three-table join whose final stage scans the intermediate the fleet is holding.
+#:
+#: `yield_session_fleet` answers that by handing the fleet back — but it cannot when an
+#: intermediate is *published* on the actors, which is exactly the staged-query case. So the
+#: bundle keeps a sliver the actor does not claim, and a stage that cannot be placed anywhere
+#: else runs there (`fleet_task_options`), co-located with the buckets it is fetching.
+#:
+#: **This is the second half of `dist.executor._headroom_grant`, not a duplicate of it.** That
+#: one thins the *auto* fan-out's grant so each node keeps a core free **outside** the group,
+#: and it is the right answer where it applies. It cannot apply here: an explicit
+#: `num_workers=N` skips `_cluster_fill_workers` entirely and sizes the grant from
+#: `_even_cpu_share`, which tiles the node exactly — the bundles in the reproduction above read
+#: `{'CPU': 96.0}` on 96-core nodes, so the thinning never ran. Every benchmark and integration
+#: test in this repo pins `num_workers`, so that is not a corner. Reserving inside the bundle
+#: instead is reachable from every path and puts the tasks on the data's own nodes.
+#:
+#: An eighth, capped at one core: 1.0 of 96 is a percent of the fleet's nominal grant and
+#: buys a hard bound on a hang. It costs the actor nothing measurable — Ray's CPU figure is a
+#: *reservation*, and the worker's real width comes from the `EngineConfig` it is granted,
+#: not from this number.
+_FLEET_TASK_HEADROOM_MAX = 1.0
+_FLEET_TASK_HEADROOM_SHARE = 8.0
+
+
+def fleet_task_headroom(num_cpus: float) -> float:
+    """CPU left unclaimed in each fleet bundle so the query's own task stages can run.
+
+    Zero for a one-core grant, where there is nothing to spare and the fleet is small enough
+    that it does not hold the cluster anyway.
+
+    Args:
+        num_cpus: The per-worker CPU grant the bundle reserves.
+
+    Returns:
+        The CPU to leave unclaimed, never enough to take the actor below one core.
+    """
+    if num_cpus <= 1.0:
+        return 0.0
+    return min(_FLEET_TASK_HEADROOM_MAX, num_cpus / _FLEET_TASK_HEADROOM_SHARE)
+
+
+def slot_actor_options(base: dict, env, index: int, in_group: bool) -> dict:
+    """`base`, with worker `index`'s own CPU grant when the fleet's nodes are unequal.
+
+    The fleet-uniform options are still resolved once — the node-class selector reads the live
+    topology, and it is the same answer for every worker. Only the grant varies, and only on a
+    fleet that has per-worker grants to vary it by, so a homogeneous fleet returns `base`
+    itself and allocates nothing.
+
+    The in-bundle headroom is re-applied per slot rather than carried over from the uniform
+    figure: it is a fraction of the grant (`fleet_task_headroom`), so a 24-core worker and a
+    4-core one leave different slivers, and taking the small one's would let the fat actor
+    claim its whole bundle.
+
+    **With no placement group the per-worker grant is dropped entirely**, and that is the
+    point of `in_group` rather than a detail of it. A per-node grant describes the machine its
+    bundle pins it to; with no bundle there is no such machine, and the figure becomes a bare
+    demand for 24 cores that Ray's default scheduler has to satisfy somewhere. Measured on the
+    27-node fleet: when the group timed out, every one of the sixteen large actors stayed
+    `PENDING_CREATION` and the fleet came up at half width after a two-minute wait, while the
+    uniform fleet the same fallback produces — small, interchangeable actors — placed
+    immediately. Degrading to the uniform grant is what the fleet had before this existed, and
+    it is the only figure that is still true once the pinning is gone.
+
+    Args:
+        base: The fleet-uniform actor options.
+        env: The active `SchedulingEnvelope`, or `None`.
+        index: The worker's position in the fleet.
+        in_group: Whether the fleet holds a placement group. `False` drops the per-worker
+            grant, because nothing then pins the worker to the node it was sized for.
+
+    Returns:
+        `base` unchanged for a uniform fleet or a group-less one, else a copy carrying this
+        worker's grant.
+    """
+    if env is None or not env.worker_cpus or not in_group:
+        return base
+    grant = env.slot_cpus(index)
+    return {**base, "num_cpus": max(1.0, grant - fleet_task_headroom(grant))}
+
+
+def fleet_worker_cpus(workers: int) -> list[float] | None:
+    """Per-worker core grants for the fleet about to be given `workers` groups of work.
+
+    The assignment side of `plan.resource.fleet_plan`. A split assignment that balances by row
+    count alone is right only when every worker computes at the same rate; on a fleet of
+    unequal machines it paces the whole stage by the smallest one, because the 4-core worker
+    and the 24-core worker are handed the same number of rows.
+
+    Returns `None` — "weigh every worker equally", which is what every caller did before this
+    existed — for a uniform fleet, for no ambient envelope, and whenever the group count does
+    not match the fleet's width. That last case is the over-partitioned read (`max_partitions`),
+    where groups are dealt to workers dynamically rather than one apiece, so a positional
+    capacity list would be attributing a grant to the wrong worker.
+
+    Args:
+        workers: How many groups the assignment will produce.
+
+    Returns:
+        One core grant per worker, or `None` to weigh them equally.
+    """
+    from batcher.dist.executors.ray_runtime.scheduling import current_envelope
+
+    try:
+        env = current_envelope()
+    except Exception as exc:  # pragma: no cover - a sizing hint never fails an assignment
+        note_suppressed("dist", "read the fleet's per-worker grants", exc)
+        return None
+    if env is None or len(env.worker_cpus) != workers:
+        return None
+    return list(env.worker_cpus)

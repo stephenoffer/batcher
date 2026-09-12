@@ -189,6 +189,35 @@ These are real, and none of the competitors have all of them:
    Ray; bulk Arrow moves over Flight with **credit-based flow control** whose bound is *proven* by
    an in-flight gauge (`crates/bc-transport/src/store.rs:16-62`). This is the single biggest reason
    Batcher beats Ray Data 50–450× — Ray Data's object-store spill storms are structural.
+   **That margin is a claim about shuffles, and it does not extend to a pipeline that has none.**
+   A `map_batches(GPU model) → aggregate` over 95.4 GiB of Parquet moves no bulk data between
+   workers at all, and there Ray Data is **ahead**: 142.1 s against 175.3 s on 8 T4s, agreeing to
+   a 1.2e-12 checksum spread, because both engines read at an identical 162.2 s and Ray Data
+   overlaps that read with the device while this route adds them
+   (`benchmarks/BENCHMARK_RESULTS.md`, 2026-09-10). The transport advantage is real where bytes
+   cross the network and is worth nothing where they do not.
+
+   Re-measured on a corpus built so that storage cannot decide the answer
+   (`benchmarks/gpu_backend/compute_bound_inference.py`, 2026-09-11), the shuffle-free
+   inference shape is a **crossover**, not a loss:
+
+   | rows | Batcher | Ray Data | ratio |
+   |---:|---:|---:|---:|
+   | 125,000 | 1.2 s | 10.5 s | **8.6x** |
+   | 500,000 | 4.0 s | 10.2 s | **2.5x** |
+   | 2,000,000 | 14.9 s | 14.4 s | 0.96x |
+   | 4,000,000 | 29.8 s | 22.6 s | 0.76x |
+
+   Two facts set it, and both are worth quoting rather than the ratio. Ray Data costs about
+   **ten seconds before it does anything** -- 10.5 s for 125,000 rows and 10.2 s for 500,000 --
+   which is where the 8.6x comes from; Batcher's warm pools make that job 1.2 s. And Batcher
+   stops scaling at about **134,000 row/s** with the devices at 48%, because a fused
+   `map(cpu) -> map(gpu)` runs the CPU stage inside the actors holding the GPUs, on the
+   accelerator nodes' cores, in *threads*. Ray Data's concurrency is processes, so it keeps
+   climbing to 176,617 row/s against a device floor near 182,000. **Do not claim a factor on
+   this shape without naming the row count**, and do not claim one at the saturated end at all:
+   both engines call the same kernels on the same devices, and the engine at the floor cannot
+   be beaten by more than the other's distance from it.
 3. **A learned cross-query loop nobody else has.** Sketch-backed cardinality (HLL/KLL wired end to
    end), cost coefficients *calibrated from measured `op_stats`*, a UCB1 bandit over join
    strategies, learned partition counts and hot keys (`kyber/learning.py`, `learned_tuning/`,
@@ -209,6 +238,43 @@ These are real, and none of the competitors have all of them:
    finished query held 960 of this cluster's 1,024 CPUs for the life of the driver
    (`dist/executors/map.py::_arm_agg_idle_release`). GPU/model pools keep their residency,
    where reloading costs minutes.
+
+## The full-lineup sweep (2026-09-11)
+
+Every standard suite against every engine that can run it, one sweep, pairwise lineups on a
+quiet 48-core box. Published whole in {doc}`/benchmarks/results/engine-matrix`; the short version
+is that Batcher leads every cell carrying a number except H2O `groupby` against DuckDB
+(1.01), and that three of the six competitors cannot run parts of the board at all.
+
+Four things the sweep establishes that a per-engine page hides:
+
+* **Ray Data now carries numbers**, because the pipelines were written for it
+  (`suites/h2o/groupby_ray`, `suites/h2o/join_ray`, `suites/semistructured/json_ray`, and
+  the scan shapes). On H2O `groupby` it is **0.00** (Batcher 9.5-283 ms against 5.4-221 s)
+  and on H2O `join` **0.01**. On the suites it has no pipeline for it does not
+  finish, and two different things are being recorded there: operators *fails* at 3 of 23
+  with `HashShuffleAggregator.finalize failed`, while scan is merely *slow* -- 26 of 27 cases
+  before a 2,700 s cap, against 2 under the 420 s cap of the first sweep, so that first
+  figure measured the cap rather than the engine. A `DNF` is recorded as a `DNF` rather than
+  converted to a ratio.
+* **Polars cannot run TPC-DS at all** through its SQL surface:
+  `multiple tables in FROM clause are not currently supported`. Zero of 99. Its DataFrame
+  API is unaffected and TPC-H is measured through it.
+* **Daft and TPC-DS sf1 do not fit together** on a 92 GiB box: OOM-killed at 71.1 GB
+  resident, reproduced twice.
+* **Two competitors returned wrong answers**, both caught only because a third engine was in
+  the lineup: Daft on four aggregates over large integers (a *negative* mean of non-negative
+  identifiers), Spark on a timezone and a row count. Batcher matched DuckDB on all six. This
+  is the argument for three-engine lineups even though pairwise is cheaper.
+
+The one loss is characterized rather than left as a number: Batcher wins the H2O `groupby`
+questions whose cost is group-by *state* (0.58-0.87 at 100,000 groups) and loses the ones
+whose cost is a single pass over few groups (1.34-1.79 at 100). It is not control-plane
+overhead (the native call is 8.25 of q4's 9.76 ms) and not the `int32` boundary widening
+(9.75 ms against 9.71 given `int64` input). A third candidate -- that the parallel aggregate
+concatenates each worker's share before hashing it -- is also **refuted**: that path is
+guarded by `width_from_sample`, which offers it only when a morsel fails to reduce, and a
+100-group aggregate reduces 164:1 per morsel, so it never runs. The cause is open.
 
 ## The scorecard
 
@@ -749,13 +815,44 @@ is no longer unbounded.
 
 ### 6. Task granularity — the shuffle map side is finer than a node; the rest is not
 
-**Closed for the Flight shuffles.** The map stage cuts its input into `workers x
-map_partition_multiplier` partitions (default 4x, `dist/executors/ray_runtime/reducers.py::map_partitions`)
-rather than one per worker, and `map_barrier` hands them out as actors go idle, keeping exactly
-`workers` in flight. So a slow worker takes fewer partitions instead of holding the barrier open
-on the one oversized partition it was statically dealt, and a dead worker's outstanding
-partitions are re-dealt across every survivor rather than replayed whole onto one. It is a
-ceiling, not a target: a source that cannot yield that many splits produces fewer partitions
+**Closed for the Flight shuffles when it was written, and cancelled since.** The map stage cuts
+its input into `workers x map_partition_multiplier` partitions (default 4x,
+`dist/executors/ray_runtime/reducers.py::map_partitions`) rather than one per worker, and
+`map_barrier` hands them out as actors go idle. That gave every actor a four-deep queue behind
+it, because the barrier then kept exactly `workers` in flight — so a slow worker took fewer
+partitions instead of holding the barrier open on the one oversized partition it was statically
+dealt, and a dead worker's outstanding partitions were re-dealt across every survivor rather
+than replayed whole onto one.
+
+**It no longer does, and the reason is that two correct changes multiplied.**
+`map_slots_per_worker()` (2026-09-03) widened the in-flight window from `workers` to
+`workers x FLEET_CONCURRENCY` so a map task's read could overlap its fold — and
+`FLEET_CONCURRENCY` is 4, the same factor `map_partition_multiplier` already was. The window now
+*equals* the partition count, so every partition is dealt in the initial fill and the go-idle
+path never runs: each worker takes exactly its share and the stage waits on the slowest. Checked
+by construction on a 100-worker fleet — 400 partitions, a 400-deep pool, four per worker,
+nothing left to re-deal. `_idle_pool`'s docstring describes this failure and its 2026-09-07 fix
+does not reach it, because that fix weights the *initial* deal by core count and returns early
+on a uniform fleet. Recovery is unaffected: a lost partition is still re-dealt, because that
+path runs on completion rather than out of the initial fill.
+
+**So since 2026-09-08 a uniform fleet no longer pays for it** — `map_partitions` spends the
+multiplier only where the workers hold different core grants, which is the fleet whose initial
+deal `_idle_pool` weights. "Uniform" is the two shapes that deal evenly: an envelope with no
+per-worker grants, and one whose grants are all the same. No ambient envelope at all is neither,
+and keeps the multiplier. The cost it was paying is not small and does not live in the map
+stage at all. Measured on 100 x 4-core nodes at TPC-H sf100, forward and reversed: a 20 M-group
+`GROUP BY` ran **3,192 ms at 400 map partitions and 2,093 ms at 100**, and a five-aggregate one
+**5,674 ms against 3,236**, monotone across mp1/mp2/mp4/mp8 in both orders. The map barrier
+itself is unchanged (443 ms against 428), and the reduce tree is not the cause either — holding
+its task count fixed while varying `fold_width` showed fw20, today's default, already optimal
+and fw8 *slower*. What scales with the multiplier is how many distinct sources each reducer
+fetches from, `mappers x reducers`: 40,000 against 10,000, the same O(nodes²) product
+`max_shuffle_partitions` bounds on the reduce side. What a uniform fleet gives up is recovery
+*spread* rather than recovery — a lost worker's share is `1/workers` either way, but one
+survivor replays it instead of four.
+
+Everything below still holds. It is a ceiling, not a target: a source that cannot yield that many splits produces fewer partitions
 instead of empty tasks, and an in-memory source stays at one per worker (cutting driver-resident
 batches finer buys no recovery). Wired through aggregate, join, sort and window; the join pads
 the shorter side's partition list because both sides map through one barrier under one source id.
@@ -1260,6 +1357,57 @@ from top-N, **every shape Batcher loses is a small result, and every one of them
 floor.** There is no scattered set of slow operators to go and optimize. There is one
 cost, it is the learning loop and the optimizer's own statistics, and section 9 already says
 where it lives.
+
+
+### 11. The scan does not pipeline into the executor, and that is the whole sf10 gap (measured 2026-09-08)
+
+Sections 8, 9 and 10 all locate Batcher's single-node losses in a *fixed cost* -- the optimizer,
+the learning loop, a floor that shows up when the result is small. This one is different in kind
+and it dominates at scale: it grows with the data, and it is not an operator.
+
+TPC-H sf10 `lineitem`, 59,986,052 rows, one column summed, warm, on a box with a 15-core cgroup
+quota. Three readers over identical files, in one process, `cpu/wall` being the mean number of
+cores occupied:
+
+| | wall | total CPU | cores occupied |
+|---|---:|---:|---:|
+| Batcher | 249.7 ms | 1,280 ms | **5.13x** |
+| pyarrow `read_table` | 129.6 ms | 1,120 ms | 8.64x |
+| DuckDB `read_parquet` | 63.1 ms | 860 ms | **13.62x** |
+
+Batcher does 1.49x DuckDB's *work* in 3.96x the *wall clock*. The decoder is not the problem,
+and neither is the engine: `bc_io::read_parquet_many` alone returns all 60M rows in **65-86 ms
+at ~12 cores**, which is DuckDB's time for the entire query, and Batcher's 15M-group aggregate
+over the same table beats DuckDB outright (817 ms against 1,063 ms).
+
+Instrumenting a live warm query attributes all of it: `ParquetSource.read` 132.7 ms,
+`engine.execute_plan_metered` 88.7 ms, everything else 24 ms, total 245.6 ms. **They sum to the
+wall clock because they are strictly serial.** `bc_py::execute_plan_metered` takes
+`sources: Vec<Vec<PyArrowType<RecordBatch>>>` -- every batch of every source, by value, at call
+time -- so Python must finish reading before the engine may begin. The batches cross zero-copy;
+what the signature costs is not a copy, it is a barrier. DuckDB decodes and aggregates in one
+pipeline, so its wall clock is roughly `max(read, aggregate)` at 13.62 cores where Batcher's is
+`read + aggregate` at 5.13.
+
+Two consequences worth stating precisely, because both are easy to overstate:
+
+- **This is a ceiling, not a slow path to tune.** Perfect overlap of the measured parts gives
+  `max(133, 89) + 24` = 157 ms, and on a quiet box roughly DuckDB's own number. It would put
+  Batcher at parity on a scan-dominated shape and *ahead* wherever the aggregate is the work.
+  That is arithmetic on measured parts, not a measurement of a fix that exists.
+- **The obvious implementation is blocked by the crate DAG.** Letting the scan read inside the
+  executor needs `bc-interp` to reach `bc-io`, and it does not depend on it -- the reader is a
+  near-leaf beside the interpreter, first assembled in `bc-py`. Adding the edge is legal and
+  would put Parquet, `object_store` and tokio into every build of the correctness oracle. The
+  alternative is a `BatchSource` trait defined in `bc-interp` and implemented in `bc-py` over
+  `bc-io`, which adds no dependency and is the shape to prefer. Either way the `scan` IR tag
+  grows a source spec, so it is a two-sided change with a differential test, and `dist/` binds
+  sources its own way and must be checked against it.
+
+Full measurements, the controls, and three readings that were taken and then **withdrawn** on
+re-running (an ungrouped aggregate that looked serial, an aggregate-count effect that was
+warm-up ordering, and a cardinality lead that cannot move a query in which operators are 7% of
+the time) are in `benchmarks/BENCHMARK_RESULTS.md` under 2026-09-08.
 
 
 ## The roadmap that would make the claim true

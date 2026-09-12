@@ -21,13 +21,18 @@ The vocabulary has two halves, and the split matters:
 
 from __future__ import annotations
 
+from typing import Any
+
 import pyarrow as pa
+
+from batcher._internal.errors import PlanError
 
 __all__ = [
     "CAST_DTYPES",
     "DTYPE_REGISTRY",
     "canonical_dtype_name",
     "dtype_name",
+    "normalize_dtype_spec",
     "resolve_dtype",
 ]
 
@@ -340,3 +345,61 @@ def dtype_name(dtype: pa.DataType) -> str | None:
     if pa.types.is_duration(dtype):
         return f"duration({dtype.unit})"
     return None
+
+
+# Python builtins accepted where a Batcher dtype name is expected, so `cast(int)` and
+# `astype({"x": float})` read the way pandas spells them. Widths follow the FFI
+# boundary's normalization (Int*/Float* → 64-bit).
+_PY_TYPE_DTYPES: dict[Any, str] = {
+    int: "int64",
+    float: "float64",
+    str: "string",
+    bool: "boolean",
+    bytes: "binary",
+}
+
+
+def normalize_dtype_spec(dtype: Any, *, caller: str = "cast") -> str:
+    """Normalize a user's dtype specification to the name the IR expects.
+
+    Accepts the three spellings a user reaches for: a Batcher dtype name
+    (``"int64"``), a Python builtin (``int``), or anything that names itself as one
+    (a pyarrow `DataType`). This is the single front door for that vocabulary, so the
+    expression surface (``col("x").cast(...)``) and the frame surface
+    (``ds.astype(...)``) accept exactly the same inputs instead of diverging.
+
+    Args:
+        dtype: The dtype specification to normalize.
+        caller: The public method name to quote in the error message.
+
+    Returns:
+        The dtype name, still unvalidated — `resolve_dtype` decides whether it exists.
+
+    Raises:
+        PlanError: If `dtype` is not a name, a Python type, or a self-naming object.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.types import normalize_dtype_spec
+            >>> normalize_dtype_spec(int)
+            'int64'
+
+            >>> normalize_dtype_spec("float64")
+            'float64'
+    """
+    if isinstance(dtype, str):
+        return dtype
+    try:
+        mapped = _PY_TYPE_DTYPES.get(dtype)
+    except TypeError:  # unhashable -- a list, a dict, a numpy array
+        mapped = None
+    if mapped is not None:
+        return mapped
+    name = getattr(dtype, "__name__", None) or str(dtype)
+    if name in _PY_TYPE_DTYPES.values() or not isinstance(dtype, type):
+        return name
+    raise PlanError(
+        f"{caller}(): cannot interpret {dtype!r} as a dtype; pass a dtype name such as "
+        "'int64', a Python type (int/float/str/bool), or a pyarrow DataType"
+    )

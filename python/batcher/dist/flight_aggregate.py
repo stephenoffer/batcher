@@ -365,16 +365,32 @@ def _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs=None):
     evenly-spread shuffle), or on any error — so the reduce path is unchanged in the
     common case. Result-preserving: which actor hosts a reducer never changes the output.
 
+    **Except on a fleet of unequal workers, where there is no such thing as a neutral
+    default.** A bucket is reduced by one worker and the buckets are hash-balanced, so the
+    round-robin the ``None`` stands for hands a 4-core worker as many buckets as a 24-core
+    one and the reduce phase runs at the small machine's rate. Every ``None`` below therefore
+    becomes a capacity-proportional deal when the fleet has per-worker grants, and stays
+    ``None`` — byte for byte — when it does not.
+
     Node identity comes from the workers' advertised shuffle addresses when the caller has
     them, which costs nothing (the driver holds them already) and is the *same* identity
     `select_mode` routes on — so placement and transport agree on what "same node" means.
     Falling back to a `node_id` probe costs a round-trip per worker, and paid it even to
     discover a single-node fleet where the answer was always `None`.
     """
+    from batcher.carbonite.transfer.placement import default_reducer_hosts
     from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime.capacity import fleet_worker_cpus
+
+    caps = fleet_worker_cpus(workers)
+    if caps and len(set(caps)) <= 1:
+        caps = None  # a uniform fleet: the weighted deal is the round-robin anyway
+
+    def _default():
+        return None if caps is None else default_reducer_hosts(n_reducers, caps, workers)
 
     if not active_config().distributed.locality_aware_scheduling:
-        return None
+        return _default()
 
     import ray
 
@@ -387,11 +403,11 @@ def _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs=None):
         else:
             nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
         if len(set(nodes)) <= 1:
-            return None  # one node: every fetch is same-node already
+            return _default()  # one node: every fetch is same-node already
         per_mapper = ray.get([actors[i].published_bucket_bytes.remote() for i in range(workers)])
     except Exception as exc:  # locality is best-effort; a probe failure keeps default placement
         note_suppressed("dist", "probe reducer host locality", exc)
-        return None
+        return _default()
     bucket_node_bytes: dict[int, dict[str, int]] = {}
     for i, sizes in enumerate(per_mapper):
         node = nodes[i]
@@ -401,8 +417,8 @@ def _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs=None):
             )
     affinity = reducer_affinity(bucket_node_bytes)
     if not affinity:
-        return None  # nothing concentrated ⇒ default placement is as good
-    return assign_reducer_hosts(n_reducers, nodes, affinity)
+        return _default()  # nothing concentrated ⇒ default placement is as good
+    return assign_reducer_hosts(n_reducers, nodes, affinity, caps)
 
 
 def _reduce_with_recovery(

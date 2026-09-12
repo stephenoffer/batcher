@@ -26,6 +26,7 @@ from batcher.plan.types.registry import (
     DTYPE_REGISTRY,
     canonical_dtype_name,
     dtype_name,
+    normalize_dtype_spec,
     resolve_dtype,
 )
 from batcher.plan.types.widths import (
@@ -44,6 +45,7 @@ __all__ = [
     "dtype_name",
     "infer_type",
     "logical_bytes",
+    "normalize_dtype_spec",
     "one_batch",
     "projected_row_bytes",
     "promote",

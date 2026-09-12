@@ -19,7 +19,7 @@ __all__ = ["ProducerActor", "coalesce", "consumer_batch_rows"]
 
 
 def coalesce(batches: list, target_rows: int) -> list:
-    """Regroup `batches` so each holds at least `target_rows` rows, where the data allows.
+    """Regroup `batches` to about `target_rows` rows each — merging short ones, splitting long.
 
     The eager counterpart of `ProducerActor._take_batch`, for a stage whose whole output is
     already in hand. Both exist for one reason: a published morsel is one model call on the
@@ -28,29 +28,60 @@ def coalesce(batches: list, target_rows: int) -> list:
     only when it is short, or it would defeat the streaming it exists to do; a relay has run
     its whole morsel already and has nothing left to pull.
 
+    **Splitting matters as much as merging, and this did only the latter**: it regrouped to
+    "at least `target_rows`", so a batch already over the target was published whole. A scan
+    morsel is sized in *rows*, so on the workload this pipeline exists for — decode a batch of
+    images, score them on a device — one upstream morsel of 16,384 rows decodes to about
+    **2.4 GB**, and the relay published it as a single morsel. That is one 16,384-image
+    forward pass, a fetch the consumer cannot break up, and a resident block far past the
+    256 MiB per-channel credit budget. Measured on 400,000 384x384 JPEGs over 8 T4s: the
+    staged pipeline died with `3 worker(s) were killed due to the node running low on memory`
+    at 28.53 GB of 30 GB. Splitting to the size the consumer declared is what makes the credit
+    window mean anything for wide rows.
+
+    Slices are zero-copy and the remainder carries forward, so no row is copied, dropped or
+    reordered, and the concatenation of the result is the concatenation of the input.
+
     Args:
         batches: The stage's output batches, in order.
-        target_rows: Rows to gather per morsel; `0` leaves the batches as they are.
+        target_rows: Rows per morsel; `0` leaves the batches as they are.
 
     Returns:
-        The regrouped batches. A short final morsel is correct — there are no more rows.
+        The regrouped batches, each `target_rows` rows except the last. A short final morsel
+        is correct — there are no more rows.
     """
     import pyarrow as pa
 
-    if target_rows <= 0 or len(batches) <= 1:
+    if target_rows <= 0:
         return list(batches)
     out: list = []
     held: list = []
     rows = 0
     for batch in batches:
+        if not held and batch.num_rows >= target_rows:
+            # The common case on a wide stage, and the one worth not concatenating for: a
+            # single oversized batch is sliced where it lies.
+            offset = 0
+            while batch.num_rows - offset >= target_rows:
+                out.append(batch.slice(offset, target_rows))
+                offset += target_rows
+            rest = batch.slice(offset)
+            if rest.num_rows:
+                held, rows = [rest], rest.num_rows
+            continue
         held.append(batch)
         rows += batch.num_rows
         if rows >= target_rows:
             # `concat_batches` rather than `combine_chunks`: the latter splits at the 32-bit
             # offset limit, so a morsel holding more than 2 GiB of string or binary data comes
             # back as several batches — see `_take_batch`, which learned this the hard way.
-            out.append(held[0] if len(held) == 1 else pa.concat_batches(held))
-            held, rows = [], 0
+            merged = held[0] if len(held) == 1 else pa.concat_batches(held)
+            offset = 0
+            while merged.num_rows - offset >= target_rows:
+                out.append(merged.slice(offset, target_rows))
+                offset += target_rows
+            rest = merged.slice(offset)
+            held, rows = ([rest], rest.num_rows) if rest.num_rows else ([], 0)
     if held:
         out.append(held[0] if len(held) == 1 else pa.concat_batches(held))
     return out
@@ -89,11 +120,25 @@ try:
         Ray; the batches move over credit-bounded Flight.
         """
 
-        def __init__(self, plan0: LogicalPlan, credits: int, target_rows: int = 0) -> None:
+        def __init__(
+            self,
+            plan0: LogicalPlan,
+            credits: int,
+            target_rows: int = 0,
+            cpu_workers: int | None = None,
+        ) -> None:
             from batcher.carbonite.transfer import ShuffleSession
-            from batcher.dist.executors.map import _prebuild_factories
+            from batcher.dist.executors.map import _prebuild_factories, _with_inference_workers
 
-            self._plan = _prebuild_factories(plan0)
+            # Threads this actor runs its sub-plan with. Left at the plan's own width, a
+            # producer ran the stage on **one** thread: `execute_with_udfs` is called once per
+            # published morsel, so a pool of N producers was an N-thread decode however many
+            # cores the fleet had. Measured on 400,000 images over a 208-core / 17-node
+            # cluster, 32 producers: 11-17% cluster CPU, and the staged form lost to the fused
+            # one it exists to beat. The caller sizes this from the cores the pool actually
+            # holds (`_producer_cpu_width`), which is the same quantity `_agg_actor_width`
+            # gives a CPU map/aggregate pool and for the same reason.
+            self._plan = _with_inference_workers(_prebuild_factories(plan0), cpu_workers)
             # Rows to gather into one published morsel. A morsel is one *model call* on the
             # consumer, so publishing at the engine's own morsel granularity hands the GPU
             # whatever the scan happened to emit — for a wide row (a 150 KB image) the
@@ -108,6 +153,7 @@ try:
             self.session = ShuffleSession(credits, advertise_host=host)
             self._it = None  # iterator over the current partition's input batches
             self._pending: deque = deque()  # mapped output morsels awaiting publish
+            self._inp_rest = None  # unconsumed tail of an oversized input batch
             self._peak = 0  # peak published-but-unreleased morsels (memory-bound probe)
 
         def addr(self) -> str:
@@ -120,6 +166,7 @@ try:
 
             self._it = iter_partition_descriptor(partition)
             self._pending = deque()
+            self._inp_rest = None
             return self.session.addr
 
         def publish_next(self, ticket) -> bool:
@@ -133,6 +180,31 @@ try:
             self._peak = max(self._peak, self.session.partition_count)
             return True
 
+        def _next_input(self):
+            """The next input chunk, bounded to `_target_rows` rows. `None` when exhausted.
+
+            The bound is what keeps the producer's resident output small, and it has to be on
+            the **input** because that is what decides the output's size. A scan morsel is
+            sized in rows (16,384 by default), so on a decode stage one chunk's *output* is
+            16,384 decoded images — about 2.4 GB — and it all lands in `_pending` before a
+            single morsel is published. Capping the published morsel does not help: the slices
+            are views on that same 2.4 GB parent, which stays resident until the last of them
+            drains. Measured on 400,000 384x384 JPEGs, 32 producers over 8 CPU nodes: a worker
+            node died at 28.0 GB of 30. Feeding the sub-plan the consumer's batch size instead
+            holds ~37 MB.
+            """
+            if self._inp_rest is not None:
+                inp, self._inp_rest = self._inp_rest, None
+            else:
+                try:
+                    inp = next(self._it)
+                except StopIteration:
+                    return None
+            if self._target_rows and inp.num_rows > self._target_rows:
+                self._inp_rest = inp.slice(self._target_rows)
+                inp = inp.slice(0, self._target_rows)
+            return inp
+
         def _next_output(self):
             """The next mapped output morsel, advancing the input stream as needed.
 
@@ -144,9 +216,8 @@ try:
             from batcher.io.source import InMemorySource
 
             while not self._pending:
-                try:
-                    inp = next(self._it)
-                except StopIteration:
+                inp = self._next_input()
+                if inp is None:
                     return None
                 if inp.num_rows == 0:
                     continue
@@ -154,28 +225,46 @@ try:
             return self._take_batch()
 
         def _take_batch(self):
-            """Pop at least `_target_rows` rows as one morsel, pulling more input as needed.
+            """Pop about `_target_rows` rows as one morsel, pulling or splitting as needed.
 
-            Concatenation is the whole point: the consumer runs one model call per published
+            Concatenation is half the point: the consumer runs one model call per published
             morsel, so a morsel below the stage's batch size is a small forward pass that no
             downstream re-batching can undo. Short at end-of-partition is correct — there are
             no more rows to wait for — and the result is unchanged either way, because the
             stage is breaker-free and its output is the concatenation of its inputs'.
+
+            **Splitting is the other half, and it was missing.** `_target_rows` was a floor
+            with no ceiling, so an input chunk whose mapped output already exceeded it was
+            published whole. That is harmless for narrow rows and ruinous for the rows this
+            pipeline exists to carry: a scan morsel is sized in *rows*, so one row-group of
+            decoded 384x384 images is ~460 MB of output published as a single morsel, against
+            a per-channel credit budget of 256 MiB. Measured: the staged route OOM-killed two
+            16-core nodes out of the fleet, twice, and narrowing the decode from `float32` to
+            `uint8` did not stop it because the morsel was oversized by row count either way.
+            Splitting to the size the consumer actually asked for bounds what is resident and
+            hands the device the forward pass it declared.
+
+            The slice is zero-copy and the remainder goes back on the queue, so no row is
+            copied, dropped or reordered.
             """
 
             from batcher import core
             from batcher.io.source import InMemorySource
 
             first = self._pending.popleft()
-            if self._target_rows <= 0 or first.num_rows >= self._target_rows:
+            if self._target_rows <= 0:
+                return first
+            if first.num_rows > self._target_rows:
+                self._pending.appendleft(first.slice(self._target_rows))
+                return first.slice(0, self._target_rows)
+            if first.num_rows == self._target_rows:
                 return first
             held = [first]
             rows = first.num_rows
             while rows < self._target_rows:
                 if not self._pending:
-                    try:
-                        inp = next(self._it)
-                    except StopIteration:
+                    inp = self._next_input()
+                    if inp is None:
                         break
                     if inp.num_rows == 0:
                         continue

@@ -2,9 +2,9 @@
 
 Three responsibilities that grew together and are now separated: `_faults` holds the pure
 ``active_config()`` → policy/option builders and the error classification they rely on,
-`_drain` answers which workers sit on a node that is going away, and `_barrier` is the
+`_drain` answers which workers sit on a node that is going away, `_barrier` is the
 map-stage gather loop that turns a preempted partition into a resubmission rather than a
-failed stage.
+failed stage, and `_topn` does the same for the shuffle-free top-N fold.
 
 Import names from here; the split is an implementation detail. The module holds no Ray
 lifecycle state, so it imports nothing from the rest of the package.
@@ -32,6 +32,7 @@ from ._faults import (
     task_event_options,
     transient_exception_allowlist,
 )
+from ._topn import topn_partition
 
 # The leading `_`-prefixed names are private to the package but re-exported deliberately:
 # the error-classification helpers decide whether a failure is retried or surfaced, and the
@@ -57,5 +58,6 @@ __all__ = [
     "skew_join_salt",
     "speculation_policy",
     "task_event_options",
+    "topn_partition",
     "transient_exception_allowlist",
 ]

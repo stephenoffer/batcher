@@ -229,6 +229,26 @@ def _list_benchmarks() -> None:
         print()
 
 
+def _tables_needed(benchmark: str, cases: list) -> set[str] | None:
+    """The tables `cases` reference, or `None` to load the whole fixture.
+
+    Answered only for TPC-H, where the SQL is a module-level dict this can read and every query
+    names its tables literally. Anything else returns `None` and loads everything, which is what
+    it did before. A table missed here is absent at query time and raises, so the failure mode is
+    loud rather than a wrong answer.
+    """
+    if benchmark != "tpch":
+        return None
+    try:
+        from sources.tables import tpch_tables_for
+        from suites.standard.tpch import QUERIES
+
+        sql = [QUERIES[c.name] for c in cases if c.name in QUERIES]
+        return tpch_tables_for(sql) if len(sql) == len(cases) else None
+    except Exception:
+        return None
+
+
 def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> list:
     wanted = [t for t in (args.only or "").split(",") if t] or [None]
     cases = [
@@ -273,7 +293,14 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     elif args.scan:
         ctx = Context.build_scan(benchmark, args.scale, engines, args.source)
     else:
-        ctx = Context.build(benchmark, args.scale, engines, args.source)
+        # Only the tables the *selected* cases name. `--isolate` runs one process per case and
+        # each rebuilds the fixture, so loading all eight TPC-H tables to answer a one-table
+        # query is paid per case — and at sf10 on a 30 GiB box that load is what dies, before
+        # any engine runs (measured: q1 SIGKILLed, three engine pairings). `None` for every
+        # other benchmark keeps the old behaviour.
+        ctx = Context.build(
+            benchmark, args.scale, engines, args.source, _tables_needed(benchmark, cases)
+        )
     runs = _runs_for(args.scale, benchmark)
     elapsed = time.perf_counter() - t0
     mode = "corpus" if benchmark in CORPUS_BENCHMARKS else ("scan" if args.scan else "loaded")

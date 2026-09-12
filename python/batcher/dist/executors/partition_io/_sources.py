@@ -31,6 +31,7 @@ from batcher.dist.executors.partition_io.assignment import (
     assign_splits,
     has_affinity,
 )
+from batcher.dist.executors.ray_runtime.capacity import fleet_worker_cpus
 from batcher.dist.executors.scan_read import (
     _SCAN_PREFETCH,
     _SPLIT_TARGET_BYTES,
@@ -350,7 +351,10 @@ def _partition_source(
     meta = {"projection": projection, "predicate": predicate, "on_read_error": on_read_error}
     schema = source.schema()
     paths = []
-    for i, group in enumerate(assign_splits(splits, workers, preserve_order=preserve_order)):
+    assignment = assign_splits(
+        splits, workers, preserve_order=preserve_order, capacities=fleet_worker_cpus(workers)
+    )
+    for i, group in enumerate(assignment):
         if group:
             path = os.path.join(work_dir, f"{tag}_part_{i}.splits")
             with open(path, "wb") as fh:
@@ -505,7 +509,11 @@ def partition_descriptors(
         assigned = assign_clustered_splits(splits, n_parts)
     else:
         assigned = assign_splits(
-            splits, n_parts, preserve_order=preserve_order, worker_addrs=worker_addrs
+            splits,
+            n_parts,
+            preserve_order=preserve_order,
+            worker_addrs=worker_addrs,
+            capacities=fleet_worker_cpus(n_parts),
         )
     for group in assigned:
         if group:

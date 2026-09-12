@@ -22,11 +22,13 @@ def test_a_lost_resident_pool_heals_onto_a_recovering_pool(monkeypatch):
 
     calls: dict[str, int] = {"resident": 0, "drive": 0, "evict": 0}
 
-    def _resident(plan0, partitions, opts, size, registry, devices=0):
+    # `launch` is the actor method the pool dispatches -- `run` for a map-terminal stage,
+    # `run_agg` for one under an aggregate. The fakes take it because the real signatures do.
+    def _resident(plan0, partitions, opts, size, registry, devices=0, launch=None):
         calls["resident"] += 1
         raise RayError("GPU node preempted mid-partition")
 
-    def _drive(plan0, partitions, opts, lo, hi, policy):
+    def _drive(plan0, partitions, opts, lo, hi, policy, write_spec=None, launch=None):
         calls["drive"] += 1
         return ["recovered"], 0.5, 0.4
 
@@ -56,7 +58,7 @@ def test_a_healthy_resident_pool_is_used_directly(monkeypatch):
     install_fake_ray(monkeypatch)
     used = {"resident": 0, "drive": 0}
 
-    def _resident(plan0, partitions, opts, size, registry, devices=0):
+    def _resident(plan0, partitions, opts, size, registry, devices=0, launch=None):
         used["resident"] += 1
         return ["ok"], 0.7, 0.6
 

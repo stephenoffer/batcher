@@ -41,6 +41,7 @@ Run (needs ray + daft on the driver, and a GPU fleet):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -366,12 +367,39 @@ def _device_share(devices: int) -> float:
     return float(ray.get(_time_the_model.remote(per_device, _batch(), _flops())))
 
 
+def _release_batcher_pools() -> None:
+    """Give every device Batcher's session-warm pool holds back to the cluster.
+
+    Batcher keeps an inference pool warm across `collect()`s so the model loads once per
+    session, and its idle-release window (`distributed.warm_inference_idle_s`) is minutes --
+    sized for an interactive session, not for a sweep whose next arm starts a second later.
+    So an arm that ends leaves one actor per device holding **every** GPU, and the engine
+    measured next cannot place its own pool at all: measured here, Ray Data's eight actors
+    sat `pending` indefinitely after Batcher's arm, and neither engine reported anything.
+    That is a benchmark measuring a starved cluster, not an engine.
+
+    `benchmarks/cluster/gpu_pipeline.py` already does this for the same reason. Releasing is
+    also the *fair* boundary rather than a handicap: every arm here is timed after its own
+    untimed warm-up, so Batcher still reloads its model once and then reuses it across its
+    three timed runs, exactly as Ray Data reuses its actor pool across its own.
+    """
+    with contextlib.suppress(Exception):
+        from batcher.dist.executors.map import release_inference_pools
+
+        release_inference_pools()
+    with contextlib.suppress(Exception):
+        from batcher.dist.fleet import release_session_fleet
+
+        release_session_fleet()
+
+
 def _time(thunk, runs: int) -> tuple[float, tuple[int, float] | None, str]:
     """Best-of-`runs` after one untimed warm-up, plus the signature and any error."""
     try:
         run = thunk()
         signature = run()
     except Exception as exc:
+        _release_batcher_pools()
         return float("nan"), None, f"{type(exc).__name__}: {str(exc)[:180]}"
     times = []
     for _ in range(runs):
@@ -379,8 +407,10 @@ def _time(thunk, runs: int) -> tuple[float, tuple[int, float] | None, str]:
         try:
             signature = run()
         except Exception as exc:
+            _release_batcher_pools()
             return float("nan"), None, f"{type(exc).__name__}: {str(exc)[:180]}"
         times.append(time.perf_counter() - t0)
+    _release_batcher_pools()
     return min(times), signature, ""
 
 

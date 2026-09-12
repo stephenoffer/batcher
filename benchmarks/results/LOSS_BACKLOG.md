@@ -61,6 +61,32 @@ here are only comparable with other isolated runs.
 Everything else is a win: 20 of 23 `operators`, 15 of 22 `tpch` sf1, 25 of 43 `clickbench`,
 all 5 `json` and all 5 `h2o-join`. `json` is won outright — 0.40x to 0.71x against DuckDB and 0.01x to 0.05x against Polars.
 
+## Distributed GPU inference at 95 GiB, the one cluster-scale loss (2026-09-10)
+
+Everything above is single-node. This row is not, and it is the largest absolute gap in the
+file by two orders of magnitude.
+
+| case | batcher | best rival | vs | ratio | gap |
+|---|---:|---:|---|---:|---:|
+| `map_batches(GPU model) -> agg`, 100M rows x 256 f32 (95.4 GiB Parquet) | 175.34 s | 142.08 s | ray-data | **1.23x** | **33.3 s** |
+
+8 x T4 + 8 x 16-core CPU nodes; answers agree to a 1.2e-12 checksum spread. Harness
+`benchmarks/gpu_backend/vs_raydata_parquet_inference.py`.
+
+**The cause is known and priced**, which is unusual for this file. The two engines read at the
+identical 162.2 s; Batcher then **adds** its 13 s of device time where Ray Data **overlaps**.
+Batcher's own staged route already overlaps -- the same work with a `write.parquet` terminal
+instead of an aggregate is 50.2 s against 64.4 s at 30M rows, 1.28x, while additionally
+writing output the aggregate does not. The aggregate shape simply never reaches that route:
+`_is_linear_map_pipeline` is false with an aggregate on top, so the dispatcher never asks
+`split_into_resource_stages` -- which, asked directly, splits the plan correctly into three
+stages.
+
+The fix is a dispatcher branch plus a partial-aggregating consumer stage, worth ~20% here on
+the evidence of one ratio measured at a third of the size -- enough to put this row at or near
+parity, not enough to name a figure. See the dated entry in `BENCHMARK_RESULTS.md` for
+the hypotheses that died first (it is not the reader, and it is not where the read runs).
+
 ## Not measured, and why
 
 | case | status |
@@ -70,6 +96,46 @@ all 5 `json` and all 5 `h2o-join`. `json` is won outright — 0.40x to 0.71x aga
 | `tpch-q21`, `q22` | PARTIAL — Daft errored (row-group pruning bind failure; unsupported `SUBSTRING` syntax). The DuckDB/Polars comparison stands. |
 | `op-dedup-keyed-ordered`, `op-window-*` | PARTIAL — Daft OOM/unsupported. Batcher wins all of them against the engines that ran. |
 | tpcds, job, scan, images | **not yet swept** — batch 2. `BENCHMARK_RESULTS.md` records 28 ClickBench losses and four catastrophic TPC-DS queries (q77 16.4x, q45 8.3x, q5 7.8x, q80 6.5x) from earlier runs on other boxes. |
+
+## The next lever on `tpch-q18`, located but deliberately not taken (2026-09-08)
+
+q18 is the largest single-node gap (11.2x DuckDB at sf10) and **99% of its operator time is one
+node**: `GROUP BY l_orderkey`, 60M rows to 15M groups (`explain(analyze=True)`). That node is the
+build side of the `SEMI` join, and `stream/builds.rs::collect_builds` runs every build side through
+`parallel::run` — the *streaming* executor.
+
+The same subtree, standing alone, was measured at **4,660 ms streaming against 736 ms
+materializing** (both orders, minimum of three; read 347 ms + aggregate 505 ms accounts for the
+second figure). It is join-free, so `materializing_aggregate_is_faster` already admits it and
+Kyber already sets `prefer_materializing_aggregate` on it — the routing simply is not consulted
+for a build side, which is decided one level up for the plan as a whole.
+
+So the change is small to write: in `collect_builds`, route a build side the aggregate guard
+admits to `par::execute_parallel_with` instead of `parallel::run`.
+
+**The obstacle is not the routing, it is the options**, and it is bigger than the memory pool
+alone. `collect_builds` receives `budget: usize`, `workers` and `meter` — not the caller's
+`ExecOptions`. Synthesizing one there would run the materializing aggregate without:
+
+* `pool` — the process-wide accounting that forces a breaker to spill instead of pushing toward
+  OOM. Dropping it on q18 at 30 GiB is the same trade that took q17/q18/q20/q21 from completing to
+  `SIGKILL` earlier the same day (`BENCHMARK_RESULTS.md`);
+* `agg_spill.dir` — `SpillOptions` **requires** a path, and the streaming executor is never given
+  one, so the subtree could not spill where the caller configured;
+* `agg_spill.codec`, `op_budgets`, and `cancel` — the last meaning a ten-minute build could not be
+  cancelled.
+
+So the prerequisite is threading `ExecOptions` through the streaming build path: **19 signatures
+taking a bare `budget: usize` across 5 files** (`breaker`, `builds`, `folds`, `mod`, `parallel`),
+in the executor's hot path. Verified safe in one respect — `par` does not call back into `stream`,
+so the sub-execution cannot recurse.
+
+**Expected value, quantified rather than guessed.** q18 is 7,755 ms at sf10 and the build subtree
+standing alone is 4,660 ms streaming, so the aggregate is ~60% of its wall time. At 736 ms it
+would take q18 to roughly 3,800 ms — **11.2x DuckDB down to ~5.5x**. A large improvement on the
+board's biggest row, and **still not a win**: q21 (6.0x) and q17 (5.4x) are untouched, and both are
+the algorithm gap this file already records. Beating DuckDB outright at sf10 needs those too, so
+this is worth doing on its own merits and should not be sold as closing the gap.
 
 ## What the top of the board already has a cause for
 
@@ -85,7 +151,81 @@ separate cases where a plausible mechanism was implemented and moved nothing.
   memory movement 14%, rayon scheduling 15%: no single villain. `combine_ndv` under-estimates
   q9's 10,000 groups at ~100.
 
-## A measured defect found while profiling the top of this board
+## Retracted 2026-09-08 — the defect below is not one, and the entry sent the wrong work first
+
+**The seeded base-table NDV does reach the cardinality estimator, on the first run, inside the
+optimizer that chooses the plan.** Re-measured by tracing every call to
+`kyber.stats.columns.scan_columns` in one fresh process, on the same shape the entry uses (a
+200,000-row table with 25 brands and 40 containers, filtered on one of each — 203 rows):
+
+| call | learned ndv | reached from |
+|---|---|---|
+| 1 | no | `rules/extra/runtime_filters/skipping.py::drop_filter_conjunct_implied_by_zonemap` |
+| 2 | no | `metadata_answer.py::_root_stats` <- `api/terminal/metadata_answer/aggregate.py` |
+| 3 | no | `metadata_filter_count/answers.py::_child_stats` <- the same |
+| 4 | **yes** — `brand 25.019`, `container 40.049` | `rules/extra/agg_rules.py::_child_stats`, inside `optimize_full` |
+
+`seed_column_ndv` runs immediately before `kyber.optimize_full`, exactly where
+`api/orchestration/run.py::_optimize` puts it, so the three blind calls are all *earlier* passes:
+the metadata-answer attempt for a `count(*)`, and a rule pass above it. None of them picks a join
+order or a build side. The one call inside the plan-choosing optimizer has the seeded counts.
+
+**The 6,325-cold / 998-warm pair the entry read as "cold plans blind" is a different thing**, and
+the two numbers say so themselves. `6,325 = 0.1 x 0.1^0.5 x 200,000` is the *default* equality
+selectivity under exponential backoff — the metadata-answer path, calls 2 and 3. And
+`998 = (1/40.049) x (1/25.019)^0.5 x 200,000` is the *same backoff rule over the seeded counts*,
+which is what the optimizer used cold. Reproduced to the digit: predicted 998.39, observed
+998.39.
+
+So the estimate the optimizer works from is 998 against an actual 203 — **4.9x over, with the
+statistics correct and present**. Independence over the same two counts gives 199.6, within 2% of
+the truth. That is `stats/selectivity/combine.py::_exponential_backoff` (`s1 * s2^(1/2) * s3^(1/4)
+...`) doing exactly what its docstring says it does: it "lifts the estimate toward the correlated
+case", and these two columns are independent.
+
+**And it is not worth fixing — that was A/B'd, not assumed.** Patched in-process so the arms
+differ in exactly one expression, TPC-H sf1, all 22 correct in every arm, control run twice:
+
+| arm | conjunction rule | b/duckdb | b/polars |
+|---|---|---:|---:|
+| backoff (today) | `s1 * s2^(1/2) * s3^(1/4) ...` | 0.87 | 0.72 |
+| independent | `prod(s_i)` | 0.87 | 0.73 |
+| sqrt_all | `prod(s_i^(1/2))` | 0.86 | 0.70 |
+| backoff (repeat) | the control again | 0.86 | 0.69 |
+
+The control's own spread between its two runs is as large as any difference between arms. A rule
+that is provably 4.9x wrong on a two-equality conjunction is worth nothing on the geomean, because
+a cardinality error costs wall time only when it changes a *decision*, and here it does not change
+enough of them to see. Repro: `backoff_ab.py` in the session scratchpad — 30 lines that patch
+`combine._exponential_backoff` and defer to `benchmarks/run.py` for everything else. **Better per-column statistics cannot fix it, and that was measured rather than argued.** The
+obvious cheaper lever is the Misra-Gries `mcv` seeded alongside the ndv by the same pass:
+`_equality_selectivity` already consults it, and a literal it covers has a *measured* frequency
+that needs no independence assumption. It does not fire on this shape because
+`optimizer.cardinality.mcv_min_fraction` is **0.05** while 25 uniform brands sit at 0.04 and 40
+containers at 0.025 — and TPC-H `part` has exactly those cardinalities. Lowering the floor and
+re-measuring:
+
+| `mcv_min_fraction` | mcv recorded | estimate | actual |
+|---|---|---:|---:|
+| 0.05 (default) | none | 998.4 | 203 |
+| 0.02 | `Brand#07` 0.0396, `BOX03` 0.0250 — both exact | **995.9** | 203 |
+| 0.005 | same | **995.9** | 203 |
+
+0.25%. The floor is doing what it should and the frequencies it then records are right; the answer
+does not move because backoff **discards the second conjunct by construction** — it takes its
+square root, so `0.0250 x 0.0396^0.5 = 0.004975` whatever the two numbers are worth. A rule that
+square-roots its inputs cannot be repaired by sharpening them. Anyone reaching for a statistics
+fix here should read this row first: it is the experiment that says the statistics are not the
+problem.
+
+What follows from the retraction is only this: **do not spend a day on the write->read path.** It
+works. The rows the entry lists as estimate-sensitive (`tpch-q17`, `q5`, `q8`, `q3`, and JOB) are
+still estimate-sensitive; the estimate they are sensitive to is arriving with correct inputs.
+
+Repro: `scratchpad/ndv_trace.py` and `ndv_cold.py` in the session that wrote this; both are ~30
+lines over a synthetic table and need no TPC-H.
+
+## The original entry, superseded by the retraction above
 
 **The seeded base-table NDV is computed correctly and never reaches the cardinality
 estimator.** Reproduced on `SELECT count(*) FROM part WHERE p_brand = 'Brand#23' AND
@@ -117,3 +257,8 @@ reached from outside it.
 Worth fixing before any of the estimate-sensitive rows above (`tpch-q17`, `q5`, `q8`, `q3`, and
 JOB as a whole, which exists to measure exactly this), because a cardinality fix moves all of
 them at once and a per-query fix moves one.
+
+**(Retracted — see the section above. Steps 1 and 2 are correct and step 3 is not: traced per
+call, `scan_columns` does receive the seeded counts inside `optimize_full`. The `4.3-4.9x over`
+observation on `tpch-q17` stands as a measurement; its cause is the conjunction rule, not a
+missing statistic.)**

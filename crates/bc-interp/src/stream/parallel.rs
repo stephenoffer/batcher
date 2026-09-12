@@ -58,8 +58,9 @@ pub fn execute_streaming_parallel(
     sources: &[Vec<RecordBatch>],
     workers: usize,
     budget: usize,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    execute_streaming_parallel_or_hand_off(plan, sources, workers, budget, false, None)
+    execute_streaming_parallel_or_hand_off(plan, sources, workers, budget, false, None, opts)
 }
 
 /// [`execute_streaming_parallel`], optionally allowed to **decline** a plan it cannot shard.
@@ -82,9 +83,10 @@ pub fn execute_streaming_parallel_or_hand_off(
     budget: usize,
     handoff: bool,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     in_scoped_pool(useful_workers(plan, sources, workers), || {
-        run(plan, sources, workers, None, budget, handoff, cancel)
+        run(plan, sources, workers, None, budget, handoff, cancel, opts)
     })
 }
 
@@ -206,8 +208,11 @@ pub fn execute_streaming_parallel_metered(
     sources: &[Vec<RecordBatch>],
     workers: usize,
     budget: usize,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
-    execute_streaming_parallel_metered_or_hand_off(plan, sources, workers, budget, false, None)
+    execute_streaming_parallel_metered_or_hand_off(
+        plan, sources, workers, budget, false, None, opts,
+    )
 }
 
 /// [`execute_streaming_parallel_or_hand_off`], with per-operator metrics.
@@ -218,14 +223,29 @@ pub fn execute_streaming_parallel_metered_or_hand_off(
     budget: usize,
     handoff: bool,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
     let m = Meter::new(plan, workers.max(1) as u32);
     let out = in_scoped_pool(useful_workers(plan, sources, workers), || {
-        run(plan, sources, workers, Some(&m), budget, handoff, cancel)
+        run(
+            plan,
+            sources,
+            workers,
+            Some(&m),
+            budget,
+            handoff,
+            cancel,
+            opts,
+        )
     })?;
     Ok((out, m.finish()))
 }
 
+// Eight parameters, all of them executor context threaded to one place: the plan, its
+// sources, the width, the meter, the budget, the row-wise flag and `opts`. Bundling them
+// into a struct would put a borrow of every field behind one lifetime on a path that
+// recurses, which is why the crate takes the allow here as it does for `record_breaker`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
@@ -234,9 +254,10 @@ pub(super) fn run(
     budget: usize,
     handoff: bool,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     run_with_cache(
-        plan, sources, workers, meter, budget, None, None, handoff, cancel,
+        plan, sources, workers, meter, budget, None, None, handoff, cancel, opts,
     )
 }
 
@@ -259,12 +280,13 @@ pub(super) fn run_reusing(
     cache: Option<&BuildCache>,
     mats: Option<&MatCache>,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     // Never hands off: this re-entry is made from *inside* a running pipeline, which has already
     // produced work the caller cannot rewind. Whether to hand the plan over is settled once, at
     // the top, before any of that exists.
     run_with_cache(
-        plan, sources, workers, meter, budget, cache, mats, false, cancel,
+        plan, sources, workers, meter, budget, cache, mats, false, cancel, opts,
     )
 }
 
@@ -292,6 +314,7 @@ fn run_with_cache(
     prebuilt_mats: Option<&MatCache>,
     handoff: bool,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     let workers = workers.max(1);
 
@@ -324,6 +347,7 @@ fn run_with_cache(
             prebuilt_mats,
             handoff,
             cancel,
+            opts,
         )?;
         let rows_in = crate::count_rows(&rows);
         let held = crate::batch_bytes(&rows);
@@ -396,6 +420,7 @@ fn run_with_cache(
                 prebuilt_mats,
                 handoff,
                 cancel,
+                opts,
             )?;
             let id = meter.map(|m| m.id(plan));
             let t = std::time::Instant::now();
@@ -460,7 +485,7 @@ fn run_with_cache(
                 .par_iter()
                 .map(|branch| {
                     run_with_cache(
-                        branch, sources, workers, meter, share, None, None, false, cancel,
+                        branch, sources, workers, meter, share, None, None, false, cancel, opts,
                     )
                 })
                 .collect::<Result<_, _>>()?;
@@ -493,7 +518,7 @@ fn run_with_cache(
     let cache: &BuildCache = if let Some(c) = prebuilt {
         c
     } else {
-        owned = super::prebuild_joins(plan, sources, meter, budget, workers)?;
+        owned = super::prebuild_joins(plan, sources, meter, budget, workers, opts)?;
         &owned
     };
 
@@ -508,7 +533,7 @@ fn run_with_cache(
         prebuilt_mats
     } else if workers > 1 {
         owned_mats =
-            materialize_spine_breakers(plan, sources, workers, meter, budget, cache, cancel)?;
+            materialize_spine_breakers(plan, sources, workers, meter, budget, cache, cancel, opts)?;
         (!owned_mats.is_empty()).then_some(&owned_mats)
     } else {
         None
@@ -541,9 +566,9 @@ fn run_with_cache(
             }
         }
         return match plan {
-            RelOp::Project { .. } | RelOp::Filter { .. } => {
-                peel_row_wise(plan, sources, workers, meter, budget, cache, mats, cancel)
-            }
+            RelOp::Project { .. } | RelOp::Filter { .. } => peel_row_wise(
+                plan, sources, workers, meter, budget, cache, mats, cancel, opts,
+            ),
             _ => fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel),
         };
     };
@@ -899,6 +924,7 @@ fn peel_row_wise(
     cache: &BuildCache,
     mats: Option<&MatCache>,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     // `run` only routes the two row-wise roots here; anything else keeps the old behaviour.
     let input = match plan {
@@ -918,6 +944,7 @@ fn peel_row_wise(
         mats,
         false,
         cancel,
+        opts,
     )?;
     let mut out = Vec::with_capacity(rows.len());
     // Hoisted out of the loop on purpose: this is one operator over many morsels, so the
@@ -1341,6 +1368,8 @@ fn materializable_spine_breaker(plan: &RelOp, cache: &BuildCache) -> bool {
 ///    one call, and nested breakers compose without special handling.
 /// 3. **The subtree is evaluated over `sources`, unsharded.** Sharding happens only *above* the
 ///    resulting leaf, never through it.
+// Same shape as `run`, which it is the breaker-materializing half of, and same reason.
+#[allow(clippy::too_many_arguments)]
 fn materialize_spine_breakers(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
@@ -1349,6 +1378,7 @@ fn materialize_spine_breakers(
     budget: usize,
     cache: &BuildCache,
     cancel: Option<&CancelToken>,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<MatCache, InterpError> {
     let mut mats = MatCache::new();
     let Some(mut node) = spine_child(plan) else {
@@ -1369,6 +1399,7 @@ fn materialize_spine_breakers(
                 None,
                 false,
                 cancel,
+                opts,
             )?;
             mats.insert(node_key(node), Arc::new(batches));
             return Ok(mats);
@@ -1470,7 +1501,17 @@ pub fn materializing_aggregate_is_faster(plan: &RelOp) -> bool {
         node = match node {
             RelOp::Project { input, .. }
             | RelOp::Sort { input, .. }
-            | RelOp::Limit { input, .. } => input,
+            | RelOp::Limit { input, .. }
+            | RelOp::Filter { input, .. } => input,
+            // A *global* aggregate over the grouped one -- `SELECT count(*) FROM (... GROUP BY
+            // k)`, and every `group_by().agg()` that ends in a scalar roll-up. It reads one row
+            // per group like the operators above it, so it says nothing about which executor
+            // should run the grouping underneath. Peeled only when it is global: a second
+            // *grouped* aggregate is its own aggregation and peeling through it would answer
+            // the question about the wrong node.
+            RelOp::Aggregate {
+                input, group_keys, ..
+            } if group_keys.is_empty() => input,
             _ => break,
         };
     }
@@ -1515,7 +1556,13 @@ mod tests {
     /// The `Sort`/`Limit` peel is the half that was missing, and the half nearly every
     /// analytics query needs: `GROUP BY k ORDER BY count(*) DESC LIMIT n` put a `Sort` at the
     /// root, so the predicate answered "not a grouped aggregate" for the whole ClickBench
-    /// leaderboard family. It must keep refusing a global aggregate and anything with a join.
+    /// leaderboard family.
+    ///
+    /// `Filter` (HAVING) and a **global** `Aggregate` were the two that remained, and they cost
+    /// the whole difference between the executors: measured on a 24 M-row group-by producing
+    /// 10 M groups, `select` above the aggregate ran in 245 ms and `filter` above the same
+    /// aggregate in 2,116 ms, same rows out. It must keep refusing a plan whose only aggregate
+    /// is global, and anything with a join.
     #[test]
     fn the_aggregate_is_seen_through_project_sort_and_limit() {
         let scan = || RelOp::Scan { source_id: 0 };
@@ -1571,12 +1618,37 @@ mod tests {
             !materializing_aggregate_is_faster(&sort(scan(), Some(10))),
             "a plain top-N is not an aggregate at all"
         );
+        let filter = |input: RelOp| RelOp::Filter {
+            input: Box::new(input),
+            predicate: bc_expr::Expr::Col { name: "k".into() },
+        };
         assert!(
-            !materializing_aggregate_is_faster(&RelOp::Filter {
+            materializing_aggregate_is_faster(&filter(grouped())),
+            "HAVING reads one row per group, exactly like the projection above it"
+        );
+        assert!(
+            materializing_aggregate_is_faster(&RelOp::Aggregate {
                 input: Box::new(grouped()),
-                predicate: bc_expr::Expr::Col { name: "k".into() },
+                group_keys: vec![],
+                aggregates: vec![],
             }),
-            "a HAVING filter is not peeled — only the operators measured here are"
+            "a scalar roll-up over the grouped aggregate — `count(*) FROM (... GROUP BY k)`"
+        );
+        assert!(
+            materializing_aggregate_is_faster(&sort(filter(project(grouped())), Some(10))),
+            "the peels compose with the two new ones in any order"
+        );
+
+        // The negative control the roll-up peel needs: peeling a *grouped* aggregate would
+        // answer this question about the wrong node. `agg(vec![])` over `agg(vec![])` has no
+        // grouped aggregate anywhere and must still be refused.
+        assert!(
+            !materializing_aggregate_is_faster(&RelOp::Aggregate {
+                input: Box::new(agg(vec![])),
+                group_keys: vec![],
+                aggregates: vec![],
+            }),
+            "two global aggregates are still no groups at all"
         );
 
         let joined = RelOp::Aggregate {

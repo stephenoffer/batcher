@@ -83,6 +83,10 @@ _LITERAL_ARGS: tuple[tuple, ...] = (
     ("upper",), ("snake",), ("gzip",), (0.5,), (True,), ("UTC",), ("%Y-%m-%d",), (_AES_KEY,),
     ("$.b",), ("day",), ("1d",), ("09:00", "17:00"), ("UTC", "UTC"), ("float64",),
     ([1.0, 3.0],), ("a", 1), (1, "a"), ("int64",),
+    # A real remap table. `replace` was previously reached only through `replace(0)`,
+    # whose falsy-mapping branch returns the receiver unchanged -- so the sweep checked
+    # the identity, not the method. Last, so no other method's shape changes.
+    ({1: 2},),
 )  # fmt: skip
 
 #: Columns offered as an argument, before any literal.

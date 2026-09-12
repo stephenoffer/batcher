@@ -29,7 +29,12 @@ from batcher._internal.mathx import is_nan
 from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import MICROS_PER_DAY, ExprTag
-from batcher.plan.types import CAST_DTYPES, canonical_dtype_name, resolve_dtype
+from batcher.plan.types import (
+    CAST_DTYPES,
+    canonical_dtype_name,
+    normalize_dtype_spec,
+    resolve_dtype,
+)
 
 if TYPE_CHECKING:
     from batcher.plan.expr_ir.audio import _AudioNamespace
@@ -709,15 +714,16 @@ class Expr:
         return Aliased(self, name)
 
     # --- unary / type methods ----------------------------------------------
-    def cast(self, dtype: str) -> Cast:
-        """Cast to an Arrow type by name (int64/float64/int32/bool/string/...).
+    def cast(self, dtype: str | type) -> Cast:
+        """Cast to an Arrow type (int64/float64/int32/bool/string/...).
 
-        The dtype is validated at plan-build time; an unknown name raises rather than
-        failing opaquely in the engine mid-query. A value that cannot be converted
-        errors the query (DuckDB ``CAST``); use `try_cast` to get NULL instead.
+        The dtype is validated at plan-build time; anything that is not a dtype raises
+        rather than failing opaquely in the engine mid-query. A value that cannot be
+        converted errors the query (DuckDB ``CAST``); use `try_cast` to get NULL instead.
 
         Args:
-            dtype: Target Arrow type name (e.g. ``"int64"``, ``"float64"``, ``"string"``).
+            dtype: Target Arrow type name (e.g. ``"int64"``), a Python type (``int``,
+                ``float``, ``str``, ``bool``), or a pyarrow `DataType`.
 
         Returns:
             A new expression of the converted values.
@@ -732,7 +738,7 @@ class Expr:
         """
         return self._cast(dtype, try_cast=False)
 
-    def try_cast(self, dtype: str) -> Cast:
+    def try_cast(self, dtype: str | type) -> Cast:
         """Cast to an Arrow type by name; unconvertible values become NULL (DuckDB ``TRY_CAST``).
 
         The common safe-ingest spelling: ``col("x").try_cast("int64")`` turns a
@@ -740,7 +746,8 @@ class Expr:
         (ready to `drop_nulls` or route to a quarantine sink).
 
         Args:
-            dtype: Target Arrow type name (e.g. ``"int64"``, ``"float64"``, ``"string"``).
+            dtype: Target Arrow type name (e.g. ``"int64"``), a Python type (``int``,
+                ``float``, ``str``, ``bool``), or a pyarrow `DataType`.
 
         Returns:
             A new expression of the converted values, NULL where conversion fails.
@@ -755,11 +762,12 @@ class Expr:
         """
         return self._cast(dtype, try_cast=True)
 
-    def _cast(self, dtype: str, *, try_cast: bool) -> Cast:
+    def _cast(self, dtype: str | type, *, try_cast: bool) -> Cast:
         # Type names are matched case-insensitively (pandas spells these `"Int64"`, SQL
         # `"BIGINT"`, and a case mismatch is a typo the user cannot see), and the IR always
         # carries the canonical form, so the wire contract is unaffected.
-        canonical = canonical_dtype_name(dtype) if isinstance(dtype, str) else dtype
+        name = normalize_dtype_spec(dtype, caller="try_cast" if try_cast else "cast")
+        canonical = canonical_dtype_name(name)
         # `resolve_dtype`, not `canonical in CAST_DTYPES`: the fixed names are only half
         # the vocabulary, and membership-testing the set rejects every parametrized dtype
         # (`decimal(12,4)`, `timestamp(ns)`) that the engine itself accepts.
@@ -939,6 +947,11 @@ class Expr:
         """
         from batcher.plan.expr_ir.constructors import when
 
+        if not hasattr(mapping, "items"):
+            raise PlanError(
+                f"replace(): mapping must be a dict of {{old: new}}, got "
+                f"{type(mapping).__name__} {mapping!r}"
+            )
         if not mapping:
             return self if default is None else _wrap(default)
         items = list(mapping.items())
@@ -3327,6 +3340,9 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").quantile_disc(0.5)).to_pydict()
                 {'g': ['a'], 'r': [2.0]}
         """
+        q = require_float(q, func="quantile_disc", arg="q")
+        if not 0.0 <= q <= 1.0:
+            raise PlanError(f"quantile_disc q must be in [0, 1], got {q}")
         return AggExpr("quantile_disc", self, param=q)
 
     def top_k(self, k: int) -> AggExpr:
@@ -5537,8 +5553,17 @@ class Lit(Expr):
                     "instant, or a naive time for a wall-clock time of day."
                 )
             return Cast(Lit(v.isoformat()), "time").to_ir()
-        else:  # pragma: no cover - guarded by typing
-            raise TypeError(f"unsupported literal type: {type(v).__name__}")
+        else:
+            # Names the value and the remedy, not just its type. This is reached
+            # whenever a non-literal object is used where a constant is expected
+            # (``col("x") == some_object``), and "unsupported literal type: Foo" left
+            # the reader to work out both which argument and what to do instead.
+            raise PlanError(
+                f"cannot use {type(v).__name__} {v!r} as a literal value: a literal must "
+                "be a string, number, boolean, None, or a date/time/datetime/Decimal. "
+                "To reference a column use col('name'); to pass a Python object to your "
+                "own code use map_batches()."
+            )
         out = {"e": ExprTag.LIT, "value": tagged}
         self._ir_cache = out
         return out

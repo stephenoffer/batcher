@@ -114,6 +114,62 @@ def literal(*, key: str | None = None, omit_none: bool = False, default: Any = _
     return _make_field(_FieldSpec(_Kind.LITERAL, key, omit), default)
 
 
+# The JSON scalars a `scalar` field may carry. Anything else -- a Python type, an
+# `Expr`, an arbitrary object -- cannot cross the wire, and until this check existed it
+# reached `json.dumps` and surfaced as "Object of type X is not JSON serializable":
+# an error naming the serializer rather than the argument the user got wrong.
+_JSON_SCALARS: tuple[type, ...] = (str, int, float, bool)
+
+
+def _json_safe(value: Any) -> bool:
+    """Whether `value` is a JSON scalar, or a list/tuple of them (nested allowed)."""
+    if value is None or isinstance(value, _JSON_SCALARS):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_json_safe(v) for v in value)
+    return False
+
+
+def _where(node: Any) -> str:
+    """``str.contains`` for a family node that carries its function, else the tag."""
+    tag = getattr(node.tag, "value", node.tag)
+    fn = getattr(node, "fn", None)
+    return f"{tag}.{fn}" if isinstance(fn, str) else str(tag)
+
+
+def _reject(node: Any, key: str, value: Any, expected: str) -> None:
+    """Raise the one wrong-argument message the whole expression surface shares."""
+    raise PlanError(
+        f"{_where(node)}(): {key}={value!r} is not valid for this argument - expected "
+        f"{expected}, got {type(value).__name__}. Most functions take their "
+        f"pattern/format/key as a plain Python value known when the plan is built, "
+        f"not a column or an object."
+    )
+
+
+def _check_scalar(node: Any, key: str, value: Any, types: tuple[type, ...] | None = None) -> None:
+    """Reject a `scalar` field value that cannot cross the JSON wire.
+
+    Names the *function* rather than the node tag where the node carries one, so a
+    family node (`StrFunc`, tag ``str``) reports ``str.contains()`` and not ``str()``.
+    """
+    if types is not None and value is not None:
+        if not isinstance(value, types):
+            _reject(node, key, value, " or ".join(sorted({t.__name__ for t in types})))
+        return
+    if _json_safe(value):
+        return
+    tag = getattr(node.tag, "value", node.tag)
+    fn = getattr(node, "fn", None)
+    where = f"{tag}.{fn}" if isinstance(fn, str) else str(tag)
+    raise PlanError(
+        f"{where}(): {key}={value!r} is not a valid value for this argument - it must "
+        f"be a string, number, boolean, or a list of those, not a "
+        f"{type(value).__name__}. Most functions take their pattern/format/key as a "
+        f"plain Python value known when the plan is built, not a column or an object."
+    )
+
+
 def _encode_child(value: Any) -> Any:
     return value.to_ir()
 
@@ -147,13 +203,49 @@ _ENCODERS: dict[_Kind, Any] = {
 }
 
 # Class attributes holding a node class's precomputed shape: its serialization plan
+# Scalar field annotations are simple unions of builtins (``str``, ``int | None``), so the
+# declared type is itself the spec for what the field may carry -- no second table to keep
+# in sync. A token this does not recognise (``list[str]``, ``object``) yields no constraint,
+# so an unusual field is left exactly as permissive as it was.
+_ANNOTATION_TYPES: dict[str, type] = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+}
+
+
+def _scalar_types(annotation: Any) -> tuple[type, ...] | None:
+    """The types a `scalar` field may hold, read off its annotation, or None for 'any'."""
+    text = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", "")
+    tokens = [t.strip() for t in text.split("|")]
+    allowed: list[type] = []
+    for token in tokens:
+        if token == "None":
+            continue
+        mapped = _ANNOTATION_TYPES.get(token)
+        if mapped is None:
+            return None  # not a plain builtin union -- impose no constraint
+        allowed.append(mapped)
+    if not allowed:
+        return None
+    # `bool` is a subclass of `int`, and an int is a fine stand-in for a float, so widen
+    # rather than reject a value the engine already accepts.
+    if int in allowed and bool not in allowed:
+        allowed.append(bool)
+    if float in allowed and int not in allowed:
+        allowed.append(int)
+        allowed.append(bool)
+    return tuple(allowed)
+
+
 # (`_wire_plan`) and its sub-expression fields (`child_fields`).
 _PLAN_ATTR = "_ir_wire_plan"
 _CHILDREN_ATTR = "_ir_child_fields"
 
 
-def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool], ...]:
-    """`cls`'s serialization plan: ``(attr, ir_key, encoder, omit_none, omit_falsy)`` per field.
+def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool, Any], ...]:
+    """`cls`'s plan: ``(attr, ir_key, encoder, omit_none, omit_falsy, types)`` per field.
 
     `to_ir` used to re-derive this on every node it serialized: `dataclasses.fields`
     materializes a fresh tuple per call, each field's metadata mapping is then probed for
@@ -176,6 +268,7 @@ def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool], ...]:
                 _ENCODERS[spec.kind],
                 spec.omit is _Omit.IF_NONE,
                 spec.omit is _Omit.IF_FALSY,
+                _scalar_types(f.type) if spec.kind is _Kind.SCALAR else None,
             )
             for f in fields(cls)
             if (spec := f.metadata.get(_META)) is not None
@@ -225,13 +318,17 @@ class IRNode(Expr):
         if cached is not None:
             return cached
         out: dict[str, Any] = {"e": self.tag}
-        for name, key, encode, omit_none, omit_falsy in _wire_plan(type(self)):
+        for name, key, encode, omit_none, omit_falsy, types in _wire_plan(type(self)):
             value = getattr(self, name)
             if omit_none and value is None:
                 continue
             if omit_falsy and not value:
                 continue
-            out[key] = value if encode is None else encode(value)
+            if encode is None:
+                _check_scalar(self, key, value, types)
+                out[key] = value
+            else:
+                out[key] = encode(value)
         self.__dict__["_ir_cache"] = out
         return out
 

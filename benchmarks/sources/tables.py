@@ -33,6 +33,8 @@ already has ``read_parquet``) — see :func:`table_uris`.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Collection, Iterable
 
 import duckdb
 import pyarrow as pa
@@ -205,10 +207,46 @@ def _rename_positional(table: pa.Table, names: tuple[str, ...]) -> pa.Table:
     return table.rename_columns(list(names[:keep]))
 
 
-def _tpch_tables(scale: float, base: str) -> dict[str, pa.Table]:
+def tpch_tables_for(queries: Iterable[str]) -> set[str]:
+    """The TPC-H tables `queries` name, for narrowing what the fixture loads.
+
+    A whole-word scan of the SQL against `TPCH_TABLES`. That is sound because every TPC-H query
+    names its tables literally in `FROM`/`IN` clauses — there are no views, no aliases that
+    introduce a table, and no dynamic SQL — and it is *conservative in the safe direction*: a
+    table this misses is absent at query time and fails loudly with an unknown-table error, never
+    silently with a wrong answer.
+
+    Args:
+        queries: SQL texts to scan.
+
+    Returns:
+        The subset of `TPCH_TABLES` any of them references.
+    """
+    text = "\n".join(queries)
+    return {t for t in TPCH_TABLES if re.search(rf"\b{t}\b", text)}
+
+
+def _tpch_tables(
+    scale: float, base: str, needed: Collection[str] | None = None
+) -> dict[str, pa.Table]:
+    """Load TPC-H at `scale`, restricted to `needed` when the caller knows what it will ask for.
+
+    **Loading all eight tables to answer a one-table query is what makes sf10 unmeasurable on a
+    small box.** The fixture materializes every table into Arrow — through a `to_arrow_table()`
+    and two more copies in `_rename_positional` and `_normalize_types` — before any engine runs,
+    so `--isolate`, which starts a fresh process per case, pays for all eight every time.
+    Measured on a 30 GiB box: **q1 at sf10 was SIGKILLed loading the fixture**, one scan and one
+    grouped aggregate, and so was every other case, for three different engine pairings. Nothing
+    about the engines was under test when they died.
+
+    `needed` is what the selected cases actually reference (`tpch_tables_for`). `None` keeps the
+    old behaviour exactly, so every caller that does not know its case list is unaffected.
+    """
     sf = int(scale) if float(scale).is_integer() else scale
     out: dict[str, pa.Table] = {}
     for name, cols in TPCH_COLUMNS.items():
+        if needed is not None and name not in needed:
+            continue
         raw = _read(f"{base}/sf{sf}/{name}/*.parquet")
         out[name] = _normalize_types(_rename_positional(raw, cols))
     return out
@@ -382,7 +420,12 @@ def scan_rename(benchmark: str, uris: dict[str, str]) -> dict[str, dict[str, str
     return out
 
 
-def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict[str, pa.Table]:
+def load_tables(
+    benchmark: str,
+    scale: float,
+    source: str | None = None,
+    needed: Collection[str] | None = None,
+) -> dict[str, pa.Table]:
     """Load the named tables for ``benchmark`` from its public parquet source.
 
     ``benchmark`` is one of ``"tpch"``, ``"clickbench"``, ``"tpcds"``. ``source``
@@ -390,7 +433,7 @@ def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict
     TPC-DS scale factor (ignored by ClickBench, which is a fixed single table).
     """
     if benchmark == "tpch":
-        return _tpch_tables(scale, source or TPCH_BASE)
+        return _tpch_tables(scale, source or TPCH_BASE, needed)
     if benchmark == "clickbench":
         return _clickbench_tables(source or CLICKBENCH_BASE, CLICKBENCH_PARTS)
     if benchmark == "tpcds":

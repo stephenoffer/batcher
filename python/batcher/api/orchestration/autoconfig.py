@@ -76,7 +76,10 @@ def resolve_auto_config(config: Config | None = None) -> Config:
     cached = _RESOLVED
     if cached is not None and cached[0] is cfg and _within_tolerance(sensed, cached[1]):
         return cached[2]
-    resolved = dataclasses.replace(cfg, memory=dataclasses.replace(mem, max_memory_bytes=sensed))
+    resolved = dataclasses.replace(
+        cfg,
+        memory=dataclasses.replace(mem, max_memory_bytes=sensed, max_memory_bytes_sensed=True),
+    )
     _RESOLVED = (cfg, sensed, resolved)
     return resolved
 

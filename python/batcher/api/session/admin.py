@@ -1,8 +1,9 @@
-"""Session-level administration: table maintenance and streaming-query control.
+"""Session-level administration: table maintenance, streaming control, cluster release.
 
 `compact` and `vacuum` are the two halves of the small-files story — one rewrites,
 only the other deletes. `streams` and `await_any_termination` are the Spark-shaped
-handles on the queries a streaming write started.
+handles on the queries a streaming write started. `release_cluster` is the manual half
+of the warm-fleet lifecycle, whose automatic half is a timer.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ __all__ = [
     "add_streaming_listener",
     "await_any_termination",
     "compact",
+    "release_cluster",
     "remove_streaming_listener",
     "reset_terminated",
     "streaming_listeners",
@@ -149,6 +151,57 @@ def reset_terminated() -> None:
     from batcher.api.streaming._query import reset_terminated as _reset
 
     _reset()
+
+
+def release_cluster() -> None:
+    """Hand every warm distributed resource back to the cluster now, without waiting.
+
+    Batcher keeps two things warm between queries because respawning them dominates a short
+    query: the **shuffle fleet** of worker actors, and any **inference actor pool** holding a
+    loaded model. Both are released automatically — the fleet after
+    ``distributed.session_fleet_idle_s`` of no use, the pools at process exit — and a second
+    query that arrives inside that window reuses them instead of paying the spawn again.
+
+    The cost of keeping them is a reservation. A shuffle fleet is a placement group holding
+    close to every schedulable core, so for the length of the idle window an *other* consumer
+    of the cluster — a second engine, another job — sees no capacity. Measured on a 27-node
+    cluster: 357 of 384 cores held, returned in full 30 s after the query finished.
+
+    Call this when a script is done with Batcher but the process is not done with the
+    cluster. It is a no-op when nothing is warm, safe to call from anywhere, and never
+    raises: a resource that cannot be released is logged and skipped.
+
+    It is **not** needed for correctness or to avoid a leak — the automatic release covers
+    both, on the failure path as well as the normal one. It only removes the wait.
+
+    A fleet that is still mid-query is never touched, so calling this from another thread
+    while a query runs cannot interrupt it; the fleet is released when that query lets go.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.release_cluster()  # doctest: +SKIP
+
+    Returns:
+        Nothing. Whether anything was warm is deliberately not reported: it is a property of
+        the last query rather than of this call, and a caller that branched on it would be
+        racing the idle timer.
+    """
+    from batcher._internal.logging import note_suppressed
+
+    try:
+        from batcher.dist.fleet import release_session_fleet
+
+        release_session_fleet()
+    except Exception as exc:  # pragma: no cover - releasing must never raise at the caller
+        note_suppressed("api", "release the warm shuffle fleet", exc)
+    try:
+        from batcher.dist.executors.map import release_inference_pools
+
+        release_inference_pools()
+    except Exception as exc:  # pragma: no cover - same contract as the fleet above
+        note_suppressed("api", "release the warm inference pools", exc)
 
 
 def compact(

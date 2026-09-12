@@ -29,6 +29,7 @@ from batcher.plan.logical import (
     WindowFrame,
     WindowFuncSpec,
 )
+from batcher.plan.types import normalize_dtype_spec
 
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
@@ -250,33 +251,9 @@ def build_train_test_split(
     return train, test
 
 
-# Python builtins and NumPy/pandas dtype objects accepted where a Batcher dtype name
-# is expected, so `astype(float)` and `astype({"x": int})` read the way pandas spells
-# them. Widths follow the FFI boundary's normalization (Int*/Float* → 64-bit).
-_PY_TYPE_DTYPES: dict[Any, str] = {
-    int: "int64",
-    float: "float64",
-    str: "string",
-    bool: "boolean",
-    bytes: "binary",
-}
-
-
 def _dtype_name(dtype: Any) -> str:
     """Normalize a dtype specification to the string the IR expects."""
-    if isinstance(dtype, str):
-        return dtype
-    if dtype in _PY_TYPE_DTYPES:
-        return _PY_TYPE_DTYPES[dtype]
-    # A pyarrow DataType (or anything else that names itself) stringifies to the
-    # same vocabulary the cast expression already understands.
-    name = getattr(dtype, "__name__", None) or str(dtype)
-    if name in _PY_TYPE_DTYPES.values() or not isinstance(dtype, type):
-        return name
-    raise PlanError(
-        f"cast(): cannot interpret {dtype!r} as a dtype; pass a dtype name such as "
-        "'int64', a Python type (int/float/str/bool), or a pyarrow DataType"
-    )
+    return normalize_dtype_spec(dtype)
 
 
 def build_cast(ds: Dataset, dtypes: str | type | dict[str, Any], *, strict: bool = True) -> Dataset:

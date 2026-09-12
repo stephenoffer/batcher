@@ -12,7 +12,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.compat.guidance import DT_UNSUPPORTED, accessor_attribute_error
-from batcher.plan.expr_ir.constructors import lit, when
+from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.func_nodes import (
     ConvertTimezone,
@@ -123,6 +123,23 @@ def _clock_micros(value: str, arg: str) -> int:
         raise PlanError(f"is_between_time() {arg} is not a valid clock time: {value!r}")
     micros = (int(hh) * 3600 + int(mm) * 60 + int(ss)) * 1_000_000
     return micros + int(frac.ljust(6, "0") or 0)
+
+
+def _wrap_temporal(other: Any) -> Expr:
+    """The other side of a ``*_between`` difference, as an expression.
+
+    A bare column name is the natural spelling (``a.dt.days_between("b")``) and used to
+    reach ``other.cast(...)`` as a `str`, raising ``AttributeError: 'str' object has no
+    attribute 'cast'`` -- an error naming an internal call rather than the argument.
+    """
+    if isinstance(other, Expr):
+        return other
+    if isinstance(other, str):
+        return col(other)
+    raise PlanError(
+        f"dt.*_between(): other must be a timestamp column name or expression, got "
+        f"{type(other).__name__} {other!r}"
+    )
 
 
 class _DtNamespace:
@@ -481,6 +498,7 @@ class _DtNamespace:
         direction silently gained a whole day. Dividing the magnitude and reapplying the sign
         keeps `a.days_between(b) == -b.days_between(a)` for every input.
         """
+        other = _wrap_temporal(other)
         delta = self._e.cast("int64") - other.cast("int64")
         magnitude = delta.abs() // micros_per_unit
         return (delta.sign().cast("int64") * magnitude).cast("int64")

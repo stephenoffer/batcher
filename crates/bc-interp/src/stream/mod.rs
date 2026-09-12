@@ -196,7 +196,7 @@ pub fn execute_streaming(
     sources: &[Vec<RecordBatch>],
     budget: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let cache = prebuild_joins(plan, sources, None, budget, 1)?;
+    let cache = prebuild_joins(plan, sources, None, budget, 1, None)?;
     let ctx = Ctx::new(sources, &cache, None, budget);
     let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
     Ok(strip_empties(out))
@@ -210,7 +210,7 @@ pub fn execute_streaming_metered(
     budget: usize,
 ) -> Result<(Vec<RecordBatch>, crate::ExecMetrics), InterpError> {
     let m = Meter::new(plan, 1);
-    let cache = prebuild_joins(plan, sources, Some(&m), budget, 1)?;
+    let cache = prebuild_joins(plan, sources, Some(&m), budget, 1, None)?;
     let ctx = Ctx::new(sources, &cache, Some(&m), budget);
     let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
     Ok((strip_empties(out), m.finish()))
@@ -502,6 +502,7 @@ fn build_join<'a>(
                 ctx.budget,
                 Some(ctx.cache),
                 ctx.mats,
+                None,
                 None,
             )?;
             return materialized_join_from(

@@ -23,6 +23,7 @@ import contextlib
 import contextvars
 import logging
 import os
+import time
 from collections import deque
 
 import pyarrow as pa
@@ -212,6 +213,68 @@ def _agg_pool_in_use():
         _arm_agg_idle_release()
 
 
+# The same discipline for the SESSION-warm *inference* pools, and for a sharper reason: those
+# actors hold **devices**. A core that is reserved and idle slows a co-tenant down; a device
+# that is reserved and idle stops one dead, because there is no oversubscription to fall back
+# on and no second GPU to borrow. Measured with a Batcher arm and a Ray Data arm in one
+# benchmark process on eight T4s: Batcher's pool finished its query, kept all eight devices for
+# the life of the driver, and Ray Data's eight-actor pool then sat `pending` forever. Neither
+# engine reported anything; the second one simply never ran.
+#
+# The window is its own knob (`distributed.warm_inference_idle_s`) rather than the fleet's,
+# because what is rebuilt is not comparable — an actor respawn is ~1-2 s where a model load is
+# 5-120 s — so sizing this at `session_fleet_idle_s` would discard exactly the win the warm
+# pool exists for. Zero restores whole-session residency.
+_INFER_IDLE_TIMER: list = []
+# Outstanding uses of the warm inference registry: "idle" must mean *no stage is running on
+# the pool*, not *N seconds since one started*, or a query longer than the window would have
+# its own actors killed underneath it.
+_INFER_IN_USE: list[int] = []
+
+
+def _cancel_inference_idle_release() -> None:
+    """Stop any pending release: the pool is in use, so it is not idle."""
+    while _INFER_IDLE_TIMER:
+        with contextlib.suppress(Exception):
+            _INFER_IDLE_TIMER.pop().cancel()
+
+
+def _release_inference_pools_if_idle() -> None:
+    """The timer's callback. Declines while a stage holds the pool; that stage re-arms."""
+    if not _INFER_IN_USE:
+        _shutdown_pools(_SESSION_POOLS)
+
+
+def _arm_inference_idle_release() -> None:
+    """(Re)start the timer that returns an idle warm inference pool's devices."""
+    import threading
+
+    from batcher.config import active_config
+
+    _cancel_inference_idle_release()
+    if not _SESSION_POOLS:
+        return
+    idle_s = float(active_config().distributed.warm_inference_idle_s)
+    if idle_s <= 0:
+        return
+    timer = threading.Timer(idle_s, _release_inference_pools_if_idle)
+    timer.daemon = True
+    timer.start()
+    _INFER_IDLE_TIMER.append(timer)
+
+
+@contextlib.contextmanager
+def _inference_pool_in_use():
+    """Hold the warm inference pool for the length of a stage, then start its idle clock."""
+    _cancel_inference_idle_release()
+    _INFER_IN_USE.append(1)
+    try:
+        yield
+    finally:
+        _INFER_IN_USE.pop()
+        _arm_inference_idle_release()
+
+
 def release_foreign_agg_pools(plan0, needed_cpus: float) -> bool:
     """Kill warm CPU pools belonging to *other* pipelines when this one cannot place.
 
@@ -279,6 +342,7 @@ def release_inference_pools() -> None:
     automatically at process exit. A no-op when no pools are warm. The next `collect()`
     rebuilds the pool it needs (paying the one-time load again)."""
     _cancel_agg_idle_release()
+    _cancel_inference_idle_release()
     _shutdown_pools(_SESSION_POOLS)
     _shutdown_pools(_AGG_POOLS)
 
@@ -634,7 +698,19 @@ def _emptiest_actor(actors, slots: dict):
     return actor if slots[actor] > 0 else None
 
 
-def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
+def _run_partition(actor, partition, idx: int):
+    """Dispatch one partition to `actor` and return its `ObjectRef` — the pool's default.
+
+    The pool drivers take this as a parameter rather than calling `actor.run` directly so a
+    `map_batches -> aggregate` stage can dispatch `run_agg` through exactly the same pool,
+    scheduling, autoscaling and preemption recovery. Without the seam that route had no way
+    to reach an actor pool at all, so an accelerator stage under an aggregate fell back to
+    stateless tasks that reserve no device and rebuild the model once per partition.
+    """
+    return actor.run.remote(partition, idx)
+
+
+def _pipeline_actor_pool(actors, partitions, depth: int, launch=_run_partition) -> list:
     """Run `partitions` through a FIXED pool of `actors`, up to `depth` in flight per actor,
     preserving partition order.
 
@@ -661,7 +737,7 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
             if actor is None:
                 break
             idx = pending.popleft()
-            inflight[actor.run.remote(parts[idx], idx)] = (actor, idx)
+            inflight[launch(actor, parts[idx], idx)] = (actor, idx)
             slots[actor] -= 1
 
     _assign()
@@ -675,7 +751,9 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
     return results
 
 
-def _run_resident_pool(plan0, partitions, opts, size, registry, devices: int = 0):
+def _run_resident_pool(
+    plan0, partitions, opts, size, registry, devices: int = 0, launch=_run_partition
+):
     """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
     once), preserving submission order.
 
@@ -687,13 +765,15 @@ def _run_resident_pool(plan0, partitions, opts, size, registry, devices: int = 0
     import ray
 
     actors = _resident_pool_for(plan0, opts, size, registry, devices)
-    results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth())
+    results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth(), launch)
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     vram = [v for v in (_drain_gpu_vram(a) for a in actors) if v is not None]
     return results, (max(samples) if samples else None), (max(vram) if vram else None)
 
 
-def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope, devices: int = 0):
+def _run_scoped_pool(
+    plan0, partitions, opts, lo, hi, scope, devices: int = 0, launch=_run_partition
+):
     """Run `partitions` through the query-resident pool for `plan0`, healing a lost pool.
 
     The `resident_inference_pools()` scope reuses one model-loaded pool across a query's
@@ -709,10 +789,10 @@ def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope, devices: int = 0):
     from batcher.dist.executors.ray_runtime import recovery_policy
 
     try:
-        return _run_resident_pool(plan0, partitions, opts, hi, scope, devices)
+        return _run_resident_pool(plan0, partitions, opts, hi, scope, devices, launch)
     except RayError:
         _evict_scoped_pool(plan0, scope)
-        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
+        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy(), launch=launch)
 
 
 def _evict_scoped_pool(plan0, scope) -> None:
@@ -720,7 +800,7 @@ def _evict_scoped_pool(plan0, scope) -> None:
     _evict_pipeline_pools(plan0, scope)
 
 
-def _run_warm_pool(plan0, partitions, opts, lo, hi, devices: int = 0):
+def _run_warm_pool(plan0, partitions, opts, lo, hi, devices: int = 0, launch=_run_partition):
     """Run `partitions` through the SESSION-warm pool for `plan0`, healing a lost pool.
 
     On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
@@ -731,11 +811,14 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi, devices: int = 0):
 
     from batcher.dist.executors.ray_runtime import recovery_policy
 
-    try:
-        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS, devices)
-    except RayError:
-        _evict_session_pool(plan0)
-        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
+    with _inference_pool_in_use():
+        try:
+            return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS, devices, launch)
+        except RayError:
+            _evict_session_pool(plan0)
+            return _drive_actor_pool(
+                plan0, partitions, opts, lo, hi, recovery_policy(), launch=launch
+            )
 
 
 def _evict_session_pool(plan0) -> None:
@@ -765,6 +848,9 @@ def _map_resources(
     num_gpus = 0.0
     wants_pool = False
     concurrency: object = None
+    #: The concurrency named by stages that ask for an accelerator, tracked apart from the
+    #: merge across all stages -- see the note where it is applied.
+    accel_concurrency: object = None
     accelerator_type: str | None = None
     resources: dict[str, float] = {}
     node: LogicalPlan | None = plan
@@ -784,7 +870,21 @@ def _map_resources(
                 wants_pool = True
                 if node.concurrency is not None:
                     concurrency = _merge_concurrency(concurrency, node.concurrency)
+                    if node.num_gpus > 0 or node.resources:
+                        accel_concurrency = _merge_concurrency(accel_concurrency, node.concurrency)
         node = getattr(node, "input", None)
+    # Taking the widest concurrency across stacked stages is right while they share a resource
+    # class and catastrophic the moment they do not. These stages fuse into ONE actor, so a CPU
+    # stage's width becomes the number of actors that each hold a **device** -- and the
+    # canonical two-stage batch-inference pipeline names both:
+    # `map_batches(Decode, concurrency=32).map_batches(Model, num_gpus=1, concurrency=8)`
+    # asked for 32 actors with a GPU apiece on an 8-GPU cluster. Unsatisfiable by construction,
+    # and it does not fail: the gang never places, the pool thrashes spawning and killing
+    # replacements (measured: 10 `PENDING_CREATION`, 1 alive, 136 dead) and the query hangs.
+    # When the fused stage holds an accelerator, the accelerator stage's own concurrency is the
+    # one that can be honoured, so it wins.
+    if (num_gpus > 0 or resources) and accel_concurrency is not None:
+        concurrency = accel_concurrency
     return num_gpus, wants_pool, concurrency, accelerator_type, resources
 
 
@@ -886,6 +986,110 @@ def _placeable_scheduling(needed_cpus: float) -> dict:
         return {}
 
 
+def _run_pool_stage(
+    plan,
+    plan0,
+    partitions,
+    opts: dict,
+    workers: int,
+    hub,
+    *,
+    num_gpus: float,
+    accelerator_type: str | None,
+    resources: dict[str, float] | None,
+    concurrency: object,
+    write_spec: dict | None = None,
+    launch=_run_partition,
+) -> list:
+    """Run `partitions` through this pipeline's load-once / accelerator actor pool.
+
+    Sizes the pool, picks its lifetime, drives it and records the device feedback — the whole
+    of what makes an inference stage load its model once and keep a device reserved while it
+    runs. Shared by the two routes that need it, `_distributed_map` (a map-terminal pipeline)
+    and `_distributed_map_aggregate` (one under an aggregate), which differ only in the actor
+    method `launch` dispatches; sharing it is what stops the second route drifting into a
+    second, worse copy of the first, which is exactly what it was before it had one.
+
+    Args:
+        plan: The stage's plan, for the learned-feedback key.
+        plan0: The same plan, single-source relabelled — what the actors run.
+        partitions: The partition descriptors to map.
+        opts: The accelerator Ray options (`_gpu_options`).
+        workers: The stage's fan-out.
+        hub: The metadata hub the device measurements are recorded into.
+        num_gpus: Devices per actor, as adapted by the scheduling envelope.
+        accelerator_type: A device-model pin, or `None`.
+        resources: Custom accelerator resources, or `None`.
+        concurrency: The caller's explicit pool size / range, or `None`.
+        write_spec: A sink bound into the actors, which forces the per-call pool.
+        launch: Dispatches one partition to one actor (see `_run_partition`).
+
+    Returns:
+        One result per partition, in partition order.
+    """
+    from batcher.dist.executors.ray_runtime import recovery_policy
+
+    if isinstance(concurrency, tuple):
+        lo, hi = concurrency
+    else:
+        from batcher.ml.gpu import gpu_aware_pool_default
+
+        default_pool = gpu_aware_pool_default(
+            num_gpus, workers, len(partitions), accelerator_type, resources=resources
+        )
+        lo = hi = _resolve_pool_size(concurrency, len(partitions), default_pool)
+        # A recurring inference pipeline that has consistently served fewer partitions than
+        # it built actors right-sizes its (auto) pool from that measured reuse, so a small
+        # job stops over-provisioning GPU actors. Only trims an auto-resolved size, never an
+        # explicit `concurrency`; pool size is pure parallelism, so the result is identical.
+        if concurrency is None:
+            from batcher.dist.adaptive_sizing import learned_actor_pool_size
+
+            learned = learned_actor_pool_size(hub, _pipeline_signature(plan0), hi)
+            if learned is not None:
+                lo = hi = learned
+    _record_actor_pool_reuse(hub, plan0, len(partitions))
+    # A first, unmeasured run starts at one actor per device and fills the devices from
+    # the model's measured footprint once it has loaded (`_resident_pool_for`). Without
+    # this, run 0 of every new pipeline is the unpacked configuration the measured loop
+    # exists to replace — which for a single-shot job is the only configuration it ever
+    # gets. Zero (no cold fill) as soon as anything has been measured, and for an
+    # explicit `concurrency`, which is the caller sizing their own pool.
+    cold_devices = _cold_start_devices(hub, plan, concurrency, num_gpus)
+    if cold_devices:
+        lo = hi = max(1, cold_devices)
+    # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
+    # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
+    # (model loads once per session, reused across `collect()`s — the 2x win on repeated
+    # / iterative / cold-start-bound inference); else the per-call pool with autoscaling +
+    # preemption recovery (spawned and killed each call, the historical default).
+    from batcher.config import active_config
+
+    scope = _INFERENCE_POOLS.get()
+    warm = active_config().distributed.warm_inference_pools
+    if write_spec is not None:
+        # A writing stage builds its actors with the sink bound in, so it cannot borrow a
+        # pool from the session-warm / resident registries (those actors were built to
+        # RETURN batches). Use the per-call pool, which also carries preemption recovery.
+        results, gpu_util, gpu_vram = _drive_actor_pool(
+            plan0, partitions, opts, lo, hi, recovery_policy(), write_spec, launch
+        )
+    elif scope is not None:
+        results, gpu_util, gpu_vram = _run_scoped_pool(
+            plan0, partitions, opts, lo, hi, scope, cold_devices, launch
+        )
+    elif warm:
+        results, gpu_util, gpu_vram = _run_warm_pool(
+            plan0, partitions, opts, lo, hi, cold_devices, launch
+        )
+    else:
+        results, gpu_util, gpu_vram = _drive_actor_pool(
+            plan0, partitions, opts, lo, hi, recovery_policy(), launch=launch
+        )
+    _record_gpu_feedback(hub, plan, gpu_util, gpu_vram, _actors_per_device(hi, num_gpus))
+    return results
+
+
 def _distributed_map(
     plan: LogicalPlan,
     sources: list[Source],
@@ -923,11 +1127,7 @@ def _distributed_map(
     # Carbonite's scheduling envelope carries the *adapted* GPU request (the raw
     # `map_batches(num_gpus=...)` tag tuned by measured utilization). When present it
     # is authoritative, so the per-task `.options(num_gpus=...)` uses the adapted value.
-    from batcher.dist.executors.ray_runtime import (
-        current_envelope,
-        gather_map_results,
-        recovery_policy,
-    )
+    from batcher.dist.executors.ray_runtime import current_envelope, gather_map_results
 
     env = current_envelope()
     if env is not None and num_gpus > 0:
@@ -973,64 +1173,19 @@ def _distributed_map(
 
     opts = _gpu_options(num_gpus, accelerator_type, resources)
     if wants_pool:
-        if isinstance(concurrency, tuple):
-            lo, hi = concurrency
-        else:
-            from batcher.ml.gpu import gpu_aware_pool_default
-
-            default_pool = gpu_aware_pool_default(
-                num_gpus, workers, len(partitions), accelerator_type, resources=resources
-            )
-            lo = hi = _resolve_pool_size(concurrency, len(partitions), default_pool)
-            # A recurring inference pipeline that has consistently served fewer partitions than
-            # it built actors right-sizes its (auto) pool from that measured reuse, so a small
-            # job stops over-provisioning GPU actors. Only trims an auto-resolved size, never an
-            # explicit `concurrency`; pool size is pure parallelism, so the result is identical.
-            if concurrency is None:
-                from batcher.dist.adaptive_sizing import learned_actor_pool_size
-
-                learned = learned_actor_pool_size(hub, _pipeline_signature(plan0), hi)
-                if learned is not None:
-                    lo = hi = learned
-        _record_actor_pool_reuse(hub, plan0, len(partitions))
-        # A first, unmeasured run starts at one actor per device and fills the devices from
-        # the model's measured footprint once it has loaded (`_resident_pool_for`). Without
-        # this, run 0 of every new pipeline is the unpacked configuration the measured loop
-        # exists to replace — which for a single-shot job is the only configuration it ever
-        # gets. Zero (no cold fill) as soon as anything has been measured, and for an
-        # explicit `concurrency`, which is the caller sizing their own pool.
-        cold_devices = _cold_start_devices(hub, plan, concurrency, num_gpus)
-        if cold_devices:
-            lo = hi = max(1, cold_devices)
-        # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
-        # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
-        # (model loads once per session, reused across `collect()`s — the 2x win on repeated
-        # / iterative / cold-start-bound inference); else the per-call pool with autoscaling +
-        # preemption recovery (spawned and killed each call, the historical default).
-        from batcher.config import active_config
-
-        scope = _INFERENCE_POOLS.get()
-        warm = active_config().distributed.warm_inference_pools
-        if write_spec is not None:
-            # A writing stage builds its actors with the sink bound in, so it cannot borrow a
-            # pool from the session-warm / resident registries (those actors were built to
-            # RETURN batches). Use the per-call pool, which also carries preemption recovery.
-            results, gpu_util, gpu_vram = _drive_actor_pool(
-                plan0, partitions, opts, lo, hi, recovery_policy(), write_spec
-            )
-        elif scope is not None:
-            results, gpu_util, gpu_vram = _run_scoped_pool(
-                plan0, partitions, opts, lo, hi, scope, cold_devices
-            )
-        elif warm:
-            results, gpu_util, gpu_vram = _run_warm_pool(
-                plan0, partitions, opts, lo, hi, cold_devices
-            )
-        else:
-            results, gpu_util, gpu_vram = _drive_actor_pool(
-                plan0, partitions, opts, lo, hi, recovery_policy()
-            )
-        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram, _actors_per_device(hi, num_gpus))
+        results = _run_pool_stage(
+            plan,
+            plan0,
+            partitions,
+            opts,
+            workers,
+            hub,
+            num_gpus=num_gpus,
+            accelerator_type=accelerator_type,
+            resources=resources,
+            concurrency=concurrency,
+            write_spec=write_spec,
+        )
     else:
         # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
         # own partition's data (x the plan's compute weight) — fractional for a tiny
@@ -1090,11 +1245,23 @@ def _distributed_map(
         )
 
     if write_spec is not None:
-        # Only locators came back. Merging them is a commutative concat, so partition order
-        # does not matter and a recomputed shard replaces its own deterministic file.
+        # Only locators and each shard's schema came back. Merging the locators is a
+        # commutative concat, so partition order does not matter and a recomputed shard
+        # replaces its own deterministic file. The schema is the plan's output type, identical
+        # across shards, so the first one that reported is the answer — and it is what saves
+        # the driver from re-deriving it by running the UDF on itself (`_write_udf_output`).
         from batcher.io.manifest import WriteManifest
 
-        return WriteManifest(tuple(f for shard in results if shard for f in shard))
+        written: list = []
+        out_schema = None
+        for shard in results:
+            if not shard:
+                continue
+            files, schema = shard
+            written.extend(files)
+            if out_schema is None:
+                out_schema = schema
+        return WriteManifest(tuple(written), schema=out_schema)
 
     batches: list[pa.RecordBatch] = []
     for r in results:
@@ -1990,12 +2157,38 @@ def _pool_placement_envelope(env, opts: dict):
 
     Left alone for a CPU-only stage, where the core *is* the resource being reserved and the
     bundle is already honest.
+
+    **The accelerator has to travel with it, for the same reason and in the other direction.**
+    A bundle is matched by resource, so a gang reserved from an envelope carrying no device
+    reserves none -- and the actor then asks its bundle for one and is refused outright:
+    ``Cannot schedule _MapActor ... the resource request {'CPU': 0, 'GPU': 1} cannot fit into
+    any bundles for the placement group, [{'CPU': 1.0}, ...]``. Not a stall; a `ValueError` at
+    spawn. It is reachable from exactly one place, which is why it went unseen: a pool builds
+    a placement group only in `_drive_actor_pool`, and an inference pool goes there rather
+    than to a resident/warm registry only when it carries a **sink** -- so the shape that
+    breaks is `map_batches(Model, num_gpus=1).write.parquet(...)`, scoring a corpus and
+    writing the scores, which is the canonical batch-inference job.
     """
-    if env is None or "num_cpus" not in opts:
+    if "num_cpus" not in opts:
         return env
     import dataclasses
 
-    return dataclasses.replace(env, num_cpus=float(opts["num_cpus"]))
+    from batcher.plan.resource import SchedulingEnvelope
+
+    # `_gpu_options` sets `num_cpus` only when it set an accelerator too, so reaching here
+    # means this pool wants a device -- and a **missing** envelope is the common case, not a
+    # rare one: nothing sets a scheduling envelope on the write path. `None` reserved
+    # `{"CPU": 1.0}` bundles (`_bundle`'s default) for actors asking `{"CPU": 0, "GPU": 1}`,
+    # which is the refusal above. Synthesize one so the reservation states what the actors
+    # will ask for.
+    base = env if env is not None else SchedulingEnvelope()
+    resources = opts.get("resources")
+    return dataclasses.replace(
+        base,
+        num_cpus=float(opts["num_cpus"]),
+        num_gpus=float(opts.get("num_gpus", base.num_gpus)),
+        resources=tuple(sorted(resources.items())) if resources else base.resources,
+    )
 
 
 def _autoscale_action(
@@ -2013,7 +2206,9 @@ def _autoscale_action(
     return "hold"
 
 
-def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write_spec=None):
+def _drive_actor_pool(
+    plan0, partitions, opts, min_size, max_size, policy, write_spec=None, launch=_run_partition
+):
     """Stream partitions through an actor pool that scales in ``[min_size, max_size]``
     and **replaces an actor lost to preemption**, reassigning its partition.
 
@@ -2109,7 +2304,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
             if actor is None:
                 break
             idx = pending.popleft()
-            inflight[actor.run.remote(parts[idx], idx)] = (actor, idx)
+            inflight[launch(actor, parts[idx], idx)] = (actor, idx)
             slots[actor] -= 1
 
     try:
@@ -2306,6 +2501,8 @@ class _MapActor:
         self._plan = _with_inference_workers(_prebuild_factories(plan0), cpu_workers)
         self._write_spec = write_spec
         self._gpu_vram_max: float | None = None
+        # Far enough in the past that the first call always samples.
+        self._gpu_vram_at = float("-inf")
         # Sustained utilization, sampled on a timer for the actor's working window — NOT the
         # post-forward reading this used to take. See `SustainedUtilization`: sampling right
         # after a forward pass reads the device at its busiest, which reported 86% for a stage
@@ -2329,9 +2526,9 @@ class _MapActor:
         self._util.end_call()
         # VRAM stays a PEAK: it is a capacity constraint, and the largest footprint the run
         # ever reached is what the next run must fit. Utilization is a rate, so it is a mean.
-        self._observe_gpu(sample_gpu_vram_fraction())
+        self._sample_gpu_vram(sample_gpu_vram_fraction)
         if not out or sum(b.num_rows for b in out) == 0:
-            return [] if self._write_spec is not None else None
+            return ([], None) if self._write_spec is not None else None
         # Writing stage: this actor writes its own inference output straight to the sink and
         # returns only `WrittenFile` locators. That is what keeps a batch-inference job whose
         # RESULT is larger than the driver (a 2B-row embedding write) from OOMing the driver
@@ -2415,13 +2612,34 @@ class _MapActor:
         self._util.begin_call()
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
         self._util.end_call()
-        self._observe_gpu(sample_gpu_vram_fraction())
+        self._sample_gpu_vram(sample_gpu_vram_fraction)
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
 
+    def _sample_gpu_vram(self, sample) -> None:
+        """Fold a VRAM reading into this actor's running peak, at most every `_VRAM_SAMPLE_S`.
+
+        The reading is an NVML call, and NVML is not cheap: measured inside the streamed
+        consumer of a GPU inference pipeline, one sample per morsel cost **12.5 ms against a
+        71 ms forward pass** -- 17% of the device stage spent asking the driver how full the
+        card was. What the number is *for* is packing the next run's actors by measured
+        footprint (`gpu_vram_stats` -> `recommend_num_gpus`), which is a per-run decision fed
+        by a running maximum. A maximum does not need every sample; it needs enough of them to
+        have seen the peak, and a model's VRAM high-water mark is reached in its first batches
+        and then flat.
+
+        Rate-limiting is therefore free of information and not of time. `_observe_gpu`'s
+        contract is unchanged for anything that already has a reading in hand -- it takes a
+        callable instead, so a skipped sample costs the call as well as the fold."""
+        now = time.monotonic()
+        if now - self._gpu_vram_at < _VRAM_SAMPLE_S:
+            return
+        self._gpu_vram_at = now
+        self._observe_gpu(sample())
+
     def _observe_gpu(self, vram: float | None) -> None:
-        """Fold one post-forward VRAM sample into this actor's running peak."""
+        """Fold one VRAM sample into this actor's running peak."""
         self._gpu_vram_max = _max_opt(self._gpu_vram_max, vram)
 
     def gpu_stats(self) -> float | None:
@@ -2465,15 +2683,39 @@ class _MapActor:
 # cores; a decode/normalize `fn` releases the GIL (PIL/cv2/NumPy/torch) so threads scale.
 _INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
 
+# Seconds between an actor's VRAM readings (see `_MapActor._sample_gpu_vram`). The reading
+# feeds a running maximum used to pack the NEXT run's actors, and a model's footprint peaks in
+# its first batches, so a second's resolution loses nothing a per-morsel NVML call was buying.
+_VRAM_SAMPLE_S = 1.0
+
 
 def _with_inference_workers(plan, cpu_workers: int | None = None):
     """Set each map stage's `num_workers` for a map actor: a GPU stage keeps 1 (one CUDA
-    context), a CPU stage gets `cpu_workers`, defaulting to `_INFERENCE_CPU_WORKERS`.
+    context), a CPU stage gets `cpu_workers`.
 
-    The default of 4 exists to feed a *device*: it is what keeps a fast/small model's
-    decode/preprocess ahead of the GPU (util < 50% without it). A CPU-only map/aggregate pool
-    has no device to feed and a whole node to use, so it passes its own width — see
-    `_agg_actor_width`, which measured 1.43x for exactly this reason."""
+    `cpu_workers` is the caller's number when it has one — a CPU-only map/aggregate pool
+    passes `_agg_actor_width`, a streamed producer passes `_producer_cpu_width`. With none the
+    stage gets `_INFERENCE_CPU_WORKERS`, which is what a device actor's fused CPU prefix runs
+    at.
+
+    **A device actor's width is deliberately NOT derived from its node's core count**, which is
+    the obvious change and was measured to be wrong. Eight device actors on 8-core nodes at a
+    flat 4 use 32 of this fleet's 192 cores, which caps cluster CPU at 17% and reads exactly
+    like an oversight. Widening to the node's 8 helps only a UDF that releases the GIL, and a
+    thread pool cannot know which it has. Measured on this box, eight batches through one
+    stage, 1 thread against 2/4/8:
+
+    | stage | 2 threads | 4 threads | 8 threads |
+    |---|---:|---:|---:|
+    | PIL JPEG decode | 1.93x | 3.58x | **4.12x** |
+    | NumPy `sort`/`tanh`/`sqrt` | 1.56x | 0.94x | **0.69x** |
+
+    NumPy's ufuncs and `sort` hold the GIL, so the second stage gets *slower* the wider it
+    goes -- 31% slower at the node's own core count. `_INFERENCE_CPU_WORKERS`'s 4 is the value
+    that neither wastes a GIL-releasing stage's node nor punishes a GIL-bound one, and the
+    cluster-CPU ceiling it implies is not a bug in this constant: it is the fused shape
+    confining a whole pipeline to the accelerator nodes. The fix for *that* is the staged
+    route, where the CPU stage runs in its own actor **processes** and the GIL is not shared."""
     import dataclasses
 
     from batcher.plan.logical import MapBatches
@@ -2511,8 +2753,8 @@ def _with_map_workers(plan, n: int):
     return plan
 
 
-def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
-    """Write one worker's UDF output to the sink, returning only `WrittenFile` locators.
+def _write_udf_output(batches: list, write_spec: dict, idx: int) -> tuple[list, object]:
+    """Write one worker's UDF output to the sink, returning its locators **and its schema**.
 
     Shared by the actor-pool path (`_MapActor.run`) and the stateless-task path
     (`_map_udf_task`) so a distributed inference write has exactly one write semantics.
@@ -2523,6 +2765,15 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
     write is the case where the driver has *never* seen the output, so the row cap behind
     `repartition(num_files=...)` / `repartition(target_size_mb=...)` can only be computed
     on the worker. `resume` likewise has to arrive here to mean anything.
+
+    **The schema comes back for the same reason the row cap is computed here**:
+    `WriteManifest.schema` is documented as attached by "the driver, which knows the plan's
+    output type", and on this path the driver does not. A `map_batches` output type is only
+    knowable by running the UDF, so the driver ran it -- under a zero-row limit, on itself, to
+    learn the schema before writing. For a model that is a model load on the driver, which on a
+    GPU-less head node is `cudaErrorInsufficientDriver` and on a 29 GiB input was an OOM kill
+    at 16.7 GB, both before a row was written. The worker has just produced the rows; it can
+    say what they are for the cost of returning a schema object.
     """
     from batcher.dist.executors.write import _shard_rows_per_file
     from batcher.io.sink import SINKS
@@ -2532,7 +2783,7 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
     layout = write_spec.get("layout")
     if layout is not None:
         layout = layout.for_shard(idx, int(write_spec.get("shards", 1)))
-    return sink.write_partitioned(
+    files = sink.write_partitioned(
         table,
         write_spec["path"],
         partition_by=write_spec.get("partition_by"),
@@ -2540,6 +2791,7 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
         resume=bool(write_spec.get("resume", False)),
         max_rows_per_file=_shard_rows_per_file(table, layout),
     )
+    return files, table.schema
 
 
 def _map_udf_task(
@@ -2556,12 +2808,12 @@ def _map_udf_task(
 
     rows = read_partition_descriptor(partition)
     if not rows:
-        return [] if write_spec is not None else None
+        return ([], None) if write_spec is not None else None
     out = core.execute_with_udfs(
         _with_map_workers(plan0, workers), [InMemorySource(rows)], engine_config=cfg_json
     )
     if not out or sum(b.num_rows for b in out) == 0:
-        return [] if write_spec is not None else None
+        return ([], None) if write_spec is not None else None
     # Write in place so the post-UDF rows never travel back through the driver.
     if write_spec is not None:
         return _write_udf_output(out, write_spec, idx)
@@ -2705,6 +2957,101 @@ def _gather_with_pool_recovery(gather, actor_launch, task_launch, map_plan, acto
         return gather(task_launch)
 
 
+def _accelerator_map_aggregate(agg, sources, sid, map_plan, gk, aj, workers):
+    """Partial-aggregate an accelerator map stage on its inference actor pool.
+
+    `map_batches(Model, num_gpus=1) -> agg(...)` is the shape every batch-inference
+    benchmark has, because reducing on the workers is what stops an engine being charged a
+    transfer its rivals do not pay. It nonetheless had no pool: `_agg_actor_pool` declines an
+    accelerator stage, so the route fell through to `_map_agg_task`, which reserves **no
+    device** and reconstructs the UDF once per partition — a model load, a CUDA context and a
+    weight upload apiece. Measured on eight T4s over a 10,000-image corpus, the identical
+    dense network: **0.90 s** for the read alone, **1.15 s** running the model on the host,
+    and **10.50 s** on the GPUs. The devices were not slow; they were being reacquired.
+
+    Sending it through `_run_pool_stage` gives it the same pool the map-terminal route has --
+    one model load per actor, a device reserved for the actor's life, gang-scheduled
+    placement, autoscaling, preemption recovery and the measured `num_gpus` feedback loop.
+    Only the actor *method* differs: `run_agg` partial-aggregates in the actor, so what
+    leaves the worker is still a partial state and the mergeable contract (`partial ->
+    combine -> finalize`) is untouched.
+
+    The partition count comes from `_pool_partition_count` rather than the data-driven
+    `_adaptive_partition_count`, for the reason that function documents: an accelerator
+    stage's unit of work is an actor, and sizing partitions from bytes lets a small corpus
+    decide how many devices are allowed to run.
+
+    Args:
+        agg: The `Aggregate` node whose input is the map chain.
+        sources: The query's bound sources.
+        sid: Index of the single source the map chain scans.
+        map_plan: The map prefix, single-source relabelled.
+        gk: The aggregate's group-key JSON.
+        aj: The aggregate's aggregate-spec JSON.
+        workers: The stage's fan-out.
+
+    Returns:
+        The folded partial-aggregate state, or `None` when every partition was empty.
+    """
+    from batcher.dist.executors.ray_runtime import current_envelope
+
+    nat = engine()
+    hub = _learning_hub()
+    num_gpus, _wants_pool, concurrency, accelerator_type, resources = _map_resources(map_plan)
+    # Carbonite's scheduling envelope carries the *adapted* device request, exactly as it
+    # does for the map-terminal route; without this the aggregate route would ignore the
+    # measured loop that the same pipeline's map form obeys.
+    env = current_envelope()
+    if env is not None and num_gpus > 0:
+        num_gpus = env.num_gpus
+    if env is not None and env.accelerator_type is not None:
+        accelerator_type = env.accelerator_type
+    n_parts = _pool_partition_count(workers, num_gpus, accelerator_type, resources, concurrency)
+    proj, pred = _scan_pushdown(map_plan)
+    partitions = partition_descriptors(
+        sources[sid], workers, projection=proj, predicate=pred, max_partitions=n_parts
+    )
+
+    def _launch(actor, partition, _idx):
+        """Dispatch the partition to the actor's *aggregating* entry point."""
+        return actor.run_agg.remote(partition, gk, aj)
+
+    partials = _run_pool_stage(
+        agg.input,
+        map_plan,
+        partitions,
+        _gpu_options(num_gpus, accelerator_type, resources),
+        workers,
+        hub,
+        num_gpus=num_gpus,
+        accelerator_type=accelerator_type,
+        resources=resources,
+        concurrency=concurrency,
+        launch=_launch,
+    )
+    state = None
+    for partial in partials:
+        if partial is None:
+            continue
+        state = partial if state is None else nat.combine(gk, aj, [state, partial])
+    return state
+
+
+def _finish_map_aggregate(above, agg, gk, aj, state):
+    """Finalize a folded partial state into the stage's output table."""
+    import pyarrow as pa
+
+    from batcher.dist.executors.partition_io import _apply_above
+    from batcher.dist.executors.plan_analysis import _empty_agg_table
+
+    if state is None:
+        table = _empty_agg_table(agg)
+    else:
+        out = engine().combine_finalize(gk, aj, [state])
+        table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
+    return table if not above else _apply_above(above, table)
+
+
 def _distributed_map_aggregate(above, agg, sources, workers):
     """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
 
@@ -2713,16 +3060,24 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     applies anything above the aggregate. The UDF — the costly part — runs across the
     cluster, not single-node on the driver."""
 
-    import pyarrow as pa
-
     nat = engine()
-    from batcher.dist.executors.partition_io import _apply_above
-    from batcher.dist.executors.plan_analysis import _empty_agg_table
     from batcher.dist.executors.ray_runtime import current_envelope, gather_map_results
 
     _ensure_ray(workers)
     map_plan, sid = _relabel_single_source(agg.input)
     gk, aj = agg_spec_json(agg)
+    # An accelerator / load-once stage has its own pool machinery and takes it — see
+    # `_accelerator_map_aggregate` for why the stateless-task fallback was so much worse than
+    # it looked. Everything below is the CPU aggregate route, unchanged.
+    accel_gpus, wants_pool, _concurrency, accel_type, accel_res = _map_resources(map_plan)
+    if wants_pool and (accel_gpus > 0 or accel_res):
+        return _finish_map_aggregate(
+            above,
+            agg,
+            gk,
+            aj,
+            _accelerator_map_aggregate(agg, sources, sid, map_plan, gk, aj, workers),
+        )
     # The pool is acquired BEFORE the partition count because the count depends on it: a
     # partition is sized to one working unit, and this route's unit is a `_agg_actor_width`-wide
     # actor (16 here) rather than the `_TARGET_TASK_CPUS`-wide task the default assumes. When
@@ -2747,12 +3102,21 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
     sched = _map_scheduling_options(current_envelope(), shares)
+    # A *plain function* asking for a device wants no pool (there is no model to load once),
+    # so it stays on tasks — but it still has to be given the device. This route named only
+    # the CPU share, so `map_batches(fn, num_gpus=1) -> agg(...)` ran with no accelerator
+    # reserved: correct wherever the UDF happened to land on a node that had one, and a
+    # `no CUDA-capable device` failure wherever it did not. `_distributed_map` spells the
+    # same merge for the same reason — `opts` after the share, so an accelerator stage's
+    # zero-CPU request (see `_gpu_options`) overrides it rather than the other way round.
+    accel_opts = _gpu_options(accel_gpus, accel_type, accel_res)
     # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
     plan_ref = _shared_arg(map_plan)
 
     def _task_launch(idx):
         task_workers = max(1, round(shares[idx]))
-        return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
+        options = {"num_cpus": shares[idx], **accel_opts, **sched}
+        return _map_agg_task.options(**options).remote(
             plan_ref, partitions[idx], gk, aj, task_workers
         )
 
@@ -2796,9 +3160,4 @@ def _distributed_map_aggregate(above, agg, sources, workers):
 
     with _agg_pool_in_use():
         state = _gather_with_pool_recovery(_gather, _actor_launch, _task_launch, map_plan, actors)
-    if state is None:
-        table = _empty_agg_table(agg)
-    else:
-        out = nat.combine_finalize(gk, aj, [state])
-        table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
-    return table if not above else _apply_above(above, table)
+    return _finish_map_aggregate(above, agg, gk, aj, state)

@@ -86,8 +86,15 @@ class _FakeRay:
             pass
 
     @staticmethod
-    def wait(refs, num_returns=1):
-        return [refs[0]], refs[1:]
+    def wait(refs, num_returns=1, timeout=None):
+        """Complete the oldest `num_returns` calls, so a run is reproducible.
+
+        `num_returns` is honored rather than ignored because the loop now drains every
+        finished call in one pass (`_completed`), and a stand-in that always returned one
+        would make that pass untestable while still passing every test written before it.
+        """
+        n = max(1, min(int(num_returns), len(refs)))
+        return list(refs[:n]), list(refs[n:])
 
     @staticmethod
     def get(ref):
@@ -225,12 +232,16 @@ def loop(monkeypatch):
     # losses are simulated, so the answer has to be the simulated type — otherwise a
     # preemption escapes as an ordinary error and the recovery paths are never entered.
     monkeypatch.setattr(schedule, "_worker_loss_errors", lambda: (_Preempted,))
-    monkeypatch.setattr(schedule, "_probe", lambda pool: {})
-    monkeypatch.setattr(
-        schedule,
-        "_probe_addrs",
-        lambda pool: {a: a.impl.addr() for a in pool if hasattr(a.impl, "addr")},
-    )
+    # Both modules, because both call these. `recovery` owns them and `schedule` imports them
+    # by name, so the two hold separate references and patching one leaves the other live --
+    # which showed up as a preempted-relay test replaying through the *real* host probe.
+    from batcher.dist.streaming.pipeline import recovery
+
+    addrs = lambda pool: {a: a.impl.addr() for a in pool if hasattr(a.impl, "addr")}  # noqa: E731
+    for mod in (schedule, recovery):
+        monkeypatch.setattr(mod, "_probe", lambda pool: {})
+        monkeypatch.setattr(mod, "_probe_addrs", addrs)
+    monkeypatch.setattr(recovery, "ray", _FakeRay)
     return schedule.run_streamed
 
 
@@ -506,3 +517,209 @@ def test_a_grown_stage_still_delivers_every_row_exactly_once(loop):
         ceilings=[1, 1, 4],
     )
     assert _values(grown) == _values(fixed)
+
+
+# --- the pipelined publish window --------------------------------------------------------
+
+
+def _max_inflight(monkeypatch, name: str) -> list[int]:
+    """Record the size of the loop's inflight dict each time a completion is handled."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    seen: list[int] = []
+    real = getattr(schedule, name)
+
+    def spy(ctx, inflight, ref, loss_errors):
+        seen.append(len(inflight))
+        return real(ctx, inflight, ref, loss_errors)
+
+    monkeypatch.setattr(schedule, name, spy)
+    return seen
+
+
+def test_a_producer_is_asked_for_its_whole_window_not_one_morsel_at_a_time(loop, monkeypatch):
+    """The window is filled with queued calls, so the actor never waits on the driver.
+
+    One `publish_next` at a time made the producer idle for a whole pass of the loop between
+    every morsel it produced. The observable is the depth of the issue queue: more than one
+    call outstanding on the same producer at once.
+    """
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    seen = _max_inflight(monkeypatch, "_on_publish")
+    results = loop([producers, consumers], _partitions([8]), "plan", 4)
+    assert _values(results) == list(range(8))
+    assert max(seen) > 1, f"publishes were issued one at a time: {seen}"
+
+
+def test_the_window_bounds_issued_calls_as_well_as_published_morsels(loop, monkeypatch):
+    """`credits` bounds issued-plus-published, not published alone.
+
+    A queued call is as resident as a published morsel -- its output exists the moment the
+    actor runs it -- so counting only the published half would let a producer hold twice the
+    window this pipeline advertises.
+    """
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    seen = _max_inflight(monkeypatch, "_on_publish")
+    loop([producers, consumers], _partitions([20]), "plan", 3)
+    assert max(seen) <= 3, f"issued more than the credit window: {seen}"
+
+
+def test_a_producer_does_not_take_the_next_partition_while_a_publish_is_queued(loop):
+    """Two partitions through one producer, every row exactly once -- the in-order guard."""
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    results = loop([producers, consumers], _partitions([5, 5]), "plan", 4)
+    assert _values(results) == list(range(10))
+    assert len(results) == 10, f"paths collided across partitions: {sorted(results)}"
+
+
+class _LifoRay(_FakeRay):
+    """`wait` completes the **newest** call first, so a queued window returns out of order.
+
+    Queueing a whole window makes completion order a thing the loop must survive, and the
+    order that matters is the one where the call that ends the partition (`publish_next` ->
+    `False`) is seen while earlier morsels of the same partition are still outstanding. Ray
+    gives no ordering guarantee across calls, and this is the arrangement that turns the
+    recycle rule from a detail into rows.
+    """
+
+    @staticmethod
+    def wait(refs, num_returns=1, timeout=None):
+        n = max(1, min(int(num_returns), len(refs)))
+        return list(reversed(refs))[:n], list(reversed(refs))[n:]
+
+
+def test_a_straggling_publish_is_not_dropped_when_its_partition_ends_first(loop, monkeypatch):
+    """A producer recycled with calls still queued loses their morsels silently.
+
+    `_recycle` pops the producer's state, and a completion that finds no state returns without
+    filing its morsel -- so the rows it published are on the wire, held, and never dispatched.
+    Nothing raises: the query returns a short answer that looks complete, which is the failure
+    mode this whole module exists for. Under LIFO completion the end-of-partition `False`
+    arrives while earlier morsels are outstanding, which is exactly that shape.
+    """
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "ray", _LifoRay)
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    results = loop([producers, consumers], _partitions([6, 6]), "plan", 8)
+    assert _values(results) == list(range(12))
+
+
+# --- consumer submit-ahead ---------------------------------------------------------------
+
+
+def test_a_consumer_holds_more_than_one_morsel_at_depth_two(loop, monkeypatch):
+    """The terminal stage double-buffers, so a device is not idle across a Flight fetch."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "_consumer_depth", lambda: 2)
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    seen = _max_inflight(monkeypatch, "_on_work")
+    results = loop([producers, consumers], _partitions([8]), "plan", 4)
+    assert _values(results) == list(range(8))
+    assert max(seen) > 1, f"the consumer took one morsel at a time: {seen}"
+
+
+def test_depth_one_keeps_one_morsel_per_consumer(loop, monkeypatch):
+    """The control for the test above: at depth 1 nothing about dispatch changes."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "_consumer_depth", lambda: 1)
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight))]
+    seen = _max_inflight(monkeypatch, "_on_work")
+    results = loop([producers, consumers], _partitions([8]), "plan", 4)
+    assert _values(results) == list(range(8))
+    assert max(seen) == 1, f"depth 1 double-buffered: {seen}"
+
+
+def test_every_row_still_arrives_once_with_a_double_buffered_consumer(loop, monkeypatch):
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "_consumer_depth", lambda: 3)
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, f"p{i}")) for i in range(2)]
+    relays = [_Handle(_Relay(flight, f"r{i}")) for i in range(2)]
+    consumers = [_Handle(_Consumer(flight)) for _ in range(2)]
+    results = loop([producers, relays, consumers], _partitions([6, 7]), "plan", 4)
+    assert sorted(v for out in results.values() if out for v, _i in out) == list(range(13))
+
+
+def test_a_preempted_double_buffered_consumer_loses_no_morsel(loop, monkeypatch):
+    """Every slot of a lost actor is dropped, not just the first one in the free list."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "_consumer_depth", lambda: 2)
+    flight = _Flight()
+    producers = [_Handle(_Producer(flight, "p0"))]
+    consumers = [_Handle(_Consumer(flight, fail_first=2))]
+    spawn = [None, lambda: _Handle(_Consumer(flight))]
+    results = loop([producers, consumers], _partitions([9]), "plan", 4, spawn=spawn)
+    assert _values(results) == list(range(9))
+
+
+# --- the autoscaler's backlog signal ------------------------------------------------------
+
+
+def _backlog_ctx(ready: int, pool: list, free: list):
+    from batcher.dist.streaming.pipeline import schedule
+
+    return schedule._Context(ready=[[], list(range(ready))], pools=[[], pool], free=[[], free])
+
+
+def test_the_backlog_counts_morsels_queued_on_an_actor_not_only_on_the_driver():
+    """Submit-ahead moves backlog from the driver's queue into the actors' queues.
+
+    Measured against the reverted first attempt at this: with the signal reading only the
+    driver's queue, a stage at depth 2 absorbed everything, read as keeping up, and never grew
+    -- four of eight devices idle. A morsel in an actor's second slot is waiting behind the
+    call that is running, which is what being behind means.
+    """
+    from batcher.dist.streaming.pipeline import schedule
+
+    a, b = object(), object()
+    # `a` is running one call with its second slot still open; `b` has both slots occupied,
+    # so one of `b`'s two morsels has not started.
+    ctx = _backlog_ctx(ready=1, pool=[a, b], free=[a])
+    assert schedule._stage_backlog(ctx, 1, 2) == 2
+    assert schedule._stage_backlog(ctx, 1, 1) == 1  # depth 1: exactly the driver's queue
+
+
+def test_an_idle_stage_reads_as_having_no_backlog():
+    """The control: every slot free and nothing queued is not a stage that is behind."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    a, b = object(), object()
+    ctx = _backlog_ctx(ready=0, pool=[a, b], free=[a, a, b, b])
+    assert schedule._stage_backlog(ctx, 1, 2) == 0
+
+
+# --- draining the completion set ----------------------------------------------------------
+
+
+def test_a_pass_handles_every_call_that_has_already_finished(monkeypatch):
+    """One event per pass was the loop's own throughput ceiling; a pass takes all the news."""
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "ray", _FakeRay)
+    refs = [_Ref(lambda v=i: v, ()) for i in range(5)]
+    assert schedule._completed(refs) == refs
+
+
+def test_a_pass_with_one_call_outstanding_returns_that_one(monkeypatch):
+    from batcher.dist.streaming.pipeline import schedule
+
+    monkeypatch.setattr(schedule, "ray", _FakeRay)
+    refs = [_Ref(lambda: 1, ())]
+    assert schedule._completed(refs) == refs

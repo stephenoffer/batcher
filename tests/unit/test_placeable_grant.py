@@ -93,7 +93,7 @@ def test_a_busy_cluster_does_not_multiply_the_fan_out(monkeypatch):
     """
     _single_numa(monkeypatch)
     _cluster(monkeypatch, [(8, 1)] * 4)
-    workers, num_cpus = executor._cluster_fill_workers()
+    workers, num_cpus, _width = executor._cluster_fill_workers()
     assert workers == 4, "the fan-out is the cluster's shape, not what is free this instant"
     assert num_cpus <= 8.0
 

@@ -27,12 +27,14 @@ The properties pinned here are the ones a wrong answer would hide behind:
 from __future__ import annotations
 
 import collections
+import contextlib
 
 import pytest
 
 from _fake_ray import install_fake_ray
 from batcher.carbonite.resilience import RecoveryPolicy, SourcePlacement
 from batcher.config import Config, DistributedConfig, config_context
+from batcher.plan.resource import SchedulingEnvelope
 
 
 def _raise(exc: BaseException):
@@ -45,6 +47,30 @@ def _multiplier(m: int, cap: int = 2048):
             distributed=DistributedConfig(map_partition_multiplier=m, max_shuffle_partitions=cap)
         )
     )
+
+
+#: The three envelope shapes `_idle_pool` distinguishes, by the `worker_cpus` each carries.
+#: A homogeneous cluster produces the empty tuple; a per-node fleet produces one grant per
+#: worker, which `_idle_pool` still deals evenly when they are all the same.
+_UNIFORM: tuple[float, ...] = ()
+_UNIFORM_SPELLED_OUT = (4.0,) * 8
+_UNEQUAL = (4.0, 4.0, 4.0, 4.0, 96.0, 96.0, 96.0, 96.0)
+
+
+@contextlib.contextmanager
+def _fleet(cpus: tuple[float, ...]):
+    """Install an ambient envelope whose fleet holds `cpus` as its per-worker core grants."""
+    from batcher.dist.executors.ray_runtime.scheduling import (
+        reset_scheduling_envelope,
+        set_scheduling_envelope,
+    )
+
+    env = SchedulingEnvelope(n_tasks=8, worker_cpus=cpus)
+    token = set_scheduling_envelope(env)
+    try:
+        yield env
+    finally:
+        reset_scheduling_envelope(token)
 
 
 # --- the policy ------------------------------------------------------------------
@@ -80,6 +106,74 @@ def test_map_partitions_respects_the_shuffle_cap():
 
     with _multiplier(4, cap=100):
         assert map_partitions(64) == 100
+
+
+def test_a_multiplier_that_can_still_buy_a_redeal_survives_a_uniform_fleet():
+    """Raising the multiplier past the slot count keeps it, even on a uniform fleet.
+
+    The collapse exists because at the shipped defaults the multiplier buys nothing on a
+    uniform fleet: `workers x 4` partitions against a `workers x 4`-deep pool leaves the
+    barrier nothing to re-deal. That is a fact about *two* numbers, and the first version of
+    this rule read only one of them — it asked whether the fleet was uniform and collapsed
+    regardless of how the multiplier compared to the slot count.
+
+    So a cluster configured with `map_partition_multiplier=8` against 4 slots per worker would
+    have had a reachable re-deal taken away from it, on exactly the fleets where the barrier is
+    widest. This pins the boundary rather than the default: at or below the slot count the
+    multiplier is spent, above it the multiplier is kept.
+    """
+    from batcher.dist.executors.ray_runtime.reducers import _map_slots, map_partitions
+
+    slots = _map_slots()
+    assert slots >= 1, "the slot count must be readable, or the rule below is vacuous"
+    # At the slot count: nothing to re-deal, so the multiplier collapses.
+    with _multiplier(slots), _fleet(_UNIFORM):
+        assert map_partitions(8) == 8
+    # One above it: a re-deal becomes reachable, so the multiplier is kept.
+    with _multiplier(slots + 1), _fleet(_UNIFORM):
+        assert map_partitions(8) == 8 * (slots + 1)
+
+
+def test_a_uniform_fleet_spends_no_multiplier():
+    # The multiplier buys the barrier's dynamic re-deal, and a uniform fleet's initial deal
+    # is already `workers x map_slots_per_worker()` deep, so there is nothing left to
+    # re-deal. What it does still cost is the exchange's `mappers x reducers` stream count.
+    from batcher.dist.executors.ray_runtime import map_partitions
+
+    with _multiplier(4), _fleet(_UNIFORM):
+        assert map_partitions(8) == 8
+
+
+def test_an_unequal_fleet_keeps_its_multiplier():
+    # The positive control for the test above: on a fleet whose workers hold different core
+    # grants, `_idle_pool` weights the deal by cores and the extra partitions are what it
+    # weights. Nothing here may change for those.
+    from batcher.dist.executors.ray_runtime import map_partitions
+
+    with _multiplier(4), _fleet(_UNEQUAL):
+        assert map_partitions(8) == 32
+
+
+def test_a_fleet_whose_equal_grants_are_spelled_out_is_still_uniform():
+    # `_idle_pool` deals evenly on an empty `worker_cpus` AND on a flat one (`max == min`), so
+    # both are fleets the multiplier buys nothing on. Reading only the empty case would leave a
+    # per-node fleet of identical machines paying for a re-deal that cannot happen there either.
+    from batcher.dist.executors.ray_runtime import map_partitions
+
+    with _multiplier(4), _fleet(_UNIFORM_SPELLED_OUT):
+        assert map_partitions(8) == 8
+
+
+def test_no_fleet_at_all_keeps_the_multiplier():
+    # The second control. "No ambient envelope" is not "a uniform fleet" — it is a caller
+    # outside a distributed execution, which knows nothing about the deal and must not be
+    # narrowed on a guess.
+    from batcher.dist.executors.ray_runtime import map_partitions
+    from batcher.dist.executors.ray_runtime.scheduling import current_envelope
+
+    assert current_envelope() is None
+    with _multiplier(4):
+        assert map_partitions(8) == 32
 
 
 # --- the barrier -----------------------------------------------------------------

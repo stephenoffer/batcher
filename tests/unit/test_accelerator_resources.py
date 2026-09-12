@@ -296,7 +296,23 @@ def test_the_pool_bundle_reserves_what_the_actor_requests():
     # resource being reserved, and the bundle was already honest.
     cpu = SchedulingEnvelope(num_cpus=4.0, n_tasks=2)
     assert _pool_placement_envelope(cpu, _gpu_options(0.0, None, None)) is cpu
-    assert _pool_placement_envelope(None, _gpu_options(1.0, None, None)) is None
+
+    # **No envelope is the case that breaks, not the case that is safe**, and this assertion
+    # used to say the opposite -- that `None` in means `None` out. `None` out means
+    # `create_worker_placement` builds `_bundle`'s default `{"CPU": 1.0}`, and the actor then
+    # asks that bundle for `{"CPU": 0, "GPU": 1}` and is refused at spawn with a `ValueError`,
+    # not a stall. Nothing sets an envelope on the write path, so the shape that hit it is
+    # `map_batches(Model, num_gpus=1).write.parquet(...)` -- scoring a corpus and writing the
+    # scores. Synthesizing an envelope from the request is what makes the bundle state what
+    # the actor will ask for, which is the property this test is named for.
+    synthesized = _pool_placement_envelope(None, _gpu_options(1.0, None, None))
+    assert synthesized is not None
+    assert synthesized.num_gpus == 1.0
+    assert synthesized.num_cpus == 0.0
+    # A custom accelerator has to reach the bundle by the same road: `num_gpus` covers only
+    # what Ray calls `GPU`, so a TPU/Trainium pool reserved nothing at all.
+    tpu = _pool_placement_envelope(None, _gpu_options(0.0, None, {"TPU": 4.0}))
+    assert dict(tpu.resources) == {"TPU": 4.0}
 
 
 def test_the_autoscaler_is_asked_for_both_gpus_and_a_custom_accelerator(monkeypatch):

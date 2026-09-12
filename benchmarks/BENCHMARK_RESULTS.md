@@ -1,5 +1,102 @@
 # Batcher CPU benchmark results
 
+## Ray Data measured for the first time: pipelines for four suites, and two bugs the row-count check would have passed (2026-09-11)
+
+**Internal only. These numbers are deliberately not in the published docs.**
+
+Ray Data has no SQL surface, so every suite it could not express reported `n/a` -- a blank
+column that reads like a loss and is an absence. It had hand-written `ray.data.Dataset`
+pipelines for TPC-H only. It now has them for the two H2O tasks, the JSON cases and every
+scan shape (`suites/h2o/groupby_ray`, `suites/h2o/join_ray`,
+`suites/semistructured/json_ray`, `suites/scan/shapes.py`), written against Ray's own
+`groupby().aggregate()` and `map_batches` over PyArrow so the measurement is Ray Data doing
+the work.
+
+48-core box, `batcher,duckdb,ray`, best of five, DuckDB the independent oracle, every case
+passing its correctness check:
+
+| suite | b/ray | cases | batcher | ray data |
+|---|---:|---:|---:|---:|
+| H2O `groupby` | **0.00** | 10 of 10 | 9.5-283 ms | 5.4-221 s |
+| H2O `join` | **0.01** | 5 of 5 | 53-284 ms | 6.7-8.0 s |
+
+The extreme is `groupby` q10, the six-key near-unique group-by: **283 ms against 221
+seconds**.
+
+Two different things get recorded as DNF and they are worth keeping apart, because a cap is
+part of the measurement rather than a property of the engine:
+
+* **A failure.** Operators stops at 3 of 23 with `HashShuffleAggregator.finalize failed` on a
+  four-key group-by whose composite cardinality runs to millions. More time does not help.
+* **Slow.** Scan reached **26 of 27 cases** before a 2,700 s cap, having reached only 2 in the
+  420 s cap used for the first sweep. So the first figure measured the cap, not Ray Data, and
+  quoting "2 of 27" as though it were a limit of the engine would have been wrong. TPC-H's
+  "2 of 22 in seven minutes" is under the same suspicion and has not been re-run at a longer
+  cap.
+
+### Three bugs in the new pipelines, all the same mistake
+
+Ray Data has no way to ask for a group count alongside other aggregates *implicitly* -- the
+SQL `COUNT(*)` has to become an explicit `Count()` in the aggregate list -- and all three
+bugs here were a different way of getting that wrong. Writing pipelines against an engine
+with no query planner means the count is the author's problem, and the author got it wrong
+three times out of ten. Take it from the **same** `aggregate` call; never from a second pass.
+
+### Why the first check missed two of them
+
+The first two were found only by comparing **values**; the first pass compared row counts
+and column names and passed all ten. The third was found by the benchmark harness's own
+correctness gate, which refused to time it -- `json-project5` would otherwise have been
+recorded at 0.24x against DuckDB while returning a table missing a column.
+
+* **q9 paired groups by position.** It aggregated the sufficient statistics, then ran a
+  *separate* `groupby().count()` and indexed the two results positionally. Two aggregations
+  need not return their groups in the same order, so that pairs one group's sums with
+  another group's count -- wrong correlations, with a matching row count and matching column
+  names. Fixed by taking `Count()` from the same aggregate.
+* **q10 joined 10 M groups to count them.** Same shape: aggregate, count separately, then
+  join on the six keys. At near-unique cardinality the join costs more than the aggregate it
+  joins, and it is what hung a benchmark run for 20 minutes against its timeout. Same fix.
+* **`json-project5` simply omitted the count.** The SQL projects six columns and the pipeline
+  produced five. Caught by the harness rather than by inspection, which is the argument for
+  running the gate over a hand-written pipeline before trusting any timing it produces.
+
+### `scan-filter_agg` is not a valid cross-engine comparison, by the suite's own rule
+
+Three cases fail for **both** Ray Data and Daft, with the same signature: DuckDB and Batcher
+return ~4.6e18 and the others return a small, sometimes negative number.
+
+`suites/scan/shapes.py`'s own module docstring states the hazard and the rule that answers
+it: the columns are `int64` drawn uniformly from `[0, 2^63)`, so a bare `SUM` overflows 64
+bits and engines disagree there **by design** (DuckDB widens to `HUGEINT`, others wrap),
+*"which would report an engine bug that is really a benchmark bug. Every sum is therefore
+taken over a bounded expression."*
+
+`filter_agg` is `SELECT AVG(column1) ... WHERE column0 < SELECTIVE`, and an average is not a
+bounded expression -- it sums before it divides. So the rule was applied to every `SUM` in
+the suite and missed the one `AVG`. The three `scan-filter_agg-*` cases therefore report an
+engine bug that is really a benchmark bug, for any engine that accumulates in `int64`:
+
+| engine | answer | |
+|---|---|---|
+| DuckDB, Batcher | 4.6046145411892787e+18 | widen before summing |
+| Ray Data | -114358894177868.86 | wrapped |
+| Daft | 106502005629481.92 | wrapped |
+
+**Not fixed here.** The one-line fix is to bound the average the way every sum in the suite is
+already bounded (`AVG(column1 % 1000)`), but that changes a benchmark query, and the three
+cases' figures in earlier entries were taken against the current one. Flagged rather than
+changed unilaterally; until it is changed, read those three rows as uncomparable rather than
+as three engines being wrong.
+
+### One false alarm worth recording
+
+q5 reported a mismatch and had **zero differing cells**. DuckDB returns `sum(int32)` as
+`Decimal128(38, 0)` and Ray Data as `int64`, so a strict tuple comparison sorts `Decimal`
+against `int` as unequal. The harness's own `assert_same` is type-tolerant by design and
+passes it. The ad-hoc checker was stricter than the gate, in the direction that manufactures
+work.
+
 ## Common-subplan reuse was refusing the shape it exists for, and materializing it at 12x the width when it did not (2026-09-11)
 
 TPC-DS is the suite Batcher is closest to losing (b/duckdb 0.98-0.99), and six of its seven
@@ -607,6 +704,810 @@ its common prefix is **0 or 1 bytes**. A range of a text column is a *band*, not
 end-to-end A/B read 216.4 / 218.8 ms against 224.9 / 223.2 — a 2% regression for the pass it
 costs. What was actually wrong in those ranges was the admission rule, which is fix 1.
 
+## Batcher against Ray Data on a compute-bound inference pipeline: 8.6x at 125k rows, 0.76x at 4M, and the ceiling that explains the crossover (2026-09-11)
+
+The entry below this one retires the image corpus: at 74 KB an image against 14 MFLOP of
+model, every arm was measuring a 0.9 GiB/s mount. This is the replacement --
+`benchmarks/gpu_backend/compute_bound_inference.py`, corpus from
+`_compute_bound_corpus.py` -- built so that neither the read nor the page cache can decide the
+answer, and sized so that the CPU stage and the device stage finish a row at the same rate:
+
+    cores / cpu_seconds_per_row  ==  devices / gpu_seconds_per_row
+
+256 bytes a row (1 GiB for 4M rows), a preprocess stage of 0.154 ms a row, a 6-matmul model of
+0.044 ms a row on a T4. Both engines run the identical two UDF classes over the identical
+shards; the row count and the checksum are compared before any timing is reported.
+
+### The measurement
+
+17 nodes, 192 cores, 8 T4s. Batch 2,048, 64 CPU actors, one actor per device, warm on both
+sides (an untimed run precedes the timed one).
+
+| shards | rows | Batcher | Ray Data | ratio | Batcher GPU | Ray GPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 125,000 | **1.2 s** | 10.5 s | **8.61x** | 25% | 5% |
+| 32 | 500,000 | **4.0 s** | 10.2 s | **2.53x** | 40% | 18% |
+| 128 | 2,000,000 | 14.9 s | **14.4 s** | 0.96x | 50% | 50% |
+| 256 | 4,000,000 | 29.8 s | **22.6 s** | 0.76x | 48% | 65% |
+
+Identical answers at every scale. Read as throughput the curve says something the wall clocks
+hide:
+
+| rows | Batcher row/s | Ray Data row/s |
+|---:|---:|---:|
+| 125,000 | 102,893 | 11,950 |
+| 500,000 | 123,671 | 48,866 |
+| 2,000,000 | 133,911 | 138,814 |
+| 4,000,000 | **134,110** | **176,617** |
+
+**Ray Data costs about ten seconds before it does anything.** 10.5 s for 125,000 rows and
+10.2 s for 500,000 -- four times the work for the same wall clock, which is what a fixed cost
+looks like. Batcher's warm pools make the same job 1.2 s, and that is where the 8.6x comes
+from: not a faster pipeline, an absent one.
+
+**Batcher stops scaling at ~134,000 row/s.** It is there by 500,000 rows and does not move
+again; Ray Data passes it at about 2M and is still climbing at 4M. At Batcher's ceiling the
+devices read **48%** -- the hardware has half its capacity left, so the ceiling is Batcher's
+own scheduling and not the T4s.
+
+### What the ceiling is
+
+`map(cpu) -> map(gpu) -> agg` fuses into the device pool, so the CPU stage runs **inside the
+eight actors that hold the GPUs**, on those nodes' 64 of the fleet's 192 cores, at
+`_INFERENCE_CPU_WORKERS` (4) threads each. That is 32 cores for the preprocess half of the
+pipeline, and it is the same 32 cores behind every cluster-CPU figure this fleet has produced.
+Per actor: 134,110 / 8 = 16,750 row/s = 60 us a row, against 44 us of model. The 16 us is the
+CPU stage failing to hide behind the device.
+
+The obvious fix -- size the fused stage from the node's own cores instead of a flat 4 -- was
+implemented, measured, and **reverted**, because whether it helps is a property of the user's
+function rather than of the fleet. Eight batches through one stage, 1 thread against 2/4/8:
+
+| stage | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|
+| PIL JPEG decode | 1.93x | 3.58x | **4.12x** |
+| NumPy `sort`/`tanh`/`sqrt` | 1.56x | 0.94x | **0.69x** |
+
+NumPy's ufuncs and `sort` hold the GIL. A thread pool cannot know which kind of function it has
+been handed, and at the node's own core count the second row is **31% slower than
+single-threaded**. Ray Data does not have this problem because its concurrency is *processes*.
+That is the real architectural difference the crossover measures, and it is why the answer for
+Batcher is the staged route -- CPU stage in its own actor processes -- rather than a wider
+thread pool in the device actor.
+
+### The staged route, and why it is not the answer yet
+
+Same pipeline, map-terminal so it reaches `stream_distributed_pipeline`: **40.9 s** at 4M rows
+against the fused route's 29.8 s and Ray Data's 22.6 s, with the devices at 33%. Instrumented
+inside the actors, per 2,048-row morsel:
+
+| | producer | consumer |
+|---|---|---|
+| map / model | 525 ms, **100% of its wall** | 71 ms |
+| Flight fetch | -- | 6 ms |
+| NVML VRAM sample | -- | 12.5 ms |
+
+The producers are saturated -- `wall == map` over their first twenty morsels, so they are never
+waiting on the driver -- and the consumers are busy about 40% of the run. The stage rates are
+122 morsels/s (producers) and 89 morsels/s (consumers); composed they deliver **48**.
+
+What that gap is has not been established, and the arithmetic that looks like an answer is a
+trap worth writing down: `1/(1/122 + 1/89) = 51`, which is the series composition of two stages
+that never overlap, and 51 is close enough to 48 to be convincing. It is a coincidence as far
+as anything here shows. Modelling the run properly -- producers flat out until the credit
+window fills at 1,024 published morsels, then throttled to the consumer rate -- predicts
+**~32 s** against 40.9 s measured, so the stages *are* overlapping and something else is
+costing about nine seconds. Four candidates were measured and are **not** it: `ray.wait`
+(0.07-0.23 ms against outstanding sets of 16 to 512), the Flight fetch (6 ms a morsel), the
+driver-side reduce (0.0 s), and producer width (176 actors measured the same as 64). The next
+session should profile rather than reason; this entry records where the time is *not*.
+
+Four scheduler defects were found and fixed on the way to that measurement, each with a unit
+test and a proven negative control:
+
+- **a producer was asked for one morsel at a time**, so it idled for a whole pass of the driver
+  loop between every morsel it produced. The window is now filled with queued calls, `depth`
+  deep, and an issued-but-unreturned call counts against `credits` exactly as a published one
+  does. On the image corpus, 71.1 s -> 50.4 s.
+- **the loop handled one completion per pass**, re-running issue, dispatch, rescale and a
+  `ray.wait` over the whole pipeline for each one. It now drains every finished call, and asks
+  non-blockingly *first*, so a busy pass costs one RPC rather than two.
+- **consumers had no submit-ahead**, so a device idled through every Flight fetch. Depth is
+  back -- this is the change reverted in `811b1cbc` -- with the fix that revert asked for: the
+  autoscaler's backlog signal now counts morsels queued *on an actor* as well as on the driver,
+  so a stage that is fully subscribed at depth 2 no longer reads as one that is half idle.
+- **a leading scan was split off even when its neighbour was a host stage**, producing
+  `[8, 64, 8]` on the ordinary two-stage shape: eight actors reading 256 shards and
+  republishing every row over Flight to the sixty-four that could have read them directly. The
+  split exists to keep the read off the accelerator nodes, which a CPU stage already does.
+
+And one cost the instrumentation found directly: **`sample_gpu_vram_fraction` was called after
+every forward pass**, 12.5 ms of NVML against a 71 ms model. It feeds a running maximum used to
+pack the *next* run's actors, and a model's footprint is flat after its first batches, so it is
+now rate-limited to once a second.
+
+### On "10x on everything Ray Data is good at"
+
+Worth stating plainly, because the arithmetic is not a matter of effort. At 4M rows Ray Data
+runs this pipeline at **176,617 row/s against a device floor of ~182,000** -- it is at the
+hardware. Both engines call the same cuBLAS kernels on the same eight T4s, so on a
+device-saturating workload the achievable ratio is bounded by how far the loser is from the
+floor, and it is at most about 1.4x here. 10x is reachable at the small and medium end, where
+it is Ray Data's ~10 s of fixed cost being measured (8.6x at 125,000 rows), and it is not
+reachable at the saturated end by anyone.
+
+Where a large factor *is* available on merit is work the engine does rather than work the
+user's Python does: relational operators, expression evaluation and I/O, which Batcher runs in
+Rust behind the IR and Ray Data runs per block in Python. That is the shape to benchmark next,
+and it is a different benchmark from this one.
+
+## The image corpus was storage-bound the whole time: `/mnt/cluster_storage` tops out at 0.9 GiB/s, so every arm in the round-3 matrix was measuring a mount (2026-09-10)
+
+Read this before the entries below it. It does not change a single number any of them
+reports, and it changes what those numbers are *about*.
+
+The image-inference matrix was run on 400,000 JPEGs -- 28.2 GiB -- in 128 Parquet shards on
+`/mnt/cluster_storage`, with arms landing between 34.5 s and 171.3 s. That spread invited
+exactly the reading it got: engine differences. So the mount was measured on its own, one Ray
+task per shard pinned across the fleet, reading bytes and returning nothing but a length. No
+engine, no decode, no model:
+
+| pass | wall | aggregate |
+|---|---:|---:|
+| cold | **269.1 s** | 0.10 GiB/s |
+| warm | 41.2 s | 0.68 GiB/s |
+| warmer | 31.2 s | 0.91 GiB/s |
+
+**31 seconds is the floor for one pass over this corpus**, on an idle cluster, and the cold
+number is 269. The best arm in the matrix was 34.5 s. It was not beating the storage by much
+because there was nothing left to beat: it was reading at roughly the rate the mount delivers,
+and so was everything else in the table.
+
+Three consequences, and the third is the one that cost time.
+
+**The arithmetic says the same thing.** A decode of one of these frames is **1.69 ms of one
+core**, measured directly -- so the whole corpus is 11.3 core-minutes, which is **3.5 seconds
+spread over the fleet's 192 cores**. Each core consuming images at that rate wants 44 MB/s of
+input, so 192 of them want **8.4 GB/s**. The mount delivers a ninth of that. Cluster CPU
+therefore *cannot* exceed about 11% on this workload however the engine schedules it, which is
+precisely the 8-17% every arm reported and which several rounds of work went into trying to
+raise.
+
+**The page cache, not the engine, is what separated some of the arms.** The same decode run
+twice in one process went **38.3 s then 18.6 s**, and 18.6 s is *faster than the mount's own
+warm floor* -- the second pass was served from the worker nodes' page cache, which holds
+28.2 GiB comfortably across 17 machines. Which shards a run happens to find cached depends on
+where its actors landed, and that is not a property of the engine under test.
+
+**The run-to-run variance is larger than the effects being attributed to code.** Two runs of
+the staged pipeline, minutes apart, differing only by a scheduler change that removes work,
+measured **50.4 s and 99.8 s**. On a 0.10-to-0.91 GiB/s mount that difference is within the
+noise of which pass you got, and reading it as a regression -- which it was, briefly -- is the
+error this entry exists to prevent.
+
+### What a benchmark on this fleet has to do instead
+
+The rule that falls out: **state the storage ceiling before reporting a throughput**, the way
+a benchmark states its scale factor. If an arm is within about 2x of it, the engines are being
+ranked on their luck with the page cache.
+
+A CPU+GPU benchmark that measures engines rather than a mount needs the compute per input byte
+to be high enough that neither the read nor the decode is the constraint. The model in this
+matrix is a four-layer MLP over a 48x48 subsample -- roughly 14 MFLOP an image against 74 KB
+of input -- which is why the devices read 1-11% busy throughout and why the read dominated.
+That is not a batch-inference workload; it is a decode benchmark with a GPU attached.
+
+## The cluster is 90% idle on the guide's own bottleneck workload, and the two-stage pipeline every guide recommends used to hang (2026-09-10)
+
+**Fleet.** 8 x `g4dn.2xlarge` (1 T4, 8 vCPU, 32 GiB), 8 x 16-core/32 GiB CPU nodes, a 16-core
+head: 208 cores, 8 devices. **Corpus:** 400,000 384x384 JPEGs packed into 128 Parquet shards,
+28.2 GiB -- the layout the Ray Data batch-inference guide recommends, because the same guide
+measures many-small-files as losing 50%+ of runtime to listing alone. Harness in the session
+scratchpad (`imgbench.py`, `utilmon.py`); utilization is sampled per node on one cadence for
+CPU, **memory** and GPU together, which neither `cluster_util.ClusterMonitor` (CPU) nor
+`gpu_util.GpuMonitor` (GPU) does alone.
+
+This is the workload the guide calls its #1 image/GPU bottleneck: "GPU idle during CPU decode --
+GPU utilization < 50% (often 10-30%), CPU at 100%".
+
+### Measured, one decode+score UDF, answers identical
+
+| arm | wall | throughput | cpu | mem | gpu |
+|---|---:|---:|---:|---:|---:|
+| Batcher | 71.8 s | 5,569 img/s | 11% | 38% | 7% |
+| Ray Data | 171.3 s | 2,336 img/s | 7% | 41% | 3% |
+
+**2.38x, and both engines leave the cluster idle.** That second half is the finding. 208 cores
+at 11% is about 23 busy; 8 devices at 7%. Neither engine is near the other's ceiling because
+neither is near the *cluster's*.
+
+**Batcher's share of it has a specific cause.** `_with_inference_workers` pins a `num_gpus > 0`
+map stage to `num_workers=1` -- correct, because an actor holds one CUDA context -- and a UDF
+that decodes *and* scores inherits that width for its decode. Eight actors, one decode thread
+each: 8 of 208 cores. The pin is right for the model and wrong for the host work fused into it.
+
+### Splitting the stages is what the guides say to do, and it hung
+
+`map_batches(Decode, concurrency=32).map_batches(Model, num_gpus=1, concurrency=8).agg(...)` is
+the two-stage form both this guide and Batcher's own `split_into_resource_stages` are written
+around. It did not run. Stacked map stages fuse into one actor and `_map_resources` merges
+their concurrency by taking the **widest**, so the fused pool asked for **32 actors holding a
+GPU apiece on an 8-GPU cluster**. Unsatisfiable by construction, and it does not fail: the gang
+never places and the pool thrashes -- measured live, **10 actors `PENDING_CREATION`, 1 alive,
+136 dead** from spawn-and-kill churn -- while the query hangs with no error.
+
+Taking the widest is right while the stages share a resource class and catastrophic the moment
+they do not. The accelerator stage's own concurrency is the one that can be honoured, so it now
+wins; a CPU-only stack still takes the widest, and a custom accelerator (TPU / Trainium / Gaudi)
+travels the same road.
+
+| arm, two stages | wall | throughput | cpu | mem | gpu |
+|---|---:|---:|---:|---:|---:|
+| Batcher | **47.8 s** | 8,374 img/s | 16% | 32% | 11% |
+| Ray Data | 65.6 s | 6,097 img/s | 17% | 36% | 8% |
+
+The best configuration found, on both engines, is two stages with a **narrowing** decode, fused:
+Batcher **34.5 s** (11,585 img/s) against Ray Data **66.8 s** (5,987 img/s) — **1.94x**, and
+5.0x Ray Data's single-UDF form. The storage floor for this corpus, measured with no decode and
+no model, is **6.1 s**, so neither engine is anywhere near read-bound and the decode is what
+both are spending their time on.
+
+**`concurrency` on a CPU stage is silently discarded when the chain fuses**, which is worth
+knowing before tuning it: `map -> map -> agg` has a breaker on top, so it fuses into the device
+pool and the accelerator stage's concurrency wins (it has to — see the hang above). Asking for
+32 decode actors and asking for 128 produced **34.5 s and 34.6 s**. The decode runs in the 8
+device actors at `_INFERENCE_CPU_WORKERS` (4) threads each, which is the 32-of-208-cores ceiling
+behind every CPU figure in this section.
+
+Identical answers. A hang became **1.50x faster than the single-stage form** (71.8 -> 47.8 s)
+and **1.37x Ray Data's** two-stage form. The decode now gets `_INFERENCE_CPU_WORKERS` (4)
+threads per actor instead of 1, which is 32 of 208 cores -- better, and still not the cluster.
+
+### An aggregating staged route was built and reverted
+
+Getting a `map -> agg` chain onto the staged pipeline needs an aggregating terminal stage, so
+partials rather than rows come back and nothing materializes on the driver. That was built here
+-- `run_split_agg`, an `agg_spec` through the scheduler, a dispatch hook -- and **reverted**,
+because it OOM-killed cluster nodes on every attempt. The cause is the section below: the
+staged path could not carry this workload at all, for reasons that had nothing to do with the
+aggregate. Those are now fixed; re-adding the route on top of them is the next step, and it
+should be re-measured rather than assumed, because the section below also shows the staged form
+losing to the fused one on this shape.
+
+One harness bug is worth separating out, since it looked like an engine defect: the decode
+emitted `float32`, making a 256-image morsel 226 MB and the corpus 236 GB of intermediate.
+`uint8` -- what a decode actually produces, with the cast belonging on the device -- cuts that
+4x. It was a real bug and fixing it did not stop the OOM.
+
+### The staged CPU-to-GPU pipeline could not run this workload at all, and now can — but fusing is still faster
+
+Continuing on the same 400,000-image corpus. `stream_distributed_pipeline` is the path built
+for exactly this shape (decode on the CPU nodes, model on the devices, morsels streamed between
+them over Flight) and `distributed.stream_inference` puts a map-terminal two-stage chain on it
+**by default**. On this workload it died, every time:
+
+```
+OutOfMemoryError: 3 worker(s) were killed due to the node running low on memory.
+Memory on the node (IP: 10.0.85.249) was 28.53GB / 30.00GB (0.950833)
+```
+
+Pre-existing: reproduced with every change of this session reverted. Three bounds were missing,
+each the same shape -- a **floor on morsel size with no ceiling** -- and each had to be fixed
+before the next became visible.
+
+| what | bound before | bound after | effect |
+|---|---|---|---|
+| `ProducerActor._take_batch` | at least `target_rows` | exactly `target_rows` | published morsel capped |
+| `producers.coalesce` (the relay) | at least `target_rows` | exactly `target_rows` | 2.4 GB morsels -> 37 MB |
+| `ProducerActor._next_input` | a whole scan morsel | `target_rows` of input | resident output 2.4 GB -> 37 MB |
+
+The third is the one that mattered and it is worth stating why the other two were not enough.
+A scan morsel is sized in **rows** -- 16,384 by default -- so on a decode stage one input chunk
+produces 16,384 decoded images, about **2.4 GB**, and all of it lands in `_pending` before a
+single morsel is published. Capping the *published* morsel does not help, because the slices
+are zero-copy views on that same 2.4 GB parent and it stays resident until the last of them
+drains. The cap has to be on the input, which is what decides the output's size.
+
+With all three: **the run completes** -- 104.5 s, 400,000 rows, peak node memory 94%, no worker
+lost. First time this path has carried this workload.
+
+**And it is 2.2x slower than fusing the stages** (104.5 s against 47.8 s).
+
+The obvious explanation is the intermediate: the staged form ships 400,000 x 147 KB = **59 GB
+of decoded pixels between stages over the network**, where the fused form keeps them in the
+actor that produced them. That explanation was written here first and it is **wrong**, which is
+worth leaving in rather than quietly replacing, because it is the kind of story that survives
+on plausibility alone.
+
+It was tested by narrowing the intermediate 64x. A real pipeline resizes to the model's input,
+and this scorer strides by 8 -- it reads 48x48 of each 384x384 image -- so a decode stage that
+hands over those 2,304 bytes instead of 147,456 cuts the intermediate from 59 GB to 922 MB with
+identical arithmetic and an identical checksum. If the transfer were the cost, the staged form
+should have won.
+
+| narrow intermediate (922 MB) | wall |
+|---|---:|
+| fused | **34.5 s** |
+| staged | 71.1 s |
+
+**2.1x -- the same penalty as at 59 GB.** A cost that does not move when the thing it is
+supposedly made of shrinks 64x is not made of that thing. The staged penalty is the *scheduling*
+-- a Flight publish, fetch and credit round-trip per morsel, through a relay -- and it is paid
+per morsel regardless of how big the morsel is. `fold_leading_scan` already exists as a
+*decision* rather than a default, and on this fleet the decision is "fuse", at both intermediate
+widths.
+
+**So the utilization ceiling on this shape is not the staged route, and it is not the device
+count either.** The guide's own answer for a small model is a fractional GPU -- "Model is small
+(<200MB)? Use `num_gpus=0.25`. Pack 4 models per GPU." Tried: `num_gpus=0.25` with 32 actors on
+the 8 devices ran in **70.9 s against 47.8 s**, i.e. 1.5x *slower*, CPU unchanged at 15%. Four
+actors land on each 8-core GPU node and each runs the decode 4 ways, so the node is
+oversubscribed 2x and four CUDA contexts contend for one T4. More actors per device does not
+add cores.
+
+That is the ceiling, and it is arithmetic rather than a defect: **in the fused form all the work
+runs on the GPU nodes, and this fleet's GPU nodes have 8 cores each -- 64 of the cluster's 208,
+31%.** Fused cannot exceed that; staged can reach the other 144 but pays 59 GB of transfer to do
+it. The lever that would actually move this is a fleet with more cores per accelerator node, or
+a first stage that *narrows* its output instead of widening it (decode-and-downsample rather
+than decode). Neither is an engine change.
+
+### Why "90% CPU and 90% GPU at once" is a property of the workload, not of the engine
+
+Worth stating because it bounds what any amount of engine work can deliver here. Both resources
+are saturated only when the workload's CPU-seconds and device-seconds are in the ratio the
+cluster's hardware is in: 208 cores to 8 T4s is **26:1**. This pipeline's decode is roughly 4 ms
+of CPU and its score roughly 3 ms of device per image -- about 1.3:1. A pipeline in that
+proportion can saturate the devices or the cores, never both, and on this fleet it is the
+devices that bind first. The honest target for an engine is that the **binding** resource runs
+near its ceiling and the other is not left idle when it has work to do; a simultaneous 90/90
+requires choosing a workload whose mix matches the fleet, or a fleet whose mix matches the
+workload.
+
+## Stress campaign at 95 GiB: Ray Data wins the biggest shape, and the two things that broke on the way to finding out (2026-09-10)
+
+**Fleet.** 8 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB), 8 x 16-core/32 GiB CPU nodes, a
+16-core/30 GiB head node: 192 cores, 8 devices, 544 GiB of cluster RAM. Corpus: a generated
+100,000,000-row x 256-`float32` Parquet table -- **95.4 GiB in 400 shards** on the shared
+mount, so both engines read the same bytes from the same place. Harness:
+`benchmarks/gpu_backend/vs_raydata_parquet_inference.py`.
+
+### The headline, and it is a loss
+
+| 100M rows / 95.4 GiB | wall | rows/s |
+|---|---:|---:|
+| Batcher, `map_batches(GPU) -> agg` | 175.34 s | 570,322 |
+| **Ray Data**, `map_batches(GPU) -> aggregate` | **142.08 s** | 703,829 |
+
+**0.81x.** Both answers agree to a checksum spread of **1.2e-12**, so it is a real gap and not
+a different query. This is the first shape in this file where Ray Data is ahead, and the size
+is why: at 10,000 images Batcher is 7.75x, at 100,000 it is 1.75x, and here it is behind.
+
+### Where it goes, in the order the hypotheses died
+
+**It is not the reader.** Read plus a trivial per-batch touch plus the same aggregate, no model
+at all: **Batcher 162.2 s, Ray Data 162.2 s.** The storage is the floor and it is the same floor
+for both.
+
+**It is not where the read runs.** The obvious suspect was the scan being folded into the
+accelerator actor, so the read gets 8 GPU nodes' 64 cores while 128 CPU-node cores idle. Same
+trivial workload through an 8-actor pool against whole-cluster stateless tasks: **169.1 s
+against 162.2 s**, 4% apart. The read is storage-bound, not core-bound, and moving it buys
+nothing. (This also retires the same hypothesis at the image scale, where it was already
+observed not to matter.)
+
+**It is the overlap.** Batcher spends 162 s reading and 13 s on the device and **adds** them.
+Ray Data's read costs it the same 162 s standing alone, yet its full inference finishes in
+142 s -- it overlaps the read with the GPU stage and Batcher does not. The routing says so
+outright: with Ray up, `fold_leading_scan` is `False` on this fleet and
+`split_into_resource_stages` returns a producer stage and a consumer stage -- but only for a
+**map-terminal** plan. Put an aggregate on top and `_is_linear_map_pipeline` is `False`, the
+dispatcher never asks, and `_distributed_map_aggregate` runs the scan and the model in one
+stage inside one actor.
+
+**Measured directly, same corpus subset, same model, same devices, differing only in the
+terminal:** 30,000,000 rows / 29.1 GiB, `agg` **64.4 s** against `write.parquet` **50.2 s**.
+The write is the staged, streamed, overlapped route and it is **1.28x faster while also
+writing 240 MB the aggregate never writes**. Carrying that same ratio to the 100M case puts it
+in the neighbourhood of 137 s against Ray Data's 142 s -- at or a little past parity, from a
+change that is routing rather than kernels. Stated as a neighbourhood on purpose: it is one
+ratio measured at a third of the size, extrapolated, and the honest form of that is a range
+and not a figure.
+
+**The lever is therefore located and priced and deliberately not pulled here**: route a
+`map_batches -> aggregate` whose map chain has an accelerator stage through
+`stream_distributed_pipeline`, with the last stage partial-aggregating instead of the driver
+concatenating. `split_into_resource_stages` **already** splits that plan correctly (three
+stages, verified); what is missing is a dispatcher branch and an aggregating consumer stage.
+Worth ~20% on this shape. It is not a small change and it should not be made from a benchmark.
+
+### Two defects the stress found, both fixed, neither of them slow
+
+Both are on `map_batches(Model, num_gpus=1).write.parquet(...)` -- scoring a corpus and writing
+the scores, which is the canonical batch-inference job and which **did not run at all** on this
+cluster.
+
+**1. The driver built the model.** `_write` asked `_schema()` before writing, and `_schema`'s
+last resort executes the plan under a zero-row limit -- which for a `map_batches` stage builds
+the UDF, on the driver. `WriteManifest.schema` is documented as attached by "the driver, which
+knows the plan's output type", and for a Python callable the driver does not. On a GPU-less
+head node the query died inside `cupy` with `cudaErrorInsufficientDriver` on a 1.9 GiB input;
+on a 29 GiB one the driver was **OOM-killed at 16.7 GB RSS**. Both before a row was written,
+and neither with a message naming the driver. Fixed by having the shard writer return the
+schema it just wrote (`_write_udf_output` -> `(files, schema)`) and asking the executing probe
+only when nothing cheaper can answer.
+
+**2. The gang reserved no device.** With the driver-side load gone, the pool then refused to
+spawn: `Cannot schedule _MapActor ... {'CPU': 0, 'GPU': 1} cannot fit into any bundles ...
+[{'CPU': 1.0}, ...]`. A `ValueError`, not a stall. Nothing sets a scheduling envelope on the
+write path, so `_pool_placement_envelope` was handed `None`, and `create_worker_placement` then
+built `_bundle`'s CPU-only default for actors that ask for a device. Only one route builds a
+placement group (`_drive_actor_pool`) and an inference pool only goes there when it carries a
+**sink**, which is why this shape and only this shape hit it. Fixed by synthesizing the
+envelope from the actor's own request, so the reservation states what the actors will ask for;
+custom accelerators (TPU / Trainium / Gaudi) travel the same road and were equally unreserved.
+
+After both: the same write runs in **6.1 s against the aggregate route's 11.5 s** on a 1.9 GiB
+subset, driver RSS 0.5 GiB, row counts identical.
+
+### The relational side of the same cluster, where the result is the other way round
+
+TPC-H **sf100** read straight from S3 (`lineitem` 27.0 GiB / 100 files, `orders` 6.4 GiB), both
+engines on all 17 nodes, one timed run after a warm-up, answers signature-checked against each
+other. Harness `benchmarks/cluster/vs_ray_daft.py`.
+
+| pipeline | Batcher | Ray Data | ratio | cluster busy (batcher \| ray) |
+|---|---:|---:|---:|---|
+| `group_by(returnflag, linestatus).agg(sum, sum, count)` | **888 ms** | 9,734 ms | **10.96x** | 26%/51% peak, 17/17 nodes \| 49%/100% peak, 17/17 |
+| `lineitem join orders -> group_by(orderpriority)` | **3,585 ms** | **TIMEOUT (>180 s)** | -- | 55%/100% peak, 17/17 \| -- |
+
+Ray Data's distributed join of the two tables did not finish inside three minutes at a scale
+Batcher completes in 3.6 s. Recorded as measured with the harness's own settings
+(`num_partitions=128` on the Ray Data side); a differently tuned Ray Data join may well finish,
+and this is not a claim that it cannot.
+
+**Both figures are warm and that is the harness's design, not an oversight.** Each engine gets
+an untimed warm-up first, so the 888 ms is roughly 10 GiB of projected columns served from the
+workers' page cache at about 660 MiB/s per node -- a plausible warm rate rather than an
+impossible cold one. Ray Data is warmed identically. Daft is `ERR` in both rows for the reason
+`vs_ray_daft._worker_pip` records: it is not in this cluster's worker image and is only shipped
+when it is the sole engine in the sweep.
+
+**sf1000 was attempted and produced no number, which is worth saying rather than omitting.**
+`lineitem` is 274.3 GiB across 1,000 files and `orders` 66.4 GiB. Batcher's fleet formed and ran
+-- 176 cores reserved, 63 busy, steady for the better part of an hour -- and the first pipeline
+had still not returned when the run was stopped to free the cluster for the correctness suite.
+So nothing is claimed at that scale in either direction: not that Batcher is slow there, and
+not that it is fast. What the attempt does establish is that the harness's 2,400 s per-call
+timeout is the binding constraint at sf1000 on 192 cores, and that a run there needs to be
+budgeted in hours and given the cluster to itself.
+
+**Read this beside the 95 GiB inference loss above rather than instead of it.** The two say
+different things about the same cluster on the same day: the relational path distributes a
+340 GiB join and a 27 GiB aggregate far better than Ray Data does, and the inference path loses
+a storage-bound shape by failing to overlap a read it performs at exactly Ray Data's speed.
+
+### Preemption: both engines survive a worker killed mid-inference, and neither pays for it
+
+A spot GPU node disappearing mid-job is the ordinary failure of this workload. Injected
+identically into both arms: one actor calls `os._exit(1)` the first time any actor reaches its
+sixth batch, which is what a preempted worker looks like to the caller -- a `RayActorError`,
+mid-partition, with work already in flight. The kill is claimed through a marker file on the
+shared mount so it happens exactly **once per run** rather than once per actor.
+
+10,000,000 rows / 9.7 GiB, width x2, 8 devices, each arm warmed once and its pool released
+before both timed runs:
+
+| engine | clean | one actor killed | answer | cost of the fault |
+|---|---:|---:|---|---:|
+| Batcher | 27.7 s | 27.0 s | identical checksum | 0.97x |
+| Ray Data | 26.4 s | 27.7 s | identical checksum | 1.05x |
+
+**Both survive and neither pays a measurable price** -- the two ratios straddle 1.0, which is
+run-to-run spread and not a recovery cost. No differentiation, which is the result.
+
+The warm-up matters and is the reason this is stated twice. Without it the clean run pays a
+cold page cache and a cold pool that the faulted run does not, and the faulted run comes back
+**faster than its own baseline** (0.80x for Batcher, 0.62x for Ray Data). That reads as
+"recovery is free" and is a fact about the cache.
+
+### Two cautions for anyone reading the numbers above
+
+**Do not compare the 10M and 100M runs as a scaling curve.** 9.5 GiB fits in the fleet's page
+cache and 95.4 GiB does not, so the 5.05 s at 10M and 175.34 s at 100M are 35x apart for 10x
+the data and almost none of that is the engine.
+
+**A test run that touches the distributed path looks hung while a benchmark holds the
+cluster.** The differential suite sat at zero completed chunks for eight minutes, at 2-6% CPU,
+while the sf1000 attempt held 176 of 192 cores in placement groups; freed, the same command ran
+normally. There is no message and no timeout -- the tests are queued behind a reservation they
+cannot see, and the natural reading is that the change under test hung them. Check
+`ray status` for reserved-but-idle cores before debugging a stalled suite, and do not run a
+correctness sweep and a cluster benchmark at the same time.
+
+**A `map_batches` UDF measured through Ray Data needs its own fast batch format.** Ray Data
+hands a `fixed_size_list` column to a numpy-format UDF as an **object** array with one small
+ndarray per row; Batcher hands over a real `(B, D)` array. Converting the object array is a
+per-row Python loop, so an arm written the obvious way measures a conversion rather than an
+engine. Both arms here take the zero-copy path their own engine offers (`batch_format="pyarrow"`
+plus `flatten()` for Ray Data), which is the same rule the sibling image benchmark learned the
+hard way.
+
+## A GPU inference stage under an aggregate had no actor pool, so it rebuilt the model once per partition — 10.50s to 1.22s, and the devices it then held forever (2026-09-10)
+
+**Fleet.** 8 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB), 8 x 16-core/32 GiB CPU nodes, and a
+16-core/30 GiB head node: 192 cores and 8 devices. Driver on the head. Harnesses:
+`benchmarks/gpu_backend/vs_ray_daft_gpu_inference.py` (JPEG corpus on S3) and the new
+`benchmarks/gpu_backend/vs_raydata_parquet_inference.py` (a generated Parquet feature table,
+sized so the run lasts minutes rather than seconds).
+
+### The defect
+
+`map_batches(Model, num_gpus=1) -> agg(...)` is the shape every batch-inference workload has,
+because reducing on the workers is what stops an engine being charged a transfer its rivals do
+not pay. It had no actor pool. `_agg_actor_pool` declines an accelerator stage by design, and
+`_distributed_map_aggregate` then fell through to `_map_agg_task` — a **stateless task that
+reserves no device** and reconstructs the class UDF once per partition, which for a model means
+a CUDA context and a weight upload apiece.
+
+Nothing failed. The answer was right, the query ran, and the devices looked slow. Measured on
+the 10,000-image corpus, the identical dense network:
+
+| arm | wall |
+|---|---:|
+| read + decode + reduce, no model | 0.90 s |
+| the same network **on the host**, class UDF on a CPU actor pool | 1.15 s |
+| the same network **on 8 T4s**, before | **10.50 s** |
+| the same network **on 8 T4s**, after | **1.22 s** |
+
+Routing it through `_run_pool_stage` — the pool the map-terminal route already had — gives it
+one model load per actor, a device reserved for the actor's life, gang-scheduled placement,
+autoscaling, preemption recovery and the measured `num_gpus` feedback loop. Only the actor
+*method* differs: `run_agg` partial-aggregates inside the actor, so what leaves the worker is
+still a partial state and `partial -> combine -> finalize` is untouched.
+
+A second hole in the same route: a **plain function** asking for a device wants no pool (there
+is no model to load once) and correctly stays on tasks — but the route named only the CPU
+share, so `map_batches(fn, num_gpus=1) -> agg(...)` reserved no accelerator at all. It ran
+wherever Ray had a core, which works only while every such node happens to have a device.
+
+### It then held every GPU on the cluster until the driver exited
+
+Found immediately, by the fix: the benchmark's Ray Data arm stopped placing. Batcher's arm
+finished, its session-warm pool kept one actor per device, and Ray Data's own eight-actor pool
+sat `pending` for as long as the process lived. Neither engine reported anything — the second
+one simply never ran.
+
+Whole-session residency is the documented contract for that pool and it is right for a process
+that owns its cluster. On any cluster with a second tenant it is a deadlock rather than an
+optimization, and a device is why: a reserved idle core slows a neighbour down, where a reserved
+idle GPU stops one dead, with no oversubscription to fall back on and no second device to
+borrow. The pool now takes the discipline the shuffle fleet and the CPU map pool already have —
+`distributed.warm_inference_idle_s`, 120 s, cancelled the moment a stage asks for the pool, `0`
+to restore residency. Longer than their 30 s because what is rebuilt is not comparable: an
+actor respawn is a second or two, a model load is five seconds to two minutes.
+
+The benchmark harness releases the pools between arms as well, which
+`benchmarks/cluster/gpu_pipeline.py` already did for the same reason. That is the fair boundary
+rather than a handicap: each arm is timed after its own untimed warm-up, so Batcher still loads
+the model once and reuses it across its timed runs, exactly as Ray Data reuses its actor pool.
+
+### Against Ray Data
+
+Two regimes, and they say different things. **Read the model share before reading the ratio.**
+
+| workload | Batcher | Ray Data | ratio | model share of Batcher |
+|---|---:|---:|---:|---:|
+| 10,000 JPEGs, width x1 | 1.19 s | 9.20 s | **7.75x** | 27% |
+| 100,000 JPEGs, width x1 | 10.95 s | 19.12 s | 1.75x | 19% |
+| 100,000 JPEGs, width x8 | 12.84 s | 24.00 s | 1.87x | 31% |
+| **10M rows x 256 f32 (9.5 GiB Parquet), width x6** | **147.44 s** | **162.66 s** | **1.10x** | **75%** |
+
+All correctness-gated: the JPEG rows agree to a 0.13-0.15% checksum spread (the JPEG-decoder
+difference this file already records), and the Parquet rows agree to **1.7e-10**, which is float
+reassociation and nothing else.
+
+**The first three rows are not throughput measurements and should not be quoted as if they
+were.** The JPEG corpus is 1 GiB of 211,742 objects of about 5 KiB; at 10,000 images the whole
+query is 1.19 s, most of Ray Data's 9.20 s is its fixed startup, and the ratio is a ratio
+between two engines' warm-up costs. The gap narrows exactly as the corpus grows, which is what
+that explanation predicts: across the 10,000-to-100,000 step the marginal cost per image is
+0.110 ms for Ray Data and 0.108 ms for Batcher, and the whole difference between them is a
+constant ~8 s of startup.
+
+**The last row is the one to read**, and it is a much smaller number. When the accelerator is
+the bottleneck — 75% of the wall on the device, 3.9 TFLOP/s per T4, about 48% of the board's
+fp32 peak — two engines running the identical kernel on the identical devices are within 10% of
+each other, because all that is left to compete on is keeping the device fed. Both do.
+
+### How much feeding headroom is left: about 7%, not 25%
+
+Worth writing down because the obvious reading of the table above is wrong. The model measured
+alone on one device for its share of the corpus is 110.17 s against a 147.44 s wall, which looks
+like 25% of the run available to a better overlap. It is not: that probe scores a **preallocated
+zeros array** in a loop, so it pays no allocation and no fresh host-to-device copy, and it
+therefore undercounts what the device really does on a real batch.
+
+Instrumenting the actor itself — every UDF call timed, plus the wall *between* calls, which is
+the device waiting on the engine — gives 3.6 s of scoring per call against 0.24 s of gap.
+**6.6%**, not 25%. There is a real overlap gap and it is small; the aggregate route gets no
+producer/consumer streaming (`stream_inference` splits a map-*terminal* chain, not one under an
+aggregate), and closing that is worth about 7% on this shape rather than the 25% the first
+reading suggested.
+
+### The training data plane, measured on the same day and unaffected by any of the above
+
+`benchmarks/cluster/gpu_train_ingest.py`, on the head node: stream an in-memory Arrow table to
+a PyTorch training loop as `{column: tensor}` batches, `device="cpu"` so the comparison is the
+loader and not the host-to-device copy, correctness-gated on the exact row count and a label
+checksum. 12,000,000 rows x 128 `float32`, batch 256, best of 3 after a warm-up:
+
+| engine | wall | rows/s |
+|---|---:|---:|
+| Batcher (`ds.ml.iter_torch_batches`) | **2.94 s** | 4,081,418 |
+| Ray Data (`iter_torch_batches`) | 33.02 s | 363,453 |
+
+**11.2x**, and it is a per-batch-overhead result rather than a bandwidth one: 46,875 batches of
+steady state either way, with the same rows and the same tensors at the end. Batcher's loader
+is zero-copy through DLPack with background prefetch; Ray Data's guides already record its
+`iter_torch_batches` as running about 20% slower than a native `DataLoader` from the
+Arrow-to-tensor conversion, and this is that cost at 12M rows.
+
+**A full Ray Train comparison did not run and is not claimed.** `gpu_ray_train.py` puts the
+loader inside a `TorchTrainer` worker, and these GPU workers carry cupy and **no torch**.
+Staging the driver's torch onto the shared mount the way `cluster_env` stages RAPIDS was tried
+and abandoned: the copy ran at about 20 MB/min against 6.6 GB of torch plus its CUDA libraries,
+which is hours. A `pip` runtime env would charge every arm a multi-minute per-node install and
+then measure it. So what is measured here is the loader, on the driver, which is the half of
+the training data plane the engine owns.
+
+### Two things this run also fixed, neither of them performance
+
+* **`benchmarks/sources/corpora.py` gained a whole-corpus image tier** (211,742), because every
+  tier below it is too short to measure a distributed engine with.
+* **Three tests were failing at `HEAD`** before any of this — `test_hardware.py` (two) and
+  `test_hardware_probe_binding.py` (one). Commit `159ca340` added an `os.path.isdir` filter to
+  `cgroup_v2_dirs`, which is load-bearing (under a cgroup namespace `/proc/self/cgroup` names a
+  host path that resolves to nothing, and a tuple of phantom directories made the memory probes
+  read `None` on a container with a perfectly readable limit). The tests fake `open` and not
+  `isdir`, so they describe a machine that cannot exist and every path they build was filtered
+  out. They fake both now.
+
+## Cluster utilization on the 27-node heterogeneous fleet (2026-09-07)
+
+Measured with a core-weighted sampler (`utilization.py` in the session scratchpad): busy% is
+weighted by each node's cores, because the unweighted node average that
+`cluster_util.ClusterMonitor` reports flatters exactly the failure a mixed fleet has -- a
+4-core node at 100% and the 96-core node at 10% average to 55% while 3.5% of cores are busy.
+
+### What the cluster does
+
+| workload | fleet | busy cores | of 384 | 96-core node |
+|---|---|---|---:|---:|
+| 60M-row distinct, ~50M keys | 32w / 384c | **129.7** | **33.8%** | 53.5% |
+| 60M-row group-by, ~50M keys | 32w / 384c | 113.7 | 29.6% | 42.6% |
+| the same group-by | 16w / 132c | 72.3 | 18.8% | 22.6% |
+| TPC-H sf100 group-by | 32w / 384c | 59.5 | 15.5% | 16.8% |
+
+**Utilization is appropriate rather than deficient, and the evidence is the fleet-width sweep,
+not the percentage.** Holding data and query fixed and varying the fan-out 4 -> 32 returns
+0.96x (group-by), 1.09x (multi-aggregate), 1.25x (string-heavy) and 1.12x (TPC-H sf100).
+Nothing tested is core-bound, so the idle cores are not parallelism being left unclaimed.
+
+**The heterogeneity handling works under load.** On the 60M distinct the 96-core node runs at
+53.5% against the 4-core nodes' 59.1% -- 51 busy cores against 38, from a quarter of the
+cluster. On TPC-H sf100 it takes 55.8% of the work on 25% of the cores.
+
+### Fleet formation is worth more than any query tuning here
+
+The identical 60M group-by measured **72.3 busy cores on a 132-core fleet and 113.7 on a
+384-core one** -- 1.6x, with no change to the query. A fleet spawned while a previous one is
+still being reaped comes up short (15-20 of 32 workers), which is the pathology
+`_regrant_fleet` documents. Both fleet shapes reach 384/384 in ~2 s on a genuinely idle
+cluster, so this is *not* a property of the per-node shape:
+
+| shape | workers | cores held | time |
+|---|---|---|---|
+| per-node (16x3, 8x15, 3x23, 5x24) | 31-32 of 32 | 380-384 of 384 | 2 s |
+| uniform (96 x 4) | 96 of 96 | 384 of 384 | 2 s |
+
+Formation through `collect(distributed=True)` is nonetheless flakier than a direct
+`spawn_flight_workers`, which reached 31-32/32 on three consecutive attempts where the query
+path gave 16/32 after the same idle wait. **That is the highest-value open lead here.**
+
+### The remaining ceiling, and one open lead
+
+A workload of genuinely unfoldable per-row work (`char_entropy` / `base64` / `count_char`
+over ~50M distinct values) scales in *time* with the work -- 968 / 1313 / 1773 ms for 4 / 16 /
+48 operations -- while busy cores stay pinned at 33-34. On a 16-worker fleet holding 136
+cores that is about **2 busy cores per worker against ~8.5 granted**. Worth chasing: whether
+a worker's rayon width or its concurrent-partition count is the binding term.
+
+### Three benchmark designs the optimizer defeated
+
+Recorded because each produced a flat curve that reads exactly like a scheduling ceiling, and
+reporting any of them would have libelled the scheduler:
+
+1. **A 512-distinct-value string column.** Evaluated on its dictionary, so 8 chained string
+   operations cost the same as 64.
+2. **`upper`/`lower`/same-length `replace` fed to `.str.len()`.** None of them changes a
+   string's length, so the whole chain folds; 12x the operations cost 11% more time.
+3. **`agg(count())` used to warm a fleet.** Answered from Parquet footer statistics, so it
+   spawns no fleet at all -- correct for the query, useless for the purpose.
+
+The general form: on this engine a naive "do lots of operations" benchmark measures the
+optimizer. Make the output depend on the content, and check the curve moves before trusting a
+flat one.
+
+## A fleet of unequal machines was sized by its smallest node (2026-09-07)
+
+**Fleet.** A 27-node heterogeneous Ray cluster: one 96-core/206 GB node, two 48-core/103 GB,
+eight 16-core/34 GB and sixteen 4-core/8.6 GB -- 384 cores. Harnesses are in the session
+scratchpad (`arm.py`, `api_matrix.py`, `api_shapes.py`, `api_scaling.py`, `api_sweep.py`);
+data is TPC-H sf100 from S3 plus a generated 24M-row rich-typed fixture.
+
+**What the cluster did before.** Every distributed sizing decision collapsed to the weakest
+node, because a *uniform* grant has to fit the smallest machine:
+
+| decision | before | after |
+|---|---|---|
+| workers x cores | 96 x 4 | 5x24, 3x23, 8x15, 16x3 |
+| per-worker memory | **228 MB**, every worker | 43.8 GB on the 206 GB node, 7.3 GB on an 8.6 GB one |
+| split assignment | equal rows per worker | proportional to cores |
+| shuffle streams | 96 x 96 | 32 x 32 |
+
+228 MB is `min(node_ram) x soft_limit / max_workers_on_any_node`: the four workers on the
+206 GB machine were budgeted from the 8.6 GB one and spilled a join they could have held.
+
+### Measured
+
+| what | result |
+|---|---|
+| TPC-H sf100 group-by | uniform 3208 ms -> per-node **2893 ms** (1.11x) |
+| fleet startup, warm | 32 per-node workers in **1.2 s**; 96 uniform in 1.5 s |
+| distributed == single-node | **8/8** operator matrix; **329/329** expression methods |
+| parallelism vs data size | 8.8 -> 14.9 -> 37.4 busy cores for 0.1M -> 5M -> 24M rows |
+| throughput | 1.1M -> 68.2M -> **255.7M rows/s** at flat wall time |
+| TPC-H sf100 work share | the 96-core node does **55.8% of the work on 25% of the cores** |
+| memory | peaks 61-84%, **zero nodes lost** across 27 cases + 7 shapes + 16 width runs |
+
+**Nothing tested here is core-bound.** Holding data and query fixed and varying the fleet
+width 4 -> 32 gives 0.96x (group-by), 1.09x (multi-aggregate), 1.25x (string-heavy) and 1.12x
+(TPC-H sf100). Utilization of 2-10% on the small shapes is therefore the right answer rather
+than lost parallelism -- and where the work is genuinely CPU-heavy (40 string ops per row) it
+rises to 24.6%.
+
+**More files is slower.** The same 24M rows at 4 / 48 / 192 files: 82 / 94 / **122 ms**. Over
+-splitting buys busy cores (23.6 -> 41.7) and loses wall time; per-split scheduling outweighs
+the parallelism at this size.
+
+### Unresolved, and not to be read as a win
+
+* **The per-node `join` arm at sf100 never completed.** Five runs exceeded 45 minutes where
+  the uniform arm did the same five in ~15. It was stopped before its timeout, so whether that
+  is a regression or a stall inside the arm is **unknown**. No join claim should rest on this
+  change until it has its own run.
+* **`skew_window` fails.** A windowed rank partitioned by a key holding 60% of the rows dies
+  in `_FlightWorker.map_publish` with `RetryableShuffleError: transport error` fetching a
+  shuffle bucket -- an error classed retryable, surfacing as a query failure.
+* **The default fan-out buys nothing on a small query**: 32 workers match 4 while holding the
+  whole cluster.
+
+### Two ways to measure this cluster wrong
+
+Both cost hours here before they were spotted, and both produce numbers that look fine.
+
+**The learned-stats loop makes a repeated query faster, so an A/B inside one process measures
+the warm-up curve.** The same sf100 group-by ran **131.6 s, then 7.8 s, then 3.2 s** in one
+driver. Alternating arms in one process reported a "26x speedup" on one case and a "5x
+regression" on another; both were the curve. One arm per process, two untimed warm-ups, then
+best of three.
+
+**Editing `python/batcher/**` between runs changes Ray's runtime-environment package hash**, so
+the next driver re-uploads 91 MB and unpacks it on all 27 nodes before an actor starts. That is
+most of the 120-second fleet-formation stalls seen here; 17 distinct packages were pushed in one
+afternoon of edit-and-measure. Measure with a tree that has not changed since the last run.
+
 ## GPU batch inference vs Ray Data and Daft: 2.4x and 5.4x, not 10x (2026-09-06)
 
 **Fleet.** The same 6 x `g4dn.2xlarge` (1 Tesla T4, 8 vCPU, 32 GiB each) plus a 30 GiB head node.
@@ -637,55 +1538,104 @@ Where the margin actually is: **read + decode + reduce, no model at all, is 1.31
 Data's 11.95 s — 9.1x** (10,000 images, identical checksums). That is the number the inference
 figures are diluted from, and it is the honest form of the claim.
 
-### A GPU stage will not place after an ordinary CPU query, and waits forever
+### A GPU stage would not place after an ordinary CPU query — a self-deadlock, now fixed
 
-Found while measuring whether Batcher overlaps its read with its inference. Reproducible, fully
-characterized, **not fixed** — the mechanism was not pinned down, and this file already carries
-one entry today about acting on an inferred cause.
+Found while measuring whether the read overlaps the inference. One variable: whether an ordinary
+CPU query ran earlier in the same driver.
 
-One variable: whether an ordinary CPU query ran earlier in the same driver process. Same corpus
-(1,000 images), same GPU query, same fleet.
+| arm | before | after |
+|---|---|---|
+| the GPU inference query alone | 7.94 s | 7.99 s |
+| an ordinary CPU query first, then the identical GPU query | **never places** | **4.34 s** |
 
-| arm | result |
-|---|---|
-| the GPU inference query alone | **7.94 s**, 1,000 rows |
-| an ordinary CPU query first, then the identical GPU query | **never places** |
+The map/aggregate route keeps a pipeline's actors warm for `distributed.session_fleet_idle_s`
+so a back-to-back query reuses their scan cache, and a timer returns the cores when the session
+goes quiet. What made that a deadlock rather than a delay is the interaction with the route's
+own lease. Measured on six 8-core nodes: the finished CPU query's pool holds **42 of 48 cores**;
+the next query — a *different* pipeline — enters the route, **takes the in-use lease**, then
+tries to build its pool and submit map tasks at **6.144 CPU each against 6.0 free**. Not one can
+be placed. And the lease it is holding is precisely what stops the stale pool being reclaimed,
+so the query waits on cores that only it could release: `0/6 tasks finished`, indefinitely, with
+every device idle.
 
-The stalled arm reports, every two minutes and indefinitely:
+The fix hands back **another pipeline's** warm pool before taking the lease, and only when the
+cluster is genuinely short — so a pool this plan would reuse is never touched, and a query that
+fits alongside a warm pool leaves it warm. What a foreign pool loses is a scan cache its next run
+rebuilds.
 
-```
-distributed barrier has waited 120s with 0/6 tasks finished cluster CPU 42/48 in use;
-6 outstanding at 6.144 CPU, 1 GPU, 29.2 GB each, and 1 candidate node(s) have 1 CPU free
-```
+Three wrong turns are worth recording, because each looked right and cost a measurement. It is
+not a leaked placement group (`placement_group_table()` reports zero live). It is not the GPU
+pool's actors reserving cores (`_gpu_options` sets zero and `_pool_placement_envelope` matches
+the bundle). And reclaiming *idle* pools does not help, because the blocking pool is not idle by
+the lease's definition — the stalled query itself holds it. Only the fourth attempt, which
+traced which hook actually fired, found that `reclaim_idle_cpu_pool()` was being called and
+returning `False`.
 
-What holds the cores is measured rather than guessed — `ray.available_resources()` sampled
-around a CPU query that has already returned its answer:
+### GPU utilization: the devices are 92% occupied, and 96% of that is reading Parquet
 
-| moment | free CPU |
-|---|---:|
-| before any query | 48.0 / 48 |
-| immediately after `collect()` returns | **6.0 / 48** |
-| +15 s | 6.0 / 48 |
-| +30 s | 6.0 / 48 |
-| +60 s | 48.0 / 48 |
+Sampled with NVML on each GPU node by a `num_gpus=0` actor, so the measurement reserves no
+device. The window is **execution only** — an earlier version sampled across warm-up and reported
+the idle cluster, which is a fact about the harness.
 
-So the CPU query's fleet is retained for something between 30 and 60 seconds after the query is
-over — reasonable on its own, since the next query would otherwise pay startup — and a GPU stage
-submitted inside that window asks for about six cores per device and can never get them. Two
-things are wrong and they are separable: an **accelerator** task reserving host cores it does not
-use (`_gpu_options` documents zero as the honest request and exists to escape exactly this), and
-a barrier that waits forever rather than degrading when the reservation cannot be met.
+| workload | SM mean | SM p90 | VRAM mean | VRAM peak | samples with any GPU activity |
+|---|---:|---:|---:|---:|---:|
+| TPC-H q1, sf10 | 18.9% | 51% | 15.2% | 18.7% | 58% |
+| TPC-H q1, sf100 | 23.1% | **93%** | 38.7% | 56.2% | 33% |
 
-It does not show up in the benchmark above because that harness runs one engine per driver
-process. It shows up the moment a real pipeline reads with the CPU engine and then infers, which
-is the ordinary shape.
+Read alone, that says the fleet is two-thirds idle. **It is not, and the SM counter is the wrong
+instrument for this tier.** Replaying a real sf100 `tpch-q1` — its 13 shard descriptors captured
+from an actual run and replayed on the workers, which time their own halves while the driver
+times the round trip:
 
-**Two hypotheses were tested and discarded before this was written.** It is not a leaked
-placement group: `placement_group_table()` reports zero live groups after the CPU query. And the
-GPU pool's actors do ask for zero CPU — `_gpu_options` sets it and `_pool_placement_envelope`
-matches the bundle to it — so the six-core demand is coming from somewhere else, and the
-`_map_agg_task` submission that carries no accelerator options is a candidate rather than a
-conclusion.
+| | sum over 13 shards | mean per shard |
+|---|---:|---:|
+| device Parquet read | **80.37 s** | 6.18 s |
+| the query's kernels | **3.58 s** | 0.28 s |
+
+Per device that is 13.99 s of busy against a 15.16 s wall — **92% occupancy, 8% dispatch**. The
+devices are not waiting for work; they are *occupied by a read* that is 22x the kernel. cuDF
+decodes Parquet on the device, so a shard blocked on storage is a resident kernel doing very
+little, which NVML reports as low SM utilization. The 90% target is unreachable on this shape for
+a reason that is arithmetic rather than a defect: 0.28 s of compute per 6.18 s of I/O.
+
+**The storage is not the ceiling either.** Six concurrent readers on this mount, disjoint files
+so nothing is answered from another reader's page cache:
+
+| readers | aggregate | per reader |
+|---:|---:|---:|
+| 1 | 1,078 MiB/s | 1,078 MiB/s |
+| 2 | 2,462 MiB/s | 1,296 MiB/s |
+| 4 | 4,488 MiB/s | 1,361 MiB/s |
+| 6 | **4,826 MiB/s** | 1,439 MiB/s |
+
+It scales. So there is a real gap between what the mount delivers and what the query's read
+achieves, and **it is not yet explained**. Three candidates were tested and all three are wrong,
+which is worth recording so they are not retried:
+
+* **Not the access pattern.** A shard reads row-group subsets rather than whole files, and that
+  is the *faster* shape: same bytes, one `read_parquet` call, **2,357 MiB/s for row groups
+  against 1,405 for whole files** cold.
+* **Not a missing concurrency.** Threading the row-group reads is slower again (1,692 MiB/s
+  cold, 2,983 against 9,061 warm), which is also why the thread pool considered earlier in this
+  file was not added.
+* **Not the frame cache.** Raising `gpu_frame_cache_fraction` from 0.25 to 0.70, so a 2.3 GiB
+  shard comfortably fits a 15 GiB board, left warm sf100 q1 at **8.06 s either way**.
+
+What is established: the tier is **storage-bound, not compute-bound or schedule-bound**, the
+kernels saturate the board when they run (p90 93%, max 100%), and dispatch costs 8%. What is
+open is the remaining read gap, and the three easy explanations for it are already spent.
+
+**VRAM peaks at 56% of a 15 GiB board.** One contributor to that is fixed here: `_row_bytes`
+charged a whole row's width (128 B) for *every* column it could not resolve — right for one
+unknown column among known ones, wrong when *nothing* resolves, which is the ordinary case for a
+renamed scan (TPC-H Parquet in the wild is positional, every query names its columns, and
+schema-on-read renaming leaves the source positional). sf100 `lineitem` was sized at **500.7 GiB
+against a real ~40 GiB**, so `plan_shard_count` asked for 24 shards where the data wanted 6. An
+unresolvable projection is now sized from the whole row of the schema that *can* be read.
+
+**It did not move this query** — sf100 q1 runs 13 shards either way, because its count comes from
+the split count rather than the memory bound. The fix is kept on its own merits and pinned by
+`tests/unit/test_gpu_shard_sizing_projection.py`, not because it improved a number.
 
 ### Two harness defects found by disbelieving the first result, both mine
 
@@ -1535,7 +2485,7 @@ the third arm of a benchmark stopped, and the arm that stopped was the one measu
 change. A route control tells you the code ran; only running it more than once tells you what
 it does to the machine around it.
 
-#### The board
+### The board
 
 sf100, `BENCH_PIPES=udf`, each engine its own driver process, measured in one session today,
 four Batcher sweeps (1,069 / 969 / 964 / 803 ms) against one Ray Data sweep.
@@ -22956,3 +23906,4109 @@ reference to what the plan does.
 - **Why a worker does not reach 96 cores in the mean is not established here.** The next
   question is the rayon pool width in the `EngineConfig` shipped to workers, which this
   benchmark does not read.
+
+## 2026-09-07 — Batcher vs Ray Data vs Daft on one heterogeneous Ray cluster
+
+Cluster: 28 nodes / 384 cores (1x96, 2x48, 8x16, 16x4), Ray 2.58.0, Daft 0.7.24. Fixture:
+24M rows x 12 cols Parquet (48 files) on `/mnt/cluster_storage`, and a 72M-row 3x replica at
+the same 500K-rows-per-file granularity. Harnesses in the session scratchpad (`vs_engines.py`,
+`scale.py`, `fault_busy2.py`); every engine reads the same files and its answer is compared
+before any timing is reported.
+
+### Wall time, warm fleet, 24M rows
+
+| case | batcher | ray_data | daft | agreement |
+|---|---|---|---|---|
+| filter_count | 65 ms | 1156 ms | 173 ms | AGREE |
+| groupby_low | 86 ms | 9516 ms | 2295 ms | AGREE |
+| groupby_high | 1112 ms | 8849 ms | 1633 ms | AGREE |
+| join | 1068 ms | 12262 ms | 2694 ms | AGREE |
+| sort_topn | 45 ms | 1753 ms | 110 ms | AGREE |
+| distinct | 166 ms | 2965 ms | 1501 ms | AGREE |
+
+`scan_count` is deliberately excluded from the table above. Batcher answers `COUNT(*)` from
+Parquet footers in ~2 ms against Ray Data's 4011 ms, and reporting that as a 2005x speedup
+would be reporting *work avoided* as *work done faster*, which
+`docs/architecture/internals/competitive_architecture.md` retires. It is a capability
+difference and belongs in that column, not this one.
+
+**Three cases first reported DIFFER and none of them was an engine divergence.** The
+signature reducer ordered each row's values by column *name*, so identical answers whose
+aggregate columns are spelled differently (`n`/`s` against `count()`/`sum(amount)`) sorted
+differently and compared unequal; `groupby_high` compared 25,000 Batcher rows against a scalar
+count from the others; and `join` was three different queries, Batcher returning `(n, s)` where
+the other two returned a row count. All three were harness defects. A correctness check that
+fails on column naming is worse than none, because you learn to ignore it.
+
+### Scaling the same filter + group-by
+
+| engine | 0.5M | 2.5M | 6M | 24M | 72M |
+|---|---|---|---|---|---|
+| batcher | 59 ms | 60 ms | 69 ms | 77 ms | 97 ms |
+| ray_data | 10061 ms | 6945 ms | 6485 ms | 7127 ms | 10307 ms |
+| daft | 68 ms | 161 ms | 376 ms | 2206 ms | 7378 ms |
+
+Batcher takes 1.6x the time for 144x the data; Daft scales cleanly but linearly and crosses
+over around 12-24M rows; Ray Data is fixed-overhead-bound at every scale here.
+
+**Two measurement artifacts had to be removed before this table meant anything, and the first
+one is worth remembering.** The harness called a `quiet()` helper that waits for 95% of cluster
+CPU to be free before each timed run -- but a warm fleet *holds* those cores by design, so
+waiting for quiet waited for the 30 s idle reaper to destroy the fleet. Every timed run then
+paid a cold start, and the resulting flat ~1.7 s curve was fleet formation measured five times
+over. It is a plausible-looking scalability result with nothing of the query in it. Second,
+Batcher's first scale in a process reads 1259 ms against 59 ms for the same scale run later;
+re-running largest-first put 0.5M at 59 ms, the fastest point on the curve, so that cost is
+one-time process startup and not a small-query weakness.
+
+### Fault tolerance: losing a worker mid-query
+
+`ray::` process names carry the executing method, so a bare `_FlightWorker` is an idle fleet
+actor and `_FlightWorker.local_topn` is one running a task. They are different faults:
+
+| fault | batcher | daft |
+|---|---|---|
+| idle spare actor killed | SURVIVED 9/9 | SURVIVED 1/1 |
+| actor killed mid-method | **FAILED 5/5** | SURVIVED 1/1 |
+
+Batcher loses the query with `ActorDiedError` whenever the lost worker was executing anything
+-- `local_topn`, and also the fleet-setup calls `__init__` and `set_grant`, so this is not
+confined to losing materialized partial state. The matched pair is the `__init__` kill, which
+both engines took: Daft finished with an identical answer and Batcher did not. **Daft's
+mid-method arm is n=1** -- its actors stay initialized, so three further trials found no busy
+actor to kill and honestly reported NO-FAULT rather than a verdict. No engine ever returned a
+WRONG answer; the failures are clean.
+
+This matters more here than the wall-clock table. On a mixed-instance fleet where nodes come
+and go (this session lost 14), a worker lost mid-task loses the query.
+
+### Two methodology notes that cost real time
+
+**A fault harness that cannot inject a fault reports SURVIVED.** Three consecutive runs printed
+a clean three-engine pass with nothing killed in any of them: Batcher's fleet handle was empty
+from the injector thread, Ray Data runs this plan on *tasks* with no actor to kill at all, and
+the Ray state API refused to answer because the cluster holds ~598K historical tasks. The fix
+that matters is not any of those three, it is that the harness now emits `NO-FAULT` and refuses
+a verdict unless a `SIGKILL` is confirmed.
+
+**Never fall back to killing "any matching process".** An earlier revision, failing to find the
+engine's own worker, killed the first `ray::` process it saw -- `ray::DashboardAgent` -- on
+three nodes, and took all three out of the cluster (384 -> 288 cores; the autoscaler replaced
+them within minutes). The harness now carries an absolute denylist of Ray infrastructure
+processes and no fallback past it. Ray Data remains untested under fault for this reason: its
+task workers exposed no matching process name, and the correct response to that is an untested
+row, not a wider blast radius.
+
+## 2026-09-07 — SQL surface and per-worker engagement on the heterogeneous cluster
+
+Same 28-node / 384-core cluster. Completes the public-API sweep: `api/dataset` (8/8 operator
+matrix) and `plan/expr_ir` (329/329 expression methods) were covered earlier, SQL is the third
+front-end and lowers to the same `LogicalPlan`, so what is checked is not that the parser
+accepts a string but that the plan means the same thing on 28 nodes as on one.
+
+**18 SQL constructs, 18 correct.** Two reported ROWS-DIFFER and both were classified rather
+than waved through, because a divergence outside the three documented exceptions is a defect
+however plausible it looks:
+
+- `SELECT count(*), sum(amount), avg(qty)` — `count(*)` exact at 6,000,000 both sides, `avg`
+  bit-identical, `sum` apart by **1.99e-16 relative**, one ULP of a float64. That is the
+  documented reassociation exception, and the check that makes it one is the exact count beside
+  it, not the small delta on its own.
+- `rank() OVER (PARTITION BY grp ORDER BY amount DESC) ... LIMIT 60` — the **full** 6M-row
+  window result is multiset-identical on both paths; only the `LIMIT` keeps different rows, at
+  equal count. That is the documented "LIMIT over a relation with no order" exception, and
+  running it without the `LIMIT` is what separates the two readings.
+
+`SqlSession` is not on the public surface; `bt.sql()` and `Dataset.sql()` are.
+
+### How many workers actually run at once
+
+Sampling every node in ONE concurrent round (a round is then a genuine instant) and reading the
+executing method out of the `ray::` process name, since Ray writes `Class.method` while a task
+runs and a bare `Class` while the actor waits:
+
+| operation (72M rows) | peak busy workers of 33 | pipeline seen |
+|---|---|---|
+| groupby_high | 23 | map_publish -> combine_publish -> combine_finalize_fetch |
+| groupby_low | 22 | map_publish -> combine_finalize_fetch |
+| join | 32 | broadcast_probe_join, map_publish, combine_publish |
+| distinct | 23 | map_publish -> combine_publish -> combine_finalize_publish |
+
+**This retires an earlier reading of "1 busy worker, 32 idle".** That came from sweeping the
+nodes sequentially, which takes seconds -- long enough for the busy phase to move ahead of the
+sweep. Sampled concurrently the fleet engages broadly, and the method names trace the mergeable
+algebra doing it.
+
+**Only the peak column survives from this run.** The sampler perturbs heavily: the 72M sort
+went from ~5 s to 121 s with sampling on and completed no rounds at all, and `groupby_high` read
+1743 ms against ~146 ms unsampled. Peak concurrency is robust to that (a worker seen busy was
+busy); the medians and the wall times from the same run are not, and are not reported. The
+open question this does not answer is the one already recorded above it -- roughly 2 busy cores
+per worker against ~8.5 granted -- which needs the rayon pool width in the shipped
+`EngineConfig`, not another sampler.
+
+## 2026-09-07 — fix: a distributed top-N no longer dies with its worker
+
+Same 28-node / 384-core cluster, 72M-row fixture, query `ORDER BY amount LIMIT 1,000,000`.
+Fault: `SIGKILL` of a `_FlightWorker` process **while it is executing a method**, found and
+killed in one remote call fired at every node concurrently, retried until it lands. Verdicts
+compare the disturbed run's answer against an undisturbed baseline, so SURVIVED means finished
+*and* identical.
+
+| | before | after |
+|---|---|---|
+| worker killed mid-method | **FAILED 5/5** (`ActorDiedError`) | **SURVIVED 5/5** |
+| idle spare actor killed | SURVIVED 9/9 | (unchanged) |
+
+Methods the landed kills hit after the fix: `local_topn` x2, `set_grant` x2, `addr`. Before it,
+`local_topn`, `set_grant` x2, `__init__` x2 — so the failure was never confined to losing
+computed state; losing a worker during fleet *setup* lost the query too.
+
+**Cause.** `execute_topn_flight` gathered its per-worker results with a bare `ray.get(ref)` and
+had no recovery of any kind, while its sibling `execute_sort_flight` in the same file documents
+"worker loss is survived in every phase". The top-N is the shuffle-free path, and it looks like
+it was simply never given the treatment the shuffling one got — nothing in the code declined
+the recovery, it was absent.
+
+**Fix** (`dist/executors/ray_runtime/policies/_topn.py`, new): recompute a lost partition on a
+surviving worker. This is the cheapest recovery case in the engine and that is why it was worth
+closing rather than documenting — a top-N partition is computed from a **durable source split**
+and ships only `k` rows, so there is no shuffle state to rebuild and the recomputed rows are the
+same rows. Two properties of the fold are preserved deliberately: the partition is folded back
+at its **original index** (an arrival-ordered fold would return different rows run to run when
+rows tie at the k-th place), and the driver's peak stays at `2k` rather than `workers x k`.
+A deterministic failure is re-raised rather than recomputed, so a UDF bug still surfaces with
+its own traceback instead of burning the retry budget and reporting a resource error.
+
+**Correctness after the fix**, distributed against single-node, compared as an ordered sequence
+rather than with the order-independent `assert_same` (which cannot see a sort bug): `k` in
+{1, 7, 137, 5000} x {ascending, descending}, 8/8 identical sequences, all correctly ordered.
+
+`tests/unit/test_topn_survives_worker_loss.py` drives the retry policy against fake actors, so
+it runs without Ray. Reverting `_topn.py` to the pre-fix bare gather fails 4 of its 7 tests and
+passes the other 3, which is the intended split: the 3 are the positive control (a healthy
+gather must not resubmit — it would pass every recovery test while doubling the work of every
+query that never lost a worker) and the deterministic-bug case, both already correct. Those
+tests do **not** prove the distributed path is wired to the policy; the run recorded above is
+the only evidence of that, and CI installs no Ray.
+
+## 2026-09-07 — chasing the per-worker utilisation ceiling: two retractions and one footgun
+
+Same 28-node / 384-core cluster, 72M rows. This entry is mostly negative results, and they are
+worth recording because each one looked like a finding first.
+
+### The per-node thread sizing was never broken
+
+Read directly out of `engine_config_json`, which is the only thing that carries the fleet plan
+into the data plane:
+
+| `execution.parallelism` | worker granted 24 cores | worker granted 3 cores |
+|---|---|---|
+| 0 (default) | ships 24 | ships 3 |
+| 16 (explicit) | ships 16 | ships 16 |
+
+**Retraction.** An A/B that moved `execution.parallelism` 0 -> 8 -> 16 -> 32 showed wall time
+falling 1519 ms -> 168 -> 150 -> 167 and busy cores rising 17.9 -> 63.9 -> 69.6 -> 68.8, which
+reads as a 10x win from raising the cap. Re-run largest-first it inverted exactly:
+`parallelism=32` took 1544 ms at **17.9** busy cores and `parallelism=0` took 149 ms at 66.6.
+The numbers tracked **position, not the setting** — both orders gave whichever arm ran first
+1519-1544 ms and 17.9 busy cores, to the decimal. There is no parallelism effect on this query,
+and the arms that looked faster were in fact *worse* configurations (see below) hidden by the
+artifact. This is the same one-time-process-cost confound that made 0.5M look like Batcher's
+worst scale earlier in the day; running the arms in both orders is what catches it, and doing
+it once does not immunise you against doing it again.
+
+### The footgun: a non-zero `parallelism` replaces the per-node plan
+
+The table above is the whole point. `parallelism: 0` is what lets each worker be pinned to the
+cores it was granted; **any** non-zero value is taken as an instruction and shipped to every
+worker unchanged, so on this cluster it hands a 4-core node a 16-thread pool (oversubscribed
+fourfold) while capping the 96-core node's workers at 16 — the thread thrash
+`engine_config_json` was written to prevent, reintroduced by the knob that looks like the way to
+tune it. Right for a single node, wrong for a mixed fleet.
+
+Documented on the field and pinned by `tests/unit/test_parallelism_pin.py`, which is the first
+thing to check this at all: a regression here changes no result, breaks no other test, and
+silently runs every worker at the wrong width. Replacing the pin with a constant fails 7 of its
+9 tests.
+
+### What the low utilisation actually is
+
+Busy cores by node class, from `/proc/stat` deltas rather than Ray's accounting (Ray reports
+what it *granted*, which is the thing in question):
+
+| per-row work | wall | busy of 384 | 96-core node | 4-core nodes |
+|---|---|---|---|---|
+| 1 regex | 200 ms | 60.1 (15.7%) | 9/96 (9%) | 29/64 (45%) |
+| 3 regex | 294 ms | 70.4 (18.3%) | 9/96 (9%) | 35/64 (55%) |
+| 6 regex | 430 ms | 80.7 (21.0%) | 9/96 (9%) | 44/64 (69%) |
+
+Utilisation rises with work per row, which is the expected shape: at 72M rows in 150 ms
+(~480M rows/s) the query ends before the cluster can fill, so a low number at this scale is a
+statement about the workload rather than the engine. The small-node/big-node spread is real and
+consistent across every arm measured today, and it is **not** explained by thread width, which
+the table at the top rules out.
+
+Two things this did NOT establish, listed so nobody reads them as established. The cause of the
+9%-vs-69% spread: the split assigner's capacity weighting (`fleet_worker_cpus`) returns `None`
+on the over-partitioned read because the group count (128) is not the fleet width (32) — that is
+deliberate and documented, and `map_barrier` deals those groups dynamically, so whether the
+spread survives the dynamic dealing is untested either way. And the `6 regex` and `12 regex`
+rows returned **n=0**: a conjunction of regexes short-circuits, so those arms are not 6x and 12x
+the work their labels claim, which is why only the 1- and 3-regex rows carry non-zero counts and
+why no ratio is quoted from them.
+
+## 2026-09-07 — fix: the fleet planner was counting its own warm fleet as a busy cluster
+
+Same 28-node / 384-core mixed cluster (1x96, 2x48, 8x16, 16x4).
+
+**The defect.** `_heterogeneous_fill` sizes each worker against its node's *free* cores, which
+is right when the busy cores belong to another tenant and wrong when they belong to us. A warm
+session fleet holds most of the cluster on purpose — that is what makes the next `collect()`
+start warm — so from the second query of a session onward the planner read a nearly-full
+cluster and cut its workers out of the remainder:
+
+| cluster state | planned slots | total planned cores |
+|---|---|---|
+| idle (query 1) | 32 | **357** (5x24, 3x23, 8x15, 16x3) |
+| fleet warm, 27 CPU free (query 2) | 32 | **32** (32x1) |
+
+An eleven-fold collapse, entirely self-inflicted. It is silent by construction: the query still
+returns the right answer, no test fails, and the only symptom is the cluster running at a
+fraction of its hardware. Both consumers of the per-worker grants degrade with it — the rayon
+width shipped to each worker (`lifecycle.engine_config_json`) and the split assigner's capacity
+weighting (`capacity.fleet_worker_cpus`).
+
+**The fix** (`dist/fleet/held.py`, new; `executor._free_cores_ignoring_our_own_fleet`): add back
+the cores held by our **own** session fleet, per node, capped at each node's nameplate.
+Attribution is per node because the planner's question is per node — a scalar "we hold 350
+cores" cannot say whether the 96-core machine is free — and the placement group knows exactly,
+since it is what reserved them. Only the *session* fleet counts: a query-scoped fleet belongs to
+a query still running, so its cores genuinely are unavailable.
+
+After the fix, query 2 plans the same 357 cores as query 1. `tests/unit/test_sizing_ignores_our_own_fleet.py`
+pins it, including the positive control that matters most here — cores held by *another* tenant
+must still read as busy, or the "fix" is indistinguishable from deleting the check.
+
+**No respawn regression.** Six consecutive queries in one process reuse one fleet (same id, 32
+actors): 9334 ms cold, then 218 / 208 / 178 / 186 / 204 ms.
+
+### How the three engines spread work across unequal machines
+
+Same query, same files, same answer (8 rows), each engine in its **own process** so no engine
+inherits another's warm-up. Busy cores from `/proc/stat` deltas per node, not from any engine's
+own accounting — each reports what it *granted*, and the question is what got *used*.
+
+| engine | wall | busy cores | 96-core node | 4-core nodes | big/small | core-seconds |
+|---|---|---|---|---|---|---|
+| batcher | **216 ms** | 40.8 (10.6%) | 2.5/96 (2.6%) | 24.9/64 (38.8%) | 0.07 | **8.8** |
+| ray_data | 11028 ms | 66.9 (17.4%) | 1.7/96 (1.7%) | 48.0/64 (75.0%) | 0.02 | 736 |
+| daft | 7344 ms | 16.5 (4.3%) | 3.9/96 (4.0%) | 6.0/64 (9.3%) | 0.43 | 121 |
+
+Batcher is **51x faster than Ray Data and 34x faster than Daft** here, for **84x and 14x less
+CPU** respectively — core-seconds is the fair efficiency measure when one engine is fifty times
+quicker.
+
+**On proportional use of the largest machine, Batcher does not lead.** Daft spreads most evenly
+(0.43), Batcher is 0.07, Ray Data is worst at 0.02 — it achieves the highest raw core count by
+dumping work on the 4-core nodes, running them at 75% while the 96-core box sits at 1.7%. All
+three under-use the big node; none is close to even.
+
+Two honest caveats on that ratio column. It is **confounded by window length**: a 216 ms query
+gives the sampler a much shorter window than an 11 s one, and fixed startup is a larger share of
+it, so a fast engine's ratio is measured under worse conditions. And every one of these queries
+is too short to saturate anything — the absolute percentages say more about the workload than
+the engines. The ratio is reported because the *ordering* was stable across three separate runs
+(combined-process, per-process, and per-process with three warm-ups), not because any single
+figure is precise.
+
+## 2026-09-07 — fix: the map barrier dealt every worker the same number of partitions
+
+Same 28-node / 384-core mixed cluster, 72M rows.
+
+**The defect.** `map_barrier`'s idle pool was pre-filled with every worker exactly `slots`
+times, and `map_partitions` sizes the source count at `workers x slots` — exactly the pool's
+depth. So every source was handed out from the initial fill and the go-idle path that would
+have corrected an imbalance never ran: a *static* even deal wearing a dynamic barrier's
+clothes. Invisible on a uniform fleet, and on an unequal one it means the smallest machine
+paces the stage.
+
+| cores | workers | partitions | per worker | per core | | per worker | per core |
+|---|---|---|---|---|---|---|---|
+| | | | **before** | **before** | | **after** | **after** |
+| 24 | 5 | 20 -> 48 | 4.00 | 0.167 | | 9.60 | 0.400 |
+| 23 | 3 | 12 -> 24 | 4.00 | 0.174 | | 8.00 | 0.348 |
+| 15 | 8 | 32 -> 40 | 4.00 | 0.267 | | 5.00 | 0.333 |
+| 3 | 16 | 64 -> 16 | 4.00 | 1.333 | | 1.00 | 0.333 |
+
+Per-core spread **8.00x -> 1.20x**. A 3-core worker was carrying eight times the per-core load
+of a 24-core one; the straggler was the *assignment*, not the machine.
+
+**The fix** (`policies/_barrier._idle_pool`): fill the pool in proportion to each worker's core
+grant, keeping its depth (the in-flight bound) unchanged, and ordered round-robin rather than
+blocked so the first `workers` sources still reach every worker. The dynamic path is untouched —
+a worker that finishes early still returns to the pool and still takes more. Assignment is a
+scheduling concern: a source is identified by its `src` id and its partition is a deterministic
+function of its durable descriptor, so which worker computes it never changes the result.
+
+End to end on the regex group-by: **216 ms -> 175 ms**, big/small ratio **0.07 -> 0.24**, the
+96-core node **2.6% -> 6.7%** busy with load moving off the 4-core nodes (38.8% -> 28.6%).
+
+### Harder workloads, including the shapes Ray Data and Daft are built for
+
+72M rows, each engine in its own process, two warm-ups, answers compared before any timing.
+`core-s` is busy-cores x wall — the fair efficiency measure when one engine is fifty times
+quicker.
+
+| case | batcher | ray_data | daft | batcher speedup |
+|---|---|---|---|---|
+| udf_map (`map_batches` + NumPy) | **2341 ms** / 99.8 core-s | 5498 ms / 250.4 | 6605 ms / 100.6 | 2.3x / 2.8x |
+| multi_agg (5 aggs, 25k groups) | **263 ms** / 10.7 | 15831 ms / 1676.8 | 6957 ms / 110.9 | 60x / 26x |
+| join_chain (two joins) | **2235 ms** / 67.8 | **FAILED** | 18912 ms / 344.0 | — / 8.5x |
+| str_etl (upper/replace/regex) | **211 ms** / 25.4 | 11639 ms / 1188.2 | 4996 ms / 98.2 | 55x / 24x |
+
+Every engine that completed a case agreed on its answer (`sum 99197712.35`, 25,000 groups,
+72,000,000 rows, 4 groups).
+
+**Batcher's best heterogeneity result is `str_etl`: 120.4 busy cores (31.4%) at a big/small
+ratio of 1.52** — the 96-core node working *harder* than the 4-core ones, the first time that
+has happened in any measurement here. Ray Data reached a comparable 102.1 busy cores on the
+same case but at a ratio of 0.06, i.e. by running the small nodes at 75% while the big one sat
+at 4.9%, and it spent 47x the CPU to do it.
+
+**One case where Batcher does not lead on efficiency:** `udf_map` costs Batcher 99.8 core-s and
+Daft 100.6 — a tie. That is the expected result and worth stating: the work is a Python NumPy
+UDF, identical text in both, so neither engine's data plane is doing it. Batcher is 2.8x faster
+in wall time for the same CPU, which is parallelism rather than per-row speed.
+
+**Ray Data could not complete `join_chain` at all**, and the reason is a defect rather than a
+tuning failure. Its planner resolves the schema correctly (`['k','grp','amount','kn','gn']`),
+then execution crashes inside `join_operator.finalize` where an empty partition reaches polars
+as a frame with no columns:
+
+| `num_partitions` on the `grp` join (8 distinct values) | result |
+|---|---|
+| 4 | OK at 24M rows; **ActorDiedError** at 72M |
+| 8 / 16 / 32 | **ColumnNotFoundError: unable to find column "grp"; valid columns: []** |
+
+So it is squeezed: above the key's cardinality the join crashes on empty partitions, and at the
+one count that avoids them each partition is large enough to kill the actor at 72M rows.
+`num_partitions` is exactly the knob a user raises for parallelism. Reported as an observed
+engine failure with the sweep that characterises it, not as a Batcher win.
+
+## 2026-09-08 — TPC-H sf100 on 100 x 4-core nodes, and two utilisation levers that were not
+
+Cluster: 101 nodes (a head with no schedulable CPU, 100 workers at 4 CPU / 8 GB), 400 CPU,
+Ray 2.58.0, Daft 0.7.24. Data: the public TPC-H sf100 parquet on S3 read straight from the
+workers -- `lineitem` 600 M rows in 100 files of 290 MB, `orders` 150 M rows in 100 of 69 MB.
+Every engine reads the same files and its answer is compared before any timing is reported.
+
+This cluster is the opposite shape to the 28-node mixed fleet the previous entries were taken
+on: many small machines rather than a few large ones. That is what surfaced the defect below,
+because its cost is `1/node_cores` and nobody had run the fleet on 4-core nodes.
+
+### A conflation worth fixing, which turned out not to be the ceiling
+
+Read this section together with the A/B further down, which measures it at 0.9-2.5% rather than
+the 33% the arithmetic below promises. The conflation is real and is fixed; the hypothesis that
+it explained this cluster's utilisation is retired by measurement, and both halves are here so
+the second is not lost behind the first.
+
+Both fan-out fills hold a core back on every node so the query's own plain Ray tasks (the map
+UDF, the hardware probe) have somewhere to run -- `executor._headroom_grant` on the uniform
+path, `fleet_plan`'s `node_reserve_cores` on the per-node one. That reserve is a **scheduling**
+concession and it is the right one.
+
+But the same figure also reached `engine_config_json`, which sizes each worker's rayon pool
+from it, so the reserve was taking a **thread** as well as a slot. `bc_interp::par::pool_for`
+caches one process-wide pool per width, so a 3-core width caps the whole worker process at
+three threads however many map slots the barrier deals it.
+
+| | reserved of 400 | threads opened | *arithmetic* ceiling on cluster CPU |
+|---|---|---|---|
+| before | 300 | 300 | 75% |
+| after | 300 | 400 | 100% |
+
+That last column is arithmetic, not a measurement, and the measurement below does not honour it:
+the fleet never reached 3 busy cores per node in the first place, so the fourth thread had
+nothing to take up.
+
+`capacity._FLEET_TASK_HEADROOM_MAX` already states the principle -- "Ray's CPU figure is a
+*reservation*, and the worker's real width comes from the `EngineConfig`" -- and it was true of
+the in-bundle headroom it documents and false of the fill's.
+
+The fix separates the two figures: `SchedulingEnvelope` carries `compute_cpus` /
+`worker_compute_cpus` beside `num_cpus` / `worker_cpus`, `_cluster_fill_workers` returns the
+grant before the headroom was taken off, `WorkerSlot` carries its node's usable share, and
+`engine_config_json` reads the compute width. **Placement is byte-identical** -- the fleet still
+reserves 300 of 400 cores -- and only the thread count moves.
+
+### The second finding: on a uniform fleet the map barrier's dynamic deal never runs
+
+`map_partitions(workers)` is `workers x distributed.map_partition_multiplier` (4), and the
+barrier's idle pool is `workers x map_slots_per_worker()` deep, where `map_slots_per_worker()`
+returns `FLEET_CONCURRENCY` (4). **Those are the same number.** Every partition therefore goes
+out in the initial fill and the go-idle path never runs, so each worker takes exactly its
+quarter of the input and the stage waits on the slowest.
+
+`_idle_pool`'s own docstring records this shape -- it is what the 2026-09-07 fix was about --
+but that fix made the *initial deal* proportional to each worker's cores, and it returns early
+when `max(caps) == min(caps)`. On a uniform fleet the early return is taken, so the case the
+docstring describes is not fixed there, it is simply not reached by that fix.
+
+The barrier is already built for over-partitioning (`gather_map_results(max_pending=workers *
+slots)` bounds what is in flight, not what exists), so the source count can exceed the pool
+without changing the memory envelope. The default multiplier just happens to equal the slot
+count.
+
+**The history is what makes this a regression rather than a bad constant.** `map_partition_multiplier
+= 4` landed 2026-08-11 (99193864), when the barrier kept **`workers`** in flight -- so 4x was a
+genuine four-deep queue behind every actor. `map_slots_per_worker()` landed 2026-09-03
+(430fd373) and widened the window to `workers x FLEET_CONCURRENCY`, which is 4x. Neither change
+was wrong on its own; the second silently consumed exactly the queue the first created.
+
+`docs/architecture/internals/competitive_architecture.md` section 6 said the barrier keeps
+"exactly `workers` in flight", which was true when it was written and is not now. Corrected in
+the same change as this entry, on the construction check rather than on the reasoning: 400
+partitions, a 400-deep pool, four per worker, nothing left to re-deal.
+
+### Method
+
+Each engine runs in its own process with the cluster to itself, one warm-up then a timed run,
+answers compared before any timing is reported. Cluster CPU is read from `/proc/stat` deltas on
+every node in one concurrent round, bracketed around the timed run -- not from any engine's own
+accounting, which reports what it *granted*.
+
+Two thresholds are reported for node engagement and both are needed. `touched` counts nodes
+above 0.05 busy cores for the window and `active` counts those above 0.5. A node that works
+hard for 100 ms of a 370 ms query averages 0.27 busy cores and reads as idle at the higher
+threshold: that is how a query which reached all 100 nodes reports "16 active", and it is a
+property of the window, not of the schedule.
+
+**Batcher's warm figures include its worker scan cache** (`scan_read.py`, decoded batches kept
+on the persistent fleet worker between queries, 30% of the node's RAM divided by its CPUs).
+Ray Data and Daft respawn their workers and have nothing equivalent, so a `nocache` arm
+(`BATCHER_SCAN_CACHE_BYTES=0`, forwarded to the workers) is reported beside it. The cache is a
+real capability of a persistent fleet; it is not a like-for-like comparison, and both numbers
+are given rather than one.
+
+### What the A/Bs had to get right
+
+**A config change does not reach a warm fleet.** `cfg_json` is handed to `_FlightWorker` in its
+constructor and `map_publish` takes no config, so setting `execution.parallelism` against a warm
+session fleet changes nothing in the data plane -- and an A/B written the obvious way measures
+the previous arm twice while looking like it worked. Both A/Bs below drop the session fleet
+between arms so the next query rebuilds it under that arm's config, and both run their arms
+forward and then reversed, because a one-time process cost lands entirely on whichever arm goes
+first and that artifact has been read as a setting effect here before.
+
+The busy-core column is the positive control: a width arm that never reached the workers cannot
+move it.
+
+### Baseline, before either fix
+
+sf100, warm (one untimed run then a timed one), answers checksum-matched across engines.
+
+| pipeline | batcher | ray_data | daft | vs ray | vs daft | batcher util | busy of 400 |
+|---|---|---|---|---|---|---|---|
+| filter_count | 320 ms | 2,801 ms | 1,218 ms | 8.8x | 3.8x | 24.1% | 96 |
+| groupby_low (4 groups) | 367 ms | 6,052 ms | 1,724 ms | 16.5x | 4.7x | 11.7% | 47 |
+| groupby_high (20M groups) | 3,605 ms | 264,422 ms | 3,087 ms | 73x | **0.9x** | 62.9% | 252 |
+| join + group-by | 1,854 ms | **TIMEOUT >600 s** | 5,901 ms | >=324x | 3.2x | 49.6% | 198 |
+| udf_map (NumPy) | 735 ms | **TIMEOUT >600 s** | (no arm) | >=816x | — | 53.2% | 213 |
+| str_etl | 429 ms | **TIMEOUT >600 s** | 1,007 ms | >=1399x | 2.5x | 30.0% | 120 |
+
+Daft's `str_etl` is a re-run: the first sweep lost it to a bug in the comparator's own thunk
+(Daft 0.7 moved its string functions off the expression's `.str` namespace onto
+`daft.functions`, which fails at build time), and a comparator that cannot build is a harness
+defect to fix rather than a win to bank.
+
+**Against Ray Data the margin is not in doubt** -- three of six shapes it cannot finish in ten
+minutes at all. **Against Daft it is, and on the one shape that genuinely loads the cluster
+Batcher loses.** `groupby_high` is the case with real work in it (3.6 s, the only pipeline that
+holds 400 cores for more than a second) and Daft is 17% faster on it, while Batcher runs at 62.9%
+of a cluster whose ceiling was 75%.
+
+That is not the same picture as the 28-node mixed cluster in the entries above, where Daft was
+8-34x behind. Two things differ and both matter: the nodes here are 4-core, which is where the
+width defect costs a quarter of the machine rather than a percent, and 100 of them is a fan-out
+where Daft's own scheduling has less to lose.
+
+Batcher's figures include its worker scan cache and Daft's include no equivalent, so the
+comparison already favours Batcher on that axis -- which makes the `groupby_high` loss a real
+one rather than a measurement artifact.
+
+### Core-seconds: the `groupby_high` loss is efficiency, not only utilisation
+
+`core-s` is busy cores x wall, the fair efficiency measure when engines differ in how much of
+the cluster they take.
+
+| pipeline | batcher core-s | daft core-s | ray core-s |
+|---|---|---|---|
+| filter_count | **30.8** | 91.3 | 61.8 |
+| groupby_low | **17.2** | 167.0 | 915.9 |
+| groupby_high | 906.8 | **496.3** | 25,935.1 |
+| join | **367.9** | 537.5 | (timeout) |
+
+Batcher is 3.0x and 9.7x more CPU-efficient than Daft on the two cheap shapes and 1.5x on the
+join. **On `groupby_high` it is 1.8x *less* efficient** -- Daft returns the same 20M-group
+answer in 496 core-seconds against Batcher's 907, while using 161 busy cores against 252.
+
+So the wall-clock loss on that shape has two independent causes and only one of them is the
+width ceiling. Raising the ceiling recovers cores; it does not close a 1.8x gap in CPU spent
+per row. Naming which half is which is the point of this table: a fix that only raises
+utilisation would take `groupby_high` past Daft on wall time while leaving Batcher spending
+nearly twice the CPU to get there, and reporting that as a win would be reporting the smaller
+half of the problem.
+
+The high-cardinality group-by is the shape to chase next, and it is a data-plane question
+(`bc-interp::agg_par`), not a scheduling one.
+
+### After the width fix (whole-arm, separate process)
+
+| pipeline | before | after | busy before | busy after | core-s before | core-s after |
+|---|---|---|---|---|---|---|
+| filter_count | 320 ms | 298 ms | 96.4 | 106.6 | 30.8 | 31.8 |
+| groupby_low | 367 ms | 330 ms | 46.8 | 45.3 | 17.2 | 14.9 |
+| groupby_high | 3,605 ms | 3,245 ms | 251.6 | 246.5 | 906.8 | 800.1 |
+| join | 1,854 ms | 1,915 ms | 198.5 | 189.3 | 367.9 | 362.6 |
+| udf_map | 735 ms | 691 ms | 212.7 | 209.9 | 156.2 | 145.0 |
+| str_etl | 429 ms | 399 ms | 119.8 | 127.7 | 51.4 | 51.0 |
+
+Five of six faster by 6-10%, the join 3% slower. **This table is not evidence on its own** and is
+reported as what it is: two runs in two processes an hour apart, which is the comparison shape
+that produced two retractions here on 2026-09-07. The busy-core column is the reason to
+distrust it -- a thread-width change from 3 to 4 predicts *more* busy cores, and the column
+barely moves and sometimes falls. Either the width was not the binding constraint or the arms
+differ for another reason.
+
+### The fixed cost of a distributed query on this cluster: ~155 ms
+
+Same query (`filter(qty > 30).agg(count())`) over one parquet file and over all hundred, warm
+fleet, three untimed runs then nine timed:
+
+| source | min | p50 | max |
+|---|---|---|---|
+| one file, 6 M rows | **155.0 ms** | 168.8 ms | 207.5 ms |
+| 100 files, 600 M rows | 286.4 ms | 332.2 ms | 451.8 ms |
+
+**A hundred times the data costs 1.8x the wall time**, so ~155 ms of a 300 ms sf100 scan is
+fixed: planning, the fleet, the partition descriptors, the barrier round trip, the reduce and
+the collect. That is the number to attack for "minimal scheduling overhead", and it is also
+what bounds the competitive claim on small queries -- 10x against Daft's 1,218 ms filter_count
+would need 122 ms, which is *below this floor*. No amount of parallelism reaches it; only
+cutting the floor does.
+
+**Do not probe this with an in-memory source.** The first version of this measurement used
+`bt.from_pydict(...).collect(distributed=True)` and reported **0.2 ms**, because an in-memory
+source is not splittable and the collect quietly ran on the driver. 0.2 ms is the cost of *not*
+distributing, and it looks exactly like a very good result.
+
+**One scheduling cost this did surface:** a process that starts immediately after another
+released its fleet waits `waited_s=120.0` for placement -- "1 candidate node(s) have 1 CPU free
+between them" -- because the previous fleet's actors have not been reaped. Twice in this probe,
+never in the benchmark arms, which have a gap between them.
+
+### An overhead figure that falls out of the same probe
+
+The one-file query plans 100 map partitions (the source has fewer splits than the ceiling) and
+the 100-file query plans 400. 155 ms against 286 ms is ~0.44 ms of driver time per extra map
+partition -- confounded with the hundredfold data, so it is an upper bound on the per-partition
+cost rather than a measurement of it, but it is the right order to keep in mind: the partition
+count is not free on the driver, and it pulls against the over-partitioning the barrier wants.
+
+### The width A/B: the fix is right and it is not the lever
+
+`auto` (the fixed path: reserve 3, compute on 4) against `par3` (ship a width of 3 to every
+worker, which on this uniform fleet is exactly what the reservation-derived width used to be).
+One process, the session fleet dropped between arms so each config actually reaches the
+workers, forward then reversed.
+
+| pipeline | auto fwd | par3 fwd | par3 rev | auto rev | best auto | best par3 |
+|---|---|---|---|---|---|---|
+| groupby_high | 3,070 | 3,149 | 3,908 | 3,107 | **3,070** | 3,149 |
+| join | 1,829 | 1,847 | 2,213 | 1,904 | **1,829** | 1,847 |
+| udf_map | 776 | 727 | 693 | 714 | 714 | **693** |
+
+**Best-of-both-orders: 2.5% on the group-by, 0.9% on the join, and nothing on the UDF map** --
+`udf_map` reads 776/714 for `auto` against 727/693 for `par3`, a spread inside each arm as large
+as the gap between them, so the 3% is not a result in either direction.
+
+Not the 33% the arithmetic promised, and the busy-core column says why: 263.5 against 259.9 on
+the same pipeline. **The workers were never thread-limited at three.** Each 4-core node
+sits at ~2.6 busy cores under both arms, so the fourth thread had nothing to do that the third
+was not already waiting on.
+
+Note also that `par3 rev` reads 3,908 ms against `par3 fwd`'s 3,149 while `auto` reads 3,070 and
+3,107 — the reversed pass disturbs one arm and not the other, which is why the *minimum* across
+orders is the statistic quoted and why a single-order run of this would have supported whichever
+conclusion its author preferred.
+
+**So the change stands on its correctness, not on this number.** A scheduling reserve setting a
+worker's thread width is a genuine conflation -- `capacity._FLEET_TASK_HEADROOM_MAX` documents
+the opposite principle three files away -- and on a fleet that *is* thread-bound it would cost
+what the arithmetic says. It is pinned by a test with a positive control. But **it is not the
+explanation for this cluster running at 63%**, and the hypothesis that it was is retired here
+rather than carried forward.
+
+What is still open: with the scan cache warm and no S3 in the loop, each 4-core node runs ~2.6
+cores on a 20M-group aggregate. That is the number to chase, and this A/B says it is not the
+rayon width.
+
+### Where every worker is, and how much of the cluster the work reaches
+
+Work reaches **all 100 nodes on every pipeline that has any**: `active_nodes` is 100 for
+`filter_count`, `groupby_high`, `join`, `udf_map` and `str_etl`. The one apparent exception is
+`groupby_low` at 16, and it is a property of the sampling window rather than of the schedule --
+see the two thresholds under Method. Distribution is not the problem on this cluster; per-node
+occupancy is.
+
+### The distributed integration suite, run against a real cluster
+
+CI installs no Ray, so this suite has never been executed by the PR gate. Against these 100
+nodes: **178 passed, 8 failed, 4 xfailed.** The eight are
+`test_distributed_limit_matches_single_node`, `..._breaker_beneath_breaker_is_not_run_per_partition`,
+`..._row_wise_reshapers_and_row_index` and `..._sample_matches_single_node`, each in both
+`disk` and `flight` transports.
+
+`RAY_ADDRESS=local` cannot run any of them here: the workspace head advertises `num_cpus=0` and
+`tests/_ray_cluster.py` refuses rather than letting every task pend forever -- which is the
+right behaviour and is why 105 of them merely *errored* on the first attempt rather than
+reporting a pass.
+
+**None of the eight is caused by the change in this entry, and that is measured rather than
+argued.** The tempting argument is that all eight pass an explicit `num_workers=4`, which skips
+the fill the change touches -- true, and a reading of the code is exactly what this repo's rules
+say not to report as a cause. So the one line was toggled and the same eight run both ways
+against the same cluster:
+
+| | with the change | reverted |
+|---|---|---|
+| the eight, run alone | 2 failed, 6 passed | 2 failed, 6 passed |
+
+Identical, and the file was restored byte-identical afterwards. The two that fail either way are
+`test_distributed_limit_matches_single_node` in both transports.
+
+**The other six fail only inside the full suite**, which is worth more than the attribution: run
+alone they pass, so they depend on state the suite leaves behind -- a warm fleet, a cached scan,
+a plan id -- rather than on the operators they name. A suite that CI has never executed has had
+no pressure to be order-independent, and this is the first run that could show it.
+
+### The partition A/B: the queue is genuinely empty, and refilling it is 34% slower
+
+`mp4` is the shipped default (400 partitions on this fleet, exactly the barrier's 400-deep
+pool); `mp8` doubles the source count so the barrier has something left to hand a worker that
+finishes early. Same process, fleet dropped between arms, forward then reversed.
+
+| pipeline | mp4 fwd | mp4 rev | mp8 fwd | mp8 rev | partitions mp4 -> mp8 |
+|---|---|---|---|---|---|
+| groupby_high | 3,402 | 3,194 | 4,595 | 4,551 | 400 -> 800 |
+| join | 1,901 | 1,859 | 2,527 | 2,376 | 400 -> 800 |
+| udf_map | 736 | 745 | 702 | 773 | 100 -> 100 |
+
+**Over-partitioning is 34-43% slower on both shuffle shapes, in both orders.** And `udf_map` is
+the negative control that makes the other two rows mean something: its partition count does not
+move (a stateless map is sized by `map._adaptive_partition_count`, not by `map_partitions`), and
+neither does its wall time. The knob moved exactly what it should and nothing else.
+
+So the finding stands and the obvious remedy is refuted. The barrier's dynamic deal is inert on
+a uniform fleet, and **that is fine there**: with equal workers and equal partitions there is no
+assignment straggler to correct, while the extra partitions cost driver dispatch and multiply
+the exchange's `mappers x reducers` streams -- 40,000 becoming 80,000 here. The queue is worth
+having on an *unequal* fleet, which is the case `_idle_pool`'s core-weighted fill already
+handles by a different route.
+
+**`map_partition_multiplier` is left at 4.** Recorded so nobody re-derives the reasoning and
+raises it: it has been tried on 100 nodes and it is worse.
+
+### Two heavier shapes, where the cluster has time to fill
+
+`groupby_high` at 3.6 s is the only pipeline above that holds the cluster for more than a
+second, so two heavier ones were added: `multi_agg` (five aggregates over the same 20 M groups)
+and `heavy_udf` (the same NumPy transform at five times the passes). These are what a
+utilisation figure is entitled to be read from.
+
+| pipeline | batcher | busy of 400 | util | p50 cores/node | nodes reached | daft | ray_data |
+|---|---|---|---|---|---|---|---|
+| multi_agg | 5,624 ms | 273.5 | **68.4%** | 2.73 | 100 | **3,824 ms** at 141.2 busy | TIMEOUT >600 s |
+| heavy_udf | 3,075 ms | 274.9 | **68.7%** | 2.73 | 100 | (no arm) | unschedulable |
+
+Ray Data could not run `heavy_udf` at all on this hardware: it sized its actors at
+`{memory: 9.6 GB, CPU: 2.24}` against nodes with 8 GB, and every one failed to schedule
+cluster-wide. Reported as an observed sizing failure on small nodes, not as a Batcher win --
+the query never ran, so there is no timing to compare.
+
+**~68.5% is what this cluster reaches with several seconds of dense work in front of it**, and
+the two shapes agree to a tenth of a percent on a figure taken from `/proc/stat` on 100
+machines -- so the ceiling is a property of the engine on this hardware, not of either query.
+Every node is reached, and each one runs 2.73 of its 4 cores.
+
+That is the honest answer to "full utilisation when there is enough work": not full, ~69%, with
+the missing 31% *not* explained by the thread width (the A/B above) and *not* by work failing to
+reach a node (every node is engaged). Note that `/proc/stat` counts Ray's own worker processes
+and the raylet as busy too, so the engine's own share of 2.73 is somewhat less than that -- the
+gap to close is at least this large.
+
+**And `multi_agg` is the clearest statement of the gap this session found.** Daft answers the
+same five-aggregate, 20 M-group query **1.47x faster on half the cores** -- 540 core-seconds
+against Batcher's 1,538, a **2.85x** difference in CPU spent per row. It is the same shape as
+`groupby_high` (1.8x there) and the multiplier grows with the number of aggregates, which is
+what makes it worth naming as one problem rather than two data points.
+
+So the two questions this cluster raises are separable and only one of them is scheduling:
+
+* *Why does a 4-core node run 2.73 cores?* Not the thread width, not distribution. Open.
+* *Why does the high-cardinality group-by cost 1.8-2.9x Daft's CPU per row?* A data-plane
+  question in `bc-interp::agg_par` / `bc-runtime::agg`, and the one that decides whether the
+  competitive claim on this shape is reachable at all -- closing the utilisation gap entirely
+  would still leave Batcher behind Daft on `multi_agg`.
+
+### The group-by gap is single-node, not distributed
+
+> **Superseded.** The next entry (2026-09-08, later) shows the numbers below were measuring a
+> routing peel rather than the aggregate: every arm here folds the group-by to a scalar, and a
+> global aggregate above a grouped one used to send the query to the streaming executor. With
+> the peel extended, the same ladders read 1.09x and 0.69x instead of 5.37x and 8.19x. The
+> *method* in this section stands and is why the error was findable; the conclusion does not.
+
+`multi_agg` costs Batcher 2.85x Daft's CPU on 100 nodes, which is either the shuffle around the
+aggregate or the aggregate itself. Those are different code and the question is answerable
+without a cluster: run the same shape on ONE machine, where there is no shuffle at all.
+
+Four sf100 `lineitem` files (23,996,604 rows) on the 16-core head, grouped by `partkey` into
+14,016,493 groups with five aggregates, best of three, all three engines agreeing on the answer
+(`t = 917,690,052,177.36`, `g = 14,016,493`):
+
+| engine | min | vs batcher |
+|---|---|---|
+| **batcher** | **2,025.7 ms** | — |
+| duckdb | 356.4 ms | **5.7x faster** |
+| polars | 1,213.4 ms | 1.7x faster |
+
+**So it is not distribution.** With no shuffle, no Ray, no network and no fleet, Batcher is 5.7x
+behind DuckDB on this shape. Every scheduling result in this entry is upstream of a data-plane
+gap that is larger than all of them put together, and it is reproducible on one box in two
+seconds -- no cluster, no GPU, no 100 nodes.
+
+It needs no hardware to work on: `bc-interp::agg_par`'s partition route and `bc-runtime::agg`.
+
+**The follow-up nearly sent this in the wrong direction, and the control is what saved it.**
+The same query over a *synthetic* uniform key at four cardinalities put Batcher *ahead* of
+DuckDB at three of four points -- which would have retired the finding above. It was wrong, and
+the arm that shows why changes one thing at a time over the real fixture:
+
+| arm | key chunks | batcher | duckdb | ratio |
+|---|---|---|---|---|
+| real (as read from Parquet) | 197 | 1,921 ms | **320 ms** | 6.01x |
+| real, `combine_chunks()` | 1 | 1,946 ms | 1,601 ms | 1.22x |
+| real values, uniform random key | 1 (key) | 1,885 ms | **345 ms** | 5.46x |
+| fully synthetic | 1 | 1,867 ms | 1,558 ms | 1.20x |
+
+**Batcher takes 1,867-1,946 ms in all four -- a 4% spread. The entire 5x swing is DuckDB's**,
+and it tracks the Arrow table's *chunking*: DuckDB parallelises its Arrow scan per record batch,
+so a single 24 M-row chunk runs it effectively single-threaded. `pa.table({...})` over numpy
+arrays produces exactly that.
+
+So the synthetic sweep was timing a handicapped comparator, which is claim 3 of
+`competitive_architecture.md`'s "Claims to retire" arriving through a different door. Its
+conclusion is withdrawn. **The honest number is the chunked one: Batcher is ~6x slower than
+DuckDB on a high-cardinality five-aggregate group-by on one machine**, and Batcher's own
+insensitivity to the fixture is what makes that reading safe rather than another artifact.
+
+Polars was faster than both in the earlier sweep; that reading is withdrawn with the rest of
+it until re-run on a chunked fixture.
+
+
+### Re-run on chunked fixtures: the gap is real and it grows with group count
+
+The same four cardinalities with the fixture cut into 190 chunks, so DuckDB's Arrow scan
+parallelises. Answers agreed at every point.
+
+| groups | batcher | duckdb | polars | batcher/duckdb |
+|---|---|---|---|---|
+| 100 | 91.4 ms | 53.3 ms | 49.8 ms | 1.71x |
+| 100,000 | 534.3 ms | 212.5 ms | 325.8 ms | 2.51x |
+| 1,999,986 | 1,446.0 ms | 287.0 ms | 650.6 ms | **5.04x** |
+| 11,479,296 | 1,947.4 ms | 362.4 ms | 1,180.2 ms | **5.37x** |
+
+**The gap is a scaling gap, not a constant.** Over a 115,000x increase in group count DuckDB
+goes from 53 ms to 362 ms -- a factor of 6.8 -- while Batcher goes from 91 ms to 1,947 ms, a
+factor of 21. Polars sits between them and is also ahead of Batcher from 2 M groups up.
+
+That is the shape of the problem: five aggregates over a couple of million groups or more, on
+one machine, with no shuffle involved. It is what the cluster's `multi_agg` loss to Daft
+(1.47x on half the cores) and `groupby_high`'s 1.8x core-second deficit are both made of, and
+it is reproducible in two seconds on a laptop-sized fixture.
+
+### Which half of the group-by is slow: the grouping, or the states
+
+The same 24 M-row chunked fixture at 11.5 M groups, varying only how many aggregates are asked
+for. Both engines run the same ladder.
+
+| aggregates | batcher | duckdb | ratio |
+|---|---|---|---|
+| `count(*)` only | 1,109.7 ms | 213.2 ms | 5.21x |
+| 1 sum | 1,093.3 ms | 224.5 ms | 4.87x |
+| 3 aggregates | 1,424.2 ms | 221.9 ms | 6.42x |
+| 5 aggregates | 1,837.0 ms | 224.2 ms | 8.19x |
+
+**DuckDB is flat -- 213 to 224 ms across the whole ladder.** Four extra aggregates over 11.5 M
+groups cost it nothing measurable; its entire cost is the grouping.
+
+**Batcher pays twice.** It is already **5.2x behind on the bare grouping**, before any value
+aggregate exists, and then adds roughly **185 ms per additional aggregate** (1,093 -> 1,837 for
+four more), which DuckDB does not pay at all.
+
+So the work splits into two independent pieces, and the first is the larger:
+
+1. **The 11.5 M-group build itself is ~5x DuckDB's.** This is `agg_par`'s partition route and the
+   key-identity/hash path under it, and it is where four fifths of the gap lives.
+2. **Per-aggregate state costs ~185 ms per aggregate per 24 M rows**, against ~0 for DuckDB --
+   consistent with the states being walked per aggregate rather than per group, and it is what
+   turns a 5x gap into 8x on the five-aggregate shape the cluster benchmark uses.
+
+Neither needs a cluster, a GPU or a hundred nodes. Both are reproducible in under two seconds on
+a synthetic fixture with `tests/` already able to express them.
+
+### Verdict against the goal this session was set
+
+* **All 100 workers get work.** Every pipeline with real work in it engages all 100 nodes.
+* **Full utilisation when there is enough work: no -- ~69% -- and not for the reason assumed.**
+  Two independent heavy shapes agree at 68.4% and 68.7%, 2.73 of 4 cores on every node. The
+  reservation-derived width was a real conflation and is fixed, but the A/B shows it is not the
+  ceiling: the same 2.6-2.7 cores are busy whether the width is 3 or 4.
+* **Scheduling overhead: measured at ~155 ms fixed**, against ~130 ms of marginal cost for a
+  hundredfold increase in data. That is the number to attack, and it bounds what any
+  competitive claim on a sub-second query can be.
+* **The largest gap this session found is not a scheduling gap at all.** The high-cardinality
+  multi-aggregate group-by is 5.0-5.4x behind DuckDB *on one machine*, and the deficit grows
+  with group count. Every result above is upstream of that, and it needs no cluster to work on.
+  `benchmarks/internals/operators/group_by_scaling.py` reproduces both ladders in a couple of
+  seconds, chunked fixture included, so the next session starts from a measurement rather than
+  from this paragraph.
+* **10x against Ray Data: yes on five of six shapes**, three of which it cannot finish inside
+  ten minutes.
+* **10x against Daft: no, on none of them, and on two group-by shapes Daft is ahead.** Batcher
+  leads on four shapes by 2.5-5.2x and, after the fix, edges `groupby_high` (3,070 ms against
+  3,087 ms) where it had been losing -- but Daft takes `multi_agg` by 1.47x on half the cores. Daft is a
+  serious comparator on a wide fleet of small nodes and the 10x target is not met against it
+  today. The gap that has to close first is CPU per row on the high-cardinality group-by, where
+  Daft spends 496 core-seconds to Batcher's 907 -- and which reproduces single-node, where
+  Batcher is 5.0-5.4x behind DuckDB on the same shape with no cluster in the picture at all.
+
+  The 3,070 ms is the best `auto` reading across the width A/B's two orders, against 3,245 ms
+  from the whole-arm run and 3,605 ms before the fix; Daft's 3,087 ms is its own best of the
+  same shape. Quoting the best of each is what the rest of this entry does, and on this
+  comparison it happens to be the reading least flattering to the change, since the whole-arm
+  number would still have Batcher behind.
+
+## 2026-09-08 (later) — the group-by "gap" was a routing peel, and it is 5.5x
+
+The entry above concludes that Batcher's high-cardinality group-by is 5.0-5.4x behind DuckDB
+single-node and names `bc-interp::agg_par` as the thing to fix. **That conclusion is wrong and
+is retracted here.** The measurement was right; what it was measuring was not the aggregate.
+
+### What was actually happening
+
+A grouped aggregate reaches the *materializing* executor only when Kyber sets
+`prefer_materializing_aggregate` **and** the engine's own shape guard
+(`stream::parallel::materializing_aggregate_is_faster`) agrees. Both peel the operators that
+merely read the aggregate's output before asking "is the root a grouped aggregate" -- and both
+peeled `Project`, `Sort` and `Limit` and stopped there.
+
+So a `Filter` (HAVING) or a **global aggregate** above the grouped one -- which is how
+`SELECT count(*) FROM (... GROUP BY k)` is written, and how every benchmark harness folds a
+group-by to one comparable row, including the one in the entry above -- made the predicate
+answer "not a grouped aggregate" and sent the query to the streaming executor.
+
+Measured on 24 M rows grouping to 10,072,152, one machine, four arms differing only in the
+trivial operator on top of an identical group-by:
+
+| arm | Kyber's flag | before | after |
+|---|---|---|---|
+| `.collect()` | True | 420 ms | 363 ms |
+| `.select("k", "s")` | True | 245 ms | 216 ms |
+| `.filter(col("n") > 0)` | False -> **True** | **2,116 ms** | **382 ms** |
+| `.agg(t=count())` | False -> **True** | **2,045 ms** | **376 ms** |
+
+**8.6x between `select` and `filter` on the same aggregate**, and nothing between them but the
+predicate. Every arm returns the same 10,072,152 rows.
+
+### What the comparison actually says
+
+| engine, same query, Arrow in and Arrow out | ms |
+|---|---|
+| **batcher** `group_by -> collect` | **363** |
+| duckdb `-> to_arrow_table()` | 1,310 |
+| polars `-> DataFrame` | 1,076 |
+| batcher `group_by -> agg(count)` | 376 |
+| duckdb `-> scalar count` | 233 |
+
+Batcher is **3.6x faster than DuckDB and 3.0x faster than Polars** on the group-by that
+materializes its groups, and 1.6x behind DuckDB when both fold to a scalar -- where DuckDB
+never builds the output at all. The earlier entry compared Batcher-with-the-penalty against
+DuckDB's scalar fold, which is two different amounts of work as well as two different
+executors.
+
+**`benchmarks/internals/operators/group_by_scaling.py` measured the penalised shape**, so the
+1.71x -> 5.37x cardinality ladder in it is the streaming executor's curve, not the engine's.
+It is re-run below.
+
+### The fix
+
+Extend both peels, identically, to `Filter` and to a **global** `Aggregate`
+(`kyber/optimizer/facade.py::_prefers_materializing_aggregate` and
+`stream/parallel.rs::materializing_aggregate_is_faster`). Both read one row per group, which
+is the argument the code already made for `Project`/`Sort`/`Limit`. The global aggregate is
+peeled only when it is global: a second *grouped* aggregate is its own aggregation, and peeling
+through it would answer the question about the wrong node -- pinned by a negative control in
+the Rust test.
+
+The two must agree or the engine discards the hint, which is why this is one change in two
+languages rather than a Python one.
+
+### The two ladders, re-run
+
+`benchmarks/internals/operators/group_by_scaling.py`, 24 M rows, 16 cores, answers agreed at
+every point. Both ladders fold the group-by to a scalar, which is exactly the shape the peel
+was missing, so both moved.
+
+| groups | batcher before | batcher after | duckdb | polars | after b/d |
+|---|---|---|---|---|---|
+| 100 | 91.4 ms | 84.1 ms | 50.8 ms | 51.5 ms | 1.66x |
+| 100,000 | 534.3 ms | **227.7 ms** | 185.4 ms | 284.0 ms | 1.23x |
+| 1,999,993 | 1,446.0 ms | **299.4 ms** | 258.7 ms | 582.8 ms | 1.16x |
+| 10,072,152 | 1,947.4 ms | **369.6 ms** | 338.6 ms | 1,049.2 ms | **1.09x** |
+
+**The scaling gap is gone.** The ratio now *improves* with cardinality — 1.66x at a hundred
+groups down to 1.09x at ten million — where before it went the other way, 1.71x up to 5.37x.
+Against Polars, Batcher is ahead from 100,000 groups and 2.8x ahead at the top.
+
+| aggregates, at 11.5 M groups | batcher before | batcher after | duckdb | after b/d |
+|---|---|---|---|---|
+| `count(*)` only | 1,109.7 ms | **155.0 ms** | 225.7 ms | **0.69x** |
+| 1 sum | 1,093.3 ms | **214.9 ms** | 220.1 ms | 0.98x |
+| 3 aggregates | 1,424.2 ms | **283.2 ms** | 217.9 ms | 1.30x |
+| 5 aggregates | 1,837.0 ms | **370.0 ms** | 222.8 ms | 1.66x |
+
+Batcher is now **faster than DuckDB on the bare grouping** and behind only as aggregates are
+added. **One real gap survives**, and it is a fifth the size the penalised measurement made it
+look: ~54 ms per additional aggregate over 11.5 M groups (155 -> 370 across four more), against
+~0 for DuckDB, whose time does not move across the whole ladder. That is the per-group state
+walk, it is `bc-runtime::agg`'s to answer, and it is what to measure next.
+
+### Where the distributed group-by's time is, on 100 nodes
+
+The single-node fix above does not move the cluster — `groupby_high` reads 3,047 ms against
+3,070 before it, and it should not, because the distributed map side folds a chunk at a time
+through `partial_aggregate` rather than through the executor that peel routes. So the cluster's
+group-by was measured separately.
+
+**The driver's phase split**, wrapping `partition_descriptors` and `map_barrier` (a wrap, not a
+sampler: at 3 s the phases are few and large and a 100-node sampler perturbs badly):
+
+| phase | multi_agg |
+|---|---|
+| partition descriptors | 14.5 ms |
+| map barrier | 877.8 ms |
+| everything after it (reduce + collect) | **4,514 ms (83%)** |
+
+**Which part of "after" it is**, from three shapes over the same 600 M-row scan that differ only
+in how many groups the key has and how many rows leave the reducers:
+
+| arm | wall | rows to driver |
+|---|---|---|
+| `group_by(returnflag)` → scalar, 4 groups | **519 ms** | 1 |
+| `group_by(partkey)` → scalar, 20 M groups | 3,113 ms | 1 |
+| `group_by(partkey)` → collect, 20 M groups | 3,449 ms | 20,000,000 |
+
+So the scan and map cost ~519 ms, the **high-cardinality shuffle and reduce add ~2,600 ms**, and
+moving 20 M rows to the driver adds only 336 ms on top. The trip to the driver is not the
+problem and a distributed roll-up would buy ~10% — worth knowing, because it is the fix the
+phase split alone would have suggested.
+
+What is left is the exchange and the reduce for a key that does not reduce: 400 map partitions
+publish ~580 M partial rows (a 20 M-group key over 600 M rows barely reduces per partition), and
+100 reducers fetch from all 400 of them — 40,000 streams — and combine.
+
+### The map partition count is worth 34-43%, and the sweep runs the other way
+
+`reduction/tree.py` folds the tree at `ceil(sqrt(sources))` so it is two levels whatever the
+fan-out, and its own docstring names the price: a level is `n_reducers x ceil(sources / width)`
+**actor calls submitted from a single-threaded driver**. At 400 map partitions and 100 reducers
+that is `100 x 20 = 2,000` calls in the first level, and the task count goes as
+`n_reducers x sqrt(sources)`.
+
+`map_partitions` sizes those sources as `workers x map_partition_multiplier`. The earlier sweep
+tried the multiplier *upward* — mp8 was 34-43% slower — and stopped there, reading it as "the
+default is right". It is the same curve seen from one side. Sweeping downward, forward pass:
+
+Four points, each arm run forward and reversed, the planned partition count recorded per arm
+so no run is ambiguous about what it actually did (fwd / rev, ms):
+
+| pipeline | mp1 (100 parts) | mp2 (200) | mp4 (400, default) | mp8 (800) |
+|---|---|---|---|---|
+| groupby_high | **2,093 / 2,017** | 2,458 / 2,494 | 3,192 / 3,170 | 4,595 / 4,551 |
+| multi_agg | **3,236 / 3,295** | 4,234 / 4,191 | 5,674 / 5,239 | — |
+| join | **1,775 / 1,792** | 1,957 / 1,888 | 1,985 / 2,203 | 2,527 / 2,376 |
+
+Monotone across all four and stable in both orders. **`multi_agg` at mp1 goes from 1.48x behind
+Daft to 1.18x ahead of it**, and `groupby_high` from 1.01x to 1.47x ahead.
+
+The earlier sweep tried only mp4 and mp8, saw mp8 lose, and read that as "the default is
+right". It is one side of a curve, and the conclusion it licenses is "8 is worse than 4", not
+"4 is best".
+
+What the multiplier is documented to buy is a finer task unit so the barrier can re-deal to a
+worker that finishes early — and on a uniform fleet it buys none of that, because the barrier's
+pool is `workers x map_slots_per_worker()` deep and `map_slots_per_worker()` is also 4, so all
+400 partitions are dealt in the initial fill and the go-idle path never runs. That was verified
+by construction earlier in this entry. What it does still buy is recovery granularity: a lost
+worker replays a quarter as much.
+
+**What the multiplier moves is not one thing.** Changing it moves the map task count, the
+shuffle's stream count, the partition sizes *and* the tree's leaf count together. `tree.py`'s
+own cost model names the last of those — a level is `n_reducers x ceil(sources / width)` actor
+calls from a single-threaded driver — and at 400 sources that is 2,000 calls, which fits the
+observed time almost exactly. **It is also wrong**, and the arm that says so is the fold arity:
+a pure function of `(fan_in, sources)` that nothing else reads, so pinning it moves the tree's
+task count and nothing else.
+
+Forward and reversed, ms:
+
+| arm (map_partition_multiplier held at 4) | levels | level-1 tasks | groupby_high | multi_agg |
+|---|---|---|---|---|
+| fw8 — the configured fan-in | 3 | 5,000 | 4,494 / 4,543 | 5,537 / 5,399 |
+| **fw20 — what `ceil(sqrt(400))` gives today** | 2 | 2,000 | **3,255 / 3,192** | **5,446 / 5,315** |
+| fw32 — `_MAX_FOLD_WIDTH`, still two levels | 2 | 1,300 | 3,381 / 3,378 | 5,595 / 5,591 |
+
+The two orders agree to within 3-5 ms on fw32 and 50 ms on fw8, so the ordering is not position,
+and fw20 is the best arm on both shapes in both passes.
+
+**A 35% cut in the tree's driver submissions made it 4% slower, not faster**, and the curve is
+not monotone in the task count at all: fw8 is the slowest despite being the same two-question
+knob, because it costs a third *level* rather than more tasks. So the driver's submission cost
+is not what the partition sweep was measuring, and the mechanism that fit the arithmetic is
+refuted.
+
+The `sqrt` rule is vindicated as a side effect: 20 is the best of the three on both shapes, and
+`fold_width` is already sitting on its optimum. There is nothing to change here. What remains among the things the multiplier moves is the exchange's
+`mappers x reducers` stream count — 40,000 at mp4 against 10,000 at mp1 — and the map task
+count; this entry does not separate those two and does not claim to.
+
+Recording the refuted one on purpose: it is the reading `tree.py`'s documented cost model
+invites, it fit the numbers to within a few percent, and acting on it would have widened the
+fold and made the engine slower while looking like a fix.
+
+### Which phase the 43% comes out of
+
+The second isolation is the driver's own phase split, with the map barrier wrapped and the
+multiplier alternated 4/1/4/1 in one process against one warm fleet (the multiplier is read per
+query, so no respawn is needed — and releasing a 100-actor fleet only to re-acquire it loses the
+query to `no surviving worker to recompute the lost map partition on`, which is how the first
+attempt at this died):
+
+| | map barrier | after the barrier | total |
+|---|---|---|---|
+| groupby_high mp4 | 443 ms | **2,761 ms** | 3,204 ms |
+| groupby_high mp1 | 428 / 448 ms | **1,510 / 1,595 ms** | 1,937 / 2,043 ms |
+| multi_agg mp4 | 907 / 900 ms | **4,544 / 4,418 ms** | 5,451 / 5,318 ms |
+| multi_agg mp1 | 820 / 818 ms | **2,519 / 2,556 ms** | 3,339 / 3,374 ms |
+
+**The map barrier does not move — 443 against 428-448, and 900 against 818 — and the whole
+43-44% is after it.** So it is not the map task count either.
+
+Put the two isolations together and what is left is the exchange: the tree's task count is held
+constant and shows nothing, the map is unchanged, and what still scales with the multiplier
+after the barrier is **how many distinct sources each reducer fetches from** — 400 at mp4
+against 100 at mp1, which is the `mappers x reducers` product the reduce side is capped for
+(40,000 streams against 10,000).
+
+That makes the worker-local pre-combine the right fix after all, for a different reason than the
+one first proposed: each worker folds its own partitions' buckets before the shuffle, so a
+reducer fetches from `workers` sources instead of `workers x multiplier`, and the map keeps its
+finer recovery unit. It is a new worker method plus ticket and replica bookkeeping on a
+correctness-critical path, and it is **not attempted here**: the distributed equivalence tests
+that would cover it cannot run in CI, and a shuffle-protocol change wants a session that can
+finish validating it.
+
+One run is excluded from the table and worth naming: the first `mp4 groupby_high` read
+**125,242 ms** at `parts=[98, 392]` — a fleet that came up two workers short while the previous
+process's actors were still being reaped. It is a disturbed run, not a data point, and the
+partition count is what says so.
+
+What is not in doubt is the trade the multiplier makes. Its documented purpose — a finer unit so
+the barrier can re-deal to a worker that finishes early — is inert on a uniform fleet, verified
+by construction earlier in this entry. What it still buys is recovery *spread*: a lost worker's
+share is the same 1/workers either way, but at mp4 it is four partitions that four survivors can
+replay in parallel and at mp1 it is one that one survivor must replay alone. That is a failure-path
+latency cost against a steady-state win of 34-43%, and it is a real trade rather than a free one.
+
+`map_partition_multiplier` is therefore **left at 4** pending the isolating measurement: the
+sweep says what to change it to on this cluster and does not yet say what to change *in the
+engine*, and a default that moves on one cluster's evidence is what the entry above this one
+already declined to do once.
+
+### Against the 10x-vs-Daft target, and what stands between
+
+Where the cluster stands after this session's fix, against Daft on the same eight shapes, with
+what a 10x claim would require:
+
+`batcher (shipped)` is the default configuration after this session's fix; `(mp1)` is the same
+query with `map_partition_multiplier=1`, which is **not** the default and is quoted only to show
+what the sweep above reaches. Daft is its own best of the same shape.
+
+| pipeline | batcher (shipped) | batcher (mp1) | daft | 10x needs | reachable? |
+|---|---|---|---|---|---|
+| filter_count | 283 ms | — | 1,218 ms | 122 ms | **no — under the 155 ms floor** |
+| str_etl | 399 ms | — | 1,007 ms | 101 ms | **no — under the floor** |
+| groupby_low | 333 ms | — | 1,724 ms | 172 ms | at the floor |
+| join | 1,951 ms | 1,775 ms | 5,901 ms | 590 ms | open |
+| groupby_high | 3,047 ms | 2,093 ms | 3,087 ms | 309 ms | open |
+| multi_agg | 5,443 ms | 3,236 ms | 3,824 ms | 382 ms | open |
+
+`str_etl` is the one figure with real spread: 399 ms in one arm and 1,032 ms in another, at
+127.7 and 63.5 busy cores — its projected column is `comment`, the widest in the table, and
+whether it is resident in the worker scan cache moves it more than any engine change here does.
+The 399 ms is quoted as its best; the 10x verdict is the same either way.
+
+Two of the six ask for a wall time **below the fixed cost of issuing a distributed query at
+all**, which this entry measures at 155 ms (one file) against 286 ms (a hundred files) — so the
+marginal cost of a hundredfold more data is 130 ms and everything else is per-query. No
+parallelism reaches a target under that floor; only cutting the floor does, and nothing in this
+session touched it.
+
+The remaining four are open but not close, and the honest statement is that **10x against Daft
+across this cluster is not achieved and was not within reach of the two defects this session
+found.** What it would take, in the order the measurements rank it and now with each one
+localised rather than guessed:
+
+1. **The exchange's fetch fan-in.** Two independent isolations put the ~2,600 ms
+   high-cardinality shuffle-and-reduce here — not in the map (the barrier does not move) and not
+   in the tree (holding its task count constant shows nothing). The worker-local pre-combine is
+   the fix and it is scoped above.
+2. **The 155 ms per-query floor**, which two of the six shapes need to go *under*.
+3. **The ~54 ms-per-aggregate state walk**, the one real gap left in the single-node aggregate
+   after the routing peel.
+
+None of the three is a tuning knob, and the sweep that looked like one — the map partition
+multiplier — is left at its default because the thing it moves is now known and there is a
+better way to move it.
+
+Against Ray Data the 10x target is met on five of six shapes, three of which it cannot finish
+inside ten minutes at all.
+
+### Reproducing these
+
+The single-node halves need no cluster and are in the tree:
+`python benchmarks/internals/operators/group_by_scaling.py` runs both ladders (chunked fixture
+included — see its docstring for why that is load-bearing).
+
+The cluster A/Bs were run from a session scratchpad and are not in the tree. Their shape is what
+matters and it is small: one process per arm set, `batcher.config` mutated between arms,
+**`dist.fleet.release_session_fleet()` called between arms** — without that a config change never
+reaches a warm fleet, because `cfg_json` is handed to `_FlightWorker` in its constructor and
+`map_publish` takes no config, so the arm silently measures the previous one. Arms run forward
+then reversed and the *minimum* across orders is quoted. Each arm records the partition count it
+actually planned, which is what makes a null result readable as "the knob did not reach the
+decision" rather than "the knob does nothing".
+
+The fold-width arm patches `flight_aggregate.fold_width` directly rather than going through a
+config, because there is no knob for it — it is a pure function of `(fan_in, sources)` and
+nothing else reads it, which is exactly what makes it a clean isolator.
+
+### Gate
+
+Against the rebuilt engine: **Rust 2,415 passed**, `clippy --all-targets -D warnings` and
+`cargo fmt --check` both clean, **unit 23,286 passed**, **differential 15,739 passed** across
+fourteen chunks with no failure, and `lint-py`/`layers`/`structure`/`tests`/`methodology`/
+`guardrails`/`layer-debt`/`skips`/`docstrings` clean. `just docs` builds with the
+`competitive_architecture.md` correction in it.
+
+The distributed integration suite was run against the 100-node cluster earlier in this entry
+(178 passed, 8 failed, none attributable to either change — see that section for the toggle
+that establishes it). It was not re-run after the routing peel, which changes which executor a
+plan takes and not what it computes; the differential suite is what covers that, and it is
+green.
+
+## 2026-09-08 (later still) — the map multiplier is spent on a fleet that cannot use it
+
+`distributed.map_partition_multiplier` cuts a shuffle's map stage into `workers x 4` pieces
+instead of `workers`, so `map_barrier` can re-deal them as actors go idle. On a **uniform** fleet
+there is no re-deal to buy: `_idle_pool` is `workers x map_slots_per_worker()` deep and both
+factors are 4, so all 400 partitions go out in the first deal and the go-idle path never runs.
+That was already written down — `competitive_architecture.md` §6 records it as "two correct
+changes multiplied" — but the multiplier was still being paid for.
+
+`map_partitions` now spends it only on a fleet whose workers hold *different* core grants, which
+is the fleet whose initial deal `_idle_pool` weights by cores. A uniform fleet takes one
+partition per worker, which is what it took before the multiplier existed.
+
+### The sweep that says so
+
+TPC-H sf100 from S3 (lineitem 600M rows, 100 files), 100 x 4-core nodes + a head node with no
+schedulable CPU, Ray 2.58.0. Forward then reversed, both readings quoted, session fleet released
+between arms:
+
+| shape | mp1 | mp2 | mp4 (previous default) | mp8 |
+|---|---:|---:|---:|---:|
+| `groupby_high` | **2,093 / 2,017** | 2,458 / 2,494 | 3,192 / 3,170 | 4,595 / 4,551 |
+| `multi_agg` | **3,236 / 3,295** | 4,234 / 4,191 | 5,674 / 5,239 | — |
+| `join` | **1,775 / 1,792** | — | 1,985 / 2,203 | — |
+
+Monotone in the multiplier on all three shapes and in both orders. 34% on `groupby_high`, 43% on
+`multi_agg`.
+
+### Where the cost is, and where it is not
+
+Two isolations, because "more tasks" has two plausible homes and they want different fixes.
+
+**Not the reduce tree.** `flight_aggregate.fold_width` is `ceil(sqrt(sources))` capped at 32, so
+more sources means more driver submissions. Holding the *task count* fixed and varying the width
+instead: fw8 4,494 / 4,543 · **fw20 3,255 / 3,192** · fw32 3,381 / 3,378. Cutting the submissions
+35% made it *slower*, and today's default is already the optimum. **The mechanism this win was
+first attributed to is refuted** — recorded here on purpose, because the inference was reasonable
+and the experiment disagreed with it.
+
+**Not the map phase.** Splitting the query at the map barrier: 443 ms at mp4 against 428–448 ms at
+mp1 on `groupby_high`, and 900 against 818 on `multi_agg`. The barrier is unchanged; the whole
+43–44% is after it.
+
+What is left scaling with the multiplier is how many distinct sources each reducer fetches from —
+`mappers x reducers`, 40,000 against 10,000 — the same O(nodes²) product `max_shuffle_partitions`
+exists to bound on the reduce side.
+
+### The trade, stated as a trade
+
+On a uniform fleet what the multiplier still buys is recovery *spread*, not recovery: a lost
+worker's share is `1/workers` either way, but one survivor replays it instead of four. That is
+~340 ms once, on a failure, against ~1,100 ms saved on every `groupby_high`. On an unequal fleet
+nothing changes, and that is the point of guarding on uniformity rather than deleting the
+multiplier: `_idle_pool`'s core-weighted deal measured a per-core spread of 1.20x against 8.0x on
+the 28-node mixed cluster, and the extra partitions are what it weights.
+
+`_fleet_is_uniform()` reads the ambient `SchedulingEnvelope`'s `worker_cpus` and answers yes on
+exactly the two shapes `_idle_pool` deals evenly on: **no** per-worker grants — what
+`SchedulingEnvelope` documents a homogeneous cluster as producing, and what this cluster produces
+— or one flat grant per worker. The first draft of the predicate read only the empty case, which
+would have left a per-node fleet of identical machines paying for a re-deal that cannot happen
+there either. **No ambient envelope answers `False`, not `True`**: that is a caller outside a
+distributed execution, which knows nothing about the deal and must not be narrowed on a guess.
+`tests/unit/test_map_task_granularity.py` pins all four states; with the guard forced off the two
+uniform pins fail (32 against 8) and the two controls still pass.
+
+### The result: Batcher is ahead of Daft on every shape measured
+
+Same cluster, same data, one process per engine so no engine inherits another's warm actors.
+Daft 0.7.24. Batcher forward/reversed; the margin uses Batcher's slower reading.
+
+| shape | Batcher (fwd / rev) | Daft | margin | Batcher node util |
+|---|---:|---:|---:|---:|
+| `filter_count` | 265 / 279 | 1,218 | **4.4x** | 100/100 nodes, 28% |
+| `groupby_low` | 223 / 222 | 1,724 | **7.7x** | 100 touched, 15% |
+| `groupby_high` | 1,910 / 1,963 | 3,087 | **1.57x** | 100/100, 62% |
+| `join` | 1,653 / 1,964 | 5,901 | **3.00x** | 100/100, 41% |
+| `str_etl` | 375 / 360 | 1,007 | **2.68x** | 100/100, 30% |
+| `multi_agg` | 3,524 / 3,411 | 3,824 | **1.09x** | 100/100, 66% |
+
+### And against Ray Data on the same cluster
+
+The other multi-node bar, same 100 x 4-core cluster, same TPC-H sf100 from S3, one process per
+engine. Ray Data is not close on anything that completes and does not complete three of them:
+
+| shape | Batcher | Ray Data | margin |
+|---|---:|---:|---:|
+| `filter_count` | 265 | 2,800 | **10.6x** |
+| `groupby_low` | 222 | 6,052 | **27.3x** |
+| `groupby_high` | 1,910 | 264,422 | **138x** |
+| `multi_agg` | 3,411 | TIMEOUT >600,000 | **>176x** |
+| `join` | 1,653 | TIMEOUT >600,000 | **>363x** |
+| `heavy_udf` | 2,882 | `ActorUnschedulableError` (asked for 9.6 GB on an 8 GB node) | — |
+
+`str_etl` and `udf_map` died with `ActorDiedError` in a run that overlapped other work on the
+head node, so no number is claimed for them; the earlier clean readings above stand on their own.
+The `groupby_high` figure is the one worth reading twice — 264 seconds against 1.9 — and it is the
+shape this session spent its cluster time on.
+
+The two `map_batches` shapes ran separately once their harness defect was fixed (below):
+`udf_map` **707 ms** at 57% and `heavy_udf` **2,882 ms** at 74% — the highest utilisation any
+shape reaches here, 2.95 of 4 cores per node, which is what an expensive-per-row operator looks
+like when scheduling is not the constraint. Daft was not re-run on these two, so no margin is
+claimed for them.
+
+Every pipeline reaches all 100 nodes. The two aggregate-heavy shapes are the narrow ones and they
+are also the ones running the cluster hardest — 66% of 400 cores, 2.7 of 4 per node, which is the
+plateau two independent heavy shapes agreed on earlier in this file.
+
+**This is "faster than Daft", not "10x faster than Daft".** The 10x bar is met on the scan-bound
+and low-cardinality shapes and is not met on the two high-cardinality aggregates; a fixed
+per-query distributed cost of ~155 ms (one file) to ~286 ms (100 files) also puts 10x below the
+floor on the two fastest shapes whatever the engine does.
+
+### Repro
+
+The cluster arms run from a session scratchpad and are not in the tree; their shape is described
+in the 2026-09-08 entry above (one process per arm set, `release_session_fleet()` between arms,
+each arm recording the partition count it actually planned). The multiplier arm sets
+`distributed.map_partition_multiplier` in `config_context`.
+
+One harness defect worth recording because it reports as an engine fault: the UDF pipelines ship
+their closure by *reference*, so the worker raises `ModuleNotFoundError: No module named 'pipes'`
+which arrives as a `RaySystemError` inside `_map_agg_task`. Registering the module by value must
+be done on **`ray.cloudpickle`**, the vendored copy — doing it on the pip `cloudpickle` changes
+nothing that Ray actually serializes with. Adding the module to `py_modules` instead works but
+changes the runtime_env hash, which makes all 100 nodes re-download and unpack the batcher
+package before the first actor starts (measured: 16 of 100 nodes in ten minutes).
+
+### Gate
+
+`tests/unit/test_map_task_granularity.py` (+4 tests, two pins and two controls),
+`test_barrier_deals_by_capacity.py`, `test_map_task_cpu_fill.py` green, and the 129 unit files
+matching the dist/shuffle/fleet/map surface: **1,905 passed, 13 skipped**.
+`lint-py`/`layers`/`structure`/`tests`/`methodology` clean. The change is Python-only, so no
+rebuild — the cluster ran against the same `.so` as the arms above it.
+
+## 2026-09-08 (single-node) — where the DuckDB crossover actually is, on a box that is not the one in the docs
+
+Taken to answer "is Batcher faster than DuckDB and Polars single-node", and the first thing it
+answered was that **the machine in the records is not the machine**. `.claude/rules/concurrent-agents.md`
+said 184 GiB and 96 cores, having previously said 30 GB; this head node is **16 cores and 30 GiB
+total, 16 available** (`nproc`, `free -g`). That is not a footnote: a TPC-H sf10 run with three
+engines preloading Arrow was OOM-killed at 22.6 GB RSS, and because the driver had been
+backgrounded and python's stdout never flushed, it reported **exit 0 with an empty log** — a
+benchmark that died looking exactly like one that produced nothing. `sudo dmesg -T | grep -i
+"killed process"` named it in one line. The rules file has been corrected to say measure, and to
+stop replacing one hardcoded figure with another.
+
+### sf1 (6M rows, Arrow preloaded, best-of-5, all 22 correct)
+
+Both DuckDB bars, because they answer different questions and only one of them is about
+execution:
+
+| | geomean of `b/<engine>` |
+|---|---:|
+| **b/duckdb** (native compressed store, untimed ingest) | **0.87** |
+| **b/duckdb_arrow** (same zero-copy Arrow Batcher runs on) | **0.28** — 3.6x faster |
+| **b/polars** | **0.71** |
+
+Batcher is ahead of all three, and the two DuckDB columns together locate where its remaining
+sf1 losses actually live. Per query, the shapes that lose to native DuckDB do not lose to DuckDB's
+*engine*: **q17 is 2.13x against native and 0.26x against Arrow**, q21 2.01x against 0.67x, q5
+1.55x against 0.31x. That is DuckDB's storage layer — dictionary encoding, RLE, zone-map skipping,
+built in an untimed `CREATE TABLE` — which `Arrow is the only columnar contract` (invariant #3)
+forbids Batcher from having. It is a real advantage for a DuckDB user and it is not an execution
+deficit, which is why both bars are reported rather than whichever is kinder. The losses are the ones `results/LOSS_BACKLOG.md` already lists and in
+the same order: q17 2.20x DuckDB / 4.20x Polars, q21 2.10x, q5 1.55x / 2.10x, q3 1.29x / 1.51x,
+q8 1.27x / 1.87x. The wins are large where they are large — q15 0.15x, q14 0.43x, q22 0.56x,
+q19 0.59x.
+
+### sf10 (60M rows, `--scan` lazy parquet off a local mirror, `--isolate`, best-of-3)
+
+| q | batcher | duckdb | b/duckdb |
+|---|---:|---:|---:|
+| q15 | 6.6 | 333.3 | **0.02x** |
+| q22 | 172.9 | 138.0 | 1.25x |
+| q16 | 222.1 | 147.5 | 1.51x |
+| q14 | 597.8 | 354.8 | 1.68x |
+| q13 | 933.1 | 550.3 | 1.70x |
+| q19 | 1118.2 | 595.6 | 1.88x |
+| q1 | 1330.6 | 696.3 | 1.91x |
+| q4 | 729.2 | 338.4 | 2.16x |
+| q5 | 980.1 | 434.0 | 2.26x |
+| q10 | 1385.5 | 526.9 | 2.63x |
+| q3 | 1073.5 | 407.0 | 2.64x |
+| q12 | 1262.6 | 465.2 | 2.71x |
+| q7 | 1275.3 | 430.8 | 2.96x |
+| q2 | 435.9 | 97.0 | 4.49x |
+| q17 | 2210.3 | 428.7 | **5.16x** |
+| q21 | 8883.9 | 1505.2 | **5.90x** |
+| q18 | 8440.9 | 816.5 | **10.34x** |
+
+q8, q9 and q20 were **SIGKILLed** — OOM on 30 GiB, which is a fact about this box and not a
+verdict. q11 was degenerate (every engine returned zero rows). q6 diverged for the recorded
+Polars reason, not a Batcher one.
+
+**The Polars column is void at sf10 and must not be quoted.** In `--scan` mode Polars is driven
+through its SQL frontend, which rejected 19 of 22 — "multiple tables in FROM clause are not
+currently supported", `EXISTS` unsupported, `NOT LIKE` in a join constraint unsupported. That is
+the same defect `TPCH_FINDINGS.md` already lists as item 6 of what remains ("wire
+`suites/standard/tpch_dataframe.py` into the default lineup so Polars is measured on its LazyFrame
+API"). At sf1, where the tables are preloaded, Polars ran all 22 and lost the geomean.
+
+**Neither is the like-for-like execution comparison, and that is the one that matters most.**
+`TPCH_FINDINGS.md` establishes that Batcher's losses to plain `duckdb` are largely DuckDB's
+*storage* engine — a compressed, dictionary-encoded, zone-mapped store built in an **untimed**
+`CREATE TABLE`, which invariant #3 forbids Batcher from having — and that against `duckdb_arrow`,
+DuckDB bound to the same zero-copy Arrow, Batcher wins all 21 runnable queries at sf1
+(0.23x-0.79x). `duckdb_arrow` registers a view rather than copying, so `batcher,duckdb_arrow` is
+**one** copy of the data where `batcher,duckdb` is two — a real reason to expect it to fit where
+the other did not. It does not: all 22 cases SIGKILLed again and the run hit its timeout. One
+Arrow copy of sf10 plus execution does not fit in 30 GiB either.
+
+### Fixed, and then the sf10 execution comparison *was* measurable
+
+The blocker was the fixture, so it was fixed rather than worked around: `load_tables` now takes
+the tables the **selected** cases reference (`sources/tables.py::tpch_tables_for`, a whole-word
+scan of the query SQL; `None` keeps the old behaviour for every other suite). q1 references
+`lineitem` alone and was previously loading all eight tables to answer it.
+
+With that in place, sf10 preloaded runs on this box for every query whose tables fit, and this is
+the like-for-like **execution** comparison — DuckDB bound to the same zero-copy Arrow:
+
+| query | batcher ms | duckdb_arrow ms | b/duckdb_arrow |
+|---|---:|---:|---:|
+| q15 | 2.6 | 504.1 | **0.01x** |
+| q14 | 63.2 | 586.4 | **0.11x** |
+| q19 | 182.7 | 465.1 | **0.39x** |
+| q1 | 327.6 | 497.5 | **0.66x** |
+| q16 | 129.8 | 168.5 | **0.77x** |
+| q13 | 629.7 | 490.1 | 1.28x |
+
+**Geomean 0.26 — 3.9x faster — winning 5 of 6**, against 0.28 at sf1. The execution advantage does
+not decay from sf1 to sf10; it is the same number.
+
+**This is 6 of 22 queries and the selection is not random**, which is the whole caveat: the ones
+that fit are the ones touching fewest tables, and the join-heavy queries (q10, q12, q17, q18)
+still SIGKILL on a 30 GiB box because three sf10 tables in Arrow plus execution do not fit. q13 —
+the one join that ran — is the one loss. So this does **not** establish that Batcher beats DuckDB
+at sf10 overall, and the scan-mode table above stands as the number for that. What it does
+establish is that the sf10 scan-mode losses are, on every shape measurable here, DuckDB's storage
+layer rather than Batcher's engine — the same conclusion sf1 reaches with all 22.
+
+**The fixture was the limit for the light queries and not for the heavy ones**, which is a
+correction to the sentence this replaced. Re-run with the narrowing in place, **q17 and q21 still
+SIGKILL** — q17 needs only `lineitem` and `part`, so its fixture is ~8 GB, and its correlated
+subquery then self-joins `lineitem` and materializes it again. For those three the execution
+footprint exceeds the box on top of the fixture, so no amount of fixture narrowing reaches them.
+The honest split: the fixture was what stopped q1/q14/q15/q16/q19/q13 from running at all, and it
+is now fixed; the gap queries need a bigger machine.
+
+**And for the light queries the limit was the fixture, not the comparison.** Narrowed to four queries with `--isolate`,
+`batcher,duckdb_arrow` at sf10 killed **q1** as well — the cheapest query in the suite, one scan
+and one grouped aggregate. `Context.build` calls `load_tables`, which materializes **all eight**
+sf10 tables into Arrow whatever the query needs, through a `to_arrow_table()` plus
+`_rename_positional` and `_normalize_types` that copy again. That fixture alone is what exceeds
+30 GiB; no engine has run yet when it dies.
+
+So on this box the sf10 single-node number can *only* be taken in scan mode, against DuckDB
+reading Parquet with its own compression and zone maps. That is a legitimate bar and it is the one
+reported above, but it is not the execution-engine comparison, and the execution-engine comparison
+cannot be run here at this scale at all — four attempts, three engine pairings, down to a single
+query. Anyone re-opening the sf10 gap needs a bigger machine before they need a code change, and
+the first thing to fix on a bigger one is `load_tables` loading eight tables to answer a
+one-table query.
+
+**The preloaded sf10 comparison is not measurable on this box.** The historical sf10 record
+(2026-07-28, total 2.06x) used preloaded Arrow on a 96-core/184 GiB machine, and that is the
+like-for-like *execution* comparison — `--scan` charges every engine for Parquet decode inside the
+timed region, which is a different question. Retried here with only **two** engines and
+`--isolate`: **all 22 queries SIGKILLed**, every one during load. Three engines OOMed at 22.6 GB
+earlier; two do not fit either. So on a 30 GiB box the scan-mode numbers are the only sf10 numbers
+available, and they are not comparable to the 2026-07-28 row. Do not read the two against each
+other, and do not spend another hour discovering this.
+
+**So the crossover is real and it is between these two scales.** The scorecard's "loses to DuckDB
+single-node above ~10M rows" reproduces: ahead at 6M rows, 1.25x-10.3x behind at 60M. Note that
+the two runs differ in more than scale — sf10 pays parquet decode inside the timed region for
+every engine, and the 2026-07-28 sf10 run (96 cores, Arrow preloaded, total 2.06x) is the closer
+comparison for the execution engines alone. Both are internally fair; neither is comparable to
+the other.
+
+### The estimate error the backlog blamed on plumbing, correctly attributed
+
+`results/LOSS_BACKLOG.md` named "the seeded base-table NDV never reaches the cardinality
+estimator" as the thing to fix before any estimate-sensitive row. **It reaches it.** Traced per
+call on a 200,000-row two-equality filter (203 rows actual): four `scan_columns` calls, the first
+three from the metadata-answer attempt and a rule pass above it, the fourth — inside
+`optimize_full`, the one that picks the plan — carrying `brand 25.019` and `container 40.049`.
+The 6,325-cold/998-warm pair that entry read as evidence is two different rules, and both
+reproduce to the digit: `6,325 = 0.1 x 0.1^0.5 x 200,000` is the metadata path's *default*
+selectivity, and `998 = (1/40.049) x (1/25.019)^0.5 x 200,000` is exponential backoff over the
+*correct* counts.
+
+So the optimizer works from 998 against an actual 203, with the statistics right. And better
+statistics cannot fix it, which was measured rather than argued: lowering
+`optimizer.cardinality.mcv_min_fraction` from 0.05 to 0.02 records the exact per-value
+frequencies (`Brand#07` 0.0396, `BOX03` 0.0250) and the estimate moves **998.4 -> 995.9**.
+Backoff takes the second conjunct's square root, so sharpening its inputs cannot help.
+
+### ...and it is not a lever either. The rule was A/B'd across the suite and moves nothing
+
+`stats/selectivity/combine.py::_exponential_backoff` is where that 4.9x comes from, so the
+obvious next step is to replace it. **Don't.** Patched in-process so the arms differ in exactly
+one expression, TPC-H sf1, all 22 correct in every arm, control run twice:
+
+| arm | conjunction rule | b/duckdb | b/polars |
+|---|---|---:|---:|
+| backoff (today) | `s1 * s2^(1/2) * s3^(1/4) ...` | 0.87 | 0.72 |
+| independent | `prod(s_i)` | 0.87 | 0.73 |
+| sqrt_all | `prod(s_i^(1/2))` | 0.86 | 0.70 |
+| backoff (repeat) | the control again | 0.86 | 0.69 |
+
+**The control's own spread between its two runs (0.87 -> 0.86, 0.72 -> 0.69) is as large as any
+difference between arms.** A rule that is provably 4.9x wrong on a two-equality conjunction is
+worth nothing on the suite geomean — because a cardinality error only costs wall time when it
+changes a *decision*, and on TPC-H sf1 it does not change enough of them to see. This would have
+been the fifth entry in `TPCH_FINDINGS.md`'s list of plausible mechanisms that measured flat, and
+it was one edit away from being implemented on the strength of the 998-against-203 arithmetic
+alone.
+
+What the estimate error is still good for is as a *diagnostic*: it is real, it is reproducible in
+30 lines, and it is not the thing standing between Batcher and DuckDB at sf10. The gaps there are
+q18 (10.3x), q21 (5.9x) and q17 (5.2x), and `LOSS_BACKLOG.md` already records q21 as an algorithm
+gap — 3.8x DuckDB's CPU while using more of the machine — rather than an estimate one. That is
+where the next work goes.
+
+The backlog file has been corrected on both counts, so the next person does not spend a day on
+plumbing that works or an afternoon on a rule that measures flat.
+
+## 2026-09-08 (single-node, later) — a sliced batch reported its parent's buffer, and it cost 6.3x
+
+TPC-H q18 is the largest single-node gap against DuckDB (10.3x at sf10) and **99% of it is one
+operator**: `GROUP BY l_orderkey`, 60M rows to 15M groups, 17.89 s of a 21.7 s query
+(`explain(analyze=True)`). The same engine on the same box aggregates 24M rows to 11.5M groups in
+365 ms, so 2.5x the rows and 1.3x the groups cannot cost 49x, and something specific to this
+aggregate was wrong.
+
+### It is the executor route, and every input already said so
+
+| arm | ms |
+|---|---:|
+| scan -> 15M-group aggregate | 4,660 |
+| the same, `execution.streaming=False` | 774 |
+| the parquet read alone, materialized | 347 |
+| the same aggregate over a **resident** copy | 505 |
+
+Both orders, minimum of three, and the accounting closes: 347 + 505 = 852 against 774. So the
+route is worth 6.0x and nothing else is.
+
+An instrumented `bc-py` (`BATCHER_DEBUG_ROUTE=1`, kept, in the same style as
+`BATCHER_DEBUG_AGGSPLIT`) prints the five inputs `execute_plan` decides from:
+
+```
+ROUTE streaming=true prefer=true shape_ok=true fits=FALSE src_bytes=9113881568 budget=19.8GiB
+```
+
+Kyber's `prefer_materializing_aggregate` was set, the engine's own shape guard admitted the plan,
+and **`materialize_fits` alone said no** — on `src_bytes` of 8.49 GiB for a two-column projection
+of `lineitem`.
+
+### Why the figure was wrong
+
+`materialize_fits` summed `RecordBatch::get_array_memory_size()`, which reports the *capacity* of
+every buffer an array points into. A sliced array points into its parent's. The parquet reader
+decodes a row group once and hands the engine morsel-sized slices of it, so each slice reports the
+whole row group. Measured on the exact batches crossing the FFI:
+
+```
+17,092 batches x 2 cols, 59,986,052 rows: nbytes=0.89 GiB  allocated=15.71 GiB  ratio=17.6x
+```
+
+The guard then multiplies by eight, so a 0.89 GiB input asked for 126 GiB of headroom against a
+20 GiB budget. It could not be true for **any** scan-sourced plan on this box, which is why the
+resident arm took the fast route and the scan arm never did — with byte-identical plans and
+byte-identical configs, which is what made this so hard to see from outside.
+
+### The fix, and what it is worth
+
+`arrow::array::ArrayData::get_slice_memory_size()` is the slice-aware counterpart and answers the
+question the guard is actually asking. One helper in `bc-py/src/lib.rs`; it falls back to the
+capacity figure on a shape whose slice size cannot be computed, which can only over-state and so
+keeps the bounded streaming path.
+
+```
+ROUTE streaming=false prefer=true shape_ok=true fits=true src_bytes=959776832
+scan -> 15M-group aggregate: 735.9 ms   (was 4,660)
+```
+
+`src_bytes` 8.49 GiB -> **915 MiB**, matching the logical measure exactly; the route flips; the
+aggregate goes **4,660 ms -> 736 ms, 6.3x**, landing on the forced-materializing arm's 774 ms.
+Against DuckDB's 242 ms for the same aggregate over the same files it is 3.0x, down from 19.3x.
+
+### ...and applied to the whole guard it is a net **regression**, which is why it is not
+
+Run across TPC-H sf10 the first version of this change was worse, not better, and in the way the
+existing code comment warns about: making the guard *accurate* makes it far more *permissive*,
+because the `x8` headroom was calibrated against the inflated figure. Four join-heavy queries went
+from completing to `SIGKILL` on the 30 GiB box:
+
+| query | before | after (whole-guard) |
+|---|---|---|
+| q17 | 5.16x | **KILLED** |
+| q18 | 10.34x | **KILLED** |
+| q21 | 5.90x | **KILLED** |
+| q20 | KILLED | KILLED |
+
+The other ratios moved within the run-to-run noise of a shared box in both directions (q5
+1.86x against 2.26x, q19 1.55x against 1.88x, q1 2.20x against 1.91x; DuckDB's own q5 read 893 ms
+against 434 ms between the two runs, which is the size of the noise).
+
+**So the accurate footprint is used only where it was validated.** The two disjuncts do not
+deserve the same test:
+
+* *streaming cannot shard this plan* materializes **join intermediates**, which the input size does
+  not bound at all, and its headroom was tuned against the capacity figure. It keeps reading it.
+* *Kyber's grouped-aggregate verdict* is **join-free by construction** on both sides
+  (`_prefers_materializing_aggregate` returns false for any plan containing a `Join`;
+  `materializing_aggregate_is_faster` requires `!has_join`), so what it materializes is the input
+  and one hash table over it — and the input's true size is exactly the right question.
+
+That split keeps the 6.1x on the aggregate and leaves every join-heavy plan on the path it was on.
+Re-measured at sf10 with the narrowed version, against the pre-change baseline:
+
+| query | baseline | whole-guard | narrowed |
+|---|---:|---:|---:|
+| q17 | 5.16x | KILLED | **5.37x** |
+| q18 | 10.34x | KILLED | **11.16x** |
+| q21 | 5.90x | KILLED | **6.04x** |
+| q20 | KILLED | KILLED | KILLED |
+| q1 / q10 / q12 / q13 / q14 / q15 / q16 / q19 | — | — | all within noise of baseline |
+
+The OOM regression is gone and nothing else moved.
+
+### **And it does not fix q18, which is what this investigation set out to do**
+
+q18 is 11.16x, statistically where it started. The reason is not subtle and it was in the
+predicate the whole time: `_prefers_materializing_aggregate` returns false for **any plan
+containing a `Join`**, and `materializing_aggregate_is_faster` requires `!has_join`. q18 has
+three joins. So the hint never fires for it, and a fix gated on that hint cannot reach it.
+
+The 6.1x is real and it is on a real and very common shape — a **join-free** high-cardinality
+grouped aggregate over a parquet scan, `SELECT k, agg(v) FROM t GROUP BY k`, which is what the
+isolated arm measures. It is not q18. The 17.89 s aggregate inside q18 is the *same operator* on
+the same rows, and it stays on the streaming path because of where it sits in the plan, not
+because of what it costs.
+
+So the honest state of the single-node bar: the over-count is a genuine defect, correctly
+diagnosed from both sides of the FFI and correctly fixed; it buys 6.1x where the routing hint is
+allowed to fire; and **the sf10 gap against DuckDB is unchanged**, still dominated by q18
+(11.2x), q21 (6.0x) and q17 (5.4x) — all join-heavy, which `results/LOSS_BACKLOG.md` already
+characterises as an algorithm gap rather than a routing one ("3.8x DuckDB's CPU while using
+*more* of the machine").
+
+Extending the aggregate hint under a join is the obvious next move and is deliberately out of
+scope here: the guard's own docstring records that the shape was never measured, and this session
+has already spent four refuted mechanisms establishing how easily that assumption goes wrong.
+
+### Four mechanisms this replaced, all refuted by measurement first
+
+Recorded because each was plausible and each would have been a wasted change:
+
+* **the `rename` blocks column pruning** — positional, no rename: 4,819 ms against 5,033. No.
+* **buffer fragmentation inflates the resident fixture** — `allocated/nbytes` on the collected
+  table is 1.00x. No. (It *is* 17.6x on the scan's own batches, which is the real finding, and the
+  difference between the two measurements is which objects were measured.)
+* **a stale `.so`** — `target/release/lib_native.so` and the installed copy match in size and
+  mtime. No.
+* **the conjunction rule** — A/B'd three ways across the suite, moves nothing (see the previous
+  entry).
+
+A fifth near-miss is worth more than the four: the first instrumented run reported `prefer=false`
+and looked like a broken hint. It was **the sandbox** — `git archive HEAD python` stages
+*committed* Python, and the Kyber peel this trace is about is uncommitted, so it measured a
+control plane that genuinely does not set the flag. `.claude/rules/concurrent-agents.md` already
+says to copy `crates/` from the working tree rather than `git archive` it, for exactly this
+reason; the same applies to `python/` whenever the control plane is part of what you are
+measuring, and the recipe does not say so.
+
+### Gate for the slice-aware footprint change
+
+`crates/bc-py/src/lib.rs` only — one helper (`batch_footprint`) and the boolean it feeds. Both
+executors are already held to the sequential oracle, so what this changes is which of them runs,
+and the differential suite is what covers that. Against the rebuilt engine in a sandbox:
+**15,624 differential assertions passed, 1 xfailed, 0 failed** across all 557 files, run in
+chunks of 40 (a whole-directory run on this box reports nothing when it is OOM-killed).
+
+`cargo fmt -p bc-py --check` clean. `cargo clippy` on `bc-py` reports six findings, all
+pre-existing (`type_complexity` and similar in code this change does not touch — `batch_footprint`
+appears nowhere in the output) and `bc-py` is excluded from the project's clippy gate by design
+(`justfile`: `--workspace --exclude bc-py`).
+
+**Not installed.** The engine is built and measured in a sandbox
+(`cargo build --release -p bc-py` + `PYTHONPATH`), not through `just build`, because that
+overwrites the shared `.so` and takes down every other session's running tests. Installing it is a
+separate decision for whoever has the tree quiet.
+
+### What this is worth, stated narrowly
+
+A join-free high-cardinality `GROUP BY` over a Parquet scan — `SELECT k, agg(v) FROM t GROUP BY k`
+— goes from 4,660 ms to 736-759 ms at 60M rows and 15M groups. That is the shape the isolated arm
+measures and the only shape the change can reach. It is a common shape and the win is real; it is
+**not** the sf10 TPC-H gap, which is join-heavy and unmoved.
+
+## 2026-09-08 (single-node, later still) — a join's build side was streamed, and it is q18's whole gap
+
+`stream/builds.rs::collect_builds` prepares every hash-join build side with `parallel::run` — the
+**streaming** executor — whatever the subtree contains. When that subtree is a join-free grouped
+aggregate, it is the wrong executor by 6x, and TPC-H q18 is the shape that pays: its `SEMI` join
+builds from `GROUP BY l_orderkey` over 60M rows to 15M groups, which `explain(analyze=True)`
+attributes **99% of the query's operator time** to.
+
+It now routes such a build side to `par::execute_parallel_with`, gated on the same
+`materializing_aggregate_is_faster` guard `bc-py` applies to a whole plan — which admits only a
+**join-free** grouped aggregate, so what it materializes is the subtree's input and one hash table
+over it, never a join's intermediates. That distinction is what makes it safe here: routing whole
+plans on a permissive test is what took four queries to `SIGKILL` earlier the same day.
+
+### Measured, TPC-H sf10, `--scan`, `--isolate`, correctness-gated
+
+| query | before | after | |
+|---|---:|---:|---|
+| q18 | 7,755 ms (11.16x) | **3,714 ms (4.89x)** | **2.1x faster** |
+| q21 | 9,408 ms (6.04x) | **3,262 ms (2.17x)** | **2.9x faster** |
+| q17 | 2,196 ms (5.37x) | **1,485-2,602 ms (3.34-6.19x)** | see below |
+
+q18 and q21 were the two largest rows on the board. q21 was not predicted: it is the self-join /
+correlated-subquery shape, and it builds from an aggregate too.
+
+**q17's "18% regression" was noise, and re-running it is what showed that.** The first reading
+after the change was 2,602 ms (6.19x) against 2,196 ms (5.37x) before, which looks like a
+regression and was reported here as one. Re-run on the *same* engine it read **1,484.8 ms
+(3.34x)** — faster than either. So q17's spread on this box is 1,485-2,602 ms, a **1.75x range**
+across runs of identical code, and no regression is established; if anything the change helps it
+too.
+
+The lesson is the one this file keeps relearning: a single timing on a shared box is not a
+measurement. The harness prints that reminder under every geomean ("SINGLE RUN — quoted to two
+decimals, which is what one pass supports"), and it applies to a per-query delta at least as much
+as to a suite total. `--repeat N` is the fix and it was one flag away the whole time.
+
+### What had to change to make it possible
+
+`ExecOptions` was never threaded into the streaming executor — its entry takes
+`(plan, sources, workers, budget, handoff, cancel)` and nothing else — so a build side rerouted to
+the materializing executor would have run **without the memory pool, the spill directory, the
+codec, `op_budgets`, or the cancel token**. That is why the route was left alone when it was first
+identified. Threading it is ~10 signatures across `stream/{builds,parallel,mod,union_all}.rs`;
+`opts` is `Option`, and `None` (the sequential `execute_streaming` entries, and the tests) streams
+exactly as before, so only the `bc-py` path changes behaviour.
+
+`op_budgets` is deliberately **dropped** for the sub-execution: the map is keyed by pre-order
+`op_id` over the *whole* plan, so handing it to a subtree would budget the wrong operators. Every
+other field carries through.
+
+### Gate for the build-side routing
+
+`cargo check` clean with no warnings on `bc-interp` and `bc-py`; `cargo fmt --check` clean *after*
+running `cargo fmt` on those two crates (scoped, never `--all` — other sessions hold files in this
+tree).
+
+That line first went in claiming fmt was already clean, on the strength of
+`cargo fmt -- --check | tail -3 && echo clean` — where `&&` tests `tail`'s exit status, not
+`fmt`'s, so it printed "clean" over 157 lines of diff. It is the exact false-green
+`.claude/rules/testing.md` describes: a check arranged so it cannot fail. Recorded rather than
+quietly fixed, because the shape recurs.
+
+Correctness, against the rebuilt engine in a sandbox: **all 98 differential files that exercise a
+join or an aggregate — 1,425 assertions, 0 failures** (the files matching
+`join|agg|group|semi|subquery|tpch|exists`, which is the behaviour this change touches), plus
+**1,431 assertions across three general chunks** of the rest of the suite. The three sf10 queries
+above are additionally correctness-gated by the harness itself, which refuses to time a query
+whose result does not match.
+
+**The full suite has now completed, clean.** It was OOM-killed twice mid-run while other
+sessions held memory, which is why this paragraph originally said the remaining ~330 files were
+unrun. Re-run in 28 chunks of 20 files against a sandbox carrying this engine:
+**15,624 passed, 0 failed, 0 errors, 1 xfailed, 100 skipped — 0 of 28 chunks with a failure.**
+Chunked deliberately: it does not prevent an OOM kill, it makes one *attributable*, where a
+whole-directory run takes the entire result down and names nothing.
+
+The targeted 98 join/aggregate files remain the place a routing change of this shape would
+show up first, but "where it would show up" is a judgement and the full suite is the gate. The
+gate is now green.
+
+`cargo test -p bc-interp` was also OOM-killed while linking its release test binaries, so the
+Rust seq==par oracle has not been re-run either. Same remedy.
+
+### Full sf10 sweep after the build-side routing, and a FAILED that was not one
+
+| query | before this session | after |
+|---|---:|---:|
+| q3 | 2.64x | **1.04x** |
+| q22 | 1.25x | 1.44x |
+| q13 | 1.70x | 1.58x |
+| q16 | 1.51x | 1.64x |
+| q14 | 1.68x | 1.67x |
+| q19 | 1.88x | 2.00x |
+| q6 | 1.79x | 2.02x |
+| q5 | 2.26x | 2.24x |
+| q4 | 2.16x | 2.61x |
+| q12 | 2.71x | 2.49x |
+| q21 | 5.90x | **2.60x** |
+| q10 | 2.63x | 3.27x |
+| q17 | 5.16x | **3.52x** |
+| q7 | 2.96x | 3.58x |
+| q2 | 4.49x | 4.57x |
+| q15 | 0.02x | 0.02x |
+
+The three the build-side routing targets moved and stayed moved: q21 5.90x -> 2.60x, q17 5.16x ->
+3.52x, and q18 (killed in this sweep, measured separately) 11.16x -> 4.89x. The rest sit within
+the run-to-run spread this box shows, in both directions.
+
+**q1 reported `FAILED correctness` in that sweep and it is not a defect.** Run on its own, in a
+process with nothing else in it, q1 returns **4 rows** with the canonical TPC-H answer
+(`A/F, N/F, N/O, R/F`, `count_order` 14,804,077 / 385,998 / 29,144,351 / 14,808,183). The sweep
+that reported it also SIGKILLed four other queries; the box was thrashing under other sessions.
+A correctness failure is the one result that must never be waved through, so it was re-run
+directly rather than attributed to load on the strength of the surrounding kills — but that is
+what it was.
+
+### The q18 profile after the fix: the aggregate is gone from the timed plan
+
+The routing change was chosen from a profile, so it is worth holding it to the same profile
+afterwards. `explain(analyze=True)` on sf10 q18, before and after:
+
+| operator | before | after |
+|---|---:|---:|
+| `aggregate [by l_orderkey]` (the build side) | 17.89s, **99%** of operator time | **no ACTUAL, no TIME — absent from the timed plan** |
+| `project` over `scan [source 2]` (lineitem) | 54ms, <1% | 68ms, **32%** |
+| `aggregate [by c_name, c_custkey, …]` (the final one) | 54ms, <1% | 64ms, **30%** |
+| `project` over `scan [source 1]` | 24ms, <1% | 29ms, **14%** |
+| the three `hash_join`s | 36ms combined, <1% | 41ms combined, 20% |
+
+The first row is the whole point and it is a *structural* reading, not a timing one: the
+aggregate branch now registers **no measured rows and no measured time at all**, because it is
+evaluated as a prepared build side outside the streaming pipeline the profiler instruments. That
+is exactly what the change intended, and it is visible without trusting a single number on a
+shared box.
+
+**The absolute times in the "after" column are not usable and the shares are.** That run took
+14,483 ms wall against the benchmark's best-of-3 3,714 ms, because other sessions had the box;
+21.74s -> 4.93s of attributed operator time is a real drop of the right sign, but its magnitude is
+worth nothing. What the profile is for is the *distribution*, and the distribution has changed
+shape: q18 no longer has a bottleneck. Its remaining time is spread across projection over the two
+large scans (46% combined), the final aggregate (30%), and the joins (20%) — four things of
+comparable size rather than one thing at 99%.
+
+So the next lever on q18 cannot be chosen the way this one was. There is no single operator left
+to move; the candidates are the projection/scan path (`--scan` reads Parquet, so this is decode
+plus column materialization) and the fixed overhead the profile still attributes to "elsewhere",
+which is the larger share of the two.
+
+**The row estimates are wildly wrong and that is a separate, unexploited finding.** Every operator
+above the build side is estimated at 15.0M-59.9M rows and runs on 624 — `95970.5x over` on the
+final aggregate, `24038.5x over` on two of the joins. The plan above the semi-join was therefore
+chosen for a relation four orders of magnitude larger than the one it got. That was true before
+the change too (it is visible in the "before" profile), so it is not a regression, and nothing
+here acts on it.
+
+**The adaptive loop is not the answer to it, and saying so was the first thing this entry got
+wrong.** The obvious reading is that q18 is exactly the case stage-by-stage re-optimization on
+measured cardinalities exists for, and that `api/adaptive/gating.py` failing to engage is a bug to
+go read. It is not: that module's own docstring records the measurement, on this benchmark at this
+scale. Staging cost **q17 6.3x, q8 4.1x, q9 3.3x and q3 3.1x at sf10** against the one-shot plan
+for the identical result, because the loop cuts one breaker per stage and so gives up operator
+fusion and the streaming executor's width at every join. q18 is a six-breaker shape — the worst
+case that measurement describes. The gate declines it on purpose.
+
+Where the error actually enters is one operator, and the profile names it. The `aggregate [by
+l_orderkey]` under the semi-join is estimated **exactly right** — `est≈15,000,000`,
+`actual=15,000,000`. The `filter [__agg0 > 300]` directly above it is estimated at **5,000,000**,
+which is one third of its input: the textbook Selinger default for an inequality with no
+statistics. It actually keeps **624** rows. That single guess is off by 8,012x, and every operator
+above it inherits the error — which is why the two joins and the final aggregate all read
+24,038x-95,970x over while their own logic is fine. So this is a cardinality-estimation gap on an
+inequality over an aggregate's *output* column, where no source statistic or sketch applies, not
+an adaptivity gap. Fixing it would be a Kyber change and would
+correct the estimate for the one-shot plan, which is the plan that wins here. Nothing in this
+session tests that, and it is written down as a lead rather than a finding.
+
+### Measured: the learning loop does not reach an aggregate's output column
+
+The lead above says a filter over an aggregate's output takes Selinger's 1/3 because no
+statistic applies. `kyber/stats/selectivity/leaves.py::_range_selectivity` names its own
+precedence — learned KLL quantiles, else EXACT source `min`/`max`, else the constant — and
+records that "quantiles only appear after the learning loop has measured a run". So the loop is
+the intended answer, and whether it arrives is a measurement, not a reading.
+
+**It does not.** Three runs of sf10 q18 in one `Session`, same query, same registered scans:
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| wall | 4,458 ms | **1,449 ms** | 3,075 ms |
+| `filter [__agg0 > 300]` est | 5,000,000 | 5,000,000 | 5,000,000 |
+| `hash_join [semi]` est | 15,000,000 (24038.5x over) | 15,000,000 (24038.5x over) | 15,000,000 (24038.5x over) |
+| final `aggregate` est | 59,885,590 (95970.5x over) | 59,885,590 (95970.5x over) | 59,885,590 (95970.5x over) |
+| build-side decisions | 3, all `[default]` | 3, all `[default]` | 3, all `[default]` |
+
+Every estimate is identical to the digit, and all three build-side selections still read
+`[default]` on run 3 — the marker for "no learned statistic was available". Core measured
+`actual=624` three times and Kyber consumed none of it. The gap is specific and it is not the
+size floor or the adaptive gate: it is that nothing writes a quantile sketch for a column that
+**an aggregate produces**, only for columns a source has. `__agg0` does not exist until the
+query runs, so the source-statistics path that fixes every TPC-H date predicate cannot see it.
+
+That is a real limitation of the cross-run learning loop, stated where the loop is the moat, and
+it is written down rather than fixed: closing it means deciding where an aggregate-output sketch
+is recorded and keyed, which is a Kyber/metadata design question and not a benchmark result.
+
+**But it is probably not q18's lever, and the same runs say why.** Operator time in run 2 totals
+about 105 ms of 1,449 ms — **7%**. Even an oracle-perfect cardinality that made every join free
+could not move the other 93%, which the profile attributes to "planning, optimization, admission,
+FFI crossing, result assembly" and, unattributed inside it, the Parquet decode of 60M rows that
+the `scan` line reports as 2.4 ms. So the estimate error is real, is worth recording, and is the
+wrong thing to spend the next change on.
+
+## 2026-09-08 (single-node, decomposed) — the sf10 gap is the Parquet reader, and the aggregate already wins
+
+Every single-node lever this session found was an *executor routing* lever, and each one paid.
+Following the q18 profile past them asks a different question: with routing fixed, operators are
+~7% of q18's wall time, so what is the other 93%? The profile calls it "planning, optimization,
+admission, FFI crossing, result assembly" and reports the `scan` line at 2.4 ms for 60M rows —
+which cannot be the decode cost, only the cost of *starting* it. The streaming executor does not
+attribute decode to the scan operator, so decode is invisible in the profile and lands in
+"elsewhere".
+
+So it was measured directly. Three shapes over the same sf10 `lineitem` (59,986,052 rows), same
+process, best of 3, batcher against DuckDB's `read_parquet` on the identical files:
+
+| | what it does | batcher | duckdb | ratio |
+|---|---|---:|---:|---:|
+| A | `sum(l_quantity)` — 1 column decoded, one scalar reduction | 198.4 ms | 69.1 ms | **2.87x slower** |
+| B | `sum` of `l_quantity`, `l_extendedprice`, `l_discount` — 3 columns | 455.3 ms | 207.2 ms | **2.20x slower** |
+| C | `group_by l_orderkey sum(l_quantity)` — 2 columns + the 15M-group aggregate q18 builds from | 817.1 ms | 1,063.1 ms | **0.77x — batcher wins** |
+
+**`count(*)` is not a decode floor and was discarded.** Both engines answer it from the Parquet
+footer; batcher returns 59,986,052 in **1.2 ms**. A floor has to touch values, which is why A is a
+`sum` over a column and not a row count. Anyone quoting a scan benchmark on this board should
+check the same thing first.
+
+### What the three rows say together
+
+Row A is the reader with essentially nothing on top of it: one column decoded, one accumulator.
+It is 2.87x. Row B decodes three columns and is 2.20x, so the marginal per-column decode is
+~128 ms against DuckDB's ~69 ms (1.9x) on top of a fixed ~70 ms batcher pays and DuckDB does not.
+**The gap grows with the fixed cost and with per-column throughput, not with the operator.**
+
+Row C is the one that changes the plan for this board. It decodes two columns *and* builds a
+15,000,000-group hash aggregate over 60M rows — and batcher is **faster than DuckDB**, 817 ms
+against 1,063 ms. Subtracting the reader from both sides, batcher's aggregate does the grouping
+in roughly 490 ms where DuckDB's takes roughly 925 ms. The mergeable aggregate is not the
+weakness on this shape; it is comfortably the strength, and it has been carrying a 2.2-2.9x
+reader on its back all session.
+
+That is the explanation for the whole sf10 board, and it is consistent with every earlier result
+here rather than competing with them. The routing fixes were real — q18 11.16x -> 4.89x, q21
+5.90x -> 2.60x — because they removed *executor* time. What they exposed underneath is a reader
+that costs 2-3x on every query that touches a wide table, which is why sf1 clears all three bars
+(the fixed and per-column costs are small against 6M rows) and sf10 does not.
+
+### What this retires and what it opens
+
+**It retires the cardinality lead from the previous entry as a *performance* lever.** The
+`filter [__agg0 > 300]` estimate is off by 8,012x and the learning loop does not reach it; both
+findings stand and are worth fixing for plan quality. Neither can move q18's wall clock, because
+the operators they would re-cost are 7% of it. Do not spend the next change there on the strength
+of how wrong the number looks.
+
+**It makes the reader the single-node target**, which is also where this branch already points
+(`perf/concurrent-native-parquet-reads`). Nothing here diagnoses *why* the reader is 2-3x —
+that is the next measurement, and the candidates are the per-column decode path and the ~70 ms
+fixed cost, which A-versus-B separates cleanly and neither of which has been read yet.
+
+### The reader gap is occupancy, not decode throughput
+
+"2-3x slower" has two very different causes and they want opposite fixes: a decoder that does
+more work per byte, or a decoder that does the right work but on a fraction of the machine.
+`os.times()` sums CPU across every thread in the process, so `cpu/wall` over an interval **is**
+the mean number of cores occupied. Same one-column `sum` over sf10 `lineitem`, same process,
+best of 3, on a box whose cgroup `cpu.max` is `15000000 1000000` — a **15-core quota** on 16
+visible CPUs:
+
+| reader | wall | total cpu | cores occupied | of the 15-core quota |
+|---|---:|---:|---:|---:|
+| batcher | 249.7 ms | 1,280 ms | **5.13x** | 34.2% |
+| pyarrow `read_table` | 129.6 ms | 1,120 ms | 8.64x | 57.6% |
+| duckdb `read_parquet` | 63.1 ms | 860 ms | **13.62x** | 90.8% |
+
+Read the CPU column first: batcher spends **1,280 ms of CPU against DuckDB's 860** — 1.49x the
+total work — while taking **3.96x the wall clock**. The decoder is not the problem. Batcher
+occupies 5.13 cores where DuckDB occupies 13.62, and 2.65x of the 3.96x is exactly that ratio.
+pyarrow sits between them on both axes, which is the control that makes the reading safe: three
+readers, same files, same interval, and occupancy tracks wall time in the same order.
+
+At DuckDB's occupancy and batcher's own current CPU, the read would finish in
+1,280 / 13.62 = **94 ms** — 1.5x DuckDB rather than 4x, without making a single decode
+instruction faster. Amdahl on (250 ms wall, 1,280 ms CPU, 15 cores) puts roughly **176 ms of
+the 250 in a serial section**, which is where the next measurement goes.
+
+**This is why `count(*)` had to be discarded and why the earlier profile was misleading.** The
+`scan` operator's own line reads 2.4 ms for 60M rows, and everything above it is genuinely
+parallel and genuinely fast — batcher's 15M-group aggregate beats DuckDB's. The engine is not
+where sf10 is lost. It is lost in a read path that leaves two thirds of the box idle.
+
+### Where the 250 ms actually goes: the scan does not pipeline into the engine
+
+The occupancy finding said 176 ms of a 250 ms query sits in a serial section. Reconstructing
+that section from outside the query kept failing, in two instructive ways worth recording
+before the result:
+
+- **A repeated identical plan is served from a cache.** The same in-memory aggregate re-run
+  costs **1.2 ms** against 244 ms for its first run. A best-of-3 over one plan can therefore
+  time the cache rather than the query. (`benchmarks/run.py` is not affected — it re-reads, and
+  the three q18 runs earlier in this file came back 4,458 / 1,449 / 3,075 ms, so nothing was
+  cached there. But a decomposition script that reuses one `Dataset` is.)
+- **A first round in a fresh process is the process, not the query.** The first `explain()`
+  measured 362 ms at 1.02x occupancy where the warm one costs **3.6 ms** — footers, page cache
+  and pool construction, none of it recurring.
+
+So the layers were wrapped in place and the query left to call them. Same one-column `sum` over
+sf10 `lineitem`, warm process, and the once-per-column cost paid or not paid:
+
+| layer | first query on the column | a repeat of it |
+|---|---:|---:|
+| `ParquetSource.read` (native read + normalize) | 120.4 ms · 15% | 132.7 ms · **54%** |
+| `engine.execute_plan_metered` | 93.9 ms · 12% | 88.7 ms · **36%** |
+| `engine.column_ndv` | **163.1 ms · 21%** | — |
+| `engine.column_stats_full` | **70.4 ms · 9%** | — |
+| neither source nor engine | 336.1 ms · 43% | 24.1 ms · 10% |
+| **total** | **783.9 ms** at 4.21x cores | **245.6 ms** at 6.47x cores |
+
+`_normalize` is free (10 calls, unmeasurable), which retires the per-file schema-conformance
+pass as a suspect.
+
+**Two separate findings, and they belong to different audiences.**
+
+*The first query on a column pays 234 ms of statistics* — `column_ndv` and `column_stats_full`,
+two full passes over the data, for a plan that is one scalar `sum` with no join, no group-by and
+no filter, where an NDV cannot change a decision. That is **2.5x the cost of executing the
+query**, plus 336 ms of once-per-column work elsewhere. It is invisible to this board, because
+the harness reports a best-of-N and the second run has it cached — and it is exactly what a
+user's first query pays. Worth fixing; not the reason sf10 loses.
+
+*The repeat — the regime the benchmark measures — is fully explained by two numbers that add
+up.* 132.7 ms of reading plus 88.7 ms of executing is 221 of the 246 ms, with 24 ms of
+everything else. **They add up because they are strictly serial.** `ParquetSource.read`
+materializes the entire relation into a Python list of 980 `RecordBatch`es and only then is the
+engine invoked on it. The read runs at ~12 cores and the execute at ~1-2, and the query's
+combined occupancy is the 6.47x you get by running them one after the other.
+
+DuckDB does the same work in 63 ms because it does not do this: it decodes and aggregates in
+one pipeline, so its wall clock is roughly `max(read, aggregate)` at 13.62 cores rather than
+`read + aggregate` at 6.47. **That is the sf10 gap, stated as an architecture rather than a
+constant.** Batcher's reader is competitive in isolation (65-86 ms at ~12 cores against
+DuckDB's 63 ms for everything) and its aggregate beats DuckDB's outright at 15M groups. What it
+gives away is the overlap between them.
+
+### What to do about it, and what not to
+
+The fix is to make the scan a *source the engine pulls from* rather than a relation Python hands
+over. Everything needed already exists in the tree — `_native_stream.py` and
+`read_row_groups_filtered` read a window of row groups at a time, and `iter_batches` is a
+streaming terminal — but the `execute_plan*` FFI takes materialized sources, so the scan cannot
+currently be pushed below it. That is a real change to the FFI contract and to `dist/`'s
+assumptions about how sources are bound, and it is **not started here**: this entry is a
+diagnosis, and the measurements above are what a change to that boundary should be held against.
+
+**A second lever was proposed here and then withdrawn, which is worth keeping rather than
+deleting.** Several readings put an ungrouped `sum` over 60M resident rows at 51-89 ms and
+**0.99x occupancy** against pyarrow's single-threaded 40 ms, and one back-to-back pair had
+`sum(x)` alone at 432 ms / 0.99x while `sum, count, min` took 186 ms / 4.24x — adding work
+making it 2.3x faster, which reads exactly like a routing decision keyed on the aggregate
+count. It was written up as a contained bug worth ~80 ms of a 246 ms query.
+
+It does not survive being run properly. Alternating 1, 2, 3 and 4 aggregates over the same
+resident table for five rounds, rotating the order each round: **round 1 reproduces the effect
+(465 / 317 / 37 / 29 ms) and rounds 2-5 do not** (23 ms flat for 2-4 aggregates, and 1 ms for
+one aggregate, which is the plan cache). Round 1's gradient is the *first shape measured*
+paying a warm-up the later shapes then skip — the same artifact under a different name, and the
+`max()` warm-up call in the script was not enough to absorb it. Every "0.99x" reading above was
+likewise a first run of its plan.
+
+So: **the ungrouped aggregate is not shown to be serial, and the aggregate-count effect is not
+real.** The one figure that stands is `execute_plan_metered` at 88.7 ms inside a genuinely warm
+repeat of a full query, which is a total and not an occupancy. What this cost is the second
+lever; the pipelining above is unaffected, because its evidence is that read and execute *sum*
+to the wall clock rather than any claim about either one's internal parallelism.
+
+The general form, which this file has now recorded three times in one session: on a shape where
+a repeat can be cached and a first run pays warm-up, **every ordering is a confound**, and the
+fix is to rotate the order and print every round rather than to take a best-of-N.
+
+**And it retires the two leads this session's earlier entries opened.** Neither the 8,012x
+filter estimate nor the learning loop's blindness to aggregate-output columns can move a warm
+query in which 90% of the time is a read and an execute that do not overlap. Both remain true;
+neither is the lever.
+
+### Sizing the pipelining change, and what it is worth
+
+Two things anyone picking this up should have before they start, both read from the code rather
+than assumed.
+
+**The serialization is structural, not incidental.** `bc_py::execute_plan_metered` takes
+`sources: Vec<Vec<PyArrowType<RecordBatch>>>` — every batch of every source, by value, at call
+time. The batches themselves cross zero-copy (Arrow C Data Interface), so this is not a data
+copy; it is a *barrier*. Python must finish reading before the engine can begin, which is why
+the two timings sum to the wall clock rather than overlapping.
+
+**The obvious fix is blocked by the crate DAG, and the blockage is easy to miss.**
+"Let the scan read Parquet inside the executor" requires `bc-interp` to reach `bc-io`. It
+cannot today: `bc-interp` depends on `bc-arrow`, `bc-expr`, `bc-ir`, `bc-runtime`, `bc-codegen`
+and `bc-resource`, and **not** `bc-io` — which itself depends only on `bc-arrow`. The reader is
+a near-leaf sitting *beside* the interpreter, and `bc-py` is where the two are first assembled
+(`.claude/rules/rust-engine.md` says exactly this: `bc-py` is a second assembly point, not a
+thin cap). So there are two shapes, and they are not equivalent:
+
+- **Add `bc-interp -> bc-io`.** Legal — it is a downward edge and makes no cycle. It also puts
+  Parquet, `object_store` and a tokio runtime into every build and every `cargo test` of the
+  interpreter, for a crate whose value is being the small, obviously-correct oracle.
+- **Define a `BatchSource` trait in `bc-interp`, implement it in `bc-py` over `bc-io`.** No new
+  dependency anywhere, the interpreter stays format-agnostic, and the scan operator pulls
+  instead of being handed a `Vec`. This is the one to do.
+
+Neither is small, and both are two-sided (the `scan` IR tag would carry a source *spec* rather
+than only an index, which `.claude/rules/python-control-plane.md` requires be changed in Python
+and Rust in the same commit, with a differential test on the new shape). `dist/` binds sources
+its own way and has to be checked against it.
+
+**What it is worth, as arithmetic on measured parts rather than as a measurement.** Warm, one
+column, sf10 `lineitem`: read 132.7 ms, execute 88.7 ms, everything else 24 ms, total 245.6 ms.
+Perfect overlap gives `max(133, 89) + 24` = **157 ms**, a 1.6x improvement on this shape. On a
+quiet box the same read is 65-86 ms at ~12 cores against DuckDB's 63 ms for the entire query,
+so an overlapped batcher would land at roughly DuckDB's number on a shape where its aggregate
+is a rounding error — and *ahead* on the shapes where the aggregate is the work, since batcher's
+15M-group aggregate already beats DuckDB's 817 ms to 1,063 ms.
+
+That is the honest ceiling: pipelining plausibly reaches parity-to-better on single-node sf10.
+It is not a claim that it will, and the numbers above are what to hold a first implementation
+against.
+
+## 2026-09-08 (single-node, the read) — the scan is the sf10 board, and one idea about it was wrong
+
+Following the pipelining diagnosis onto the *real* queries changes which lever matters. The
+case for pipelining was built on a synthetic one-column `sum`, where the read is 54% of the
+query and the engine 36% — the friendliest possible shape for it, because there is almost no
+compute to hide the read behind. On TPC-H at sf10, warm, with `ParquetSource.read` and the
+`execute_plan*` entries wrapped in place:
+
+| query | wall | read | execute | other | recorded ratio vs duckdb |
+|---|---:|---:|---:|---:|---:|
+| q6 | 654.8 ms | **96.0%** | 1.7% | 2.3% | 2.02x |
+| q1 | 1,390.7 ms | 69.2% | 29.4% | 1.4% | — |
+| q3 | 1,576.7 ms | 50.6% | 32.1% | 17.2% | 1.04x |
+
+q6 is **96% read**, so overlapping the read with execution could not help it at all. Its 2.02x
+is the scan and nothing else. This is the strongest single statement this file can make about
+the single-node board: **the queries Batcher loses at sf10 are lost in the reader, not in the
+engine**, and the engine's share is small enough on the worst of them that no operator or
+optimizer change can reach it.
+
+### An idea that failed, on both counts, and the check that caught it
+
+`ParquetSource.read` tries `_native_read_filtered`, then falls back to `_pyarrow_read_filtered`.
+`to_native_predicate` **refuses a temporal literal** — it cannot verify the parquet physical
+unit — so for any query filtering on a date the native reader declines in 0.0 ms (observed, not
+inferred) and the scan lands on pyarrow's per-file filtered read. Nearly every TPC-H query
+filters on a date. Measured, sf10 `lineitem`, four columns:
+
+| | |
+|---|---:|
+| unfiltered *batched* native read | 287.1 ms at **12.68 cores** |
+| `_pyarrow_read_filtered` (the date fallback) | 621.9 ms |
+| `_native_read_filtered` (numeric-only predicate) | 589.9 ms |
+| whole q6 | 931.4 ms at 7.10 cores |
+
+So the obvious move: when the native filtered read declines, read unfiltered and *batched*, and
+leave the predicate to the engine's `Filter` — which the code comments say is kept regardless
+("pushdown is a pure I/O optimization"). Rerouting exactly that one decision and running the
+identical SQL both ways:
+
+| query | today | native batched + engine filter | | |
+|---|---:|---:|---:|---|
+| q6 | 632.3 ms | 689.1 ms | 0.92x | slower |
+| q1 | 1,303.1 ms | 1,079.4 ms | 1.21x | **different answer** |
+| q3 | 1,036.8 ms | 1,752.8 ms | 0.59x | much slower |
+| q12 | 1,257.6 ms | 1,548.2 ms | 0.81x | slower |
+
+**Three of four slower.** The idea is discarded on that alone.
+
+**This entry originally also said q1 "returned a different answer", and that was wrong — the
+comparator was.** The arms were compared with an exact string equality over
+`collect().to_pydict()`. q1 sums `l_extendedprice` to ~5.6e11, and the two arms read through
+different paths, so they sum in different orders: the results differ in the ~13th significant
+digit and agree everywhere else. That is float reassociation, which
+`.claude/rules/python-control-plane.md` documents as an *expected* difference and which
+`assert_same` tolerates by design. Re-run later with a relative-tolerance comparison, every
+query matches DuckDB on both arms.
+
+So the safety question this raised is **unresolved, not answered**: nothing here shows that
+answering a predicated `read` with an unfiltered superset is unsafe. It shows it is slower.
+
+It also **corrects an earlier reading in this session**. "Pushing a selective predicate costs
+more than not pushing it" was taken from 589.9 ms filtered against 196.3 ms unfiltered — but
+those read three columns and two respectively, so the comparison was confounded. q3 at 0.59x and
+q12 at 0.81x say plainly that row-group pruning earns its keep. Pushdown is not the problem.
+
+### What is actually wrong with the filtered read, and it is not the pruning
+
+`_native_read_filtered` calls `read_row_groups_filtered` **once per file**, inside a Python
+`ThreadPoolExecutor`. The unfiltered path makes a *single* `read_parquet_many` call that
+overlaps every file's footer and column-chunk reads on one tokio runtime. `read_parquet_many`'s
+own doc comment says what the difference costs: calling the single-file entry per file "pays a
+`block_on` + GIL round trip and a fresh future per file, serializing at the FFI boundary".
+
+That is the 12.68 cores against 7.10, and unlike everything above it is not a trade-off — same
+files, same projection, same predicate, same pruning, same rows out. The filtered read simply
+had no batched form. Adding one (`bc_io::read_parquet_many_filtered`, exposed as
+`read_parquet_many_filtered`, with the shared body factored into `read_parquet_many_with`) is
+the change this measurement supports, and it is the only one carried forward from this entry.
+
+### Built, measured, and reverted: a batched form of the filtered Parquet read
+
+The one change the previous entry carried forward was implemented in full and then backed out.
+Recording it because the reasoning is reusable and the code is a half-hour to restore.
+
+**What it was.** `_native_read_filtered` calls `read_row_groups_filtered` once per file inside a
+Python `ThreadPoolExecutor`; the unfiltered path makes a single `read_parquet_many` call that
+overlaps every file on one tokio runtime. The filtered read simply had no batched form. Added
+`bc_io::read_parquet_many_filtered` (shared body factored into `read_parquet_many_with`),
+exposed it through `bc-py`, wrapped it as `_parquet_native.read_many_filtered`, and had the
+caller loop over groups of `_read_concurrency` files — the same width the thread pool held in
+flight, so the peak-memory bound that method exists to enforce was preserved rather than traded.
+
+**Correctness held everywhere.** Identical row counts in every arm: 7,522,992 on sf10
+`lineitem` with a numeric predicate, 1,499,860 on a 300-file corpus. Same files, projection,
+predicate and pruning; only the number of FFI calls changed.
+
+**And it is not measurably faster on local storage.** Interleaved arms, alternating sandboxes so
+both see the same box:
+
+| corpus | old (per-file) | new (batched) | |
+|---|---|---|---|
+| sf10 `lineitem`, 10 files x 49 row-groups | 409-658 ms (mean 510) | 371-559 ms (mean 441) | 13.5% on the mean, ranges overlap heavily |
+| 300 small files, 1 row-group each | min 162.8 ms, median ~230 | min 208.1 ms, median ~235 | **no win** |
+
+The 300-file arm is the one that matters, because it is the layout the batched read exists for —
+and it shows nothing. The reason is in `read_parquet_many`'s own doc comment, which measures its
+4.8x **against S3**: what batching buys is overlapped per-file *round trips*. On local
+page-cached files there is no round-trip latency to hide, so a per-file `block_on` costs almost
+nothing. The sf10 arm's 13.5% is inside the spread this box shows on six samples and is not
+claimed.
+
+**So it was reverted** — `bc-io`, `bc-py`, `_parquet_native.py` and `parquet/source.py` are
+byte-identical to HEAD again, with this session's unrelated earlier work in `bc-py/src/lib.rs`
+left intact (93/3, unchanged). Shipping it would have added FFI and Python API surface on a
+hypothesis, which is the "no speculative generality" rule in `.claude/rules/python-quality.md`,
+and would have put an unmeasured perf claim on this board.
+
+**What would justify it: a measurement against object storage.** The cluster benchmarks read
+from S3, where the per-file round trip is the whole cost and `read_parquet_many` is already
+measured at 4.8x. If someone reproduces that gap for the *filtered* path on a remote store, this
+change is ready-made and the design decisions above (group width = `_read_concurrency`, shared
+body, superset-safe semantics unchanged) are the ones to keep.
+
+### The Rust test gate found a real defect in this session's own work
+
+`cargo test -p bc-interp` had been OOM-killed twice and was carried as "unrun" for most of this
+session. Run properly, it did not pass — it **did not compile**:
+
+```
+error[E0061]: this function takes 5 arguments but 4 arguments were supplied
+    --> crates/bc-interp/tests/stream_oracle.rs:1323:15
+error: could not compile `bc-interp` (test "stream_oracle") due to 5 previous errors
+error: could not compile `bc-interp` (test "dictionary_operators") due to 1 previous error
+```
+
+Threading `ExecOptions` into the streaming executor added an `opts: Option<&ExecOptions>`
+parameter to four public entry points. Every *library* call site was updated; the three
+integration tests under `crates/bc-interp/tests/` were not — seven call sites across
+`stream_oracle.rs`, `stream_metrics.rs` and `dictionary_operators.rs`.
+
+**Why it stayed hidden through every check that was run.** `cargo check` and
+`cargo check -p bc-io -p bc-py` build the *library* target only. So does the release build that
+produced the `.so` the whole differential suite ran against — 15,624 Python assertions passed on
+an engine whose own Rust test targets would not build, because the Python suite exercises the
+library through the FFI and never compiles `tests/`. The gate matrix in `CLAUDE.md` is not
+decorative here: `cargo clippy --workspace --exclude bc-py --all-targets` and `just test-rust`
+are separate rows from `just check` precisely because only they see test targets.
+
+Fixed by passing `None` at each of the seven sites, which is what those tests had before the
+parameter existed — no pool, spill directory, budgets or cancel token — so their behaviour is
+restored verbatim rather than changed.
+
+**And the clippy row found a second defect from the same change.** With the test targets
+compiling, `cargo clippy --workspace --exclude bc-py --all-targets -- -D warnings` failed too:
+adding `opts` pushed `stream::parallel::run` and `materialize_spine_breakers` to **8 arguments
+against clippy's limit of 7**, which `-D warnings` makes an error rather than a lint. Handled the
+way the workspace already handles it -- there are ten-plus `#[allow(clippy::too_many_arguments)]`
+in `crates/`, including one on `record_breaker` in `bc-interp/src/lib.rs` -- with a stated reason
+on each rather than a bare silencer, because both are internal plumbing threading executor
+context rather than public API.
+
+The general form, and it is the same shape as the `cargo fmt --check` false green recorded
+earlier in this file: **a check that passes is only evidence about what it compiled.** Two
+different gates reported green on this change while a third had never been run, and that third
+row found two separate defects on its first execution -- one that would not compile and one that
+would not lint. The honest characterisation of this session's engine work is that it was
+measured carefully and gated incompletely, and the two are independent.
+
+### The date-decline reroute, attempt two: also slower, also wrong
+
+The first attempt returned the native reader's rows *unfiltered* and let the engine's `Filter`
+do the work; it was slower on three of four queries and q1 came back different. The obvious
+diagnosis was the superset — so attempt two read natively and then applied the **exact** Arrow
+filter per file, which is the same step `_native_read_filtered` performs after its pruning, and
+should therefore return precisely the matching rows.
+
+| query | today (pyarrow) | native + exact filter | | same answer |
+|---|---:|---:|---:|---|
+| q6 | 540.9 ms | 863.9 ms | 0.63x | **no** |
+| q1 | 1,078.4 ms | 1,189.7 ms | 0.91x | **no** |
+| q3 | 1,057.5 ms | 1,627.3 ms | 0.65x | yes |
+| q12 | 1,130.0 ms | 2,155.7 ms | 0.52x | yes |
+| q14 | 601.0 ms | 1,387.1 ms | 0.43x | **no** |
+
+Slower on all five. (The box was at load 44 for this run, so the *margins* are not
+quotable — but 0.43-0.65x is far outside the spread.)
+
+**The "same answer" column in this table is wrong and is retracted.** It used the same exact
+float comparison as the previous attempt, and it fails for the same reason: q6, q1 and q14 all
+sum to 1e9-1e12, the two arms sum in different orders, and the results differ in the last two
+or three digits of ~16. Under a relative tolerance every one of them matches. **Both attempts
+were rejected on a correctness claim that does not hold**; both are still rejected, because
+both are slower, which is independent of how the answers were compared.
+
+The lesson is the comparator, and it cost two false conclusions before it was caught: **an
+exact equality over floating-point aggregates is not a correctness check on this engine.** It
+reports a failure on every large `SUM` whose summation order moved — which is every change to
+how a scan is partitioned or read. The project's own oracle
+(`tests/differential/conftest.py::assert_same`) and the benchmark harness
+(`FLOAT_ATOL`/`FLOAT_RTOL`) both tolerate this deliberately; a scratch comparison must too, or
+it manufactures exactly the defect it is looking for.
+
+**The prize was real and is still unclaimed.** A native read of q6's four columns is 287 ms at
+12.7 cores where the pyarrow fallback it actually uses costs 622 ms, and q6 is 96% read — so
+getting the native reader onto date-filtered scans is worth roughly a 2x on the queries that
+dominate this board. The route that would earn it is **teaching `to_native_predicate` to accept
+a temporal literal** (validating the column's Parquet logical type, which the footer carries)
+rather than routing around the decline in Python. That keeps one read path, one set of
+semantics, and the pruning — and it is a `bc-io`/predicate change with a correctness obligation,
+not a plumbing change.
+
+**A hypothesis ruled out cheaply along the way.** The FFI normalizes narrow numerics
+(Int8/16/32 -> Int64, Float32 -> Float64) at the boundary, which would have batcher moving twice
+the bytes DuckDB does. It does not apply here: sf10 `lineitem`'s columns are already `int64` and
+`double` physically (`column00`/`column04` INT64, `column05`/`column06` DOUBLE,
+`column10` INT32/Date), so nothing is widened and the decode gap is not a width artifact.
+
+## 2026-09-08 (single-node, the date decline) — pushing dates is a real win on two queries and a real loss on three
+
+Third attempt at the date decline, and the first one that changed the *engine* rather than
+routing around it in Python. `to_native_predicate` refused temporal literals because it could
+not verify the Parquet physical unit; a date now pushes as the tagged `{"date": <days>}`, which
+`bc_io` turns into a real `date32` and prunes with only after `ColumnIndex` confirms the column
+is a Parquet DATE. Two unit tests pin it: a date literal is pushable against a `Date32` column
+and against nothing else (with a positive control, so the gate cannot pass by refusing
+everything), and the wire spelling round-trips (`{"date": 8766}` parses as a date, bare `8766`
+does not).
+
+### The measurement, and three earlier ones it invalidates
+
+**Single variable, one sandbox, one `.so`.** Both arms are the same build; `DATE_PUSH=0` only
+makes `_native_scalar` decline a date as before, and the Rust side is inert when no date literal
+is emitted. The toggle was shown to move the translation (`{'date': 8766}` against `None`, with
+integers unchanged) before anything was timed. Arms alternate within each of three rounds.
+
+| query | pushdown OFF | ON | effect | ON vs duckdb |
+|---|---:|---:|---:|---:|
+| q6 | 641.6 ms | **512.7 ms** | **1.25x faster** | 1.90x |
+| q14 | 711.9 ms | **438.6 ms** | **1.62x faster** | 1.27x |
+| q19 (no date predicate) | 4,262.9 ms | 4,388.9 ms | no change | 6.64x |
+| q1 | 2,739.8 ms | 2,947.1 ms | 0.93x | 6.90x |
+| q12 | 3,922.3 ms | 4,819.2 ms | 0.81x | 11.40x |
+| q3 | 1,244.1 ms | 5,046.3 ms | **0.25x** | 11.80x |
+
+**q19 is the control and it is what makes the rest readable**: it has no date predicate, so the
+change cannot reach it, and it does not move. Every query matched DuckDB on both arms.
+
+Summed over the six, ON is 34% worse (18,153 ms against 13,523 ms), so it reverts.
+
+**Three earlier readings of this same change were confounded, and all three are withdrawn.**
+
+- *All of one arm, then all of the other.* Box load climbed between them, and the tell was q19 —
+  a query the change cannot affect — appearing to regress 4x. Any A/B whose control moves is
+  measuring the box.
+- *Two separately-staged sandboxes.* `pybox-q18` was staged at 18:09 and `pybox-date` two hours
+  later, so they differed by other sessions' in-flight work in `dist/`, `carbonite/` and
+  `kyber/` as well as by the change. Running the *disabled* arm inside the newer sandbox
+  reproduced the "regression" exactly, which is how this was caught.
+- *A first build in which `lit_f64` returned `None` for dates.* That was reasoned as "declining
+  is the safe direction" and is wrong: `None` does not decline the row filter, it means "no
+  estimate" and routes to the **measured probe** — a real decode of the predicate column per row
+  group. Fixed by interpolating day numbers, which is well-defined because `bounds_f64` reads a
+  DATE column's `INT32` stats as day numbers too. (The fix did not change the verdict, so the
+  probe was not the dominant cost either.)
+
+### The A/B above is itself unreliable, and the reason is a finding
+
+Chasing q3's 4x led somewhere more useful than a gate. **q3 at sf10 is bimodal**: runs land in
+one of two tight clusters, ~1.0 s or ~5.3 s, and nothing in between. Twenty runs, four rounds,
+both arms:
+
+| | fast-mode minimum | runs in the ~5.3 s mode |
+|---|---|---:|
+| pushdown OFF | 962, 962, 967, 1025 ms | 4 of 20 |
+| pushdown ON | 973, 1271, 1435, 1310 ms | 15 of 20 |
+
+**The mechanism is not identified, and two candidates were tested and did not hold.** This
+paragraph first asserted the adaptive route bandit: `api/adaptive/gating.py` records staging
+costing q3 3.1x at sf10, and `_learned_adaptive_route` is a UCB1 bandit whose evidence expires,
+which would produce exactly this shape. That was an *inference from a plausible reading*, which
+`.claude/rules/testing.md` warns is the more dangerous kind of claim because it arrives with
+evidence attached. Two controlled checks:
+
+- **Route.** Wrapping `resolve_adaptive` and recording its verdict per run: `adaptive=False` on
+  all 14 runs, 12 slow and 2 fast alike. But this check is **weak and does not settle it** — the
+  probe patched `gating.resolve_adaptive`, and the conductor does not read the name from there
+  (patching `orchestration.run` found no such attribute), so the spy may have observed a
+  different call site than the one that governs execution. Adaptivity is therefore *unproven*,
+  not refuted, and a stronger probe would instrument the staging loop itself.
+- **Contention.** Load average recorded per run: 5.8-7.1 across the whole set, flat, with the
+  single fast run occurring at the **highest** load of the fourteen. A bursty neighbour would
+  produce two modes, so this was the better simple explanation, and it does not fit.
+
+What is established is the observation, not the cause: q3 alternates between roughly 1.0 s and
+4-6 s, the split is not explained by box load, and the proportion of fast runs itself varies
+between sessions (4 of 5 in one set, 1 of 14 in another).
+
+**This invalidates the per-query numbers in the table above rather than confirming them.** A
+min-of-3 catches the fast mode most of the time for one arm and rarely for the other, which is
+how a neutral result became a 4x regression. Re-running with seven attempts per query moved q12
+from 3,922 ms to 1,866 ms with nothing else changed, so q12 is bimodal too -- and its "0.81x
+slower" is the same artefact. A later reading then put q6's ON arm at 1,813 ms where the
+earlier one had 512.7 ms, on the same sandbox and engine.
+
+**So the honest statement is that this box cannot currently measure an effect of this size.**
+The variance across identical runs exceeds the 1.25-1.62x the change is worth. Three separate
+conclusions in this session were drawn from timings inside that variance, and all three had to
+be withdrawn. The change stays reverted because reverting is the conservative option when the
+measurement cannot decide, **not** because it was shown to be slower.
+
+### The bimodality is worth fixing on its own account
+
+Independent of any of this: a benchmark query that takes 1.0 s or 5.3 s run to run makes every
+number recorded for it a sample from a mixture. q3 sits on this board at 1.04x-2.76x across this
+file's entries, and that spread is now at least *explicable* even though the cause is not known.
+Anyone reading a per-query figure for q3 or q12 should treat it as a draw rather than a
+measurement, and anyone chasing it should start by instrumenting the staging loop directly
+rather than `resolve_adaptive`, for the reason above.
+
+### Why it is reverted rather than gated, and what a gate would need
+
+The wins are not noise and they are on the right queries: q6 and q14 are the two most
+read-dominated on this board, and q6 reaches **1.90x DuckDB** where it sits at 2.14-2.48x
+without the change. A cost gate that pushed dates only where they pay would be a net win.
+
+**The obvious discriminator does not survive contact with the data.** "Push a selective date"
+predicts q6 and q14 (which keep ~14% and ~1.2% on the date alone) and predicts q1 (98.5%, a
+loss) — but it also predicts q12, whose bounded one-year range on `l_receiptdate` keeps about
+the same fraction as q6's and which **loses 0.81x**. Single-table versus joined does not
+separate them either: q14 joins `part` and wins, q12 joins `orders` and loses. With no model
+that fits all six, a gate would be a guess dressed as a cost decision, and this file already
+has enough of those.
+
+So it is reverted whole — `native.py`, `predicate.rs` and `row_filter.rs` are byte-identical to
+HEAD — and what is left is the measurement a fourth attempt should start from: **the mechanism
+works and is sound; the missing piece is a rule that separates q6/q14 from q3/q12, and finding
+it means understanding why q3 costs 4x rather than assuming selectivity explains it.**
+
+## 2026-09-08 (single-node, the instrument) — CPU time is measurable on this box, wall clock is not
+
+Every wrong conclusion in this session came from the same place: a wall-clock timing on a shared
+head node, where a neighbour's burst is indistinguishable from an engine effect. The fix is not
+more repetitions, it is a different instrument.
+
+**`os.times()` CPU is stable here to 1-3%; wall clock swings up to 5x on identical work.** Same
+query, same sandbox, same `.so`, different rounds:
+
+| | reading 1 | reading 2 | reading 3 |
+|---|---:|---:|---:|
+| q1 CPU | 11,520 ms | 11,530 ms | 11,430 ms |
+| q14 CPU | 7,100 ms | 7,100 ms | 7,180 ms |
+| q19 CPU | 16,190 ms | 16,320 ms | 16,410 ms |
+| q6 **wall** | 655 ms | 1,711 ms | 473 ms |
+
+A neighbour stealing cores inflates wall time and leaves CPU alone, so for two variants doing
+the same work CPU is what discriminates. This is the measurement note that should have been
+written first.
+
+### What CPU says, and it is the one number that has reproduced all day
+
+Batcher uses **1.6-2.1x DuckDB's CPU** on every sf10 query measured (q1 2.06x, q3 1.88x,
+q6 1.79x, q12 1.88x, q14 1.58x, q19 1.87x). That is the real, stable single-node gap, and it is
+consistent with the decode decomposition recorded earlier: the reader costs roughly 1.5x per
+column and the aggregate is better than DuckDB's.
+
+**Do not read a per-query wall ratio from this board as an engine property.** The wall gap
+decomposes exactly as `CPU ratio x occupancy ratio`, and the occupancy term is where the
+contention lands: q6 measured 10.2 occupied cores in one run and 3.5 in another with identical
+configuration. An earlier draft of this entry treated that variation as structural and built an
+argument on it; it is not.
+
+### A hypothesis this retired: the learning loop is not the cost here
+
+`competitive_architecture.md` ceiling 9 measures ~70% of a *small* grouped query going to
+`learn_column_stats` / `close_plan_learning_loops` and the optimizer's statistics. q1 groups into
+4 rows and q12 into 2, so the obvious inference is that the same thing explains their low
+occupancy on this board.
+
+It does not. Stubbing both loops and alternating the arms across three rounds, by CPU:
+
+| query | loop on | loop off | saved |
+|---|---:|---:|---:|
+| q1 | 12,190 ms | 12,480 ms | **-2.4%** |
+| q6 | 5,320 ms | 5,130 ms | 3.6% |
+| q12 | 11,410 ms | 12,230 ms | **-7.2%** |
+| q19 | 17,570 ms | 17,880 ms | **-1.8%** |
+
+Three of the four are negative — stubbing the loop measured *slower* — which is what "no effect"
+looks like against this noise floor. Every answer was unchanged.
+
+**A single non-alternated comparison of the same thing said 3.6x.** It put q6 at 1,711 ms with
+the loop and 473 ms without, and 3.5 occupied cores against 10.7. That reading was noise, and it
+was compelling: it agreed with a documented ceiling, it had a plausible mechanism, and it was
+wrong. Ceiling 9's finding stands for the shape it was measured on; it does not carry to sf10
+TPC-H, and this is the fourth conclusion this session to survive a first measurement and die to
+an alternated one.
+
+### The bounded-range gate was never actually running, and that invalidates its measurement
+
+The date pushdown's one clear pattern was that bounded ranges (`col >= A AND col < B`) win and
+one-sided comparisons lose, so a gate admitting only the bounded case should have kept q6's and
+q14's CPU wins while returning q1/q3/q12 to baseline. Measured, it did nothing: every query came
+back at baseline CPU.
+
+**It came back at baseline because it was inert.** `_native_read_filtered` does
+`from batcher.io.predicate import to_native_predicate`, so the name it calls is bound in the
+**package** namespace at import time. The prototype patched
+`batcher.io.predicate.native.to_native_predicate`, which that caller never consults — the
+wrapper computing the allow-set never ran, the set stayed empty, and every date declined. This
+is the trap `.claude/rules/concurrent-agents.md` records verbatim ("Monkeypatch targets follow
+the name"), and it produced a result that looked like a clean negative.
+
+A second bug sat behind it: the wrapper recomputed the allow-set on every call with
+`negated=False`, and the translator recurses through `AND` branches with `negated` unchanged, so
+a sub-tree's analysis overwrote the whole conjunction's before the date leaf was reached.
+
+**Patching the package binding did not rescue it either, and the reason retires a claim made
+earlier in this file.** With the binding fixed and a probe on the read methods, q6 makes **zero**
+calls to `_native_read_filtered` in this sandbox. So the statement that a date-filtered q6 runs
+on `_pyarrow_read_filtered` — measured earlier at 621.9 ms against a 287 ms native read, and
+used to size the whole opportunity — does not describe this tree. Which path it *does* take was
+not established, and no further claim should be built on the old one until it is.
+
+### Why this line of work is being stopped rather than continued
+
+Six consecutive findings in this session were defects in the measurement rather than in the
+engine: arms run sequentially while load drifted; two sandboxes staged hours apart and differing
+by other sessions' work; exact float equality reporting reassociation as a wrong answer; single
+un-alternated readings; a monkeypatch on a name the caller does not use; and an assumption about
+a read path that does not hold. Each was individually plausible, several agreed with documented
+behaviour, and every one of them was wrong.
+
+That rate is the signal. It is not evidence about the engine, it is evidence that this box plus
+this instrumentation cannot currently support attribution at the 1.2-2x scale being chased. The
+responsible move is to stop generating candidate wins and record the one measurement that has
+reproduced all day.
+
+**The durable result: Batcher uses 1.6-2.1x DuckDB's CPU on sf10 TPC-H**, measured in-process
+against DuckDB in the same run — which is why it survives contention when everything derived
+from wall clock does not. Closing that is a decode-throughput problem, and it is the honest
+statement of the single-node gap.
+
+## 2026-09-08 (cluster) — the 100 x 4-core fleet, and what the utilisation says
+
+Recorded run for the `dist/` change below, on the live fleet: **101 nodes = 1 head + 100 workers
+x 4 cores, 400 CPU, 832 GiB, perfectly uniform.** This is the "many small workers" shape, and it
+is the one the map-multiplier collapse was measured on.
+
+### The map multiplier rule now reads the slot count, not just the fleet's shape
+
+The multiplier buys exactly two things, and they are independent:
+
+* a **dynamic re-deal**, which needs the barrier to still hold partitions after its initial
+  fill — `workers x multiplier` against a pool `workers x map_slots_per_worker()` deep, so it
+  needs `multiplier > slots` and says nothing about the fleet; and
+* a **core-weighted initial deal**, which only means anything when the workers differ.
+
+The first version of the collapse tested only the second. At the shipped defaults (both 4) that
+is the same decision, which is why it measured correctly — but configuring
+`map_partition_multiplier = 8` against 4 slots would have collapsed it to 1 and discarded a
+re-deal that had just become reachable, on exactly the widest fleets. The condition is now
+`1 < multiplier <= _map_slots() and _fleet_is_uniform(workers)`.
+
+**Behaviour is unchanged at the defaults**, verified against the real shape:
+
+| fleet | map partitions for 100 workers |
+|---|---:|
+| uniform 100 x 4 (this cluster) | **100** — the 34%/43% win, unchanged |
+| uniform, grants spelled out | 100 |
+| heterogeneous (50 x 4 + 50 x 96) | 400 — core-weighted deal kept |
+| no envelope (unit test, pre-fleet) | 400 — unchanged, conservative |
+
+The new boundary test is checked against the *old* rule rather than only asserted: at
+`multiplier = slots + 1` on a uniform fleet the old rule returns 8 where the test requires 40,
+so it discriminates instead of passing vacuously.
+
+### sf100, five pipelines, on an idle cluster — and two numbers not to quote
+
+| pipeline | batcher | ray data | batcher util | ray util |
+|---|---:|---:|---|---|
+| scan_count | 1 ms | 6,610 ms | 0%, **0 of 101 nodes** | 9% mean, 38 nodes |
+| filter_count | 317 ms | 2,821 ms | 50% mean / 71% peak, 101 nodes | 20% mean / 76% peak, 101 nodes |
+| groupby | 290 ms | ERR | 35% mean / 57% peak, 101 nodes | — |
+| join | 2,621 ms | ERR | 48% mean / 100% peak, 101 nodes | — |
+| udf | 887 ms | ERR | 66% mean / 100% peak, 101 nodes | — |
+
+**`scan_count`'s 4,474x is not a distributed win and must not be quoted as one.** Batcher used
+*zero nodes*: it answered `count(*)` from the Parquet footers in 1 ms. That is a better plan and
+worth having, but Ray Data did real distributed work (38 nodes) for its 6,610 ms, and comparing
+the two as cluster throughput is a category error.
+
+**The `ERR`s are an artefact of engine ordering, not a Batcher result.** `bench_engine`'s own
+docstring says it plainly: Batcher runs first on a clean cluster, Ray Data leaks its actors for
+the life of the process, and Daft runs third inheriting Ray's residue as well as its own,
+because **only Batcher has release hooks** (`release_session_fleet`, `release_inference_pools`).
+Daft's failure is `No flotilla workers became available within 120s (100 attempted)` — that is
+Ray Data starving it. Confirmed Batcher is not the cause: after the sweep the cluster reports
+400/400 CPU free and no Batcher actors alive at all.
+
+So the one clean comparison in that table is **filter_count at 8.89x**, where Batcher also
+occupies the fleet better than Ray Data does (50% mean against 20%).
+
+### The rotation was run, and it corrects the attribution above
+
+`BENCH_ENGINE_ORDER=daft,batcher,ray` at sf100, giving Daft the clean cluster Batcher normally
+gets:
+
+| pipeline | batcher | ray data | vs ray | batcher util | ray util |
+|---|---:|---:|---:|---|---|
+| scan_count | 2 ms | 7,281 ms | 4,396x | 0%, 0 of 101 nodes | 18% mean, 87 nodes |
+| filter_count | 303 ms | 2,619 ms | **8.65x** | 45% mean / 72% peak | 36% mean / 96% peak |
+| groupby | 306 ms | ERR | — | 34% / 60% peak | — |
+| join | 2,069 ms | ERR | — | 54% / 100% peak | — |
+| udf | 845 ms | ERR | — | 49% / 100% peak | — |
+
+**Daft errored again, running first on an idle cluster.** So the earlier paragraph's attribution
+— that Ray Data's leaked actors starved it — is **wrong**, and is corrected here rather than
+left standing: Daft fails on this fleet regardless of order, which makes it an environment
+problem of Daft's own and not a Batcher result either way. No `vs_daft` number should be quoted
+from this cluster until Daft runs at all.
+
+**`filter_count` is robust to ordering: 8.89x forward, 8.65x rotated.** That is the one
+competitive claim this fleet currently supports, and Batcher wins it on utilisation as well as
+on time. Ray Data's own utilisation moved a lot between the two orders (20% -> 36% mean, 38 ->
+87 nodes on `scan_count`), which is what the harness's warning about residue predicts and
+another reason to trust only the arm that reproduced.
+
+### What the utilisation actually says about this fleet shape
+
+Batcher engages all 101 nodes on every pipeline that distributes, which is what the map-barrier
+and fleet work was for. But **mean utilisation is 35-66% against peaks of 57-100%**, and the gap
+between mean and peak on a *uniform* fleet is the signature of a barrier — intervals where most
+of the fleet is waiting on the slowest member rather than working. That is the remaining
+multi-node headroom, and it is a different problem from the single-node decode gap recorded
+earlier in this file: nothing about Parquet decode throughput explains a fleet that is 100% busy
+at its peak and 48% busy on average.
+
+### What the `ERR` column was hiding: Ray Data did not fail, it timed out
+
+`ERR` covers two very different outcomes, and reading the harness's own error prints separates
+them. In **both** orderings, identically:
+
+* **Ray Data — `TIMEOUT (>180s)`** on `groupby`, `join` and `udf`. Not a crash: it was still
+  running when the per-engine cap fired.
+* **Daft — `No flotilla workers became available within 120s (100 attempted)`** on every
+  pipeline, first or third, idle cluster or not.
+
+That makes the Ray Data comparison far stronger than the table suggested, with three of the four
+figures **bounded below by the cap rather than measured**:
+
+| pipeline | batcher | ray data | speedup |
+|---|---:|---:|---:|
+| filter_count | 303 ms | 2,619 ms | **8.65x** (measured) |
+| groupby | 306 ms | >180,000 ms | **>588x** (floor) |
+| udf | 845 ms | >180,000 ms | **>213x** (floor) |
+| join | 2,069 ms | >180,000 ms | **>87x** (floor) |
+| scan_count | 2 ms | 7,281 ms | *excluded* — 0 nodes, a footer shortcut, not distributed work |
+
+**So the multi-node bar is met against Ray Data on every pipeline that distributes**, on the
+100 x 4-core fleet, reproduced across two engine orderings. Quote the three large ones as
+"> Nx (Ray Data did not finish within 180 s)" rather than as measurements — the cap is a floor,
+and a run that completed might have been faster or very much slower.
+
+**It is not met against Daft, and it is not lost either — Daft does not run here.** It fails to
+obtain workers on this cluster regardless of ordering, which is a fact about Daft on this fleet
+and not a Batcher result. The earlier `vs_daft` figures in this file were recorded on a
+different cluster state; nothing in these two runs supports or refutes them.
+
+## 2026-09-08 (single-node, all three bars) — Polars measured at last, and it does not rescue the leg
+
+Every single-node entry in this session compared Batcher against DuckDB only, which left one of
+the two bars in the goal unevaluated. Measured now, at sf10, by **CPU time** — because the
+benchmark harness refuses to time on this box at all (`load average is 0.57 per core, threshold
+0.40 ... any timing here measures the neighbour`, another session at 176% CPU), and CPU is the
+metric that reproduced to 1-3% where wall clock swung 5x. Every row is correctness-gated against
+DuckDB with float-reassociation tolerance.
+
+| query | batcher | duckdb | polars | vs duckdb | vs polars |
+|---|---:|---:|---:|---:|---:|
+| q1 | 11,930 ms | 5,520 ms | 8,580 ms | 2.16x | **1.39x** |
+| q6 | 5,440 ms | 3,570 ms | 2,620 ms | 1.52x | **2.08x** |
+| q14 | 6,820 ms | 4,420 ms | — | 1.54x | — |
+| q19 | 17,320 ms | 8,660 ms | — | 2.00x | — |
+
+**Batcher trails Polars as well as DuckDB.** The hope worth stating and discarding was that the
+1.6-2.1x deficit is specifically against DuckDB's Parquet reader and that a different reader
+would show differently. Polars is a different reader, and on q1 it is 1.39x and on q6 2.08x — so
+the deficit is not a DuckDB-specific artefact. The single-node leg fails against both bars.
+
+q14 and q19 have no Polars figure because its SQL front-end rejects an implicit multi-table
+`FROM` (`multiple tables in FROM clause are not currently supported (found 2); use explicit JOIN
+syntax`). That is a limitation of how these queries are written here, not of Polars, and those
+two rows should not be read as Polars failing.
+
+**One process per query.** Three engines holding sf10 intermediates in a single process was
+OOM-killed on this 30 GiB box producing no output at all — the exact failure
+`.claude/rules/concurrent-agents.md` records at 22.6 GB RSS, walked into anyway. Each query now
+runs in its own process.
+
+### Why Daft cannot be measured here, and why Batcher's own hardware probe fails the same way
+
+Daft errors on every pipeline with `No flotilla workers became available within 120s (100
+attempted)`, in both engine orderings, on an idle 400/400-CPU fleet. Reading its source rather
+than guessing: flotilla creates one `RaySwordfishActor` per node, **hard-pinned** with
+`NodeAffinitySchedulingStrategy(soft=False)`, skips any that raise, and hard-fails only when none
+come up — so the per-actor reason is swallowed and has to be provoked.
+
+Provoked, by creating one actor by hand with flotilla's own constructor arguments, pinned to one
+worker: **it does not become ready in 240 s**, twice Daft's own timeout. So this is not a timeout
+that wants raising.
+
+**That is the same failure as Batcher's `hardware_probe`**, which this session spent a while
+diagnosing separately: `num_cpus: 0`, hard-pinned with `soft=False`, never completes, so
+`cluster_l3_cache_bytes()` stays `0` and cache-sized planning silently defaults. Two independent
+systems, the same shape.
+
+The distinguishing fact is that **unpinned work runs on these nodes perfectly well** — Batcher's
+fleet occupied 101/101 nodes at 100% peak CPU in the same sweep, and the probe payload run
+unpinned returns in milliseconds (on the head node). So the constraint is specific to *starting a
+hard-pinned actor or task on a worker node*.
+
+**Corrected: a hard pin is not refused here, it is slow.** This entry first concluded that
+`soft=False` "does not schedule on this cluster's workers", on the strength of a 240 s timeout.
+Raising Daft's own knob settles it — `set_runner_ray(worker_startup_timeout=600)` and Daft
+**starts and runs**, its first worker becoming ready in **265.9 s** and the query returning all
+59,986,052 rows. So the actors do schedule; 120 s and 240 s were both simply shorter than this
+fleet's first-time runtime-env materialization across 100 nodes. "Does not schedule" was a
+conclusion drawn from two timeouts, and one longer timeout refuted it.
+
+Two consequences, and neither is a Batcher result:
+
+* **A `vs_daft` number IS obtainable**, once Daft is given a startup timeout this fleet can
+  meet. That is a property of the harness environment rather than of Daft's execution speed —
+  the startup is paid once per process, before anything is timed, and the benchmark's own warmup
+  absorbs it. Measured with it raised, below.
+* **Batcher's cache-sized planning is defaulted on this fleet** for the same reason, which is a
+  real if separate cost — the broadcast-join threshold is sized by config rather than by what a
+  4-core worker's L3 can hold.
+
+### An attempted fix for the probe, and why it was reverted unvalidated
+
+Replacing the hard pin with soft affinity plus a *verification* of which shape replied
+(`_profile_matches_shape`) looked right: the pin's only job is to guarantee the sample belongs
+to the shape it was aimed at, and checking the reply gives the same guarantee without demanding
+the scheduler honour a pin it evidently will not. It was implemented, and reverted.
+
+**It is not shown to help, and there is a specific reason to think it cannot.** `probe_options()`
+requests `num_cpus: 0`, so under *soft* affinity the task may land on the head node — which here
+is 15-16 cores against the workers' 4 — and the new shape check then correctly **rejects** it. So
+the change plausibly converts "pending forever" into "answers and is discarded", which is no
+better. Through Batcher's own lifecycle, with a real distributed query first, the probe still
+returned 0 profiles after 61 s with the change in place.
+
+**Most of the probe diagnosis in this session was also invalid, and it is worth saying why.**
+Every ad-hoc experiment called `ray.init()` directly and then poked `hardware_probe`, which
+bypasses `lifecycle.py` — so `_JOB_SHIPS_BATCHER` kept its module default of `True`,
+`worker_runtime_env()` returned `None`, nothing was shipped, and the payload could not
+`import batcher` on the worker. That produced a very convincing "the worker cannot import
+batcher" reading which is **a property of the test harness, not the engine**: on a foreign
+`ray.init` the lifecycle calls `set_job_ships_batcher(False)` and the package is shipped, and
+Batcher's own fleet actors demonstrably run on these workers.
+
+What survives, measured through the real path: **the probe returns nothing on this fleet, and
+`cluster_l3_cache_bytes()` is 0**, so cache-sized planning takes its default. And, independent
+of Batcher, **a hard-pinned actor does not schedule on these workers** — one pinned at a live
+worker that accepted an unpinned actor 4.8 s earlier was still not ready after 240 s. That is
+what Daft's flotilla depends on, and it is why no `vs_daft` figure is obtainable here.
+
+### The single-node deficit is strings, not decode in general
+
+"Batcher uses 1.6-2.1x DuckDB's CPU" is true of whole TPC-H queries and was read here as a
+general Parquet-decode deficit. Isolating the column type says something narrower and more
+useful. Same table, same rows, a predicate no footer can resolve so the decode is total:
+
+| column | predicate | batcher CPU | duckdb CPU | ratio |
+|---|---|---:|---:|---:|
+| `column04` `int64` | `% 7 = 3` | 1,370 ms | 1,570 ms | **0.87x — Batcher is faster** |
+| `column15` `utf8` (`l_comment`) | `LIKE '%zq%'` | 14,460 ms | 7,450 ms | **1.94x** |
+
+**Numeric decode is not the problem — Batcher wins it.** The first reading of the string row
+was that this is `competitive_architecture.md` ceiling 2 ("no string-optimized representation").
+**That is wrong, and the follow-up says so.** `LIKE '%zq%'` is two costs in one — decoding every
+value, and searching inside it — and splitting them on the same column, with every arm
+footer-opaque so the decode is total in all three:
+
+| predicate on `l_comment` | batcher CPU | duckdb CPU | ratio |
+|---|---:|---:|---:|
+| `= 'nosuchvalue'` | 5,150 ms | 5,990 ms | **0.86x — Batcher faster** |
+| `LIKE 'zq%'` (prefix) | 5,730 ms | 6,270 ms | **0.91x — Batcher faster** |
+| `LIKE '%zq%'` (substring) | 14,040 ms | 7,310 ms | **1.92x** |
+
+**String decode is fine — Batcher beats DuckDB on it.** Equality and an anchored prefix over the
+same column both decode every value and both win. The whole 1.92x is the **unanchored substring
+search**, which is one kernel rather than a representation. That is a far more tractable target
+than StringView adoption, and ceiling 2 is *not* what this row is evidence for.
+
+**It also does not explain q1.** q1 carries no `LIKE` at all — its strings are two `GROUP BY`
+keys — so its 2.16x is a different string cost (hashing and grouping) that this measurement does
+not cover, and should not be folded in with it.
+
+**Three earlier attempts at this measurement were answered from metadata and had to be thrown
+away**, which is worth recording because each looked like a result:
+
+* `min(col)` on an integer returned in **1 ms with 0 CPU** — the footer carries the bounds.
+* A sentinel `col <> '~~~~'` filter with a count returned in **1 ms with 0 CPU** for all three
+  columns: Kyber proved the predicate always-true from footer bounds and read the count off the
+  row counts, where DuckDB spent 66-471 ms. A real win, and useless as a decoder measurement.
+* The 1-char string row above reports `65x` and is an **artifact of DuckDB's** pruning, not of
+  Batcher's decoder: a two-character pattern cannot occur in a one-character value, and DuckDB
+  proves that from the column's bounds in 60 ms while Batcher decodes.
+
+The general form is the one this file keeps relearning in new clothes: **an engine that is good
+at avoiding work makes a bad subject for a microbenchmark.** Any measurement of decode has to
+defeat the metadata path first, and check that it did.
+
+**Consequence for the roadmap.** The single-node gap should not be attacked as "make the Parquet
+reader faster" — on numerics *and* on string decode Batcher is already faster than DuckDB. The
+measured deficits are narrower than that: an **unanchored substring kernel** at 1.92x, and
+whatever q1's string `GROUP BY` costs, which is still unmeasured. Neither is a reader rewrite.
+
+### The single-node deficit, finally localised: two string *operators*, not the reader
+
+Decomposing by operation rather than by query. Every arm is sf10 `lineitem`, CPU time,
+correctness-gated, and footer-opaque so no arm is answered from metadata:
+
+| operation | batcher CPU | duckdb CPU | ratio | |
+|---|---:|---:|---:|---|
+| `int64` decode + filter (`% 7 = 3`) | 1,370 ms | 1,570 ms | **0.87x** | Batcher faster |
+| `utf8` decode + equality | 5,150 ms | 5,990 ms | **0.86x** | Batcher faster |
+| `utf8` decode + prefix `LIKE 'zq%'` | 5,730 ms | 6,270 ms | **0.91x** | Batcher faster |
+| `GROUP BY` an `int64` key (50 groups) | 2,780 ms | 2,960 ms | **0.94x** | Batcher faster |
+| `GROUP BY` one `utf8` key (3 groups) | 3,390 ms | 2,090 ms | **1.62x** | Batcher slower |
+| `GROUP BY` two `utf8` keys (q1's, 4 groups) | 4,750 ms | 3,730 ms | **1.27x** | Batcher slower |
+| unanchored `LIKE '%zq%'` | 14,040 ms | 7,310 ms | **1.92x** | Batcher slower |
+
+**Batcher is faster than DuckDB at every one of these except two, and both are string work in an
+*operator*.** Not the Parquet reader — it wins on numerics *and* on string decode. Not the
+at-rest representation — decode plus an equality or an anchored prefix over the same
+`l_comment` column both win. What loses is:
+
+1. **hashing/comparing string keys in the grouped aggregate** (1.27-1.62x), and
+2. **unanchored substring search** (1.92x).
+
+This supersedes two earlier readings in this file. "The gap is Parquet decode throughput" was
+built on whole-query CPU ratios and is wrong as stated; so is the follow-up that attributed it to
+`competitive_architecture.md` ceiling 2's missing string representation. The representation is
+not what these two rows measure — a `StringView` would not obviously help either a hash of a
+3-character key or a two-character substring scan.
+
+**Why this matters for the goal.** The single-node bar is 1.5-2.2x away at the query level, and
+the operator-level breakdown says that gap is concentrated in two named kernels rather than
+spread across the engine. Both are bounded pieces of work with an oracle to check against
+(`seq == par == JIT`), unlike a reader rewrite or a representation change. That is the first
+single-node lead this session that is both measured and tractable, and it is where the next
+attempt should start.
+
+**Caveat kept deliberately.** q1 measures 2.16x end to end while its `GROUP BY` shape measures
+1.27x here, so the group-by keys are *a* contributor and not the whole of q1 — it also carries
+eight aggregates, a filter and a sort. Nothing here licenses attributing all of q1 to string
+grouping.
+
+### Where the string group-by cost is *not*, and why this stops here
+
+The obvious next step is "string keys must be falling to arrow's `RowConverter` while integers
+take a raw fold". Read before assumed, and it does not hold:
+`agg::group::hash::hash_keys_gated` already dispatches a single `Utf8`/`LargeUtf8`/`Binary` key
+to a `hash_bytes` fast path, exactly as it does `Int64` to `hash_primitive`. There is no
+`RowConverter` encode to remove on that path.
+
+The measurement argues against it too, in the opposite direction to the theory: **two** string
+keys — which cannot take the single-column fast path, since the multi-column fold is all-`Int64`
+null-free only — measured **1.27x**, better than the **1.62x** of the *one* string key that does
+take it. A `RowConverter` penalty predicts the reverse.
+
+So the cost is somewhere else in the string grouping path (the assigner rather than the radix
+combine, key comparison rather than hashing, or the group-representative gather), and **naming
+it needs a profile rather than another reading**. `perf` is unavailable on this box
+(`perf_event_paranoid = 4`), so that profile cannot be taken here.
+
+This is where the single-node investigation stops, deliberately. Every code-reading hypothesis
+in this session — the adaptive bandit, box contention, `num_cpus` starvation, permanent-pending
+bookkeeping, dead node ids, `RowConverter` — was refuted by a measurement or by reading further,
+and the one thing that consistently worked was measuring first. Continuing without a profiler
+would be generating the same class of plausible, unverifiable claim that this file already
+records six of.
+
+**What the next attempt inherits:** two named, bounded deficits (unanchored substring search at
+1.92x, string `GROUP BY` at 1.27-1.62x), an operator-level table showing Batcher *ahead* of
+DuckDB everywhere else, one ruled-out cause (`RowConverter` on the combine path), and the
+instrument that makes any of it measurable on a shared box (CPU time, alternated arms).
+
+### A profile of the string GROUP BY, and the tooling note that made it possible
+
+The previous entry stopped at "naming it needs a profile, and `perf` is unavailable
+(`perf_event_paranoid = 4`)". That was half right. **py-spy 0.4.2 is installed and
+`--native` samples Rust and C++ frames through `process_vm_readv`, which needs no perf events.**
+
+It does need one thing this box makes non-obvious: `/proc/sys/kernel/yama/ptrace_scope` is `1`,
+so a profiler may only attach to its own **descendants**. `py-spy record --pid <sibling>` fails
+silently-ish; `py-spy record ... -- python load.py`, where py-spy launches the target, works.
+That is the difference between "no profiler here" and 1,380 native samples.
+
+Sampling a `GROUP BY column08` (a 1-char string key) over sf10 `lineitem`, self time by leaf
+frame:
+
+| share | frame |
+|---:|---|
+| 14.6% | *(unresolved address)* |
+| 7.4% | `syscall` |
+| 3.5% | **`arrow::(anonymous namespace)::ConcatenateOffsets<int>`** |
+| 2.5% | `_Sp_counted_base::_M_release` |
+| 2.2% + 1.9% + 1.0% | `malloc` / `_mi_page_malloc` / arrow mimalloc `Allocate` |
+| 1.2% + 0.7% | `ReleaseExportedArray` / `ArrayExporter::Export` |
+| 1.0% + 0.6% | `RecordBatch::from_pyarrow` / `ImportedArrowArray::consume` |
+
+**What this suggests, and how firmly.** The resolved frames are dominated by Arrow **C++**
+allocation and by the FFI boundary — `ConcatenateOffsets` is arrow-cpp joining the *offset*
+buffers of string arrays, which is work a string column pays and a fixed-width one does not, and
+the export/import frames are the Python-to-Rust crossing. There is no Rust hashing or
+key-comparison frame anywhere near the top, which is consistent with the earlier finding that
+`hash_bytes` already gives single string keys a fast path.
+
+**It is a hint, not a conclusion.** The single largest frame is an unresolved address, so ~15% of
+the profile is unattributed and could change the picture entirely; the sample is one shape on one
+box; and a 3.5% frame is not by itself an explanation for a 1.62x ratio. What it does do is move
+the next hypothesis from "the grouping kernel is slow" — which the `hash_bytes` fast path already
+argues against — to "string columns pay at the Python/Arrow boundary", which is the same boundary
+the pipelining entry earlier in this file measured as strictly serial.
+
+## 2026-09-09 (cluster) — Daft measured at last: the multi-node leg is met against both engines
+
+With `set_runner_ray(worker_startup_timeout=600)` Daft starts on this fleet and runs. sf100,
+100 x 4-core workers, engine-major (Batcher, then Ray Data, then Daft), best-of-2,
+`BENCH_ENGINE_TIMEOUT=400`:
+
+| pipeline | batcher | ray data | daft | vs ray | vs daft | batcher util |
+|---|---:|---:|---:|---:|---:|---|
+| scan_count | 2 ms | 9,299 ms | 267 ms | *(4,129x)* | *(118.75x)* | 0%, **0 of 101 nodes** |
+| filter_count | 282 ms | 2,902 ms | 1,701 ms | **10.28x** | **6.03x** | 33% mean / 50% peak, 101 nodes |
+| groupby | 322 ms | TIMEOUT >400s | 1,200 ms | — | **3.72x** | 17% / 58%, 101 nodes |
+| join | 1,845 ms | TIMEOUT >400s | 201,165 ms | — | **109.04x** | 45% / 100%, 101 nodes |
+| udf | 744 ms | TIMEOUT >400s | ERR | — | — | 60% / 100%, 101 nodes |
+
+**Batcher beats Daft on every pipeline where both produced a number** — 6.03x on `filter_count`,
+3.72x on `groupby`, and 109x on `join`, where Daft took **201 seconds** to Batcher's 1.8. And it
+beats Ray Data on the one pipeline Ray finished (10.28x) while Ray timed out at 400 s on the
+other three, which Batcher completes in 0.3-1.8 s.
+
+**`scan_count` is bracketed on purpose and must not be quoted.** Batcher used **zero nodes**: it
+answers `count(*)` from the Parquet footers in 2 ms. That is a better plan, not distributed
+throughput, and both competitors did real work for their numbers.
+
+**What changed to make this measurable, and it was not Batcher.** Daft had failed on this fleet
+in every previous run with `No flotilla workers became available within 120s (100 attempted)`,
+which this file first recorded as "hard-pinned actors do not schedule here". That was wrong:
+they schedule, slowly — the first flotilla worker becomes ready in **265.9 s**, because this
+cluster materializes a runtime env across 100 nodes on first use. The default timeout is simply
+shorter than that. The cost is paid once per process, before any pipeline is timed, and the
+harness's own warmup pass absorbs it, so raising it removes a harness artefact rather than
+granting Batcher an advantage.
+
+**Status against the goal.** The multi-node leg is **met against both Daft and Ray Data**,
+on the queries where a comparison exists, on the 100 x 4-core fleet. The single-node leg is
+**not** met: Batcher remains 1.5-2.2x DuckDB and 1.4-2.1x Polars on sf10 by CPU, with the
+deficit localised to two string operators (see the operator-level table above).
+
+### The offset-concatenation hypothesis is refuted, and the string gap is relative not absolute
+
+The profile put `ConcatenateOffsets<int>` near the top, suggesting the string `GROUP BY` pays per
+*batch* at the Arrow boundary rather than per row in the kernel. `NATIVE_READ_BATCH` tests that
+without touching engine code: raising it produces proportionally fewer, larger batches over the
+same data, so a per-batch cost must fall.
+
+| `NATIVE_READ_BATCH` | utf8 key CPU | int64 key CPU (control) |
+|---:|---:|---:|
+| 65,536 | 3,270 ms | 2,680 ms |
+| 262,144 | 3,580 ms | 3,210 ms |
+| 1,048,576 | 3,580 ms | 3,130 ms |
+
+**16x fewer batches does not reduce it — CPU rises slightly, and the integer control rises with
+it.** So the cost is not per-batch offset concatenation, and a 3.5% profile frame was not the
+explanation for a 1.62x ratio. That is the second string hypothesis refuted (after
+`RowConverter`), both by measurement rather than by reading.
+
+**What the numbers do say, and it reframes the gap.** Within Batcher, a `utf8` group-by costs
+only **1.15-1.22x** its `int64` group-by. Against DuckDB the same two shapes are **1.62x** and
+**0.94x**. So Batcher's string handling is not unusually bad in its own terms — *DuckDB's is
+unusually good relative to its own integer path*. The gap to close is therefore a specific
+optimisation DuckDB has and Batcher does not, in string grouping, rather than an inefficiency
+visible from Batcher's own internals. Nothing measured here says which one.
+
+That is where the single-node investigation stands: two refuted mechanisms, one reframed target,
+and no further hypothesis worth spending engine changes on without deeper profiling than 1,380
+samples with 15% unresolved.
+
+### It is not strings — it is small results. Crossing type against cardinality
+
+The string story survived two refutations (`RowConverter`, per-batch offset concatenation) and
+then failed the obvious control: **hold the type and vary the cardinality**. One sf10 file
+(6,001,215 rows, so the high-cardinality arms fit in memory), same aggregate, CPU time:
+
+| group key | batcher CPU | duckdb CPU | ratio | groups |
+|---|---:|---:|---:|---:|
+| `utf8` low-cardinality | 330 ms | 210 ms | 1.57x | 3 |
+| `int64` low-cardinality | 290 ms | 200 ms | **1.45x** | 50 |
+| `utf8` high-cardinality | 2,490 ms | 5,090 ms | **0.49x — Batcher 2.0x faster** | 4,580,667 |
+| `int64` high-cardinality | 410 ms | 1,230 ms | **0.33x — Batcher 3.0x faster** | 1,500,000 |
+
+**The integer arm loses at low cardinality too (1.45x), and both types win at high
+cardinality** — at *this* row count. Putting that beside the 60M-row numbers is what makes it
+readable, and the first draft of this paragraph ("type is not the variable, result size is")
+**over-corrected**:
+
+| group key | 6M rows (one file) | 60M rows (all of sf10) |
+|---|---:|---:|
+| `int64` low-cardinality | 1.45x | **0.99x** |
+| `utf8` low-cardinality | 1.57x | **1.67x** |
+| `int64` high-cardinality | 0.33x | 0.77x (15M groups, 817 ms vs 1,063) |
+| `utf8` high-cardinality | 0.49x | *(OOM on this box)* |
+
+**Both effects are real and they separate by scale.** At 6M rows a fixed per-query overhead
+dominates and *both* types sit near 1.5x — which is the small-result floor. At 60M rows that
+overhead is amortized and the two diverge: the integer key recovers to parity (0.99x) while the
+string key does not (1.67x). So there **is** a string-specific cost that scales with rows, and it
+is visible only once the query is big enough for the floor to stop hiding it.
+
+The honest reading is therefore *two* deficits, not one: a **small-result floor** that catches
+every shape at low row counts, and a **string grouping cost** that persists at scale where the
+integer path reaches parity. q1 has both — 4 groups *and* two string keys — which is consistent
+with it being the worst row on the board at 2.16x.
+
+That lands on ground this project already mapped: `competitive_architecture.md` ceiling 9 ("a
+small `GROUP BY` pays most of its wall time learning, not aggregating") and the closing note of
+its operator sweep — "every shape Batcher loses is a small result, and every one of them is the
+same floor". q1 groups into **4 rows**; q6 returns **1**. They are that floor.
+
+**But ceiling 9's stated mechanism does not survive either.** Its measured cause is the
+cross-query learning loop and the optimizer's statistics. Stubbing both and alternating arms
+across three rounds moved sf10 CPU by **-2.4% to +3.6%** — three of four negative. So the floor
+is real and reproduced here, and what pays for it is *not* the learning loop at this scale.
+
+**Where that leaves the single-node leg.** Batcher is faster than DuckDB at numeric decode,
+string decode, prefix matching, and — decisively — at high-cardinality grouping of both types
+(0.33x and 0.49x). It loses on two separable things: the **small-result floor**, which catches
+integers and strings alike at low row counts and is *not* the learning loop; and **string
+grouping at scale**, where the integer path reaches parity at 60M rows and the string path stays
+at 1.67x. That is a sharper statement of the gap than this session started with, and it is *not*
+a fix.
+
+### The string-grouping deficit is `competitor_technique_review.md` item 6, and the payoff is bounded
+
+The 1.67x on a low-cardinality `utf8` group-by at 60M rows has a name already. DuckDB's *string*
+low-card group-by (1,950 ms) is **faster than its own integer** one (2,770 ms) — an inversion
+that only happens when the engine groups on dictionary codes rather than on values, and
+TPC-H's `l_returnflag`/`l_linestatus` are dictionary-encoded in Parquet.
+
+Batcher has that kernel. `assign_groups` grouping over a `Dictionary` exists and is tested;
+`bc-interp/tests/dictionary_operators.rs` checks twelve operators against the decoded oracle on
+all three executors. **It is unreachable from a query**: `bc_py::normalize_to` rewrites
+`Dictionary(_, value)` to `value` for every input column, so no dictionary crosses the FFI.
+
+**What this session adds to that item is a group-by-at-scale number, which it did not have.**
+The prior review measured *filters* (1.2x-2.8x, scaling with string length) and quoted ~7x for
+"grouping on codes" from a kernel microbenchmark. Here is a grouped aggregate over 60M real rows
+where the integer path reaches parity (0.99x) and the string path does not (1.67x) — the gap the
+encoding would close, measured end to end at the engine level rather than at the kernel.
+
+**And it bounds the payoff, which argues against rushing it.** The review's own honest valuation
+is **~1.2x on TPC-H-shaped short codes** (`l_returnflag` is one character) and ~2.8x only on long
+low-cardinality strings. A 1.2x does not close a 1.67x, let alone q1's 2.16x. So dictionary
+survival is *a* necessary piece of the single-node leg and not sufficient on its own.
+
+**Why it is not attempted here.** The boundary edit alone is already known to fail: preserving
+the encoding unconditionally regresses `SELECT <string col>` to **0.63x**, because the decode
+moves from ingress to an equally large egress. The working version is a *planner* rule —
+preserve when the plan consumes the column (filter, group-by, join key), decode at the leaf when
+it projects it — which is a cost model spanning Kyber, `normalize.rs` and a new egress pass. That
+is a multi-file, two-sided change with a known regression mode, and this box cannot currently
+validate a 1.2x (the harness itself refuses to time here, and wall-clock variance exceeded 2x all
+session). Starting it without the ability to measure the thing it is for would repeat the
+session's most expensive mistake.
+
+### Correction to item 6's scope: for a Parquet query the dictionary is gone *before* the FFI
+
+Item 6 and `normalize.rs`'s own NOTE both locate the loss at the FFI boundary — "a `Dictionary`
+column is decoded **at the FFI boundary** ... so no dictionary ever reaches the engine from
+Python". For a query whose input is a **Python-held dictionary array** that is exactly right, and
+its 3.9x figure (`GROUP BY id1, id2` over 10M rows: 38.8 ms plain `Utf8`, 151.5 ms
+dictionary-encoded) is a measurement of that cast.
+
+**For a Parquet-sourced query it is one layer too late.** Checked directly on sf10 `lineitem`:
+
+| | |
+|---|---|
+| `column08` encodings in the file | `('PLAIN', 'RLE_DICTIONARY')` |
+| what `bc_io::read_parquet_many` returns | **`string`** |
+| what pyarrow's reader returns by default | `string` |
+
+The column *is* dictionary-encoded on disk, and arrow-rs decodes it during the read. So by the
+time anything reaches `normalize_to` there is no dictionary left to preserve, and the
+boundary change — the one that was built, measured at 1.2x-2.8x on consuming shapes and reverted
+for regressing `SELECT <string col>` to 0.63x — **would not have moved the group-by measured
+here at all**.
+
+**This retires the estimate made one step earlier in this file.** Reasoning that "dictionary
+grouping is integer grouping, and integer low-card grouping is 0.99x, so the win is ~1.69x" was
+arithmetic on a lever that does not exist in this path. Reaching it needs the *reader* to
+preserve the encoding (arrow-rs supports this) **and** the boundary **and** the plan's
+logical-vs-physical type split — three layers, not one.
+
+So the honest statement of the single-node string deficit is: DuckDB carries dictionary codes
+from its Parquet reader through to its aggregate, and Batcher decodes them at the first step.
+Closing that is a three-layer change whose first layer nobody has costed. It is the right target
+and it is materially larger than item 6 implies.
+
+## 2026-09-09 (mixed CPU+GPU cluster) — the AI leg, and the two things that were measuring themselves
+
+Fleet: **8 x `16cpu-32gb` CPU nodes + 8 x `1xt4-8cpu-32gb` GPU nodes + head** — 192 CPU, 8
+Tesla T4 (15 GB, driver 580.126.20), 544 GiB. Every worker image carries torch 2.9.1+cu128,
+torchvision, cupy 14.2, cuDF 26.06, numpy 2.2.6, PIL. Corpora on `/mnt/cluster_storage`, read
+by the workers directly; the driver stages no rows.
+
+### At 10x the corpus the flagship result inverts, and Batcher is the engine that degrades
+
+The board below was measured on corpora of a few GB and runs of a few seconds. Re-run on a
+**24.72 GB** corpus of 163,840 images — the identical benchmark, model, batch size and fleet,
+only more data:
+
+| scale | batcher | ray data | verdict |
+|---|---|---|---|
+| 16,384 imgs (2.4 GB) | 6.88 s · **2,380 img/s** · 81% util · 8/8 nodes | 14.42 s · 1,136 img/s · 38% · 8/8 | **2.09x Batcher** |
+| 163,840 imgs (24.7 GB) | 248.71 s · **659 img/s** · 31% util · **6/8 nodes** | 105.31 s · **1,556 img/s** · 50% · 8/8 | **0.42x — Batcher loses 2.4x** |
+
+Predictions still agree to 100.000%, so this is a throughput result and not a correctness one.
+
+**Two things in that table matter more than the ratio.** Ray Data got *faster* with scale,
+1,136 to 1,556 img/s, which is what an engine built for large jobs is supposed to do. Batcher
+got **3.6x slower**, 2,380 to 659, its GPU utilisation fell from 81% to 31%, and **two of its
+eight GPU nodes stopped participating entirely**. The engine does not merely lose at scale; it
+degrades with it.
+
+**So the 2.09x on this workload was a small-scale artifact and must not be quoted.** More
+generally, every ratio on the board below was taken in a regime where actor spawn and model
+load dominate, which flatters the engine with the warm pool — and this measurement shows that
+advantage does not survive into the regime the comparison is actually about. Ray Data is built
+for jobs far larger than a seven-second one, and benchmarking it there was measuring the wrong
+thing.
+
+**The CPU→GPU pipeline, scaled the same way, does the opposite — and that is evidence.**
+122,880 JPEGs (7.30 GB) instead of 12,288:
+
+| scale | batcher | ray data | verdict |
+|---|---|---|---|
+| 12,288 imgs | 11.56 s · 1,063 img/s · 37% util | 9.43 s · 1,303 img/s · 41% | 0.82x |
+| 122,880 imgs | 61.60 s · **1,995 img/s** · **70%** util | 50.91 s · **2,414 img/s** · **79%** | 0.83x |
+
+**Both** engines roughly doubled their throughput and their utilisation, and the ratio did not
+move. So this benchmark's small-scale number was startup-dominated for both arms *equally*,
+and its 0.83x is a real steady-state loss rather than an artifact — confirmed, not retired.
+
+The two benchmarks differ in exactly the way the widening hypothesis cares about. Batch
+inference reads a **`fixed_size_list<uint8>` image column**, which the boundary expands 8x on
+the way in. The pipeline reads **compressed JPEG binary** — small rows, no list-of-uint8 at the
+source — and its decoded tensors are `arrow.fixed_shape_tensor`, which the boundary exempts
+(measured earlier at 1.0x). The workload carrying the 8x collapses at scale; the workload
+without it improves. That is a discriminating observation from two independent benchmarks
+rather than an inference from one, and it is the strongest support the hypothesis has.
+
+**Ray Train ingest, scaled 10x, loses most of its margin the same way.** 10,000,000 rows
+x 256 `f32` instead of 1,000,000:
+
+| scale | batcher | ray data | verdict |
+|---|---|---|---|
+| 1 M rows | 8.90 s · 112,307 rows/s | 16.83 s · 59,400 rows/s | 1.89x |
+| 10 M rows | 79.31 s · **126,069 rows/s** | 86.57 s · **115,499 rows/s** | **1.09x** |
+
+Ray Data nearly **doubled** its rate with scale (59,400 to 115,499); Batcher gained 12%. What
+looked like a 1.89x win is 1.09x — parity within the run-to-run variation this fleet shows.
+Worth noting that this is the workload the float half of this session's tensor fix helps most
+(`feat` is `fixed_size_list<float32>`, no longer widened), and it still only reaches parity.
+
+The corrected correctness gate did its job here for the first time at scale: both arms consumed
+9,998,336 rows, the checksums differ by 29,929, and that is attributed to a different
+`drop_last` tail rather than reported as a mismatch.
+
+### LLM batch inference holds up at scale, and it is the one genuine >10x
+
+16x the corpus — 32,768 prompts instead of 2,048, so Ray Data's run is nearly five minutes and
+its per-execution model reload is a few percent of it rather than a third:
+
+| scale | batcher | ray data | verdict |
+|---|---|---|---|
+| 2,048 prompts | 1.40 s · 1,461 prompt/s | 29.23 s · 70 prompt/s | 20.85x |
+| 32,768 prompts | 21.37 s · **1,533 prompt/s** | 286.83 s · **114 prompt/s** | **13.42x** |
+
+Generated text agrees to 100.000%.
+
+**Batcher's rate is flat across the 16x** (1,461 to 1,533), which is what an engine should do
+and the exact opposite of what batch inference did. Ray Data's rate rose from 70 to 114 as its
+reload amortized, and then stopped: **114 prompt/s against 1,533 is a steady-state gap, not a
+startup one.** The 20.85x was inflated by reload; the 13.42x is not, and it survives the
+objection that killed the other headline numbers.
+
+**This is where a 10x actually lives.** On batch inference both engines run the identical
+ResNet-50 on the identical T4s, so the model forward is a floor both share and 10x is not
+physically available — 10x Ray's 1,556 img/s would need 1,945 img/s per T4, above what the
+device does under PyTorch. Iterative generation is different: it is launch- and
+scheduling-bound rather than kernel-bound, which is precisely where an engine's machinery
+decides the answer, and where Ray Data's per-execution actor pool and block scheduling cost it
+an order of magnitude. The lesson for where to look next is that one: **multiples come from
+shapes Ray Data is structurally weak on, not from shapes where both engines call the same
+kernel.**
+
+### The mechanism: residency scales with partition size, and a worker gets OOM-killed
+
+Slices of the *same* 24.72 GB corpus, so the only variable is how much of it is read:
+
+| imgs | disk | widened | per GPU node | wall | img/s |
+|---:|---:|---:|---:|---:|---:|
+| 16,384 | 2.47 GB | 19.7 GB | 2.5 GB | 196.4 s | 83 — first run, cold start |
+| 40,960 | 6.17 GB | 49.3 GB | 6.2 GB | 23.1 s | **1,775** |
+| 81,920 | 12.33 GB | 98.7 GB | 12.3 GB | 50.6 s | **1,620** |
+| 163,840 | 24.66 GB | 197.3 GB | **24.7 GB** | 136.1 s | **1,204** |
+
+**At the last point Ray killed a worker**, and said why:
+
+```
+Worker exit type: SYSTEM_ERROR ... Worker unexpectedly exits with a connection error code 2.
+Some common causes include: (1) the process was killed by the OOM killer due to high memory
+```
+
+That is the benchmark's "6 of 8 gnodes" — actors dying and restarting, not idle scheduling.
+
+**The arithmetic identifies it precisely.** 160 shards across 8 actors is 20 shards each, 3.1 GB
+on disk, **24.7 GB per actor once widened** — against 32 GB nodes. Not 24.7 GB spread over the
+fleet: 24.7 GB *in one actor*, which is why the wall is where it is.
+
+**And that is the defect, more than the widening is.** This plan passes an explicit
+`batch_size`, so `stream_eligible` puts it on the streaming path, where
+`_lazy_partition_source` is documented to read its splits incrementally so that "reading chunk
+k+1 overlaps the GPU forward on chunk k". If residency were bounded by that, per-actor
+partition size would not matter and there would be no OOM at any corpus size. It OOMs at
+24.7 GB per actor and not at 12.3, and throughput declines monotonically with per-actor bytes
+(1,775 -> 1,620 -> 1,204). **Residency tracks the partition, not the batch.**
+
+The `uint8` 8x widening is the multiplier rather than the cause: it makes a 3.1 GB partition
+into a 24.7 GB working set, so the wall arrives eight times sooner than it otherwise would.
+Both are worth fixing and they are separate bugs. The residency one is the reason a
+larger-than-memory corpus cannot run at all, which is the property the streaming path exists
+to provide.
+
+**The mechanism is not established.** The arithmetic that fits is the `uint8` widening: `img`
+is `fixed_size_list<uint8>[150528]`, which the boundary expands 8x, so 2.4 GB on disk is
+19.7 GB resident (2.5 GB per GPU node) while 24.7 GB is **197 GB** (24.7 GB per node against
+32 GB of RAM). That would explain the utilisation drop, the idle nodes and the cliff — and it
+is a hypothesis with five refuted predecessors this session, so it is being tested with a
+scale sweep over slices of the same corpus rather than written down as the answer. A cliff
+where the widened per-node share approaches node memory would support it; smooth degradation
+would not.
+
+### Read the board with this first: most of these runs are too short to mean much
+
+Every timed run below finishes in **0.4 to 17 seconds**, and at that scale a comparison against
+Ray Data is largely a comparison of *startup*. Ray Data respawns its actor pool per execution
+and reloads the model with it; Batcher keeps a session-warm pool. That is a real engine
+difference and it is the dominant term in a fifteen-second run — which means several of these
+ratios are measuring model-load amortization and calling it throughput.
+
+The ones most affected are the largest: **text embeddings (29.5x)** on a 0.41 s run and **LLM
+(20.85x)** on a 1.40 s run are close to pure startup comparisons, and **image generation
+(7.77x)** and **training ingest (9.36x)** are not much better. They are not wrong about what
+they measure; they are wrong to be read as steady-state rates, and this file presented them
+that way.
+
+Ray Data is built for jobs far larger than this. A fair steady-state comparison needs the
+timed region to be minutes, so that pool spawn and model load are a few percent rather than
+most of it. The corpora were therefore rebuilt at **10x** and the headline workloads re-run;
+see the section at the end. Where a scaled number exists, **quote that one**.
+
+The short-run numbers are kept rather than deleted, because the startup difference is genuine
+and worth knowing — a user whose job *is* a few seconds gets exactly that speedup. They are
+just not the throughput claim.
+
+### The board
+
+| workload | batcher | ray data | daft | verdict |
+|---|---|---|---|---|
+| GPU batch inference — resnet50, 16,384 imgs, 8 devices | **6.88 s** · 2,380 img/s · 81%/100% util · 8/8 nodes | 14.42 s · 1,136 img/s · 38%/100% | — | **2.09x** |
+| GPU text embeddings — MiniLM, 8,192 texts | **0.41 s** · 20,033 text/s | 12.07 s · 679 text/s | — | **29.5x** |
+| GPU batch inference, three-way — 10,000 S3 JPEGs | **5.50 s** | 8.36 s | 15.99 s | **1.52x / 2.91x** |
+| training ingest — 500k x 512 `f32` → torch tensors | **0.23 s** · 2,176,977 rows/s | 2.15 s · 232,521 rows/s | — | **9.36x** |
+| LLM batch inference — gpt2 FP16, 2,048 prompts, 32 new tokens | **1.40 s** · 1,461 prompt/s | 29.23 s · 70 prompt/s | — | **20.85x** |
+| image generation — DDPM UNet + DDIM, 2,048 images | **13.49 s** · 152 img/s | 104.87 s · 20 img/s | — | **7.77x** |
+| video clip inference — resnet18 over 4,096 clips x 16 frames | **TIMEOUT >900 s** (cold start; 3.2 ms/clip warm) | 7.23 s · 566 clip/s | — | **a failure, see below** |
+| Ray Train ingest — 8 GPU ranks, 1 M rows x 256 `f32`, 1 epoch | **8.90 s** · 112,307 rows/s | 16.83 s · 59,400 rows/s | — | **1.89x** |
+| two-stage CPU→GPU pipeline — JPEG decode → resnet50, 12,288 imgs | 11.56 s · 1,063 img/s · 37% | **9.43 s** · 1,303 img/s · 41% | — | **0.82x — a loss** |
+
+Correctness is gated before any timing on every row: predictions agree to 100.000% on both
+inference benchmarks and on the LLM's generated text, the three engines' checksums agree to
+0.15%, and the ingest row counts and label checksums match exactly.
+
+**The two largest ratios share one mechanism**, and it is worth naming so they are not read
+as two independent wins: text embeddings (29.5x) and LLM (20.85x) both turn on the **warm
+pool** — Batcher loads the model once per *session* and reuses it across `collect()`s, where
+Ray Data respawns its actor pool per execution. On gpt2 that is a 7-10 s load charged to every
+Ray run and to no Batcher run after the first. Both benchmarks' own docstrings name this as
+what they are built to measure. It is a real engine property and it is also a *single*
+property: a workload that executes once would not see it.
+
+Whether the image-inference 2.09x shares it is **not established here** — that benchmark also
+re-executes per run, so the mechanism plausibly applies, and nothing in this session isolated
+it. Do not add it to the list without an ablation.
+
+**`gpu_audio.py` did not run and that is not a Batcher result.** Its CPU stage is a
+`torchaudio` mel-spectrogram and this image carries torchaudio on neither the driver nor the
+workers, so both engines died in their first stage. It now skips in one line saying so.
+
+**The training-ingest row is the one that moved**, from 1.06x to 9.36x, and it moved because
+of an engine change made during this session rather than a tuning knob. See below.
+
+### Two results that were measurements of something other than an engine
+
+**The GPU relational benchmark was timing a `pip install`.** `relational_vs_raydata.py`
+reported `batcher gpu` at **63,191 ms** against Ray Data+cuDF's 13,280 ms — 0.21x, the worst
+number on the board — and the whole of it was its own `_CUDF_PIP_DEFAULT`
+(`cudf-cu13==26.6.0,numpy==1.26.4`). A `pip` block is never free: Ray builds a virtualenv for
+that environment hash once per node a task first lands on, `cluster_env.py` already measures
+that at 168 s across this fleet, and it is charged to whichever arm touches a node first —
+Batcher's. The file's own docstring records that "cuDF 26.06 imports and runs a group-by on a
+worker under numpy 2.2.6 with no runtime_env at all", so the default contradicted the
+measurement printed above it.
+
+Re-measured with RAPIDS reaching the workers off the shared mount instead
+(`init_gpu_cluster`, which is what `_init` now uses), so **both** engines get cuDF for free:
+
+| arm | ms |
+|---|---:|
+| batcher CPU, single node | **1,287** |
+| batcher GPU, distributed | 22,854 |
+| ray data + cuDF | 20,898 |
+| ray data CPU | 7,012 |
+| batcher GPU, warm | 111 |
+
+**batcher-gpu vs ray-data+cuDF is 0.91x — parity, not 0.21x.** Emptying the pin alone was
+*not* enough and is worth recording: Batcher's own GPU tasks carry the RAPIDS path themselves
+(`gpu_task_runtime_env`), so with no pip and no shared-mount staging Batcher kept working
+while Ray Data's cuDF arm lost the import entirely and failed. Removing an unfairness by
+deleting the comparator is not removing it.
+
+The separate diagnostic that isolated this measured the device floor at **12,249 ms cold and
+4,117 ms warm** for 8 raw cuDF tasks with no engine at all, against Batcher's 9,073 ms cold
+and **89 ms warm**. The warm figure is below the floor because of `cached_device_frame` —
+Parquet is immutable and the split-to-worker assignment deterministic, so a repeated query
+re-reads nothing — which is a real engine feature and also why the two are not measuring the
+same thing.
+
+**The honest verdict on this shape is not a Batcher win.** Batcher's own **CPU** engine
+answers it single-node in 1,287 ms, faster than either engine's eight-GPU run. A 60M-row
+`GROUP BY` into 1,000 groups is not work a T4 fleet should be given, and the benchmark's value
+is that it now says so instead of saying "0.21x".
+
+**The `batcher auto` arm's 71 ms in the original run must not be quoted either** — it ran
+third, on the same query, against the same warm device frames.
+
+### The stage-overlapped CPU→GPU pipeline was dead on any cluster a user attaches to
+
+`benchmarks/cluster/gpu_pipeline.py` failed outright with
+`AttributeError: 'ActorOptionWrapper' object has no attribute 'options'`. Ray's `.options()`
+does not return the actor class, it returns a wrapper exposing only `remote`/`bind`, and
+`pipeline/driver.py` applied **two** option fragments in two calls: the accelerator request
+when it built the pool, the shipped `runtime_env` when it spawned an actor.
+
+It needed both fragments non-empty to fire, which is exactly why nothing caught it. The
+`runtime_env` fragment is empty whenever Batcher started Ray itself — the whole test suite and
+the default path — and the accelerator fragment is empty for a CPU-only chain. The
+intersection is **a GPU stage on a cluster the user attached to themselves**, which is every
+stage-overlapped CPU→GPU inference pipeline on real hardware: the AI moat's own shape, and the
+one `competitive_architecture.md` ceiling 5 says was fixed by defaulting `stream_inference`
+to True. It was on by default and it could not run.
+
+Fixed by applying both fragments in one `.options(...)` on the raw class, with
+`tests/unit/test_stream_pipeline_actor_options.py` reproducing the exact production failure
+(`'_Bound' object has no attribute 'options'`) against stubs that mimic Ray's contract on the
+one point that matters. The pipeline then runs and agrees with Ray Data to 100.000% — and
+loses, 0.82x, which is a real result rather than a crash.
+
+### A tensor column was doubled at the FFI boundary, and it is 8.2x of the training loader
+
+The boundary widens narrow numerics once (`Int8/16/32 → Int64`, `Float16/32 → Float64`) so
+every operator stays on two numeric paths, and it recurses into nested types. For a **list of
+floats** that recursion was pure loss, and the loader benchmark is where it showed.
+
+Splitting `iter_torch_batches` on the 500,000 x 512 `f32` fixture (1 GB):
+
+| stage | before | after | |
+|---|---:|---:|---|
+| `iter_batches` (Arrow only) | 1,490 ms | **4.1 ms** | 364x |
+| + `to_numpy_batches` | 1,518 ms | 31 ms | 48x |
+| + `arrays_to_torch` | 1,818 ms | 173 ms | 10.5x |
+| **full `iter_torch_batches`** | **1,866 ms** | **227 ms** | **8.2x** |
+| full, `zero_copy=True` | 1,632 ms | 113 ms | 14.4x |
+
+**82% of the loader was one cast.** `pyarrow`'s own re-batching of the same table is 1.9 ms,
+against `iter_batches`' 1,490 — and it was flat in batch size, so it was never re-batching. It
+was `fixed_size_list<float32>[512]` → `fixed_size_list<double>[512]`: 1 GB in, 2 GB out, at
+0.68 GB/s. Flat columns went through at 6-20 GB/s (zero-copy) the whole time; only the list
+ones were copied. The caller also got `float64` tensors back from a `float32` corpus.
+
+**The engine already had the right path and the column could not reach it.** `normalize_batch`
+exempts an Arrow *extension* column — "opaque at the boundary, never rewrite its storage type"
+— so the identical data carrying `arrow.fixed_shape_tensor` took **0.9 ms** and kept its
+`float32`. A plain `FixedSizeList<Float32>`, which is what `pa.FixedSizeListArray`, Ray Data,
+a Parquet round-trip and every ML corpus produce, did not.
+
+So `bc_py::normalize_list_element` now leaves a float leaf reached through list containers at
+its own width, and `plan.types.lattice::_widen_element` mirrors it in the same change. What
+made that safe to do rather than plausible:
+
+- **The kernels already read an `f32` child**, because the extension path has always handed
+  them one. Run both ways over the whole `.list` surface, **62 of 63 operations agree** — to a
+  2e-6 relative tolerance, which is the comparison that was actually made and not a claim of
+  bit-identity; the two arms sum in different precisions by construction — and the 63rd
+  (`flatten`) fails identically on both.
+- **Nine relational shapes that *carry* a tensor** — filter, sort, limit, group-by, join,
+  distinct, union, `with_columns`, `iter_batches` — agree on row count, on the produced
+  element type, and (where a value was reduced) on the reduction, exactly.
+- **No new schema divergence.** The same 21 `.list` operations have an absent Python type
+  prediction on both engines; only the produced element width changed. Nothing that predicted
+  correctly started lying.
+- **DuckDB was asked, and it reports `FLOAT[]`** for a `list<float32>` column. The widening
+  was the divergence; this is the agreement.
+
+**The integer arm is deliberately untouched**, and the asymmetry is the point. Its
+justification is not width but wrap — an `int32` element that later reaches arithmetic
+overflows silently — and the two oracle-backed integer tests in
+`test_diff_nested_narrow_normalize.py` are unchanged and green. A float does not wrap.
+
+`test_diff_nested_narrow_normalize.py::test_nested_list_narrow_float_widens` did pin the old
+behaviour, and it is worth saying exactly why replacing it is not weakening a differential
+test: **it took no `duck` fixture and consulted no oracle.** It was a note about the boundary
+sitting in a file whose other cases are oracle comparisons. Its replacement asks DuckDB.
+
+### The kernel gap this uncovered, fixed on its own account
+
+`eval/list.rs`'s exact-integer `sum`/`avg` arm listed `Int8|Int16|Int32|Int64` and no unsigned
+width, so an unsigned child fell through to the `Float64` view — losing the low bit above 2^53,
+which is the exact bug that arm exists to fix, and returning `Float64` where the signed column
+of the same values returns `Int64`. It was unreachable only because the boundary widened every
+unsigned column before a kernel could see one. `UInt8|UInt16|UInt32` are now in it (`UInt64` is
+not: it is the one width that does not fit `Int64`). Two tests pin it; both fail before.
+
+### Ray Train: 1.89x on the loop, and two numbers that must not be read as one
+
+The workload the goal names first, finally scored: **8.90 s against 16.83 s** on the training
+loop, the slowest of eight ranks each way, with both arms consuming exactly 999,424 of the
+corpus's 1,000,000 rows.
+
+**The trainer *wall* times are 334.1 s and 31.2 s and they are not an engine comparison.**
+Batcher's arm runs first and pays this workspace's per-node runtime-env build for the
+`RayTrainWorker` actors; Ray Data's arm then finds those environments warm. That is why the
+benchmark scores the loop and prints the wall beside it rather than instead of it, and why the
+wall figure should be quoted only with that sentence attached.
+
+**The correctness gate was wrong and reported MISMATCH on a correct run.** It demanded the two
+arms produce the same label checksum. They consumed the same *number* of rows and not the same
+rows: `drop_last` discards a ragged tail per rank, the two shard differently
+(`files[rank::W]` against Ray Data's block split), so they drop different tails, and neither
+engine promises otherwise. The delta was 9,374 — **1.6%** of the 575,424 that a different
+576-row tail can account for.
+
+It now checks each arm against the **corpus** instead of against the other engine, which is
+the stronger claim as well as the correct one: labels are non-negative, so dropping rows can
+only lower the sum and only by the dropped count times the largest label. An arm that
+duplicated a shard, skipped one, or read the wrong rows fails it; an arm that dropped a
+different tail does not. Both properties are exercised rather than asserted.
+
+### The video benchmark times out on **cold start**, not on throughput — a correction
+
+Batcher timed out at 900 s on `gpu_video.py` where Ray Data finished in 7.23 s, with no error.
+The obvious explanation was the uint8 expansion, and **this file said so before it was
+measured**. That was wrong, and the correction is the useful part.
+
+A clip is a `fixed_size_list<uint8>[602112]` — 16 frames of 3x112x112, **602 KB per row** — and
+the integer arm of the boundary widening turns each `uint8` into an `int64`. That is real and
+was measured directly on the column shape, through the **native Parquet reader**: 64 rows of
+602 KB arrive as **308.3 MB against 38.5 MB on disk, 8.0x**. The same probe confirms the float
+half of this session's change reaches the read path — `list<float32>` now comes back `float`
+from `bt.read.parquet`, declared and produced agreeing — while `list<uint8>` comes back
+`int64`.
+
+But scaling the clip count says the expansion is not what breaks it:
+
+| clips | on disk | widened | wall | per clip |
+|---:|---:|---:|---:|---:|
+| 128 | 0.08 GB | 0.62 GB | **239.6 s** | 1,871.8 ms |
+| 512 | 0.31 GB | 2.47 GB | **4.9 s** | 9.6 ms |
+| 2,048 | 1.23 GB | **9.87 GB** | **6.6 s** | **3.2 ms** |
+
+**9.87 GB of widened data completes in 6.6 s**, and the cost per clip *falls* with scale. The
+239.6 s at 128 clips is the first run in the process paying actor spawn and the ResNet-18 load
+across eight GPU nodes; every later run reuses that pool. Extrapolated, 4,096 clips is on the
+order of ten seconds warm, against Ray Data's 7.23 s timed run.
+
+**So what the benchmark measured is a ~240 s cold start**, and that is the finding — a real
+competitive weakness on a first-run workload, and a different problem from the one this
+section originally claimed. It is also not fully explained: 240 s of cold start plus a warm
+pass does not reach 900 s, so something in the 4,096-clip first run is worse still, and the
+probe stopped at 2,048. That is the next measurement.
+
+The 8x remains worth fixing on its own account — it is bytes over Flight in the two-stage
+pipeline — but it is **not** this benchmark's failure, and the section below explains why the
+cheap fix for it is closed anyway.
+
+### Ray Train: 1.89x on the loop, and two numbers that must not be read as one
+
+The workload the goal names first, finally scored: **8.90 s against 16.83 s** on the training
+loop, the slowest of eight ranks each way, with both arms consuming exactly 999,424 of the
+corpus's 1,000,000 rows.
+
+**The trainer *wall* times are 334.1 s and 31.2 s and they are not an engine comparison.**
+Batcher's arm runs first and pays this workspace's per-node runtime-env build for the
+`RayTrainWorker` actors; Ray Data's arm then finds those environments warm. That is why the
+benchmark scores the loop and prints the wall beside it rather than instead of it, and why the
+wall figure should be quoted only with that sentence attached.
+
+**The correctness gate was wrong and reported MISMATCH on a correct run.** It demanded the two
+arms produce the same label checksum. They consumed the same *number* of rows and not the same
+rows: `drop_last` discards a ragged tail per rank, the two shard differently
+(`files[rank::W]` against Ray Data's block split), so they drop different tails, and neither
+engine promises otherwise. The delta was 9,374 — **1.6%** of the 575,424 that a different
+576-row tail can account for.
+
+It now checks each arm against the **corpus** instead of against the other engine, which is
+the stronger claim as well as the correct one: labels are non-negative, so dropping rows can
+only lower the sum and only by the dropped count times the largest label. An arm that
+duplicated a shard, skipped one, or read the wrong rows fails it; an arm that dropped a
+different tail does not. Both properties are exercised rather than asserted.
+
+### The video benchmark does not finish, and it is the uint8 expansion
+
+Batcher timed out at **900 s** on `gpu_video.py` where Ray Data finished in 7.23 s, with no
+error in the log — the arm simply never returned from its first run. It is the worst result on
+this board and it has the same cause as the pipeline's inter-stage cost.
+
+A clip is a `fixed_size_list<uint8>[602112]` — 16 frames of 3x112x112, so **602 KB per row** —
+and the integer arm of the boundary widening turns each `uint8` into an `int64`. Measured
+directly on that exact column shape, through the **native Parquet reader** rather than the FFI
+boundary:
+
+| | |
+|---|---|
+| on disk | 64 rows x 602 KB = **38.5 MB** |
+| in memory after the read | **308.3 MB** |
+| ratio | **8.0x** |
+
+At the benchmark's 4,096 clips that is 2.47 GB of corpus arriving as **19.7 GB**. The same
+probe confirms the float half of this session's change reaches the read path: `list<float32>`
+now comes back `float` from `bt.read.parquet`, declared and produced agreeing, where
+`list<uint8>` comes back `int64`.
+
+**Whether that is a deadlock or superlinear slowness is not established**, and the two want
+different fixes, so a scaling probe over 128/512/2048 clips is the next measurement rather
+than a guess. What is established is the 8x and that it is the integer arm.
+
+**And the shortcut is closed**, which is the point of the section below: exempting integer list
+children the way floats were exempted makes `list.get(i) + list.get(i)` wrap. The design that
+would work is to widen on *extraction* instead of on *ingestion* — keep the column narrow, and
+have the element-returning kernels (`get`, `min`, `max`, `first`, `last`, `max_pool`, and the
+list-returning `sort`/`unique`/`concat`/set family) widen their own output, which restores
+every observable type this session measured while leaving storage at the caller's width. That
+is a real design and a large one: it is most of `eval/list.rs` plus the Python inference mirror
+plus a re-run of the whole-surface sweep. It is not started here.
+
+### The same idea does NOT extend to integers, and the reason is a wrap
+
+A **uint8** image tensor still widens, and it is 8x rather than 2x: measured, a 301 MB
+`fixed_size_list<uint8>[150528]` column (2,000 decoded 224x224 images) leaves the boundary as
+**2,408 MB of int64**, in 1,684 ms. In the two-stage pipeline that payload is what crosses
+Flight between the CPU node and the GPU node, so Batcher ships 8x the bytes Ray Data does for
+the inter-stage hand-off. It is the obvious next lever and it is the wrong one.
+
+**An earlier revision of this section said the wrap argument "does not hold for list elements",
+on the strength of a sweep showing the kernels accumulate wide. That was an over-read and it is
+false.** The sweep measured *reductions* -- `sum`, `mean`, `max` -- which do accumulate in
+`i64` whatever the child's width, and 42 of 60 operations agreed with zero value differences.
+None of them extracts an element.
+
+Asked directly, with the case `test_nested_list_narrow_int_widens` already pins:
+
+| child | expression | widened | narrow |
+|---|---|---|---|
+| `int32` | `list.get(0) + list.get(0)` at 2e9 | 4,000,000,000 | **-294,967,296** |
+| `uint8` | `list.get(0) + list.get(1)` at 250 each | 500 | **244** |
+
+`list.get(i)` yields a column *at the element's own width*, and two of those in an arithmetic
+expression wrap at that width. So the justification `normalize_to` gives for the integer arm is
+exactly right, and the existing differential test is testing the thing it names. Floats do not
+wrap, which is the whole of why the float exemption is safe and this one is not.
+
+What that costs, stated plainly: **the 8x on image tensors is real and cannot be recovered this
+way.** Recovering it needs the logical-vs-physical type split -- the plan carrying `int64` as
+the column's logical type while the morsel carries `uint8` -- which is the same three-layer
+change `competitive_architecture.md` already names for dictionary preservation, and is not a
+boundary edit. The `uint8` measurement above is the argument for doing that work; the wrap
+table is the argument for not shortcutting it.
+
+The kernel gap the investigation turned up (unsigned children summing through `Float64`) was
+real and is fixed on its own account above. It was a prerequisite for an exemption that should
+not happen, and a correctness fix regardless.
+
+### The heterogeneous-node isolation was keyed to a resource nothing advertises
+
+`distributed.heterogeneous_node_isolation` keeps a CPU fleet off accelerator nodes by
+requiring a custom resource only CPU-only nodes carry, so a CPU shuffle cannot hold an idle
+GPU node's cores from an inference stage. The resource it asked for was the configured
+default `cpu_node`, which is a deploy-time convention an operator applies by hand.
+
+**This fleet labels itself, and under a different name.** Every one of its eight CPU nodes
+advertises `anyscale/cpu_only:true` and not one of its eight GPU nodes does. Selecting on
+`cpu_node` matched nothing, so the mechanism was inert on exactly the cluster shape it was
+written for — the same defect the zone selector already fixed by reading `zone_label` off the
+node instead of assuming a key.
+
+`cpu_only_marker_resource()` now discovers it: a candidate must be on **every**
+accelerator-free node, absent from **every** accelerator node, and *name* the property rather
+than merely correlate with it. That last clause is what the tests spend most of their length
+on — with one CPU instance type, `anyscale/node-group:16cpu-32gb` is carried by exactly the
+same nodes and a purely structural rule picks it, and it is a different fact that stops
+holding the moment a second CPU instance type appears. The configured name stays the
+**fallback**, so an operator who did the labelling gets what they asked for and a cluster that
+opted in without labelling behaves as before. Verified live: the selector now resolves to
+`{'resources': {'anyscale/cpu_only:true': 0.001}}`.
+
+The gate itself is still off by default, so this changes no placement until a cluster asks
+for it. What it changes is that asking now works.
+
+### New: `benchmarks/cluster/gpu_ray_train.py`
+
+There was no benchmark for the workload the goal names first — distributed training with Ray
+Train fed by Batcher. `gpu_train_ingest.py` times a loader on the driver with no trainer
+attached, which is a component measurement. This one puts the loader inside a `TorchTrainer`
+worker on a GPU and times the loop it feeds: each rank of the batcher arm opens its own
+disjoint slice of the Parquet corpus with `bt.read.parquet` and streams it with
+`ds.ml.iter_torch_batches(device="cuda")`; the ray arm uses `get_dataset_shard`, the pattern
+every Ray Train guide is written around. Same seeded model, optimizer, batch size and epoch
+count; the score is the **slowest rank's** loop, because a data-parallel step ends when the
+last rank arrives.
+
+It cost two findings before it produced a number, both worth keeping:
+
+- **Ray Train's own actors inherit the workspace's runtime-env hook.** Batcher's actors do
+  not — they are created with an explicit `runtime_env` that replaces it — but `RayTrainWorker`
+  is created by Ray Train, so it took the hook's fourteen-package dev `pip` set. Eight workers
+  sat in `PENDING_CREATION` for seventeen minutes with the placement group already reserved,
+  **no pending resource demand, and nothing printed**. No error, no timeout.
+- **Stripping that hook is not the fix, and trying it cost a run.** On this workspace the hook
+  is also what makes `torch` importable on the workers, so dropping it unconditionally killed
+  every GPU actor in its constructor with `ModuleNotFoundError: No module named 'torch'`. The
+  benchmark now leaves the hook alone and gives the trainer a `RunConfig` on the shared mount,
+  which is what a multi-node trainer needs anyway.
+- **`ray.train.report` is a collective, and reporting from rank 0 alone hangs the trainer.**
+  The obvious shape -- gather the per-rank tallies, have rank 0 report them -- leaves the other
+  seven ranks outside the barrier, and `trainer.fit()` never returns. No error, no timeout, the
+  same silent shape as the hook. Every rank reports now; only rank 0 carries a payload.
+- **And rank 0's payload still did not reach `Result.metrics`.** Both arms then trained
+  correctly and quickly and the driver printed "no rank metrics returned" -- a benchmark that
+  runs, is fast, and yields nothing. The tallies now travel by their own channel: rank 0 writes
+  the gathered list as JSON to the shared mount and the driver reads it, with `Result.metrics`
+  kept as the first source. A measurement that vanishes into a framework's metric plumbing is
+  worth less than a slightly less idiomatic one that arrives.
+
+**Three failure modes, none of which produced an error message**, is the thing to carry out of
+this benchmark independently of any number it eventually prints.
+
+### The CPU→GPU pipeline: the host-stage hypothesis is measured, and it is wrong
+
+Batcher loses this shape 0.83x with both engines CPU-starved near 40% GPU utilization, so the
+question was which of them gets more decode parallelism. Instrumenting `_pool_bounds` on a
+real run gave a clean asymmetry:
+
+```
+workers=16  partitions=16  bounds=[(16, 16), (8, 8)]  stage_gpus=[0.0, 1]
+```
+
+**The GPU stage is sized correctly** — one actor per device, 8 of 8. **The CPU decode stage
+gets 16 actors on a 192-CPU cluster**, because stage 0 is `clamp(partitions, 1, workers)` and
+`workers` is the *relational* fleet width. The decode is a per-row PIL loop, so it is GIL-bound
+per process; more processes should mean more parallelism. That is a mechanism with a measured
+input, and it reads as obvious.
+
+Testing it needed a fix first, because the lever was inert: stage 0's `concurrency` was
+discarded entirely (fixed separately — the same fix `_pool_partition_count` already made on
+the non-streamed path). With it honoured, the same plan over the same corpus:
+
+| host `concurrency` | wall | img/s | shape |
+|---|---:|---:|---|
+| default (None) | 11.69 s | 1,051 | `parts=16 bounds=[(16,16),(8,8)]` |
+| 16 | 11.70 s | 1,051 | `parts=16 bounds=[(16,16),(8,8)]` |
+| 32 | **11.56 s** | 1,063 | `parts=32 bounds=[(32,32),(8,8)]` |
+| 48 | 11.67 s | 1,053 | `parts=48 bounds=[(48,48),(8,8)]` |
+| 96 | 11.77 s | 1,044 | `parts=96 bounds=[(96,96),(8,8)]` |
+
+**Six times the decode stage's actor count moves the wall time by under 2%**, and not
+monotonically — 32 is the fastest row and 96 the slowest, which is noise, not a trend. The lever is
+demonstrably live — the shape column shows the pool and the partitioning both tracking the
+request, which is precisely the control this file elsewhere insists on ("before trusting a
+comparison across a setting, show the setting changes something you can see"). It changes
+something visible and it does not change the time.
+
+**So the host stage's width is not the binding constraint, and the mechanism above is wrong.**
+The baseline row also reproduces the benchmark to within 1% (11.69 s against 11.55 s), so this
+is not a probe measuring something else.
+
+What *is* binding is **not established**. The narrowing arithmetic in `_narrow_for_overlap`
+means the wider configurations do not simply redistribute a fixed CPU budget — by its own
+formula the 48-actor case holds a larger aggregate grant than the 16-actor one — so "the total
+CPU was constant" is not the explanation either, and offering it would be one more mechanism
+asserted from one result. The next measurement is where the pipeline's time actually goes
+(per-stage `stats()`, or the Flight hand-off), not another sizing knob.
+
+### Decomposed: the decode is 5% of it, and the hand-off is the cost
+
+With the width hypothesis dead, the next measurement is where the time goes. `stats()` refuses
+a `map_batches` pipeline, so the pipeline was decomposed instead — each stage run alone over
+the same corpus, each arm ending in an aggregate so no pixels reach the driver:
+
+| arm | wall |
+|---|---:|
+| scan alone (count) | **0.00 s** — answered from Parquet metadata |
+| **JPEG decode alone** (12,288 images, reduced to a scalar per row) | **0.83 s** |
+| fused decode -> model | 17.14 s |
+
+**The decode is not the bottleneck.** It is 0.83 s against a fused run of the same corpus, so
+under 5% of it — which also explains why widening the stage that performs it changed nothing.
+
+The sharper comparison is against a benchmark that has no hand-off. `gpu_inference.py` runs
+the **same** ResNet-50 on the **same** eight T4s as a *single* stage and sustains
+**2,380 img/s**; `gpu_pipeline.py` sustains **1,064 img/s**. Subtracting the measured decode
+still leaves ~1,150 img/s, so roughly **2x is spent between the stages** rather than in either
+of them. (The 17.14 s above is not the benchmark's 11.55 s — this arm ends in an aggregate,
+which routes differently — so it is used for the decode *ratio*, and the 2,380-vs-1,064
+comparison comes from the two benchmarks themselves.)
+
+**The obvious candidate for that is wrong, and was checked before anything was changed.** A
+`uint8` inter-stage tensor widened 8x would put 14.7 GB on the wire instead of 1.8 GB. Asked
+directly, the column the decode stage produces is
+`extension<arrow.fixed_shape_tensor[value_type=uint8, shape=[3,224,224]]>` at **151 KB/row,
+1.0x** — the interop layer hands back the extension type and `normalize_batch` exempts it. So
+the hand-off carries what it should, and the expansion that hurts elsewhere does not apply
+here.
+
+**What the 2x actually is remains open.** Candidates not yet separated: the Flight round trip
+itself, the credit window bounding how far a stage runs ahead, morsel sizing across the
+boundary, or simply that two pools of actors on the same devices contend where one does not.
+That is the next measurement, and it is a narrower question than the one this session started
+with.
+
+**Four hypotheses were refuted by measurement this session**: the host-stage width above; the
+uint8 expansion as the cause of the video timeout; the wrap argument as inapplicable to integer
+list elements; and the inter-stage payload as the pipeline's cost. Each was plausible, each was
+cheap to test, and each was wrong. **Nothing was changed in the engine on the strength of any
+of them** — the only code that shipped is what a measurement supported.
+
+### An observation about the learning loop, not a measurement of it
+
+A repeat of the GPU batch-inference benchmark against the same cluster later in the session
+did not reproduce its own setup. The first run's pool was eight actors at `num_gpus=1`, one
+per device, formed in about two minutes. The repeat's actors requested **`num_gpus: 0.5`**
+(and 7.3 GB of memory each), which is the adaptive loop doing what it is for: the first run
+recorded 81% sustained utilization, and `recommend_num_gpus` read that as room to pack two
+actors per device. The pool then took materially longer to form and the run was abandoned
+after fifteen minutes in warm-up.
+
+Recorded as an **observation**, deliberately, because that is all it is. Nothing here measures
+whether packing two actors per T4 is faster or slower for this model — the run never produced
+a time. What it does establish is that a second run of this benchmark on a cluster with
+recorded feedback is not the same experiment as the first, so a before/after taken across a
+session's own earlier runs is not a controlled comparison. The 2.09x above is the first run,
+on unmeasured state.
+
+### Scoreboard against the goal
+
+Met, on this fleet, correctness-gated: **GPU batch inference (2.09x Ray Data), text
+embeddings (29.5x), three-way batch inference (1.52x Ray Data, 2.91x Daft), training ingest
+(9.36x)**.
+
+Not met: **the two-stage CPU→GPU pipeline**, 0.83x — which now runs at all, and which the
+tensor-width change did **not** move (11.55 s against 11.56 s before it). That is evidence
+rather than disappointment: this pipeline's inter-stage payload is `uint8`, which still
+widens, so the two measurements together rule the float arm out for this shape and point at
+the uint8 one. The section above then shows the cheap way to take that lever is unsafe -- an
+exempted integer element wraps on `list.get(i) + list.get(i)` -- so the 8x is real, located,
+and costs a type-system change rather than a boundary edit.
+
+Reframed rather than met: **the GPU relational benchmark**, at parity (0.91x) once both
+engines stopped paying for an environment build, and losing to Batcher's own single-node CPU
+engine by 17.8x (Batcher GPU) and 16.2x (Ray Data + cuDF).
+
+
+---
+
+## 2026-09-09 — the 8x was taken, and GPU batch inference went from 0.42x to 1.51x
+
+The section above ends by locating an 8x on the AI hot path and declaring it out of reach:
+"the 8x is real, located, and costs a type-system change rather than a boundary edit." That
+was wrong about the cost. It is a boundary edit plus three one-cast-per-row escapes, and
+taking it — together with a second, larger defect it exposed — turned the largest measured
+loss in this file into a win.
+
+Fleet: 8 GPU nodes (1 T4, 8 CPU, 31 GB each) + 8 CPU nodes (16 CPU, 31 GB) + head. Engine
+`release`. Corpus `/mnt/cluster_storage/bench_gpu_imgs_200k` — 200,000 fixed-seed
+224x224x3 `uint8` images in 200 Parquet shards, 29 GB.
+
+### The headline
+
+| Benchmark | Before | After | Ray Data | Ratio |
+|---|---|---|---|---|
+| GPU batch inference, 200k images | 659 img/s | **2,280 img/s** | 1,506 img/s | **1.51x** |
+
+100.000% prediction agreement, 8/8 GPU nodes participating in both arms. Batcher's devices
+run at **84% mean utilization against Ray Data's 51%** — the same eight T4s, the same
+ResNet-50, the same weights. Before the change the run lost a worker to the kernel's OOM
+killer partway through and finished on six nodes.
+
+### What was actually wrong
+
+Two defects, found by bisecting a 24 GB actor down to a single-node `collect()` that could be
+reproduced with no Ray, no GPU and four files.
+
+**The FFI boundary widened a `uint8` tensor child to `int64`.** A decoded image is
+`FixedSizeList<UInt8>`; `normalize_list_element` had a float exemption and no integer one, so
+every image column arrived at 8x its size. The control arm for this is not a projection: the
+identical corpus written with `arrow.fixed_shape_tensor` metadata is already exempt, so the
+two can be read side by side.
+
+| 4,000 images (0.56 GB on disk) | materialized | wall | peak RSS |
+|---|---|---|---|
+| `fixed_size_list<uint8>` before | 4.49 GB | 4.75 s | 10.98 GB |
+| `arrow.fixed_shape_tensor` (control) | 0.56 GB | 2.93 s | 6.28 GB |
+| `fixed_size_list<uint8>` after | 0.56 GB | 2.87 s | 10.5 GB |
+
+The two arms are identical afterwards, which is the point: the widening was the whole
+difference. (The peak-RSS column in the first two rows is not comparable — both arms ran in
+one process and RSS is a high-water mark. Re-measured one arm per process, both read paths
+peaked at 10.5 GB, which is the second defect.)
+
+**The native Parquet read batch was a row count with no byte term.** A Parquet decode's
+working set is several times the batch it produces — the physical column buffer (a `uint8`
+tensor child is INT32 on disk, so 4x), the definition levels, the cast to the Arrow type — so
+the read batch size *is* the reader's residency. 65,536 rows is ~4 MB for an ordinary 64-byte
+row and **9.6 GB** for a decoded image.
+
+| `collect()`, 4,000 images | wall | peak RSS |
+|---|---|---|
+| 65,536-row read batch | 5.82 s | 10.16 GB |
+| 64-row read batch | 4.89 s | 2.34 GB |
+
+Same result, same batch count out (the engine re-morselizes either way). Smaller is not a
+trade once a row is wide; it is strictly better in both dimensions. The cap now targets 16 MiB
+per decoded batch, sized from the *projection*'s row width.
+
+Cumulatively, over four files: result 4.49 GB -> 0.56 GB, peak RSS 11.47 GB -> 3.09 GB,
+wall 5.34 s -> 2.41 s.
+
+### That the cap does not touch an ordinary table, checked rather than assumed
+
+16 MiB is what 65,536 rows of 256 bytes cost, so it binds only on a genuinely wide row.
+TPC-H `lineitem`, `orders` and `customer` all still read 65,536 rows, at full width and
+projected. ClickBench `hits` (105 columns, ~1.25 KB/row) is the one ordinary table it touches,
+at 13,378 rows, and that read measures **0.38 s / 1.34 GB against 0.39 s / 1.42 GB** — neutral
+to slightly better. This is the half a benchmark regression would find first.
+
+### What did not move, and why that is the expected answer
+
+**The two-stage CPU->GPU pipeline stayed at 0.85x** (131,072 images: Batcher 65.32 s / 2,007
+img/s against Ray Data 55.23 s / 2,373 img/s, 100% agreement) — against 0.83x before. That is
+not a disappointment, it is the control: `gpu_pipeline`'s corpus is a `binary` JPEG column, not
+a numeric tensor, so neither the widening nor the byte cap applies to it. The two measurements
+together say the pipeline's loss is somewhere else entirely, and it remains the open item.
+
+### Corrections to the section above
+
+- "Recovering those bytes needs the plan's *logical* type to stay `int64` while the morsel
+  carries `uint8`, which is a type-system change and not a boundary edit." **False.** An
+  element only reaches arithmetic by first becoming a *column*, and three ops do that
+  (`list.get`, `list.min`, `list.max`). Widening there is one cast per row, leaves every
+  observable type unchanged, and DuckDB agrees with the narrow column type besides.
+- The 0.42x collapse at scale was attributed to "the learned feedback loop packing two actors
+  per T4 while `max_actors_per_gpu` bounds density by VRAM only, not host RAM." The VRAM-only
+  bound is real and still unaddressed, but it was **not** the cause here: the failing run had
+  **one** `_MapActor` per GPU node holding 24 GB of a 31 GB node. Host RAM was the constraint,
+  and what consumed it was the two read-path defects above, not the packing.
+
+### The pipeline's remaining 15%: two levers ruled out by measurement
+
+`gpu_pipeline` at 131,072 images has Batcher's devices 73% busy against Ray Data's 80%, and
+Ray Data is effectively at the hardware ceiling: 2,373 img/s over eight T4s is 297 img/s each,
+and the fused single-stage benchmark measures the same T4s at 285 img/s each. So the loss is
+**15-20% of GPU idle waiting for input**, not a slower forward pass, and the question is which
+part of the hand-off leaves it idle.
+
+Two candidates swept, same corpus, same UDFs, warm pool, one timed run each:
+
+| decode-stage `concurrency` | 64 | 128 | 192 | default |
+|---|---|---|---|---|
+| img/s | 1,986 | 2,023 | 2,024 | 2,023 |
+
+| Flight credit window | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|
+| img/s | 2,025 | 2,000 | 2,053 | 2,052 |
+
+Both flat inside 3%. **The decode fan-out does not bind and neither does the credit window** —
+which also means neither is where a fix lives, and neither should be tuned in the hope that it
+is. The `concurrency` lever is live rather than inert (stage 0 discarding it was a real defect,
+fixed earlier in this session and pinned by
+`test_stream_pipeline_actor_options::test_the_host_stage_honours_an_explicit_concurrency`), so
+this is a flat response to a working knob rather than a knob that does nothing.
+
+What that left was the third candidate: **the terminal consumer held exactly one call at a
+time**, so the device idled through every Flight fetch and every Arrow assembly. Double-
+buffering it measured **2,007 -> 2,232 img/s at 73% -> 80% GPU** on this two-stage pipeline,
+against Ray Data's 2,422 at 81%, and a depth sweep said 2 was the whole win (2,251 / 2,277 /
+2,216 / 2,250 img/s at depth 2 / 3 / 4 / 6).
+
+**It was then reverted, because it cost more on the one-stage benchmark than it bought here.**
+A single `map_batches` over a scan is *one* stage, so stage 0 is also the terminal stage and
+takes the same path — and the per-stage autoscaler reads `ready[k]` after dispatch as the
+stage's backlog. Handing each consumer two morsels empties that queue, the stage reads as
+over-provisioned, and it shrinks to about half the pool:
+
+| `gpu_inference`, 200,000 images | img/s | GPU | nodes used | vs Ray Data |
+|---|---|---|---|---|
+| double-buffered | 989-1,061 | 36-38% | **4 of 8** | 0.64x |
+| reverted | 1,666 | 59% | 8 of 8 | 1.07x |
+
+Half the devices idle. The two-stage pipeline hides it because its producer keeps the queue
+full, which is exactly why the first measurement looked settled. Re-landing needs the
+autoscaler's idle/backlog signal expressed in *slots* rather than queued morsels, so a stage
+fully subscribed at depth 2 does not read as one that is half idle.
+
+**And then the evidence for that reading fell apart, which is the part worth reading.** The
+`4 of 8` was chased further and the cluster itself is what produced it: the raylet logs on the
+GPU nodes carry `[Timeout] Exiting because this node manager has mistakenly been marked as
+dead by the GCS ... the machine or raylet has become overloaded`, and `ray.available_resources`
+read **4.0 of 8.0 GPU** between runs. Nodes were dying under a long series of back-to-back
+200,000-image runs, and the benchmark's `n/8gnodes` column reports how many nodes the run
+*used*, which on a shrunken cluster is a fact about the cluster.
+
+The node count then stayed at 5 of 8 on a later run started when the cluster reported 8 of 8
+available and the streaming change was already reverted — so the revert did not fix it, and it
+was never what caused it. The full series of the batcher arm on this benchmark, same corpus,
+same scale:
+
+    2,280 img/s  8/8 nodes  gpu 84%   (first run of the evening)
+    1,061        4/8        38%
+      989        4/8        36%
+    1,666        8/8        59%
+    1,071        5/8        38%
+    1,055        5/8        38%
+
+Ray Data's arm measured 1,506-1,621 img/s at 8/8 in every one of them. A spread of 2.3x on the
+Batcher side with no code change between several of those runs means **this benchmark's number
+on a cluster this session has already run hard is not reproducible**, and every ratio taken
+from a single run of it — the 1.51x above included — should be read as one sample, not a
+result.
+
+What that costs: the revert above was decided on a contaminated signal and should be
+re-examined on a fresh cluster rather than trusted. The two-stage measurement it was reverted
+*for* (2,007 -> 2,232 img/s at 73% -> 80% GPU) was taken earlier, on a healthy fleet, and
+still stands.
+
+The methodology lesson is the one this file keeps relearning from the other direction: a
+long benchmarking session degrades the thing it is measuring. **Read `ray.available_resources()`
+and the alive-node count immediately before and after every cluster timing**, and treat a run
+whose node count moved as void rather than as evidence.
+
+### The two large multiples, re-measured where both arms run longer than 30 seconds
+
+The ratios recorded earlier for these two were taken at a scale where Batcher finished in a few
+seconds, so they were measuring start-up against Ray Data rather than throughput. Re-run until
+the *slower* arm is minutes and the faster one is not seconds:
+
+| Workload | Scale | Batcher | Ray Data | Ratio | Previously reported |
+|---|---|---|---|---|---|
+| LLM batch inference (gpt2, 32 new tokens) | 65,536 prompts | 43.09 s (1,521 prompt/s) | 289.11 s (227 prompt/s) | **6.71x** | 13.42x at 32,768 |
+| Text embeddings (all-MiniLM-L6-v2) | 327,680 texts | 7.63 s (42,921 text/s) | 20.88 s (15,692 text/s) | 2.74x | 29.5x at 8,192 |
+| Text embeddings, again | 1,310,720 texts | 31.16 s (42,059 text/s) | 47.39 s (27,659 text/s) | **1.52x** | — |
+
+Both 100% agreement. The embeddings row is the whole argument for the 30-second floor in one
+line: **29.5x -> 2.74x -> 1.52x** as the scale went 8,192 -> 327,680 -> 1,310,720, and nothing
+about either engine changed. Batcher's throughput is flat across the last two (42,921 ->
+42,059 text/s), so it is not degrading; Ray Data's rises (15,692 -> 27,659) as its fixed
+per-run cost amortizes over more work. **1.52x is the honest steady-state number** and the two
+larger ones were measurements of start-up. A further scale-up would be expected to shave it
+again, not to hold it.
+
+### Where 10x is and is not reachable, stated plainly
+
+Ray Data's 2,422 img/s over eight T4s is 303 img/s per device, and the fused single-stage
+benchmark measures the same T4s at 285. A 10x on that workload needs **3,000 img/s per T4 for
+fp32 ResNet-50**, which is an order of magnitude past what the hardware does. When both engines
+run the identical model on the identical devices and both keep those devices ~80% busy, the
+engine is no longer the variable and no data engine can be 10x another. The honest ceiling on
+this fleet for a device-bound stage is roughly **2x**, and Batcher is at 1.51x of it on the
+fused benchmark and 0.92x on the two-stage one.
+
+The large multiples come from the shapes where Ray Data's overhead, not the device, is the
+cost: LLM generation at 6.71x (its per-run model reload and per-task overhead dominate).
+Embeddings looked like one and is not — at 1.3M texts it is 1.52x, because the overhead that
+made it look like 29.5x is exactly what amortizes. The way to find more of them is to look for
+shapes with a high fixed cost per unit of work at *scale* rather than to keep tuning a
+saturated GPU, and to distrust any ratio whose faster arm finishes in seconds.
+
+### The relational side of the same cluster, sf100 on S3
+
+`benchmarks/cluster/vs_ray_daft.py 100`, one timed run, 17 nodes, TPC-H sf100 read directly
+from S3 by each engine:
+
+| pipeline | batcher | ray data | daft | vs ray |
+|---|---|---|---|---|
+| scan_count | 2 ms | 5,055 ms | error | 2,075x |
+| filter_count | 366 ms | 3,601 ms | error | 9.83x |
+| groupby | 4,670 ms | 10,880 ms | error | 2.33x |
+| join | 4,338 ms | **died** | error | — |
+| udf | 2,777 ms | 7,366 ms | error | 2.65x |
+
+Read with the caveats, which matter more than the numbers:
+
+- **Every one of these is seconds, so every one is under the 30-second floor this file
+  imposes on itself.** They are the shape of the answer, not the steady-state ratio.
+- `scan_count`'s 2,075x is an *architectural* difference rather than a throughput one —
+  Batcher answers a bare count from Parquet footer metadata and never reads a row. Quoting it
+  as a speedup on the same work would be dishonest; it is a different amount of work.
+- Ray Data's `join` did not lose, it **died**: its `HashShuffleAggregator` actor was killed
+  (`Worker exit type: SYSTEM_ERROR`, the kernel OOM shape). Batcher completed the same join in
+  4.3 s. A completed query against a dead one is worth recording and is not a ratio.
+- Daft failed every pipeline in this run with `No flotilla workers became available within
+  120s`, which is a deployment failure on this fleet rather than a result about Daft.

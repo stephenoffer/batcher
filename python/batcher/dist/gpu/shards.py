@@ -102,13 +102,34 @@ def _row_bytes(source, projection: list[str] | None) -> float:
         note_suppressed("dist", "read a source's schema for shard sizing", exc)
         return _FALLBACK_ROW_BYTES
     names = projection if projection is not None else schema.names
-    total = 0.0
+    total, resolved = 0.0, 0
     for name in names:
         try:
             total += _field_bytes(schema.field(name).type)
         except KeyError:
-            total += _FALLBACK_ROW_BYTES
-    return max(total, 1.0)
+            continue
+        resolved += 1
+    if resolved:
+        # Some names matched, so the projection and the schema share a namespace; a name that
+        # did not match is one column of unknown width and gets the generous per-column figure.
+        total += _FALLBACK_ROW_BYTES * (len(names) - resolved)
+        return max(total, 1.0)
+    # **Nothing** matched, which does not mean every column is 128 bytes wide — it means the
+    # projection is in a different namespace from the schema, and charging the per-column
+    # fallback for each is wrong by a factor of the column count in the one direction that
+    # hurts. It is the ordinary case for a renamed scan: TPC-H Parquet in the wild is named
+    # positionally (`column00`, ...), every query names its columns, and schema-on-read renaming
+    # leaves the *source* positional while the projection carries canonical names. Measured on
+    # sf100 `lineitem`, seven projected columns: **500.7 GiB against a real ~40 GiB, ~12x**, so
+    # `plan_shard_count` asked for 24 shards where the data wanted 6 — several extra waves of
+    # dispatch, with the devices idle between them.
+    #
+    # The honest answer when the projection cannot be resolved is that it cannot be narrowed,
+    # so size the *whole* row from the schema that can be read. That is a real measurement of
+    # this relation and an upper bound on any projection of it, which keeps the conservative
+    # direction the fallback exists for without inventing a width per column.
+    whole = sum(_field_bytes(schema.field(n).type) for n in schema.names) if schema.names else 0.0
+    return max(whole or _FALLBACK_ROW_BYTES, 1.0)
 
 
 def _field_bytes(dtype) -> float:

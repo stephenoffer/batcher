@@ -610,6 +610,27 @@ def _is_empty(
     return _collect(Limit(plan, 1), sources, columns, source_stats=source_stats).num_rows == 0
 
 
+def _declared_schema(plan: LogicalPlan, sources: list[Source]) -> pa.Schema | None:
+    """The output schema from **static analysis alone**, or `None` when it needs a run.
+
+    Split out of `_schema` because the difference between the two halves is the difference
+    between free and ruinous. This half reads the plan; the other half *executes* it, and for
+    a `map_batches` stage executing means **building the UDF**, which for a load-once model is
+    a model load. On the driver.
+    """
+    from batcher.plan.logical import Scan
+    from batcher.plan.types import widen
+
+    if isinstance(plan, Scan) and len(sources) == 1:
+        source_schema = sources[0].schema()
+        return pa.schema(
+            [f.with_type(widen(f.type)) for f in source_schema],
+            metadata=source_schema.metadata,
+        )
+    inferred = plan.available_schema()
+    return inferred.arrow if inferred is not None else None
+
+
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
     """The output Arrow schema without scanning rows.
 
@@ -627,18 +648,11 @@ def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.
     `dictionary<values=string, ...>` by `Dataset.schema` when `collect()` returns plain
     `string`, so the cheapest arm was the only one that lied.
     """
-    from batcher.plan.logical import Limit, Scan
-    from batcher.plan.types import widen
+    from batcher.plan.logical import Limit
 
-    if isinstance(plan, Scan) and len(sources) == 1:
-        source_schema = sources[0].schema()
-        return pa.schema(
-            [f.with_type(widen(f.type)) for f in source_schema],
-            metadata=source_schema.metadata,
-        )
-    inferred = plan.available_schema()
-    if inferred is not None:
-        return inferred.arrow
+    declared = _declared_schema(plan, sources)
+    if declared is not None:
+        return declared
     return _collect(Limit(plan, 0), sources, columns).schema
 
 
@@ -1061,7 +1075,6 @@ def _write(
         from batcher.dist import resolve_worker_fanout
         from batcher.dist.executors.write import _distributed_write_plan
 
-        out_schema = _schema(plan, sources, columns)
         manifest = _distributed_write_plan(
             plan,
             sources,
@@ -1073,6 +1086,27 @@ def _write(
             layout=layout,
             resume=resume,
         )
+        # The schema, asked for in the order that costs least, and **after** the write rather
+        # than before it. `_schema`'s last resort executes the plan under a zero-row limit,
+        # which for a `map_batches` stage builds the UDF here on the driver -- and this is the
+        # one write shape where that is a batch-inference model. Measured on a GPU-less head
+        # node: `map_batches(Model, num_gpus=1).write.parquet(...)` died in `cupy` with
+        # `cudaErrorInsufficientDriver` on a 1.9 GiB input, and on a 29 GiB one the driver was
+        # OOM-killed at 16.7 GB, both before a single row was written. Scoring a corpus and
+        # writing the scores is the canonical batch-inference job, so that was the shape it
+        # broke on.
+        #
+        # It is asked for at all only because a transactional sink creating a table cannot
+        # recover it from the data files (see `_commit`), and because an empty result still
+        # has to write one empty file with the right columns. The workers already attach the
+        # schema they wrote, which answers both -- except under `partition_by`, where the
+        # partition columns live in the path rather than in the file, so that case keeps the
+        # analysis it had.
+        out_schema = _declared_schema(plan, sources)
+        if out_schema is None and not partition_by:
+            out_schema = manifest.schema
+        if out_schema is None:
+            out_schema = _schema(plan, sources, columns)
         # Every shard produced zero rows (a filter that matched nothing). Each worker
         # correctly wrote no file, but the single-node path writes ONE empty file, so
         # without this the distributed result is an absent path where single-node leaves a

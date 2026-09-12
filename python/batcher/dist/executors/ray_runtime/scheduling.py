@@ -14,6 +14,10 @@ import logging
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.dist.executors.ray_runtime.capacity import (
+    fleet_task_headroom as fleet_task_headroom,
+)
+from batcher.dist.executors.ray_runtime.capacity import slot_actor_options
 from batcher.dist.executors.ray_runtime.fabric.bundles import (
     fleet_market_selector,
     fleet_zone_selector,
@@ -268,19 +272,27 @@ def _fleet_node_class_resources(env: SchedulingEnvelope | None) -> dict:
     return sel.get("resources", {}) if sel else {}
 
 
-def _bundle(env: SchedulingEnvelope | None, node_class: dict | None = None) -> dict:
+def _bundle(
+    env: SchedulingEnvelope | None, node_class: dict | None = None, index: int | None = None
+) -> dict:
     """One placement-group bundle = the resources for a single worker slot.
 
     `node_class` is the precomputed fleet node-class selector (see
     `_fleet_node_class_resources`); it is threaded in rather than recomputed here so a
     W-bundle fleet reads the topology once, not W times. Falls back to computing it for a
     lone-bundle caller that passes nothing.
+
+    `index` names which worker this bundle is for, so a fleet whose nodes are unequal reserves
+    each worker's own grant (`SchedulingEnvelope.slot_cpus`) instead of one figure sized for
+    the smallest node. `None`, and any envelope carrying no per-worker grants, reserves the
+    uniform `num_cpus` — every homogeneous fleet, unchanged.
     """
-    bundle: dict = {"CPU": env.num_cpus if env else 1.0}
+    bundle: dict = {"CPU": env.slot_cpus(index) if env else 1.0}
     if env and env.num_gpus > 0:
         bundle["GPU"] = env.num_gpus
-    if env and env.memory_bytes > 0:
-        bundle["memory"] = int(env.memory_bytes)
+    memory = env.slot_memory_bytes(index) if env else 0
+    if memory > 0:
+        bundle["memory"] = int(memory)
     # Custom accelerator resources belong in the bundle for the same reason the node-class
     # selector below does: a bundle reserves by resource, so a `TPU`/`neuron_cores`/`HPU`
     # request that lives only in `.options()` reserves nothing. The gang would then be
@@ -512,7 +524,7 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     strategy = _resolve_placement_strategy(env, workers)
     _report_collective_fabric(workers, env)
     bundles = _collective_bundles(workers, env, node_class) or [
-        _bundle(env, node_class) for _ in range(workers)
+        _bundle(env, node_class, i) for i in range(workers)
     ]
     zone = {**fleet_zone_selector(len(bundles), env), **fleet_market_selector(len(bundles), env)}
     pg = _reserve(placement_group, bundles, strategy, zone)
@@ -630,53 +642,6 @@ def placement_actor_options(pg, index: int, base: dict | None = None) -> dict:
     return opts
 
 
-#: Fraction of a fleet worker's grant left unclaimed inside its placement-group bundle.
-#:
-#: A fleet bundle reserves a whole node's cores, and the fleet spans every node, so a fleet
-#: holds **100% of the cluster's schedulable CPU**. Anything the same query then runs as
-#: plain Ray tasks is submitted outside that reservation and can never be placed: measured on
-#: a 4x96 cluster as `{'CPU': 0.125}: 1+ pending` against `384.0/384.0`, forever, from a
-#: three-table join whose final stage scans the intermediate the fleet is holding.
-#:
-#: `yield_session_fleet` answers that by handing the fleet back — but it cannot when an
-#: intermediate is *published* on the actors, which is exactly the staged-query case. So the
-#: bundle keeps a sliver the actor does not claim, and a stage that cannot be placed anywhere
-#: else runs there (`fleet_task_options`), co-located with the buckets it is fetching.
-#:
-#: **This is the second half of `dist.executor._headroom_grant`, not a duplicate of it.** That
-#: one thins the *auto* fan-out's grant so each node keeps a core free **outside** the group,
-#: and it is the right answer where it applies. It cannot apply here: an explicit
-#: `num_workers=N` skips `_cluster_fill_workers` entirely and sizes the grant from
-#: `_even_cpu_share`, which tiles the node exactly — the bundles in the reproduction above read
-#: `{'CPU': 96.0}` on 96-core nodes, so the thinning never ran. Every benchmark and integration
-#: test in this repo pins `num_workers`, so that is not a corner. Reserving inside the bundle
-#: instead is reachable from every path and puts the tasks on the data's own nodes.
-#:
-#: An eighth, capped at one core: 1.0 of 96 is a percent of the fleet's nominal grant and
-#: buys a hard bound on a hang. It costs the actor nothing measurable — Ray's CPU figure is a
-#: *reservation*, and the worker's real width comes from the `EngineConfig` it is granted,
-#: not from this number.
-_FLEET_TASK_HEADROOM_MAX = 1.0
-_FLEET_TASK_HEADROOM_SHARE = 8.0
-
-
-def fleet_task_headroom(num_cpus: float) -> float:
-    """CPU left unclaimed in each fleet bundle so the query's own task stages can run.
-
-    Zero for a one-core grant, where there is nothing to spare and the fleet is small enough
-    that it does not hold the cluster anyway.
-
-    Args:
-        num_cpus: The per-worker CPU grant the bundle reserves.
-
-    Returns:
-        The CPU to leave unclaimed, never enough to take the actor below one core.
-    """
-    if num_cpus <= 1.0:
-        return 0.0
-    return min(_FLEET_TASK_HEADROOM_MAX, num_cpus / _FLEET_TASK_HEADROOM_SHARE)
-
-
 def fleet_task_options(pg) -> dict:
     """Ray `.options(...)` scheduling a task into a held fleet's placement group.
 
@@ -769,7 +734,8 @@ def fleet_actor_options(pg, workers: int) -> list[dict]:
     as much as of throughput: an actor's methods no longer run strictly one at a time, so
     anything they keep on `self` has to tolerate being touched by two calls at once.
     """
-    base = task_options(current_envelope())
+    env = current_envelope()
+    base = task_options(env)
     # The actor claims slightly less than its bundle reserves — see `_FLEET_TASK_HEADROOM_MAX`.
     # Without a PG there is no bundle to leave room in, so the grant is untouched.
     if pg is not None:
@@ -785,7 +751,10 @@ def fleet_actor_options(pg, workers: int) -> list[dict]:
         base.pop("label_selector", None)
         base.pop("fallback_strategy", None)
     return [
-        {**placement_actor_options(pg, i, base), "max_concurrency": FLEET_CONCURRENCY}
+        {
+            **placement_actor_options(pg, i, slot_actor_options(base, env, i, pg is not None)),
+            "max_concurrency": FLEET_CONCURRENCY,
+        }
         for i in range(workers)
     ]
 

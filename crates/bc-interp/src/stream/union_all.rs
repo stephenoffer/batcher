@@ -193,6 +193,7 @@ mod union_all_tests {
             None,
             0,
             1,
+            None,
         )
         .unwrap();
         let ctx = Ctx::new(&sources, &cache, None, 0);
