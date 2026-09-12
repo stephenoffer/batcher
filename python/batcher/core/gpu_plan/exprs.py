@@ -386,27 +386,54 @@ DECLINED_EXPRS: dict[str, str] = {
     "video": "media decode is a Rust kernel (`bc-expr::eval::media`)",
     "geo": "geometry is a Rust kernel (`bc-geo` + `bc-expr::eval::geo`)",
     "spatial": "rigid-body math is a Rust kernel (`bc-spatial` + `bc-expr::eval::spatial`)",
-    # Not translated. Listed rather than absent so adding one is a decision with a date on it.
-    "array": "not translated",
-    "convert_timezone": "not translated",
-    "hash": "not translated",
-    "list_filter": "not translated",
-    "list_join": "not translated",
-    "list_set": "not translated",
-    "list_simhash": "not translated",
-    "list_slice": "not translated",
+    # **Expressions that return a LIST column.** Not an oversight and not a matter of effort:
+    # the two backends cannot *construct* one symmetrically. cuDF has `GroupBy.collect`, and
+    # pandas has nothing equivalent — its Arrow-backed `.list` accessor offers only `flatten`
+    # and `len`, and `groupby().agg(list)` raises `Unsupported cast from list<item: int64> to
+    # int64` on an Arrow-typed column. `vocab.lists` translates the whole list *reduction*
+    # family through `explode` + `groupby` precisely because that produces a scalar per row;
+    # the same walk cannot put the elements back. Translating these would ship a path only the
+    # device can run — and therefore only the device can be wrong about, on a tier whose entire
+    # verification story is a pandas replay.
+    "array": "returns a list column, which the host backend cannot construct (see above)",
+    "list_filter": "returns a list column, which the host backend cannot construct",
+    "list_set": "returns a list column, which the host backend cannot construct",
+    "list_slice": "returns a list column, which the host backend cannot construct",
+    "list_simhash": "a per-bit rolling hash over list elements; no dataframe equivalent",
+    # `list_join` reduces a list to a string, so it escapes the rule above — and lands on the
+    # same obstacle one step later. The reduction is a *string concatenation within a group*,
+    # and neither library has a grouped string join: cuDF's `ListMethods.join` has no pandas
+    # counterpart, and `agg` will not take a Python callable on the device.
+    "list_join": "a grouped string concatenation, which neither backend expresses",
+    # `Expr::Hash` is a **specific digest** — SplitMix64 mixing with an FNV-1a fold over bytes,
+    # written out in `bc-expr::eval::hash` and pinned by golden tests because a train/test split
+    # assigns rows by it. cuDF's `hash_values` is murmur3 or xxhash, so translating to it would
+    # return different numbers for the same rows: not a slower answer, a different one. The
+    # numeric half could be reproduced with unsigned integer arithmetic; the string half is a
+    # per-byte loop with no vectorized form, and a hash that is exact for some column types and
+    # absent for others is worse than one that declines.
+    "hash": "a specific digest (SplitMix64 + FNV-1a) that no dataframe hash reproduces",
+    # A timezone conversion is a lookup in a tz database, and the three implementations do not
+    # share one: the engine's Rust, pandas' zoneinfo and cuDF's own table. They agree on the
+    # common zones and the recent decades, which is exactly the shape of disagreement a test
+    # over ordinary data never reaches — the same reason a regex is declined next door.
+    "convert_timezone": "three tz databases that agree only where a test would look",
     # The per-row-parameter forms. Their constant siblings (`str`, `list_get`) translate,
     # but the engine answers these by grouping rows on the parameter and calling the same
     # kernel per group — a shape with no cuDF equivalent, and one this package will not
     # approximate by evaluating the parameter once.
     "str_dyn": "not translated (a per-row string-function parameter)",
     "list_get_dyn": "not translated (a per-row list index)",
-    "list_transform": "not translated",
-    "list_zip": "not translated",
-    "make_map": "not translated",
-    "make_struct": "not translated",
-    "map": "not translated",
-    "sequence": "not translated",
-    "strptime": "not translated",
-    "window_buckets": "not translated",
+    "list_transform": "returns a list column, which the host backend cannot construct",
+    "list_zip": "returns a list column, which the host backend cannot construct",
+    "make_map": "returns a map column, which the host backend cannot construct",
+    "make_struct": "returns a struct column, which the host backend cannot construct",
+    "map": "reads a map column; the construction half is declined, so the pair stays together",
+    "sequence": "returns a list column, which the host backend cannot construct",
+    # The engine parses with chrono and, when that fails, with a *partial* parse that fills in
+    # the fields the format left unnamed. `to_datetime(format=...)` does neither — it is a
+    # different parser with different partial-match behaviour and a different strftime dialect —
+    # so a translation would silently null rows the engine parses, and parse rows it nulls.
+    "strptime": "a chrono parser with a partial-match fallback that `to_datetime` does not have",
+    "window_buckets": "returns a list of window assignments per row; a list column again",
 }

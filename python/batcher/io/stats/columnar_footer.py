@@ -36,6 +36,7 @@ import pyarrow as pa
 
 from batcher._internal.mathx import is_nan
 from batcher.io._concurrent import read_each_file
+from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.io.stats.sortedness import proved_sorted_by
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
@@ -153,6 +154,27 @@ def _native_accumulators(stats: Any) -> dict[str, _ColAcc]:
     return acc
 
 
+#: Native footer-statistics aggregates, keyed by the identities of the files they cover.
+#:
+#: `footer_stats` is a pure function of its file list and is called once per query with the
+#: same list, so a repeated query re-derived it every time: measured at **51 ms warm** (216 ms
+#: cold) on a 100-file TPC-H `lineitem` read, against a driver whose whole non-waiting time is
+#: ~180-250 ms. `io/splits/parquet.py` already caches footers (`_FOOTERS`) and planned splits
+#: (`_SPLITS`) this way; the statistics aggregation over those same footers was the one member
+#: of the trio without a cache.
+#:
+#: Keyed on `file_identity` — `(path, size, mtime_ns)`, the token that changes whenever a
+#: file's content could have — so a rewritten file misses rather than serving a stale row
+#: count, and a file that cannot be stat-ed is never cached at all. Obtaining the identities
+#: is what makes this viable and it is not free by assumption: measured at **0 ms for 100
+#: files**, because the filesystem answers `get_file_info` from the listing the planner has
+#: already done rather than issuing a request per object.
+#:
+#: Entry-weighted (weight 1): an entry holds one bounds table sized by *column* count, not by
+#: file count, so entries here really are the fixed-size records `FileMetaCache` documents.
+_NATIVE_STATS = FileMetaCache(256)
+
+
 def _native_statistics(fs: Any, files: list[str], schema: pa.Schema) -> SourceStatistics | None:
     """`parquet_statistics` via the native footer walk, or None to use the Python path.
 
@@ -184,7 +206,15 @@ def _native_statistics(fs: Any, files: list[str], schema: pa.Schema) -> SourceSt
 
     from batcher.io.formats.structured import _parquet_native
 
-    stats = _parquet_native.footer_stats(files)
+    identities = tuple(file_identity(path, fs) for path in files)
+    # One un-stat-able file voids the whole key: the aggregate covers every file, so it may
+    # not be cached under a token that could not notice one of them changing.
+    key = identities if all(i is not None for i in identities) else None
+    stats = _NATIVE_STATS.get(key) if key is not None else None
+    if stats is None:
+        stats = _parquet_native.footer_stats(files)
+        if stats is not None and key is not None:
+            _NATIVE_STATS.put(key, stats, weight=1)
     if stats is None or stats.files_read != len(files):
         return None
     if stats.sort_declared:

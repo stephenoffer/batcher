@@ -59,6 +59,7 @@ def common_subplans(
     max_bytes: int,
     row_bytes: int,
     max_nodes: int = 400,
+    normalize: Callable[[LogicalPlan], LogicalPlan] | None = None,
 ) -> list[LogicalPlan]:
     """The subplans in `plan` that are worth computing once instead of once per appearance.
 
@@ -98,6 +99,23 @@ def common_subplans(
         max_nodes: Skip the analysis for a plan larger than this. The scan is quadratic in
             plan size (each node's structural key encodes its whole subtree), which is
             nothing at the size real plans reach and not worth risking on a generated one.
+        normalize: Maps a subtree to the form the engine will actually run it as -- the
+            optimized one. Bars 3 and 5 are the two that ask *how big* and *how costly*, and
+            asking that of the plan as written is not a small imprecision: a `WHERE` clause
+            sits **above** the join tree as written, so every join in it is estimated over
+            *unfiltered* inputs and the error compounds multiplicatively across a
+            multi-way join. Counted on TPC-DS q80's largest repeated subtree: as written, 3
+            filters above every join and none below, with join estimates reaching 4.8e12;
+            after pushdown, none above and 15 below, with the largest at 1.34e5. The
+            subtree as a whole read **1.6e13 rows (1.53e9 MB)** against **687 rows
+            (0.066 MB)**, so the size gate refused to hold a result that is 66 kilobytes.
+            q18's read 6.1e25 against 1.51e4. The joins are keyed in both forms -- this is
+            predicate *placement*, not a cross product -- which is the same trap
+            `kyber.optimizer.facade.optimize_logical` documents for the adaptive loop, one
+            predicate class over.
+
+            Structure is still read from the plan as written, so the positions the caller
+            rewrites are unaffected. Defaults to identity.
 
     Returns:
         The subplans to compute once, outermost first. Empty when nothing qualifies, which
@@ -140,6 +158,8 @@ def common_subplans(
     accepted: list[LogicalPlan] = []
     covered: set[str] = set()
     sized = None
+    as_run = normalize or (lambda node: node)
+    run_plan = None
     for key, node in ordered:
         if key == root_key or key in covered:
             continue
@@ -147,9 +167,14 @@ def common_subplans(
             continue
         if sized is None:
             sized = estimator()
-        if not _fits(node, sized, max_bytes, row_bytes):
+            # Once, outside the loop: bar 5 judges every candidate against the whole plan's
+            # cost, so normalizing it per candidate would optimize the same plan once per
+            # candidate for the same answer.
+            run_plan = as_run(plan)
+        run_node = as_run(node)
+        if not _fits(run_node, sized, max_bytes, row_bytes):
             continue
-        if not _worth_materializing(node, plan, sized, appearances[key]):
+        if not _worth_materializing(run_node, run_plan, sized, appearances[key]):
             continue
         accepted.append(node)
         covered.update(k for k in map(structural_key, walk(node)) if k is not None)
@@ -212,7 +237,15 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
         total = model.cost(plan).total()
         if total <= 0 or appearances < 2:
             return False
-        share = model.cost(node).total() / total
+        # `share` is every appearance's cost as a fraction of the plan, which is what the
+        # formula above is written in terms of -- `model.cost(node)` prices **one**
+        # appearance, and `total` already counts all of them. Multiplying by `appearances`
+        # is the half that was missing, and leaving it out inverted the bar: the saving
+        # came out a factor of `appearances` low, so the *more* often a subtree repeated
+        # the less worth sharing it looked. Measured on a subtree that is the whole plan's
+        # cost, repeated: at 2 appearances it scored 0.247 and passed, at 9 it scored
+        # 0.094 and was refused -- where the true savings are half the plan and 8/9 of it.
+        share = model.cost(node).total() * appearances / total
         return share * (appearances - 1) / appearances >= _MIN_SAVED_SHARE
     except Exception as exc:  # pragma: no cover - a cost failure must not break planning
         note_suppressed("kyber", "cost a common-subplan candidate", exc)

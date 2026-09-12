@@ -20,7 +20,7 @@ Ten workload families on 8xT4, real models, correctness-gated. 33,611 text/s emb
 :::{grid-item-card} {octicon}`database;1.1em` Analytics & I/O
 :link: /benchmarks/results/analytics
 :link-type: doc
-Operators, TPC-H, ClickBench, and the connectors, against DuckDB and Polars on the same Arrow.
+Operators, TPC-H, ClickBench, and the connectors, against DuckDB, Polars, Daft, PyArrow and Spark on the same Arrow.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` Methodology
@@ -37,6 +37,8 @@ Batcher leads the classical analytics suites against DuckDB reading the same Arr
 Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
 Coverage is **346 benchmarks across ten suites**, including the full 99-query TPC-DS set, all 113 Join Order Benchmark queries against the real IMDb dataset, and the H2O.ai db-benchmark group-by and join sweeps. {doc}`methodology` lists them.
+
+For the standing against every engine at once, read {doc}`the full engine matrix </benchmarks/results/engine-matrix>`. It publishes the gaps as well as the wins, and labels which kind each gap is: an engine that cannot express a suite, one that did not finish it, and one that could not be held in memory beside Batcher are three different things and none of them is a ratio.
 
 Suite geometric means at scale factor 1 on 96 cores / 184 GiB, measured 2026-08-15. `duckdb`
 is DuckDB on its native compressed store (the harder bar); `duckdb_arrow` is DuckDB over the

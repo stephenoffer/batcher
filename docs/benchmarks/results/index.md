@@ -14,6 +14,7 @@ engine.
 | {doc}`AI and GPU workloads <ai-and-gpu>` | Ten families on 8xT4 with real models: inference, embeddings, decode, and training ingest |
 | {doc}`Multimodal ingest <multimodal-ingest>` | Turning camera frames, LiDAR sweeps, and audio clips into model-ready tensors |
 | {doc}`Scaling out <scaling>` | What distribution buys, what it costs at small sizes, and how much of each suite runs distributed at all |
+| {doc}`The full engine matrix <engine-matrix>` | Every standard suite against every engine that can run it, with the gaps labeled |
 
 ## See also
 
@@ -25,6 +26,7 @@ engine.
 
 analytics
 tpch
+engine-matrix
 ai-and-gpu
 multimodal-ingest
 scaling

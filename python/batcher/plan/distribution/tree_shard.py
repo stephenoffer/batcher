@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from batcher.plan.ir_tags import LEFT_DRIVEN_JOINS
 
-__all__ = ["LEFT_DRIVEN_JOINS", "RIGHT_DRIVEN_JOINS", "shardable_leaves"]
+__all__ = ["LEFT_DRIVEN_JOINS", "RIGHT_DRIVEN_JOINS", "ir_divides", "shardable_leaves"]
 
 #: Join types whose output is driven by the LEFT input, so splitting it is safe: each left row
 #: is seen by exactly one worker and contributes to the answer exactly as many times as the
@@ -82,3 +82,134 @@ def _walk(spec: dict, out: set[int]) -> None:
         _walk(spec["left"], out)
     if join_type in RIGHT_DRIVEN_JOINS:
         _walk(spec["right"], out)
+
+
+#: Plan IR tags that are a *branch* rather than a chain step. A chain above one of these is what
+#: a tree fan-out folds; the branch itself is what it splits a leaf of.
+_BRANCH_OPS = frozenset({"hash_join", "union"})
+
+
+def ir_divides(ir: dict) -> bool:
+    """Whether a whole plan — join tree included — can be run a shard at a time.
+
+    `shard_plan` answers this for a **chain**: the operators divide or they do not. It answers
+    `None` for anything containing a join, because `flatten_ops` cannot flatten a branch — and
+    the router read that as "this plan does not divide", so **every join plan was routed as
+    though one device were enough for it**. On a six-T4 fleet at TPC-H sf10 that put a
+    60 M x 15 M join on a single board: q4 and q12 took 8.7 s and 8.5 s against CPU-engine
+    answers of 0.33 s and 1.28 s, with five devices idle.
+
+    A plan divides when both halves of what a tree fan-out actually does are available:
+
+    * the run of operators **above** the outermost branch has a mergeable decomposition, so the
+      shards' outputs fold (`shard_plan`); and
+    * some leaf of the branch is safe to **split** while every other leaf is replicated
+      (`shardable_leaves`), which is the left/right-driven rule this module states.
+
+    A plan with no branch at all is exactly `shard_plan`'s question, and is answered by it.
+
+    Args:
+        ir: A logical plan's JSON IR, as `LogicalPlan.to_ir()` produces it.
+
+    Returns:
+        True when the plan divides. False whenever it does not, or cannot be read — which every
+        caller treats as "keep this on one device", the conservative direction.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.distribution import ir_divides
+            >>> scan = lambda i: {"op": "scan", "source_id": i}
+            >>> ir_divides({"op": "hash_join", "join_type": "inner",
+            ...             "left": scan(0), "right": scan(1)})
+            True
+            >>> ir_divides({"op": "hash_join", "join_type": "outer",
+            ...             "left": scan(0), "right": scan(1)})
+            False
+    """
+    from batcher.plan.distribution.mergeable import shard_plan
+
+    above, branch = _above_branch(ir)
+    if branch is None:
+        return shard_plan(above) is not None
+    if shard_plan(above) is None:
+        return False
+    spec = _as_spec(branch)
+    return bool(spec is not None and shardable_leaves(spec))
+
+
+def _above_branch(ir: dict) -> tuple[list[dict], dict | None]:
+    """The chain above the outermost branch, bottom-up, and the branch itself.
+
+    `(ops, None)` for a plan with no branch, which is `shard_plan`'s own question.
+    """
+    ops: list[dict] = []
+    node: dict | None = ir
+    while isinstance(node, dict):
+        op = node.get("op")
+        if op == "scan":
+            return list(reversed(ops)), None
+        if op in _BRANCH_OPS:
+            return list(reversed(ops)), node
+        ops.append(node)
+        node = node.get("input")
+    return list(reversed(ops)), None
+
+
+def _as_spec(ir: dict) -> dict | None:
+    """The branch's IR as the `{"kind": ...}` shape `shardable_leaves` walks.
+
+    A translation rather than a second walk, so the left/right-driven rule is stated once. Leaf
+    indices are assigned in encounter order, matching how a tree spec numbers them — only their
+    *existence* matters here, never which source they came from.
+
+    `None` for IR that cannot be read as a tree — a branch missing an input. Reading such a node
+    as a join of two scans would answer "this divides" about a plan nobody can execute.
+    """
+    counter = [0]
+
+    def convert(node) -> dict | None:
+        if not isinstance(node, dict):
+            return {"kind": "scan", "leaf": _next()}
+        op = node.get("op")
+        if op == "hash_join":
+            # A join whose inputs are absent is malformed IR, not a join of two scans. Reading
+            # it as one would answer "this divides" about a plan nobody can execute, which is
+            # the opposite of the conservative direction every other decline here takes.
+            if node.get("left") is None or node.get("right") is None:
+                return None
+            left, right = convert(_below(node["left"])), convert(_below(node["right"]))
+            if left is None or right is None:
+                return None
+            return {
+                "kind": "join",
+                "join": {"join_type": node.get("join_type")},
+                "left": left,
+                "right": right,
+            }
+        if op == "union":
+            inputs = [convert(_below(i)) for i in node.get("inputs", [])]
+            if not inputs or any(i is None for i in inputs):
+                return None
+            return {"kind": "union", "inputs": inputs}
+        return {"kind": "scan", "leaf": _next()}
+
+    def _next() -> int:
+        counter[0] += 1
+        return counter[0] - 1
+
+    return convert(ir)
+
+
+def _below(node):
+    """Skip the chain of linear operators over a branch's input, down to the next branch or scan.
+
+    A pushed-down filter or projection sits between a join and its input in essentially every
+    optimized plan, and it changes neither which leaves exist nor which of them may be split.
+    """
+    while isinstance(node, dict) and node.get("op") not in _BRANCH_OPS and node.get("op") != "scan":
+        nxt = node.get("input")
+        if nxt is None:
+            return node
+        node = nxt
+    return node

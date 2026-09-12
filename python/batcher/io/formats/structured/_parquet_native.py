@@ -20,9 +20,11 @@ from batcher._internal.native import engine
 
 __all__ = [
     "NATIVE_READ_BATCH",
+    "NATIVE_READ_TARGET_BYTES",
     "FooterStats",
     "file_manifest",
     "footer_stats",
+    "native_read_batch",
     "read_many",
     "read_one",
     "read_row_groups_filtered",
@@ -32,12 +34,66 @@ __all__ = [
 # larger read batch just trades a few big Arrow batches for better decode throughput.
 NATIVE_READ_BATCH = 65536
 
+# Bytes one decoded batch is aimed at, capping `NATIVE_READ_BATCH` for a wide row.
+#
+# The row count alone is not a memory bound, and the difference is not marginal on the shape
+# it misses. A Parquet decode's working set is several times the batch it produces — the
+# physical column buffer (a `uint8` tensor child is INT32 on disk, so 4x), the definition
+# levels beside it, and the cast to the Arrow type — so the batch size *is* the reader's
+# residency. At 65,536 rows that is ~4 MB for an ordinary 64-byte row and **9.6 GB** for a
+# decoded 224x224x3 image, which is why a GPU inference actor holding one 31 GB node's worth
+# of images was OOM-killed by the kernel rather than by anything the engine could see.
+#
+# Measured on 4,000 such images (0.56 GB) read through `collect()`: **10.16 GB peak RSS in
+# 5.82 s at 65,536 rows against 2.34 GB in 4.89 s at 64** — 4.3x the memory *and* 1.2x the
+# time, for the same result and the same batch count out (the engine re-morselizes either
+# way). Smaller is not a trade here; it is strictly better once a row is wide.
+#
+# 16 MiB is deliberately generous: it is what 65,536 rows of 256 bytes cost, so it does not
+# bind on any ordinary table (TPC-H `lineitem` is ~130 bytes/row) and only shrinks the read
+# for genuinely wide rows. The cap never raises the caller's request.
+NATIVE_READ_TARGET_BYTES = 16 << 20
 
-def read_one(uri: str, projection: list[str] | None) -> list[pa.RecordBatch] | None:
-    """One whole Parquet file's batches via the native reader, or ``None`` to fall back."""
+
+def native_read_batch(
+    schema: pa.Schema | None,
+    projection: list[str] | None = None,
+    ceiling: int = NATIVE_READ_BATCH,
+) -> int:
+    """Rows to decode at once: `ceiling`, capped so one batch stays near the byte target.
+
+    Returns `ceiling` unchanged when the schema is unknown or the row is narrow enough that
+    the cap does not bind, so this can be dropped in wherever the flat row count was used.
+
+    Args:
+        schema: The Arrow schema being read, or ``None`` when it isn't known here.
+        projection: Columns actually read, or ``None`` for all of them.
+        ceiling: The largest batch the caller wants; never raised.
+
+    Returns:
+        A row count in ``[1, ceiling]``.
+    """
+    if schema is None:
+        return ceiling
+    from batcher.plan.types.widths import projected_row_bytes
+
+    row_bytes = projected_row_bytes(schema, projection)
+    if row_bytes <= 0:
+        return ceiling
+    return max(1, min(ceiling, int(NATIVE_READ_TARGET_BYTES // row_bytes)))
+
+
+def read_one(
+    uri: str, projection: list[str] | None, schema: pa.Schema | None = None
+) -> list[pa.RecordBatch] | None:
+    """One whole Parquet file's batches via the native reader, or ``None`` to fall back.
+
+    `schema` sizes the decode batch by bytes rather than rows (`native_read_batch`); without
+    it the flat row ceiling stands, which is only safe for a narrow row.
+    """
     try:
         _native = engine()
-        return _native.read_parquet(uri, [], projection, NATIVE_READ_BATCH)
+        return _native.read_parquet(uri, [], projection, native_read_batch(schema, projection))
     except Exception:
         return None
 
@@ -140,7 +196,9 @@ def file_manifest(uris: list[str], columns: list[str]) -> pa.Table | None:
         return None
 
 
-def read_many(uris: list[str], projection: list[str] | None) -> list[list[pa.RecordBatch]] | None:
+def read_many(
+    uris: list[str], projection: list[str] | None, schema: pa.Schema | None = None
+) -> list[list[pa.RecordBatch]] | None:
     """Many whole Parquet files in one native pass (per-file batch lists), or ``None``.
 
     The many-small-files throughput path: one GIL release + one runtime pass overlaps every
@@ -148,6 +206,6 @@ def read_many(uris: list[str], projection: list[str] | None) -> list[list[pa.Rec
     """
     try:
         _native = engine()
-        return _native.read_parquet_many(uris, projection, NATIVE_READ_BATCH)
+        return _native.read_parquet_many(uris, projection, native_read_batch(schema, projection))
     except Exception:
         return None

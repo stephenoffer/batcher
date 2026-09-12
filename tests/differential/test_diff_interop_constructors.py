@@ -95,17 +95,29 @@ def test_from_torch_converts_a_tensor_a_tuple_and_a_dataset():
     }
 
 
-def test_from_torch_and_from_numpy_agree_on_a_per_row_vector():
-    """One convention for a vector feature, whichever constructor produced it."""
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_from_torch_and_from_numpy_agree_on_a_per_row_vector(dtype):
+    """One convention for a vector feature, whichever constructor produced it.
+
+    The dtype is now a **parameter**, and it has to be: this used to pass `[[1.0, ...]]` to
+    both, which `torch.tensor` reads as `float32` and `numpy.array` as `float64`. The two
+    doors were handed different inputs and agreed only because the boundary widened both to
+    `double` — so the assertion held whatever the constructors did with the caller's dtype,
+    which is the property it is named for. A list of floats is a tensor and keeps its child
+    width now (`bc_py::normalize_list_element`), so the difference is visible, and pinning
+    agreement at each width is the check that was intended.
+    """
     torch = pytest.importorskip("torch")
     numpy = pytest.importorskip("numpy")
     rows = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
-    through_torch = bt.from_torch(torch.tensor(rows))
-    through_numpy = bt.from_numpy(numpy.array(rows))
+    through_torch = bt.from_torch(torch.tensor(rows, dtype=getattr(torch, dtype)))
+    through_numpy = bt.from_numpy(numpy.array(rows, dtype=dtype))
     assert through_torch.to_pydict() == through_numpy.to_pydict()
     assert _schema(through_torch) == _schema(through_numpy), (
         "the two doors into the engine must give a vector feature the same type"
     )
+    expected = "float" if dtype == "float32" else "double"
+    assert _schema(through_torch) == {"data": f"fixed_size_list<item: {expected}>[3]"}
 
 
 def test_from_torch_widens_float32_to_double_at_the_boundary():

@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-from _ray_env import init_ray
+from cluster_env import init_gpu_cluster
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -39,19 +39,45 @@ _DATA_DIR = os.environ.get("BENCH_RR_DIR", "/mnt/cluster_storage/gpu_relbench")
 _N = int(os.environ.get("BENCH_RR_N", "60000000"))
 _FILES = int(os.environ.get("BENCH_RR_FILES", "16"))
 _GROUPS = int(os.environ.get("BENCH_RR_GROUPS", "1000"))
-_CUDF_PIP = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
+# A pip set for the workers, EMPTY by default because `_init` reaches cuDF the cheap way.
+#
+# A `pip` block is never free: Ray builds a virtualenv for that environment hash once per node
+# a task first lands on, `cluster_env.py` measures that at 168 s across this fleet, and it is
+# charged to whichever arm touches a node first -- which is Batcher's. This defaulted to
+# `cudf-cu13==26.6.0,numpy==1.26.4` and the cost landed squarely on the result: the benchmark
+# reported `batcher gpu` at **63,191 ms** against Ray Data+cuDF's 13,280 ms, a 0.21x loss that
+# was read as an engine verdict. Re-measured with RAPIDS on the shared mount instead, the same
+# query is **9,073 ms cold and 89 ms warm** against a 4,117 ms raw-cuDF floor.
+#
+# The pin also downgraded the workers to numpy 1.26.4 under a numpy-2 driver, which
+# `_ray_env.worker_pip` documents as fatal for actor pickling in its own right.
+#
+# Set `BENCH_RR_PIP=cudf-cu13==26.6.0,numpy==1.26.4` on a cluster with no shared mount -- and
+# expect the first arm to run to be charged for the build.
+_CUDF_PIP_DEFAULT = ""
+_CUDF_PIP = [r for r in os.environ.get("BENCH_RR_PIP", _CUDF_PIP_DEFAULT).split(",") if r]
 
 
 def _init() -> None:
-    """Attach to the cluster with a clean job-level cuDF+numpy pip set.
+    """Attach with cuDF reachable by **both** engines, off the shared mount rather than pip.
 
-    The workspace's runtime-env hook is dropped *unconditionally*: it injects a default
-    dev-pip set containing a broken `batcher-engine[delta]` requirement into EVERY task
-    (even ones with no runtime_env of their own, e.g. data generation), failing env setup.
-    With the hook gone, `_CUDF_PIP` installs once per node and Ray Data's GPU map tasks
-    find cuDF without per-op runtime_env plumbing.
+    Ray Data's cuDF arm needs `import cudf` inside an ordinary Ray task, and there are two
+    ways to get it there. The one this used — a job-level `pip` set — costs a per-node
+    virtualenv build (168 s across this fleet, `cluster_env.py`) charged to whichever arm
+    touches a node first, which is Batcher's; it is what made this benchmark report
+    `batcher gpu` at 63,191 ms and read as a 0.21x engine loss. The other stages RAPIDS once
+    onto `/mnt/cluster_storage` and hands the workers a `PYTHONPATH` entry, which Ray
+    propagates as a plain environment variable and never resolves: 9.1 s once, ~0 after.
+
+    Emptying the pin alone is not the fix and was tried: Batcher's own GPU tasks carry the
+    RAPIDS path themselves (`gpu_task_runtime_env`), so Batcher kept working while Ray Data's
+    arm lost cuDF entirely and failed. `init_gpu_cluster` is what puts the path on *every*
+    worker, so the two engines are compared on the same footing and neither pays a build.
+
+    `BENCH_RR_PIP` still forces a pip set, for a cluster with no shared mount -- and the first
+    arm to run will be charged for it.
     """
-    init_ray(pip=_CUDF_PIP, unconditional_hook_strip=True)
+    init_gpu_cluster(pip=_CUDF_PIP or None)
 
 
 def _gen_shard(path: str, n: int, groups: int, seed: int) -> int:
@@ -81,7 +107,8 @@ def _ensure_data() -> str:
     per = -(-_N // _FILES)
     # An explicit per-task pip overrides the workspace hook's broken default dev-pip (a task with
     # NO runtime_env inherits that default and fails env setup); numpy is all these need.
-    gen = ray.remote(num_cpus=1, runtime_env={"pip": ["numpy==1.26.4"]})(_gen_shard)
+    gen_env = {"pip": _CUDF_PIP} if _CUDF_PIP else {}
+    gen = ray.remote(num_cpus=1, runtime_env=gen_env)(_gen_shard)
     refs = [
         gen.remote(
             os.path.join(_DATA_DIR, f"part-{i:04d}.parquet"), min(per, _N - i * per), _GROUPS, i

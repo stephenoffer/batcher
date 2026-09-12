@@ -38,6 +38,7 @@ from batcher.carbonite.accel.allocator import (
     plan_allocator,
     prepare_device_memory,
     reset_device_allocator,
+    visible_device_usable_bytes,
 )
 from batcher.carbonite.accel.amd_health import amd_verdicts
 from batcher.carbonite.accel.health import (
@@ -116,5 +117,6 @@ __all__ = [
     "schedulable_devices",
     "smallest_profile_for",
     "validate_fleet_power",
+    "visible_device_usable_bytes",
     "xid_verdicts",
 ]

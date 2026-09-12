@@ -28,6 +28,7 @@ from batcher.dist.gpu.fabric.collective_env import (
     merge_env,
     node_collective_env,
     p2p_disabled,
+    reset_node_collective_env,
     socket_ifnames,
 )
 from batcher.dist.gpu.fabric.placement import (
@@ -50,6 +51,7 @@ __all__ = [
     "node_collective_env",
     "p2p_disabled",
     "placement_summary",
+    "reset_node_collective_env",
     "shard_device_assignment",
     "socket_ifnames",
 ]

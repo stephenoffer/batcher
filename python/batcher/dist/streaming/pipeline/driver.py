@@ -72,7 +72,7 @@ def stream_distributed_pipeline(
     _ensure_ray(workers)
     stages = split_into_resource_stages(plan)
     sid = next(iter(scanned_source_ids(plan)))
-    partitions = partition_descriptors(sources[sid], workers)
+    partitions = partition_descriptors(sources[sid], producer_fanout(stages[0], workers))
     if not partitions:
         return _empty(plan)
 
@@ -132,6 +132,34 @@ def stream_distributed_pipeline(
     return pa.Table.from_batches(batches) if batches else _empty(plan)
 
 
+def producer_fanout(stage, workers: int) -> int:
+    """How wide stage 0 may open: its explicit `concurrency` when it has one, else `workers`.
+
+    Stage 0 reads partitions, so its pool size and the partition count are the same number —
+    which is why both are taken from here, and why an explicit `concurrency` has to reach the
+    *partitioning* and not only the pool. It did not: the fan-out was `workers`, the relational
+    fleet width, and `map_batches(..., concurrency=N)` on the host stage of a streamed pipeline
+    was silently discarded. A caller asking for forty-eight decode actors got sixteen.
+
+    This is the fix `executors.map._pool_partition_count` already made on the non-streamed
+    path, in its own words: "`_drive_actor_pool` then clamps the pool to
+    `min(max_size, len(partitions))` and the caller's number is silently reduced to the worker
+    count". The streaming path inherited the shape and not the fix, so the same public argument
+    meant two different things depending on which path a plan happened to take.
+
+    Args:
+        stage: The first resource stage, carrying its `concurrency` spec.
+        workers: The worker count the run was sized for.
+
+    Returns:
+        The actor and partition count for stage 0, at least 1.
+    """
+    from batcher.dist.executors.map import _explicit_pool_ceiling
+
+    explicit = _explicit_pool_ceiling(getattr(stage, "concurrency", None))
+    return max(1, explicit) if explicit else workers
+
+
 def _pool_bounds(stages, workers: int, num_partitions: int) -> list[tuple[int, int]]:
     """`(start, ceiling)` per stage: how many actors it opens with and may grow to.
 
@@ -140,7 +168,7 @@ def _pool_bounds(stages, workers: int, num_partitions: int) -> list[tuple[int, i
     fed by the Flight hand-off rather than by a partition, so its bounds come from its own
     `concurrency` spec.
     """
-    producers = clamp(num_partitions, 1, workers)
+    producers = clamp(num_partitions, 1, producer_fanout(stages[0], workers))
     bounds = [(producers, producers)]
     bounds.extend(consumer_pool_bounds(stage, workers, num_partitions) for stage in stages[1:])
     return bounds
@@ -172,13 +200,17 @@ def _build_pools(stages, bounds, credits: int):
         if k == 0:
             spawns.append(_producer_factory(stage, credits, target_rows))
             continue
-        opts = _gpu_options(stage.num_gpus, stage.accelerator_type)
-        cls = (
-            (_MapActor if k == last else RelayActor).options(**opts)
-            if opts
-            else (_MapActor if k == last else RelayActor)
+        cls = _MapActor if k == last else RelayActor
+        spawns.append(
+            _actor_factory(
+                cls,
+                stage,
+                credits,
+                target_rows,
+                terminal=k == last,
+                resources=_gpu_options(stage.num_gpus, stage.accelerator_type),
+            )
         )
-        spawns.append(_actor_factory(cls, stage, credits, target_rows, terminal=k == last))
     pools = [
         [spawn() for _ in range(start)] for spawn, (start, _hi) in zip(spawns, bounds, strict=True)
     ]
@@ -263,9 +295,34 @@ def _producer_factory(stage, credits: int, target_rows: int):
     return spawn
 
 
-def _actor_factory(cls, stage, credits: int, target_rows: int, *, terminal: bool):
+def _actor_factory(
+    cls, stage, credits: int, target_rows: int, *, terminal: bool, resources: dict | None = None
+):
+    """A factory minting one actor of `cls` for `stage`, under `resources` plus the shipping env.
+
+    Both option fragments are applied in **one** `.options(...)` call, on the raw remote class.
+    Applying them in two — the accelerator request when the pool was built, the `runtime_env`
+    when an actor was spawned — raised `AttributeError: 'ActorOptionWrapper' object has no
+    attribute 'options'`, because Ray's `.options()` returns a thin wrapper exposing only
+    `remote`/`bind`. It needed both fragments to be non-empty to fire, so it was invisible
+    until a GPU stage ran on a cluster the user had attached to themselves: `_shipping_options`
+    is empty whenever Batcher started Ray, and `resources` is empty for a CPU-only chain. That
+    is every stage-overlapped CPU->GPU inference pipeline on a real cluster.
+
+    Args:
+        cls: The Ray-remote actor class for this stage.
+        stage: The resource stage this actor runs.
+        credits: The Flight production credit window a relay takes.
+        target_rows: Morsel width, taken from the stage above.
+        terminal: Whether this is the last stage (returns rows instead of republishing).
+        resources: The accelerator `.options(...)` fragment, or `None` for a host stage.
+
+    Returns:
+        A zero-argument callable that spawns one actor.
+    """
+
     def spawn():
-        opts = _shipping_options()
+        opts = {**(resources or {}), **_shipping_options()}
         bound = cls.options(**opts) if opts else cls
         # A terminal consumer returns its rows to the driver, so it runs no Flight server and
         # takes no credit window; a relay republishes and takes both.

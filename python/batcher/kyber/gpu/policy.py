@@ -71,36 +71,91 @@ def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None)
     """`(rows, working_set_gb)` for the volume the GPU actually processes, or `(None, None)` when
     the size is unknown (an estimator failure or an unbounded source).
 
-    For a *reducing* operator the plan's OUTPUT cardinality massively understates the work and
-    the memory: the GPU reads and reduces the whole INPUT. So the estimate descends past every
-    reducing node to the first one whose output is what it processes.
-
-    Descending past a **run** of them, rather than only the top node, is what makes the common
-    analytical shape estimable at all: `group_by().agg().sort().limit(10)` has a `Limit` on top,
-    whose output cardinality is ten. Estimating that put every such query below the small-input
-    threshold and refused it the GPU on the grounds that ten rows do not amortize a kernel
-    launch — while the scan underneath it was a billion rows. A map-shaped plan (filter/project)
-    already has output ~ processed, so it estimates directly."""
+    The arithmetic is `_processed`, which states the two rules and why each exists. In short: a
+    plan's OUTPUT cardinality massively understates what a device reads, for two different
+    reasons — a *reducing* node emits far less than it consumes, and a *join* consumes both of
+    its inputs whole before emitting anything — so neither is estimated where it stands."""
     from batcher.kyber import load_learned_stats
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 
-    target = plan
-    while isinstance(target, (Aggregate, Distinct, Limit, Sort)):
-        below = getattr(target, "input", None)
-        if below is None:
-            break
-        target = below
     try:
         learned = load_learned_stats(hub) if hub is not None else None
         est = CardinalityEstimator(sources=sources, learned=learned)
-        rows = int(est.estimate(target).rows)
-        width = est.row_width(target, active_config().optimizer.row_bytes)
+        rows, nbytes = _processed(plan, est, active_config().optimizer.row_bytes)
     except Exception:
         return None, None
     if rows <= 0:
         return 0, 0.0
-    return rows, rows * max(width, 1) / 1e9
+    return rows, nbytes / 1e9
+
+
+def _processed(plan: LogicalPlan, est, row_bytes: int) -> tuple[int, float]:
+    """`(rows, bytes)` the device has to read and hold to answer `plan`.
+
+    Three node kinds are walked *through* rather than estimated, and each for its own reason:
+
+    * a **reducing** node (`aggregate`, `distinct`, `limit`, `sort`) outputs far less than it
+      reads, so its own cardinality understates both the work and the memory. A run of them is
+      descended, not just the top one: `group_by().agg().sort().limit(10)` has a `Limit` on top
+      whose output is ten rows, over a scan of a billion;
+    * a **join** reads both of its inputs whole and only then produces its output, so the volume
+      is the sum of the two sides rather than the join's cardinality. Estimating the join node
+      instead is what made every heavy join look small enough for a single device: measured on a
+      six-T4 fleet at TPC-H sf10, q14 (`lineitem` joined to `part`) estimated **one row** and was
+      routed to one board, where it took 11.4 s against the CPU engine's 1.9 s;
+    * a **union** is the same argument without the cardinality question — its inputs are all read.
+
+    Anything else is a map-shaped chain, whose output is what it processes, and is estimated
+    directly.
+    """
+    from batcher.plan.logical import Aggregate, Distinct, Join, Limit, Sort, Union
+
+    branch = _first_branch(plan)
+    if isinstance(branch, Join):
+        left = _processed(branch.left, est, row_bytes)
+        right = _processed(branch.right, est, row_bytes)
+        return left[0] + right[0], left[1] + right[1]
+    if isinstance(branch, Union):
+        parts = [_processed(i, est, row_bytes) for i in branch.inputs]
+        return sum(p[0] for p in parts), sum(p[1] for p in parts)
+    # No branch: a chain over one scan, and the existing rule applies unchanged — descend the
+    # run of reducing nodes and estimate the first whose output is what it processes.
+    node = plan
+    while isinstance(node, (Aggregate, Distinct, Limit, Sort)):
+        below = getattr(node, "input", None)
+        if below is None:
+            break
+        node = below
+    rows = int(est.estimate(node).rows)
+    if rows <= 0:
+        return 0, 0.0
+    return rows, rows * max(est.row_width(node, row_bytes), 1)
+
+
+def _first_branch(plan: LogicalPlan):
+    """The outermost `Join` or `Union` under `plan`, or `None` for a chain over one scan.
+
+    Walked through **every** single-input node, not only the reducing ones. A projection sits
+    above the outermost join in essentially every real analytical plan, and stopping there
+    estimated the *join's* cardinality — which is not what a join processes, and which the
+    estimator is at its least reliable about. Measured on TPC-H sf10, that reported **one row**
+    for q14 and q17 and ten for q3, so all three were routed to a single device.
+    """
+    from batcher.plan.logical import Join, Union
+
+    node = plan
+    seen = 0
+    while node is not None and not isinstance(node, (Join, Union)):
+        node = getattr(node, "input", None)
+        seen += 1
+        if seen > _MAX_PLAN_DEPTH:  # a malformed plan must not spin here
+            return None
+    return node
+
+
+#: Plan nodes to walk before concluding a chain has no branch. Far above any real plan; it
+#: exists so a cyclic or malformed `input` chain cannot hang the router.
+_MAX_PLAN_DEPTH = 10_000
 
 
 def decide_gpu_backend(
@@ -141,7 +196,9 @@ def decide_gpu_backend(
             else GpuDecision(False, False, "size unknown; GPU overhead not justified")
         )
 
-    cpu = _cpu_veto(plan, hub, rows, ws_gb, dc, force=force, accelerator_type=accelerator_type)
+    cpu = _cpu_veto(
+        plan, sources, hub, rows, ws_gb, dc, force=force, accelerator_type=accelerator_type
+    )
     if cpu is not None:
         return cpu
 
@@ -152,6 +209,7 @@ def decide_gpu_backend(
 
 def _cpu_veto(
     plan: LogicalPlan,
+    sources: list[Source],
     hub: MetadataHub | None,
     rows: int,
     ws_gb: float,
@@ -208,14 +266,28 @@ def _cpu_veto(
         )
 
     # Size is necessary but not sufficient. A relational stage's bytes cross the host link
-    # before a kernel sees them, and on PCIe that link is slower than a server's own memory:
+    # before a kernel sees them **when the host is the one that decodes them** — which is no
+    # longer true of this tier's own reader, and skipping the veto for a source it can read is
+    # the difference between an accelerator that is used and one that is not. Measured on six
+    # T4s: the model refused every TPC-H query at "0.53x the CPU, 97% of device time is
+    # transfer", and the same queries ran at 2.35x. What crosses PCIe for a device-read scan is
+    # the *compressed* Parquet, and on a frame-cache hit nothing crosses at all.
+    #
+    # On PCIe that link is slower than a server's own memory:
     # a big enough scan can clear every threshold above and still finish sooner on the CPU.
     # The verdict is only consulted when the device model is known and only ever *refuses* —
     # a forced request is still honored, and an unrecognized device has no opinion.
     # ...and only while this fleet has measured nothing. A learned crossover means the GPU
     # path actually ran here and was timed against the CPU on this hardware, which outranks a
     # model whose CPU-bandwidth constant may not describe this machine. Measurement wins.
-    if not force and accelerator_type and rows > 0 and ws_gb > 0 and learned_min is None:
+    if (
+        not force
+        and accelerator_type
+        and rows > 0
+        and ws_gb > 0
+        and learned_min is None
+        and not _device_reads_its_own_input(plan, sources)
+    ):
         veto = _transfer_veto(accelerator_type, ws_gb, rows)
         if veto is not None:
             return GpuDecision(False, False, veto, rows)
@@ -250,6 +322,9 @@ def _route_by_memory(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb()
     )
     one_gpu_gb = max(capacity_gb * (1.0 - device_headroom()), 1e-9)
+    # What one device may hold of a *replicated* build side. The join fan-out's ceiling, asked
+    # of the device rather than of a CPU's cache — see `DistributedConfig.device_replication_bytes`.
+    replication_bytes = dc.device_replication_bytes(capacity_gb)
     if ws_gb <= one_gpu_gb:
         # Fitting one device is a floor, not a target. This used to end the decision, so a plan
         # small enough for a single GPU ran on a single GPU whatever the fleet had — on four
@@ -265,10 +340,10 @@ def _route_by_memory(
             + (f"; spread across {spread} for throughput" if spread > 1 else ""),
             rows,
             spread,
-            broadcast_join(plan, sources, hub),
+            broadcast_join(plan, sources, hub, replication_bytes, gpu_count),
         )
     shardable = is_shardable(plan)
-    broadcast = broadcast_join(plan, sources, hub)
+    broadcast = broadcast_join(plan, sources, hub, replication_bytes, gpu_count)
     # How many devices would hold the working set in one wave, which is what the autoscaler is
     # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
     wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
@@ -511,3 +586,43 @@ def decide_gpu_map_params(
         out_bs,
         f"model {model_memory_gb:.1f}GB → num_gpus={out_gpus}, batch_size={out_bs}",
     )
+
+
+def _device_reads_its_own_input(plan: LogicalPlan, sources: list[Source]) -> bool:
+    """Whether every scan in `plan` reads a source the device can decode for itself.
+
+    The transfer veto below charges the decoded working set as a host-to-device copy. That is
+    the right model for a frame the driver hands a device and the wrong one for a scan the
+    device reads off storage — so it is applied only where the host really is in the path.
+
+    Conservative in the direction that costs the least: `False` whenever the answer cannot be
+    established, which restores the veto exactly as it was. A `True` that the executor's own
+    stricter check later contradicts costs a fallback to the CPU engine, which every path here
+    already has.
+    """
+    from batcher._internal.logging import note_suppressed
+    from batcher.io.splits.device import reads_on_device
+    from batcher.plan.logical import Scan
+
+    try:
+        scans = [node for node in _walk_plan(plan) if isinstance(node, Scan)]
+        if not scans:
+            return False
+        return all(reads_on_device(sources[scan.source_id]) for scan in scans)
+    except Exception as exc:  # pragma: no cover - routing must never break a plan
+        note_suppressed("kyber", "ask whether the device reads this plan's input", exc)
+        return False
+
+
+def _walk_plan(node, seen: set[int] | None = None):
+    """Every *distinct* node of a plan. A logical plan is a DAG, so a shared subtree is one
+    object reachable by two paths and must be yielded once."""
+    seen = set() if seen is None else seen
+    if node is None or id(node) in seen:
+        return
+    seen.add(id(node))
+    yield node
+    for name in ("input", "left", "right"):
+        yield from _walk_plan(getattr(node, name, None), seen)
+    for child in getattr(node, "inputs", ()) or ():
+        yield from _walk_plan(child, seen)

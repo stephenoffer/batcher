@@ -28,6 +28,7 @@ import pyarrow as pa
 
 from batcher._internal.mathx import ceil_div
 from batcher._internal.native import engine
+from batcher.dist.executors.partition_io import _compacted_table_for_shipping
 from batcher.io.base._layout import FileLayout
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.source import Source
@@ -195,7 +196,7 @@ def _write_shards(table: pa.Table, partition_by: list[str] | None, workers: int)
     if not partition_by or n == 0:
         per = max(1, ceil_div(n, workers))
         shards = [table.slice(i * per, per) for i in range(workers) if i * per < n]
-        return shards or [table.slice(0, 0)]
+        return [_compacted_table_for_shipping(s) for s in shards] or [table.slice(0, 0)]
 
     import pyarrow.compute as pc
 
@@ -219,7 +220,7 @@ def _write_shards(table: pa.Table, partition_by: list[str] | None, workers: int)
         # those rows are then written twice.
         pieces.extend(ordered.slice(o, min(share, end - o)) for o in range(begin, end, share))
     if len(pieces) <= 1:
-        return [ordered]
+        return [_compacted_table_for_shipping(ordered)]
     buckets: list[list[pa.Table]] = [[] for _ in range(min(workers, len(pieces)))]
     loads = [0] * len(buckets)
     # Two pieces of one key landing in the same shard is harmless: `write_partitioned`
@@ -228,7 +229,7 @@ def _write_shards(table: pa.Table, partition_by: list[str] | None, workers: int)
         lightest = loads.index(min(loads))
         buckets[lightest].append(piece)
         loads[lightest] += piece.num_rows
-    return [pa.concat_tables(b) for b in buckets if b]
+    return [_compacted_table_for_shipping(pa.concat_tables(b)) for b in buckets if b]
 
 
 def _write_shard(

@@ -22,7 +22,7 @@ use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
 
-use crate::byte_key::{ByteKeyColumn, ByteKeys};
+use crate::byte_key::{pack_word, ByteKeyColumn, ByteKeys};
 use crate::error::RuntimeError;
 
 /// Below this row count the hash pass runs serially: rayon's fan-out/join costs more
@@ -864,13 +864,38 @@ fn bytes_part_of(
     let keys = ByteKeyColumn::new(key_col).ok_or_else(|| RuntimeError::NonNumericRangeKey {
         dtype: key_col.data_type().to_string(),
     })?;
+    // Each boundary's leading eight bytes, packed once. The search below is `log2(parts)` deep
+    // and was doing a full `memcmp` at every step of it — for a whole-relation range shuffle
+    // that is five slice comparisons a row, over a value buffer far too large to cache. A pack
+    // that differs already answers the step (see `pack_word`), so only a boundary sharing the
+    // row's first eight bytes is ever compared in full.
+    let fences: Vec<u64> = boundaries
+        .iter()
+        .map(|b| pack_word(b.as_ref(), 0))
+        .collect();
     Ok(map_rows(keys.len(), |i| {
         if keys.is_null(i) {
-            null_bucket
-        } else {
-            let v = keys.key(i);
-            boundaries.partition_point(|b| b.as_ref() <= v) as u32
+            return null_bucket;
         }
+        let v = keys.key(i);
+        let packed = pack_word(v, 0);
+        // `partition_point(|b| b <= v)`, written out so the pack can answer each step: the
+        // first index whose boundary is strictly greater than the row's key.
+        let (mut lo, mut hi) = (0usize, boundaries.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let below = if fences[mid] == packed {
+                boundaries[mid].as_ref() <= v
+            } else {
+                fences[mid] < packed
+            };
+            if below {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u32
     }))
 }
 
@@ -1882,6 +1907,54 @@ mod tests {
                 of_key[k], *bucket,
                 "key {k} landed in different sub-buckets on the two sides under one salt"
             );
+        }
+    }
+
+    /// The packed binary search must land every row in the bucket a full-comparison
+    /// `partition_point` would, including on the keys the pack cannot settle.
+    ///
+    /// The pack answers a search step only when it *differs*; equal packs fall through to the
+    /// slice comparison, and the cases where that matters are the ones a `memcmp` handles for
+    /// free and an integer does not — two keys sharing eight leading bytes, a key that is a
+    /// prefix of a boundary, a literal NUL where the other value ended, and the empty key.
+    /// Routing a row one bucket wide is a wrong *order*, which the order-independent
+    /// correctness gate cannot see, so this is checked against the definition rather than
+    /// against another engine.
+    #[test]
+    fn the_packed_route_agrees_with_a_full_comparison_on_every_key_the_pack_ties() {
+        let boundaries: Vec<Vec<u8>> = [
+            b"".to_vec(),
+            b"\0".to_vec(),
+            b"abcdefgh".to_vec(),
+            b"abcdefgh\0".to_vec(),
+            b"abcdefghi".to_vec(),
+            b"abcdefghzzzz".to_vec(),
+            b"zzzzzzzz".to_vec(),
+        ]
+        .to_vec();
+        let values: Vec<Option<&[u8]>> = vec![
+            Some(b""),
+            Some(b"\0"),
+            Some(b"a"),
+            Some(b"abcdefg"),
+            Some(b"abcdefgh"),
+            Some(b"abcdefgh\0"),
+            Some(b"abcdefghh"),
+            Some(b"abcdefghi"),
+            Some(b"abcdefghzzzz"),
+            Some(b"abcdefghzzzzz"),
+            Some(b"zzzzzzzz"),
+            Some(b"zzzzzzzzz"),
+            None,
+        ];
+        let col: ArrayRef = Arc::new(arrow::array::BinaryArray::from(values.clone()));
+        let got = bytes_part_of(&col, &boundaries, 99).unwrap();
+        for (i, v) in values.iter().enumerate() {
+            let want = match v {
+                None => 99,
+                Some(v) => boundaries.partition_point(|b| b.as_slice() <= *v) as u32,
+            };
+            assert_eq!(got[i], want, "row {i} ({v:?}) routed to the wrong bucket");
         }
     }
 

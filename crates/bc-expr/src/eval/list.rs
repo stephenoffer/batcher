@@ -563,52 +563,20 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return Ok(Arc::new(n.into_iter().collect::<Int64Array>()));
     }
 
-    // `min`/`max` over any non-float child (integers, decimals, strings, bools, dates,
-    // …). DuckDB `list_min`/`list_max` are defined on every comparable type and return
-    // the *exact* element. Casting the child to Float64 both nulled non-numeric elements
-    // (`list.min(['apple'])` → null) and lost integer precision above 2^53
-    // (`list.min([2^53+1, 2^53+2])` → 2^53, a value not even in the list). Only floats stay
-    // on the numeric path below, whose NaN / total-order semantics are well-tested; every
-    // other type gathers the min/max non-null element here, preserving its own type.
+    // `min`/`max` over any non-float child (integers, decimals, strings, bools, dates, …) is
+    // a gather of the exact element rather than a `Float64` reduction — see
+    // `list_ops::list_reduce::order_reduce` for why, and for the widening it applies on the
+    // way out. Only floats fall through to the numeric path below.
     let child_is_float = matches!(
         list.values().data_type(),
         DataType::Float16 | DataType::Float32 | DataType::Float64
     );
     if matches!(func, ListFunc::Min | ListFunc::Max) && !child_is_float {
-        use arrow::array::UInt32Array;
-        use arrow::compute::{sort_to_indices, take, SortOptions};
-        let child = list.values();
-        let want_min = matches!(func, ListFunc::Min);
-        // Ascending with nulls last, so non-null values occupy the front in value order:
-        // min is the first non-null, max the last non-null. Null elements are ignored.
-        let opts = SortOptions {
-            descending: false,
-            nulls_first: false,
-        };
-        let take_idx: UInt32Array = (0..list.len())
-            .map(|i| {
-                if list.is_null(i) {
-                    return None;
-                }
-                let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
-                if e == s {
-                    return None;
-                }
-                let slice = child.slice(s, e - s);
-                let ord = sort_to_indices(&slice, Some(opts), None).ok()?;
-                let mut valid = ord
-                    .values()
-                    .iter()
-                    .map(|&l| s as u32 + l)
-                    .filter(|&g| child.is_valid(g as usize));
-                if want_min {
-                    valid.next()
-                } else {
-                    valid.next_back()
-                }
-            })
-            .collect();
-        return Ok(take(child.as_ref(), &take_idx, None)?);
+        return crate::eval::list_ops::list_reduce::order_reduce(
+            list,
+            offsets,
+            matches!(func, ListFunc::Min),
+        );
     }
 
     // Exact integer `sum`/`avg`. The Float64 view below rounds every element to 53
@@ -620,9 +588,16 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     // (`checked_add` → `SumOverflow`); the wrapping convention in `eval/binary.rs` exists
     // for JIT parity on scalar arithmetic and deliberately does not extend to reductions.
     // A null row, an empty row, and an all-null row all have no values, hence null.
+    // Unsigned widths belong here too; `UInt64` does not (see `unsigned_sum_is_exact_...`).
     let int_child = matches!(
         list.values().data_type(),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
     );
     if matches!(func, ListFunc::Sum | ListFunc::Mean) && int_child {
         let child = cast(list.values(), &DataType::Int64)?;
@@ -1313,6 +1288,66 @@ mod tests {
         assert_eq!(i64s(&s), vec![Some(big + 2)]);
         // The float path would have produced this instead — pin the difference.
         assert_ne!(i64s(&s)[0].unwrap() as f64, (big as f64 + 2.0) - 1.0);
+    }
+
+    fn u32_lists(rows: &[Option<Vec<Option<u32>>>]) -> ArrayRef {
+        use arrow::array::UInt32Builder;
+        let mut b = ListBuilder::new(UInt32Builder::new());
+        for row in rows {
+            match row {
+                Some(vs) => {
+                    for v in vs {
+                        b.values().append_option(*v);
+                    }
+                    b.append(true);
+                }
+                None => b.append(false),
+            }
+        }
+        Arc::new(b.finish())
+    }
+
+    /// The same exactness, for an **unsigned** child.
+    ///
+    /// `UInt8`/`UInt16`/`UInt32` were missing from the exact-integer arm, so an unsigned list
+    /// summed through the `Float64` view and lost the low bit above 2^53 — the identical bug
+    /// `int_sum_is_exact_above_two_pow_53` pins for the signed widths, and it returned
+    /// `Float64` where the signed column of the same values returned `Int64`. Nothing caught
+    /// it because the FFI boundary widened every unsigned column to `Int64` before a kernel
+    /// could see one, so the arm was unreachable from a query rather than correct.
+    #[test]
+    fn unsigned_sum_is_exact_above_two_pow_53_and_stays_int64() {
+        // 2^53 + 1 as a sum of `u32` values: no single element needs more than 32 bits, so
+        // this is reachable for a `list<uint32>` and is exactly where `f64` starts rounding.
+        let parts: Vec<Option<u32>> = (0..(1u32 << 21) + 1).map(|_| Some(u32::MAX)).collect();
+        let expected: i64 = parts.len() as i64 * u32::MAX as i64;
+        assert!(
+            expected > (1i64 << 53),
+            "the fixture must exceed f64's exact range"
+        );
+        let a = u32_lists(&[Some(parts)]);
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(
+            s.data_type(),
+            &DataType::Int64,
+            "sum of an unsigned child is Int64"
+        );
+        assert_eq!(i64s(&s), vec![Some(expected)]);
+    }
+
+    /// A `uint8` child — the image-pixel case — sums to `Int64`, not `Float64`.
+    #[test]
+    fn uint8_sum_stays_int64() {
+        use arrow::array::UInt8Builder;
+        let mut b = ListBuilder::new(UInt8Builder::new());
+        for v in [250u8, 250, 250, 250] {
+            b.values().append_value(v);
+        }
+        b.append(true);
+        let a: ArrayRef = Arc::new(b.finish());
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(s.data_type(), &DataType::Int64);
+        assert_eq!(i64s(&s), vec![Some(1000)]);
     }
 
     /// `list_avg` keeps a Float64 *result* but must accumulate the total exactly,

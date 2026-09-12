@@ -30,6 +30,7 @@ from batcher.plan.schema import SchemaRef
 pytestmark = pytest.mark.unit
 
 _CORES = 128.0
+_NODE_CORES = 16.0  # the widest bundle one node can host
 _TARGET_BYTES = 256 * 1024 * 1024  # optimizer.target_bytes_per_task default
 
 
@@ -71,6 +72,24 @@ def _map_plan() -> MapBatches:
 def _partitions(source, plan) -> int:
     with patch.object(mapmod, "_cluster_cores", lambda: _CORES):
         return mapmod._adaptive_partition_count(source, plan, fallback=8)
+
+
+def _shares(partitions, plan, learned: float) -> list[float]:
+    """Per-task CPU shares against a *pinned* fleet.
+
+    `_adaptive_task_cpus` reads the live cluster twice (its fleet fill and its per-node
+    cap), so leaving either unpinned makes the result a property of whatever cluster the
+    suite happens to be able to reach. It reached the 65 x 16-core one here — a `ray.init()`
+    in another unit module leaves Ray's global state answering after its own shutdown — and
+    a fleet that wide saturates every share at the node cap, which is what made the assertion
+    below read `16.0 < 16.0`.
+    """
+    with (
+        patch.object(mapmod, "_cluster_cores", lambda: _CORES),
+        patch.object(mapmod, "_placeable_node_cores", lambda: _NODE_CORES),
+        patch.object(mapmod, "_learned_weight_factor", lambda *a, **k: learned),
+    ):
+        return mapmod._adaptive_task_cpus(partitions, plan)
 
 
 def test_a_terabyte_scan_still_holds_one_task_to_the_byte_budget() -> None:
@@ -132,11 +151,7 @@ def test_a_udf_does_widen_the_cpu_it_reserves() -> None:
     """The other half: the weight has to land somewhere, and this is where."""
     partitions = [{"splits": [_Split(2_000_000)], "projection": None, "predicate": None}]
 
-    with patch.object(mapmod, "_learned_weight_factor", lambda *a, **k: 1.0):
-        for_map = mapmod._adaptive_task_cpus(partitions, _map_plan())
-        for_scan = mapmod._adaptive_task_cpus(partitions, _scan())
-
-    assert for_map[0] > for_scan[0]
+    assert _shares(partitions, _map_plan(), 1.0)[0] > _shares(partitions, _scan(), 1.0)[0]
 
 
 def test_the_learned_packing_factor_does_not_shrink_cluster_parallelism() -> None:
@@ -162,17 +177,15 @@ def test_the_learned_packing_factor_does_not_shrink_cluster_parallelism() -> Non
 
 def test_the_learned_packing_factor_still_shrinks_the_per_task_cpu_reservation() -> None:
     """The other half of the same contract: packing is exactly where it *should* apply."""
-    # Big enough that both reservations clear the `_MIN_TASK_CPU` floor, or the two would
-    # be equal for a reason that has nothing to do with the factor.
-    partitions = [{"splits": [_Split(2_000_000)], "projection": None, "predicate": None}]
+    # Each partition is big enough that both reservations clear the `_MIN_TASK_CPU` floor,
+    # and there are enough of them that the stage's ask stays under the fleet. A *single*
+    # partition does not discriminate: `_filled_to_the_fleet` scales one task's want by
+    # `node_cores * 1 / want`, so on any fleet wider than a node both factors saturate at
+    # the node cap and the assertion compares a number with itself.
+    partitions = [{"splits": [_Split(2_000_000)], "projection": None, "predicate": None}] * 8
     plan = _map_plan()
 
-    with patch.object(mapmod, "_learned_weight_factor", lambda *a, **k: 1.0):
-        full = mapmod._adaptive_task_cpus(partitions, plan)
-    with patch.object(mapmod, "_learned_weight_factor", lambda *a, **k: 0.25):
-        packed = mapmod._adaptive_task_cpus(partitions, plan)
-
-    assert packed[0] < full[0]
+    assert _shares(partitions, plan, 0.25)[0] < _shares(partitions, plan, 1.0)[0]
 
 
 def test_the_engine_config_is_built_once_per_distinct_cpu_share() -> None:

@@ -78,6 +78,22 @@ gcp-secrets = ["google-cloud-secret-manager>=2.16"]
 azure-secrets = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
+# Live GPU telemetry (`_internal.hardware.nvml`): SM utilization, VRAM actually resident,
+# board power, thermal/ECC health. Ray reports a device *count* and nothing else, so this is
+# the only source for any of it, and three things the GPU path advertises are blind without
+# it: utilization-driven autobatching, the actors-per-device packing loop
+# (`dist.executors.map`), and `accelerator.enabled` health checks.
+#
+# Declared because it was documented as a requirement in seven places and installable from
+# none of them. `nvml_session` degrades to `None` on ImportError by design — telemetry that
+# can fail a query is worse than no telemetry — so a missing `pynvml` is indistinguishable
+# from a CPU-only host and the sizing loop simply never fires. That is the same
+# undeclared-extra defect `tests/unit/test_optional_guard_is_shared.py` exists to catch, and
+# it slipped past because this guard is a bare `import`, not an `optional.require`.
+#
+# `nvidia-ml-py` is the distribution NVIDIA publishes; it provides the `pynvml` module. The
+# old `pynvml` distribution stopped shipping (see docs/configuration/accelerator.md).
+nvml = ["nvidia-ml-py>=12"]
 tensorflow = ["tensorflow>=2.15"]
 # Text embeddings via sentence-transformers (ds.ml.embed_text).
 st = ["sentence-transformers>=2.2"]
@@ -240,7 +256,7 @@ docs = [
     "sphinx-copybutton>=0.5",
 ]
 all = [
-    "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow]",
+    "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow,nvml]",
     "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
     "batcher-engine[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
 ]

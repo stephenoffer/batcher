@@ -38,9 +38,11 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
+    cluster_topology,
     create_worker_placement,
     current_envelope,
     engine_config_json,
+    fleet_task_headroom,
     placement_actor_options,
     release_placement,
 )
@@ -71,6 +73,26 @@ _MAP_INFLIGHT_MAX = INFERENCE_INFLIGHT_DEPTH_MAX
 # `ray.get(timeout=10)`, but now paid ONCE for the whole pool rather than per actor (see
 # `_healthy_actors`), so a 200-actor pool costs 10s of worst-case probing, not 2000s.
 _POOL_PROBE_TIMEOUT_S = 10.0
+# Bound on the cold-start VRAM probe, which is a *sizing* question and not a correctness one.
+#
+# `_cold_start_density` asks the first actor how much VRAM its loaded model took, so a second
+# actor can be packed onto a device that has room. That answer cannot arrive until the actor
+# is constructed, and an actor is constructed only once the cluster hands it a device — so on
+# a busy fleet the probe waits for capacity, not for a measurement.
+#
+# It used to wait with a bare `ray.get` and no bound. Measured on a 6-GPU cluster, a
+# `read.parquet(...).map_batches(cls, num_gpus=1).collect(distributed=True)` over four shards:
+# **251.5s of a 267.6s query** was this single call, with the actor pool itself doing the work
+# in 3.8s. The pool's own liveness probe 40 lines below is bounded for exactly this reason,
+# and its docstring says why: a probe that blocks "before any work started" is the worst place
+# to spend a timeout.
+#
+# Generous rather than tight, because a legitimate answer here waits on a real model load
+# (ResNet-50-class weights to device), and falling back on a slow-but-working load would
+# switch the packing off for every pipeline with a large model. Past it, `_cold_start_density`
+# returns its documented fallback of 1 — the unpacked configuration — and the measured loop
+# (`recommend_num_gpus`) packs the device on the next run from a real reading.
+_COLD_START_VRAM_PROBE_TIMEOUT_S = 45.0
 
 _log = get_logger("dist")
 
@@ -94,6 +116,25 @@ _INFERENCE_POOLS: contextvars.ContextVar[dict[tuple, list] | None] = contextvars
 # by `release_inference_pools()`; a pool whose actors died is rebuilt on next use.
 _SESSION_POOLS: dict[tuple, list] = {}
 
+# The session-warm pool for a CPU `map_batches -> aggregate` stage (`_agg_actor_pool`),
+# deliberately NOT `_SESSION_POOLS`, and deliberately holding **at most one pipeline**.
+#
+# Two different models are legitimately resident at once — that is the whole point of the
+# inference registry, and each pool holds the devices its own model needs. A CPU aggregate
+# pool is the opposite case: it holds general-purpose cores that every other stage also
+# wants, and it earns them only from the scan cache of the pipeline that filled it. Left to
+# accumulate they starve the cluster rather than sharing it. Measured: three pipelines in one
+# session put 960 of 1024 cores under reservation and the third stalled at the barrier with
+# `0/256 tasks finished` — the hang `_pool_key` warns about, reached by a different road.
+# So a second pipeline evicts the first, and a session that alternates pays a rebuild instead
+# of deadlocking.
+_AGG_POOLS: dict[tuple, list] = {}
+
+# The intra-actor width `_AGG_POOLS`' live pool was built with. An actor fixes its width in
+# `__init__`, so a fleet that grew or shrank leaves a pool running the old one; recording it is
+# what lets `_agg_actor_pool` notice and rebuild rather than silently keep the stale shape.
+_AGG_POOL_WIDTH: list[int] = []
+
 # Pins the `fn` objects whose `id()` a live pool's key was built from. Without this the key
 # is a bare address: once a pipeline's model callable is freed (its `Dataset` went out of
 # scope while the warm pool outlived it), CPython may hand that same address to a *different*
@@ -103,15 +144,143 @@ _SESSION_POOLS: dict[tuple, list] = {}
 _POOL_KEEPALIVE: dict[tuple, tuple] = {}
 
 
+# Holds the pending idle-release timer for `_AGG_POOLS` (a list rather than a `global`, like
+# `_AGG_POOL_WIDTH` above). Single-tenancy stopped the pools *accumulating*; it did not stop
+# the one tenant holding the cluster. Measured on the 65-node fleet: after a `udf` query
+# returned, `ray status` reported **960 of 1,024 CPU in use** for as long as the driver
+# process lived -- 64 actors at 16 CPU each -- and a Ray Data run started next in the same
+# process finished its 600,037,902-row map in seconds and then sat at `0/1` on a final
+# aggregate it could not schedule. The cores are earned by the scan cache of the query that
+# filled them, and a query that is not coming keeps earning nothing.
+#
+# So the pool takes the discipline the shuffle's session fleet already has
+# (`dist.fleet._arm_idle_release`), including its knob: `distributed.session_fleet_idle_s`,
+# 30 s. Back-to-back queries never see it -- the timer is cancelled the moment a stage asks
+# for the pool -- and a session that walks away gets its cluster back without knowing
+# `release_inference_pools` exists.
+#
+# **CPU pools only.** A GPU/model pool in `_SESSION_POOLS` is the case where residency is
+# worth the hold: reloading a model costs minutes, and it holds devices whose only other
+# user is another model. This one holds general-purpose cores and reloads a file cache.
+_AGG_IDLE_TIMER: list = []
+# Outstanding uses of `_AGG_POOLS`, for the same reason `dist.fleet` counts leases: "idle"
+# has to mean *no stage is running on the pool*, not *N seconds since one started*. Without
+# it a query longer than the idle window would have its own actors killed underneath it.
+_AGG_IN_USE: list[int] = []
+
+
+def _cancel_agg_idle_release() -> None:
+    """Stop any pending release: the pool is in use, so it is not idle."""
+    while _AGG_IDLE_TIMER:
+        with contextlib.suppress(Exception):
+            _AGG_IDLE_TIMER.pop().cancel()
+
+
+def _release_agg_pool_if_idle() -> None:
+    """The timer's callback. Declines while a stage holds the pool; that stage re-arms."""
+    if not _AGG_IN_USE:
+        _shutdown_pools(_AGG_POOLS)
+
+
+def _arm_agg_idle_release() -> None:
+    """(Re)start the timer that returns the warm CPU map pool's cores once it goes idle."""
+    import threading
+
+    from batcher.config import active_config
+
+    _cancel_agg_idle_release()
+    if not _AGG_POOLS:
+        return
+    idle_s = float(active_config().distributed.session_fleet_idle_s)
+    if idle_s <= 0:
+        return
+    timer = threading.Timer(idle_s, _release_agg_pool_if_idle)
+    timer.daemon = True
+    timer.start()
+    _AGG_IDLE_TIMER.append(timer)
+
+
+@contextlib.contextmanager
+def _agg_pool_in_use():
+    """Hold the warm CPU pool for the length of a stage, then start its idle clock."""
+    _cancel_agg_idle_release()
+    _AGG_IN_USE.append(1)
+    try:
+        yield
+    finally:
+        _AGG_IN_USE.pop()
+        _arm_agg_idle_release()
+
+
+def release_foreign_agg_pools(plan0, needed_cpus: float) -> bool:
+    """Kill warm CPU pools belonging to *other* pipelines when this one cannot place.
+
+    The warm map/aggregate pool keeps a pipeline's actors alive for
+    `distributed.session_fleet_idle_s` so a back-to-back query reuses their scan cache, and a
+    timer returns the cores when the session goes quiet. That is right for a pipeline running
+    again; it is wrong for a **different** pipeline that needs those cores now, and the failure
+    it produced is a self-deadlock rather than a slowdown.
+
+    The shape, measured on six 8-core nodes. An ordinary CPU query returns and leaves its pool
+    holding **42 of 48 cores**. The next query — a different pipeline — enters this route,
+    takes the in-use lease, and tries to build its own pool and submit its map tasks at
+    **6.144 CPU each against 6.0 free**. Not one can be placed. And the lease it is holding is
+    exactly what stops the stale pool being reclaimed, so the query waits on cores that only it
+    could release: `0/6 tasks finished`, indefinitely, with every GPU idle. A pipeline that
+    reads with the CPU engine and then infers hit this every time.
+
+    Keyed on the pipeline signature, so a pool this plan would actually reuse is never touched
+    — the lease still protects the current pipeline's own pool, which is what it is for. What a
+    foreign pool loses is a scan cache its next run rebuilds.
+
+    Gated on the cluster genuinely being short, so a query that fits alongside a warm pool
+    leaves it warm and the optimization survives for the case it was written for.
+
+    Args:
+        plan0: The pipeline about to acquire a pool; its own pools are kept.
+        needed_cpus: What this stage needs free before it can place.
+
+    Returns:
+        True when a pool was killed, so the caller can note that it made room.
+    """
+    if not _AGG_POOLS:
+        return False
+    sig = _pipeline_signature(plan0)
+    foreign = [k for k in _AGG_POOLS if k[0] != sig]
+    if not foreign:
+        return False
+    try:
+        import ray
+
+        if float(ray.available_resources().get("CPU", 0.0)) >= float(needed_cpus):
+            return False
+    except Exception as exc:  # pragma: no cover - a scheduling courtesy, never a failure
+        note_suppressed("dist", "read free CPU before releasing a foreign pool", exc)
+        return False
+    _kill_pool_keys(foreign, _AGG_POOLS)
+    log_kv(
+        get_logger("dist"),
+        logging.INFO,
+        "released another pipeline's idle CPU map pool to place this stage",
+        reason="its cores were held for a scan cache this pipeline cannot use",
+        needed_cpus=needed_cpus,
+        pools=len(foreign),
+    )
+    return True
+
+
 def release_inference_pools() -> None:
-    """Tear down all session-warm inference actor pools and free their GPUs.
+    """Tear down every session-warm actor pool and free the GPUs and cores they hold.
 
     Warm pools (``distributed.warm_inference_pools``, on by default) keep a model's actors
-    alive across ``collect()`` calls so it loads once per session. Call this to release those
-    GPUs before other GPU work, or when done with inference; it also runs automatically at
-    process exit. A no-op when no pools are warm. The next inference `collect()` rebuilds the
-    pool (paying the one-time load again)."""
+    alive across ``collect()`` calls so it loads once per session, and keep a CPU
+    ``map_batches`` + aggregate stage's workers alive so their scan cache survives the query.
+    Call this to release those resources before other work, or when done; it also runs
+    automatically at process exit. A no-op when no pools are warm. The next `collect()`
+    rebuilds the pool it needs (paying the one-time load again)."""
+    _cancel_agg_idle_release()
     _shutdown_pools(_SESSION_POOLS)
+    _shutdown_pools(_AGG_POOLS)
 
 
 # Free any session-warm GPU actors at process exit so a finished batch job never leaves GPUs
@@ -179,11 +348,14 @@ def _unpin_pool_keys(sigs) -> None:
         _POOL_KEEPALIVE.pop(sig, None)
 
 
-def _new_map_actor(plan0: LogicalPlan, opts: dict):
+def _new_map_actor(plan0: LogicalPlan, opts: dict, cpu_workers: int | None = None):
     """Spawn one model-loaded `_MapActor` (the single actor-creation point, so residency
-    reuse and tests can account for every build)."""
+    reuse and tests can account for every build).
+
+    `cpu_workers` overrides the actor's intra-actor width; `None` keeps
+    `_INFERENCE_CPU_WORKERS`, which is what every inference caller wants."""
     cls = _MapActor.options(**opts) if opts else _MapActor
-    return cls.remote(plan0)
+    return cls.remote(plan0, None, cpu_workers)
 
 
 def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
@@ -200,6 +372,23 @@ def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
     return (_pipeline_signature(plan0), resources)
 
 
+def _kill_pool_keys(keys: list[tuple], registry: dict) -> None:
+    """Kill and forget every pool `registry` holds under `keys` — the one eviction path.
+
+    Three call sites want this loop with three different predicates (a stale resource
+    request, a whole pipeline, every *other* tenant), and the difference between them is the
+    key list, never the teardown. The copy that had drifted omitted `_unpin_pool_keys`, so it
+    left a `_POOL_KEEPALIVE` entry pinning the callables of every pool it removed.
+    """
+    import ray
+
+    for key in keys:
+        for actor in registry.pop(key, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    _unpin_pool_keys(keys)
+
+
 def _evict_stale_configurations(key: tuple, registry: dict) -> None:
     """Kill any pool for the same pipeline built against a *different* resource request.
 
@@ -207,17 +396,16 @@ def _evict_stale_configurations(key: tuple, registry: dict) -> None:
     hold exactly the devices the new pool needs, so leaving them warm is a deadlock rather
     than a wasted reservation.
     """
-    import ray
-
-    stale = [k for k in registry if k[0] == key[0] and k != key]
-    for k in stale:
-        for actor in registry.pop(k, []):
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
+    _kill_pool_keys([k for k in registry if k[0] == key[0] and k != key], registry)
 
 
 def _resident_pool_for(
-    plan0: LogicalPlan, opts: dict, size: int, registry: dict, devices: int = 0
+    plan0: LogicalPlan,
+    opts: dict,
+    size: int,
+    registry: dict,
+    devices: int = 0,
+    cpu_workers: int | None = None,
 ) -> list:
     """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
@@ -237,11 +425,15 @@ def _resident_pool_for(
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
-        pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+        pool = pool + [
+            _new_map_actor(plan0, opts, cpu_workers) for _ in range(max(1, size) - len(pool))
+        ]
     if devices > 0:
         want = devices * _cold_start_density(pool)
         if want > len(pool):
-            pool = pool + [_new_map_actor(plan0, opts) for _ in range(want - len(pool))]
+            pool = pool + [
+                _new_map_actor(plan0, opts, cpu_workers) for _ in range(want - len(pool))
+            ]
     registry[sig] = pool
     _pin_pool_key(sig, plan0)
     return pool
@@ -250,6 +442,23 @@ def _resident_pool_for(
 #: A partition ceiling high enough that `gpu_aware_pool_default`'s "never more actors than
 #: partitions" clamp cannot bind while we are asking it how many actors the devices want.
 _UNCLAMPED_PARTITIONS = 1 << 30
+
+
+def _explicit_pool_ceiling(concurrency: object) -> int | None:
+    """The largest pool an explicit `concurrency` asks for, or `None` when it is unset.
+
+    `map_batches(concurrency=...)` is either an `int` (a fixed pool) or a `(min, max)` tuple
+    (the autoscaling contract), and the *ceiling* is what the partition count has to cover:
+    a pool that may grow to `max` needs `max` partitions to grow into.
+    """
+    if concurrency is None:
+        return None
+    if isinstance(concurrency, tuple):
+        vals = [int(v) for v in concurrency if isinstance(v, int | float)]
+        return max(vals) if vals else None
+    if isinstance(concurrency, int | float):
+        return int(concurrency)
+    return None
 
 
 def _pool_partition_count(
@@ -274,9 +483,19 @@ def _pool_partition_count(
 
     Never below the caller's `workers`, and a partition count only shards, so the merged
     result is identical for any value.
+
+    **An explicit `concurrency` needs the same floor, for the same reason.** Not
+    second-guessing the caller's *pool size* is right; returning `workers` as the *partition*
+    count is not, because `_drive_actor_pool` then clamps the pool to
+    `min(max_size, len(partitions))` and the caller's number is silently reduced to the
+    worker count. Measured on this cluster: `concurrency=6, num_gpus=1` over a 200-shard
+    corpus with `workers=3` produced 3 partitions, so 3 of 6 GPUs ran and the other three sat
+    idle for the whole query — the same causality inversion the paragraph above describes,
+    reached by the one path that had opted out of the fix for it.
     """
-    if concurrency is not None:  # the caller sized their own pool; don't second-guess it
-        return workers
+    explicit = _explicit_pool_ceiling(concurrency)
+    if explicit is not None:  # the caller sized their own pool; give it enough to fill
+        return max(workers, explicit)
     from batcher.ml.gpu import gpu_aware_pool_default
 
     replicas = gpu_aware_pool_default(
@@ -322,7 +541,20 @@ def _cold_start_density(pool: list) -> int:
     if not pool:
         return 1
     try:
-        return cold_start_actors_per_device(ray.get(pool[0].loaded_vram.remote()))
+        ref = pool[0].loaded_vram.remote()
+        # Bounded: see `_COLD_START_VRAM_PROBE_TIMEOUT_S`. An unbounded wait here does not
+        # make the packing better, it makes the query wait for cluster capacity before any
+        # work is dispatched — and the fallback below is exactly what the measured loop
+        # would have chosen anyway.
+        ready, _ = ray.wait([ref], num_returns=1, timeout=_COLD_START_VRAM_PROBE_TIMEOUT_S)
+        if not ready:
+            _log.debug(
+                "cold-start VRAM probe did not answer within %.0fs; leaving the pool "
+                "unpacked (one actor per device) and letting the measured loop size it",
+                _COLD_START_VRAM_PROBE_TIMEOUT_S,
+            )
+            return 1
+        return cold_start_actors_per_device(ray.get(ready[0]))
     except Exception as exc:  # pragma: no cover - sizing must never break a query
         note_suppressed("dist", "probe the loaded model's VRAM for cold-start packing", exc)
         return 1
@@ -518,15 +750,8 @@ def _evict_pipeline_pools(plan0, registry: dict) -> None:
     (`_pool_key`) — so an eviction that matched only one exact key would leave the other
     configuration's actors alive holding their devices.
     """
-    import ray
-
     sig = _pipeline_signature(plan0)
-    keys = [k for k in list(registry) if k[0] == sig]
-    for key in keys:
-        for actor in registry.pop(key, []):
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
-    _unpin_pool_keys(keys)
+    _kill_pool_keys([k for k in registry if k[0] == sig], registry)
 
 
 def _map_resources(
@@ -585,6 +810,27 @@ def _resolve_pool_size(spec: object, num_partitions: int, default: int) -> int:
         lo, hi = spec
         return max(lo, min(hi, num_partitions))
     return int(spec)
+
+
+def _clamped_to_fleet_bundles(shares: list[float], sched: dict) -> list[float]:
+    """`shares`, each capped at what one bundle of the held fleet keeps free for a task.
+
+    Only used on `_placeable_scheduling`'s second answer -- running inside the shuffle
+    fleet's own reservation, which is the shape a staged query's final scan is forced into
+    because its intermediate is published on those actors. The bundles were sized from the
+    query's envelope, not from a node, and each actor claims all but `fleet_task_headroom`
+    of its own, so that headroom is the largest request Ray can place there.
+
+    Returns `shares` unchanged when the group is unreadable, which leaves the stage exactly
+    where it was rather than shrinking it on a guess.
+    """
+    pg = getattr(sched.get("scheduling_strategy"), "placement_group", None)
+    cpus = [float(b.get("CPU", 0.0)) for b in (getattr(pg, "bundle_specs", None) or ())]
+    cpus = [c for c in cpus if c > 0]
+    if not cpus:
+        return shares
+    ceiling = max(_MIN_TASK_CPU, min(fleet_task_headroom(c) for c in cpus))
+    return [min(s, ceiling) for s in shares]
 
 
 def _placeable_scheduling(needed_cpus: float) -> dict:
@@ -701,13 +947,23 @@ def _distributed_map(
         else _adaptive_partition_count(sources[sid], plan, workers, hub)
     )
     proj, pred = _scan_pushdown(plan0)
+    # The partition count goes in as `max_partitions`, NOT as the worker count, and the two
+    # are not interchangeable: `_scan_splits` coalesces adjacent row-groups to
+    # `_SPLIT_TARGET_BYTES` only while the result still holds `workers x _SCAN_PREFETCH`
+    # splits, so passing a compute-derived partition count there sets a floor no large read
+    # can meet and silently disables coalescing. Measured on TPC-H sf100 `lineitem`: this
+    # route planned **4,902** splits where `flight_aggregate` — same query, same projected
+    # column, and this same idiom — planned **2,494**, i.e. twice the object-store requests
+    # for the same bytes. `partition_descriptors` takes `max(workers, min(max_partitions,
+    # len(splits)))`, so the descriptor count is unchanged; only the split *shape* is.
     partitions = partition_descriptors(
         sources[sid],
-        n_parts,
+        workers,
         projection=proj,
         predicate=pred,
         preserve_order=preserve_order,
         cluster_by=cluster_by,
+        max_partitions=n_parts,
     )
     if write_spec is not None:
         # A `num_files` layout names a total across the whole write, so each shard needs to
@@ -792,6 +1048,14 @@ def _distributed_map(
         # `placeable` is empty unless the cluster is full, and then it *replaces* the
         # SPREAD/DEFAULT choice below: a strategy that cannot be scheduled is not a
         # placement preference to be balanced against, it is the whole question.
+        if placeable:
+            # Ray checks a task's WHOLE request against a SINGLE bundle, so a share sized to a
+            # node does not merely queue inside an envelope-sized fleet, it raises at submit:
+            # `Cannot schedule _map_udf_task ... {'CPU': 16.0} cannot fit into any bundles ...
+            # [{'CPU': 8.0}, ...]`. The query fails rather than running slowly, which is the
+            # opposite of what this fallback is for. `fleet_task_headroom` is the CPU those
+            # bundles actually keep unclaimed for these tasks, so it is the ceiling.
+            shares = _clamped_to_fleet_bundles(shares, placeable)
         sched = placeable or _map_scheduling_options(env, shares)
         plan_ref = _shared_arg(plan0)
         cfg_for = _engine_config_cache()
@@ -1031,30 +1295,36 @@ def _map_scheduling_options(env, shares: list[float]) -> dict:
 
 def _placeable_node_cores() -> float:
     """Max CPUs a single task may request and still be placeable on every node — the
-    smallest alive node's core count (so a multi-CPU task fits anywhere). Falls back to
-    the driver's cpu count when topology is unavailable."""
-    try:
-        import ray
+    smallest *worker* node's core count (so a multi-CPU task fits anywhere). Falls back to
+    the driver's cpu count when topology is unavailable.
 
-        cores = [
-            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
-        ]
-        cores = [c for c in cores if c > 0]
-        if cores:
-            return float(int(min(cores)))
+    Read from the shared topology snapshot rather than from `ray.nodes()` here, which is a
+    correction as well as a saving. The local read counted the Ray head and the nodes Ray is
+    draining, neither of which a map task is placed on, so a head narrower than the fleet
+    capped every task at the head's width — and it went to the GCS on every call, outside the
+    snapshot (`topology_scope`) and the 50 ms window every other topology reader shares.
+    """
+    try:
+        cores = int(cluster_topology().get("min_node_cpus", 0.0))
     except Exception as exc:
         note_suppressed("dist", "read cluster node CPU counts", exc)
-    return float(available_cpu_count())
+        cores = 0
+    return float(cores) or float(available_cpu_count())
 
 
 def _cluster_cores() -> float:
-    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism)."""
-    try:
-        import ray
+    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism).
 
-        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(available_cpu_count())
-    except Exception:
-        return float(available_cpu_count())
+    Worker-eligible and snapshot-aware, for the reasons on `_placeable_node_cores`: the head's
+    cores are not parallelism this stage can use, and the count is asked for three times per
+    query (the fan-out cap, the fleet fill, the actor width).
+    """
+    try:
+        cores = int(cluster_topology().get("cpus", 0.0))
+    except Exception as exc:
+        note_suppressed("dist", "read cluster CPU capacity", exc)
+        cores = 0
+    return float(cores) or float(available_cpu_count())
 
 
 def _learning_hub(hub=None):
@@ -1260,7 +1530,40 @@ def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> t
     return declared_clustering(splits)
 
 
-def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
+#: How many cores a map task should be, when there is enough data to choose. The parallelism
+#: term is clamped to `cluster_cores / this` rather than to the core count itself, because a
+#: task is not a core: `_map_udf_task` sets its intra-task `num_workers` from its CPU share,
+#: so N tasks of 4 cores and 4N tasks of 1 core buy the same threads — and the first buys them
+#: with a quarter of the dispatch, descriptor decoding, engine setup and worker acquisition.
+#: The table in `_adaptive_partition_count` measured that on a 128-core fleet (32 tasks x 4 CPU
+#: won at every UDF weight, i.e. cores/4), and it reproduces on this 1,024-core one: forcing
+#: 256 partitions (= 1,024/4) against the 301 the unclamped term asks for runs the sf100 heavy
+#: UDF pipeline in 1,345/1,382 ms against 1,662/1,758 ms.
+_TARGET_TASK_CPUS = max(1, int(os.environ.get("BATCHER_TARGET_TASK_CPUS", "4")))
+
+
+def _widest_useful_fan_out(task_cpus: float | None = None) -> int:
+    """The most units worth cutting the *rows* into — the fleet at one unit's width.
+
+    `task_cpus` is how wide one working unit actually is, defaulting to `_TARGET_TASK_CPUS`
+    because a stateless map task reserves about that. **An actor pool is not that width.**
+    `_agg_actor_width` gives a CPU map/aggregate actor `cluster cores / pool size` threads
+    (16 here), so sizing its row fan-out at 4 cuts four times more partitions than there are
+    working units and pays the per-partition dispatch, transfer and fold four times over —
+    measured at 70-79 ms on a sweep whose whole remaining gap to 10x was ~68 ms.
+
+    Only the parallelism term is clamped by this. The byte term is a **memory bound** and
+    must stay free to ask for more (see `_byte_partition_count`): a source that needs 4,096
+    tasks to keep one task's input under budget still gets them, because the alternative is
+    an OOM rather than a slow query. That is what makes widening this safe where forcing the
+    count outright was not: the earlier arm that set the count to the worker width bypassed
+    the bound and quadrupled per-partition memory, and this cannot, because the bound is
+    applied as a `max` after it.
+    """
+    return max(1, int(_cluster_cores() // max(1.0, float(task_cpus or _TARGET_TASK_CPUS))))
+
+
+def _adaptive_partition_count(source, plan, fallback: int, hub=None, task_cpus=None) -> int:
     """How many tasks to split a map/scan source into — data- and compute-driven.
 
     Two independent terms, taken as a **maximum**, because they answer different questions
@@ -1329,11 +1632,76 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
         return fallback
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
     by_rows = math.ceil(total / rows_per_cpu)
-    n = max(1, min(by_rows, int(_cluster_cores())))
+    n = max(1, min(by_rows, _widest_useful_fan_out(task_cpus)))
     n = max(n, _byte_partition_count(source, plan, total, hub))
     with contextlib.suppress(Exception):
         n = min(n, max(1, len(source.splits())))  # never more tasks than splits
     return n
+
+
+def _minus_pruned_columns(source, plan, total_rows: int, total_bytes: float) -> float:
+    """`total_bytes` less the columns the pushed projection means nobody reads.
+
+    A source's own byte total is the whole relation — every column, whatever the query
+    asked for — and the byte term is a bound on what **one task holds**, which is the
+    *projected* read. Sizing it on the unprojected total shards a narrow query over a wide
+    table as if it read the wide table. Measured on TPC-H sf100 `lineitem`, one `float64`
+    column of sixteen: the source reports 124.8 GB, the read is 4.8 GB, and the byte term
+    came out at 465 partitions against the row term's 301 — so the term that is supposed to
+    be a memory *bound* was setting the fan-out, 55% above what the rows asked for. At 465
+    partitions that pipeline runs in 2,257 ms; at 256 it runs in 1,438 ms.
+
+    Only the **pruned** columns are modelled, and never the retained ones — that is what
+    makes this safe in the one direction that matters. A variable-length column's width is a
+    prior (`plan.types.widths`), and a media column's real bytes can exceed it by orders of
+    magnitude. Subtracting a prior that is too small removes too little, so the result
+    over-states the projected bytes and asks for *more* partitions, which is the direction
+    an OOM guard should fail in. The retained columns are never estimated at all: they keep
+    whatever share of the source's authoritative total is left.
+
+    Args:
+        source: The source being sized, for its schema.
+        plan: The plan being run, for the projection its scan pushes down.
+        total_rows: The source's row count.
+        total_bytes: The source's own reported byte total, all columns.
+
+    Returns:
+        The bytes the projected read is estimated to move, never above the source's own
+        reported total.
+    """
+    from batcher.plan.types.widths import projected_row_bytes, schema_row_bytes
+
+    projection, _predicate = _scan_pushdown(plan)
+    if not projection:
+        return total_bytes
+    try:
+        schema = source.schema()
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "read the source schema for byte sizing", exc)
+        return total_bytes
+    full = schema_row_bytes(schema)
+    if full <= 0:
+        return total_bytes
+    kept = projected_row_bytes(schema, projection)
+    pruned = max(0.0, full - kept)
+    # Two readings of the same projection, and the larger wins, because each is wrong in a
+    # direction the other covers.
+    #
+    # *Subtracting* the pruned columns is what keeps a media source honest: its retained
+    # column is never modelled, so a `binary` blob whose real bytes dwarf its 36-byte prior
+    # keeps whatever share of the authoritative total is left. But it assumes `total_bytes`
+    # and the width model share a unit, and they do not always — `Source.statistics()`
+    # reports *compressed on-disk* bytes for some formats and decoded logical bytes for
+    # others, so the subtraction can run past zero on a well-compressed table.
+    #
+    # *Scaling* by `kept / full` is a dimensionless ratio, so it is right in either unit —
+    # and it is the one that under-counts a media column, because the ratio is computed from
+    # the same priors that under-model it.
+    #
+    # Neither can exceed `total_bytes` (`kept <= full`, `pruned >= 0`), so the max only ever
+    # takes back an over-subtraction. It never asks for fewer partitions than the source's
+    # own total would have.
+    return max(total_bytes * (kept / full), total_bytes - total_rows * pruned)
 
 
 def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
@@ -1358,6 +1726,8 @@ def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
 
         opt = active_config().optimizer
         total_bytes = _source_total_bytes(source)
+        if total_bytes is not None:
+            total_bytes = _minus_pruned_columns(source, plan, total_rows, total_bytes)
         if total_bytes is None:
             from batcher.kyber import load_learned_stats
             from batcher.kyber.cardinality import CardinalityEstimator
@@ -1924,11 +2294,16 @@ class _MapActor:
     It also samples GPU utilization while running so the scheduler can adapt the
     `num_gpus` request on the next run (the feedback half of GPU scheduling)."""
 
-    def __init__(self, plan0: LogicalPlan, write_spec: dict | None = None) -> None:
+    def __init__(
+        self,
+        plan0: LogicalPlan,
+        write_spec: dict | None = None,
+        cpu_workers: int | None = None,
+    ) -> None:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
-        self._plan = _with_inference_workers(_prebuild_factories(plan0))
+        self._plan = _with_inference_workers(_prebuild_factories(plan0), cpu_workers)
         self._write_spec = write_spec
         self._gpu_vram_max: float | None = None
         # Sustained utilization, sampled on a timer for the actor's working window — NOT the
@@ -1978,6 +2353,39 @@ class _MapActor:
         import ray
 
         return os.environ.get("BATCHER_ADVERTISE_HOST") or ray.util.get_node_ip_address()
+
+    def run_agg(self, partition: dict, group_keys_json: str, aggregates_json: str):
+        """Map this partition through the UDF prefix and PARTIAL-aggregate it here.
+
+        The actor-resident twin of `_map_agg_task`, and the reason it exists is the scan
+        cache. A stateless task lands wherever Ray has room, so the partition it reads is
+        almost never the one this process cached: instrumented over three consecutive runs of
+        one query, `_map_agg_task` workers reported `hit_rate 0.0` while each held 74-186 MB
+        of cached batches. An actor addressed by ``idx % n`` sees the *same* partition every
+        run, and the counters then show the hit — `pid=124496 idx=36` went `hit_rate 0.0` on
+        run 1 and `0.5` on run 2, across 64 actors. Measured on this route, warm on TPC-H
+        sf100 `lineitem`: a light UDF 910-1,060 ms of tasks against 584 ms of actors, a
+        compute-heavy one 1,422-1,687 ms against 1,017 ms.
+
+        Only the small partial-aggregate state leaves the worker, exactly as in the task
+        form, so the mergeable contract (`partial -> combine -> finalize`) is untouched and
+        the driver's `combine_finalize` is unchanged.
+
+        Unlike `_map_agg_task` this does not re-width the plan per call (`_with_map_workers`):
+        an actor's plan is widened once in `__init__` by `_with_inference_workers`, which gives
+        a CPU stage `_INFERENCE_CPU_WORKERS` (4) — the same width the task computed from its
+        share. So the two forms differ in worker *count*, not in per-worker width.
+        """
+        from batcher import core
+
+        nat = engine()
+        source = _lazy_partition_source(partition)
+        if source is None:
+            return None
+        out = core.execute_with_udfs(self._plan, [source])
+        if not out or sum(b.num_rows for b in out) == 0:
+            return None
+        return nat.partial_aggregate(group_keys_json, aggregates_json, out)
 
     def run_split(self, addr: str, ticket):
         """Map one prior-stage bucket fetched in place from `(addr, ticket)`, so a
@@ -2058,11 +2466,14 @@ class _MapActor:
 _INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
 
 
-def _with_inference_workers(plan):
-    """Set each map stage's `num_workers` for a GPU inference actor: a GPU stage keeps 1 (one
-    CUDA context), a CPU stage gets `_INFERENCE_CPU_WORKERS` so its decode/preprocess fans
-    across the node's spare cores and stays ahead of the GPU stage — the fix for a fast/small
-    model whose single-threaded decode would otherwise starve the device (util < 50%)."""
+def _with_inference_workers(plan, cpu_workers: int | None = None):
+    """Set each map stage's `num_workers` for a map actor: a GPU stage keeps 1 (one CUDA
+    context), a CPU stage gets `cpu_workers`, defaulting to `_INFERENCE_CPU_WORKERS`.
+
+    The default of 4 exists to feed a *device*: it is what keeps a fast/small model's
+    decode/preprocess ahead of the GPU (util < 50% without it). A CPU-only map/aggregate pool
+    has no device to feed and a whole node to use, so it passes its own width — see
+    `_agg_actor_width`, which measured 1.43x for exactly this reason."""
     import dataclasses
 
     from batcher.plan.logical import MapBatches
@@ -2070,11 +2481,12 @@ def _with_inference_workers(plan):
 
     if isinstance(plan, MapBatches):
         plan = dataclasses.replace(
-            plan, num_workers=1 if plan.num_gpus > 0 else _INFERENCE_CPU_WORKERS
+            plan,
+            num_workers=1 if plan.num_gpus > 0 else (cpu_workers or _INFERENCE_CPU_WORKERS),
         )
     kids = children(plan)
     if kids:
-        return with_children(plan, [_with_inference_workers(c) for c in kids])
+        return with_children(plan, [_with_inference_workers(c, cpu_workers) for c in kids])
     return plan
 
 
@@ -2177,6 +2589,122 @@ def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: i
     return nat.partial_aggregate(group_keys_json, aggregates_json, out)
 
 
+def _agg_actor_width(pool_size: int) -> int:
+    """Threads each actor of a CPU map/aggregate pool should run its UDF with.
+
+    The pool is the stage's whole parallelism, so its actors should between them hold the
+    fleet: `cluster cores / pool size`. Capped by the smallest alive node
+    (`_placeable_node_cores`), because an actor's threads all run in one process on one node
+    and a pool smaller than the node count would otherwise ask a 16-core box for 128 threads.
+
+    This is the lever the earlier arms missed. `_MapActor.__init__` overrides whatever width
+    it is handed with `_with_inference_workers`, so an experiment that widened the *plan* or
+    the Ray *reservation* changed nothing and read as "width does not matter" — it was never
+    varied. Measured here, same pipeline and same 64-actor pool, 4 threads against 16:
+    **1,068 ms against 746 ms**, identical sums. 64 x 16 is 1,024-way on a 1,024-core fleet,
+    which is what the 256-actor arm was reaching for when it stalled.
+
+    Args:
+        pool_size: Actors in the pool.
+
+    Returns:
+        Threads per actor, at least 1.
+    """
+    per_actor = int(_cluster_cores() // max(1, pool_size))
+    return max(1, min(per_actor, int(_placeable_node_cores())))
+
+
+def _agg_actor_pool(plan0: LogicalPlan, workers: int) -> list | None:
+    """A session-warm actor pool for a `map_batches -> aggregate` stage, or `None`.
+
+    `_distributed_map_aggregate` has always run stateless tasks, which is why this shape gets
+    nothing from the per-process scan cache (see `_MapActor.run_agg`). Reusing the machinery
+    the inference path already has — same builder, same healing, same key — gives it
+    persistent workers without a second pool implementation.
+
+    The *registry* is its own, and holds one pipeline at a time: these actors hold
+    general-purpose cores rather than the devices a model needs, so a second pipeline evicts
+    the first instead of joining it. See `_AGG_POOLS` for what accumulation measured.
+
+    Declined for a GPU stage: those size and place their pool from device measurements
+    (`gpu_aware_pool_default`, `_cold_start_devices`), and none of that reasoning applies to a
+    CPU aggregate. Declined when `warm_inference_pools` is off, which is the switch that says
+    actors must not outlive a query.
+
+    Args:
+        plan0: The map prefix, already single-source-relabelled.
+        workers: The stage's fan-out — one actor per worker.
+
+    Returns:
+        The pool's actors, or `None` to keep the stateless-task path.
+    """
+    from batcher.config import active_config
+
+    if not active_config().distributed.warm_inference_pools:
+        return None
+    try:
+        num_gpus, _wants_pool, _concurrency, accelerator_type, resources = _map_resources(plan0)
+        if num_gpus:
+            return None
+        opts = _gpu_options(num_gpus, accelerator_type, resources)
+        size = max(1, workers)
+        width = _agg_actor_width(size)
+        sig = _pool_key(plan0, opts)
+        stale = [k for k in _AGG_POOLS if k != sig]
+        if _AGG_POOL_WIDTH and _AGG_POOL_WIDTH[0] != width:
+            stale = list(_AGG_POOLS)  # the live pool's actors are fixed at the old width
+        _kill_pool_keys(stale, _AGG_POOLS)
+        _AGG_POOL_WIDTH[:] = [width]
+        return _resident_pool_for(plan0, opts, size, _AGG_POOLS, cpu_workers=width) or None
+    except Exception as exc:  # a pool is an optimisation; never fail the stage for one
+        note_suppressed("dist", "acquire the warm pool for a map/aggregate stage", exc)
+        return None
+
+
+def _gather_with_pool_recovery(gather, actor_launch, task_launch, map_plan, actors):
+    """Run a map/aggregate stage on `actors`, redoing it on stateless tasks if the pool dies.
+
+    This is `_run_warm_pool`'s contract applied to the aggregate route: **a warm pool must
+    never turn a preemption into a failed query**. A stateless task is rescheduled anywhere by
+    Ray, so the route had that property for free before it had a pool; an actor pinned to a
+    preempted node does not, and rotating the partition onto a neighbouring actor only helps
+    while some actor survives.
+
+    Redoing the whole stage is safe rather than merely convenient: a partial is a pure
+    function of its durable partition descriptor, and `gather` folds into a state it creates
+    itself, so the second pass cannot double-count the first pass's partials.
+
+    Args:
+        gather: Runs one full pass with the launcher it is given and returns the folded state.
+        actor_launch: Launcher dispatching partition `idx` to its index-stable actor.
+        task_launch: Launcher submitting partition `idx` as a stateless task.
+        map_plan: The map prefix, used to evict the pool that failed.
+        actors: The pool, or `None`/empty to go straight to tasks.
+
+    Returns:
+        The folded aggregate state, or `None` when every partition was empty.
+    """
+    if not actors:
+        return gather(task_launch)
+    from ray.exceptions import RayError
+
+    try:
+        return gather(actor_launch)
+    except RayError as exc:
+        # WARNING rather than the `note_suppressed` DEBUG the other best-effort paths use:
+        # nothing was suppressed here, the stage was *recomputed*, and a user looking at why
+        # one query took twice as long as the last needs that in the log.
+        log_kv(
+            _log,
+            logging.WARNING,
+            "warm map/aggregate pool lost mid-stage; redoing the stage on stateless tasks",
+            pool_size=len(actors),
+            exc_info=exc,
+        )
+        _evict_pipeline_pools(map_plan, _AGG_POOLS)
+        return gather(task_launch)
+
+
 def _distributed_map_aggregate(above, agg, sources, workers):
     """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
 
@@ -2195,9 +2723,26 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     _ensure_ray(workers)
     map_plan, sid = _relabel_single_source(agg.input)
     gk, aj = agg_spec_json(agg)
-    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
+    # The pool is acquired BEFORE the partition count because the count depends on it: a
+    # partition is sized to one working unit, and this route's unit is a `_agg_actor_width`-wide
+    # actor (16 here) rather than the `_TARGET_TASK_CPUS`-wide task the default assumes. When
+    # the pool declines, the units really are tasks and the default is right.
+    _cancel_agg_idle_release()  # about to use the pool, so it is not idle
+    # Before taking the lease, hand back any *other* pipeline's warm pool if this stage cannot
+    # place without its cores. The lease below is what protects a running stage's own actors,
+    # and it would otherwise protect a stale pool from a previous query too — which is the
+    # self-deadlock `release_foreign_agg_pools` describes.
+    release_foreign_agg_pools(map_plan, _agg_actor_width(max(1, workers)))
+    actors = _agg_actor_pool(map_plan, workers)
+    unit_cpus = _agg_actor_width(max(1, workers)) if actors else None
+    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers, task_cpus=unit_cpus)
     proj, pred = _scan_pushdown(map_plan)
-    partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)
+    # `max_partitions`, not the worker count — see `_distributed_map`'s note: a
+    # compute-derived count passed as `workers` sets `_scan_splits`' coalescing floor out of
+    # reach and doubles this route's object-store requests.
+    partitions = partition_descriptors(
+        sources[sid], workers, projection=proj, predicate=pred, max_partitions=n_parts
+    )
     # Skew-aware adaptive CPU per task (sized to the partition that runs the UDF here);
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
@@ -2205,11 +2750,15 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
     plan_ref = _shared_arg(map_plan)
 
-    def _launch(idx):
-        workers = max(1, round(shares[idx]))
+    def _task_launch(idx):
+        task_workers = max(1, round(shares[idx]))
         return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
-            plan_ref, partitions[idx], gk, aj, workers
+            plan_ref, partitions[idx], gk, aj, task_workers
         )
+
+    def _actor_launch(idx):
+        """Partition `idx` always goes to the same actor — the point of the pool."""
+        return actors[idx % len(actors)].run_agg.remote(partitions[idx], gk, aj)
 
     # Fold each partition's partial into a running state **as it lands**, rather than
     # holding all of them and folding after the barrier. `combine` is associative and
@@ -2227,19 +2776,29 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # it is also within one. Integer and min/max/count aggregates are unaffected; a caller
     # needing bit-repeatable float sums has the same recourse it always had, which is to fix
     # the partition count.
-    running: list = [None]
+    def _gather(launch):
+        """One pass over every partition, folding partials as they land. Returns the state."""
+        running: list = [None]
 
-    def _fold(_idx, partial):
-        if partial is None:
-            return
-        running[0] = partial if running[0] is None else nat.combine(gk, aj, [running[0], partial])
+        def _fold(_idx, partial):
+            if partial is None:
+                return
+            running[0] = (
+                partial if running[0] is None else nat.combine(gk, aj, [running[0], partial])
+            )
 
-    gather_map_results(
-        _launch, len(partitions), task_cpus=min(shares) if shares else 1.0, sink=_fold
-    )
-    if running[0] is None:
+        # `task_cpus` is the smallest share any of these asks for, so the submit-ahead window
+        # counts units rather than cores.
+        gather_map_results(
+            launch, len(partitions), task_cpus=min(shares) if shares else 1.0, sink=_fold
+        )
+        return running[0]
+
+    with _agg_pool_in_use():
+        state = _gather_with_pool_recovery(_gather, _actor_launch, _task_launch, map_plan, actors)
+    if state is None:
         table = _empty_agg_table(agg)
     else:
-        out = nat.combine_finalize(gk, aj, [running[0]])
+        out = nat.combine_finalize(gk, aj, [state])
         table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
     return table if not above else _apply_above(above, table)

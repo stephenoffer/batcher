@@ -213,3 +213,196 @@ def test_a_shared_source_under_disjoint_filters_keeps_both_halves(tmp_path, cse_
     assert _rows(build().collect()) == [(1, 10), (2, 20), (3, 30), (4, 40)]
     with cse_off():
         assert _rows(build().collect()) == [(1, 10), (2, 20), (3, 30), (4, 40)]
+
+
+def _sess_with_star_schema():
+    """Four tables joined on one key, the shape a `WHERE` above a join tree is written in."""
+    rng = np.random.default_rng(7)
+    n = 4000
+    sess = bt.Session()
+    sess.register(
+        "f",
+        bt.from_arrow(pa.table({"k": rng.integers(0, 400, n), "v": rng.integers(0, 100, n)})),
+    )
+    for name in ("d1", "d2", "d3"):
+        sess.register(
+            "" + name,
+            bt.from_arrow(pa.table({"k": np.arange(400), name: np.arange(400) % 11})),
+        )
+    return sess
+
+
+_SHARED = (
+    "SELECT f.k AS k, f.v AS v FROM f, d1, d2, d3 "
+    "WHERE f.k = d1.k AND f.k = d2.k AND f.k = d3.k AND d1.d1 < 3"
+)
+_REPEATED = (
+    f"SELECT l.k AS k, sum(l.v) AS total FROM ({_SHARED}) l, ({_SHARED}) r "
+    "WHERE l.k = r.k GROUP BY l.k"
+)
+
+
+def test_a_predicate_above_a_join_tree_is_reused_and_still_matches_duckdb(duck):
+    """The shape the size gate used to refuse, because it read the unpushed estimate.
+
+    Every join is keyed here; what the optimizer moves is the predicate. Before the gates
+    read the optimized form, the repeated subtree estimated orders of magnitude too large
+    and the rewrite declined.
+    """
+    sess = _sess_with_star_schema()
+    for name in ("f", "d1", "d2", "d3"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    assert_same(sess.sql(_REPEATED).collect(), duck.sql(_REPEATED))
+
+
+def test_a_predicate_above_a_join_tree_matches_the_unrewritten_plan(cse_off):
+    sess = _sess_with_star_schema()
+    with cse_off():
+        want = _rows(sess.sql(_REPEATED).collect())
+    assert _rows(sess.sql(_REPEATED).collect()) == want
+    assert want, "the fixture must return rows, or neither side proves anything"
+
+
+def test_the_rewrite_fires_on_a_predicate_above_a_join_tree():
+    """The positive control for the two above, which a declining rewrite would satisfy."""
+    from batcher import core
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    q = _sess_with_star_schema().sql(_REPEATED)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    rewritten, sources = reuse_common_subplans(q._plan, list(q._sources), ctx)
+    assert len(sources) > len(q._sources), "no subplan was materialized"
+    assert rewritten is not q._plan, "the plan must be rewritten to read the materialization"
+
+
+def test_a_rollup_over_a_join_matches_duckdb(duck):
+    """ROLLUP lowers to one GROUP BY per level over the same input, so the input subtree is
+    repeated once per level -- the shape that makes this rewrite worth the most."""
+    sess = _sess_with_star_schema()
+    for name in ("f", "d1", "d2", "d3"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    sql = (
+        "SELECT d1.d1 AS a, d2.d2 AS b, sum(f.v) AS total "
+        "FROM f, d1, d2 WHERE f.k = d1.k AND f.k = d2.k "
+        "GROUP BY ROLLUP(d1.d1, d2.d2)"
+    )
+    assert_same(sess.sql(sql).collect(), duck.sql(sql))
+
+
+def test_a_materialized_subtree_carries_only_the_columns_the_plan_reads(duck):
+    """Materializing forfeits the fusion each appearance had with its parent, and what that
+    costs is a width: embedded, a subtree's consumers prune it; standalone there is no
+    consumer to prune it. Measured on TPC-DS q18 the chosen subtree carried 133 columns
+    where the plan read 11, and on q86 84 where it read 3 -- and those were exactly the two
+    queries reuse made slower.
+
+    The answer must not move, which is the half that matters: dropping a column the plan
+    still needs is a wrong result, not a slow one.
+    """
+    from batcher import core
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    sess = _sess_with_star_schema()
+    q = sess.sql(_REPEATED)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    _, sources = reuse_common_subplans(q._plan, list(q._sources), ctx)
+    assert len(sources) > len(q._sources), "no subplan was materialized"
+    materialized = sources[len(q._sources) :][0]
+    carried = set(materialized.schema().names)
+    # The shared SELECT projects k and v; the enclosing query reads both, so nothing is
+    # dropped here -- what this pins is that narrowing never drops a column that is read.
+    assert {"k", "v"} <= carried, f"a needed column was dropped; kept {sorted(carried)}"
+
+    for name in ("f", "d1", "d2", "d3"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    assert_same(sess.sql(_REPEATED).collect(), duck.sql(_REPEATED))
+
+
+def _sess_with_wide_star_schema():
+    """The same star schema with several columns per table, so width is visible."""
+    rng = np.random.default_rng(7)
+    n = 4000
+    sess = bt.Session()
+    sess.register(
+        "f",
+        bt.from_arrow(
+            pa.table(
+                {
+                    "k": rng.integers(0, 400, n),
+                    "v": rng.integers(0, 100, n),
+                    "w": rng.integers(0, 100, n),
+                    "x": rng.integers(0, 100, n),
+                }
+            )
+        ),
+    )
+    for name in ("d1", "d2", "d3"):
+        sess.register(
+            name,
+            bt.from_arrow(
+                pa.table(
+                    {
+                        "k": np.arange(400),
+                        name: np.arange(400) % 11,
+                        name + "b": np.arange(400) % 7,
+                    }
+                )
+            ),
+        )
+    return sess
+
+
+_WIDE_ROLLUP = (
+    "SELECT d1.d1 AS a, d2.d2 AS b, sum(f.v) AS total "
+    "FROM f, d1, d2, d3 WHERE f.k = d1.k AND f.k = d2.k AND f.k = d3.k AND d1.d1 < 3 "
+    "GROUP BY ROLLUP(d1.d1, d2.d2)"
+)
+
+
+def test_narrowing_drops_the_columns_the_levels_never_read(duck):
+    """The positive control: a wide subtree shared by several *different* consumers.
+
+    A `ROLLUP`'s levels are exactly that -- one group-by each over one common input -- so
+    the largest repeated subtree is the join's `Filter`, which carries every column of all
+    four tables while the levels read three. This is TPC-DS q18's shape, where the chosen
+    subtree carried 133 columns against the 11 the plan read, and q86's, where it carried 84
+    against 3; those were the two queries reuse made slower before this cut them down.
+
+    Both halves are asserted, and the second is the one that matters: narrowing must drop
+    columns, and the answer must not move -- dropping one the plan still needs is a wrong
+    result, not a slow one.
+    """
+    from batcher import core
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    sess = _sess_with_wide_star_schema()
+    q = sess.sql(_WIDE_ROLLUP)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    _, sources = reuse_common_subplans(q._plan, list(q._sources), ctx)
+    assert len(sources) > len(q._sources), "no subplan was materialized"
+    kept = sorted(sources[len(q._sources) :][0].schema().names)
+    assert len(kept) <= 4, f"the wide subtree was materialized at full width; kept {kept}"
+
+    for name in ("f", "d1", "d2", "d3"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    assert_same(q.collect(), duck.sql(_WIDE_ROLLUP))
+
+
+def test_narrowing_keeps_a_column_a_later_level_still_reads(duck):
+    """Guard on the other side: the union of what *every* appearance reads, not the first.
+
+    Each `ROLLUP` level reads a different subset of the keys, so narrowing to one level's
+    need would drop a column another level groups by -- a wrong answer, and one the row
+    count would not reveal.
+    """
+    sess = _sess_with_wide_star_schema()
+    for name in ("f", "d1", "d2", "d3"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    got = sess.sql(_WIDE_ROLLUP).collect()
+    assert_same(got, duck.sql(_WIDE_ROLLUP))
+    # One row per (a, b), one per a, and one grand total -- so more rows than the finest
+    # level alone, which is what proves every level survived.
+    finest = sess.sql(_WIDE_ROLLUP.replace("ROLLUP(d1.d1, d2.d2)", "d1.d1, d2.d2")).collect()
+    assert got.num_rows > finest.num_rows > 0, (
+        f"levels went missing: {got.num_rows} rows against {finest.num_rows} for the finest"
+    )

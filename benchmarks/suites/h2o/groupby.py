@@ -26,6 +26,7 @@ scale such as ``--scale 0.01``, where a group can be small enough to be constant
 from __future__ import annotations
 
 from registry import suite
+from suites.h2o.groupby_ray import case_with_ray
 
 groupby = suite("h2o-groupby", dataset="h2o-groupby")
 
@@ -63,5 +64,8 @@ QUERIES: dict[str, str] = {
     ),
 }
 
+# `sql_with_builder`, not `sql`: Ray Data has no SQL surface, so it reported `n/a` on all
+# ten questions and the column read as a loss rather than an absence. `groupby_ray` supplies
+# the pipeline; every SQL engine still runs the query string unchanged.
 for _name, _query in QUERIES.items():
-    groupby.sql(_name, _query)
+    groupby.sql_with_builder(_name, _query, case_with_ray(_name, _query))

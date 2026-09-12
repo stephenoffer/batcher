@@ -111,7 +111,7 @@ def execute_distributed(
     mark = time.perf_counter()
     if prof is not None:
         prof.worker_metrics = worker_metrics
-    collect_source_metadata(ctx.hub, sources)
+    collect_source_metadata(ctx.hub, sources, plan)
     phase("collect_source_metadata", time.perf_counter() - mark)
 
     record_distributed(
@@ -354,6 +354,16 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
     to read, and both are only known once the plan is optimized. Core measures the I/O the
     hardware actually delivered so a later read of the same source can predict its cost.
 
+    **A source the plan does not scan is not read at all.** The bound source list is the
+    *query's*, while `opt` is often a sub-plan of it: the adaptive staging loop executes one
+    breaker's subtree at a time against the full list, so a stage scanning two tables used to
+    read all six. That is not merely wasted I/O — the pushdown analysis records a projection
+    only for scans the plan contains, and an absent entry means "read every column", so the
+    sources a stage does not use are exactly the ones it reads *widest*. On TPC-H q9 at sf10
+    the first stage resolved 8.9 GiB where its own plan needed 2.9 GiB, and the query was
+    OOM-killed. Skipped sources keep their index and resolve to no batches, which is what a
+    plan that never scans them asks the engine for.
+
     Args:
         sources: The plan's bound sources.
         opt: The optimized physical plan, carrying the pushed projections and predicates.
@@ -365,9 +375,17 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
     from batcher.api.source_stats import _source_identity
     from batcher.metadata.io_stats import record_source_io, scanned_byte_count
 
+    scanned_ids = opt.scanned_source_ids()
     batches_per_source = []
     complete: list[bool] = []
     for i, src in enumerate(sources):
+        if i not in scanned_ids:
+            # No rows, and `complete=False`: nothing was read, so nothing was proven about
+            # this source's size. Recording a zero-row "complete scan" would teach the
+            # cardinality model that the table is empty.
+            batches_per_source.append([])
+            complete.append(False)
+            continue
         read_started = time.perf_counter()
         predicate = opt.source_predicates.get(i)
         limit = opt.source_limits.get(i)

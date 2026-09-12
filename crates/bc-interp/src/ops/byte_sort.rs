@@ -37,9 +37,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
+    UInt32Array, UInt64Array,
+};
 use arrow::compute::SortOptions;
-use bc_runtime::byte_key::{ByteKeyColumn, ByteKeys};
+use arrow::datatypes::DataType;
+use bc_runtime::byte_key::{pack_word, ByteKeyColumn, ByteKeys};
 
 /// The widest key the pack covers: one `u64` word.
 ///
@@ -56,79 +60,156 @@ const MAX_PACK_BYTES: usize = 8;
 /// byte-lexicographically (the ordering arrow itself uses for `Utf8` and `Binary`), descending
 /// inverting only the key comparison, never the tie-break — so equal keys always keep input
 /// order.
+///
+/// **The type is resolved once, here, and the sort below it is monomorphic.** That is the split
+/// `bc_runtime::byte_key` documents — the generic [`ByteKeys`] for a caller that reads a key
+/// `n log n` times, the erased [`ByteKeyColumn`] for one that reads each row once — and this
+/// path was on the wrong side of it: it built a `ByteKeyColumn` and handed *that* to the
+/// generic sort, so every one of the sort's key reads paid a five-arm match it had already
+/// decided. Measured on `op-sort-string`, `ByteKeyColumn::key` was **10.5%** of the operator's
+/// profile. Dispatching here costs one match per sort and leaves the comparison reading a
+/// concrete array's offsets inline.
 pub(super) fn stable_sort_indices_bytes(
     values: &ArrayRef,
     opts: SortOptions,
 ) -> Option<UInt32Array> {
-    Some(sort_generic(&ByteKeyColumn::new(values)?, opts))
-}
-
-/// Bytes `[from, from + 8)` of `key` as a big-endian `u64`, zero-padded when the key runs out.
-///
-/// Ordering this integer orders the keys, for every pair whose words differ. The padding is
-/// what makes that true rather than merely usual: a missing byte packs as `0`, no byte is less
-/// than `0`, and a key that runs out is a prefix of the one that does not — which is exactly
-/// the byte-lexicographic rule. Where the words are *equal* the answer is unknown (either the
-/// keys share a prefix, or one contains a literal NUL where the other ended) unless
-/// [`ByteKeys::exact_pack_width`] has ruled that out, so a caller either checks that first or
-/// falls through to a full comparison.
-#[inline]
-fn pack_word(key: &[u8], from: usize) -> u64 {
-    let mut buf = [0u8; 8];
-    if from < key.len() {
-        let take = (key.len() - from).min(8);
-        buf[..take].copy_from_slice(&key[from..from + take]);
-    }
-    u64::from_be_bytes(buf)
+    let any = values.as_any();
+    Some(match values.data_type() {
+        DataType::Utf8 => sort_generic(any.downcast_ref::<StringArray>()?, opts),
+        DataType::LargeUtf8 => sort_generic(any.downcast_ref::<LargeStringArray>()?, opts),
+        DataType::Binary => sort_generic(any.downcast_ref::<BinaryArray>()?, opts),
+        DataType::LargeBinary => sort_generic(any.downcast_ref::<LargeBinaryArray>()?, opts),
+        DataType::FixedSizeBinary(_) => {
+            sort_generic(any.downcast_ref::<FixedSizeBinaryArray>()?, opts)
+        }
+        _ => return None,
+    })
 }
 
 /// Rows sampled to decide whether a packed prefix is worth building.
 const PREFIX_SAMPLE_ROWS: usize = 512;
 
-/// Whether the first eight bytes discriminate enough rows for a packed key to pay.
+/// Whether the eight bytes at `from` settle enough comparisons for a packed key to pay.
 ///
-/// The question is **not** how many distinct packs the sample holds — it is whether the packs
-/// tie where the values do not. A URL column is the shape that makes the distinction matter:
-/// every value begins `https://`, so one constant pack settles nothing and the pointer chase
-/// happens on every comparison anyway (measured: 7% *slower* than comparing the values
-/// directly). But a `shipmode` column with seven distinct values also has few distinct packs,
-/// and there the pack settles every unequal pair — it is the best key available, not the worst.
-/// A distinctness floor cannot tell those apart; comparing the two counts can, because they are
-/// equal exactly when the pack is as informative as the value.
+/// The question is **not** how many distinct packs the sample holds — it is how often two rows
+/// the pack cannot separate turn up in a comparison. Those are different quantities and the
+/// difference is most of a string sort.
+///
+/// A URL column is one end of it: every value begins `https://`, so one constant pack settles
+/// nothing and the pointer chase happens on every comparison anyway (measured: 7% *slower*
+/// than comparing the values directly). A `shipmode` column with seven distinct values is the
+/// other: it also has few distinct packs, and there the pack settles every unequal pair — it is
+/// the best key available, not the worst.
+///
+/// **The rule that used to stand here — "at least half as many distinct packs as distinct
+/// values" — reads those two correctly and the whole middle of the range wrong**, which is
+/// where the benchmark's own column lives. Traced on `op-sort-string`, every one of the
+/// sample-sort's thirty ranges of `l_comment` was rejected: 512 sampled rows of a range hold
+/// 512 distinct values and only ~150 distinct eight-byte prefixes, because a range *is* a
+/// narrow lexicographic band. Distinctness of 29% fails a 50% floor. But 150 packs over 512
+/// rows means two rows drawn at random tie on the pack about **0.7%** of the time — the pack
+/// settles 99.3% of comparisons, and the sort was doing every one of them with `memcmp`
+/// (37.8% of the operator's profile, beside 10.7% in the key accessor it makes necessary).
+///
+/// So the quantity is the **tie probability**, `Σ rᵢ² / m²` over the sample's pack runs, which
+/// is what a comparison actually pays for. A pack earns its build whenever it settles a decent
+/// share of pairs, and separately whenever it is simply *as informative as the value* — the
+/// low-cardinality case, where both tie at the same rate and the pack is the cheaper way to do
+/// it. Either condition admits it; only a pack that is both coarse and much coarser than the
+/// value is refused.
 ///
 /// The sample must be drawn with a stride rather than from the head, for the same reason a
 /// sorted-looking prefix would mislead — the first 512 rows of a partitioned scan are not a
 /// sample of the column.
-fn prefix_discriminates<'a>(live: usize, sample: impl Iterator<Item = &'a [u8]>) -> bool {
+fn prefix_discriminates<'a>(
+    live: usize,
+    from: usize,
+    sample: impl Iterator<Item = &'a [u8]>,
+) -> bool {
     if live < PREFIX_SAMPLE_ROWS {
         // Too small for the difference to matter either way; the packed path is no worse.
         return true;
     }
     let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) = sample
         .take(PREFIX_SAMPLE_ROWS)
-        .map(|s| (pack_word(s, 0), s))
+        .map(|s| (pack_word(s, from), s))
+        .unzip();
+    packs.sort_unstable();
+    values.sort_unstable();
+    let pack_ties = tie_fraction(&packs);
+    pack_ties <= MAX_PACK_TIE_FRACTION || pack_ties <= tie_fraction(&values) * PACK_TIE_SLACK
+}
+
+/// Comparisons the pack cannot settle, above which it stops paying on resolution alone.
+///
+/// Half is deliberately permissive: the pack costs one pass to build and one register compare
+/// per comparison, against a `memcmp` through two offset lookups for every comparison it
+/// removes. Even a pack that settles only half the pairs halves the expensive half. What it
+/// must not do is settle *nothing*, which is the constant-prefix case this still refuses.
+const MAX_PACK_TIE_FRACTION: f64 = 0.5;
+
+/// How much coarser than the values themselves a pack may be and still be taken as their
+/// stand-in. Slack rather than equality because both are sampled, so a column whose pack *is*
+/// its value reads the two rates as equal only up to sampling noise.
+const PACK_TIE_SLACK: f64 = 1.25;
+
+/// The chance two rows drawn at random from `sorted` are equal — `Σ rᵢ² / m²` over its runs.
+///
+/// This is the quantity a comparison sort pays for: a pair that ties on the key it is sorting
+/// by has to be settled some other way. `sorted` must be sorted, which is what makes the runs
+/// contiguous.
+fn tie_fraction<T: PartialEq>(sorted: &[T]) -> f64 {
+    if sorted.len() < 2 {
+        return 1.0;
+    }
+    let mut sum_sq = 0f64;
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j] == sorted[i] {
+            j += 1;
+        }
+        let run = (j - i) as f64;
+        sum_sq += run * run;
+        i = j;
+    }
+    sum_sq / (sorted.len() * sorted.len()) as f64
+}
+
+/// Whether the pack **resolves** the column — the stricter question, for a caller that must
+/// narrow a field rather than merely cheapen a comparison.
+///
+/// [`prefix_discriminates`] asks what fraction of *comparisons* the pack settles, and admits a
+/// pack that settles half of them, because halving the `memcmp`s of an `n log n` sort is worth
+/// the pass that builds it. **A top-N cannot use that pack**, and the difference is not a
+/// tuning margin: [`top_k_generic`] keeps the rows whose pack is at or below the `k`-th best
+/// one, so a pack that ties half the column hands it half the column as candidates, and it
+/// abandons the whole effort at its budget *after* packing every row, filling the heap, and
+/// scanning. That late decline was measured at **146 -> 212 ms** on a shared-prefix column,
+/// which is why this question is asked first and why it is a different question.
+///
+/// So this keeps the resolution rule: at least half as many distinct packs as distinct values.
+/// A `shipmode` column with seven values passes it — the pack settles every unequal pair, so it
+/// is the best key available, not the worst — and a URL column whose values all begin `https://`
+/// does not.
+fn packs_discriminate<A: ByteKeys>(arr: &A) -> bool {
+    let nulls = arr.null_buffer();
+    let live = arr.len() - nulls.map_or(0, |nb| nb.null_count());
+    if live < PREFIX_SAMPLE_ROWS {
+        return true; // too small for the difference to matter; the packed path is no worse
+    }
+    let step = (live / PREFIX_SAMPLE_ROWS).max(1);
+    let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) = (0..arr.len())
+        .filter(|&i| nulls.is_none_or(|nb| nb.is_valid(i)))
+        .step_by(step)
+        .take(PREFIX_SAMPLE_ROWS)
+        .map(|i| (pack_word(arr.key(i), 0), arr.key(i)))
         .unzip();
     packs.sort_unstable();
     packs.dedup();
     values.sort_unstable();
     values.dedup();
-    // Half the resolution of the values themselves is the floor: the pack is allowed to lose
-    // some pairs to a shared prefix, and stops paying once it loses most of them.
     packs.len() * 2 >= values.len()
-}
-
-/// [`prefix_discriminates`] over the live rows of a whole array, without an index list to stride.
-fn packs_discriminate<A: ByteKeys>(arr: &A) -> bool {
-    let nulls = arr.null_buffer();
-    let live = arr.len() - nulls.map_or(0, |nb| nb.null_count());
-    let step = (live / PREFIX_SAMPLE_ROWS).max(1);
-    prefix_discriminates(
-        live,
-        (0..arr.len())
-            .filter(|&i| nulls.is_none_or(|nb| nb.is_valid(i)))
-            .step_by(step)
-            .map(|i| arr.key(i)),
-    )
 }
 
 /// Whether `live` is already in the order the sort would put it in, so the permutation is the
@@ -338,8 +419,8 @@ fn radix_sort_live<A: ByteKeys>(arr: &A, live: &[u32], opts: SortOptions) -> Opt
 /// 1. [`already_ordered`] — one pass, and the answer outright when it holds.
 /// 2. [`rank_sort_live`] — no comparisons at all, when the column has few distinct values.
 /// 3. [`radix_sort_live`] — no comparisons at all, when the key is narrow enough to pack whole.
-/// 4. The packed-prefix comparison sort — carrying the first eight bytes inline so comparisons
-///    the pack settles become a register compare against a *sequentially* read array.
+/// 4. The packed-prefix comparison sort — carrying eight key bytes inline so comparisons the
+///    pack settles become a register compare against a *sequentially* read array.
 ///
 /// The prefix only helps when it actually settles comparisons, so [`prefix_discriminates`]
 /// decides between the last two spellings. Every branch produces the identical permutation —
@@ -356,10 +437,13 @@ fn sort_live<A: ByteKeys>(arr: &A, mut live: Vec<u32>, opts: SortOptions) -> Vec
         return ordered;
     }
     let step = (live.len() / PREFIX_SAMPLE_ROWS).max(1);
-    let discriminates = prefix_discriminates(
-        live.len(),
-        live.iter().step_by(step).map(|&i| arr.key(i as usize)),
-    );
+    let sample: Vec<&[u8]> = live
+        .iter()
+        .step_by(step)
+        .take(PREFIX_SAMPLE_ROWS)
+        .map(|&i| arr.key(i as usize))
+        .collect();
+    let discriminates = prefix_discriminates(live.len(), 0, sample.iter().copied());
     if !discriminates {
         live.sort_unstable_by(|&a, &b| {
             let (x, y) = (arr.key(a as usize), arr.key(b as usize));
@@ -738,6 +822,85 @@ mod tests {
                     ord.then_with(|| x.cmp(&y))
                 });
                 assert_eq!(got, want, "shared={shared:?} descending={descending}");
+            }
+        }
+    }
+
+    /// The two gates ask different questions, and the shape they disagree about is the one
+    /// the benchmark is made of.
+    ///
+    /// | shape | pack settles | distinct packs / values | sort gate | top-N gate |
+    /// |---|---|---|---|---|
+    /// | `narrowband` | ~99% of pairs | ~29% | **admit** | **refuse** |
+    /// | `lowcard` | every unequal pair | 100% | admit | admit |
+    /// | `stemmed` | nothing | ~0% | refuse | refuse |
+    ///
+    /// `narrowband` is a sample-sort range of a text column: 512 rows hold 512 distinct values
+    /// and a few hundred distinct eight-byte prefixes, because a range *is* a narrow
+    /// lexicographic band. Halving that sort's `memcmp`s is worth the pass that builds the
+    /// pack; narrowing a top-N to ten rows with a pack that hands back a third of the column
+    /// is not, and [`top_k_generic`] would pack every row and fill its heap before abandoning
+    /// the attempt. That is why [`packs_discriminate`] keeps the resolution rule.
+    #[test]
+    fn the_sort_gate_and_the_top_n_gate_disagree_where_the_pack_is_coarse_but_useful() {
+        let n = PREFIX_SAMPLE_ROWS * 8;
+        let cases = [
+            // (name, sort gate, top-N gate)
+            ("narrowband", true, false),
+            ("lowcard", true, true),
+            ("stemmed", false, false),
+        ];
+        for (name, want_sort, want_topn) in cases {
+            let owned: Vec<String> = (0..n)
+                .map(|i| {
+                    let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    match name {
+                        // Far fewer distinct prefixes than values, and every run is short.
+                        "narrowband" => format!("{:08}-{i}", h % 150),
+                        "lowcard" => ["AIR", "RAIL", "TRUCK", "SHIP", "MAIL", "FOB", "REG AIR"]
+                            [(h % 7) as usize]
+                            .to_string(),
+                        // Every value shares more than the pack can reach.
+                        _ => format!("https://example.com/{h:08}"),
+                    }
+                })
+                .collect();
+            let vals: Vec<Option<&str>> = owned.iter().map(|s| Some(s.as_str())).collect();
+            let a: ArrayRef = Arc::new(StringArray::from(vals));
+            let arr = a.as_any().downcast_ref::<StringArray>().unwrap();
+            let live: Vec<u32> = (0..n as u32).collect();
+            let step = (live.len() / PREFIX_SAMPLE_ROWS).max(1);
+            let sample: Vec<&[u8]> = live
+                .iter()
+                .step_by(step)
+                .take(PREFIX_SAMPLE_ROWS)
+                .map(|&i| arr.key(i as usize))
+                .collect();
+
+            assert_eq!(
+                prefix_discriminates(live.len(), 0, sample.iter().copied()),
+                want_sort,
+                "sort gate on {name}"
+            );
+            assert_eq!(packs_discriminate(arr), want_topn, "top-N gate on {name}");
+
+            // Whichever way either went, the relation is the same.
+            for descending in [false, true] {
+                let opts = SortOptions {
+                    descending,
+                    nulls_first: false,
+                };
+                let mut expected = live.clone();
+                expected.sort_by(|&x, &y| {
+                    let (p, q) = (arr.value(x as usize), arr.value(y as usize));
+                    let ord = if descending { q.cmp(p) } else { p.cmp(q) };
+                    ord.then_with(|| x.cmp(&y))
+                });
+                assert_eq!(
+                    sort_live(arr, live.clone(), opts),
+                    expected,
+                    "{name} descending={descending}"
+                );
             }
         }
     }
@@ -1245,6 +1408,181 @@ mod byte_key_tests {
                 println!(
                     "{rows:>9} {width:>6} {radix_ms:>11.1}ms {comparison_ms:>11.1}ms {:>7.2}x",
                     comparison_ms / radix_ms
+                );
+            }
+        }
+    }
+
+    /// Two alternatives to the eight-byte packed prefix, **both measured and neither taken**.
+    ///
+    /// `cargo test --release -p bc-interp --lib -- --ignored --nocapture report_the_packed_prefix_alternatives`
+    ///
+    /// Recorded because each is the obvious next idea and each costs a day to re-derive.
+    /// `competitor_technique_review.md` item 9 lists "an adaptive-width key" as its one open
+    /// lead; this is that lead, measured. Both helpers are local to this test, so no product
+    /// code carries a rejected design.
+    ///
+    /// Measured 2026-09-11, 48-core Xeon 8275CL, quiet box. `skip` is `packed@0 / packed@lcp`
+    /// and `n/p` is the narrow key against `packed@lcp`; above 1.00x favours the alternative.
+    ///
+    /// | rows | shape | lcp | narrow | packed@lcp | packed@0 | n/p | skip |
+    /// |---:|---|---:|---:|---:|---:|---:|---:|
+    /// | 65,536 | comment27 | 0 | 3.3ms | 4.3ms | 3.8ms | 1.33x | 0.89x |
+    /// | 65,536 | sharedprefix12 | 7 | 2.9ms | 4.1ms | 10.2ms | 1.42x | 2.48x |
+    /// | 262,144 | sharedprefix12 | 7 | 24.3ms | 24.4ms | 54.3ms | 1.01x | 2.22x |
+    /// | 1,048,576 | comment27 | 0 | 225.2ms | 79.7ms | 72.8ms | 0.35x | 0.91x |
+    /// | 1,048,576 | sharedprefix12 | 7 | 231.9ms | 166.8ms | 347.2ms | 0.72x | 2.08x |
+    /// | 4,194,304 | distinct12 | 2 | 1311.9ms | 342.0ms | 467.8ms | 0.26x | 1.37x |
+    /// | 4,194,304 | sharedprefix12 | 7 | 1606.9ms | 1151.7ms | 2669.8ms | 0.72x | 2.32x |
+    ///
+    /// **A four-byte key above the row's own position** — one `u64`, sorted with no comparator
+    /// at all and half the bytes of the `(u64, u32)` pair — loses 0.26x-0.72x above a quarter
+    /// of a million rows. Four bytes settle a comparison only while the distinct four-byte
+    /// prefixes stay comparable to the row count; past that, the rows sharing one prefix are
+    /// re-sorted by their real values, and that repair is the pointer-chasing comparison sort
+    /// the pack existed to avoid, now on top of a wasted pass. `comment27` at four million rows
+    /// holds ~8,000 distinct prefixes, so a row lands in a run of five hundred. Worse, a gate
+    /// **cannot see this from a sample**: 512 rows drawn from 8,000 distinct prefixes are
+    /// essentially all distinct, so a sampled run length reads 1.0 where the true figure is
+    /// 500. A collision-counting estimator recovers the distinct count, and with it the narrow
+    /// key wins only below ~100,000 rows and by 1.3x-1.7x.
+    ///
+    /// **Starting the pack past the bytes every live key shares** is worth 2.1x-2.5x here and
+    /// **nothing on the benchmark**, which is the more interesting half. The premise was that a
+    /// sample-sort range is a clustered column, so its pack is mostly constant. Traced on
+    /// `op-sort-string`, the thirty ranges of `l_comment` have a common prefix of **0 or 1
+    /// bytes** — a range of a text column is a narrow *band*, not a shared stem — and the
+    /// end-to-end A/B read 216.4/218.8 ms against 224.9/223.2 ms, a 2% regression for the pass
+    /// it costs. What was actually wrong in those ranges was the admission rule above, which
+    /// refused a pack that settled 99% of comparisons. Do not reach for the offset again
+    /// without first checking that the column has a stem rather than a band.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn report_the_packed_prefix_alternatives() {
+        use std::time::Instant;
+
+        use arrow::array::StringArray;
+
+        /// Bytes `[from, from + 4)` as a big-endian `u32` — the rejected narrow key's pack.
+        fn pack_half(key: &[u8], from: usize) -> u32 {
+            let mut buf = [0u8; 4];
+            if from < key.len() {
+                let take = (key.len() - from).min(4);
+                buf[..take].copy_from_slice(&key[from..from + take]);
+            }
+            u32::from_be_bytes(buf)
+        }
+
+        /// Leading bytes every key shares, capped at the pack's width — the rejected offset.
+        fn common_prefix(arr: &StringArray, live: &[u32]) -> usize {
+            let head = arr.key(live[0] as usize);
+            let mut shared = head.len().min(MAX_PACK_BYTES);
+            for &i in live {
+                let key = arr.key(i as usize);
+                let n = shared.min(key.len());
+                shared = (0..n).take_while(|&k| head[k] == key[k]).count();
+                if shared == 0 {
+                    return 0;
+                }
+            }
+            shared
+        }
+
+        /// The permutation the packed-prefix branch of [`sort_live`] builds, timed alone.
+        fn packed(arr: &StringArray, live: &[u32], from: usize) -> Vec<u32> {
+            let mut keyed: Vec<(u64, u32)> = live
+                .iter()
+                .map(|&i| (pack_word(arr.key(i as usize), from), i))
+                .collect();
+            keyed.sort_unstable_by(|&(px, a), &(py, b)| {
+                let ord = if px == py {
+                    arr.key(a as usize).cmp(arr.key(b as usize))
+                } else {
+                    px.cmp(&py)
+                };
+                ord.then_with(|| a.cmp(&b))
+            });
+            keyed.into_iter().map(|(_, i)| i).collect()
+        }
+
+        /// The rejected narrow key: four bytes above the row's position in one `u64`, sorted
+        /// with no comparator, then every equal-prefix run repaired by a full comparison.
+        fn narrow(arr: &StringArray, live: &[u32], from: usize) -> Vec<u32> {
+            let mut keyed: Vec<u64> = live
+                .iter()
+                .enumerate()
+                .map(|(pos, &i)| (pack_half(arr.key(i as usize), from) as u64) << 32 | pos as u64)
+                .collect();
+            keyed.sort_unstable();
+            let mut start = 0usize;
+            while start < keyed.len() {
+                let prefix = keyed[start] >> 32;
+                let mut end = start + 1;
+                while end < keyed.len() && keyed[end] >> 32 == prefix {
+                    end += 1;
+                }
+                if end - start > 1 {
+                    keyed[start..end].sort_unstable_by(|&x, &y| {
+                        let (p, q) = (x as u32, y as u32);
+                        arr.key(live[p as usize] as usize)
+                            .cmp(arr.key(live[q as usize] as usize))
+                            .then_with(|| p.cmp(&q))
+                    });
+                }
+                start = end;
+            }
+            keyed.into_iter().map(|k| live[k as u32 as usize]).collect()
+        }
+
+        println!(
+            "{:>9} {:>16} {:>4} {:>11} {:>11} {:>11} {:>8} {:>8}",
+            "rows", "shape", "lcp", "narrow", "packed@lcp", "packed@0", "n/p", "skip"
+        );
+        for rows in [1usize << 16, 1 << 18, 1 << 20, 1 << 22] {
+            for shape in ["comment27", "distinct12", "sharedprefix12"] {
+                let owned: Vec<String> = (0..rows)
+                    .map(|i| {
+                        let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        match shape {
+                            // TPC-H `l_comment`: wide, high-cardinality, an ASCII head.
+                            "comment27" => format!(
+                                "{}{} regular accounts sleep",
+                                (b'a' + (h >> 59) as u8) as char,
+                                h % 100_000
+                            ),
+                            // Every value distinct and separated inside four bytes.
+                            "distinct12" => format!("{:012x}", h % 1_000_000_000_000),
+                            // The H2O `id3` shape: twelve bytes, seven of them constant.
+                            _ => format!("id00000{:05}", h % 100_000),
+                        }
+                    })
+                    .collect();
+                let vals: Vec<Option<&str>> = owned.iter().map(|s| Some(s.as_str())).collect();
+                let a: ArrayRef = Arc::new(StringArray::from(vals));
+                let arr = a.as_any().downcast_ref::<StringArray>().unwrap();
+                let live: Vec<u32> = (0..rows as u32).collect();
+                let from = common_prefix(arr, &live);
+
+                let start = Instant::now();
+                let by_narrow = narrow(arr, &live, from);
+                let narrow_ms = start.elapsed().as_secs_f64() * 1e3;
+
+                let start = Instant::now();
+                let by_skip = packed(arr, &live, from);
+                let skip_ms = start.elapsed().as_secs_f64() * 1e3;
+
+                let start = Instant::now();
+                let by_flat = packed(arr, &live, 0);
+                let flat_ms = start.elapsed().as_secs_f64() * 1e3;
+
+                // All three must agree, or the table reports a speed for a not-quite-sort.
+                assert_eq!(by_narrow, by_skip, "rows={rows} shape={shape} (narrow)");
+                assert_eq!(by_flat, by_skip, "rows={rows} shape={shape} (flat)");
+                println!(
+                    "{rows:>9} {shape:>16} {from:>4} {narrow_ms:>9.1}ms {skip_ms:>9.1}ms \
+                     {flat_ms:>9.1}ms {:>7.2}x {:>7.2}x",
+                    skip_ms / narrow_ms,
+                    flat_ms / skip_ms
                 );
             }
         }

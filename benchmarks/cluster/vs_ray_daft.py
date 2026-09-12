@@ -260,7 +260,8 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
     confines every engine's residue to its own numbers. Batcher runs first (a clean
     cluster). Batcher runs first, so it is the one engine guaranteed a clean cluster; Ray
     inherits nothing and Daft, running third, inherits Ray's residue as well as its own,
-    because only Batcher has a release hook (`release_session_fleet`). An earlier note here
+    because only Batcher has release hooks (`release_session_fleet` and
+    `release_inference_pools`, both called below). An earlier note here
     claimed "an engine that leaks only ever taxes itself", which is true of the leaker and
     false of whatever runs after it — the ordering favours the system under test, and that
     is worth knowing when reading a `vs_ray`/`vs_daft` column rather than being asserted
@@ -298,13 +299,35 @@ def bench_engine(eng: str, builder, pipelines: list[str], scale: int, runs: int)
         except Exception as e:
             out[name] = {"error": f"{type(e).__name__}: {e}"}
         finally:
-            # Free batcher's warm session fleet so the next engine gets the whole
-            # cluster; a no-op for ray/daft (neither exposes one).
+            # Free batcher's warm session fleet AND its warm map-actor pool so the next
+            # engine gets the whole cluster; a no-op for ray/daft (neither exposes one).
+            #
+            # Both, because they are two different holdings and only one of them used to be
+            # released here. A CPU `map_batches` + aggregate stage keeps its actors alive
+            # across `collect()` calls so their scan cache survives the query
+            # (`distributed.warm_inference_pools`), and on this fleet that is 64 actors at 16
+            # CPU each. Measured with only the fleet released: `ray status` showed
+            # **960 of 1,024 CPU still in use** while the Ray Data arm ran, its `MapBatches`
+            # finished all 600,037,902 rows in seconds, and its final
+            # `HashAggregate(num_partitions=1)` then sat at 0/1 with 100 tasks queued until
+            # the 180 s cap -- recorded as `TIMEOUT`, which reads as a Ray Data result and is
+            # an artifact of the harness.
+            #
+            # What it did *not* do is quietly distort a number: a starved arm did not finish,
+            # so it reported `ERR` rather than a slow time, and no `vs_ray` ratio was ever
+            # computed from one. With this line in, Ray Data's `udf` arm comes back at
+            # 4,905-5,315 ms over five runs, which brackets the 5,061 ms recorded before the
+            # warm pool existed -- so the earlier baseline stands and the starvation cost
+            # measurements rather than corrupting them.
             if eng == "batcher":
                 with contextlib.suppress(Exception):
                     from batcher.dist.fleet import release_session_fleet
 
                     release_session_fleet()
+                with contextlib.suppress(Exception):
+                    from batcher.dist.executors.map import release_inference_pools
+
+                    release_inference_pools()
     return out
 
 
@@ -314,6 +337,62 @@ def _fmt_util(u: dict) -> str:
     mean, peak = u.get("mean_busy_pct", 0), u.get("peak_busy_pct", 0)
     nodes = f"{int(u.get('active_nodes', 0))}/{int(u.get('total_nodes', 0))}n"
     return f"{mean:.0f}%/{peak:.0f}%peak {nodes}"
+
+
+def _worker_pip(order: list[str]) -> list[str] | None:
+    """The job runtime env's pip set for a sweep running `order`, or `None` for no install.
+
+    `None` drops the workspace's inherited pip env, which lists a local editable
+    (`batcher-engine`) no index can resolve — the per-worker build hard-fails and no task
+    runs. The cluster base image already carries Batcher's and Ray Data's deps, so both
+    engines want exactly that. (Mirrors `engines/ray.py`; Batcher's own dist path pins
+    `pip: None` the same way.)
+
+    **Daft is the exception, and it is why a Daft column used to read `ERR`.** `daft` is not
+    in this cluster's worker image, so its Ray-runner (flotilla) actors cannot import it and
+    the runner never starts — a failure of the environment, not of the engine, which is a
+    worse thing to print than nothing. Shipping `daft` in the job's runtime env is what makes
+    the column real.
+
+    The install is charged to *every* worker in the job, so it is only applied when Daft is
+    the sole engine in the sweep: adding it to a Batcher or Ray Data sweep would tax an
+    engine that does not need it and make its numbers a measurement of a pip install. That is
+    the same reason `bench_engine` runs engine-major and the recorded head-to-heads give each
+    engine its own driver process — run Daft as `BENCH_ENGINE_ORDER=daft`.
+
+    Args:
+        order: The engines this sweep will run, in order.
+
+    Returns:
+        The pip requirement list for the job's workers, or `None` to install nothing.
+    """
+    if order != ["daft"]:
+        return None
+    import daft
+
+    return [f"daft=={daft.__version__}"]
+
+
+def _warm_the_fleet(eng: str) -> None:
+    """Pay an engine's *fleet* startup before the sweep, on a query with no data in it.
+
+    `bench_engine` already runs each pipeline once untimed, which pays planning and the read.
+    It does not help an engine whose worker startup has its own deadline: Daft's Ray runner
+    spawns flotilla actors on first use and gives up on them after 120 s, and on this cluster
+    the first pipeline of a Daft sweep died with `No flotilla workers became available within
+    120s (64 attempted)` while the second -- with the actors up -- returned a number. That is
+    the harness charging one pipeline for the fleet the whole sweep uses, and it reads as a
+    Daft failure.
+
+    Best-effort and untimed: an engine that cannot answer a one-row query here will fail in
+    its own arm with its own error, which is where a reader should see it.
+    """
+    if eng != "daft":
+        return
+    with contextlib.suppress(Exception):
+        import daft
+
+        daft.from_pydict({"x": [1]}).agg(daft.col("x").sum().alias("s")).to_pydict()
 
 
 def main() -> int:
@@ -335,19 +414,20 @@ def main() -> int:
     pipes = os.environ.get("BENCH_PIPES")
     pipelines = pipes.split(",") if pipes else PIPELINES
 
+    # The sweep order is resolved BEFORE `ray.init`, because which engines run decides the
+    # job's runtime env (see `_worker_pip`) and a job's runtime env cannot be changed after.
+    order = [e for e in os.environ.get("BENCH_ENGINE_ORDER", "").split(",") if e in ENGINES]
+    order = order or list(ENGINES)
+
     import ray
 
     if not ray.is_initialized():
         os.environ.setdefault("RAY_ADDRESS", "auto")
-        # Drop the workspace's inherited pip runtime-env: it lists a local editable
-        # (`batcher-engine`) that no index can resolve, so the per-worker pip build hard-fails
-        # and no task runs. The cluster base env already carries the deps. (Mirrors
-        # `engines/ray.py`; batcher's own dist path pins `pip: None` the same way.)
         ray.init(
             address="auto",
             logging_level="ERROR",
             log_to_driver=False,
-            runtime_env={"pip": None},
+            runtime_env={"pip": _worker_pip(order)},
         )
     print(f"cluster: {ray.cluster_resources().get('CPU')} CPU, {len(ray.nodes())} nodes")
     print(f"TPC-H sf{scale}, best-of-{runs}\n")
@@ -359,10 +439,10 @@ def main() -> int:
     # no other engine's residue on it, and only Batcher has a release hook. Default order
     # puts Batcher first, which is the order every recorded run used; `BENCH_ENGINE_ORDER`
     # rotates it so a reader can bound how much of a margin is ordering rather than engine.
-    order = [e for e in os.environ.get("BENCH_ENGINE_ORDER", "").split(",") if e in ENGINES]
-    order = order or list(ENGINES)
     if order != list(ENGINES):
         print(f"engine sweep order: {' -> '.join(order)} (BENCH_ENGINE_ORDER)")
+    for eng in order:
+        _warm_the_fleet(eng)
     by_engine = {eng: bench_engine(eng, ENGINES[eng], pipelines, scale, runs) for eng in order}
 
     h = ("pipeline", "batcher_ms", "ray_ms", "daft_ms", "vs_ray", "vs_daft")

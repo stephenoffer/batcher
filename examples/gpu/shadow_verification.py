@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import batcher as bt
 from _common import has_gpu, resolve_device, tpch
 from batcher import col
+from batcher.api.terminal.gpu_backend.verify import compare_results
 
 
 def main() -> None:
@@ -51,7 +52,12 @@ def main() -> None:
 
         # Then values.
         assert on_device.num_rows == on_cpu.num_rows, name
-        assert on_device.to_pydict() == on_cpu.to_pydict(), f"{name}: values differ"
+        # `compare_results` is what `gpu_shadow_verify` itself uses: schema first, then values
+        # with a float tolerance. An exact `to_pydict()` comparison fails on two *CPU* runs of
+        # the same query, because a distributed float reduction is identical only up to
+        # reassociation — `sum(l_extendedprice)` differs in its last bits between runs.
+        difference = compare_results(on_device, on_cpu)
+        assert difference is None, f"{name}: {difference}"
         print(f"  {name:<18} {on_device.num_rows:>6} rows, schema and values agree")
 
     # The integer case keeps its integer type — the widening bug in one line.

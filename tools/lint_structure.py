@@ -66,7 +66,7 @@ DIR_ALLOW: dict[str, str] = {
         "stay where they are cited"
     ),
     "benchmarks/gpu_backend": (
-        "14 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
+        "16 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
         "benchmarks/gpu_backend/<name>.py` entry point a reader runs by name, so grouping them "
         "into subdirectories would change every invocation in the docs and the results file to "
         "hide a count. Split by what is being measured (kernel / cluster / energy) if it grows "

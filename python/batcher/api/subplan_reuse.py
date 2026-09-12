@@ -230,7 +230,7 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
     held = 0
     for positions in verdict:
         appearances = [nodes[i] for i in positions]
-        table = _materialize(appearances[0], srcs, ctx)
+        table = _materialize(_narrowed(plan, appearances, len(srcs)), srcs, ctx)
         if table is None:
             continue
         # `retained_bytes`: a cached subplan is *held* for the query's lifetime, so the
@@ -273,6 +273,65 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
     return plan, srcs
 
 
+def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> LogicalPlan:
+    """The chosen subtree cut down to the columns the rest of the plan still reads.
+
+    Materializing forfeits the *fusion* each appearance had with its parent, and what that
+    costs is a width: embedded, a subtree's consumers prune it through projection pushdown,
+    and standalone there is no consumer to prune it — so every column it carries is built,
+    held for the query, and re-scanned once per appearance. Measured on TPC-DS, the chosen
+    subtree against what the plan reads of it: q18 **133 columns against 11**, q86 **84
+    against 3**, and q80 5 against 5, q70 1 against 1, q14 6 against 6. Those are exactly
+    the two that lost and the three that won — q18 by 640 ms and q86 by 118, against wins
+    of 78 ms on q14 and 41 on q70 — so the waste is the whole of the difference.
+
+    The need is not recomputed here. The hypothetical rewrite is built (a `Scan` of the
+    subtree's own schema in place of every appearance) and the optimizer's own
+    need-propagation is asked what that scan must read, so the one definition of "which
+    columns does this plan require" stays in `kyber.rules.projections`. A subtree with no
+    static schema, or one the pass cannot narrow, is returned unchanged.
+
+    Args:
+        plan: The plan being rewritten, as it currently stands.
+        appearances: Every occurrence of the chosen subtree within it.
+        sid: The source id the materialized result will take.
+
+    Returns:
+        The subtree, wrapped in a `Project` when that drops a column and unchanged otherwise.
+    """
+    from batcher.kyber.rules.projections import required_columns_per_source
+    from batcher.plan.expr_ir import col
+    from batcher.plan.logical import Project, Projection
+
+    target = appearances[0]
+    try:
+        schema = target.available_schema()
+        if schema is None:
+            return target
+        # Deliberately the need of the plan **as written**, not of its optimized form, which
+        # is the opposite of what the size gate wants and for a reason that is easy to walk
+        # into. Running projection pushdown first reports a *smaller* need -- a column a
+        # projection merely passes through stops counting -- but the plan being rewritten
+        # still names that column above the appearance, so a `Scan` without it does not
+        # validate. Measured: asking the pushed form for a shared SELECT carrying an unread
+        # column returned ['k', 'v'] against ['k', 'v', 'unused'], and the narrower scan
+        # raised, so `reuse_common_subplans` caught it and declined the reuse altogether --
+        # turning a saving into nothing at all. The need as written is exactly the set the
+        # surrounding plan references, which is the set that keeps it valid.
+        hypothetical = _replace_all(plan, appearances, Scan(sid, schema))
+        wanted = required_columns_per_source(hypothetical).get(sid)
+        carried = list(target.available_columns())
+        if wanted is None or len(wanted) >= len(carried):
+            return target
+        keep = [c for c in carried if c in set(wanted)]
+        if not keep or len(keep) >= len(carried):
+            return target
+        return Project(target, tuple(Projection(c, col(c)) for c in keep))
+    except Exception as exc:  # pragma: no cover - narrowing must never break a query
+        note_suppressed("api", "narrow a common-subplan candidate", exc)
+        return target
+
+
 def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[int, ...], ...]:
     """Which subtrees to materialize, as pre-order positions in `plan`'s own walk.
 
@@ -313,6 +372,7 @@ def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[
         lambda: build_estimator(sources, ctx.hub),
         max_bytes=cfg.common_subplan_max_bytes,
         row_bytes=cfg.row_bytes,
+        normalize=lambda node: _as_run(node, sources, ctx),
     )
     if not targets:
         return ()
@@ -326,6 +386,41 @@ def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[
         if positions:
             out.append(positions)
     return tuple(out)
+
+
+def _as_run(node: LogicalPlan, sources: list[Source], ctx) -> LogicalPlan:
+    """`node` as the engine will run it, for the analysis's size and cost gates.
+
+    Those two gates ask how big a subtree's result is and what it costs, and the plan as
+    written answers neither: a `WHERE` clause sits above the join tree until pushdown moves
+    it, so every join under it is estimated over unfiltered inputs and the error compounds
+    across a multi-way join. See `common_subplans`' `normalize` argument for the counts and
+    the measured sizes -- on TPC-DS q80 they differ by more than ten orders of magnitude,
+    which is the difference between "too large to hold" and 66 kilobytes.
+
+    Only the *gates* read this form. The structure being matched, and the positions handed
+    back to be rewritten, are still the plan as written.
+
+    Failing to optimize a subtree is not a reason to fall back to the raw estimate and
+    admit it: without a trustworthy size there is no bound on what materializing would
+    hold, so the raw node is returned and its own (astronomical) estimate declines it --
+    the same direction `_fits` takes for a missing estimate.
+
+    Args:
+        node: A subtree of the canonical plan, or the plan itself.
+        sources: The plan's bound inputs, for the optimizer's statistics.
+        ctx: The execution context, for the hub the optimizer reads.
+
+    Returns:
+        The optimized logical form, or `node` unchanged if optimizing it failed.
+    """
+    from batcher.kyber.optimizer.facade import optimize_logical
+
+    try:
+        return optimize_logical(node, sources=sources, hub=ctx.hub)
+    except Exception as exc:
+        note_suppressed("api", "optimize a common-subplan candidate for sizing", exc)
+        return node
 
 
 def _one_id_per_source(plan: LogicalPlan, sources: list[Source]) -> LogicalPlan:

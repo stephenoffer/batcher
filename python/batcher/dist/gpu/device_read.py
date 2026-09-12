@@ -29,6 +29,8 @@ on cannot change an answer.
 
 from __future__ import annotations
 
+import collections
+import threading
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
@@ -36,7 +38,192 @@ from batcher._internal.logging import note_suppressed
 if TYPE_CHECKING:
     from batcher.core.gpu_plan import DfBackend
 
-__all__ = ["read_descriptor_on_device"]
+__all__ = [
+    "cached_device_frame",
+    "clear_device_frame_cache",
+    "device_frame_cache_stats",
+    "read_descriptor_on_device",
+    "remember_source_dates",
+    "reset_device_frame_cache",
+]
+
+#: Decoded device frames kept between queries: key -> (bytes, frame). An `OrderedDict` used as
+#: an LRU, exactly as the host worker scan cache is.
+_FRAME_CACHE: collections.OrderedDict = collections.OrderedDict()
+_FRAME_CACHE_BYTES = 0
+_FRAME_CACHE_LOCK = threading.Lock()
+_FRAME_CACHE_HITS = 0
+_FRAME_CACHE_MISSES = 0
+
+
+def device_frame_cache_stats() -> dict[str, int]:
+    """This worker's device frame cache: entries, bytes held, hits and misses."""
+    with _FRAME_CACHE_LOCK:
+        return {
+            "entries": len(_FRAME_CACHE),
+            "bytes": _FRAME_CACHE_BYTES,
+            "hits": _FRAME_CACHE_HITS,
+            "misses": _FRAME_CACHE_MISSES,
+        }
+
+
+def clear_device_frame_cache() -> int:
+    """Drop every cached frame, returning the bytes released.
+
+    Called before the subdivision ladder on a device out-of-memory: the cache is the one part
+    of a worker's device footprint that is pure optimization, so it is the first thing to give
+    back. A shard that then fits has cost one uncached read; a shard that still does not is
+    subdivided exactly as it was before the cache existed.
+    """
+    global _FRAME_CACHE_BYTES
+    with _FRAME_CACHE_LOCK:
+        released = _FRAME_CACHE_BYTES
+        _FRAME_CACHE.clear()
+        _FRAME_CACHE_BYTES = 0
+    return released
+
+
+def reset_device_frame_cache() -> None:
+    """Forget the cache *and* the memoized budget — for tests, and for a changed device."""
+    clear_device_frame_cache()
+    _BUDGET.clear()
+
+
+#: The budget this process settled on, keyed by the inputs that can legitimately change it.
+#: **Memoized because pricing the device is expensive, not because it is slow to compute.**
+#: `visible_device_usable_bytes` reads the local inventory, this process's physical index, the
+#: live telemetry and its own resident bytes — the same NVML sequence `prepare_device_memory`
+#: measures at **414 ms**, and it was being paid once per shard. On a fan-out whose shards are a
+#: fifth of a second each, sizing the cache cost more than the read it exists to avoid.
+_BUDGET: dict[tuple[float, int], int] = {}
+
+
+def _cache_budget_bytes() -> int:
+    """How many bytes of cached frames this process may hold on its device.
+
+    A share of the device's **usable** memory — the cache sits beside the shard being computed,
+    the intermediates built over it and the CUDA context — net of the co-tenants Ray packed onto
+    this board, since the cache is per process and the device is not.
+
+    Memoized per `(fraction, tenants)`. Those are the only two inputs that differ between two
+    calls in one worker: a stage packed four to a device gets a different answer than one that
+    had the board to itself, and memoizing across that would hand the second stage the first
+    one's budget.
+    """
+    from batcher.config import active_config
+    from batcher.dist.gpu.resources import task_device_tenants
+
+    cfg = active_config()
+    fraction = min(0.9, max(0.0, float(cfg.distributed.gpu_frame_cache_fraction)))
+    if fraction <= 0.0:
+        return 0
+    tenants = max(1, task_device_tenants())
+    settled = _BUDGET.get((fraction, tenants))
+    if settled is not None:
+        return settled
+    from batcher.carbonite.accel import visible_device_usable_bytes
+
+    try:
+        # Already net of the CUDA context, of what a co-tenant has resident, and of the
+        # headroom — the same figure the RMM pool is planned against, so the cache and the
+        # pool cannot each believe they own the same bytes.
+        usable = float(visible_device_usable_bytes(cfg.accelerator.vram_headroom, tenants))
+    except Exception as exc:
+        note_suppressed("dist", "size the device frame cache", exc)
+        usable = 0.0
+    budget = int(usable * fraction)
+    _BUDGET[(fraction, tenants)] = budget
+    return budget
+
+
+def _frame_key(descriptor: dict) -> tuple | None:
+    """The cache key for a shard: which row-groups, which columns, which pushed predicate.
+
+    The same three things the host worker scan cache keys on, and for the same reason: all
+    three change the rows that come back. `identity()` encodes file and row-groups; a split
+    that cannot identify itself makes the shard uncacheable rather than mis-keyed.
+
+    **It carries no version, and that is inherited rather than overlooked.** A
+    `RowGroupSplit`'s identity is `parquet:<path>:rg<ids>` — no mtime, no size — so a file
+    *rewritten in place* would be served from either cache as it was before. Both rest on the
+    same assumption, stated on `dist/executors/scan_read.py`: Parquet data files are immutable,
+    which is how every lakehouse format writes (Delta, Iceberg and Hudi add files and rewrite
+    manifests; they do not edit a data file). A deployment that rewrites data files under a live
+    path must set `gpu_frame_cache_fraction` to `0` and `BATCHER_SCAN_CACHE_BYTES=0`, and the
+    reason is the same for both.
+    """
+    splits = descriptor.get("splits")
+    if not splits:
+        return None
+    try:
+        ids = tuple(sorted(split.identity() for split in splits))
+    except Exception as exc:
+        note_suppressed("dist", "identify a shard for the device frame cache", exc)
+        return None
+    projection = descriptor.get("projection")
+    columns = tuple(projection) if projection is not None else ()
+    return (ids, columns, repr(descriptor.get("predicate")))
+
+
+def _frame_bytes(frame) -> int:
+    """Device bytes a frame occupies, or `0` when it will not say (then it is not cached)."""
+    try:
+        return int(frame.memory_usage(deep=True).sum())
+    except Exception as exc:
+        note_suppressed("dist", "measure a device frame for the cache", exc)
+        return 0
+
+
+def cached_device_frame(descriptor: dict, be: DfBackend):
+    """The shard as a device frame, served from this worker's cache when it is warm.
+
+    The device counterpart of `dist/executors/scan_read.py`'s worker scan cache, and the same
+    argument for it: a GPU worker persists between tasks (`gpu_worker_reuse`), the split-to-
+    worker assignment is deterministic, and Parquet is immutable — so the second query over the
+    same shard, columns and predicate need not read anything at all. Measured on a T4 against a
+    10 M-row shard of TPC-H `lineitem` projected to six columns, that is 0.12 s of a 0.22 s
+    shard.
+
+    A **shallow copy** is handed out, never the cached frame itself. The copy shares every
+    column's buffer, so it costs a Python object rather than a device allocation, and it means
+    an operator that adds a private column to what it was given — which `aggregate` and `sort`
+    both do — cannot grow the cached entry.
+
+    Returns `None` exactly where `read_descriptor_on_device` does, so the caller's host-reader
+    fallback is unchanged.
+    """
+    global _FRAME_CACHE_BYTES, _FRAME_CACHE_HITS, _FRAME_CACHE_MISSES
+    budget = _cache_budget_bytes()
+    key = _frame_key(descriptor) if budget else None
+    if key is not None:
+        with _FRAME_CACHE_LOCK:
+            hit = _FRAME_CACHE.get(key)
+            if hit is not None:
+                _FRAME_CACHE.move_to_end(key)
+                _FRAME_CACHE_HITS += 1
+            else:
+                _FRAME_CACHE_MISSES += 1
+        if hit is not None:
+            # A hit skips the read, and the read is where the backend learns which columns are
+            # calendar days. Without this the shard's dates come back as timestamps — the right
+            # values in the wrong column, which the schema contract then refuses.
+            remember_source_dates(descriptor, be)
+            return hit[1].copy(deep=False)
+    frame = read_descriptor_on_device(descriptor, be)
+    if frame is None or key is None:
+        return frame
+    nbytes = _frame_bytes(frame)
+    # A shard larger than the whole budget is served uncached rather than evicting everything
+    # to hold one entry that the next shard would evict again.
+    if nbytes <= 0 or nbytes > budget:
+        return frame
+    with _FRAME_CACHE_LOCK:
+        _FRAME_CACHE[key] = (nbytes, frame)
+        _FRAME_CACHE_BYTES += nbytes
+        while budget < _FRAME_CACHE_BYTES and len(_FRAME_CACHE) > 1:
+            _evicted, (evicted_bytes, _f) = _FRAME_CACHE.popitem(last=False)
+            _FRAME_CACHE_BYTES -= evicted_bytes
+    return frame.copy(deep=False)
 
 
 def read_descriptor_on_device(descriptor: dict, be: DfBackend):
@@ -80,6 +267,30 @@ def read_descriptor_on_device(descriptor: dict, be: DfBackend):
     return frame if _schema_agrees(frame, descriptor, projection) else None
 
 
+def remember_source_dates(descriptor: dict, be: DfBackend) -> None:
+    """Tell `be` which of this shard's columns are calendar days.
+
+    Neither the device reader nor the frame cache goes through `from_arrow`, which is where a
+    backend normally learns this — and a DATE that entered a frame comes back out of `to_arrow`
+    as a **timestamp** unless the backend was told. The result is a column of the right values
+    and the wrong type, which is this tier's characteristic defect and the one its pandas-backed
+    tests are structurally unable to see.
+
+    It is a separate function because there are now two doors into a device frame and both have
+    to walk through it. Measured on TPC-H q3 at sf10, the second one — a cache hit, which by
+    construction skips the read — produced `o_orderdate` as `timestamp[s]` where the engine
+    declares `date32[day]`; the schema contract refused the result and the CPU engine answered,
+    so the query was correct and lost its device.
+    """
+    splits = descriptor.get("splits")
+    if not splits:
+        return
+    try:
+        be.remember_dates(splits[0].schema())
+    except Exception as exc:
+        note_suppressed("dist", "register a shard's date columns", exc)
+
+
 def _widen(frame, descriptor: dict, projection: list[str] | None, be: DfBackend):
     """Widen the frame's narrow numeric columns, as the host path's `from_arrow` would.
 
@@ -92,11 +303,7 @@ def _widen(frame, descriptor: dict, projection: list[str] | None, be: DfBackend)
     from batcher.core.gpu_plan.backend import widened_type
 
     schema = descriptor["splits"][0].schema()
-    # This reader never goes through `from_arrow`, so the backend would not otherwise learn
-    # which columns were calendar days — and a DATE that entered a frame comes back out of
-    # `to_arrow` as a timestamp. Registering the source schema here is what keeps a device-read
-    # shard's schema equal to a host-read one's.
-    be.remember_dates(schema)
+    remember_source_dates(descriptor, be)
     names = list(projection) if projection is not None else list(frame.columns)
     for name in names:
         target = widened_type(schema.field(name).type)

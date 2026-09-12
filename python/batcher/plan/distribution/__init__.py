@@ -23,6 +23,7 @@ from batcher.plan.distribution.mergeable import (
 from batcher.plan.distribution.tree_shard import (
     LEFT_DRIVEN_JOINS,
     RIGHT_DRIVEN_JOINS,
+    ir_divides,
     shardable_leaves,
 )
 
@@ -34,6 +35,7 @@ __all__ = [
     "ShardSplit",
     "decompose",
     "flatten_ops",
+    "ir_divides",
     "nest_ops",
     "recombine",
     "shard_plan",

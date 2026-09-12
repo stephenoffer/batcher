@@ -5,18 +5,37 @@ present: Ray builds a separate virtualenv for that environment and resolves the 
 into it. Measured on a fleet whose image already ships RAPIDS, that is **26 seconds** on the
 first GPU task of a session and a further ~120 ms on every task after, charged to a query that
 needed neither — and it is charged per distinct runtime_env, so a fan-out pays it per node.
+Measured on a six-T4 fleet whose image ships *no* RAPIDS, where the block genuinely installs
+something, it is **168 s on the first round** and ~0 after: 6 shards whose task bodies summed
+to 1.7 s took 168 s, and 0.3 s on the round immediately following.
 
 So the pip block is added only when the cluster actually needs it, which means asking. The
 asking is optimistic on purpose and self-correcting: an inconclusive probe answers "present",
 and a task that then dies on the import records otherwise for every task after it. The reasons
 are on `cluster_has_cudf` and `mark_cudf_missing`.
+
+And when the cluster does need it, there are two ways to deliver it and they are not close in
+cost. A **shared mount** — which any fleet with an NFS/EFS/Lustre volume already has — carries
+one staged RAPIDS tree that reaches every worker as a `PYTHONPATH` entry Ray propagates as an
+ordinary environment variable and never resolves. Measured against the same fleet: **9.1 s**
+for the first worker's cold import off NFS and nothing after, against 168 s. `rapids_env_path`
+is that mechanism; `cudf_pip_spec` is the fallback for a fleet with no shared mount.
 """
 
 from __future__ import annotations
 
+import os
+
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["cluster_has_cudf", "mark_cudf_missing", "reset_cudf_probe"]
+__all__ = [
+    "cluster_has_cudf",
+    "cudf_pip_spec",
+    "mark_cudf_missing",
+    "rapids_env_path",
+    "reset_cudf_probe",
+    "stage_rapids_env",
+]
 
 
 #: Whether this cluster's GPU workers already import cuDF, or `None` before anything asked.
@@ -142,3 +161,181 @@ def reset_cudf_probe() -> None:
     """
     global _cluster_cudf
     _cluster_cudf = None
+
+
+#: Site-packages entries a staged RAPIDS tree needs. Deliberately **not** numpy or pyarrow: a
+#: GPU worker already carries both, at versions the driver was checked against, and a staged
+#: copy of either shadows a working install with one whose bundled `.libs` directory was not
+#: copied beside it. Measured: staging numpy this way makes every worker fail on
+#: `libscipy_openblas64_-*.so: cannot open shared object file` before it reaches cuDF at all.
+_RAPIDS_STAGE = (
+    "cuda",
+    "cudf",
+    "libcudf",
+    "libkvikio",
+    "librmm",
+    "numba",
+    "numba_cuda",
+    "nvidia",
+    "rmm",
+    "pylibcudf",
+    "rapids_logger",
+    "cachetools",
+    "llvmlite",
+    # NVML, which is not a RAPIDS dependency and is easy to leave out of a worker image — and
+    # without it `gpu_inventory()` is empty, so every device-memory decision this engine makes
+    # silently sizes against nothing: the RMM pool is not built, the frame cache's budget is
+    # zero, and an overflowing shard is subdivided blind. Measured on this fleet, all four.
+    "pynvml.py",
+    "nvtx",
+    "packaging",
+    "fsspec",
+    "pandas",
+    "pytz",
+    "dateutil",
+    "six.py",
+    "typing_extensions.py",
+)
+
+
+def rapids_env_path() -> str:
+    """The shared-mount RAPIDS directory the workers should import cuDF from, or `""`.
+
+    `""` — the default — means the mechanism is off and the pip fallback applies. A directory
+    that is configured but absent also answers `""`, because a `PYTHONPATH` pointing at nothing
+    would silently give the workers no cuDF at all while suppressing the pip block that would
+    have.
+
+    Returns:
+        The directory, or `""` when the mechanism is off or the directory is not there.
+    """
+    from batcher.config import active_config
+
+    path = str(active_config().distributed.gpu_rapids_path or "")
+    if not path:
+        return ""
+    return path if os.path.isdir(path) else ""
+
+
+def cudf_pip_spec() -> list[str]:
+    """The pip requirements that put this driver's cuDF on a worker, for a fleet with no mount.
+
+    Derived from the driver's own installation rather than hardcoded. A pinned
+    `cudf-cu13==26.6.0` is wrong on every fleet that is not this one: a CUDA-12 image needs
+    `cudf-cu12`, and a driver on a different RAPIDS release ships partials the workers cannot
+    unpickle. Reading the version off the driver makes the two sides the same build by
+    construction, which is the property the whole fan-out depends on.
+
+    **numpy is deliberately not pinned.** It used to be, to `1.26.4`, and that pin was actively
+    harmful: RAPIDS 25.04 and later support numpy 2, so the pin dragged a numpy-2 driver's
+    workers *back* to numpy 1 — and Ray pickles arrays by module path, so every array the task
+    returned then failed to unpickle on the driver with
+    `ModuleNotFoundError: No module named 'numpy._core'`. It made the exact failure it was
+    written to prevent, in the direction nobody tested.
+
+    Returns:
+        The requirement list, or `[]` when the driver has no cuDF to describe — in which case
+        there is nothing this fleet could be told to install that is known to match.
+    """
+    try:
+        import cudf
+    except ImportError as exc:
+        note_suppressed("dist", "read the driver's cuDF version for the worker pip spec", exc)
+        return []
+    version = str(getattr(cudf, "__version__", "")).strip()
+    suffix = _cuda_wheel_suffix()
+    if not version or not suffix:
+        return []
+    # cuDF reports `26.06.00`; the wheel is `26.6.0`. Normalizing rather than passing the
+    # reported string through: `cudf-cu13==26.06.00` resolves to nothing on PyPI, so an
+    # unnormalized pin turns a slow environment build into a failed one.
+    normalized = ".".join(str(int(part)) for part in version.split(".")[:3] if part.isdigit())
+    return [f"cudf-{suffix}=={normalized or version}"]
+
+
+def _cuda_wheel_suffix() -> str:
+    """`"cu13"` / `"cu12"` — the wheel variant matching the driver's CUDA major, or `""`.
+
+    Read from the installed distribution's own name rather than from a CUDA runtime probe: the
+    question is which wheel *this driver* has, and a head node with no device (the common
+    shape) answers a runtime probe with nothing at all.
+    """
+    try:
+        from importlib.metadata import distributions
+
+        for dist in distributions():
+            name = (dist.metadata["Name"] or "").lower()
+            if name.startswith("cudf-cu"):
+                return name.split("-", 1)[1]
+    except Exception as exc:
+        note_suppressed("dist", "read the driver's cuDF wheel variant", exc)
+    return ""
+
+
+def stage_rapids_env(dest: str = "", *, force: bool = False) -> str:
+    """Copy the driver's RAPIDS install to a shared mount so workers import it for free.
+
+    Idempotent: an already-populated directory is left alone, so calling this before every
+    query costs one `isdir`.
+
+    Args:
+        dest: Where to stage. Defaults to `distributed.gpu_rapids_path`.
+        force: Re-copy entries that are already there.
+
+    Returns:
+        The staged directory, or `""` when there is nothing to stage or nowhere to put it.
+    """
+    import shutil
+
+    from batcher.config import active_config
+
+    target = dest or str(active_config().distributed.gpu_rapids_path or "")
+    if not target:
+        return ""
+    root = os.path.abspath(target)
+    if not force and os.path.isdir(os.path.join(root, "cudf")):
+        return root
+    try:
+        import cudf
+    except ImportError as exc:
+        note_suppressed("dist", "stage RAPIDS for the workers: the driver has no cuDF", exc)
+        return ""
+    site = os.path.dirname(os.path.dirname(os.path.abspath(cudf.__file__)))
+    os.makedirs(root, exist_ok=True)
+    for name in _RAPIDS_STAGE:
+        src = os.path.join(site, name)
+        dst = os.path.join(root, name)
+        if not os.path.exists(src) or (os.path.exists(dst) and not force):
+            continue
+        try:
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        except OSError as exc:
+            note_suppressed("dist", f"stage {name} for the workers", exc)
+    _graft_numba_cuda(root)
+    return root
+
+
+def _graft_numba_cuda(root: str) -> None:
+    """Put `numba_cuda`'s `numba.cuda` where a bare `sys.path` entry will find it.
+
+    `numba-cuda` ships its package as `numba_cuda/numba/cuda` and grafts it onto `numba.cuda`
+    through a `.pth` file the interpreter runs at start-up. A `PYTHONPATH` entry runs no `.pth`,
+    so without this the workers import the *stub* `numba.cuda` that numba 0.64 ships and cuDF
+    dies on `No module named 'numba.cuda.core'` — several imports deep, in a task, with a
+    traceback that names neither numba-cuda nor the staging.
+    """
+    import shutil
+
+    overlay = os.path.join(root, "numba_cuda", "numba", "cuda")
+    target = os.path.join(root, "numba", "cuda")
+    if not os.path.isdir(overlay) or os.path.isdir(os.path.join(target, "core")):
+        return
+    try:
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        shutil.copytree(overlay, target)
+    except OSError as exc:
+        note_suppressed("dist", "graft numba.cuda into the staged RAPIDS tree", exc)

@@ -224,8 +224,8 @@ def test_a_packed_device_plans_a_proportionally_smaller_pool(monkeypatch):
     )
     monkeypatch.setattr(nvml, "device_telemetry", lambda: ())
 
-    alone = allocator._visible_device_usable_bytes(0.15, 1)
-    packed = allocator._visible_device_usable_bytes(0.15, 4)
+    alone = allocator.visible_device_usable_bytes(0.15, 1)
+    packed = allocator.visible_device_usable_bytes(0.15, 4)
     assert alone == pytest.approx((80 << 30) * 0.85, rel=0.01)
     assert packed * 4 == pytest.approx(alone, rel=0.01)
 

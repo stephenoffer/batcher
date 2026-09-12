@@ -28,6 +28,7 @@ __all__ = [
     "listfunc_type",
     "mapfunc_type",
     "struct_field_type",
+    "widened_element_out",
 ]
 
 # `list` accessor (`ListFunc`) output types. `len`/`n_unique`/`arg_max`/`arg_min`
@@ -110,14 +111,17 @@ def listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
     if fn in _LIST_FLOAT_REDUCE:
         return pa.float64()  # always double, whatever the element width
     if fn in _LIST_ORDER_REDUCE:
-        # `min`/`max` preserve the element type (already widened at the scan leaf).
-        return list_element_type(input_t)
+        # `min`/`max` preserve the element type, except that a narrow *integer* element widens
+        # on the way out — see `widened_element_out`.
+        return widened_element_out(list_element_type(input_t))
     if fn in _LIST_NUMERIC_SUM:
         element = list_element_type(input_t)
         if element is None:
             return None
         numeric = pa.types.is_integer(element) or pa.types.is_floating(element)
-        return element if numeric else pa.float64()
+        # `sum` accumulates a narrow integer child in `i64` and returns Int64 (the engine's
+        # exact-integer arm), so the same widening applies here for the same reason.
+        return widened_element_out(element) if numeric else pa.float64()
     if fn in ("normalize", "log_softmax"):
         # Rescale each element (unit L2 norm, or the log-domain distribution) -> List<Float64>.
         return pa.list_(pa.float64()) if list_element_type(input_t) is not None else None
@@ -181,3 +185,20 @@ def mapfunc_type(fn: str, map_t: pa.DataType | None, key: object = None) -> pa.D
     if fn == "element_at":
         return map_t.item_type
     return None
+
+
+def widened_element_out(element: pa.DataType | None) -> pa.DataType | None:
+    """A list element's type once an op has made it a *top-level column*.
+
+    The FFI boundary leaves a narrow numeric leaf inside a list at its own width, because a
+    tensor column's child is a component of one value rather than a column (see
+    ``plan.types.lattice._widen_element``). The ops that hand an element back as a column widen
+    a narrow **integer** there, so `Dataset.schema` has to predict the same thing or it lies
+    about a query the engine answers with `int64`. Floats keep their width on both sides, and
+    ``uint64`` was never widened at the boundary either.
+    """
+    if element is None:
+        return None
+    from batcher.plan.types.lattice import widen
+
+    return widen(element) if pa.types.is_integer(element) else element

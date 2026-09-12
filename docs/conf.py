@@ -182,6 +182,14 @@ exclude_patterns = [
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "architecture/internals/competitive_architecture.md",
+    # A code audit of which single-node operators and optimizations keep scaling as nodes are
+    # added, and which are O(1) in the node count. Carries an explicit "what this did not do"
+    # register and names an unclosed gap, so it is a working record rather than a site page.
+    "architecture/internals/single_node_scaleout_audit.md",
+    # A code audit of how much batch and streaming share: which operator semantics are one
+    # implementation, which differences are earned, and the one divergence that is a gap.
+    # Working record with an explicit "did not check" register, not a site page.
+    "architecture/internals/batch_streaming_sharing_audit.md",
     # The parts list behind that scorecard: which specific mechanisms DuckDB / Polars /
     # DataFusion / Spark / Daft have that Batcher does not, each cited to the
     # competitor file it was read from, plus the ranked build order. A contributor working

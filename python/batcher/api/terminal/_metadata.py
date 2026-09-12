@@ -47,8 +47,29 @@ _rng = random.Random(0x5EED)
 # large input on the driver.
 _STATS_SAMPLE_ROWS = 1 << 18
 
+# Byte cap for the same sample, applied *with* the row cap — whichever binds first.
+#
+# The row cap alone says "a couple of row-groups" only for a table whose rows are tens of
+# bytes. A row is not a bounded quantity: one row of an image, embedding, audio frame or
+# document column is routinely six orders of magnitude wider than one row of `lineitem`.
+# At 150,528 bytes a row — a 224x224x3 uint8 image, the shape every multimodal pipeline in
+# `benchmarks/cluster` uses — 262,144 rows is **39 GB**, pulled into the driver *after* the
+# distributed work is done, for statistics no plan over that column can consult.
+#
+# Measured on a 6-GPU cluster, `read.parquet(...).map_batches(model, num_gpus=1)
+# .collect(distributed=True)` over 32,768 such images: the driver's RssAnon climbed to
+# 13.7 GiB and the process was SIGKILLed (exit 137) during the benchmark's warm-up, on a
+# query whose *output* is 512 KB. On a 2,732-row slice of the same corpus the driver reached
+# 7,500 MiB against 145 MiB with this sampling ablated — so the sample was 52x the rest of
+# the driver's footprint, and it is the whole of that OOM.
+#
+# 128 MiB is chosen to be far above what the sketches need (`_sketch_sample` subsamples this
+# again, and `_learn_row_bytes` wants `nbytes / rows`, which one batch answers) and far below
+# what a driver can be asked to hold beside a running query.
+_STATS_SAMPLE_BYTES = 128 << 20
 
-def _stats_sample(src: Source) -> list[pa.RecordBatch]:
+
+def _stats_sample(src: Source, projection: list[str] | None = None) -> list[pa.RecordBatch]:
     """A bounded row sample of `src` for column-stat learning — NOT the whole source.
 
     `collect_source_metadata` runs on the driver after a query; on the distributed/UDF
@@ -65,26 +86,36 @@ def _stats_sample(src: Source) -> list[pa.RecordBatch]:
     single sf10 sample, which then blocks the query *return* after the distributed work is
     already done). The fast reader cuts that to ~0.4 s. Any non-splittable source (or a
     read failure) falls back to the lazy `iter_source` read; `iter_source` stops after the
-    first batches past the row cap (an in-memory source is already resident and small)."""
+    first batches past the row cap (an in-memory source is already resident and small).
+
+    `projection` restricts the read to the columns whose statistics are actually wanted, and
+    on a wide source that is the difference between a bounded read and an unbounded one. The
+    row and byte caps bound the *payload*; they do not bound what decoding it costs. Measured
+    on a 150,528-byte `FixedSizeList<uint8>` image column, through pyarrow's Parquet reader —
+    not through anything this module owns — the decode costs ~12x the payload in transient
+    memory: `pq.read_table` of one 98 MiB file peaks at 1,171 MiB, and of four at 4,571 MiB.
+    So a 128 MiB cap on a column nothing will consult still asks the driver for gigabytes,
+    which is why the caller narrows the columns and not only the rows."""
     # Under `measuring()`: this read meets the same malformed records the data read did,
     # and counting them again would inflate the very metric that says how much data the job
     # quietly dropped. Tolerance still applies — a bad record must not fail the sample —
     # only the tally is suppressed.
     with measuring():
-        fast = _fast_sample(src)
+        fast = _fast_sample(src, projection)
         if fast is not None:
             return fast
         out: list[pa.RecordBatch] = []
-        n = 0
-        for b in iter_source(src, None, None):
+        n = nbytes = 0
+        for b in iter_source(src, projection, None):
             out.append(b)
             n += b.num_rows
-            if n >= _STATS_SAMPLE_ROWS:
+            nbytes += b.nbytes
+            if n >= _STATS_SAMPLE_ROWS or nbytes >= _STATS_SAMPLE_BYTES:
                 break
         return out
 
 
-def _fast_sample(src: Source) -> list[pa.RecordBatch] | None:
+def _fast_sample(src: Source, projection: list[str] | None = None) -> list[pa.RecordBatch] | None:
     """The bounded sample read through the coalesced Parquet row-group scanner, or `None`.
 
     Reuses the distributed scan reader (pre-buffered, 32-IO-thread pyarrow dataset scan)
@@ -106,21 +137,27 @@ def _fast_sample(src: Source) -> list[pa.RecordBatch] | None:
             rows += s.row_count() or 0
             if rows >= _STATS_SAMPLE_ROWS:
                 break
+        # Deliberately rows-only: a `RowGroupSplit` carries a footer row count and no byte
+        # size, so a byte bound here could only be guessed. It is not needed — `chosen` is a
+        # list of descriptors, nothing is read until the loop below, and that loop stops on
+        # the byte cap. What this selection costs when it over-selects is bounded by the
+        # reader's own look-ahead window, not by the size of `chosen`.
         from batcher.dist.executors.scan_read import _read_split_batches
 
         out: list[pa.RecordBatch] = []
-        n = 0
-        for b in _read_split_batches(chosen, None, None):
+        n = nbytes = 0
+        for b in _read_split_batches(chosen, projection, None):
             out.append(b)
             n += b.num_rows
-            if n >= _STATS_SAMPLE_ROWS:
+            nbytes += b.nbytes
+            if n >= _STATS_SAMPLE_ROWS or nbytes >= _STATS_SAMPLE_BYTES:
                 break
         return out or None
     except Exception:  # any read/scan failure → caller falls back to iter_source
         return None
 
 
-def collect_source_metadata(hub, sources: list[Source]) -> None:
+def collect_source_metadata(hub, sources: list[Source], plan: LogicalPlan | None = None) -> None:
     """Record per-column ndv/quantiles from the base sources (Core collects).
 
     The UDF and distributed paths don't surface their scanned batches the way the
@@ -129,6 +166,20 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
     It is gated on the cheap `Source.schema` — a source is only read when it has a
     not-yet-measured column — so a file is never re-scanned once its columns are
     learned. Best-effort: learning never breaks a query.
+
+    **`plan` is what restricts the sketching to columns a plan can consult**, and passing
+    it is not optional in practice. `learn_column_stats` gates its distribution sketches on
+    `ndv_columns(plan)`, whose whole point is that "a column no predicate mentions has no
+    use for a quantile grid, and is very often the widest column in the row". This caller
+    passed `None`, which that gate reads as "no restriction" — so the one path that samples
+    *unprojected base sources* was also the one path that sketched **every** column of them.
+
+    On a multimodal pipeline that is the entire cost. Measured on a 6-GPU cluster,
+    `read.parquet(...).map_batches(model, num_gpus=1).collect(distributed=True)` over images
+    stored as a 150,528-byte `FixedSizeList<uint8>` column: the driver's RssAnon reached
+    7.5 GiB on a 2,732-row slice against 145 MiB with this whole pass ablated, and at 32,768
+    rows the driver was SIGKILLed mid-benchmark. The plan there is a scan feeding a UDF, so
+    `ndv_columns` is empty and the correct amount of sketching is none of it.
 
     **The sample is declared as a sample.** `learn_column_stats` already refuses to record a
     distinct count from a partial scan — its own comment spells out why an ndv is the one
@@ -155,6 +206,12 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
 
     try:
         learned = kyber.load_learned_stats(hub)
+        # The columns any later plan could consult a *distribution* statistic for. An empty
+        # set means none, and then the whole pass is a read with no consumer -- so it is not
+        # performed at all. `None` (no plan handed down) keeps the old unrestricted behaviour.
+        wanted = ndv_columns(plan) if plan is not None else None
+        if wanted is not None and not wanted:
+            return
         sampled: list[list[pa.RecordBatch]] = []
         keep: list[Source] = []
         complete: list[bool] = []
@@ -177,16 +234,27 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
             # the ndv is (correctly) withheld from a partial scan, a column is never marked
             # measured, and this pass re-sampled the same source on every query for the life
             # of the process -- 389 ms of a 3,100 ms sf100 join, forever, to learn nothing.
+            # What this pass will read, and therefore what it can mark measured. The two
+            # must be the same set or the "already learned" marker never completes and the
+            # source is re-sampled on every query forever -- see the note above, which
+            # records that exact failure from the previous version of this gate.
+            names = list(src.schema().names)
+            cols = names if wanted is None else [c for c in names if c in wanted]
+            if not cols:
+                continue  # this source contributes no column any plan consults
             known = set(kyber.columns_for(learned, kyber.AVG_BYTES_KEY, source_key))
-            if any(c not in known for c in src.schema().names):
-                batches = _stats_sample(src)
+            if any(c not in known for c in cols):
+                # Projected: a payload column no plan can consult is never decoded, which is
+                # what keeps the driver's footprint proportional to the statistics wanted
+                # rather than to the width of the row. See `_stats_sample`.
+                batches = _stats_sample(src, None if wanted is None else cols)
                 sampled.append(batches)
                 keep.append(src)
                 # `None` rows means "unknown", which cannot support a completeness claim.
                 rows = src.row_count()
                 complete.append(rows is not None and sum(b.num_rows for b in batches) >= rows)
         if sampled:
-            learn_column_stats(hub, sampled, keep, complete_scan=complete)
+            learn_column_stats(hub, sampled, keep, plan, complete_scan=complete)
     except Exception as exc:  # pragma: no cover - learning must never break execution
         note_suppressed("api", "learn column statistics", exc)
 

@@ -12,7 +12,8 @@ than against a name.
 | {doc}`vs DuckDB <vs-duckdb>` | Batcher takes the operator mix and the shared-Arrow suites |
 | {doc}`vs Polars <vs-polars>` | Batcher takes sort, top-N, and windows by a wide margin, and the sf10 suite by 2.26x |
 | {doc}`vs Daft <vs-daft>` | Batcher takes image decode, top-N, and the distributed join, and is correct where Daft is not |
-| {doc}`vs Spark <vs-spark>` | An architectural comparison: where each engine re-plans a query, and what that costs |
+| {doc}`vs Spark <vs-spark>` | An architectural comparison, and the measured board: Batcher takes every suite |
+| {doc}`vs PyArrow <vs-pyarrow>` | Same Arrow kernels underneath; the margin is scheduling and planning |
 
 :::{note}
 Every comparison runs each engine over the identical zero-copy Arrow input unless the page
@@ -33,4 +34,5 @@ vs-duckdb
 vs-polars
 vs-daft
 vs-spark
+vs-pyarrow
 ```

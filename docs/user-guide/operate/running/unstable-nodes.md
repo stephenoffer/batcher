@@ -127,8 +127,8 @@ the results independently.
 ## Requirements and limitations
 
 The Xid and node-fault readers need a readable `/dev/kmsg`, which means `CAP_SYSLOG` or a
-container that shares the host's kernel log. Device health needs `pynvml` on each worker, or
-the AMD equivalent. Where a source cannot be read, Batcher reports nothing rather than
+container that shares the host's kernel log. Device health needs `pynvml` on each worker
+(`pip install 'batcher-engine[nvml]'`), or the AMD equivalent. Where a source cannot be read, Batcher reports nothing rather than
 assuming the worst, so a fleet never drains because a base image changed.
 
 Quarantine is keyed on the worker's placement within a fleet, so it is remembered across the

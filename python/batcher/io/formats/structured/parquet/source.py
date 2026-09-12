@@ -97,7 +97,7 @@ class ParquetSource(FileSource):
             return None
         if not self._native_uri_is_addressable(files[0]):
             return None
-        per_file = _parquet_native.read_many(files, projection)
+        per_file = _parquet_native.read_many(files, projection, self._read_schema_or_none())
         if per_file is None:
             return None
         return [
@@ -105,6 +105,22 @@ class ParquetSource(FileSource):
             for path, file_batches in zip(files, per_file, strict=True)
             for b in self._normalize(file_batches, projection, path)
         ]
+
+    def _read_schema_or_none(self) -> pa.Schema | None:
+        """The source's declared schema, or ``None`` when it cannot be had right now.
+
+        Only ever used to *size* a read (`_parquet_native.native_read_batch`), so an answer is
+        an optimization and a failure is not an error. `schema()` infers, which reads a file —
+        and a source whose files are all corrupt raises `SchemaError` from that inference. On
+        the read path that is the wrong moment to raise: `on_error="skip"` exists so a bad file
+        is dropped and the read continues, and asking for a schema here turned two such reads
+        into hard failures. Sizing falls back to the flat row ceiling instead.
+        """
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            return self.schema()
+        return None
 
     def _native_uri_is_addressable(self, path: str) -> bool:
         """Whether the native reader can be handed `path` and reach the same bytes.
@@ -169,7 +185,13 @@ class ParquetSource(FileSource):
 
         def _read_one(f: str) -> list[pa.RecordBatch] | None:
             # `[]` row-groups = every row-group in the file; the reader prunes from there.
-            batches = _parquet_native.read_row_groups_filtered(f, [], projection, predicate)
+            batches = _parquet_native.read_row_groups_filtered(
+                f,
+                [],
+                projection,
+                predicate,
+                _parquet_native.native_read_batch(self._read_schema_or_none(), projection),
+            )
             if not batches:
                 return batches  # None, or a file pruned away to nothing — both pass through
             # Conform before filtering: the filter is bound against the source's declared
@@ -217,7 +239,7 @@ class ParquetSource(FileSource):
             if self._fs.native_read_target(path) is None:
                 return None
             return self._read_table(path, projection).to_batches()
-        native = _parquet_native.read_one(path, projection)
+        native = _parquet_native.read_one(path, projection, self._read_schema_or_none())
         if native is not None:
             return native
         return self._read_table(path, projection).to_batches()

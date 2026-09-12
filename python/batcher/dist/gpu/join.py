@@ -81,6 +81,15 @@ def sharded_gpu_join(
     from batcher.dist.gpu.aggregate import shard_descriptors
     from batcher.dist.gpu.dispatch import whole_source_descriptor
 
+    # Which side is replicated is decided by **measuring both**, not by which one the plan put
+    # on the right. See `_replicate_the_smaller_side` for why the plan's order does not answer
+    # this and what it cost when this code assumed it did.
+    swap = _replicate_the_smaller_side(left, right, join_ir)
+    if swap:
+        left, right = right, left
+        left_ops, right_ops = right_ops, left_ops
+        join_ir = _mirrored_join_ir(join_ir)
+
     build = whole_source_descriptor(right)
     if build is None:
         return None
@@ -98,6 +107,10 @@ def sharded_gpu_join(
     if probes is None:
         return None
 
+    build_bytes = _build_side_bytes(build, right)
+    if not _replication_measures_up(build_bytes, left, probe_projection, gpu_count):
+        return None
+
     shards = _run_join_shards(
         probes,
         build,
@@ -110,13 +123,85 @@ def sharded_gpu_join(
         # aggregate fan-out is: packing asks how much of a device one shard holds, and a shard
         # read through a projection holds the projection.
         probe_schema=narrowed_schema(_schema_of(left), probe_projection),
-        build_bytes=_build_side_bytes(build, right),
+        build_bytes=build_bytes,
     )
     if not shards:
         return None
     from batcher.dist.gpu.aggregate import fold_shards
 
     return fold_shards(shards, above)
+
+
+def _replicate_the_smaller_side(left, right, join_ir: dict) -> bool:
+    """Whether to mirror this join so the *smaller* relation is the one every device copies.
+
+    The fan-out splits the probe side and gives every device the whole build side, and this
+    module used to take the build side to be whatever the plan put on the **right**. Nothing
+    guarantees that. Kyber reorders a join's inputs for its own costing, and the CPU hash join
+    it reorders for picks its build side at runtime, so the plan's left/right carries no promise
+    about size — it just happened to hold on the plans this path was written against.
+
+    It stops holding as soon as a fleet learns anything, and the failure is silent and
+    expensive. TPC-H q14 (`lineitem ⋈ part`) runs at **12.2x** against an empty statistics hub.
+    Give the same query a hub with two of its own passes in it and Kyber emits the mirrored
+    join — probe `part` (2 M rows), build `lineitem` (60 M) — so the fan-out tries to replicate
+    **15.36 GB** onto every device, `_replication_measures_up` refuses it at a 4.79 GB budget,
+    and the query silently leaves the accelerator. The learning loop made the device tier worse
+    the longer the fleet ran, on the *forced* `backend="gpu"` path.
+
+    Measuring both sides answers it for good, and it is strictly better than the old rule rather
+    than a different guess: a plan that already had the small side on the right is unchanged.
+
+    **Only `inner` mirrors.** `LEFT_DRIVEN_JOINS` also carries `left`, `semi` and `anti`, and
+    all three are asymmetric by definition — their output is driven by left rows, so exchanging
+    the sides changes the answer rather than the schedule. An inner join is commutative, and
+    `_mirrored_join_ir` keeps even the column order identical.
+
+    Args:
+        left: The side the plan puts on the left, which the fan-out would split.
+        right: The side the plan puts on the right, which every device would copy.
+        join_ir: The join node's IR.
+
+    Returns:
+        True when the sides should be exchanged before the fan-out runs.
+    """
+    if join_ir.get("join_type") != "inner":
+        return False
+    try:
+        return _relation_bytes(right) > _relation_bytes(left) > 0.0
+    except Exception as exc:  # pragma: no cover - sizing must never break the join
+        note_suppressed("dist", "size both join sides to pick the replicated one", exc)
+        return False
+
+
+def _relation_bytes(source) -> float:
+    """A relation's decoded size, or `0.0` when it will not say.
+
+    A zero on either side leaves the plan's own order standing, which is what this path did
+    before it measured anything.
+    """
+    from batcher.dist.gpu.shards import source_bytes
+
+    return float(source_bytes(source))
+
+
+def _mirrored_join_ir(join_ir: dict) -> dict:
+    """`join_ir` with its two sides exchanged, producing the identical output columns.
+
+    The translator builds a join's result explicitly from `join_ir["output"]` — one entry per
+    column carrying the `side` it comes from, its `name` there, and its `alias` — rather than
+    from whatever order the underlying `merge` returns. So exchanging the sides is fully
+    expressible: swap the key lists, and flip each output entry's `side`. Column identity,
+    column order and column type all survive, which is what makes this a scheduling change and
+    not a semantic one.
+    """
+    flip = {"left": "right", "right": "left"}
+    return {
+        **join_ir,
+        "left_keys": list(join_ir["right_keys"]),
+        "right_keys": list(join_ir["left_keys"]),
+        "output": [{**o, "side": flip[o["side"]]} for o in join_ir["output"]],
+    }
 
 
 def _schema_of(source):
@@ -179,7 +264,7 @@ def _run_join_shards(
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime import speculation_policy
-    from batcher.dist.gpu.resources import gpu_shard_options
+    from batcher.dist.gpu.resources import gpu_shard_options, shard_node_affinity
     from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import gpu_join_task, gpu_task_options
 
@@ -188,6 +273,9 @@ def _run_join_shards(
         probes, probe_schema, gpu_count=gpu_count, resident_bytes=build_bytes
     )
     task = ray.remote(**opts)(gpu_join_task)
+    # The probe shards prefer the node that last read them, for the same reason the aggregate
+    # fan-out's do. The build side is read whole by every node either way.
+    affinity = shard_node_affinity(probes)
     # A probe shard that did not fit its packed share is retried on a whole device: the share is
     # the thing that was just shown to be too small, and a join's retry also carries the whole
     # replicated build side, which is the part of the footprint subdividing the probe cannot
@@ -197,7 +285,10 @@ def _run_join_shards(
     report = ShardReport("gpu-join", len(probes), packing=packing)
 
     def _launch(i: int):
-        return task.remote(probes[i], build, left_ops, right_ops, join_ir, above_ops)
+        args = (probes[i], build, left_ops, right_ops, join_ir, above_ops)
+        if affinity:
+            return task.options(scheduling_strategy=affinity[i]).remote(*args)
+        return task.remote(*args)
 
     def _on_failure(i: int, _ref, exc):
         if not is_memory_failure(exc) or dc.gpu_shard_subdivide <= 1:
@@ -216,3 +307,64 @@ def _run_join_shards(
     results = gather_with_backups(refs, _launch, speculation_policy(), on_failure=_on_failure)
     report.publish()
     return [t for t in results if t is not None and t.num_rows]
+
+
+def _replication_measures_up(
+    build_bytes: float, probe: Source, projection: list[str] | None, gpu_count: int
+) -> bool:
+    """Whether the *measured* build side still fits beside a probe shard on every device.
+
+    Kyber decided to replicate from estimates, and an estimate of a join's inputs is what this
+    engine's cardinality model is least reliable about — TPC-H q14 and q17 at sf10 estimate
+    **one row** for relations of tens of millions. So the executor asks again with what it can
+    count: `build_bytes` comes from the descriptor's footer row count and the source's own
+    schema.
+
+    It asks only about **fit**, and that restraint is the correction to a rule that was here
+    first and was wrong. That rule compared the *aggregate bytes* replication reads
+    (`build x devices`) against the probe side it splits — and aggregate bytes is not what a
+    fan-out costs, because the devices read **concurrently**. Per device the shapes are
+    `build + probe/N` against `build + probe`, so replicating is never slower than the single
+    device it replaces; it is only ever *not faster*. Measured on six T4s at TPC-H sf10, the
+    byte rule refused q14 — 0.48 GB replicated against a 1.68 GB probe — and turned a **12.4x**
+    speedup into a decline.
+
+    Whether the fan-out buys enough to be worth running at all is a different question, decided
+    on the plan by `kyber.gpu.shape`. This is the one the executor is uniquely able to answer:
+    the planner's estimate said it fits, and only the descriptor knows.
+
+    This mirrors the CPU path, whose threshold documents that "the executor re-checks the
+    *measured* build side against this same number before replicating it, so a planner
+    under-estimate costs a fallback rather than a cluster-wide OOM". Measured on six T4s,
+    TPC-H q12 at sf10 replicates **15.4 GB** against a 4.8 GB budget on the strength of an
+    estimate, and took 24.1 s against the CPU engine's 1.3 s.
+
+    Args:
+        build_bytes: The measured size of the side every device would read.
+        probe: The side that would be split across devices. Unused by the fit test and kept in
+            the signature because the caller has it and the next question about this join is
+            about the pair.
+        projection: The columns the probe side is read with.
+        gpu_count: Devices that would each hold a copy.
+
+    Returns:
+        True when the measured build side fits the device budget, and whenever it cannot be
+        measured — an unmeasurable input is exactly where Kyber's estimate is all there is, and
+        overriding a planner decision on no evidence would decline the fan-out this protects.
+    """
+    del probe, projection  # the fit question needs neither; see the docstring
+    if max(1, int(gpu_count)) < 2 or build_bytes <= 0:
+        return True
+    from batcher.config import active_config
+
+    budget = active_config().distributed.device_replication_bytes()
+    if build_bytes <= budget:
+        return True
+    note_suppressed(
+        "dist",
+        "replicate this join's build side across the devices",
+        ResourceWarning(
+            f"{build_bytes / 1e9:.1f}GB measured is past the {budget / 1e9:.1f}GB device budget"
+        ),
+    )
+    return False

@@ -65,7 +65,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_WEBDATASET_BATCH_BYTES": "payload bytes per WebDataset batch",
     # --- distributed scan / scheduling ---------------------------------------------
     "BATCHER_SPLIT_TARGET_BYTES": "target bytes per scan split",
-    "BATCHER_SCAN_PREFETCH": "scan-task prefetch depth",
+    "BATCHER_SCAN_PREFETCH": "concurrent reads a scan task keeps in flight",
     "BATCHER_SCAN_CACHE_BYTES": "per-worker scan cache size",
     "BATCHER_SCAN_CACHE_FRACTION": "scan cache as a fraction of worker memory",
     "BATCHER_BATCH_READAHEAD": "batches read ahead per scan task",
@@ -75,6 +75,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_FOLD_CHUNK_BYTES": "bytes per chunk in the distributed fold",
     "BATCHER_MIN_TASK_CPU": "floor on the CPU a map task reserves",
     "BATCHER_MAP_COMPUTE_WEIGHT": "compute weight used to size map tasks",
+    "BATCHER_TARGET_TASK_CPUS": "cores a map task should be, capping the row-based fan-out",
     "BATCHER_INFERENCE_CPU_WORKERS": "CPU-side workers feeding an inference stage",
     # --- shuffle transport ----------------------------------------------------------
     "BATCHER_ADVERTISE_HOST": "host a worker advertises for Flight connections",

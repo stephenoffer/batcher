@@ -172,7 +172,39 @@ def promote(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
         return pa.large_string()
     if _is_binary(a) and _is_binary(b):
         return pa.large_binary()
+    listed = _promote_list(a, b)
+    if listed is not None:
+        return listed
     return None
+
+
+def _is_any_list(dt: pa.DataType) -> bool:
+    return pa.types.is_list(dt) or pa.types.is_large_list(dt) or pa.types.is_fixed_size_list(dt)
+
+
+def _promote_list(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
+    """Two lists meet at a list of their elements' supertype, or ``None`` if the elements don't.
+
+    Mirrors the list arm of ``bc_expr::common_supertype``, which is reachable only since the FFI
+    boundary stopped widening a narrow numeric list child: before that every integer child
+    arrived as ``int64``, so a ``list<int32>`` could not *meet* a ``list<int64>`` and the absent
+    arm was invisible. The offset width follows the same "wider wins" rule as
+    ``string``/``large_string``; a ``fixed_size_list`` keeps its size only when both sides agree,
+    because two different fixed shapes disagree about what one value is.
+    """
+    if not (_is_any_list(a) and _is_any_list(b)):
+        return None
+    element = promote(a.value_type, b.value_type)
+    if element is None:
+        return None
+    field = a.value_field.with_type(element).with_nullable(
+        a.value_field.nullable or b.value_field.nullable
+    )
+    if pa.types.is_fixed_size_list(a) and pa.types.is_fixed_size_list(b):
+        return pa.list_(field, a.list_size) if a.list_size == b.list_size else pa.list_(field)
+    if pa.types.is_large_list(a) or pa.types.is_large_list(b):
+        return pa.large_list(field)
+    return pa.list_(field)
 
 
 def widen(dt: pa.DataType) -> pa.DataType:
@@ -184,13 +216,18 @@ def widen(dt: pa.DataType) -> pa.DataType:
     layouts normalize to the layout they respell — ``string_view`` to ``string``,
     ``binary_view`` to ``binary``, ``list_view``/``large_list_view`` to ``list`` — and a
     ``run_end_encoded`` column decodes to its value type, exactly as a dictionary does. The
-    widening
-    **recurses into nested types** — a ``struct<a: int32>`` becomes ``struct<a: int64>`` and
-    a ``list<float32>`` becomes ``list<float64>`` — because the boundary widens a narrow
-    numeric at every nesting depth, so a narrow field buried in a struct/list must be
-    predicted widened too or ``Dataset.schema`` would lie (and later arithmetic on the
-    widened engine value would disagree with the inferred narrow type). Booleans and
-    strings are unchanged. Idempotent.
+    widening **recurses into structs** — a ``struct<a: int32>`` becomes
+    ``struct<a: int64>`` — because the boundary widens a narrow numeric at that depth too, so a
+    narrow field buried in a struct must be predicted widened or ``Dataset.schema`` would lie
+    (and later arithmetic on the widened engine value would disagree with the inferred narrow
+    type).
+
+    A **list element** is the exception, and now for every narrow numeric width rather than
+    only floats: ``list<float32>``, ``fixed_size_list<uint8>`` and ``list<int32>`` all keep
+    their child, because that column is a tensor rather than a numeric column. See
+    `_widen_element` for what the widening cost and for how the wrap it used to prevent is
+    answered instead. ``list<uint64>`` still widens — ``int64`` cannot hold it, so that
+    normalization is not a widening. Booleans and strings are unchanged. Idempotent.
 
     The dictionary and ``LargeUtf8`` arms are what make this an actual mirror. Leaving them
     out did make ``Dataset.schema`` lie in exactly the way the paragraph above warns
@@ -230,13 +267,13 @@ def _widen_nested(dt: pa.DataType) -> pa.DataType:
     if pa.types.is_list(dt) or pa.types.is_large_list(dt):
         vf = dt.value_field
         make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
-        return make(vf.with_type(_widen_nested(vf.type)))
+        return make(vf.with_type(_widen_element(vf.type)))
     if _is(dt, "is_list_view", "is_large_list_view"):
         vf = dt.value_field
-        return pa.list_(vf.with_type(_widen_nested(vf.type)))
+        return pa.list_(vf.with_type(_widen_element(vf.type)))
     if pa.types.is_fixed_size_list(dt):
         vf = dt.value_field
-        return pa.list_(vf.with_type(_widen_nested(vf.type)), dt.list_size)
+        return pa.list_(vf.with_type(_widen_element(vf.type)), dt.list_size)
     if pa.types.is_map(dt):
         return pa.map_(
             dt.key_field.with_type(_widen_nested(dt.key_type)),
@@ -244,3 +281,50 @@ def _widen_nested(dt: pa.DataType) -> pa.DataType:
             dt.keys_sorted,
         )
     return dt
+
+
+def _widen_element(dt: pa.DataType) -> pa.DataType:
+    """`_widen_nested` for a list's element type, where a narrow numeric leaf keeps its width.
+
+    Mirrors ``bc_py::normalize_list_element``. A list of numbers is a *tensor* — an embedding,
+    a decoded image, a feature vector — not a numeric column: the list kernels read a narrow
+    child correctly (the ``arrow.fixed_shape_tensor`` extension column has always handed them
+    one, because the boundary exempts extension columns from widening), and widening it
+    multiplies the AI hot path's bytes and forces a cast where the transfer would otherwise be
+    zero-copy. On a decoded-image corpus (``fixed_size_list<uint8>``) that factor is eight.
+
+    Integer elements used to widen because their reason is wrap rather than width: an ``int32``
+    that later reaches arithmetic overflows where the widened value does not. That is answered
+    where it bites instead — the three ops that turn an element into a *column* (``list.get``,
+    ``list.min``, ``list.max``) widen their own output, so every observable type is unchanged.
+    ``uint64`` is not exempt: ``int64`` cannot hold it, so its normalization is not a widening.
+    A ``struct`` reached inside a list reverts to the ordinary rules — its fields are
+    addressable and behave like columns.
+    """
+    if pa.types.is_floating(dt):
+        return dt
+    if _is_narrow_integer(dt):
+        return dt
+    if pa.types.is_dictionary(dt):
+        return _widen_element(dt.value_type)
+    if pa.types.is_list(dt) or pa.types.is_large_list(dt):
+        vf = dt.value_field
+        make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
+        return make(vf.with_type(_widen_element(vf.type)))
+    if _is(dt, "is_list_view", "is_large_list_view"):
+        vf = dt.value_field
+        return pa.list_(vf.with_type(_widen_element(vf.type)))
+    if pa.types.is_fixed_size_list(dt):
+        vf = dt.value_field
+        return pa.list_(vf.with_type(_widen_element(vf.type)), dt.list_size)
+    return _widen_nested(dt)
+
+
+def _is_narrow_integer(dt: pa.DataType) -> bool:
+    """Whether `dt` is an integer width the boundary widens to ``int64`` losslessly.
+
+    ``uint64`` is excluded deliberately: it is the one integer type ``int64`` cannot hold, so
+    its normalization is a *reinterpretation* rather than a widening and both sides keep it on
+    the ordinary path. Mirrors the arm in ``bc_py::normalize_list_element``.
+    """
+    return dt in (pa.int8(), pa.int16(), pa.int32(), pa.uint8(), pa.uint16(), pa.uint32())

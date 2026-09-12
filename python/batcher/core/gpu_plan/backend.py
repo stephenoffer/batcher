@@ -365,6 +365,22 @@ class DfBackend:
 
         return pa.types.is_date(arrow)
 
+    def temporal_type(self, value: Any):
+        """`value`'s Arrow DATE or TIMESTAMP type, or `None` when it is neither.
+
+        The narrower `is_date` answers a question about arithmetic; this answers one about
+        *literals*, and it has to distinguish the two temporal types because the engine parses
+        a string against them differently.
+        """
+        if not self.is_series(value):
+            return None
+        arrow = getattr(getattr(value, "dtype", None), "pyarrow_dtype", None)
+        if arrow is None:
+            return None
+        import pyarrow as pa
+
+        return arrow if (pa.types.is_date(arrow) or pa.types.is_timestamp(arrow)) else None
+
     def is_integer(self, value: Any) -> bool:
         """Whether `value` is an integer column.
 
@@ -439,6 +455,25 @@ class DfBackend:
     def column(self, value: Any, df):
         """`value` as a column of `df`'s length, whether it arrived as a column or a scalar."""
         return value if self.is_series(value) else self.broadcast(value, df)
+
+    def null_column(self, df, arrow_name: str):
+        """An all-null column of `df`'s length, typed `arrow_name`.
+
+        The answer to a comparison the engine makes against a value it could not parse: SQL's
+        unknown, all the way down, rather than a `False` that reads as a decided negative.
+        Typed explicitly because an untyped null column is `float64` on one backend and `null`
+        on the other, and a shard contributing either cannot be concatenated with its peers.
+        """
+        import pyarrow as pa
+
+        # Built through this backend's own Arrow ingestion rather than from a Python list, so
+        # the column is typed the same way every other column that entered the frame was —
+        # `bool[pyarrow]` on pandas, a nullable boolean on cuDF — instead of `object`.
+        column = self.from_arrow(pa.table({"c": pa.nulls(len(df), pa.type_for_alias(arrow_name))}))[
+            "c"
+        ]
+        column.index = df.index
+        return column
 
 
 # --- conforming a dataframe column to what the engine would return ------------------

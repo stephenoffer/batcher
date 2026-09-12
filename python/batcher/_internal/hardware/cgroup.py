@@ -143,7 +143,21 @@ def cgroup_v2_dirs() -> tuple[str, ...]:
     # Leaf first (most specific) down to the root; `cfs_quota_count` mins over all anyway.
     for i in range(len(parts), 0, -1):
         dirs.append("/sys/fs/cgroup/" + "/".join(parts[:i]))
-    return tuple(dirs)
+    # Only the directories that exist. Under a cgroup *namespace* -- Docker, Kubernetes, and
+    # this Anyscale host -- `/proc/self/cgroup` reports the path as the **host** sees it while
+    # the mount shows that same cgroup at the root, so every path built above is absent. The
+    # docstring anticipates root and leaf coinciding in a pod; what it does not say is that the
+    # reported sub-path is then a host path that resolves to nothing.
+    #
+    # It reads as harmless -- a missing file yields `None` and the caller moves on -- and it is
+    # not, because `_own_cgroup_dirs` treats a non-empty tuple as proof that this workload has
+    # its own slice and never falls back to the mount root. So `memory.current` read `None` on
+    # a box whose `/sys/fs/cgroup/memory.current` said 19.57 GiB, and every consumer of the
+    # live footprint went quiet: the pressure signal that `spill_reason` calls "the one number
+    # here that cannot be wrong the way an estimate can", and the OOM-kill history that is the
+    # only *evidence*-based spill trigger. Both failed open, in containers, which is where they
+    # matter.
+    return tuple(d for d in dirs if os.path.isdir(d))
 
 
 @functools.lru_cache(maxsize=1)

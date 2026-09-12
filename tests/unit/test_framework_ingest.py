@@ -40,10 +40,17 @@ def test_a_recarray_becomes_one_column_per_field():
 
 
 def test_a_structured_field_holding_a_vector_keeps_the_embedding_shape():
-    """A sub-array field is a per-row vector, so it takes the same type a bare 2-D array does."""
+    """A sub-array field is a per-row vector, so it takes the same type a bare 2-D array does.
+
+    The width is what this is about, and it is unchanged. The **element type** used to be
+    `float64` here and is now the `f4` the caller wrote: a list of floats is a tensor, and the
+    boundary stopped widening its child (`bc_py::normalize_list_element`), so an embedding
+    column no longer doubles on the way in. Asserting the narrow type is what pins that from
+    this side — the caller's dtype survives the trip.
+    """
     array = np.zeros(2, dtype=[("id", "i8"), ("emb", "f4", (4,))])
     schema = bt.from_numpy(array).schema
-    assert schema.field("emb").type == pa.list_(pa.float64(), 4)
+    assert schema.field("emb").type == pa.list_(pa.float32(), 4)
 
 
 def test_a_nested_compound_field_becomes_a_struct_column():
@@ -63,10 +70,14 @@ def test_a_nested_compound_field_nests_to_any_depth():
 
 
 def test_a_sub_array_inside_a_nested_field_keeps_the_embedding_shape():
-    """The rank rules apply at every level, not only the top one."""
+    """The rank rules apply at every level, not only the top one.
+
+    And so does the tensor exemption: the list is inside a struct, and it is still a list of
+    floats, so its child keeps the caller's `f4` exactly as the top-level case above does.
+    """
     array = np.zeros(1, dtype=[("rec", [("emb", "f4", (3,))])])
     struct = bt.from_numpy(array).schema.field("rec").type
-    assert struct.field("emb").type == pa.list_(pa.float64(), 3)
+    assert struct.field("emb").type == pa.list_(pa.float32(), 3)
 
 
 def test_a_masked_structured_array_keeps_the_mask_per_field():

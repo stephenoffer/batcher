@@ -1670,9 +1670,44 @@ class DistributedConfig:
     autocast_inference: bool = True
     # Ship cuDF (RAPIDS) to the `backend="gpu"` worker tasks so the GPU group-by uses cuDF's
     # mature kernels (~3x the hand-rolled torch fallback, and the engine behind Polars-GPU).
-    # cuDF's pip install is cached per node after the first task; numpy stays pinned so returned
-    # arrays unpickle on the driver. Off → the torch fallback (no install, slower). On by default.
+    # Delivered through `gpu_rapids_path` where a shared mount is configured and through a pip
+    # block otherwise; the version is read off the driver's own install so both sides run the
+    # same build. Off → the torch fallback (no install, slower). On by default.
     gpu_backend_cudf: bool = True
+    # Share of a device's usable memory a GPU worker may hold as *cached decoded shards*,
+    # between queries. `0.0` turns the cache off; the default keeps a quarter of the board.
+    #
+    # It is the device analogue of the host worker scan cache (`dist/executors/scan_read.py`),
+    # and it exists because the read is the larger half of a device query and the one a repeat
+    # need not pay. Measured on a T4 against one 10 M-row shard of TPC-H `lineitem` projected
+    # to six columns: **0.12 s to read it from storage onto the device and 0.10 s to run q1's
+    # filter and eight-way aggregate over it**. A warm shard therefore runs at roughly the
+    # kernel time alone, which is where a device's memory bandwidth is actually being compared
+    # against the CPU's — and where the comparison is worth making.
+    #
+    # Parquet files are immutable, so a cached decode is the same rows as a fresh one; the key
+    # is the same `(split identities, projection, predicate)` the host cache uses. Bounded LRU,
+    # sized per **co-tenant** so four packed shards do not each reserve a quarter of the board
+    # for cache alone, and dropped whole on a device out-of-memory before the subdivision
+    # ladder runs — so the worst case is the uncached behaviour, paid once.
+    gpu_frame_cache_fraction: float = 0.25
+    # A directory on **shared** storage (NFS/EFS/Lustre) holding a staged RAPIDS tree, put on
+    # the GPU tasks' `PYTHONPATH` instead of installing cuDF into a Ray `runtime_env`. Empty
+    # (the default) means no shared mount and the pip block applies.
+    #
+    # The two deliver the same cuDF and are two orders of magnitude apart in what they cost to
+    # deliver it. A `pip` block makes Ray build a virtualenv and resolve the requirements into
+    # it, once per node a task first lands on: measured on a six-T4 fleet whose image ships no
+    # RAPIDS, six shards whose task bodies summed to 1.7 s took **168 s** on the first round
+    # and 0.3 s on the second. A `PYTHONPATH` entry is an environment variable Ray propagates
+    # and never resolves: **9.1 s** for the first worker's cold import off NFS, and nothing
+    # after.
+    #
+    # `dist.gpu.cudf_probe.stage_rapids_env` populates the directory from the driver's own
+    # installation, which is what keeps the two sides on one build. A path that does not exist
+    # is ignored rather than trusted — a `PYTHONPATH` pointing at nothing would give the
+    # workers no cuDF while suppressing the pip block that would have.
+    gpu_rapids_path: str = ""
     # Shards per GPU for the distributed GPU aggregate. Fanning out one shard per GPU puts an
     # unbounded slice on each device — a big source then OOMs a single GPU and the whole query
     # collapses to the CPU fallback. Oversubscribing (this many shards per GPU) bounds each
@@ -2032,6 +2067,53 @@ class DistributedConfig:
     # only moves *where* a partial lives, never what it holds, so this never changes a
     # result. See `carbonite/resilience/deadline.py`.
     drain_lead_s: float = 120.0
+
+    def device_replication_bytes(self, gpu_gb: float = 0.0) -> float:
+        """How many bytes of *replicated* input one device may hold beside its own shard.
+
+        The ceiling for a broadcast join on the device tier, and for the tree fan-out's
+        replicated leaves. It is a fraction (`gpu_tree_broadcast_fraction`) of one device's
+        **usable** memory: the replicated side sits beside this device's own shard, the hash
+        table built over it, and the CUDA context, so charging it a share of memory that
+        includes the part nothing may allocate would spend the budget twice.
+
+        It exists here, in the config layer, because two subsystems have to agree on it and
+        neither may import the other. Kyber decides whether a join broadcasts; `dist` sizes the
+        tasks that carry the replicated side. When they disagree the result is an
+        out-of-memory on every device at once, so the number is defined once.
+
+        **What it replaces is the reason it is worth having.** Kyber's GPU router asked
+        `adaptive_build_side` for the broadcast verdict with no threshold, which resolves to
+        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the historical **4 MiB**
+        fallback, a share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is
+        wrong by three orders of magnitude, and it declined the fan-out for joins that fit a
+        device many times over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build
+        sides of roughly 240 MB and were refused, then ran the whole join on a single device —
+        8.7 s and 8.5 s against CPU-engine answers of 0.33 s and 1.28 s.
+
+        Over-estimating is bounded rather than fatal: a probe shard that does not fit its share
+        falls into `dist.gpu.shards.run_subdivided`, which divides it and reruns it on the
+        device. Under-estimating has no such ladder — the fan-out simply never runs.
+
+        Args:
+            gpu_gb: One device's total memory in GB, as the cluster reports it. `0.0` falls
+                back to `resolved_gpu_memory_gb()`.
+
+        Returns:
+            Bytes one device may hold of replicated input.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import DistributedConfig
+                >>> round(DistributedConfig().device_replication_bytes(16.0) / 1e9, 2)
+                4.76
+        """
+        from batcher._internal.device_share import device_headroom
+
+        capacity = float(gpu_gb) if gpu_gb and gpu_gb > 0 else self.resolved_gpu_memory_gb()
+        fraction = min(0.9, max(0.0, float(self.gpu_tree_broadcast_fraction)))
+        return max(0.0, capacity) * 1e9 * (1.0 - device_headroom()) * fraction
 
     def resolved_gpu_memory_gb(self) -> float:
         """The usable memory budget of one GPU, detected when `gpu_memory_gb` is `0.0`.

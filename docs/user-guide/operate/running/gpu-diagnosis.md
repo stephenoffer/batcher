@@ -242,8 +242,8 @@ does not silently stop evaluating the day a container loses its driver mount.
 
 ## Requirements and limitations
 
-- Live telemetry needs `pynvml` and a mounted driver. Without it the sampler collects nothing,
-  the report says so, and every verdict is `unknown`.
+- Live telemetry needs `pynvml` (`pip install 'batcher-engine[nvml]'`) and a mounted driver.
+  Without it the sampler collects nothing, the report says so, and every verdict is `unknown`.
 - Real occupancy and tensor-core activity come from DCGM, which ships as a separate daemon and
   separate Python bindings that are not on PyPI. Without it, `occupancy_limited` is never
   reported and a badly shaped kernel reads as `compute_bound`.

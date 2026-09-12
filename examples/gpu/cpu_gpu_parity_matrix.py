@@ -56,15 +56,34 @@ def main() -> None:
     for name, query in shapes.items():
         on_device = query.collect(backend=device)
         on_cpu = query.collect(backend="cpu")
-        same_schema = on_device.schema == on_cpu.schema
-        same_values = on_device.to_pydict() == on_cpu.to_pydict()
-        status = "ok  " if (same_schema and same_values) else "FAIL"
+        difference = _agrees(on_device, on_cpu)
+        status = "ok  " if difference is None else "FAIL"
         print(f"  {status} {name:<18} {on_device.num_rows:>6} rows")
-        if not (same_schema and same_values):
-            failures.append(name)
+        if difference is not None:
+            failures.append(f"{name}: {difference}")
 
     assert not failures, failures
     print(f"{len(shapes)} shapes agree on schema and values")
+
+
+def _agrees(device, cpu) -> str | None:
+    """Why the two results differ, or `None` when they agree — the tier's own standard.
+
+    `compare_results` is what `distributed.gpu_shadow_verify` uses at runtime: schema first,
+    then values, with a float tolerance. Using it here rather than `to_pydict() == to_pydict()`
+    is not a loosening — it is the correct comparison, and the exact one was **failing on two
+    CPU runs of the same query**.
+
+    The reason is the engine's own documented contract: a distributed float reduction is
+    identical only *up to reassociation*. IEEE addition is not associative, the partition count
+    decides the summation order, and Neumaier compensation bounds the error near the last bits
+    without removing it. So `sum(l_extendedprice)` came back `1083388866.8000002` on one run and
+    `1083388866.8` on the next, and an exact comparison called that a parity failure on a
+    machine with no accelerator at all.
+    """
+    from batcher.api.terminal.gpu_backend.verify import compare_results
+
+    return compare_results(device, cpu)
 
 
 if __name__ == "__main__":

@@ -67,12 +67,34 @@ def _widen_schema(schema: pa.Schema, targets: dict[str, pa.DataType]) -> pa.Sche
 
 
 def _widen_narrow_type(dt: pa.DataType) -> pa.DataType | None:
-    """`dt`'s widened form if the boundary narrow-widens it (recursing nested types), else None.
+    """`dt`'s widened form if this source widens it *eagerly*, else None.
 
-    Applies the leaf `_WIDEN_NARROW` mapping at every nesting depth, so a narrow numeric (or
-    ``LargeUtf8``) buried in a ``struct``/``list``/``map`` widens exactly as a top-level one
-    does — matching what the Rust ``normalize_batch`` produces. ``UInt64`` and dictionaries are
-    left to the Rust boundary (as at the top level), so a nested one is passed through here.
+    Applies the leaf `_WIDEN_NARROW` mapping to a top-level scalar and to a scalar inside a
+    ``struct``. **A list element is deliberately left alone**, and so is a map's key/item.
+
+    The eager cast is an optimization, not the contract: it exists so a *relational* query
+    does not re-cast a narrow column on every execution, and `normalize_batch` on the Rust
+    side stays the correctness backstop — it widens whatever actually reaches a kernel, and
+    is a no-op on a column already wide. So declining to widen here changes what a query
+    *costs*, never what it returns.
+
+    For a list payload that trade inverts, because widening multiplies the column rather
+    than re-typing it. A ``fixed_size_list<uint8>`` image is the case the multimodal path is
+    built on, and `uint8 -> int64` makes it **8x** larger: measured on 256 224x224x3 images,
+    `from_arrow` turned a 36.8 MiB table into 294.0 MiB of source batches, on the driver,
+    before a single row was read. An embedding column (``list<float32>``) doubles the same
+    way. That cost is paid by every such table whether or not any query touches the payload
+    relationally — and a UDF is the overwhelmingly common thing to do with one, which
+    touches no kernel at all.
+
+    The parquet path already behaves this way and is the evidence the backstop is enough:
+    the same image column read from a file reaches a `map_batches` UDF as ``uint8``, while
+    from `from_arrow` it arrived as ``int64``. Two sources disagreeing about the type a UDF
+    receives is the defect; this makes them agree, on the cheaper side.
+
+    A relational query over a nested narrow column now pays its cast per execution. That is
+    the documented trade of the paragraph above, taken deliberately in the direction that
+    does not multiply a payload nobody asked to widen.
     """
     flat = _WIDEN_NARROW.get(dt)
     if flat is not None:
@@ -82,27 +104,6 @@ def _widen_narrow_type(dt: pa.DataType) -> pa.DataType | None:
         if not any(w is not None for _, w in widened):
             return None
         return pa.struct([f.with_type(w) if w is not None else f for f, w in widened])
-    if pa.types.is_list(dt) or pa.types.is_large_list(dt):
-        vf = dt.value_field
-        wt = _widen_narrow_type(vf.type)
-        if wt is None:
-            return None
-        make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
-        return make(vf.with_type(wt))
-    if pa.types.is_fixed_size_list(dt):
-        vf = dt.value_field
-        wt = _widen_narrow_type(vf.type)
-        return pa.list_(vf.with_type(wt), dt.list_size) if wt is not None else None
-    if pa.types.is_map(dt):
-        kt = _widen_narrow_type(dt.key_type)
-        it = _widen_narrow_type(dt.item_type)
-        if kt is None and it is None:
-            return None
-        return pa.map_(
-            dt.key_field.with_type(kt or dt.key_type),
-            dt.item_field.with_type(it or dt.item_type),
-            dt.keys_sorted,
-        )
     return None
 
 

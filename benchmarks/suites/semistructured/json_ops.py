@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING
 
 from registry import EngineQueries, suite
 
+# Ray Data has no JSON-path expression, so its pipelines parse the document per batch;
+# without them the whole suite reported `n/a` for it.
+from suites.semistructured import json_ray
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -102,7 +106,8 @@ def json_groupby1(ctx: Context) -> EngineQueries:
             .to_arrow()
         )
 
-    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars)
+    ray = json_ray.ray_fn(ctx, lambda h: json_ray.group_count(h, "country", "$.user.country"))
+    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars, ray=ray)
 
 
 # --------------------------------------------------------------------------- #
@@ -158,7 +163,15 @@ def json_project5(ctx: Context) -> EngineQueries:
             .to_arrow()
         )
 
-    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars)
+    ray = json_ray.ray_fn(
+        ctx,
+        lambda h: json_ray.project5(
+            h,
+            {"country": "$.user.country", "tier": "$.user.tier", "os": "$.device.os"},
+            {"s": "$.event.value", "isum": "$.event.items"},
+        ),
+    )
+    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars, ray=ray)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +204,8 @@ def json_array(ctx: Context) -> EngineQueries:
             .to_arrow()
         )
 
-    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars)
+    ray = json_ray.ray_fn(ctx, lambda h: json_ray.array_first_tag(h, "tag"))
+    return _with(ctx, _sql(ctx, duck, batcher=False), batcher=batcher, polars=polars, ray=ray)
 
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +249,8 @@ def json_filter_agg(ctx: Context) -> EngineQueries:
         return out.to_arrow()
 
     daft_fn = daft if "daft" in ctx.names() else None
-    return _with(ctx, _sql(ctx, duck, batcher=True), polars=polars, daft=daft_fn)
+    ray = json_ray.ray_fn(ctx, json_ray.filter_agg)
+    return _with(ctx, _sql(ctx, duck, batcher=True), polars=polars, daft=daft_fn, ray=ray)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,4 +274,5 @@ def json_groupby_sql(ctx: Context) -> EngineQueries:
             .to_arrow()
         )
 
-    return _with(ctx, _sql(ctx, duck, batcher=True), polars=polars)
+    ray = json_ray.ray_fn(ctx, lambda h: json_ray.group_count(h, "tier", "$.user.tier"))
+    return _with(ctx, _sql(ctx, duck, batcher=True), polars=polars, ray=ray)
