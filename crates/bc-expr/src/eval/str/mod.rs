@@ -165,14 +165,7 @@ pub(crate) fn eval_str(
                 v.to_lowercase()
             }
         })),
-        // `char_len` for the same reason: an ASCII row's character count is its byte length,
-        // and `is_ascii` reads the buffer a word at a time where `chars().count()` reads it a
-        // byte at a time looking for continuation bytes.
-        StrFunc::Len => Arc::new(
-            s.iter()
-                .map(|o| o.map(|v| char_len(v) as i64))
-                .collect::<Int64Array>(),
-        ),
+        StrFunc::Len => Arc::new(char_len_array(s)),
         StrFunc::Contains => {
             let pat = require_pattern(pattern, func)?;
             Arc::new(like::LikeMatcher::contains(pat).eval(s))
@@ -1394,6 +1387,47 @@ fn char_len(v: &str) -> usize {
     } else {
         v.chars().count()
     }
+}
+
+/// `LENGTH` over a whole column: test the value buffer for ASCII **once**, then take every
+/// row's length as an offset subtraction.
+///
+/// The per-row form (`char_len` on each value) already short-circuits on ASCII, and that is
+/// not enough, because the check is per row and a row is short. TPC-H `l_comment` averages 27
+/// bytes, so a per-value `is_ascii` never fills a SIMD register and pays its setup on every
+/// row; the same test over the whole 162 MB value buffer is one linear, fully vectorized pass.
+/// After it, a character count *is* a byte count, and the byte count is already in the offsets
+/// — no second look at the text at all.
+///
+/// Measured on `SELECT SUM(LENGTH(l_comment))` over 6,001,215 rows: **206 ms of CPU against
+/// DuckDB's 71 ms** before, which is the gap `competitive_architecture.md` ceiling 12 records.
+///
+/// Non-ASCII data keeps the per-row path exactly as before, so this is a short-circuit rather
+/// than a change of meaning: for ASCII the two agree by definition (every ASCII byte is a
+/// one-byte character), and for anything else the old code runs.
+fn char_len_array(s: &StringArray) -> Int64Array {
+    use arrow::array::Array;
+
+    let offsets = s.value_offsets();
+    // **This array's own bytes, not the buffer's.** A morsel is a *slice* of the column, and
+    // `value_data()` hands back the whole shared values buffer — so testing that would re-scan
+    // the entire column once per morsel. Measured that way the "optimization" ran 10.9 ms ->
+    // 14.5 ms on `SUM(LENGTH(l_comment))`, which is how this comment came to exist.
+    let (lo, hi) = match (offsets.first(), offsets.last()) {
+        (Some(&lo), Some(&hi)) => (lo as usize, hi as usize),
+        _ => return Int64Array::from(Vec::<Option<i64>>::new()),
+    };
+    if !s.value_data()[lo..hi].is_ascii() {
+        return s.iter().map(|o| o.map(|v| char_len(v) as i64)).collect();
+    }
+    // `from_iter` with the row's own validity: a null row must stay null rather than report
+    // the zero-width its offsets happen to span.
+    (0..s.len())
+        .map(|i| {
+            s.is_valid(i)
+                .then(|| i64::from(offsets[i + 1] - offsets[i]))
+        })
+        .collect()
 }
 
 /// 1-based character position of the first occurrence of `finder`'s needle in `v`, or 0 if
@@ -2951,5 +2985,60 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod char_len_tests {
+    use super::*;
+
+    fn lens(values: Vec<Option<&str>>) -> Vec<Option<i64>> {
+        let arr = StringArray::from(values);
+        let fast = char_len_array(&arr);
+        // The per-row path this short-circuits, computed the same way it was before.
+        let slow: Int64Array = arr.iter().map(|o| o.map(|v| char_len(v) as i64)).collect();
+        assert_eq!(
+            fast, slow,
+            "the whole-buffer path must agree with the per-row one"
+        );
+        fast.iter().collect()
+    }
+
+    /// The ASCII case is the one that changes route, so it is the one to pin: a length taken
+    /// from the offsets must equal the character count, and a null must stay null rather than
+    /// report the zero width its offsets span.
+    #[test]
+    fn an_ascii_column_measures_by_offsets() {
+        assert_eq!(
+            lens(vec![Some("abc"), None, Some(""), Some("hello world")]),
+            vec![Some(3), None, Some(0), Some(11)]
+        );
+    }
+
+    /// One non-ASCII byte anywhere in the buffer sends the whole column down the per-row path,
+    /// because the buffer test is whole-buffer. The counts are characters, not bytes.
+    #[test]
+    fn a_column_with_any_multibyte_value_counts_characters() {
+        assert_eq!(
+            lens(vec![Some("abc"), Some("héllo"), None, Some("日本語")]),
+            vec![Some(3), Some(5), None, Some(3)]
+        );
+    }
+
+    /// A sliced array does not start at offset zero, which is exactly where an offset
+    /// subtraction goes wrong if it indexes the buffer rather than the array's own offsets.
+    #[test]
+    fn a_sliced_array_measures_its_own_rows() {
+        let arr = StringArray::from(vec![Some("aaaa"), Some("bb"), None, Some("ccc")]);
+        let sliced = arr.slice(1, 3);
+        let got = char_len_array(&sliced);
+        assert_eq!(got.iter().collect::<Vec<_>>(), vec![Some(2), None, Some(3)]);
+    }
+
+    /// An all-null column has no values at all; the buffer test must not decide it is
+    /// non-ASCII and the result must still be all null.
+    #[test]
+    fn an_all_null_column_is_all_null() {
+        assert_eq!(lens(vec![None, None]), vec![None, None]);
     }
 }

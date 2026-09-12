@@ -15,6 +15,7 @@
  *
  * ── Encoding discipline (the visuals must not break these) ──────────────────
  *   magnitude -> one hue, light→dark (--seq-*). Operator time, bar length, node fill.
+ *   brand     -> the logo's gradient (--brand-gradient), on chrome only and never on data.
  *   state     -> the reserved status palette, always paired with a text label, so meaning
  *                is never carried by colour alone.
  *   identity  -> unused. Plan steps are labelled, not hue-coded: they are stages of one
@@ -37,42 +38,52 @@
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --content-max: 1680px;
   /* Text placed ON a filled accent/status surface. Named rather than `#fff` so a
-   * theme with a light accent can flip it without hunting through components. */
+   * theme with a light accent can flip it without hunting through components -- which the
+   * dark theme does, because its accent is the logo's light cyan. */
   --on-accent: #ffffff;
+  /* Text placed ON a filled data-ramp cell (flame graph, gantt bar). Separate from
+   * --on-accent because the ramp stays a mid-to-deep blue in both themes while the dark
+   * accent does not, so the two need opposite label colours there. */
+  --on-seq: #ffffff;
+  /* The logo's own gradient, cyan -> electric blue -> violet -> magenta. Brand chrome only
+   * (the top bar edge, the travelling tab ink, the KPI hairline), never data, which keeps
+   * the one-hue --seq-* ramp so a magnitude is never read off a hue change. */
+  --brand-gradient: linear-gradient(90deg, #6dfafc 0%, #40bbf9 22%, #2a3bf4 52%, #7a0af5 76%, #f023d3 100%);
 
   /* The default palette. Defined here, on the bare :root, so the page is fully styled
    * before any attribute is stamped and on any host that never stamps one. The two
    * :root[data-theme=...] blocks below are overrides for an explicit choice, not the
    * only place the palette exists. */
   color-scheme: light;
-  --bg: #eceff4;
+  --bg: #eceef7;
     --surface-1: #ffffff;
-    --surface-2: #f5f7fb;
-    --surface-3: #e9edf4;
-    --surface-4: #dbe1eb;
-    --border: #dce1ea;
-    --border-strong: #bcc5d3;
-    --text-1: #0e141d;
-    --text-2: #47515f;
-    --text-3: #78828f;
-    --accent: #2563eb;
-    --accent-2: #5b8def;
-    --accent-wash: rgba(37, 99, 235, .09);
-    --accent-line: rgba(37, 99, 235, .24);
-    --seq-1: #c7dbfa; --seq-2: #86b0f0; --seq-3: #2563eb; --seq-4: #1e51c0; --seq-5: #16388a;
+    --surface-2: #f5f6fc;
+    --surface-3: #e9ebf6;
+    --surface-4: #dbdeef;
+    --border: #dcdff0;
+    --border-strong: #bcc1dc;
+    --text-1: #0d0f24;
+    --text-2: #474d66;
+    --text-3: #737994;
+    --accent: #2a3bf4;
+    --accent-2: #7a0af5;
+    --accent-wash: rgba(42, 59, 244, .09);
+    --accent-line: rgba(42, 59, 244, .24);
+    --seq-1: #c9cffd; --seq-2: #8f9bf8; --seq-3: #2a3bf4; --seq-4: #1f2bc0; --seq-5: #151d86;
     --good: #0f9d6b; --warn: #b7791f; --serious: #cf5a2c; --critical: #d0362f;
     --good-wash: rgba(15, 157, 107, .09); --warn-wash: rgba(183, 121, 31, .10);
     --serious-wash: rgba(207, 90, 44, .09); --critical-wash: rgba(208, 54, 47, .09);
     --shadow-1: 0 1px 2px rgb(20 30 48 / .06);
     --shadow-2: 0 2px 6px rgb(20 30 48 / .07), 0 8px 20px rgb(20 30 48 / .06);
     --shadow-3: 0 10px 24px rgb(20 30 48 / .10), 0 26px 60px rgb(20 30 48 / .10);
-    --grid-line: rgba(30, 60, 120, .05);
+    --grid-line: rgba(42, 59, 244, .045);
     --glass: rgba(255, 255, 255, .82);
     --glow-accent: 0 0 0 rgba(0,0,0,0);
     --glow-good: 0 0 0 rgba(0,0,0,0);
     --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
-    --scan: rgba(30, 60, 120, .02);
+    --scan: rgba(42, 59, 244, .02);
     --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+    --glow-brand: drop-shadow(0 2px 6px rgba(122, 10, 245, .30));
 }
 
 /* No explicit choice recorded: follow the OS. :where() keeps specificity at zero so an
@@ -80,99 +91,104 @@
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme])) {
     color-scheme: dark;
-    --bg: #080a10;
-      --surface-1: #0d111a;
-      --surface-2: #131824;
-      --surface-3: #1a2030;
-      --surface-4: #242c40;
-      --border: #212a3c;
-      --border-strong: #35415a;
-      --text-1: #e9edf7;
-      --text-2: #9aa7c0;
-      --text-3: #66718a;
-      --accent: #56a0ff;
-      --accent-2: #8fc0ff;
-      --accent-wash: rgba(86, 160, 255, .13);
-      --accent-line: rgba(86, 160, 255, .32);
-      --seq-1: #bcd8ff; --seq-2: #7fb0f5; --seq-3: #56a0ff; --seq-4: #2f6fd4; --seq-5: #1d4c96;
+    --bg: #070919;
+      --surface-1: #0c0e28;
+      --surface-2: #12153a;
+      --surface-3: #1a1e4a;
+      --surface-4: #252a5e;
+      --border: #1f2450;
+      --border-strong: #353b74;
+      --text-1: #e9ebfa;
+      --text-2: #9aa0cc;
+      --text-3: #7178aa;
+      --accent: #4ed5f9;
+      --accent-2: #8fe6fb;
+      --accent-wash: rgba(78, 213, 249, .12);
+      --accent-line: rgba(78, 213, 249, .30);
+      --seq-1: #c3c9fd; --seq-2: #8d99fa; --seq-3: #5f6ff7; --seq-4: #3847e6; --seq-5: #2430b0;
       --good: #34d399; --warn: #f0b429; --serious: #f97c5a; --critical: #f2555a;
       --good-wash: rgba(52, 211, 153, .13); --warn-wash: rgba(240, 180, 41, .13);
       --serious-wash: rgba(249, 124, 90, .13); --critical-wash: rgba(242, 85, 90, .13);
       --shadow-1: 0 1px 2px rgb(0 0 0 / .55);
       --shadow-2: 0 2px 8px rgb(0 0 0 / .5), 0 10px 26px rgb(2 6 18 / .42);
       --shadow-3: 0 10px 26px rgb(0 0 0 / .55), 0 28px 64px rgb(2 6 18 / .5);
-      --grid-line: rgba(120, 160, 255, .05);
-      --glass: rgba(10, 13, 21, .8);
-      --glow-accent: 0 0 14px rgba(86, 160, 255, .5);
+      --grid-line: rgba(110, 130, 255, .05);
+      --glass: rgba(9, 11, 32, .8);
+      --glow-accent: 0 0 14px rgba(78, 213, 249, .45);
       --glow-good: 0 0 12px rgba(52, 211, 153, .45);
       --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
-      --scan: rgba(120, 160, 255, .03);
+      --scan: rgba(110, 130, 255, .03);
       --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+    --on-accent: #070919;
+    --glow-brand: drop-shadow(0 2px 8px rgba(122, 10, 245, .55));
   }
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #080a10;
-    --surface-1: #0d111a;
-    --surface-2: #131824;
-    --surface-3: #1a2030;
-    --surface-4: #242c40;
-    --border: #212a3c;
-    --border-strong: #35415a;
-    --text-1: #e9edf7;
-    --text-2: #9aa7c0;
-    --text-3: #66718a;
-    --accent: #56a0ff;
-    --accent-2: #8fc0ff;
-    --accent-wash: rgba(86, 160, 255, .13);
-    --accent-line: rgba(86, 160, 255, .32);
-    --seq-1: #bcd8ff; --seq-2: #7fb0f5; --seq-3: #56a0ff; --seq-4: #2f6fd4; --seq-5: #1d4c96;
+  --bg: #070919;
+    --surface-1: #0c0e28;
+    --surface-2: #12153a;
+    --surface-3: #1a1e4a;
+    --surface-4: #252a5e;
+    --border: #1f2450;
+    --border-strong: #353b74;
+    --text-1: #e9ebfa;
+    --text-2: #9aa0cc;
+    --text-3: #7178aa;
+    --accent: #4ed5f9;
+    --accent-2: #8fe6fb;
+    --accent-wash: rgba(78, 213, 249, .12);
+    --accent-line: rgba(78, 213, 249, .30);
+    --seq-1: #c3c9fd; --seq-2: #8d99fa; --seq-3: #5f6ff7; --seq-4: #3847e6; --seq-5: #2430b0;
     --good: #34d399; --warn: #f0b429; --serious: #f97c5a; --critical: #f2555a;
     --good-wash: rgba(52, 211, 153, .13); --warn-wash: rgba(240, 180, 41, .13);
     --serious-wash: rgba(249, 124, 90, .13); --critical-wash: rgba(242, 85, 90, .13);
     --shadow-1: 0 1px 2px rgb(0 0 0 / .55);
     --shadow-2: 0 2px 8px rgb(0 0 0 / .5), 0 10px 26px rgb(2 6 18 / .42);
     --shadow-3: 0 10px 26px rgb(0 0 0 / .55), 0 28px 64px rgb(2 6 18 / .5);
-    --grid-line: rgba(120, 160, 255, .05);
-    --glass: rgba(10, 13, 21, .8);
-    --glow-accent: 0 0 14px rgba(86, 160, 255, .5);
+    --grid-line: rgba(110, 130, 255, .05);
+    --glass: rgba(9, 11, 32, .8);
+    --glow-accent: 0 0 14px rgba(78, 213, 249, .45);
     --glow-good: 0 0 12px rgba(52, 211, 153, .45);
     --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
-    --scan: rgba(120, 160, 255, .03);
+    --scan: rgba(110, 130, 255, .03);
     --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+    --on-accent: #070919;
+    --glow-brand: drop-shadow(0 2px 8px rgba(122, 10, 245, .55));
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #eceff4;
+  --bg: #eceef7;
     --surface-1: #ffffff;
-    --surface-2: #f5f7fb;
-    --surface-3: #e9edf4;
-    --surface-4: #dbe1eb;
-    --border: #dce1ea;
-    --border-strong: #bcc5d3;
-    --text-1: #0e141d;
-    --text-2: #47515f;
-    --text-3: #78828f;
-    --accent: #2563eb;
-    --accent-2: #5b8def;
-    --accent-wash: rgba(37, 99, 235, .09);
-    --accent-line: rgba(37, 99, 235, .24);
-    --seq-1: #c7dbfa; --seq-2: #86b0f0; --seq-3: #2563eb; --seq-4: #1e51c0; --seq-5: #16388a;
+    --surface-2: #f5f6fc;
+    --surface-3: #e9ebf6;
+    --surface-4: #dbdeef;
+    --border: #dcdff0;
+    --border-strong: #bcc1dc;
+    --text-1: #0d0f24;
+    --text-2: #474d66;
+    --text-3: #737994;
+    --accent: #2a3bf4;
+    --accent-2: #7a0af5;
+    --accent-wash: rgba(42, 59, 244, .09);
+    --accent-line: rgba(42, 59, 244, .24);
+    --seq-1: #c9cffd; --seq-2: #8f9bf8; --seq-3: #2a3bf4; --seq-4: #1f2bc0; --seq-5: #151d86;
     --good: #0f9d6b; --warn: #b7791f; --serious: #cf5a2c; --critical: #d0362f;
     --good-wash: rgba(15, 157, 107, .09); --warn-wash: rgba(183, 121, 31, .10);
     --serious-wash: rgba(207, 90, 44, .09); --critical-wash: rgba(208, 54, 47, .09);
     --shadow-1: 0 1px 2px rgb(20 30 48 / .06);
     --shadow-2: 0 2px 6px rgb(20 30 48 / .07), 0 8px 20px rgb(20 30 48 / .06);
     --shadow-3: 0 10px 24px rgb(20 30 48 / .10), 0 26px 60px rgb(20 30 48 / .10);
-    --grid-line: rgba(30, 60, 120, .05);
+    --grid-line: rgba(42, 59, 244, .045);
     --glass: rgba(255, 255, 255, .82);
     --glow-accent: 0 0 0 rgba(0,0,0,0);
     --glow-good: 0 0 0 rgba(0,0,0,0);
     --hairline: linear-gradient(90deg, transparent, var(--accent-line) 20%, var(--accent-line) 80%, transparent);
-    --scan: rgba(30, 60, 120, .02);
+    --scan: rgba(42, 59, 244, .02);
     --skeleton: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+    --glow-brand: drop-shadow(0 2px 6px rgba(122, 10, 245, .30));
 }
 
 /* ═══════════════ base ═══════════════ */
@@ -258,8 +274,16 @@ h1, h2, h3 { text-wrap: balance; }
   -webkit-backdrop-filter: saturate(1.6) blur(12px);
   border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 30;
 }
+/* The logo's gradient along the bottom edge of the bar, drifting slowly the way the logo's
+ * bars run. Decoration on chrome; the reduced-motion rule stills it. */
+.topbar::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; pointer-events: none;
+  background: var(--brand-gradient); background-size: 200% 100%; opacity: .85;
+  animation: brand-flow 12s var(--ease-in-out) infinite;
+}
+@keyframes brand-flow { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
 .brand { display: flex; align-items: center; gap: var(--s2); font-weight: 650; letter-spacing: -.015em; }
-.brand .mark { color: var(--accent); font-size: var(--t5); line-height: 1; }
+.brand .mark { display: block; width: 24px; height: 24px; flex: none; filter: var(--glow-brand); }
 
 .viewnav { display: flex; gap: var(--s1); height: 100%; }
 .viewtab {
@@ -281,7 +305,7 @@ h1, h2, h3 { text-wrap: balance; }
 .viewnav { position: relative; }
 .viewnav-ink, .tabs-ink {
   position: absolute; bottom: 0; left: 0; height: 2px; width: 0; opacity: 0;
-  background: var(--accent); border-radius: 2px 2px 0 0; pointer-events: none;
+  background: var(--brand-gradient); border-radius: 2px 2px 0 0; pointer-events: none;
   transition: transform var(--dur-2) var(--ease-spring), width var(--dur-2) var(--ease-spring),
               opacity var(--dur-1) var(--ease-out);
 }
@@ -441,7 +465,7 @@ main { padding: var(--s4) var(--s5) var(--s7); max-width: var(--content-max); ma
 /* A hairline of accent along the top of the strip — the HUD "this panel is powered" cue. */
 .kpis { position: relative; }
 .kpis::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 1px;
-                background: var(--hairline); opacity: .8; z-index: 1; }
+                background: var(--brand-gradient); opacity: .7; z-index: 1; }
 
 /* ═══════════════ cards ═══════════════ */
 
@@ -1505,7 +1529,7 @@ button.ch-bar-row:hover { background: var(--surface-2); }
 .ch-flame-row { display: flex; gap: 2px; height: 26px; }
 .ch-flame-cell {
   display: flex; align-items: center; min-width: 0; padding: 0 var(--s2); border: 0;
-  border-radius: var(--r1); color: var(--on-accent); font: var(--t1) var(--font-ui);
+  border-radius: var(--r1); color: var(--on-seq); font: var(--t1) var(--font-ui);
   cursor: pointer; overflow: hidden; transition: transform var(--dur-1) var(--ease-out),
                                                  filter var(--dur-1) var(--ease-out);
 }
@@ -1588,7 +1612,7 @@ button.ch-bar-row:hover { background: var(--surface-2); }
                  border-radius: var(--r1); }
 .ch-lane-grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid-line); }
 .ch-gantt-bar { position: absolute; top: 3px; height: 16px; border: 0; border-radius: var(--r1);
-                background: var(--seq-3); color: var(--on-accent); font: var(--t0) var(--font-ui);
+                background: var(--seq-3); color: var(--on-seq); font: var(--t0) var(--font-ui);
                 padding: 0 var(--s1); overflow: hidden; cursor: pointer; }
 .ch-gantt-bar.is-crit { box-shadow: inset 0 0 0 2px var(--warn); }
 .ch-gantt-text { white-space: nowrap; }

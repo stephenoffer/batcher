@@ -404,6 +404,30 @@ extension whose `dsdgen` produces the tables), JOB from its reference implementa
 Refresh with `python tools/vendor_tpcds_queries.py` / `python tools/vendor_job_queries.py`;
 do not edit the `.sql` by hand.
 
+### What the operator-mix covers
+
+One family per module under `suites/operators/`, each over the real TPC-H tables:
+
+| Family | Covers |
+|---|---|
+| `ops-aggregation` | grouped and global aggregates, filtered counts |
+| `ops-dedup` | `DISTINCT`, keyed dedup, ordered and unordered |
+| `ops-expressions` | scalar evaluation — arithmetic (the JIT's subset), `CASE`, `COALESCE`/`NULLIF`, temporal extraction and interval arithmetic, cast chains |
+| `ops-joins` | inner, left outer, semi (`EXISTS`), anti (`NOT EXISTS`), composite-key, inequality, and a build side larger than any dimension table |
+| `ops-ordering` | full sorts and top-N, by string, float, and multiple keys |
+| `ops-projection` | filter + project |
+| `ops-setops` | `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT` |
+| `ops-strings` | `LIKE` (substring and prefix), `length`, `upper`, `substring`, concatenation into a `DISTINCT`, `replace` |
+| `ops-window` | `rank`, running sum, `lag`, partitioned aggregate |
+
+Run one with `--family`, e.g. `python3 benchmarks/run.py --benchmark operators --family ops-strings`.
+
+`ops-strings`, `ops-setops`, `ops-expressions` and the six join shapes beyond `op-join-agg`
+were added because the public API reached them and the suite did not. That matters most for
+strings: `docs/architecture/internals/competitive_architecture.md` ceiling 2 records string
+execution as a standing structural loss (no `StringView`, dictionary decoded at the leaf), and
+a loss with no case in the suite can neither be tracked nor shown to have closed.
+
 PyArrow has no SQL surface, so it sits out the standard suites (shown `n/a`) and competes
 in the operator-mix, where a case is one SQL string for the SQL engines plus a native
 callable for PyArrow (Acero):

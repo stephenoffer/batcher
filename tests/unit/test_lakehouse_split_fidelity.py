@@ -91,22 +91,27 @@ class _FakeSlice:
 
 
 class _FakeHudiTable:
-    """Records which slice-enumeration call the source made.
+    """Records which slice enumeration the source asked for.
 
-    A real Hudi table with history needs a Spark writer to produce, so the behaviour
-    under test — *which* API the source asks for its slices — is observed directly. That
-    is the whole bug: `read()` used the as-of call and `splits()` did not.
+    A real Hudi table with history needs a Spark writer to produce, so the behaviour under
+    test — *whether the instant reaches the enumeration* — is observed directly. That is the
+    whole bug: `read()` applied the instant and `splits()` did not.
+
+    hudi-rs takes the instant through a `HudiReadOptions` rather than a
+    `get_file_slices_as_of` method (which is what this stub modelled before 0.5), so what is
+    recorded is the options object's own `as_of_timestamp`. The property under test is
+    unchanged; only where the instant is carried moved.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
 
-    def get_file_slices(self, filters=None):
-        self.calls.append(("latest", None))
-        return [_FakeSlice()]
-
-    def get_file_slices_as_of(self, instant, filters=None):
-        self.calls.append(("as_of", instant))
+    def get_file_slices(self, options=None):
+        # `as_of_timestamp` is a getter *method* on the pyo3 class, not an attribute.
+        instant = getattr(options, "as_of_timestamp", None) if options is not None else None
+        if callable(instant):
+            instant = instant()
+        self.calls.append(("as_of", instant) if instant else ("latest", None))
         return [_FakeSlice()]
 
 

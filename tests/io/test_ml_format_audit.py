@@ -269,9 +269,14 @@ def test_an_npz_archive_still_reports_every_column(tmp_path):
     assert NumpySource(str(path)).schema().names == ["x", "y"]
 
 
-def test_a_npy_read_is_cut_into_morsels(tmp_path):
+def test_a_npy_read_is_cut_to_the_read_batch_budget(tmp_path):
     """One array is one Arrow chunk, so this used to emit the whole file as a single
-    RecordBatch — which every downstream operator then had to hold whole."""
+    RecordBatch — which every downstream operator then had to hold whole.
+
+    The bound is `execution.read_batch_bytes` rather than the morsel row count; see
+    `tests/io/test_source_morsel_cap.py` for why, and for the floor that keeps a batch from
+    being cut below one morsel.
+    """
     import dataclasses
 
     from batcher.config import Config, config_context
@@ -280,7 +285,9 @@ def test_a_npy_read_is_cut_into_morsels(tmp_path):
     path = tmp_path / "a.npy"
     np.save(path, np.arange(50, dtype=np.int64))
     base = Config()
-    cfg = base.replace(execution=dataclasses.replace(base.execution, morsel_rows=16))
+    cfg = base.replace(
+        execution=dataclasses.replace(base.execution, morsel_rows=1, read_batch_bytes=16 * 8)
+    )
     with config_context(cfg):
         sizes = [b.num_rows for b in NumpySource(str(path)).read()]
     assert sizes == [16, 16, 16, 2]

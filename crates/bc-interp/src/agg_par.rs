@@ -608,17 +608,31 @@ pub(crate) fn key_disjoint_runs(
 
     let bounds: Vec<(i64, i64)> = morsels.par_iter().map(bounds_of).collect::<Option<_>>()?;
 
-    // Close a run at the first *legal* cut past its share of the rows: legal means the run's
-    // largest key is strictly below the next morsel's smallest, so no group straddles the cut.
+    // A cut must be legal against **everything that follows**, not the next morsel alone. This
+    // was `hi < bounds[i + 1].0` with `hi` reset per cut, which asks the weaker question; the
+    // two agree on an ordered relation and not on a **concatenation of two**, where the left
+    // side cuts freely as its keys ascend and the right restarts at the bottom, leaving every
+    // left run overlapping the run holding the right. `concat_disjoint` then emits each shared
+    // key twice — a `GROUP BY` returning one key on two rows. `INTERSECT`/`EXCEPT` lower to
+    // `union → GROUP BY k` and build exactly that: over 6M sorted rows against 1.5M,
+    // `INTERSECT` returned 4,906 where the answer is 1,472,588. Prefix max against suffix min
+    // is the fix, still one O(morsels) pass, and the prefix max is **not** reset at a cut —
+    // the guarantee is about all earlier runs, not the current one.
+    let mut suffix_min = vec![i64::MAX; morsels.len() + 1];
+    for i in (0..morsels.len()).rev() {
+        suffix_min[i] = suffix_min[i + 1].min(bounds[i].0);
+    }
+
+    // Close a run at the first *legal* cut past its share of the rows.
     let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
-    let (mut start, mut rows, mut hi) = (0usize, 0usize, i64::MIN);
+    let (mut start, mut rows, mut prefix_max) = (0usize, 0usize, i64::MIN);
     for i in 0..morsels.len() {
         rows += morsels[i].num_rows();
-        hi = hi.max(bounds[i].1);
-        let cuttable = i + 1 < morsels.len() && hi < bounds[i + 1].0;
+        prefix_max = prefix_max.max(bounds[i].1);
+        let cuttable = i + 1 < morsels.len() && prefix_max < suffix_min[i + 1];
         if cuttable && rows >= target {
             runs.push(start..i + 1);
-            (start, rows, hi) = (i + 1, 0, i64::MIN);
+            (start, rows) = (i + 1, 0);
         }
     }
     runs.push(start..morsels.len());
@@ -790,6 +804,48 @@ mod tests {
         let k: Vec<i64> = (0..rows as i64).map(|i| from + i / per).collect();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(k))]).expect("batch")
+    }
+
+    /// **A concatenation of two ordered relations is not an ordered relation**, and cutting it
+    /// as though it were is how a `GROUP BY` returns the same key twice.
+    ///
+    /// This is the shape `INTERSECT`/`EXCEPT` produce — they lower to `union → GROUP BY k`, so
+    /// the aggregate sees one side's morsels ascending and then the other side's ascending
+    /// again from the bottom. Cutting on "is this run below the *next* morsel?" cuts freely
+    /// through the first side and then cannot cut again, leaving every one of those runs
+    /// overlapping the run that holds the second side. Over 6M rows against 1.5M that made
+    /// `INTERSECT` return 4,906 rows where the answer is 1,472,588.
+    ///
+    /// The property asserted is the one `concat_disjoint` is promised, checked on the cut
+    /// points rather than inferred: no key may appear in two runs.
+    #[test]
+    fn two_ordered_relations_concatenated_are_never_cut_into_overlapping_runs() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+
+        let per = 4i64;
+        // Each "side" is ordered on its own; together they restart the key space once.
+        let side: Vec<RecordBatch> = (0..200)
+            .map(|m| keyed(m as i64 * 1_000 / per, 1_000, per))
+            .collect();
+        let morsels: Vec<RecordBatch> = side.iter().chain(side.iter()).cloned().collect();
+        let keys = vec!["k".to_string()];
+
+        let Some(runs) = key_disjoint_runs(&morsels, &keys, 8) else {
+            return; // declining is a correct answer for this shape
+        };
+        let mut seen: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for (r, run) in runs.iter().enumerate() {
+            for m in run.clone() {
+                for &k in morsels[m].column(0).as_primitive::<Int64Type>().values() {
+                    if let Some(&prev) = seen.get(&k) {
+                        assert_eq!(prev, r, "key {k} appears in runs {prev} and {r}");
+                    } else {
+                        seen.insert(k, r);
+                    }
+                }
+            }
+        }
     }
 
     /// The runs this cuts must be **key-disjoint**, because that is the entire licence for

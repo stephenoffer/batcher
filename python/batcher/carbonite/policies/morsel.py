@@ -141,7 +141,31 @@ def learned_row_cap(
     return _cap_for_width(config, model.max_bytes_per_row(families), byte_target)
 
 
-def planned_row_cap(config: Config, plan: object, byte_target: int | None = None) -> int | None:
+def _node_row_bytes(arrow: object, carried: frozenset[str] | None) -> float:
+    """A node's per-row width, counting only the columns that can actually flow through it.
+
+    `carried` is what the conductor derived from Kyber's projection analysis (see
+    `planned_row_cap`); `None` means it could not be derived, and every column is charged —
+    which is the behaviour this had unconditionally.
+    """
+    import pyarrow as pa
+
+    from batcher.plan.types import schema_row_bytes
+
+    if carried is None:
+        return schema_row_bytes(arrow)
+    kept = [f for f in arrow if f.name in carried]
+    if len(kept) == len(arrow):
+        return schema_row_bytes(arrow)
+    return schema_row_bytes(pa.schema(kept)) if kept else 0.0
+
+
+def planned_row_cap(
+    config: Config,
+    plan: object,
+    byte_target: int | None = None,
+    carried: frozenset[str] | None = None,
+) -> int | None:
     """Row cap from the width the plan's **schema** implies.
 
     The companion to `learned_row_cap`, and the one that exists on the *first* run. A
@@ -168,7 +192,6 @@ def planned_row_cap(config: Config, plan: object, byte_target: int | None = None
         The row cap, or `None` when no node carries a schema or the implied width is no
         wider than the configured target already assumes.
     """
-    from batcher.plan.types import schema_row_bytes
     from batcher.plan.visitor import walk
 
     widest = 0.0
@@ -177,13 +200,18 @@ def planned_row_cap(config: Config, plan: object, byte_target: int | None = None
         resolved = schema() if callable(schema) else None
         arrow = getattr(resolved, "arrow", None)
         if arrow is not None:
-            widest = max(widest, schema_row_bytes(arrow))
+            widest = max(widest, _node_row_bytes(arrow, carried))
     return _cap_for_width(config, widest, byte_target) if widest > 0.0 else None
 
 
-def _planned(config: Config, plan: object | None, byte_target: int | None = None) -> int | None:
+def _planned(
+    config: Config,
+    plan: object | None,
+    byte_target: int | None = None,
+    carried: frozenset[str] | None = None,
+) -> int | None:
     """`planned_row_cap` for an optional plan — `None` when the caller supplied none."""
-    return planned_row_cap(config, plan, byte_target) if plan is not None else None
+    return planned_row_cap(config, plan, byte_target, carried) if plan is not None else None
 
 
 def _envelope_byte_cap(config: Config, plan: object | None) -> int | None:
@@ -233,6 +261,7 @@ def morsel_target(
     model: LearnedMemoryModel | None = None,
     families: Iterable[str] | None = None,
     plan: object | None = None,
+    carried: frozenset[str] | None = None,
 ) -> tuple[int, int] | None:
     """The per-morsel ``(rows, bytes)`` target for this pressure level and row width.
 
@@ -246,6 +275,9 @@ def morsel_target(
         plan: The logical plan about to run, whose schema sizes the morsel on a cold
             store. Measured width wins wherever there is one; this only covers the first
             run, which is the one that has no measurement and OOMs.
+        carried: Column names that can actually flow through the plan, from the conductor.
+            `None` charges every column in every node's schema, which over-charges a narrow
+            query over a wide table — see `planned_row_cap`.
 
     Returns:
         The recommended `(rows, bytes)`, or `None` to keep the configured target — the
@@ -280,7 +312,7 @@ def morsel_target(
         c
         for c in (
             learned_row_cap(config, model, families, nbytes),
-            _planned(config, plan, nbytes),
+            _planned(config, plan, nbytes, carried),
         )
         if c is not None
     ]

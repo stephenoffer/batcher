@@ -11,7 +11,6 @@ import os
 
 from batcher._internal.errors import ConfigError, unknown_value
 from batcher.metadata.backends.in_process import InProcessBackend
-from batcher.metadata.backends.sqlite import SQLiteBackend
 from batcher.metadata.store import MetadataBackend
 
 __all__ = ["BACKEND_NAMES", "default_sqlite_uri", "make_backend"]
@@ -79,6 +78,23 @@ def make_backend(name: str, uri: str | None = None) -> MetadataBackend:
     if name == "in_process":
         return InProcessBackend()
     if name == "sqlite":
+        # Imported here, like every backend below, so `sqlite3` is loaded only by a
+        # deployment that chose it — see the package docstring for the environment where it
+        # cannot be. Where it cannot, say so in terms of the setting that asked for it.
+        try:
+            from batcher.metadata.backends.sqlite import SQLiteBackend
+        except ImportError as exc:
+            raise ConfigError(
+                f"metadata.backend='sqlite' needs Python's sqlite3 module, which failed to "
+                f"load: {exc}",
+                hint=(
+                    "Use metadata.backend='in_process' (the default), or fix the sqlite3 "
+                    "install. On Anaconda with a pip-installed pyarrow, a CXXABI error here "
+                    "is pyarrow loading the system libstdc++ first; importing sqlite3 before "
+                    "pyarrow, or LD_LIBRARY_PATH pointing at the Anaconda lib directory, "
+                    "resolves it."
+                ),
+            ) from exc
         # No URI → a persistent per-user file (not an ephemeral `:memory:` store, which
         # would silently defeat the point of choosing the durable backend).
         return SQLiteBackend(uri if uri is not None else default_sqlite_uri())

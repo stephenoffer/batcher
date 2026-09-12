@@ -142,6 +142,17 @@ class ExecutionConfig:
     # wide/variable-width data (large strings, embeddings, blob handles) stays
     # cache- and memory-bounded. ~16_384 rows × 64 B, so narrow data is unaffected.
     morsel_bytes: int = 1 << 20  # 1 MiB
+    # Byte ceiling on a single `RecordBatch` a *source* hands the engine, which is a
+    # different question from how big a morsel is. The engine re-morselizes every batch it
+    # receives against `morsel_rows`/`morsel_bytes` (zero-copy), so a read that cuts to the
+    # morsel size itself changes nothing downstream and pays one extra Arrow C Data
+    # Interface import per extra batch, on the GIL-holding thread, before the executor may
+    # start. Measured on TPC-H sf10 `lineitem` (60M rows, three columns): the same rows and
+    # the same work ran in 94.5 ms across 3,907 morsel-sized batches, 46.5 ms across 980
+    # 65,536-row ones, and 31.4 ms as a single chunk. So this bounds what it is for -- a
+    # reader that returns a whole file as ONE batch -- in the unit that costs memory.
+    # `FileSource._normalize` applies it, never cutting below one morsel.
+    read_batch_bytes: int = 16 << 20  # 16 MiB
     # Target byte size of a single file split (source readers chunk large files into
     # splits so the driver never materializes a whole file at once).
     split_bytes: int = 128 * 1024 * 1024

@@ -1,5 +1,502 @@
 # Batcher CPU benchmark results
 
+## Found and not fixed: a distributed `LIMIT` larger than its input loses row order, because the optimizer removes the `LIMIT` that asked for it (2026-09-12)
+
+**Pre-existing, root-caused, deliberately left alone.** Recorded so the next person does not
+re-derive it: the diagnosis took a stale-cluster false lead and a wrong split-assignment theory
+before the real cause.
+
+`tests/integration/test_distributed.py::test_distributed_limit_matches_single_node` fails its
+`limit(999_999)` case on a 50,000-row file with `row_group_size=5_000`. Every row comes back
+and the multiset is right; the **order** is not. After row 4999 the distributed result jumps to
+20000, then 40000, 5000, 25000 — the row groups round-robined across four partitions.
+
+### What it is not
+
+* **Not the stale Ray cluster.** The repo documents that a long-lived cluster keeps an old
+  engine after `just build`, and this session rebuilt several times. Run against a fresh
+  instance (`RAY_ADDRESS=local`), it fails identically.
+* **Not this session's changes.** It reproduces with HEAD's Python in a sandbox.
+* **Not split assignment.** `assign_splits(preserve_order=True)` returns correct contiguous
+  runs. The order-preserving path is simply never called.
+
+### What it is
+
+The distributed dispatcher (`dist/executor.py`) sends a `LIMIT` over a splittable scan through
+`_distributed_map(..., preserve_order=True)`, which assembles contiguous source-ordered split
+runs by partition index. But it can only do that if it *sees* the `Limit`.
+
+`kyber.rules.extra.adaptive_meta.drop_inert_limit` removes `Limit(n)` when the input has an
+EXACT row count no larger than `n` — correctly, since a limit covering every row is those rows,
+unchanged and in order. So `limit(12_345)` plans as `limit -> scan` and distributes in order,
+while `limit(999_999)` plans as a bare `scan`, reaches the default map path with
+`preserve_order=False`, and gets load-balanced, round-robin split assignment.
+
+### Why it is not fixed here
+
+Each place a fix could go has a cost that is a design decision rather than a bug fix:
+
+* **Keep the `Limit`.** Kyber would have to know that a no-op operator carries an ordering
+  requirement for one executor. That is Kyber reasoning about distribution, which the layering
+  forbids, and it keeps a pipeline breaker the adaptive loop would otherwise not split on.
+* **Preserve order on every bare distributed scan.** Contiguous assignment balances by position
+  rather than by load, so every order-independent distributed read would pay for a guarantee
+  only this one shape needs.
+* **Relax the test for `n >= rows`.** A bare distributed scan's order is not part of the stated
+  single-node == distributed contract (the multiset is), so the case asserts more than the
+  contract promises once the optimizer has run. That is a judgement about the contract, not a
+  mechanical fix.
+
+It also needs a recorded cluster run to change, per the gate for `dist/`.
+
+## Every query failed on a stock Anaconda box because the default metadata store imported `sqlite3`, and a CSV read could be handed another read's schema (2026-09-12)
+
+Neither is a benchmark result. Both are recorded here because they are what made the suite
+and the examples unrunnable, and the first one was worked around with `LD_LIBRARY_PATH` for most
+of a session before anyone fixed it.
+
+### No query could run without `LD_LIBRARY_PATH`
+
+On this box `import batcher` succeeded and the first query raised
+`ImportError: ... libstdc++.so.6: version CXXABI_1.3.15 not found`. The trigger is import
+order, and it is not Batcher's to control: a pip-installed `pyarrow` binds the system
+`libstdc++`, after which Anaconda's `_sqlite3` cannot load its ICU dependency. Measured:
+`import pyarrow; import sqlite3` fails, `import sqlite3; import pyarrow` does not, and
+`duckdb` or the engine first is fine — the engine links `libgcc_s` only.
+
+Batcher's part was needing `sqlite3` at all. The executor imports `batcher.metadata.backends`
+to build its default store, and that package imported `SQLiteBackend` eagerly — so the stdlib
+module was a precondition of every query, although the configured default is `in_process`
+and the other four backends were already imported lazily inside `make_backend`. SQLite now
+resolves on first use (a PEP 562 `__getattr__` on the facade, and an import inside the
+`sqlite` branch of the factory), and choosing it where it cannot load is a `ConfigError`
+naming the setting and the workaround rather than a traceback from a stdlib module.
+
+Examples, with no `LD_LIBRARY_PATH`: **511 passed, 2 skipped** by the repo's own harness
+(`tests/docs/test_examples.py`); the two skips are the scripts marked as needing a Kafka broker.
+
+A caution about the first sweep that reported otherwise: it showed 38 examples still failing
+with `CXXABI`. Those ran while HEAD's two backend files were briefly swapped back in to prove
+the regression test fails without the fix. The same sweep re-run with the fix in place had
+none. A long run reading files that are being edited is measuring the edit, not the code.
+
+### A CSV read could be served another read's schema
+
+`FileSource._file_schema` caches an inferred schema so a repeated query does not re-open the
+file. It was keyed on `(reader class, file identity)`. That is the whole key for Parquet, whose
+schema is in the file, and not for CSV, whose schema depends on the delimiter, header and
+quoting: the same file read with `delimiter="\t"` and then `delimiter=","` returned three
+columns both times. `examples/io/csv_roundtrip_and_options.py` failed on it, reading as
+"the wrong delimiter did not collapse the columns" — the example was right and the cache was
+not. `FileSource._schema_cache_token()` (empty by default) is now part of the key and CSV
+returns its read options; a token that is too fine costs a cache miss, one that is too coarse
+returns a wrong schema.
+
+### Two examples compared float sums from two executions with `==`
+
+`pipe_and_compose.py` and `observability_events.py` each ran a query twice and asserted the
+results equal bit for bit. After the read-batch change above, a file-backed query's **first**
+run can add its floats in a different order from later runs, so the sums differ in the last
+bits — measured at 1e-7 absolute on 2.6e8, and 1.04e-15 relative after a `show(3)` warmed the
+learned statistics. Group keys and integer counts were identical in every run, so no row was
+wrong. Both examples now compare keys and counts exactly and float sums within `rel_tol=1e-9`,
+which is the engine's stated contract for float reductions and the tolerance
+`tests/differential`'s `assert_same` already applies.
+
+**This is a real behaviour change and is recorded as one:** before it, the first and second
+execution of these queries matched to the bit. The trade for 2.08x on sf10 file scans was made
+deliberately, and a reader relying on first-run bit reproducibility of a floating-point
+aggregate should not.
+
+## `LENGTH` re-scanned the whole column once per morsel when the "optimization" was added, and is 2.1x faster once it does not (2026-09-12)
+
+`SUM(LENGTH(l_comment))` over 6,001,215 rows was the operator suite's worst string case at
+**3.96x DuckDB** (10.9 ms against 2.7, and 206 ms of CPU against 71). The per-row evaluator
+already short-circuited on ASCII — `char_len` returns `v.len()` when `v.is_ascii()` — and that
+is not enough: `l_comment` averages 27 bytes, so the check never fills a SIMD register and
+pays its setup per row.
+
+Testing the whole value buffer once and taking each length as an offset subtraction is the
+right shape. **The obvious spelling of it is a 1.3x regression**, and it is worth recording
+because it looks correct:
+
+```rust
+if !s.value_data().is_ascii() { /* slow path */ }
+```
+
+A morsel is a **slice** of the column, and `value_data()` returns the whole shared values
+buffer — so this tests all 162 MB once per morsel rather than the morsel's own bytes. Measured:
+10.9 ms -> **14.5 ms**, worse than the per-row path it replaced, with every unit test passing
+because correctness was never in question.
+
+Bounding the test to `value_data()[offsets.first()..offsets.last()]` is the whole difference:
+
+| | wall | CPU | vs DuckDB |
+|---|---:|---:|---:|
+| per-row `is_ascii` (before) | 10.9 ms | 206 ms | 3.96x |
+| whole *buffer* test | 14.5 ms | — | 5.38x |
+| whole *slice* test | **5.3 ms** | **65 ms** | **1.82x** |
+
+CPU now sits below DuckDB's 71 ms; the residual wall-clock gap is worker count (12.3 cores
+against 25.0), which is a different ceiling.
+
+Non-ASCII data keeps the per-row path untouched, so this is a short-circuit rather than a
+change of meaning — for ASCII the two agree by definition. `char_len_tests` pins the agreement
+on ASCII, multi-byte, all-null and **sliced** input, the last because an offset subtraction
+that indexes the buffer rather than the array's own offsets is exactly the bug above.
+
+## A `GROUP BY` over two ordered relations emitted every shared key twice, so `INTERSECT` returned 4,906 rows where the answer was 1,472,588 (2026-09-12)
+
+Found by adding a set-operation family to the operator benchmark — `INTERSECT` was the only
+case in the suite that ever produced this shape, and it reported `FAILED` on its first run.
+It is a wrong answer, not a slow one, and it is silent.
+
+### What it was
+
+`agg_par::key_disjoint_runs` is the optimization that lets an **ordered** relation skip the
+hash partition an aggregate would otherwise pay: morsel `i`'s largest key is below morsel
+`i+1`'s smallest, so a cut between them separates the key space for free, each run is
+finalized on its own, and the results are glued with `concat_disjoint` — a concatenation with
+no regroup. `concat_disjoint`'s precondition is that no key appears in two runs, and its
+documented failure on violation is exactly "it emits the same key twice".
+
+The cut test was `run_max < next_morsel_min`, with the running maximum **reset at each cut**.
+That asks whether a run is below the *next morsel*. What `concat_disjoint` needs is whether
+it is below *everything that follows*. On a globally ordered relation the two questions have
+the same answer. On a **concatenation of two ordered relations** they do not:
+
+* the left side ascends, so cuts are legal all the way through it;
+* the right side restarts at the bottom of the key space, so no further cut is legal;
+* every left run therefore overlaps the single run holding the right side.
+
+### How it surfaced
+
+`INTERSECT` and `EXCEPT` lower to `union -> GROUP BY k` with `bool_or` tags, so they build
+that shape by construction. Over 6,000,000 rows sorted on the key against 1,500,000:
+
+| | returned | correct |
+|---|---:|---:|
+| `INTERSECT` | **4,906** | 1,472,588 |
+| `EXCEPT` | **1,467,682** | 0 |
+| `UNION` | 1,500,000 | 1,500,000 |
+
+The two wrong answers sum to the true distinct count, which is the tell: every key was
+classified, each into one of two groups that should have been one. The `GROUP BY` underneath
+returned **2,967,682 groups for 1,500,000 distinct keys**. `UNION` is unaffected because it
+has no aggregate above it, and `COUNT(DISTINCT k)` over the same input was right throughout —
+which is what kept the existing suite green.
+
+**It needs the left input to be sorted and large.** Unsorted input is correct at every size,
+and so is sorted input below the size at which `key_disjoint_runs` will cut at all.
+
+### The fix
+
+Compare the **prefix maximum** against the **suffix minimum**, and do not reset the prefix
+maximum at a cut: cutting after morsel `i` then proves every key in `0..=i` is strictly below
+every key after it, which is precisely the disjointness `concat_disjoint` is promised. Still
+one O(morsels) pass over bounds that were already being read.
+
+### What the tests had to learn
+
+`tests/differential/test_diff_setops_ordered_inputs.py` is sized at 6,000,000 x 1,500,000 and
+that is load-bearing. Written first at 2,000,000 x 500,000 it passed against the **broken**
+engine — below that size `key_disjoint_runs` declines and the path is never reached. The
+figures were fixed by reintroducing the defect, rebuilding, and keeping the size at which the
+assertions actually fail. A Rust unit test
+(`agg_par::tests::two_ordered_relations_concatenated_are_never_cut_into_overlapping_runs`)
+checks the property directly on the cut points and fails the same way.
+
+## The morsel was sized from the table's width, not the query's — ClickBench 0.71 -> 0.62 b/duckdb, 19 losing cases -> 13 (2026-09-12)
+
+`carbonite.policies.morsel.planned_row_cap` walks the plan and caps the morsel's row count by
+the widest node's `available_schema`. But `available_schema` is what a node *could* produce:
+under projection pushdown a `Scan` and the `Filter` above it both still report all 105 columns
+of ClickBench's `hits` while five flow through them. Measured on this box, unchanged by
+optimization — the cap is the same on the raw and the optimized plan:
+
+| query | columns charged | columns carried | morsel cap | configured |
+|---|---:|---:|---:|---:|
+| `cb-q31` | 105 (1,620 B/row) | 5 (40 B/row) | **647** | 16,384 |
+| `cb-q33` | 105 | 1 | **647** | 16,384 |
+| `cb-q14` | 105 | 3 | **647** | 16,384 |
+
+So every per-morsel cost was paid 25 times over on the suite whose tables are widest.
+
+**This was diagnosed and its patch measured on 2026-09-11 and then held**, because swept across
+the board it traded ClickBench against TPC-H and H2O. It is shipped now with the column set
+derived differently, and the entry below records what it costs as well as what it buys.
+
+### The fix
+
+The columns that can reach a morsel are the union of two sets, and the second is what keeps the
+policy doing its job:
+
+* what a scan **supplies** — `kyber.required_columns_per_source` over the plan **as given**, not
+  the optimized one (see "The version that shipped" below);
+* what a node **introduces** — a name in some node's schema that no source schema carries,
+  which is a derived column: a decoded image tensor, an aggregate's output. The policy exists
+  for exactly those, and charging only scanned columns would size the morsel as if a decoded
+  tensor were not there.
+
+Kyber knows which columns survive, Carbonite sizes the morsel, and `api/orchestration/run.py`
+is the only layer that may ask both. `None` — any failure deriving the set — charges every
+column, exactly as before, because this decides what a query *costs* and never what it returns.
+
+### Measured, matched arms, two engines, quiet box
+
+| suite | without | with | losing cases |
+|---|---:|---:|---|
+| ClickBench (43) | 0.71 | **0.62** | 19 -> 13 |
+| operators (46) | 0.83 | **0.82** | 14 -> 14 |
+| TPC-H sf1 (22) | 0.72 | 0.75 | 4 -> 4 |
+| H2O `groupby` (10) | 1.05 | 1.07 | 6 -> 7 |
+
+The worst ClickBench ratios collapse: `cb-q30` 2.98x -> 1.22x, `cb-q31` 2.77x -> 1.30x,
+`cb-q40` 2.36x -> 1.05x, `cb-q38` 2.00x -> 1.21x, `cb-q14` 1.84x -> 1.35x.
+
+**The trade the 2026-09-11 entry predicted is real and is still here.** What loses is
+`ORDER BY ... LIMIT`: `cb-q25` 1.25x -> 1.47x, `cb-q26` 1.12x -> 1.41x, `cb-q24` 0.93x -> 1.05x,
+`cb-q10` 0.89x -> 1.06x, and H2O `q10` 0.91x -> 1.19x. The mechanism that entry named — a
+correct, larger morsel leaves a small relation with fewer morsels than the pool has workers —
+is unchanged by this patch, which only stops the *width* being wrong.
+
+### The version that shipped is not the version measured above
+
+The table above is the first implementation, which ran `kyber.optimize_logical` to sharpen the
+column set. That broke the learning loop: `kyber.plan_cache` counts executions during warmup, the
+extra optimizer run advanced it, and the memo took **four** runs to settle where it takes two —
+caught by `test_the_memo_stops_missing_once_there_is_nothing_left_to_learn`, which a sizing
+hint has no business moving.
+
+So the column set is read off the plan as given. Optimization only ever removes columns from a
+scan, so the unoptimized analysis can only **over-count**, and over-counting charges a morsel
+for a column that will not flow — the safe direction for a memory bound. On the cases that
+matter it is the same answer:
+
+| query | carried (as given) | cap |
+|---|---:|---:|
+| `cb-q31`, `cb-q30` | 8 | 647 -> **15,420** |
+| `cb-q38` | 7 | 647 -> **14,563** |
+| `cb-q40`, `cb-q14`, `cb-q33` | 7, 3, 2 | 647 -> **no cap** |
+| `cb-q25`, `cb-q24`, `cb-q26` | 105 | **647 (unchanged)** |
+
+**The last row needs saying plainly, because it looks like design and is not.** `cb-q24/25/26`
+are exactly the `ORDER BY ... LIMIT` shapes that *regressed* above, and they keep the old cap here
+only because the SQL front-end wraps them in a `Project(*)` that the unoptimized analysis cannot
+see through, so it reports all 105 columns. The regression is avoided by an imprecision, not by
+anything that understands why those shapes want a small morsel. The mechanism the 2026-09-11
+entry named — a correct, larger morsel under-parallelizing a small relation — is still unfixed,
+and a query written through the DataFrame API reaches the larger morsel and should be expected
+to show it. The suite-level numbers for this version are in the full sweep recorded below.
+
+## The operator suite had no cases for strings, set operations or scalar expressions, and adding them found one wrong answer and fourteen losses (2026-09-12)
+
+The operator mix ran 23 cases over aggregation, dedup, joins, ordering, projection and windows.
+It had **no case** for a string function, a set operation, or a scalar expression — three
+families the public API reaches and the standard suites bury inside larger plans. Four new
+families (`ops-strings`, `ops-setops`, `ops-expressions`, and six join shapes beyond the single
+`op-join-agg`) take it to 46.
+
+The first run of the new cases produced a `FAILED` row, which is recorded separately above:
+`INTERSECT` returned 4,906 rows where the answer was 1,472,588. A correctness bug in `GROUP BY`
+had been sitting behind a shape no benchmark produced.
+
+### What the new coverage measures (batcher / duckdb, sf1, two engines)
+
+| case | batcher | duckdb | ratio |
+|---|---:|---:|---:|
+| `op-join-range` | 320.8 ms | 85.6 ms | 3.75x |
+| `op-str-length` | 10.2 ms | 2.8 ms | 3.62x |
+| `op-expr-date-part` | 6.5 ms | 2.4 ms | 2.73x |
+| `op-str-like-prefix` | 8.3 ms | 3.1 ms | 2.65x |
+| `op-expr-case` | 19.5 ms | 9.7 ms | 2.01x |
+| `op-join-build-large` | 106.7 ms | 54.9 ms | 1.94x |
+| `op-expr-cast-chain` | 5.6 ms | 3.6 ms | 1.55x |
+| `op-except` | 43.9 ms | 29.1 ms | 1.51x |
+| `op-str-like-contains` | 13.1 ms | 9.5 ms | 1.37x |
+| `op-expr-conditional` | 6.5 ms | 5.0 ms | 1.29x |
+| `op-str-substring-group` | 26.4 ms | 21.1 ms | 1.25x |
+| `op-expr-date-arith` | 20.1 ms | 16.2 ms | 1.24x |
+| `op-str-upper-group` | 20.0 ms | 17.0 ms | 1.17x |
+
+The joins the suite gained are not all losses — `op-join-semi` is **0.28x** and `op-join-anti`
+**0.27x**, both large wins that nothing was measuring either.
+
+### These are execution losses, not storage ones, and the CPU says so
+
+The comparison that matters is CPU rather than wall clock, because it removes the worker-count
+difference (Batcher schedules `operator_cores()` = 32 on this 48-CPU box; DuckDB uses 46):
+
+| case | batcher CPU | duckdb CPU | batcher cores | duckdb cores |
+|---|---:|---:|---:|---:|
+| `str-length` | 206 ms | 71 ms | 18.9 | 26.5 |
+| `expr-date-part` | 126 ms | 58 ms | 17.0 | 27.4 |
+| `expr-case` | 461 ms | 276 ms | 22.7 | 29.1 |
+
+Batcher does **1.7-2.9x the work**, so more threads would not close it. Pinning
+`execution.parallelism` to 46 was measured and moves the geomean of these cases from 2.07 to
+1.84 — real, and not the cause.
+
+**Batcher is much faster than the raw Arrow kernels it sits on** (`str-length` 10.9 ms against
+pyarrow's 122.1 ms single-threaded, `str-like-contains` 13.4 against 482.9), so the gap is not
+"Batcher calls a slow kernel". It is that DuckDB's string and temporal kernels do less work per
+row — the `LENGTH` of an ASCII column is an offset subtraction, and a year extraction has a
+division-free form. Those are the fixes this suite now makes visible and trackable; none is
+made here.
+
+## A file read was cut into morsels the engine then cut again, and the second cut was pure FFI — TPC-H sf10 `lineitem` 419.8 ms -> 201.3 ms (2026-09-12)
+
+`FileSource._normalize` sliced every batch a reader returned down to `execution.morsel_rows`,
+on the stated grounds that "the engine's memory model assumes a batch is a morsel". The
+engine does not assume it — `bc_interp::ops::morsel::morselize` re-morselizes whatever it is
+handed, against `morsel_rows` *and* `morsel_bytes`, zero-copy, and `stream::pipeline::
+scan_stream` slices each source batch again on the way into the pipeline. So the Python-side
+cut reduced no downstream work by a row. What it did do is multiply the number of
+`RecordBatch`es crossing the FFI, and each one costs an Arrow C Data Interface import on the
+GIL-holding thread **before `py.allow_threads` lets the executor start**.
+
+The native Parquet reader returns 65,536-row batches sized to `NATIVE_READ_TARGET_BYTES`;
+the cut shredded each into four.
+
+### The cost, with the work held fixed
+
+TPC-H sf10 `lineitem`, 59,986,052 rows, local mirror, `SELECT l_returnflag, l_linestatus,
+sum(l_extendedprice), count(*) GROUP BY 1, 2`. The same rows, read once and re-presented
+three ways to the same engine — so the only variable is how many batches they arrive in:
+
+| input shape | wall | total CPU | cores busy |
+|---|---:|---:|---:|
+| 3,907 batches x 16,384 rows | 94.5 ms | 781.5 ms | 8.27 |
+| 980 batches x 65,536 rows | 46.5 ms | 728.2 ms | 15.67 |
+| 1 batch x 59,986,052 rows | **31.4 ms** | 683.6 ms | **21.80** |
+
+CPU is flat to within 14% while wall clock moves 3x. The difference is serial per-batch
+work — roughly 16 us a batch at three columns — which shows up as cores *not* busy.
+
+### End to end
+
+Same query, read from the local Parquet mirror, best of three after a warm-up:
+
+| | before | after |
+|---|---:|---:|
+| `ParquetSource.read` | 234 ms | 167 ms |
+| `execute_plan_metered` | 228 ms | ~46 ms |
+| whole query | **419.8 ms** | **201.3 ms** |
+| DuckDB `read_parquet`, same query | 100.6 ms | 100.6 ms |
+
+Before the change the whole query cost *more than* read + execute measured separately
+(419.8 against 208.3); after it, the two sum to the wall clock (201.3 against 213.0), which
+is the signature of the missing 211 ms having been per-batch overhead rather than work.
+
+### What replaced the cut
+
+`execution.read_batch_bytes` (16 MiB, the Parquet reader's own decode target), applied in
+`FileSource._normalize` with `morsel_rows` as a floor. The cut still does the job it was
+written for — a reader that returns a whole file as ONE batch (numpy, XML, point clouds,
+several SQL drivers) is still cut — but in the unit that costs memory rather than one the
+engine immediately re-derives. `tests/io/test_source_morsel_cap.py` pins both halves,
+including that a byte budget below one morsel cannot shred a read into single-row batches.
+
+**This does not touch the serial read/execute barrier itself** (`competitive_architecture.md`
+ceiling 11). Python still finishes reading before the engine may begin; what is gone is the
+*extra* cost that barrier was being charged. The barrier is worth ~167 ms of the remaining
+201 ms and still needs the `BatchSource` trait that ceiling describes.
+
+## A string top-N declined to select whenever its 8-byte prefix tied, and a decline meant sorting all six million rows — `ORDER BY <shared-prefix string> LIMIT 10` 36.0 ms -> 10.5 ms (2026-09-12)
+
+`byte_sort::top_k_generic` packs each key's first eight bytes into a `u64` and heap-selects on
+that. Two shapes defeat the pack, and both returned `None`:
+
+* `packs_discriminate` refuses outright when a sample shows the prefix separates too little —
+  every value starting `https://`, an ISO timestamp rendered as text, ClickBench's
+  `SearchPhrase`, which is **empty on about 93% of rows**;
+* the candidate budget overflows when so many rows tie at the k-th pack that the "narrowed"
+  field is the whole morsel.
+
+`None` sent the caller to `stable_sort_indices_bytes` — a **full** `O(n log n)` comparison sort
+of every row, to keep ten of them. A decline was not falling back to a cheaper plan; it was
+falling back to the most expensive one available.
+
+### Measured
+
+6,000,000 rows, one `Utf8` column whose first nine characters are constant, best of five on a
+48-core box:
+
+| shape | before | after | DuckDB |
+|---|---:|---:|---:|
+| `ORDER BY s LIMIT 10` | 36.0 ms | **10.5 ms** | 4.6 ms |
+| `ORDER BY s LIMIT 1000` | 50.6 ms | **28.4 ms** | 7.4 ms |
+| `ORDER BY s LIMIT 10 OFFSET 1000` | 47.3 ms | **25.4 ms** | 7.5 ms |
+
+8.73x DuckDB -> 2.28x on the first. Still a loss, and the residue is not this mechanism.
+
+### What replaced the decline
+
+`top_k_by_comparison` — a quickselect over the key bytes with the same total order the exact
+pass uses (bytes, then input position), then an `O(k log k)` sort of the survivors. `O(n)`
+expected comparisons against `O(n log n)`, and the caller's own gate
+(`k * TOP_K_SELECT_RATIO <= num_rows`) already confines it to `k <= n / 2` where that is
+strictly less work.
+
+**The survivors are returned sorted, and that is not incidental.** An earlier attempt at a
+quickselect here returned them unordered and made `LIMIT 100000` *slower* (893 -> 1139 ms),
+because `parallel_top_n`'s merge relies on each morsel handing back a sorted run. Ordering `k`
+rows restores it.
+
+### The test that had to change, and why that is not a weakening
+
+`a_column_whose_prefix_settles_nothing_declines` asserted `top_k_single_key(...).is_none()`,
+on the stated grounds that "the selection must decline rather than sort the whole morsel
+twice". That premise was true while the alternative was a failed selection *plus* a full sort,
+and is false now that the decline path selects. The test asserts the strictly stronger property
+instead: the selection runs **and returns exactly the rows a stable full sort keeps, in the same
+order**, at k = 1, 10 and 100.
+
+Four new tests cover the two decline paths directly
+(`byte_sort::undiscriminating_prefix_tests`), each with a **positive control** asserting its
+fixture really takes the path it names — a constant-prefix column must fail
+`packs_discriminate`, and the budget-overflow column must pass it. Without those controls both
+tests would pass whether or not the fallback existed.
+
+## The statistics pass widened every column of a relation, including the ones no query reads — a first query over a 12-column `int32` table, 595 ms -> 140 ms (2026-09-12)
+
+`InMemorySource`'s docstring promised the widening was "lazily and per column, with caching:
+only the columns a query actually reads are cast". The *read* path keeps that promise
+(`_project` widens the projection). `statistics()` does not go through the read path: it
+walks **every** column of the schema through `_build_column`, and `_build_column` widened.
+So a query naming two columns of a twelve-column table paid ten casts it had no use for, at
+roughly 47 ms per 10M-row `int32` column.
+
+Measured on 10,000,000 rows x 12 `int32` columns, a `GROUP BY c0 SUM(c1)`, a fresh `Dataset`
+per trial so the per-source memo cannot hide it:
+
+| source | first query | second query |
+|---|---:|---:|
+| `int32` columns, before | 595-757 ms | 7.2 ms |
+| `int32` columns, after | **140-142 ms** | 7.0 ms |
+| the same table already `int64` | 49 ms | 6.8 ms |
+
+The residue over the `int64` row (140 against 49) is the two columns the query *does* read,
+which is the cast the read path is supposed to pay.
+
+### Why it is sound to skip
+
+Every fact the statistics pass derives — min, max, null count, distinct count, sum, mean,
+and the surviving count of a comparison — is invariant under an order- and
+equality-preserving injection, and `int8/16/32 -> int64` and `uint8/16/32 -> int64` are
+exactly that. Arrow promotes a narrow column against a *wide* literal rather than truncating
+it, so even `WHERE c > 2^40` over an `int32` column compares correctly rather than
+overflowing. Floats are deliberately **not** in the set: widening is exact for their bounds
+but changes the accumulation width of `sum`/`mean`.
+
+Checked rather than argued: every statistic above, over `int8`/`int16`/`int32` columns with
+10% nulls, computed both ways in one process — identical, including the null counts and both
+predicate directions.
+
+This is a cold-query fix and moves no suite geomean: every suite here is best-of-five, and
+the widening was only ever paid on the first run. It is what a one-shot query over
+narrow-typed data pays, which is most Parquet and all of ClickBench's `hits`.
+
 ## Ray Data measured for the first time: pipelines for four suites, and two bugs the row-count check would have passed (2026-09-11)
 
 **Internal only. These numbers are deliberately not in the published docs.**

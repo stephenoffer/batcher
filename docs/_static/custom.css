@@ -1,16 +1,28 @@
 /* Batcher documentation theme — professional, layered on top of Furo.
-   Confident blue brand on light content, a permanently dark slate sidebar (both
-   modes), restrained navy hero, Inter + JetBrains Mono. Brand colors and the dark
-   sidebar variables are set in conf.py; this file carries typography, the hero,
-   navigation polish, cards (sphinx-design), code, tables, and the animations. */
+   Every color comes from the logo, whose bars run cyan -> electric blue -> violet ->
+   magenta. Links and focus read in one hue (the logo's blue on light, its cyan on
+   dark, set in conf.py as --color-brand-primary); the full gradient is kept for the
+   few places that carry the brand itself: the hero edge, the stat strip, the current
+   page marker. The sidebar is a permanent indigo night in both modes. Inter +
+   JetBrains Mono. This file carries typography, the hero, navigation polish, cards
+   (sphinx-design), code, tables, and the animations. */
 
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap");
 
 :root {
-  --bt-blue: #2563eb;
-  --bt-blue-deep: #1d4ed8;
+  /* The logo's gradient stops, sampled from the mark itself. */
+  --bt-cyan: #6dfafc;
+  --bt-sky: #40bbf9;
+  --bt-blue: #2a3bf4;
+  --bt-violet: #7a0af5;
+  --bt-magenta: #f023d3;
+  --bt-gradient: linear-gradient(90deg, var(--bt-cyan) 0%, var(--bt-sky) 22%,
+    var(--bt-blue) 52%, var(--bt-violet) 76%, var(--bt-magenta) 100%);
+  --bt-night: #0b0d26;
+  --bt-night-line: #1b1f4a;
+  /* "Partial" in the competitive matrix is a status, not the brand, so it keeps a
+     status color rather than borrowing one from the logo. */
   --bt-amber: #f59e0b;
-  --bt-navy: #0f172a;
   --bt-radius: 12px;
   --font-stack: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     Helvetica, Arial, sans-serif;
@@ -20,7 +32,11 @@
 
 html { scroll-behavior: smooth; }
 
+/* The single-hue accent follows the theme: Furo defines --color-brand-primary on body
+   per mode, so the alias has to be declared there too to resolve against it. */
 body {
+  --bt-accent: var(--color-brand-primary);
+  --bt-accent-wash: color-mix(in srgb, var(--color-brand-primary) 10%, transparent);
   font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
   -webkit-font-smoothing: antialiased;
 }
@@ -53,10 +69,12 @@ article a.reference {
 /* ---- Dark sidebar + navigation ---------------------------------------- */
 
 .sidebar-drawer {
-  border-right: 1px solid #1e293b;
+  border-right: 1px solid var(--bt-night-line);
 }
 
-/* Brand: a small gradient mark + the "Batcher" wordmark, linking home. */
+/* Brand: the logo mark + the "Batcher" wordmark in one row, linking home. Furo stacks
+   and centers the two by default, which spends a tall block of the sidebar on a mark
+   that reads perfectly well at wordmark height. */
 .sidebar-brand {
   display: flex;
   align-items: center;
@@ -66,15 +84,14 @@ article a.reference {
   transition: opacity 0.12s ease;
 }
 .sidebar-brand:hover { opacity: 0.85; text-decoration: none; }
-.sidebar-brand::before {
-  content: "";
-  flex: none;
-  width: 27px;
-  height: 27px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #60a5fa 0%, #2563eb 55%, #6366f1 100%);
-  box-shadow: 0 3px 10px -3px rgba(37, 99, 235, 0.75),
-    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+.sidebar-logo-container { flex: none; margin: 0; }
+.sidebar-logo {
+  display: block;
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  max-width: none;
+  filter: drop-shadow(0 3px 10px rgba(122, 10, 245, 0.45));
 }
 .sidebar-brand-text {
   color: #f8fafc;
@@ -90,18 +107,18 @@ article a.reference {
   transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
 }
 .sidebar-tree .reference:hover {
-  background: #1e293b;
+  background: var(--bt-night-line);
   color: #ffffff;
 }
-/* current page: brand accent bar + tint */
+/* current page: the logo's cyan edge, fading through its blue into the sidebar */
 .sidebar-tree .current-page > .reference {
   color: #ffffff;
-  background: linear-gradient(90deg, rgba(37, 99, 235, 0.30), rgba(37, 99, 235, 0.10));
-  box-shadow: inset 3px 0 0 0 var(--bt-blue);
+  background: linear-gradient(90deg, rgba(42, 59, 244, 0.42), rgba(122, 10, 245, 0.08));
+  box-shadow: inset 3px 0 0 0 var(--bt-cyan);
   font-weight: 600;
 }
 .sidebar-tree .caption-text {
-  color: #94a3b8;
+  color: #9097c8;
   text-transform: uppercase;
   letter-spacing: 0.07em;
   font-size: 0.72rem;
@@ -112,9 +129,9 @@ article a.reference {
 .sidebar-search-container { transition: border-color 0.12s ease; }
 
 /* slim, subtle sidebar scrollbar */
-.sidebar-scroll { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.sidebar-scroll { scrollbar-width: thin; scrollbar-color: #2a2f66 transparent; }
 .sidebar-scroll::-webkit-scrollbar { width: 7px; }
-.sidebar-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+.sidebar-scroll::-webkit-scrollbar-thumb { background: #2a2f66; border-radius: 4px; }
 
 /* ---- Landing hero ------------------------------------------------------ */
 
@@ -126,9 +143,28 @@ article a.reference {
   border-radius: 18px;
   color: #f8fafc;
   background:
-    radial-gradient(900px 360px at 88% -20%, rgba(37, 99, 235, 0.55), transparent 60%),
-    linear-gradient(135deg, #0b1120 0%, #0f172a 45%, #1e3a8a 130%);
-  box-shadow: 0 18px 44px -24px rgba(15, 23, 42, 0.8);
+    radial-gradient(620px 300px at 96% -10%, rgba(240, 35, 211, 0.38), transparent 62%),
+    radial-gradient(900px 380px at 70% -30%, rgba(42, 59, 244, 0.55), transparent 60%),
+    radial-gradient(520px 260px at -8% 110%, rgba(64, 187, 249, 0.22), transparent 65%),
+    linear-gradient(135deg, #070919 0%, #0b0d26 45%, #1c1470 130%);
+  box-shadow: 0 18px 44px -24px rgba(11, 13, 38, 0.85);
+}
+/* The logo's gradient as the hero's top edge. */
+.bt-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 4px;
+  background: var(--bt-gradient);
+  background-size: 200% 100%;
+  z-index: 1;
+}
+.bt-hero-logo {
+  display: block;
+  width: 72px;
+  height: 72px;
+  margin: 0 0 1.1rem;
+  filter: drop-shadow(0 6px 18px rgba(122, 10, 245, 0.5));
 }
 .bt-hero::after {
   content: "";
@@ -149,9 +185,9 @@ article a.reference {
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--bt-amber);
-  background: rgba(251, 191, 36, 0.12);
-  border: 1px solid rgba(251, 191, 36, 0.32);
+  color: var(--bt-cyan);
+  background: rgba(109, 250, 252, 0.10);
+  border: 1px solid rgba(109, 250, 252, 0.30);
   padding: 0.32rem 0.8rem;
   border-radius: 999px;
   margin: 0 0 1.15rem;
@@ -196,11 +232,11 @@ article a.reference {
 .bt-btn:hover { transform: translateY(-1px); text-decoration: none; }
 .bt-btn-primary {
   background: #ffffff;
-  color: var(--bt-blue-deep);
+  color: var(--bt-blue);
   border-color: #ffffff;
   box-shadow: 0 8px 20px -10px rgba(0, 0, 0, 0.55);
 }
-.bt-btn-primary:hover { background: #eff6ff; }
+.bt-btn-primary:hover { background: #eef0ff; }
 
 /* ---- sphinx-design cards / grids -------------------------------------- */
 
@@ -212,8 +248,8 @@ article a.reference {
 }
 .sd-card:hover {
   transform: translateY(-3px);
-  border-color: var(--bt-blue) !important;
-  box-shadow: 0 16px 34px -20px rgba(37, 99, 235, 0.65);
+  border-color: var(--bt-accent) !important;
+  box-shadow: 0 16px 34px -20px color-mix(in srgb, var(--bt-violet) 65%, transparent);
 }
 .sd-card .sd-card-body { padding: 1.35rem 1.45rem; }
 .sd-card .sd-card-title {
@@ -234,9 +270,9 @@ article a.reference {
 .sd-card .sd-card-title .sd-octicon,
 .sd-card-title svg.octicon {
   flex: none;
-  color: var(--bt-blue);
-  fill: var(--bt-blue);
-  background: rgba(37, 99, 235, 0.10);
+  color: var(--bt-accent);
+  fill: var(--bt-accent);
+  background: var(--bt-accent-wash);
   padding: 0.5rem;
   border-radius: 10px;
   box-sizing: content-box;
@@ -245,7 +281,10 @@ article a.reference {
   background-color: var(--bt-blue) !important;
   border-color: var(--bt-blue) !important;
 }
-.sd-btn-primary:hover { background-color: var(--bt-blue-deep) !important; }
+.sd-btn-primary:hover {
+  background-color: var(--bt-violet) !important;
+  border-color: var(--bt-violet) !important;
+}
 
 /* ---- Tabs (sphinx-design) --------------------------------------------- */
 
@@ -255,8 +294,8 @@ article a.reference {
   transition: color 0.12s ease, border-color 0.12s ease;
 }
 .sd-tab-set > input:checked + label {
-  color: var(--bt-blue);
-  border-color: var(--bt-blue);
+  color: var(--bt-accent);
+  border-color: var(--bt-accent);
 }
 
 /* ---- Code + copy button ----------------------------------------------- */
@@ -283,8 +322,8 @@ button.copybtn:hover { opacity: 1; }
   border-left-width: 4px;
   box-shadow: none;
 }
-.admonition.note, .admonition.seealso { border-left-color: var(--bt-blue); }
-.admonition.tip, .admonition.hint, .admonition.important { border-left-color: var(--bt-amber); }
+.admonition.note, .admonition.seealso { border-left-color: var(--bt-accent); }
+.admonition.tip, .admonition.hint, .admonition.important { border-left-color: var(--bt-magenta); }
 
 /* ---- Tables ------------------------------------------------------------ */
 
@@ -297,7 +336,7 @@ table.docutils {
 }
 table.docutils thead th {
   background: var(--color-background-secondary);
-  border-bottom: 2px solid var(--bt-blue);
+  border-bottom: 2px solid var(--bt-accent);
   font-weight: 650;
 }
 table.docutils td, table.docutils th { border-color: var(--color-background-border); }
@@ -364,6 +403,16 @@ article img[src*="_images/"]:not([src$=".svg"]) {
   /* The hero's grid drifts slowly, one cell on a seamless loop — life, not noise. */
   @keyframes bt-grid-drift { to { background-position: 36px 36px; } }
   .bt-hero::after { animation: bt-grid-drift 22s linear infinite; }
+
+  /* The gradient edge flows the way the logo's bars do, cyan toward magenta and back. */
+  @keyframes bt-gradient-flow {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  .bt-hero::before { animation: bt-gradient-flow 9s ease-in-out infinite; }
+
+  /* The mark settles in with the hero, a beat behind it. */
+  .bt-hero-logo { animation: bt-fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.08s both; }
 }
 
 /* ---- Competitive matrix ------------------------------------------------ */
@@ -388,10 +437,12 @@ article img[src*="_images/"]:not([src$=".svg"]) {
 .bt-matrix th:first-child, .bt-matrix td:first-child { text-align: left; font-weight: 600; }
 .bt-matrix thead th { background: var(--color-background-secondary); font-weight: 700; }
 /* highlight the Batcher column */
-.bt-matrix th:nth-child(2), .bt-matrix td:nth-child(2) { background: rgba(37, 99, 235, 0.07); }
-.bt-matrix thead th:nth-child(2) { color: var(--bt-blue); border-bottom: 2px solid var(--bt-blue); }
+.bt-matrix th:nth-child(2), .bt-matrix td:nth-child(2) { background: var(--bt-accent-wash); }
+.bt-matrix thead th:nth-child(2) { color: var(--bt-accent); border-bottom: 2px solid var(--bt-accent); }
 .bt-matrix tbody tr:hover td { background: var(--color-background-hover); }
-.bt-matrix tbody tr:hover td:nth-child(2) { background: rgba(37, 99, 235, 0.13); }
+.bt-matrix tbody tr:hover td:nth-child(2) {
+  background: color-mix(in srgb, var(--color-brand-primary) 18%, transparent);
+}
 .bt-matrix .y { color: #16a34a; font-weight: 700; }
 .bt-matrix .p { color: var(--bt-amber); font-weight: 700; }
 .bt-matrix .n { color: var(--color-foreground-secondary); opacity: 0.45; }
@@ -414,15 +465,16 @@ article img[src*="_images/"]:not([src$=".svg"]) {
   padding: 1rem 1.05rem;
   border: 1px solid var(--color-background-border);
   border-radius: var(--bt-radius);
-  background: var(--color-background-secondary);
-  border-top: 3px solid var(--bt-blue);
+  /* The logo's gradient as a top rule. A painted strip rather than border-image, which
+     would discard the rounded corners. */
+  background: var(--bt-gradient) top / 100% 3px no-repeat, var(--color-background-secondary);
 }
 .bt-stat-value {
   display: block;
   font-size: 1.5rem;
   font-weight: 800;
   line-height: 1.15;
-  color: var(--bt-blue);
+  color: var(--bt-accent);
   letter-spacing: -0.02em;
 }
 .bt-stat-label {

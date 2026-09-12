@@ -9,6 +9,7 @@ runtime — the pieces fuse into one plan before anything executes. That is what
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -57,7 +58,16 @@ def main() -> None:
         .sort("l_returnflag")
         .to_pydict()
     )
-    assert result == direct
+    # Same groups exactly; same sums to within float reassociation. These are two separate
+    # executions, and a floating-point SUM is identical across executions only up to the order
+    # its additions happen in, which can move between a query's first run and a later one as
+    # learned statistics change how the input is split. That is the engine's stated contract
+    # for float reductions, and it is the tolerance the differential harness applies too.
+    assert result["l_returnflag"] == direct["l_returnflag"]
+    assert all(
+        math.isclose(a, b, rel_tol=1e-9)
+        for a, b in zip(result["revenue"], direct["revenue"], strict=True)
+    )
 
 
 if __name__ == "__main__":

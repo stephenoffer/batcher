@@ -25,6 +25,7 @@ import json
 import uuid
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -176,9 +177,27 @@ def test_a_predicate_prunes_partitions_at_plan_time(partitioned: str) -> None:
     assert len(source.splits(predicate=_predicate(1))) == 1
 
 
-def test_pruning_needs_a_partition_column(flat: str) -> None:
-    """An unpartitioned table has nothing to prune; the engine's Filter does the work."""
-    assert len(HudiSource(flat).splits(predicate=_predicate(1))) == 3
+def test_pruning_an_unpartitioned_table_never_loses_a_matching_row(flat: str) -> None:
+    """Pruning may skip files by column statistics — it may never skip a matching row.
+
+    This used to assert that an unpartitioned table prunes to all three splits, on the
+    premise that a Hudi filter is evaluated against the partition path alone. hudi-rs also
+    skips base files whose column statistics exclude the predicate, so the flat table now
+    prunes to the one slice holding ``day = 1`` — strictly better, and invisible to a count
+    assertion that reads it as a regression. What must hold either way is that the surviving
+    splits carry *every* matching row, which is what this checks.
+    """
+    source = HudiSource(flat)
+    splits = source.splits(predicate=_predicate(1))
+    assert 1 <= len(splits) <= 3
+
+    pruned = sorted(
+        row for split in splits for batch in split.read() for row in batch.column("id").to_pylist()
+    )
+    whole = pa.Table.from_batches(list(source.read()))
+    expected = sorted(whole.filter(pc.equal(whole.column("day"), 1)).column("id").to_pylist())
+    assert expected  # the fixture really does hold day=1 rows, so the check can fail
+    assert [i for i in pruned if i in expected] == expected
 
 
 # --- statistics ------------------------------------------------------------

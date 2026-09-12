@@ -9,11 +9,15 @@ blocks they have glyphs for, so both are detected and both degrade: truecolor �
 16-color → none, and block-drawing → ASCII. The degraded forms are designed, not accidental
 — a 16-color CI log and a truecolor iTerm2 render the same layout, only the fidelity differs.
 
-The palette is the same sequential blue ramp the web dashboard uses (see
-`assets/app.css`), for the same reason: elapsed time and progress are *magnitudes*, and one
-hue light→dark is how a magnitude is encoded. The retro character comes from the typography
-— block-drawing, braille, sparklines — not from a nostalgic amber that would break that
-correspondence.
+The palette is the logo's: its bars run cyan → electric blue → violet → magenta, and the
+progress bar and the indeterminate comet are drawn along that same gradient, so a running
+query looks like the mark it belongs to. That is decoration and is allowed to be, because
+nothing in the bar is encoded by hue — how far a query has got is carried by fill *length*,
+which reads the same in a 16-color log where the ramp collapses to one value. The web
+dashboard keeps its single-hue sequential ramp (`assets/app.css`) because its charts do
+encode magnitude in color. The status roles (`good`/`warn`/`critical`) stay off the brand
+gradient for the same reason: they mean something. The retro character comes from the
+typography — block-drawing, braille, sparklines.
 """
 
 from __future__ import annotations
@@ -37,9 +41,11 @@ _SHADES = "█▓▒░"
 # Vertical bars for the throughput sparkline.
 _SPARK = "▁▂▃▄▅▆▇█"
 
-# The blue column of the xterm-256 color cube, light → dark. The 256-color stand-in for
-# the truecolor ramp: coarser, but still a gradient rather than a flat fill.
-_XTERM_BLUES = (153, 111, 75, 69, 33, 32, 26, 25)
+# The logo's gradient stops, sampled from the mark: cyan, sky, electric blue, violet, magenta.
+_LOGO_STOPS = ((109, 250, 252), (64, 187, 249), (42, 59, 244), (122, 10, 245), (240, 35, 211))
+# The nearest xterm-256 cube colors along that gradient, cyan → magenta. The 256-color
+# stand-in for the truecolor ramp: coarser, but still the logo's sweep rather than a flat fill.
+_XTERM_LOGO = (87, 81, 39, 33, 27, 57, 129, 200)
 
 
 class Glyphs:
@@ -75,12 +81,14 @@ class Palette:
         self.dim = "\x1b[2m" if on else ""
         self.bold = "\x1b[1m" if on else ""
         self.muted = "\x1b[38;5;244m" if depth >= 8 else ("\x1b[90m" if on else "")
+        # The logo's magenta head: the color the comet leads with and the bar fills toward,
+        # and it holds its contrast on light and dark terminal backgrounds alike.
         if depth >= 24:
-            self.accent = self._fg(57, 135, 229)
+            self.accent = self._fg(*_LOGO_STOPS[-1])
         elif depth >= 8:
-            self.accent = "\x1b[38;5;75m"
+            self.accent = "\x1b[38;5;200m"
         else:
-            self.accent = "\x1b[36m" if on else ""
+            self.accent = "\x1b[35m" if on else ""
         self.good = self._fg(12, 163, 12) if depth >= 24 else ("\x1b[32m" if on else "")
         self.warn = self._fg(250, 178, 25) if depth >= 24 else ("\x1b[33m" if on else "")
         self.serious = self._fg(236, 131, 90) if depth >= 24 else ("\x1b[33m" if on else "")
@@ -91,25 +99,32 @@ class Palette:
         return f"\x1b[38;2;{r};{g};{b}m"
 
     def ramp(self, t: float) -> str:
-        """A color from the sequential blue ramp at position `t` in [0, 1], light → dark.
+        """A color from the logo's gradient at position `t` in [0, 1], cyan → magenta.
 
         Used to tint the progress bar along its length, so the filled region reads as a
-        single gradient object rather than a flat block — the cheapest way to make a bar
-        look considered. A 256-color terminal gets a real (coarser) ramp from the xterm
-        cube rather than a flat accent; only 16-color and monochrome collapse to one value,
-        where there is nothing to interpolate between.
+        single gradient object rather than a flat block, and to shade the indeterminate
+        comet from a cyan tail to a magenta head, the way the logo's bars are drawn. A
+        256-color terminal gets a real (coarser) ramp from the xterm cube rather than a
+        flat accent; only 16-color and monochrome collapse to one value, where there is
+        nothing to interpolate between.
+
+        Args:
+            t: Position along the gradient; clamped to [0, 1].
+
+        Returns:
+            The foreground escape for that position, or the flat accent below 256 colors.
         """
         t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
         if self.depth == 8:
-            return (
-                f"\x1b[38;5;{_XTERM_BLUES[min(int(t * len(_XTERM_BLUES)), len(_XTERM_BLUES) - 1)]}m"
-            )
+            return f"\x1b[38;5;{_XTERM_LOGO[min(int(t * len(_XTERM_LOGO)), len(_XTERM_LOGO) - 1)]}m"
         if self.depth < 24:
             return self.accent
-        # Steps 250 → 550 of the documented blue ramp, interpolated.
-        lo = (134, 182, 239)
-        hi = (28, 92, 171)
-        return self._fg(*(round(lo[i] + (hi[i] - lo[i]) * t) for i in range(3)))
+        # Piecewise-linear between the logo's stops, evenly spaced along [0, 1].
+        segments = len(_LOGO_STOPS) - 1
+        i = min(int(t * segments), segments - 1)
+        local = t * segments - i
+        lo, hi = _LOGO_STOPS[i], _LOGO_STOPS[i + 1]
+        return self._fg(*(round(lo[c] + (hi[c] - lo[c]) * local) for c in range(3)))
 
 
 def detect(stream: TextIO | None = None) -> tuple[Palette, Glyphs]:
