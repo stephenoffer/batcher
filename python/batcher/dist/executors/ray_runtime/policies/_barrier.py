@@ -15,6 +15,7 @@ from collections import deque
 from batcher._internal import events
 from batcher.config import active_config
 
+from ..capacity import fleet_worker_cpus
 from ..scheduling import map_slots_per_worker
 from ._drain import draining_workers  # noqa: F401  (re-exported for the façade)
 from ._faults import (
@@ -22,6 +23,7 @@ from ._faults import (
     _is_fatal_ray_error,
     _is_transient_udf_error,
     check_results_trusted,
+    is_recoverable_task_failure,
     node_ledger,
     recovery_policy,
     retry_budget,
@@ -103,6 +105,55 @@ def _stall_diagnosis(task_cpus: float, outstanding: int) -> str | None:
 
         note_suppressed("dist", "diagnose the stalled barrier", exc)
         return None
+
+
+def _relieve_stall(task_cpus: float, *, pinned: bool) -> bool:
+    """Hand the idle session fleet's cores back, so this stage's pending tasks can place.
+
+    A warm fleet is a placement-group reservation of nearly the whole cluster, held for
+    `distributed.session_fleet_idle_s` after the query that used it finished. That is what
+    makes a *second* Batcher query cheap, and it is also what a stage of plain Ray tasks
+    submitted outside the reservation waits on. Measured on a 27-node fleet: the uniform
+    fan-out reserved 384 of 384 cores, so such a stage had no core to run on at all and
+    waited out the idle timer.
+
+    `yield_session_fleet` already knew how to resolve that and had one caller
+    (`map._placeable_scheduling`), which covers the map and write stages and nothing else.
+    Calling it here covers every stage that gathers through this barrier, and does so
+    *reactively* — the fleet is kept warm right up to the point something else needs its
+    cores, which is the whole value of keeping it.
+
+    Args:
+        task_cpus: What one pending task requests, the figure that has to become free.
+        pinned: Whether this barrier's work runs on the fleet's own actors. Then the fleet
+            must NOT be released: tearing it down would kill the actors mid-stage, turning a
+            slow query into a failed one. `on_lost` is the caller's own marker for that —
+            a stateless-task barrier passes none, an actor-pinned one must.
+
+    Returns:
+        Whether the fleet was released. `False` leaves the caller exactly where it was.
+    """
+    import logging
+
+    from batcher._internal.logging import get_logger, log_kv, note_suppressed
+
+    if pinned:
+        return False
+    try:
+        from batcher.dist.fleet import yield_session_fleet
+
+        if not yield_session_fleet(task_cpus):
+            return False
+    except Exception as exc:  # pragma: no cover - relief must never fail the stage
+        note_suppressed("dist", "yield the idle fleet for a stalled stage", exc)
+        return False
+    log_kv(
+        get_logger("dist"),
+        logging.INFO,
+        "released the idle shuffle fleet so this stage could be scheduled",
+        task_cpus=task_cpus,
+    )
+    return True
 
 
 def gather_map_results(
@@ -206,17 +257,19 @@ def gather_map_results(
     # output for as long as the cluster stays full. That is the common shape on a shared
     # cluster — a shuffle fleet's placement group holds every core, and the map tasks
     # submitted outside it wait for a core that never comes free — and it presents as a hung
-    # job with idle devices. The shuffle barrier already says so after two minutes
-    # (`warn_barrier_stalled`, which reads Ray's own view of the reservation); this is the
-    # same wait on the path an inference user is actually on. Waiting is still the behavior:
-    # a legitimately slow first task is indistinguishable from a stuck one, so the barrier
-    # reports rather than fails.
+    # job with idle devices.
+    #
+    # On the first stall the barrier now tries to *fix* that rather than only report it
+    # (`_relieve_stall`): the warm fleet is handed back, and the tasks already pending place
+    # themselves on the cores it was holding. Reporting remains the answer for every other
+    # cause, because a legitimately slow first task is indistinguishable from a stuck one.
     import time
 
     from batcher.carbonite.resilience import STALL_WARN_AFTER_S, warn_barrier_stalled
 
     barrier_started = time.monotonic()
     stall_warnings = 0
+    relieved = False
     finished = 0
     completed = 0
     while inflight:
@@ -225,6 +278,12 @@ def gather_map_results(
             waited = time.monotonic() - barrier_started
             if not finished and waited > STALL_WARN_AFTER_S * (stall_warnings + 1):
                 stall_warnings += 1
+                if not relieved:
+                    # Once per barrier: a second attempt cannot help (the fleet is gone) and
+                    # would only spend the stall window re-reading the cluster.
+                    relieved = True
+                    if _relieve_stall(task_cpus, pinned=on_lost is not None):
+                        continue
                 warn_barrier_stalled(waited, n, _stall_diagnosis(task_cpus, len(inflight)))
             continue
         finished += 1
@@ -253,7 +312,17 @@ def gather_map_results(
             # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
             # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
             # Failing the whole job on one used to discard hours of completed inference.
-            if not _is_transient_udf_error(exc):
+            #
+            # `is_recoverable_task_failure` is the second of those, and it was missing. The
+            # comment in `_faults` reads "a map task that fails reports worker loss as a *Ray*
+            # error", which was true until a map task could **read a Flight intermediate**: a
+            # stage scanning what a previous stage published fetches from a peer inside the
+            # task, so a lost peer arrives here as a `RetryableShuffleError` wrapped in a
+            # `RayTaskError` — the transport's own word for "retry me" — and was re-raised.
+            # Observed as a windowed rank over a hot key dying with `transport error` while
+            # the identical query on a uniform key passed, because only the skewed one moved
+            # a bucket big enough for the fetch to break.
+            if not (_is_transient_udf_error(exc) or is_recoverable_task_failure(exc)):
                 raise
             # Almost every failure loses work, which is what a retry is for. A device that
             # took an uncontained ECC fault did something else: it kept running and returned
@@ -290,6 +359,76 @@ def gather_map_results(
             pending.appendleft(idx)
         _fill()
     return results
+
+
+def _idle_pool(workers: int, slots: int) -> deque[int]:
+    """The pre-filled idle pool, each worker appearing in proportion to the cores it holds.
+
+    The pool is what the barrier deals sources from, and it used to be filled with every worker
+    exactly `slots` times. On a uniform fleet that is right. On an unequal one it is a *static*
+    even deal wearing a dynamic barrier's clothes, because `map_partitions` sizes the source
+    count at `workers x slots` — exactly the pool's depth — so every source is handed out from
+    the initial fill and the go-idle path that would have corrected the imbalance never runs.
+
+    Measured on the 28-node / 384-core mixed cluster, 128 sources over 32 workers:
+
+        cores  workers  partitions  per worker  per core
+           24        5          20        4.00       0.167
+           15        8          32        4.00       0.267
+            3       16          64        4.00       1.333
+
+    Every worker took exactly four regardless of size, so a 3-core worker carried eight times
+    the per-core load of a 24-core one and the whole stage waited on the small machines. That
+    is the straggler being the *assignment* rather than the machine — the same failure
+    `assignment._balance` documents for split packing, on the other side of the barrier.
+
+    Dealing in proportion to cores fixes the initial deal without touching the dynamic one: a
+    worker that finishes early still returns to the pool and still takes more. Ordering is
+    round-robin rather than blocked, so the first `workers` sources still reach every worker
+    and the extra slots land on the big machines afterwards — a blocked fill would hand the
+    first twenty-four sources to one worker and idle the rest.
+
+    Assignment is a scheduling concern only: a source is identified by its `src` id and its
+    partition is a deterministic function of its durable descriptor, so which worker computes
+    it never changes the result.
+
+    Args:
+        workers: The fleet's width.
+        slots: How many sources each worker may hold in flight, on average.
+
+    Returns:
+        Worker ids to deal from, `workers * slots` deep.
+    """
+    total = max(1, slots) * workers
+    caps = fleet_worker_cpus(workers)
+    if not caps or len(caps) != workers or min(caps) <= 0 or max(caps) == min(caps):
+        return deque(h for _ in range(slots) for h in range(workers))
+
+    share = total / sum(caps)
+    counts = [max(1, round(c * share)) for c in caps]
+    # Rounding drifts off `total`; settle it on the largest workers, which is where a slot is
+    # worth the most and where a rounding loss would otherwise land systematically.
+    order = sorted(range(workers), key=lambda h: caps[h], reverse=True)
+    drift = total - sum(counts)
+    position = 0
+    while drift != 0 and position < 4 * workers:
+        host = order[position % workers]
+        if drift > 0:
+            counts[host] += 1
+            drift -= 1
+        elif counts[host] > 1:
+            counts[host] -= 1
+            drift += 1
+        position += 1
+
+    pool: deque[int] = deque()
+    left = list(counts)
+    while any(left):
+        for host in range(workers):
+            if left[host]:
+                pool.append(host)
+                left[host] -= 1
+    return pool
 
 
 def map_barrier(
@@ -404,7 +543,7 @@ def map_barrier(
     # on a 64 x 16-core fleet at TPC-H sf100, the map phase held the cluster at 7-14% of
     # its cores while the barrier waited on 64 single-threaded S3 reads.
     slots = map_slots_per_worker() if not pinned else 1
-    idle: deque[int] = deque(h for _ in range(slots) for h in range(workers))
+    idle: deque[int] = _idle_pool(workers, slots) if not pinned else deque(range(workers))
 
     def _next_idle() -> int:
         while idle:

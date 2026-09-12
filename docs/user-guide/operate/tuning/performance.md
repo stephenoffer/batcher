@@ -392,6 +392,11 @@ than the window keeps its own workers. Measured on a 65-node, 1,024-core cluster
 `map_batches` and aggregate held 960 cores at 25 seconds after the query returned and 0 at
 33 seconds.
 
+A **GPU** pool gives its devices back on its own window, `distributed.warm_inference_idle_s`,
+120 seconds by default. It is longer because a model load costs far more than an actor
+respawn, and it is bounded because a reserved idle GPU stops another tenant dead where a
+reserved idle core only slows one down. Set it to `0` for whole-session residency.
+
 The whole behavior is under `distributed.warm_inference_pools`, on by default. Turn it off
 and every stage runs on stateless tasks released as soon as they finish. To hand the cluster
 to something else immediately, rather than waiting out the idle window, release the pools
@@ -404,6 +409,8 @@ from batcher.dist.executors.map import release_inference_pools
 cfg = Config()
 print(cfg.distributed.warm_inference_pools, cfg.distributed.session_fleet_idle_s)
 # True 30.0
+print(cfg.distributed.warm_inference_idle_s)
+# 120.0
 
 release_inference_pools()
 ```

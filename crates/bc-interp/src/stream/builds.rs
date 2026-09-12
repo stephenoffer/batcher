@@ -149,6 +149,7 @@ pub(crate) fn prebuild_joins(
     meter: Option<&Meter>,
     budget: usize,
     workers: usize,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<Arc<BuildCache>, InterpError> {
     let mut cache = BuildCache::new();
     // A plan with exactly one hash join can decline the per-morsel probe and still be run
@@ -160,7 +161,9 @@ pub(crate) fn prebuild_joins(
         driving: driving_rows(plan, sources),
         can_hand_off: parallel::count_hash_joins(plan) == 1,
     };
-    collect_builds(plan, sources, &mut cache, meter, budget, workers, admission)?;
+    collect_builds(
+        plan, sources, &mut cache, meter, budget, workers, admission, opts,
+    )?;
     // Every build side now exists, so every reducible join's key set is a known constant and can
     // be placed over the probe pipeline that is about to run. One pass per build key column; no
     // execution. See [`runtime_filter`] for which joins qualify and why it cannot regress.
@@ -168,6 +171,45 @@ pub(crate) fn prebuild_joins(
     Ok(Arc::new(cache))
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Options for running this build side on the **materializing** executor, or `None` to stream it.
+///
+/// A build side is prepared by `parallel::run` — the streaming executor — whatever it contains.
+/// When it is a join-free grouped aggregate, that is the wrong executor by a wide margin, and the
+/// margin is the whole of TPC-H q18's gap: its `SEMI` join builds from `GROUP BY l_orderkey` over
+/// 60M rows to 15M groups, which `explain(analyze=True)` attributes **99% of the query's operator
+/// time** to. Measured standing alone, both orders, minimum of three: **4,660 ms streaming
+/// against 736 ms materializing**, with read (347 ms) plus aggregate (505 ms) accounting for the
+/// second figure exactly.
+///
+/// The shape test is `materializing_aggregate_is_faster`, the same guard `bc-py` applies to a
+/// whole plan, and it admits only a **join-free** grouped aggregate — so what this materializes is
+/// the subtree's input and one hash table over it, never a join's intermediates. That is the
+/// distinction that makes it safe here: routing *whole* plans on a permissive affordability test
+/// is what took q17/q18/q20/q21 from completing to `SIGKILL` on a 30 GiB box.
+///
+/// **`op_budgets` is dropped and everything else kept.** The map is keyed by pre-order `op_id`
+/// over the *whole* plan, so handing it to a subtree would budget the wrong operators; without it
+/// each falls back to the global envelope, which is what an unkeyed operator already does. The
+/// pool, the spill directory, the codec and the cancel token all carry over — a build side that
+/// materializes must still be able to spill where the caller configured and to be cancelled.
+///
+/// `None` whenever the caller gave us no options (the sequential `execute_streaming` entries, and
+/// the tests), so those paths stream exactly as they always have.
+fn build_materializes_faster(
+    right: &RelOp,
+    opts: Option<&crate::par::ExecOptions>,
+) -> Option<crate::par::ExecOptions> {
+    let opts = opts?;
+    if !parallel::materializing_aggregate_is_faster(right) {
+        return None;
+    }
+    let mut sub = opts.clone();
+    sub.op_budgets = Default::default();
+    Some(sub)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_builds(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
@@ -176,6 +218,7 @@ fn collect_builds(
     budget: usize,
     workers: usize,
     admission: Admission,
+    opts: Option<&crate::par::ExecOptions>,
 ) -> Result<(), InterpError> {
     if let RelOp::HashJoin {
         left,
@@ -188,7 +231,9 @@ fn collect_builds(
         // Only the probe spine draws on *this* cache. The build side is executed below as one
         // self-contained unit, which prepares whatever joins it holds itself, so descending into
         // it here would build them twice.
-        collect_builds(left, sources, cache, meter, budget, workers, admission)?;
+        collect_builds(
+            left, sources, cache, meter, budget, workers, admission, opts,
+        )?;
         // Shard the build side across the workers, exactly as the probe side is sharded. This
         // was the streaming executor's worst asymmetry: the probe ran on every core while the
         // build — the *whole* other relation — ran on one. It is hashed into a table either way,
@@ -199,7 +244,10 @@ fn collect_builds(
         // terminates because each build subtree is strictly smaller than the plan.
         // Never hands off: a build side is prepared *for* a decision the caller has not made yet,
         // so declining here would abort the plan before the fact that decides it exists.
-        let batches = parallel::run(right, sources, workers, meter, budget, false, None)?;
+        let batches = match build_materializes_faster(right, opts) {
+            Some(sub) => crate::par::execute_parallel_with(right, sources, &sub)?,
+            None => parallel::run(right, sources, workers, meter, budget, false, None, opts)?,
+        };
         if let Ok(side) = ops::materialize(&batches) {
             let probe = make_probe(&side, right_keys, *join_type, admission)?;
             cache.insert(node_key(plan), Arc::new(JoinBuild { side, probe }));
@@ -211,7 +259,9 @@ fn collect_builds(
         return Ok(());
     }
     for child in plan.children() {
-        collect_builds(child, sources, cache, meter, budget, workers, admission)?;
+        collect_builds(
+            child, sources, cache, meter, budget, workers, admission, opts,
+        )?;
     }
     Ok(())
 }

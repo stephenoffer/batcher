@@ -168,3 +168,81 @@ class SchedulingEnvelope:
     capacity_preference: str = "any"
     gpu_collective: bool = False
     inflight_depth: int = 1
+    # Per-worker grants for a fleet whose nodes are NOT the same size, parallel to each other
+    # and `n_tasks` long. Empty — the default, and what every homogeneous cluster and every
+    # explicitly-sized fan-out produces — means the fleet is uniform and `num_cpus` /
+    # `memory_bytes` describe every worker, which is what this envelope meant before these
+    # existed.
+    #
+    # They exist because a mixed fleet has no single right answer and forcing one makes the
+    # whole cluster behave like its weakest member: a uniform grant is sized so *every* node
+    # can host it, so a 96-core/206 GB node next to a 4-core/8.6 GB one ran 24 four-core
+    # workers on a 228 MB budget each. See `plan.resource.fleet_plan`, which computes these.
+    #
+    # `num_cpus` and `memory_bytes` stay populated alongside them, and mean what they always
+    # did: `num_cpus` is set to the fleet's *smallest* grant, so a placement bound or an
+    # oversubscription check reading the scalar reads a figure no worker undercuts, and
+    # `memory_bytes` remains Carbonite's own per-task estimate rather than any node's share.
+    # Anything sized per worker must read `slot_cpus`/`slot_memory_bytes`.
+    worker_cpus: tuple[float, ...] = ()
+    worker_memory_bytes: tuple[int, ...] = ()
+    # Cores a worker may COMPUTE over, where that differs from the cores it RESERVES above.
+    #
+    # The two are the same number on almost every path and were one field for a long time,
+    # which is right until a reservation is deliberately thinned. Both fills hold a core back
+    # on every node (`executor._headroom_grant`, `fleet_plan`'s `node_reserve_cores`) so the
+    # query's own plain Ray tasks have somewhere to run — a *scheduling* reserve, and the
+    # right one. But the same figure also sizes each worker's rayon pool
+    # (`ray_runtime.lifecycle.engine_config_json`), so the reserve was silently taking a
+    # thread as well as a slot: on a 96-core node that is 1%, and on a **4-core node it is
+    # 25% of the machine, permanently**, which is what a wide fleet of small instances is.
+    #
+    # `capacity._FLEET_TASK_HEADROOM_MAX` already states the principle these carry — "Ray's
+    # CPU figure is a *reservation*, and the worker's real width comes from the
+    # `EngineConfig`" — and it was true of the in-bundle headroom and false of the fill's.
+    # Empty/zero means "no difference", which is every fleet that does not thin.
+    compute_cpus: float = 0.0
+    worker_compute_cpus: tuple[float, ...] = ()
+
+    def slot_compute_cpus(self, index: int | None = None) -> float:
+        """Cores worker `index` may compute over — its reservation unless one was held back.
+
+        Args:
+            index: The worker's position in the fleet, or `None` for the uniform figure.
+
+        Returns:
+            That worker's compute width, falling back to its reservation.
+        """
+        reserved = self.slot_cpus(index)
+        if index is not None and index < len(self.worker_compute_cpus):
+            return max(reserved, self.worker_compute_cpus[index])
+        # `max`, not the bare figure: a later step may *raise* the reservation
+        # (`dist.executor`'s `_even_cpu_share` branch does), and a width recorded before that
+        # would then quietly cap the worker below the cores it now holds.
+        return max(reserved, self.compute_cpus)
+
+    def slot_cpus(self, index: int | None = None) -> float:
+        """Cores granted to worker `index`, falling back to the uniform `num_cpus`.
+
+        Args:
+            index: The worker's position in the fleet, or `None` to ask for the uniform grant.
+
+        Returns:
+            That worker's core grant.
+        """
+        if index is not None and index < len(self.worker_cpus):
+            return self.worker_cpus[index]
+        return self.num_cpus
+
+    def slot_memory_bytes(self, index: int | None = None) -> int:
+        """Heap bytes granted to worker `index`, falling back to the uniform `memory_bytes`.
+
+        Args:
+            index: The worker's position in the fleet, or `None` to ask for the uniform grant.
+
+        Returns:
+            That worker's memory budget.
+        """
+        if index is not None and index < len(self.worker_memory_bytes):
+            return self.worker_memory_bytes[index]
+        return self.memory_bytes

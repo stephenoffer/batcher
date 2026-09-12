@@ -86,7 +86,12 @@ from batcher.plan.logical import (
     Union,
     Window,
 )
-from batcher.plan.resource import SchedulingEnvelope
+from batcher.plan.resource import (
+    SchedulingEnvelope,
+    WorkerSlot,
+    is_heterogeneous,
+    plan_worker_slots,
+)
 from batcher.plan.visitor import scanned_source_ids
 
 __all__ = ["execute_distributed", "resolve_worker_fanout"]
@@ -102,6 +107,20 @@ _TARGET_WORKER_CORES = 24
 #: of two-core workers pays that fixed cost many times over for parallelism the cores cannot
 #: deliver. Slicing is declined outright rather than reduced, leaving the coarser fan-out.
 _MIN_WORKER_CORES = 8
+
+#: Cores left unreserved on every node a per-node fleet lands on.
+#:
+#: A fleet spans every node, so tiling each one exactly means the placement group holds
+#: **100% of the cluster's schedulable CPU** — and the query's own plain Ray tasks (the map
+#: UDF, the hardware probe) are submitted outside it and can never be placed. Measured here:
+#: the 27-node fleet's slots summed to 384 cores against a cluster of exactly 384, and the
+#: fleet then failed to come up complete on two runs out of three, each costing a 120-second
+#: wait before the query ran at reduced width.
+#:
+#: One core is the same figure `_headroom_grant` leaves on the uniform path, for the same
+#: reason and with the same bound: it costs a node with `c` cores a `1/c` share of its
+#: compute, and buys a hard limit on a stall the query cannot otherwise escape.
+_NODE_RESERVE_CORES = 1.0
 
 
 def resolve_worker_fanout(num_workers: int | None) -> int:
@@ -199,22 +218,51 @@ def execute_distributed(
         # what this stage is (no device grant, no accelerator nodes, unreadable topology).
         fill = None
         by_device = False
+        # A fleet of unequal machines is tiled per node rather than by one grant every node
+        # can host — see `_heterogeneous_fill`. `None` on a homogeneous or unreadable cluster,
+        # which then takes the uniform path below exactly as before.
+        slots = None
         if num_workers is None:
             fill = _accelerator_fill_workers(num_gpus)
             by_device = fill is not None
             if fill is None:
-                fill = _cluster_fill_workers()
+                slots = _heterogeneous_fill()
+                # The scalar `num_cpus` stays the fleet's SMALLEST grant, so every bound that
+                # reads it (placement, oversubscription, the clamp) keeps reading a figure no
+                # worker exceeds; the per-worker tuple carries what each actually gets.
+                fill = (
+                    (len(slots), min(slot.cpus for slot in slots))
+                    if slots
+                    else _cluster_fill_workers()
+                )
         if fill is not None:
-            desired, (workers, num_cpus) = workers, fill
+            # The uniform fill carries a third figure — the grant before its scheduling
+            # headroom was taken off — and the accelerator/heterogeneous fills do not; unpack
+            # the tail rather than the tuple so all three shapes stay one branch.
+            desired, (workers, num_cpus) = workers, fill[:2]
+            width = fill[2] if len(fill) > 2 else 0.0
             mem = (
                 int(envelope.memory_bytes * max(1, desired) / workers)
                 if envelope is not None and envelope.memory_bytes
                 else (envelope.memory_bytes if envelope is not None else 0)
             )
+            per_worker = (
+                {
+                    "worker_cpus": tuple(slot.cpus for slot in slots),
+                    "worker_memory_bytes": tuple(slot.memory_bytes for slot in slots),
+                    # The reserve `_NODE_RESERVE_CORES` holds back is a scheduling slot, not a
+                    # thread; each slot carries the width it may actually compute at.
+                    "worker_compute_cpus": tuple(slot.compute_cpus or slot.cpus for slot in slots),
+                }
+                if slots
+                else ({"compute_cpus": width} if width > num_cpus else {})
+            )
             envelope = (
-                dataclasses.replace(envelope, n_tasks=workers, num_cpus=num_cpus, memory_bytes=mem)
+                dataclasses.replace(
+                    envelope, n_tasks=workers, num_cpus=num_cpus, memory_bytes=mem, **per_worker
+                )
                 if envelope is not None
-                else SchedulingEnvelope(num_cpus=num_cpus, n_tasks=workers)
+                else SchedulingEnvelope(num_cpus=num_cpus, n_tasks=workers, **per_worker)
             )
             reset_scheduling_envelope(token)
             token = set_scheduling_envelope(envelope)
@@ -224,7 +272,7 @@ def execute_distributed(
                 (
                     f"one worker per {num_gpus:g}-device slice, {num_cpus:g} cores each"
                     if by_device
-                    else f"one worker per {num_cpus:g}-core node slice"
+                    else _fill_summary(slots, num_cpus)
                 ),
             )
         elif num_workers is not None:
@@ -243,7 +291,10 @@ def execute_distributed(
         # worker a share no GPU node can host — and the clamp below would then collapse the
         # fan-out to one worker per node, which is the behavior the device tiling exists to
         # replace.
-        share = 0.0 if by_device else _even_cpu_share(workers)
+        # `_even_cpu_share` produces one figure for the whole fleet, so raising a per-node
+        # fleet to it would put back exactly the uniformity this shape exists to avoid — and
+        # at the *average* node's size, which no node need be able to host.
+        share = 0.0 if (by_device or slots) else _even_cpu_share(workers)
         # The raise must not hand back the core the fill deliberately kept free.
         # `_cluster_fill_workers` thins its grant so the fleet leaves a schedulable core on
         # every node (`_headroom_grant`), while `_even_cpu_share` caps at `min(node cores)` —
@@ -327,7 +378,11 @@ def execute_distributed(
         # — enough to use the machine before spilling, bounded so it never OOMs the smallest
         # node. A tighter Carbonite estimate still wins; the topology having no memory info
         # leaves the grant untouched (today's behavior).
-        sized = _size_worker_memory(envelope, workers, num_cpus)
+        # Skipped for a per-node fleet: this sizes every worker from the *smallest* node's RAM
+        # divided by the *busiest* node's worker count, which is the 228 MB figure
+        # `_heterogeneous_fill` exists to replace. Those slots already carry each worker's own
+        # node's budget.
+        sized = envelope if slots else _size_worker_memory(envelope, workers, num_cpus)
         if sized is not envelope:
             envelope = sized
             reset_scheduling_envelope(token)
@@ -489,10 +544,14 @@ def _accelerator_fill_workers(num_gpus: float) -> tuple[int, float] | None:
         return None
 
 
-def _cluster_fill_workers() -> tuple[int, float] | None:
+def _cluster_fill_workers() -> tuple[int, float, float] | None:
     """The cluster-filling fan-out: enough `min`-core workers to fill EVERY node's cores.
 
-    Returns `(workers, num_cpus)` on a genuine multi-node cluster. `num_cpus` = the smallest
+    Returns `(workers, num_cpus, compute_cpus)` on a genuine multi-node cluster.
+    `compute_cpus` is the grant BEFORE `_headroom_grant` thins it: the headroom is a
+    scheduling reserve (a core left free so the query's own plain tasks can be placed) and it
+    must not also narrow the worker's rayon pool. The two differ by `1/node_cores`, which is a
+    percent on a 96-core node and **a quarter of a 4-core one**. `num_cpus` = the smallest
     worker node's cores, so a worker is placeable on any node (SPREAD-safe); `workers` =
     ``Σ floor(node_cores / num_cpus)`` over the worker nodes — one worker per `num_cpus`-core
     slice. A **homogeneous** cluster reduces to one worker per node exactly as before; a
@@ -519,13 +578,131 @@ def _cluster_fill_workers() -> tuple[int, float] | None:
         # entirely and never saw it.
         shape = _numa_sliced(_fill_grant(node_cpus))
         workers = sum(max(1, int(c // shape)) for c in node_cpus)
-        num_cpus = _headroom_grant(_placeable_grant(shape, node_cpus), node_cpus)
-        return workers, num_cpus
+        placeable = _placeable_grant(shape, node_cpus)
+        return workers, _headroom_grant(placeable, node_cpus), placeable
     except Exception as exc:
         # Same reason as the accelerator fill above: a topology read that fails quietly halves
         # a large cluster's fan-out and leaves nothing to attribute it to.
         note_suppressed("dist", "read the cluster topology for the fan-out", exc)
         return None
+
+
+def _fill_summary(slots: list[WorkerSlot] | None, num_cpus: float) -> str:
+    """One line describing the fan-out the cluster fill chose, for the decision trace.
+
+    A uniform fleet is its grant. A per-node fleet is the distinct grants it produced and how
+    many workers hold each, which is the figure a reader needs to tell "the big node is being
+    used" from "the big node is hosting twenty-four workers sized for the small one".
+
+    Args:
+        slots: The per-node worker slots, or `None` for a uniform fleet.
+        num_cpus: The uniform grant, used when there are no slots.
+
+    Returns:
+        The summary line.
+    """
+    if not slots:
+        return f"one worker per {num_cpus:g}-core node slice"
+    from collections import Counter
+
+    census = Counter(slot.cpus for slot in slots)
+    shape = ", ".join(f"{count}x{cpus:g} cores" for cpus, count in sorted(census.items()))
+    return f"per-node slices on an uneven fleet ({shape})"
+
+
+def _heterogeneous_fill() -> list[WorkerSlot] | None:
+    """Per-node worker slots for a fleet whose nodes are not the same size, else `None`.
+
+    `_cluster_fill_workers` answers "one grant, how many workers" — the right question on a
+    homogeneous cluster and an unanswerable one on a mixed fleet, because the grant must fit
+    the smallest node and the fan-out is then that grant tiled everywhere. Measured on the
+    27-node cluster this was written for (one 96-core/206 GB node, two 48-core, seven 16-core,
+    sixteen 4-core): 96 workers of 4 cores, each budgeted **228 MB** of RAM, including the
+    twenty-four packed onto the 206 GB machine.
+
+    This asks the question per node instead (`plan.resource.plan_worker_slots`), so the same
+    cluster becomes 32 workers — four of ~24 cores and 43.8 GB on the big node, one of 3 cores
+    and 7.3 GB on each small one — and every worker's grant describes the machine it lands on.
+    Ray places heterogeneous bundles the same way it places uniform ones (`_collective_bundles`
+    has built them for GPU collectives all along), so this costs nothing but the arithmetic.
+    Measured: the placement group for those 32 bundles forms in under a second, under SPREAD
+    and PACK alike.
+
+    A slot is cut from a particular node, but **Ray decides which node its bundle lands on**,
+    so nothing here can assume slot `i` reaches the machine it was measured from. What makes
+    that safe is the bundle reserving the slot's *memory* as well as its cores
+    (`ray_runtime.scheduling._bundle`): Ray will not place a 41 GB bundle on a node without
+    41 GB free, so a grant can only ever land somewhere that can honour it. Reserving the
+    cores alone would leave the memory half of the grant as a hope about placement.
+
+    Returns `None` on a homogeneous cluster, a single node, or an unreadable topology, all of
+    which keep `_cluster_fill_workers` and are byte-for-byte unchanged.
+    """
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime.scaling import cluster_numa_nodes, node_classes
+
+    try:
+        rows = [n for n in node_classes() if float(n["cpus"]) > 0]
+        cores = [float(n["cpus"]) for n in rows]
+        if len(cores) <= 1 or not is_heterogeneous(cores):
+            return None
+        try:
+            domains = max(1, int(cluster_numa_nodes()))
+        except Exception as exc:
+            note_suppressed("dist", "read the worker NUMA topology for the fleet shape", exc)
+            domains = 1
+        slots = plan_worker_slots(
+            cores,
+            [int(float(n.get("memory") or 0)) for n in rows],
+            target_cores=_TARGET_WORKER_CORES,
+            min_slice_cores=_MIN_WORKER_CORES,
+            domains=domains,
+            memory_share=active_config().memory.soft_limit,
+            node_free_cores=_free_cores_ignoring_our_own_fleet(rows),
+            node_reserve_cores=_NODE_RESERVE_CORES,
+        )
+        return slots or None
+    except Exception as exc:
+        # Same reason as the fills beside it: a topology read that fails quietly reshapes the
+        # fleet and leaves nothing to attribute it to. `None` keeps the uniform sizing.
+        note_suppressed("dist", "plan the heterogeneous fleet shape", exc)
+        return None
+
+
+def _free_cores_ignoring_our_own_fleet(rows: list[dict]) -> list[float]:
+    """Per-node free cores, counting the session fleet's own reservation as available.
+
+    Sizing against free cores is right when the busy ones belong to another tenant and wrong
+    when they belong to us. A warm session fleet holds most of the cluster on purpose -- that
+    is what makes the next `collect()` start warm -- so without this the second query of a
+    session reads a nearly-full cluster and cuts its workers out of the remainder.
+
+    Measured on the 28-node / 384-core mixed cluster, `reuse_session_fleet` at its default:
+    an idle cluster planned 32 slots totalling **357** cores (5x24, 3x23, 8x15, 16x3) and the
+    very next query, with 27 CPU free, planned 32 slots totalling **32** -- every worker
+    collapsed to one core. Eleven-fold, and entirely self-inflicted: the rayon width shipped
+    to each worker and the split assigner's capacity weighting both read those grants.
+
+    Capped at each node's nameplate, so adding a holding back can only ever restore capacity
+    the node actually has. Falls back to the plain free-core figure whenever the fleet's
+    placement is unreadable (`fleet.held`), which is the behaviour that existed before this.
+
+    Args:
+        rows: Live per-node records from `node_classes()` -- `node_id`, `cpus`, `free_cpus`.
+
+    Returns:
+        One usable-core figure per node, positionally matching `rows`.
+    """
+    from batcher.dist.fleet.held import session_fleet_held_cores
+
+    held = session_fleet_held_cores()
+    out = []
+    for n in rows:
+        nameplate = float(n["cpus"])
+        free = float(n.get("free_cpus") or nameplate)
+        ours = held.get(str(n.get("node_id") or ""), 0.0) if held else 0.0
+        out.append(min(nameplate, free + ours))
+    return out
 
 
 def _numa_sliced(grant: float) -> float:
@@ -844,7 +1021,18 @@ def _rescale_envelope(
     """
     actual = max(1, actual)
     memory_bytes = int(envelope.memory_bytes * desired / actual) if envelope.memory_bytes else 0
-    return dataclasses.replace(envelope, n_tasks=actual, memory_bytes=memory_bytes)
+    # A per-node fleet's grants are positional, so a clamp that drops workers must drop their
+    # grants too — a tuple left at the old length would hand worker `i` the slot of a worker
+    # the fleet no longer has. The surviving grants are NOT rescaled: each still describes the
+    # machine its worker sits on, which a smaller fan-out does not change.
+    trimmed = {}
+    if envelope.worker_cpus or envelope.worker_memory_bytes or envelope.worker_compute_cpus:
+        trimmed = {
+            "worker_cpus": envelope.worker_cpus[:actual],
+            "worker_memory_bytes": envelope.worker_memory_bytes[:actual],
+            "worker_compute_cpus": envelope.worker_compute_cpus[:actual],
+        }
+    return dataclasses.replace(envelope, n_tasks=actual, memory_bytes=memory_bytes, **trimmed)
 
 
 def _is_splittable_source(source: Source) -> bool:
@@ -1581,8 +1769,19 @@ def _dispatch(
 
             if active_config().distributed.stream_inference:
                 from batcher.dist.executors.plan_analysis import split_into_resource_stages
+                from batcher.dist.streaming.pipeline.driver import fold_leading_scan
 
-                if split_into_resource_stages(plan) is not None:
+                # The same fold decision the driver makes, asked here because it decides
+                # whether there *is* a pipeline: a `scan -> GPU map` chain is one stage when
+                # the scan folds and two when it does not, and only the two-stage form has an
+                # overlap to win. See `fold_leading_scan` for what the fleet shape has to do
+                # with it.
+                if (
+                    split_into_resource_stages(
+                        plan, fold_leading_scan=fold_leading_scan(plan, workers)
+                    )
+                    is not None
+                ):
                     from batcher.dist.streaming import stream_distributed_pipeline
 
                     return stream_distributed_pipeline(plan, sources, workers, hub)

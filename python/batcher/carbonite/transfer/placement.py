@@ -18,10 +18,11 @@ the assignment, keeping this layer free of Ray.
 
 from __future__ import annotations
 
+import heapq
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
-__all__ = ["assign_reducer_hosts", "reducer_affinity"]
+__all__ = ["assign_reducer_hosts", "default_reducer_hosts", "reducer_affinity"]
 
 # A bucket is "concentrated" — worth pulling its reducer onto a node — only when that
 # node holds at least this fraction of the bucket's bytes. At/below it the bucket is
@@ -63,16 +64,60 @@ def reducer_affinity(
     return out
 
 
+def default_reducer_hosts(
+    n_reducers: int, capacities: Sequence[float] | None, n_actors: int
+) -> list[int]:
+    """The default host per reducer, before any locality affinity overrides it.
+
+    Plain `reducer r -> actor r % n_actors` when every actor is the same size, which is what
+    this always did. With `capacities` it is the *weighted* form of the same deal: the actor
+    with the smallest share of its own capacity takes the next bucket, so a 24-core worker
+    hosts six buckets for every one a 4-core worker hosts.
+
+    That matters because a bucket is reduced by exactly one worker and the buckets are
+    hash-balanced, so an equal deal makes the reduce phase as long as its *slowest* worker
+    needs -- the fleet is paced by its smallest machine however large the rest of it is.
+
+    Equal capacities reproduce the round-robin exactly, index for index: every actor starts at
+    a share of zero and ties break on the lowest index, so bucket `r` lands on actor
+    `r % n_actors` as before.
+
+    Args:
+        n_reducers: How many reducer buckets need a host.
+        capacities: Relative throughput per actor, or `None` for an even deal.
+        n_actors: How many actors are available.
+
+    Returns:
+        An actor index per reducer.
+    """
+    if not capacities or len(capacities) != n_actors:
+        return [r % n_actors for r in range(n_reducers)]
+    caps = [float(c) if c and c > 0 else 1.0 for c in capacities]
+    heap = [(0.0, a) for a in range(n_actors)]
+    heapq.heapify(heap)
+    counts = [0] * n_actors
+    hosts: list[int] = []
+    for _ in range(n_reducers):
+        _, a = heapq.heappop(heap)
+        hosts.append(a)
+        counts[a] += 1
+        heapq.heappush(heap, (counts[a] / caps[a], a))
+    return hosts
+
+
 def assign_reducer_hosts(
-    n_reducers: int, actor_nodes: Sequence[str], affinity: Mapping[int, str]
+    n_reducers: int,
+    actor_nodes: Sequence[str],
+    affinity: Mapping[int, str],
+    capacities: Sequence[float] | None = None,
 ) -> list[int]:
     """Host-actor index for each of `n_reducers` reducers.
 
     A bucket with an `affinity` node is hosted on an actor *on that node* (round-robin
     across the node's actors, so one hot node's reducers still spread over its actors);
-    every other bucket keeps the default `reducer r → actor r` round-robin, so an
-    unskewed shuffle's placement — and behavior — is exactly as before. `actor_nodes[i]`
-    is the node id actor `i` runs on.
+    every other bucket takes the default deal (`default_reducer_hosts`), so an unskewed shuffle
+    over an even fleet places exactly as before. `actor_nodes[i]` is the node id actor `i`
+    runs on.
 
     With no actors there is nowhere to place anything, and the answer is an empty list
     rather than a list of zeros. `[0, 0, ...]` names actor `0` of a fleet that has none,
@@ -83,6 +128,8 @@ def assign_reducer_hosts(
         n_reducers: How many reducer buckets need a host.
         actor_nodes: Node id per actor, indexed by actor.
         affinity: Bucket to node, from `reducer_affinity`.
+        capacities: Relative throughput per actor, so a fleet of unequal machines is dealt
+            buckets in proportion to what each can reduce. `None` deals evenly.
 
     Returns:
         An actor index per reducer, or an empty list when there are no actors.
@@ -95,7 +142,7 @@ def assign_reducer_hosts(
     for i, node in enumerate(actor_nodes):
         nodes_to_actors[node].append(i)
 
-    hosts = [r % n_actors for r in range(n_reducers)]
+    hosts = default_reducer_hosts(n_reducers, capacities, n_actors)
     cursor: dict[str, int] = defaultdict(int)
     for r in range(n_reducers):
         node = affinity.get(r)

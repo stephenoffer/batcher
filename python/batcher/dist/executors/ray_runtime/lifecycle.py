@@ -42,7 +42,7 @@ from .scheduling import (
 )
 
 
-def engine_config_json(num_cpus: float | None = None) -> str:
+def engine_config_json(num_cpus: float | None = None, memory_bytes: int | None = None) -> str:
     """The driver's active `EngineConfig` (morsel size, parallelism) as JSON, to
     ship into remote tasks.
 
@@ -56,6 +56,19 @@ def engine_config_json(num_cpus: float | None = None) -> str:
     `num_cpus` from its own partition (`map._adaptive_task_cpus`), so the envelope's
     per-worker grant is not what any individual map task actually holds. Omit it and the
     envelope's grant is used (the shuffle operators, whose tasks are uniform).
+
+    `memory_bytes` pins the spill threshold to *this worker's* memory grant, for the same
+    reason `num_cpus` pins its thread width: on a fleet whose nodes are unequal the envelope's
+    scalar is the smallest node's figure, and handing it to a worker on the biggest machine
+    makes that machine spill a join it could have held in RAM. Omit it and the envelope's
+    grant is used, which is every uniform fleet.
+
+    Such a grant is also taken **as given**, where the envelope's is passed through
+    `_spill_budget` first. That headroom lifts a *point estimate of the query's footprint*,
+    which is routinely too low and costs a disk round trip when it is; a per-worker grant is
+    not an estimate but the worker's share of its own node's RAM, and multiplying a hardware
+    ceiling by sixteen is the OOM the ceiling exists to prevent. Measured here: a worker on an
+    8.6 GB node came out with a 20.3 GB threshold.
 
     When a `SchedulingEnvelope` is in force (the ambient Carbonite grant for the
     current distributed execution), its per-task `memory_bytes` is folded into
@@ -82,14 +95,29 @@ def engine_config_json(num_cpus: float | None = None) -> str:
         if num_cpus is not None:
             grant = num_cpus
         elif env is not None:
-            grant = env.num_cpus
+            # The *compute* width, which is the reservation on any fleet that does not thin
+            # one. Both fills hold a core back per node so the query's own plain Ray tasks can
+            # be placed; reading the reservation here made that scheduling reserve a missing
+            # thread too — 1% of a 96-core node, a quarter of a 4-core one.
+            grant = env.slot_compute_cpus()
         else:
             grant = 1.0
         cfg["parallelism"] = max(1, int(grant))
 
-    if env is not None and env.memory_bytes > 0:
-        existing = int(cfg.get("memory_budget_bytes", 0) or 0)
-        budget = _spill_budget(env.memory_bytes, env.n_tasks)
+    granted = memory_bytes if memory_bytes is not None else (env.memory_bytes if env else 0)
+    if granted > 0:
+        # The driver's own budget must not bound a worker sized from a different machine. It
+        # describes the driver in both the cases that are not an instruction: a cap the driver
+        # *sensed* from its own live envelope (`MemoryConfig.max_memory_bytes_sensed`), and no
+        # cap at all, where the budget falls back to `default_total_bytes` — a stand-in for a
+        # machine nobody measured. Measured here: both produced the same ~7.7 GB ceiling on a
+        # worker granted 43.8 GB of a 206 GB node. A cap the user actually *set* is an
+        # instruction about the query and still wins over every worker's own node.
+        mem = active_config().memory
+        user_set = mem.max_memory_bytes is not None and not mem.max_memory_bytes_sensed
+        local = memory_bytes is not None and not user_set
+        existing = 0 if local else int(cfg.get("memory_budget_bytes", 0) or 0)
+        budget = granted if local else _spill_budget(granted, env.n_tasks if env is not None else 1)
         cfg["memory_budget_bytes"] = budget if existing <= 0 else min(existing, budget)
     return json.dumps(cfg)
 

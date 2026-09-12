@@ -253,6 +253,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
 | `bt.date_range(start, end, *, interval_days=1, name="date")` | the date-dimension generator: a one-column Dataset of dates, inclusive, as ISO `YYYY-MM-DD` |
 | {py:func}`bt.compact(path, *, target_size_mb=128.0, num_files=None, by=None, format=None, **opts) <batcher.compact>` | rewrite many small files at `path` into fewer larger ones in place; returns a {py:class}`WriteManifest <batcher.io.WriteManifest>` |
 | {py:func}`bt.engine_version() <batcher.engine_version>` | the version reported by the compiled Rust engine (`str`) |
+| {py:func}`bt.release_cluster() <batcher.release_cluster>` | hand the warm shuffle fleet and inference pools back to the cluster now, instead of waiting out `distributed.session_fleet_idle_s` (the fleet and CPU pools) or `distributed.warm_inference_idle_s` (a GPU pool's devices); a no-op when nothing is warm |
 | {py:func}`bt.start_ui(*, port=4040, host="127.0.0.1", open_browser=False) <batcher.start_ui>` | start the web dashboard (queries, plan DAG, per-operator timings, live logs); returns its URL |
 | {py:func}`bt.stop_ui() <batcher.stop_ui>` | stop the web dashboard; safe to call when none is running |
 | {py:func}`bt.ui_url() <batcher.ui_url>` | the running dashboard's URL, or `None` |

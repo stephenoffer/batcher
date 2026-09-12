@@ -106,7 +106,7 @@ A pool that respawns per execution reloads the model every time. Batcher keeps G
 
 That's worth about 2x on iterative or repeated inference, and far more when the load dominates. A gpt2 FP16 load takes 7 to 10 s while generation takes about 1 s, so paying it once rather than per execution is most of the wall clock. Measured over 8xT4 with 2,048 prompts, Batcher generated at 814.8 prompt/s, finishing in 2.51 s with 100% text match.
 
-Pools are keyed by UDF identity, healed when an actor dies to preemption, and freed at process exit or through `release_inference_pools()`.
+Pools are keyed by UDF identity, healed when an actor dies to preemption, and freed at process exit or through `release_inference_pools()`. They are also freed on their own once a session goes quiet, after `distributed.warm_inference_idle_s` of no stage running on them, which is 120 seconds by default. Holding a device across a whole session is a deadlock rather than an optimization on a cluster with a second tenant, because a device has no oversubscription to fall back on: a finished query that keeps every GPU leaves the next pool pending forever, and nothing reports it. Back-to-back queries never wait for the rebuild, since taking the pool cancels the pending release, and `0` restores whole-session residency for a process that owns its cluster.
 
 :::{important}
 A warm pool only helps if the model is *loadable once*. That's why `map_batches(Model, num_gpus=1)` takes a class rather than a function. The class's `__init__` loads the model and `__call__` runs it. Passing a closure that loads the model per batch emits a `PerformanceWarning`, and it throws away the single biggest win on this page.

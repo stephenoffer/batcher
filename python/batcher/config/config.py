@@ -119,6 +119,19 @@ class ExecutionConfig:
     """
 
     # 0 means "use all available cores".
+    #
+    # Leave it at 0 for distributed runs on a fleet of unequal machines. 0 is what lets
+    # `dist.executors.ray_runtime.lifecycle.engine_config_json` pin each worker's rayon
+    # width to the cores that worker was actually GRANTED, which is the whole point of the
+    # per-node fleet plan: measured on a 27-node mixed cluster, a worker granted 24 cores
+    # ships `parallelism=24` and one granted 3 ships `parallelism=3`.
+    #
+    # Any non-zero value is taken as an instruction and shipped to EVERY worker unchanged,
+    # which on that same cluster gives a 4-core node a 16-thread pool (oversubscribed
+    # fourfold) while capping the 96-core node's workers at 16 — the thread thrash
+    # `engine_config_json` documents, reintroduced by the knob meant to tune it. It is the
+    # right setting for a single node and a footgun on a heterogeneous fleet.
+    # Pinned by `tests/unit/test_parallelism_pin.py`.
     parallelism: int = 0
     # Default morsel size in rows (§1.4): fits L2/L3, amortizes scheduling. This is
     # the value shipped to Rust as `EngineConfig.morsel_rows`; the Rust
@@ -334,6 +347,17 @@ class MemoryConfig:
     # instead of OOMing. Set it explicitly to pin a cap the OS won't report; set
     # `unbounded_memory` to opt out of auto-sensing and stay fully in-memory.
     max_memory_bytes: int | None = None
+    # Whether `max_memory_bytes` above was *sensed* rather than *set*, which is the difference
+    # between a fact about one machine and an instruction about the query. The `api` resolver
+    # sets this when it fills the cap from the driver's live envelope.
+    #
+    # It exists because a sensed cap must not travel. The driver ships its config to every
+    # distributed worker, so on a fleet whose nodes are unequal the driver's own RAM was
+    # bounding the spill threshold of workers on much larger machines — measured here as a
+    # 7.7 GB ceiling on a worker granted 43.8 GB of a 206 GB node, from a 34 GB driver. A cap
+    # the user actually set is an instruction and still binds every worker; a sensed one
+    # describes the driver and binds only the driver.
+    max_memory_bytes_sensed: bool = False
     # Opt out of the auto-sensed spill budget: keep the in-memory fast path with no
     # out-of-core spilling in the data-plane engine (the pre-auto-tuning behavior).
     # The data-plane spill budget is then 0 (unbounded) regardless of `max_memory_bytes`;
@@ -1648,6 +1672,26 @@ class DistributedConfig:
     # pool whose actors died (preemption) is transparently respawned on next use. On by
     # default; result-identical (same model, same per-batch contract).
     warm_inference_pools: bool = True
+    # Seconds a warm inference pool survives with no stage running on it before its actors
+    # are killed and their **devices** returned to the cluster.
+    #
+    # Residency across a whole session was the original contract, and on a cluster with
+    # another tenant it is a deadlock rather than an optimization: a finished inference query
+    # leaves one actor per device holding every GPU for the life of the driver process, and
+    # unlike a core a device has no oversubscription to fall back on. Measured here — a
+    # Batcher arm and a Ray Data arm in one benchmark process, eight T4s: Batcher's pool
+    # finished, kept all eight, and Ray Data's own eight-actor pool then sat `pending` and
+    # never placed. Nothing failed; the second engine simply never ran.
+    #
+    # So the pool takes the discipline the shuffle's session fleet and the CPU map pool
+    # already have. Longer than their `session_fleet_idle_s` because what is rebuilt is not
+    # comparable: an actor respawn is ~1-2 s and a model load is 5-120 s, so a window sized
+    # for the fleet would throw away the thing this pool exists for. Back-to-back queries
+    # never see it at all — the timer is cancelled the moment a stage asks for the pool.
+    #
+    # `0` disables the release and restores residency for the whole session, which is the
+    # right setting for a dedicated inference process that owns its cluster.
+    warm_inference_idle_s: float = 120.0
     # `channels_last` + `torch.compile` a **vision (CNN)** model in the managed `ds.ml.infer`
     # path — kernel fusion + graph capture for ~2x GPU inference at inference-identical results
     # (measured: 1.9x on ResNet-50, predicted labels unchanged). Applied ONLY to convolutional

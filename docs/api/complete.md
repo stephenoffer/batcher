@@ -65,6 +65,7 @@ register SQL functions or sessions.
    udf
    compact
    vacuum
+   release_cluster
    engine_version
    versions
    show_versions

@@ -20,6 +20,7 @@ inside its own timed call.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,8 +78,16 @@ class Context:
         scale: float,
         engines: list[Engine],
         source: str | None = None,
+        needed: Collection[str] | None = None,
     ) -> Context:
-        tables = load_tables(SOURCE_FOR[benchmark], scale, source)
+        """Load `benchmark` at `scale`, optionally restricted to the tables `needed`.
+
+        `needed` is what the *selected* cases reference. It exists because the fixture is loaded
+        per process and `--isolate` starts one per case, so an eight-table load to answer a
+        one-table query is paid every time — and at sf10 on a 30 GiB box that load is itself what
+        gets SIGKILLed, before any engine runs. `None` loads everything, as before.
+        """
+        tables = load_tables(SOURCE_FOR[benchmark], scale, source, needed)
         return cls(benchmark=benchmark, tables=tables, engines=engines)
 
     @classmethod

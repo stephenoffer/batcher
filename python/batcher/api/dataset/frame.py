@@ -216,6 +216,24 @@ def _as_opt_str_list(value: str | list[str] | None) -> list[str] | None:
     return [value] if isinstance(value, str) else value
 
 
+def _require_columns(
+    available: list[str], names: list[str] | None, *, where: str
+) -> list[str] | None:
+    """Check every name exists, raising the same typed error the rest of the API raises.
+
+    The framework converters and the blob helpers reached pyarrow with an unchecked name
+    and surfaced ``KeyError: 'Field "x" does not exist in schema'`` -- a message naming
+    Arrow's schema object rather than the argument, and the only place on the frame where
+    a column typo was not a `ColumnNotFoundError` with a did-you-mean.
+    """
+    if names is None:
+        return None
+    for name in names:
+        if name not in available:
+            raise ColumnNotFoundError.of(name, sorted(available), where=where)
+    return names
+
+
 def _unknown_cols(missing: set[str], available: list[str]) -> str:
     """Render an unknown-column list with a 'did you mean' hint for the first miss."""
     ordered = sorted(missing)
@@ -1437,6 +1455,7 @@ class Dataset:
 
         from batcher.io.formats.multimodal.blob import default_blob_root, offload_blob_bytes
 
+        _require_columns(self.columns, [column], where="in offload_blobs()")
         resolved = root or default_blob_root()
         out_cols = list(self.columns)
         if uri_column not in out_cols:
@@ -1483,6 +1502,7 @@ class Dataset:
 
         from batcher.io.formats.multimodal.blob import read_blob_bytes
 
+        _require_columns(self.columns, [uri_column], where="in materialize_blobs()")
         out_cols = list(self.columns)
         if into not in out_cols:
             out_cols.append(into)
@@ -1744,6 +1764,11 @@ class Dataset:
         """
         mapping = _one_of(mapping, columns, "mapping", "columns")
         available = self._plan.available_columns()
+        if mapping is not None and not callable(mapping) and not hasattr(mapping, "items"):
+            raise PlanError(
+                f"rename(): mapping must be a dict of {{old: new}} or a callable, got "
+                f"{type(mapping).__name__} {mapping!r}"
+            )
         if callable(mapping):
             renamed = {c: mapping(c) for c in available}
             # One counting pass, not a `list.count()` per element: the latter is quadratic
@@ -1767,7 +1792,7 @@ class Dataset:
 
     def distinct(
         self,
-        subset: list[str] | None = None,
+        subset: str | list[str] | None = None,
         *,
         keep: str = "any",
         order_by: str | list[str] | list[tuple[str, bool]] | None = None,
@@ -1808,11 +1833,11 @@ class Dataset:
         """
         if subset is None:
             return self._derive(Distinct(self._plan))
-        return build_distinct(self, subset, keep, order_by)
+        return build_distinct(self, _as_opt_str_list(subset), keep, order_by)
 
     def unique(
         self,
-        subset: list[str] | None = None,
+        subset: str | list[str] | None = None,
         *,
         keep: str = "any",
         order_by: str | list[str] | list[tuple[str, bool]] | None = None,
@@ -1877,6 +1902,13 @@ class Dataset:
         by_cols = () if by is None else ((by,) if isinstance(by, str) else tuple(by))
         if num_files is None and target_size_mb is None and not by_cols:
             raise PlanError("repartition(): provide num_files, target_size_mb, or by")
+        # A partition key nobody checked is a partition key that silently does nothing: the
+        # write lays the data out by whatever `by` names, so a typo here produced one
+        # unpartitioned output and no error at all.
+        available = self.columns
+        for key in by_cols:
+            if key not in available:
+                raise ColumnNotFoundError.of(key, sorted(available), where="in repartition()")
         spec = RepartitionSpec(num_files=num_files, by=by_cols, target_size_mb=target_size_mb)
         return Dataset(self._plan, self._sources, spec)
 
@@ -2437,7 +2469,7 @@ class Dataset:
     def pivot(
         self,
         *,
-        index: list[str],
+        index: str | list[str],
         on: str,
         values: str,
         aggregate: str = "sum",
@@ -2482,13 +2514,13 @@ class Dataset:
             if aggregate != "sum":
                 raise PlanError("pass aggregate or aggfunc, not both")
             aggregate = aggfunc
-        return build_pivot(self, index, on, values, aggregate, columns)
+        return build_pivot(self, _as_opt_str_list(index), on, values, aggregate, columns)
 
     def unpivot(
         self,
         *,
-        index: list[str] | None = None,
-        on: list[str] | None = None,
+        index: str | list[str] | None = None,
+        on: str | list[str] | None = None,
         variable_name: str = "variable",
         value_name: str = "value",
     ) -> Dataset:
@@ -2516,7 +2548,9 @@ class Dataset:
                 >>> ds.unpivot(index=["id"]).to_pydict()
                 {'id': [1, 1], 'variable': ['a', 'b'], 'value': [10, 20]}
         """
-        return build_unpivot(self, index, on, variable_name, value_name)
+        return build_unpivot(
+            self, _as_opt_str_list(index), _as_opt_str_list(on), variable_name, value_name
+        )
 
     def fill_null(
         self,
@@ -2576,7 +2610,7 @@ class Dataset:
             raise PlanError("fill_null(): provide a `value` or a `strategy`")
         return build_fill_null(self, value, subset)
 
-    def drop_nulls(self, subset: list[str] | None = None, *, how: str = "any") -> Dataset:
+    def drop_nulls(self, subset: str | list[str] | None = None, *, how: str = "any") -> Dataset:
         """Drop rows that are null in any of `subset` (default: any column).
 
         The row-filtering counterpart to `fill_null`: with ``how="any"`` a row
@@ -2608,7 +2642,7 @@ class Dataset:
                 {'x': [1], 'y': [None]}
         """
         if how == "any":
-            return build_drop_nulls(self, subset)
+            return build_drop_nulls(self, _as_opt_str_list(subset))
         if how != "all":
             raise PlanError(f"drop_nulls(): how must be 'any' or 'all', got {how!r}")
         cols = list(self.columns) if subset is None else list(subset)
@@ -3538,7 +3572,7 @@ class Dataset:
         """
         return self.to_pydict()
 
-    def drop_duplicates(self, subset: list[str] | None = None) -> Dataset:
+    def drop_duplicates(self, subset: str | list[str] | None = None) -> Dataset:
         """Remove duplicate rows — the pandas ``drop_duplicates`` spelling of :meth:`distinct`.
 
         Args:
@@ -5923,7 +5957,7 @@ class Dataset:
         self._require_column(y, "corr")
         return self._exec_scalar(corr(Col(x), Col(y)))
 
-    def corr_matrix(self, columns: list[str] | None = None) -> Dataset:
+    def corr_matrix(self, columns: str | list[str] | None = None) -> Dataset:
         """The pairwise Pearson correlation matrix over numeric columns.
 
         **Executes** and returns a small `Dataset`: a ``column`` label column plus one
@@ -5950,9 +5984,9 @@ class Dataset:
         """
         from batcher.api.dataset._describe import corr_matrix
 
-        return corr_matrix(self, columns)
+        return corr_matrix(self, _as_opt_str_list(columns))
 
-    def cov_matrix(self, columns: list[str] | None = None) -> Dataset:
+    def cov_matrix(self, columns: str | list[str] | None = None) -> Dataset:
         """The pairwise sample covariance matrix over numeric columns.
 
         The covariance companion to `corr_matrix`: **executes** and returns a small
@@ -5977,7 +6011,7 @@ class Dataset:
         """
         from batcher.api.dataset._describe import cov_matrix
 
-        return cov_matrix(self, columns)
+        return cov_matrix(self, _as_opt_str_list(columns))
 
     def cov(self, x: str, y: str, *, ddof: int = 1) -> float | None:
         """The covariance of columns `x` and `y` (SQL ``COVAR_SAMP``/``COVAR_POP``).
@@ -6382,7 +6416,7 @@ class Dataset:
         """
         return _to_polars(self._plan, self._sources, self.columns, self._cache)
 
-    def to_numpy(self, columns: list[str] | None = None) -> dict[str, Any]:
+    def to_numpy(self, columns: str | list[str] | None = None) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: numpy.ndarray}`` dict.
 
         A terminal operation for numeric / scientific work: each column becomes a NumPy
@@ -6407,9 +6441,10 @@ class Dataset:
         """
         from batcher.api.dataset._export import to_numpy
 
-        return to_numpy(self, columns)
+        cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_numpy()")
+        return to_numpy(self, cols)
 
-    def to_jax(self, columns: list[str] | None = None) -> dict[str, Any]:
+    def to_jax(self, columns: str | list[str] | None = None) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: jax.Array}`` dict.
 
         The JAX counterpart of `to_numpy`: each column becomes a ``jax.numpy`` array, with a
@@ -6433,7 +6468,8 @@ class Dataset:
         """
         from batcher.api.dataset._export import to_jax
 
-        return to_jax(self, columns)
+        cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_jax()")
+        return to_jax(self, cols)
 
     def to_pydict(self) -> dict[str, list[Any]]:
         """Execute the plan and return the result as a column-oriented dict.
@@ -6473,7 +6509,9 @@ class Dataset:
         """
         return _to_pylist(self._plan, self._sources, self.columns, self._cache)
 
-    def to_torch(self, *, columns: list[str] | None = None, batch_size: int | None = None) -> Any:
+    def to_torch(
+        self, *, columns: str | list[str] | None = None, batch_size: int | None = None
+    ) -> Any:
         """A re-iterable ``torch.utils.data.IterableDataset`` of per-batch tensor dicts.
 
         Each item is a ``{column: torch.Tensor}`` for one engine batch (non-numeric
@@ -6497,10 +6535,15 @@ class Dataset:
         """
         from batcher.api.dataset._export import to_torch
 
-        return to_torch(self, columns, batch_size)
+        cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_torch()")
+        return to_torch(self, cols, batch_size)
 
     def to_torch_dataloader(
-        self, *, columns: list[str] | None = None, batch_size: int | None = None, **dl_kwargs: Any
+        self,
+        *,
+        columns: str | list[str] | None = None,
+        batch_size: int | None = None,
+        **dl_kwargs: Any,
     ) -> Any:
         """A ``torch.utils.data.DataLoader`` over the engine-batched tensor dicts.
 
@@ -6526,9 +6569,14 @@ class Dataset:
         """
         from batcher.api.dataset._export import to_torch_dataloader
 
-        return to_torch_dataloader(self, columns, batch_size, **dl_kwargs)
+        cols = _require_columns(
+            self.columns, _as_opt_str_list(columns), where="in to_torch_dataloader()"
+        )
+        return to_torch_dataloader(self, cols, batch_size, **dl_kwargs)
 
-    def to_tf(self, *, columns: list[str] | None = None, batch_size: int | None = None) -> Any:
+    def to_tf(
+        self, *, columns: str | list[str] | None = None, batch_size: int | None = None
+    ) -> Any:
         """A re-iterable ``tf.data.Dataset`` of per-batch tensor dicts (needs `tensorflow`).
 
         Each element is one engine batch's numeric columns as TensorFlow tensors;
@@ -6551,7 +6599,8 @@ class Dataset:
         """
         from batcher.api.dataset._export import to_tf
 
-        return to_tf(self, columns, batch_size)
+        cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_tf()")
+        return to_tf(self, cols, batch_size)
 
     def to_ray_dataset(
         self,

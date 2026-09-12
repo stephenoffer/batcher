@@ -394,10 +394,20 @@ def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
     node's cores — the cluster's entire CPU capacity — so a respawn issued while the fleet
     it replaces is still being reaped cannot be placed, and the spawn silently degrades to
     the 1-2 workers it *can* place (measured: the same join at 16 s on a 2-worker fleet).
+
+    The config is re-granted **per worker** on a fleet whose nodes are unequal, for the same
+    reason the spawn ships one per worker: a re-grant carrying the uniform config would undo
+    the per-node sizing on every reuse, so the *first* query on a warm fleet would use the big
+    nodes and every later one would not. A uniform fleet re-grants `cfg_json` itself, which is
+    what this always did.
     """
     import ray
 
-    ray.get([a.set_grant.remote(credits, cfg_json) for a in fleet.actors])
+    from batcher.dist.executors.ray_runtime import current_envelope
+    from batcher.dist.flight_worker import _slot_engine_configs
+
+    cfgs = _slot_engine_configs(current_envelope(), len(fleet.actors), cfg_json, fleet.pg is not None)
+    ray.get([a.set_grant.remote(credits, cfgs[i]) for i, a in enumerate(fleet.actors)])
     fleet.credits = credits
     fleet.cfg_json = cfg_json
 

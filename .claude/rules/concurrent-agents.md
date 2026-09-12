@@ -185,6 +185,20 @@ not stage is simply absent. Measured by running the sandbox with and without eac
 exactly the drift the test exists to catch. It is 7.5 MB. The rest are not compiled into the
 `.so`, so HEAD's copies are right and keep the "committed state, not their WIP" property.
 
+**`python/` needs the same treatment whenever the control plane is part of what you are
+measuring, and this recipe did not say so.** A session instrumented the engine's executor-routing
+decision, ran it in a sandbox staged the way above, and read `prefer_materializing_aggregate=false`
+— which looks exactly like a broken hint and sent it looking for a wire that was not broken. The
+flag is computed in `kyber/optimizer/facade.py`, the change that makes it fire on that shape was
+**uncommitted**, and `git archive HEAD python` had staged a control plane that genuinely does not
+set it. Re-staged from the working tree, the same run read `prefer=true` and the real cause was
+one field further on.
+
+The rule generalises past both directories: **`git archive HEAD` is right for the files that are
+merely *present*, and wrong for any file whose behaviour is the subject of the measurement.**
+Decide per directory, and when a reading contradicts something you verified against the installed
+build minutes earlier, suspect the staging before you suspect the engine.
+
 Two things about this table are worth more than the entries.
 
 **The failure modes are not equally readable, and the worst one is not the loudest.** A
@@ -262,11 +276,25 @@ The head node is shared. With three other sessions running suites, a whole-direc
 
 Run the directory in chunks of ~40 files, one process each. **The reason that survives a
 hardware change is attribution, not headroom**: a chunk that is killed names itself, where a
-whole-directory run takes the entire result down with it and tells you nothing. (This
-paragraph said "the head node has 30 GB" for long enough that at least one session throttled
-itself on the strength of it. It is 184 GB with ~170 available and 96 cores. Measure with
-`free -g` rather than trusting a number in a document — including this one.) The same applies
-to a memory-hungry benchmark: a 10 M-row x 9-column A/B was killed until it was cut to 4 M.
+whole-directory run takes the entire result down with it and tells you nothing.
+
+**The head node is not one machine, so no number written here is the number you have.** This
+paragraph said "30 GB" for long enough that one session throttled itself on it; it was then
+corrected to "184 GB with ~170 available and 96 cores", which was a real reading of a real
+c5d.24xlarge and is wrong on the box this was next read on — `nproc` 16, `free -g` 30 GiB total
+and 16 available (2026-09-08). A correction that replaces one hardcoded figure with another
+inherits the defect it fixed. Read the box:
+
+```
+nproc; free -g
+```
+
+The consequence is not academic. A TPC-H **sf10** run with three engines preloading Arrow was
+OOM-killed on the small box at 22.6 GB RSS, and the wrapper reported exit 0 with an empty log,
+because the driver was backgrounded and python's stdout never flushed — so it looks like a
+benchmark that produced no output rather than one that died. `sudo dmesg -T | grep -i "killed
+process"` names it in one line. The same applies to any memory-hungry benchmark: a 10 M-row x
+9-column A/B was killed until it was cut to 4 M.
 
 **Write the loop carefully, because the obvious spelling is broken here and fails silently.**
 The shell is **zsh**, which does *not* word-split an unquoted parameter expansion, so this —

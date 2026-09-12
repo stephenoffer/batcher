@@ -44,6 +44,23 @@ def _fake_open(files: dict[str, str]):
     return opener
 
 
+def _fake_cgroup_tree(monkeypatch, files: dict[str, str]) -> None:
+    """Serve `files` from `open` **and** make their parent directories exist.
+
+    `cgroup_v2_dirs` keeps only directories that are really there, because under a cgroup
+    namespace `/proc/self/cgroup` names a host path that resolves to nothing and a non-empty
+    tuple of phantom dirs makes the memory probes read `None` on a container that has a
+    perfectly readable limit. A test faking a *delegated* (non-namespaced) hierarchy is
+    describing a machine where those directories do exist, so it has to fake `isdir` too --
+    faking only `open` describes no real machine and the filter drops the whole chain.
+    """
+    import builtins
+
+    dirs = {os.path.dirname(path) for path in files if path.startswith("/sys/fs/cgroup")}
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(os.path, "isdir", lambda path: path in dirs)
+
+
 def test_available_cpu_count_is_positive():
     assert hardware.available_cpu_count() >= 1
 
@@ -91,29 +108,29 @@ def test_cfs_quota_reads_non_namespaced_leaf_cgroup(monkeypatch):
     # A Ray worker in a delegated cgroup with NO namespace: the mount root reads unlimited,
     # but the real limit lives at the process's own leaf (from /proc/self/cgroup). Missing it
     # would over-subscribe. The tightest limit across root+leaf must win.
-    import builtins
-
-    files = {
-        "/proc/self/cgroup": "0::/system.slice/ray-worker-7.scope\n",
-        "/sys/fs/cgroup/cpu.max": "max 100000",  # root: unlimited
-        "/sys/fs/cgroup/system.slice/ray-worker-7.scope/cpu.max": "400000 100000",  # leaf: 4 cores
-    }
-    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    _fake_cgroup_tree(
+        monkeypatch,
+        {
+            "/proc/self/cgroup": "0::/system.slice/ray-worker-7.scope\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000",  # root: unlimited
+            "/sys/fs/cgroup/system.slice/ray-worker-7.scope/cpu.max": "400000 100000",  # 4 cores
+        },
+    )
     assert cgroup.cfs_quota_count() == 4  # the leaf limit, not the root's "unlimited"
 
 
 def test_cfs_quota_takes_tightest_across_the_hierarchy(monkeypatch):
     # cgroup v2 enforces the quota at every level: a limit set on a PARENT slice (not the
     # leaf, not the root) must still bind. The tightest cpu.max in the whole chain wins.
-    import builtins
-
-    files = {
-        "/proc/self/cgroup": "0::/parent.slice/child.scope\n",
-        "/sys/fs/cgroup/cpu.max": "max 100000",  # root: unlimited
-        "/sys/fs/cgroup/parent.slice/cpu.max": "600000 100000",  # parent: 6 cores (the binder)
-        "/sys/fs/cgroup/parent.slice/child.scope/cpu.max": "max 100000",  # leaf: unlimited
-    }
-    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    _fake_cgroup_tree(
+        monkeypatch,
+        {
+            "/proc/self/cgroup": "0::/parent.slice/child.scope\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000",  # root: unlimited
+            "/sys/fs/cgroup/parent.slice/cpu.max": "600000 100000",  # parent: 6 cores (binds)
+            "/sys/fs/cgroup/parent.slice/child.scope/cpu.max": "max 100000",  # leaf: unlimited
+        },
+    )
     assert cgroup.cfs_quota_count() == 6  # the parent slice's limit, missed by root+leaf only
 
 

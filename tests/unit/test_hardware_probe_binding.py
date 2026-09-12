@@ -219,6 +219,13 @@ def test_cgroup_v2_dirs_orders_leaf_before_its_ancestors(monkeypatch):
         raise OSError
 
     monkeypatch.setattr("builtins.open", opener)
+    # `cgroup_v2_dirs` keeps only directories that really exist, because under a cgroup
+    # namespace `/proc/self/cgroup` names a host path that resolves to nothing and a tuple of
+    # phantom dirs makes the memory probes read `None` on a container with a readable limit.
+    # A test describing a *delegated* hierarchy is describing a machine where those
+    # directories do exist, so it has to say so -- faking only `open` describes no real
+    # machine and every path here is filtered out before the ordering can be seen.
+    monkeypatch.setattr(os.path, "isdir", lambda path: path.startswith("/sys/fs/cgroup"))
     cgroup.cgroup_v2_dirs.cache_clear()
     dirs = cgroup.cgroup_v2_dirs()
     assert dirs[0] == "/sys/fs/cgroup", "the mount root comes first"

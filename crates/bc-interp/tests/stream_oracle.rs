@@ -104,7 +104,7 @@ fn executors(p: &RelOp, sources: &[Vec<RecordBatch>]) -> Vec<(&'static str, Vec<
         ),
         (
             "streaming-parallel",
-            execute_streaming_parallel(p, sources, 4, 0).expect("streaming-parallel"),
+            execute_streaming_parallel(p, sources, 4, 0, None).expect("streaming-parallel"),
         ),
     ]
 }
@@ -944,8 +944,9 @@ fn a_semi_join_with_a_huge_build_matches_the_oracle() {
         // half for exactly this reason.
         let plan: RelOp = RelOp::from_json(&json).expect("plan");
         let sources = [left.clone(), right.clone()];
-        let kept =
-            bc_interp::execute_streaming_parallel_or_hand_off(&plan, &sources, 4, 0, true, None);
+        let kept = bc_interp::execute_streaming_parallel_or_hand_off(
+            &plan, &sources, 4, 0, true, None, None,
+        );
         assert!(
             kept.is_ok(),
             "{jt}: a tiny probe against a huge build buys nothing by being handed over, got \
@@ -990,7 +991,7 @@ fn a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks()
     let plan: RelOp = RelOp::from_json(&json).expect("plan");
 
     let handed_off =
-        bc_interp::execute_streaming_parallel_or_hand_off(&plan, &sources, 4, 0, true, None);
+        bc_interp::execute_streaming_parallel_or_hand_off(&plan, &sources, 4, 0, true, None, None);
     assert!(
         matches!(
             handed_off,
@@ -1000,7 +1001,7 @@ fn a_large_probe_against_a_huge_build_is_handed_back_only_when_the_caller_asks()
     );
 
     // Not opted in: the same plan runs, and answers.
-    let ran = bc_interp::execute_streaming_parallel(&plan, &sources, 4, 0);
+    let ran = bc_interp::execute_streaming_parallel(&plan, &sources, 4, 0, None);
     assert!(ran.is_ok(), "not opted in, it must still answer: {ran:?}");
 }
 
@@ -1320,7 +1321,7 @@ fn a_root_limit_over_a_pipeline_still_stops_pulling_early() {
     let json = format!(r#"{{"op":"limit","input":{proj},"n":3,"offset":0}}"#);
     let p = plan(&json);
 
-    let got = execute_streaming_parallel(&p, &[src], 4, 0).expect(
+    let got = execute_streaming_parallel(&p, &[src], 4, 0, None).expect(
         "the parallel limit must stop before the bad batch, exactly as the sequential one does",
     );
     assert_eq!(rows(&got), vec!["1", "2", "3"]);

@@ -171,6 +171,11 @@ IMAGE_COUNTS: dict[int, tuple[str, int]] = {
     100: ("000", 1_000),
     1000: ("00", 10_000),
     10000: ("0", 100_000),
+    # The whole corpus, which is not a power of ten because the corpus is not. It is here
+    # because every tier above is too short to measure a distributed engine with: at 100,000
+    # images the fastest arm of the GPU inference benchmark finishes in ~11 s, and a run that
+    # short is mostly each engine's fixed startup rather than its throughput.
+    100000: ("", 211_742),
 }
 IMAGE_SUFFIX = ".jpg"
 # The corpus's native pixel dimensions (H, W). The decode benchmark targets these so all

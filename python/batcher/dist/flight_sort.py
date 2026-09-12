@@ -40,6 +40,7 @@ from batcher.dist.executors.ray_runtime import (
     map_barrier,
     map_partitions,
     shuffle_partitions,
+    topn_partition,
 )
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
 from batcher.dist.fleet import acquire_fleet, borrows_session_fleet, release_fleet
@@ -110,9 +111,12 @@ def execute_topn_flight(
     merge *after* the barrier, a Θ(workers · k log k) serial tail that grows exactly as the
     map phase in front of it shrinks. Folding makes the peak `2k` and leaves one merge behind
     the barrier instead of `workers` of them. It is `streaming_topn`'s fold, one level up.
-    """
-    import ray
 
+    Worker loss is survived: a partition whose worker dies is recomputed on a survivor from
+    its durable source split and folded back at its original index, so the tie-break at the
+    k-th place is unchanged (`policies._topn`). Until that landed this path gathered with a
+    bare `ray.get` and a mid-fold worker death lost the query, 5 times out of 5 under test.
+    """
     nat = engine()
     _ensure_ray(workers)
     cfg_json = engine_config_json()
@@ -151,8 +155,10 @@ def execute_topn_flight(
             worker_addrs=fleet_addrs,
         )
         refs = [actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)]
+
         merged: list = []
-        for i, ref in enumerate(refs):
+        dead: set[int] = set()
+        for i in range(workers):
             # In worker order, not arrival order. The fold has to be bounded, but it must
             # not become *arrival*-ordered: `LIMIT k` over rows that tie at the k-th place
             # may return any of them, and which ones it returns would then vary run to run
@@ -160,7 +166,7 @@ def execute_topn_flight(
             # exactly what the one-shot merge did. Waiting on worker `i` still overlaps the
             # merge with every later worker's scan, so the serial tail is one merge rather
             # than `workers` of them.
-            arrived = [b for b in ray.get(ref) if b.num_rows > 0]
+            arrived = topn_partition(refs, i, actors, local_ir, parts, dead)
             refs[i] = None  # drop the ref so the worker's copy can be freed
             if arrived:
                 merged = list(nat.execute_plan(merge_ir, [merged + arrived], cfg_json))

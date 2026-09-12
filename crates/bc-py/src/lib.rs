@@ -39,6 +39,7 @@ mod hardware;
 mod normalize;
 mod pool;
 mod process;
+mod route;
 mod shuffle;
 mod sketches;
 mod tracing_init;
@@ -91,6 +92,12 @@ fn execute_plan(
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),
+                    // The options the streaming executor needs to hand a *build side* to the
+                    // materializing executor — the pool, the spill directory and the cancel
+                    // token. Without them that route would run a 60M-row breaker unable to spill
+                    // where the caller configured or to be cancelled, which is why it was not
+                    // taken before. See `stream::builds::build_materializes_faster`.
+                    Some(&opts),
                 ) {
                     // Either a breaker would have blown the envelope (the materializing executor
                     // spills it; re-run there rather than OOM) or the streaming executor found it
@@ -153,6 +160,12 @@ fn execute_plan_metered(
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),
+                    // The options the streaming executor needs to hand a *build side* to the
+                    // materializing executor — the pool, the spill directory and the cancel
+                    // token. Without them that route would run a 60M-row breaker unable to spill
+                    // where the caller configured or to be cancelled, which is why it was not
+                    // taken before. See `stream::builds::build_materializes_faster`.
+                    Some(&opts),
                 ) {
                     Err(e) if wants_materializing(&e) => {
                         bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts)
@@ -187,28 +200,6 @@ struct ExecSetup {
     /// Whether the materializing executor's footprint fits this query's envelope — the
     /// permission the streaming executor needs before it may decline a plan it cannot shard.
     materialize_fits: bool,
-}
-
-/// Whether this query runs on the streaming executor. `true` by default.
-///
-/// Streaming pulls morsels through the linear runs and materializes only at breakers, so its peak
-/// memory is a constant rather than the sum of every operator's output — and on the shapes where
-/// that matters it is also *faster*, because the copies it stops making were not free.
-///
-/// **The two executors do not dominate one another, and that is why this is not a simple swap.**
-/// Streaming bounds the *intermediates* but its breakers fold in memory; the materializing
-/// executor has unbounded intermediates but breakers that spill out of core. A plan whose
-/// aggregate state exceeds the envelope is one the materializing executor survives and this one
-/// would OOM on. So the streaming breakers check their state against `memory_budget_bytes` and
-/// return `MemoryBudgetExceeded` instead of dying — and `execute_plan` catches exactly that and
-/// re-runs on the executor that can spill. Streaming takes the queries it fits (the
-/// overwhelming majority, and every one whose intermediates were the problem) and gives way on
-/// the ones it does not, rather than quietly turning a spill into a crash.
-///
-/// Set `streaming = false` to force the materializing executor — a bisecting escape hatch, not a
-/// tuning knob.
-fn use_streaming(cfg: &EngineConfig) -> bool {
-    cfg.streaming
 }
 
 /// The memory envelope the streaming breakers must stay inside — `0` means unbounded.
@@ -269,21 +260,9 @@ fn prepare_exec(
     // still fits, and the materializing executor's breakers spill on top of that; a large input
     // keeps the bounded streaming path. Correctness is identical either way (both executors are
     // checked against the sequential oracle) — this trades only memory headroom for speed.
-    // **The sources this plan scans, not every source bound to the session**
-    // (`RelOp::scanned_source_ids`). Judged by the catalog, a session holding the 24 TPC-DS
-    // tables made every query look like 1.76 GB, which the `x8` below turns into 14.1 GB
-    // against a 7.73 GB envelope — so `materialize_fits` was false for *every* TPC-DS query at
-    // every size and what it gates, mostly Kyber's grouped-aggregate verdict, could not fire at
-    // all. Suite geomeans against the three rounds before it (0.840/0.859/0.879 and
-    // 1.184/1.201/1.189): **TPC-H 0.826, TPC-DS 1.157**, each below every one of them.
     let scanned = plan.scanned_source_ids();
-    let src_bytes: usize = sources
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| scanned.contains(i))
-        .flat_map(|(_, relation)| relation.iter())
-        .map(|b| b.get_array_memory_size())
-        .sum();
+    let src_bytes: usize = route::scanned_capacity_bytes(&sources, &scanned);
+    let src_rows_bytes: usize = route::scanned_rows_bytes(&sources, &scanned);
     //
     // The same guard also decides whether the streaming executor may *decline* a plan it turns
     // out it cannot shard. It answers "is the materializing executor affordable here", which is
@@ -292,6 +271,8 @@ fn prepare_exec(
     // it can only be read off the build sides once they exist — so the two halves meet by the
     // executor reporting `PreferMaterializing` and this side honoring it (see `run_materializing`).
     let materialize_fits = budget > 0 && src_bytes.saturating_mul(8) < budget;
+    // The join-free aggregate route's own affordability, asked of the true row footprint.
+    let aggregate_materialize_fits = budget > 0 && src_rows_bytes.saturating_mul(8) < budget;
     // Two independent reasons the materializing executor is the better answer, sharing one
     // envelope guard. The first is structural and the engine can see it: a plan streaming
     // cannot shard (a repeated source). The second is a *cardinality* question the engine
@@ -299,11 +280,22 @@ fn prepare_exec(
     // materialized once the group count is high, and dearer below it — so Kyber decides it
     // and sends the verdict in the config. The shape check stays here as the engine's own
     // guard, so a stale or over-eager flag cannot reroute a plan this was never measured on.
-    let materialize_is_safe_and_faster = (!bc_interp::streaming_parallelizes(&plan)
-        || (cfg.prefer_materializing_aggregate
-            && bc_interp::materializing_aggregate_is_faster(&plan)))
-        && materialize_fits;
-    let streaming = use_streaming(&cfg) && !materialize_is_safe_and_faster;
+    let materialize_is_safe_and_faster = route::materialize_is_safe_and_faster(
+        &plan,
+        cfg.prefer_materializing_aggregate,
+        materialize_fits,
+        aggregate_materialize_fits,
+    );
+    let streaming = route::use_streaming(&cfg) && !materialize_is_safe_and_faster;
+    route::trace(
+        &plan,
+        streaming,
+        route::use_streaming(&cfg),
+        cfg.prefer_materializing_aggregate,
+        aggregate_materialize_fits,
+        src_rows_bytes,
+        budget,
+    );
     // Record pre-widening source widths *before* normalization (which widens them
     // away), and only when output re-narrowing is requested; an empty map makes
     // `narrow_output` a no-op (the default fast path).

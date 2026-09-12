@@ -57,11 +57,25 @@ _IMBALANCE_TOLERANCE = 2.0
 S = TypeVar("S")
 
 
-def _balance(splits: list[S], workers: int) -> list[list[S]]:
+def _balance(
+    splits: list[S], workers: int, capacities: Sequence[float] | None = None
+) -> list[list[S]]:
     """Greedily bin-pack splits into `workers` groups balanced by row count.
 
     Splits with an unknown row count are weighted as 1 so they spread evenly.
     Largest-first assignment keeps the per-worker load roughly equal.
+
+    `capacities` makes "equal" mean *equal finishing time* rather than equal rows, for a fleet
+    whose workers are not the same size. A group's cost to its worker is its rows divided by
+    that worker's cores, so the packer compares `load / capacity` instead of `load` and a
+    24-core worker draws six times the rows of a 4-core one. Without it a mixed fleet is paced
+    by its smallest worker: on the 27-node cluster this was written for, an even deal gives a
+    4-core worker and a 24-core worker a thirty-first of the scan each, so the small one takes
+    six times as long and every other worker waits on it — the straggler is the *assignment*,
+    not the machine.
+
+    `None` (the default) weighs every worker equally, which is exactly right on a uniform
+    fleet and is what every caller got before this existed.
 
     Weights are computed once (`split_weights`) rather than per comparison: this used to ask
     each split for its row count twice, and for a whole-file split that question is a
@@ -76,13 +90,37 @@ def _balance(splits: list[S], workers: int) -> list[list[S]]:
     if workers <= 0 or not splits:
         return groups
     weights = split_weights(splits)
-    # (load, worker): ties break on the lower worker index, as the linear scan did.
-    heap = [(0, w) for w in range(workers)]
+    caps = _capacities(capacities, workers)
+    loads = [0.0] * workers
+    # (load / capacity, worker): ties break on the lower worker index, as the linear scan did.
+    # The key is the worker's *share of its own capacity*, so a uniform fleet — every capacity
+    # 1.0 — pops in exactly the order the plain load did.
+    heap = [(0.0, w) for w in range(workers)]
     for i in sorted(range(len(splits)), key=lambda i: weights[i], reverse=True):
-        load, w = heapq.heappop(heap)
+        _, w = heapq.heappop(heap)
         groups[w].append(splits[i])
-        heapq.heappush(heap, (load + weights[i], w))
+        loads[w] += weights[i]
+        heapq.heappush(heap, (loads[w] / caps[w], w))
     return groups
+
+
+def _capacities(capacities: Sequence[float] | None, workers: int) -> list[float]:
+    """Per-worker throughput weights, normalized and never zero.
+
+    A short, empty or unusable sequence falls back to an equal-capacity fleet rather than
+    raising: an assignment is a placement, so a capacity figure that cannot be read must cost
+    balance, never the query.
+
+    Args:
+        capacities: Relative throughput per worker, or `None` for a uniform fleet.
+        workers: How many workers the assignment is for.
+
+    Returns:
+        One positive weight per worker.
+    """
+    if not capacities or len(capacities) != workers:
+        return [1.0] * workers
+    return [float(c) if c and c > 0 else 1.0 for c in capacities]
 
 
 def _contiguous(splits: list[S], workers: int) -> list[list[S]]:
@@ -115,6 +153,7 @@ def assign_splits(
     *,
     preserve_order: bool = False,
     worker_addrs: Sequence[str] | None = None,
+    capacities: Sequence[float] | None = None,
 ) -> list[list[S]]:
     """Divide `splits` among `workers`, picking the strategy the caller's needs allow.
 
@@ -128,6 +167,9 @@ def assign_splits(
         preserve_order: Keep the source's global row order (contiguous runs per group).
         worker_addrs: Shuffle address per worker, enabling locality-aware assignment for
             splits that are already resident on one of them.
+        capacities: Relative throughput per worker (cores, in practice), so a fleet of unequal
+            machines is balanced by finishing time rather than by row count. `None` weighs
+            every worker equally.
 
     Returns:
         One list of splits per worker, in worker order.
@@ -135,8 +177,10 @@ def assign_splits(
     if preserve_order:
         return _contiguous(splits, workers)
     if worker_addrs and has_affinity(splits):
-        return balance_with_affinity(splits, workers, worker_addrs, _balance)
-    return _balance(splits, workers)
+        return balance_with_affinity(
+            splits, workers, worker_addrs, lambda s, w: _balance(s, w, capacities)
+        )
+    return _balance(splits, workers, capacities)
 
 
 @dataclass(frozen=True, slots=True)

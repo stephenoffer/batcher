@@ -151,6 +151,27 @@ def map_partitions(workers: int) -> int:
     *input*, and a shuffle's imbalance lives in its hash buckets, which is `shuffle_partitions`
     and, for a single dominant key, `dist/skew.py`'s salting.
 
+    **The multiplier is spent only on a fleet that can use it.** Its benefit is the dynamic
+    re-deal, and that requires the barrier to have partitions left over after its initial fill
+    — which on a *uniform* fleet it never does, because `_idle_pool` is `workers x
+    map_slots_per_worker()` deep and both factors are 4, so all `workers x 4` partitions go out
+    in the first deal and the go-idle path never runs. Verified by construction on a 100-worker
+    fleet: 400 partitions, a 400-deep pool, four per worker, nothing to re-deal.
+
+    Its cost is not zero, and it lands after the barrier. Measured on 100 x 4-core nodes at
+    TPC-H sf100, forward and reversed (`BENCHMARK_RESULTS.md`, 2026-09-08): a 20 M-group
+    `GROUP BY` ran **3,192 ms at 400 partitions and 2,093 ms at 100**, and a five-aggregate one
+    **5,674 ms against 3,236** — 34% and 43%, entirely in the phase after the map barrier
+    (443 ms against 428, unchanged) and not in the tree, whose task count was held fixed and
+    showed nothing. What is left scaling with the multiplier there is how many distinct sources
+    each reducer fetches from: `mappers x reducers`, 40,000 against 10,000.
+
+    So on an *unequal* fleet the multiplier stays, because there `_idle_pool` weights the
+    initial deal by each worker's cores and that is worth having — measured at a per-core
+    spread of 8.0x against 1.2x. What it costs on a uniform fleet is recovery *spread*, not
+    recovery: a lost worker's share is `1/workers` either way, but one survivor replays it
+    instead of four, which is ~340 ms once on a failure against ~1,100 ms saved on every query.
+
     The count is a ceiling, not a target. The caller passes it to `partition_descriptors` as
     `max_partitions`, and a source that cannot yield that many splits produces fewer — an
     input of ten row-groups on an eight-worker cluster is ten partitions, not thirty-two, so
@@ -174,9 +195,83 @@ def map_partitions(workers: int) -> int:
     """
     cfg = active_config().distributed
     workers = max(1, workers)
-    n = workers * max(1, cfg.map_partition_multiplier)
+    multiplier = max(1, cfg.map_partition_multiplier)
+    if 1 < multiplier <= _map_slots() and _fleet_is_uniform(workers):
+        multiplier = 1
+    n = workers * multiplier
     cap = cfg.max_shuffle_partitions
     return max(workers, n if cap <= 0 else min(n, cap))
+
+
+def _map_slots() -> int:
+    """How many map partitions one actor may hold in flight, as the barrier will deal them.
+
+    This is the second half of the condition above, and stating it as a *number* rather than
+    as an assumption is what makes the rule adapt instead of being tuned to one configuration.
+    The multiplier buys exactly two things. A **dynamic re-deal**, which requires the barrier to
+    still hold partitions after its initial fill — that is `workers x multiplier` against a pool
+    `workers x map_slots_per_worker()` deep, so it needs `multiplier > slots` and nothing about
+    the fleet's shape. And a **core-weighted initial deal**, which only means anything when the
+    workers differ, which is what `_fleet_is_uniform` asks.
+
+    At the shipped defaults both are 4, so the re-deal is unreachable and a uniform fleet gets
+    no value from the multiplier at all — which is the 34-43% recorded above. But the earlier
+    form of this check tested only the fleet's shape, so raising `map_partition_multiplier` to
+    8 against 4 slots would have collapsed it to 1 and thrown away a re-deal that had just
+    become reachable. Reading the slot count keeps the two reasons independent.
+
+    Falls back to the multiplier's own value when the count cannot be read, which makes the
+    comparison false and leaves the multiplier alone: not knowing is a reason to change nothing.
+
+    Returns:
+        The per-worker map slot count, or a value that disables the collapse.
+    """
+    try:
+        from batcher.dist.executors.ray_runtime.scheduling import map_slots_per_worker
+
+        return max(1, int(map_slots_per_worker()))
+    except Exception as exc:  # pragma: no cover
+        note_suppressed("dist", "read the map slot count for the partition multiplier", exc)
+        return 0
+
+
+def _fleet_is_uniform(workers: int) -> bool:
+    """Whether the fleet about to take `workers` groups of work holds one core grant per worker.
+
+    The two states `_idle_pool` deals evenly on, and only those: an envelope carrying **no**
+    per-worker grants — which is what `SchedulingEnvelope` documents a homogeneous cluster and
+    every explicitly-sized fan-out as producing — or one carrying a grant per worker that is
+    flat. Both are its `caps` guard read from this side, and the two have to agree about which
+    fleet this is: a multiplier spent on a deal that weighs every worker equally buys nothing,
+    and a multiplier withheld from a deal that weighs by cores takes away what it weights.
+
+    **No ambient envelope is not a uniform fleet.** It is a caller outside a distributed
+    execution — a unit test, a sizing question asked before a fleet exists — which knows nothing
+    about the deal, so it answers `False` and the multiplier behaves exactly as it always did
+    there. A grant list of the wrong length is the same kind of "don't know": `fleet_worker_cpus`
+    declines it because a positional grant would then name the wrong worker.
+
+    Not routed through `fleet_worker_cpus` itself, even though `_idle_pool` calls it, because it
+    folds all three of those into one `None` and the first of them is the case this must say yes
+    to.
+
+    Args:
+        workers: The fleet's width, as `map_partitions` was given it.
+
+    Returns:
+        `True` for a known-uniform fleet, `False` otherwise.
+    """
+    try:
+        from batcher.dist.executors.ray_runtime.scheduling import current_envelope
+
+        env = current_envelope()
+    except Exception as exc:  # pragma: no cover - a sizing hint never fails a query
+        note_suppressed("dist", "read the fleet shape for the map partition count", exc)
+        return False
+    if env is None:
+        return False
+    caps = env.worker_cpus
+    return not caps or (len(caps) == workers and max(caps) == min(caps))
 
 
 def _learned_shuffle_fanout(ceiling: int) -> int | None:

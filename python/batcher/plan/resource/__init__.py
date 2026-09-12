@@ -24,6 +24,11 @@ from batcher.plan.resource.bounds import (
     SchedulingEnvelope,
 )
 from batcher.plan.resource.cluster import ClusterShape, NodeShape
+from batcher.plan.resource.fleet_plan import (
+    WorkerSlot,
+    is_heterogeneous,
+    plan_worker_slots,
+)
 from batcher.plan.resource.hardware import HardwareProfile
 from batcher.plan.resource.locality import LocalityShares
 from batcher.plan.resource.storage import StorageLevel
@@ -41,4 +46,7 @@ __all__ = [
     "ResourceBounds",
     "SchedulingEnvelope",
     "StorageLevel",
+    "WorkerSlot",
+    "is_heterogeneous",
+    "plan_worker_slots",
 ]

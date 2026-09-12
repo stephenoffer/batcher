@@ -407,16 +407,34 @@ def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -
     aggregate's output — one row per group — so, exactly like the projection, they are small
     beside the aggregation whichever executor runs them.
 
+    A `Filter` (`HAVING`) and a **global** `Aggregate` are peeled for the same reason and were
+    the two remaining gaps. Both read one row per group, and leaving them out cost the whole
+    difference between the two executors on plans that are entirely ordinary: measured on a
+    24 M-row group-by producing 10 M groups, `select k, s` above the aggregate ran in **245 ms**
+    and `filter(n > 0)` above the same aggregate in **2,116 ms** — same rows in, same
+    10,072,152 rows out, and nothing between them but this predicate. `group_by(...).agg(...)`
+    ending in a scalar roll-up is the other one, and it is how nearly every benchmark and
+    `SELECT count(*) FROM (... GROUP BY k)` is written.
+
+    The global aggregate is peeled *only* when it is global. A second **grouped** aggregate is
+    its own aggregation over its own cardinality, so peeling through it would answer this
+    question about the wrong node.
+
     **The group count is read off the `Aggregate`, not off the plan root**, which is what the
     added peels force: a `LIMIT 10` above the aggregate makes the root's estimate 10, so
     estimating the root would refuse every one of the queries this peel exists to admit —
     silently, and while looking like it had asked the right question.
     """
-    from batcher.plan.logical import Aggregate, Join, Limit, Project, Sort
+    from batcher.plan.logical import Aggregate, Filter, Join, Limit, Project, Sort
 
     node = plan
-    while isinstance(node, (Project, Sort, Limit)):
-        node = node.input
+    while True:
+        if isinstance(node, (Project, Sort, Limit, Filter)):
+            node = node.input
+        elif isinstance(node, Aggregate) and not node.group_keys:
+            node = node.input  # a scalar roll-up over one row per group
+        else:
+            break
     if not isinstance(node, Aggregate) or not node.group_keys:
         return False
     if any(isinstance(n, Join) for n in walk(plan)):

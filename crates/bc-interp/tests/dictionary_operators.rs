@@ -223,7 +223,7 @@ impl Executor {
             Executor::Sequential => bc_interp::execute(plan, sources),
             Executor::Streaming => bc_interp::execute_streaming(plan, sources, 0),
             Executor::StreamingParallel => {
-                bc_interp::execute_streaming_parallel(plan, sources, 4, 0)
+                bc_interp::execute_streaming_parallel(plan, sources, 4, 0, None)
             }
         };
         r.unwrap_or_else(|e| panic!("{}: plan failed to run: {e}", self.name()))

@@ -78,7 +78,7 @@ fn assert_metrics_agree(json: &str, sources: &[Vec<RecordBatch>]) {
         ),
         (
             "streaming-parallel",
-            execute_streaming_parallel_metered(&p, sources, 4, 0)
+            execute_streaming_parallel_metered(&p, sources, 4, 0, None)
                 .expect("streaming-parallel")
                 .1,
         ),
@@ -225,7 +225,7 @@ fn a_computed_aggregate_reports_the_jit_and_a_bare_one_does_not() {
             // aggregate implementation — a tag recorded only on the serial breaker would
             // still read `interp` for every real query.
             "sharded",
-            execute_streaming_parallel_metered(&computed, &[facts()], 4, 0)
+            execute_streaming_parallel_metered(&computed, &[facts()], 4, 0, None)
                 .unwrap()
                 .1,
         ),
