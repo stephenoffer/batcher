@@ -196,7 +196,7 @@ pub(crate) fn prebuild_joins(
 ///
 /// `None` whenever the caller gave us no options (the sequential `execute_streaming` entries, and
 /// the tests), so those paths stream exactly as they always have.
-fn build_materializes_faster(
+pub(super) fn build_materializes_faster(
     right: &RelOp,
     opts: Option<&crate::par::ExecOptions>,
 ) -> Option<crate::par::ExecOptions> {

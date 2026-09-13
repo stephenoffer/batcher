@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1455 Python modules across 213 packages and 286 Rust files across 15 crates.
+Covering 1455 Python modules across 213 packages and 287 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -2242,7 +2242,7 @@ The plan, in every shape the dashboard needs to show it.
 | module | lines | what it is |
 |---|---|---|
 | `build.py` | 269 | The executed plan as a laid-out graph — nodes, edges, and their measured stats. |
-| `describe.py` | 236 | Reading a plan IR node: what is a child, and what does this operator actually do. |
+| `describe.py` | 239 | Reading a plan IR node: what is a child, and what does this operator actually do. |
 | `diff.py` | 242 | What the optimizer actually did — the logical plan against the one that ran. |
 | `explain.py` | 146 | The plan as text — the EXPLAIN output every SQL engine's users already know how to read. |
 
@@ -2955,8 +2955,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 697 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1520 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/mod.rs` | 713 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/parallel.rs` | 1538 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -3005,7 +3005,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
-| `join/range/mod.rs` | 659 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/mod.rs` | 665 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/small.rs` | 174 | A range join whose right side is a handful of rows: scan, don't sort. |
 | `join/sort_merge.rs` | 206 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 360 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 391 | The one canonical form for grouping/partitioning keys. |
@@ -3143,7 +3144,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/quality/mod.rs` | 33 | Per-document text-quality measures — the LLM pretraining-corpus filters. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
-| `eval/temporal/civil.rs` | 175 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
+| `eval/temporal/civil.rs` | 193 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
 | `eval/temporal/date.rs` | 630 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 161 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |

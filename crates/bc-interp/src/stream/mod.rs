@@ -664,15 +664,31 @@ fn materialized_join_from<'a>(
         // A side with no batches at all (not even a schema) — the oracle yields nothing.
         return Ok(Box::new(std::iter::empty()));
     };
-    // `ops::join_batches`, NOT the parallel `par::join_partitioned` — even though this arm has
-    // already materialized both sides and running it on one core is a real cost (it is ~55% of
-    // TPC-H q4). `join_partitioned` buckets by `rayon::current_num_threads()` where
-    // `join_batches`'s radix buckets by `radix_parts(build_rows)`, so it emits the same rows in a
-    // **different order** — and this executor's contract is the same rows in the *same order* as
-    // `crate::execute` (a `LIMIT` over a semi join would otherwise return different rows on
-    // different executors). Swapping it in measured q3 120→34.5 ms and q4 169→120 ms and was
-    // reverted for exactly that: `a_semi_join_with_a_huge_build_matches_the_oracle` fails on it.
-    // Making this parallel means making it *order-preserving*, not just parallel.
+    // `ops::join_batches`, NOT a parallel join — even though this arm has already materialized
+    // both sides and running it on one core is a real cost (it is ~55% of TPC-H q4). Two parallel
+    // joins sit right beside it and **neither is order-safe here**, which is what this executor's
+    // contract requires: the same rows in the same *order* as `crate::execute`, because a `LIMIT`
+    // over a semi join would otherwise keep different rows on different executors.
+    //
+    // `join_partitioned` buckets by `rayon::current_num_threads()` where `join_batches`'s radix
+    // buckets by `radix_parts(build_rows)`, so it emits the same rows in a different order.
+    // Swapping it in measured q3 120→34.5 ms and q4 169→120 ms and was reverted for exactly that.
+    //
+    // `join_par::broadcast_join` — build once, probe contiguous row ranges, concatenate in range
+    // order — looks like the order-preserving one this arm has been waiting for, and it is not.
+    // It agrees with the sequential join almost everywhere, which is the trap:
+    // `join_par::tests::broadcast_matches_the_sequential_join_where_the_order_is_defined` measures
+    // all four join types at four sizes and finds exactly one disagreement in the regime this arm
+    // runs in. A semi join over a build past `RADIX_MIN_BUILD_ROWS_BROADCAST` is the one shape
+    // that reaches here at all (`Admission::admits` declines semi/anti only above that ceiling),
+    // and it is the one shape where `hash_join_indices` flips to `semi_anti_swapped` — building
+    // the small probe side and marking it — so its order is the *build* walk's, not the probe's.
+    // A 150,000-row build agrees and a 2,200,000-row one does not, so a test sized below the
+    // ceiling certifies a swap that breaks `stream_oracle::a_semi_join_with_a_huge_build_matches_the_oracle`.
+    // Measured, then reverted, on 2026-09-12; the smaller test came first and said it was safe.
+    //
+    // Making this parallel means making it order-preserving **in the swapped-build regime**, not
+    // just parallel.
     let out = ops::join_batches(
         &probe_side,
         &build_side,

@@ -104,6 +104,7 @@ use crate::error::RuntimeError;
 mod band;
 mod keys;
 mod marks;
+mod small;
 
 use keys::{supported_key_type, AxisKeys};
 use marks::MarkSet;
@@ -374,7 +375,12 @@ pub fn range_join_indices(
         return Ok(out.into_indices(&right_excluded));
     }
 
-    if ops.len() == 1 {
+    if small::worth_it(lmap.len(), rmap.len()) {
+        // A right side of a handful of rows is answered by `|R|` vectorized comparisons over
+        // the left key column, which is cheaper than any sort of the left side — whatever the
+        // predicate's shape. See `small`.
+        small::run(left_keys, right_keys, ops, &lmap, &rmap, &mut out)?;
+    } else if ops.len() == 1 {
         // A single inequality is a band with an open upper bound, so it takes the same
         // parallel merge — see `band::run_single` for what it replaced and why the
         // difference was so large.

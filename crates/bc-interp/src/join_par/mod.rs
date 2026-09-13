@@ -1226,4 +1226,99 @@ mod tests {
             vec!["lv", "rv"]
         );
     }
+
+    /// Where `broadcast_join` and the sequential `ops::join_batches` agree on row *order*, and
+    /// where they only agree on rows — which is what decides when the streaming executor may
+    /// swap one for the other (`stream::materialized_join_from`).
+    ///
+    /// **Semi and anti agree at every size**, because both paths emit probe-row order: the flat
+    /// path scans the probe in order and the radix path is put back in probe order by
+    /// `probe_order_semi`, since a semi join's row order is the only information in its result.
+    /// **Inner and left agree only below the radix threshold**; above it the sequential path
+    /// emits partition-major and the broadcast probe emits probe-major. Both halves are asserted,
+    /// because the second is the reason the swap is not applied to every join type.
+    #[test]
+    fn broadcast_matches_the_sequential_join_where_the_order_is_defined() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        for (n_probe, n_build) in [
+            (1_000_usize, 10_usize),
+            (200_000, 150_000),
+            (60_000, 3),
+            (5_000, 2_200_000),
+        ] {
+            let probe_keys: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                (0..n_probe as i64).map(|i| (i * 7) % (n_build as i64).max(1)),
+            ));
+            let build_keys: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n_build as i64));
+            let probe = RecordBatch::try_from_iter(vec![("k", probe_keys)]).unwrap();
+            let build = RecordBatch::try_from_iter(vec![("bk", build_keys)]).unwrap();
+            for jt in [
+                JoinType::Inner,
+                JoinType::Left,
+                JoinType::Semi,
+                JoinType::Anti,
+            ] {
+                let output = match jt {
+                    JoinType::Semi | JoinType::Anti => vec![JoinOutputCol {
+                        side: JoinSide::Left,
+                        name: "k".into(),
+                        alias: "k".into(),
+                    }],
+                    _ => vec![
+                        JoinOutputCol {
+                            side: JoinSide::Left,
+                            name: "k".into(),
+                            alias: "k".into(),
+                        },
+                        JoinOutputCol {
+                            side: JoinSide::Right,
+                            name: "bk".into(),
+                            alias: "bk".into(),
+                        },
+                    ],
+                };
+                let seq = ops::join_batches(
+                    &probe,
+                    &build,
+                    &["k".into()],
+                    &["bk".into()],
+                    jt,
+                    &output,
+                    JoinStrategy::Hash,
+                )
+                .unwrap();
+                let par =
+                    broadcast_join(&probe, &build, &["k".into()], &["bk".into()], jt, &output)
+                        .unwrap();
+                let par = ops::materialize(&par).unwrap();
+                assert_eq!(
+                    seq.num_rows(),
+                    par.num_rows(),
+                    "{jt:?} {n_probe}x{n_build}: the two paths must agree on rows at every size",
+                );
+                // Only inner/left over a build past the radix threshold may differ, and there
+                // only in order.
+                // The measured matrix, pinned case by case rather than derived from a rule —
+                // the rule is what got this wrong. Rows agree everywhere; *order* agrees except
+                // in two regimes, and each one is a reason a caller cannot swap the two paths:
+                //
+                //   inner/left, build past the radix threshold -> sequential is partition-major
+                //   semi, build big enough to flip `semi_anti_swapped` -> it walks the build
+                //
+                // The second is the one that matters to `stream::materialized_join_from`, which
+                // only ever sees a semi join over a huge build. A test sized below that flip
+                // reports agreement and certifies a swap that breaks the oracle.
+                let expect_ordered = !matches!(
+                    (jt, n_build),
+                    (JoinType::Inner | JoinType::Left, 150_000) | (JoinType::Semi, 2_200_000)
+                );
+                assert_eq!(
+                    seq == par,
+                    expect_ordered,
+                    "{jt:?} {n_probe}x{n_build}: order agreement should be {expect_ordered}",
+                );
+            }
+        }
+    }
 }

@@ -1386,21 +1386,39 @@ fn materialize_spine_breakers(
     };
     loop {
         if materializable_spine_breaker(node, cache) {
+            // A join-free grouped aggregate goes to the **materializing** executor, exactly as
+            // the same shape does on a build side (`builds::build_materializes_faster`). The
+            // asymmetry had no reason behind it: the guard, the hand-off and the argument for
+            // both already existed, and only the build side called them — so a join between two
+            // grouped aggregates sent one of its inputs down the fast route and the other down
+            // the slow one. Measured on `lineitem` grouped to 1.5M orderkeys twice and joined,
+            // best of four against the unchanged engine: **84.8 -> 65.6 ms**, and 117.0 -> 103.6
+            // with `op-join-build-large`'s two filters. A bare grouped aggregate is the control
+            // and does not move (12.9 ms either way).
+            //
+            // What is left on that case is the join, not this: the same query with the whole plan
+            // on the materializing executor is 39.8 ms, because the streaming join serves a
+            // 1.2M-row build with a flat per-morsel probe where the materializing one radix-
+            // partitions it. See `Admission::admits` and `BENCHMARK_RESULTS.md`.
+            //
             // The builds are handed down (`collect_builds` descends the probe spine, so the cache
             // already covers every join under here); the mats are not, because this subtree owns
             // whatever lies below it.
-            let batches = run_with_cache(
-                node,
-                sources,
-                workers,
-                meter,
-                budget,
-                Some(cache),
-                None,
-                false,
-                cancel,
-                opts,
-            )?;
+            let batches = match super::builds::build_materializes_faster(node, opts) {
+                Some(sub) => crate::par::execute_parallel_with(node, sources, &sub)?,
+                None => run_with_cache(
+                    node,
+                    sources,
+                    workers,
+                    meter,
+                    budget,
+                    Some(cache),
+                    None,
+                    false,
+                    cancel,
+                    opts,
+                )?,
+            };
             mats.insert(node_key(node), Arc::new(batches));
             return Ok(mats);
         }

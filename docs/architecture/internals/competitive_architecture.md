@@ -287,7 +287,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5 at sf100) — but the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (722 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
-| Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |
+| Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M); **W against a right side under 32 rows at any left size** (6M x 6: 1.12x) — ceiling 7 | — | — | — | — | — |
 | Learned/adaptive | **W** | **W** | **W** | — | **W** | = |
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
 | Streaming guarantees | — | — | L | **✗** | — | — |
@@ -956,8 +956,38 @@ why it stays invisible to about a million rows and dominates past that. DuckDB d
 `PhysicalIEJoin` decomposes the sorted union into blocks and prunes block *pairs* whose key
 ranges cannot intersect, so its inner loop never walks a suffix holding no answers.
 
+#### A right side of a handful of rows was paying for a sort of the left one (2026-09-12)
+
+Both strategies above answer "which right rows match this left row" by searching a sorted
+order, so both sort the left side. That is the right trade between two comparable inputs and
+the wrong one against a bucket table, which is what an inequality join meets most often in
+practice: price bands, IP ranges, a date dimension, a histogram's edges.
+
+The operator-mix case `op-join-range` is exactly that shape — six discount bands against
+`lineitem` — and it sorted six million left rows twice to answer six comparisons a row. A
+right side of at most 32 rows now takes a third strategy
+(`bc-runtime/src/join/range/small.rs`): `|R|` vectorized Arrow comparisons over the left key
+column, chunked and run in parallel, with no sort, no universe and no mark array. Measured
+through the benchmark harness, best of five:
+
+| | before | after | DuckDB |
+|---|---|---|---|
+| `op-join-range` (6M x 6) | 329.0 ms | **79.6 ms** | 89.4 ms |
+
+The gate is on size alone and never on the predicate's shape, so it serves one inequality or
+two, every operator combination and every join type; `tests/differential/test_diff_range_join_small_side.py`
+holds all of them against DuckDB, and the in-crate test holds the scan against IEJoin pair for
+pair on the same data.
+
+**It also covers a shape the band path structurally could not see.** `band::bounds` recognises
+two conditions bounding one *right* key (`L.a <= R.y AND R.y <= L.b`). A bucket table is the
+mirror — one left key bounded by two right columns — which is an interval-stabbing query, not a
+contiguous slice of anything once the intervals overlap, so it fell through to IEJoin. The
+general form of that shape is still open; at this size it does not need the general form.
+
 **So the honest state of this ceiling: the quadratic plan is gone, the memory wall with it, and
-the operator now wins below ~500,000 rows and loses above ~1,000,000.** The named next step is the block
+the operator now wins below ~500,000 rows and loses above ~1,000,000 — except against a small
+right side, where it no longer sorts at all.** The named next step is the block
 decomposition above — which is also what would make the operator *distributable*, since both
 need the same "which block pairs can intersect" pruning. Today the distributed planner has no
 range-join staging and executes the operator whole, which satisfies single-node == distributed
@@ -1474,10 +1504,23 @@ form. Both are known techniques neither engine invented.
 So this is a *closable* ceiling rather than a structural one, unlike 2 and 11 — and it is now
 tracked: `benchmarks/suites/operators/{strings,expressions}.py` fail visibly if it widens.
 
-**One of the three is closed.** `LENGTH` now tests the morsel's own bytes for ASCII once and
+**Two of the three are closed.** `LENGTH` now tests the morsel's own bytes for ASCII once and
 takes each row's length from the offsets: `SUM(LENGTH(l_comment))` goes **10.9 ms -> 5.3 ms**
 (3.96x -> 1.82x), with CPU at 65 ms against DuckDB's 71 — below it, so what remains on that
-shape is worker count rather than work. The temporal and `CASE` rows are untouched.
+shape is worker count rather than work.
+
+The temporal row was the division-free civil-date form named above
+(`bc-expr/src/eval/temporal/civil.rs`), and the size of the arithmetic turned out to matter as
+much as its shape: the same decomposition in `i64` measured **slower than Arrow's chrono
+kernel** (12.8 ns a row against 10.8), because a 64-bit division by a constant is a widening
+multiply. Biased into `u32`, where no division handles a sign and each is a 32-bit
+multiply-high, it is 7.3 ns. `EXTRACT(YEAR ...)` grouped goes **7.4 ms -> 5.5 ms** and the bare
+`SUM(EXTRACT(YEAR ...))` **5.8 ms -> 4.4 ms**; day-of-week needs no decomposition at all and is
+2.8 ns a row against the kernel's 12.4. Arrow's kernel stays the oracle — a `Date32` or
+timezone-naive `Timestamp` in chrono's range takes the fast path and everything else, a zoned
+timestamp included, falls back whole.
+
+`CASE` is untouched and is now the largest of the three.
 
 ## The roadmap that would make the claim true
 

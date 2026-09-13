@@ -1,14 +1,21 @@
 //! Calendar field extraction as integer arithmetic, for the date parts a query groups by.
 //!
 //! Arrow's `date_part` answers `year`/`month`/`day` by building a `chrono::NaiveDateTime` per
-//! value and reading the field off it. That is correct and roughly 8 ns a row, and it made
-//! `GROUP BY EXTRACT(YEAR FROM l_shipdate)` over TPC-H `lineitem` spend more time extracting
-//! the key than grouping by it: 6.5 ms against DuckDB's 1.5 ms for the bare `SUM(year(..))`.
+//! value and reading the field off it. That is correct, and it costs more than the grouping it
+//! feeds: `SUM(EXTRACT(YEAR FROM l_shipdate))` over TPC-H `lineitem` spent 111 ms of CPU where
+//! the same aggregate over `l_linenumber + 1` spent 25 ms.
 //!
 //! The civil-from-days conversion (Howard Hinnant's, the one `std::chrono` specifies) needs no
-//! calendar object and no table: an era split, a year-of-era by subtraction, and a
-//! March-based month from one multiply-divide. Every division is by a constant, so the loop
-//! is a handful of multiplies per row with no branch on the data.
+//! calendar object and no table: an era split, a year-of-era by subtraction, and a March-based
+//! month from one multiply-divide. Every division is by a constant, so the row costs a few
+//! multiplies and no branch on the data.
+//!
+//! **The arithmetic is 32-bit and unsigned, and both halves of that are load-bearing.** The
+//! same decomposition in `i64` measured *slower than the kernel it replaces* — 12.8 ns a row
+//! against 10.8 — because a 64-bit division by a constant is a widening multiply; in `u32` it
+//! is 7.3. The values are biased by a whole number of eras first (`BIAS_DAYS`), which puts
+//! every supported day in the non-negative range, so no division has to handle a sign either.
+//! Day-of-week needs no decomposition at all and costs 2.8 ns against the kernel's 12.4.
 //!
 //! **Arrow's kernel is the oracle, and this path declines rather than extends it.** Only a
 //! `Date32` or a timezone-naive `Timestamp` takes this route — a zoned timestamp extracts in
@@ -26,9 +33,14 @@ use arrow::datatypes::{DataType, Date32Type, Int64Type, TimeUnit};
 use crate::DateFunc;
 
 /// Days from 0000-03-01 to 1970-01-01: the shift that puts the era boundary on a March 1.
-const EPOCH_SHIFT: i64 = 719_468;
+const EPOCH_SHIFT: i32 = 719_468;
 /// Days in one 400-year Gregorian era.
-const DAYS_PER_ERA: i64 = 146_097;
+const DAYS_PER_ERA: u32 = 146_097;
+/// Eras added to every value so the arithmetic never meets a negative number. 656 eras clears
+/// the earliest supported day; the years they add come back off at the end.
+const BIAS_ERAS: i32 = 656;
+const BIAS_DAYS: i32 = DAYS_PER_ERA as i32 * BIAS_ERAS;
+const BIAS_YEARS: i32 = BIAS_ERAS * 400;
 /// The inclusive day range chrono represents (years −262,144 … 262,143). Arrow's kernel
 /// cannot convert a value outside it, so neither does this.
 const MIN_DAY: i64 = -96_465_292;
@@ -38,32 +50,34 @@ const SECS_PER_DAY: i64 = 86_400;
 /// The fields one value decomposes into; each `DateFunc` reads one of them.
 #[derive(Clone, Copy)]
 struct Civil {
-    year: i64,
-    month: i64,
-    day: i64,
+    year: i32,
+    month: u32,
+    day: u32,
 }
 
 /// Year, month and day of `days` since 1970-01-01, on the proleptic Gregorian calendar.
+///
+/// `days` must be within `[MIN_DAY, MAX_DAY]`; `extract` checks the column before calling.
 #[inline(always)]
-fn civil_from_days(days: i64) -> Civil {
-    let z = days + EPOCH_SHIFT;
-    let era = z.div_euclid(DAYS_PER_ERA);
+fn civil_from_days(days: i32) -> Civil {
+    let z = (days + EPOCH_SHIFT + BIAS_DAYS) as u32;
+    let era = z / DAYS_PER_ERA;
     let doe = z - era * DAYS_PER_ERA; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365], March 1 = 0
     let mp = (5 * doy + 2) / 153; // [0, 11], March = 0
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let year = (yoe + era * 400) as i32 - BIAS_YEARS + i32::from(month <= 2);
     Civil { year, month, day }
 }
 
 /// 1-based day of the year for a civil date.
 #[inline(always)]
 fn ordinal(c: Civil) -> i64 {
-    const CUMULATIVE: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    const CUMULATIVE: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let leap = (c.year % 4 == 0 && c.year % 100 != 0) || c.year % 400 == 0;
-    CUMULATIVE[(c.month - 1) as usize] + c.day + i64::from(leap && c.month > 2)
+    i64::from(CUMULATIVE[(c.month - 1) as usize] + c.day + u32::from(leap && c.month > 2))
 }
 
 /// Whether every non-null value in `vals` lies in `[lo, hi]`.
@@ -87,49 +101,51 @@ fn within<T: Copy + Into<i64>>(vals: &[T], nulls: Option<&NullBuffer>, lo: i64, 
 
 /// Apply one field to every value, chosen once outside the loop so the loop body is branchless.
 ///
-/// `per_sec` is `None` for a day count (`Date32`) and the unit's ticks per second for a
+/// `ticks_per_sec` is `None` for a day count (`Date32`) and the unit's ticks per second for a
 /// timestamp, whose values are clamped to `[lo, hi]` first: that only ever moves a slot under a
-/// null (`within` has already vouched for the rest), and it keeps that slot's arithmetic finite.
+/// null (`within` has already vouched for the rest), and it keeps that slot's arithmetic in range.
 fn map_fields<T: Copy + Into<i64>>(
     vals: &[T],
-    per_sec: Option<i64>,
+    ticks_per_sec: Option<i64>,
     (lo, hi): (i64, i64),
     func: DateFunc,
 ) -> Option<Vec<i64>> {
-    fn apply<T: Copy + Into<i64>, F: Fn(i64, i64) -> i64>(
+    fn apply<T: Copy + Into<i64>, F: Fn(i32, u32) -> i64>(
         vals: &[T],
-        per_sec: Option<i64>,
+        ticks_per_sec: Option<i64>,
         (lo, hi): (i64, i64),
         f: F,
     ) -> Vec<i64> {
-        match per_sec {
-            None => vals.iter().map(|&d| f(d.into(), 0)).collect(),
+        match ticks_per_sec {
+            None => vals.iter().map(|&d| f(d.into() as i32, 0)).collect(),
             Some(per_sec) => {
                 let per_day = per_sec * SECS_PER_DAY;
                 vals.iter()
                     .map(|&v| {
                         let v = v.into().clamp(lo, hi);
-                        f(v.div_euclid(per_day), v.rem_euclid(per_day) / per_sec)
+                        let secs = v.rem_euclid(per_day) / per_sec;
+                        f(v.div_euclid(per_day) as i32, secs as u32)
                     })
                     .collect()
             }
         }
     }
     let b = (lo, hi);
-    let timed = per_sec.is_some();
+    let t = ticks_per_sec;
+    let timed = ticks_per_sec.is_some();
     Some(match func {
-        DateFunc::Year => apply(vals, per_sec, b, |d, _| civil_from_days(d).year),
-        DateFunc::Month => apply(vals, per_sec, b, |d, _| civil_from_days(d).month),
-        DateFunc::Day => apply(vals, per_sec, b, |d, _| civil_from_days(d).day),
-        DateFunc::Quarter => apply(vals, per_sec, b, |d, _| {
-            (civil_from_days(d).month - 1) / 3 + 1
+        DateFunc::Year => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).year)),
+        DateFunc::Month => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).month)),
+        DateFunc::Day => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).day)),
+        DateFunc::Quarter => apply(vals, t, b, |d, _| {
+            i64::from((civil_from_days(d).month - 1) / 3 + 1)
         }),
-        DateFunc::DayOfYear => apply(vals, per_sec, b, |d, _| ordinal(civil_from_days(d))),
+        DateFunc::DayOfYear => apply(vals, t, b, |d, _| ordinal(civil_from_days(d))),
         // 1970-01-01 was a Thursday; Sunday is 0.
-        DateFunc::DayOfWeek => apply(vals, per_sec, b, |d, _| (d + 4).rem_euclid(7)),
-        DateFunc::Hour if timed => apply(vals, per_sec, b, |_, s| s / 3600),
-        DateFunc::Minute if timed => apply(vals, per_sec, b, |_, s| s / 60 % 60),
-        DateFunc::Second if timed => apply(vals, per_sec, b, |_, s| s % 60),
+        DateFunc::DayOfWeek => apply(vals, t, b, |d, _| i64::from((d + 4).rem_euclid(7))),
+        DateFunc::Hour if timed => apply(vals, t, b, |_, s| i64::from(s / 3600)),
+        DateFunc::Minute if timed => apply(vals, t, b, |_, s| i64::from(s / 60 % 60)),
+        DateFunc::Second if timed => apply(vals, t, b, |_, s| i64::from(s % 60)),
         _ => return None,
     })
 }
@@ -159,7 +175,9 @@ pub(crate) fn extract(func: DateFunc, arr: &ArrayRef) -> Option<ArrayRef> {
             // The last day runs to its final tick, not to its midnight.
             let (lo, hi) = (
                 MIN_DAY.saturating_mul(per_day),
-                (MAX_DAY + 1).checked_mul(per_day).map_or(i64::MAX, |end| end - 1),
+                (MAX_DAY + 1)
+                    .checked_mul(per_day)
+                    .map_or(i64::MAX, |end| end - 1),
             );
             let ints = arrow::compute::cast(arr, &DataType::Int64).ok()?;
             let vals = ints.as_primitive::<Int64Type>().values();
@@ -298,21 +316,5 @@ mod tests {
         assert!(extract(DateFunc::Year, &zoned).is_none());
         let date: ArrayRef = Arc::new(Date32Array::from(vec![0]));
         assert!(extract(DateFunc::Hour, &date).is_none());
-    }
-
-    #[test]
-    #[ignore]
-    fn zz_bench() {
-        let days: Vec<i32> = (0..16_384).map(|i| 8_000 + (i * 37) % 2_500).collect();
-        let arr: ArrayRef = Arc::new(Date32Array::from(days));
-        for (func, part) in [(DateFunc::Year, DatePart::Year), (DateFunc::Month, DatePart::Month), (DateFunc::DayOfWeek, DatePart::DayOfWeekSunday0)] {
-            let t = std::time::Instant::now();
-            for _ in 0..200 { std::hint::black_box(extract(func, &arr)); }
-            let fast = t.elapsed().as_nanos() as f64 / (200.0 * 16_384.0);
-            let t = std::time::Instant::now();
-            for _ in 0..200 { std::hint::black_box(oracle(part, &arr)); }
-            let slow = t.elapsed().as_nanos() as f64 / (200.0 * 16_384.0);
-            println!("{func:?}: civil {fast:.2} ns/row, arrow {slow:.2} ns/row");
-        }
     }
 }
