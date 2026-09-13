@@ -48,6 +48,7 @@ use crate::{Expr, ExprError};
 
 mod case;
 mod coalesce;
+mod literal_case;
 
 pub(crate) use case::eval_case;
 pub(crate) use coalesce::eval_coalesce;

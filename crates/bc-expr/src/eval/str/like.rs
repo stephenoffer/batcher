@@ -122,9 +122,49 @@ impl LikeMatcher {
     /// per-element `Option<bool>` iterator, so a trivial predicate is bit-packing bound, not
     /// iterator-adapter bound.
     pub(crate) fn eval(&self, s: &StringArray) -> BooleanArray {
-        let values = BooleanBuffer::collect_bool(s.len(), |i| self.is_match(s.value(i)));
+        // The three byte-anchored variants dispatch **once**, here, and then run a loop that
+        // compares raw bytes. Left inside the per-row closure, the `match self` in `is_match`
+        // plus `value(i)`'s `str` wrapper cost 6.5 ns a row for a three-byte prefix, against
+        // 0.42 ns to touch every row's bytes and do nothing — so the predicate was an order of
+        // magnitude cheaper than the machinery around it. `Contains` and `Segments` keep the
+        // generic path: their per-row work is a `memmem` search that dwarfs the dispatch.
+        let values = match self {
+            LikeMatcher::StartsWith(p) => {
+                let k = p.as_bytes();
+                anchored(s, |d, a, b| b - a >= k.len() && &d[a..a + k.len()] == k)
+            }
+            LikeMatcher::EndsWith(p) => {
+                let k = p.as_bytes();
+                anchored(s, |d, a, b| b - a >= k.len() && &d[b - k.len()..b] == k)
+            }
+            LikeMatcher::Exact(p) => {
+                let k = p.as_bytes();
+                anchored(s, |d, a, b| b - a == k.len() && &d[a..b] == k)
+            }
+            _ => BooleanBuffer::collect_bool(s.len(), |i| self.is_match(s.value(i))),
+        };
         BooleanArray::new(values, s.nulls().cloned())
     }
+}
+
+/// The match mask for a needle anchored at one end of each row, over the raw buffers.
+///
+/// `hit` receives the row's byte range and answers for it, and the caller passes a *different*
+/// closure per variant rather than a shared one branching on an enum: with the branch inside the
+/// loop the row cost was 5.9 ns against 3.1 ns for the identical loop written out, because the
+/// discriminant test is per row and does not hoist. `value(i)`'s `str` wrapper was the other
+/// half — the same predicate through it costs 6.5 ns.
+///
+/// Byte-oriented and therefore identical to the `str` comparison it replaces: the haystack is
+/// valid UTF-8, the needle is a whole UTF-8 substring, and a byte match can only land on a char
+/// boundary (UTF-8 self-synchronization) — the same argument `segment_match` rests on.
+#[inline(always)]
+fn anchored(s: &StringArray, hit: impl Fn(&[u8], usize, usize) -> bool) -> BooleanBuffer {
+    let data = s.value_data();
+    let offsets = s.value_offsets();
+    BooleanBuffer::collect_bool(s.len(), |i| {
+        hit(data, offsets[i] as usize, offsets[i + 1] as usize)
+    })
 }
 
 /// A prefix, then ordered middle substrings, then a suffix — all within the region the anchors

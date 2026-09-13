@@ -1520,7 +1520,78 @@ multiply-high, it is 7.3 ns. `EXTRACT(YEAR ...)` grouped goes **7.4 ms -> 5.5 ms
 timezone-naive `Timestamp` in chrono's range takes the fast path and everything else, a zoned
 timestamp included, falls back whole.
 
-`CASE` is untouched and is now the largest of the three.
+**And the third is closed too.** The `CASE` row was never about branching: the identical
+four-arm ladder returning *integers* already won (6.8 ms against DuckDB's 10.5) while the one
+returning *strings* lost at 21.2 against 10.2. The general algorithm evaluates each arm over the
+whole batch and folds the arms with `zip`, so a four-arm `CASE` builds eight full-length arrays
+to produce one, and a string is the most expensive thing to copy eight times. When every arm is
+a literal — the bucketing shape this measures — the selections already partition the rows, so
+the column can be built in one pass straight from them (`bc-expr/src/eval/branch/literal_case.rs`):
+**21.2 ms -> 8.2 ms, 473 ms of CPU -> 153**, and the case turns from 2.08x into 0.68x.
+
+| shape | before | after | DuckDB |
+|---|---|---|---|
+| four-arm `CASE` to strings, grouped | 21.2 ms | **8.2 ms** | 10.2 ms |
+| the same to integers, grouped | 6.8 ms | 6.8 ms | 10.5 ms |
+
+So all three rows of this ceiling are now closed, and what the section retires with them is its
+own framing: *"scalar kernels do 1.7-2.9x DuckDB's work per row"* was measured against DuckDB's
+**native, compressed** storage, and two of the three gaps were not kernel work at all. Held to
+the same Arrow input (`duckdb_arrow`), the engine is **ahead** on the shapes that looked worst —
+`str-length` 0.42x, `like-prefix` 0.48x, `date-part` 0.55x — and behind only where it is still
+behind DuckDB-native. See "What is storage and what is execution" below.
+
+## What is storage and what is execution (measured 2026-09-12)
+
+Every headline ratio on this page compares Batcher against **DuckDB's native, compressed
+storage**. The harness ingests each table with an untimed `CREATE TABLE`, so the timed query
+runs on DuckDB's dictionary-encoded, zone-mapped format while Batcher reads raw Arrow. That is
+"DuckDB at its best" and it is the right bar for a headline. It is not a comparison of execution
+engines, and on a whole class of queries it is the storage that answers.
+
+`duckdb_arrow` is the same DuckDB over the *same Arrow buffers Batcher reads*. Run across the
+board (best-of-five, 48-core box, three engines plus Batcher):
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars |
+|---|---:|---:|---:|
+| TPC-H sf1 | 0.71 | **0.25** | 0.52 |
+| operator mix | 0.74 | **0.47** | 0.16 |
+| ClickBench | 0.63 | **0.16** | 0.37 |
+| H2O groupby | 1.04 | **0.82** | 0.52 |
+
+The third column is what the execution engine does on equal input: **four times faster than
+DuckDB on TPC-H and six on ClickBench**, over the identical bytes.
+
+### What that changes about the remaining losses
+
+It splits them in two, and the split is not obvious from the ratio alone.
+
+**Storage losses.** Every one of ClickBench's fifteen remaining losses is a case where Batcher
+is 5-20x *faster* than DuckDB over the same Arrow data — `cb-q41` 6.2 ms against 45.5,
+`cb-q37` 12.5 against 82.9, `cb-q39` 44.5 against 100.9 — and loses to DuckDB-native by one to
+four milliseconds. The `hits` table is wide and string-heavy, which is exactly what a dictionary
+and a zone map are for. The sharpest single demonstration is a predicate that matches nothing:
+`WHERE l_comment LIKE 'zzzzq%'` over six million rows costs DuckDB **0.49 ms and 1 ms of CPU**,
+because its zone maps prove no block can contain a match, and costs Batcher 7.95 ms because it
+reads the column. The same shape at 1% selectivity is 3.3 ms against 7.7.
+
+Closing these means changing what Batcher reads, not how it computes: `StringView`, dictionaries
+preserved through the kernels, and block-level statistics over in-memory inputs. That is
+ceiling 2 and item 2 of the roadmap below, and until it lands these cases stay lost against
+DuckDB-native however fast the kernels get. Three string and temporal shapes that read as the
+worst kernel losses on this page — `str-length` 1.73x, `like-prefix` 2.34x, `date-part` 2.42x —
+are **wins of 0.42x, 0.48x and 0.55x** against the same engine on the same data.
+
+**Execution losses.** Where `duckdb_arrow` or Polars *also* beats Batcher, the gap is the engine
+and it is worth fixing. As of this measurement that is `op-join-build-large` (107.6 against 60.2
+on Arrow), `op-sort-string-limit` (12.4 against 6.4), `h2o-gb-q8` (105.5 against 83.0),
+`h2o-gb-q7` (67.2 against 55.1), `op-except` (47.8 against Polars' 22.6) and TPC-H q21, q17, q8
+and q5, where Polars — also an Arrow engine — is the one ahead.
+
+**Neither column excuses the other.** A `duckdb_arrow` win is not "Batcher beats DuckDB": a user
+who hands DuckDB a table gets the native format and the number in the first column. Quote the
+first column for a competitive claim and the second only for what it says — which engine does
+more per byte read.
 
 ## The roadmap that would make the claim true
 

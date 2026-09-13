@@ -1,5 +1,101 @@
 # Batcher CPU benchmark results
 
+## A four-arm CASE copied the batch eight times, and an unshardable join ran on one core (2026-09-12)
+
+Two operator losses closed, and a measurement lesson about which comparisons on this board are
+signal.
+
+### `op-expr-case`: 2.08x DuckDB -> 0.68x
+
+The case is a four-arm `CASE` bucketing `l_discount` into named bands, grouped. The identical
+ladder returning **integers** already won (6.8 ms against 10.5); the one returning **strings**
+lost at 21.2 against 10.2. So the cost was never the branching.
+
+`eval_case` evaluates each arm over the whole batch and folds the arms together with `zip`, so a
+four-arm `CASE` over six million rows builds **eight full-length arrays** to produce one, and a
+string is the most expensive thing to copy eight times. When every arm is a literal the
+selections already partition the rows, so the column can be built straight from them in one pass
+(`bc-expr/src/eval/branch/literal_case.rs`): offsets from the arms' own lengths, then one
+`extend_from_slice` a row.
+
+| | before | after | DuckDB |
+|---|---|---|---|
+| four-arm `CASE` to strings, grouped | 21.2 ms (473 ms CPU) | **8.2 ms (153 ms CPU)** | 10.2 ms |
+
+A NULL arm declines by construction rather than by a check: the control plane lowers `lit(None)`
+as `nullif(1, 1)`, which is not a literal. Mixed families decline too, so `coerce_numeric` keeps
+the `when(...).then(0).otherwise(x)` case it already handles.
+
+### `op-join-build-large`: 107 ms -> 68 ms, by fixing a probe count that read zero
+
+Two 1.5M-group aggregates over `lineitem`, joined and counted. The streaming executor cannot
+shard a plan that scans one source twice — the shape of every self-join and correlated subquery
+— so the whole probe pipeline runs on **one core** while the materializing executor partitions
+the same join across all of them. The hand-off for exactly this (`InterpError::PreferMaterializing`)
+was already there and never fired, for a reason that took an instrumented build to see.
+
+`spine_join_blocks_sharding` judges the join by comparing the probe side's rows against the
+build's. It takes the probe count from `leftmost_scan`, which **stops at a materialized node by
+design** — and in this shape the probe side *is* a materialized breaker (the aggregate the
+executor just evaluated). So the count came back zero, compared unfavourably against a 1.2M-row
+build, and the check declined every time. Counting the breaker's own output is what the join
+will actually probe with.
+
+With a probe count that exists, the second condition can be relaxed where it is safe to: an
+unshardable plan with a single hash join and a probe side over a million rows hands off even
+when the build is small enough to probe per morsel, because the alternative is not a better
+probe, it is one core.
+
+| | before | after |
+|---|---|---|
+| `op-join-build-large` | 107 ms | **68 ms** (DuckDB 55) |
+| operator mix, join/group-by third, 3 repeats | 0.745 | **0.717** |
+| TPC-H sf1 geomean, 5 repeats | 0.731 | 0.733 (unmoved, 2% spread) |
+
+**Two attempts before this one were reverted, and both looked reasonable.** Lowering the
+flat-probe admission ceiling for semi/anti joins left the target unmoved and cost `op-join-semi`
+12.9 -> 17.3 ms, because declining the morsel probe does not route to the partitioned join — it
+routes to the *sequential* join inside the streaming pipeline. Moving the hand-off judgement to
+before the sharding decision, rather than only after it fails, cost `op-join-agg` 29 -> 47 ms and
+`op-join-semi` 14 -> 22 ms while still not moving the target.
+
+### Tried and reverted: `EXCEPT` as a null-safe anti-join (47 ms -> 260 ms)
+
+`op-except` is the operator mix's second-largest execution loss — 47 ms against Polars' 23 —
+and the algorithm is the reason. `Dataset._set_membership` lowers `EXCEPT`/`INTERSECT` by
+tagging both sides, unioning them, grouping by the whole row and reading two membership flags
+per group: 7.5M rows through a 1.5M-group aggregate. A semi/anti join is the same answer and
+is what Polars does.
+
+It is not written that way because SQL compares NULLs **equal** in a set operation while a hash
+join drops NULL keys, so a naive anti-join keeps every null-keyed left row. That is fixable with
+no engine change: join on `(fill_null(c, standin), c IS NULL)` instead of `c`, which makes two
+NULLs meet and cannot collide a real value with a NULL. It is correct — the whole set-op
+differential suite passes, 115 cases including the NULL files — and it is **5.6x slower**:
+`EXCEPT` 43.8 -> 260.2 ms, `INTERSECT` 45.0 -> 111.1.
+
+The cause is that the second key column leaves the fast path. `hash_join_indices` has a
+single-integer-key route that hashes and compares native values; two columns go through
+`RowConverter`, which is a per-row encode and a byte-slice compare on every chain walk. The
+null-safety cost more than the algorithm saved.
+
+So the join form needs a **single** null-safe key, which means either an engine-level
+null-equal join mode or a proof that the key columns hold no NULLs (`kyber.metadata_answer`
+already answers `exact_null_count` where a source declares it). Both are real designs; neither
+is a lowering change, which is what this attempt assumed. The group-by form stays.
+
+### The measurement lesson: an 8% per-case move on this board is noise
+
+Comparing two single-pass boards showed eight TPC-H "regressions" from the join change —
+including q1 and q6, which contain no join at all. `--repeat 5` says why: the **median per-query
+spread is 11%** across the 22 TPC-H cases, while the geomean's spread is 1.4-2.3%. The two
+engines' geomeans are 0.731 and 0.733, which is the same number.
+
+The harness prints this and it is worth reading before acting on any single row: *"a single-pass
+per-query ratio is far less reproducible than the geomean above it — quote a row only if it was
+repeated, and never a row that crosses 1.00."* Every per-case number in this entry is either a
+30%+ move or was repeated.
+
 ## A grouped aggregate on a join's probe side ran on the executor that is three times slower for it, and one order-preserving join that is not (2026-09-12)
 
 `op-join-build-large` — two 6M-row `GROUP BY l_orderkey` aggregates, 1.5M groups each, joined

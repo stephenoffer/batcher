@@ -47,6 +47,13 @@ pub(crate) fn eval_case(
         selections.push(BooleanArray::new(selection, None));
     }
 
+    // Pass two, when every arm is a literal: build the column directly from the selections.
+    // The general fold below is one full-length array per arm plus a `zip` each, which is
+    // where a four-arm string `CASE` over six million rows spends its time. See `literal_case`.
+    if let Some(out) = super::literal_case::eval_literal_case(branches, otherwise, &selections, n) {
+        return Ok(out);
+    }
+
     // Pass two: the bodies, each over its own rows. The `otherwise` arm takes whatever
     // no branch claimed.
     let mut acc = eval_over(otherwise, batch, &BooleanArray::new(unclaimed, None), n)?;
