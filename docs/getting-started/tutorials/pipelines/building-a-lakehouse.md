@@ -177,9 +177,7 @@ from batcher.io.formats.lakehouse import DeltaSource
 
 by_day = os.path.join(work, "by_day")
 for day in ["2024-03-01", "2024-03-02", "2024-03-03", "2024-03-04"]:
-    bt.from_pydict({"day": [day] * 3, "amount": [1.0, 2.0, 3.0]}).write.delta(
-        by_day, mode="append"
-    )
+    bt.from_pydict({"day": [day] * 3, "amount": [1.0, 2.0, 3.0]}).write.delta(by_day, mode="append")
 
 source = DeltaSource(by_day)
 predicate = (bt.col("day") == "2024-03-03").to_ir()

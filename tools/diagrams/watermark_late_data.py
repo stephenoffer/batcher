@@ -25,9 +25,9 @@ from _authoring import AMBER_DEEP, BLUE, FONT, GREY, band, label, note, svg, wri
 
 W, H = 980, 520
 
-X0, X1 = 130, 790          # plot horizontal extent
-AXIS_Y = 345               # the arrival-order axis
-PX_PER_MIN = 13            # vertical scale
+X0, X1 = 130, 790  # plot horizontal extent
+AXIS_Y = 345  # the arrival-order axis
+PX_PER_MIN = 13  # vertical scale
 LATENESS_PX = 5 * PX_PER_MIN
 
 
@@ -52,7 +52,12 @@ ARRIVALS = (
 MAX_SEEN = ((215, 345, 0), (345, 435, 2), (435, 615, 5), (615, 760, 7), (760, 790, 12))
 
 body: list[str] = [
-    note(490, 50, "Seven records, left to right in the order they arrived. The frontier trails the highest event time seen by the allowed lateness.", anchor="middle"),
+    note(
+        490,
+        50,
+        "Seven records, left to right in the order they arrived. The frontier trails the highest event time seen by the allowed lateness.",
+        anchor="middle",
+    ),
     note(60, 78, "event time", anchor="start"),
 ]
 
@@ -70,12 +75,12 @@ for minutes, clock in ((15, "10:15"), (10, "10:10"), (5, "10:05"), (0, "10:00"),
 max_path = " ".join(f"M {a} {ey(m)} H {b}" for a, b, m in MAX_SEEN)
 wm_path = " ".join(f"M {a} {ey(m) + LATENESS_PX} H {b}" for a, b, m in MAX_SEEN)
 risers = "".join(
-    f'M {MAX_SEEN[i + 1][0]} {ey(MAX_SEEN[i][2])} V {ey(MAX_SEEN[i + 1][2])}'
+    f"M {MAX_SEEN[i + 1][0]} {ey(MAX_SEEN[i][2])} V {ey(MAX_SEEN[i + 1][2])}"
     for i in range(len(MAX_SEEN) - 1)
 )
 wm_risers = "".join(
-    f'M {MAX_SEEN[i + 1][0]} {ey(MAX_SEEN[i][2]) + LATENESS_PX} '
-    f'V {ey(MAX_SEEN[i + 1][2]) + LATENESS_PX}'
+    f"M {MAX_SEEN[i + 1][0]} {ey(MAX_SEEN[i][2]) + LATENESS_PX} "
+    f"V {ey(MAX_SEEN[i + 1][2]) + LATENESS_PX}"
     for i in range(len(MAX_SEEN) - 1)
 )
 body += [
@@ -120,9 +125,24 @@ body += [
     f'<path d="M {X0} {AXIS_Y} H {X1 + 10}" stroke="{GREY}" stroke-width="1.6" marker-end="url(#arG)"/>',
     note(465, AXIS_Y + 37, "arrival order (processing time)", anchor="middle"),
     band(20, 396, 940, 104, "WHAT THE ENGINE DOES WITH EACH ROW", "grey"),
-    note(490, 440, "A row is compared against the frontier as it stood before its own batch, so record 4 arrives out of order and still counts.", anchor="middle"),
-    note(490, 458, "Across several partitions the watermark is the minimum of their maxima, so one slow partition holds the whole frontier back.", anchor="middle"),
-    note(490, 476, "Record 6 is filtered out in Rust and never reaches the aggregate. It is counted: num_late_inputs_dropped on the progress record.", anchor="middle"),
+    note(
+        490,
+        440,
+        "A row is compared against the frontier as it stood before its own batch, so record 4 arrives out of order and still counts.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        458,
+        "Across several partitions the watermark is the minimum of their maxima, so one slow partition holds the whole frontier back.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        476,
+        "Record 6 is filtered out in Rust and never reaches the aggregate. It is counted: num_late_inputs_dropped on the progress record.",
+        anchor="middle",
+    ),
 ]
 
 write("watermark_late_data", svg(W, H, "".join(body)))

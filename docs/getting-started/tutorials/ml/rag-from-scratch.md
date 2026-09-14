@@ -100,14 +100,10 @@ def encode(texts):
 
 def embed_batch(batch):
     vectors = encode(batch.column("chunk").to_pylist())
-    return batch.append_column(
-        "embedding", pa.array(vectors, type=pa.list_(pa.float64()))
-    )
+    return batch.append_column("embedding", pa.array(vectors, type=pa.list_(pa.float64())))
 
 
-index = chunks.map_batches(
-    embed_batch, output_columns=["doc_id", "chunk", "embedding"]
-).cache()
+index = chunks.map_batches(embed_batch, output_columns=["doc_id", "chunk", "embedding"]).cache()
 print(index.count())
 # 6
 ```

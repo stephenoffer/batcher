@@ -38,8 +38,12 @@ body = [
     label(332, 122, "cut here", anchor="middle"),
     arrow(616, 132, 680, 132, "blue"),
     label(648, 122, "measure", anchor="middle"),
-    note(490, 208, "Provenance.DEFAULT: the optimizer knows it is guessing this one.", anchor="middle"),
-
+    note(
+        490,
+        208,
+        "Provenance.DEFAULT: the optimizer knows it is guessing this one.",
+        anchor="middle",
+    ),
     # ---- the branch: did the estimate hold? --------------------------------
     card(80, 312, 330, 88, "Stop cutting", "finish the rest in one shot"),
     card(570, 312, 330, 88, "Re-plan the residual", "on the size just measured"),
@@ -47,18 +51,25 @@ body = [
     label(556, 252, "held: within 3x", anchor="middle"),
     arrow(830, 180, 760, 308, "amber"),
     label(872, 250, "missed by more", anchor="start"),
-
     card(570, 440, 330, 84, "Build side, broadcast, join order", "chosen on rows, not on a guess"),
     arrow(735, 400, 735, 440, "amber"),
     label(750, 426, "re-optimize", anchor="start"),
-
     note(80, 440, "The splice is a Scan over the stage's", anchor="start"),
     note(80, 458, "result, so the next stage's estimator", anchor="start"),
     note(80, 476, "reads an exact size rather than one", anchor="start"),
     note(80, 494, "more inherited guess.", anchor="start"),
-
-    note(490, 526, "\"Held\" is the symmetric q-error, against optimizer.reoptimize_error (2.0). Same mechanism and granularity as Spark AQE -- nothing re-plans inside a stage.", anchor="middle"),
-    note(490, 546, "A breaker whose output size is already known exactly is not cut at all: 17 of 51 across the 22 TPC-H shapes ran inline, fused into the subplan above them.", anchor="middle"),
+    note(
+        490,
+        526,
+        '"Held" is the symmetric q-error, against optimizer.reoptimize_error (2.0). Same mechanism and granularity as Spark AQE -- nothing re-plans inside a stage.',
+        anchor="middle",
+    ),
+    note(
+        490,
+        546,
+        "A breaker whose output size is already known exactly is not cut at all: 17 of 51 across the 22 TPC-H shapes ran inline, fused into the subplan above them.",
+        anchor="middle",
+    ),
 ]
 
 write("reopt_at_breaker", svg(W, H, "".join(body)))

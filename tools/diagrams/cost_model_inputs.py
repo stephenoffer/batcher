@@ -38,7 +38,6 @@ body = [
     card(278, 86, 190, 86, "Row width", "type-exact, not a flat 64"),
     card(516, 86, 190, 86, "Machine terms", "L3, memory budget, device"),
     card(754, 86, 190, 86, "Coefficients", "constants, then calibrated"),
-
     card(340, 250, 300, 100, "CostModel.cost(node)", "one fold over the plan tree"),
     arrow(135, 172, 355, 246, "blue"),
     label(200, 212, "rows", anchor="end"),
@@ -48,7 +47,6 @@ body = [
     label(620, 212, "the machine", anchor="start"),
     arrow(849, 172, 620, 246, "blue"),
     label(770, 212, "work units", anchor="start"),
-
     band(20, 390, 940, 140, "WHAT IT EMITS  ·  FOUR AXES, THREE IN THE SCALAR", "amber"),
     card(100, 420, 340, 88, "One comparable number", "1.0 x cpu  +  1.0 x io  +  2.0 x net"),
     card(540, 420, 340, 88, "Peak working set", "a max along the tree, never summed"),
@@ -56,7 +54,6 @@ body = [
     label(300, 382, "cpu, io, net", anchor="end"),
     arrow(560, 350, 700, 416, "amber"),
     label(700, 382, "mem", anchor="start"),
-
     note(270, 552, "ranks the alternatives:", anchor="middle"),
     note(270, 572, "join order, join strategy, whether to spill", anchor="middle"),
     note(710, 552, "gates feasibility, not throughput --", anchor="middle"),

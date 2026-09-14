@@ -173,15 +173,19 @@ The simplest possible call is where out-of-the-box utilization is won or lost.
 # docs: skip
 import batcher as bt
 
+
 class Classifier:
     def __init__(self):
         import torchvision, torch
+
         self.model = torchvision.models.resnet50(weights="DEFAULT").cuda().eval()
 
     def __call__(self, batch):
         import torch
+
         with torch.no_grad():
             return {"pred": self.model(batch["img"].cuda()).argmax(1).cpu().numpy()}
+
 
 # No batch_size given. Batcher picks a VRAM-safe default.
 ds = bt.read.images("s3://bucket/frames/", decode=True, size=(224, 224))

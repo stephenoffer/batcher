@@ -110,19 +110,31 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"acct-1", b"acct-2", b"acct-1"],
-    "value": [b'{"account":"acct-1","delta":50}', b'{"account":"acct-2","delta":-20}',
-              b'{"account":"acct-1","delta":15}'],
-    "partition": [0, 1, 0],
-    "offset": [881, 12, 882],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["persistent://public/default/ledger"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"acct-1", b"acct-2", b"acct-1"],
+        "value": [
+            b'{"account":"acct-1","delta":50}',
+            b'{"account":"acct-2","delta":-20}',
+            b'{"account":"acct-1","delta":15}',
+        ],
+        "partition": [0, 1, 0],
+        "offset": [881, 12, 882],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["persistent://public/default/ledger"] * 3,
+    },
+    schema=schema,
+)
 
 # Stand in for the topic; the pipeline below is what you run against the real one.
 ledger = bt.from_batches(lambda: iter([batch]), schema)
@@ -143,15 +155,13 @@ the practical shape of the warning above.
 
 ```python
 # docs: skip
-q = (
-    bt.read.pulsar("events", service_url="pulsar://broker:6650",
-                   subscription="bronze-events", num_partitions=8)
-    .write.delta(
-        "lake/bronze/events",
-        trigger=bt.Trigger.processing_time("30 seconds"),
-        checkpoint="/var/lib/batcher/ckpt/bronze-events",
-        query_name="bronze-events",
-    )
+q = bt.read.pulsar(
+    "events", service_url="pulsar://broker:6650", subscription="bronze-events", num_partitions=8
+).write.delta(
+    "lake/bronze/events",
+    trigger=bt.Trigger.processing_time("30 seconds"),
+    checkpoint="/var/lib/batcher/ckpt/bronze-events",
+    query_name="bronze-events",
 )
 q.await_termination()
 ```

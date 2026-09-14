@@ -108,7 +108,7 @@ using an unfitted object.
 # docs: skip
 for batch in train_v.ml.iter_torch_batches(
     batch_size=256,
-    device="auto",                  # CUDA / ROCm / XPU / MPS / CPU
+    device="auto",  # CUDA / ROCm / XPU / MPS / CPU
     pin_memory=True,
     local_shuffle_buffer_size=8192,
 ):

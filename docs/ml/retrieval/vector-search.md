@@ -25,11 +25,7 @@ docs = bt.from_pydict(
 )
 query = array(1.0, 0.0)
 
-hits = (
-    docs.with_columns(dist=col("vec").list.cosine_distance(query))
-    .sort("dist")
-    .head(2)
-)
+hits = docs.with_columns(dist=col("vec").list.cosine_distance(query)).sort("dist").head(2)
 print(hits.select("id", "title").to_pydict())
 # {'id': [1, 3], 'title': ['cats', 'kittens']}
 ```
@@ -74,6 +70,7 @@ exactly what a binary vector index ranks by:
 ```python
 # docs: skip
 from batcher import col
+
 # `bits` columns are quantized 0/1 embeddings; rank by how many bits differ.
 nearest = docs.with_columns(dist=col("bits").list.hamming_distance(query_bits)).sort("dist")
 ```
@@ -94,9 +91,12 @@ Use `top_k` rather than `sort().head(k)` when you only want the winners: it keep
 bounded heap instead of ordering the whole relation.
 
 ```python
-print(docs.with_columns(dist=col("vec").list.cosine_distance(query))
-      .top_k(2, by="dist", descending=False)
-      .select("id").to_pydict())
+print(
+    docs.with_columns(dist=col("vec").list.cosine_distance(query))
+    .top_k(2, by="dist", descending=False)
+    .select("id")
+    .to_pydict()
+)
 # {'id': [1, 3]}
 ```
 

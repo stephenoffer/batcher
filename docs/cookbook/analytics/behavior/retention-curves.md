@@ -16,6 +16,7 @@ import datetime as dt
 import batcher as bt
 from batcher import col
 
+
 def may(day: int) -> dt.date:
     return dt.date(2024, 5, day)
 
@@ -72,11 +73,7 @@ production.
 Count the rows in each cell:
 
 ```python
-naive = (
-    labelled.group_by("cohort", "day_n")
-    .agg(active=bt.count())
-    .sort("cohort", "day_n")
-)
+naive = labelled.group_by("cohort", "day_n").agg(active=bt.count()).sort("cohort", "day_n")
 print(naive.to_pydict())
 # {'cohort': ['2024-05-01', '2024-05-01', '2024-05-01', '2024-05-02', '2024-05-02'],
 #  'day_n': [0, 1, 7, 0, 7], 'active': [4, 2, 2, 1, 1]}
@@ -109,9 +106,7 @@ render it.
 ```python
 cells = labelled.group_by("cohort", "day_n").agg(active=col("user").n_unique())
 sizes = (
-    labelled.filter(col("day_n") == 0)
-    .group_by("cohort")
-    .agg(cohort_size=col("user").n_unique())
+    labelled.filter(col("day_n") == 0).group_by("cohort").agg(cohort_size=col("user").n_unique())
 )
 
 curve = (

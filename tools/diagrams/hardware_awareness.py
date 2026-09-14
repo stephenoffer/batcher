@@ -56,7 +56,6 @@ body = [
     note(936, 238, "Re-read every 100 ms, so a", anchor="end"),
     note(936, 258, "worker pinned after start is", anchor="end"),
     note(936, 278, "picked up.", anchor="end"),
-
     band(20, 330, 940, 190, "WHERE A HARDWARE FACT REACHES A PLAN DECISION", "blue"),
     card(44, 386, 280, 96, "Shard and pool width", "every physical core, plus a"),
     note(184, 452, "third of the SMT siblings", anchor="middle"),
@@ -70,10 +69,24 @@ body = [
     label(500, 300, "memory ceiling", anchor="end"),
     arrow(660, 240, 796, 378, "blue"),
     label(740, 300, "device inventory", anchor="start"),
-
-    note(490, 556, "The same record hashes to a 12-character fingerprint, and that fingerprint scopes every learned value measured in machine units --", anchor="middle"),
-    note(490, 576, "nanoseconds, bytes, batch sizes -- so unlike machines never blend their coefficients. A statement about the data is never scoped:", anchor="middle"),
-    note(490, 596, "a column has the same distinct count whatever machine reads it, and scoping those would fragment the statistics hardest to collect.", anchor="middle"),
+    note(
+        490,
+        556,
+        "The same record hashes to a 12-character fingerprint, and that fingerprint scopes every learned value measured in machine units --",
+        anchor="middle",
+    ),
+    note(
+        490,
+        576,
+        "nanoseconds, bytes, batch sizes -- so unlike machines never blend their coefficients. A statement about the data is never scoped:",
+        anchor="middle",
+    ),
+    note(
+        490,
+        596,
+        "a column has the same distinct count whatever machine reads it, and scoping those would fragment the statistics hardest to collect.",
+        anchor="middle",
+    ),
 ]
 
 write("hardware_awareness", svg(W, H, "".join(body)))

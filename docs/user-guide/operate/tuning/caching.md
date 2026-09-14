@@ -50,8 +50,8 @@ separate question, answered by the storage level below.
 ```python
 hot = events.filter(bt.col("status") == "active").cache()
 
-first = hot.count()          # executes the plan, stores the result
-second = hot.count()         # cache hit, no re-execution
+first = hot.count()  # executes the plan, stores the result
+second = hot.count()  # cache hit, no re-execution
 totals = hot.group_by("region").agg(total=bt.col("amount").sum())
 
 print(first, second)
@@ -94,8 +94,8 @@ is a hit.
 
 ```python
 warm = events.filter(bt.col("status") == "active").cache()
-warm.collect()                 # fills the cache
-print(warm.count())            # served from it, no second scan
+warm.collect()  # fills the cache
+print(warm.count())  # served from it, no second scan
 # 4
 ```
 

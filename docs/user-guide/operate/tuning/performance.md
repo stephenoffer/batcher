@@ -35,7 +35,7 @@ queries.
 ```python
 hot = events.filter(bt.col("status") == "active").cache()
 
-first = hot.to_pydict()   # computed once, then stored
+first = hot.to_pydict()  # computed once, then stored
 second = hot.to_pydict()  # cache hit — no re-execution
 print(first == second)
 # True
@@ -101,9 +101,7 @@ import dataclasses
 from batcher.config import active_config, config_context
 
 current = active_config()
-quiet = current.replace(
-    observability=dataclasses.replace(current.observability, event_log=False)
-)
+quiet = current.replace(observability=dataclasses.replace(current.observability, event_log=False))
 with config_context(quiet):
     print(events.count())
 # 6
@@ -204,10 +202,7 @@ runs.
 ```python
 dim = bt.from_pydict({"region": ["us", "eu"], "tier": ["gold", "silver"]})
 joined = (
-    events.join(dim, on="region")
-    .group_by("tier")
-    .agg(total=bt.col("amount").sum())
-    .sort("tier")
+    events.join(dim, on="region").group_by("tier").agg(total=bt.col("amount").sum()).sort("tier")
 )
 print(joined.collect(adaptive=True).to_pydict())
 # {'tier': ['gold', 'silver'], 'total': [112.0, 20.0]}

@@ -25,7 +25,19 @@ then one worker's pass over one morsel.
 
 from __future__ import annotations
 
-from _authoring import AMBER_DEEP, BLUE_MID, FONT, GREY, arrow, band, card, curve, label, note, svg, write
+from _authoring import (
+    BLUE_MID,
+    FONT,
+    GREY,
+    arrow,
+    band,
+    card,
+    curve,
+    label,
+    note,
+    svg,
+    write,
+)
 
 W, H = 980, 596
 
@@ -46,7 +58,7 @@ body.append(band(20, 24, 940, 130, "MAKE THE MORSELS", "grey"))
 body.append(note(44, 64, "input: whatever the source emitted"))
 
 x = 44
-for w in (142, 30, 96, 16, 20, 58):          # row groups, arrivals, a filter's crumbs
+for w in (142, 30, 96, 16, 20, 58):  # row groups, arrivals, a filter's crumbs
     body.append(chip(x, 78, w, 34, "grey"))
     x += w + 6
 
@@ -66,16 +78,30 @@ body.append(arrow(490, 156, 490, 194))
 body.append(label(504, 180, "par_iter() over the morsel vector", size=11.5))
 
 body.append(band(20, 200, 940, 190, "SCHEDULE: ONE POOL, ONE MORSEL PER TASK", "blue"))
-body.append(note(490, 244, "W = operator_cores(), capped by the number of morsels the input can produce "
-                           "(par::auto_width)", anchor="middle"))
+body.append(
+    note(
+        490,
+        244,
+        "W = operator_cores(), capped by the number of morsels the input can produce "
+        "(par::auto_width)",
+        anchor="middle",
+    )
+)
 
 WORKER_Y, WORKER_H = 258, 82
 for i, wx in enumerate((44, 286, 528, 770)):
     body.append(card(wx, WORKER_Y, 196, WORKER_H, f"worker {i}", "one morsel at a time"))
 
 body.append(curve(142, WORKER_Y + WORKER_H, 490, 386, 868, WORKER_Y + WORKER_H, "amber"))
-body.append(label(490, 378, "an idle worker steals: rayon's scheduler, not Batcher's",
-                  anchor="middle", size=11.5))
+body.append(
+    label(
+        490,
+        378,
+        "an idle worker steals: rayon's scheduler, not Batcher's",
+        anchor="middle",
+        size=11.5,
+    )
+)
 
 # ---- Zoom 3: what one worker does ---------------------------------------------------
 body.append(arrow(490, 392, 490, 424))
@@ -99,8 +125,15 @@ body.append(
     f'<text x="864" y="508" font-family="{FONT}" font-size="11.5" class="t-sub">index order</text>'
 )
 
-body.append(note(490, 572, "Filter and project preserve row order because the morsels are collected in index "
-                           "order. The hash operators do not.", anchor="middle"))
+body.append(
+    note(
+        490,
+        572,
+        "Filter and project preserve row order because the morsels are collected in index "
+        "order. The hash operators do not.",
+        anchor="middle",
+    )
+)
 
 write("morsel_scheduling", svg(W, H, "".join(body)))
 print("wrote morsel_scheduling.svg")

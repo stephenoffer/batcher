@@ -104,13 +104,24 @@ body += [
     note(858, 506, "streams past it, so the cost", anchor="middle"),
     note(858, 524, "is one bucket, not two.", anchor="middle"),
     curve(478, 544, 355, 590, 232, 544, "amber"),
-    label(355, 602, "build bucket still over budget: re-partition it with a fresh salt, at most 3 deep",
-          anchor="middle", size=11.5),
+    label(
+        355,
+        602,
+        "build bucket still over budget: re-partition it with a fresh salt, at most 3 deep",
+        anchor="middle",
+        size=11.5,
+    ),
 ]
 
-body.append(note(490, 636, "A re-split is a re-hash, so it cannot separate rows that share a key. "
-                           "One hot key stays in one bucket at every level, which is why the depth is bounded.",
-                 anchor="middle"))
+body.append(
+    note(
+        490,
+        636,
+        "A re-split is a re-hash, so it cannot separate rows that share a key. "
+        "One hot key stays in one bucket at every level, which is why the depth is bounded.",
+        anchor="middle",
+    )
+)
 
 write("hash_join_spill", svg(W, H, "".join(body)))
 print("wrote hash_join_spill.svg")

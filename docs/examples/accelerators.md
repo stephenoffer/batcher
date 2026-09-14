@@ -32,9 +32,7 @@ stage runs on the CPU engine, so `backend="gpu"` stays safe.
 import batcher as bt
 from batcher import col
 
-lineitem = bt.from_pydict(
-    {"l_shipmode": ["AIR", "SHIP", "AIR"], "l_quantity": [17, 36, 8]}
-)
+lineitem = bt.from_pydict({"l_shipmode": ["AIR", "SHIP", "AIR"], "l_quantity": [17, 36, 8]})
 
 query = (
     lineitem.filter(col("l_quantity") > 10)

@@ -41,7 +41,7 @@ import batcher as bt
 ds = bt.from_pydict({"city": ["NYC", "LA", "NYC", "SF"], "amount": [10, 20, 30, 40]})
 plan = ds.filter(bt.col("amount") > 15).group_by("city").agg(total=bt.col("amount").sum())
 
-print(plan.stats().rows)   # rows the query actually produced
+print(plan.stats().rows)  # rows the query actually produced
 # 3
 ```
 

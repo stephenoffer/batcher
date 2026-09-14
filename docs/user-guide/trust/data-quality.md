@@ -216,9 +216,7 @@ failing, which is what lets scoped and unscoped constraints sit in one chain wit
 interfering.
 
 ```python
-addresses = bt.from_pydict(
-    {"country": ["US", "FR", "US"], "state": ["CA", None, None]}
-)
+addresses = bt.from_pydict({"country": ["US", "FR", "US"], "state": ["CA", None, None]})
 scoped = addresses.dq.where(bt.col("country") == "US").not_null("state")
 print(scoped.validate().violations)
 # {'not_null(state)': 1}

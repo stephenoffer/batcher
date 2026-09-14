@@ -12,8 +12,8 @@ passing `backend=` to `collect()`. It is the same query and the same result. Onl
 ds = bt.read.parquet("s3://warehouse/events/")
 q = ds.group_by("country").agg(revenue=bt.col("amount").sum())
 
-q.collect(backend="cpu")   # the native engine (default)
-q.collect(backend="gpu")   # force the cuDF GPU backend for any supported shape
+q.collect(backend="cpu")  # the native engine (default)
+q.collect(backend="gpu")  # force the cuDF GPU backend for any supported shape
 q.collect(backend="auto")  # let Kyber decide GPU vs CPU by estimated size
 ```
 
@@ -39,15 +39,24 @@ That is why the shape of the query, not just its size, decides whether the GPU h
 ds.group_by("country").agg(revenue=bt.col("amount").sum()).collect(backend="auto")
 
 # reduces, and the sort and limit run once on the folded result
-(ds.group_by("country").agg(r=bt.col("amount").sum())
-   .sort("r", descending=True).limit(10).collect(backend="auto"))
+(
+    ds.group_by("country")
+    .agg(r=bt.col("amount").sum())
+    .sort("r", descending=True)
+    .limit(10)
+    .collect(backend="auto")
+)
 
 # does not reduce: still splits, and the shards' rows reassemble in order
 ds.filter(bt.col("amount") > 100).collect(backend="auto")
 
 # a star schema: the fact side splits, every device reads the dimension itself
-(facts.join(dims, on="sku").group_by("category").agg(r=bt.col("amount").sum())
-      .collect(backend="auto"))
+(
+    facts.join(dims, on="sku")
+    .group_by("category")
+    .agg(r=bt.col("amount").sum())
+    .collect(backend="auto")
+)
 ```
 
 A shard that a device cannot hold is subdivided and rerun on the device rather than

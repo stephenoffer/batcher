@@ -376,9 +376,7 @@ one and swap it onto `Config`. For example, to ship JSON logs and see every deci
 from batcher import Config
 from batcher.config import ObservabilityConfig
 
-cfg = Config().replace(
-    observability=ObservabilityConfig(log_level="INFO", log_format="json")
-)
+cfg = Config().replace(observability=ObservabilityConfig(log_level="INFO", log_format="json"))
 print((cfg.observability.resolved_log_level, cfg.observability.event_log))
 # ('INFO', True)
 ```

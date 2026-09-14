@@ -377,4 +377,3 @@ def broadcast_aggregate_leaves(expr: Expr | AggExpr) -> Expr:
             return expr
         return dataclasses.replace(expr, **updates)
     return expr
-

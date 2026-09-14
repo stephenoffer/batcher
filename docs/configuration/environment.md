@@ -38,9 +38,7 @@ You can reproduce the overlay in code by passing an explicit environment mapping
 ```python
 from batcher import Config
 
-cfg = Config.from_env(
-    {"BATCHER_EXECUTION_PARALLELISM": "8", "BATCHER_MEMORY_SOFT_LIMIT": "0.75"}
-)
+cfg = Config.from_env({"BATCHER_EXECUTION_PARALLELISM": "8", "BATCHER_MEMORY_SOFT_LIMIT": "0.75"})
 print((cfg.execution.parallelism, cfg.memory.soft_limit))
 # (8, 0.75)
 ```

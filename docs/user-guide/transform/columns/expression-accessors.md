@@ -74,7 +74,11 @@ out = events.select(
     next_month=bt.col("ts").dt.offset_by("1mo"),
     in_ny=bt.col("ts").dt.convert_timezone("UTC", "America/New_York"),
 )
-print(out.select(text=bt.col("text"), next=bt.col("next_month").dt.month(), ny_hour=bt.col("in_ny").dt.hour()).to_pydict())
+print(
+    out.select(
+        text=bt.col("text"), next=bt.col("next_month").dt.month(), ny_hour=bt.col("in_ny").dt.hour()
+    ).to_pydict()
+)
 # {'text': ['2024/01/15', '2024/06/01'], 'next': [2, 7], 'ny_hour': [4, 14]}
 ```
 
@@ -92,7 +96,11 @@ out = events.select(
     later=bt.date_add(bt.col("ts"), 7),
     earlier=bt.date_sub(bt.col("ts"), 7),
 )
-print(out.select(part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt.col("earlier").dt.day()).to_pydict())
+print(
+    out.select(
+        part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt.col("earlier").dt.day()
+    ).to_pydict()
+)
 # {'part': [1, 6], 'later': [22, 8], 'earlier': [8, 25]}
 ```
 

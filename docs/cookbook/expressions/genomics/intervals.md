@@ -75,9 +75,8 @@ Once these are tables, an overlap query is a join on the contig plus a predicate
 
 ```python
 # docs: skip
-in_target = (
-    variants.join(regions, left_on="chrom", right_on="chrom", how="inner")
-    .filter((bt.col("pos") >= bt.col("start_1")) & (bt.col("pos") <= bt.col("end_1")))
+in_target = variants.join(regions, left_on="chrom", right_on="chrom", how="inner").filter(
+    (bt.col("pos") >= bt.col("start_1")) & (bt.col("pos") <= bt.col("end_1"))
 )
 ```
 

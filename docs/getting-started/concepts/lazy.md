@@ -9,8 +9,8 @@ import batcher as bt
 
 ds = bt.from_pydict({"x": [1, 2, 3, 4], "g": ["a", "b", "a", "b"]})
 
-filtered = ds.filter(bt.col("x") > 1)     # ds is unchanged
-projected = filtered.select("x")          # filtered is unchanged
+filtered = ds.filter(bt.col("x") > 1)  # ds is unchanged
+projected = filtered.select("x")  # filtered is unchanged
 
 print(ds.columns)
 # ['x', 'g']
@@ -37,8 +37,8 @@ The common terminals:
   {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink.
 
 ```python
-plan = ds.filter(bt.col("x") >= 2).select("x")   # nothing runs yet
-print(plan.to_pydict())                            # runs here
+plan = ds.filter(bt.col("x") >= 2).select("x")  # nothing runs yet
+print(plan.to_pydict())  # runs here
 # {'x': [2, 3, 4]}
 ```
 

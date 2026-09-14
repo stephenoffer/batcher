@@ -130,7 +130,9 @@ a single bool or a list aligned with `by`.
 print(ds.sort("price", descending=True).select("price").to_pydict())
 # {'price': [60.0, 50.0, 40.0, 30.0, 20.0, 10.0]}
 
-print(ds.sort("category", "price", descending=[False, True]).select("category", "price").to_pydict())
+print(
+    ds.sort("category", "price", descending=[False, True]).select("category", "price").to_pydict()
+)
 # {'category': ['a', 'a', 'a', 'b', 'b', 'c'], 'price': [50.0, 30.0, 10.0, 40.0, 20.0, 60.0]}
 ```
 
@@ -365,9 +367,9 @@ import duckdb
 import polars as pl
 import pyarrow as pa
 
-pl.DataFrame(ds)                  # Polars
-duckdb.sql("SELECT * FROM ds")    # DuckDB, by variable name
-pa.table(ds)                      # pyarrow
+pl.DataFrame(ds)  # Polars
+duckdb.sql("SELECT * FROM ds")  # DuckDB, by variable name
+pa.table(ds)  # pyarrow
 ```
 
 The stream is lazy. Batches are pulled from the plan as the consumer reads them, so a

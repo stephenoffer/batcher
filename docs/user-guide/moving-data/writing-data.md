@@ -68,9 +68,7 @@ import datetime as dt
 
 import batcher as bt
 
-events = bt.from_pydict(
-    {"at": [dt.datetime(2024, 2, 29, 12, 34, 56, 123456)], "amount": [10]}
-)
+events = bt.from_pydict({"at": [dt.datetime(2024, 2, 29, 12, 34, 56, 123456)], "amount": [10]})
 print(events.schema.field("at").type)
 # timestamp[us]
 ```
@@ -307,9 +305,7 @@ and deletes the now-stale parts. It runs on local files, so it executes here:
 import glob
 
 comp_dir = tempfile.mkdtemp()
-_ = bt.from_pydict({"x": [1, 2, 3, 4]}).repartition(num_files=2).write(
-    comp_dir, format="parquet"
-)
+_ = bt.from_pydict({"x": [1, 2, 3, 4]}).repartition(num_files=2).write(comp_dir, format="parquet")
 _ = bt.compact(comp_dir, num_files=1, format="parquet")
 print(len(glob.glob(os.path.join(comp_dir, "*.parquet"))))
 # 1

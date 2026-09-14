@@ -51,8 +51,14 @@ body: list[str] = []
 
 # ---- Zoom 1: the cut set is a plan property ----------------------------------------
 body.append(band(20, 24, 940, 142, "CUT THE PLAN AT ITS PIPELINE BREAKERS", "grey"))
-body.append(note(44, 62, "the cut set is decided from the plan alone (plan_analysis._has_breaker); "
-                         "the cluster does not enter into it"))
+body.append(
+    note(
+        44,
+        62,
+        "the cut set is decided from the plan alone (plan_analysis._has_breaker); "
+        "the cluster does not enter into it",
+    )
+)
 
 body.append(card(44, 76, 230, 62, "scan / filter / project", "row-wise: no cut"))
 body.append(arrow(278, 107, 326, 107))
@@ -67,8 +73,14 @@ body.append(card(828, 76, 110, 62, "limit", "BREAKER"))
 
 for x in (328, 576, 824):
     body.append(cut(x, 70, 150))
-body.append(note(452, 162, "Aggregate, Sort, Join, Distinct, Limit -- every other node "
-                           "runs inside the stage it is in", anchor="middle"))
+body.append(
+    note(
+        452,
+        162,
+        "Aggregate, Sort, Join, Distinct, Limit -- every other node runs inside the stage it is in",
+        anchor="middle",
+    )
+)
 
 # ---- Zoom 2: one stage ---------------------------------------------------------------
 body.append(arrow(490, 172, 490, 208))

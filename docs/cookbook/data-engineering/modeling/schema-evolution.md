@@ -187,9 +187,7 @@ happen.
 narrow = os.path.join(work, "narrow")
 bt.from_pydict({"id": [1], "amount": [10]}).write.delta(narrow, mode="overwrite")
 try:
-    bt.from_pydict({"id": [2], "amount": [20], "region": ["us"]}).write.delta(
-        narrow, mode="append"
-    )
+    bt.from_pydict({"id": [2], "amount": [20], "region": ["us"]}).write.delta(narrow, mode="append")
 except Exception as exc:
     print(type(exc).__name__)
 # CommitError

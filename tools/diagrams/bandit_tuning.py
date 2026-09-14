@@ -39,8 +39,12 @@ body = [
     card(44, 84, 280, 90, "Join strategy", "hash / broadcast / sort_merge"),
     card(350, 84, 280, 90, "Execution route", "one_shot / staged"),
     card(656, 84, 280, 90, "The reward", "measured latency, minimized"),
-    note(490, 206, "Every arm emits the same relation. A wrong pick costs throughput, never correctness -- which is what makes exploring safe at all.", anchor="middle"),
-
+    note(
+        490,
+        206,
+        "Every arm emits the same relation. A wrong pick costs throughput, never correctness -- which is what makes exploring safe at all.",
+        anchor="middle",
+    ),
     card(44, 290, 260, 96, "Under 3 observations?", "yes: the cost model decides"),
     card(360, 290, 260, 96, "An arm never tried?", "yes: give it exactly one turn"),
     card(676, 290, 260, 96, "Otherwise", "the lowest bound wins"),
@@ -49,16 +53,21 @@ body = [
     arrow(620, 338, 676, 338, "blue"),
     label(648, 328, "no", anchor="middle"),
     note(490, 412, "mean - 1.0 x spread x sqrt(2 ln N / n)", anchor="middle"),
-    note(490, 430, "ties break by name. No RNG anywhere, so a plan is reproducible.", anchor="middle"),
-
+    note(
+        490, 430, "ties break by name. No RNG anywhere, so a plan is reproducible.", anchor="middle"
+    ),
     card(676, 452, 260, 84, "Evidence decays", "0.975 per observation"),
     arrow(806, 386, 806, 452, "amber"),
     label(818, 424, "record the ms", anchor="start"),
     note(806, 560, "an effective horizon of about 40 runs", anchor="middle"),
     curve(676, 516, 420, 580, 176, 394, "amber"),
     label(420, 548, "so an arm that got faster is asked again", anchor="middle"),
-
-    note(490, 600, "Statistics are per plan signature, and anything in machine units is additionally scoped by hardware fingerprint, so unlike machines never blend.", anchor="middle"),
+    note(
+        490,
+        600,
+        "Statistics are per plan signature, and anything in machine units is additionally scoped by hardware fingerprint, so unlike machines never blend.",
+        anchor="middle",
+    ),
 ]
 
 write("bandit_tuning", svg(W, H, "".join(body)))

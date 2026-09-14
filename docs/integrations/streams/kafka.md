@@ -54,19 +54,31 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"u1", b"u2", b"u1"],
-    "value": [b'{"user":"u1","amount":10}', b'{"user":"u2","amount":5}',
-              b'{"user":"u1","amount":7}'],
-    "partition": [0, 0, 1],
-    "offset": [11, 12, 4],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["orders"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"u1", b"u2", b"u1"],
+        "value": [
+            b'{"user":"u1","amount":10}',
+            b'{"user":"u2","amount":5}',
+            b'{"user":"u1","amount":7}',
+        ],
+        "partition": [0, 0, 1],
+        "offset": [11, 12, 4],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["orders"] * 3,
+    },
+    schema=schema,
+)
 
 # Stand in for the Kafka source; the pipeline below is what you run against the real one.
 orders = bt.from_batches(lambda: iter([batch]), schema)
@@ -252,8 +264,9 @@ You can also pin a reader to a subset yourself:
 
 ```python
 # docs: skip
-shard = bt.read.kafka("clicks", bootstrap_servers="broker-1:9092",
-                      group="etl", partitions=[0, 1, 2])
+shard = bt.read.kafka(
+    "clicks", bootstrap_servers="broker-1:9092", group="etl", partitions=[0, 1, 2]
+)
 ```
 
 ## Security and client config

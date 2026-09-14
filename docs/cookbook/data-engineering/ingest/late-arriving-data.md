@@ -136,9 +136,7 @@ import datetime
 t0 = datetime.datetime(2024, 3, 5, 10, 0)
 minute = datetime.timedelta(minutes=1)
 
-clicks = bt.from_pydict(
-    {"ts": [t0, t0 + minute, t0 + 6 * minute], "revenue": [1.0, 2.0, 4.0]}
-)
+clicks = bt.from_pydict({"ts": [t0, t0 + minute, t0 + 6 * minute], "revenue": [1.0, 2.0, 4.0]})
 windowed = (
     clicks.with_watermark("ts", "10m")
     .group_by(w=bt.window(bt.col("ts"), "5m"))

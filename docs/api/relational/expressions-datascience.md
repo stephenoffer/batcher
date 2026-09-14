@@ -121,11 +121,13 @@ them with signatures and docstrings.
 
 ```python
 scored = bt.from_pydict({"y": [1, 0, 1, 1, 0], "p": [1, 0, 0, 1, 1]})
-print(scored.agg(
-    f1=bt.f1_score("y", "p"),
-    jaccard=bt.jaccard_score("y", "p"),
-    informedness=bt.informedness("y", "p"),
-).to_pydict())
+print(
+    scored.agg(
+        f1=bt.f1_score("y", "p"),
+        jaccard=bt.jaccard_score("y", "p"),
+        informedness=bt.informedness("y", "p"),
+    ).to_pydict()
+)
 ```
 
 Two kinds of metric don't fit that shape. One needs a global ordering over the rows, such

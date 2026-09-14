@@ -35,8 +35,11 @@ pivot without an aggregate: if a cell can hold two rows, something has to combin
 `aggregate` is one of sum, mean, min, max, count.
 
 ```python
-print(sales.pivot(index=["region"], on="quarter", values="amount", aggregate="mean")
-      .sort("region").to_pydict())
+print(
+    sales.pivot(index=["region"], on="quarter", values="amount", aggregate="mean")
+    .sort("region")
+    .to_pydict()
+)
 # {'region': ['east', 'west'], 'q1': [30.0, 7.5], 'q2': [40.0, 20.0]}
 ```
 
@@ -53,9 +56,7 @@ Pass `columns=[...]` when you know the vocabulary. The pre-pass disappears, the 
 is fixed, and a missing value shows up as a null column instead of a missing one.
 
 ```python
-fixed = sales.pivot(
-    index=["region"], on="quarter", values="amount", columns=["q1", "q2", "q3"]
-)
+fixed = sales.pivot(index=["region"], on="quarter", values="amount", columns=["q1", "q2", "q3"])
 print(fixed.sort("region").to_pydict())
 # {'region': ['east', 'west'], 'q1': [30.0, 15.0], 'q2': [40.0, 20.0], 'q3': [None, None]}
 ```

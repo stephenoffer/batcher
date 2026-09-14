@@ -14,8 +14,8 @@ import batcher as bt
 from batcher.ml.sampling import class_counts, class_weights, oversample, undersample
 
 ds = bt.from_pydict({"y": [0] * 100 + [1] * 10, "x": list(range(110))})
-print(class_counts(undersample(ds, "y"), "y"))   # exactly balanced by discarding
-print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicating
+print(class_counts(undersample(ds, "y"), "y"))  # exactly balanced by discarding
+print(class_counts(oversample(ds, "y"), "y"))  # exactly balanced by duplicating
 ```
 
 `undersample` discards majority rows. `oversample` duplicates minority rows
@@ -33,8 +33,7 @@ segment between a real minority row and one of its nearest minority neighbours:
 from batcher.ml import smote
 
 rare = bt.from_pydict(
-    {"x": [0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 5.3, 5.4],
-     "label": ["rare"] * 3 + ["common"] * 5}
+    {"x": [0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 5.3, 5.4], "label": ["rare"] * 3 + ["common"] * 5}
 )
 print(smote(rare, "label", minority="rare", features=["x"]).count())
 # 10

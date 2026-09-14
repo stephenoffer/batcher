@@ -63,9 +63,7 @@ this runs here on CPU with no GPU and no model:
 ```python
 import batcher as bt
 
-ds = bt.from_pydict(
-    {"f0": [0.1, 0.2, 0.3, 0.4], "f1": [1.0, 2.0, 3.0, 4.0], "label": [0, 1, 0, 1]}
-)
+ds = bt.from_pydict({"f0": [0.1, 0.2, 0.3, 0.4], "f1": [1.0, 2.0, 3.0, 4.0], "label": [0, 1, 0, 1]})
 
 batches = list(ds.ml.iter_torch_batches(batch_size=2, device="cpu"))
 print(len(batches))
@@ -88,9 +86,9 @@ import batcher as bt
 ds = bt.read.parquet("s3://bucket/train/*.parquet")
 loader = ds.ml.iter_torch_batches(
     batch_size=256,
-    device="auto",          # CUDA / ROCm / XPU / MPS / CPU
-    pin_memory=True,         # faster async host→device copies
-    prefetch_batches=2,      # overlap the device move with compute
+    device="auto",  # CUDA / ROCm / XPU / MPS / CPU
+    pin_memory=True,  # faster async host→device copies
+    prefetch_batches=2,  # overlap the device move with compute
     local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
 )
 for batch in loader:
@@ -128,12 +126,8 @@ class BatcherDataset(IterableDataset):
         self.batch_size = batch_size
 
     def __iter__(self):
-        for batch in self.dataset.iter_batches(
-            batch_size=self.batch_size
-        ):
-            features = torch.tensor(
-                [batch.column(c).to_pylist() for c in ("f0", "f1")]
-            ).T
+        for batch in self.dataset.iter_batches(batch_size=self.batch_size):
+            features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
             labels = torch.tensor(batch.column("label").to_pylist())
             for i in range(batch.num_rows):
                 yield features[i], labels[i]
@@ -207,9 +201,7 @@ convert a whole Arrow batch to a tensor directly, which is faster.
 import torch
 
 for batch in prepared.iter_batches(batch_size=256):
-    features = torch.tensor(
-        [batch.column(c).to_pylist() for c in ("f0", "f1")]
-    ).T
+    features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
     labels = torch.tensor(batch.column("label").to_pylist())
     # forward, loss, backward, step ...
 ```

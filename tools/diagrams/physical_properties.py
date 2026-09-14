@@ -129,16 +129,32 @@ body += [
 # ---- Band 3: the containment, which runs opposite ways -------------------
 body += [
     band(20, 444, 940, 178, "AND THE TWO CONTAIN IN OPPOSITE DIRECTIONS", "amber"),
-    card(50, 482, 400, 84, "An ordering: longer satisfies shorter",
-         "sorted by (a, b) is also sorted by (a)"),
-    card(510, 482, 400, 84, "A partitioning: subset satisfies superset",
-         "partitioned on (a) keeps every (a, b) group whole"),
+    card(
+        50,
+        482,
+        400,
+        84,
+        "An ordering: longer satisfies shorter",
+        "sorted by (a, b) is also sorted by (a)",
+    ),
+    card(
+        510,
+        482,
+        400,
+        84,
+        "A partitioning: subset satisfies superset",
+        "partitioned on (a) keeps every (a, b) group whole",
+    ),
     f'<text x="250" y="592" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'font-weight="700" fill="{AMBER_DEEP}">(a) alone does not satisfy (a, b).</text>',
     f'<text x="730" y="592" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'font-weight="700" fill="{AMBER_DEEP}">(a, b) does not keep an (a) group whole.</text>',
-    note(490, 612, "Getting this backwards drops a sort that was needed, or skips a shuffle that was not optional.",
-         anchor="middle"),
+    note(
+        490,
+        612,
+        "Getting this backwards drops a sort that was needed, or skips a shuffle that was not optional.",
+        anchor="middle",
+    ),
 ]
 
 body.append(

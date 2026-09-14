@@ -63,8 +63,7 @@ schema = pa.schema([("ts", pa.timestamp("us")), ("amount", pa.int64())])
 
 
 def feed():
-    yield pa.record_batch({"ts": [base, base + 30 * minute], "amount": [3, 5]},
-                          schema=schema)
+    yield pa.record_batch({"ts": [base, base + 30 * minute], "amount": [3, 5]}, schema=schema)
     yield pa.record_batch({"ts": [base + 130 * minute], "amount": [1]}, schema=schema)
     yield pa.record_batch({"ts": [base + 20 * minute], "amount": [100]}, schema=schema)
 
@@ -163,16 +162,17 @@ seen-key set does not grow forever. An at-least-once producer that re-sends on a
 exactly what this is for:
 
 ```python
-dedup_schema = pa.schema([
-    ("id", pa.string()),
-    ("ts", pa.timestamp("us")),
-    ("v", pa.int64()),
-])
+dedup_schema = pa.schema(
+    [
+        ("id", pa.string()),
+        ("ts", pa.timestamp("us")),
+        ("v", pa.int64()),
+    ]
+)
 
 
 def dupes():
-    yield pa.record_batch({"id": ["x", "y"], "ts": [base, base], "v": [1, 2]},
-                          schema=dedup_schema)
+    yield pa.record_batch({"id": ["x", "y"], "ts": [base, base], "v": [1, 2]}, schema=dedup_schema)
     yield pa.record_batch(
         {"id": ["x", "z"], "ts": [base + minute, base + minute], "v": [3, 4]},
         schema=dedup_schema,

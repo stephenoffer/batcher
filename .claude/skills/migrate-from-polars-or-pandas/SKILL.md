@@ -156,7 +156,7 @@ int↔float and float-rounding tolerance. Reuse it rather than hand-rolling:
 import batcher as bt
 from batcher import col
 
-old = original_polars_pipeline()            # -> pl.DataFrame
+old = original_polars_pipeline()  # -> pl.DataFrame
 new = (
     bt.from_polars(source_df)
     .filter(col("amount") > 10)
@@ -164,9 +164,7 @@ new = (
     .agg(total=col("amount").sum(), n=bt.count())
 )
 # Order-independent multiset comparison, the assert_same way.
-assert sorted(map(tuple, old.rows())) == sorted(
-    tuple(r.values()) for r in new.to_pylist()
-)
+assert sorted(map(tuple, old.rows())) == sorted(tuple(r.values()) for r in new.to_pylist())
 ```
 
 For a sorted query, compare `new.to_pylist()` against the oracle **in order**.

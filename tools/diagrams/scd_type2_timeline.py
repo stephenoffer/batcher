@@ -26,7 +26,7 @@ from _authoring import AMBER, AMBER_DEEP, BLUE_MID, FONT, GREY, arrow, band, lab
 
 W, H = 980, 616
 
-T0, T1, T_END = 150, 520, 780      # 2024-01-01, 2024-06-01, and the right edge of "now"
+T0, T1, T_END = 150, 520, 780  # 2024-01-01, 2024-06-01, and the right edge of "now"
 
 
 def bar(x0: float, x1: float, y: float, h: float, color: str, lines: tuple[str, ...]) -> str:
@@ -47,14 +47,26 @@ def bar(x0: float, x1: float, y: float, h: float, color: str, lines: tuple[str, 
 
 
 body: list[str] = [
-    note(490, 50, "One natural key, id = 1, tracked on the city column. Each bar is a row of the dimension table and the interval it is valid over.", anchor="middle"),
+    note(
+        490,
+        50,
+        "One natural key, id = 1, tracked on the city column. Each bar is a row of the dimension table and the interval it is valid over.",
+        anchor="middle",
+    ),
     # Before.
     band(20, 74, 940, 128, "THE TABLE BEFORE THE 2024-06-01 LOAD", "grey"),
-    bar(T0, T_END, 114, 70, BLUE_MID, (
-        "city = NYC",
-        "valid_from = 2024-01-01 · valid_to = NULL",
-        "is_current = true",
-    )),
+    bar(
+        T0,
+        T_END,
+        114,
+        70,
+        BLUE_MID,
+        (
+            "city = NYC",
+            "valid_from = 2024-01-01 · valid_to = NULL",
+            "is_current = true",
+        ),
+    ),
     arrow(T_END, 149, T_END + 34, 149, "grey"),
     label(T_END + 42, 153, "open"),
     # The load itself, carried on the arrow between the two states.
@@ -62,16 +74,30 @@ body: list[str] = [
     label(96, 228, "ds.scd.type2(as_of='2024-06-01') with city = LA for id = 1"),
     # After.
     band(20, 258, 940, 214, "THE SAME TABLE AFTER IT", "blue"),
-    bar(T0, T1, 300, 70, AMBER, (
-        "city = NYC",
-        "valid_from = 2024-01-01 (unchanged)",
-        "valid_to = 2024-06-01 · is_current = false",
-    )),
-    bar(T1, T_END, 386, 70, BLUE_MID, (
-        "city = LA",
-        "valid_from = 2024-06-01",
-        "valid_to = NULL · is_current = true",
-    )),
+    bar(
+        T0,
+        T1,
+        300,
+        70,
+        AMBER,
+        (
+            "city = NYC",
+            "valid_from = 2024-01-01 (unchanged)",
+            "valid_to = 2024-06-01 · is_current = false",
+        ),
+    ),
+    bar(
+        T1,
+        T_END,
+        386,
+        70,
+        BLUE_MID,
+        (
+            "city = LA",
+            "valid_from = 2024-06-01",
+            "valid_to = NULL · is_current = true",
+        ),
+    ),
     arrow(T_END, 421, T_END + 34, 421, "grey"),
     label(T_END + 42, 425, "open"),
     label(40, 334, "expired"),
@@ -86,9 +112,24 @@ body: list[str] = [
     f'<path d="M {T1} 284 V 300 M {T1} 370 V 386" stroke="{AMBER_DEEP}" stroke-width="2" stroke-dasharray="5 4"/>',
     label(T1 + 10, 296, "as_of"),
     band(20, 492, 940, 108, "WHAT THE LOAD DID", "grey"),
-    note(40, 532, "The previous version keeps its valid_from. Only valid_to and is_current change on it, and the new version starts exactly where the old one ends.", anchor="start"),
-    note(40, 554, "A key whose tracked columns did not change is not touched at all, and a key the target has never seen is inserted as a first open version.", anchor="start"),
-    note(40, 578, "No new operator is involved: history, untouched current rows, expired rows and new versions are unioned and written back over the target.", anchor="start"),
+    note(
+        40,
+        532,
+        "The previous version keeps its valid_from. Only valid_to and is_current change on it, and the new version starts exactly where the old one ends.",
+        anchor="start",
+    ),
+    note(
+        40,
+        554,
+        "A key whose tracked columns did not change is not touched at all, and a key the target has never seen is inserted as a first open version.",
+        anchor="start",
+    ),
+    note(
+        40,
+        578,
+        "No new operator is involved: history, untouched current rows, expired rows and new versions are unioned and written back over the target.",
+        anchor="start",
+    ),
 ]
 
 write("scd_type2_timeline", svg(W, H, "".join(body)))

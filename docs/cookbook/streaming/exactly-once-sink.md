@@ -157,7 +157,7 @@ def write_once(values):
 
 
 write_once([1, 2])
-write_once([9, 9])   # a *different* batch 0, into the same directory
+write_once([9, 9])  # a *different* batch 0, into the same directory
 print(bt.read.parquet(shared).to_pydict())
 # {'v': [1, 2]}
 ```

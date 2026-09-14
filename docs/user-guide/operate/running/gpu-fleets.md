@@ -65,9 +65,7 @@ from batcher.kyber.gpu import device_energy_advice
 scan = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
 print(scan.transfer_share > 0.5)
 # True
-resident = device_energy_advice(
-    "NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, resident=True
-)
+resident = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, resident=True)
 print(resident.speedup > scan.speedup)
 # True
 ```
@@ -127,9 +125,12 @@ work in {py:func}`bt.measure_energy() <batcher.measure_energy>` and every accele
 import batcher as bt
 
 with bt.measure_energy() as energy:
-    out = bt.from_pydict({"g": [1, 1, 2], "v": [10, 20, 30]}).group_by("g").agg(
-        total=bt.col("v").sum()
-    ).to_pydict()
+    out = (
+        bt.from_pydict({"g": [1, 1, 2], "v": [10, 20, 30]})
+        .group_by("g")
+        .agg(total=bt.col("v").sum())
+        .to_pydict()
+    )
 
 print(sorted(out))
 # ['g', 'total']
@@ -151,9 +152,7 @@ ledger.record(
     StageEnergy("Decode#1", "NVIDIA_H100", 8, 120.0, 0.35, joules=1_900_000.0, rows=4_000_000)
 )
 ledger.record(
-    StageEnergy(
-        "Generate#2", "NVIDIA_H100", 8, 400.0, 0.92, joules=2_400_000.0, tokens=88_000_000
-    )
+    StageEnergy("Generate#2", "NVIDIA_H100", 8, 400.0, 0.92, joules=2_400_000.0, tokens=88_000_000)
 )
 print(ledger.idle_fraction() > 0)
 # True
@@ -383,9 +382,7 @@ before placement:
 from batcher.governance import DataResidency, ResidencyCatalog
 
 catalog = ResidencyCatalog(mode="advisory")
-catalog.register(
-    DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR Art. 44")
-)
+catalog.register(DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR Art. 44"))
 
 verdict = catalog.check("s3://eu-customers/orders", "us-east-1")
 print(verdict.allowed, verdict.enforced)

@@ -75,19 +75,17 @@ body += [
     mono(710, 322, "bushy shapes, up to 20 leaves"),
     card(50, 236, 400, 96, "Greedy", "smallest leaf, then the cheapest next join"),
     mono(250, 322, "left-deep by construction"),
-
     # budget -> DP
     f'<path d="M 740 150 L 716 228" fill="none" stroke="{BLUE}" stroke-width="2.4" '
     f'marker-end="url(#arB)"/>',
     label(756, 182, "search inside", size=11.5),
     note(756, 200, "the budget"),
-
     # DP -> greedy, routed under both cards so it crosses no text
     f'<path d="M 540 340 V 368 H 420 V 338" fill="none" stroke="{AMBER_DEEP}" '
     f'stroke-width="2.4" stroke-dasharray="6 4" marker-end="url(#arA)"/>',
     f'<text x="480" y="392" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'font-weight="700" fill="{AMBER_DEEP}">budget spent, over 20 leaves, or a '
-    f'disconnected graph</text>',
+    f"disconnected graph</text>",
     note(710, 352, "a bushy tree", anchor="middle"),
     note(250, 352, "a left-deep tree", anchor="middle"),
 ]
@@ -108,10 +106,10 @@ body += [
 body += [
     f'<text x="490" y="606" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'fill="{MUTED}">Both searches build the same relation. They differ only in how much '
-    f'of the space they read.</text>',
+    f"of the space they read.</text>",
     f'<text x="490" y="624" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'fill="{MUTED}">An exhaustive subset DP exists beside them, as the test oracle, and '
-    f'is never on the live path.</text>',
+    f"is never on the live path.</text>",
 ]
 
 write("join_order_search", svg(W, H, "".join(body)))

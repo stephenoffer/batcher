@@ -84,15 +84,19 @@ consumes and that {py:meth}`.over(...) <batcher.AggExpr.over>` lifts into a {doc
 You rarely name it directly.
 
 ```python
-stats = ds.group_by("category").agg(
-    total=bt.col("price").sum(),
-    avg=bt.col("price").mean(),
-    lo=bt.col("price").min(),
-    hi=bt.col("price").max(),
-    med=bt.col("price").median(),
-    p90=bt.col("price").quantile(0.9),
-    distinct_qty=bt.col("qty").n_unique(),
-).sort("category")
+stats = (
+    ds.group_by("category")
+    .agg(
+        total=bt.col("price").sum(),
+        avg=bt.col("price").mean(),
+        lo=bt.col("price").min(),
+        hi=bt.col("price").max(),
+        med=bt.col("price").median(),
+        p90=bt.col("price").quantile(0.9),
+        distinct_qty=bt.col("qty").n_unique(),
+    )
+    .sort("category")
+)
 print(stats.to_pydict())
 # {'category': ['a', 'b'], 'total': [90.0, 60.0], 'avg': [30.0, 30.0], 'lo': [10.0, 20.0],
 #  'hi': [50.0, 40.0], 'med': [30.0, 30.0], 'p90': [46.0, 38.0], 'distinct_qty': [3, 2]}
@@ -106,11 +110,15 @@ reductions `bool_and`/`bool_or`, and `array_agg` (collect a group's values into 
 list).
 
 ```python
-adv = ds.group_by("category").agg(
-    any_big=(bt.col("price") > 35).bool_or(),
-    all_big=(bt.col("price") > 35).bool_and(),
-    costliest=bt.col("price").arg_max(bt.col("price")),
-).sort("category")
+adv = (
+    ds.group_by("category")
+    .agg(
+        any_big=(bt.col("price") > 35).bool_or(),
+        all_big=(bt.col("price") > 35).bool_and(),
+        costliest=bt.col("price").arg_max(bt.col("price")),
+    )
+    .sort("category")
+)
 print(adv.to_pydict())
 # {'category': ['a', 'b'], 'any_big': [True, True], 'all_big': [False, False],
 #  'costliest': [50.0, 40.0]}
@@ -126,10 +134,14 @@ the same shorthand `bt.sum("x")` is for `col("x").sum()`:
 {py:obj}`bt.array_agg(x) <batcher.array_agg>`.
 
 ```python
-shorthand = ds.group_by("category").agg(
-    prod=bt.product("price"),
-    values=bt.array_agg("price"),
-).sort("category")
+shorthand = (
+    ds.group_by("category")
+    .agg(
+        prod=bt.product("price"),
+        values=bt.array_agg("price"),
+    )
+    .sort("category")
+)
 print(shorthand.to_pydict())
 # {'category': ['a', 'b'], 'prod': [15000.0, 800.0], 'values': [[10.0, 30.0, 50.0], [20.0, 40.0]]}
 ```
@@ -152,11 +164,15 @@ market = bt.from_pydict(
         "revenue": [10.0, 20.0, 30.0, 30.0, 20.0, 10.0],
     }
 )
-bivariate = market.group_by("region").agg(
-    r=bt.corr(bt.col("spend"), bt.col("revenue")),
-    cov_p=bt.covar_pop(bt.col("spend"), bt.col("revenue")),
-    cov_s=bt.covar_samp(bt.col("spend"), bt.col("revenue")),
-).sort("region")
+bivariate = (
+    market.group_by("region")
+    .agg(
+        r=bt.corr(bt.col("spend"), bt.col("revenue")),
+        cov_p=bt.covar_pop(bt.col("spend"), bt.col("revenue")),
+        cov_s=bt.covar_samp(bt.col("spend"), bt.col("revenue")),
+    )
+    .sort("region")
+)
 print(bivariate.to_pydict())
 # {'region': ['east', 'west'], 'r': [-0.9999999999999998, 0.9999999999999998],
 #  'cov_p': [-6.666666666666667, 6.666666666666667], 'cov_s': [-10.0, 10.0]}
@@ -174,11 +190,15 @@ aggregate once and evaluates the surrounding arithmetic in a projection, so the
 result is identical single-node and distributed. Aggregates cannot be nested.
 
 ```python
-derived = ds.group_by("category").agg(
-    revenue=(bt.col("price") * bt.col("qty")).sum(),
-    avg_price=bt.col("price").sum() / bt.count(),
-    spread=bt.col("price").max() - bt.col("price").min(),
-).sort("category")
+derived = (
+    ds.group_by("category")
+    .agg(
+        revenue=(bt.col("price") * bt.col("qty")).sum(),
+        avg_price=bt.col("price").sum() / bt.count(),
+        spread=bt.col("price").max() - bt.col("price").min(),
+    )
+    .sort("category")
+)
 print(derived.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'avg_price': [30.0, 30.0], 'spread': [40.0, 20.0]}
 ```
@@ -207,12 +227,16 @@ market = bt.from_pydict(
         "revenue": [15.0, 25.0, 35.0, 35.0, 25.0, 15.0],
     }
 )
-fit = market.group_by("region").agg(
-    slope=bt.regr_slope(bt.col("revenue"), bt.col("spend")).round(2),
-    intercept=bt.regr_intercept(bt.col("revenue"), bt.col("spend")).round(2),
-    r2=bt.regr_r2(bt.col("revenue"), bt.col("spend")).round(4),
-    n=bt.regr_count(bt.col("revenue"), bt.col("spend")),
-).sort("region")
+fit = (
+    market.group_by("region")
+    .agg(
+        slope=bt.regr_slope(bt.col("revenue"), bt.col("spend")).round(2),
+        intercept=bt.regr_intercept(bt.col("revenue"), bt.col("spend")).round(2),
+        r2=bt.regr_r2(bt.col("revenue"), bt.col("spend")).round(4),
+        n=bt.regr_count(bt.col("revenue"), bt.col("spend")),
+    )
+    .sort("region")
+)
 print(fit.to_pydict())
 # {'region': ['east', 'west'], 'slope': [-10.0, 10.0], 'intercept': [45.0, 5.0], 'r2': [1.0, 1.0], 'n': [3, 3]}
 ```
@@ -234,12 +258,16 @@ proportion to another. You can also apply a math function to any aggregate yours
 as `col("x").sum().sqrt()` or `col("x").mean().round(2)`.
 
 ```python
-stats = ds.group_by("category").agg(
-    pop_std=bt.stddev_pop("price").round(3),
-    geo=bt.geometric_mean("price").round(3),
-    rms=bt.rms("price").round(3),
-    cv=bt.cv("price").round(3),
-).sort("category")
+stats = (
+    ds.group_by("category")
+    .agg(
+        pop_std=bt.stddev_pop("price").round(3),
+        geo=bt.geometric_mean("price").round(3),
+        rms=bt.rms("price").round(3),
+        cv=bt.cv("price").round(3),
+    )
+    .sort("category")
+)
 print(stats.to_pydict())
 # {'category': ['a', 'b'], 'pop_std': [16.33, 10.0], 'geo': [24.662, 28.284], 'rms': [34.157, 31.623], 'cv': [0.667, 0.471]}
 ```
@@ -259,10 +287,14 @@ exact count. Each also has a top-level spelling:
 {py:obj}`bt.histogram(x) <batcher.histogram>`.
 
 ```python
-approx = ds.group_by("category").agg(
-    exact=bt.col("qty").n_unique(),
-    approx=bt.col("qty").approx_n_unique(),
-).sort("category")
+approx = (
+    ds.group_by("category")
+    .agg(
+        exact=bt.col("qty").n_unique(),
+        approx=bt.col("qty").approx_n_unique(),
+    )
+    .sort("category")
+)
 print(approx.to_pydict())
 # {'category': ['a', 'b'], 'exact': [3, 2], 'approx': [3, 2]}
 ```
@@ -280,9 +312,11 @@ sales = bt.from_pydict(
         "amount": [10.0, 20.0, 30.0, 40.0],
     }
 )
-by_pair = sales.group_by("category", "region").agg(
-    total=bt.col("amount").sum(), n=bt.count()
-).sort("category", "region")
+by_pair = (
+    sales.group_by("category", "region")
+    .agg(total=bt.col("amount").sum(), n=bt.count())
+    .sort("category", "region")
+)
 print(by_pair.to_pydict())
 # {'category': ['a', 'a', 'b', 'b'], 'region': ['east', 'west', 'east', 'west'],
 #  'total': [20.0, 10.0, 40.0, 30.0], 'n': [1, 1, 1, 1]}
@@ -294,7 +328,9 @@ A derived key works the same way. Define it in
 
 ```python
 buckets = (
-    ds.with_columns(tier=bt.when(bt.col("price") >= 30.0).then(bt.lit("high")).otherwise(bt.lit("low")))
+    ds.with_columns(
+        tier=bt.when(bt.col("price") >= 30.0).then(bt.lit("high")).otherwise(bt.lit("low"))
+    )
     .group_by("tier")
     .agg(n=bt.count(), revenue=bt.col("price").sum())
     .sort("tier")
@@ -308,9 +344,7 @@ print(buckets.to_pydict())
 Call `group_by()` with no keys to aggregate the whole dataset into one row.
 
 ```python
-totals = ds.group_by().agg(
-    total=bt.col("price").sum(), rows=bt.count()
-)
+totals = ds.group_by().agg(total=bt.col("price").sum(), rows=bt.count())
 print(totals.to_pydict())
 # {'total': [150.0], 'rows': [5]}
 ```

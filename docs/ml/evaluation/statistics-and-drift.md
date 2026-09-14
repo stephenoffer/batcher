@@ -63,9 +63,7 @@ print(survey.agg(m=bt.weighted_mean("income", "weight")).to_pydict())
 An A/B test or a cohort comparison is arithmetic over *conditional* aggregates, so both samples are summarized in one pass and neither leaves the engine:
 
 ```python
-ds = bt.from_pydict(
-    {"value": [10.0, 11.0, 12.0, 20.0, 21.0, 22.0], "arm": ["a"] * 3 + ["b"] * 3}
-)
+ds = bt.from_pydict({"value": [10.0, 11.0, 12.0, 20.0, 21.0, 22.0], "arm": ["a"] * 3 + ["b"] * 3})
 arm_a = bt.col("arm") == bt.lit("a")
 print(
     ds.agg(
@@ -85,9 +83,7 @@ print(
 Four measures answer "is this feature worth keeping", each for a different pair of types:
 
 ```python
-ds = bt.from_pydict(
-    {"tenure": [1.0, 2.0, 8.0, 9.0], "churned": [False, False, True, True]}
-)
+ds = bt.from_pydict({"tenure": [1.0, 2.0, 8.0, 9.0], "churned": [False, False, True, True]})
 churned = bt.col("churned")
 print(
     ds.agg(
@@ -145,7 +141,11 @@ transform each column is asking for:
 from batcher.ml.selection import feature_profile
 
 ds = bt.from_pydict(
-    {"flat": [1.0] * 8, "skewed": [float(2**i) for i in range(8)], "ok": [float(i) for i in range(8)]}
+    {
+        "flat": [1.0] * 8,
+        "skewed": [float(2**i) for i in range(8)],
+        "ok": [float(i) for i in range(8)],
+    }
 )
 print(feature_profile(ds).sort("column").to_pydict()["suggestion"])
 ```
@@ -215,7 +215,7 @@ from batcher.ml.outliers import count_outliers, flag_outliers
 
 ds = bt.from_pydict({"latency": [10.0, 12.0, 11.0, 13.0, 5000.0]})
 print(count_outliers(ds, "latency", method="iqr"))
-flagged = flag_outliers(ds, "latency", method="iqr")   # a boolean flag column, not a drop
+flagged = flag_outliers(ds, "latency", method="iqr")  # a boolean flag column, not a drop
 ```
 
 `flag_outliers` marks them (the decision to keep or drop is yours), `count_outliers` tallies
@@ -229,7 +229,9 @@ from batcher.ml.outliers import mahalanobis_distance
 
 ds = bt.from_pydict({"height": [60.0, 65.0, 70.0, 62.0], "weight": [120.0, 150.0, 180.0, 40.0]})
 scored = mahalanobis_distance(ds, ["height", "weight"])
-print(scored.to_pydict()["mahalanobis"][3] == max(scored.to_pydict()["mahalanobis"]))  # the light-but-average-height row
+print(
+    scored.to_pydict()["mahalanobis"][3] == max(scored.to_pydict()["mahalanobis"])
+)  # the light-but-average-height row
 ```
 
 `mahalanobis_distance` relearns the centre and the covariance from whatever dataset you hand it. That is what you want for a one-off audit and the wrong thing for scoring new data: a batch made entirely of outliers relearns itself as normal and comes back clean. {py:class}`EllipticEnvelope <batcher.ml.outliers.EllipticEnvelope>` splits the two steps, so the envelope is learned once on the training data and applied unchanged to whatever arrives:
@@ -298,9 +300,7 @@ Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for W
 import batcher as bt
 from batcher.ml.stats import t_test_ind, anova_test
 
-ds = bt.from_pydict(
-    {"g": ["a", "a", "a", "b", "b", "b"], "x": [1.0, 2.0, 3.0, 8.0, 9.0, 10.0]}
-)
+ds = bt.from_pydict({"g": ["a", "a", "a", "b", "b", "b"], "x": [1.0, 2.0, 3.0, 8.0, 9.0, 10.0]})
 result = t_test_ind(ds, "x", "g")
 print(round(result.pvalue, 4), result.pvalue < 0.05)
 ```

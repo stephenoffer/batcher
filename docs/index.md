@@ -142,7 +142,7 @@ print(revenue.sort("total", descending=True).to_pydict())
 import batcher as bt
 
 ds = bt.from_pydict({"price": [10.0, 20.0, 30.0], "qty": [1, 2, 3]})
-revenue = bt.col("price") * bt.col("qty")            # a value you build once
+revenue = bt.col("price") * bt.col("qty")  # a value you build once
 tier = bt.when(revenue > 40).then(bt.lit("high")).otherwise(bt.lit("low"))
 print(ds.select(revenue=revenue, tier=tier).to_pydict())
 # {'revenue': [10.0, 40.0, 90.0], 'tier': ['low', 'low', 'high']}

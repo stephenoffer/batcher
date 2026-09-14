@@ -88,9 +88,7 @@ corpus = bt.from_pydict(
         ],
     }
 )
-clean = corpus.distinct(["chunk"]).ml.drop_near_duplicates(
-    "chunk", threshold=0.7, key="chunk_id"
-)
+clean = corpus.distinct(["chunk"]).ml.drop_near_duplicates("chunk", threshold=0.7, key="chunk_id")
 print(sorted(clean.to_pydict()["chunk_id"]))
 # [1, 4]
 ```
@@ -166,9 +164,7 @@ print(retrieved.select("chunk_id", "chunk").to_pydict())
 # docs: skip
 from batcher.ml import vector_search
 
-hits = vector_search(
-    "s3://bucket/chunks.lance", question_vec, k=5, filter="tenant = 'acme'"
-)
+hits = vector_search("s3://bucket/chunks.lance", question_vec, k=5, filter="tenant = 'acme'")
 ```
 
 Metadata scoping is a predicate here, not a post-filter.

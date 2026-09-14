@@ -154,9 +154,8 @@ went quiet loses its zeros again, one region at a time.
 regions = bt.from_pydict({"region": ["us", "eu"]})
 grid = spine.cross_join(regions)
 
-by_region = (
-    events.group_by("region", day=col("ts").dt.truncate("day"))
-    .agg(revenue=col("amount").sum())
+by_region = events.group_by("region", day=col("ts").dt.truncate("day")).agg(
+    revenue=col("amount").sum()
 )
 dense_region = (
     grid.join(by_region, on=["day", "region"], how="left")

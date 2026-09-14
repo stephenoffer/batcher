@@ -110,8 +110,11 @@ class Splitter:
         return batch.append_column("parts", pa.array(counts, pa.int64()))
 
 
-print(ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "parts"])
-      .select("text", "parts").to_pydict())
+print(
+    ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "parts"])
+    .select("text", "parts")
+    .to_pydict()
+)
 # {'text': ['a,b', 'c', 'd,e,f'], 'parts': [2, 1, 3]}
 ```
 
@@ -125,11 +128,15 @@ A model class almost never takes zero arguments, so `fn_constructor_args` and
 not the same as passing an instance:
 
 ```python
-print(ds.map_batches(
-    Splitter,
-    fn_constructor_args=(",",),
-    output_columns=["text", "price", "qty", "parts"],
-).select("parts").to_pydict())
+print(
+    ds.map_batches(
+        Splitter,
+        fn_constructor_args=(",",),
+        output_columns=["text", "price", "qty", "parts"],
+    )
+    .select("parts")
+    .to_pydict()
+)
 # {'parts': [2, 1, 3]}
 ```
 
@@ -149,9 +156,11 @@ def scale(batch):  # batch is {column: ndarray}
     return {"price": batch["price"] * 2.0, "qty": batch["qty"]}
 
 
-print(ds.select("price", "qty")
-      .map_batches(scale, batch_format="numpy", output_columns=["price", "qty"])
-      .to_pydict())
+print(
+    ds.select("price", "qty")
+    .map_batches(scale, batch_format="numpy", output_columns=["price", "qty"])
+    .to_pydict()
+)
 # {'price': [20.0, 40.0, 60.0], 'qty': [1, 2, 3]}
 ```
 
@@ -169,8 +178,9 @@ those columns is also boxed into a Python object for every row.
 :::{tab-item} flat_map
 
 ```python
-print(ds.select("text").flat_map(lambda row: [{"tok": t} for t in row["text"].split(",")])
-      .to_pydict())
+print(
+    ds.select("text").flat_map(lambda row: [{"tok": t} for t in row["text"].split(",")]).to_pydict()
+)
 # {'tok': ['a', 'b', 'c', 'd', 'e', 'f']}
 ```
 
@@ -330,10 +340,12 @@ Batcher spelling of pandas {py:meth}`groupby().apply() <batcher.Dataset.groupby>
 time series, a document's chunks.
 
 ```python
-sales = bt.from_pydict({
-    "region": ["west", "east", "west", "east"],
-    "amount": [10.0, 5.0, 7.0, 3.0],
-})
+sales = bt.from_pydict(
+    {
+        "region": ["west", "east", "west", "east"],
+        "amount": [10.0, 5.0, 7.0, 3.0],
+    }
+)
 
 
 def spread(group):  # group is a RecordBatch of one region's rows
@@ -344,9 +356,12 @@ def spread(group):  # group is a RecordBatch of one region's rows
     }
 
 
-print(sales.group_by("region")
-      .map_groups(spread, output_columns=["region", "spread"])
-      .sort("region").to_pydict())
+print(
+    sales.group_by("region")
+    .map_groups(spread, output_columns=["region", "spread"])
+    .sort("region")
+    .to_pydict()
+)
 # {'region': ['east', 'west'], 'spread': [2.0, 3.0]}
 ```
 
@@ -364,8 +379,11 @@ Two cases do not need a callback at all. A plain reduction is `.agg(...)`, which
 Rust. Broadcasting a group statistic back onto every row is a window:
 
 ```python
-print(sales.window(partition_by=["region"], functions={"total": ("sum", "amount")})
-      .sort("region", "amount").to_pydict()["total"])
+print(
+    sales.window(partition_by=["region"], functions={"total": ("sum", "amount")})
+    .sort("region", "amount")
+    .to_pydict()["total"]
+)
 # [8.0, 8.0, 17.0, 17.0]
 ```
 

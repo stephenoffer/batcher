@@ -95,9 +95,7 @@ rag = bt.from_pydict(
 )
 print(
     rag.select(
-        prompt=bt.tagged_fields(
-            question=bt.col("q"), context=bt.join_context(bt.col("hits"))
-        )
+        prompt=bt.tagged_fields(question=bt.col("q"), context=bt.join_context(bt.col("hits")))
     ).to_pydict()["prompt"][0]
 )
 ```

@@ -22,8 +22,8 @@ from __future__ import annotations
 import json
 
 import pytest
-from _fake_ray import install_fake_ray
 
+from _fake_ray import install_fake_ray
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
 
 pytestmark = pytest.mark.unit

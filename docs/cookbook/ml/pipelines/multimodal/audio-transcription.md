@@ -48,6 +48,7 @@ model trained on torchaudio features (apply the model's own log/normalization do
 ```python
 # docs: skip
 from batcher import col
+
 # Whisper's front end: 16 kHz, 80 mel bands, in the data plane instead of a per-file UDF.
 feats = clips.with_columns(mel=col("bytes").audio.mel_spectrogram(16000, n_mels=80))
 ```
@@ -83,7 +84,7 @@ over a corpus nobody has curated.
 # docs: skip
 usable = clips.filter(
     (col("bytes").audio.trim_silence().list.len() > 16000)  # at least a second of sound
-    & (col("bytes").audio.zero_crossing_rate() < 0.5)       # not pure noise
+    & (col("bytes").audio.zero_crossing_rate() < 0.5)  # not pure noise
 )
 ```
 

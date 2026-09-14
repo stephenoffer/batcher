@@ -78,6 +78,7 @@ from PIL import Image
 import batcher as bt
 from batcher import col
 
+
 # Two synthetic JPEGs: one dark, one bright.
 def jpeg(value):
     buf = io.BytesIO()

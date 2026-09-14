@@ -31,15 +31,41 @@ W, H = 980, 684
 
 BR_Y, BR_H = 148, 84
 BRANCHES = (
-    (50, 280, "NOT MATCHED BY SOURCE", "target key 1, absent from the change set", "update · update_all · delete", "1 target row"),
-    (350, 250, "MATCHED", "keys 2 and 3, present in both", "update · update_all · delete", "2 matched rows"),
-    (630, 280, "NOT MATCHED", "source key 4, new to the target", "insert · insert_all", "1 new row"),
+    (
+        50,
+        280,
+        "NOT MATCHED BY SOURCE",
+        "target key 1, absent from the change set",
+        "update · update_all · delete",
+        "1 target row",
+    ),
+    (
+        350,
+        250,
+        "MATCHED",
+        "keys 2 and 3, present in both",
+        "update · update_all · delete",
+        "2 matched rows",
+    ),
+    (
+        630,
+        280,
+        "NOT MATCHED",
+        "source key 4, new to the target",
+        "insert · insert_all",
+        "1 new row",
+    ),
 )
 
 COMMIT_X, COMMIT_W, COMMIT_Y, COMMIT_H = 320, 340, 366, 76
 
 body: list[str] = [
-    note(490, 50, "One statement over a target holding keys 1, 2, 3 and a change set holding keys 2, 3, 4. Each key falls into exactly one population.", anchor="middle"),
+    note(
+        490,
+        50,
+        "One statement over a target holding keys 1, 2, 3 and a change set holding keys 2, 3, 4. Each key falls into exactly one population.",
+        anchor="middle",
+    ),
     band(20, 78, 940, 222, "THREE POPULATIONS, THREE CLAUSES", "blue"),
 ]
 
@@ -55,7 +81,14 @@ body += [
     arrow(190, BR_Y + BR_H + 54, COMMIT_X + 60, COMMIT_Y - 6, "amber"),
     arrow(475, BR_Y + BR_H + 54, COMMIT_X + COMMIT_W / 2, COMMIT_Y - 6, "amber"),
     arrow(770, BR_Y + BR_H + 54, COMMIT_X + COMMIT_W - 60, COMMIT_Y - 6, "amber"),
-    card(COMMIT_X, COMMIT_Y, COMMIT_W, COMMIT_H, "one Delta commit", "only the files the join touches are rewritten"),
+    card(
+        COMMIT_X,
+        COMMIT_Y,
+        COMMIT_W,
+        COMMIT_H,
+        "one Delta commit",
+        "only the files the join touches are rewritten",
+    ),
     note(50, 400, "clauses are tried in", anchor="start"),
     note(50, 416, "the order they were", anchor="start"),
     note(50, 432, "added; first match wins", anchor="start"),
@@ -86,8 +119,18 @@ body += [
     note(660, 576, "append commits", anchor="middle"),
     f'<text x="540" y="600" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'font-weight="700" class="t-arrow">rows gone, not yet replaced</text>',
-    note(40, 634, "One commit is a property of a transactional target. On a plain directory there is no log: the merge writes its new files and then deletes the ones it", anchor="start"),
-    note(40, 652, "replaced, so a crash between the two leaves both copies of a key. A when_not_matched_by_source clause forces a full rewrite: no file can be skipped.", anchor="start"),
+    note(
+        40,
+        634,
+        "One commit is a property of a transactional target. On a plain directory there is no log: the merge writes its new files and then deletes the ones it",
+        anchor="start",
+    ),
+    note(
+        40,
+        652,
+        "replaced, so a crash between the two leaves both copies of a key. A when_not_matched_by_source clause forces a full rewrite: no file can be skipped.",
+        anchor="start",
+    ),
 ]
 
 write("merge_into_branches", svg(W, H, "".join(body)))

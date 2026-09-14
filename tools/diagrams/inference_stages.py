@@ -32,7 +32,12 @@ body = [
     arrow(500, MID, 580, MID, "amber"),
     label(540, MID - 18, "credits", anchor="middle", size=12),
     arrow(780, MID, 830, MID, "blue"),
-    note(400, 232, "A stage blocks once its credit window to the next stage is full.", anchor="middle"),
+    note(
+        400,
+        232,
+        "A stage blocks once its credit window to the next stage is full.",
+        anchor="middle",
+    ),
     # What the bound buys you.
     band(20, 292, 940, 118, "WHY THE WINDOW IS BOUNDED", "grey"),
     note(180, 338, "Fast stage cannot", anchor="middle"),

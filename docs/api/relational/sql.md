@@ -116,9 +116,7 @@ print(out.to_pydict())
 DuckDB's `COLUMNS(*)` and `COLUMNS('regex')` project a set of columns chosen at plan time, and a function applied to `COLUMNS(...)` runs on each matched column. A wide-table transform therefore needs no exhaustive column list.
 
 ```python
-metrics = bt.from_pydict(
-    {"day": ["mon", "tue"], "sales_us": [10, 20], "sales_eu": [30, 40]}
-)
+metrics = bt.from_pydict({"day": ["mon", "tue"], "sales_us": [10, 20], "sales_eu": [30, 40]})
 out = bt.sql("SELECT day, COLUMNS('sales_.*') * 2 FROM metrics", metrics=metrics)
 print(out.to_pydict())
 # {'day': ['mon', 'tue'], 'sales_us': [20, 40], 'sales_eu': [60, 80]}
@@ -345,6 +343,7 @@ A *table* function, called as `SELECT * FROM f(t)`, transforms a whole relation:
 def add_flag(batch):
     big = pc.greater(batch.column("amount"), 25)
     return batch.append_column("big", big)
+
 
 s.register_function(
     "flagged", add_flag, table=True, output_columns=["id", "category", "amount", "big"]

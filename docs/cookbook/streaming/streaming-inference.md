@@ -165,14 +165,15 @@ rollup_schema = pa.schema([("model", pa.string()), ("text", pa.string())])
 
 
 def rollup_batches():
-    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]},
-                          schema=rollup_schema)
+    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]}, schema=rollup_schema)
     yield pa.record_batch({"model": ["v1"], "text": ["fine"]}, schema=rollup_schema)
 
 
 def score_length(batch):
-    return {"model": batch.column("model").to_pylist(),
-            "score": [len(t) for t in batch.column("text").to_pylist()]}
+    return {
+        "model": batch.column("model").to_pylist(),
+        "score": [len(t) for t in batch.column("text").to_pylist()],
+    }
 
 
 rollup = (

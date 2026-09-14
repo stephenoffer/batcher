@@ -18,14 +18,18 @@ keeping one representative per cluster.
 ```python
 import batcher as bt
 
-docs = bt.from_pydict({"text": [
-    "the quick brown fox jumps over the lazy dog",
-    "the quick brown fox jumps over the lazy dog!",   # near-duplicate
-    "a treatise on the migratory habits of geese",
-]})
+docs = bt.from_pydict(
+    {
+        "text": [
+            "the quick brown fox jumps over the lazy dog",
+            "the quick brown fox jumps over the lazy dog!",  # near-duplicate
+            "a treatise on the migratory habits of geese",
+        ]
+    }
+)
 print(docs.ml.drop_near_duplicates("text", threshold=0.7).count())
 # 2
-print(docs.distinct().count())   # exact dedup keeps all three
+print(docs.distinct().count())  # exact dedup keeps all three
 # 3
 ```
 

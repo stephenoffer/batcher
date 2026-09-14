@@ -23,7 +23,7 @@ W, H = 980, 340
 PANEL_W = 440
 PANEL_X = (40, 500)
 BAR_W = 120
-BASE_Y = 262          # bars grow upward from here
+BASE_Y = 262  # bars grow upward from here
 MAX_BAR = 132
 
 STYLE = """<style>
@@ -59,8 +59,9 @@ def bar(x: float, h: float, cls: str, r: float = 4.0) -> str:
     )
 
 
-def panel(px: float, title: str, unit: str, before: float, after: float,
-          fmt: str, ceiling: float) -> list[str]:
+def panel(
+    px: float, title: str, unit: str, before: float, after: float, fmt: str, ceiling: float
+) -> list[str]:
     """One measure: a before bar and an after bar, each labeled in place."""
     out = [
         f'<rect x="{px}" y="96" width="{PANEL_W}" height="212" rx="12" class="panel" stroke-width="1"/>',
@@ -70,7 +71,10 @@ def panel(px: float, title: str, unit: str, before: float, after: float,
         f'<line x1="{px + 24}" y1="{BASE_Y}" x2="{px + PANEL_W - 24}" y2="{BASE_Y}" '
         f'class="base" stroke-width="1.5"/>',
     ]
-    slots = ((px + 78, before, "before", "Stage at a time"), (px + 250, after, "after", "Overlapped"))
+    slots = (
+        (px + 78, before, "before", "Stage at a time"),
+        (px + 250, after, "after", "Overlapped"),
+    )
     for bx, val, cls, caption in slots:
         h = max(6.0, val / ceiling * MAX_BAR)
         out.append(bar(bx, h, cls))
@@ -93,7 +97,9 @@ parts = [
     f"Two-stage ResNet-50 pipeline. Same result, same order, one scheduling change.</text>",
 ]
 parts += panel(PANEL_X[0], "Throughput", "images per second", 942, 2504, "{:,.0f}", 2600)
-parts += panel(PANEL_X[1], "GPU utilization", "percent of the device kept busy", 30, 81, "{:.0f}%", 100)
+parts += panel(
+    PANEL_X[1], "GPU utilization", "percent of the device kept busy", 30, 81, "{:.0f}%", 100
+)
 parts.append(
     f'<text x="40" y="{H - 20}" font-family="{FONT}" font-size="11.5" class="t-sub">'
     f"Source: benchmarks/BENCHMARK_RESULTS.md. The device idled through the whole decode "

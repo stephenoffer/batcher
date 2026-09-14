@@ -129,9 +129,7 @@ the same number:
 
 ```python
 tied = (
-    sales.with_columns(
-        rk=rank().over(partition_by=["category"], order_by=[("revenue", True)])
-    )
+    sales.with_columns(rk=rank().over(partition_by=["category"], order_by=[("revenue", True)]))
     .filter(col("rk") <= 2)
     .select("category", "product", "revenue", "rk")
     .sort("category", "rk", "product")

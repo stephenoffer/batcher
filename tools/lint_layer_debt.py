@@ -24,7 +24,6 @@ import argparse
 import json
 import pathlib
 import sys
-
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

@@ -123,11 +123,11 @@ deliberately small API.
 :::{dropdown} The whole `MetadataHub` surface
 ```python
 # docs: skip
-hub.record(feedback)                       # the FeedbackSink: Core's only entry point
-hub.version                                # monotonic counter; the cache-invalidation signal
-hub.op_stats_by_kind()                     # bucketed by operator kind, for cost calibration
-hub.op_stats_with_signature()              # oldest-first, for the q-error correction
-hub.load_keyed_params(namespace)           # per-key learned scalars
+hub.record(feedback)  # the FeedbackSink: Core's only entry point
+hub.version  # monotonic counter; the cache-invalidation signal
+hub.op_stats_by_kind()  # bucketed by operator kind, for cost calibration
+hub.op_stats_with_signature()  # oldest-first, for the q-error correction
+hub.load_keyed_params(namespace)  # per-key learned scalars
 hub.get_keyed_param(namespace, key)
 hub.put_keyed_param(namespace, key, value)
 ```

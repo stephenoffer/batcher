@@ -103,7 +103,9 @@ bt.from_pydict({"id": [4], "amount": [40]}).write.iceberg(
 
 print(bt.read.iceberg("db.orders", catalog=catalog).sort("id").to_pydict()["id"])
 # [1, 2, 3, 4]
-print(bt.read.iceberg("db.orders", catalog=catalog, snapshot_id=before).sort("id").to_pydict()["id"])
+print(
+    bt.read.iceberg("db.orders", catalog=catalog, snapshot_id=before).sort("id").to_pydict()["id"]
+)
 # [1, 2, 3]
 ```
 

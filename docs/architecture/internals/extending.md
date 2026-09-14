@@ -72,10 +72,10 @@ generic `IRNode.to_ir` assembles the JSON, so you write no `to_ir` and no `__ini
 class StrFunc(IRNode):
     """A string function over a sub-expression."""
 
-    tag = ExprTag.STR          # the "e" discriminator, from ir_tags.ExprTag
-    vocab = STR_FNS            # validate `fn` against the family vocabulary
-    fn: str = scalar()         # emitted as-is
-    input: Expr = child()      # recursed via .to_ir()
+    tag = ExprTag.STR  # the "e" discriminator, from ir_tags.ExprTag
+    vocab = STR_FNS  # validate `fn` against the family vocabulary
+    fn: str = scalar()  # emitted as-is
+    input: Expr = child()  # recursed via .to_ir()
     pattern: str | None = scalar(omit_none=True, default=None)  # dropped when None
 ```
 
@@ -110,7 +110,7 @@ A **parameterless** accessor is one row in the family's dispatch table, and noth
 _STR_TRANSFORMS = {
     "upper": "upper",
     "lower": "lower",
-    "swapcase": "swapcase",   # add the row, and the accessor is generated
+    "swapcase": "swapcase",  # add the row, and the accessor is generated
 }
 ```
 
@@ -148,8 +148,8 @@ matching family module, decorate it, and the driver discovers it with no pipelin
 @rule(name="drop_noop_filter", phase=Phase.NORMALIZE, matches=(Filter,))
 def drop_noop_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     if _is_constant_true(node.predicate):
-        return node.input      # the rewritten node
-    return None                # or None for "no change"
+        return node.input  # the rewritten node
+    return None  # or None for "no change"
 ```
 
 Pick the family by what the rule rewrites (boolean/CASE algebra, sargable
@@ -175,7 +175,8 @@ def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Filter) and isinstance(node.input, Join):
             return _push_into_join(node.predicate, node.input) or node
         return node
-    return transform_up(plan, push)   # children visited and rebuilt generically
+
+    return transform_up(plan, push)  # children visited and rebuilt generically
 ```
 
 Invariants: a rule *decides, never executes*. No engine calls and no metric
@@ -203,6 +204,7 @@ class MyFmtSource(FileSource):
 
     def _read_schema(self, fh): ...
     def _read_file(self, fh, projection): ...
+
 
 @SINKS.register("myfmt")
 class MyFmtSink(FileSink):

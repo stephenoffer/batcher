@@ -52,7 +52,12 @@ body += [
     card(642, CARD_TOP, 290, 92, "NETWORK", "credit-bounded Arrow Flight"),
     note(COLS[2], 372, "One credit is one batch slot.", anchor="middle"),
     note(COLS[2], 390, "The producer blocks at zero.", anchor="middle"),
-    note(490, 440, "locality_ratio reports the fraction of transfers that stayed off the network.", anchor="middle"),
+    note(
+        490,
+        440,
+        "locality_ratio reports the fraction of transfers that stayed off the network.",
+        anchor="middle",
+    ),
 ]
 
 write("transfer_modes", svg(W, H, "".join(body)))

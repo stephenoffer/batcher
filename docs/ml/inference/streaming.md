@@ -102,8 +102,8 @@ import batcher as bt
 ds = bt.read.parquet("s3://bucket/train/*.parquet")
 for batch in ds.ml.iter_torch_batches(
     batch_size=256,
-    device="auto",                   # CUDA / ROCm / XPU / MPS / CPU
-    pin_memory=True,                 # fast async host→device copies
+    device="auto",  # CUDA / ROCm / XPU / MPS / CPU
+    pin_memory=True,  # fast async host→device copies
     local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
 ):
     train_step(batch["features"], batch["label"])
@@ -258,8 +258,8 @@ from itertools import islice
 from batcher.ml import ResumableSampler
 
 sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
-seen = list(islice(sampler, 3))          # train three steps
-state = sampler.state_dict()             # checkpoint between steps
+seen = list(islice(sampler, 3))  # train three steps
+state = sampler.state_dict()  # checkpoint between steps
 
 resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
 resumed.load_state_dict(state)

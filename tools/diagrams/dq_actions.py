@@ -30,7 +30,14 @@ body = [
     ),
     arrow(490, 116, 490, 152, "blue"),
     label(504, 140, "lowers to FILTER, count() OVER, LEFT JOIN", size=12),
-    card(300, 152, 380, 64, "valid = every constraint", "non-null, so valid and invalid are the whole input"),
+    card(
+        300,
+        152,
+        380,
+        64,
+        "valid = every constraint",
+        "non-null, so valid and invalid are the whole input",
+    ),
     # The three terminals.
     arrow(430, 218, 200, 300, "amber"),
     label(286, 250, "any violation", anchor="middle", size=12),
@@ -57,8 +64,18 @@ body = [
     note(800, 450, "second lazy Dataset.", anchor="middle"),
     note(800, 474, "Dead-letter sink: write that", anchor="middle"),
     note(800, 492, "second Dataset to it.", anchor="middle"),
-    note(490, 532, "annotate() is the fourth: it keeps every row and names what each one failed, so a quarantined row carries its reason.", anchor="middle"),
-    note(490, 560, "NULL is not a violation. mostly=0.99 passes while 1% violate, and severity='warn' reports without enforcing anywhere.", anchor="middle"),
+    note(
+        490,
+        532,
+        "annotate() is the fourth: it keeps every row and names what each one failed, so a quarantined row carries its reason.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        560,
+        "NULL is not a violation. mostly=0.99 passes while 1% violate, and severity='warn' reports without enforcing anywhere.",
+        anchor="middle",
+    ),
 ]
 
 write("dq_actions", svg(W, H, "".join(body)))

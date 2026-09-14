@@ -146,10 +146,17 @@ only touches the rows the tenant may see.
 from batcher import array
 
 query = bt.from_pydict(
-    {"chunk_id": [0], "doc_id": [0], "title": [""], "chunk": ["refunds issued to the original payment method"]}
+    {
+        "chunk_id": [0],
+        "doc_id": [0],
+        "title": [""],
+        "chunk": ["refunds issued to the original payment method"],
+    }
 )
 qvec = (
-    query.ml.embed(HashEmbedder, output_columns=["chunk_id", "doc_id", "title", "chunk", "embedding"])
+    query.ml.embed(
+        HashEmbedder, output_columns=["chunk_id", "doc_id", "title", "chunk", "embedding"]
+    )
     .with_columns(embedding=col("embedding").list.normalize())
     .to_pydict()["embedding"][0]
 )
@@ -211,7 +218,9 @@ from batcher import col
 
 changed = bt.read.parquet("s3://bucket/docs.parquet").filter(col("updated_at") > last_run)
 new_chunks = changed.with_columns(chunk=col("body").str.chunk(512, overlap=64)).explode("chunk")
-new_vectors = new_chunks.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="chunk", num_gpus=1)
+new_vectors = new_chunks.ml.embed(
+    "sentence-transformers/all-MiniLM-L6-v2", column="chunk", num_gpus=1
+)
 new_vectors.write.lance("s3://bucket/chunks.lance", mode="append")
 ```
 

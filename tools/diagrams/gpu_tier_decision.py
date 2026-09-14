@@ -41,12 +41,14 @@ body: list[str] = []
 body.append(band(20, 24, 940, 148, "WHY THIS TIER IS DIFFERENT", "grey"))
 
 body.append(card(44, 58, 396, 66, "every other tier", "consumes the same Rust bc_expr::Expr"))
-body.append(note(242, 144, "one definition of what a shape means, so it cannot drift",
-                 anchor="middle"))
+body.append(
+    note(242, 144, "one definition of what a shape means, so it cannot drift", anchor="middle")
+)
 
 body.append(card(540, 58, 396, 66, "the device tier", "cuDF has no Rust binding"))
-body.append(note(738, 144, "a second statement of the semantics, in another language",
-                 anchor="middle"))
+body.append(
+    note(738, 144, "a second statement of the semantics, in another language", anchor="middle")
+)
 
 body.append(label(490, 96, "vs", anchor="middle"))
 
@@ -67,8 +69,15 @@ body.append(note(726, 349, "image / audio / geo: Rust kernels with no", anchor="
 body.append(note(726, 366, "dataframe equivalent to translate onto", anchor="middle"))
 
 body.append(label(490, 282, "no third state", anchor="middle", size=11.5))
-body.append(note(490, 390, "a tag in neither set fails test_gpu_vocabulary_contract -- so a new "
-                           "operator is a decision, not an oversight", anchor="middle"))
+body.append(
+    note(
+        490,
+        390,
+        "a tag in neither set fails test_gpu_vocabulary_contract -- so a new "
+        "operator is a decision, not an oversight",
+        anchor="middle",
+    )
+)
 
 # ---- What that buys at run time --------------------------------------------------------
 body.append(arrow(254, 404, 254, 442))
@@ -83,8 +92,9 @@ body.append(card(516, 474, 420, 66, "run on the CPU engine", "the same rows, mor
 body.append(note(254, 562, "eligible only as a chain over a scan, a join of two", anchor="middle"))
 body.append(note(254, 579, "chains, or a union of chains", anchor="middle"))
 body.append(note(726, 562, "a decline costs time; an approximation would cost a", anchor="middle"))
-body.append(note(726, 579, "wrong answer, so backend=\"gpu\" is always safe to ask for",
-                 anchor="middle"))
+body.append(
+    note(726, 579, 'wrong answer, so backend="gpu" is always safe to ask for', anchor="middle")
+)
 
 write("gpu_tier_decision", svg(W, H, "".join(body)))
 print("wrote gpu_tier_decision.svg")

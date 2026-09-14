@@ -22,9 +22,11 @@ class Classifier:
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self.tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            "distilbert-base-uncased"
-        ).cuda().eval()
+        self.model = (
+            AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased")
+            .cuda()
+            .eval()
+        )
         self._torch = torch
 
     def __call__(self, batch):
@@ -41,10 +43,10 @@ class Classifier:
 
 scored = (
     bt.read.parquet("s3://bucket/reviews/*.parquet")
-    .filter(bt.col("lang") == "en")                    # cut rows before the GPU
-    .select("id", "text")                              # cut columns before the GPU
+    .filter(bt.col("lang") == "en")  # cut rows before the GPU
+    .select("id", "text")  # cut columns before the GPU
     .ml.infer(
-        Classifier,                                     # the CLASS: loads once per worker
+        Classifier,  # the CLASS: loads once per worker
         output_columns=["id", "text", "label"],
         batch_size=256,
         num_gpus=1,
@@ -81,7 +83,7 @@ import batcher as bt
 
 class ToyScorer:
     def __init__(self, threshold):
-        self.threshold = threshold      # in a real model: load the weights here
+        self.threshold = threshold  # in a real model: load the weights here
         self.calls = 0
 
     def __call__(self, batch):
@@ -179,7 +181,9 @@ def flaky_engine():
 
 
 reviews = bt.from_pydict({"text": ["good", "bad"]})
-print(reviews.ml.generate(flaky_engine, prompt_column="text", max_retries=3, timeout=30.0).to_pydict())
+print(
+    reviews.ml.generate(flaky_engine, prompt_column="text", max_retries=3, timeout=30.0).to_pydict()
+)
 # {'text': ['good', 'bad'], 'response': ['GOOD', 'BAD']}
 ```
 
@@ -215,7 +219,7 @@ import batcher as bt
 
 for day in days:
     out = f"s3://bucket/scored/dt={day}/"
-    if already_written(out):        # your check: a manifest, a marker, a listing
+    if already_written(out):  # your check: a manifest, a marker, a listing
         continue
     (
         bt.read.parquet(f"s3://bucket/events/dt={day}/")

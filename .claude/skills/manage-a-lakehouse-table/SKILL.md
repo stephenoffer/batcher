@@ -18,11 +18,11 @@ Verify before citing: `bt.read` has `delta`, `iceberg`, `hudi`, `delta_sharing`,
 ## Reading a table
 
 ```python
-bt.read.delta(uri)                          # latest version
-bt.read.delta(uri, version=0)               # time travel by version
+bt.read.delta(uri)  # latest version
+bt.read.delta(uri, version=0)  # time travel by version
 bt.read.delta(uri, timestamp="2024-06-01")  # ... or by wall clock
 bt.read.iceberg("db.t", catalog=spec, snapshot_id=snaps[0])
-bt.read.hudi(uri)                           # read-only snapshot query
+bt.read.hudi(uri)  # read-only snapshot query
 bt.read.delta_sharing("config.share#share.schema.table")
 ```
 
@@ -32,9 +32,14 @@ the backend (`rest` covers Unity Catalog / Polaris / Tabular; also `glue`, `hive
 parameter is annotated `str | None`, but a dict spec is the working form:
 
 ```python
-spec = {"type": "sql", "name": "local", "uri": f"sqlite:///{wh}/cat.db", "warehouse": f"file://{wh}"}
+spec = {
+    "type": "sql",
+    "name": "local",
+    "uri": f"sqlite:///{wh}/cat.db",
+    "warehouse": f"file://{wh}",
+}
 bt.from_pydict({"id": [1, 2], "v": [10.0, 20.0]}).write.iceberg("db.t", mode="append", catalog=spec)
-bt.read.iceberg("db.t", catalog=spec).sort("id").to_pydict()   # {'id': [1, 2], 'v': [10.0, 20.0]}
+bt.read.iceberg("db.t", catalog=spec).sort("id").to_pydict()  # {'id': [1, 2], 'v': [10.0, 20.0]}
 ```
 
 Note `bt.read(path)` **auto-detects a table** from its marker directory (`_delta_log`,
@@ -45,9 +50,9 @@ maintenance rewrite that does so deletes files older versions still reference.
 ## Writing: append, overwrite, upsert
 
 ```python
-ds.write.delta(uri, mode="append")                    # one transactional commit
+ds.write.delta(uri, mode="append")  # one transactional commit
 ds.write.delta(uri, mode="overwrite")
-ds.write.delta(uri, merge_on="id")                    # MERGE INTO upsert, keyed
+ds.write.delta(uri, merge_on="id")  # MERGE INTO upsert, keyed
 ds.write.iceberg("db.t", mode="append", catalog=spec)
 ds.write.hudi(uri, mode="append")
 ```
@@ -58,8 +63,9 @@ predicate from the keys (pass `merge_predicate=` for a custom one) — against a
 holding ids 1–4, upserting `{2, 9}` updates 2 and inserts 9, leaving 1/3/4 untouched:
 
 ```python
-bt.from_pydict({"id": [2, 9], "amount": [99.0, 90.0], "region": ["eu", "ap"]}) \
-  .write.delta(uri, merge_on="id")
+bt.from_pydict({"id": [2, 9], "amount": [99.0, 90.0], "region": ["eu", "ap"]}).write.delta(
+    uri, merge_on="id"
+)
 bt.read.delta(uri).sort("id").to_pydict()
 # {'id': [1, 2, 3, 4, 9], 'amount': [10.0, 99.0, 30.0, 40.0, 90.0], ...}
 ```
@@ -82,14 +88,18 @@ Reference the two sides with `bt.source_col(name)` and `bt.target_col(name)`.
 from batcher import lit, source_col
 
 # target: id 1,2,3 all status="active";  changes: update 2, delete 3, insert 4
-(changes.write.merge_into(uri, on="id")
-    .when_matched(source_col("op") == lit("D")).delete()
-    .when_matched().update(amount=source_col("amount"))
-    .when_not_matched().insert(id=source_col("id"),
-                               amount=source_col("amount"),
-                               status=lit("active"))
-    .when_not_matched_by_source().update(status=lit("stale"))
-    .execute())
+(
+    changes.write.merge_into(uri, on="id")
+    .when_matched(source_col("op") == lit("D"))
+    .delete()
+    .when_matched()
+    .update(amount=source_col("amount"))
+    .when_not_matched()
+    .insert(id=source_col("id"), amount=source_col("amount"), status=lit("active"))
+    .when_not_matched_by_source()
+    .update(status=lit("stale"))
+    .execute()
+)
 
 bt.read.delta(uri).sort("id").to_pydict()
 # {'id': [1, 2, 4], 'status': ['stale', 'active', 'active'], 'amount': [10, 99, 40]}
@@ -148,16 +158,18 @@ rows — which `type1` cannot consume. `ds.scd.apply_changes` is that shape, fol
 Live Tables' `APPLY CHANGES INTO ... SCD TYPE 1`:
 
 ```python
-feed = bt.from_pydict({"id": [1, 2, 1], "city": ["NYC", "LA", "SF"],
-                       "op": ["I", "I", "U"], "seq": [1, 2, 3]})
-feed.scd.apply_changes(t, keys="id", sequence_by="seq",
-                       deletes=bt.col("op") == "D", columns=["id", "city"])
+feed = bt.from_pydict(
+    {"id": [1, 2, 1], "city": ["NYC", "LA", "SF"], "op": ["I", "I", "U"], "seq": [1, 2, 3]}
+)
+feed.scd.apply_changes(
+    t, keys="id", sequence_by="seq", deletes=bt.col("op") == "D", columns=["id", "city"]
+)
 # {'id': [1, 2], 'city': ['SF', 'LA']}     ← seq 3 beats seq 1 within the batch
 
-later = bt.from_pydict({"id": [2, 1], "city": ["LA", "OLD"],
-                        "op": ["D", "U"], "seq": [4, 0]})
-later.scd.apply_changes(t, keys="id", sequence_by="seq",
-                        deletes=bt.col("op") == "D", columns=["id", "city"])
+later = bt.from_pydict({"id": [2, 1], "city": ["LA", "OLD"], "op": ["D", "U"], "seq": [4, 0]})
+later.scd.apply_changes(
+    t, keys="id", sequence_by="seq", deletes=bt.col("op") == "D", columns=["id", "city"]
+)
 # {'id': [1], 'city': ['SF']}    ← 2 deleted; the seq-0 change for 1 is stale, discarded
 ```
 
@@ -187,14 +199,14 @@ collected, counted, or joined.
 ```python
 # Bounded: a closed window you can merge into a target, and re-run identically after a crash.
 changes = bt.read.read_change_feed(uri, starting_version=last + 1, ending_version=latest)
-changes.is_streaming   # False
-changes.count()        # works
+changes.is_streaming  # False
+changes.count()  # works
 # `starting_timestamp=` / `ending_timestamp=` bound by time instead; both take a datetime,
 # a date, 'YYYY-MM-DD', or 'YYYY-MM-DD HH:MM:SS' (naive values are the driver's local time).
 
 # Unbounded: no bound named, for a continuous query.
 stream = bt.read.read_change_feed(uri, starting_version=0)
-stream.is_streaming    # True
+stream.is_streaming  # True
 stream.columns  # ['id', 'v', '_change_type', '_commit_version', '_commit_timestamp']
 # _change_type ∈ insert / update_preimage / update_postimage / delete
 ```
@@ -213,11 +225,13 @@ you want the whole range gone and rewritten. That is `replace_where=`, and on De
 matching partitions from the log. Backfilling one day of a 100 TB table costs one day.
 
 ```python
-bt.from_pydict({"day": ["a", "a", "b"], "v": [1, 2, 3]}) \
-  .write.delta(ev, mode="append", partition_by=["day"])
-bt.from_pydict({"day": ["a"], "v": [99]}) \
-  .write(ev, "delta", partition_by=["day"], replace_where=bt.col("day") == lit("a"))
-bt.read.delta(ev).sort("v").to_pydict()      # {'day': ['b', 'a'], 'v': [3, 99]}
+bt.from_pydict({"day": ["a", "a", "b"], "v": [1, 2, 3]}).write.delta(
+    ev, mode="append", partition_by=["day"]
+)
+bt.from_pydict({"day": ["a"], "v": [99]}).write(
+    ev, "delta", partition_by=["day"], replace_where=bt.col("day") == lit("a")
+)
+bt.read.delta(ev).sort("v").to_pydict()  # {'day': ['b', 'a'], 'v': [3, 99]}
 ```
 
 Two things that will bite you, both by design:
@@ -240,9 +254,10 @@ intent, and writing it into files the table cannot see is unrecoverable:
 ```python
 bt.from_pydict({"day": ["c"], "v": [7], "extra": ["x"]}).write.delta(ev, mode="append")
 # CommitError: the write has column(s) ['extra'] that Delta table ... does not have
-bt.from_pydict({"day": ["c"], "v": [7], "extra": ["x"]}) \
-  .write.delta(ev, mode="append", merge_schema=True)
-bt.read.delta(ev).columns          # ['day', 'v', 'extra']
+bt.from_pydict({"day": ["c"], "v": [7], "extra": ["x"]}).write.delta(
+    ev, mode="append", merge_schema=True
+)
+bt.read.delta(ev).columns  # ['day', 'v', 'extra']
 ```
 
 ## Maintenance: `compact` and `vacuum`
@@ -252,8 +267,8 @@ An incremental writer leaves one small file per commit, and the next write canno
 
 ```python
 bt.compact(uri, target_size_mb=128, z_order=["region", "day"], where=..., by=None)
-ds.write.delta(uri, mode="append", auto_compact=True)   # compact after the commit, if needed
-would_delete = bt.vacuum(uri)                           # dry_run=True — deletes nothing
+ds.write.delta(uri, mode="append", auto_compact=True)  # compact after the commit, if needed
+would_delete = bt.vacuum(uri)  # dry_run=True — deletes nothing
 bt.vacuum(uri, dry_run=False, retention_hours=168)
 ```
 

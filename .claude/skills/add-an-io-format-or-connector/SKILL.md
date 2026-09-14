@@ -53,20 +53,22 @@ A format that outgrows one module becomes a package (`parquet/`, `delta/`,
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
 
+
 @SOURCES.register("myfmt")
 class MyFmtSource(FileSource):
-    suffix = ".myf"          # drives directory/glob expansion
-    format_name = "myfmt"    # the registry key a split rebuilds through
+    suffix = ".myf"  # drives directory/glob expansion
+    format_name = "myfmt"  # the registry key a split rebuilds through
 
-    def _read_schema(self, fh): ...                 # abstract — no data scan if possible
-    def _read_file(self, fh, projection): ...       # abstract — one file → list[RecordBatch]
+    def _read_schema(self, fh): ...  # abstract — no data scan if possible
+    def _read_file(self, fh, projection): ...  # abstract — one file → list[RecordBatch]
+
 
 @SINKS.register("myfmt")
 class MyFmtSink(FileSink):
     suffix = ".myf"
     format_name = "myfmt"
 
-    def _write_file(self, table, fh): ...           # abstract — whole table → open handle
+    def _write_file(self, table, fh): ...  # abstract — whole table → open handle
 ```
 
 Then import the module from the category `__init__.py` so the decorator runs.

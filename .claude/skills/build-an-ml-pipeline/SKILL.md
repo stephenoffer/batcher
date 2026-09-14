@@ -51,7 +51,7 @@ import torch
 
 class Classifier:
     def __init__(self) -> None:
-        self.model = torch.load("model.pt").eval()   # once per worker
+        self.model = torch.load("model.pt").eval()  # once per worker
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         features = torch.tensor(batch.column("feature").to_numpy())
@@ -62,9 +62,14 @@ class Classifier:
 
 labeled = (
     bt.read.parquet("s3://bucket/features.parquet")
-    .filter(bt.col("active"))                       # pushed below the model stage
-    .ml.map_batches(Classifier, batch_size=1024, num_gpus=1.0, concurrency=4,
-                    input_columns=["feature", "active"])
+    .filter(bt.col("active"))  # pushed below the model stage
+    .ml.map_batches(
+        Classifier,
+        batch_size=1024,
+        num_gpus=1.0,
+        concurrency=4,
+        input_columns=["feature", "active"],
+    )
 )
 labeled.write.parquet("s3://bucket/labeled.parquet")
 ```
@@ -73,9 +78,15 @@ For a HuggingFace `transformers` pipeline, skip the wrapper entirely (needs the
 `transformers` extra):
 
 ```python
-scored = reviews.ml.infer("distilbert-base-uncased-finetuned-sst-2-english",
-                          column="text", output_column="sentiment", task="sentiment-analysis",
-                          batch_size=64, num_gpus=1, concurrency=(1, 4))
+scored = reviews.ml.infer(
+    "distilbert-base-uncased-finetuned-sst-2-english",
+    column="text",
+    output_column="sentiment",
+    task="sentiment-analysis",
+    batch_size=64,
+    num_gpus=1,
+    concurrency=(1, 4),
+)
 ```
 
 For a model that was **exported** out of its framework — an ONNX graph, a TorchScript
@@ -84,8 +95,9 @@ class UDF built on `serving_udf`, so it splits a batch against the model's own w
 in-flight requests pipelined, and releases the model with the worker:
 
 ```python
-udf = bt.ml.onnx_predictor("resnet50.onnx", input_columns=["pixel_values"],
-                           output_columns=["logits"], providers=["cuda"])
+udf = bt.ml.onnx_predictor(
+    "resnet50.onnx", input_columns=["pixel_values"], output_columns=["logits"], providers=["cuda"]
+)
 scored = images.ml.map_batches(udf, num_gpus=1, concurrency=8)
 ```
 
@@ -116,8 +128,12 @@ import batcher as bt
 from batcher.ml import build_vector_index, vector_search
 
 vectors = bt.read.parquet("s3://bucket/chunks.parquet").ml.embed(
-    "sentence-transformers/all-MiniLM-L6-v2", column="text",
-    output_column="embedding", batch_size=256, num_gpus=1, concurrency=2,
+    "sentence-transformers/all-MiniLM-L6-v2",
+    column="text",
+    output_column="embedding",
+    batch_size=256,
+    num_gpus=1,
+    concurrency=2,
 )
 vectors.write.lance("s3://bucket/chunks.lance")
 build_vector_index("s3://bucket/chunks.lance", "embedding")
@@ -174,11 +190,14 @@ from batcher.ml import StandardScaler
 train, test = featured.ml.train_test_split(test_size=0.25, seed=7, key="user_id")
 
 scaler = StandardScaler(["clicks", "spend"])
-scaler.fit(train)                       # fit on train only
+scaler.fit(train)  # fit on train only
 train_x = scaler.transform(train)
 
 for batch in train_x.select("clicks", "spend", "label").ml.iter_torch_batches(
-    batch_size=16, device="cpu", prefetch_batches=2, pin_memory=True,
+    batch_size=16,
+    device="cpu",
+    prefetch_batches=2,
+    pin_memory=True,
 ):
     ...  # batch is a {column: tensor} dict
 ```
@@ -225,9 +244,13 @@ metric is optimistic and production is worse. Split *first*, `fit` on train, the
 import batcher as bt
 from batcher.ml import Chain, OneHotEncoder, SimpleImputer, StandardScaler
 
-ds = bt.from_pydict({"clicks": [1.0, 2.0, 3.0, 4.0],
-                     "spend": [10.0, 20.0, 30.0, 40.0],
-                     "city": ["a", "b", "a", "b"]})
+ds = bt.from_pydict(
+    {
+        "clicks": [1.0, 2.0, 3.0, 4.0],
+        "spend": [10.0, 20.0, 30.0, 40.0],
+        "city": ["a", "b", "a", "b"],
+    }
+)
 train, test = ds.ml.train_test_split(test_size=0.5, seed=0)
 
 chain = Chain(
@@ -235,9 +258,9 @@ chain = Chain(
     StandardScaler(["clicks", "spend"]),
     OneHotEncoder(["city"]),
 )
-chain.fit(train)                    # statistics come from train only
+chain.fit(train)  # statistics come from train only
 train_x = chain.transform(train)
-test_x = chain.transform(test)      # same fitted statistics — no leakage
+test_x = chain.transform(test)  # same fitted statistics — no leakage
 ```
 
 The encoders hold the same line: the vocabulary is frozen at `fit`, so a category first

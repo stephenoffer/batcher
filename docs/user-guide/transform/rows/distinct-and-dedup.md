@@ -60,8 +60,9 @@ print(latest.sort("user").to_pydict())
 :::{tab-item} SQL
 
 ```python
-print(bt.sql(
-    """
+print(
+    bt.sql(
+        """
     SELECT user, ts, status
     FROM (
         SELECT *, row_number() OVER (PARTITION BY user ORDER BY ts DESC) AS rn FROM t
@@ -69,8 +70,9 @@ print(bt.sql(
     WHERE rn = 1
     ORDER BY user
     """,
-    t=events,
-).to_pydict())
+        t=events,
+    ).to_pydict()
+)
 # {'user': ['a', 'b', 'c'], 'ts': [3, 4, 5], 'status': ['paid', 'paid', 'new']}
 ```
 
@@ -226,9 +228,7 @@ redelivery that arrives inside the lateness window is still caught.
 
 ```python
 # docs: skip
-deduped = stream.drop_duplicates_within_watermark(
-    ["event_id"], event_time="ts", lateness="10m"
-)
+deduped = stream.drop_duplicates_within_watermark(["event_id"], event_time="ts", lateness="10m")
 ```
 
 Over a bounded source it degrades to plain exact deduplication. See

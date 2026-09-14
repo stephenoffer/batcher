@@ -31,9 +31,11 @@ import pyarrow as pa
 
 schema = pa.schema([("user", pa.string()), ("amount", pa.int64())])
 
+
 def feed():
     yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema)
     yield pa.record_batch({"user": ["a", "c"], "amount": [7, 3]}, schema=schema)
+
 
 stream = bt.from_batches(feed, schema, bounded=False)
 # The bounded-memory streaming path is chosen automatically.
@@ -77,11 +79,12 @@ one bad record stops on it and stays stopped.
 ```python
 # docs: skip
 q = bt.read.files_incremental(
-    "s3://bucket/landing/", "csv",
+    "s3://bucket/landing/",
+    "csv",
     state_dir="s3://bucket/_seen",
     delimiter=";",
-    on_error="skip",        # a truncated upload drops the file
-    on_bad_lines="skip",    # a ragged line drops the line
+    on_error="skip",  # a truncated upload drops the file
+    on_bad_lines="skip",  # a ragged line drops the line
 ).write.delta("s3://lake/bronze", trigger="30 seconds")
 ```
 
@@ -167,9 +170,11 @@ import pyarrow as pa
 
 schema = pa.schema([("user", pa.string()), ("amount", pa.int64())])
 
+
 def feed():
     yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema)
     yield pa.record_batch({"user": ["a"], "amount": [7]}, schema=schema)
+
 
 stream = bt.from_batches(feed, schema, bounded=False)
 
@@ -239,14 +244,21 @@ print(bt.OutputMode.COMPLETE)
 ```
 
 ```python
-agg_stream = bt.from_batches(feed, schema, bounded=False).group_by("user").agg(
-    total=col("amount").sum()
+agg_stream = (
+    bt.from_batches(feed, schema, bounded=False).group_by("user").agg(total=col("amount").sum())
 )
-q = agg_stream.write.memory("running_totals", trigger=bt.Trigger.available_now(),
-                            output_mode="complete")
+q = agg_stream.write.memory(
+    "running_totals", trigger=bt.Trigger.available_now(), output_mode="complete"
+)
 q.await_termination()
-print(dict(zip(*[bt.read_memory("running_totals").to_pydict()[c]
-                 for c in ("user", "total")], strict=True)))
+print(
+    dict(
+        zip(
+            *[bt.read_memory("running_totals").to_pydict()[c] for c in ("user", "total")],
+            strict=True,
+        )
+    )
+)
 ```
 
 ### Sizing the files a stream leaves behind
@@ -292,10 +304,12 @@ any other key, batch or streaming:
 import datetime as dt
 
 base = dt.datetime(2024, 1, 1)
-clicks = bt.from_pydict({
-    "ts": [base, base + dt.timedelta(minutes=30), base + dt.timedelta(minutes=90)],
-    "n": [1, 2, 3],
-})
+clicks = bt.from_pydict(
+    {
+        "ts": [base, base + dt.timedelta(minutes=30), base + dt.timedelta(minutes=90)],
+        "n": [1, 2, 3],
+    }
+)
 hourly = clicks.group_by(w=bt.window(col("ts"), "1h")).agg(hits=col("n").sum())
 print(hourly.to_pydict())  # 00:00 → 3, 01:00 → 3
 ```
@@ -350,8 +364,12 @@ windowed = (
     .group_by(w=bt.window(col("ts"), "1h"))
     .agg(hits=col("n").sum())
 )
-windowed.write.delta("gold/hourly", trigger=bt.Trigger.processing_time("1 minute"),
-                     output_mode="append", checkpoint="gold/_ckpt")
+windowed.write.delta(
+    "gold/hourly",
+    trigger=bt.Trigger.processing_time("1 minute"),
+    output_mode="append",
+    checkpoint="gold/_ckpt",
+)
 ```
 
 **Session windows** group consecutive events whose gap is below a timeout:
@@ -405,7 +423,8 @@ stable but shared, so two different unnamed queries writing the same table would
 ```python
 # docs: skip
 q = bt.read.kafka(topic="orders").write(
-    "lake/bronze", format="parquet",
+    "lake/bronze",
+    format="parquet",
     trigger=bt.Trigger.processing_time("30 seconds"),
     checkpoint="lake/bronze/_checkpoint",
 )
@@ -435,14 +454,19 @@ is one the next run safely replays.
 # docs: skip
 # New files land continuously; each arrival becomes one micro-batch, fanned across
 # the cluster, and one Delta transaction.
-q = (bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze/_seen")
-       .filter(col("status") == "ok")
-       .write.delta("lake/bronze",
-                    trigger=bt.Trigger.processing_time("1 minute"),
-                    checkpoint="lake/bronze/_ck",
-                    query_name="bronze-ingest",
-                    distributed=True, num_workers=16))
-q.stop()   # the query runs until you stop it; an idle minute is not the end of a stream
+q = (
+    bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze/_seen")
+    .filter(col("status") == "ok")
+    .write.delta(
+        "lake/bronze",
+        trigger=bt.Trigger.processing_time("1 minute"),
+        checkpoint="lake/bronze/_ck",
+        query_name="bronze-ingest",
+        distributed=True,
+        num_workers=16,
+    )
+)
+q.stop()  # the query runs until you stop it; an idle minute is not the end of a stream
 ```
 
 A streaming aggregation distributes too. Each worker aggregates only its share of the
@@ -465,22 +489,37 @@ checkpointed write out.
 # docs: skip
 # Bronze: raw ingestion.
 bt.read.kafka(topic="events").write(
-    "lake/bronze", format="parquet",
-    trigger=bt.Trigger.available_now(), checkpoint="lake/bronze/_ck")
+    "lake/bronze",
+    format="parquet",
+    trigger=bt.Trigger.available_now(),
+    checkpoint="lake/bronze/_ck",
+)
 
 # Silver: clean + dedup, reading bronze incrementally.
-(bt.read.files_incremental("lake/bronze", "parquet", state_dir="lake/silver/_seen")
-   .drop_duplicates_within_watermark(["id"], event_time="ts", lateness="10m")
-   .write("lake/silver", format="parquet",
-          trigger=bt.Trigger.available_now(), checkpoint="lake/silver/_ck"))
+(
+    bt.read.files_incremental("lake/bronze", "parquet", state_dir="lake/silver/_seen")
+    .drop_duplicates_within_watermark(["id"], event_time="ts", lateness="10m")
+    .write(
+        "lake/silver",
+        format="parquet",
+        trigger=bt.Trigger.available_now(),
+        checkpoint="lake/silver/_ck",
+    )
+)
 
 # Gold: windowed aggregates, reading silver incrementally.
-(bt.read.files_incremental("lake/silver", "parquet", state_dir="lake/gold/_seen")
-   .with_watermark("ts", "10m")
-   .group_by(w=bt.window(col("ts"), "1h"))
-   .agg(total=col("v").sum())
-   .write.delta("lake/gold", trigger=bt.Trigger.available_now(),
-                output_mode="append", checkpoint="lake/gold/_ck"))
+(
+    bt.read.files_incremental("lake/silver", "parquet", state_dir="lake/gold/_seen")
+    .with_watermark("ts", "10m")
+    .group_by(w=bt.window(col("ts"), "1h"))
+    .agg(total=col("v").sum())
+    .write.delta(
+        "lake/gold",
+        trigger=bt.Trigger.available_now(),
+        output_mode="append",
+        checkpoint="lake/gold/_ck",
+    )
+)
 ```
 
 ## See also

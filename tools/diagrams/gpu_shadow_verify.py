@@ -48,7 +48,9 @@ body.append(band(20, 174, 940, 268, "TWO ORACLES, AND THEY COST VERY DIFFERENT T
 GATE_Y, GATE_H, GATE_W = 210, 72, 274
 gates = (
     (
-        44, "schema contract", "enforce_schema_contract",
+        44,
+        "schema contract",
+        "enforce_schema_contract",
         (
             "On for every device run.",
             "Reads a field list: no rows, no",
@@ -58,7 +60,9 @@ gates = (
         ),
     ),
     (
-        356, "shadow re-run", "shadow_verify",
+        356,
+        "shadow re-run",
+        "shadow_verify",
         (
             "Off by default, behind",
             "distributed.gpu_shadow_verify.",
@@ -97,8 +101,9 @@ body.append(note(516, 542, "contract is that a device changes where a plan runs,
 body.append(note(516, 560, "it computes."))
 
 # ---- Why the free check is the schema one ----------------------------------------------
-body.append(band(20, 582, 940, 62, "EVERY DEFECT ON RECORD: A COLUMN TYPE, WITH CORRECT VALUES",
-                 "grey"))
+body.append(
+    band(20, 582, 940, 62, "EVERY DEFECT ON RECORD: A COLUMN TYPE, WITH CORRECT VALUES", "grey")
+)
 body.append(note(44, 626, "a DATE returning timestamp[ms] on a device, date32 under pandas"))
 body.append(note(430, 626, "an integer abs widening to double"))
 body.append(note(672, 626, "an empty cuDF string column arriving as null"))

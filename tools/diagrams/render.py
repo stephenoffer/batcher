@@ -23,7 +23,10 @@ WIDTH = 2000  # retina-crisp; Furo scales to the column width
 def main() -> int:
     rsvg = shutil.which("rsvg-convert")
     if not rsvg:
-        print("error: `rsvg-convert` not found — install librsvg (brew install librsvg)", file=sys.stderr)
+        print(
+            "error: `rsvg-convert` not found — install librsvg (brew install librsvg)",
+            file=sys.stderr,
+        )
         return 1
     svgs = sorted(HERE.glob("*.svg"))
     if not svgs:

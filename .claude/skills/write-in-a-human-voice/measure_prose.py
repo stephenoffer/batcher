@@ -56,7 +56,9 @@ CLEFT = re.compile(
 )
 
 #: ", making it easier to", ", allowing teams to", ", ensuring that".
-PARTICIPIAL_TAIL = re.compile(r",\s+(?:making|allowing|ensuring|enabling|giving|providing|helping)\b")
+PARTICIPIAL_TAIL = re.compile(
+    r",\s+(?:making|allowing|ensuring|enabling|giving|providing|helping)\b"
+)
 
 #: An em-dash that is a table cell's whole content, or sits alone inside a tag, is a
 #: *glyph* meaning "not applicable", not prose punctuation. `docs/index.md`'s support
@@ -102,7 +104,12 @@ def strip_code(text: str) -> tuple[list[str], list[str]]:
             continue
         content.append(line)
         stripped = line.strip()
-        if not stripped or _HEADING.match(line) or stripped.startswith("|") or stripped.startswith(":"):
+        if (
+            not stripped
+            or _HEADING.match(line)
+            or stripped.startswith("|")
+            or stripped.startswith(":")
+        ):
             # A blank line, a heading and a table row all end a paragraph; keeping the
             # break is what makes the paragraph-length spread measurable.
             prose.append("")
@@ -161,7 +168,8 @@ def measure(path: pathlib.Path) -> dict[str, float]:
         "sentences": float(len(lengths)),
         "headings_per_1k": sum(bool(_HEADING.match(ln)) for ln in content) * per_k,
         "bullet_line_ratio": (
-            sum(bool(_BULLET.match(ln)) for ln in content) / max(1, sum(bool(ln.strip()) for ln in content))
+            sum(bool(_BULLET.match(ln)) for ln in content)
+            / max(1, sum(bool(ln.strip()) for ln in content))
         ),
         "bold_per_1k": len(_BOLD.findall(" ".join(prose))) * per_k,
         "short_ratio": sum(n <= 8 for n in lengths) / max(1, len(lengths)),
@@ -179,13 +187,19 @@ def measure(path: pathlib.Path) -> dict[str, float]:
 def report(path: pathlib.Path, m: dict[str, float]) -> None:
     """Print one file's metrics, with the target beside each one that has a target."""
     print(f"\n{path}  ({int(m['words'])} prose words, {int(m['sentences'])} sentences)")
-    print(f"  shape   headings/1k {m['headings_per_1k']:5.1f}   bullet-line ratio {m['bullet_line_ratio']:.2f}"
-          f"   bold/1k {m['bold_per_1k']:5.1f}")
-    print(f"  rhythm  short {m['short_ratio']:.2f} (>=0.12)   mid-band {m['mid_band_ratio']:.2f} (<=0.72)"
-          f"   sent CoV {m['sentence_cov']:.2f} (>=0.5)   para CoV {m['paragraph_cov']:.2f} (>=0.3)")
+    print(
+        f"  shape   headings/1k {m['headings_per_1k']:5.1f}   bullet-line ratio {m['bullet_line_ratio']:.2f}"
+        f"   bold/1k {m['bold_per_1k']:5.1f}"
+    )
+    print(
+        f"  rhythm  short {m['short_ratio']:.2f} (>=0.12)   mid-band {m['mid_band_ratio']:.2f} (<=0.72)"
+        f"   sent CoV {m['sentence_cov']:.2f} (>=0.5)   para CoV {m['paragraph_cov']:.2f} (>=0.3)"
+    )
     print(f"  syntax  clefts {int(m['clefts'])}   participial tails {int(m['participial_tails'])}")
     glyphs = f"   +{int(m['dash_glyphs'])} table glyphs (leave them)" if m["dash_glyphs"] else ""
-    print(f"  diction em-dashes {int(m['em_dashes'])} (0 in docs/)   filler {int(m['filler'])}{glyphs}")
+    print(
+        f"  diction em-dashes {int(m['em_dashes'])} (0 in docs/)   filler {int(m['filler'])}{glyphs}"
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -198,20 +212,30 @@ def main(argv: list[str]) -> int:
     paths: list[pathlib.Path] = []
     for arg in args:
         p = pathlib.Path(arg)
-        paths.extend(sorted(q for q in p.rglob("*.md") if "_build" not in str(q)) if p.is_dir() else [p])
+        paths.extend(
+            sorted(q for q in p.rglob("*.md") if "_build" not in str(q)) if p.is_dir() else [p]
+        )
 
     rows = [(p, measure(p)) for p in paths if p.exists()]
     if not rows:
         print("no Markdown files found", file=sys.stderr)
         return 2
     if summary:
-        keys = ("headings_per_1k", "bullet_line_ratio", "short_ratio", "mid_band_ratio", "sentence_cov")
+        keys = (
+            "headings_per_1k",
+            "bullet_line_ratio",
+            "short_ratio",
+            "mid_band_ratio",
+            "sentence_cov",
+        )
         print(f"{len(rows)} files, {int(sum(m['words'] for _, m in rows))} prose words")
         for key in keys:
             values = sorted(m[key] for _, m in rows)
             print(f"  {key:20} median {statistics.median(values):.2f}   worst {values[-1]:.2f}")
         flagged = [(m["em_dashes"], str(p)) for p, m in rows if m["em_dashes"]]
-        print(f"  em-dashes            {int(sum(v for v, _ in flagged))} across {len(flagged)} files")
+        print(
+            f"  em-dashes            {int(sum(v for v, _ in flagged))} across {len(flagged)} files"
+        )
         for value, name in sorted(flagged, reverse=True)[:5]:
             print(f"      {int(value):4}  {name}")
         return 0

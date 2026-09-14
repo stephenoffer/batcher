@@ -177,9 +177,8 @@ when you do not supply one.
 
 ```python
 # docs: skip
-written = (
-    catalog.with_columns(thumb=col("photo").image.resize(256, 256))
-    .ml.upload("thumb", "s3://bucket/thumbs/", name_column="sku", extension=".png")
+written = catalog.with_columns(thumb=col("photo").image.resize(256, 256)).ml.upload(
+    "thumb", "s3://bucket/thumbs/", name_column="sku", extension=".png"
 )
 ```
 :::

@@ -159,9 +159,7 @@ is both large and consistent keeps almost all of its own mean:
 ```python
 from batcher.ml.preprocessors import JamesSteinEncoder
 
-mixed = bt.from_pydict(
-    {"city": ["big"] * 20 + ["tiny"] * 2, "churn": [1.0] * 20 + [1.0, 1.0]}
-)
+mixed = bt.from_pydict({"city": ["big"] * 20 + ["tiny"] * 2, "churn": [1.0] * 20 + [1.0, 1.0]})
 fitted = JamesSteinEncoder(["city"], "churn").fit(mixed)
 print(round(fitted.mapping_["city"]["big"], 4) >= round(fitted.mapping_["city"]["tiny"], 4))
 # True
@@ -187,7 +185,7 @@ from batcher.ml.preprocessors import WOEEncoder
 
 ds = bt.from_pydict({"grade": ["a", "a", "b", "b"], "default": [0, 0, 1, 1]})
 encoded = WOEEncoder(["grade"], "default").fit_transform(ds).to_pydict()["grade"]
-print(encoded[0] < 0 < encoded[2])   # grade a leans safe, grade b leans default
+print(encoded[0] < 0 < encoded[2])  # grade a leans safe, grade b leans default
 ```
 
 Like `TargetEncoder` it is supervised, so fit it on the training split only. An unseen or
@@ -271,7 +269,9 @@ When the edges are known up front rather than learned from the data, {py:func}`b
 
 ```python
 ds = bt.from_pydict({"age": [5, 18, 40, 70]})
-banded = ds.with_columns(band=bt.cut("age", [12, 19, 65], labels=["child", "teen", "adult", "senior"]))
+banded = ds.with_columns(
+    band=bt.cut("age", [12, 19, 65], labels=["child", "teen", "adult", "senior"])
+)
 print(banded.to_pydict()["band"])
 # ['child', 'teen', 'adult', 'senior']
 ```

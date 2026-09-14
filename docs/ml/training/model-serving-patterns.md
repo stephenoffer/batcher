@@ -99,13 +99,13 @@ import batcher as bt
 from batcher.ml import Stage, run_pipeline
 
 
-class Decode:              # stands in for a CPU stage (image decode, tokenize)
+class Decode:  # stands in for a CPU stage (image decode, tokenize)
     def __call__(self, batch):
         scaled = pc.multiply(pc.cast(batch.column("x"), "float64"), 2.0)
         return batch.set_column(0, "x", scaled)
 
 
-class Forward:             # stands in for the GPU forward pass
+class Forward:  # stands in for the GPU forward pass
     def __call__(self, batch):
         label = pc.greater(batch.column("x"), 4.0)
         return batch.append_column("label", label)
@@ -115,7 +115,10 @@ ds = bt.from_pydict({"x": [1, 2, 3, 4]})
 out = list(
     run_pipeline(
         ds.iter_batches(),
-        [Stage(Decode, credits=2, name="decode"), Stage(Forward, credits=2, num_gpus=0, name="gpu")],
+        [
+            Stage(Decode, credits=2, name="decode"),
+            Stage(Forward, credits=2, num_gpus=0, name="gpu"),
+        ],
     )
 )
 print(out[0].to_pydict())

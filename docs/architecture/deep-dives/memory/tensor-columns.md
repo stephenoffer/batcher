@@ -26,8 +26,9 @@ contract to keep in lockstep.
 def tensor_type(value_type: pa.DataType, shape: tuple[int, ...]) -> pa.DataType:
     return pa.fixed_shape_tensor(value_type, list(shape))
 
+
 def to_tensor_column(ndarray: np.ndarray) -> pa.Array:
-    return pa.FixedShapeTensorArray.from_numpy_ndarray(ndarray)   # leading axis = rows
+    return pa.FixedShapeTensorArray.from_numpy_ndarray(ndarray)  # leading axis = rows
 ```
 
 That whole module is 98 lines. The shape rides with the data, which means it crosses the FFI
@@ -54,9 +55,11 @@ import batcher as bt
 emb = bt.from_numpy(np.arange(12, dtype=np.float32).reshape(4, 3), column="emb")
 print(emb.collect().schema.field("emb").type)
 
+
 # rank-3 per row: the canonical extension type
 def make_images(batch):
     return {"img": np.zeros((batch.num_rows, 2, 2, 3), dtype=np.uint8)}
+
 
 imgs = bt.from_pydict({"i": [0, 1, 2, 3]}).map_batches(make_images)
 field = imgs.collect().schema.field("img")
@@ -137,9 +140,9 @@ conventions. `ml/converters.py` re-exports it, deliberately rather than by accid
 ```python
 # docs: skip
 if is_tensor_column(arr):
-    return arr.to_numpy_ndarray()              # (n, *shape)
+    return arr.to_numpy_ndarray()  # (n, *shape)
 if fixed_size_list_of_primitives(arr):
-    return child.reshape(-1, width)            # (n, W)
+    return child.reshape(-1, width)  # (n, W)
 return arr.to_numpy(zero_copy_only=False)
 ```
 
@@ -156,8 +159,10 @@ zero-copy DLPack path is what {py:meth}`iter_torch_batches <batcher.api.dataset.
 import numpy as np
 import batcher as bt
 
+
 def make_images(batch):
     return {"img": np.zeros((batch.num_rows, 2, 2, 3), dtype=np.uint8)}
+
 
 ds = bt.from_pydict({"i": [0, 1, 2, 3]}).map_batches(make_images)
 for batch in ds.ml.iter_torch_batches(batch_size=2):

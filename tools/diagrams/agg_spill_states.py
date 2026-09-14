@@ -53,14 +53,20 @@ body: list[str] = [
     arrow(535, 98, 593, 98),
     label(564, 86, "scatter", anchor="middle", size=11.5),
     card(599, 70, 280, 56, "state columns per group", "Arrow, one row per group"),
-    note(490, 152, "The state is not the answer. mean carries (sum, count); var carries (mean, M2, count);",
-         anchor="middle"),
-    note(490, 170, "median carries the group's values as a list. Only finalize turns one into a number.",
-         anchor="middle"),
-
+    note(
+        490,
+        152,
+        "The state is not the answer. mean carries (sum, count); var carries (mean, M2, count);",
+        anchor="middle",
+    ),
+    note(
+        490,
+        170,
+        "median carries the group's values as a list. Only finalize turns one into a number.",
+        anchor="middle",
+    ),
     arrow(490, 202, 490, 228),
     label(504, 220, "partials", size=11.5),
-
     band(20, 232, 940, 180, "SPILL: ROUTE EVERY PARTIAL BY A HASH OF THE GROUP KEY", "amber"),
     note(126, 274, "partials", anchor="middle"),
     row_of(44, 284, 6, 28, 36, 33),
@@ -73,10 +79,8 @@ body: list[str] = [
     note(772, 326, "P is the state bytes over the budget, 2 to 256.", anchor="middle"),
     note(772, 360, "A key always hashes to the same partition,", anchor="middle"),
     note(772, 378, "so a group is never split across two of them.", anchor="middle"),
-
     arrow(485, 414, 485, 440),
     label(499, 432, "one partition at a time", size=11.5),
-
     band(20, 444, 940, 180, "MERGE ONE PARTITION AT A TIME", "blue"),
     note(109, 486, "partition i", anchor="middle"),
     stack(44, 494, 130, 2),
@@ -90,12 +94,25 @@ body: list[str] = [
     label(753, 501, "rows", anchor="middle", size=11.5),
     card(788, 484, 158, 58, "output rows", "this partition's groups"),
     curve(446, 548, 345, 590, 244, 548, "amber"),
-    label(345, 606, "partition still over budget: re-partition it with a fresh salt", anchor="middle", size=11.5),
+    label(
+        345,
+        606,
+        "partition still over budget: re-partition it with a fresh salt",
+        anchor="middle",
+        size=11.5,
+    ),
 ]
 
 body.append(note(490, 644, "Peak memory is one partition, not one hash table.", anchor="middle"))
-body.append(note(490, 662, "This is the algebra the distributed path runs, with combine reading from disk "
-                           "instead of from the network.", anchor="middle"))
+body.append(
+    note(
+        490,
+        662,
+        "This is the algebra the distributed path runs, with combine reading from disk "
+        "instead of from the network.",
+        anchor="middle",
+    )
+)
 
 write("agg_spill_states", svg(W, H, "".join(body)))
 print("wrote agg_spill_states.svg")

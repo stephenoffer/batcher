@@ -24,8 +24,8 @@ W, H = 980, 540
 
 # The three functions share one vertical axis so the chain reads left to right.
 CHAIN_Y, CHAIN_H = 62, 80
-MID = CHAIN_Y + CHAIN_H / 2           # 102
-RAIL_Y = 208                          # the bus every mode publishes onto
+MID = CHAIN_Y + CHAIN_H / 2  # 102
+RAIL_Y = 208  # the bus every mode publishes onto
 MODE_Y, MODE_H = 268, 88
 
 body = [
@@ -68,8 +68,13 @@ for x, title, where, carrier, gloss in modes:
 # The invariant, and the two algebraic properties it rests on.
 body += [
     band(20, 452, 940, 68, "THE TEST THAT MUST STAY GREEN", "grey"),
-    label(490, 492, "combine_finalize(partition(partial(p_k)))  ==  the single-node result",
-          anchor="middle", size=14),
+    label(
+        490,
+        492,
+        "combine_finalize(partition(partial(p_k)))  ==  the single-node result",
+        anchor="middle",
+        size=14,
+    ),
     curve(736, MODE_Y + MODE_H, 640, 470, 300, 462, "amber"),
     note(500, 446, "arrival order cannot change the answer", anchor="middle"),
 ]

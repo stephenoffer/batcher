@@ -94,7 +94,7 @@ body += [
     f'stroke-dasharray="9 6"/>',
     f'<text x="20" y="{DIVIDER_Y - 12}" font-family="{FONT}" font-size="12.5" '
     f'font-weight="700" fill="{AMBER_DEEP}">'
-    f'The boundary: one JSON document and zero-copy Arrow, and nothing else.</text>',
+    f"The boundary: one JSON document and zero-copy Arrow, and nothing else.</text>",
 ]
 
 # The crossing edge, routed down the right margin and back along under the divider.
@@ -138,10 +138,18 @@ body += [
     f'<path d="M {BOT_X[2] + BOT_W / 2} {BOT_Y - 10} V 276" fill="none" stroke="{GREY}" '
     f'stroke-width="2.4" stroke-dasharray="5 4" marker-end="url(#arG)"/>',
     note(BOT_X[2] + BOT_W / 2, 272, "result batches return the same way", anchor="middle"),
-    note(490, 464, "Python never sees a row on the way down and never copies one on the way back.",
-         anchor="middle"),
-    note(490, 484, "A per-row loop above the line is the one thing this shape is designed to prevent.",
-         anchor="middle"),
+    note(
+        490,
+        464,
+        "Python never sees a row on the way down and never copies one on the way back.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        484,
+        "A per-row loop above the line is the one thing this shape is designed to prevent.",
+        anchor="middle",
+    ),
 ]
 
 write("plan_lowering", svg(W, H, "".join(body)))

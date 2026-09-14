@@ -55,11 +55,7 @@ print(events.count())
 Run a real query against the generated data to confirm it is well formed:
 
 ```python
-by_region = (
-    events.group_by("region")
-    .agg(total=bt.col("amount").sum(), n=bt.count())
-    .sort("region")
-)
+by_region = events.group_by("region").agg(total=bt.col("amount").sum(), n=bt.count()).sort("region")
 print(by_region.to_pydict()["region"])
 # ['east', 'north', 'south', 'west']
 ```

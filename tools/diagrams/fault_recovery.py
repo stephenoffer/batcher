@@ -41,7 +41,9 @@ body: list[str] = []
 
 # ---- The event ---------------------------------------------------------------------------
 body.append(band(20, 24, 940, 100, "A TASK DID NOT RETURN", "grey"))
-body.append(card(310, 48, 360, 56, "a map or reduce task raised", "or its worker stopped answering"))
+body.append(
+    card(310, 48, 360, 56, "a map or reduce task raised", "or its worker stopped answering")
+)
 
 # ---- Classify, and note that two of three answers are not a retry -------------------------
 body.append(arrow(490, 130, 490, 166))
@@ -51,7 +53,9 @@ body.append(band(20, 172, 940, 244, "THREE VERDICTS, AND ONLY ONE OF THEM RETRIE
 
 verdicts = (
     (
-        44, "lost data", "recompute it",
+        44,
+        "lost data",
+        "recompute it",
         (
             "A RayError that is not a RayTaskError:",
             "an actor, a worker or a node died.",
@@ -61,7 +65,9 @@ verdicts = (
         ),
     ),
     (
-        356, "a deterministic bug", "re-raise it",
+        356,
+        "a deterministic bug",
+        "re-raise it",
         (
             "A UDF exception, a bad cast, a schema",
             "mismatch, a broken runtime env.",
@@ -71,7 +77,9 @@ verdicts = (
         ),
     ),
     (
-        668, "results untrusted", "refuse to continue",
+        668,
+        "results untrusted",
+        "refuse to continue",
         (
             "An uncontained ECC fault: the device",
             "kept running and answered wrongly.",
@@ -91,16 +99,32 @@ body.append(arrow(181, 392, 181, 440))
 body.append(label(193, 424, "only this one", size=11.5))
 
 # ---- What a recompute costs ---------------------------------------------------------------
-body.append(band(20, 446, 940, 138, "WHAT A RECOMPUTE COSTS, AND WHAT WAS ARRANGED BEFOREHAND",
-                 "amber"))
+body.append(
+    band(20, 446, 940, 138, "WHAT A RECOMPUTE COSTS, AND WHAT WAS ARRANGED BEFOREHAND", "amber")
+)
 
 costs = (
-    (44, "re-read and re-map", "the default", "Re-read the source partition and re-run",
-     "the map. Usually the longest phase."),
-    (356, "fetch a replica", "shuffle_replication > 1", "An off-node copy was acknowledged",
-     "before the bucket was advertised."),
-    (668, "migrate while alive", "on advance notice", "Spot metadata, SIGTERM or a Slurm",
-     "deadline: one copy, not a re-read."),
+    (
+        44,
+        "re-read and re-map",
+        "the default",
+        "Re-read the source partition and re-run",
+        "the map. Usually the longest phase.",
+    ),
+    (
+        356,
+        "fetch a replica",
+        "shuffle_replication > 1",
+        "An off-node copy was acknowledged",
+        "before the bucket was advertised.",
+    ),
+    (
+        668,
+        "migrate while alive",
+        "on advance notice",
+        "Spot metadata, SIGTERM or a Slurm",
+        "deadline: one copy, not a re-read.",
+    ),
 )
 for x, title, when, a, b in costs:
     cx = x + 137
@@ -111,8 +135,14 @@ for x, title, when, a, b in costs:
 # ---- The hazard recovery itself introduces ------------------------------------------------
 body.append(band(20, 596, 940, 56, "AND THE HAZARD RECOVERY INTRODUCES", "grey"))
 body.append(label(44, 632, "a worker presumed dead may not be"))
-body.append(note(340, 632, "so each round carries a higher epoch, and a reducer discards any "
-                           "batch arriving under a stale one"))
+body.append(
+    note(
+        340,
+        632,
+        "so each round carries a higher epoch, and a reducer discards any "
+        "batch arriving under a stale one",
+    )
+)
 
 write("fault_recovery", svg(W, H, "".join(body)))
 print("wrote fault_recovery.svg")

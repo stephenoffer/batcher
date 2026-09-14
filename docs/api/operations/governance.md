@@ -232,9 +232,7 @@ residency is an obligation you state rather than one Batcher infers from a bucke
 from batcher.governance import DataResidency, ResidencyCatalog
 
 catalog = ResidencyCatalog(mode="strict")
-catalog.register(
-    DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR Art. 44")
-)
+catalog.register(DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR Art. 44"))
 
 verdict = catalog.check("s3://eu-customers/orders", "us-east-1")
 print(verdict.allowed)

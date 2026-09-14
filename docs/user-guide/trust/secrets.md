@@ -14,7 +14,7 @@ Pass a key reference rather than the raw key:
 
 ```python
 # docs: skip
-enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))            # from the environment
+enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))  # from the environment
 enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "file:/run/secrets/aes"))  # from a mounted secret
 ```
 
@@ -55,15 +55,18 @@ URI. That is the larger secret surface in most deployments.
 # docs: skip
 import batcher as bt
 
-bt.read.clickhouse(query="SELECT ...", host="ch.internal", database="events",
-                   password="env:CH_PASSWORD")
+bt.read.clickhouse(
+    query="SELECT ...", host="ch.internal", database="events", password="env:CH_PASSWORD"
+)
 
 bt.read.table("connectorx", query="SELECT ...", conn_uri="file:/run/secrets/pg_uri")
 
 bt.read.mongo(uri="env:MONGO_URI", database="app", collection="events")
 
-bt.read.parquet("oss://bucket/events/*.parquet",
-                storage_options={"key": "env:OSS_KEY", "secret": "cmd:prod/oss-secret"})
+bt.read.parquet(
+    "oss://bucket/events/*.parquet",
+    storage_options={"key": "env:OSS_KEY", "secret": "cmd:prod/oss-secret"},
+)
 ```
 
 All three schemes work here, including `cmd:`, and so do the `storage_options` an object

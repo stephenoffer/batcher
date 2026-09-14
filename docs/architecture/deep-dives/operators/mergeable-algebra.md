@@ -249,6 +249,7 @@ from batcher import Config, config_context
 ds = bt.from_pydict({"g": [i % 3 for i in range(10_000)], "x": list(range(10_000))})
 base = Config()
 
+
 def run(morsel_rows, parallelism):
     cfg = base.replace(
         execution=dataclasses.replace(
@@ -258,8 +259,9 @@ def run(morsel_rows, parallelism):
     with config_context(cfg):
         return ds.group_by("g").agg(s=bt.col("x").sum()).sort("g").to_pydict()
 
-one_core = run(1024, 1)     # one partial, no combine
-eight = run(256, 8)         # ~40 partials, combined in an arbitrary order
+
+one_core = run(1024, 1)  # one partial, no combine
+eight = run(256, 8)  # ~40 partials, combined in an arbitrary order
 print(one_core == eight, one_core)
 ```
 

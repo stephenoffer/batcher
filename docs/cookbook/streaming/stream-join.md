@@ -32,14 +32,18 @@ import batcher as bt
 base = dt.datetime(2024, 1, 1)
 minute = dt.timedelta(minutes=1)
 
-impressions = bt.from_pydict({
-    "ad": ["a1", "a2", "a3"],
-    "shown": [base, base + 5 * minute, base + 10 * minute],
-})
-clicks = bt.from_pydict({
-    "ad": ["a1", "a3"],
-    "clicked": [base + 2 * minute, base + 200 * minute],
-})
+impressions = bt.from_pydict(
+    {
+        "ad": ["a1", "a2", "a3"],
+        "shown": [base, base + 5 * minute, base + 10 * minute],
+    }
+)
+clicks = bt.from_pydict(
+    {
+        "ad": ["a1", "a3"],
+        "clicked": [base + 2 * minute, base + 200 * minute],
+    }
+)
 
 attributed = impressions.join_stream(
     clicks, on="ad", left_time="shown", right_time="clicked", within="30m"
@@ -66,23 +70,21 @@ right_schema = pa.schema([("ad", pa.string()), ("clicked", pa.timestamp("us"))])
 
 
 def impression_feed():
-    yield pa.record_batch({"ad": ["a1", "a2"], "shown": [base, base + 5 * minute]},
-                          schema=left_schema)
+    yield pa.record_batch(
+        {"ad": ["a1", "a2"], "shown": [base, base + 5 * minute]}, schema=left_schema
+    )
     yield pa.record_batch({"ad": ["a3"], "shown": [base + 10 * minute]}, schema=left_schema)
 
 
 def click_feed():
     yield pa.record_batch({"ad": ["a1"], "clicked": [base + 2 * minute]}, schema=right_schema)
-    yield pa.record_batch({"ad": ["a3"], "clicked": [base + 200 * minute]},
-                          schema=right_schema)
+    yield pa.record_batch({"ad": ["a3"], "clicked": [base + 200 * minute]}, schema=right_schema)
 
 
 left = bt.from_batches(impression_feed, left_schema, bounded=False)
 right = bt.from_batches(click_feed, right_schema, bounded=False)
 
-joined = left.join_stream(
-    right, on="ad", left_time="shown", right_time="clicked", within="30m"
-)
+joined = left.join_stream(right, on="ad", left_time="shown", right_time="clicked", within="30m")
 for batch in joined.iter_batches():
     print(batch.to_pydict()["ad"])
 # ['a1']
@@ -102,7 +104,7 @@ attributed = impressions.join_stream(
     left_time="shown_at",
     right_time="clicked_at",
     within="30m",
-    lateness="5m",   # grace before buffered rows are evicted
+    lateness="5m",  # grace before buffered rows are evicted
 )
 for batch in attributed.iter_batches():
     publish(batch)
@@ -158,10 +160,12 @@ registry, impressions against a campaign dimension. Only one side streams, so no
 is needed. Write it as an ordinary {py:meth}`join <batcher.Dataset.join>`:
 
 ```python
-campaigns = bt.from_pydict({
-    "ad": ["a1", "a2", "a3"],
-    "campaign": ["spring", "fall", "spring"],
-})
+campaigns = bt.from_pydict(
+    {
+        "ad": ["a1", "a2", "a3"],
+        "campaign": ["spring", "fall", "spring"],
+    }
+)
 
 enriched = left.join(campaigns, on="ad", how="left")
 for batch in enriched.iter_batches():

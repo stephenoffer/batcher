@@ -81,9 +81,7 @@ the source clip's resolution or length was:
 import batcher as bt
 from batcher import col
 
-tensors = bt.read.video("s3://bucket/clips/").with_columns(
-    x=col("bytes").video.frames(8, 224, 224)
-)
+tensors = bt.read.video("s3://bucket/clips/").with_columns(x=col("bytes").video.frames(8, 224, 224))
 ```
 
 The result is a fixed-shape tensor column of `(8, 224, 224, 3)` uint8, tagged with the

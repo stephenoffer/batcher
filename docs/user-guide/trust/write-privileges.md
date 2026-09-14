@@ -15,9 +15,9 @@ import batcher as bt
 
 d = tempfile.mkdtemp()
 customers = os.path.join(d, "customers.parquet")
-bt.from_pydict(
-    {"id": [1, 2], "email": ["a@x.com", "b@x.com"], "salary": [100, 200]}
-).write(customers, format="parquet")
+bt.from_pydict({"id": [1, 2], "email": ["a@x.com", "b@x.com"], "salary": [100, 200]}).write(
+    customers, format="parquet"
+)
 analyst = bt.Principal("ana", roles=["analyst"])
 catalog = bt.SecurityCatalog().grant("analyst", on=customers)
 ```

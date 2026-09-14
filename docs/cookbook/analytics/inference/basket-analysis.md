@@ -16,10 +16,16 @@ baskets = bt.from_pydict(
     {
         "order_id": [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5],
         "item": [
-            "bread", "butter", "jam",
-            "bread", "butter",
-            "bread", "jam", "milk",
-            "butter", "jam",
+            "bread",
+            "butter",
+            "jam",
+            "bread",
+            "butter",
+            "bread",
+            "jam",
+            "milk",
+            "butter",
+            "jam",
             "bread",
         ],
     }
@@ -86,9 +92,7 @@ The join itself is still quadratic *per basket*, though. One pathological order 
 line items contributes four million rows on its own. Cap it before you join:
 
 ```python
-sane = baskets.filter(
-    col("order_id").count().over(partition_by=["order_id"]) <= 50
-)
+sane = baskets.filter(col("order_id").count().over(partition_by=["order_id"]) <= 50)
 print(sane.count())
 # 11
 ```

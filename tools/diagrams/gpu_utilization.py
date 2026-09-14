@@ -33,16 +33,16 @@ DATA = [
 ]
 
 W, H = 980, 486
-LABEL_W = 268          # left column for category names
-X0 = LABEL_W + 16      # plot origin
-X1 = W - 108           # leave room for the value label outside the bar
+LABEL_W = 268  # left column for category names
+X0 = LABEL_W + 16  # plot origin
+X1 = W - 108  # leave room for the value label outside the bar
 PLOT_W = X1 - X0
 BAR_H = 36
 GAP = 16
 TOP = 132
-MAX = 100.0            # a percentage occupies its whole scale
+MAX = 100.0  # a percentage occupies its whole scale
 PX = PLOT_W / MAX
-TARGET = 80.0          # the sustained-utilization target
+TARGET = 80.0  # the sustained-utilization target
 
 STYLE = """<style>
   .surf { fill: #ffffff; }

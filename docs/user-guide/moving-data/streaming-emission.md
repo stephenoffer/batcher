@@ -48,17 +48,25 @@ streaming query, which emits the running result on the trigger:
 ```python
 # docs: skip
 # Windowed: each window is a finite question, closed by the watermark.
-(stream.with_watermark("ts", "10 minutes")
-       .group_by(w=bt.window(col("ts"), "1 hour"))
-       .agg(total=col("amount").sum())
-       .iter_batches())
+(
+    stream.with_watermark("ts", "10 minutes")
+    .group_by(w=bt.window(col("ts"), "1 hour"))
+    .agg(total=col("amount").sum())
+    .iter_batches()
+)
 
 # Or a streaming query, which emits the running result every trigger.
-q = (stream.group_by("user").agg(total=col("amount").sum())
-           .write("out/totals", format="parquet",
-                  output_mode="update",
-                  trigger=bt.Trigger.processing_time("30 seconds"),
-                  checkpoint="out/_ck"))
+q = (
+    stream.group_by("user")
+    .agg(total=col("amount").sum())
+    .write(
+        "out/totals",
+        format="parquet",
+        output_mode="update",
+        trigger=bt.Trigger.processing_time("30 seconds"),
+        checkpoint="out/_ck",
+    )
+)
 ```
 
 `output_mode="update"` emits the groups that changed this trigger and `"complete"` emits

@@ -40,9 +40,7 @@ The obvious pipeline collapses the batch to one row per key and upserts it. Coll
 ```python
 naive = os.path.join(work, "naive.parquet")
 
-by_arrival = feed.with_row_index("arrived").distinct(
-    subset=["id"], keep="last", order_by="arrived"
-)
+by_arrival = feed.with_row_index("arrived").distinct(subset=["id"], keep="last", order_by="arrived")
 by_arrival.select("id", "email").write.merge(naive, on="id")
 
 print(bt.read.parquet(naive).to_pydict())

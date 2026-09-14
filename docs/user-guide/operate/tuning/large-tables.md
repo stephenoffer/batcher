@@ -78,8 +78,8 @@ scan is planned:
 
 ```python
 # docs: skip
-facts = bt.read.parquet("s3://bucket/events/")       # a directory per day, ten years of them
-recent = bt.read.parquet("s3://bucket/campaigns/")   # names four days
+facts = bt.read.parquet("s3://bucket/events/")  # a directory per day, ten years of them
+recent = bt.read.parquet("s3://bucket/campaigns/")  # names four days
 
 facts.join(recent, on="day", how="inner")
 ```

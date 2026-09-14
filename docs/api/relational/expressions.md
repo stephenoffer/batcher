@@ -317,7 +317,11 @@ those rows null instead (the Polars default).
 
 ```python
 r = bt.from_pydict({"x": [1, 2, 3, 4]})
-print(r.with_columns(m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict())
+print(
+    r.with_columns(
+        m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)
+    ).to_pydict()
+)
 # {'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
 ```
 
@@ -406,11 +410,13 @@ likewise carry {py:meth}`.and_(o) <batcher.plan.expr_ir.core.Expr.and_>`, {py:me
 import batcher as bt
 
 ds = bt.from_pydict({"x": [1, None, 3], "y": [10, 20, 30]})
-print(ds.select(
-    filled=bt.col("x").fillna(0),
-    missing=bt.col("x").isna(),
-    total=bt.col("x").add(bt.col("y")),
-).to_pydict())
+print(
+    ds.select(
+        filled=bt.col("x").fillna(0),
+        missing=bt.col("x").isna(),
+        total=bt.col("x").add(bt.col("y")),
+    ).to_pydict()
+)
 # {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
 ```
 

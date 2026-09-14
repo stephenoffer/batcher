@@ -177,10 +177,10 @@ and `read.table` accept the same path and option style.
 
 ```python
 # docs: skip
-ds = bt.read("data/events.parquet")          # format inferred from extension
-ds = bt.read("data/*.parquet")               # glob across many files
-ds = bt.read("output/events/")               # a directory: inferred from the files in it
-ds = bt.read("s3://bucket/events.parquet")   # object storage (needs [cloud])
+ds = bt.read("data/events.parquet")  # format inferred from extension
+ds = bt.read("data/*.parquet")  # glob across many files
+ds = bt.read("output/events/")  # a directory: inferred from the files in it
+ds = bt.read("s3://bucket/events.parquet")  # object storage (needs [cloud])
 ```
 
 A directory has no extension of its own, so the format comes from the files inside it.
@@ -194,7 +194,7 @@ by more than one entry is still read once.
 
 ```python
 # docs: skip
-ds = bt.read.parquet(["runs/2024-01/", "runs/2024-02/"])   # two outputs, one relation
+ds = bt.read.parquet(["runs/2024-01/", "runs/2024-02/"])  # two outputs, one relation
 ds = bt.read.parquet(["a/events.parquet", "b/*.parquet"])  # mixed spellings
 ```
 

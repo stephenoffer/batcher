@@ -110,9 +110,7 @@ import batcher as bt
 from batcher.governance.authn import JwtVerifier
 
 bt.set_verifier(
-    JwtVerifier.from_issuer(
-        "https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher"
-    )
+    JwtVerifier.from_issuer("https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher")
 )
 ```
 
@@ -297,9 +295,7 @@ four characters a card policy reveals:
 import batcher as bt
 from batcher.governance import Redact
 
-people = bt.from_pydict(
-    {"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]}
-)
+people = bt.from_pydict({"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]})
 masked = people.select(
     name=Redact(show_first=1)(bt.col("name")),
     postcode=Redact(show_last=3)(bt.col("postcode")),

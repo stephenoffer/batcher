@@ -144,7 +144,9 @@ body += [
 # The two exits.
 body += [
     card(420, 396, 500, 76, "Kept as a column", "three values survive: true, false, unknown"),
-    card(420, 492, 500, 76, "Used as a filter", "truthy() folds unknown to false, and the row goes"),
+    card(
+        420, 492, 500, 76, "Used as a filter", "truthy() folds unknown to false, and the row goes"
+    ),
     f'<path d="M {AX + STRIP_W + 10} 427 L 410 434" fill="none" stroke="{BLUE}" '
     f'stroke-width="2.4" marker-end="url(#arB)"/>',
     f'<path d="M {AX + STRIP_W + 10} 455 L 410 530" fill="none" stroke="{AMBER_DEEP}" '

@@ -28,7 +28,7 @@ on the upper one, so the split is spatial rather than asserted in a caption.
 
 from __future__ import annotations
 
-from _authoring import AMBER_DEEP, BLUE, BLUE_MID, GREY, arrow, band, card, label, note, svg, write
+from _authoring import AMBER_DEEP, BLUE, BLUE_MID, GREY, band, card, label, note, svg, write
 
 W, H = 980, 560
 
@@ -47,8 +47,14 @@ body: list[str] = []
 # ---- The control plane: what Ray carries --------------------------------------------
 body.append(band(20, 24, 940, 118, "CONTROL PLANE -- THROUGH RAY", "grey"))
 body.append(card(300, 52, 380, 62, "Ray tasks and actors", "schedules the workers"))
-body.append(note(490, 128, "an address, a ticket, a file path, a row count, a metrics JSON "
-                           "string -- and nothing else", anchor="middle"))
+body.append(
+    note(
+        490,
+        128,
+        "an address, a ticket, a file path, a row count, a metrics JSON string -- and nothing else",
+        anchor="middle",
+    )
+)
 
 # The two thin control edges. Grey and dashed-thin on purpose: the volume is the point.
 body.append(
@@ -79,8 +85,9 @@ body.append(
     f'marker-end="url(#arB)"/>'
 )
 body.append(label(490, 276, "Arrow record batches, credit-bounded", anchor="middle"))
-body.append(note(490, 320, "one credit is one batch slot; the producer blocks at zero",
-                 anchor="middle"))
+body.append(
+    note(490, 320, "one credit is one batch slot; the producer blocks at zero", anchor="middle")
+)
 body.append(note(490, 342, "do_exchange over gRPC, LZ4 by default", anchor="middle"))
 
 body.append(card(724, 252, 212, 92, "reducers", "gather_combine, in Rust"))
@@ -98,8 +105,14 @@ body.append(
 )
 body.append(label(296, 509, "bulk batches", anchor="end"))
 body.append(label(684, 509, "the Ray object store"))
-body.append(note(490, 534, "routing them through it reintroduces the serialization the "
-                           "columnar design removes", anchor="middle"))
+body.append(
+    note(
+        490,
+        534,
+        "routing them through it reintroduces the serialization the columnar design removes",
+        anchor="middle",
+    )
+)
 
 write("shuffle_dataflow", svg(W, H, "".join(body)))
 print("wrote shuffle_dataflow.svg")

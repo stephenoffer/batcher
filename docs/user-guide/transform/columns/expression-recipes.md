@@ -60,10 +60,12 @@ keywords can't express.
 
 ```python
 sales = bt.from_pydict({"units": [2, None, 5], "price": [10, 20, 30]})
-print(sales.select(
-    revenue=bt.col("units").fillna(0).mul(bt.col("price")),
-    missing=bt.col("units").isna(),
-).to_pydict())
+print(
+    sales.select(
+        revenue=bt.col("units").fillna(0).mul(bt.col("price")),
+        missing=bt.col("units").isna(),
+    ).to_pydict()
+)
 # {'revenue': [20, 0, 150], 'missing': [False, True, False]}
 ```
 
@@ -75,12 +77,14 @@ numpy's `argmin` / `argmax`.
 
 ```python
 records = bt.from_pydict({"code": ["123", "a1"], "tags": [[3, 1, 2], [5]]})
-print(records.select(
-    numeric=bt.col("code").str.isdigit(),
-    n=bt.col("tags").list.lengths(),
-    smallest=bt.col("tags").list.argmin(),
-    second=bt.col("tags").list.element_at(1),
-).to_pydict())
+print(
+    records.select(
+        numeric=bt.col("code").str.isdigit(),
+        n=bt.col("tags").list.lengths(),
+        smallest=bt.col("tags").list.argmin(),
+        second=bt.col("tags").list.element_at(1),
+    ).to_pydict()
+)
 # {'numeric': [True, False], 'n': [3, 1], 'smallest': [1, 0], 'second': [1, None]}
 ```
 
@@ -164,9 +168,7 @@ shape statistics {py:meth}`line_count <batcher.plan.expr_ir.namespaces.strings._
 removes most boilerplate, link dumps, and machine-generated text.
 
 ```python
-corpus = bt.from_pydict(
-    {"text": ["Real prose, with sentences and words.", "AAA 111 &&& ||| ###"]}
-)
+corpus = bt.from_pydict({"text": ["Real prose, with sentences and words.", "AAA 111 &&& ||| ###"]})
 kept = corpus.filter(
     (bt.col("text").str.alpha_ratio() > 0.6)
     & (bt.col("text").str.avg_word_length().is_between(3, 10))

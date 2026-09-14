@@ -72,14 +72,30 @@ body.append(band(20, 204, 940, 214, "FOUR TESTS, AND ONLY THE LAST IS ABOUT SPEE
 
 CARD_Y, CARD_H, CARD_W = 238, 60, 190
 tests = (
-    (44, "same columns?", "declared_clustering",
-     ("Every split holds the same", "columns constant, or none do.")),
-    (266, "assigned together?", "group_by_clustering",
-     ("A value's splits are one unit.", "No split can promise this.")),
-    (488, "keys contain them?", "properties.satisfies",
-     ("Clustering must be a subset", "of the group keys.")),
-    (710, "enough tasks left?", "scan_clustering_for",
-     ("At least 2, and a quarter of", "the shuffle's. A judgment.")),
+    (
+        44,
+        "same columns?",
+        "declared_clustering",
+        ("Every split holds the same", "columns constant, or none do."),
+    ),
+    (
+        266,
+        "assigned together?",
+        "group_by_clustering",
+        ("A value's splits are one unit.", "No split can promise this."),
+    ),
+    (
+        488,
+        "keys contain them?",
+        "properties.satisfies",
+        ("Clustering must be a subset", "of the group keys."),
+    ),
+    (
+        710,
+        "enough tasks left?",
+        "scan_clustering_for",
+        ("At least 2, and a quarter of", "the shuffle's. A judgment."),
+    ),
 )
 for i, (x, title, where, lines) in enumerate(tests):
     cx = x + CARD_W / 2
@@ -90,7 +106,9 @@ for i, (x, title, where, lines) in enumerate(tests):
     body.append(arrow(drop, 360, drop, 392, "grey"))
     body.append(label(drop + 9, 382, "no", size=11.5))
     if i < 3:
-        body.append(arrow(x + CARD_W + 2, CARD_Y + CARD_H / 2, x + CARD_W + 28, CARD_Y + CARD_H / 2))
+        body.append(
+            arrow(x + CARD_W + 2, CARD_Y + CARD_H / 2, x + CARD_W + 28, CARD_Y + CARD_H / 2)
+        )
         body.append(label(x + CARD_W + 15, CARD_Y - 6, "yes", anchor="middle", size=11.5))
 
 # The failure rail: any one test failing lands on the same plan.
@@ -101,17 +119,29 @@ body.append(arrow(254, 394, 254, 444, "grey"))
 body.append(arrow(851, 360, 851, 444))
 body.append(label(864, 382, "yes, all four", size=11.5))
 
-body.append(note(490, 404, "the first three are correctness -- a group split across two "
-                           "workers returns two partial sums, each labelled final",
-                 anchor="middle"))
+body.append(
+    note(
+        490,
+        404,
+        "the first three are correctness -- a group split across two "
+        "workers returns two partial sums, each labelled final",
+        anchor="middle",
+    )
+)
 
 # ---- The two outcomes ------------------------------------------------------------------
 body.append(band(20, 428, 940, 110, "TWO PLANS, THE SAME ROWS", "amber"))
 body.append(card(44, 452, 420, 60, "hash shuffle", "every row crosses the network"))
 body.append(card(516, 452, 420, 60, "no exchange", "each worker folds its own directories"))
 body.append(note(254, 530, "the fallback, and never wrong", anchor="middle"))
-body.append(note(726, 530, "published to explain(analyze=True) as a core / exchange decision",
-                 anchor="middle"))
+body.append(
+    note(
+        726,
+        530,
+        "published to explain(analyze=True) as a core / exchange decision",
+        anchor="middle",
+    )
+)
 
 # ---- What puts the guarantee back out of reach -----------------------------------------
 body.append(band(20, 552, 940, 72, "WHAT UNCLAIMS THE LAYOUT", "grey"))

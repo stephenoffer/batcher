@@ -21,7 +21,7 @@ people = bt.from_pydict(
 
 contract = people.dq.in_range("age", 0, 120).accepted_values("country", ["US", "CA"])
 
-report = contract.validate()          # a report, no raise
+report = contract.validate()  # a report, no raise
 clean, rejected = contract.quarantine()  # both sides, for a dead-letter sink
 
 assert not report.ok

@@ -33,11 +33,11 @@ print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
 s.sql("CREATE TABLE stock AS SELECT * FROM (VALUES (1, 10), (2, 20)) AS v(sku, qty)")
 s.sql("CREATE TABLE delivery AS SELECT * FROM (VALUES (2, 5), (3, 7)) AS v(sku, qty)")
 
-s.sql('''
+s.sql("""
     MERGE INTO stock USING delivery ON stock.sku = delivery.sku
     WHEN MATCHED THEN UPDATE SET qty = stock.qty + delivery.qty
     WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (delivery.sku, delivery.qty)
-''')
+""")
 print(s.sql("SELECT * FROM stock ORDER BY sku").to_pydict())
 ```
 

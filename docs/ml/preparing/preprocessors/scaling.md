@@ -45,7 +45,9 @@ from batcher.ml.preprocessors import MinMaxScaler, MaxAbsScaler, RobustScaler
 
 ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
 
-print([round(v, 3) for v in MinMaxScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist()])
+print(
+    [round(v, 3) for v in MinMaxScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist()]
+)
 # [0.0, 0.25, 0.5, 0.75, 1.0]
 print(MaxAbsScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist())
 # [0.2, 0.4, 0.6, 0.8, 1.0]

@@ -73,8 +73,12 @@ body += [
     label(751, 220, "one file", anchor="middle", size=11.5),
     stack(790, 196, 150, 4),
     note(865, 300, "one run per file, closed at once", anchor="middle"),
-    note(400, 300, "each input batch is dropped as the run is written, so the relation is never all resident",
-         anchor="middle"),
+    note(
+        400,
+        300,
+        "each input batch is dropped as the run is written, so the relation is never all resident",
+        anchor="middle",
+    ),
 ]
 
 # ---- Pass 1..n: merge, bounded fan-in, repeated ---------------------------------------
@@ -98,9 +102,20 @@ body += [
     card(766, 396, 180, 60, "sorted rows", "16,384 at a time"),
 ]
 
-body.append(note(490, 572, "The merged row count is checked against the rows that went in.", anchor="middle"))
-body.append(note(490, 590, "A truncated spill file reads back as a valid shorter stream, which is a sorted "
-                           "prefix rather than an error.", anchor="middle"))
+body.append(
+    note(
+        490, 572, "The merged row count is checked against the rows that went in.", anchor="middle"
+    )
+)
+body.append(
+    note(
+        490,
+        590,
+        "A truncated spill file reads back as a valid shorter stream, which is a sorted "
+        "prefix rather than an error.",
+        anchor="middle",
+    )
+)
 
 write("sort_run_merge", svg(W, H, "".join(body)))
 print("wrote sort_run_merge.svg")

@@ -42,7 +42,7 @@ flag. The plan and the result don't change.
 
 ```python
 # docs: skip
-counts.collect(distributed=True)   # same plan, many machines, identical result
+counts.collect(distributed=True)  # same plan, many machines, identical result
 ```
 
 

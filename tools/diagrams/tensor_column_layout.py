@@ -46,8 +46,16 @@ body = [
     band(24, 336, 912, 180, "WHAT A READER GETS BACK", "grey"),
     card(48, 376, 420, 72, "to_numpy_ndarray()", "(n, 224, 224, 3), shape from the type"),
     card(496, 376, 416, 72, "arrays_to_torch(zero_copy=True)", "a DLPack view over that buffer"),
-    note(48, 480, "The shape travels with the data, so the column crosses the FFI boundary and comes back shaped:"),
-    note(48, 498, "no IR tag and no two-sided contract, which is what choosing the canonical type buys."),
+    note(
+        48,
+        480,
+        "The shape travels with the data, so the column crosses the FFI boundary and comes back shaped:",
+    ),
+    note(
+        48,
+        498,
+        "no IR tag and no two-sided contract, which is what choosing the canonical type buys.",
+    ),
     note(
         480,
         546,

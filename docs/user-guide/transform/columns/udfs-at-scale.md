@@ -47,9 +47,7 @@ raw = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
 
 
 def parse(batch):
-    return pa.RecordBatch.from_pydict(
-        {"n": [int(v) for v in batch.column("s").to_pylist()]}
-    )
+    return pa.RecordBatch.from_pydict({"n": [int(v) for v in batch.column("s").to_pylist()]})
 
 
 print(raw.map_batches(parse, output_columns=["n"], max_errored_rows=10).to_pydict())

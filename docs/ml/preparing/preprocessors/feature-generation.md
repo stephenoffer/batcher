@@ -38,9 +38,7 @@ fixes it. Two coordinates on a circle put them adjacent, which is the truth.
 ```python
 from batcher.ml.preprocessors import CyclicalEncoder
 
-hours = bt.from_pydict(
-    {"ordered_at": [dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2, 0)]}
-)
+hours = bt.from_pydict({"ordered_at": [dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2, 0)]})
 circle = CyclicalEncoder("ordered_at", parts=["hour"]).fit_transform(hours).to_pydict()
 print([round(v, 4) for v in circle["ordered_at_hour_cos"]])
 ```
@@ -83,9 +81,7 @@ with no option to include the current one. It and {py:class}`LagFeaturizer <batc
 import batcher as bt
 from batcher.ml.preprocessors import LagFeaturizer, RollingFeaturizer
 
-sales = bt.from_pydict(
-    {"store": ["a", "a", "a"], "day": [1, 2, 3], "units": [10.0, 20.0, 60.0]}
-)
+sales = bt.from_pydict({"store": ["a", "a", "a"], "day": [1, 2, 3], "units": [10.0, 20.0, 60.0]})
 lagged = LagFeaturizer("units", order_by="day", lags=[1], partition_by="store")
 rolled = RollingFeaturizer("units", order_by="day", window=2, partition_by="store")
 out = rolled.fit_transform(lagged.fit_transform(sales)).sort("day")
@@ -182,7 +178,9 @@ aggregates, and only the small eigendecomposition runs on the driver.
 ```python
 from batcher.ml.preprocessors import PCA
 
-ds = bt.from_pydict({"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 2.1, 2.9, 4.0], "c": [4.0, 3.0, 2.0, 1.0]})
+ds = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 2.1, 2.9, 4.0], "c": [4.0, 3.0, 2.0, 1.0]}
+)
 reducer = PCA(["a", "b", "c"], n_components=2).fit(ds)
 print(reducer.transform(ds).columns)
 # ['pc1', 'pc2']
@@ -307,9 +305,7 @@ group's mean rather than the global one, which matters when the groups differ:
 ```python
 from batcher.ml.preprocessors import GroupImputer, GroupStatEncoder
 
-grouped = bt.from_pydict(
-    {"grp": ["x", "x", "y", "y"], "val": [1.0, 3.0, 5.0, None]}
-)
+grouped = bt.from_pydict({"grp": ["x", "x", "y", "y"], "val": [1.0, 3.0, 5.0, None]})
 encoded = GroupStatEncoder("val", by="grp", statistics=["mean"]).fit_transform(grouped)
 print(encoded.collect().column_names)
 # ['grp', 'val', 'val_mean_by_grp']

@@ -82,18 +82,27 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"order-1", b"order-2", b"order-1"],          # the ordering key
-    "value": [b'{"sku":"a","qty":2}', b'{"sku":"b","qty":1}', b'{"sku":"a","qty":3}'],
-    "partition": [0, 0, 0],                                # always 0 on Pub/Sub
-    "offset": [7314159265358979, 2718281828459045, 1414213562373095],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["projects/acme-prod/subscriptions/events-batcher"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"order-1", b"order-2", b"order-1"],  # the ordering key
+        "value": [b'{"sku":"a","qty":2}', b'{"sku":"b","qty":1}', b'{"sku":"a","qty":3}'],
+        "partition": [0, 0, 0],  # always 0 on Pub/Sub
+        "offset": [7314159265358979, 2718281828459045, 1414213562373095],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["projects/acme-prod/subscriptions/events-batcher"] * 3,
+    },
+    schema=schema,
+)
 
 # Stand in for the subscription; the pipeline below is what you run against the real one.
 events = bt.from_batches(lambda: iter([batch]), schema)
@@ -158,10 +167,9 @@ Deduplicate on the message id, which is what the `offset` column is for.
 
 ```python
 # docs: skip
-clean = (
-    bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000)
-    .drop_duplicates_within_watermark(["offset"], event_time="ts", lateness="10 minutes")
-)
+clean = bt.read.pubsub(
+    "projects/acme-prod/subscriptions/events-batcher", poll_size=1_000
+).drop_duplicates_within_watermark(["offset"], event_time="ts", lateness="10 minutes")
 ```
 :::
 
@@ -177,14 +185,11 @@ must not delete between runs.
 :::{dropdown} A checkpointed write into a bronze Delta table
 ```python
 # docs: skip
-q = (
-    bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000)
-    .write.delta(
-        "lake/bronze/events",
-        trigger=bt.Trigger.processing_time("30 seconds"),
-        checkpoint="/var/lib/batcher/ckpt/bronze-events",
-        query_name="bronze-events",
-    )
+q = bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000).write.delta(
+    "lake/bronze/events",
+    trigger=bt.Trigger.processing_time("30 seconds"),
+    checkpoint="/var/lib/batcher/ckpt/bronze-events",
+    query_name="bronze-events",
 )
 q.await_termination()
 ```

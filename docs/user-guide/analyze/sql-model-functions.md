@@ -21,7 +21,9 @@ train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
 s.register_model("doubler", LinearRegression(features=["x"], target="y").fit(train))
 s.register("points", bt.from_pydict({"x": [5.0, 10.0]}))
 
-print(s.sql("SELECT COUNT(*) AS n FROM ML_PREDICT(points, doubler) WHERE prediction > 15").to_pydict())
+print(
+    s.sql("SELECT COUNT(*) AS n FROM ML_PREDICT(points, doubler) WHERE prediction > 15").to_pydict()
+)
 # {'n': [1]}
 ```
 

@@ -33,11 +33,13 @@ from batcher import col
 base = dt.datetime(2024, 1, 1)
 minute = dt.timedelta(minutes=1)
 
-events = bt.from_pydict({
-    "ts": [base, base + 30 * minute, base + 90 * minute, base + 100 * minute],
-    "user": ["a", "b", "a", "c"],
-    "amount": [3, 5, 7, 11],
-})
+events = bt.from_pydict(
+    {
+        "ts": [base, base + 30 * minute, base + 90 * minute, base + 100 * minute],
+        "user": ["a", "b", "a", "c"],
+        "amount": [3, 5, 7, 11],
+    }
+)
 
 hourly = events.group_by(w=bt.window(col("ts"), "1h")).agg(total=col("amount").sum())
 print(hourly.to_pydict())
@@ -142,9 +144,7 @@ consecutive events per key whose gap is under a timeout, and starts a new sessio
 the gap is exceeded. Same aggregate expressions:
 
 ```python
-sessions = events.session_window(
-    "ts", "45m", partition_by=["user"], total=col("amount").sum()
-)
+sessions = events.session_window("ts", "45m", partition_by=["user"], total=col("amount").sum())
 print(sessions.select("user", "session_start", "total").to_pydict()["total"])
 # [3, 5, 7, 11]
 ```
@@ -163,8 +163,9 @@ gap, and only then aggregates and emits it.
 The call is unchanged. Only the source is:
 
 ```python
-session_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
-                            ("amount", pa.int64())])
+session_schema = pa.schema(
+    [("user", pa.string()), ("ts", pa.timestamp("us")), ("amount", pa.int64())]
+)
 
 
 def click_feed():

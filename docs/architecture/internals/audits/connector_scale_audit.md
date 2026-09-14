@@ -78,8 +78,10 @@ size**. A genuinely streaming reader holds one batch.
 And the multi-file path defeats even the two that do stream (`io/base/source.py:222-225`):
 ```python
 depth = min(len(files), max(2, min(available_cpu_count(), _ITER_READAHEAD_FILES)))  # up to 16
+
+
 def _read(f: str) -> list[pa.RecordBatch]:
-    return list(self._iter_file(f, self._file_proj(f, projection)))   # collapses the stream
+    return list(self._iter_file(f, self._file_proj(f, projection)))  # collapses the stream
 ```
 `list()` around the generator turns Parquet's real row-group stream back into a whole-file
 materialization, and up to **16 files are held concurrently**. Peak memory is therefore
@@ -196,7 +198,7 @@ at *construction*. Every one of these drivers has a metadata-only path (`LIMIT 0
 def _enumerate_partitions(self) -> list[_Window]:
     segments = max(1, self._partition_spec.segments)
     if segments == 1:
-        return [(0, 0)]                                  # unbounded — correct, serial
+        return [(0, 0)]  # unbounded — correct, serial
     return [(i * _WINDOW_ROWS, _WINDOW_ROWS) for i in range(segments)]
 ```
 `_WINDOW_ROWS` is a constant 100,000. With `segments=8` this reads rows `[0, 800_000)` and
@@ -245,7 +247,7 @@ exactly-once the docstring claims.
 
 `seen_store.py:90-92`:
 ```python
-cur = self._conn.execute("SELECT path FROM seen_files")   # the ENTIRE table
+cur = self._conn.execute("SELECT path FROM seen_files")  # the ENTIRE table
 known = {row[0] for row in cur.fetchall()}
 return [c for c in candidates if c not in known]
 ```

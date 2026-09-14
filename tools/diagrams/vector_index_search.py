@@ -60,9 +60,24 @@ body = [
     note(730, 558, "you buy recall back with time.", anchor="middle"),
     # What approximate costs, stated plainly.
     band(20, 604, 940, 126, "WHAT APPROXIMATE ACTUALLY COSTS YOU", "grey"),
-    note(490, 648, "The exact path is the one that distributes. The index path runs on the driver, against one Lance dataset, unsharded.", anchor="middle"),
-    note(490, 670, "Nothing here measures the recall you gave up: recall_at_k scores a set you hand it, and no code wires it to the index.", anchor="middle"),
-    note(490, 700, "ds.ml.embed defaults to output_type='tensor', which Lance cannot index. build_vector_index raises rather than mis-index it.", anchor="middle"),
+    note(
+        490,
+        648,
+        "The exact path is the one that distributes. The index path runs on the driver, against one Lance dataset, unsharded.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        670,
+        "Nothing here measures the recall you gave up: recall_at_k scores a set you hand it, and no code wires it to the index.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        700,
+        "ds.ml.embed defaults to output_type='tensor', which Lance cannot index. build_vector_index raises rather than mis-index it.",
+        anchor="middle",
+    ),
 ]
 
 write("vector_index_search", svg(W, H, "".join(body)))

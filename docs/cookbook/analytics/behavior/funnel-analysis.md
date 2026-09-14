@@ -29,9 +29,14 @@ events = bt.from_pydict(
     {
         "user": ["u1", "u1", "u1", "u1", "u2", "u2", "u3", "u3", "u4"],
         "step": [
-            "view", "cart", "checkout", "purchase",
-            "view", "cart",
-            "view", "purchase",
+            "view",
+            "cart",
+            "checkout",
+            "purchase",
+            "view",
+            "cart",
+            "view",
+            "purchase",
             "view",
         ],
         "ts": [at(0), at(2), at(5), at(7), at(0), at(30), at(1), at(0), at(3)],
@@ -50,11 +55,7 @@ thing.
 :::
 
 ```python
-naive = (
-    events.group_by("step")
-    .agg(users=col("user").n_unique())
-    .sort("users", descending=True)
-)
+naive = events.group_by("step").agg(users=col("user").n_unique()).sort("users", descending=True)
 print(naive.to_pydict())
 # {'step': ['view', 'cart', 'purchase', 'checkout'], 'users': [4, 2, 2, 1]}
 ```

@@ -122,8 +122,8 @@ from itertools import islice
 from batcher.ml import ResumableSampler
 
 sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
-seen = list(islice(sampler, 3))   # three steps in
-state = sampler.state_dict()      # checkpoint, between steps
+seen = list(islice(sampler, 3))  # three steps in
+state = sampler.state_dict()  # checkpoint, between steps
 
 resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
 resumed.load_state_dict(state)
@@ -237,7 +237,7 @@ raw = bt.from_pydict(
 train, test = raw.ml.train_test_split(0.25, seed=0, key="id")
 
 pipeline = Chain(SimpleImputer(["age"]), StandardScaler(["age"]))
-pipeline.fit(train)                      # statistics from train only
+pipeline.fit(train)  # statistics from train only
 train_ready = pipeline.transform(train)  # lazy; runs in the engine
 test_ready = pipeline.transform(test)
 

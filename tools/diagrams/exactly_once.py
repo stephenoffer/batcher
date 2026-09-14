@@ -31,7 +31,12 @@ ROW_A, ROW_B = 118, 258
 MID_A, MID_B = ROW_A + CH / 2, ROW_B + CH / 2
 
 body = [
-    note(490, 52, "One batch of 5,000 rows, delivered to the same table twice. The write is what decides whether that is a problem.", anchor="middle"),
+    note(
+        490,
+        52,
+        "One batch of 5,000 rows, delivered to the same table twice. The write is what decides whether that is a problem.",
+        anchor="middle",
+    ),
     band(20, 76, 940, 300, "THE SAME BATCH, DELIVERED TWICE", "blue"),
     # Lane A: an unkeyed append. The replay is a second, indistinguishable insert.
     label(38, ROW_A + 38, "APPEND"),
@@ -57,10 +62,30 @@ body = [
     label(655, ROW_B - 12, "each row is rewritten, not added", anchor="middle"),
     # What the comparison is actually about.
     band(20, 396, 940, 112, "WHAT MAKES THE SECOND LANE SAFE", "grey"),
-    note(490, 438, "The merge matches on a key, so a redelivered row overwrites the row it already wrote. Running it a third time changes nothing again:", anchor="middle"),
-    note(490, 456, "the example asserts 5,000 rows and the batch's own total, not a doubled one. The append has no key to match on and cannot tell the two apart.", anchor="middle"),
-    note(490, 480, "A streaming write gets the same property from the Delta txn action: the commit records the query name and batch id, and a replayed id commits nothing.", anchor="middle"),
-    note(490, 498, "Resuming also needs the position the write reached, recorded with it. An idempotent write alone does not say where to restart.", anchor="middle"),
+    note(
+        490,
+        438,
+        "The merge matches on a key, so a redelivered row overwrites the row it already wrote. Running it a third time changes nothing again:",
+        anchor="middle",
+    ),
+    note(
+        490,
+        456,
+        "the example asserts 5,000 rows and the batch's own total, not a doubled one. The append has no key to match on and cannot tell the two apart.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        480,
+        "A streaming write gets the same property from the Delta txn action: the commit records the query name and batch id, and a replayed id commits nothing.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        498,
+        "Resuming also needs the position the write reached, recorded with it. An idempotent write alone does not say where to restart.",
+        anchor="middle",
+    ),
 ]
 
 write("exactly_once", svg(W, H, "".join(body)))

@@ -16,7 +16,7 @@ knowing which they got. A lambda returning a lambda is a legal `EngineFactory` t
 is how you test a generation pipeline with no GPU:
 
 ```python
-engine_factory = lambda: (lambda prompts: [p.upper() for p in prompts])
+engine_factory = lambda: lambda prompts: [p.upper() for p in prompts]
 print(engine_factory()(["a", "b"]))
 # ['A', 'B']
 ```
@@ -194,7 +194,7 @@ engine = http_engine(
     "some-model",
     api_key="...",
     concurrency=16,
-    requests_per_minute=500,     # per worker, not per fleet
+    requests_per_minute=500,  # per worker, not per fleet
     tokens_per_minute=400_000,
 )
 ```
@@ -223,7 +223,7 @@ from batcher.ml import vllm_engine
 engine = vllm_engine(
     "meta-llama/Llama-3-70B",
     sampling={"temperature": 0.7, "top_p": 0.9, "max_tokens": 512},
-    tensor_parallel_size=4,          # shard the model across 4 GPUs
+    tensor_parallel_size=4,  # shard the model across 4 GPUs
     gpu_memory_utilization=0.92,
     quantization="awq",
 )
@@ -281,8 +281,8 @@ answers = llm_generate(
     ds.iter_batches(),
     engine,
     prompt_column="question",
-    num_workers=4,           # 4 model replicas in parallel
-    target_batch_rows=512,   # requests handed to each engine call
+    num_workers=4,  # 4 model replicas in parallel
+    target_batch_rows=512,  # requests handed to each engine call
 )
 ```
 

@@ -54,7 +54,12 @@ body += [
     label(853, 84, "slice", anchor="middle", size=11.5),
     chip(888, 76, 54, 40, "grey"),
     note(915, 136, "k rows", anchor="middle"),
-    note(490, 158, "The relation is copied twice and ordered once, to keep k rows of it.", anchor="middle"),
+    note(
+        490,
+        158,
+        "The relation is copied twice and ordered once, to keep k rows of it.",
+        anchor="middle",
+    ),
 ]
 
 # ---- Lane 2: what the engine does ----------------------------------------------------
@@ -84,10 +89,24 @@ body += [
     note(180, 450, "fully sorted.", anchor="middle"),
 ]
 
-body.append(note(490, 508, "The heap is used when k is small against the morsel. Above that the morsel is sorted "
-                           "and sliced, because a linear sort costs no more.", anchor="middle"))
-body.append(note(490, 530, "A shared bound can skip a whole morsel whose key range cannot reach the answer, and "
-                           "switches itself off after 32 checks that excluded nothing.", anchor="middle"))
+body.append(
+    note(
+        490,
+        508,
+        "The heap is used when k is small against the morsel. Above that the morsel is sorted "
+        "and sliced, because a linear sort costs no more.",
+        anchor="middle",
+    )
+)
+body.append(
+    note(
+        490,
+        530,
+        "A shared bound can skip a whole morsel whose key range cannot reach the answer, and "
+        "switches itself off after 32 checks that excluded nothing.",
+        anchor="middle",
+    )
+)
 
 write("topn_heap", svg(W, H, "".join(body)))
 print("wrote topn_heap.svg")

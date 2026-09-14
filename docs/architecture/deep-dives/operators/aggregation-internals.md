@@ -393,7 +393,7 @@ out = (
     .agg(
         n=bt.count(),
         total=bt.col("amount").sum(),
-        avg=bt.col("amount").mean(),          # state is (sum, count), not an average
+        avg=bt.col("amount").mean(),  # state is (sum, count), not an average
         hi=bt.col("units").max(),
     )
     .sort("region")

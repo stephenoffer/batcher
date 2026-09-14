@@ -52,8 +52,15 @@ for x, title, sub in deployments:
 
 body.append(label(300, 140, "the same three functions", anchor="middle", size=11.5))
 body.append(card(340, 158, 300, 56, "partial / combine / finalize", "written once"))
-body.append(note(490, 206, "combine is associative and commutative, so arrival order cannot "
-                           "change which rows come back", anchor="middle"))
+body.append(
+    note(
+        490,
+        206,
+        "combine is associative and commutative, so arrival order cannot "
+        "change which rows come back",
+        anchor="middle",
+    )
+)
 
 # ---- What is exact --------------------------------------------------------------------
 body.append(arrow(490, 226, 490, 262))
@@ -66,15 +73,22 @@ for x, text in (
     (814, "every column type"),
 ):
     body.append(label(x, 314, text, anchor="middle"))
-body.append(note(490, 342, "no tolerance and no qualification -- these three have no "
-                           "exceptions", anchor="middle"))
+body.append(
+    note(
+        490,
+        342,
+        "no tolerance and no qualification -- these three have no exceptions",
+        anchor="middle",
+    )
+)
 
 # ---- The three stated exceptions ------------------------------------------------------
 body.append(arrow(490, 370, 490, 406))
 body.append(label(504, 396, "except where the query fixes no answer", size=11.5))
 
-body.append(band(20, 412, 940, 238, "THREE PLACES THE QUERY ITSELF DOES NOT DETERMINE AN ANSWER",
-                 "amber"))
+body.append(
+    band(20, 412, 940, 238, "THREE PLACES THE QUERY ITSELF DOES NOT DETERMINE AN ANSWER", "amber")
+)
 
 cases = (
     (
@@ -119,8 +133,14 @@ for x, title, sub, lines, binds in cases:
     body.append(label(cx, 596, "still exact here:", anchor="middle", size=11.5))
     body.append(note(cx, 614, binds, anchor="middle"))
 
-body.append(note(490, 672, "A divergence that is not one of these three is a defect, however "
-                           "plausible its rows look.", anchor="middle"))
+body.append(
+    note(
+        490,
+        672,
+        "A divergence that is not one of these three is a defect, however plausible its rows look.",
+        anchor="middle",
+    )
+)
 
 write("single_node_equals_distributed", svg(W, H, "".join(body)))
 print("wrote single_node_equals_distributed.svg")

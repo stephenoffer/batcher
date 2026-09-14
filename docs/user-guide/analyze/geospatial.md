@@ -93,9 +93,7 @@ points on a flat plane and answer in whatever unit the coordinates are stated in
 EPSG:4326 that unit is degrees, and a degree is not a distance:
 
 ```python
-pair = bt.from_pydict(
-    {"a": ["POINT(-122.4194 37.7749)"], "b": ["POINT(-0.1278 51.5074)"]}
-)
+pair = bt.from_pydict({"a": ["POINT(-122.4194 37.7749)"], "b": ["POINT(-0.1278 51.5074)"]})
 print(
     pair.select(
         planar=bt.st_distance(col("a"), col("b")).round(2),
@@ -151,13 +149,15 @@ negatives.
 
 ```python
 regions = bt.from_pydict(
-    {"region": ["west", "east"], "shape": [
-        "POLYGON((0 0, 5 0, 5 10, 0 10, 0 0))",
-        "POLYGON((5 0, 10 0, 10 10, 5 10, 5 0))",
-    ]}
+    {
+        "region": ["west", "east"],
+        "shape": [
+            "POLYGON((0 0, 5 0, 5 10, 0 10, 0 0))",
+            "POLYGON((5 0, 10 0, 10 10, 5 10, 5 0))",
+        ],
+    }
 )
-points = bt.from_pydict({"pid": [1, 2, 3], "at": [
-    "POINT(1 1)", "POINT(7 3)", "POINT(20 20)"]})
+points = bt.from_pydict({"pid": [1, 2, 3], "at": ["POINT(1 1)", "POINT(7 3)", "POINT(20 20)"]})
 
 hits = (
     points.join(regions, how="cross")
@@ -183,9 +183,7 @@ it does not *contain* it, because `contains` also requires the point to meet the
 polygon's interior.
 
 ```python
-edge = bt.from_pydict(
-    {"poly": ["POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))"], "pt": ["POINT(0 2)"]}
-)
+edge = bt.from_pydict({"poly": ["POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))"], "pt": ["POINT(0 2)"]})
 print(
     edge.select(
         covers=bt.st_covers(col("poly"), col("pt")),
@@ -271,9 +269,7 @@ shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the single big
 geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` measures what the tolerance cost you:
 
 ```python
-detailed = bt.from_pydict(
-    {"g": ["LINESTRING(0 0, 1 0.001, 2 0, 3 0.002, 4 0, 5 0)"]}
-)
+detailed = bt.from_pydict({"g": ["LINESTRING(0 0, 1 0.001, 2 0, 3 0.002, 4 0, 5 0)"]})
 simple = bt.st_simplify(col("g"), 0.01)
 print(
     detailed.select(

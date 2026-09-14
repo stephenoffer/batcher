@@ -42,13 +42,38 @@ body = [
     note(184, 408, "the group key's own expression", anchor="middle"),
     note(490, 408, "the sum's input column", anchor="middle"),
     note(796, 408, "count() reads no column", anchor="middle"),
-    note(490, 448, "customers.ssn appears in none of them. The filter chose which rows survived,", anchor="middle"),
-    note(490, 466, "not what any value is, so it carries no lineage. Data flow, not control flow.", anchor="middle"),
-    note(490, 498, "Tag customers.ssn as PII and the tag follows nothing here. Tag customers.region and it follows the first column.", anchor="middle"),
+    note(
+        490,
+        448,
+        "customers.ssn appears in none of them. The filter chose which rows survived,",
+        anchor="middle",
+    ),
+    note(
+        490,
+        466,
+        "not what any value is, so it carries no lineage. Data flow, not control flow.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        498,
+        "Tag customers.ssn as PII and the tag follows nothing here. Tag customers.region and it follows the first column.",
+        anchor="middle",
+    ),
     # The safety direction.
     band(20, 552, 940, 86, "AN OPERATOR THE ANALYSIS DOES NOT MODEL", "amber"),
-    note(490, 596, "map_batches is opaque, so every output column is reported as deriving from every input column.", anchor="middle"),
-    note(490, 618, "It over-approximates on purpose: a false 'might carry PII' costs a review, a false 'cannot' costs a breach.", anchor="middle"),
+    note(
+        490,
+        596,
+        "map_batches is opaque, so every output column is reported as deriving from every input column.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        618,
+        "It over-approximates on purpose: a false 'might carry PII' costs a review, a false 'cannot' costs a breach.",
+        anchor="middle",
+    ),
 ]
 
 write("column_lineage", svg(W, H, "".join(body)))

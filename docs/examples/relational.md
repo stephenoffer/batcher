@@ -124,9 +124,7 @@ and you can move between them mid-pipeline.
 import batcher as bt
 from batcher import col
 
-sales = bt.from_pydict(
-    {"region": ["west", "east", "west"], "amount": [10, 20, 30]}
-)
+sales = bt.from_pydict({"region": ["west", "east", "west"], "amount": [10, 20, 30]})
 
 summary = bt.sql(
     "SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region",

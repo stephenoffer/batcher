@@ -51,12 +51,32 @@ body = [
     arrow(620, 438, 674, 438, "amber"),
     curve(805, 482, 490, 544, 185, 482, "amber"),
     label(490, 562, "the next batch size", anchor="middle", size=12),
-    note(490, 586, "The threads share one model and one CUDA context, so they buy overlap with host work, not replicas.", anchor="middle"),
-    note(490, 606, "An OOM bisects the batch and records a ceiling for the run; the size that worked is written back for the next one.", anchor="middle"),
+    note(
+        490,
+        586,
+        "The threads share one model and one CUDA context, so they buy overlap with host work, not replicas.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        606,
+        "An OOM bisects the batch and records a ceiling for the run; the size that worked is written back for the next one.",
+        anchor="middle",
+    ),
     # The boundary the whole surface is built on.
     band(20, 652, 940, 86, "THE BATCH-FIRST BOUNDARY", "grey"),
-    note(490, 692, "Your callable is handed a whole pyarrow.RecordBatch. batch_format reframes only the call; the data plane stays Arrow.", anchor="middle"),
-    note(490, 712, "ds.ml.map is the row-at-a-time escape hatch, and it is marked as one so a profile can price what it costs.", anchor="middle"),
+    note(
+        490,
+        692,
+        "Your callable is handed a whole pyarrow.RecordBatch. batch_format reframes only the call; the data plane stays Arrow.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        712,
+        "ds.ml.map is the row-at-a-time escape hatch, and it is marked as one so a profile can price what it costs.",
+        anchor="middle",
+    ),
 ]
 
 write("inference_actor_pool", svg(W, H, "".join(body)))

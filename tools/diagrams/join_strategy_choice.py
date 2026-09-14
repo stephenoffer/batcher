@@ -77,8 +77,15 @@ body += [
     note(866, 552, "beat estimates", anchor="middle"),
 ]
 
-body.append(note(490, 614, "All three produce the same relation, so a wrong pick is slow rather than wrong. "
-                           "That is what makes the choice safe to learn across runs.", anchor="middle"))
+body.append(
+    note(
+        490,
+        614,
+        "All three produce the same relation, so a wrong pick is slow rather than wrong. "
+        "That is what makes the choice safe to learn across runs.",
+        anchor="middle",
+    )
+)
 
 write("join_strategy_choice", svg(W, H, "".join(body)))
 print("wrote join_strategy_choice.svg")

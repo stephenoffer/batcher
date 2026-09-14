@@ -53,9 +53,9 @@ base = Config()
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
-        task_max_retries=2,        # rerun a failed shuffle task
-        retry_on_transient=True,   # extend retries to application exceptions
-        actor_max_restarts=1,      # respawn a crashed compute actor (map/inference pool)
+        task_max_retries=2,  # rerun a failed shuffle task
+        retry_on_transient=True,  # extend retries to application exceptions
+        actor_max_restarts=1,  # respawn a crashed compute actor (map/inference pool)
         actor_max_task_retries=1,  # rerun the in-flight call on the respawned actor
     )
 )
@@ -77,7 +77,7 @@ This is the lineage-recovery path the mergeable algebra makes safe.
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
-        recovery_max_attempts=3,      # recompute -> retry rounds before failing loudly
+        recovery_max_attempts=3,  # recompute -> retry rounds before failing loudly
         recovery_backoff_base_s=0.5,  # exponential backoff between rounds
     )
 )
@@ -119,8 +119,8 @@ deterministic, the two copies are identical, so the result is unchanged.
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
-        speculation_max_backups=1,           # one concurrent backup at a barrier
-        speculation_straggler_factor=1.5,    # back up a task 1.5x slower than the median
+        speculation_max_backups=1,  # one concurrent backup at a barrier
+        speculation_straggler_factor=1.5,  # back up a task 1.5x slower than the median
         speculation_min_finished_frac=0.75,  # only once 75% of tasks have finished
     )
 )
@@ -145,8 +145,8 @@ and clamps any request to `default_credits` times `credit_ceiling_factor`.
 cfg = base.replace(
     flow_control=dataclasses.replace(
         base.flow_control,
-        default_credits=4,        # in-flight batch slots per channel
-        credit_ceiling_factor=4, # max window = default_credits x this
+        default_credits=4,  # in-flight batch slots per channel
+        credit_ceiling_factor=4,  # max window = default_credits x this
     )
 )
 ```

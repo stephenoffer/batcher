@@ -20,8 +20,10 @@ from batcher.ml.model_selection import cross_val_score
 
 ds = bt.from_pydict({"x": [float(i) for i in range(40)], "y": [2.0 * i for i in range(40)]})
 
+
 def r2(scored, y_true, y_pred):
     return evaluate(scored, y_true, y_pred=y_pred, task="regression", metrics=["r2"])["r2"]
+
 
 scores = cross_val_score(
     ds,
@@ -106,6 +108,7 @@ confidently and with no error anywhere. Set it whenever the metric is a loss:
 ```python
 def rmse(scored, y_true, y_pred):
     return evaluate(scored, y_true, y_pred=y_pred, task="regression", metrics=["rmse"])["rmse"]
+
 
 by_error = grid_search(
     ds,

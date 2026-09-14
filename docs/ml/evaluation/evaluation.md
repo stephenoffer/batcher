@@ -204,11 +204,9 @@ of them at once, naming them separately forces the choice to be explicit.
 ```python
 from batcher.ml.metrics import demographic_parity_difference, equal_opportunity_difference
 
-ds = bt.from_pydict(
-    {"race": ["a", "a", "b", "b"], "y": [1, 0, 1, 0], "p": [1, 1, 0, 0]}
-)
-print(demographic_parity_difference(ds, "race", "p"))       # selection-rate gap
-print(equal_opportunity_difference(ds, "race", "y", "p"))   # true-positive-rate gap
+ds = bt.from_pydict({"race": ["a", "a", "b", "b"], "y": [1, 0, 1, 0], "p": [1, 1, 0, 0]})
+print(demographic_parity_difference(ds, "race", "p"))  # selection-rate gap
+print(equal_opportunity_difference(ds, "race", "y", "p"))  # true-positive-rate gap
 ```
 
 `demographic_parity_difference` and `disparate_impact_ratio` measure equal *selection*;
@@ -275,8 +273,7 @@ that looks perfect in development and is wrong in use.
 from batcher.ml.preprocessors import IsotonicCalibrator
 
 scored = bt.from_pydict(
-    {"score": [0.02, 0.05, 0.3, 0.5, 0.7, 0.95, 0.97, 0.99],
-     "label": [0, 0, 0, 1, 0, 1, 1, 1]}
+    {"score": [0.02, 0.05, 0.3, 0.5, 0.7, 0.95, 0.97, 0.99], "label": [0, 0, 0, 1, 0, 1, 1, 1]}
 )
 calibrator = IsotonicCalibrator("score", "label", n_bins=4).fit(scored)
 print(calibrator.transform(scored).to_pydict()["calibrated"])

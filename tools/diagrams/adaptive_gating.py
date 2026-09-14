@@ -38,10 +38,19 @@ G1, G2, G3 = 40, 350, 660
 GW = 280
 
 body = [
-    band(20, 20, 940, 294, "adaptive=\"auto\"  ·  WHEN THE WITHIN-QUERY LOOP ENGAGES", "blue"),
-    note(490, 72, "Two things skip the ladder: an explicit adaptive=True or False wins outright, and a distributed plan the one-shot dispatcher", anchor="middle"),
-    note(490, 92, "cannot route is staged whatever its size, because there staging is the only execution path rather than an optimization.", anchor="middle"),
-
+    band(20, 20, 940, 294, 'adaptive="auto"  ·  WHEN THE WITHIN-QUERY LOOP ENGAGES', "blue"),
+    note(
+        490,
+        72,
+        "Two things skip the ladder: an explicit adaptive=True or False wins outright, and a distributed plan the one-shot dispatcher",
+        anchor="middle",
+    ),
+    note(
+        490,
+        92,
+        "cannot route is staged whatever its size, because there staging is the only execution path rather than an optimization.",
+        anchor="middle",
+    ),
     card(G1, GATE_Y, GW, GATE_H, "Is there a join?", "no join: nothing to re-decide"),
     card(G2, GATE_Y, GW, GATE_H, "Does it clear the floor?", "per breaker, not per query"),
     card(G3, GATE_Y, GW, GATE_H, "Is an operand unsized?", "breaker-produced, and still a guess"),
@@ -49,10 +58,11 @@ body = [
     label(335, GATE_Y + 42, "yes", anchor="middle"),
     arrow(630, GATE_Y + 52, 660, GATE_Y + 52, "blue"),
     label(645, GATE_Y + 42, "yes", anchor="middle"),
-
     # ---- every "no" goes to the same place ---------------------------------
-    band(20, 344, 600, 96, "ANY \"NO\"  ·  PLAN ONCE, RUN ONCE", "grey"),
-    note(44, 392, "No staging, no per-stage cut, no re-plan. This is where the great", anchor="start"),
+    band(20, 344, 600, 96, 'ANY "NO"  ·  PLAN ONCE, RUN ONCE', "grey"),
+    note(
+        44, 392, "No staging, no per-stage cut, no re-plan. This is where the great", anchor="start"
+    ),
     note(44, 412, "majority of queries land, and it is the cheaper path for them.", anchor="start"),
     arrow(180, GATE_Y + GATE_H, 180, 344, "grey"),
     label(192, 294, "no", anchor="start"),
@@ -60,7 +70,6 @@ body = [
     label(502, 294, "no", anchor="start"),
     arrow(760, GATE_Y + GATE_H, 610, 340, "grey"),
     label(660, 294, "no", anchor="start"),
-
     # ---- the "yes" outcome --------------------------------------------------
     card(660, 348, 280, 88, "Stage, measure, re-plan", "one breaker per stage"),
     arrow(870, GATE_Y + GATE_H, 870, 348, "blue"),
@@ -74,13 +83,24 @@ body = [
 FX, FY = 20, 512
 body += [
     band(FX, FY, 940, 112, "THE FLOOR IS CHARGED PER BREAKER, NOT PER QUERY", "amber"),
-    note(FX + 24, FY + 46, "5,000,000 rows  OR  about 320 MB  --  times the pipeline", anchor="start"),
-    note(FX + 24, FY + 64, "breakers the loop would cut at. A cut is what staging costs,", anchor="start"),
+    note(
+        FX + 24, FY + 46, "5,000,000 rows  OR  about 320 MB  --  times the pipeline", anchor="start"
+    ),
+    note(
+        FX + 24,
+        FY + 64,
+        "breakers the loop would cut at. A cut is what staging costs,",
+        anchor="start",
+    ),
     note(FX + 24, FY + 82, "so a plan with more cuts must be larger to earn them.", anchor="start"),
     note(FX + 24, FY + 100, "The flat 20,000,000-row whole-query gate is retired.", anchor="start"),
 ]
 
-ROWS = (("2 breakers", "10,000,000 rows"), ("4 breakers", "20,000,000 rows"), ("6 breakers", "30,000,000 rows"))
+ROWS = (
+    ("2 breakers", "10,000,000 rows"),
+    ("4 breakers", "20,000,000 rows"),
+    ("6 breakers", "30,000,000 rows"),
+)
 for i, (left, right) in enumerate(ROWS):
     y = FY + 40 + i * 26
     body += [

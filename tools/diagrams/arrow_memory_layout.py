@@ -41,10 +41,22 @@ body = [
     arrow(396, 412, 520, 412),
     label(458, 400, "batch.slice(off, len)", anchor="middle"),
     card(520, 376, 384, 72, "a second RecordBatch", "an offset and a length, nothing else"),
-    note(56, 476, "Copied: nothing. But get_array_memory_size still reports the parent's whole allocation, which is why"),
-    note(56, 494, "every size decision in the engine measures a morsel with bc_arrow::slice_bytes instead."),
+    note(
+        56,
+        476,
+        "Copied: nothing. But get_array_memory_size still reports the parent's whole allocation, which is why",
+    ),
+    note(
+        56,
+        494,
+        "every size decision in the engine measures a morsel with bc_arrow::slice_bytes instead.",
+    ),
     band(24, 532, 912, 88, "WHY THE FFI BOUNDARY COSTS NOTHING", "blue"),
-    note(56, 572, "Those same buffer pointers cross to pyarrow through the Arrow C Data Interface. No copy, no"),
+    note(
+        56,
+        572,
+        "Those same buffer pointers cross to pyarrow through the Arrow C Data Interface. No copy, no",
+    ),
     note(56, 590, "serialization: the morsel Rust hands back is the batch Python already holds."),
 ]
 

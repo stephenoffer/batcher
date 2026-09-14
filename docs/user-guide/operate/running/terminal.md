@@ -140,9 +140,11 @@ when you need to:
 import batcher as bt
 from batcher.config import ObservabilityConfig, active_config, set_config
 
-set_config(active_config().replace(
-    observability=ObservabilityConfig(progress="off")   # "auto" | "on" | "off"; None derives it
-))
+set_config(
+    active_config().replace(
+        observability=ObservabilityConfig(progress="off")  # "auto" | "on" | "off"; None derives it
+    )
+)
 ```
 
 `progress="on"` forces rendering, which helps inside a pseudo-terminal your tooling owns.

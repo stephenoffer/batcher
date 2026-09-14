@@ -39,13 +39,15 @@ import pyarrow as pa
 
 import batcher as bt
 
+
 class Scorer:
     def __init__(self):
-        self.weights = {"a": 1.5, "b": 2.0}   # a real model loads here, once per worker
+        self.weights = {"a": 1.5, "b": 2.0}  # a real model loads here, once per worker
 
     def __call__(self, batch):
         scores = [self.weights.get(k, 0.0) for k in batch.column("k").to_pylist()]
         return pa.table({"k": batch.column("k"), "score": pa.array(scores)})
+
 
 ds = bt.from_pydict({"k": ["a", "b", "a"]})
 print(ds.ml.map_batches(Scorer, num_gpus=0, concurrency=2).sort("k").to_pydict())

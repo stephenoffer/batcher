@@ -32,7 +32,9 @@ sales = bt.from_pydict(
 )
 
 summary = (
-    sales.with_columns(bucket=bt.when(bt.col("price") > 35.0).then(bt.lit("high")).otherwise(bt.lit("low")))
+    sales.with_columns(
+        bucket=bt.when(bt.col("price") > 35.0).then(bt.lit("high")).otherwise(bt.lit("low"))
+    )
     .group_by("bucket")
     .agg(avg_price=bt.col("price").mean(), n=bt.count())
     .sort("bucket")

@@ -43,7 +43,12 @@ def bar(m0: float, m1: float, y: float, h: float, count: int, color: str) -> str
 
 
 body: list[str] = [
-    note(490, 62, "Eight events on one event-time axis. Each window shows how many of them it caught.", anchor="middle"),
+    note(
+        490,
+        62,
+        "Eight events on one event-time axis. Each window shows how many of them it caught.",
+        anchor="middle",
+    ),
 ]
 
 # Guides first, so the bars drawn over them stay readable while the alignment stays visible.
@@ -99,8 +104,18 @@ body += [
 
 body += [
     band(20, 438, 940, 76, "READING IT", "grey"),
-    note(490, 482, "A sliding window whose hop equals its width is a tumbling window. The second lane holds the offset windows in between, which is why one event is counted twice.", anchor="middle"),
-    note(490, 500, "A session has no grid: it ends when nothing has arrived for the gap, so the data decides both bounds. The gap here is five minutes, and a gap of exactly five does not split one.", anchor="middle"),
+    note(
+        490,
+        482,
+        "A sliding window whose hop equals its width is a tumbling window. The second lane holds the offset windows in between, which is why one event is counted twice.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        500,
+        "A session has no grid: it ends when nothing has arrived for the gap, so the data decides both bounds. The gap here is five minutes, and a gap of exactly five does not split one.",
+        anchor="middle",
+    ),
 ]
 
 write("window_types", svg(W, H, "".join(body)))

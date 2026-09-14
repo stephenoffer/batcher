@@ -55,13 +55,14 @@ and only the final terminal op executes.
 For a persistent catalog (the `duckdb.connect()` analogue), use a `Session`:
 
 ```python
-s = bt.Session()                          # Session(*, dialect="duckdb")
-s.register("orders", orders)              # name -> Dataset
+s = bt.Session()  # Session(*, dialect="duckdb")
+s.register("orders", orders)  # name -> Dataset
 s.sql("CREATE VIEW paid AS SELECT * FROM orders WHERE status = 'paid'")
 totals = s.sql("SELECT region, SUM(amount) AS t FROM paid GROUP BY region")
-s.list()          # -> registered table names
-s.table("paid")   # -> the Dataset behind a name
-s.drop("paid"); s.clear()
+s.list()  # -> registered table names
+s.table("paid")  # -> the Dataset behind a name
+s.drop("paid")
+s.clear()
 ```
 
 `bt.sql` / `bt.register_function` share one process-global default session, so a

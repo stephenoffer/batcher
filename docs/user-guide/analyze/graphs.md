@@ -80,7 +80,12 @@ comes back orders everything else by closeness to those, measured through the wh
 ```python
 chain = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 4]}))
 near_1 = bg.personalized_pagerank(chain, bt.from_pydict({"node": [1]}))
-print([(n, round(v, 3)) for n, v in zip(*near_1.sort("pagerank", descending=True).to_pydict().values())])
+print(
+    [
+        (n, round(v, 3))
+        for n, v in zip(*near_1.sort("pagerank", descending=True).to_pydict().values())
+    ]
+)
 # [(1, 0.314), (2, 0.267), (3, 0.227), (4, 0.193)]
 ```
 
@@ -180,9 +185,7 @@ Triangles are the smallest structure that distinguishes a real social graph from
 one with the same degrees. If your friends know each other, the graph has triangles.
 
 ```python
-two_triangles = bt.from_pydict(
-    {"src": [1, 2, 1, 4, 5, 4], "dst": [2, 3, 3, 5, 6, 6]}
-)
+two_triangles = bt.from_pydict({"src": [1, 2, 1, 4, 5, 4], "dst": [2, 3, 3, 5, 6, 6]})
 cg = bg.Graph.from_edges(two_triangles)
 print(bg.triangles(cg).count(), round(bg.average_clustering(cg), 3))
 # 2 1.0
@@ -318,9 +321,7 @@ arrive as edges. Four constructors make that step explicit.
 embedding space to every algorithm above:
 
 ```python
-vecs = bt.from_pydict(
-    {"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]}
-)
+vecs = bt.from_pydict({"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]})
 print(bg.knn_graph(vecs, 1).edges.sort("src").to_pydict()["dst"])
 # ['b', 'a', 'b']
 ```

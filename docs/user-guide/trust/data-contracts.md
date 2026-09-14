@@ -74,8 +74,8 @@ Each result carries the number it measured, so a failing contract says how far o
 rather than only that it failed.
 
 ```python
-result = orders.dq.mean_between("amount", 1.0, 10.0).validate().result(
-    "mean_between(amount, 1.0, 10.0)"
+result = (
+    orders.dq.mean_between("amount", 1.0, 10.0).validate().result("mean_between(amount, 1.0, 10.0)")
 )
 print(result.ok, round(result.value, 2))
 # False 34.75

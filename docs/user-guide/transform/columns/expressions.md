@@ -251,13 +251,9 @@ measures the distance over the Earth's surface. It uses the haversine formula, w
 its precision for nearby points, and that is the case a proximity filter cares about.
 
 ```python
-trips = bt.from_pydict(
-    {"alat": [51.5074], "alon": [-0.1278], "blat": [48.8566], "blon": [2.3522]}
-)
+trips = bt.from_pydict({"alat": [51.5074], "alon": [-0.1278], "blat": [48.8566], "blon": [2.3522]})
 out = trips.select(
-    km=bt.great_circle_distance(
-        bt.col("alat"), bt.col("alon"), bt.col("blat"), bt.col("blon")
-    )
+    km=bt.great_circle_distance(bt.col("alat"), bt.col("alon"), bt.col("blat"), bt.col("blon"))
 )
 print(out.to_pydict())
 # {'km': [343.55653488088325]}

@@ -41,7 +41,6 @@ body = [
     card(44, 152, 508, 66, "Count-Min", "how often is THIS key -- folds by cell-wise sum"),
     card(44, 232, 508, 66, "Bloom", "membership, data skipping -- folds by bitwise OR"),
     note(298, 312, "ColumnStats' min, max, count and ndv fold the same way.", anchor="middle"),
-
     # ---- merges to a close enough state ------------------------------------
     band(604, 20, 356, 300, "WITHIN ITS OWN RANK ERROR", "amber"),
     card(628, 72, 308, 66, "KLL", "quantiles -- its merge compacts"),
@@ -50,15 +49,18 @@ body = [
     note(782, 266, "Worst measured gap in rank: 0.0097 at", anchor="middle"),
     note(782, 286, "k=200, and 0.0050 at compression 100.", anchor="middle"),
     note(782, 312, "That is the error the sketch promises.", anchor="middle"),
-
     # ---- what they are for --------------------------------------------------
     card(300, 386, 380, 88, "The cardinality estimate", "row counts and per-column stats"),
     arrow(298, 320, 400, 382, "blue"),
     label(292, 364, "exact counts", anchor="end"),
     arrow(782, 320, 600, 382, "amber"),
     label(700, 356, "quantiles, selectivity", anchor="start"),
-
-    note(490, 502, "Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.", anchor="middle"),
+    note(
+        490,
+        502,
+        "Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.",
+        anchor="middle",
+    ),
 ]
 
 write("cardinality_sketches", svg(W, H, "".join(body)))

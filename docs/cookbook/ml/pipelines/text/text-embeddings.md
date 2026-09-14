@@ -174,9 +174,7 @@ qvec = (
     .to_pydict()["embedding"][0]
 )
 
-hits = embedded.with_columns(score=col("embedding").list.dot(array(*qvec))).top_k(
-    2, "score"
-)
+hits = embedded.with_columns(score=col("embedding").list.dot(array(*qvec))).top_k(2, "score")
 print(hits.to_pydict()["id"])
 # [1, 4]
 ```

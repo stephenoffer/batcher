@@ -40,7 +40,7 @@ Names and integers are interchangeable, so a CLI counting `-v` flags can pass th
 straight through:
 
 ```python
-ObservabilityConfig(verbosity=4)          # same as "debug"
+ObservabilityConfig(verbosity=4)  # same as "debug"
 ```
 
 Or from the environment, without touching code:
@@ -119,14 +119,16 @@ print(get_logger("kyber").name)
 For anything these don't cover, one config controls all of them:
 
 ```python
-set_config(active_config().replace(
-    observability=ObservabilityConfig(
-        log_level="INFO",          # CRITICAL | ERROR | WARNING | INFO | DEBUG
-        log_format="json",         # "human" (default) or "json" for a log shipper
-        log_file="/var/log/batcher.log",
-        console=False,             # file-only
+set_config(
+    active_config().replace(
+        observability=ObservabilityConfig(
+            log_level="INFO",  # CRITICAL | ERROR | WARNING | INFO | DEBUG
+            log_format="json",  # "human" (default) or "json" for a log shipper
+            log_file="/var/log/batcher.log",
+            console=False,  # file-only
+        )
     )
-))
+)
 ```
 
 Engine log records carry structured fields, not only a sentence. The terminal layout is
@@ -190,7 +192,7 @@ the process it is observing:
 ```python
 import batcher as bt
 
-bt.start_ui()                    # returns 'http://127.0.0.1:4040'
+bt.start_ui()  # returns 'http://127.0.0.1:4040'
 bt.start_ui(port=8080, open_browser=True)
 ```
 
@@ -286,9 +288,7 @@ To have a long-running service always expose it, turn it on in config instead of
 `start_ui` by hand:
 
 ```python
-set_config(active_config().replace(
-    observability=ObservabilityConfig(ui=True, ui_port=4040)
-))
+set_config(active_config().replace(observability=ObservabilityConfig(ui=True, ui_port=4040)))
 ```
 
 ```{admonition} The dashboard binds to loopback on purpose
@@ -310,13 +310,15 @@ durable artifact: the dashboard's ring buffer is a debugging window that forgets
 does not.
 
 ```python
-set_config(active_config().replace(
-    observability=ObservabilityConfig(
-        event_log=True,                     # on by default
-        event_log_dir="/data/batcher-events",
-        event_log_max_files=1000,           # oldest pruned on write; 0 = unbounded
+set_config(
+    active_config().replace(
+        observability=ObservabilityConfig(
+            event_log=True,  # on by default
+            event_log_dir="/data/batcher-events",
+            event_log_max_files=1000,  # oldest pruned on write; 0 = unbounded
+        )
     )
-))
+)
 ```
 
 `event_log=False` removes the per-query write. That is worth doing when you run many small
@@ -336,9 +338,7 @@ second place to look. Batcher emits one span per query with a child span per ope
 the tracer your application configured. It owns no exporter:
 
 ```python
-set_config(active_config().replace(
-    observability=ObservabilityConfig(otel_traces=True)
-))
+set_config(active_config().replace(observability=ObservabilityConfig(otel_traces=True)))
 ```
 
 This needs the `otel` extra, `pip install 'batcher-engine[otel]'`, plus a provider the host

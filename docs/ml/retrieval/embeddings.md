@@ -178,9 +178,7 @@ direction, so an index returns it as a garbage neighbor; it usually means an emp
 or a failed encode. {py:meth}`ds.ml.drop_degenerate_embeddings <batcher.api.dataset.ml.DatasetML.drop_degenerate_embeddings>` removes both:
 
 ```python
-with_holes = bt.from_pydict(
-    {"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]}
-)
+with_holes = bt.from_pydict({"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]})
 clean = with_holes.ml.drop_degenerate_embeddings("embedding")
 print(clean.to_pydict()["id"])
 # [1, 3]

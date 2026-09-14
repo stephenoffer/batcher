@@ -63,7 +63,12 @@ body = [
     note(800, 596, "A denied column is removed", anchor="middle"),
     note(800, 614, "from the output, not flagged.", anchor="middle"),
     note(800, 632, "There is no check to bypass.", anchor="middle"),
-    note(490, 662, "collect, count, iter_batches, write and the distributed path all run this same plan.", anchor="middle"),
+    note(
+        490,
+        662,
+        "collect, count, iter_batches, write and the distributed path all run this same plan.",
+        anchor="middle",
+    ),
 ]
 
 write("policy_plan_rewrite", svg(W, H, "".join(body)))

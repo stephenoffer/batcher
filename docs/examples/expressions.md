@@ -67,9 +67,7 @@ step possible without reflection in Python. The `*_horizontal` family is the row
 counterpart to an aggregate, for when a value is spread across columns rather than rows.
 
 ```python
-readings = bt.from_pydict(
-    {"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening": [2.0, 4.0]}
-)
+readings = bt.from_pydict({"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening": [2.0, 4.0]})
 
 folded = readings.select(
     "sensor",

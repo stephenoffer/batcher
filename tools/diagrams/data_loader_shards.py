@@ -63,8 +63,18 @@ body = [
     note(806, 552, "memory that was already freed.", anchor="middle"),
     # Resume.
     band(20, 622, 940, 88, "RESUME", "grey"),
-    note(490, 664, "global_consumed counts positions in the global order, not in a rank's shard, so a run resumes on a differently sized cluster.", anchor="middle"),
-    note(490, 686, "It must land on a multiple of world_size, a synchronized step boundary, or the ranks come back with unequal counts.", anchor="middle"),
+    note(
+        490,
+        664,
+        "global_consumed counts positions in the global order, not in a rank's shard, so a run resumes on a differently sized cluster.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        686,
+        "It must land on a multiple of world_size, a synchronized step boundary, or the ranks come back with unequal counts.",
+        anchor="middle",
+    ),
 ]
 
 write("data_loader_shards", svg(W, H, "".join(body)))

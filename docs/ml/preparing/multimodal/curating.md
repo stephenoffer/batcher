@@ -21,8 +21,8 @@ from batcher import col, lit
 
 brightness = col("bytes").image.brightness()
 usable = photos.filter(
-    (brightness > lit(0.05))          # not a black tile
-    & (brightness < lit(0.95))        # not a blown-out scan
+    (brightness > lit(0.05))  # not a black tile
+    & (brightness < lit(0.95))  # not a blown-out scan
     & (col("bytes").image.sharpness() > lit(1e-4))  # not out of focus
 )
 ```
@@ -88,9 +88,9 @@ from batcher import col, lit
 
 background = col("bytes").image.mean_color()
 usable = photos.filter(
-    (col("bytes").image.entropy() > lit(4.0))          # not a placeholder tile
-    & (col("bytes").image.colorfulness() > lit(5.0))   # not a scan or a line drawing
-    & ~col("bytes").image.is_grayscale()               # not gray stored as RGB
+    (col("bytes").image.entropy() > lit(4.0))  # not a placeholder tile
+    & (col("bytes").image.colorfulness() > lit(5.0))  # not a scan or a line drawing
+    & ~col("bytes").image.is_grayscale()  # not gray stored as RGB
 )
 on_white = photos.filter(background.struct.field("r") > lit(240.0))
 ```
@@ -150,9 +150,7 @@ It returns a plain integer, so no new operator is needed. Exact-duplicate collap
 import batcher as bt
 from batcher import col
 
-photos = bt.read.images("s3://bucket/scrape/").with_columns(
-    h=col("bytes").image.dhash()
-)
+photos = bt.read.images("s3://bucket/scrape/").with_columns(h=col("bytes").image.dhash())
 
 # Exact duplicates: one row per distinct image.
 unique = photos.distinct(subset=["h"])

@@ -73,18 +73,27 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"cust-1", b"cust-2", b"cust-1"],
-    "value": [b'{"amount": 10}', b'{"amount": 5}', b'{"amount": 7}'],
-    "partition": [0, 1, 0],
-    "offset": [4956, 4957, 4958],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["payments"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"cust-1", b"cust-2", b"cust-1"],
+        "value": [b'{"amount": 10}', b'{"amount": 5}', b'{"amount": 7}'],
+        "partition": [0, 1, 0],
+        "offset": [4956, 4957, 4958],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["payments"] * 3,
+    },
+    schema=schema,
+)
 
 records = bt.from_batches(lambda: iter([batch]), schema)
 per_shard = records.group_by("partition").agg(records_read=col("offset").count())
@@ -149,9 +158,7 @@ backfill = bt.read.kinesis(
 :::{tab-item} Start at the tip
 ```python
 # docs: skip
-live = bt.read.kinesis(
-    "payments", region="us-east-1", poll_size=5_000, iterator_type="LATEST"
-)
+live = bt.read.kinesis("payments", region="us-east-1", poll_size=5_000, iterator_type="LATEST")
 ```
 :::
 
@@ -164,14 +171,11 @@ none is skipped.
 :::{dropdown} A checkpointed write into a bronze Delta table
 ```python
 # docs: skip
-q = (
-    bt.read.kinesis("payments", region="us-east-1", poll_size=5_000)
-    .write.delta(
-        "lake/bronze/payments",
-        trigger=bt.Trigger.processing_time("30 seconds"),
-        checkpoint="/var/lib/batcher/ckpt/bronze-payments",
-        query_name="bronze-payments",
-    )
+q = bt.read.kinesis("payments", region="us-east-1", poll_size=5_000).write.delta(
+    "lake/bronze/payments",
+    trigger=bt.Trigger.processing_time("30 seconds"),
+    checkpoint="/var/lib/batcher/ckpt/bronze-payments",
+    query_name="bronze-payments",
 )
 ```
 :::

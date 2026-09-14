@@ -63,8 +63,12 @@ body = [
     note(LEFT_X + LEFT_W + 34, ROW_Y + 50, "string", anchor="middle"),
     label(MID_X + MID_W + 34, ROW_Y + 32, "must accept it", anchor="middle"),
     note(MID_X + MID_W + 34, ROW_Y + 50, "deny_unknown_fields", anchor="middle"),
-    note(490, 236, "16 RelOp tags and 55 Expr tags today, plus 19 function vocabularies underneath them.",
-         anchor="middle"),
+    note(
+        490,
+        236,
+        "16 RelOp tags and 55 Expr tags today, plus 19 function vocabularies underneath them.",
+        anchor="middle",
+    ),
 ]
 
 # Arrows drawn after the labels so the heads sit above the band fill.
@@ -99,7 +103,14 @@ FAIL_Y = 428
 body += [
     card(52, FAIL_Y, 420, 92, "Python emits, Rust rejects", "the plan fails to deserialize"),
     note(262, FAIL_Y + 78, "Loud, but only for a query that uses that tag.", anchor="middle"),
-    card(508, FAIL_Y, 420, 92, "Rust accepts, Python never emits", "an engine capability goes unreachable"),
+    card(
+        508,
+        FAIL_Y,
+        420,
+        92,
+        "Rust accepts, Python never emits",
+        "an engine capability goes unreachable",
+    ),
     note(718, FAIL_Y + 78, "Silent. Nothing raises, nothing is slower to notice.", anchor="middle"),
 ]
 

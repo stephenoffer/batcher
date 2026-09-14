@@ -39,10 +39,7 @@ Enrich with a region dimension, then aggregate on the joined column.
 ```python
 regions = bt.from_pydict({"region": ["W", "E"], "name": ["West", "East"]})
 by_name = (
-    orders.join(regions, on="region")
-    .group_by("name")
-    .agg(revenue=col("amt").sum())
-    .sort("name")
+    orders.join(regions, on="region").group_by("name").agg(revenue=col("amt").sum()).sort("name")
 )
 print(by_name.to_pydict())
 # {'name': ['East', 'West'], 'revenue': [60, 90]}
@@ -66,9 +63,9 @@ Ranking functions take the same shape: `rank().over(partition_by=..., order_by=.
 numbers rows within each partition.
 
 ```python
-ranked = orders.with_columns(
-    position=rank().over(partition_by=["region"], order_by=["amt"])
-).sort("region", "amt")
+ranked = orders.with_columns(position=rank().over(partition_by=["region"], order_by=["amt"])).sort(
+    "region", "amt"
+)
 print(ranked.to_pydict()["position"])
 # [1, 2, 1, 2, 3]
 ```

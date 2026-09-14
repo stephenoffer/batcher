@@ -98,7 +98,7 @@ import pyarrow as pa
 t = pa.table({"a": pa.array([1, 2, 3], pa.int32())})
 out = bt.from_arrow(t).select("a").collect()
 
-print(type(out).__name__, out.schema.field("a").type)   # widened at the boundary
+print(type(out).__name__, out.schema.field("a").type)  # widened at the boundary
 print(out.column("a").to_pylist())
 ```
 

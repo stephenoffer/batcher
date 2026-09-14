@@ -228,8 +228,17 @@ from batcher.ml import LogisticRegression, OneVsRestClassifier
 ds = bt.from_pydict(
     {
         "weight": [0.2, 0.3, 0.4, 5.0, 5.2, 5.4, 20.0, 21.0, 22.0],
-        "grade": ["small", "small", "small", "medium", "medium", "medium",
-                  "large", "large", "large"],
+        "grade": [
+            "small",
+            "small",
+            "small",
+            "medium",
+            "medium",
+            "medium",
+            "large",
+            "large",
+            "large",
+        ],
     }
 )
 
@@ -247,9 +256,9 @@ Prediction stays a single pass however many classes there are. Each sub-model's 
 Pass hyperparameters for every sub-model through `params`:
 
 ```python
-model = OneVsRestClassifier(
-    LogisticRegression, ["weight"], "grade", params={"max_iter": 50}
-).fit(ds)
+model = OneVsRestClassifier(LogisticRegression, ["weight"], "grade", params={"max_iter": 50}).fit(
+    ds
+)
 print(len(model.estimators_))
 # 3
 ```
@@ -363,9 +372,9 @@ from batcher.ml import LinearRegression, TransformedTargetRegressor
 skewed = bt.from_pydict(
     {"x": [1.0, 2.0, 3.0, 4.0], "y": [math.expm1(v) for v in (1.0, 2.0, 3.0, 4.0)]}
 )
-model = TransformedTargetRegressor(
-    LinearRegression(["x"], "y"), target="y", transform="log1p"
-).fit(skewed)
+model = TransformedTargetRegressor(LinearRegression(["x"], "y"), target="y", transform="log1p").fit(
+    skewed
+)
 print([round(v, 3) for v in model.predict(skewed).to_pydict()["prediction"]])
 # [1.718, 6.389, 19.086, 53.598]
 ```
@@ -394,9 +403,7 @@ has local structure, and the right tool when a boundary is genuinely irregular.
 import batcher as bt
 from batcher.ml import KNeighborsClassifier
 
-train = bt.from_pydict(
-    {"x": [0.0, 1.0, 10.0, 11.0], "label": ["low", "low", "high", "high"]}
-)
+train = bt.from_pydict({"x": [0.0, 1.0, 10.0, 11.0], "label": ["low", "low", "high", "high"]})
 model = KNeighborsClassifier(["x"], "label", k=2).fit(train)
 print(model.predict(bt.from_pydict({"x": [0.5, 10.5]})).to_pydict()["prediction"])
 # ['low', 'high']

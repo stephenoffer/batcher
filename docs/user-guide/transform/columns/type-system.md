@@ -276,11 +276,13 @@ is a float, the result of an operation such as `0.0 / 0.0`. {py:meth}`is_null() 
 
 ```python
 mixed = bt.from_pydict({"x": [1.0, float("nan"), None]})
-print(mixed.select(
-    null=bt.col("x").is_null(),
-    nan=bt.col("x").is_nan(),
-    filled=bt.col("x").fill_null(-1.0),
-).to_pydict())
+print(
+    mixed.select(
+        null=bt.col("x").is_null(),
+        nan=bt.col("x").is_nan(),
+        filled=bt.col("x").fill_null(-1.0),
+    ).to_pydict()
+)
 # {'null': [False, False, True], 'nan': [False, True, None], 'filled': [1.0, nan, -1.0]}
 ```
 
@@ -302,11 +304,13 @@ NumPy. Integer-by-integer division promotes too, so `7 / 2` is `3.5` and not `3`
 
 ```python
 nums = bt.from_pydict({"a": [7, 8], "b": [2, 3]})
-print(nums.select(
-    div=bt.col("a") / bt.col("b"),
-    mod=bt.col("a") % bt.col("b"),
-    mixed=bt.col("a") + 0.5,
-).to_pydict())
+print(
+    nums.select(
+        div=bt.col("a") / bt.col("b"),
+        mod=bt.col("a") % bt.col("b"),
+        mixed=bt.col("a") + 0.5,
+    ).to_pydict()
+)
 # {'div': [3.5, 2.6666666666666665], 'mod': [1, 2], 'mixed': [7.5, 8.5]}
 ```
 
@@ -457,8 +461,10 @@ import pyarrow as pa
 # `from_pydict` infers a struct from a dict, so a genuine map column needs the type.
 maps = bt.from_arrow(
     pa.table(
-        {"m": pa.array([[("a", 1)], [("a", 2)]], type=pa.map_(pa.string(), pa.int64())),
-         "v": pa.array([1, 2], pa.int64())}
+        {
+            "m": pa.array([[("a", 1)], [("a", 2)]], type=pa.map_(pa.string(), pa.int64())),
+            "v": pa.array([1, 2], pa.int64()),
+        }
     )
 )
 print(maps.group_by("v").agg(n=bt.count()).to_pydict())

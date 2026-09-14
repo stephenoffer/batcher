@@ -77,7 +77,6 @@ body = [
     crate(LX + CW / 2, B_Y + CH - 10, "Send + Sync"),
     card(LX, C_Y, CW, CH, "eval(batch)", "16,384 rows at a time"),
     crate(LX + CW / 2, C_Y + CH - 10, "bc-interp drives the loop"),
-
     # ---- The memo and the interpreter -------------------------------------
     card(RX, A_Y, CW, CH, "Compile cache", "keyed on the expression and the schema"),
     crate(RX + CW / 2, A_Y + CH - 10, "1024 entries"),
@@ -91,12 +90,10 @@ body += [
     f'stroke-width="2.4" marker-end="url(#arB)"/>',
     label(SPINE + 16, A_Y + CH + 32, "in the subset: compile,", size=11.5),
     note(SPINE + 16, A_Y + CH + 50, "and compile exactly once"),
-
     f'<path d="M {SPINE} {B_Y + CH + 8} L {SPINE} {C_Y - 10}" fill="none" stroke="{BLUE}" '
     f'stroke-width="2.4" marker-end="url(#arB)"/>',
     label(SPINE + 16, B_Y + CH + 32, "reused for every morsel,", size=11.5),
     note(SPINE + 16, B_Y + CH + 50, "never recompiled"),
-
     # analyze asks the memo first, and writes its answer back either way.
     f'<path d="M {LX + CW + 8} {A_Y + CH / 2} L {RX - 10} {A_Y + CH / 2}" fill="none" '
     f'stroke="{BLUE}" stroke-width="2.4" marker-end="url(#arB)"/>',
@@ -109,19 +106,21 @@ body += [
     fall(LX + CW + 8, A_Y + CH - 4, RX - 10, B_Y + 30),
     amber(486, B_Y - 2, "outside the subset:"),
     note(486, B_Y + 16, "this operator never compiles at all", anchor="middle"),
-
     fall(LX + CW + 8, C_Y + 22, RX - 10, B_Y + CH - 16),
     amber(486, C_Y + 10, "nulls this body cannot carry:"),
     note(486, C_Y + 28, "this batch only, and the next one tries again", anchor="middle"),
 ]
 
 body += [
-    note(490, H - 46,
-         "The subset is narrow on purpose: numeric, date and timestamp columns, arithmetic and comparison. No strings.",
-         anchor="middle"),
+    note(
+        490,
+        H - 46,
+        "The subset is narrow on purpose: numeric, date and timestamp columns, arithmetic and comparison. No strings.",
+        anchor="middle",
+    ),
     f'<text x="490" y="{H - 24}" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'fill="{MUTED}">A per-morsel compile would lose. One 64-row query paid 16.6 ms of '
-    f'Cranelift before the cache existed.</text>',
+    f"Cranelift before the cache existed.</text>",
 ]
 
 write("jit_fallback", svg(W, H, "".join(body)))

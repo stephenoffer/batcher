@@ -16,11 +16,11 @@ type in the estimator.
 # docs: skip
 # python/batcher/plan/stats.py
 class Provenance(IntEnum):
-    EXACT = 0      # provably correct without execution (a footer, a manifest)
+    EXACT = 0  # provably correct without execution (a footer, a manifest)
     HISTOGRAM = 1  # KLL / t-digest / DDSketch quantile sketch measured from data
-    SKETCH = 2     # HLL distinct / Count-Min frequency (approximate by construction)
-    LEARNED = 3    # a prior from a past run, keyed by plan signature
-    DEFAULT = 4    # Selinger heuristic / an unconstrained guess
+    SKETCH = 2  # HLL distinct / Count-Min frequency (approximate by construction)
+    LEARNED = 3  # a prior from a past run, keyed by plan signature
+    DEFAULT = 4  # Selinger heuristic / an unconstrained guess
 ```
 
 Ordered strongest-first, so trust composes with `max`. There is exactly one combiner:
@@ -78,11 +78,11 @@ answer since System R. They live in {py:class}`CardinalityConfig <batcher.config
 
 ```python
 # docs: skip
-eq_selectivity: float = 0.1           # col = literal
+eq_selectivity: float = 0.1  # col = literal
 range_selectivity: float = 1.0 / 3.0  # col < | <= | > | >= literal
-null_selectivity: float = 0.05        # col IS NULL
-substring_selectivity: float = 0.05   # LIKE '%x%' / contains / regex
-prefix_selectivity: float = 0.10      # LIKE 'x%' / starts_with / ends_with
+null_selectivity: float = 0.05  # col IS NULL
+substring_selectivity: float = 0.05  # LIKE '%x%' / contains / regex
+prefix_selectivity: float = 0.10  # LIKE 'x%' / starts_with / ends_with
 default_filter_selectivity: float = 0.5
 ```
 
@@ -158,7 +158,7 @@ same exponential-backoff shape.
 ordered = sorted((d for d in per_column if d > 0), reverse=True)
 combined, exponent = 1.0, 1.0
 for d in ordered:
-    combined *= d ** exponent
+    combined *= d**exponent
     exponent /= 2.0
 return max(1.0, min(combined, cap))
 ```
@@ -189,7 +189,7 @@ pinned:
 # docs: skip
 # python/batcher/kyber/stats/aggregate_columns.py
 if src.null_count == 0:
-    return 0                                    # no nulls in, none out, for any key count
+    return 0  # no nulls in, none out, for any key count
 return 1 if len(node.group_keys) == 1 else None  # one key: the nulls are one group
 ```
 

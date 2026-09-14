@@ -98,9 +98,8 @@ import batcher as bt
 from batcher import col
 
 ds = bt.read.parquet("s3://bucket/catalog.parquet")
-tensors = (
-    ds.ml.download("url", output_column="bytes")
-    .with_columns(image=col("bytes").image.to_tensor(224, 224))
+tensors = ds.ml.download("url", output_column="bytes").with_columns(
+    image=col("bytes").image.to_tensor(224, 224)
 )
 ```
 

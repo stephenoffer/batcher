@@ -28,7 +28,7 @@ testable with no GPU:
 ```python
 import batcher as bt
 
-shout = lambda: (lambda prompts: [p.upper() for p in prompts])
+shout = lambda: lambda prompts: [p.upper() for p in prompts]
 print(bt.from_pydict({"q": ["hi"]}).ml.generate(shout, prompt_column="q").to_pydict())
 # {'q': ['hi'], 'response': ['HI']}
 ```

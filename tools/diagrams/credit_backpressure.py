@@ -56,8 +56,18 @@ body = [
     note(RMID, 394, "traffic without loosening the bound:", anchor="middle"),
     note(RMID, 412, "a grant is deferred, never", anchor="middle"),
     note(RMID, 430, "anticipated.", anchor="middle"),
-    note(490, 482, "One credit is one in-flight batch slot, so the window is the channel's memory bound -", anchor="middle"),
-    note(490, 500, "about 16 MiB at a 1 MiB morsel. Carbonite's AIMD controller sizes it per channel.", anchor="middle"),
+    note(
+        490,
+        482,
+        "One credit is one in-flight batch slot, so the window is the channel's memory bound -",
+        anchor="middle",
+    ),
+    note(
+        490,
+        500,
+        "about 16 MiB at a 1 MiB morsel. Carbonite's AIMD controller sizes it per channel.",
+        anchor="middle",
+    ),
 ]
 
 write("credit_backpressure", svg(W, H, "".join(body)))

@@ -146,11 +146,7 @@ print(out.to_pydict())
 `group_by(*keys)` returns a {py:class}`GroupBy <batcher.GroupBy>`. Finalize it with `.agg(**named_aggs)`, where each keyword is the output column name. `group_by()` with no keys aggregates the whole dataset.
 
 ```python
-out = (
-    ds.group_by("category")
-    .agg(total=bt.col("price").sum(), n=bt.count())
-    .sort("category")
-)
+out = ds.group_by("category").agg(total=bt.col("price").sum(), n=bt.count()).sort("category")
 print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [40.0, 20.0], 'n': [2, 1]}
 ```
@@ -319,7 +315,9 @@ Typed methods hang off an expression by namespace rather than crowding `Expr` it
 {py:func}`bt.sql(query, table_name=ds_or_table, ...) <batcher.sql>` returns a Dataset. Each table named in the query is bound by a keyword argument. The {doc}`SQL page </api/relational/sql>` lists the supported clauses and features in full.
 
 ```python
-out = bt.sql("SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds)
+out = bt.sql(
+    "SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds
+)
 print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [40.0, 20.0]}
 ```

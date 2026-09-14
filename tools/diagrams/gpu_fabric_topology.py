@@ -102,10 +102,17 @@ body.append(note(526, 244, "same NIC: one rail carries the shuffle and seven sit
 body.append(note(526, 264, "idle, with every counter reporting a healthy fabric."))
 
 # ---- The exchange schedule ---------------------------------------------------------------
-body.append(band(20, 292, 940, 206, "THE EXCHANGE SCHEDULE: n-1 ROUNDS OF n/2 DISJOINT PAIRS",
-                 "amber"))
-body.append(note(44, 328, "pairwise_rounds([0, 1, 2, 3]) -- no device is the source of one "
-                          "copy and the destination of another in the same round"))
+body.append(
+    band(20, 292, 940, 206, "THE EXCHANGE SCHEDULE: n-1 ROUNDS OF n/2 DISJOINT PAIRS", "amber")
+)
+body.append(
+    note(
+        44,
+        328,
+        "pairwise_rounds([0, 1, 2, 3]) -- no device is the source of one "
+        "copy and the destination of another in the same round",
+    )
+)
 
 rounds = ((0, ((0, 3), (1, 2))), (1, ((0, 2), (1, 3))), (2, ((0, 1), (2, 3))))
 for r, pairs in rounds:
@@ -122,8 +129,15 @@ for r, pairs in rounds:
         )
     body.append(note(ox + 110, 462, " and ".join(f"{a}-{b}" for a, b in pairs), anchor="middle"))
 
-body.append(note(490, 486, "The ring for a reduction is ordered by the fabric, not by device "
-                           "index: its rate is its worst hop.", anchor="middle"))
+body.append(
+    note(
+        490,
+        486,
+        "The ring for a reduction is ordered by the fabric, not by device "
+        "index: its rate is its worst hop.",
+        anchor="middle",
+    )
+)
 
 # ---- What changes because of it ----------------------------------------------------------
 body.append(band(20, 520, 940, 100, "WHAT CHANGES BECAUSE OF IT", "grey"))

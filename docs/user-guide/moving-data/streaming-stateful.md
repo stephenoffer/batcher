@@ -37,13 +37,14 @@ watermark window, forgetting keys the watermark has passed so memory stays bound
 Over a bounded source it is exact deduplication:
 
 ```python
-records = bt.from_pydict({
-    "id": ["x", "y", "x", "z"],
-    "ts": [base, base, base + dt.timedelta(minutes=1), base],
-    "v": [1, 2, 3, 4],
-})
-deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
-                                                   lateness="1h")
+records = bt.from_pydict(
+    {
+        "id": ["x", "y", "x", "z"],
+        "ts": [base, base, base + dt.timedelta(minutes=1), base],
+        "v": [1, 2, 3, 4],
+    }
+)
+deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts", lateness="1h")
 print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'], the second 'x' dropped
 ```
 
@@ -148,14 +149,12 @@ between two sessions merges them. So its rows are held until the watermark passe
 event plus the gap, and only then aggregated:
 
 ```python
-visit_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
-                          ("pages", pa.int64())])
+visit_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")), ("pages", pa.int64())])
 
 
 def visit_feed():
     yield pa.record_batch(
-        {"user": ["u1", "u1"], "ts": [base, base + dt.timedelta(minutes=2)],
-         "pages": [1, 1]},
+        {"user": ["u1", "u1"], "ts": [base, base + dt.timedelta(minutes=2)], "pages": [1, 1]},
         schema=visit_schema,
     )
     yield pa.record_batch(
@@ -199,9 +198,11 @@ engine owns when it is called, checkpointed, and expired.
 ```python
 import pyarrow as pa
 
+
 def running_total(key, rows, state):
     total = (state or {"total": 0})["total"] + sum(rows.column("v").to_pylist())
     return {"user": [key[0]], "total": [total]}, {"total": total}
+
 
 events = bt.from_pydict({"user": ["a", "b", "a"], "v": [1, 2, 3]})
 totals = events.transform_with_state(
@@ -248,13 +249,16 @@ import pyarrow as pa
 
 feed_schema = pa.schema([("v", pa.int64())])
 
+
 def eu():
     for i in (0, 1):
         yield pa.record_batch({"v": [i]}, schema=feed_schema)
 
+
 def us():
     for i in (10, 11):
         yield pa.record_batch({"v": [i]}, schema=feed_schema)
+
 
 both = bt.from_batches(eu, feed_schema, bounded=False).union(
     bt.from_batches(us, feed_schema, bounded=False)

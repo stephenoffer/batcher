@@ -23,23 +23,22 @@ constrain. Relational basics (lazy plans, expressions, `group_by`) live in
 
 ```python
 gate = (
-    ds.dq
-    .not_null("email", "user_id")                        # *cols, varargs
-    .unique("id")                                        # str | list[str] (composite)
-    .in_range("age", 0, 120)                             # inclusive; closed= narrows it
-    .positive("score")                                   # strict= admits zero
-    .is_finite("ratio")                                  # no NaN, no infinity
-    .accepted_values("country", ["US", "CA", "MX"])      # enum membership
-    .rejected_values("status", ["N/A", "unknown"])       # deny-list
-    .matches("email", r"^[a-z]+@[a-z]+\.[a-z]+$")        # regex
-    .not_matches("note", r"TODO")                        # regex, negated
-    .matches_format("email", "email")                    # email | url | uuid | ipv4
-    .str_length_between("iso", 2, 2)                     # characters, not bytes
-    .not_empty("name")                                   # "" and "   " are not values
-    .compare_columns("start", "<=", "end")               # two columns, one row
-    .not_in_future("event_time", tolerance="5m")         # clock-skew tolerant
-    .references("customer_id", to=customers)             # referential integrity
-    .check(bt.col("score") > 0.0, name="score_positive") # any Expr; name= required
+    ds.dq.not_null("email", "user_id")  # *cols, varargs
+    .unique("id")  # str | list[str] (composite)
+    .in_range("age", 0, 120)  # inclusive; closed= narrows it
+    .positive("score")  # strict= admits zero
+    .is_finite("ratio")  # no NaN, no infinity
+    .accepted_values("country", ["US", "CA", "MX"])  # enum membership
+    .rejected_values("status", ["N/A", "unknown"])  # deny-list
+    .matches("email", r"^[a-z]+@[a-z]+\.[a-z]+$")  # regex
+    .not_matches("note", r"TODO")  # regex, negated
+    .matches_format("email", "email")  # email | url | uuid | ipv4
+    .str_length_between("iso", 2, 2)  # characters, not bytes
+    .not_empty("name")  # "" and "   " are not values
+    .compare_columns("start", "<=", "end")  # two columns, one row
+    .not_in_future("event_time", tolerance="5m")  # clock-skew tolerant
+    .references("customer_id", to=customers)  # referential integrity
+    .check(bt.col("score") > 0.0, name="score_positive")  # any Expr; name= required
 )
 ```
 
@@ -102,8 +101,8 @@ is a *terminal* that hands back the orphan rows themselves, for when the orphans
 answer. Neither treats a NULL key as an orphan.
 
 ```python
-gate = ds.dq.references("customer_id", to=customers)     # mid-chain
-orphans = ds.dq.foreign_key("customer_id", references=customers)   # the rows
+gate = ds.dq.references("customer_id", to=customers)  # mid-chain
+orphans = ds.dq.foreign_key("customer_id", references=customers)  # the rows
 ```
 
 **`on(other)` rebinds a whole chain to another dataset**, which is how one contract runs
@@ -122,13 +121,13 @@ This is the decision the skill exists to make. All three consume the same `gate`
 | `annotate()` | `Dataset` (+1 column) | no | You want every row kept, each labelled with what it failed |
 
 ```python
-report = gate.validate()          # never raises
+report = gate.validate()  # never raises
 if not report.ok:
-    print(report.violations)      # {'not_null(email)': 1, 'unique(id)': 1, ...}
+    print(report.violations)  # {'not_null(email)': 1, 'unique(id)': 1, ...}
 
-gate.fail()                       # raises DataQualityError if any violation
-kept = gate.drop()                # lazy filtered Dataset
-clean, bad = gate.quarantine()    # BOTH lazy Datasets — a total partition
+gate.fail()  # raises DataQualityError if any violation
+kept = gate.drop()  # lazy filtered Dataset
+clean, bad = gate.quarantine()  # BOTH lazy Datasets — a total partition
 ```
 
 `quarantine()` returns a **2-tuple `(clean, rejected)`** and the split is total:
@@ -180,8 +179,8 @@ headroom. It executes (a profile pass, a numeric-minimum pass, and one `distinct
 enumeration candidate, capped at eight), so it is a profiling step, not a pipeline stage.
 
 ```python
-proposed = ds.dq.suggest()          # or suggest(["col_a", "col_b"])
-print(repr(proposed))               # read it, delete the coincidences, keep the contract
+proposed = ds.dq.suggest()  # or suggest(["col_a", "col_b"])
+print(repr(proposed))  # read it, delete the coincidences, keep the contract
 ```
 
 It deliberately never proposes an `in_range` off an observed min/max: tomorrow's legitimate
@@ -207,16 +206,18 @@ Run these *before* writing constraints; they tell you the real null rates, range
 cardinalities so the thresholds are measured rather than guessed.
 
 ```python
-ds.profile()        # one row PER COLUMN: column, count, null_count, null_fraction, approx_distinct
-ds.describe()       # statistic-rows x column-cols: count/null_count/mean/std/min/25%/50%/75%/max
-ds.null_count()     # lazy Dataset, one row: null count per column
-ds.value_counts("country")            # column, count — sorted desc by default
-ds.class_balance("label")             # column, fraction — label skew before training
-ds.crosstab("country", "tier")        # contingency table
-ds.corr("age", "score")               # float | None
-ds.cov("age", "score", ddof=1)        # float | None
-ds.drop_constant_columns()            # prune zero-information columns
-ds.n_null("email"); ds.has_nulls("email"); ds.all_null("email")   # int / bool / bool
+ds.profile()  # one row PER COLUMN: column, count, null_count, null_fraction, approx_distinct
+ds.describe()  # statistic-rows x column-cols: count/null_count/mean/std/min/25%/50%/75%/max
+ds.null_count()  # lazy Dataset, one row: null count per column
+ds.value_counts("country")  # column, count — sorted desc by default
+ds.class_balance("label")  # column, fraction — label skew before training
+ds.crosstab("country", "tier")  # contingency table
+ds.corr("age", "score")  # float | None
+ds.cov("age", "score", ddof=1)  # float | None
+ds.drop_constant_columns()  # prune zero-information columns
+ds.n_null("email")
+ds.has_nulls("email")
+ds.all_null("email")  # int / bool / bool
 ```
 
 **`ds.profile()` is a data-quality column profiler, not a performance profiler.** This
@@ -236,12 +237,12 @@ turns a global null rate into a per-partition quality dashboard:
 
 ```python
 ds.agg(
-    email_nulls=bt.null_rate("email"),        # fraction NULL
-    email_filled=bt.non_null_rate("email"),   # 1 - null_rate
-    id_uniqueness=bt.nunique_ratio("id"),     # n_distinct / n_rows -> 1.0 means a key
+    email_nulls=bt.null_rate("email"),  # fraction NULL
+    email_filled=bt.non_null_rate("email"),  # 1 - null_rate
+    id_uniqueness=bt.nunique_ratio("id"),  # n_distinct / n_rows -> 1.0 means a key
 )
 
-ds.group_by("ingest_date").agg(bad=bt.null_rate("score"))   # find the bad partition
+ds.group_by("ingest_date").agg(bad=bt.null_rate("score"))  # find the bad partition
 ```
 
 `bt.histogram(column)` takes **one** argument and returns a value→count map aggregate

@@ -154,9 +154,7 @@ import datetime
 t0 = datetime.datetime(2024, 1, 1)
 minute = datetime.timedelta(minutes=1)
 
-stream = bt.from_pydict(
-    {"event_id": ["e1", "e1", "e2"], "ts": [t0, t0 + minute, t0 + 2 * minute]}
-)
+stream = bt.from_pydict({"event_id": ["e1", "e1", "e2"], "ts": [t0, t0 + minute, t0 + 2 * minute]})
 deduped = stream.drop_duplicates_within_watermark(["event_id"], event_time="ts", lateness="10m")
 print(deduped.sort("event_id").to_pydict())
 # {'event_id': ['e1', 'e2'],

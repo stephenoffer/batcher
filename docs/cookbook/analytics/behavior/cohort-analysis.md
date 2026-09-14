@@ -166,7 +166,9 @@ and the triangle makes obvious.
 cohort report:
 
 ```python
-triangle = cells.pivot(index=["cohort"], on="period", values="users", aggregate="sum").sort("cohort")
+triangle = cells.pivot(index=["cohort"], on="period", values="users", aggregate="sum").sort(
+    "cohort"
+)
 print(triangle.to_pydict())
 # {'cohort': ['2024-01', '2024-02', '2024-03'], '0': [2, 1, 1],
 #  '1': [1, None, None], '2': [1, None, None], '3': [1, None, None]}

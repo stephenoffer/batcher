@@ -61,12 +61,12 @@ measured throughput:
 # docs: skip
 import batcher as bt
 
-with bt.config_context(bt.Config(
-    streaming=bt.StreamingConfig(backpressure_enabled=True),
-)):
-    query = events.write.delta(
-        "s3://lake/orders", trigger=bt.Trigger.processing_time("30 seconds")
+with bt.config_context(
+    bt.Config(
+        streaming=bt.StreamingConfig(backpressure_enabled=True),
     )
+):
+    query = events.write.delta("s3://lake/orders", trigger=bt.Trigger.processing_time("30 seconds"))
 ```
 
 Each completed micro-batch reports how many rows it consumed and how long it took, which is a

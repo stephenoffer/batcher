@@ -21,8 +21,8 @@ returns a `WriteManifest` (batch) or a live `StreamingQuery` (stream) depending 
 *source*, not on how the call is written:
 
 ```python
-bt.from_pydict({"x": [1, 2, 3]}).write.parquet(path)        # -> WriteManifest
-bt.read.rate(rows_per_second=1000).write.parquet(path)      # -> StreamingQuery
+bt.from_pydict({"x": [1, 2, 3]}).write.parquet(path)  # -> WriteManifest
+bt.read.rate(rows_per_second=1000).write.parquet(path)  # -> StreamingQuery
 ```
 
 `write.parquet` is even **annotated `-> WriteManifest`** while returning a
@@ -52,9 +52,10 @@ public name is **`for_each_batch`**.)
 bt.read.kafka("topic", bootstrap_servers="...", group="batcher")
 bt.read.kinesis("stream", region="us-east-1")
 bt.read.pulsar("topic", service_url="pulsar://...", subscription="batcher")
-bt.read.pubsub("topic");  bt.read.eventhubs("topic", connection_str="...")
-bt.read.socket("localhost", 9999)                    # dev
-bt.read.rate(rows_per_second=5, num_rows=20)         # dev/test generator
+bt.read.pubsub("topic")
+bt.read.eventhubs("topic", connection_str="...")
+bt.read.socket("localhost", 9999)  # dev
+bt.read.rate(rows_per_second=5, num_rows=20)  # dev/test generator
 bt.read.files_incremental("s3://drop/", "parquet", state_dir="s3://state/")  # autoloader
 ```
 
@@ -71,10 +72,10 @@ re-finds them and the sink's per-batch transaction makes the replay idempotent.
 ## Triggers — when a micro-batch fires
 
 ```python
-bt.Trigger.available_now()          # drain all available data, then stop  <- use in tests
-bt.Trigger.once()                   # exactly one micro-batch, then stop
-bt.Trigger.processing_time("5s")    # a micro-batch every 5s   <- the production default
-bt.Trigger.continuous("1s")         # low-latency, STATELESS pipelines only
+bt.Trigger.available_now()  # drain all available data, then stop  <- use in tests
+bt.Trigger.once()  # exactly one micro-batch, then stop
+bt.Trigger.processing_time("5s")  # a micro-batch every 5s   <- the production default
+bt.Trigger.continuous("1s")  # low-latency, STATELESS pipelines only
 ```
 
 Every trigger exposes `.kind` and `.interval_seconds`; build them with these classmethods,
@@ -88,9 +89,9 @@ latency/efficiency dial); `once` for an externally-scheduled tick.
 offset form** (`y/mo/w/d/h/m/s`, e.g. `"10s"`, `"1mo15d"`):
 
 ```python
-bt.Trigger.processing_time("5 seconds")   # fine
-ds.with_watermark("ts", "5 seconds")      # ValueError: invalid offset '5 seconds'
-ds.with_watermark("ts", "5s")             # correct
+bt.Trigger.processing_time("5 seconds")  # fine
+ds.with_watermark("ts", "5 seconds")  # ValueError: invalid offset '5 seconds'
+ds.with_watermark("ts", "5s")  # correct
 ```
 
 ## Output modes
@@ -118,8 +119,8 @@ for a bursty partition; zero disables idleness and never advances past a silent 
 ```python
 events = (
     bt.read.kafka("clicks")
-    .with_watermark("ts", "10m")                       # tolerate 10m of lateness
-    .group_by(w=bt.window(bt.col("ts"), "1h"))         # tumbling
+    .with_watermark("ts", "10m")  # tolerate 10m of lateness
+    .group_by(w=bt.window(bt.col("ts"), "1h"))  # tumbling
     .agg(hits=bt.count())
 )
 ```
@@ -134,7 +135,7 @@ a running aggregate that never emits.
 state and later emission. Set it from your source's measured lag, not by taste.
 
 ```python
-ds.session_window("ts", "45m", partition_by=["user"], hits=bt.count())      # gap-based
+ds.session_window("ts", "45m", partition_by=["user"], hits=bt.count())  # gap-based
 ds.drop_duplicates_within_watermark(["event_id"], event_time="ts", lateness="10m")
 ```
 
@@ -147,9 +148,12 @@ standard defense against an at-least-once upstream.
 
 ```python
 impressions.join_stream(
-    clicks, on="ad_id",
-    left_time="imp_ts", right_time="click_ts",
-    within="30m", lateness="10m",
+    clicks,
+    on="ad_id",
+    left_time="imp_ts",
+    right_time="click_ts",
+    within="30m",
+    lateness="10m",
 )
 ```
 
@@ -165,9 +169,11 @@ Pass a `checkpoint=` directory and a **stable `query_name=`** to any streaming w
 
 ```python
 q = bt.read.kafka("orders").write(
-    "s3://lake/bronze/orders/", format="parquet",
+    "s3://lake/bronze/orders/",
+    format="parquet",
     trigger=bt.Trigger.processing_time("30s"),
-    checkpoint="s3://state/orders/", query_name="orders-ingest",
+    checkpoint="s3://state/orders/",
+    query_name="orders-ingest",
 )
 ```
 
@@ -201,10 +207,10 @@ source keeps its own `state_dir` alongside the checkpoint; both must survive a r
 
 ```python
 ds.write(path, format="parquet", trigger=..., checkpoint=..., query_name=...)  # path/lakehouse
-ds.write.console(num_rows=20)                      # debugging
-ds.write.memory("name", output_mode="complete")    # read back with bt.read_memory("name")
-ds.write.for_each_batch(fn)                        # fn(table: pa.Table, batch_id: int)
-ds.write.for_each(fn)                              # fn(row: dict) — convenience, slower
+ds.write.console(num_rows=20)  # debugging
+ds.write.memory("name", output_mode="complete")  # read back with bt.read_memory("name")
+ds.write.for_each_batch(fn)  # fn(table: pa.Table, batch_id: int)
+ds.write.for_each(fn)  # fn(row: dict) — convenience, slower
 ```
 
 A file-sink stream writes **one file per micro-batch**, so its file size is whatever the
@@ -225,10 +231,10 @@ and per-batch quality gates: it receives a whole Arrow table, never a row.
 A streaming write returns a `StreamingQuery`. Note the property/method split:
 
 ```python
-q.name / q.is_active / q.status / q.last_progress   # PROPERTIES
-q.recent_progress()                 # METHOD -> list[StreamingQueryProgress]
-q.exception()                       # METHOD -> BaseException | None (does not raise)
-q.await_termination(timeout=None)   # -> bool; RE-RAISES a query failure
+q.name / q.is_active / q.status / q.last_progress  # PROPERTIES
+q.recent_progress()  # METHOD -> list[StreamingQueryProgress]
+q.exception()  # METHOD -> BaseException | None (does not raise)
+q.await_termination(timeout=None)  # -> bool; RE-RAISES a query failure
 q.stop()
 ```
 

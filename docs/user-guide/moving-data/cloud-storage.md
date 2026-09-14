@@ -43,7 +43,9 @@ Only the scheme changes between a bucket and a local disk, so the same read is r
 ```python
 import batcher as bt
 
-bt.from_pydict({"user_id": [1, 2], "status": ["active", "closed"]}).write.parquet("events/a.parquet")
+bt.from_pydict({"user_id": [1, 2], "status": ["active", "closed"]}).write.parquet(
+    "events/a.parquet"
+)
 bt.from_pydict({"user_id": [3], "status": ["active"]}).write.parquet("events/b.parquet")
 
 ds = bt.read.parquet("events/*.parquet")
@@ -133,8 +135,11 @@ Credentials go in `storage_options`, which reaches an fsspec backend as **keywor
 # docs: skip
 ds = bt.read.parquet(
     "oss://bucket/events/*.parquet",
-    storage_options={"key": "...", "secret": "env:OSS_SECRET",
-                     "endpoint": "oss-cn-hangzhou.aliyuncs.com"},
+    storage_options={
+        "key": "...",
+        "secret": "env:OSS_SECRET",
+        "endpoint": "oss-cn-hangzhou.aliyuncs.com",
+    },
 )
 ```
 
@@ -155,15 +160,18 @@ Every reader and writer accepts two optional keywords, so you are never limited 
 import pyarrow.fs as pafs
 import batcher as bt
 
-fs = pafs.S3FileSystem(endpoint_override="https://minio.internal:9000",
-                       access_key="...", secret_key="...")
+fs = pafs.S3FileSystem(
+    endpoint_override="https://minio.internal:9000", access_key="...", secret_key="..."
+)
 ds = bt.read.parquet("s3://bucket/events/*.parquet", filesystem=fs)
 
 # Or the portable dict, which also works across a Ray cluster:
 ds = bt.read.parquet(
     "s3://bucket/events/*.parquet",
-    storage_options={"endpoint_override": "https://minio.internal:9000",
-                     "force_virtual_addressing": "false"},
+    storage_options={
+        "endpoint_override": "https://minio.internal:9000",
+        "force_virtual_addressing": "false",
+    },
 )
 ```
 
@@ -184,8 +192,10 @@ Large cloud datasets are split into tasks so the driver never has to materialize
 ```python
 # docs: skip
 ds = bt.read("s3://bucket/huge/*.parquet")
-result = ds.group_by("region").agg(total=bt.col("amount").sum()).collect(
-    distributed=True, num_workers=16
+result = (
+    ds.group_by("region")
+    .agg(total=bt.col("amount").sum())
+    .collect(distributed=True, num_workers=16)
 )
 ```
 

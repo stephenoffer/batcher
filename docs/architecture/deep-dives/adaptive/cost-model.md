@@ -46,8 +46,8 @@ Weights (`optimizer.cost_weights`):
 ```python
 # docs: skip
 cpu: float = 1.0
-io:  float = 1.0
-net: float = 2.0   # a shuffled byte costs twice a local one
+io: float = 1.0
+net: float = 2.0  # a shuffled byte costs twice a local one
 ```
 
 What feeds that fold, and what comes out of it:

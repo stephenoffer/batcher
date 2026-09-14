@@ -545,10 +545,7 @@ def check_repo_root(tracked: list[str]) -> None:
         path = Path(name)
         if path.name in ROOT_ALLOWED_NAMES or path.suffix in ROOT_ALLOWED_SUFFIXES:
             continue
-        fail(
-            f"{name}: data/scratch file tracked at the repository root — "
-            "it belongs in a package"
-        )
+        fail(f"{name}: data/scratch file tracked at the repository root — it belongs in a package")
 
 
 # --- Allowlist hygiene ------------------------------------------------------------

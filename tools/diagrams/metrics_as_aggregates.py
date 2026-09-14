@@ -27,7 +27,12 @@ body = [
     card(694, 86, 242, 84, "accuracy", "matched / compared"),
     arrow(274, 128, 348, 128, "blue"),
     arrow(604, 128, 688, 128, "blue"),
-    note(490, 196, "No row depends on another, so the partial counts merge in any order, on one core or a hundred.", anchor="middle"),
+    note(
+        490,
+        196,
+        "No row depends on another, so the partial counts merge in any order, on one core or a hundred.",
+        anchor="middle",
+    ),
     # The case that needs a global ordering.
     band(20, 250, 940, 200, "DOES NOT COMPOSE  -  roc_auc(ds, 'y', 's')", "amber"),
     label(314, 304, "sort by score", anchor="middle", size=12),
@@ -37,8 +42,18 @@ body = [
     card(694, 316, 242, 84, "ROC AUC", "the rank identity"),
     arrow(274, 358, 348, 358, "amber"),
     arrow(604, 358, 688, 358, "amber"),
-    note(490, 426, "A rank depends on every other row, so this one adds a distributed sort. That is the whole difference.", anchor="middle"),
-    note(490, 474, "Both take by= or group_by, so per-segment scoring is the same query with a grouping added.", anchor="middle"),
+    note(
+        490,
+        426,
+        "A rank depends on every other row, so this one adds a distributed sort. That is the whole difference.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        474,
+        "Both take by= or group_by, so per-segment scoring is the same query with a grouping added.",
+        anchor="middle",
+    ),
 ]
 
 write("metrics_as_aggregates", svg(W, H, "".join(body)))

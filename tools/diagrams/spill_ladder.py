@@ -52,7 +52,12 @@ body = [
     arrow(249, 350, 249, 382, "amber"),
     label(261, 372, "bucket still over budget"),
     card(50, 386, 398, 64, "re-split under a salted hash", "fan-out 256 max, depth 3 max"),
-    note(249, 468, "Each sub-bucket is an independent instance of the same operator.", anchor="middle"),
+    note(
+        249,
+        468,
+        "Each sub-bucket is an independent instance of the same operator.",
+        anchor="middle",
+    ),
     # --- right: external merge sort ----------------------------------------------
     band(500, 146, 450, 330, "EXTERNAL MERGE SORT", "grey"),
     card(526, 186, 398, 64, "sort into sized runs, spill each", "cut by size, never by key"),
@@ -62,7 +67,12 @@ body = [
     arrow(725, 350, 725, 382, "amber"),
     label(737, 372, "more than one run left"),
     card(526, 386, 398, 64, "another pass over everything", "log16(runs) passes in all"),
-    note(725, 468, "Runs are cut by size (64 MiB by default), not by key, so skew cannot defeat it.", anchor="middle"),
+    note(
+        725,
+        468,
+        "Runs are cut by size (64 MiB by default), not by key, so skew cannot defeat it.",
+        anchor="middle",
+    ),
     # --- legend -------------------------------------------------------------------
     band(24, 492, 926, 140, "WHAT EACH OPERATOR ACTUALLY WRITES", "grey"),
 ]

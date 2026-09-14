@@ -223,7 +223,7 @@ loader = shard_stream_loader(
     epoch=epoch,
     seed=42,
     shuffle_block_size=8 * 65_536,  # eight shards wide
-    cache_size=9,                   # ...so nine shards stay resident
+    cache_size=9,  # ...so nine shards stay resident
 )
 ```
 

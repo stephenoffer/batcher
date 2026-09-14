@@ -60,7 +60,12 @@ def cell(col: int, row: int, lines: tuple[str, ...], live: bool = True) -> str:
 
 
 body: list[str] = [
-    note(490, 50, "Three micro-batches of (key, value) pairs, into group_by(k).agg(m = col('v').max()). Each cell is what the sink receives on that trigger.", anchor="middle"),
+    note(
+        490,
+        50,
+        "Three micro-batches of (key, value) pairs, into group_by(k).agg(m = col('v').max()). Each cell is what the sink receives on that trigger.",
+        anchor="middle",
+    ),
     band(20, 96, 940, 366, "THE SAME INPUT, THREE OUTPUT MODES", "blue"),
 ]
 
@@ -105,9 +110,24 @@ body += [
 
 body += [
     band(20, 482, 940, 108, "READING THE THIRD COLUMN", "grey"),
-    note(490, 524, "Nothing in the third batch raises any group's maximum, so the running result is the one already emitted. Complete re-sends all three rows anyway;", anchor="middle"),
-    note(490, 542, "update anti-joins against what it last emitted and sends none. On a wide key space that difference is the whole reason to pick update.", anchor="middle"),
-    note(490, 566, "The mode is checked at start(). An aggregate refuses append without a watermark and a windowed group key; a stateless pipeline refuses complete and update.", anchor="middle"),
+    note(
+        490,
+        524,
+        "Nothing in the third batch raises any group's maximum, so the running result is the one already emitted. Complete re-sends all three rows anyway;",
+        anchor="middle",
+    ),
+    note(
+        490,
+        542,
+        "update anti-joins against what it last emitted and sends none. On a wide key space that difference is the whole reason to pick update.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        566,
+        "The mode is checked at start(). An aggregate refuses append without a watermark and a windowed group key; a stateless pipeline refuses complete and update.",
+        anchor="middle",
+    ),
 ]
 
 write("output_modes", svg(W, H, "".join(body)))

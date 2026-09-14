@@ -55,7 +55,7 @@ without losing or duplicating data, and `max_rows_per_file` bounds each output f
 import batcher as bt
 
 ds = bt.from_pydict({"v": list(range(1000))})
-ds.write.parquet("/tmp/bt_resume_demo", max_rows_per_file=400)            # 3 part files
+ds.write.parquet("/tmp/bt_resume_demo", max_rows_per_file=400)  # 3 part files
 ds.write.parquet("/tmp/bt_resume_demo", max_rows_per_file=400, resume=True)  # skips committed
 print(bt.read.parquet("/tmp/bt_resume_demo").count())
 # 1000
@@ -72,7 +72,7 @@ because `stream_loader` is the single shard authority.
 ```python
 # docs: skip  (requires torch; shown for reference)
 loader = ds.ml.stream_loader(batch_size=256, world_size=8, rank=0, epoch=0, seed=1)
-for batch in loader:          # {column: torch.Tensor}, this rank's shard
+for batch in loader:  # {column: torch.Tensor}, this rank's shard
     train_step(batch)
 ```
 

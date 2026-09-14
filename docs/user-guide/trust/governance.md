@@ -462,8 +462,8 @@ from batcher.governance import Pseudonymize, Nullify, MatchesAttribute
 catalog = (
     bt.SecurityCatalog()
     .grant("analyst", on=customers, select=["id", "email", "region"])
-    .mask_tag("pii", Pseudonymize("env:PII_KEY"))          # keyed pseudonym
-    .mask_column(customers, "salary", Nullify())            # full redaction
+    .mask_tag("pii", Pseudonymize("env:PII_KEY"))  # keyed pseudonym
+    .mask_column(customers, "salary", Nullify())  # full redaction
     .filter_rows(customers, MatchesAttribute("region", "region"))
 )
 ```

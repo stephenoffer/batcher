@@ -45,9 +45,7 @@ deployment injects settings without touching code.
 ```python
 from batcher import Config
 
-cfg = Config.from_env(
-    {"BATCHER_EXECUTION_PARALLELISM": "16", "BATCHER_MEMORY_SOFT_LIMIT": "0.70"}
-)
+cfg = Config.from_env({"BATCHER_EXECUTION_PARALLELISM": "16", "BATCHER_MEMORY_SOFT_LIMIT": "0.70"})
 print((cfg.execution.parallelism, cfg.memory.soft_limit))
 # (16, 0.7)
 ```

@@ -269,9 +269,9 @@ out. They all accept `partition_by` / `order_by` and lower to the windows above.
 ts = bt.from_pydict({"price": [10, 15, 30]})
 print(
     ts.with_columns(
-        change=bt.col("price").diff(),          # price - lag(price)
-        growth=bt.col("price").pct_change(),    # price / lag(price) - 1
-        rnk=bt.col("price").rank(),             # RANK() OVER (ORDER BY price)
+        change=bt.col("price").diff(),  # price - lag(price)
+        growth=bt.col("price").pct_change(),  # price / lag(price) - 1
+        rnk=bt.col("price").rank(),  # RANK() OVER (ORDER BY price)
     ).to_pydict()
 )
 # {'price': [10, 15, 30], 'change': [None, 5, 15],
@@ -295,9 +295,7 @@ such as a configuration setting or a slowly-changing dimension, and for interpol
 the quantity was moving the whole time, such as a temperature or a meter reading.
 
 ```python
-readings = bt.from_pydict(
-    {"t": [1, 2, 3, 4, 5], "temp": [10.0, None, None, 40.0, None]}
-)
+readings = bt.from_pydict({"t": [1, 2, 3, 4, 5], "temp": [10.0, None, None, 40.0, None]})
 print(
     readings.with_columns(
         held=bt.col("temp").forward_fill().over(order_by=["t"]),

@@ -31,9 +31,11 @@ slice in the same pass.
 
 ```python
 scored = bt.from_pydict(
-    {"model": ["a", "a", "b", "b"],
-     "answer": ["the quick brown fox", "yes", "a slow brown fox", "no"],
-     "gold": ["a fast brown fox", "yes", "the brown fox", "yes"]}
+    {
+        "model": ["a", "a", "b", "b"],
+        "answer": ["the quick brown fox", "yes", "a slow brown fox", "no"],
+        "gold": ["a fast brown fox", "yes", "the brown fox", "yes"],
+    }
 )
 print(scored.group_by("model").agg(f1=bt.token_set_f1("answer", "gold")).sort("model").to_pydict())
 ```
@@ -229,7 +231,11 @@ usage = bt.from_pydict(
 )
 print(
     usage.group_by("model")
-    .agg(spend=bt.token_spend("prompt_tokens", "completion_tokens", input_price=3.0, output_price=15.0))
+    .agg(
+        spend=bt.token_spend(
+            "prompt_tokens", "completion_tokens", input_price=3.0, output_price=15.0
+        )
+    )
     .sort("model")
     .to_pydict()
 )
@@ -313,7 +319,7 @@ misunderstanding into a strong positive.
 import batcher as bt
 from batcher.ml import llm_score_udf
 
-judge = lambda: (lambda prompts: ["4"] * len(prompts))
+judge = lambda: lambda prompts: ["4"] * len(prompts)
 graded = bt.from_pydict({"answer": ["Paris is the capital of France."]}).ml.map_batches(
     llm_score_udf(judge, template="Rate this answer 1-5 for accuracy:\n{answer}"),
     output_columns=["answer", "score"],
@@ -336,7 +342,7 @@ between a win rate and a measurement of the judge.
 ```python
 from batcher.ml import llm_pairwise_udf
 
-biased = lambda: (lambda prompts: ["A"] * len(prompts))  # always prefers the first
+biased = lambda: lambda prompts: ["A"] * len(prompts)  # always prefers the first
 compared = bt.from_pydict({"base": ["one"], "tuned": ["two"]}).ml.map_batches(
     llm_pairwise_udf(
         biased,

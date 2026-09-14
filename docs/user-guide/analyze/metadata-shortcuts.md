@@ -15,14 +15,14 @@ You do not have to ask for any of it. It happens underneath the API you already 
 # docs: skip
 import batcher as bt
 
-ds = bt.read.parquet("s3://warehouse/events/")      # 10 billion rows
+ds = bt.read.parquet("s3://warehouse/events/")  # 10 billion rows
 
-ds.count()                                          # a footer read
-ds.min("amount"), ds.max("amount")                  # a footer read
-ds.null_count()                                     # a footer read
-ds.filter(bt.col("amount") > 10**9).collect()       # provably empty: the files go unread
-ds.join(dim, on="region_id").collect()              # key ranges disjoint? no shuffle at all
-ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()   # a contract the footer discharges
+ds.count()  # a footer read
+ds.min("amount"), ds.max("amount")  # a footer read
+ds.null_count()  # a footer read
+ds.filter(bt.col("amount") > 10**9).collect()  # provably empty: the files go unread
+ds.join(dim, on="region_id").collect()  # key ranges disjoint? no shuffle at all
+ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()  # a contract the footer discharges
 ```
 
 Each of those is an ordinary call. Each one, on this data, costs a metadata round trip
@@ -152,22 +152,22 @@ answered from a recorded statistic when there is one, and from a query when ther
 ```python
 c = ds.meta.col("amount")
 
-assert c.bounds() == (3.25, 99.0)   # (min, max), one footer read not two passes
-assert c.range() == 95.75           # max - min
-assert c.midpoint() == 51.125       # the center of the range (not the mean, not the median)
-assert c.abs_max() == 99.0          # max(|min|, |max|): does this fit in an int32?
-assert c.n_unique() == 4            # exact COUNT(DISTINCT)
-assert c.is_unique()                # every non-null value occurs once?
+assert c.bounds() == (3.25, 99.0)  # (min, max), one footer read not two passes
+assert c.range() == 95.75  # max - min
+assert c.midpoint() == 51.125  # the center of the range (not the mean, not the median)
+assert c.abs_max() == 99.0  # max(|min|, |max|): does this fit in an int32?
+assert c.n_unique() == 4  # exact COUNT(DISTINCT)
+assert c.is_unique()  # every non-null value occurs once?
 assert not c.has_duplicates()
-assert c.duplicate_count() == 0     # how many rows a DISTINCT would remove
-assert c.is_key()                   # unique and never null
-assert not c.is_constant()          # min == max would mean one value, and no other
+assert c.duplicate_count() == 0  # how many rows a DISTINCT would remove
+assert c.is_key()  # unique and never null
+assert not c.is_constant()  # min == max would mean one value, and no other
 assert c.constant_value() is None
-assert c.is_low_cardinality(128)    # dictionary-encode it? one-hot it?
-assert not c.is_binary_valued()     # a flag, a label, a mask
+assert c.is_low_cardinality(128)  # dictionary-encode it? one-hot it?
+assert not c.is_binary_valued()  # a flag, a label, a mask
 assert c.null_fraction() == 0.0
 assert c.no_nulls()
-assert c.sum() == 137.75            # from a recorded total, when the source has one
+assert c.sum() == 137.75  # from a recorded total, when the source has one
 assert c.mean() == 34.4375
 assert c.summary()["n_unique"] == 4  # all of the above, as one dict
 ```
@@ -185,12 +185,12 @@ and that turns a whole class of questions into arithmetic on two numbers.
 ```python
 amt = ds.meta.col("amount").check
 
-assert amt.all_positive()          # decided by the minimum, alone
+assert amt.all_positive()  # decided by the minimum, alone
 assert amt.all_non_negative()
 assert not amt.all_negative()
 assert not amt.all_non_positive()
 assert not amt.all_zero()
-assert amt.all_between(0, 1000)    # the range check a quality gate runs on every row
+assert amt.all_between(0, 1000)  # the range check a quality gate runs on every row
 assert amt.all_greater_than(0)
 assert amt.all_greater_equal(3.25)
 assert amt.all_less_than(1000)
@@ -212,11 +212,11 @@ Membership is the other half, and it is **asymmetric** on purpose:
 ```python
 ids = ds.meta.col("id").check
 
-assert not ids.contains(9999)     # absence is provable; presence usually is not
-assert ids.never_equals(9999)     # the spelling a skip decision reads as
+assert not ids.contains(9999)  # absence is provable; presence usually is not
+assert ids.never_equals(9999)  # the spelling a skip decision reads as
 assert not ids.may_contain(9999)  # free, one-sided: False is a proof of absence
 assert ids.contains(3)
-assert ids.any_in([3, 4])         # SQL IN, refuted for free when every candidate is out of range
+assert ids.any_in([3, 4])  # SQL IN, refuted for free when every candidate is out of range
 assert ids.none_in([9998, 9999])
 ```
 
@@ -335,8 +335,8 @@ returns `None` if nobody has measured it yet.
 ```python
 approx = ds.meta.approx
 
-assert approx.rows() == 4.0        # the cost model's estimate, always available
-assert approx.memory_bytes() > 0   # size a buffer, a broadcast, a spill threshold
+assert approx.rows() == 4.0  # the cost model's estimate, always available
+assert approx.memory_bytes() > 0  # size a buffer, a broadcast, a spill threshold
 assert approx.row_bytes() > 0
 assert approx.column_bytes("amount") == 32.0
 assert 0.0 <= approx.selectivity(bt.col("amount") > 20) <= 1.0

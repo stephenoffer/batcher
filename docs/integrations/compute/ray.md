@@ -262,9 +262,7 @@ import batcher as bt
 
 base = bt.active_config()
 bt.set_config(
-    base.replace(
-        distributed=dataclasses.replace(base.distributed, capacity_aware_placement=True)
-    )
+    base.replace(distributed=dataclasses.replace(base.distributed, capacity_aware_placement=True))
 )
 
 # The scan and the filter run on spot; the aggregate's shuffle fleet runs on on-demand.

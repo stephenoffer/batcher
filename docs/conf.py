@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath(".."))
 
 project = "Batcher"
 author = "Batcher Contributors"
-copyright = f"{datetime.now(tz=timezone.utc):%Y}, Batcher Contributors"
+copyright = f"{datetime.now(tz=UTC):%Y}, Batcher Contributors"
 
 # Track the installed package version (set in the workspace Cargo.toml) instead of a
 # hardcoded literal; fall back when the docs are built without the engine installed.

@@ -36,7 +36,9 @@ body = [
     arrow(600, 104, 670, 104),
     label(635, 92, "held while", anchor="middle"),
     card(670, 68, 230, 72, "probe subtree", "adds its own peak"),
-    label(490, 178, "peak(join) = max( peak(build),  resident(join) + peak(probe) )", anchor="middle"),
+    label(
+        490, 178, "peak(join) = max( peak(build),  resident(join) + peak(probe) )", anchor="middle"
+    ),
     note(
         490,
         202,
@@ -55,7 +57,11 @@ for i, (right, text) in enumerate(STEPS):
     ]
 
 body += [
-    note(62, 448, "Floored at one morsel, so a streaming plan is never refused for a budget smaller than a single batch."),
+    note(
+        62,
+        448,
+        "Floored at one morsel, so a streaming plan is never refused for a budget smaller than a single batch.",
+    ),
     band(30, 478, 920, 206, "OVER BUDGET IS A COUNTER-OFFER, NOT A FAILURE", "grey"),
     label(490, 514, "is the plan's peak inside that envelope?", anchor="middle"),
     arrow(430, 522, 280, 548),
@@ -65,7 +71,9 @@ body += [
     card(70, 552, 380, 76, "Runs in memory", "admitted with no bound imposed"),
     card(530, 552, 380, 76, "m_max_bytes = the envelope", "the operator goes out of core"),
     note(720, 652, "The verdict names the binding join, aggregate or sort.", anchor="middle"),
-    note(720, 670, "Sized from a guess it is advisory: it routes, it never fails.", anchor="middle"),
+    note(
+        720, 670, "Sized from a guess it is advisory: it routes, it never fails.", anchor="middle"
+    ),
 ]
 
 write("memory_envelope", svg(W, H, "".join(body)))

@@ -45,9 +45,7 @@ frequency table, and no Python touches a token.
 import batcher as bt
 from batcher import col
 
-documents = bt.from_pydict(
-    {"text": ["the quick brown fox", "the lazy dog", "the quick dog"]}
-)
+documents = bt.from_pydict({"text": ["the quick brown fox", "the lazy dog", "the quick dog"]})
 
 frequencies = (
     documents.select(word=col("text").str.split(" "))

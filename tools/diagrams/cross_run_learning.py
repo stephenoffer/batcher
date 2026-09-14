@@ -39,34 +39,44 @@ body = [
     card(44, 222, 292, 80, "Core measures", "rows, times, column sketches"),
     arrow(190, 190, 190, 222, "blue"),
     label(202, 212, "executes it", anchor="start"),
-
     # ---- the thing in the middle -------------------------------------------
     card(390, 150, 220, 140, "MetadataHub", "keyed by plan signature"),
     note(500, 246, "and, for anything in machine", anchor="middle"),
     note(500, 264, "units, by hardware fingerprint", anchor="middle"),
     note(500, 338, "Core writes after every run; Kyber reads before every plan.", anchor="middle"),
     note(500, 366, "measured cardinalities  ·  operator wall times", anchor="middle"),
-    note(500, 386, "column sketches  ·  fitted cost coefficients  ·  bandit arm rewards", anchor="middle"),
-
+    note(
+        500,
+        386,
+        "column sketches  ·  fitted cost coefficients  ·  bandit arm rewards",
+        anchor="middle",
+    ),
     # ---- run N + 1 ---------------------------------------------------------
     band(640, 56, 320, 280, "RUN N + 1", "blue"),
     card(664, 110, 272, 80, "Kyber plans again", "on measured numbers"),
     card(664, 222, 272, 80, "Core measures", "and records again"),
     arrow(800, 190, 800, 222, "blue"),
     label(812, 212, "executes it", anchor="start"),
-
     arrow(336, 258, 390, 232, "amber"),
     label(363, 222, "writes", anchor="middle"),
     arrow(610, 198, 664, 166, "amber"),
     label(637, 140, "reads", anchor="middle"),
-
     # ---- the axis that makes it different ----------------------------------
     arrow(40, 442, 940, 442, "grey"),
     label(40, 428, "the query ends; the hub does not", anchor="start"),
     note(940, 428, "a later query, another process, minutes or days on", anchor="end"),
-
-    note(490, 490, "This is the same stage-boundary mechanism Spark AQE uses, with one difference worth claiming: AQE keeps nothing once the", anchor="middle"),
-    note(490, 510, "query finishes, so it re-learns the same shape every time. Core measures, Kyber consumes -- and never the other way round.", anchor="middle"),
+    note(
+        490,
+        490,
+        "This is the same stage-boundary mechanism Spark AQE uses, with one difference worth claiming: AQE keeps nothing once the",
+        anchor="middle",
+    ),
+    note(
+        490,
+        510,
+        "query finishes, so it re-learns the same shape every time. Core measures, Kyber consumes -- and never the other way round.",
+        anchor="middle",
+    ),
 ]
 
 write("cross_run_learning", svg(W, H, "".join(body)))

@@ -49,11 +49,26 @@ body = [
     # And back to the trigger. Dashed, because this edge is a wait, not work.
     curve(COL[1] - 6, MID2, COL[0] + CW / 2, MID2, COL[0] + CW / 2, ROW1 + CH + 6, "amber"),
     label(370, 340, "sleep the rest of the interval", anchor="end"),
-    note(190, 364, "A draining trigger (once · available_now) skips the wait and stops when the source is spent.", anchor="start"),
+    note(
+        190,
+        364,
+        "A draining trigger (once · available_now) skips the wait and stops when the source is spent.",
+        anchor="start",
+    ),
     # What the ordering buys, stated as the window it leaves open.
     band(20, 412, 940, 76, "IF THE PROCESS DIES", "grey"),
-    note(490, 456, "The only epoch a crash can lose is one that was staged and not published.", anchor="middle"),
-    note(490, 474, "The next run replays it, and a sink that records its own query name and batch id commits nothing the second time.", anchor="middle"),
+    note(
+        490,
+        456,
+        "The only epoch a crash can lose is one that was staged and not published.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        474,
+        "The next run replays it, and a sink that records its own query name and batch id commits nothing the second time.",
+        anchor="middle",
+    ),
 ]
 
 write("streaming_microbatch", svg(W, H, "".join(body)))

@@ -69,7 +69,12 @@ body = [
     arrow(710, 414, 710, 452),
     label(722, 438, "ask the largest other consumer"),
     card(560, 456, 300, 84, "Cooperative retry", "it spills, then re-reserve"),
-    note(710, 560, "At most 32 rounds, and it stops the moment a round frees nothing.", anchor="middle"),
+    note(
+        710,
+        560,
+        "At most 32 rounds, and it stops the moment a round frees nothing.",
+        anchor="middle",
+    ),
     arrow(556, 528, 368, 528),
     label(462, 514, "still short", anchor="middle"),
     card(62, 486, 300, 84, "The caller spills", "the refusal is the signal"),

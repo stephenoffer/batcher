@@ -166,9 +166,7 @@ real thing, so anything else that reads gzip reads what Batcher writes, and the 
 
 ```python
 records = bt.from_pydict({"body": ["round trip"]})
-out = records.select(
-    back=bt.col("body").str.compress("zstd").str.decompress("zstd").cast("string")
-)
+out = records.select(back=bt.col("body").str.compress("zstd").str.decompress("zstd").cast("string"))
 print(out.to_pydict())
 # {'back': ['round trip']}
 ```

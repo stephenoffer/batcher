@@ -46,11 +46,7 @@ It is the shortcut everyone reaches for, because it is one `GROUP BY` and it nee
 window function:
 
 ```python
-by_day = (
-    events.group_by("user", day=col("ts").dt.truncate("day"))
-    .agg(hits=bt.count())
-    .sort("user")
-)
+by_day = events.group_by("user", day=col("ts").dt.truncate("day")).agg(hits=bt.count()).sort("user")
 print(by_day.to_pydict())
 # {'user': ['u1', 'u2'], 'day': [datetime.datetime(2024, 1, 1, 0, 0),
 #  datetime.datetime(2024, 1, 1, 0, 0)], 'hits': [5, 3]}

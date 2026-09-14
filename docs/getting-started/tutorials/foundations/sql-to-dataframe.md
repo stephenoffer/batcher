@@ -106,9 +106,7 @@ direction is a conversion, because there is nothing to convert: both are the sam
 ::::{tab-set}
 :::{tab-item} SQL, then DataFrame
 ```python
-customers = bt.from_pydict(
-    {"customer": ["ann", "bo", "cy"], "tier": ["gold", "silver", "silver"]}
-)
+customers = bt.from_pydict({"customer": ["ann", "bo", "cy"], "tier": ["gold", "silver", "silver"]})
 
 by_tier = bt.sql(
     "SELECT c.tier, SUM(o.amount) AS revenue "

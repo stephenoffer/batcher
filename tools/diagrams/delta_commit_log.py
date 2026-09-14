@@ -43,7 +43,12 @@ VERSIONS = (
 )
 
 body: list[str] = [
-    note(490, 54, "Every commit records which files the table now holds. It adds files and retires references; it never rewrites an earlier version.", anchor="middle"),
+    note(
+        490,
+        54,
+        "Every commit records which files the table now holds. It adds files and retires references; it never rewrites an earlier version.",
+        anchor="middle",
+    ),
     band(20, 90, 940, 292, "ONE TABLE, FOUR COMMITS, FIVE DATA FILES", "blue"),
 ]
 
@@ -95,10 +100,30 @@ for name, x in zip(FILES, COL_X):
 
 body += [
     band(20, 462, 940, 140, "VACUUM IS THE ONLY OPERATION THAT DELETES", "amber"),
-    note(40, 504, "Those three files are referenced by no live version, so vacuum may reclaim them. Until it does, every one of them is still on storage, which is the only", anchor="start"),
-    note(40, 522, "reason reading version 1 works at all. Time travel is not a backup taken on the side: it is what a log that only ever adds leaves behind.", anchor="start"),
-    note(40, 550, "Compact produced v3 by bin-packing f1 and f3 into f5. Its remove actions retire the two from the log and leave them on storage, so v1 and v2 still read.", anchor="start"),
-    note(40, 572, "Vacuum is the step that makes that irreversible, so it defaults to a dry run and keeps an unreferenced file for a retention window first.", anchor="start"),
+    note(
+        40,
+        504,
+        "Those three files are referenced by no live version, so vacuum may reclaim them. Until it does, every one of them is still on storage, which is the only",
+        anchor="start",
+    ),
+    note(
+        40,
+        522,
+        "reason reading version 1 works at all. Time travel is not a backup taken on the side: it is what a log that only ever adds leaves behind.",
+        anchor="start",
+    ),
+    note(
+        40,
+        550,
+        "Compact produced v3 by bin-packing f1 and f3 into f5. Its remove actions retire the two from the log and leave them on storage, so v1 and v2 still read.",
+        anchor="start",
+    ),
+    note(
+        40,
+        572,
+        "Vacuum is the step that makes that irreversible, so it defaults to a dry run and keeps an unreferenced file for a retention window first.",
+        anchor="start",
+    ),
 ]
 
 write("delta_commit_log", svg(W, H, "".join(body)))

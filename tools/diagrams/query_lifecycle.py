@@ -63,15 +63,12 @@ body = [
     card(LEFT_X, TOP_Y, CW, CH, "Kyber", "rules, join order, bounds"),
     verb(LEFT_X + CW / 2, TOP_Y + 26, "DECIDES"),
     phase(LEFT_X + CW / 2, TOP_Y + CH - 12, "kyber.optimize_full"),
-
     card(RIGHT_X, TOP_Y, CW, CH, "Carbonite", "does this fit the envelope?"),
     verb(RIGHT_X + CW / 2, TOP_Y + 26, "PROTECTS"),
     phase(RIGHT_X + CW / 2, TOP_Y + CH - 12, "carbonite.validate"),
-
     card(RIGHT_X, BOT_Y, CW, CH, "Core", "runs it, reports what happened"),
     verb(RIGHT_X + CW / 2, BOT_Y + 26, "MEASURES"),
     phase(RIGHT_X + CW / 2, BOT_Y + CH - 12, "core.execute"),
-
     card(LEFT_X, BOT_Y, CW, CH, "MetadataHub", "sketches and measured rows"),
     verb(LEFT_X + CW / 2, BOT_Y + 26, "REMEMBERS"),
     phase(LEFT_X + CW / 2, BOT_Y + CH - 12, "collect_source_metadata"),
@@ -85,29 +82,26 @@ body += [
     f'fill="none" stroke="{BLUE}" stroke-width="2.4" marker-end="url(#arB)"/>',
     label(MID_X, TOP_Y + CH / 2 - 16, "a PhysicalPlan", anchor="middle", size=11.5),
     note(MID_X, TOP_Y + CH / 2 + 26, "with a resource bound per operator", anchor="middle"),
-
     # Carbonite -> Core, the direct route
     f'<path d="M {RIGHT_X + CW / 2} {TOP_Y + CH + 8} L {RIGHT_X + CW / 2} {BOT_Y - 10}" '
     f'fill="none" stroke="{BLUE}" stroke-width="2.4" marker-end="url(#arB)"/>',
     label(RIGHT_X + CW / 2 + 14, TOP_Y + CH + 58, "it fits:", size=11.5),
     note(RIGHT_X + CW / 2 + 14, TOP_Y + CH + 76, "reserve, then run"),
-
     # Core -> MetadataHub
     f'<path d="M {RIGHT_X - 10} {BOT_Y + CH / 2} L {LEFT_X + CW + 8} {BOT_Y + CH / 2}" '
     f'fill="none" stroke="{BLUE}" stroke-width="2.4" marker-end="url(#arB)"/>',
     label(MID_X, BOT_Y + CH / 2 - 16, "per-operator metrics", anchor="middle", size=11.5),
     note(MID_X, BOT_Y + CH / 2 + 26, "actual rows, time, peak bytes", anchor="middle"),
-
     # MetadataHub -> Kyber, the edge that makes it a loop
     f'<path d="M {LEFT_X + CW / 2} {BOT_Y - 10} L {LEFT_X + CW / 2} {TOP_Y + CH + 8}" '
     f'fill="none" stroke="{AMBER_DEEP}" stroke-width="2.4" stroke-dasharray="6 4" '
     f'marker-end="url(#arA)"/>',
     f'<text x="{LEFT_X + CW / 2 - 16}" y="{TOP_Y + CH + 58}" text-anchor="end" '
     f'font-family="{FONT}" font-size="11.5" font-weight="700" fill="{AMBER_DEEP}">'
-    f'read on the</text>',
+    f"read on the</text>",
     f'<text x="{LEFT_X + CW / 2 - 16}" y="{TOP_Y + CH + 76}" text-anchor="end" '
     f'font-family="{FONT}" font-size="11.5" font-weight="700" fill="{AMBER_DEEP}">'
-    f'next run, not this one</text>',
+    f"next run, not this one</text>",
 ]
 
 # ---- The third outcome of admission ---------------------------------------
@@ -118,10 +112,18 @@ body += [
     f'<path d="M {DET_X + DET_W + 10} {DET_Y + DET_H - 14} L {RIGHT_X + 46} {BOT_Y - 10}" '
     f'fill="none" stroke="{AMBER_DEEP}" stroke-width="2.2" marker-end="url(#arA)"/>',
     note(DET_X + DET_W / 2, DET_Y - 16, "won't fit in memory: spill, then run", anchor="middle"),
-    note(DET_X + DET_W / 2, DET_Y + DET_H + 20, "Any other binding constraint raises instead:",
-         anchor="middle"),
-    note(DET_X + DET_W / 2, DET_Y + DET_H + 38, "spilling only ever answers a memory constraint.",
-         anchor="middle"),
+    note(
+        DET_X + DET_W / 2,
+        DET_Y + DET_H + 20,
+        "Any other binding constraint raises instead:",
+        anchor="middle",
+    ),
+    note(
+        DET_X + DET_W / 2,
+        DET_Y + DET_H + 38,
+        "spilling only ever answers a memory constraint.",
+        anchor="middle",
+    ),
 ]
 
 # ---- In and out ------------------------------------------------------------

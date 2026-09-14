@@ -267,7 +267,7 @@ batch *n+1* runs while the GPU chews on batch *n*.
 scored = (
     bt.read.parquet("s3://bucket/corpus.parquet")
     .map_batches(HFTokenizer(), output_columns=["id", "text", "input_ids"])  # CPU
-    .ml.infer(Classifier, num_gpus=1, concurrency=4)                          # GPU
+    .ml.infer(Classifier, num_gpus=1, concurrency=4)  # GPU
 )
 ```
 

@@ -134,7 +134,7 @@ narrow = bt.read.table(
     "bigquery",
     project="acme-billing",
     table="acme-data.analytics.events",
-    selected_fields=("user_id", "ts"),          # scanned server-side
+    selected_fields=("user_id", "ts"),  # scanned server-side
     row_restriction="event_type = 'purchase'",  # filtered server-side
 )
 ```

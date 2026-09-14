@@ -50,9 +50,7 @@ Clips from different sources differ in level, length and sample rate, and a mode
 # docs: skip
 from batcher import col
 
-fixed = clips.with_columns(
-    audio=col("bytes").audio.trim_silence().audio.pad_or_trim(30.0, 16000)
-)
+fixed = clips.with_columns(audio=col("bytes").audio.trim_silence().audio.pad_or_trim(30.0, 16000))
 ```
 
 `slice(offset_secs, duration_secs)` extracts a region, measured against the clip's own sample rate. A window past the end of the recording yields an empty list rather than null, because an empty region is a fact about the window and not a failure to read the clip.

@@ -39,7 +39,9 @@ NW, NH = 150, 46
 SW, SH = 168, 52
 
 
-def node(x: float, y: float, w: float, h: float, title: str, sub: str, changed: bool = False) -> str:
+def node(
+    x: float, y: float, w: float, h: float, title: str, sub: str, changed: bool = False
+) -> str:
     """One plan node. `changed` outlines a node this rewrite moved or narrowed."""
     stroke = AMBER_DEEP if changed else "#cbd5e1"
     width = "2.2" if changed else "1.2"
@@ -104,12 +106,15 @@ body += [
 ]
 
 body += [
-    note(490, 492,
-         "The Filter stays put. source_predicates is a hint, so a connector that translates none of it, or only part of it, is still correct.",
-         anchor="middle"),
+    note(
+        490,
+        492,
+        "The Filter stays put. source_predicates is a hint, so a connector that translates none of it, or only part of it, is still correct.",
+        anchor="middle",
+    ),
     f'<text x="490" y="516" text-anchor="middle" font-family="{FONT}" font-size="11.5" '
     f'font-weight="700" fill="{AMBER_DEEP}">Only a conjunct naming one side of the join '
-    f'moves below it. One that names both stays above.</text>',
+    f"moves below it. One that names both stays above.</text>",
 ]
 
 write("pushdown_before_after", svg(W, H, "".join(body)))

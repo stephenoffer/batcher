@@ -56,12 +56,11 @@ in either direction.
 ```python
 import batcher as bt
 
-orders = bt.read.parquet("s3://bucket/orders/")      # lazy
+orders = bt.read.parquet("s3://bucket/orders/")  # lazy
 customers = bt.read.parquet("s3://bucket/customers/")
 
 result = (
-    orders
-    .filter(bt.col("status") == "paid")              # filter early — it pushes down
+    orders.filter(bt.col("status") == "paid")  # filter early — it pushes down
     .join(customers, on="cust_id", how="inner")
     .with_columns(net=bt.col("amount") * 0.9)
     .group_by("region")
@@ -69,7 +68,7 @@ result = (
     .sort("revenue", descending=True)
 )
 
-result.write("s3://bucket/out/", mode="overwrite")   # terminal
+result.write("s3://bucket/out/", mode="overwrite")  # terminal
 ```
 
 Nothing before `.write(...)` executes. Swap the last line for `result.to_pydict()` when
@@ -103,8 +102,8 @@ folds across columns: `bt.sum_horizontal`, `bt.max_horizontal`, `bt.coalesce`,
 is dropped. `with_columns(*exprs, **named)` **adds or replaces**, keeping everything else.
 
 ```python
-ds.with_columns(net=bt.col("amount") * 0.9)         # all original columns + net
-ds.select("order_id", net=bt.col("amount") * 0.9)   # exactly two columns
+ds.with_columns(net=bt.col("amount") * 0.9)  # all original columns + net
+ds.select("order_id", net=bt.col("amount") * 0.9)  # exactly two columns
 ```
 
 Use `select` as the last step to prune the output; the optimizer pushes that pruning back
@@ -113,10 +112,10 @@ into the scan.
 ## Joins
 
 ```python
-ds.join(other, on="k", how="inner")                       # on / left_on / right_on
+ds.join(other, on="k", how="inner")  # on / left_on / right_on
 ds.join(other, left_on="cust_id", right_on="id", how="left", suffix="_c")
 ds.cross_join(other)
-quotes.join_asof(trades, on="ts", by="symbol", direction="backward")   # time-series
+quotes.join_asof(trades, on="ts", by="symbol", direction="backward")  # time-series
 ```
 
 `how` is `"inner" | "left" | "right" | "full"` (`"outer"`) `| "semi" | "anti"` — semi/anti
@@ -129,8 +128,11 @@ Set ops: `ds.union(other)` (`distinct=True` to dedup), `ds.intersect`, `ds.excep
 ## group_by / agg
 
 ```python
-(ds.group_by("region", "status")
-   .agg(revenue=bt.sum("amount"), n=bt.count(), p95=bt.quantile("amount", 0.95)))
+(
+    ds.group_by("region", "status").agg(
+        revenue=bt.sum("amount"), n=bt.count(), p95=bt.quantile("amount", 0.95)
+    )
+)
 ```
 
 Keyword names become output column names — that is the one obvious spelling. `group_by`
@@ -172,9 +174,11 @@ When no expression covers the logic, drop to a callback over **whole Arrow batch
 import pyarrow as pa
 import pyarrow.compute as pc
 
+
 def add_total(batch: pa.RecordBatch) -> pa.RecordBatch:
     total = pc.multiply(batch.column("price"), batch.column("qty"))
     return batch.append_column("total", total)
+
 
 ds.map_batches(add_total, output_columns=["price", "qty", "total"])
 ```
