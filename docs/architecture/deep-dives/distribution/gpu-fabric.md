@@ -12,11 +12,15 @@ Three facts decide it, and Batcher reads all three.
 
 The connected groups of that overlay are *islands*. An eight-device server is usually one island. Two four-device boards in one chassis are two, and a collective spanning them runs every step at the slower of the two links.
 
-**Which NIC each device leaves through.** A dense node has several NICs, and a transfer between a device and a NIC under a different root complex crosses the inter-socket link twice for a transfer whose whole purpose is to leave the node. Asking each device for its nearest NIC gives the right answer per device and the wrong one per node: eight devices asked independently can all name the same NIC, and then one rail carries the whole shuffle while seven sit idle. Batcher assigns rails node-wide instead. A device takes its closest NIC unless that NIC already holds its share and an equally close one is free, and balance never overrides distance, because crossing a socket to even out a rail costs more than the imbalance saves.
+**Which NIC each device leaves through.** A dense node has several NICs, and a transfer between a device and a NIC under a different root complex crosses the inter-socket link twice for a transfer whose whole purpose is to leave the node. Asking each device for its nearest NIC gives the right answer per device and the wrong one per node. Eight devices asked independently can all name the same NIC, and then one rail carries the whole shuffle while seven sit idle. Batcher assigns rails node-wide instead. A device takes its closest NIC unless that NIC already holds its share and an equally close one is free, and balance never overrides distance, because crossing a socket to even out a rail costs more than the imbalance saves.
 
 **What the links actually negotiated.** A card that renegotiated to half width enumerates, runs, and returns correct results at half its host bandwidth. That figure is the term a device decision is most sensitive to, so it is read rather than assumed.
 
 Every probe degrades to nothing. Off Linux, without the driver, or inside a container that did not mount the relevant `/sys` tree, each reports an empty or neutral answer and every decision below keeps the behavior it had before the probe existed.
+
+The same eight devices are one island or two depending on wires nothing in a job's timings reports, and both arrangements return correct results.
+
+![The fabric facts Batcher reads on a multi-GPU node, and the exchange schedule read off them. Peer islands are the connected groups of the NVLink-over-bus overlay: eight devices joined as two groups of four by a coherent fabric, with only the PCI bus between the groups, are two islands of four rather than one of eight. Two devices under different root complexes are the furthest apart the bus can express and still exchange at full fabric rate if NVLink joins them, so a group picked on bus distance alone picks the wrong four. Rails are which NIC each device leaves the node through, assigned node-wide rather than per device: asked one at a time, all eight devices can name the same NIC, and then one rail carries the whole shuffle while seven sit idle with every counter reporting a healthy fabric. The exchange schedule is n - 1 rounds of n / 2 disjoint pairs, so no device is the source of one copy and the destination of another in the same round: for four devices that is 0-3 and 1-2, then 0-2 and 1-3, then 0-1 and 2-3. A reduction ring is ordered by the fabric rather than by device index, because its rate is its worst hop. Three decisions follow: a collective is strict-packed inside one island and a plan covering fewer devices than the stage asked for is refused, because a partial gang hangs; shards are dealt by measured throughput under largest-remainder apportionment, with an unmeasured device treated as average and never as idle; and the device path is used only when it wins by 1.25x, so an unpriced link makes a plan refuse and a plan that merely ties loses.](/_static/diagrams/gpu_fabric_topology.svg)
 
 ## What changes because of it
 
@@ -28,7 +32,7 @@ Two rules keep that safe. Nothing is set that a probe did not answer, so an unre
 
 ### A collective is placed inside one fabric
 
-A stage flagged as running its own collective is gang-scheduled with `STRICT_PACK`, so its workers are co-located. Co-location alone does not make a node wide enough, so the bundle layout comes from the fleet's topology: a node whose coherent domain already holds the whole world size is preferred, the largest domain is filled first when none does, and a node excluded by a data-residency rule or a power-zone budget is skipped before placement rather than after.
+A stage flagged as running its own collective is gang-scheduled with `STRICT_PACK`, so its workers are co-located. Co-location alone does not make a node wide enough. The bundle layout therefore comes from the fleet's topology: a node whose coherent domain already holds the whole world size is preferred, the largest domain is filled first when none does, and a node excluded by a data-residency rule or a power-zone budget is skipped before placement rather than after.
 
 A plan that covers fewer devices than the stage asked for is not used. Reserving the partial gang succeeds and then hangs the stage on a world size it never receives, which is a worse failure than the pending request Ray reports on its own.
 
@@ -72,7 +76,7 @@ A shuffle's own statistics carry the same measurement while it runs. Alongside t
 
 ## Requirements and limitations
 
-- **The probes need the host's `/sys` tree.** A container without the PCI tree, the InfiniBand tree, or NVML mounted reports an unreadable topology, and every decision here falls back to the behavior it had before. Nothing fails; the fleet is simply scheduled blind.
+- **The probes need the host's `/sys` tree.** A container without the PCI tree, the InfiniBand tree, or NVML mounted reports an unreadable topology, and every decision here falls back to the behavior it had before. Nothing fails. The fleet is scheduled blind.
 - **These are control-plane decisions.** Batcher places work, sizes it, and configures the collective library. It does not perform device-to-device copies itself: the Arrow contract at every operator boundary is unchanged, and the exchange schedule is a plan the framework doing the copying carries out.
 - **The figures are nameplate or measured, never inferred.** A device model Batcher does not recognize contributes no bandwidth figure rather than a guessed one, and an unpriced link makes a plan refuse rather than proceed optimistically.
 - **AMD's XGMI fabric is not read.** The sysfs names have moved between kernel releases, and a fabric figure that is wrong is worse than one that is absent, so an Instinct node reports its bus topology and no coherent fabric.

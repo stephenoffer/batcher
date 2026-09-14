@@ -7,9 +7,9 @@ file pruning; writes are `append` or `overwrite`, committed as one snapshot by t
 | | |
 | --- | --- |
 | **Read** | {py:meth}`bt.read.iceberg(identifier, catalog=...) <batcher.api.io_namespace.reader.Reader.iceberg>`, with `snapshot_id=` |
-| **Write** | {py:meth}`ds.write.iceberg(identifier, mode="append"\|"overwrite") <batcher.api.io_namespace.writer.Writer.iceberg>` |
+| **Write** | {py:meth}`ds.write.iceberg(identifier, mode="append"\|"overwrite") <batcher.api.io_namespace.writer.Writer.iceberg>`, with `replace_where=` |
 | **Extra** | `pip install 'batcher-engine[iceberg]'` |
-| **Parallelism** | One split per data file surviving `plan_files`; serial on merge-on-read |
+| **Parallelism** | One split per data file surviving `plan_files`, merge-on-read included |
 | **Pushdown** | Predicates into `plan_files`, answered against the manifests |
 | **Credentials** | The catalog properties authenticate to the catalog, not to storage |
 
@@ -103,7 +103,9 @@ bt.from_pydict({"id": [4], "amount": [40]}).write.iceberg(
 
 print(bt.read.iceberg("db.orders", catalog=catalog).sort("id").to_pydict()["id"])
 # [1, 2, 3, 4]
-print(bt.read.iceberg("db.orders", catalog=catalog, snapshot_id=before).sort("id").to_pydict()["id"])
+print(
+    bt.read.iceberg("db.orders", catalog=catalog, snapshot_id=before).sort("id").to_pydict()["id"]
+)
 # [1, 2, 3]
 ```
 
@@ -167,13 +169,12 @@ misreads, which is worse than publishing nothing.
 
 ## Failure modes worth knowing
 
-:::{warning}
-**Merge-on-read kills the parallel read.** If a scan task carries positional or equality delete
-files, reading the data file directly would resurrect every deleted row. Rather than return wrong
-data, Batcher falls back to a whole-source scan through pyiceberg, which applies the deletes. It is
-correct and it is serial. Copy-on-write tables keep the split-parallel path; if an Iceberg read is
-mysteriously single-threaded, look for delete files.
-:::
+**Merge-on-read reads in parallel too.** A split carries the planned `FileScanTask` itself and
+reads it through Iceberg's own scanner, which resolves columns by field id and applies positional
+and equality delete files. So a table with deletes neither resurrects rows nor collapses to one
+worker. It used to: the per-file reader knew nothing about delete files, so a MoR table fell back
+to a whole-source scan. A fallback still exists, but only for a `plan_files` that raises or
+returns nothing.
 
 **Writes are append/overwrite only.** No merge-on-read writes, no equality deletes, no row-level
 `MERGE`. pyiceberg's support is not solid enough to build on, and Batcher raises rather than
@@ -181,9 +182,12 @@ pretending. If you need upserts today, use {doc}`Delta </integrations/lakehouse/
 `MERGE INTO`.
 
 :::{important}
-**`overwrite` is a full delete-then-add.** It issues `delete(AlwaysTrue())` and then registers the
-new files, in one catalog transaction. That is not a partition-scoped replace, and there is no
-`replace_where` for Iceberg.
+**`overwrite` is table-wide.** It issues `delete(AlwaysTrue())` and then registers the new files,
+in one catalog transaction. For a partition-scoped replace, pass a predicate as
+`replace_where=bt.col("day") == "2024-03-01"` instead. It is translated to an Iceberg expression
+that deletes exactly the rows it matches, in the same transaction that adds the new files. A
+predicate the table cannot express is refused rather than widened into an overwrite of
+everything.
 :::
 
 ## Computing a partition value

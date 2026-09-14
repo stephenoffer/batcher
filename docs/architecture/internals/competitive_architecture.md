@@ -287,7 +287,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5 at sf100) — but the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (722 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
-| Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |
+| Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M); **W against a right side under 32 rows at any left size** (6M x 6: 1.12x) — ceiling 7 | — | — | — | — | — |
 | Learned/adaptive | **W** | **W** | **W** | — | **W** | = |
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
 | Streaming guarantees | — | — | L | **✗** | — | — |
@@ -956,8 +956,38 @@ why it stays invisible to about a million rows and dominates past that. DuckDB d
 `PhysicalIEJoin` decomposes the sorted union into blocks and prunes block *pairs* whose key
 ranges cannot intersect, so its inner loop never walks a suffix holding no answers.
 
+#### A right side of a handful of rows was paying for a sort of the left one (2026-09-12)
+
+Both strategies above answer "which right rows match this left row" by searching a sorted
+order, so both sort the left side. That is the right trade between two comparable inputs and
+the wrong one against a bucket table, which is what an inequality join meets most often in
+practice: price bands, IP ranges, a date dimension, a histogram's edges.
+
+The operator-mix case `op-join-range` is exactly that shape — six discount bands against
+`lineitem` — and it sorted six million left rows twice to answer six comparisons a row. A
+right side of at most 32 rows now takes a third strategy
+(`bc-runtime/src/join/range/small.rs`): `|R|` vectorized Arrow comparisons over the left key
+column, chunked and run in parallel, with no sort, no universe and no mark array. Measured
+through the benchmark harness, best of five:
+
+| | before | after | DuckDB |
+|---|---|---|---|
+| `op-join-range` (6M x 6) | 329.0 ms | **79.6 ms** | 89.4 ms |
+
+The gate is on size alone and never on the predicate's shape, so it serves one inequality or
+two, every operator combination and every join type; `tests/differential/test_diff_range_join_small_side.py`
+holds all of them against DuckDB, and the in-crate test holds the scan against IEJoin pair for
+pair on the same data.
+
+**It also covers a shape the band path structurally could not see.** `band::bounds` recognises
+two conditions bounding one *right* key (`L.a <= R.y AND R.y <= L.b`). A bucket table is the
+mirror — one left key bounded by two right columns — which is an interval-stabbing query, not a
+contiguous slice of anything once the intervals overlap, so it fell through to IEJoin. The
+general form of that shape is still open; at this size it does not need the general form.
+
 **So the honest state of this ceiling: the quadratic plan is gone, the memory wall with it, and
-the operator now wins below ~500,000 rows and loses above ~1,000,000.** The named next step is the block
+the operator now wins below ~500,000 rows and loses above ~1,000,000 — except against a small
+right side, where it no longer sorts at all.** The named next step is the block
 decomposition above — which is also what would make the operator *distributable*, since both
 need the same "which block pairs can intersect" pruning. Today the distributed planner has no
 range-join staging and executes the operator whole, which satisfies single-node == distributed
@@ -1474,10 +1504,98 @@ form. Both are known techniques neither engine invented.
 So this is a *closable* ceiling rather than a structural one, unlike 2 and 11 — and it is now
 tracked: `benchmarks/suites/operators/{strings,expressions}.py` fail visibly if it widens.
 
-**One of the three is closed.** `LENGTH` now tests the morsel's own bytes for ASCII once and
+**Two of the three are closed.** `LENGTH` now tests the morsel's own bytes for ASCII once and
 takes each row's length from the offsets: `SUM(LENGTH(l_comment))` goes **10.9 ms -> 5.3 ms**
 (3.96x -> 1.82x), with CPU at 65 ms against DuckDB's 71 — below it, so what remains on that
-shape is worker count rather than work. The temporal and `CASE` rows are untouched.
+shape is worker count rather than work.
+
+The temporal row was the division-free civil-date form named above
+(`bc-expr/src/eval/temporal/civil.rs`), and the size of the arithmetic turned out to matter as
+much as its shape: the same decomposition in `i64` measured **slower than Arrow's chrono
+kernel** (12.8 ns a row against 10.8), because a 64-bit division by a constant is a widening
+multiply. Biased into `u32`, where no division handles a sign and each is a 32-bit
+multiply-high, it is 7.3 ns. `EXTRACT(YEAR ...)` grouped goes **7.4 ms -> 5.5 ms** and the bare
+`SUM(EXTRACT(YEAR ...))` **5.8 ms -> 4.4 ms**; day-of-week needs no decomposition at all and is
+2.8 ns a row against the kernel's 12.4. Arrow's kernel stays the oracle — a `Date32` or
+timezone-naive `Timestamp` in chrono's range takes the fast path and everything else, a zoned
+timestamp included, falls back whole.
+
+**And the third is closed too.** The `CASE` row was never about branching: the identical
+four-arm ladder returning *integers* already won (6.8 ms against DuckDB's 10.5) while the one
+returning *strings* lost at 21.2 against 10.2. The general algorithm evaluates each arm over the
+whole batch and folds the arms with `zip`, so a four-arm `CASE` builds eight full-length arrays
+to produce one, and a string is the most expensive thing to copy eight times. When every arm is
+a literal — the bucketing shape this measures — the selections already partition the rows, so
+the column can be built in one pass straight from them (`bc-expr/src/eval/branch/literal_case.rs`):
+**21.2 ms -> 8.2 ms, 473 ms of CPU -> 153**, and the case turns from 2.08x into 0.68x.
+
+| shape | before | after | DuckDB |
+|---|---|---|---|
+| four-arm `CASE` to strings, grouped | 21.2 ms | **8.2 ms** | 10.2 ms |
+| the same to integers, grouped | 6.8 ms | 6.8 ms | 10.5 ms |
+
+So all three rows of this ceiling are now closed, and what the section retires with them is its
+own framing: *"scalar kernels do 1.7-2.9x DuckDB's work per row"* was measured against DuckDB's
+**native, compressed** storage, and two of the three gaps were not kernel work at all. Held to
+the same Arrow input (`duckdb_arrow`), the engine is **ahead** on the shapes that looked worst —
+`str-length` 0.42x, `like-prefix` 0.48x, `date-part` 0.55x — and behind only where it is still
+behind DuckDB-native. See "What is storage and what is execution" below.
+
+## What is storage and what is execution (measured 2026-09-12)
+
+Every headline ratio on this page compares Batcher against **DuckDB's native, compressed
+storage**. The harness ingests each table with an untimed `CREATE TABLE`, so the timed query
+runs on DuckDB's dictionary-encoded, zone-mapped format while Batcher reads raw Arrow. That is
+"DuckDB at its best" and it is the right bar for a headline. It is not a comparison of execution
+engines, and on a whole class of queries it is the storage that answers.
+
+`duckdb_arrow` is the same DuckDB over the *same Arrow buffers Batcher reads*. Run across the
+board (best-of-five, 48-core box, three engines plus Batcher):
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars |
+|---|---:|---:|---:|
+| TPC-H sf1 | 0.72 | **0.25** | 0.54 |
+| operator mix | 0.75 | **0.47** | 0.16 |
+| ClickBench | 0.65 | **0.16** | 0.37 |
+| H2O groupby | 1.05 | **0.83** | 0.53 |
+| H2O join | 0.63 | **0.58** | 0.51 |
+| JSON | 0.35 | **0.32** | 0.01 |
+
+The third column is what the execution engine does on equal input: **four times faster than
+DuckDB on TPC-H and six on ClickBench**, over the identical bytes. The two suites Batcher wins
+outright — every case of `h2o-join` and `json` — it wins on both bars.
+
+### What that changes about the remaining losses
+
+It splits them in two, and the split is not obvious from the ratio alone.
+
+**Storage losses — 19 of the 40, including ten of ClickBench's fifteen.** Each is a case where
+Batcher is *faster* than DuckDB over the same Arrow data and loses to DuckDB-native by one to
+four milliseconds: `cb-q41` 6.1 ms against DuckDB-on-Arrow's 43.4, `cb-q37` 11.4 against 80.0,
+`cb-q39` 44.7 against 101.1. The `hits` table is wide and string-heavy, which is exactly what a dictionary
+and a zone map are for. The sharpest single demonstration is a predicate that matches nothing:
+`WHERE l_comment LIKE 'zzzzq%'` over six million rows costs DuckDB **0.49 ms and 1 ms of CPU**,
+because its zone maps prove no block can contain a match, and costs Batcher 7.95 ms because it
+reads the column. The same shape at 1% selectivity is 3.3 ms against 7.7.
+
+Closing these means changing what Batcher reads, not how it computes: `StringView`, dictionaries
+preserved through the kernels, and block-level statistics over in-memory inputs. That is
+ceiling 2 and item 2 of the roadmap below, and until it lands these cases stay lost against
+DuckDB-native however fast the kernels get. Three string and temporal shapes that read as the
+worst kernel losses on this page — `str-length` 1.53x, `like-prefix` 2.47x, `date-part` 2.50x —
+are **wins of 0.42x, 0.48x and 0.59x** against the same engine on the same data.
+
+**Execution losses — the other 21.** Where `duckdb_arrow` or Polars *also* beats Batcher, the
+gap is this engine's and is worth fixing here: `h2o-gb-q8` (104.9 against 83.2 on Arrow),
+`op-except` (46.6 against Polars' 24.7), `h2o-gb-q7` (66.8 against 56.7),
+`op-join-build-large` (70.6 against 60.5), `op-sort-string-limit` (11.1 against 6.4), and TPC-H
+q17, q8, q5 and q2, where Polars — also an Arrow engine — is the one ahead.
+`benchmarks/results/LOSS_BACKLOG.md` carries the whole board with this column on every row.
+
+**Neither column excuses the other.** A `duckdb_arrow` win is not "Batcher beats DuckDB": a user
+who hands DuckDB a table gets the native format and the number in the first column. Quote the
+first column for a competitive claim and the second only for what it says — which engine does
+more per byte read.
 
 ## The roadmap that would make the claim true
 

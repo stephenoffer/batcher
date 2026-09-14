@@ -1,8 +1,10 @@
 """Nulls and type casting: the two places a pipeline quietly changes its answer.
 
-Null is not zero and not empty string, and every aggregate skips it. Casting is where a
-schema mismatch between two sources gets resolved, and where an unparseable value becomes
-a null rather than an error.
+Null is not zero and not empty string, and every *column* aggregate skips it: with one
+null present ``col("a").count()`` is 2 where ``bt.count()`` is 3. Casting is where a
+schema mismatch between two sources gets resolved, and it is strict by default: ``cast``
+raises on a value it cannot parse, and ``try_cast`` is the one that returns a null
+instead. The assertions below pin exactly that.
 
     python examples/expressions/nulls_and_casting.py
 """

@@ -1,6 +1,6 @@
 # Parquet round trip
 
-Parquet is the default for a reason: the footer carries statistics, so a filtered read skips row groups without decoding them and ``count()`` is answered from metadata alone. Partitioning on a column you always filter by turns that skipping into directory pruning.
+Parquet is the default for a reason: the footer carries statistics, so a filtered read skips row groups without decoding them and `count()` is answered from metadata alone. Partitioning on a column you always filter by turns that skipping into directory pruning.
 
 The whole script, executed on every test run:
 

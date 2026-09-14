@@ -33,9 +33,9 @@ from _authoring import FONT, write
 
 W, H = 980, 334
 
-AXIS_Y = 234           # baseline for the bars
-MID_X = 500            # the 1.0x parity line
-PX_PER_X = 150         # horizontal pixels per 1x of ratio
+AXIS_Y = 234  # baseline for the bars
+MID_X = 500  # the 1.0x parity line
+PX_PER_X = 150  # horizontal pixels per 1x of ratio
 BAR_H = 44
 ROW_Y = (120, 186)
 
@@ -79,10 +79,10 @@ def bar(y: float, ratio: float, engine: str, detail: str, wins: str) -> list[str
 parts = [
     f'<rect x="0" y="0" width="{W}" height="{H}" rx="14" class="surf"/>',
     f'<text x="40" y="50" font-family="{FONT}" font-size="19" font-weight="700" class="t-head">'
-    f'TPC-H scale factor 10, all 22 queries</text>',
+    f"TPC-H scale factor 10, all 22 queries</text>",
     f'<text x="40" y="74" font-family="{FONT}" font-size="13" class="t-sub">'
-    f'Batcher total 4,453 ms on 96 cores, correctness-gated. Bars show the suite ratio '
-    f'against each engine.</text>',
+    f"Batcher total 4,453 ms on 96 cores, correctness-gated. Bars show the suite ratio "
+    f"against each engine.</text>",
     # the parity rule, drawn behind the bars
     f'<line x1="{MID_X}" y1="100" x2="{MID_X}" y2="{AXIS_Y + 4}" class="parity" '
     f'stroke-width="1.6" stroke-dasharray="5 4"/>',
@@ -92,18 +92,22 @@ parts = [
     f'class="t-sub">Batcher ahead &#8594;</text>',
 ]
 
-parts += bar(ROW_Y[0], 1.89, "DuckDB on the same Arrow",
-             "like-for-like: identical zero-copy input", "wins 21 of 22 (q9 a tie at 1.01x)")
-parts += bar(ROW_Y[1], 2.26, "Polars",
-             "same Arrow input", "wins 17 of 22")
+parts += bar(
+    ROW_Y[0],
+    1.89,
+    "DuckDB on the same Arrow",
+    "like-for-like: identical zero-copy input",
+    "wins 21 of 22 (q9 a tie at 1.01x)",
+)
+parts += bar(ROW_Y[1], 2.26, "Polars", "same Arrow input", "wins 17 of 22")
 
 parts += [
     f'<text x="40" y="{H - 44}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f'Source: benchmarks/BENCHMARK_RESULTS.md, 2026-07-27. Ratios are suite totals; only '
-    f'Batcher (4,453 ms) and DuckDB-on-Arrow (8,436 ms) have</text>',
+    f"Source: benchmarks/BENCHMARK_RESULTS.md, 2026-07-27. Ratios are suite totals; only "
+    f"Batcher (4,453 ms) and DuckDB-on-Arrow (8,436 ms) have</text>",
     f'<text x="40" y="{H - 26}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f'recorded absolute totals, so the Polars bar is plotted from its stated ratio. '
-    f'The box was shared during the run, and the entry notes totals swing about 25%.</text>',
+    f"recorded absolute totals, so the Polars bar is plotted from its stated ratio. "
+    f"The box was shared during the run, and the entry notes totals swing about 25%.</text>",
 ]
 
 svg = (

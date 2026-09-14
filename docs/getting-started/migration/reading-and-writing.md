@@ -17,7 +17,7 @@ explicit and discoverable. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it
 import batcher as bt
 
 ds = bt.from_pydict({"city": ["NYC", "LA", "NYC"], "amount": [10, 20, 30]})
-ds.write.parquet("/tmp/sales")          # ds.write("/tmp/sales") also infers parquet
+ds.write.parquet("/tmp/sales")  # ds.write("/tmp/sales") also infers parquet
 back = bt.read.parquet("/tmp/sales")
 print(sorted(back.to_pydict()["amount"]))
 # [10, 20, 30]
@@ -140,10 +140,10 @@ existing pipeline without a copy where the framework's Arrow bridge allows it.
 import pandas as pd
 import batcher as bt
 
-ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3]}))   # pandas  -> Batcher
-pdf = ds.filter(bt.col("a") > 1).to_pandas()          # Batcher -> pandas
-pl_df = ds.to_polars()                                # Batcher -> Polars
-table = ds.to_arrow()                                 # Batcher -> pyarrow.Table
+ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3]}))  # pandas  -> Batcher
+pdf = ds.filter(bt.col("a") > 1).to_pandas()  # Batcher -> pandas
+pl_df = ds.to_polars()  # Batcher -> Polars
+table = ds.to_arrow()  # Batcher -> pyarrow.Table
 ```
 
 Each row pairs a source system with its constructor and, where one exists, its exporter.

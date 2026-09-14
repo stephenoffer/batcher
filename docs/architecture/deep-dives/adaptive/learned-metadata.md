@@ -45,6 +45,10 @@ separately, by the conductor in `api/tuning/decisions.py`, which calls into
 to see both the plan it chose and the run that followed, so no Kyber pass has to observe an
 execution to close that loop.
 
+That loop turns once per query. The hub's other axis runs across runs, and it is the one with no DuckDB or Spark equivalent:
+
+![The loop that outlives one query. In run N, Kyber plans on whatever it knows now, Core executes it and measures rows, times and column sketches, and writes them to the MetadataHub, keyed by plan signature and, for anything in machine units, by hardware fingerprint. In run N plus 1, which is a later query in another process, minutes or days on, Kyber reads the hub before planning and plans on measured numbers, and Core measures and records again. What travels through the hub: measured cardinalities, operator wall times, column sketches, fitted cost coefficients and bandit arm rewards. Core writes after every run; Kyber reads before every plan, and never the other way round. The horizontal axis is the difference worth claiming: this is the same stage-boundary mechanism Spark AQE uses, but AQE keeps nothing once the query finishes, so it re-learns the same shape every time.](/_static/diagrams/cross_run_learning.svg)
+
 ## What Core measures
 
 `bc-interp` returns metrics alongside the result batches from `execute_plan_metered`. Per
@@ -96,16 +100,20 @@ print(ds.filter(bt.col("x") > 500).group_by("g").agg(s=bt.sum("x")).stats())
 ```
 
 ```text
- op  kind             rows_in    rows_out        ms      out_kb  backend
-------------------------------------------------------------------------
-  0  aggregate           7499          50      0.31           1  interp
-  1  filter              8000        7499      0.36           0  jit
-  2  scan                8000        8000      0.05         125  interp
-------------------------------------------------------------------------
+OP  KIND       ROWS IN  ROWS OUT   TIME  OP SHARE          OUT  BACKEND
+───────────────────────────────────────────────────────────────────────
+ 0  aggregate    7,499        50  434µs  ████▎░  71%      800 B  interp
+ 1  filter       8,000     7,499  180µs  █▉░░░░  29%  117.2 KiB  interp
+ 2  scan         8,000     8,000    1µs  ░░░░░░  <1%  125.0 KiB  interp
+───────────────────────────────────────────────────────────────────────
 ```
 
-`backend: jit` on the filter is the Cranelift tier. That tag is what `jit_speedup`
-calibration fits against.
+The timings move run to run; the row counts and the `BACKEND` column do not. That column is
+the execution tier each operator ran on, one of `interp`, `jit`, or `interp+jit` for an
+operator that fell back part way, and it is what `jit_speedup` calibration fits against. It
+reads `interp` throughout here because a query this small runs on the sequential executor,
+which never calls the JIT at all. See
+{doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`.
 
 ## The hub
 
@@ -115,11 +123,11 @@ deliberately small API.
 :::{dropdown} The whole `MetadataHub` surface
 ```python
 # docs: skip
-hub.record(feedback)                       # the FeedbackSink: Core's only entry point
-hub.version                                # monotonic counter; the cache-invalidation signal
-hub.op_stats_by_kind()                     # bucketed by operator kind, for cost calibration
-hub.op_stats_with_signature()              # oldest-first, for the q-error correction
-hub.load_keyed_params(namespace)           # per-key learned scalars
+hub.record(feedback)  # the FeedbackSink: Core's only entry point
+hub.version  # monotonic counter; the cache-invalidation signal
+hub.op_stats_by_kind()  # bucketed by operator kind, for cost calibration
+hub.op_stats_with_signature()  # oldest-first, for the q-error correction
+hub.load_keyed_params(namespace)  # per-key learned scalars
 hub.get_keyed_param(namespace, key)
 hub.put_keyed_param(namespace, key, value)
 ```
@@ -223,6 +231,10 @@ Selection is a deterministic lower-confidence-bound (the bandit *minimizes*), wi
 exploration radius scaled by the pooled standard deviation recovered from the stored
 `sumsq`. Textbook UCB1 assumes rewards in [0,1]; a bare radius against a 500 ms mean is a
 0.2% nudge and collapses to greedy.
+
+The bound on exploration is the half of a bandit that usually goes undrawn, and it is what keeps a cold signature from paying for the search:
+
+![The learned-tuning bandit: its arms, its reward, and the bound on exploration. Two arm sets are learned: join strategy over hash, broadcast and sort_merge, and execution route over one_shot and staged. The reward is a measured latency in milliseconds, and the bandit minimizes it. Every arm emits the same relation, so a wrong pick costs throughput and never correctness, which is what makes exploring safe at all. Selection runs three ways. Under three observations the bandit returns nothing and the cost model decides. An arm never tried is given exactly one turn. Otherwise the lowest bound wins, computed as the mean minus 1.0 times the arm's own spread times the square root of 2 ln N over n, with ties broken by arm name and no RNG anywhere, so a plan is reproducible. Evidence decays at 0.975 per observation, so an arm that got faster is asked again rather than frozen out by a confidence radius that has shrunk to nothing. Statistics are kept per plan signature, and anything in machine units is additionally scoped by hardware fingerprint, so unlike machines never blend.](/_static/diagrams/bandit_tuning.svg)
 
 Alongside it sit OLS two-line crossover fits for `broadcast_max_bytes` and the sort-merge
 row threshold, learned build sides, and a learned verdict on whether partial

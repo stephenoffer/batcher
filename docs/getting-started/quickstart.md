@@ -108,7 +108,7 @@ print(revenue.sort("category").to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
 ```
 
-{doc}`/user-guide/analyze/sql` lists the supported surface, and {doc}`/tutorials/foundations/sql-to-dataframe`
+{doc}`/user-guide/analyze/sql` lists the supported surface, and {doc}`/getting-started/tutorials/foundations/sql-to-dataframe`
 translates a SQL query into DataFrame verbs step by step.
 
 ## Execute and inspect
@@ -164,14 +164,12 @@ Every format, glob, and credential path is in {doc}`/user-guide/moving-data/read
 
 ## What you have now
 
-You built a dataset, filtered and derived columns, aggregated, joined, ran the same query
-as SQL, inspected a plan, and round-tripped a file. That is the whole shape of a Batcher
-pipeline: **read, chain lazy verbs, collect once at the end.** Scaling it up changes the
-source and the machine, not the code.
+Every Batcher pipeline has the shape you just wrote: read, chain lazy verbs, collect once
+at the end. Scaling it up changes the source and the machine. The code stays as it is.
 
 ## See also
 
-- {doc}`/tutorials/foundations/first-pipeline`: the same shape again, on a realistic dataset.
+- {doc}`/getting-started/tutorials/foundations/first-pipeline`: the same shape again, on a realistic dataset.
 - {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one short page each.
 - {doc}`../user-guide/index`: every operator, with runnable examples.
 - {doc}`/getting-started/migration/index`: the verb-by-verb table if you already know pandas, Polars, Spark, or SQL.

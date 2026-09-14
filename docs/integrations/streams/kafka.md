@@ -1,13 +1,14 @@
 # Kafka
 
-{py:meth}`bt.read.kafka(topic) <batcher.api.io_namespace.reader.Reader.kafka>` consumes a Kafka topic as an unbounded {py:class}`Dataset <batcher.Dataset>`. It is a read path
-only. Batcher has no Kafka sink, so producing back to Kafka goes through
-{py:meth}`ds.write.for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` with your own producer, covered at the end of this page.
+{py:meth}`bt.read.kafka(topic) <batcher.api.io_namespace.reader.Reader.kafka>` consumes a Kafka topic as an unbounded {py:class}`Dataset <batcher.Dataset>`, and
+{py:meth}`ds.write.kafka(topic) <batcher.api.io_namespace.writer.Writer.kafka>` publishes each
+micro-batch back to one. Both sides take Spark's column contract, so a ported job needs no
+reshaping. The write is covered at the end of this page.
 
 | | |
 | --- | --- |
 | **Read** | `bt.read.kafka(topic)` |
-| **Write** | Not supported. `ds.write.for_each_batch` with your own producer. |
+| **Write** | `ds.write.kafka(topic)`, one message per row. At-least-once. |
 | **Extra** | `pip install 'batcher-engine[kafka]'` |
 | **Parallelism** | One split per topic partition |
 | **Pushdown** | None. The payload arrives as opaque bytes. |
@@ -53,19 +54,31 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"u1", b"u2", b"u1"],
-    "value": [b'{"user":"u1","amount":10}', b'{"user":"u2","amount":5}',
-              b'{"user":"u1","amount":7}'],
-    "partition": [0, 0, 1],
-    "offset": [11, 12, 4],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["orders"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"u1", b"u2", b"u1"],
+        "value": [
+            b'{"user":"u1","amount":10}',
+            b'{"user":"u2","amount":5}',
+            b'{"user":"u1","amount":7}',
+        ],
+        "partition": [0, 0, 1],
+        "offset": [11, 12, 4],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["orders"] * 3,
+    },
+    schema=schema,
+)
 
 # Stand in for the Kafka source; the pipeline below is what you run against the real one.
 orders = bt.from_batches(lambda: iter([batch]), schema)
@@ -251,17 +264,20 @@ You can also pin a reader to a subset yourself:
 
 ```python
 # docs: skip
-shard = bt.read.kafka("clicks", bootstrap_servers="broker-1:9092",
-                      group="etl", partitions=[0, 1, 2])
+shard = bt.read.kafka(
+    "clicks", bootstrap_servers="broker-1:9092", group="etl", partitions=[0, 1, 2]
+)
 ```
 
 ## Security and client config
 
 Anything else you pass through goes to the `confluent-kafka` consumer config with underscores
-rewritten as dots, so `security_protocol` becomes `security.protocol`. Batcher owns three of
-those keys: `enable.auto.commit` (false, for the commit-after-batch behavior above),
-`bootstrap.servers`, and `group.id`, which come from the named arguments. Everything else in
-the librdkafka configuration surface is available this way.
+rewritten as dots, so `security_protocol` becomes `security.protocol`. Batcher owns four of
+those keys. `enable.auto.commit` is false, for the commit-after-batch behavior above.
+`bootstrap.servers` and `group.id` come from the named arguments. `auto.offset.reset` is
+derived from `starting_offsets`, which wins, though `auto_offset_reset=` still reaches it for
+a caller who prefers the librdkafka name. Everything else in the librdkafka configuration
+surface is available this way.
 
 :::{dropdown} A SASL_SSL read against Confluent Cloud
 ```python

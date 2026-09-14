@@ -13,8 +13,8 @@ is the Polars `LazyFrame` model rather than the eager pandas one.
 ## Coming from
 
 Each card names the single shift that matters most from that system, and links to the
-page to read first. The translation tables below are shared across all five, because the
-mapping is organized by what you are porting rather than by where it came from.
+page to read first. The translation tables below are shared across all six, because they
+are organized by what you are porting rather than by where it came from.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -67,7 +67,7 @@ distribution is an argument to `collect` rather than a property of the dataset.
 
 ## The translation tables
 
-The mapping is split by what you're porting, so each page is one sitting.
+Each of the four pages below is one sitting.
 
 ::::{grid} 1 2 2 2
 :gutter: 3

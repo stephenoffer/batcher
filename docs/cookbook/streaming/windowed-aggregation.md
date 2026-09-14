@@ -5,7 +5,7 @@ stays live forever, because another row for it might arrive tomorrow.
 
 :::{warning}
 Run a plain {py:meth}`group_by("user").agg(...) <batcher.Dataset.group_by>` against Kafka in `complete` mode and the state grows
-for as long as the job runs. Eventually it is the job's memory that ends the query.
+for as long as the job runs. Eventually the job's memory ends the query.
 :::
 
 Event-time windows fix this by making a group *finishable*. A window has an end. Once
@@ -33,11 +33,13 @@ from batcher import col
 base = dt.datetime(2024, 1, 1)
 minute = dt.timedelta(minutes=1)
 
-events = bt.from_pydict({
-    "ts": [base, base + 30 * minute, base + 90 * minute, base + 100 * minute],
-    "user": ["a", "b", "a", "c"],
-    "amount": [3, 5, 7, 11],
-})
+events = bt.from_pydict(
+    {
+        "ts": [base, base + 30 * minute, base + 90 * minute, base + 100 * minute],
+        "user": ["a", "b", "a", "c"],
+        "amount": [3, 5, 7, 11],
+    }
+)
 
 hourly = events.group_by(w=bt.window(col("ts"), "1h")).agg(total=col("amount").sum())
 print(hourly.to_pydict())
@@ -56,9 +58,11 @@ Now the source never ends. Add {py:meth}`.with_watermark(time_col, lateness) <ba
 partial per open window, and a window is emitted the moment the watermark passes its
 end.
 
-The watermark is `max(event_time seen) - lateness`. Watch it work. The third micro-batch
-carries an event at 02:10, which pushes the watermark to 02:00 and closes the 00:00
-window:
+The watermark is the highest event time the stream has delivered, less the lateness. On a
+partitioned source the slowest partition sets it, which
+{doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` covers. Watch it
+work. The second micro-batch carries an event at 02:10, which pushes the watermark to 02:00
+and closes the 00:00 window:
 
 ```python
 import pyarrow as pa
@@ -140,9 +144,7 @@ consecutive events per key whose gap is under a timeout, and starts a new sessio
 the gap is exceeded. Same aggregate expressions:
 
 ```python
-sessions = events.session_window(
-    "ts", "45m", partition_by=["user"], total=col("amount").sum()
-)
+sessions = events.session_window("ts", "45m", partition_by=["user"], total=col("amount").sum())
 print(sessions.select("user", "session_start", "total").to_pydict()["total"])
 # [3, 5, 7, 11]
 ```
@@ -161,8 +163,9 @@ gap, and only then aggregates and emits it.
 The call is unchanged. Only the source is:
 
 ```python
-session_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
-                            ("amount", pa.int64())])
+session_schema = pa.schema(
+    [("user", pa.string()), ("ts", pa.timestamp("us")), ("amount", pa.int64())]
+)
 
 
 def click_feed():

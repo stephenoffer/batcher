@@ -7,9 +7,9 @@ a running query has left on a shared machine.
 
 ## What counts as an artifact
 
-An artifact is any file Batcher creates that holds rows, plan text, or measured statistics. The
-distinction that matters is not whether a file is temporary. A spilled partition is deleted
-within seconds and still holds the query's actual data for as long as it exists, and a scratch
+An artifact is any file Batcher creates that holds rows, plan text, or measured statistics.
+Whether it is temporary does not matter. A spilled partition is deleted
+within seconds and still holds the query's actual data for as long as it exists. A scratch
 volume on a Ray worker is a volume other tenants mount.
 
 Result caching is not on this list. `carbonite/cache.py` holds `pyarrow.Table` objects in
@@ -18,9 +18,9 @@ process memory and writes nothing.
 ## The catalogue
 
 Every artifact below is Arrow unless the format column says otherwise. The two Arrow encodings
-differ in one way that decides which is used: the **stream** format is append-only and read
-front to back, and the **file** format carries a footer of block offsets, so a reader can seek
-to one batch or memory-map the whole thing.
+differ in one way that decides which is used. The **stream** format is append-only and read
+front to back. The **file** format carries a footer of block offsets, so a reader can seek to
+one batch or memory-map the whole thing.
 
 | Artifact | Written by | Format | Lands in |
 |---|---|---|---|
@@ -44,16 +44,14 @@ of them is the shape this list keeps regrowing in.
 
 An artifact holds the query's own rows, and the paths above are shared. `/dev/shm` and `/tmp`
 are world-writable, a cluster mount is shared between tenants, and a node scratch volume is
-shared with whatever else the node is running. At the default umask a new file lands 0644 and a
-new directory 0755.
+shared with whatever else the node is running. At the default umask a new file lands 0644. A
+new directory lands 0755.
 
-The mode is therefore set in the `open` call rather than by a following `chmod`, because a
-chmod leaves a window in which the rows are world-readable and a reader that wins that race
-gets everything. One helper does this on each side of the boundary:
+So the mode is set in the `open` call, never by a following `chmod`. A chmod leaves a window in
+which the rows are world-readable, and a reader that wins that race gets everything. One helper does this on each side of the boundary:
 `_internal/paths.py::open_private` and `private_dir` in the control plane, and
 `bc_arrow::create_private_file` and `create_private_dir` in the data plane. Both live in the
-lowest module their callers share, because the alternative is a copy per subsystem and the
-copies drift.
+lowest module their callers share. The alternative is a copy per subsystem, and copies drift.
 
 For the same-node shuffle the property is sharper than confidentiality. `/dev/shm` is
 writable, so at 0644 a local user could *plant* a well-formed bucket under a ticket a reducer
@@ -66,28 +64,28 @@ isolation, and what actually rots is a new write site that does not reach for th
 
 ### Buffered
 
-Arrow's IPC writer issues a separate `write` per message *and* per buffer within it, so a batch
-with `k` columns costs on the order of `2k` syscalls, most of them a few KB of validity or
-offset data. Written straight to a file that is one syscall per buffer, and a spilled bucket of
+Arrow's IPC writer issues a separate `write` per message *and* per buffer within it. A batch
+with `k` columns therefore costs on the order of `2k` syscalls, most of them a few KB of
+validity or offset data. Written straight to a file that is one syscall per buffer, and a spilled bucket of
 a few thousand morsels over a dozen columns is hundreds of thousands of syscalls for bytes that
 coalesce into a handful of large writes.
 
 Buffering is invisible to the reader, because the IPC bytes are identical either way, so it is
-pure throughput. Two shapes exist and the difference is how many writers are open at once. The
+pure throughput. Two shapes exist, and the difference is how many writers are open at once. The
 grace spill store holds one writer per partition and can be re-partitioned 4,096 ways under
 skew, so it budgets 32 MiB *in total* and divides it
-(`bc-runtime::agg::spill::write_buf_capacity`). The shm publisher and the Flight gather write
+(`bc-runtime::agg::spill::store::write_buf_capacity`). The shm publisher and the Flight gather write
 exactly one file at a time, so each takes a fixed 1 MiB buffer that cannot multiply.
 
 A buffered writer has one failure mode worth naming. Dropping it flushes the tail and discards
-any error doing so, which publishes a truncated file that reads back as a short bucket rather
+any error doing so. That publishes a truncated file, which reads back as a short bucket rather
 than as a failure. Every buffered path here calls `into_inner` explicitly to surface that
 error.
 
 ### Compressed by what the link costs
 
-Compression is a trade between a core and a device, and the exchange rate is the device. The
-engine makes the decision per path rather than globally:
+Compression trades a core against a device, and the device sets the exchange rate. So the
+decision is made per path, not globally:
 
 | Path | Under `"auto"` | Why |
 |---|---|---|
@@ -105,9 +103,9 @@ also why the choice is result-invariant: it trades CPU for bytes and nothing els
 
 ## Where the bytes go
 
-Two questions have one answer each, and both used to have several.
+Two questions, one answer each. Both used to have several.
 
-`site.spill_scratch_dir()` resolves *which disk this process spills to*: the configured
+`site.spill_scratch_dir()` resolves *which disk this process spills to*. It takes the configured
 `memory.spill_dir`, else the best measured node-local volume, else the system temp directory.
 The hardware fingerprint that keys every learned spill threshold reads the same function, so a
 learned threshold names the disk the spill actually landed on. When those two disagreed, the
@@ -144,14 +142,19 @@ zstd
 
 ## Cleanup
 
+A spill directory has the fullest lifecycle of anything in the catalogue, and the two ends
+a `Drop` cannot reach are what the pid in its name is for.
+
+![What a spill puts on disk, and its whole lifecycle. Under the spill root, which is memory.spill_dir or else the node's local scratch, each store owns a directory bc-spill-{pid}-{seq} holding part-0.arrow through part-N.arrow, one Arrow IPC stream each, made owner-only where the filesystem allows. A partition is a hash bucket for the grace operators and a sorted run for the external sort, in the same file format. A writer opens on the first append, so a bucket that received no rows has no file at all, and the codec comes from the first batch's schema: ZSTD for blob-bearing columns, none for anything else. The ordinary lifecycle is created, appended with rows and bytes counted per file, then read back once in the merge phase before the partition is released, and the store removes its own directory on drop, on success, on an error and on a panic alike. Two ends fall outside that: a SIGKILL leaves the directory behind, because the OOM killer picks the spilling process, and it is reclaimed by an orphan sweep that removes only directories whose embedded pid is no longer a live process, which is what keeps a concurrently spilling sibling safe. A truncated IPC stream reads back as a shorter valid one, so every read is checked against the row count taken on the way in.](/_static/diagrams/spill_artifacts.svg)
+
 Each artifact is removed by the thing that created it. `DiskSpillStore` has a `Drop` that
-removes its directory, `spill_scratch` removes a work directory it allocated and leaves an
-operator-configured one alone, and the file cache evicts least-recently-used entries to stay
-under its byte budget.
+removes its directory. `spill_scratch` removes a work directory it allocated and leaves an
+operator-configured one alone. The file cache evicts least-recently-used entries to stay under
+its byte budget.
 
 A remote file larger than the whole file-cache budget is never admitted. Caching it would
-evict every other entry and then, with nothing else left to drop, the entry itself, so the
-budget cannot be exceeded by a single file. The read goes straight to the object store
+evict every other entry and then, with nothing else left to drop, the entry itself. No single
+file can push the budget over. The read goes straight to the object store
 instead, and `file_cache_max_bytes` bounds the volume as stated rather than approximately.
 Concurrent readers that miss the same file share one download rather than each fetching a
 copy.

@@ -1,4 +1,4 @@
-# Machine learning
+# Complete pipelines
 
 Turning a table, or a folder of media, into something a model can consume. Then running the
 model over it without wasting the GPU you are paying for.
@@ -9,7 +9,7 @@ decode. One corrupt JPEG that kills a six-hour job at hour five. These recipes a
 about not doing that.
 
 :::{tip}
-The single idiom that carries most of these pages: pass a **class** to `map_batches`, `infer`,
+The single idiom that carries most of these pages: pass a class to `map_batches`, `infer`,
 `embed`, or `generate`, never an instance and never a plain function. The engine constructs it
 once per worker, so the weights load in the constructor and stay loaded. A function is rebuilt
 on every batch, and on a GPU stage that is usually the whole performance story.
@@ -113,11 +113,11 @@ recipes above are built on, and the full table lives in
 
 | Workload | Model | Throughput |
 | --- | --- | ---: |
-| Audio feature extraction | torchaudio mel + ResNet-18 | **38,546 clip/s** |
-| Text embeddings | sentence-transformers MiniLM | **33,611 text/s** |
-| Fractional-GPU packing | EfficientNet-B0, 2 per GPU | **6,764 img/s** at 89% GPU |
-| Batch inference | ResNet-50 | **2,504 img/s** at 81% GPU |
-| LLM batch inference | HF gpt2 | **814.8 prompt/s** |
+| Audio feature extraction | torchaudio mel + ResNet-18 | 38,546 clip/s |
+| Text embeddings | sentence-transformers MiniLM | 33,611 text/s |
+| Fractional-GPU packing | EfficientNet-B0, 2 per GPU | 6,764 img/s at 89% GPU |
+| Batch inference | ResNet-50 | 2,504 img/s at 81% GPU |
+| LLM batch inference | HF gpt2 | 814.8 prompt/s |
 
 None of that comes from per-workload tuning. It comes from the model loading once, the CPU
 stage overlapping the GPU stage, and the decode running in the data plane.

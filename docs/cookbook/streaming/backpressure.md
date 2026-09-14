@@ -1,7 +1,8 @@
 # Backpressure
 
-This page covers how a streaming query stops its source from handing it more than it can
-process, and how to tell whether it is working.
+A streaming query reads whatever its source hands it. Stopping the source from handing over
+more than the query can process is the whole of this page, along with how to tell whether it
+is working.
 
 ## What runs away
 
@@ -47,8 +48,9 @@ matters more than it looks: ten thousand 4 KiB JSON files and three 8 GiB Parque
 both "a backlog", and only one of them fits.
 
 This is a real bound and it is the right first move. Its limit is that you have to pick the
-number, and you have to pick it for the worst trigger the query will ever see — so it throttles
-every other one, and it goes stale as soon as the cluster, the data, or the plan changes.
+number, and you have to pick it for the worst trigger the query will ever see. That number then
+throttles every other trigger, and it goes stale as soon as the cluster, the data, or the plan
+changes.
 
 ## The adaptive cap
 
@@ -59,10 +61,12 @@ measured throughput:
 # docs: skip
 import batcher as bt
 
-with bt.config_context(bt.Config(
-    streaming=bt.StreamingConfig(backpressure_enabled=True),
-)):
-    query = events.write_stream.delta("s3://lake/orders", trigger=bt.Trigger.processing_time(30))
+with bt.config_context(
+    bt.Config(
+        streaming=bt.StreamingConfig(backpressure_enabled=True),
+    )
+):
+    query = events.write.delta("s3://lake/orders", trigger=bt.Trigger.processing_time("30 seconds"))
 ```
 
 Each completed micro-batch reports how many rows it consumed and how long it took, which is a
@@ -102,7 +106,7 @@ An admission cap changes how much of a stream a trigger reads. It never changes 
 computes from the rows it read, so none of this can change a result.
 
 :::{note}
-The controller acts through a source's per-trigger admission, so it paces broker sources —
+The controller acts through a source's per-trigger admission, so it paces broker sources:
 Kafka, Kinesis, Pulsar, Pub/Sub, Event Hubs. A file source has no per-trigger row admission to
 narrow, and is governed by `max_files_per_trigger` and `max_bytes_per_trigger` instead. This
 matches where Spark's rate controller applies.

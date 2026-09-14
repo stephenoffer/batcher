@@ -94,9 +94,9 @@ the seven are working as intended, and the eighth is quietly costing a third of 
 Each verdict comes from readings you can also inspect directly. They are worth knowing about,
 because each names a failure that nothing else reports.
 
-**The host link.** A slot that trained to x8 on a x16 part, or to Gen3 on a Gen5 board, halves
-or quarters every transfer without failing anything. This is the most common silent capacity
-loss on rented GPU capacity.
+Start with the host link. A slot that trained to x8 on a x16 part, or to Gen3 on a Gen5
+board, halves or quarters every transfer without failing anything. This is the most common
+silent capacity loss on rented GPU capacity.
 
 ```python
 from batcher._internal.hardware.telemetry.throughput import device_throughput
@@ -108,22 +108,22 @@ print(isinstance(device_throughput(), tuple))
 Each record carries the negotiated generation and width against the maximum both ends support,
 live transmit and receive rates, and the fraction of the link's capacity in use.
 
-**Intermittent clamping.** Asking whether a device is throttled *right now* only finds a clamp
-if you happen to ask during one. A device clamped for 30 percent of a stage looks unclamped on
-70 percent of samples. The driver publishes cumulative counters instead, so two readings and a
-subtraction give the fraction of an interval the device actually spent clamped. That is a
-measurement rather than a sample.
+Clamping is usually intermittent, which is what makes it hard to catch. Asking whether a
+device is throttled *right now* only finds a clamp if you happen to ask during one, and a
+device clamped for 30 percent of a stage looks unclamped on 70 percent of samples. The driver
+publishes cumulative counters instead, so two readings and a subtraction give the fraction of
+an interval the device actually spent clamped. That is a measurement rather than a sample.
 
-**The fixed-function engines.** A datacenter GPU is not one processor. Beside the SMs sit
-dedicated video decode, video encode, and JPEG decode blocks, each with its own utilization
-counter, and none of them contributes to `sm_utilization`. A pipeline decoding H.264 on the
-shader cores shows a busy GPU while the decoder that would have done the same work for free
-sits at zero.
+A datacenter GPU is not one processor, and the fixed-function engines are the part the usual
+figure misses. Beside the SMs sit dedicated video decode, video encode, and JPEG decode
+blocks, each with its own utilization counter, and none of them contributes to
+`sm_utilization`. A pipeline decoding H.264 on the shader cores shows a busy GPU while the
+decoder that would have done the same work for free sits at zero.
 
-**Who else is on the device.** On a shared device, every device-level utilization figure is the
-sum across tenants. Autobatching that reads it sees a neighbour's load as its own, backs off,
-gets less of the device, and reads the same high number again. The loop is stable at the wrong
-answer.
+Last, who else is on the device. Every device-level utilization figure on a shared device is
+the sum across tenants. Autobatching that reads it sees a neighbour's load as its own, backs
+off, gets less of the device, and reads the same high number again. The loop is stable at the
+wrong answer.
 
 ## Label the timeline for a profiler
 
@@ -152,15 +152,15 @@ with the missing time landing on whichever call happens to synchronize first.
 Both are off by default. They are free when nothing is capturing, and a CUDA event pair per
 range is not free, so the cost is only paid by somebody reading a profile.
 
-## Two ways a device path silently is not one
+## Two optimizations that silently did not happen
 
-Some slow stages are slow because an optimization that was requested did not happen. These are
-worth checking explicitly, because in both cases the fallback is *slower* than the plain host
-path it replaced and reports success either way.
+Some slow stages are slow because an optimization that was requested did not happen. Check
+these two explicitly. In both cases the fallback is *slower* than the plain host path it
+replaced, and it reports success either way.
 
-**Compression the device cannot undo.** A device Parquet read decodes where the compute is,
-which is the whole argument for it. That argument has an unstated precondition: the
-decompression has to happen there too. Handed a codec it has no kernel for, the device reader
+The first is compression the device cannot undo. A device Parquet read decodes where the
+compute is, which is the whole argument for it. That argument has an unstated precondition:
+the decompression has to happen there too. Handed a codec it has no kernel for, the device reader
 copies the pages to the host, decompresses them there, and copies them back. It crosses PCIe
 twice instead of once and uses the host cores anyway.
 
@@ -170,8 +170,9 @@ better tested. The check reads through the same cache the row-group splitter use
 usual path it costs nothing, and a footer it cannot read leaves the decision alone rather than
 disabling the device path on a guess.
 
-**GPUDirect Storage that is not direct.** KvikIO has a fallback called compat mode, in which
-every read is an ordinary host read into a bounce buffer followed by a copy to the device. It
+The second is GPUDirect Storage that is not direct. KvikIO has a fallback called compat mode,
+in which every read is an ordinary host read into a bounce buffer followed by a copy to the
+device. It
 engages when the `nvidia-fs` kernel module is missing, which is the normal state of a container
 built without it. Nothing raises, and the read is slower than the plain host read because it
 does the same work plus an extra buffer.

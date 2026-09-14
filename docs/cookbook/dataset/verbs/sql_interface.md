@@ -1,6 +1,6 @@
 # The SQL interface
 
-``bt.sql`` and ``ds.sql`` build the *same* logical plan the DataFrame API builds, so there is no second engine and no second semantics. That means you can write the join in SQL and the feature engineering in expressions, in one pipeline.
+`bt.sql` and `ds.sql` build the *same* logical plan the DataFrame API builds. No second engine, no second semantics. Write the join in SQL and the feature engineering in expressions, in one pipeline.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/dataset/sql_interface.py
 
 ## See also
 
-- {doc}`/cookbook/dataset/cleaning/sampling_and_splits`: reproducible subsets that do not leak.
-- {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
+- {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join for time series.
+- {doc}`/cookbook/dataset/verbs/grouping`: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -130,7 +130,7 @@ The finer ladder lives in `carbonite/memory/pressure.py`:
 `max(raw, previous_ewma)`, so pressure escalates instantly and de-escalates only as the EWMA
 relaxes. A monitor that flapped between NORMAL and SPILL would flap the morsel size and the
 credit window with it. Readers that must not advance the EWMA, such as morsel sizing and the
-cache trim, call {py:meth}`classify() <batcher.api.dataset.ml.DatasetML.classify>` instead. Exactly one component per round may call `level()`.
+cache trim, call `PressureMonitor.classify()` instead. Exactly one component per round may call `level()`.
 :::
 ::::
 
@@ -184,6 +184,11 @@ reserve is always the one that spills. Closing that half needs a `Spillable` on 
 operators that own in-progress state, which the pool may call from another thread while
 the owning operator is reading it.
 
+The pool's whole behavior fits in one picture: one soft line, one limit, and the two ways
+a refused reservation can end.
+
+![The Rust buffer pool as a single gauge with one soft line at 80% of the limit. Below that line the pool is nominal and nothing throttles; above it the pool is elevated and operators spill early. Critical is used == limit rather than a band, because growth past the limit is refused outright. The value moves right as operators reserve and back as they release: the pool counts bytes, it never allocates them. A try_reserve(n) that still fits under the limit is granted as an RAII guard, and every byte returns when the guard drops, on a panic as much as on a clean finish. One that does not fit is refused with the denial counted and used untouched, the pool then asks the largest other registered consumer to spill and re-reserves, for at most 32 rounds and stopping the moment a round frees nothing. A caller still short after that spills itself, the refusal being the signal. Carbonite's pool and the engine's pool count different bytes and are read side by side, never summed.](/_static/diagrams/buffer_pool_zones.svg)
+
 ## Where the limit comes from
 
 `memory.max_memory_bytes` is `None` by default, and `api` auto-senses it once at the
@@ -236,7 +241,7 @@ stateful operator whose estimated footprint exceeds it goes out of core instead 
 
 The pool's accounting answers how much the engine reserved. It cannot answer whether the kernel is coping, and the two disagree in exactly the cases that kill a container. Three cgroup v2 signals close that gap, each read only from the container's own cgroup slice.
 
-`memory.high` is the threshold Kubernetes memory QoS derives from a pod's *request*, while `memory.max` comes from its *limit*. Past `memory.high` the kernel does not fail an allocation. It puts every allocating task to sleep in direct reclaim, so a query sized against `memory.max` spends its whole life being throttled while every counter reports success. With `memory.respect_cgroup_high` on, the engine treats the lower of the two as the ceiling, and the pressure fraction is measured against it.
+`memory.high` is the threshold Kubernetes memory QoS derives from a pod's *request*, while `memory.max` comes from its *limit*. Past `memory.high` the kernel does not fail an allocation. It puts every allocating task to sleep in direct reclaim. A query sized against `memory.max` then spends its whole life being throttled while every counter reports success. With `memory.respect_cgroup_high` on, the engine treats the lower of the two as the ceiling, and the pressure fraction is measured against it.
 
 Pressure Stall Information answers the coping question directly. A cgroup can sit at 70% of its limit and still spend most of every second in reclaim, because the limit being defended is `memory.high`, or because its resident set is nearly all anonymous and there is no cache left to drop. Batcher reads the `full` share, meaning the fraction of the window in which every runnable task was stalled, and uses it only as a floor on the pressure level, capped at `SPILL`. A stall share is a rate rather than a headroom figure, so it must never be the thing that halts a query with gigabytes free. A host-wide reading is deliberately ignored: acting on it would make one container spill because a different one is thrashing.
 
@@ -274,6 +279,11 @@ The share is reactive as well as proactive. `BudgetingAdmission` subtracts what 
 queries have already reserved, and a reservation that does not fit routes the query out of
 core. Those two see reservations that have happened; the share covers the window before
 they do.
+
+Admission applies those reductions in a fixed order, and what it holds the result against is
+the plan's estimated peak rather than a count of live hash tables.
+
+![How Carbonite sizes the envelope one query may plan against, and what it does when the plan will not fit inside it. A join's peak is the larger of its build subtree's peak and the resident build table plus its probe subtree's peak, because the build table stays resident while the probe runs; on one worked bushy plan the largest single operator reads 18.2 MB where that concurrent figure is 27.4 MB, a 1.5x under-count. The envelope starts at the process envelope, or total RAM when none is set, is multiplied by memory.soft_limit, has what concurrent work already holds subtracted, and is divided by the query's share of 1 / min(active, slots), which is exactly 1 when concurrency is unbounded. It is floored at one morsel, so a streaming plan is never refused for a budget smaller than a single batch. A plan whose peak fits is admitted with no bound imposed; one that does not is admitted anyway with m_max_bytes set to the envelope, so the binding join, aggregate or sort goes out of core. The verdict names that operator, and where it rests on a guess it is advisory: it routes, it never fails.](/_static/diagrams/memory_envelope.svg)
 
 Read the division back from the Carbonite resource decision:
 

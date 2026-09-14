@@ -14,9 +14,14 @@ cost rises for the life of the query. A delta costs the *batch's* distinct group
 instead. Recovery combines the newest snapshot with every delta recorded after it, which is
 sound because `combine` is associative and commutative (invariant #7).
 
-Only a fold that never *removes* rows may use deltas: a delta chain has no way to express an
-eviction, so replaying it would resurrect a closed window. `core.streaming.folds._AggFold`
-qualifies and offers a delta; `_WindowedAggFold` does not and keeps whole snapshots.
+A delta chain has to be able to express an eviction, or replaying it would resurrect a closed
+window. Both folds can. `core.streaming.folds._AggFold` never removes a row, so the question
+does not arise. `_WindowedAggFold` does evict, and what it removes is always a *prefix* on a
+totally ordered axis, which one integer describes: `take_delta` rides that bound in each entry
+as `_EVICTED_META` (`core/streaming/folds/windowed.py`). This paragraph said the windowed fold
+"does not and keeps whole snapshots" until 2026-09-13; that had stopped being true, and the
+stale sentence had already been copied into `tools/diagrams/state_store.py` and onto the
+figure it draws.
 
 Local and remote are written differently, and `location.py` says why: a local write is
 fsynced and renamed and the directory fsynced, because the engine snapshots state and

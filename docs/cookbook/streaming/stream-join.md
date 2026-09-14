@@ -9,8 +9,8 @@ ever seen is retained, because a click for it could theoretically arrive next ye
 runs for a week and then dies on memory.
 :::
 
-The fix is not a bigger heap. It is admitting that a click ten hours after its impression
-is not an attribution, and telling the engine so, in the join itself.
+A bigger heap only buys a longer week. The fix is to admit that a click ten hours after
+its impression is not an attribution, and to tell the engine so inside the join itself.
 
 ## The interval is the contract
 
@@ -32,14 +32,18 @@ import batcher as bt
 base = dt.datetime(2024, 1, 1)
 minute = dt.timedelta(minutes=1)
 
-impressions = bt.from_pydict({
-    "ad": ["a1", "a2", "a3"],
-    "shown": [base, base + 5 * minute, base + 10 * minute],
-})
-clicks = bt.from_pydict({
-    "ad": ["a1", "a3"],
-    "clicked": [base + 2 * minute, base + 200 * minute],
-})
+impressions = bt.from_pydict(
+    {
+        "ad": ["a1", "a2", "a3"],
+        "shown": [base, base + 5 * minute, base + 10 * minute],
+    }
+)
+clicks = bt.from_pydict(
+    {
+        "ad": ["a1", "a3"],
+        "clicked": [base + 2 * minute, base + 200 * minute],
+    }
+)
 
 attributed = impressions.join_stream(
     clicks, on="ad", left_time="shown", right_time="clicked", within="30m"
@@ -66,23 +70,21 @@ right_schema = pa.schema([("ad", pa.string()), ("clicked", pa.timestamp("us"))])
 
 
 def impression_feed():
-    yield pa.record_batch({"ad": ["a1", "a2"], "shown": [base, base + 5 * minute]},
-                          schema=left_schema)
+    yield pa.record_batch(
+        {"ad": ["a1", "a2"], "shown": [base, base + 5 * minute]}, schema=left_schema
+    )
     yield pa.record_batch({"ad": ["a3"], "shown": [base + 10 * minute]}, schema=left_schema)
 
 
 def click_feed():
     yield pa.record_batch({"ad": ["a1"], "clicked": [base + 2 * minute]}, schema=right_schema)
-    yield pa.record_batch({"ad": ["a3"], "clicked": [base + 200 * minute]},
-                          schema=right_schema)
+    yield pa.record_batch({"ad": ["a3"], "clicked": [base + 200 * minute]}, schema=right_schema)
 
 
 left = bt.from_batches(impression_feed, left_schema, bounded=False)
 right = bt.from_batches(click_feed, right_schema, bounded=False)
 
-joined = left.join_stream(
-    right, on="ad", left_time="shown", right_time="clicked", within="30m"
-)
+joined = left.join_stream(right, on="ad", left_time="shown", right_time="clicked", within="30m")
 for batch in joined.iter_batches():
     print(batch.to_pydict()["ad"])
 # ['a1']
@@ -102,7 +104,7 @@ attributed = impressions.join_stream(
     left_time="shown_at",
     right_time="clicked_at",
     within="30m",
-    lateness="5m",   # grace before buffered rows are evicted
+    lateness="5m",  # grace before buffered rows are evicted
 )
 for batch in attributed.iter_batches():
     publish(batch)
@@ -123,7 +125,7 @@ for a straggler; it costs you exactly that much more buffer.
 
 :::{important}
 **A stream-stream join has no checkpoint.** It writes to a sink like any other streaming
-query — `joined.write.delta(..., trigger=...)` runs — but passing `checkpoint=` is refused
+query, so `joined.write.delta(..., trigger=...)` runs. Passing `checkpoint=` is refused
 rather than accepted, because the join's state is two buffered sides and two watermarks,
 none of it addressable by a source offset. A restart therefore begins with an empty join
 and re-reads from wherever the sources start. The sink's own idempotency still applies, so
@@ -139,7 +141,7 @@ still arrive for it.
 # docs: skip
 unattributed = impressions.join_stream(
     clicks, on="ad", left_time="shown", right_time="clicked", within="30m", how="left"
-).filter(col("clicked").is_null())
+).filter(bt.col("clicked").is_null())
 ```
 
 :::{note}
@@ -158,10 +160,12 @@ registry, impressions against a campaign dimension. Only one side streams, so no
 is needed. Write it as an ordinary {py:meth}`join <batcher.Dataset.join>`:
 
 ```python
-campaigns = bt.from_pydict({
-    "ad": ["a1", "a2", "a3"],
-    "campaign": ["spring", "fall", "spring"],
-})
+campaigns = bt.from_pydict(
+    {
+        "ad": ["a1", "a2", "a3"],
+        "campaign": ["spring", "fall", "spring"],
+    }
+)
 
 enriched = left.join(campaigns, on="ad", how="left")
 for batch in enriched.iter_batches():

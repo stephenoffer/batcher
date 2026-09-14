@@ -5,7 +5,7 @@ the geospatial, graph and rigid-body surfaces.
 
 ## Statistics
 
-Centre, spread, shape and extremes in one pass, and the order matters for interpretation. The
+Centre, spread, shape and extremes in one pass. The order matters for interpretation: the
 skew tells you whether to report the mean or the median, so compute both before deciding
 which goes in the summary.
 
@@ -29,7 +29,7 @@ assert summary["mean"][0] > summary["median"][0]
 
 Two habits the scripts enforce. A difference between groups is not a finding until you know
 the spread and the sample size, so the standard error comes out of the same pass as the mean.
-And with enough rows every difference is significant, so an effect size is what makes the
+And with enough rows every difference is significant. An effect size is what makes the
 comparison informative.
 
 ## Time series
@@ -56,13 +56,13 @@ daily = events.group_by("day").agg(total=col("amount").sum()).sort("day")
 assert daily.count() == 2
 ```
 
-Growth needs a previous value, and the first period has none. A null there is correct; a zero
-is a lie that shows up as a spike on every chart.
+Growth needs a previous value, and the first period has none. A null there is correct. A zero
+is a lie, and it shows up as a spike on every chart.
 
 ## Geospatial
 
-Longitude first, then latitude, which is what WKT, GeoJSON and PostGIS all use. Reversing it
-puts the data in the wrong hemisphere without any error.
+Longitude first, then latitude. That is what WKT, GeoJSON and PostGIS all use, and reversing
+it puts the data in the wrong hemisphere without raising anything.
 
 A spatial join cannot hash, so the pattern is to bound the candidates cheaply with an
 envelope or a grid key and evaluate the exact predicate only on what survives. A geohash
@@ -75,8 +75,8 @@ A graph is an edge table with two columns you have chosen to call source and tar
 what makes graph analytics available to any dataset with a foreign key. Degree and connected
 components cost one pass each and tell you whether an expensive algorithm will mean anything.
 
-Materialize the edge list before running the iterative algorithms. They re-read the edges once
-per iteration, so handing them a join-and-distinct plan re-executes that plan every time.
+Materialize the edge list first. The iterative algorithms re-read the edges once per
+iteration, so handing them a join-and-distinct plan re-executes that plan every time.
 
 ## Robotics and autonomous driving
 

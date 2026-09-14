@@ -19,9 +19,10 @@ ds = bt.from_pydict(
 )
 ```
 
-## select
+## Choosing and deriving columns
 
-`select` chooses the full output. Pass existing column names as positional
+Two verbs cover almost everything, and the difference between them is what happens to the
+columns you didn't mention. `select` chooses the full output. Pass existing column names as positional
 arguments and derived columns as keyword arguments. The result contains exactly
 the columns you name.
 
@@ -39,9 +40,7 @@ print(ds.select("name", "price").to_pydict())
 # {'name': ['alice', 'bob', 'carol'], 'price': [10.0, 20.0, 30.0]}
 ```
 
-## with_columns
-
-{py:meth}`with_columns <batcher.Dataset.with_columns>` adds or replaces columns and keeps every other column. New columns
+{py:meth}`with_columns <batcher.Dataset.with_columns>` is the other half. It adds or replaces columns and keeps every other one. New columns
 are passed as keyword arguments. Adding several in one call evaluates them in a
 single pass.
 
@@ -63,10 +62,7 @@ print(out.to_pydict())
 # {'name': ['alice', 'bob', 'carol'], 'price': [11.0, 22.0, 33.0], 'qty': [1, 2, 3]}
 ```
 
-## with_column
-
-{py:meth}`with_column <batcher.Dataset.with_column>` adds or replaces a single column by name. It is the one-column form
-of `with_columns`.
+{py:meth}`with_column <batcher.Dataset.with_column>` is the one-column form of the same thing.
 
 ```python
 out = ds.with_column("subtotal", bt.col("price") * bt.col("qty"))
@@ -75,7 +71,7 @@ print(out.to_pydict())
 #  'subtotal': [10.0, 40.0, 90.0]}
 ```
 
-## drop
+## Dropping and renaming
 
 `drop` removes the named columns and keeps the rest.
 
@@ -83,8 +79,6 @@ print(out.to_pydict())
 print(ds.drop("qty").to_pydict())
 # {'name': ['alice', 'bob', 'carol'], 'price': [10.0, 20.0, 30.0]}
 ```
-
-## rename
 
 `rename` takes a mapping of old name to new name. Columns not in the mapping are
 unchanged.
@@ -96,7 +90,7 @@ print(ds.rename({"qty": "quantity"}).to_pydict())
 
 ## Column selectors
 
-The transforms above name columns one at a time. A **selector** stands for *every*
+The transforms above name columns one at a time. A *selector* stands for every
 column matching a rule: a name, a name pattern, an Arrow dtype. One written
 expression then becomes as many computed columns as match. Because a selector is an
 `Expr` leaf ({py:class}`Selector <batcher.plan.expr_ir.selectors.Selector>`), the whole scalar algebra composes onto it, and it works
@@ -167,10 +161,10 @@ place when the output name is unchanged, and adds a new one when it changes:
 
 ```python
 print(ds.with_columns(bt.floating() * 2).to_pydict()["price"])
-# [20.0, 40.0, 60.0] — price replaced in place
+# [20.0, 40.0, 60.0]: price replaced in place
 
 print(ds.with_columns(bt.floating().name.suffix("_x2") * 2).columns)
-# ['name', 'price', 'qty', 'price_x2'] — price kept, a new column added
+# ['name', 'price', 'qty', 'price_x2']: price kept, a new column added
 ```
 
 Selectors compose with set algebra: `|` (union), `&` (intersection), `-`
@@ -178,14 +172,12 @@ Selectors compose with set algebra: `|` (union), `&` (intersection), `-`
 
 ```python
 print(ds.select(bt.numeric() - bt.floating()).columns)
-# ['qty'] — the numeric columns that are not floats
+# ['qty'], the numeric columns that are not floats
 ```
 
-## Choosing between select and with_columns
+## Casting inside a projection
 
-One obvious tool per intent. `select` defines the complete set of output columns.
-`with_columns` and `with_column` add to or replace columns in the set you already have.
-Casting is an expression method taking an Arrow type name, and works inside either one:
+Casting is an expression method taking an Arrow type name, so it works inside either verb:
 
 ```python
 print(ds.with_columns(qty=bt.col("qty").cast("float64")).to_pydict())
@@ -216,7 +208,7 @@ built-in method.
 Semistructured data arrives with lists and structs inside columns. Two relational
 transforms flatten them, and they compose to unnest arbitrarily deep shapes.
 
-`explode` turns a **list** column into one row per element, repeating the other
+`explode` turns a `list` column into one row per element, repeating the other
 columns, the same as SQL `UNNEST`. Empty and null lists drop out.
 
 ```python
@@ -225,7 +217,7 @@ print(nested.explode("tags").to_pydict())
 # {'id': [1, 1, 2], 'tags': ['a', 'b', 'c']}
 ```
 
-`unnest` promotes a **struct** column's fields to top-level columns, replacing the
+`unnest` promotes a `struct` column's fields to top-level columns, replacing the
 struct in place.
 
 ```python

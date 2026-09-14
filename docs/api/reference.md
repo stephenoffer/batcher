@@ -1,6 +1,6 @@
 # Quick reference
 
-This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The {doc}`area pages <index>` explain the same surface with runnable examples, and the {doc}`complete reference <complete>` renders every signature and docstring.
+This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The {doc}`area pages <index>` explain the same surface with runnable examples, and the {doc}`complete reference <complete/index>` renders every signature and docstring.
 
 ```python
 import batcher as bt
@@ -124,9 +124,9 @@ These compute (or read) a small result and so are eager.
 | Member | Returns |
 | --- | --- |
 | `.columns` | current schema names (property) |
-| `.schema()` / `.dtypes()` | the Arrow schema / its column types |
+| `.schema` / `.dtypes` | the Arrow schema / its column types (properties) |
 | {py:meth}`.is_empty() <batcher.Dataset.is_empty>` | whether the dataset has zero rows |
-| {py:obj}`.is_streaming() <batcher.Dataset.is_streaming>` | whether the source is unbounded |
+| {py:obj}`.is_streaming <batcher.Dataset.is_streaming>` | whether the source is unbounded (property) |
 | {py:meth}`.describe(percentiles=(.25,.5,.75)) <batcher.Dataset.describe>` | summary statistics per column |
 | {py:meth}`.null_count() <batcher.Dataset.null_count>` | null count per column |
 | {py:meth}`.corr_matrix(columns=None) <batcher.Dataset.corr_matrix>` | pairwise Pearson correlation matrix over numeric columns (one scan) |
@@ -146,11 +146,7 @@ print(out.to_pydict())
 `group_by(*keys)` returns a {py:class}`GroupBy <batcher.GroupBy>`. Finalize it with `.agg(**named_aggs)`, where each keyword is the output column name. `group_by()` with no keys aggregates the whole dataset.
 
 ```python
-out = (
-    ds.group_by("category")
-    .agg(total=bt.col("price").sum(), n=bt.count())
-    .sort("category")
-)
+out = ds.group_by("category").agg(total=bt.col("price").sum(), n=bt.count()).sort("category")
 print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [40.0, 20.0], 'n': [2, 1]}
 ```
@@ -182,7 +178,7 @@ schema wherever a column is expected. They produce a {py:class}`Selector <batche
 | {py:func}`bt.string() <batcher.string>` / {py:func}`bt.boolean() <batcher.boolean>` / {py:func}`bt.temporal() <batcher.temporal>` | string / boolean / date-time columns |
 | {py:func}`bt.exclude(*names) <batcher.exclude>` | every column except the named ones |
 
-{py:func}`bt.by_dtype <batcher.by_dtype>`, {py:func}`bt.matches <batcher.matches>`, {py:func}`bt.starts_with <batcher.starts_with>`, {py:func}`bt.ends_with <batcher.ends_with>`, and {py:func}`bt.contains <batcher.contains>` select by dtype or by name pattern. See the {doc}`complete reference <complete>` for their signatures.
+{py:func}`bt.by_dtype <batcher.by_dtype>`, {py:func}`bt.matches <batcher.matches>`, {py:func}`bt.starts_with <batcher.starts_with>`, {py:func}`bt.ends_with <batcher.ends_with>`, and {py:func}`bt.contains <batcher.contains>` select by dtype or by name pattern. See the {doc}`complete reference <complete/index>` for their signatures.
 
 ## Scalar, aggregate, and window functions
 
@@ -279,7 +275,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
   `.arg_min()`, `.arg_max()`, `.bool_and()`, `.bool_or()`,
   `.bit_and()` / `.bit_or()` / `.bit_xor()`, `.histogram()`, `.array_agg()`
 - Approximate aggregates, sketch-backed and mergeable so they scale: `.approx_n_unique()` /
-  `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (KLL)
+  `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (DDSketch)
 - Cumulative & window analytics (bind with `.over(...)`): `.cum_sum()` / `.cum_min()` /
   {py:meth}`.cum_max() <batcher.plan.expr_ir.core.Expr.cum_max>` / {py:meth}`.cum_count() <batcher.plan.expr_ir.core.Expr.cum_count>`, {py:meth}`.rolling_sum(k) <batcher.plan.expr_ir.core.Expr.rolling_sum>` / {py:meth}`.rolling_mean(k) <batcher.plan.expr_ir.core.Expr.rolling_mean>` /
   `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)`, `.diff(n=1)`,
@@ -319,7 +315,9 @@ Typed methods hang off an expression by namespace rather than crowding `Expr` it
 {py:func}`bt.sql(query, table_name=ds_or_table, ...) <batcher.sql>` returns a Dataset. Each table named in the query is bound by a keyword argument. The {doc}`SQL page </api/relational/sql>` lists the supported clauses and features in full.
 
 ```python
-out = bt.sql("SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds)
+out = bt.sql(
+    "SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds
+)
 print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [40.0, 20.0]}
 ```
@@ -335,7 +333,7 @@ model once per worker.
 | {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` | batched inference |
 | {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` | batched embeddings |
 | {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | offline LLM text generation |
-| {py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` | LLM → **typed** columns (AI-powered ETL) |
+| {py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` | LLM output parsed into typed columns against a schema |
 | {py:meth}`ds.ml.classify(engine, labels=[...]) <batcher.api.dataset.ml.DatasetML.classify>` | zero-shot labelling, domain pinned to `labels` |
 | {py:meth}`ds.ml.near_duplicates(col) <batcher.api.dataset.ml.DatasetML.near_duplicates>` / {py:meth}`drop_near_duplicates(col) <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` | MinHash+LSH fuzzy dedup |
 | {py:meth}`ds.ml.similarity_join(other, left_on=...) <batcher.api.dataset.ml.DatasetML.similarity_join>` | join two datasets on embedding similarity |
@@ -367,7 +365,7 @@ from batcher import Config, set_config, config_context
 `optimizer`, `pid`, `metadata`). Derive a modified Config and apply it process-wide
 with {py:func}`set_config(...) <batcher.set_config>` or temporarily with {py:func}`config_context(...) <batcher.config_context>`. {py:meth}`Config.from_env <batcher.Config.from_env>`
 and {py:meth}`Config.from_file <batcher.Config.from_file>` overlay `BATCHER_*` environment variables and a JSON file.
-See the configuration page for the full pattern.
+{doc}`/api/operations/configuration` has the full pattern and the precedence order.
 
 ## See also
 
@@ -376,6 +374,6 @@ See the configuration page for the full pattern.
   `.str` / `.dt` / `.list` / `.struct` / `.json` namespaces.
 - {doc}`/api/relational/functions`: the free functions, grouped by family.
 - {doc}`/api/relational/io`: readers, writers, save modes, and the format-specific options.
-- {doc}`../user-guide/index`: the task-oriented guides behind these signatures.
-- {doc}`../getting-started/quickstart`: the same surface as a five-minute walkthrough.
-- {doc}`../cookbook/index`: 100 runnable recipes, when the signature is not enough.
+- {doc}`/user-guide/index`: the task-oriented guides behind these signatures.
+- {doc}`/getting-started/quickstart`: the same surface as a five-minute walkthrough.
+- {doc}`/cookbook/index`: 145 runnable recipes, when the signature is not enough.

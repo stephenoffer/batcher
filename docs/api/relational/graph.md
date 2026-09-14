@@ -28,9 +28,10 @@ A graph is an edge table plus the conventions the algorithms read: which columns
 ## Building a graph from other data
 
 Most data that wants graph analysis does not arrive as edges. It arrives as embeddings,
-coordinates, or an interaction log, and the graph is a decision you make from it. All
-four are quadratic in the worst case, because "which pairs are close" is a question about
-pairs; each takes a blocking key, and choosing it is the engineering.
+coordinates or an interaction log, and the graph is a decision you make from it. All four
+of these are quadratic in the worst case, because "which pairs are close" is a question
+about pairs rather than about rows, so each takes a blocking key and picking that key is
+where the engineering goes.
 
 ```{eval-rst}
 .. autosummary::
@@ -46,7 +47,7 @@ pairs; each takes a blocking key, and choosing it is the engineering.
 
 ## Degree
 
-The cheapest thing you can ask a graph, and usually the first. One {py:meth}`group_by <batcher.Dataset.group_by>` over the edge list. Note that on a symmetrized graph `degree` counts each edge twice, so `out_degree` is the neighbour count there.
+The cheapest thing you can ask a graph, and usually the first. One {py:meth}`group_by <batcher.Dataset.group_by>` over the edge list. On a symmetrized graph `degree` counts each edge twice, so `out_degree` is the neighbour count there.
 
 ```{eval-rst}
 .. autosummary::
@@ -64,7 +65,7 @@ The cheapest thing you can ask a graph, and usually the first. One {py:meth}`gro
 
 ## Centrality
 
-Which nodes matter, by six different definitions of matter. `pagerank` is the default; `personalized_pagerank` is the recommendation and local-neighbourhood primitive; `hits` is the one that separates hubs from authorities.
+Which nodes matter, by six different definitions of matter. Start with `pagerank`. `personalized_pagerank` is the recommendation and local-neighbourhood primitive, and `hits` separates hubs from authorities.
 
 ```{eval-rst}
 .. autosummary::
@@ -154,7 +155,7 @@ How alike two nodes are, judged by who they connect to. Scored for candidate pai
 
 ## Sampling
 
-What graph ML actually runs on. `neighbor_sample` bounds a GNN layer's cost regardless of degree; `random_walks` turns a graph into sequences an embedding model can read. Every function is deterministic given a seed, because an embedding trained on walks you cannot regenerate is one you cannot debug.
+What graph ML actually runs on. `neighbor_sample` bounds a GNN layer's cost regardless of degree. `random_walks` turns a graph into sequences an embedding model can read. Every function is deterministic given a seed, because an embedding trained on walks you cannot regenerate is one you cannot debug.
 
 ```{eval-rst}
 .. autosummary::
@@ -170,7 +171,7 @@ What graph ML actually runs on. `neighbor_sample` bounds a GNN layer's cost rega
 
 ## Graph-ML features
 
-Turning a graph into a feature table. `aggregate_neighbors` is one round of message passing, the arithmetic core of every GNN; stacking it and handing the result to a gradient-boosted model is a strong baseline that trains in seconds.
+Turning a graph into a feature table. `aggregate_neighbors` is one round of message passing, the arithmetic core of every GNN. Stack it and hand the result to a gradient-boosted model: that is a strong baseline, and it trains in seconds.
 
 ```{eval-rst}
 .. autosummary::

@@ -20,8 +20,10 @@ from batcher.ml.model_selection import cross_val_score
 
 ds = bt.from_pydict({"x": [float(i) for i in range(40)], "y": [2.0 * i for i in range(40)]})
 
+
 def r2(scored, y_true, y_pred):
     return evaluate(scored, y_true, y_pred=y_pred, task="regression", metrics=["r2"])["r2"]
+
 
 scores = cross_val_score(
     ds,
@@ -70,9 +72,9 @@ Every combination is scored on the *same* folds. That makes the comparison paire
 rows train and validate each candidate, so a difference between two scores is a difference
 between the candidates rather than fold-assignment luck.
 
-Nothing is refitted on the full dataset afterwards. What comes back is the winning
-parameters, which keeps the search independent of whatever `fit` builds — refit yourself
-with one more call.
+Nothing is refitted on the full dataset afterwards. You get back the winning parameters,
+which keeps the search independent of whatever `fit` builds. Refit yourself with one more
+call.
 
 ## Reading the whole search, not just the winner
 
@@ -100,12 +102,13 @@ print(found.to_dataset().columns)
 ## Minimizing a loss
 
 `greater_is_better` decides the direction, and it defaults to maximizing. Hand a search an
-error metric and leave the default alone, and it returns the *worst* combination —
-confidently, with no error. Set it whenever the metric is a loss:
+error metric and leave the default alone, and it returns the *worst* combination,
+confidently and with no error anywhere. Set it whenever the metric is a loss:
 
 ```python
 def rmse(scored, y_true, y_pred):
     return evaluate(scored, y_true, y_pred=y_pred, task="regression", metrics=["rmse"])["rmse"]
+
 
 by_error = grid_search(
     ds,
@@ -189,6 +192,7 @@ for plotting the peak rather than just naming it.
 ## See also
 
 - {doc}`evaluation` for the metrics these searches optimize.
+- {doc}`splits-and-resampling` for the folds, stratified hold-outs, and class rebalancing these searches run over.
 - {doc}`/ml/preparing/preprocessors/feature-selection` for pruning features rather than
   tuning parameters.
 - {doc}`/api/models/ml-statistics` for the full reference.

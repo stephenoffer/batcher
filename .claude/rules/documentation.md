@@ -4,6 +4,13 @@
 built by `just docs`. This rule is the full reference for authoring and restructuring it.
 The always-loaded contract in `CLAUDE.md` names the gates; this file says what "good" is.
 
+Two skills sit under it and neither repeats it. `docs-grammar-style` is the lookup table for
+a specific sentence, link, table, or term, and it carries the one thing this file does not:
+which syntax survives on which rendering surface, since everything outside `docs/` renders
+as plain GitHub Markdown with no MyST pipeline. `write-in-a-human-voice` handles the shape
+of a whole page, which is the part a style pass never reaches: heading density, sentence
+rhythm, paragraphs that say nothing, and a survey standing where a verdict belongs.
+
 **Rule priority.** When rules conflict: (1) this file, (2) `CLAUDE.md` and the other
 `.claude/rules/` files, (3) the Google developer documentation style guide as a general
 fallback.
@@ -57,9 +64,26 @@ that, and needing the preview usually means the page is too dense to be one page
 
 ### Files and directories
 
-- One topic per page.
+- One topic per page, and a page holds **at most 500 lines**. Past that it has stopped
+  being one topic: it needs a bullet preview to navigate and it buries its own sections.
+- **At most 12 pages and 10 subdirectories in any one directory**, and **at most 5 levels**
+  below `docs/`. A directory holding thirty files is unnavigable however good each file is,
+  and nothing in a page-by-page review notices. At the ceiling, group the pages into a
+  subdirectory by responsibility, or merge the short ones. Never flatten a name
+  (`streaming-stateful-windows.md`) to dodge the limit, which is the docs version of the
+  `expr_str_funcs.py` move `.claude/rules/maintainability.md` bans.
+- The page count includes files `conf.py` excludes from the build, because an excluded
+  working record is still a file a contributor scans past. The directory that first hit the
+  limit, `architecture/internals`, was 29 files of which 23 were excluded.
 - Every directory has an `index.md` that introduces its children and carries their
   `{toctree}`. If a directory doesn't warrant an index, the content shouldn't be nested.
+  A directory whose pages are *all* excluded is a shelf of contributor records rather than
+  a published section, so it is held to the breadth limits but needs no index.
+- All four limits are mechanical, in `tests/docs/test_docs_structure.py`
+  (`_MAX_PAGE_LINES`, `_MAX_PAGES_PER_DIR`, `_MAX_DIRS_PER_DIR`, `_MAX_DEPTH`), for the
+  reason the Python and Rust size limits are: a reviewer's patience is not a gate. A genuine
+  exception goes in `OVERSIZED_ALLOW` or `BREADTH_ALLOW` with a one-line reason, and both
+  lists may shrink rather than grow.
 - Prefer `index.md` over a legacy `overview.md`; fold the latter in when you touch it.
 - Adding, moving, or removing a page means editing the parent `{toctree}` in the same
   change. `tests/docs/test_docs_structure.py` fails on an orphan or a dangling entry, and
@@ -72,8 +96,13 @@ that, and needing the preview usually means the page is too dense to be one page
 
 ### When to restructure rather than edit
 
+- The page passes 500 lines, or the directory passes 12 pages → split or group.
 - H4 or H5 appears → split into sub-pages.
 - The page needs an opening bullet preview to be navigable → split.
+- The rendered page is enormous even though the source is short → split. An `autoclass`
+  with `:members:` is a few lines of source and hundreds of rendered ones, which is how
+  `docs/api/complete/` came to render the whole public surface on one page. Judge the built
+  page, not the Markdown.
 - Several sections answer the same reader goal → consolidate into one use-case narrative.
 - A parent page carries content *and* nests children → move the content down or the
   children up.

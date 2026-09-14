@@ -1,7 +1,7 @@
 # Embeddings, retrieval, and generation
 
-Vectors are first-class columns rather than a bolted-on index, which is what lets one
-pipeline chunk a corpus, embed it, retrieve against it, and call a model on the result
+Vectors are first-class columns here rather than a bolted-on index. One pipeline can
+therefore chunk a corpus, embed it, retrieve against it, and call a model on the result
 without leaving the engine.
 
 - {doc}`/ml/retrieval/embeddings`: encoding a text or image column into vectors.
@@ -15,9 +15,9 @@ without leaving the engine.
 :hidden:
 
 embeddings
-llm/index
-llm-evaluation
-llm-outputs
-rag
 vector-search
+rag
+llm/index
+llm-outputs
+llm-evaluation
 ```

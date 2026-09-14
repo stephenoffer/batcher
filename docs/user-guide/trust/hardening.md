@@ -1,8 +1,7 @@
 # Hardening a deployment
 
-This page covers the settings to change before running Batcher somewhere that matters, and
-and, just as importantly, the boundaries Batcher does not enforce, so you can put a real one
-around it.
+This page covers the settings to change before running Batcher somewhere that matters. It
+also covers the boundaries Batcher does not enforce, so you can put a real one around it.
 
 Read {doc}`/user-guide/trust/governance` first for what row filters and column masks do. This page is about
 making them mandatory, and about everything else on the disk and in the process.
@@ -74,8 +73,6 @@ Install a verifier at startup, from the layer that owns the network edge, and tu
 `require_verified_principal`:
 
 ```python
-import dataclasses
-
 import batcher as bt
 from batcher import Config, GovernanceConfig
 from batcher.governance.authn import ProcessIdentityVerifier
@@ -113,9 +110,7 @@ import batcher as bt
 from batcher.governance.authn import JwtVerifier
 
 bt.set_verifier(
-    JwtVerifier.from_issuer(
-        "https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher"
-    )
+    JwtVerifier.from_issuer("https://login.microsoftonline.com/<tenant>/v2.0", audience="batcher")
 )
 ```
 
@@ -150,7 +145,7 @@ it.
 ```{warning}
 This is a deployment control, not a security boundary. Code inside the engine's process can
 set `issuer` by hand. It makes "we only accept established identities" enforceable for the
-code paths you control; it does not make Batcher a trust boundary.
+code paths you control. It does not make Batcher a trust boundary.
 ```
 
 ## Isolate UDF processes
@@ -167,7 +162,7 @@ variable. Set it to `"strict"` to add resource ceilings:
 ```python
 import dataclasses
 
-from batcher import Config, ExecutionConfig
+from batcher import Config
 
 cfg = Config()
 hardened = cfg.replace(
@@ -203,14 +198,17 @@ environment, because it is that process.
 
 ## Bound how many queries run at once
 
-Batcher admits every arriving query immediately by default, and each one asks the executor for a worker pool sized to every core. That is right for one query and wrong for sixteen: sixteen full-width pools on one machine spend their time context-switching rather than working.
+Batcher admits every arriving query immediately by default, and each one asks the executor
+for a worker pool sized to every core. That is right for one query and wrong for sixteen.
+Sixteen full-width pools on one machine spend their time context-switching rather than
+working.
 
 Set `execution.max_concurrent_queries` to bound it:
 
 ```python
 import dataclasses
 
-from batcher import Config, ExecutionConfig
+from batcher import Config
 
 cfg = Config()
 bounded = cfg.replace(
@@ -225,14 +223,21 @@ print(bounded.execution.max_concurrent_queries)
 # 4
 ```
 
-Query five then waits for a slot rather than joining the scrum, and each admitted query requests a proportionally narrower pool, so four concurrent queries divide the machine instead of each claiming all of it. A single query still gets every core.
+Query five then waits for a slot rather than joining the scrum, and each admitted query
+requests a proportionally narrower pool, so four concurrent queries divide the machine
+instead of each claiming all of it. A single query still gets every core.
 
-`admission_queue_depth` caps the waiting line. Past it, a query raises `AdmissionTimeout` immediately instead of joining a queue nobody is draining, which is an outage that presents as slowness. `admission_timeout_s` bounds how long an admitted-but-waiting query blocks.
+`admission_queue_depth` caps the waiting line. Past it, a query raises `AdmissionTimeout`
+immediately instead of joining a queue nobody is draining, which is an outage that presents
+as slowness. `admission_timeout_s` bounds how long an admitted-but-waiting query blocks.
 
-A `collect()` nested inside a `map_batches` UDF does not consume a second slot. The outer query already holds the machine, and making the inner one queue behind it would deadlock the process against itself.
+A `collect()` nested inside a `map_batches` UDF does not consume a second slot. The outer
+query already holds the machine, and making the inner one queue behind it would deadlock the
+process against itself.
 
 ```{note}
-This is a per-process gate. Batcher has no cross-node admission queue, so on a Ray cluster each driver bounds only its own concurrency.
+This is a per-process gate. Batcher has no cross-node admission queue, so on a Ray cluster
+each driver bounds only its own concurrency.
 ```
 
 ## Artifacts on disk
@@ -290,9 +295,7 @@ four characters a card policy reveals:
 import batcher as bt
 from batcher.governance import Redact
 
-people = bt.from_pydict(
-    {"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]}
-)
+people = bt.from_pydict({"name": ["Anastasia", "Bo", "Li"], "postcode": ["SW1A 2AA", "EC1", "N1"]})
 masked = people.select(
     name=Redact(show_first=1)(bt.col("name")),
     postcode=Redact(show_last=3)(bt.col("postcode")),

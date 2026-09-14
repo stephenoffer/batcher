@@ -188,7 +188,7 @@ def _representative_nodes() -> dict[type, object]:
     parameterized form of each multimodal node — so the corpus is shared rather than
     restated here.
     """
-    from tests.unit.test_ir_snapshot import _representatives
+    from test_ir_snapshot import _representatives
 
     by_type: dict[type, object] = {}
     for node in _representatives().values():

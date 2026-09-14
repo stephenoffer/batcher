@@ -5,10 +5,10 @@ analyse text corpora at scale.
 
 ## Filter on metadata before you decode
 
-An image read produces one row per file, carrying the bytes plus the metadata that can be had
-without decoding: size, mime type, width and height. Decoding is opt-in because it is the
-expensive part, and putting the metadata filter first is the single biggest win in a
-multimodal pipeline.
+An image read produces one row per file. It carries the bytes plus the metadata that can be
+had without decoding: size, mime type, width and height. Decoding is opt-in, because it is
+the expensive part, and putting the metadata filter ahead of it is the single biggest win
+available in a multimodal pipeline.
 
 ```python
 # docs: skip
@@ -45,9 +45,7 @@ frequency table, and no Python touches a token.
 import batcher as bt
 from batcher import col
 
-documents = bt.from_pydict(
-    {"text": ["the quick brown fox", "the lazy dog", "the quick dog"]}
-)
+documents = bt.from_pydict({"text": ["the quick brown fox", "the lazy dog", "the quick dog"]})
 
 frequencies = (
     documents.select(word=col("text").str.split(" "))
@@ -62,8 +60,8 @@ assert top["n"][0] == 3
 ```
 
 Structural detection comes before semantic work. Questions, all-caps, code fences and
-markdown are all detectable without a model, and routing on them is how you notice that a
-third of a corpus is stack traces before you pay to embed it.
+markdown are all detectable without a model. Route on them and you notice that a third of a
+corpus is stack traces before you pay to embed it.
 
 ## Every script on this page
 

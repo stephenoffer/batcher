@@ -22,9 +22,11 @@ class Classifier:
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self.tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            "distilbert-base-uncased"
-        ).cuda().eval()
+        self.model = (
+            AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased")
+            .cuda()
+            .eval()
+        )
         self._torch = torch
 
     def __call__(self, batch):
@@ -41,10 +43,10 @@ class Classifier:
 
 scored = (
     bt.read.parquet("s3://bucket/reviews/*.parquet")
-    .filter(bt.col("lang") == "en")                    # cut rows before the GPU
-    .select("id", "text")                              # cut columns before the GPU
+    .filter(bt.col("lang") == "en")  # cut rows before the GPU
+    .select("id", "text")  # cut columns before the GPU
     .ml.infer(
-        Classifier,                                     # the CLASS: loads once per worker
+        Classifier,  # the CLASS: loads once per worker
         output_columns=["id", "text", "label"],
         batch_size=256,
         num_gpus=1,
@@ -81,7 +83,7 @@ import batcher as bt
 
 class ToyScorer:
     def __init__(self, threshold):
-        self.threshold = threshold      # in a real model: load the weights here
+        self.threshold = threshold  # in a real model: load the weights here
         self.calls = 0
 
     def __call__(self, batch):
@@ -103,7 +105,11 @@ take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`.
 
 ## Sizing the pool
 
-`num_gpus` is what each actor holds, and `concurrency` is how many actors run.
+Each actor holds `num_gpus` of a device, and `concurrency` sets how many actors run.
+
+The two pools that `concurrency` and `batch_size` are really tuning are nested, and they are easy to conflate:
+
+![Two nested pools sit behind one ml.infer or ml.map_batches call, and they are not the same thing. The outer pool is one Ray actor per GPU and exists only on the distributed path: each partition goes to the emptiest actor, each actor builds your class once in __init__, num_gpus is a Ray reservation, and concurrency=(min, max) grows the pool while work waits and reaps an idle actor. Inside a single actor, an InferencePool of threads shares one model object and one CUDA context, so the threads buy overlap with host work rather than extra model replicas. They call your __call__ with a whole Arrow RecordBatch, in input order, and an autobatch controller hill-climbs the batch size under a VRAM cap from the measured rows per second; an out-of-memory error bisects the batch and records a ceiling for the run, and the size that worked is written back for the next one. batch_format reframes only the call, never the data plane, which stays Arrow, and ml.map is the row-at-a-time escape hatch, marked as one so a profile can price what it costs.](/_static/diagrams/inference_actor_pool.svg)
 
 | The situation | The knobs | What happens |
 | --- | --- | --- |
@@ -175,7 +181,9 @@ def flaky_engine():
 
 
 reviews = bt.from_pydict({"text": ["good", "bad"]})
-print(reviews.ml.generate(flaky_engine, prompt_column="text", max_retries=3, timeout=30.0).to_pydict())
+print(
+    reviews.ml.generate(flaky_engine, prompt_column="text", max_retries=3, timeout=30.0).to_pydict()
+)
 # {'text': ['good', 'bad'], 'response': ['GOOD', 'BAD']}
 ```
 
@@ -211,7 +219,7 @@ import batcher as bt
 
 for day in days:
     out = f"s3://bucket/scored/dt={day}/"
-    if already_written(out):        # your check: a manifest, a marker, a listing
+    if already_written(out):  # your check: a manifest, a marker, a listing
         continue
     (
         bt.read.parquet(f"s3://bucket/events/dt={day}/")
@@ -249,10 +257,11 @@ thousand rows, not on a billion.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: scoring images, audio, and video.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: what an actor pool actually is, and
   what keeps the device fed.
-- {doc}`Batch inference tutorial </tutorials/ml/batch-inference>`: this job, built up from
+- {doc}`Batch inference tutorial </getting-started/tutorials/ml/batch-inference>`: this job, built up from
   nothing.
 - {doc}`Image classification </cookbook/ml/pipelines/multimodal/image-classification>` and
   {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same shape, two models.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the throughput this path reaches.
-- {doc}`UDFs </user-guide/transform/columns/udfs>`: `max_errored_rows`, `output_columns`, and the rest of
-  the batch-function contract.
+- {doc}`UDFs </user-guide/transform/columns/udfs>`: `output_columns` and the rest of the batch-function
+  contract, with {doc}`Running a UDF at scale </user-guide/transform/columns/udfs-at-scale>` for
+  `max_errored_rows`.

@@ -1,6 +1,6 @@
 # Numeric math
 
-All of these are columnar and fuse into a single pass, so a chain of ten of them is not ten scans. Watch the division operators in particular: ``/`` is true division and ``floordiv`` truncates, and mixing them up is a quiet source of off-by-one bugs.
+All of these are columnar and fuse into a single pass, so a chain of ten of them is not ten scans. Watch the division operators. `/` is true division, and `floordiv` (the `//` operator) rounds toward negative infinity rather than toward zero, so `-7 // 2` is `-4` where SQL integer division would give `-3`. Mixing the two up is a quiet source of off-by-one bugs.
 
 The whole script, executed on every test run:
 

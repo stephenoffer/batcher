@@ -1,6 +1,6 @@
 # Structs and maps
 
-A struct column holds a fixed set of named fields per row; a map column holds variable key/value pairs. Both are read with an accessor rather than by exploding the table, so a nested field stays one projection away.
+A struct column holds a fixed set of named fields per row. A map column holds variable key/value pairs. Neither needs flattening: both are read with an accessor rather than by exploding the table, so a nested field stays one projection away.
 
 The whole script, executed on every test run:
 

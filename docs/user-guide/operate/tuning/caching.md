@@ -50,8 +50,8 @@ separate question, answered by the storage level below.
 ```python
 hot = events.filter(bt.col("status") == "active").cache()
 
-first = hot.count()          # executes the plan, stores the result
-second = hot.count()         # cache hit, no re-execution
+first = hot.count()  # executes the plan, stores the result
+second = hot.count()  # cache hit, no re-execution
 totals = hot.group_by("region").agg(total=bt.col("amount").sum())
 
 print(first, second)
@@ -94,8 +94,8 @@ is a hit.
 
 ```python
 warm = events.filter(bt.col("status") == "active").cache()
-warm.collect()                 # fills the cache
-print(warm.count())            # served from it, no second scan
+warm.collect()  # fills the cache
+print(warm.count())  # served from it, no second scan
 # 4
 ```
 
@@ -417,6 +417,6 @@ Here is the whole decision:
   envelope.
 - {doc}`On-disk artifacts </architecture/deep-dives/memory/on-disk-artifacts>`: everything the
   engine writes to local disk, the cache's second tier among it.
-- {doc}`Optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`: caching in its
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: caching in its
   place, among the other fixes.
 - {doc}`/cookbook/operations/memory_and_caching`: caching a reused branch, and spilling under a tight budget, as a script.

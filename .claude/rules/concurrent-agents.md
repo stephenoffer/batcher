@@ -179,6 +179,7 @@ not stage is simply absent. Measured by running the sandbox with and without eac
 | `benchmarks/` | `test_benchmark_isolation.py` fails to **collect** — `ModuleNotFoundError: No module named 'harness'`. |
 | `pyproject.toml` | `test_python_floor` and `test_optional_guard_is_shared` fail: the declared Python floor and the extras an optional-guard names both live there. |
 | `.github` | `test_python_floor::test_the_release_workflow_builds_on_the_declared_floor` fails. It reads `.github/workflows/release.yml` and cross-checks the pinned `python-version` against the floor. |
+| `tools/` | Four `tests/unit` modules fail to **collect** with `ModuleNotFoundError: No module named 'tools'` — `test_agentic_runner`, `test_audit_health_detectors`, `test_ir_contract`, `test_lint_tests`. They import the linters they are about, which is the point of them. A collection error takes the whole module down, so this reads as a broken `PYTHONPATH` rather than an unstaged directory (found 2026-09-12, running `tests/unit` in a sandbox staged by the recipe above). **Staging it is not enough for `test_agentic_runner`:** four of its cases create `git worktree`s, and a `git archive`d sandbox is not a repository, so they fail there and pass in the tree. Run that file where the `.git` is. |
 
 `crates/` is the one copied from the working tree rather than `git archive`d, because the
 `.so` you just built came from the working tree and staging HEAD's sources would reintroduce

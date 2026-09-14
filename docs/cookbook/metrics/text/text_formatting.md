@@ -1,6 +1,6 @@
 # Output format checks
 
-Format compliance is the cheapest eval there is and the one that catches the most regressions. If you asked for JSON and ``valid_json_rate`` drops to 0.7, that is a production incident regardless of how good the prose is.
+Format compliance is the cheapest eval there is and the one that catches the most regressions. If you asked for JSON and `valid_json_rate` drops to 0.7, that is a production incident regardless of how good the prose is.
 
 The whole script, executed on every test run:
 

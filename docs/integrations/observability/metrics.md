@@ -99,8 +99,7 @@ it at 99% and 60 GB spilled are identical by every counter and completely differ
 operationally.
 
 They are flattened generically from each resource's own statistics, so a resource that grows
-a field starts being exported without a change to the exporter. Two consequences worth
-knowing:
+a field starts being exported without a change to the exporter. That has knock-on effects:
 
 - The `HELP` text is derived from the group and the field name rather than hand-written, so
   it describes the series without being able to fall behind it.

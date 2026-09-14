@@ -1,11 +1,11 @@
 # Model serving patterns
 
-There are two ways to get a model's predictions into a pipeline. You either load the
-weights into the worker, or call a service that already has them loaded. The first is
-faster, with no network, no serialization, and no shared queue, and it is what a batch job
-should do. The second is what you do when the model does not belong to you. Another team
-owns it, it runs on hardware you cannot schedule, or the same endpoint has to serve an
-online path that must not be starved by your backfill.
+A model's predictions reach a pipeline one of two ways. You load the weights into the worker,
+or you call a service that already has them loaded. Loading is faster, with no network, no
+serialization, and no shared queue, and it is what a batch job should do. Call a service when
+the model does not belong to you: another team owns it, it runs on hardware you cannot
+schedule, or the same endpoint has to serve an online path that must not be starved by your
+backfill.
 
 :::{warning}
 The mistake is picking the second because it is architecturally tidier. A 10-million-row
@@ -76,20 +76,20 @@ Tune `batch_size` against what the endpoint will accept. Most serving stacks hav
 payload, and a batch that exceeds it does not degrade. It fails every request.
 :::
 
-`retries` handles the transient failure, and a request that keeps failing raises. If the
-endpoint is flaky enough that you would rather lose rows than the job, pair it with
+`retries` handles the transient failure. A request that keeps failing raises, so if the
+endpoint is flaky enough that you would rather lose rows than the job, pair `retries` with
 `max_errored_rows`.
 
-Writing your own adapter means implementing `ServingClient` and handing `serving_udf` a
-`connect` callable. Same shape, so the connection is made once per worker.
+To write your own adapter, implement `ServingClient` and hand `serving_udf` a `connect`
+callable. Same shape, so the connection is made once per worker.
 
 ## Overlapping stages with run_pipeline
 
-The problem with a single map stage doing decode-then-forward is that both wait on each
-other. The CPU decodes batch *n+1* only after the GPU finishes batch *n*.
-`run_pipeline` chains {py:class}`Stage <batcher.ml.Stage>`s with credit-based backpressure, so each stage runs while
-the next one is still working. No stage can run ahead far enough to blow up memory,
-because credits bound the queue between them.
+A single map stage doing decode-then-forward makes both halves wait on each other: the CPU
+decodes batch *n+1* only after the GPU finishes batch *n*. `run_pipeline` chains
+{py:class}`Stage <batcher.ml.Stage>`s with credit-based backpressure instead, so each stage
+runs while the next one is still working. No stage can run ahead far enough to blow up memory.
+Credits bound the queue between them.
 
 ```python
 import pyarrow as pa
@@ -99,13 +99,13 @@ import batcher as bt
 from batcher.ml import Stage, run_pipeline
 
 
-class Decode:              # stands in for a CPU stage (image decode, tokenize)
+class Decode:  # stands in for a CPU stage (image decode, tokenize)
     def __call__(self, batch):
         scaled = pc.multiply(pc.cast(batch.column("x"), "float64"), 2.0)
         return batch.set_column(0, "x", scaled)
 
 
-class Forward:             # stands in for the GPU forward pass
+class Forward:  # stands in for the GPU forward pass
     def __call__(self, batch):
         label = pc.greater(batch.column("x"), 4.0)
         return batch.append_column("label", label)
@@ -115,7 +115,10 @@ ds = bt.from_pydict({"x": [1, 2, 3, 4]})
 out = list(
     run_pipeline(
         ds.iter_batches(),
-        [Stage(Decode, credits=2, name="decode"), Stage(Forward, credits=2, num_gpus=0, name="gpu")],
+        [
+            Stage(Decode, credits=2, name="decode"),
+            Stage(Forward, credits=2, num_gpus=0, name="gpu"),
+        ],
     )
 )
 print(out[0].to_pydict())
@@ -129,11 +132,11 @@ control the engine's shuffle uses.
 
 ## Adaptive batching with InferencePool
 
-{py:class}`InferencePool <batcher.ml.InferencePool>` sits underneath the `infer` path and is worth reaching for directly when
-you are driving the stream yourself, in a serving process or a custom loop. It keeps
-workers alive, so the factory runs once per worker and the model loads once, and it
-*rebatches* the incoming stream to a target size. That is the difference between feeding
-a GPU 64-row batches and feeding it whatever size the reader happened to produce.
+{py:class}`InferencePool <batcher.ml.InferencePool>` sits underneath the `infer` path. Reach for it directly when you are
+driving the stream yourself, in a serving process or a custom loop. It keeps workers alive, so
+the factory runs once per worker and the model loads once, and it *rebatches* the incoming
+stream to a target size rather than feeding the GPU whatever size the reader happened to
+produce.
 
 ```python
 import pyarrow.compute as pc

@@ -1,13 +1,13 @@
 # Key-value stores
 
-This page covers DynamoDB, Cassandra (and ScyllaDB), Redis, and HBase: the stores Batcher reads and writes by *key* rather than by query. It explains how a full read parallelizes, when a filtered read stops being a full read at all, and what each store's write path can and cannot express.
+This page covers DynamoDB, Cassandra (and ScyllaDB), Redis, and HBase: the stores Batcher reads and writes by *key* rather than by query. A full read of one of them fans out across the store's own parallel unit. A filtered read sometimes stops being a fan-out at all, and that is the difference between one read unit and the whole table's worth.
 
 | | |
 | --- | --- |
 | **Read** | {py:meth}`bt.read.dynamodb(table=...) <batcher.api.io_namespace.reader.Reader.dynamodb>`, {py:meth}`bt.read.cassandra(...) <batcher.api.io_namespace.reader.Reader.cassandra>`, {py:meth}`bt.read.redis(...) <batcher.api.io_namespace.reader.Reader.redis>`, {py:meth}`bt.read.hbase(...) <batcher.api.io_namespace.reader.Reader.hbase>` |
 | **Write** | {py:meth}`ds.write.dynamodb(table, ...) <batcher.api.io_namespace.writer.Writer.dynamodb>`, {py:meth}`ds.write.cassandra(table, ...) <batcher.api.io_namespace.writer.Writer.cassandra>`, {py:meth}`ds.write.redis(prefix, ...) <batcher.api.io_namespace.writer.Writer.redis>`, {py:meth}`ds.write.hbase(table, ...) <batcher.api.io_namespace.writer.Writer.hbase>` |
 | **Extras** | `pip install 'batcher-engine[dynamodb]'`, `[cassandra]`, `[redis]`, `[hbase]` |
-| **Parallelism** | Scan segments, token ranges, hash-slot ranges, region ranges — one split each |
+| **Parallelism** | One split per scan segment, token range, hash-slot range, or region range |
 | **Credentials** | Passed as connection keywords, never logged, and `env:`/`file:` references resolve on the worker |
 
 ## Reading a whole store
@@ -25,7 +25,7 @@ Raise the count with `partition_spec=PartitionSpec(segments=N)`. On Cassandra th
 
 ## A filter can stop the fan-out entirely
 
-A parallel scan is the right shape for reading a table. It is the wrong shape for reading one row, and a server-side filter does not fix that.
+A parallel scan is the right shape for reading a table. It is the wrong shape for reading one row. A server-side filter does not fix that.
 
 On DynamoDB it makes it worse than it looks. A `FilterExpression` is applied *after* items are read, and read capacity is billed for what was examined rather than for what came back. So a scan filtered down to one item costs the same as reading the table.
 
@@ -64,11 +64,11 @@ Three shapes look close and are not, and each falls back to the full scan:
 - **A range on the partition key.** `user_id > "a"` names no partition; the key is hashed, so ordering on it means nothing to the store.
 - **A composite partition key only partly pinned.** Cassandra hashes the whole key together, so fixing one of two columns still names no partition.
 
-Everything the predicate says beyond the key becomes a `FilterExpression` on DynamoDB, or stays in the `WHERE` on Cassandra. A term that will not translate is simply left to the engine, which re-checks every row regardless.
+Everything the predicate says beyond the key becomes a `FilterExpression` on DynamoDB, or stays in the `WHERE` on Cassandra. A term that will not translate is left to the engine, which re-checks every row regardless.
 
 ### Tell DynamoDB its keys, or let it ask
 
-Batcher learns the key schema from `DescribeTable`. A role granted `dynamodb:Query` and `dynamodb:Scan` but not `dynamodb:DescribeTable` is a common least-privilege split, and there the metadata call fails and the read stays a scan. Pass the keys instead:
+Batcher learns the key schema from `DescribeTable`. Granting `dynamodb:Query` and `dynamodb:Scan` without it is a common least-privilege split, and there the metadata call fails and the read stays a scan. Pass the keys instead:
 
 ```python
 # docs: skip
@@ -80,11 +80,11 @@ events = bt.read.dynamodb(
 )
 ```
 
-Cassandra always needs `partition_key=` anyway, because the token predicate is built from it.
+Cassandra always needs `partition_key=`. The token predicate is built from it.
 
 ### Temporal predicates are not pushed
 
-Neither DynamoDB nor Elasticsearch has a date type of its own: an application stores a timestamp as an ISO string, as epoch seconds, or as epoch millis, and nothing in the data says which. A comparison against a date or a timestamp is therefore evaluated by the engine rather than pushed, which costs bandwidth and never rows. Store a key you can compare — an epoch integer, or an ISO string with a fixed width — if you need the server to narrow on time.
+Neither DynamoDB nor Elasticsearch has a date type of its own. An application stores a timestamp as an ISO string, as epoch seconds, or as epoch millis, and nothing in the data says which. A comparison against a date or a timestamp is therefore evaluated by the engine rather than pushed, which costs bandwidth and never rows. If you need the server to narrow on time, store a key it can compare: an epoch integer, or an ISO string of fixed width.
 
 ## Writing
 
@@ -110,13 +110,13 @@ sessions.write.redis("session", host="cache", ttl_seconds=3600)
 
 ### What HBase writes
 
-Every column but the row key becomes a cell. A column named `family:qualifier` keeps its family, and one without a colon is placed in `column_family=` (default `"cf"`). That is what lets a frame read by `bt.read.hbase(...)` — whose column names already carry the family — round-trip unchanged, while a plain relational frame can be written without qualifying every column by hand. A null cell is left unwritten rather than stored as the four characters `None`.
+Every column but the row key becomes a cell. A column named `family:qualifier` keeps its family, and one without a colon is placed in `column_family=` (default `"cf"`). A frame read by `bt.read.hbase(...)` already carries the family in its column names, so it round-trips unchanged. A plain relational frame goes in without qualifying every column by hand. A null cell is left unwritten rather than stored as the four characters `None`.
 
 ### What Redis writes
 
 The shape of the frame decides, and the rule is the one that makes a round trip return what was written:
 
-- Two columns named `key` and `value` — the shape `bt.read.redis(...)` returns — writes one string per key.
+- Two columns named `key` and `value`, the shape `bt.read.redis(...)` returns, writes one string per key.
 - Anything wider writes one hash per key, with a field per remaining column.
 
 Keys are prefixed by `prefix=` if given, and by the write's destination name otherwise, so `ds.write.redis("session")` writes `session:<key>`. Nulls are written as the empty string rather than the four characters `None`.
@@ -125,19 +125,19 @@ Keys are prefixed by `prefix=` if given, and by the write's destination name oth
 
 Each of these APIs can fail *inside* a successful call, and each sink reads the response rather than the status.
 
-`BatchWriteItem` returns the requests it could not process under `UnprocessedItems` with a 200 — throttling, usually. Those are resent with jittered backoff, and a remainder that survives every attempt raises rather than being dropped. Cassandra's concurrent execution returns a success flag per statement; a failed one raises naming how many failed and what the first said.
+`BatchWriteItem` returns the requests it could not process under `UnprocessedItems` with a 200. Throttling, usually. Those are resent with jittered backoff, and a remainder that survives every attempt raises rather than being dropped. Cassandra's concurrent execution returns a success flag per statement; a failed one raises naming how many failed and what the first said.
 
 A sink that trusted the call would have written some of its rows and reported success, which is the quietest kind of data loss there is.
 
 ## Requirements and limitations
 
-A distributed write is one operation per shard, with no transaction across them. `upsert` and `delete` are safe that way, because a shard only ever touches the keys its own rows name.
+A distributed write is one operation per shard, with no transaction across them. `upsert` and `delete` survive that, because a shard only ever touches the keys its own rows name.
 
 An HBase `Put` replaces only the cells it names and leaves the rest of the row alone, so an upsert there is a *merge* of columns rather than a replacement of the row. That differs from DynamoDB and Cassandra, where the write replaces the item or row, and it matters when two pipelines maintain different columns of the same key.
 
-Schema inference samples one item or one row. A store whose records disagree — a field that is a number in some and a string in others, or missing from the first — gives a schema that does not describe the store, and later batches then fail to convert or arrive null. Narrow the read with a `query=` that constrains the shape, or project the fields you need.
+Schema inference on DynamoDB, Cassandra, and HBase samples a single item or row. (Redis is exempt: its rows are always the fixed `(key, value)` pair.) A store whose records disagree gives back a schema that does not describe it, and later batches then fail to convert or arrive null. The disagreement that bites is a field that is a number in some items and a string in others, or one missing from whichever item the sample happened to draw. Project the fields you need, or pin the shape with a predicate the connector can push.
 
-Rows cross into Python on both the read and the write for all three stores. That is the drivers' shape, and it makes these good sinks for a serving or feature dataset and poor ones for moving a billion analytical rows. Write those to Parquet or a lakehouse table.
+Rows cross into Python on both the read and the write for all four stores. That is the drivers' shape. It makes these good sinks for a serving or feature dataset and poor ones for moving a billion analytical rows, which belong in Parquet or a lakehouse table.
 
 Redis reads every matching key's value with a round trip per key inside its slot range. `match=` is what keeps that bounded; a read with no pattern walks the whole keyspace.
 

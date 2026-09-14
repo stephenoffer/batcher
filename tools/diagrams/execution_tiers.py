@@ -37,7 +37,7 @@ W, H = 980, 430
 
 SRC_X, SRC_Y, SRC_W, SRC_H = 40, 150, 200, 108
 TIER_W, TIER_H = 208, 108
-TIER_X = (330, 590, 850 - 208 + 130)   # third column right-aligned in the canvas
+TIER_X = (330, 590, 850 - 208 + 130)  # third column right-aligned in the canvas
 TIER_Y = (60, 176, 292)
 
 STYLE = """<style>
@@ -84,8 +84,9 @@ def tier(x: float, y: float, title: str, crate: str, role: str, oracle: bool = F
     )
 
 
-def edge(x1: float, y1: float, x2: float, y2: float, marker: str, colour: str,
-         dashed: bool = False) -> str:
+def edge(
+    x1: float, y1: float, x2: float, y2: float, marker: str, colour: str, dashed: bool = False
+) -> str:
     dash = ' stroke-dasharray="6 4"' if dashed else ""
     return (
         f'<path d="M {x1} {y1} L {x2} {y2}" fill="none" stroke="{colour}" stroke-width="2.2"'
@@ -104,9 +105,9 @@ T0X, T1X, T2X = 330, 620, 620
 parts = [
     f'<rect x="0" y="0" width="{W}" height="{H}" rx="14" class="surf"/>',
     f'<text x="40" y="48" font-family="{FONT}" font-size="19" font-weight="700" class="t-head">'
-    f'One expression type, three ways to run it</text>',
+    f"One expression type, three ways to run it</text>",
     f'<text x="40" y="72" font-family="{FONT}" font-size="13" class="t-sub">'
-    f'Speed comes from scheduling and compilation, never from a second set of semantics.</text>',
+    f"Speed comes from scheduling and compilation, never from a second set of semantics.</text>",
     # the single source of truth
     f'<g filter="url(#sh)"><rect x="{SRC_X}" y="{SRC_Y}" width="{SRC_W}" height="{SRC_H}" rx="11" '
     f'class="card-src" stroke-width="1.6"/></g>',
@@ -120,12 +121,16 @@ parts = [
 
 # the three tiers
 parts += [
-    tier(T0X, TIER_Y[0], "Tier-0 sequential", "bc-interp::execute",
-         "the correctness oracle", oracle=True),
-    tier(T0X, TIER_Y[1], "Tier-0 parallel", "bc-interp::par",
-         "same operators, morselized"),
-    tier(T0X, TIER_Y[2], "Tier-1 JIT", "bc-codegen (Cranelift)",
-         "compiled once per operator"),
+    tier(
+        T0X,
+        TIER_Y[0],
+        "Tier-0 sequential",
+        "bc-interp::execute",
+        "the correctness oracle",
+        oracle=True,
+    ),
+    tier(T0X, TIER_Y[1], "Tier-0 parallel", "bc-interp::par", "same operators, morselized"),
+    tier(T0X, TIER_Y[2], "Tier-1 JIT", "bc-codegen (Cranelift)", "compiled once per operator"),
 ]
 
 # fan-out from the shared source
@@ -137,8 +142,8 @@ parts.append(elabel(SRC_X + SRC_W + 52, src_mid_y - 46, "tree", BLUE, "start"))
 
 # Parity obligations and the fallback both run right of the tier column, on two
 # separate spines, so neither crosses the fan-out or the shared-source card.
-SPINE = T0X + TIER_W + 26          # parity spine
-FALLBACK = T0X + TIER_W + 232      # fallback spine, well clear of the parity labels
+SPINE = T0X + TIER_W + 26  # parity spine
+FALLBACK = T0X + TIER_W + 232  # fallback spine, well clear of the parity labels
 right = T0X + TIER_W
 oracle_mid = TIER_Y[0] + TIER_H / 2
 
@@ -166,8 +171,8 @@ parts += [
 
 parts.append(
     f'<text x="40" y="{H - 24}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f'The parity edges are enforced by tests, not convention: seq == par == JIT on every '
-    f'supported input, and the interpreter is the reference for both.</text>'
+    f"The parity edges are enforced by tests, not convention: seq == par == JIT on every "
+    f"supported input, and the interpreter is the reference for both.</text>"
 )
 
 svg = (

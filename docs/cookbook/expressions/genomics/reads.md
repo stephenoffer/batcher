@@ -37,24 +37,24 @@ If your reads came off an instrument before about 2011, pass `offset=64`. Every 
 
 {py:meth}`minimizers <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.minimizers>` keeps only the lexicographically smallest canonical k-mer of each window of `window` consecutive k-mers, collapsing consecutive repeats. The result is roughly `2/(window+1)` of the k-mers, which is what makes it a sketch rather than a re-encoding.
 
-The reason a sketch is safe to compare is a guarantee rather than a heuristic: two sequences sharing a substring of length `window + k - 1` are **guaranteed** to share a minimizer. So an `array_intersect` between two rows' sketches cannot miss a real overlap, which is what seed-and-extend alignment is built on.
+The reason a sketch is safe to compare is a guarantee rather than a heuristic: two sequences sharing a substring of length `window + k - 1` are guaranteed to share a minimizer. So a `.list.intersect()` between two rows' sketches cannot miss a real overlap, which is what seed-and-extend alignment is built on.
 
 The output is a list column rather than packed integers, deliberately, because a list composes with the vocabulary the engine already has. `explode` plus `group_by` is a k-mer frequency table. `.list.n_unique()` is a cardinality estimate. `.list.intersect()` between two rows is a shared-substring count. A packed `u64` encoding would be faster per k-mer and would compose with nothing.
 
 ## Designing primers
 
-Screening candidate oligos is a filter over a computed column, which is the shape this engine is for. The alternative — a per-row call into a design library over millions of candidates — is a control-plane row loop.
+Screening candidate oligos is a filter over a computed column, which is the shape this engine is for. The alternative, a per-row call into a design library over millions of candidates, is a control-plane row loop.
 
-{py:meth}`melting_temp <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.melting_temp>` uses the SantaLucia (1998) unified nearest-neighbour model, the one primer3 and Biopython's `Tm_NN` default to, at 50 mM Na+ and 500 nM total strand. Those conditions are part of the answer: melting temperature is not a property of a sequence alone, and halving the concentration moves it by several degrees.
+{py:meth}`melting_temp <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.melting_temp>` uses the SantaLucia (1998) unified nearest-neighbor model, the one primer3 and Biopython's `Tm_NN` default to, at 50 mM Na+ and 500 nM total strand. Those conditions are part of the answer: melting temperature is not a property of a sequence alone, and halving the concentration moves it by several degrees.
 
-A nearest-neighbour model is used rather than the Wallace rule or a GC-percentage formula because those two read a sequence as a bag of bases. `GCGCGC` and `GGGCCC` get the same answer from them despite stacking very differently, and the error is several degrees — enough to put a primer outside its annealing window.
+A nearest-neighbor model is used rather than the Wallace rule or a GC-percentage formula because those two read a sequence as a bag of bases. `GCGCGC` and `GGGCCC` get the same answer from them despite stacking very differently, and the error is several degrees, enough to put a primer outside its annealing window.
 
 A sequence containing any character outside `ACGT` yields null rather than an approximate temperature. An ambiguity code has no defined stacking energy, and reporting a specific number the data does not support would be worse than reporting nothing.
 
 ## Requirements and limitations
 
 - {py:meth}`melting_temp <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.melting_temp>` is fixed at 50 mM Na+ and 500 nM strand. If your buffer differs materially, treat the output as a ranking rather than as an absolute temperature.
-- {py:meth}`molecular_weight <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.molecular_weight>` reports a **single** strand. Double it for a duplex.
+- {py:meth}`molecular_weight <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.molecular_weight>` reports a single strand. Double it for a duplex.
 - The degenerate alphabets have no defined mass, so {py:meth}`molecular_weight <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace.molecular_weight>` accepts only `dna`, `rna`, and `protein`, and raises rather than returning a column of nulls.
 - `k` and `window` are capped at 256. Assembly uses 21 to 127 and alignment seeds 15 to 31, so this binds on nothing real, but it does catch a `k` that was meant to be a window.
 

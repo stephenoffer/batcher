@@ -6,7 +6,8 @@ moves the bulk data, and what that means for a single node.
 ## The measured standing
 
 Spark 4.2 on OpenJDK 17, local mode, 48-core box, `batcher,spark` pairwise, best of five,
-every row correctness-gated. Measured 2026-09-11.
+every row correctness-gated. Measured 2026-09-11. Each cell is `batcher_ms / spark_ms`, so
+lower is better and every number here is a Batcher win.
 
 | Suite | b/spark | Cases |
 |---|---:|---:|
@@ -53,7 +54,7 @@ the materialized shuffle statistics and can coalesce partitions, switch a sort-m
 a broadcast join, or split a skewed partition. It is a real and valuable capability, and it
 is why Spark survives bad estimates that would sink a purely static optimizer.
 
-The constraint is where those decision points sit. A stage boundary is a shuffle boundary.
+The decision points sit where the shuffles do, and that is the constraint.
 Inside a stage (a scan, a filter, a projection, a hash-aggregate's build) Spark is committed
 to the plan it entered with, however wrong the estimate that produced it turns out to be.
 
@@ -83,7 +84,7 @@ and gives both engines' answer:
 | Distributed story | The design center | The *same* mergeable operators, scheduled across nodes |
 | Bulk data movement | Shuffle files, exchange service | Arrow Flight with credit-based flow control; the Ray object store is bypassed |
 
-The row that carries the most weight is the second-to-last. Batcher's stateful operators are
+The second-to-last row carries the most weight. Batcher's stateful operators are
 built once as `partial → combine → finalize`, so one implementation serves a single core,
 many cores, and many machines. There is no separate distributed engine with its own
 semantics, and a distributed result holds the same rows and types as the single-node one
@@ -100,10 +101,28 @@ refuses to make without a correctness-gated measurement. Do not cite this page a
 result. It is not one.
 :::
 
-What *is* measured, and does bear on the comparison, is the layer beneath: on a 128-CPU
-cluster Batcher's distributed path takes the join, the group-by, and the metadata count
-against Daft's Ray runner, and keeps per-node memory bounded through the mergeable algebra
-and spill. See {doc}`/benchmarks/results/scaling`.
+The layer beneath it is measured, and it does bear on the comparison. On a 128-CPU cluster
+Batcher's distributed path takes the join, the group-by, and the metadata count against
+Daft's Ray runner, and keeps per-node memory bounded through the mergeable algebra and spill.
+See {doc}`/benchmarks/results/scaling`.
+
+## Three things Spark has that Batcher does not
+
+The measured board above is a single-node board, and single-node is where Spark is weakest.
+Three of Spark's advantages do not appear on it at all.
+
+**An external shuffle service.** Batcher's shuffle replicas live in RAM, so they cost memory,
+and losing a whole node takes every copy with it and forces a recompute. Spark's shuffle
+outlives the executor that wrote it. This is the gap the scorecard in
+`docs/architecture/internals/competitive_architecture.md` records as structural rather than
+a tuning item.
+
+**Streaming guarantees.** Batcher's streaming is micro-batch. It cannot express what a
+continuous-operator engine expresses, which is a limitation against Flink first and Spark
+Structured Streaming second.
+
+**Lakehouse formats.** Batcher reaches Iceberg, Delta and Hudi through `pyiceberg` and
+`delta-rs` rather than through a native writer, so format support tracks those libraries.
 
 ## Migrating
 

@@ -106,8 +106,12 @@ def expr_date_arith(ctx: Context):
 @expressions.case("op-expr-cast-chain")
 def expr_cast_chain(ctx: Context):
     """Explicit casts across three widths inside a reduction."""
+    # `FLOOR` before the narrowing cast on purpose. Without it the case measures the
+    # engines' *rounding* of a fractional float, which DuckDB and Polars answer differently
+    # (229,577,311,657 against 229,574,449,893 over `l_extendedprice`) — a real semantic
+    # difference, but not one a timing case should turn into a correctness failure.
     sql = (
         "SELECT SUM(CAST(CAST(l_quantity AS INTEGER) AS BIGINT)) AS s, "
-        "SUM(CAST(l_extendedprice AS BIGINT)) AS p FROM lineitem"
+        "SUM(CAST(FLOOR(l_extendedprice) AS BIGINT)) AS p FROM lineitem"
     )
     return sql_fanout(ctx, sql)

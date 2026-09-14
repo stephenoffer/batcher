@@ -1,6 +1,6 @@
 # Arrow interop
 
-Arrow is the shared contract, so ``from_arrow``/``to_arrow`` are the cheapest boundary there is. The pandas and Polars bridges go through Arrow too, which is why they are much cheaper than a row-by-row conversion.
+Arrow is the shared contract, so `from_arrow` and `to_arrow` are the cheapest boundary there is. The pandas and Polars bridges go through Arrow as well. A row-by-row conversion costs far more than any of them.
 
 The whole script, executed on every test run:
 

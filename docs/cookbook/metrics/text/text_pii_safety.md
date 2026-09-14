@@ -1,6 +1,6 @@
 # PII and safety rates
 
-Run this over model output *and* over training data. On output it tells you whether the model is emitting personal data; on input it tells you whether you are about to train on it. Both are one aggregate pass, so it is cheap enough to run on every batch.
+Run this over model output *and* over training data. On output it tells you whether the model is emitting personal data. On input it tells you whether you are about to train on it. Either way it is one aggregate pass, cheap enough to run on every batch.
 
 The whole script, executed on every test run:
 

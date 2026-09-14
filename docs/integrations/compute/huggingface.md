@@ -101,17 +101,14 @@ appended as a column. `task=` picks the pipeline kind when it cannot be inferred
 # docs: skip
 import batcher as bt
 
-scored = (
-    bt.read.parquet("s3://lake/reviews/*.parquet")
-    .ml.infer(
-        "distilbert-base-uncased-finetuned-sst-2-english",
-        column="text",
-        output_column="sentiment",
-        batch_size=64,
-        num_gpus=1,
-        concurrency=8,
-        model_memory_gb=1.5,
-    )
+scored = bt.read.parquet("s3://lake/reviews/*.parquet").ml.infer(
+    "distilbert-base-uncased-finetuned-sst-2-english",
+    column="text",
+    output_column="sentiment",
+    batch_size=64,
+    num_gpus=1,
+    concurrency=8,
+    model_memory_gb=1.5,
 )
 scored.write.parquet("s3://lake/reviews_scored")
 ```
@@ -126,16 +123,13 @@ a vector column.
 # docs: skip
 import batcher as bt
 
-vectors = (
-    bt.read.parquet("s3://lake/reviews/*.parquet")
-    .ml.embed(
-        "sentence-transformers/all-MiniLM-L6-v2",
-        column="text",
-        output_column="embedding",
-        batch_size=64,
-        num_gpus=1,
-        concurrency=8,
-    )
+vectors = bt.read.parquet("s3://lake/reviews/*.parquet").ml.embed(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    column="text",
+    output_column="embedding",
+    batch_size=64,
+    num_gpus=1,
+    concurrency=8,
 )
 vectors.write.parquet("s3://lake/reviews_embedded")
 ```

@@ -5,7 +5,7 @@ parses a query, binds each named table to a Dataset, and returns a new Dataset.
 Because the result is a Dataset, you can keep chaining DataFrame operations onto a
 SQL query, or feed a DataFrame pipeline into SQL.
 
-{py:obj}`bt.sql <batcher.sql>` reads DuckDB syntax by default; pass `dialect=` to
+{py:obj}`bt.sql <batcher.sql>` reads DuckDB syntax by default. Pass `dialect=` to
 read another sqlglot dialect. For a reusable catalog of tables and Python functions,
 build a {py:obj}`bt.Session <batcher.Session>`, the DuckDB-connection / SparkSession
 analogue. {py:func}`bt.sql <batcher.sql>` and {py:func}`bt.register_function <batcher.register_function>` use a shared default session.
@@ -50,9 +50,11 @@ A query may use:
 - `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (equi-keys; an extra non-equi
   `AND` condition is applied as a filter), `NATURAL JOIN`, and `ASOF JOIN`
 - `UNION` / `INTERSECT` / `EXCEPT`, `WITH` (CTEs), and subqueries
-- Column alias lists on a table, subquery, or CTE — `FROM (SELECT ...) AS t(a, b)`,
-  `WITH t(a, b) AS (...)` — which rename the relation's columns positionally
-- Window functions over any expression, including a computed `PARTITION BY` / `ORDER BY` key such as `date_trunc('month', ts)`, with explicit `ROWS` / `RANGE` / `GROUPS` frames — including `RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING` for a time window
+- Column alias lists on a table, subquery, or CTE, such as `FROM (SELECT ...) AS t(a, b)`
+  and `WITH t(a, b) AS (...)`, which rename the relation's columns positionally
+- Window functions over any expression, including a computed `PARTITION BY` / `ORDER BY`
+  key such as `date_trunc('month', ts)`, with explicit `ROWS` / `RANGE` / `GROUPS` frames.
+  `RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING` gives a time window
 - `CASE` expressions, `CAST`, and `SIMILAR TO`
 - `INTERVAL` literals, including compound (`'1 day 3 hours'`), fractional
   (`'1.5 hours'`), clock (`'04:05:06'`) and abbreviated (`'1 mon'`) forms
@@ -62,7 +64,9 @@ A query may use:
 You can also register Python functions and call them from SQL, and define tables and
 views with `CREATE`/`DROP`. See [Sessions and Python functions](#sessions-tables-and-python-functions).
 
-## Filtering and projection
+## Filters, aggregates, and expressions
+
+The rest of the supported subset reads the way it reads anywhere else. `WHERE` filters:
 
 ```python
 out = bt.sql("SELECT category, price FROM t WHERE price >= 30 ORDER BY price", t=ds)
@@ -70,7 +74,7 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'a', 'c'], 'price': [30.0, 40.0, 50.0, 60.0]}
 ```
 
-## Aggregation with HAVING
+`GROUP BY` aggregates and `HAVING` filters the groups it produced:
 
 ```python
 out = bt.sql(
@@ -82,7 +86,7 @@ print(out.to_pydict())
 # {'category': ['a'], 'total': [90.0]}
 ```
 
-## CASE and CAST
+`CASE` and `CAST` are ordinary expressions in the select list:
 
 ```python
 out = bt.sql(
@@ -174,109 +178,9 @@ print(ds.sql("SELECT category FROM self WHERE price >= 50 ORDER BY price").to_py
 # {'category': ['a', 'c']}
 ```
 
-A fitted model registers the same way, with {py:meth}`register_model <batcher.Session.register_model>`, and `ML_PREDICT` then scores a relation inside the query. The prediction is an ordinary column, so the rest of the statement filters, joins and aggregates over it without leaving SQL:
-
-```python
-from batcher.ml import LinearRegression
-
-train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
-s.register_model("doubler", LinearRegression(features=["x"], target="y").fit(train))
-s.register("points", bt.from_pydict({"x": [5.0, 10.0]}))
-
-print(s.sql("SELECT COUNT(*) AS n FROM ML_PREDICT(points, doubler) WHERE prediction > 15").to_pydict())
-# {'n': [1]}
-```
-
-Scoring stays inside the plan, so the model runs where the data is rather than pulling rows back to the driver. A saved model can be named by quoted path instead of registering it first; see the {doc}`SQL API </api/relational/sql>`.
-
-## Generative AI functions
-
-`ML_PREDICT` covers the *traditional* model. `AI_GENERATE` is the generative half: a language
-model asked to write from a text column, with `ai_query` and `ai_complete` accepted as aliases
-so a query ported from Databricks or Snowflake runs as written. `AI_EXTRACT` is the same shape
-for pulling typed fields out of the text.
-
-An engine is registered in Python and named in SQL, never written inline. It carries an
-endpoint, credentials and sampling settings, so a quoted engine argument is refused rather than
-becoming a way to put an API key in query text:
-
-```python
-s = bt.Session()
-s.register(
-    "reviews", bt.from_pydict({"id": [1, 2, 3], "body": ["love it", "broke fast", "it is fine"]})
-)
-
-
-def shouty():
-    # Stands in for `bt.ml.http_engine(...)` / `bt.ml.vllm_engine(...)` so this page needs
-    # no model: any zero-argument callable returning `list[str] -> list[str]` is an engine.
-    return lambda prompts: [p.upper() for p in prompts]
-
-
-s.register_engine("shouty", shouty)
-
-print(
-    s.sql(
-        "SELECT id, response FROM AI_GENERATE(reviews, shouty, prompt_column => 'body')"
-    ).to_pydict()
-)
-# {'id': [1, 2, 3], 'response': ['LOVE IT', 'BROKE FAST', 'IT IS FINE']}
-```
-
-The relation and the engine are positional; everything that changes the answer is a named
-setting. `AI_GENERATE` takes `prompt_column` (required), `template` and `output_column`.
-`AI_EXTRACT` takes `prompt_column` and a `schema` written as a column definition list, and
-appends one typed column per field:
-
-```python
-import json
-
-
-def grader():
-    return lambda prompts: [
-        json.dumps({"label": "positive" if "love" in p else "negative"}) for p in prompts
-    ]
-
-
-s.register_engine("grader", grader)
-
-print(
-    s.sql(
-        "SELECT label, COUNT(*) AS n FROM AI_EXTRACT(reviews, grader,"
-        " prompt_column => 'body', schema => ['label string'])"
-        " GROUP BY label ORDER BY label"
-    ).to_pydict()
-)
-# {'label': ['negative', 'positive'], 'n': [2, 1]}
-```
-
-The generated column is an ordinary column, so the rest of the statement groups, filters and
-joins over it without leaving SQL.
-
-### Why these read as tables rather than as functions in the SELECT list
-
-Every warehouse writes its AI call in the `SELECT` list and this does not, for the reason that
-also makes `ML_PREDICT` a table function. A Batcher scalar function lowers to an expression
-evaluated per row in Rust, and a language-model call is neither expressible there nor wanted
-per row: the whole point of the inference path is that an engine loads once per worker and
-sees a batch at a time. Writing the call in `FROM` says that rather than hiding it.
-
-### What is not translated
-
-`AI_CLASSIFY` is not. Its grammar is fixed at three arguments, and a relational form needs
-four: the relation, the engine, the text column and the labels. Use `AI_EXTRACT` with a
-one-field schema, or {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` on
-the `Dataset`. `AI_EMBED`, `AI_SIMILARITY`, `AI_AGG` and `AI_FORECAST` are likewise
-DataFrame-side; each reports where its capability lives rather than failing as an unknown
-table.
-
-The full set is always available on the `Dataset`, where these lower to anyway:
-{py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`,
-{py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`,
-{py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and
-{py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`. See
-{doc}`the LLM engines page </ml/retrieval/llm/engines>` for the engines they take, and
-{doc}`batch inference </ml/inference/index>` for batching, GPU sizing and error handling.
+A fitted model registers the same way, and a language-model engine alongside it. Both are
+then called as table functions inside a query. See
+{doc}`Model and AI functions in SQL <sql-model-functions>`.
 
 ## Matching each row to the nearest one
 
@@ -306,9 +210,9 @@ right columns.
 ## Shifting a date or timestamp by an interval
 
 `ts + INTERVAL ...` and `ts - INTERVAL ...` shift an instant. The literal is read into three
-independent components — calendar months, whole days, and exact microseconds — because that
-is what a calendar shift is: a month is not a fixed number of days, and under a time zone
-neither is a day.
+independent components: calendar months, whole days, and exact microseconds. A calendar shift
+needs all three. A month is not a fixed number of days, and under a time zone neither is a
+day.
 
 Four spellings are accepted, and they compose:
 
@@ -419,9 +323,8 @@ genuinely holds inside the partition stays NULL.
 ## Duplicate output names
 
 SQL lets a `SELECT` list emit the same name twice, most often when a join projects a key
-from both sides. A Dataset is keyed by column name, so the second one is suffixed —
-`id`, then `id_1` — which is the same name DuckDB assigns when it has to make result
-names unique.
+from both sides. A Dataset is keyed by column name, so the second one is suffixed: `id`,
+then `id_1`. DuckDB assigns the same names when it has to make a result unique.
 
 ```python
 left = bt.from_pydict({"id": [1, 2], "v": [10, 20]})
@@ -445,7 +348,7 @@ downstream can detect.
 | `ASOF JOIN` on a strict `>` or `<` | The nearest-match key is inclusive. Use `>=` or `<=`. |
 | A negative list-slice bound, `a[-2:]` | Counts back from the end in DuckDB; the underlying slice clamps to the start. Index from the front, or reverse the list first. |
 | A correlated subquery whose correlation is an inequality | An equality correlation decorrelates to a join and is supported; an inequality one is not. |
-| An **inequality** quantified subquery, `x > ALL (...)` / `x >= ANY (...)` | Only the equality forms have a faithful rewrite: `= ANY` is `IN` and `<> ALL` is `NOT IN`, by definition. The tempting `x > ALL (S)` → `x > (SELECT max(c) FROM S)` is wrong when `S` holds a NULL — `max` skips it, so the rewrite answers TRUE where SQL says UNKNOWN, which is a silently wrong row rather than an error. Write the `max`/`min` form yourself, with `AND NOT EXISTS (SELECT 1 FROM S WHERE c IS NULL)` to keep the NULL case. |
+| An **inequality** quantified subquery, `x > ALL (...)` / `x >= ANY (...)` | Only the equality forms have a faithful rewrite: `= ANY` is `IN` and `<> ALL` is `NOT IN`, by definition. The tempting `x > ALL (S)` → `x > (SELECT max(c) FROM S)` is wrong when `S` holds a NULL, because `max` skips it: the rewrite then answers TRUE where SQL says UNKNOWN, which is a silently wrong row rather than an error. Write the `max`/`min` form yourself, with `AND NOT EXISTS (SELECT 1 FROM S WHERE c IS NULL)` to keep the NULL case. |
 | `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch, DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day (`1 DAY`, `6 HOUR`, `15 MINUTE`), or `date_trunc` for calendar buckets. |
 | Two `UNNEST` calls in one `SELECT` list | SQL zips them into one relation. Unnest one list per query, or use `FROM t, UNNEST(...)` for each. |
 
@@ -464,9 +367,9 @@ does give a `TIMESTAMP`. This matches Spark and keeps a date column usable as a 
 cast explicitly if you need DuckDB's type. The row values are identical either way.
 
 Descending list sorts agree with DuckDB, NULLs included. `list_reverse_sort` lowers to
-`.list.sort_desc()`, which is a kernel of its own rather than `sort().reverse()` — ascending
-puts NULLs last, so reversing would lift them to the front, where DuckDB keeps them at the
-back. Both spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
+`.list.sort_desc()`, a kernel of its own rather than `sort().reverse()`. Ascending puts NULLs
+last, so reversing would lift them to the front, where DuckDB keeps them at the back. Both
+spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
 
 (deliberate-differences)=
 ### Deliberate differences
@@ -483,6 +386,7 @@ difference and don't report it as a defect.
 
 ## See also
 
+- {doc}`Model and AI functions in SQL <sql-model-functions>`: `ML_PREDICT`, `AI_GENERATE`, and `AI_EXTRACT`.
 - {doc}`SQL API </api/relational/sql>`: the {py:class}`Session <batcher.Session>`, function registration, and the supported
   SQL surface.
 - {doc}`Expressions </user-guide/transform/columns/expressions>`: the DataFrame column language SQL lowers to.

@@ -16,24 +16,10 @@ rebuilt without losing progress, because the relational state lives in `bc-runti
 And spilling and the network shuffle become the same operation with a different sink, because
 Arrow IPC serializes what is already in memory.
 
-```text
-    Python                      │                       Rust
-    ──────────────────────      │      ──────────────────────────
-    pa.RecordBatch              │      arrow::RecordBatch
-          │                     │            │
-          └────► ArrowArray / ArrowSchema pointers ◄────┘
-                 (the Arrow C Data Interface)
-                              │
-                              ▼
-                 ┌──────────────────────────────┐
-                 │  ONE set of buffers          │   values
-                 │  in ONE allocation           │   validity bitmap
-                 │  neither side owns a copy    │   offsets
-                 └──────────────────────────────┘
+One `RecordBatch` is a schema and a set of buffers per column, and what the slice and the
+FFI boundary cost is decided by what neither of them copies.
 
-    Nothing is serialized. There is no Python object per row anywhere in this path.
-    collect() hands back the same buffers the engine produced.
-```
+![A RecordBatch is a schema plus a set of buffers per column. An Int64 column carries a validity bitmap of one bit per row, absent when nothing is null, and a values buffer of eight bytes per row back to back; it needs no offsets buffer, because every value is the same width and row i begins at byte i times 8. A Utf8 column carries a validity bitmap, an offsets buffer of n plus 1 int32s, and a values buffer holding every row's bytes end to end and unpadded, so row i is the stretch of the values buffer between offset i and offset i plus 1, and no per-row length has to be stored. batch.slice(off, len) copies nothing: the second RecordBatch is an offset and a length over the parent's buffers. But get_array_memory_size still reports the parent's whole allocation, which is why every size decision in the engine measures a morsel with bc_arrow::slice_bytes instead. Those same buffer pointers cross to pyarrow through the Arrow C Data Interface, with no copy and no serialization: the morsel Rust hands back is the batch Python already holds.](/_static/diagrams/arrow_memory_layout.svg)
 
 The cost is that every kernel must be an Arrow kernel or must operate on Arrow buffers, and a
 type Arrow does not have is a type the engine does not have.
@@ -46,7 +32,7 @@ The crate DAG points one way, and where a piece of memory machinery lives is dec
 |---|---|---|
 | `bc-arrow` | `Morsel`, `MorselTarget`, `RuntimeTuning`, and the workspace's single Arrow version pin | arrow only |
 | `bc-resource` | `MemoryPool`, `MemoryReservation`, `Pressure`, on `std` + `thiserror` with no Arrow | nothing in the workspace |
-| `bc-expr` → `bc-ir` → `bc-runtime` / `bc-codegen` → `bc-interp` | the operators and the state they hold | strictly downward |
+| `bc-expr` → `{bc-ir → bc-runtime, bc-codegen}` → `bc-interp` | the operators and the state they hold | strictly downward. `bc-codegen` compiles scalar `Expr`, so it sits beside `bc-ir` rather than under it |
 | `bc-py` | the C Data Interface boundary, type normalization, and the global allocator | everything |
 
 `bc-resource` sits at the bottom with no Arrow dependency precisely so that `bc-runtime` and
@@ -112,7 +98,7 @@ import pyarrow as pa
 t = pa.table({"a": pa.array([1, 2, 3], pa.int32())})
 out = bt.from_arrow(t).select("a").collect()
 
-print(type(out).__name__, out.schema.field("a").type)   # widened at the boundary
+print(type(out).__name__, out.schema.field("a").type)  # widened at the boundary
 print(out.column("a").to_pylist())
 ```
 
@@ -226,15 +212,15 @@ swapless node is fatal rather than slow. The unmapping it costs is tens of milli
 spill measured in seconds.
 
 The valve sits at the executor rather than at the decision, and the difference matters. Three
-independent signals route a query to disk — admission's counter-offer, the plan's estimated peak,
-and the resident size of the input — and only the second passes through a live pressure reading.
+independent signals route a query to disk: admission's counter-offer, the plan's estimated peak,
+and the resident size of the input. Only the second passes through a live pressure reading.
 A trim hung off that reading covers one route of the three and misses the estimate, which is the
 ordinary way a large query spills.
 
 It does **not** try to avoid the spill, and that is deliberate. By the time it runs the decision
 is already made. Even taken earlier it could not change one: the pressure level is the maximum
-of two buffer-pool utilizations and the process footprint, and a trim moves only the footprint —
-so a level driven by reservation accounting cannot come down however much arena is returned, and
+of two buffer-pool utilizations and the process footprint, and a trim moves only the footprint.
+A level driven by reservation accounting cannot come down however much arena is returned, and
 what is left is smoothed by a de-escalation average whose purpose is not to fall on one good
 reading. Re-reading it would pay a forced walk of every heap for an answer that mostly cannot
 change.
@@ -243,7 +229,7 @@ Two details the measurements forced. The trim must be *forced*: a plain collect 
 calling thread's heap and the engine allocates on rayon workers, so an unforced call from the
 control plane returned 0 MiB where the forced one returned 408. And the bytes released are
 measured against the kernel's own figure, because mimalloc's committed figure does not move on a
-collect at all — bracketing with it reported zero released, always, on precisely the occasions the
+collect at all. Bracketing with it reported zero released, always, on precisely the occasions the
 valve gave the most. `ResourceManager.stats()["reclaim"]` reports the attempts and the bytes, and
 a rising attempt count with no bytes is the signature of a box that is genuinely full rather than
 an engine sitting on memory.

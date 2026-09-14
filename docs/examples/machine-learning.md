@@ -5,7 +5,7 @@ inference, plus the retrieval and metric scripts that sit alongside them.
 
 ## Fit and transform are separate for a reason
 
-Every preprocessor follows the same split: the statistics come from the training set and are
+Every preprocessor follows the same split. The statistics come from the training set and are
 then applied to validation and production data. Fitting on everything is the classic leak,
 and the API makes the correct thing the easy thing.
 
@@ -32,8 +32,8 @@ what the batch produced for that row.
 ## Evaluation
 
 On an imbalanced problem a model that always predicts the majority class scores well on
-accuracy and finds nothing. Precision and recall are what separate the two, and they need the
-confusion counts rather than a single number.
+accuracy and finds nothing. Precision and recall separate the two. Both need the confusion
+counts rather than a single number.
 
 ```python
 import batcher as bt
@@ -62,7 +62,7 @@ assert recall == 0.5
 Python model call from costing a Python function call per row. Using a class rather than a
 closure lets an expensive model load once per worker rather than once per batch.
 
-One consequence to plan for: a Python callback's output schema is not known until it runs, so
+One consequence to plan for. A Python callback's output schema is not known until it runs, so
 the new column exists in the result but not in `Dataset.columns`. Materialize before you
 project it.
 

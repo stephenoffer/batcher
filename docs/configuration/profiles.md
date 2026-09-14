@@ -2,7 +2,7 @@
 
 This page collects worked {py:class}`Config <batcher.Config>` recipes for common deployment goals.
 
-Batcher has no built-in named profiles and no `apply_profile`. A profile here is a `Config` object you build for a goal and activate with {py:func}`set_config <batcher.set_config>` or {py:func}`config_context <batcher.config_context>`. Each recipe derives from `Config()` with `dataclasses.replace` on the sections it changes, leaving every other field at its tuned default.
+Batcher has no built-in named profiles and no `apply_profile`. A profile here is a `Config` object you build for a goal and activate with {py:func}`set_config <batcher.set_config>` or {py:func}`config_context <batcher.config_context>`. Each recipe derives from `Config()` with `dataclasses.replace` on the sections it changes. Every other field stays at its tuned default.
 
 ```python
 import dataclasses
@@ -12,9 +12,8 @@ from batcher import Config, set_config, config_context
 
 ## Low-latency small queries
 
-For many small, interactive queries, the priority is low fixed overhead. Use a
-smaller morsel so a tiny input is not split into one oversized batch, and keep all
-cores available.
+For many small, interactive queries the priority is low fixed overhead. Use a smaller morsel,
+so a tiny input is not split into one oversized batch, and keep all cores available.
 
 ```python
 base = Config()
@@ -193,9 +192,9 @@ To pin the fan-out instead and skip the wait entirely, pass `num_workers=` to th
 ## Reusing a recipe
 
 A recipe is an ordinary `Config`. Define it once, then activate it process-wide with
-`set_config` or per block with `config_context`. Because `Config` is immutable, the
-same object can be reused freely and combined by chaining `replace` calls. See
-{doc}`options` for every field you can change.
+`set_config` or per block with `config_context`. `Config` is immutable, so the same object
+is safe to reuse and to combine by chaining `replace` calls. See {doc}`options` for every
+field you can change.
 
 ## See also
 

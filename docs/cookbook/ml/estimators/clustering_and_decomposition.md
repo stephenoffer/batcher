@@ -20,4 +20,4 @@ python examples/ml/clustering_and_decomposition.py
 - {doc}`/cookbook/ml/estimators/classifiers`: naive Bayes, discriminant analysis, and baselines.
 - {doc}`/cookbook/ml/preprocessing/feature_construction`: interactions, ratios, calendar parts, lags, and rolling windows.
 - {doc}`/ml/index`: the ML surface these recipes sit on.
-- {doc}`/ml/preparing/preprocessors/index`: the fit and transform steps most pipelines start with.
+- {doc}`/ml/evaluation/index`: scoring the model once it is fitted, as engine expressions.

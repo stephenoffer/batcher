@@ -1,6 +1,6 @@
 # Configuration
 
-Configuration is a value, not global mutable state you have to remember to undo. ``option_context`` and ``config_context`` scope an override to a block, so a memory-tight step cannot leak its settings into the rest of the program.
+Configuration here is a value you pass. Nothing global mutates, so there is nothing to remember to undo. Reach for `option_context` when one step needs a different setting and `config_context` when a whole block does. Both restore the previous value on the way out, so a memory-tight step cannot leak its settings into the rest of the program. `set_option` is the global escape hatch, and it needs a matching `reset_option`.
 
 The whole script, executed on every test run:
 

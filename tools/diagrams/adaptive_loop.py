@@ -21,10 +21,10 @@ from _authoring import arrow, band, card, curve, label, note, svg, write
 
 W, H = 980, 560
 
-ROW1_Y = 76           # inner-loop card row
+ROW1_Y = 76  # inner-loop card row
 ROW1_BOTTOM = ROW1_Y + 84
-RETURN_APEX = 214     # the feedback curve's low point, clear of the cards
-ROW2_Y = 372          # outer-loop card row
+RETURN_APEX = 214  # the feedback curve's low point, clear of the cards
+ROW2_Y = 372  # outer-loop card row
 
 body = [
     # ---- Inner loop: within one query -------------------------------------
@@ -38,9 +38,18 @@ body = [
     arrow(678, 118, 708, 118, "blue"),
     curve(820, ROW1_BOTTOM, 490, RETURN_APEX, 143, ROW1_BOTTOM, "blue"),
     label(490, 208, "the remaining stages, re-planned", anchor="middle"),
-    note(490, 250, "Same mechanism and granularity as Spark AQE, and available single-node.", anchor="middle"),
-    note(490, 270, "Gated off below 5,000,000 input rows per pipeline breaker, so most queries never reach it.", anchor="middle"),
-
+    note(
+        490,
+        250,
+        "Same mechanism and granularity as Spark AQE, and available single-node.",
+        anchor="middle",
+    ),
+    note(
+        490,
+        270,
+        "Gated off below 5,000,000 input rows per pipeline breaker, so most queries never reach it.",
+        anchor="middle",
+    ),
     # ---- Outer loop: across runs ------------------------------------------
     band(20, 318, 940, 218, "ACROSS RUNS  ·  LEARNED STATISTICS", "amber"),
     card(48, ROW2_Y, 244, 84, "Record what happened", "sketches, not raw rows"),
@@ -48,7 +57,12 @@ body = [
     card(636, ROW2_Y, 296, 84, "The next run plans better", "bandit picks what worked"),
     arrow(292, 414, 342, 414, "amber"),
     arrow(586, 414, 636, 414, "amber"),
-    note(490, 500, "Core measures, Kyber consumes. This half is what neither DuckDB nor Spark has.", anchor="middle"),
+    note(
+        490,
+        500,
+        "Core measures, Kyber consumes. This half is what neither DuckDB nor Spark has.",
+        anchor="middle",
+    ),
 ]
 
 write("adaptive_loop", svg(W, H, "".join(body)))

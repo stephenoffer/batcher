@@ -4,10 +4,10 @@ This page covers the scripts that run the TPC-H benchmark queries over the real 
 plus the scripts that measure what those queries cost.
 
 Every table comes from the public mirror in `s3://ray-benchmark-data`, cached locally with
-its canonical column names restored. The fact tables are read as a bounded prefix so the
-suite stays a release check rather than a benchmark, which means the results are correct for
-the slice rather than equal to the published TPC-H answers. The scripts assert on structural
-properties that hold at any scale, not on magic numbers.
+its canonical column names restored. The fact tables are read as a bounded prefix, so the
+suite stays a release check rather than a benchmark. The results are correct for the slice
+and not equal to the published TPC-H answers. The scripts assert on structural properties
+that hold at any scale, never on magic numbers.
 
 ## The query shapes
 
@@ -51,8 +51,8 @@ Q6 is the query with no joins and no grouping, so it isolates the read path. Com
 wide read against a projected one, and a filtered one against an unfiltered one, shows what
 projection and predicate pushdown actually buy.
 
-Q9 is the opposite: its filter is a substring match that no statistic can help with, so the
-only way to cut work is to apply the expensive predicate to the smallest relation first.
+Q9 is the opposite. Its filter is a substring match no statistic can help with, so the only
+way to cut work is to apply the expensive predicate to the smallest relation first.
 `examples/tpch/join_order_matters.py` runs the same five-table query in two orders and
 asserts they return identical rows.
 

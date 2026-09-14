@@ -8,29 +8,10 @@ shape has to survive.
 The tempting answer is a bespoke `TensorArray` type. Batcher does not have one, and the
 absence is the design.
 
-```text
-   read.images()  ──►  schema {uri, bytes, size, mime}   (no pixels yet)
-                            │
-                            ▼
-                    ┌────────────────┐
-                    │  bytes column  │   a ~5 KB encoded JPEG per row
-                    └───────┬────────┘
-                            │
-                            │  col("bytes").image.to_tensor(w, h)
-                            │  a Rust expression, with a per-row rayon fan-out
-                            ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │  FixedSizeList<UInt8, w*h*3>                                 │
-   │  + Arrow field metadata:                                     │
-   │      ARROW:extension:name     = "arrow.fixed_shape_tensor"   │
-   │      ARROW:extension:metadata = {"shape":[h,w,3]}            │
-   └───────────────────────────────┬──────────────────────────────┘
-                                   │
-                                   │  the shape rides WITH the data, so it
-                                   │  crosses the FFI boundary for free
-                                   ▼
-                    numpy (n, h, w, 3)   /   torch tensor
-```
+What that absence buys is visible in the bytes: one contiguous Arrow buffer, against one
+Python object per row.
+
+![A batch of images held as one Python object per row, against the same batch held as one Arrow column. Per-row objects are n separate allocations and every row is a pointer, so the batch's bytes are scattered and nothing can be handed to a kernel or across the FFI boundary whole; that is what RecordBatch.to_pandas() gives back for a tensor column, which is why the batch is re-wrapped before a user function ever sees it. The Arrow column is a validity bitmap of one bit per row plus a values buffer of n by 150,528 uint8, contiguous. It needs no offsets buffer, because every row is the same size and row i begins at byte i times 150,528, and it is typed as arrow.fixed_shape_tensor over a FixedSizeList with the shape (224, 224, 3) in the field metadata. A reader gets it back as to_numpy_ndarray() shaped (n, 224, 224, 3), the shape taken from the type, or as a DLPack view over that same buffer through arrays_to_torch(zero_copy=True). Because the shape travels with the data, the column crosses the FFI boundary and comes back shaped with no IR tag and no two-sided contract, which is what choosing the canonical type buys. The default torch path owns a writable copy instead: a training loop mutates its batch, and the Arrow buffer is read-only.](/_static/diagrams/tensor_column_layout.svg)
 
 ## The canonical Arrow extension type
 
@@ -45,8 +26,9 @@ contract to keep in lockstep.
 def tensor_type(value_type: pa.DataType, shape: tuple[int, ...]) -> pa.DataType:
     return pa.fixed_shape_tensor(value_type, list(shape))
 
+
 def to_tensor_column(ndarray: np.ndarray) -> pa.Array:
-    return pa.FixedShapeTensorArray.from_numpy_ndarray(ndarray)   # leading axis = rows
+    return pa.FixedShapeTensorArray.from_numpy_ndarray(ndarray)  # leading axis = rows
 ```
 
 That whole module is 98 lines. The shape rides with the data, which means it crosses the FFI
@@ -73,9 +55,11 @@ import batcher as bt
 emb = bt.from_numpy(np.arange(12, dtype=np.float32).reshape(4, 3), column="emb")
 print(emb.collect().schema.field("emb").type)
 
+
 # rank-3 per row: the canonical extension type
 def make_images(batch):
     return {"img": np.zeros((batch.num_rows, 2, 2, 3), dtype=np.uint8)}
+
 
 imgs = bt.from_pydict({"i": [0, 1, 2, 3]}).map_batches(make_images)
 field = imgs.collect().schema.field("img")
@@ -149,15 +133,16 @@ which made decode alone 17x to 22x faster.
 
 ## Out to numpy and torch
 
-`python/batcher/ml/converters.py::_column_to_numpy` is the one place that knows about both
-conventions:
+`python/batcher/interop/arrays.py::_column_to_numpy` is the one place that knows about both
+conventions. `ml/converters.py` re-exports it, deliberately rather than by accident, because
+`ml.serving` and the tests reach for the old path:
 
 ```python
 # docs: skip
 if is_tensor_column(arr):
-    return arr.to_numpy_ndarray()              # (n, *shape)
+    return arr.to_numpy_ndarray()  # (n, *shape)
 if fixed_size_list_of_primitives(arr):
-    return child.reshape(-1, width)            # (n, W)
+    return child.reshape(-1, width)  # (n, W)
 return arr.to_numpy(zero_copy_only=False)
 ```
 
@@ -174,8 +159,10 @@ zero-copy DLPack path is what {py:meth}`iter_torch_batches <batcher.api.dataset.
 import numpy as np
 import batcher as bt
 
+
 def make_images(batch):
     return {"img": np.zeros((batch.num_rows, 2, 2, 3), dtype=np.uint8)}
+
 
 ds = bt.from_pydict({"i": [0, 1, 2, 3]}).map_batches(make_images)
 for batch in ds.ml.iter_torch_batches(batch_size=2):
@@ -214,8 +201,8 @@ struct<data: binary, shape: list<int32>, dtype: string>
 
 Both halves of that layout are doing work. It is a **plain struct**, so it crosses the FFI,
 writes to Parquet, shuffles, and passes through every operator with no engine change, no IR
-tag, and no wire-contract change — unlike an extension type, which the Rust side would have
-had to learn. And `data` is a **binary buffer rather than a list of elements**, because the
+tag, and no wire-contract change. An extension type would have had to be taught to the Rust
+side. And `data` is a **binary buffer rather than a list of elements**, because the
 boundary widens narrow numerics: a `list<uint8>` image column arrives as `list<int64>`, eight
 bytes per pixel, for the one workload the representation exists to carry.
 
@@ -260,7 +247,7 @@ Video is the weak spot, and the two decode paths are worth seeing side by side.
 ::::{tab-set}
 :::{tab-item} Native decode (image, audio, .npy)
 ```text
-crates/bc-expr/src/eval/media/{image,audio}.rs
+crates/bc-expr/src/eval/media/{image/, audio.rs}
 
   a Rust expression in the plan
   interpreter-only (the JIT cannot compile a library-backed decode)
@@ -272,7 +259,7 @@ crates/bc-expr/src/eval/media/{image,audio}.rs
 
 :::{tab-item} Python decode (video)
 ```text
-python/batcher/ml/decode.py::video_dataset
+python/batcher/ml/decode/video.py::video_dataset
 
   a Python map_batches over PyAV
   builds the FixedSizeListArray by hand
@@ -292,9 +279,9 @@ handed to a model:
 | The type helpers | `python/batcher/io/formats/ml/tensor.py` |
 | The variable-shape representation | `python/batcher/io/formats/ml/ragged.py` |
 | Metadata preservation in projection | `crates/bc-interp/src/ops/project_field.rs` |
-| Decode kernels | `crates/bc-expr/src/eval/media/{image,audio,video}.rs` |
-| Decode orchestration | `python/batcher/ml/decode.py` |
-| Arrow → numpy / torch | `python/batcher/ml/{converters,batch_format,loader}.py` |
+| Decode kernels | `crates/bc-expr/src/eval/media/` |
+| Decode orchestration | `python/batcher/ml/decode/` |
+| Arrow → numpy / torch | `python/batcher/interop/arrays.py` (re-exported by `ml/converters.py`), `loader/` |
 | UDF output tensorization | `python/batcher/core/udf/call.py` |
 
 ## See also

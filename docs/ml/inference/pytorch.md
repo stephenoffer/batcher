@@ -63,9 +63,7 @@ this runs here on CPU with no GPU and no model:
 ```python
 import batcher as bt
 
-ds = bt.from_pydict(
-    {"f0": [0.1, 0.2, 0.3, 0.4], "f1": [1.0, 2.0, 3.0, 4.0], "label": [0, 1, 0, 1]}
-)
+ds = bt.from_pydict({"f0": [0.1, 0.2, 0.3, 0.4], "f1": [1.0, 2.0, 3.0, 4.0], "label": [0, 1, 0, 1]})
 
 batches = list(ds.ml.iter_torch_batches(batch_size=2, device="cpu"))
 print(len(batches))
@@ -88,9 +86,9 @@ import batcher as bt
 ds = bt.read.parquet("s3://bucket/train/*.parquet")
 loader = ds.ml.iter_torch_batches(
     batch_size=256,
-    device="auto",          # CUDA / ROCm / XPU / MPS / CPU
-    pin_memory=True,         # faster async host→device copies
-    prefetch_batches=2,      # overlap the device move with compute
+    device="auto",  # CUDA / ROCm / XPU / MPS / CPU
+    pin_memory=True,  # faster async host→device copies
+    prefetch_batches=2,  # overlap the device move with compute
     local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
 )
 for batch in loader:
@@ -128,12 +126,8 @@ class BatcherDataset(IterableDataset):
         self.batch_size = batch_size
 
     def __iter__(self):
-        for batch in self.dataset.iter_batches(
-            batch_size=self.batch_size
-        ):
-            features = torch.tensor(
-                [batch.column(c).to_pylist() for c in ("f0", "f1")]
-            ).T
+        for batch in self.dataset.iter_batches(batch_size=self.batch_size):
+            features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
             labels = torch.tensor(batch.column("label").to_pylist())
             for i in range(batch.num_rows):
                 yield features[i], labels[i]
@@ -153,7 +147,7 @@ come from, whether `iter_batches()`, a reader, or the output of {py:class}`Infer
 `run_pipeline`. Use them when you drive the loop yourself. Use
 `ds.ml.iter_torch_batches` when you want tensors straight out of a dataset.
 
-{py:meth}`to_numpy_batches(batches, columns=...) <batcher.api.dataset.ml.DatasetML.to_numpy_batches>` is the base of the other two. It yields one
+{py:func}`to_numpy_batches(batches, columns=...) <batcher.ml.to_numpy_batches>` is the base of the other two. It yields one
 `{column: ndarray}` dict per batch, with numeric non-null columns converted zero-copy. A
 tensor column, or a fixed-size list of numbers, comes back with its real `(n, width...)`
 shape rather than an object array, so an embedding or image column feeds a model as a
@@ -167,7 +161,7 @@ print({name: array.tolist() for name, array in arrays.items()})
 # {'f0': [0.1, 0.2], 'label': [0, 1]}
 ```
 
-`to_torch_iterable(batches, columns=...)` wraps that in a
+{py:func}`to_torch_iterable(batches, columns=...) <batcher.ml.to_torch_iterable>` wraps that in a
 `torch.utils.data.IterableDataset` yielding `{column: tensor}` dicts. It is the class
 from the previous section, minus the writing. Non-numeric columns are skipped, so keep
 text and ids in the engine rather than in the trainer's hot path. It is single-pass unless
@@ -185,7 +179,7 @@ for batch in DataLoader(stream, batch_size=None):  # batches are already sized
     loss.backward()
 ```
 
-`to_tf_dataset(batches, columns=...)` is the TensorFlow equivalent. It returns a
+{py:func}`to_tf_dataset(batches, columns=...) <batcher.ml.to_tf_dataset>` is the TensorFlow equivalent. It returns a
 `tf.data.Dataset` of `{column: tensor}` dicts, with the output signature derived from the
 first batch.
 
@@ -207,9 +201,7 @@ convert a whole Arrow batch to a tensor directly, which is faster.
 import torch
 
 for batch in prepared.iter_batches(batch_size=256):
-    features = torch.tensor(
-        [batch.column(c).to_pylist() for c in ("f0", "f1")]
-    ).T
+    features = torch.tensor([batch.column(c).to_pylist() for c in ("f0", "f1")]).T
     labels = torch.tensor(batch.column("label").to_pylist())
     # forward, loss, backward, step ...
 ```

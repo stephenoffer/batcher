@@ -116,9 +116,7 @@ print(out.to_pydict())
 DuckDB's `COLUMNS(*)` and `COLUMNS('regex')` project a set of columns chosen at plan time, and a function applied to `COLUMNS(...)` runs on each matched column. A wide-table transform therefore needs no exhaustive column list.
 
 ```python
-metrics = bt.from_pydict(
-    {"day": ["mon", "tue"], "sales_us": [10, 20], "sales_eu": [30, 40]}
-)
+metrics = bt.from_pydict({"day": ["mon", "tue"], "sales_us": [10, 20], "sales_eu": [30, 40]})
 out = bt.sql("SELECT day, COLUMNS('sales_.*') * 2 FROM metrics", metrics=metrics)
 print(out.to_pydict())
 # {'day': ['mon', 'tue'], 'sales_us': [20, 40], 'sales_eu': [60, 80]}
@@ -149,8 +147,8 @@ print(out.to_pydict())
 (distinct-aggregates)=
 ### DISTINCT aggregates
 
-`COUNT(DISTINCT x)` is a native aggregate and mixes with anything. The others —
-`SUM(DISTINCT x)`, `AVG(DISTINCT x)`, `MIN`/`MAX(DISTINCT x)` — are answered by grouping on
+`COUNT(DISTINCT x)` is a native aggregate and mixes with anything. The rest,
+`SUM(DISTINCT x)`, `AVG(DISTINCT x)` and `MIN`/`MAX(DISTINCT x)`, are answered by grouping on
 the group keys plus `x`, which dedups `x`, and then aggregating that. Any other aggregate in
 the same query has to survive that pre-aggregation, so it must combine from per-sub-group
 partials: `COUNT`, `SUM`, `MIN`, `MAX`, `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`,
@@ -205,7 +203,7 @@ print(out.to_pydict())
 # {'site': ['a', 'b'], 'mask': [7, 3], 'p': [10.0, 3.0]}
 ```
 
-Three decline, and they are the *composite* aggregates — each is built from several
+Three decline, and they are the *composite* aggregates. Each is built from several
 aggregates over more than one input, so no single column carries the dedup: `STDDEV_POP`,
 `VAR_POP`, and `SEM`. So do the two-input aggregates (`CORR`, `COVAR_*`, the `REGR_*`
 family, `ARG_MIN`/`ARG_MAX`). Each raises naming itself, and the rewrite that does work is
@@ -328,7 +326,7 @@ Register a Python function with
 function runs over Arrow batches (it lowers to `map_batches`), so it composes with
 relational operators in one plan. There are two call forms.
 
-A **scalar** function, called as `SELECT f(x)` or `WHERE f(x)`, is vectorized by default. It receives an Arrow array and returns one:
+A *scalar* function, called as `SELECT f(x)` or `WHERE f(x)`, is vectorized by default. It receives an Arrow array and returns one:
 
 ```python
 import pyarrow.compute as pc
@@ -339,12 +337,13 @@ print(out.to_pydict())
 # {'id': [3, 4, 5], 'scaled': [300.0, 400.0, 500.0]}
 ```
 
-A **table** function, called as `SELECT * FROM f(t)`, transforms a whole relation:
+A *table* function, called as `SELECT * FROM f(t)`, transforms a whole relation:
 
 ```python
 def add_flag(batch):
     big = pc.greater(batch.column("amount"), 25)
     return batch.append_column("big", big)
+
 
 s.register_function(
     "flagged", add_flag, table=True, output_columns=["id", "category", "amount", "big"]
@@ -437,6 +436,7 @@ print(out.to_pydict())
 ## See also
 
 - {doc}`SQL user guide </user-guide/analyze/sql>`: a guided tour with runnable queries.
+- {doc}`Model and AI functions in SQL </user-guide/analyze/sql-model-functions>`: the guide to `ML_PREDICT`, `AI_GENERATE`, and `AI_EXTRACT`.
 - {doc}`Dataset </api/relational/dataset>`: the DataFrame surface SQL lowers to.
 - {doc}`Expressions </api/relational/expressions>`: the scalar functions available in projections.
 - {doc}`/cookbook/dataset/verbs/sql_interface`: mixing SQL with DataFrame verbs, as a runnable script.

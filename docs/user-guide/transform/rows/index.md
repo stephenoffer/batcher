@@ -4,6 +4,10 @@ These pages cover the verbs that decide which rows survive and in what order. Th
 the shape of the table rather than the contents of a column, which is what
 {doc}`/user-guide/transform/columns/index` covers.
 
+The usual order is filter first, sort last. A sort has to see every row before it can emit
+one, so every row a predicate cut earlier is a row the sort never has to order, and a
+`distinct` or a `limit` in between cuts more of them still.
+
 | Page | What it covers |
 |---|---|
 | {doc}`Transformations <transformations>` | `select` and `with_columns`, and which of the two you want |

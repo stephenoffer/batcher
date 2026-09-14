@@ -84,14 +84,12 @@ print(in_world.select("world_x", "world_y", "world_z").to_pydict())
 The transform rotates and then translates. The other order is a different transform and
 gets a different, wrong answer for every point that is not at the origin.
 
-Going the other way — a world-frame obstacle expressed relative to the vehicle — is
+Going the other way, to a world-frame obstacle expressed relative to the vehicle, is
 {py:func}`se3_inverse_transform <batcher.se3_inverse_transform>`:
 
 ```python
 relative = in_world.with_columns(
-    **bt.se3_inverse_transform(
-        world_from_lidar, ("world_x", "world_y", "world_z"), prefix="back_"
-    )
+    **bt.se3_inverse_transform(world_from_lidar, ("world_x", "world_y", "world_z"), prefix="back_")
 )
 print(relative.select("back_x", "back_y", "back_z").to_pydict())
 ```
@@ -113,19 +111,27 @@ import batcher as bt
 frames = bt.from_pydict(
     {
         # world_from_ego: the vehicle, from the localizer.
-        "etx": [100.0], "ety": [50.0], "etz": [0.0],
-        "eqx": [0.0], "eqy": [0.0], "eqz": [0.0], "eqw": [1.0],
+        "etx": [100.0],
+        "ety": [50.0],
+        "etz": [0.0],
+        "eqx": [0.0],
+        "eqy": [0.0],
+        "eqz": [0.0],
+        "eqw": [1.0],
         # ego_from_lidar: the sensor mount, from the calibration file.
-        "ltx": [1.2], "lty": [0.0], "ltz": [1.8],
-        "lqx": [0.0], "lqy": [0.0], "lqz": [0.0], "lqw": [1.0],
+        "ltx": [1.2],
+        "lty": [0.0],
+        "ltz": [1.8],
+        "lqx": [0.0],
+        "lqy": [0.0],
+        "lqz": [0.0],
+        "lqw": [1.0],
     }
 )
 
 world_from_ego = ("etx", "ety", "etz", "eqx", "eqy", "eqz", "eqw")
 ego_from_lidar = ("ltx", "lty", "ltz", "lqx", "lqy", "lqz", "lqw")
-chained = frames.with_columns(
-    **bt.se3_compose(world_from_ego, ego_from_lidar, prefix="w_")
-)
+chained = frames.with_columns(**bt.se3_compose(world_from_ego, ego_from_lidar, prefix="w_"))
 print(chained.select("w_tx", "w_ty", "w_tz").to_pydict())
 ```
 
@@ -157,9 +163,16 @@ rows = bt.from_pydict(
         "t_meas": [1500.0],
         "t_before": [1000.0],
         "t_after": [2000.0],
-        "ax": [0.0], "ay": [0.0], "az": [0.0],
-        "bx": [10.0], "by": [0.0], "bz": [0.0],
-        "qx": [0.0], "qy": [0.0], "qz": [0.0], "qw": [1.0],
+        "ax": [0.0],
+        "ay": [0.0],
+        "az": [0.0],
+        "bx": [10.0],
+        "by": [0.0],
+        "bz": [0.0],
+        "qx": [0.0],
+        "qy": [0.0],
+        "qz": [0.0],
+        "qw": [1.0],
     }
 )
 
@@ -176,8 +189,8 @@ table with {py:meth}`join_asof <batcher.Dataset.join_asof>` twice: once backward
 pose at or before each timestamp, and once forward for the one after.
 
 `t` is not clamped, so a measurement whose timestamp falls just past the last logged pose
-extrapolates along the same arc rather than pinning to the endpoint. That is usually what
-you want, and it is worth knowing you are doing it.
+extrapolates along the same arc rather than pinning to the endpoint. That is usually the
+behaviour you want, and it is worth knowing you are relying on it.
 
 ## Filtering a point cloud
 
@@ -267,14 +280,18 @@ import batcher as bt
 
 runs = bt.from_pydict(
     {
-        "ax": [0.0, 0.0], "ay": [0.0, 0.0], "az": [0.0, 0.0], "aw": [1.0, 1.0],
+        "ax": [0.0, 0.0],
+        "ay": [0.0, 0.0],
+        "az": [0.0, 0.0],
+        "aw": [1.0, 1.0],
         # The second row is the same rotation spelled with every sign flipped.
-        "bx": [0.0, 0.0], "by": [0.0, 0.0], "bz": [0.0, 0.0], "bw": [1.0, -1.0],
+        "bx": [0.0, 0.0],
+        "by": [0.0, 0.0],
+        "bz": [0.0, 0.0],
+        "bw": [1.0, -1.0],
     }
 )
-err = runs.select(
-    e=bt.quat_angular_distance("ax", "ay", "az", "aw", "bx", "by", "bz", "bw")
-)
+err = runs.select(e=bt.quat_angular_distance("ax", "ay", "az", "aw", "bx", "by", "bz", "bw"))
 print(err.to_pydict())
 ```
 

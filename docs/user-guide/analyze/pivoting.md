@@ -35,8 +35,11 @@ pivot without an aggregate: if a cell can hold two rows, something has to combin
 `aggregate` is one of sum, mean, min, max, count.
 
 ```python
-print(sales.pivot(index=["region"], on="quarter", values="amount", aggregate="mean")
-      .sort("region").to_pydict())
+print(
+    sales.pivot(index=["region"], on="quarter", values="amount", aggregate="mean")
+    .sort("region")
+    .to_pydict()
+)
 # {'region': ['east', 'west'], 'q1': [30.0, 7.5], 'q2': [40.0, 20.0]}
 ```
 
@@ -53,9 +56,7 @@ Pass `columns=[...]` when you know the vocabulary. The pre-pass disappears, the 
 is fixed, and a missing value shows up as a null column instead of a missing one.
 
 ```python
-fixed = sales.pivot(
-    index=["region"], on="quarter", values="amount", columns=["q1", "q2", "q3"]
-)
+fixed = sales.pivot(index=["region"], on="quarter", values="amount", columns=["q1", "q2", "q3"])
 print(fixed.sort("region").to_pydict())
 # {'region': ['east', 'west'], 'q1': [30.0, 15.0], 'q2': [40.0, 20.0], 'q3': [None, None]}
 ```
@@ -118,8 +119,7 @@ value. Once `aggregate=` stops being enough, write that out yourself: same plan 
 same cost, and you get a different aggregate per column or a filter inside one cell.
 :::
 
-Writing it out by hand is what you do when you need something the operator does not
-offer.
+Written out by hand, one cell can sum while another counts:
 
 ```python
 by_hand = sales.group_by("region").agg(
@@ -129,9 +129,6 @@ by_hand = sales.group_by("region").agg(
 print(by_hand.sort("region").to_pydict())
 # {'region': ['east', 'west'], 'q1': [30.0, 15.0], 'q2_rows': [1, 1]}
 ```
-
-Same plan shape, same cost, and full control. Reach for it as soon as `aggregate=` stops
-being enough.
 
 ## Round-tripping
 

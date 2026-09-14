@@ -1,20 +1,17 @@
 # Feature selection
 
-This page describes how to cut a wide feature table down to the columns that earn their
-place, and how to do it without leaking the validation split into the choice.
-
-Fewer features is not an aesthetic preference. A column that carries no signal still costs
-memory, still costs a shuffle when you join, and still gives a model one more chance to fit
-noise. Two columns that duplicate each other are worse: a linear fit has to split one
-effect between them, so the coefficients come out large, opposite in sign, and unstable
-under resampling.
+Cutting a wide feature table down is not an aesthetic preference. A column that carries no
+signal still costs memory, still costs a shuffle when you join, and still gives a model one
+more chance to fit noise. Two columns that duplicate each other are worse: a linear fit has
+to split one effect between them, so the coefficients come out large, opposite in sign, and
+unstable under resampling. This page covers the selectors that do the cutting, and how to
+do it without leaking the validation split into the choice.
 
 ## Selection is fitted state
 
-The single most important thing about a selector is that it is an object. Choose features
-on the whole frame, or re-choose them per split, and the held-out rows have participated in
-the decision. Your validation score is then optimistic by an amount nothing measures and no
-test catches.
+A selector is an object, and that is the point of it. Choose features on the whole frame,
+or re-choose them per split, and the held-out rows have participated in the decision. Your
+validation score is then optimistic by an amount nothing measures and no test catches.
 
 ```python
 import batcher as bt
@@ -148,9 +145,8 @@ print(SelectFromModel(model).fit(regression).selected_)
 # ['a']
 ```
 
-The estimator must already be fitted. That is deliberate: refitting inside the selector
-would hide which rows the selection saw, and that is precisely what decides whether it
-leaks.
+The estimator must already be fitted, deliberately. Refitting inside the selector would
+hide which rows the selection saw, and which rows it saw decides whether it leaks.
 
 `threshold` also accepts `"mean"` or `"median"` to cut at that statistic of the
 importances, and `max_features` caps the count regardless.
@@ -167,8 +163,8 @@ print(sorted(feature_importances(model)))
 # ['a', 'b']
 ```
 
-Coefficient magnitudes are only comparable across features when the features are on a
-comparable scale, so scale before you fit the model you read.
+Coefficient magnitudes are only comparable when the features are on a comparable scale.
+Scale first, then fit the model you read.
 
 ## Recursive elimination
 
@@ -201,29 +197,28 @@ a fraction of the features still in play.
 
 ## Composing into a pipeline
 
-Selectors are ordinary preprocessors, so they chain with the rest:
+Selectors are ordinary preprocessors, so they chain with the rest. Fit the chain on the
+training split, as you would fit the selector alone:
 
 ```python
 from batcher.ml.preprocessors import Chain, StandardScaler
 
-pipeline = Chain(SelectKBest("y", k=2), StandardScaler(["signal"]))
-print(sorted(pipeline.fit_transform(ds).columns))
+pipeline = Chain(SelectKBest("y", k=2), StandardScaler(["signal"])).fit(train)
+print(sorted(pipeline.transform(test).columns))
 # ['signal', 'weak', 'y']
 ```
 
-Put selection early. Everything downstream then runs on a narrower table, which is where
-the saving is.
+Put selection early. Everything downstream then runs on a narrower table, and that is
+where the saving comes from.
 
 ## Requirements and limitations
 
 - A univariate score sees one feature at a time. It cannot detect a feature that matters
-  only in combination, and it cannot detect that two features are the same feature — use
+  only in combination, and it cannot detect that two features are the same feature. Use
   `DropCorrelated` for the latter.
 - `chi2` and `mutual_info` reject a feature with one distinct value per row, because a
   contingency statistic sits at its structural maximum there however unrelated the column
   is. Bucket a continuous column first.
-- `SelectFromModel` reads coefficient magnitudes, which are only comparable across features
-  when the features are on a comparable scale. Scale before you fit the model you read.
 - `RFE` costs one model fit per round. On a wide table, filter first and run `RFE` on what
   is left.
 

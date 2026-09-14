@@ -10,9 +10,7 @@ while the model call goes to the server, and the stage parallelizes across the c
 import batcher as bt
 from batcher.ml.serving import triton_client
 
-udf = triton_client(
-    "triton:8000", "resnet50", input_columns=["image"], output_columns=["logits"]
-)
+udf = triton_client("triton:8000", "resnet50", input_columns=["image"], output_columns=["logits"])
 scored = bt.read.images("s3://bucket/imgs/", decode=True, size=(224, 224)).ml.map_batches(
     udf, concurrency=(2, 8)
 )
@@ -69,8 +67,8 @@ Arrow batch into requests the server can hold, and `pipeline_depth` keeps that m
 so the remote GPU is not idle while this worker encodes and decodes. Results stay in input
 order either way.
 
-`triton_client` reads the window from the model's own configuration on the server when you
-leave `max_batch_size` unset, which is where the number is declared and where it can be right.
+Leave `max_batch_size` unset and `triton_client` reads the window from the model's own
+configuration on the server, which is where the number is declared and where it can be right.
 The other adapters cannot ask, so state it yourself: for TorchServe it is the model's
 registered `batch_size`, and for a custom endpoint it is whatever that endpoint was built for.
 
@@ -81,7 +79,7 @@ udf = triton_client(
     "resnet50",
     input_columns=["image"],
     output_columns=["logits"],
-    pipeline_depth=4,      # four requests in flight; the window comes from the server
+    pipeline_depth=4,  # four requests in flight; the window comes from the server
 )
 ```
 
@@ -122,12 +120,14 @@ method satisfies it, so this runs as written:
 import batcher as bt
 from batcher.ml.serving import serving_udf
 
+
 class LocalClient:
     def __init__(self):
-        self.bias = 0.5          # stands in for the once-per-worker connection
+        self.bias = 0.5  # stands in for the once-per-worker connection
 
     def predict(self, inputs):
         return {"score": inputs["features"] * 2 + self.bias}
+
 
 udf = serving_udf(LocalClient, input_columns=["features"], output_columns=["score"])
 ds = bt.from_pydict({"features": [1.0, 2.0, 3.0]})
@@ -145,28 +145,27 @@ distribution in the data plane with {py:meth}`.list.softmax() <batcher.plan.expr
 ```python
 # docs: skip
 from batcher import col
+
 scored = scored.with_columns(
     prob=col("logits").list.softmax(),
     ranked=col("logits").list.arg_sort().list.reverse(),  # class indices, best first
 )
 ```
 
-{py:meth}`arg_sort <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` gives you positions, and {py:meth}`.list.gather(...) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.gather>` is what spends them. Together they
-turn a score vector and a candidate list into a ranked selection without a per-row loop, which
-is the shape of a reranking stage:
+{py:meth}`arg_sort <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` gives you positions and {py:meth}`.list.gather(...) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.gather>` spends them. Together they turn
+a score vector and a candidate list into a ranked selection without a per-row loop. That is the
+shape of a reranking stage:
 
 ```python
 import batcher as bt
 
-candidates = bt.from_pydict(
-    {"docs": [["low", "high", "mid"]], "scores": [[0.1, 0.9, 0.5]]}
-)
+candidates = bt.from_pydict({"docs": [["low", "high", "mid"]], "scores": [[0.1, 0.9, 0.5]]})
 best_first = bt.col("scores").list.arg_sort().list.reverse()
 print(candidates.select(top2=bt.col("docs").list.gather(best_first.list.head(2))).to_pydict())
 # {'top2': [['high', 'mid']]}
 ```
 
-A cutoff wider than the candidate list is fine — the extra positions come back as nulls rather
+A cutoff wider than the candidate list is fine. The extra positions come back as nulls rather
 than an error, because a fixed `k` against a short candidate set is ordinary.
 
 Two more read the scores rather than reorder them. {py:meth}`.list.log_softmax() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.log_softmax>` is the log-domain
@@ -174,9 +173,9 @@ distribution, and it is not the same as taking the log of `softmax`: a probabili
 to underflow to zero there becomes `-inf`, while the log form stays finite. That is the whole
 reason a scoring pipeline carries log-probabilities.
 
-{py:meth}`.list.entropy() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.entropy>` reduces a row to its uncertainty in nats — zero when the model put all its
-mass on one class, `ln n` when it spread evenly over `n`. It is the routing signal for a
-cascade: answer the confident rows from the small model and send the rest somewhere more
+{py:meth}`.list.entropy() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.entropy>` reduces a row to its uncertainty in nats: zero when the model put all
+its mass on one class, `ln n` when it spread evenly over `n`. That is the routing signal for a
+cascade. Answer the confident rows from the small model and send the rest somewhere more
 expensive.
 
 ```python

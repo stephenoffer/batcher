@@ -8,8 +8,8 @@ Read {doc}`/ml/retrieval/llm/index` first for how the generation itself runs.
 
 ## Extracting typed columns
 
-No analyst can filter, join, or aggregate a string, so turning it into a column is the
-actual ETL step. Two Dataset methods do it.
+Nobody can filter, join, or aggregate a string. Turning it into a column is the actual ETL
+step, and two Dataset methods do it.
 
 {py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` appends one **typed** column per declared field. The
 declaration decides the Arrow type, not whatever the model happened to emit:
@@ -18,8 +18,12 @@ declaration decides the Arrow type, not whatever the model happened to emit:
 import batcher as bt
 
 notes = bt.from_pydict({"note": ["Paid 42 USD to Acme"]})
-stub = lambda: (lambda ps: ['{"vendor": "Acme", "total": "42"}'] * len(ps))
-print(notes.ml.extract(stub, schema={"vendor": "string", "total": "float64"}, prompt_column="note").to_pydict())
+stub = lambda: lambda ps: ['{"vendor": "Acme", "total": "42"}'] * len(ps)
+print(
+    notes.ml.extract(
+        stub, schema={"vendor": "string", "total": "float64"}, prompt_column="note"
+    ).to_pydict()
+)
 # {'note': ['Paid 42 USD to Acme'], 'vendor': ['Acme'], 'total': [42.0]}
 ```
 
@@ -40,7 +44,7 @@ compare, filter, and group by:
 import batcher as bt
 
 invoices = bt.from_pydict({"note": ["Invoice 7 dated 2024-01-05, total 42 USD"]})
-stub = lambda: (lambda ps: ['{"due": "2024-01-05", "total": 42}'] * len(ps))
+stub = lambda: lambda ps: ['{"due": "2024-01-05", "total": 42}'] * len(ps)
 typed = invoices.ml.extract(
     stub, schema={"due": "date32", "total": "float64"}, prompt_column="note"
 )
@@ -72,8 +76,10 @@ column's domain is exactly `labels`:
 import batcher as bt
 
 reviews = bt.from_pydict({"review": ["loved it", "awful"]})
-stub = lambda: (lambda ps: ["Positive." if "loved" in p else "negative" for p in ps])
-print(reviews.ml.classify(stub, labels=["positive", "negative"], prompt_column="review").to_pydict())
+stub = lambda: lambda ps: ["Positive." if "loved" in p else "negative" for p in ps]
+print(
+    reviews.ml.classify(stub, labels=["positive", "negative"], prompt_column="review").to_pydict()
+)
 # {'review': ['loved it', 'awful'], 'label': ['positive', 'negative']}
 ```
 
@@ -133,9 +139,7 @@ trace and {py:func}`strip_reasoning <batcher.strip_reasoning>` removes it to lea
 named XML-style tag, the convention prompts use to mark a final answer:
 
 ```python
-traces = bt.from_pydict(
-    {"out": ["<think>2+2 is 4</think><answer>4</answer>"]}
-)
+traces = bt.from_pydict({"out": ["<think>2+2 is 4</think><answer>4</answer>"]})
 print(
     traces.select(
         why=bt.extract_reasoning("out"),
@@ -171,8 +175,8 @@ print(
 
 Three more read the answer conventions that {doc}`llm-evaluation` already measures the
 *compliance* of. {py:func}`bt.extract_boxed <batcher.extract_boxed>` reads the LaTeX `\boxed{}` a math benchmark grades on, and
-{py:func}`bt.extract_last_number <batcher.extract_last_number>` reads the conclusion of a reasoning chain — which is not the same as
-{py:func}`bt.extract_first_number <batcher.extract_first_number>`, because a model that reasons before answering emits its intermediate
+{py:func}`bt.extract_last_number <batcher.extract_last_number>` reads the conclusion of a reasoning chain. That is not the same as
+{py:func}`bt.extract_first_number <batcher.extract_first_number>`: a model that reasons before answering emits its intermediate
 quantities first.
 
 ```python
@@ -192,9 +196,7 @@ into a citation *check*: set-subtract the retrieved passage ids and whatever is 
 reference to a source that was never retrieved.
 
 ```python
-answered = bt.from_pydict(
-    {"answer": ["backed by [1] and [9]"], "retrieved": [["1", "2"]]}
-)
+answered = bt.from_pydict({"answer": ["backed by [1] and [9]"], "retrieved": [["1", "2"]]})
 print(
     answered.select(
         fabricated=bt.extract_citations("answer").list.set_difference(bt.col("retrieved"))
@@ -205,13 +207,11 @@ print(
 
 ## Structured output
 
-Constrain generation to a JSON schema so every row is parseable, then parse it into a
-struct column. `guided_json` on the engine forces the model's decoding to the schema,
-and `parse_json=True` on `llm_generate` parses each output into a struct. A row that
-fails to parse gets a null rather than failing the batch. Prefer `ds.ml.extract` above
-when the fields are known, because it pins the Arrow types. Pair the two so that guided
-decoding makes the output well-formed and `parse_json` turns it into typed columns you
-can query downstream.
+Constrain generation to a JSON schema so every row is parseable, then parse it into a struct
+column. `guided_json` on the engine forces the model's decoding to the schema, and
+`parse_json=True` on `llm_generate` parses each output into a struct. A row that fails to parse
+gets a null rather than failing the batch. Prefer `ds.ml.extract` when the fields are known,
+because it pins the Arrow types. Pair the two otherwise.
 
 ```python
 # docs: skip
@@ -231,7 +231,7 @@ classified = llm_generate(
     engine,
     prompt_column="text",
     output_column="result",
-    parse_json=True,         # "result" becomes a struct: {label, confidence}
+    parse_json=True,  # "result" becomes a struct: {label, confidence}
 )
 ```
 
@@ -251,7 +251,7 @@ tasks), {py:func}`bt.choice_answer_rate <batcher.choice_answer_rate>` the fracti
 points at the prompt, not the model's reasoning.
 
 ```python
-outs = bt.from_pydict({"o": ['{"label": "yes"}', "Sure! {\"label\": \"no\"}", "I refuse"]})
+outs = bt.from_pydict({"o": ['{"label": "yes"}', 'Sure! {"label": "no"}', "I refuse"]})
 print(
     outs.agg(
         strict=bt.valid_json_rate("o"),

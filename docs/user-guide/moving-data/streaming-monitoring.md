@@ -14,20 +14,23 @@ neither. The fields below do.
 
 ```python
 # docs: skip
-q = clicks.write("s3://bucket/out", format="parquet",
-                 trigger=bt.Trigger.processing_time("10 seconds"),
-                 checkpoint="s3://bucket/_ckpt")
-q.is_active            # True while running
-q.status               # a point-in-time StreamingQueryStatus
-q.recent_progress    # per-micro-batch metrics
-q.exception()          # the failure that stopped it, or None (does not re-raise)
-q.explain()            # the plan this query is running
+q = clicks.write(
+    "s3://bucket/out",
+    format="parquet",
+    trigger=bt.Trigger.processing_time("10 seconds"),
+    checkpoint="s3://bucket/_ckpt",
+)
+q.is_active  # True while running
+q.status  # a point-in-time StreamingQueryStatus
+q.recent_progress  # per-micro-batch metrics
+q.exception()  # the failure that stopped it, or None (does not re-raise)
+q.explain()  # the plan this query is running
 q.process_all_available()  # block until the current backlog is done
-q.stop()               # halt at the next micro-batch boundary
-bt.streams()           # all active streaming queries
+q.stop()  # halt at the next micro-batch boundary
+bt.streams()  # all active streaming queries
 ```
 
-{py:meth}`explain <batcher.StreamingQuery.explain>` shows the *planned* tree only. `Dataset.explain(analyze=True)` runs the
+`q.explain()` shows the *planned* tree only. `Dataset.explain(analyze=True)` runs the
 query to measure it, which a stream cannot do twice: the source has moved on, and running
 it again would double-consume the topic. Per-micro-batch measurements live in
 `recent_progress` instead.
@@ -61,7 +64,7 @@ to be late for.
 
 Falling behind is one of the two ways a streaming query goes wrong. The other is dropping
 rows quietly. A windowed aggregation discards every row that arrives below its watermark,
-which is correct and produces a total that is simply short. `num_late_rows` on each
+which is correct and produces a total that is short. `num_late_rows` on each
 micro-batch is the count of what it discarded:
 
 ```python
@@ -126,6 +129,7 @@ once, as it happens:
 ```python
 import batcher as bt
 
+
 class LatenessAlarm(bt.StreamingQueryListener):
     def on_query_started(self, event):
         print(f"{event.name} started")
@@ -137,6 +141,7 @@ class LatenessAlarm(bt.StreamingQueryListener):
     def on_query_terminated(self, event):
         if event.exception:
             print(f"{event.name} failed: {event.exception}")
+
 
 alarm = LatenessAlarm()
 bt.add_streaming_listener(alarm)
@@ -186,7 +191,6 @@ last `progress_history` micro-batches, not every batch since the query started.
 Apply it for one query with {py:func}`bt.config_context(cfg) <batcher.config_context>`, or process-wide with
 {py:func}`bt.set_config(cfg) <batcher.set_config>`.
 
-
 ## Shipping progress somewhere else
 
 A progress record's destination is usually a log line or a metrics system, and both want
@@ -196,7 +200,7 @@ camelCase, so a dashboard written against `StreamingQueryProgress` reads these u
 ```python
 # docs: skip
 for p in q.recent_progress:
-    metrics.emit(p.to_dict())          # or p.json() straight into a log line
+    metrics.emit(p.to_dict())  # or p.json() straight into a log line
 ```
 
 `durationMs` in that payload is where the micro-batch's time went: `latestOffset` (asking

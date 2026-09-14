@@ -57,7 +57,7 @@ catalog = (
 analyst = bt.Principal("ana", roles=["analyst"], attrs={"region": "EU"})
 
 with bt.security(catalog, analyst):
-    ds = bt.read.parquet(customers)      # policy binds at READ time
+    ds = bt.read.parquet(customers)  # policy binds at READ time
 
 print(ds.sort("id").to_pydict())
 # {'id': [1, 2], 'email': ['XXXXx.com', 'XXXx.com'], 'region': ['EU', 'EU'], 'amount': [10, 20]}
@@ -99,7 +99,7 @@ masks the column — a narrow explicit exemption cannot disable a broad tag-base
 ```python
 catalog.filter_rows(customers, MatchesAttribute("region", "region"), name="own_region")
 catalog.filter_rows(customers, AttributeIn("region", "regions"), exempt=["auditor"])
-catalog.filter_rows(customers, lambda p: bt.col("tier") == "public")   # in-process only
+catalog.filter_rows(customers, lambda p: bt.col("tier") == "public")  # in-process only
 ```
 
 The predicate takes the **principal**, not a row, and is called once while the plan is
@@ -126,10 +126,10 @@ an encrypted column reveals which rows share a value.** Where that is unacceptab
 the column out of the projection entirely.
 
 ```python
-key = "env:PII_KEY"                                   # a reference, never the secret
+key = "env:PII_KEY"  # a reference, never the secret
 users = bt.from_pydict({"email": ["a@x.com", "a@x.com", "b@x.com"]})
 out = users.select(p=bt.hmac_sha256(bt.col("email"), key=key)).to_pydict()
-print(out["p"][0] == out["p"][1], out["p"][0] == out["p"][2])   # True False — stable, so it joins
+print(out["p"][0] == out["p"][1], out["p"][0] == out["p"][2])  # True False — stable, so it joins
 ```
 
 `env:NAME` / `file:PATH` are resolved by the data plane on the machine that runs the

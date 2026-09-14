@@ -6,8 +6,7 @@ and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace
 live behind `.str` rather than on every expression.
 
 This page covers each namespace in turn. The core expression language they hang off is
-in {doc}`/user-guide/transform/columns/expressions`. Every example runs against the engine, and blocks share one
-namespace and execute in order.
+in {doc}`/user-guide/transform/columns/expressions`. The blocks below build on each other in order.
 
 ```python
 import batcher as bt
@@ -23,9 +22,9 @@ ds = bt.from_pydict(
 
 ## String accessor: .str
 
-The `.str` namespace is the largest of them by a wide margin -- casing, trimming, search,
-slicing, padding, regular expressions, encodings and the document-quality filters -- so it
-has a page of its own: {doc}`/user-guide/transform/columns/string-accessor`.
+The `.str` namespace is the largest of them by a wide margin. Casing, trimming, search,
+slicing, padding, regular expressions, encodings and the document-quality filters all live
+behind it, so it has a page of its own: {doc}`/user-guide/transform/columns/string-accessor`.
 
 ## Datetime accessor: .dt
 
@@ -75,7 +74,11 @@ out = events.select(
     next_month=bt.col("ts").dt.offset_by("1mo"),
     in_ny=bt.col("ts").dt.convert_timezone("UTC", "America/New_York"),
 )
-print(out.select(text=bt.col("text"), next=bt.col("next_month").dt.month(), ny_hour=bt.col("in_ny").dt.hour()).to_pydict())
+print(
+    out.select(
+        text=bt.col("text"), next=bt.col("next_month").dt.month(), ny_hour=bt.col("in_ny").dt.hour()
+    ).to_pydict()
+)
 # {'text': ['2024/01/15', '2024/06/01'], 'next': [2, 7], 'ny_hour': [4, 14]}
 ```
 
@@ -93,7 +96,11 @@ out = events.select(
     later=bt.date_add(bt.col("ts"), 7),
     earlier=bt.date_sub(bt.col("ts"), 7),
 )
-print(out.select(part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt.col("earlier").dt.day()).to_pydict())
+print(
+    out.select(
+        part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt.col("earlier").dt.day()
+    ).to_pydict()
+)
 # {'part': [1, 6], 'later': [22, 8], 'earlier': [8, 25]}
 ```
 
@@ -168,6 +175,11 @@ Numeric lists support reductions: `sum`, `min`, `max`, `mean`, `median`, `std`,
 `sort`, `reverse`, `unique`, `slice`, `head(n)` (the leading `n` elements), and
 `contains`. Element access is `get(i)` (negative indexes from the end), with
 `first()`/`last()` as shorthands.
+
+`concat(other)` appends one list to another and is deliberately not `union`: it keeps
+duplicates and order, and a null list counts as *empty*, so `concat` of `[1,2]` and
+`[2,3]` is `[1,2,2,3]` where `union` is `[1,2,3]`. `has_all(other)` and `has_any(other)`
+test containment and, unlike `concat`, are null when either side is null.
 
 ## Struct accessor: .struct
 

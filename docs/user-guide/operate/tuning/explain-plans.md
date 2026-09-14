@@ -423,7 +423,7 @@ Then, and only then, start changing the query.
 - {doc}`Cost model </architecture/deep-dives/adaptive/cost-model>`: how an `est≈N` becomes a join order.
 - {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: why the same
   `explain()` says something different after a run.
-- {doc}`Optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`: this checklist,
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: this checklist,
   walked end to end on a query that is actually slow.
 - {doc}`Dataset API </api/relational/dataset>`: the `explain` and `stats` reference.
 - {doc}`/cookbook/operations/inspecting_a_query`: reading a plan and timing a query, as a runnable script.

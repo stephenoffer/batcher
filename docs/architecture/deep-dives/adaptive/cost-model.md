@@ -11,7 +11,7 @@ scalar, and the only property that matters is that a cheaper plan really is fast
 
 ```python
 # docs: skip
-# python/batcher/kyber/cost.py
+# python/batcher/kyber/cost/model.py
 @dataclass(frozen=True)
 class Cost:
     cpu: float
@@ -46,9 +46,13 @@ Weights (`optimizer.cost_weights`):
 ```python
 # docs: skip
 cpu: float = 1.0
-io:  float = 1.0
-net: float = 2.0   # a shuffled byte costs twice a local one
+io: float = 1.0
+net: float = 2.0  # a shuffled byte costs twice a local one
 ```
+
+What feeds that fold, and what comes out of it:
+
+![What the cost model consumes and what it emits. Four inputs feed one fold over the plan tree in CostModel.cost(node): estimated rows per node from the estimator, a type-exact row width rather than a flat 64 bytes, machine terms such as L3 cache size, memory budget and spill device, and coefficients that ship as constants and are then calibrated from measured runs. It emits four axes, three of which enter the scalar. cpu, io and net combine as 1.0 times cpu plus 1.0 times io plus 2.0 times net, and that one comparable number ranks the alternatives: join order, join strategy, whether to spill. mem is the peak working set, a max along the tree and never summed, so it gates feasibility rather than throughput, because a peak is not a quantity you can add up.](/_static/diagrams/cost_model_inputs.svg)
 
 ## Per-operator formulas
 
@@ -70,7 +74,7 @@ The interesting ones:
 | `Filter` | `filter_row × in_rows × expr_factor` | none |
 | `Aggregate` | `hash_build_row × in_rows + output_row × out_rows` | `row_bytes × out_rows` |
 | `Sort` | `sort_row × n × log2(max(2, heap))` | `row_bytes × heap` |
-| `Join` | `hash_build_row × |R| + hash_probe_row × |L| + output_row × out_rows` | `row_bytes(right) × |R|` |
+| `Join` | `hash_build_row × \|R\| + hash_probe_row × \|L\| + output_row × out_rows` | `row_bytes(right) × \|R\|` |
 | `Window` | `sort_row × in_rows × log2(in_rows)` | `row_bytes × in_rows` |
 
 `Sort`'s `heap = min(limit, n)` when there is a limit. A top-N heap can never hold more
@@ -90,17 +94,22 @@ print(left.join(right, on="k").group_by("k").agg(s=bt.sum("w")).explain())
 
 :::{dropdown} The plan, and the decision the coefficients drove
 ```text
-query plan (planned)                                   4 operators
-──────────────────────────────────────────────────────────────────
-OPERATOR                             ESTIMATE  NOTES
-aggregate  [by region · sum]          est≈2,000  (default)
-└─ hash_join  [inner on customer]    est≈20,000  (default)
-   ├─ scan  [source 0]               est≈20,000  (exact)
-   └─ scan  [source 1]                est≈1,000  (exact)
+query plan (planned)                                                5 operators
+───────────────────────────────────────────────────────────────────────────────
+OPERATOR                            ESTIMATE  NOTES
+aggregate  [by k · sum]               est≈50  (default)
+└─ hash_join  [inner on k]        est≈20,000  (default)
+   ├─ scan  [source 1]            est≈20,000  (exact)
+   └─ filter  [k ≥ 0 AND k ≤ 49]      est≈50  (default)
+      └─ scan  [source 0]          est≈1,000  (exact)  pushed[k ≥ 0 AND k ≤ 49]
 
 decisions:
   - [kyber/selection] join build side: left≈1,000 right≈20,000 [exact] → swap build→left + broadcast
 ```
+
+The filter nobody wrote is `rules.joins.runtime_join_filter`. The right side's `k` runs 0 to 49,
+so a left row outside that range can never match, and the `[min, max]` bound is mirrored onto the
+left scan. The build-side line at the bottom is the one this section is about.
 :::
 
 The join is written left-joins-right, and the two orientations do not cost the same:
@@ -258,13 +267,16 @@ entire `op_stats` history on every {py:meth}`collect() <batcher.Dataset.collect>
 
 ## Join ordering
 
-`kyber/rules/joins/order.py` dispatches on leaf count:
+`kyber/rules/joins/order.py` dispatches on leaf count. Under three leaves it skips, because a
+two-way join has no ordering left to choose and its orientation is the build-side rule's
+business. From three leaves up it runs a DPccp-style connected-subgraph DP over bushy trees,
+bounded by a per-query search budget rather than a fixed cap. When the budget runs out, or the
+join graph is disconnected and the DP has nothing to enumerate, it falls back to greedy: start
+from the smallest leaf and repeatedly add whichever connected leaf costs least to add next.
 
-- fewer than 3 leaves: skip (a two-way join is the build-side rule's business)
-- otherwise: a DPccp-style connected-subgraph DP over bushy trees, bounded by a per-query
-  search budget rather than by a fixed cap
-- on a bail, or a disconnected graph: greedy. Start from the smallest leaf, repeatedly add
-  the connected leaf minimizing the incremental cost
+Both searches and the budget that chooses between them, end to end:
+
+![How a join order is chosen, and how hard it is looked for. The region is the connected inner joins of three leaves or more; with fewer, build-side selection handles it. The region is costed as written and a tenth of its estimated run time becomes a search budget, expressed in evaluated join pairs, clamped to between 512 and 200,000, and re-checked inside the loop rather than set once. Inside the budget, a connected-subset DP splits each subset into two connected halves, so the shapes it reaches are bushy, up to 20 leaves. When the budget is spent, the region runs past 20 leaves, or the join graph is disconnected, it falls back to a greedy search that starts from the smallest leaf and repeatedly adds the cheapest next join, which is left-deep by construction. Both searches rank every candidate by the same two things: cardinality, from left rows times right rows over the larger distinct count, refined by skew and range overlap using HLL, Misra-Gries and KLL, and cost, from build rows, probe rows and cache residency, priced at the cheaper build side. Both build the same relation and differ only in how much of the space they read. An exhaustive subset DP exists beside them as the test oracle and is never on the live path.](/_static/diagrams/join_order_search.svg)
 
 ### How hard to search is itself a decision
 
@@ -275,7 +287,7 @@ costed. A pair costs the planner ~150 us, measured across sixteen configurations
 
 Neither of the axes a fixed cap can use predicts the right answer. Leaf count does not predict
 search *work*, because density decides it: measured over 1,000 rows, a 14-leaf chain evaluates
-455 pairs and a 14-leaf star evaluates 53,248 — the same leaf count and 117 times the work. And
+455 pairs and a 14-leaf star evaluates 53,248. Same leaf count, 117 times the work. And
 no static number predicts what a better order is *worth*, because that depends entirely on the
 data: a 15-leaf star over a thousand rows spent 25.5 s searching for an order whose best and
 worst cases are microseconds apart, while the same shape over a petabyte would repay far more
@@ -287,7 +299,7 @@ grants a tenth of it back as search time, and divides by the measured cost of a 
 result is clamped to `[512, 200000]` pairs. The floor covers the full search for every star up
 to 8 leaves and every chain past 15, so small queries keep the plans they already get. The
 ceiling is the same number as the flat cap it replaces, so no query that could afford a search
-before gets a smaller one now — what changed is that the ceiling has to be earned, and only a
+before gets a smaller one now. What changed is that the ceiling has to be earned, and only a
 query estimated to run for minutes earns it.
 
 Density is triaged before any of it is spent. The DP knows its connected-subset count before it

@@ -130,7 +130,9 @@ a single bool or a list aligned with `by`.
 print(ds.sort("price", descending=True).select("price").to_pydict())
 # {'price': [60.0, 50.0, 40.0, 30.0, 20.0, 10.0]}
 
-print(ds.sort("category", "price", descending=[False, True]).select("category", "price").to_pydict())
+print(
+    ds.sort("category", "price", descending=[False, True]).select("category", "price").to_pydict()
+)
 # {'category': ['a', 'a', 'a', 'b', 'b', 'c'], 'price': [50.0, 30.0, 10.0, 40.0, 20.0, 60.0]}
 ```
 
@@ -205,10 +207,10 @@ print(ranked.select("category", "price", "rnk").to_pydict())
 ### map_batches
 
 `map_batches(fn, batch_size=None, output_columns=None, num_workers=1, num_gpus=0.0, concurrency=None)`
-applies a Python function to whole Arrow `RecordBatch`es, never per row. It is the
-escape hatch for logic that has no expression form. When the function changes the
-schema, pass `output_columns` so later operations know the new columns. The `.ml`
-accessor exposes the same call with ML defaults; see {doc}`the ML accessor </api/models/ml>`.
+applies a Python function to whole Arrow `RecordBatch`es, never per row. Reach for it when
+logic has no expression form, and not before. When the function changes the schema, pass
+`output_columns` so later operations know the new columns. The `.ml` accessor exposes the
+same call with ML defaults; see {doc}`the ML accessor </api/models/ml>`.
 
 ```python
 import pyarrow.compute as pc
@@ -354,8 +356,10 @@ print(ds.columns)
 
 ## Interoperability
 
-A `Dataset` implements the Arrow **PyCapsule stream interface**
-(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes one directly. There's no {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` call, no copy, and no conversion through Python objects.
+A `Dataset` implements the Arrow PyCapsule stream interface (`__arrow_c_stream__`), so any
+library that speaks the Arrow C Data Interface consumes one directly. You don't call
+{py:meth}`to_arrow() <batcher.Dataset.to_arrow>` first, nothing is copied, and no value
+passes through a Python object on the way.
 
 ```python
 # docs: skip
@@ -363,14 +367,15 @@ import duckdb
 import polars as pl
 import pyarrow as pa
 
-pl.DataFrame(ds)                  # Polars
-duckdb.sql("SELECT * FROM ds")    # DuckDB, by variable name
-pa.table(ds)                      # pyarrow
+pl.DataFrame(ds)  # Polars
+duckdb.sql("SELECT * FROM ds")  # DuckDB, by variable name
+pa.table(ds)  # pyarrow
 ```
 
-The stream is **lazy**: batches are pulled from the plan as the consumer reads them, so
-a result larger than memory streams into DuckDB rather than landing in it first. Because
-the consumer's iteration is what drives execution, this is a terminal operation.
+The stream is lazy. Batches are pulled from the plan as the consumer reads them, so a
+result larger than memory streams into DuckDB rather than landing in it first. The
+consumer's iteration drives execution, which makes handing a dataset over a terminal
+operation like any other.
 
 {py:meth}`collect() <batcher.Dataset.collect>` returns a pyarrow `Table` when you want the whole result in hand, and
 {py:meth}`to_pandas() <batcher.Dataset.to_pandas>` / {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` are there for the direct conversions.
@@ -394,7 +399,7 @@ print(ds.unnest("s").columns)
 {py:meth}`describe() <batcher.Dataset.describe>` returns a small summary `Dataset` (pandas/Polars-style): a `statistic`
 label column and one column per input column. Numeric columns report count /
 null_count / mean / std / min / quartiles / max; non-numeric columns report count
-and null_count only. It **executes** the query (the summary is the result). Pass
+and null_count only. It executes the query, since the summary is the result. Pass
 `percentiles=` to choose the quantile rows. {py:meth}`null_count() <batcher.Dataset.null_count>` is the lazy per-column
 null tally (it lowers to one aggregate, so nothing runs until a terminal op).
 
@@ -405,9 +410,10 @@ print(ds.null_count().to_pydict())
 # {'g': [0], 'x': [0]}
 ```
 
-{py:meth}`profile() <batcher.Dataset.profile>` is the quick "what does this column look like" check before a load: it
-**executes** and returns one row per column with `count`, `null_count`,
-`null_fraction`, and `approx_distinct` (HyperLogLog cardinality).
+{py:meth}`profile() <batcher.Dataset.profile>` is the quick "what does this column look
+like" check before a load. It executes too, and returns one row per column with `count`,
+`null_count`, `null_fraction` and `approx_distinct`, the last from a HyperLogLog sketch
+rather than an exact count.
 
 ## Data quality and dimension upserts
 

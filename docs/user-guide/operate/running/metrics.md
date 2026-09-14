@@ -26,8 +26,8 @@ at zero rather than absent, so a scraper never has to handle a changing key set.
 
 Two sections are the exception and stay empty until something fills them. `resources` needs
 a query to have completed under a resource manager, and `streaming` needs a continuous query
-to have run a micro-batch. Both hold *levels* rather than totals, and a zero level is a
-claim — "the pool is empty", "the query is idle" — that would be wrong rather than merely
+to have run a micro-batch. Both hold *levels* rather than totals, and a zero level makes a
+claim: the pool is empty, the query is idle. That would be wrong rather than merely
 uninformative.
 
 ## Resource utilization
@@ -65,7 +65,7 @@ The fields worth knowing:
 | `backends` | Operators per execution tier: `interp`, `jit`, or `interp+jit`. |
 
 `cores_busy` is the one to plot first. A query at 1.0 on a sixteen-core box did not
-parallelize; one at 14 with a high `involuntary_context_switches_total` is fighting
+parallelize. One at 14 with a high `involuntary_context_switches_total` is fighting
 something else on the machine, and those two have opposite fixes.
 
 Two conventions matter when reading any of this. `bytes.scanned_total` is the Arrow
@@ -126,16 +126,16 @@ export means unmeasured, not none**.
 
 `iter_batches` is the one path that reports *more* than the others in one respect: it is
 the only one that can count rows while the query runs, so it fills `rows.streamed_total` and
-`bytes.streamed_total` per batch. Those count rows **delivered to you**, not rows read — a
-filter upstream means the two differ — which is why they are their own fields rather than
+`bytes.streamed_total` per batch. Those count rows **delivered to you**, not rows read. A
+filter upstream means the two differ, which is why they are their own fields rather than
 folded into `rows.scanned_total`.
 
 The Flight row is the one to know about, because Flight is what a genuine multi-node cluster
 uses by default. Its workers call the engine's unmetered entry point, so they produce no
 per-operator record at all: nothing reaches the profile, and nothing reaches the optimizer's
 learned statistics either. Live progress still works there, so `partitions` counts and the
-dashboard fills in. Pass `transport="disk"` to `collect()` if you need the per-operator
-numbers from a distributed run today.
+dashboard fills in. Pass `transport="disk"` to `collect()` when you need the per-operator
+numbers from a distributed run.
 
 ## Streaming queries
 
@@ -180,8 +180,7 @@ and so on, with an enumerated level such as memory pressure exposed the conventi
 `batcher_memory_pressure_level{state="NORMAL"} 1`.
 
 The pairing is what makes a diagnosis. A query that spilled with an empty pool and a full
-cache was starved by storage; one that spilled with a full pool and no cache was simply too
-big.
+cache was starved by storage. One that spilled with a full pool and no cache was too big.
 
 ## Data-quality counters
 
@@ -212,6 +211,8 @@ value cannot grow it without bound; the roll-ups stay exact either way.
 The Prometheus rendering exposes the same numbers as `batcher_dq_checks_total`,
 `batcher_dq_failed_total`, `batcher_dq_violations_total`, and a labelled
 `batcher_dq_constraint_violations_total{constraint="..."}`.
+
+## Scraping the counters
 
 If the dashboard is already running, the same counters are served from it, so a scrape
 loop needs no code of yours at all:

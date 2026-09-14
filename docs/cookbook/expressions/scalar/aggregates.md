@@ -1,6 +1,6 @@
 # Aggregates
 
-Exact aggregates read every row. The ``approx_*`` family reads sketches instead, trading a bounded error for a large constant-factor speedup and, more importantly, bounded memory on a high-cardinality column.
+Exact aggregates read every row. The `approx_*` family reads sketches instead, trading a bounded error for a large constant-factor speedup and, more importantly, bounded memory on a high-cardinality column.
 
 The whole script, executed on every test run:
 

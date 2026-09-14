@@ -5451,8 +5451,8 @@ batcher.config.enable_error_monitoring = True
 # Configure alerts
 batcher.config.alert_thresholds = {
     "cardinality_error_p90": 5.0,  # Alert if p90 Q-error > 5×
-    "cost_error_p90": 3.0,         # Alert if p90 cost error > 3×
-    "regret_rate": 0.1,            # Alert if regret > 10% of optimal
+    "cost_error_p90": 3.0,  # Alert if p90 cost error > 3×
+    "regret_rate": 0.1,  # Alert if regret > 10% of optimal
 }
 ```
 

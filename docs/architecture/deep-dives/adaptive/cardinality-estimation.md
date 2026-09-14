@@ -16,11 +16,11 @@ type in the estimator.
 # docs: skip
 # python/batcher/plan/stats.py
 class Provenance(IntEnum):
-    EXACT = 0      # provably correct without execution (a footer, a manifest)
+    EXACT = 0  # provably correct without execution (a footer, a manifest)
     HISTOGRAM = 1  # KLL / t-digest / DDSketch quantile sketch measured from data
-    SKETCH = 2     # HLL distinct / Count-Min frequency (approximate by construction)
-    LEARNED = 3    # a prior from a past run, keyed by plan signature
-    DEFAULT = 4    # Selinger heuristic / an unconstrained guess
+    SKETCH = 2  # HLL distinct / Count-Min frequency (approximate by construction)
+    LEARNED = 3  # a prior from a past run, keyed by plan signature
+    DEFAULT = 4  # Selinger heuristic / an unconstrained guess
 ```
 
 Ordered strongest-first, so trust composes with `max`. There is exactly one combiner:
@@ -78,11 +78,11 @@ answer since System R. They live in {py:class}`CardinalityConfig <batcher.config
 
 ```python
 # docs: skip
-eq_selectivity: float = 0.1           # col = literal
+eq_selectivity: float = 0.1  # col = literal
 range_selectivity: float = 1.0 / 3.0  # col < | <= | > | >= literal
-null_selectivity: float = 0.05        # col IS NULL
-substring_selectivity: float = 0.05   # LIKE '%x%' / contains / regex
-prefix_selectivity: float = 0.10      # LIKE 'x%' / starts_with / ends_with
+null_selectivity: float = 0.05  # col IS NULL
+substring_selectivity: float = 0.05  # LIKE '%x%' / contains / regex
+prefix_selectivity: float = 0.10  # LIKE 'x%' / starts_with / ends_with
 default_filter_selectivity: float = 0.5
 ```
 
@@ -158,7 +158,7 @@ same exponential-backoff shape.
 ordered = sorted((d for d in per_column if d > 0), reverse=True)
 combined, exponent = 1.0, 1.0
 for d in ordered:
-    combined *= d ** exponent
+    combined *= d**exponent
     exponent /= 2.0
 return max(1.0, min(combined, cap))
 ```
@@ -189,7 +189,7 @@ pinned:
 # docs: skip
 # python/batcher/kyber/stats/aggregate_columns.py
 if src.null_count == 0:
-    return 0                                    # no nulls in, none out, for any key count
+    return 0  # no nulls in, none out, for any key count
 return 1 if len(node.group_keys) == 1 else None  # one key: the nulls are one group
 ```
 
@@ -224,8 +224,8 @@ constant column whenever the child's exact statistics determine it, so `count(*)
 ## Sketches
 
 Once a query has run, sketches from `bc-sketches` supersede the constants. They are all
-`Mergeable` with a fixed seed, so a sketch built on partition 3 of worker 7 merges with one
-built anywhere else, in any order:
+`Mergeable` and they all hash with the same fixed seed, so a sketch built on partition 3 of
+worker 7 merges with one built anywhere else:
 
 ```rust
 // crates/bc-sketches/src/lib.rs
@@ -240,6 +240,26 @@ pub(crate) const SEED: ahash::RandomState =
 | `CountMinSketch` | frequency of a known key | `width = ⌈e/ε⌉`, `depth = ⌈ln(1/δ)⌉` | ≤ εN, never under |
 | `FrequentItems` | *find* the hot keys (Misra-Gries) | capacity | ≥ N/(cap+1) guaranteed found |
 | `BloomFilter` | membership (data skipping) | `fp_rate` | one-sided |
+
+What merging "in any order" buys you is not the same for all five, and the line runs where the
+algorithm does. HyperLogLog folds by register-wise max, Count-Min by cell-wise sum, and Bloom by
+bitwise OR. Each of those is associative and commutative on the nose, so any merge order reaches
+a bit-identical state, and two runs' distinct counts are directly comparable. The quantile
+sketches don't work that way. KLL compacts and TDigest re-clusters its centroids, both of which
+depend on what has already been folded in, so a reduce that sees the partials in a different
+order returns a different estimate. `crates/bc-sketches/tests/merge_order.rs` pins both halves:
+bit-identity for the first three, and for the quantile sketches the property a caller actually
+needs, which is that two orders agree to within the sketch's own rank error. Don't write code,
+or a test, that expects a KLL to merge to an identical state.
+
+That line, and what each side of it is asked for:
+
+![The sketches behind an estimate, split by how they merge. Three of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; Count-Min, for how often a given key appears, folds by cell-wise sum; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
+
+`FrequentItems` sits on neither side of that line yet. `frequent.rs` argues in its own comments
+that the algorithm is order-independent, because `merge` sums counts and `reduce_to_capacity`
+thresholds on a sorted count, and no test in `merge_order.rs` covers it either way. Treat it as
+unpinned rather than as settled, and don't cite it as an example of either behaviour.
 
 Count-Min and Misra-Gries are used together on purpose. Count-Min never under-counts;
 Misra-Gries never over-counts and is guaranteed to *contain* every key above `N/(capacity+1)`.
@@ -358,7 +378,7 @@ a number is actually derived:
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the passes these estimates feed.
 - `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds, derived.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the `est≈` and provenance tags in the tree.
-- {doc}`Optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`: what to do when an estimate is badly wrong.
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: what to do when an estimate is badly wrong.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: q5 and q9, the two queries this page keeps naming.
 - {doc}`Cost model </architecture/deep-dives/adaptive/cost-model>`: what consumes these row counts.
 - {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: measuring the truth at a breaker.

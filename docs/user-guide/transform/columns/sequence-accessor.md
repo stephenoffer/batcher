@@ -16,11 +16,8 @@ import batcher as bt
 
 ## Strands, composition, and coding
 
-{py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>` reads a text column as a biological sequence: DNA, RNA, protein, or a
-FASTQ quality string. It is a separate namespace rather than more `.str` methods because
-the operations are genuinely different. Reverse-complement is one pass over a byte table,
-not `reverse` composed with `translate`. Codon translation reads three bases at a time,
-which has no substring spelling that isn't a per-row loop.
+One call does three jobs here. It reads back the complement strand, the fraction of
+bases that are G or C, and the protein those bases code for.
 
 ```python
 contigs = bt.from_pydict({"dna": ["ATGGCCTAA", "atgnnntaa"]})

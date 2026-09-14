@@ -1,9 +1,11 @@
 # Multimodal data
 
-This section covers turning media into columns a model can read: fetching the bytes, decoding them into tensors, curating what comes back, and moving the result through a pipeline without paying for it twice.
+This section covers turning media into columns a model can read: fetching the bytes,
+decoding them into tensors, curating what comes back, and moving the result through a
+pipeline without paying for it twice.
 
-A multimodal pipeline turns references such as URLs and file paths into bytes, decodes
-them into tensors, and feeds a model. Each step is a lazy operator that runs on whole
+The chain is always the same. References such as URLs and file paths become bytes, bytes
+become tensors, and tensors reach a model. Each step is a lazy operator that runs on whole
 batches and parallelizes across the cluster.
 
 ## In this section
@@ -12,8 +14,8 @@ batches and parallelizes across the cluster.
 |---|---|
 | {doc}`/ml/preparing/multimodal/decoding` | Getting the bytes, and turning them into tensors. |
 | {doc}`/ml/preparing/multimodal/video` | Sampling frames, pulling stills, and reading a clip without decoding it. |
-| {doc}`/ml/preparing/multimodal/audio` | Measuring how a corpus was recorded, levelling it, and turning it into features. |
-| {doc}`/ml/preparing/multimodal/augmenting` | Turning and re-colouring images, and fingerprinting them for deduplication. |
+| {doc}`/ml/preparing/multimodal/audio` | Measuring how a corpus was recorded, leveling it, and turning it into features. |
+| {doc}`/ml/preparing/multimodal/augmenting` | Turning and re-coloring images, and fingerprinting them for deduplication. |
 | {doc}`/ml/preparing/multimodal/curating` | A scraped corpus is mostly rows that decode perfectly and teach a model nothing. |
 | {doc}`/ml/preparing/multimodal/pipelines` | What changes once media is a column: what it costs to move, how it reaches a model, and how it is retrieved. |
 

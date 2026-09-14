@@ -1,8 +1,11 @@
 """Grouping: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
 
-``group_by().agg()`` is the workhorse. ``rollup`` and ``cube`` compute subtotals in the
-same pass, which is how you build a report with per-region, per-product, and grand-total
-rows without three separate queries and a union.
+``group_by().agg()`` is the workhorse. ``rollup`` and ``cube`` give you a report with
+per-region, per-product and grand-total rows without writing three queries and a union
+yourself. They are that union, built for you: `api/multi_group.py` says a multi-level
+GROUP BY is not a distinct execution strategy, but one ordinary `group_by` per level with
+the inactive keys grouped by a typed null, stacked with ``union(distinct=False)``. The
+levels share one source list, so they share one read rather than taking one each.
 
     python examples/dataset/grouping.py
 """

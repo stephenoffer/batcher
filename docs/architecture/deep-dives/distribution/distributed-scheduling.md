@@ -141,12 +141,16 @@ table stages only the branch. `map_batches(...).join(other).group_by(...)` then 
 fused join-aggregate reducer, the same one a join over two tables reaches.
 
 An operand whose staged output turns out empty is declined rather than folded away. A breaker
-is not uniformly empty-preserving — an outer join with an empty right side still emits every
-left row — so "empty" there would be a wrong answer rather than a missing route.
+is not uniformly empty-preserving. An outer join with an empty right side still emits every
+left row, so "empty" there would be a wrong answer rather than a missing route.
 
 ## What never reaches the driver
 
 Composing the stages is not the same as carrying their data, and the executor keeps those apart. A stage can be asked to leave its result where it was computed rather than hand it back, and every breaker that has a shuffle honors that: an aggregate, a `distinct`, a hash join, a sort, and a partitioned window all publish one bucket per reducer and return handles instead of rows. On the disk transport a handle is an Arrow IPC file and the relation is a `MaterializedSource`; on the Flight transport the bucket stays resident on the actor that produced it and the relation is a `FlightMaterializedSource`, which the next stage's workers fetch shared-nothing, straight from the holding actor.
+
+Where those cuts fall is decided by the plan alone, and a handle rather than a row is what crosses one.
+
+![Where a distributed query is cut, and what crosses a cut. The cut set is a plan property: plan_analysis._has_breaker names Aggregate, Sort, Join, Distinct and Limit, and every other node runs inside the stage it is already in, so a scan, filter and project chain feeding an aggregate, then a sort, then a limit is cut three times and the cluster does not enter into it. One cut is one stage. Inside a stage the input is cut into the worker count times four partitions, each a durable descriptor of splits with the projection already pushed into it, and a barrier deals them to whichever actor just went idle, keeping exactly workers tasks in flight so a slow node takes fewer. The map tasks compute partials, emit one bucket per reducer, and each bucket is reduced by the one worker it hashes to, through combine and combine_finalize. What crosses to the next stage is one handle per reducer bucket, scanned in place as an ordinary scan: the rows stay on the worker that computed them, and a multi-join query never round-trips an intermediate through the driver.](/_static/diagrams/distributed_stages.svg)
 
 Three things consume that. The adaptive executor scans one stage's buckets as the next stage's input, so a multi-join query never round-trips an intermediate through one process. {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads one bucket at a time, so peak driver memory is a single reducer's output rather than the whole result. And an unpartitioned distributed write hands the buckets to the workers to write, so only file locators travel back.
 
@@ -182,7 +186,7 @@ this is what distributed.distribute_min_rows (1M) protects
 ```text
 TPC-H sf1 (6M rows), the udf-map workload:   92 ms   (batcher, 4 workers)
 
-the result is bit-identical to the single-node one. at this size the shuffle
+the same rows come back either way. at this size the shuffle
 plus actor startup costs more than the whole query, and taking the distributed
 path anyway costs about 7%.
 ```

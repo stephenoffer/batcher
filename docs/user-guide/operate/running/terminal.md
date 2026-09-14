@@ -43,7 +43,7 @@ When it finishes, the line collapses to one aligned summary:
 ✘  join              PlanError: unknown column 'nope'
 ```
 
-**Throughput is the rows read per second, not the rows returned.** A rate built from the
+Throughput is the rows read per second, not the rows returned. A rate built from the
 output understates the engine by exactly the query's selectivity: an aggregation reducing
 400,000 rows to five in 100 ms is doing 4M rows/s, not 50. The rows read are shown beside it
 whenever the two differ, so the rate always has a visible denominator.
@@ -61,8 +61,8 @@ That line is the difference between a run that read every file and one that quie
 98% of its corpus, and between a job that was four times too slow and one that
 transparently survived losing two workers.
 
-**A commit gets its own line**: it lands after the query that produced the rows has
-finished, because only then is there a manifest to report.
+A commit gets its own line. It lands after the query that produced the rows has finished,
+because only then is there a manifest to report.
 
 Two events do not wait for the end, because acting on them late is acting too late: a
 fault-tolerance action on the distributed path, and a data-quality contract that failed.
@@ -85,7 +85,8 @@ throughput figure it has no basis for:
 Read those as a *good* result rather than a suspicious one: a `sum` over a billion-row table
 returning in a millisecond has read the total the writer already computed. The reason
 replaces the rate because dividing one output row by the time taken to fetch it produces
-something like `12 rows/s` -- the width of the answer, not the speed of the engine.
+something like `12 rows/s`, which is the width of the answer rather than the speed of the
+engine.
 
 These count in the metrics export and appear in the dashboard like any other, so a job built
 out of `count()` and `agg()` no longer reports that it ran no queries, and they carry a
@@ -94,55 +95,60 @@ pipeline signature so repeated runs group rather than filing a row each.
 run the query for real, so both leave a summary line, a dashboard row, a span and an
 event-log document.
 
-Details worth knowing, because they are deliberate:
+## Why the display behaves as it does
 
-- **The bar advances in eighth-cells**, giving it eight times the resolution of its width,
-  which is what makes it read as motion rather than as stepping blocks.
-- **Throughput is measured over a trailing window**, not averaged since the query started.
-  That is what lets the sparkline show a stall: a cumulative average thirty seconds into a
-  run moves by a few percent per second, so it stays flat through exactly the event you are
-  watching for.
-- **Live row counts only exist on the streaming path.** {py:meth}`iter_batches <batcher.Dataset.iter_batches>` surfaces each Arrow
-  batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
-  the profile at the end, so its bar shows an indeterminate sweep, the phase carries what is
-  happening, and the counts appear in the summary line. No row count is drawn at all until
-  one has been observed: a standing `0 rows` is the absence of a reading, not a reading of
-  zero, and it read as the most alarming number it could have been.
-- **Nothing is invented.** With no row estimate and no partition count, the bar shows an
-  honest indeterminate sweep instead of a fabricated percentage, and the ETA is omitted
-  rather than guessed. That is the common case, because Kyber leaves an operator unbudgeted
-  whenever the source size is unknown.
-- **The terminal is left as it was found.** The cursor is hidden while a bar animates and
-  restored when the run ends or the reporter is detached, so a job interrupted mid-query
-  does not leave a hidden cursor and a frozen line behind.
-- **Several queries in flight say so.** One moving line is an instrument and five
-  interleaved ones are a mess, so the most recently started run is drawn and the rest are
-  counted: `+4 more`.
+Each of the following is a decision rather than an accident.
+
+The bar advances in eighth-cells, which gives it eight times the resolution of its width
+and is what makes it read as motion rather than as stepping blocks. Throughput is measured
+over a trailing window rather than averaged since the query started, and that is what lets
+the sparkline show a stall: a cumulative average thirty seconds into a run moves by a few
+percent per second, so it stays flat through exactly the event you are watching for.
+
+Live row counts only exist on the streaming path. {py:meth}`iter_batches <batcher.Dataset.iter_batches>` surfaces each Arrow
+batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
+the profile at the end, so its bar shows an indeterminate sweep, the phase carries what is
+happening, and the counts appear in the summary line. No row count is drawn until one has
+been observed. A standing `0 rows` is the absence of a reading rather than a reading of
+zero, and it read as the most alarming number it could have been.
+
+Nothing else is invented either. With no row estimate and no partition count, the bar shows
+an honest indeterminate sweep instead of a fabricated percentage, and the ETA is omitted
+rather than guessed. That is the common case, because Kyber leaves an operator unbudgeted
+whenever the source size is unknown.
+
+Two smaller habits. The cursor is hidden while a bar animates and restored when the run ends
+or the reporter is detached, so a job interrupted mid-query leaves neither a hidden cursor
+nor a frozen line behind. And with several queries in flight, the most recently started run
+is drawn and the rest are counted as `+4 more`, because one moving line is an instrument and
+five interleaved ones are a mess.
 
 Rendering degrades by detected capability rather than assuming one. Color falls back from
 truecolor to 256-color to 16-color to none, and block-drawing falls back to ASCII.
-`NO_COLOR`, `FORCE_COLOR`/`CLICOLOR_FORCE`,
-`COLORTERM`, and `TERM=dumb` are all honored, and the ASCII forms are chosen so a `LANG=C`
-terminal gets readable output rather than mojibake.
+`NO_COLOR`, `FORCE_COLOR`/`CLICOLOR_FORCE`, `COLORTERM`, and `TERM=dumb` are all honored,
+and the ASCII forms are chosen so a `LANG=C` terminal gets readable output rather than
+mojibake.
 
-This is **automatic and self-suppressing**. Batcher renders escape codes only into a real
-TTY that has not asked for plain output, so a script whose output you redirect to a file
-gets no bar and no control characters. Continuous integration is suppressed by name as well
-(`CI` or `GITHUB_ACTIONS` in the environment): a CI runner is a terminal nobody is watching,
-and thousands of repainted frames bury the output someone will actually read. Set it
-explicitly when you need to:
+The whole thing is self-suppressing. Batcher renders escape codes only into a real TTY that
+has not asked for plain output, so a script whose output you redirect to a file gets no bar
+and no control characters. Continuous integration is suppressed by name as well, on `CI` or
+`GITHUB_ACTIONS` in the environment: a CI runner is a terminal nobody is watching, and
+thousands of repainted frames bury the output someone will actually read. Set it explicitly
+when you need to:
 
 ```python
 import batcher as bt
 from batcher.config import ObservabilityConfig, active_config, set_config
 
-set_config(active_config().replace(
-    observability=ObservabilityConfig(progress="off")   # "auto" | "on" | "off"; None derives it
-))
+set_config(
+    active_config().replace(
+        observability=ObservabilityConfig(progress="off")  # "auto" | "on" | "off"; None derives it
+    )
+)
 ```
 
 `progress="on"` forces rendering, which helps inside a pseudo-terminal your tooling owns.
-`"off"` disables it entirely. The `NO_COLOR` and `TERM=dumb` conventions are honored.
+`"off"` disables it entirely.
 
 ## See also
 

@@ -4,13 +4,15 @@ This page describes how to score predictions against labels in Batcher, and how 
 
 ## Why metrics are expressions here
 
-Every metric on this page is an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, not a function that takes two arrays. That one decision is what makes the surface different from `sklearn.metrics`:
+Every metric on this page is an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, not a function that takes two arrays. That one decision separates the surface from `sklearn.metrics`. The metrics run inside the engine, so evaluating a billion scored rows never materializes them on a driver, and asking for ten metrics costs what asking for one costs, because they all reduce to the same aggregate pass.
 
-- The metrics run **in the engine**, so evaluating a billion scored rows never materializes them on a driver.
-- Asking for ten metrics costs what asking for one costs, because they reduce to the same aggregate pass.
-- They compose with {py:meth}`group_by <batcher.Dataset.group_by>`, so "what is the F1 *per country, per month*" is the same query with a grouping added. That is the question a model review actually asks, and the one a driver-side call cannot answer at scale.
+They also compose with {py:meth}`group_by <batcher.Dataset.group_by>`. "What is the F1 *per country, per month*" is the same query with a grouping added, which is the question a model review actually asks and the one a driver-side call cannot answer at scale.
 
 The exceptions are the metrics that need a global ordering rather than a per-row quantity: ROC AUC, average precision, and the KS statistic. Those are Dataset functions built on a window rank, and each adds one sort.
+
+The split between the two kinds runs along whether a metric's value for one row depends on any other row:
+
+![Why a metric is an aggregate here, and when it is not. ds.agg(m=bt.accuracy('y', 'p')) composes: each worker's partition of scored rows computes partial count_if counts of matched and compared rows, those partials combine by addition in any order because no row depends on another, and accuracy is matched divided by compared. The same code runs on one core or a hundred. roc_auc(ds, 'y', 's') does not compose: it is built on rank and cume_dist, a window over every score, so the rows are sorted by score first and only then does one aggregate pass produce the AUC from the rank identity. A rank depends on every other row, so this one adds a distributed sort, and that is the whole difference between the two rows of the picture. Both forms take by= or group_by, so per-segment scoring is the same query with a grouping added.](/_static/diagrams/metrics_as_aggregates.svg)
 
 ## One call for a whole task
 
@@ -79,7 +81,7 @@ The full vocabulary:
 | Multi-label | {py:func}`hamming_loss <batcher.hamming_loss>` (the fraction of label cells predicted wrong) |
 | Diagnostic-test | `jaccard_score`, `false_discovery_rate`, `false_omission_rate`, `positive_likelihood_ratio`, `negative_likelihood_ratio`, `diagnostic_odds_ratio`, `informedness`, `markedness`, `fowlkes_mallows_index`, `geometric_mean_score`, `prevalence_threshold` |
 
-Every one of them is checked against `sklearn.metrics` at 1e-12 in the test suite, so the definitions are the ones you expect.
+Every one is checked against `sklearn.metrics` at 1e-12 in the test suite. The definitions are the ones you expect.
 
 ## Choosing the right metric
 
@@ -89,7 +91,7 @@ A few of these exist specifically because the obvious choice misleads, and it is
 
 `mape` is undefined where the actual is zero, and Batcher excludes those rows from *both* the numerator and the denominator. Use `wape` when zeros are common: it is a ratio of totals rather than a mean of ratios, so one near-zero actual cannot dominate it.
 
-`mean_percentage_error` keeps the sign `mape` discards, so it measures a forecast's *bias*. A positive value means it systematically under-predicts. `normalized_rmse` divides the RMSE by the mean of the actuals, making it comparable across series on different scales. On the classification side `false_negative_rate` (`1 - recall`) is the miss rate to watch when an undetected positive is the costly outcome.
+`mean_percentage_error` keeps the sign `mape` discards, so it measures a forecast's *bias*. A positive value means it systematically under-predicts. `normalized_rmse` divides the RMSE by the mean of the actuals, so two series on different scales compare directly. On the classification side `false_negative_rate` (`1 - recall`) is the miss rate to watch when an undetected positive is the costly outcome.
 
 `roc_auc` counts every negative equally, so at very low prevalence it stays high while the top of the ranking is worthless. Report `average_precision` instead when positives are rare.
 
@@ -99,7 +101,7 @@ A few of these exist specifically because the obvious choice misleads, and it is
 
 ## Diagnostic tables
 
-A single metric says how good a model is; these say *where* it is wrong. Each returns a lazy `Dataset`, so the result joins, filters, and writes:
+A single metric says how good a model is. These say *where* it is wrong. Each returns a lazy `Dataset`, so the result joins, filters, and writes:
 
 ```python
 from batcher.ml.metrics import calibration_curve, confusion_matrix, lift_table
@@ -202,11 +204,9 @@ of them at once, naming them separately forces the choice to be explicit.
 ```python
 from batcher.ml.metrics import demographic_parity_difference, equal_opportunity_difference
 
-ds = bt.from_pydict(
-    {"race": ["a", "a", "b", "b"], "y": [1, 0, 1, 0], "p": [1, 1, 0, 0]}
-)
-print(demographic_parity_difference(ds, "race", "p"))       # selection-rate gap
-print(equal_opportunity_difference(ds, "race", "y", "p"))   # true-positive-rate gap
+ds = bt.from_pydict({"race": ["a", "a", "b", "b"], "y": [1, 0, 1, 0], "p": [1, 1, 0, 0]})
+print(demographic_parity_difference(ds, "race", "p"))  # selection-rate gap
+print(equal_opportunity_difference(ds, "race", "y", "p"))  # true-positive-rate gap
 ```
 
 `demographic_parity_difference` and `disparate_impact_ratio` measure equal *selection*;
@@ -242,9 +242,8 @@ ROC AUC uses the rank identity rather than integrating a threshold sweep, so it 
 
 ## Is the probability calibrated?
 
-A model can rank perfectly and still lie about its confidence, pairing an excellent AUC with
-a useless probability. Calibration is the property AUC cannot see, and it is what matters the
-moment a predicted probability is multiplied by a dollar amount.
+`log_loss` and `brier_score` above score calibration as one number. These two say where the
+gap sits and how wide it is, which is what you need before deciding whether to correct it.
 
 ```python
 from batcher.ml.metrics import brier_skill_score, expected_calibration_error
@@ -274,8 +273,7 @@ that looks perfect in development and is wrong in use.
 from batcher.ml.preprocessors import IsotonicCalibrator
 
 scored = bt.from_pydict(
-    {"score": [0.02, 0.05, 0.3, 0.5, 0.7, 0.95, 0.97, 0.99],
-     "label": [0, 0, 0, 1, 0, 1, 1, 1]}
+    {"score": [0.02, 0.05, 0.3, 0.5, 0.7, 0.95, 0.97, 0.99], "label": [0, 0, 0, 1, 0, 1, 1, 1]}
 )
 calibrator = IsotonicCalibrator("score", "label", n_bins=4).fit(scored)
 print(calibrator.transform(scored).to_pydict()["calibrated"])
@@ -294,8 +292,8 @@ an asymmetric distortion. Isotonic regression assumes only that a higher score s
 mean a lower probability, which fits a boosted tree's asymmetric overconfidence far better,
 at the cost of needing more data before its steps are trustworthy.
 
-Neither reorders the model's ranking — both are monotone in the score — so AUC is unchanged
-and only the calibration metrics above move.
+Neither reorders the model's ranking, because both are monotone in the score. AUC is
+unchanged, and only the calibration metrics above move.
 
 ## Count and rate models
 
@@ -350,7 +348,7 @@ print(DummyClassifier("y").fit(ds).constant_)  # the majority class a model must
 
 ## Requirements and limitations
 
-`average_precision` breaks ties in the engine's sort order, so a score column with heavy ties gives an optimistic value. `roc_auc` is exact under ties and is the safer choice there.
+`average_precision` breaks ties in the engine's sort order, so a score column with heavy ties gives an optimistic value. `roc_auc` is exact under ties, and the safer choice there.
 
 A ranking metric on a split containing only one class is undefined and returns NaN. Check the class balance of a segment before trusting a per-segment AUC.
 

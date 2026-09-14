@@ -10,9 +10,9 @@ five-second trigger with a model that takes four seconds to initialize, the job 
 life loading weights, and the throughput number you report is a measurement of `from_pretrained`.
 :::
 
-The fix is one character of API: pass the **class** itself, rather than an instance or a
-closure. The engine constructs it once and reuses that instance across every micro-batch
-of the query.
+The fix is in what you pass, not in how you configure it. Hand `map_batches` the **class**
+itself rather than an instance or a closure, and the engine constructs it once and reuses
+that instance across every micro-batch of the query.
 
 | What you pass to `map_batches` | What the engine does with it | The cost |
 | --- | --- | --- |
@@ -113,7 +113,7 @@ planning to restart the job on a schedule.
 ## The poison record
 
 A 24/7 job will eventually meet a row that breaks the model: a truncated UTF-8 sequence, a
-zero-byte image, a text field that is 400KB of base64. If the exception propagates, the
+zero-byte image, a text field that is 400 KB of base64. If the exception propagates, the
 query stops. At 3am.
 
 `max_errored_rows` caps how many failures the pipeline absorbs before it gives up:
@@ -156,23 +156,24 @@ yourself downstream.
 
 ## Rolling the scores up
 
-Scoring is rarely the last stage. A rollup over the scored stream -- alerts per model
-version, a running mean, a count above threshold -- is an ordinary aggregation over a
-`map_batches` input, and it writes to a sink like any other streaming aggregation:
+Scoring is rarely the last stage. Alerts per model version, a running mean, a count above
+threshold: a rollup over the scored stream is an ordinary aggregation over a `map_batches`
+input, and it writes to a sink like any other streaming aggregation.
 
 ```python
 rollup_schema = pa.schema([("model", pa.string()), ("text", pa.string())])
 
 
 def rollup_batches():
-    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]},
-                          schema=rollup_schema)
+    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]}, schema=rollup_schema)
     yield pa.record_batch({"model": ["v1"], "text": ["fine"]}, schema=rollup_schema)
 
 
 def score_length(batch):
-    return {"model": batch.column("model").to_pylist(),
-            "score": [len(t) for t in batch.column("text").to_pylist()]}
+    return {
+        "model": batch.column("model").to_pylist(),
+        "score": [len(t) for t in batch.column("text").to_pylist()],
+    }
 
 
 rollup = (
@@ -255,9 +256,9 @@ bottleneck and no amount of trigger tuning changes that.
 Two limits worth knowing before you scale this out. The resident-model path shown here is
 single-node: the model lives in the driver process for the life of the query. And
 `distributed=True` on a streaming write only covers an `available_now`/`once` drain of a
-stateless pipeline, with no checkpoint, so it is a backfill tool. A GPU inference stream
-that must span nodes is not something Batcher does today; run the inference as a
-distributed *batch* job over the landed bronze table instead.
+stateless pipeline, with no checkpoint, so it is a backfill tool. Batcher has no GPU
+inference stream that spans nodes. Run the inference as a distributed *batch* job over the
+landed bronze table instead.
 :::
 
 ## See also

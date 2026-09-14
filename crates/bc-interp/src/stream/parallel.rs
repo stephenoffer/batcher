@@ -1213,6 +1213,20 @@ fn spine_is_shardable(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>)
 /// other (164 ms vs 163 ms at sf10) and handing it over bought nothing while paying for the
 /// discarded build. Comparing the driving relation's row count against the build's exact one
 /// keeps the hand-off to the shape where it was worth 3-11x.
+/// Probe rows past which an **unshardable** plan is worth handing to the materializing
+/// executor even though its build side is small enough to probe one morsel at a time.
+///
+/// The morsel probe is not the thing being judged here; the alternative is. A plan this
+/// executor cannot shard — because a source is scanned twice, which is every self-join and
+/// every correlated subquery — runs its whole probe pipeline on **one core**, while the
+/// materializing executor partitions the same join across all of them. Below this size that
+/// trade is not worth the materialization; above it, it is, by a wide margin: measured on
+/// `op-join-build-large` (two 1.5M-group aggregates joined and counted, `lineitem` scanned
+/// twice) the case goes **107 ms to 68 ms**, and the join/group-by third of the operator mix
+/// from 0.745 to 0.717 against DuckDB over three repeats, with TPC-H unmoved (0.731 against
+/// 0.733, inside a 2% spread).
+const HANDOFF_MIN_PROBE_ROWS: usize = 1_000_000;
+
 fn spine_join_blocks_sharding(
     plan: &RelOp,
     cache: &BuildCache,
@@ -1225,9 +1239,21 @@ fn spine_join_blocks_sharding(
         RelOp::Aggregate { input, .. } | RelOp::Distinct { input, .. } => input.as_ref(),
         other => other,
     };
+    // The probe side's row count: the driving scan's, or — when a materialized spine breaker
+    // stands between the join and its scan — that breaker's own output, which is what the join
+    // will actually probe with.
+    //
+    // Reading only the scan made this **zero** for the shape the check most exists for.
+    // `leftmost_scan` stops at a materialized node by design (the rows below it are not what
+    // flows), so a join above an aggregate this executor just materialized measured a probe of
+    // no rows, compared it against the build, and declined every time. The shape is not exotic:
+    // two aggregates joined is what `GROUP BY ... JOIN GROUP BY ...` lowers to.
     let driving_rows: usize = leftmost_scan(spine, mats)
         .and_then(|sid| sources.get(sid))
-        .map_or(0, |b| b.iter().map(|b| b.num_rows()).sum());
+        .map_or_else(
+            || materialized_probe_rows(spine, mats),
+            |b| b.iter().map(|b| b.num_rows()).sum(),
+        );
     // Only the **first** join on the spine is judged, and only in a single-join plan. Both
     // restrictions look over-cautious and both were measured before being left in place.
     //
@@ -1249,7 +1275,10 @@ fn spine_join_blocks_sharding(
         }
         if let RelOp::HashJoin { .. } = node {
             let build = cache.get(&node_key(node))?;
-            if build.has_morsel_probe() || driving_rows <= build.side.num_rows() {
+            if driving_rows <= build.side.num_rows() {
+                return None;
+            }
+            if build.has_morsel_probe() && driving_rows < HANDOFF_MIN_PROBE_ROWS {
                 return None;
             }
             return Some("a hash join's build side is too large to probe one morsel at a time");
@@ -1286,6 +1315,28 @@ pub(crate) fn leftmost_scan(plan: &RelOp, mats: Option<&MatCache>) -> Option<usi
             .children()
             .first()
             .and_then(|c| leftmost_scan(c, mats)),
+    }
+}
+
+/// Rows in the first materialized breaker on the probe spine, or 0 when there is none.
+///
+/// The counterpart to [`leftmost_scan`] for a spine whose leaf is a breaker this executor has
+/// already evaluated: what the join above it probes with is that breaker's output, not the
+/// scan underneath it.
+fn materialized_probe_rows(plan: &RelOp, mats: Option<&MatCache>) -> usize {
+    let mats = match mats {
+        Some(m) => m,
+        None => return 0,
+    };
+    let mut node = plan;
+    loop {
+        if let Some(batches) = mats.get(&node_key(node)) {
+            return batches.iter().map(RecordBatch::num_rows).sum();
+        }
+        node = match spine_child(node) {
+            Some(next) => next,
+            None => return 0,
+        };
     }
 }
 
@@ -1386,21 +1437,39 @@ fn materialize_spine_breakers(
     };
     loop {
         if materializable_spine_breaker(node, cache) {
+            // A join-free grouped aggregate goes to the **materializing** executor, exactly as
+            // the same shape does on a build side (`builds::build_materializes_faster`). The
+            // asymmetry had no reason behind it: the guard, the hand-off and the argument for
+            // both already existed, and only the build side called them — so a join between two
+            // grouped aggregates sent one of its inputs down the fast route and the other down
+            // the slow one. Measured on `lineitem` grouped to 1.5M orderkeys twice and joined,
+            // best of four against the unchanged engine: **84.8 -> 65.6 ms**, and 117.0 -> 103.6
+            // with `op-join-build-large`'s two filters. A bare grouped aggregate is the control
+            // and does not move (12.9 ms either way).
+            //
+            // What is left on that case is the join, not this: the same query with the whole plan
+            // on the materializing executor is 39.8 ms, because the streaming join serves a
+            // 1.2M-row build with a flat per-morsel probe where the materializing one radix-
+            // partitions it. See `Admission::admits` and `BENCHMARK_RESULTS.md`.
+            //
             // The builds are handed down (`collect_builds` descends the probe spine, so the cache
             // already covers every join under here); the mats are not, because this subtree owns
             // whatever lies below it.
-            let batches = run_with_cache(
-                node,
-                sources,
-                workers,
-                meter,
-                budget,
-                Some(cache),
-                None,
-                false,
-                cancel,
-                opts,
-            )?;
+            let batches = match super::builds::build_materializes_faster(node, opts) {
+                Some(sub) => crate::par::execute_parallel_with(node, sources, &sub)?,
+                None => run_with_cache(
+                    node,
+                    sources,
+                    workers,
+                    meter,
+                    budget,
+                    Some(cache),
+                    None,
+                    false,
+                    cancel,
+                    opts,
+                )?,
+            };
             mats.insert(node_key(node), Arc::new(batches));
             return Ok(mats);
         }
@@ -1840,5 +1909,63 @@ mod tests {
                 rows / shards
             );
         }
+    }
+
+    /// The probe-row count a join above a **materialized** breaker is judged on.
+    ///
+    /// `leftmost_scan` stops at a materialized node, so the count has to come from the breaker
+    /// itself; reading the scan instead returned zero and made `spine_join_blocks_sharding`
+    /// decline the shape it exists for. Both directions are asserted, because a function that
+    /// always returned zero would pass an assertion on the no-breaker case alone.
+    ///
+    /// `node_key` is **address** identity, so every key here is taken from the node in the
+    /// position it will be looked up in — moving a node into a `Box` gives it a new key, which
+    /// is a way to write a test that silently checks nothing.
+    #[test]
+    fn a_materialized_spine_breaker_supplies_the_probe_row_count() {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+
+        let agg = |source_id| RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id }),
+            group_keys: vec![],
+            aggregates: vec![],
+        };
+        let rows = |n: usize| {
+            let col: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
+            vec![RecordBatch::try_from_iter(vec![("k", col)]).expect("batch")]
+        };
+
+        let bare = agg(0);
+        assert_eq!(
+            materialized_probe_rows(&bare, None),
+            0,
+            "no cache: nothing is materialized"
+        );
+        let mut mats = MatCache::new();
+        assert_eq!(
+            materialized_probe_rows(&bare, Some(&mats)),
+            0,
+            "an empty cache is the same"
+        );
+        mats.insert(node_key(&bare), Arc::new(rows(1_500)));
+        assert_eq!(materialized_probe_rows(&bare, Some(&mats)), 1_500);
+
+        // Found through the row-wise operators that sit between a join and its breaker.
+        let limited = RelOp::Limit {
+            input: Box::new(agg(0)),
+            n: 10,
+            offset: 0,
+        };
+        let RelOp::Limit { input, .. } = &limited else {
+            unreachable!("just built a Limit")
+        };
+        let mut deeper = MatCache::new();
+        deeper.insert(node_key(input.as_ref()), Arc::new(rows(2_400)));
+        assert_eq!(materialized_probe_rows(&limited, Some(&deeper)), 2_400);
+        assert_eq!(
+            materialized_probe_rows(&limited, Some(&mats)),
+            0,
+            "a key from a node that has since moved must not match"
+        );
     }
 }

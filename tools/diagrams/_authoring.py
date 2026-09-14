@@ -114,7 +114,9 @@ def arrow(x1: float, y1: float, x2: float, y2: float, kind: str = "blue") -> str
     )
 
 
-def curve(x1: float, y1: float, cx: float, cy: float, x2: float, y2: float, kind: str = "amber") -> str:
+def curve(
+    x1: float, y1: float, cx: float, cy: float, x2: float, y2: float, kind: str = "amber"
+) -> str:
     """A quadratic connector, for feedback edges that must not overlap the forward path."""
     stroke, marker = {
         "blue": (BLUE, "arB"),

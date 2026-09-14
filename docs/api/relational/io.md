@@ -253,7 +253,7 @@ The concrete implementations behind `bt.read.*` and `ds.write.*`.
 
 ### The registries
 
-Formats are discovered, not hard-coded. Registering a source under a name is what makes `bt.read(path, format="myfmt")` resolve.
+Formats register themselves rather than being listed anywhere. Registering a source under a name makes `bt.read(path, format="myfmt")` resolve.
 
 ```{eval-rst}
 .. autodata:: SOURCES

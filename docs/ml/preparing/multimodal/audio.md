@@ -32,7 +32,7 @@ print(
 | `rms()` | root-mean-square amplitude in `0..1` | tracks perceived loudness; a recording with one door slam has a peak of 1.0 and an RMS that still says quiet |
 | `dbfs()` | the same level in decibels below full scale | the unit every audio tool states a threshold in |
 | `peak_dbfs()` | the loudest single sample, in dBFS | paired with `dbfs()` it is the crest factor, which separates a compressed broadcast recording from a natural one |
-| `clipping_ratio(threshold)` | fraction of samples at the rail | distortion no normalization can undo, and invisible to every other measure because normalizing makes it *look* well-levelled |
+| `clipping_ratio(threshold)` | fraction of samples at the rail | distortion no normalization can undo, and invisible to every other measure because normalizing makes it *look* well-leveled |
 | `silence_ratio(threshold_db)` | fraction of samples below a floor | finds the recordings that are mostly dead air |
 | `zero_crossing_rate()` | fraction of adjacent pairs that change sign | the classic voiced/unvoiced descriptor |
 
@@ -42,7 +42,7 @@ print(
 
 Clips from different sources differ in level, length and sample rate, and a model sees each of those as a different distribution rather than a different recording.
 
-`rms_normalize(target_db=-20)` matches loudness. It is usually the one you want over `peak_normalize()`, which equalizes the *maximum* — so a clip with one loud click stays quiet everywhere else. The gain is capped so the result cannot clip, which means a whisper is lifted toward the target rather than driven into the rails.
+`rms_normalize(target_db=-20)` matches loudness. It is usually the one you want over `peak_normalize()`, which equalizes the *maximum*, so a clip with one loud click stays quiet everywhere else. The gain is capped so the result cannot clip, which means a whisper is lifted toward the target rather than driven into the rails.
 
 `pad_or_trim(duration_secs, rate)` is the operation that makes a clip corpus batchable at all. Whisper requires exactly 30 seconds of 16 kHz audio and every other fixed-input audio model requires something like it, so without it a pipeline either loops in Python or hands the model rows of unequal length:
 
@@ -50,9 +50,7 @@ Clips from different sources differ in level, length and sample rate, and a mode
 # docs: skip
 from batcher import col
 
-fixed = clips.with_columns(
-    audio=col("bytes").audio.trim_silence().audio.pad_or_trim(30.0, 16000)
-)
+fixed = clips.with_columns(audio=col("bytes").audio.trim_silence().audio.pad_or_trim(30.0, 16000))
 ```
 
 `slice(offset_secs, duration_secs)` extracts a region, measured against the clip's own sample rate. A window past the end of the recording yields an empty list rather than null, because an empty region is a fact about the window and not a failure to read the clip.
@@ -72,7 +70,7 @@ cleaned = clips.select(
 
 ## Writing audio back out
 
-Every waveform method hands back a `List<Float32>`, which is what a model wants and what nothing else can read. `encode_wav(rate=None)` closes the loop, producing a mono 16-bit PCM WAV container — the format every player, dataset loader and annotation tool accepts:
+Every waveform method hands back a `List<Float32>`, which is what a model wants and what nothing else can read. `encode_wav(rate=None)` closes the loop, producing a mono 16-bit PCM WAV container, the format every player, dataset loader and annotation tool accepts:
 
 ```python
 # docs: skip
@@ -95,7 +93,7 @@ Four descriptors reduce the whole clip to one number instead:
 
 | Method | Reports |
 |---|---|
-| `spectral_centroid(rate)` | the energy-weighted mean frequency — the standard brightness descriptor |
+| `spectral_centroid(rate)` | the energy-weighted mean frequency, the standard brightness descriptor |
 | `spectral_rolloff(rate, percentile=0.85)` | the frequency below which most of the energy lies |
 | `spectral_bandwidth(rate)` | the spread of frequencies about the centroid |
 | `spectral_flatness(rate)` | geometric over arithmetic mean of the power spectrum: near 0 for a tone, near 1 for noise |
@@ -106,8 +104,8 @@ All four average over frames and skip frames carrying no energy. A silent frame 
 
 ## Requirements and limitations
 
-- Decoding is WAV/PCM and FLAC. Compressed formats are read through `ds.ml.decode_audio`, which uses `soundfile`.
-- The methods that need no sample rate — the level and hygiene measures, `trim_silence`, `peak_normalize`, `rms_normalize`, `pre_emphasis`, and `encode_wav` — also accept a waveform column, so they chain without re-decoding. The ones defined against a rate (`resample`, `slice`, `pad_or_trim`, and the spectral front ends) need encoded bytes, because a waveform carries no sample rate; handed one, they say which method and what to do.
+- Native decode covers WAV/PCM and FLAC, the `symphonia` codecs the engine is built with. Bytes in any other container decode to null rather than raising, so a corpus of MP3 or Ogg needs a conversion pass before these methods see it.
+- Some methods need no sample rate: the level and hygiene measures, `trim_silence`, `peak_normalize`, `rms_normalize`, `pre_emphasis`, and `encode_wav`. Those take a waveform column as readily as encoded bytes, so they chain without re-decoding. The ones defined against a rate, meaning `resample`, `slice`, `pad_or_trim`, and the spectral front ends, need the bytes, because a waveform carries no sample rate. Handed a waveform, they say which method it was and what to do instead.
 - The waveform methods return a *variable*-length list, including `pad_or_trim`, whose length is knowable but whose column type stays `list<float32>` so the engine's declared schema matches the column it describes.
 - Multi-channel audio is averaged to mono at decode.
 

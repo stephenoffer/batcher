@@ -43,7 +43,7 @@ The per-operator budget path, `op_budget` keyed by Kyber's pre-order `op_id`, is
 fallback for pool-less contexts.
 
 The pool's decision is binary and reactive: it admits until it cannot. It also reports a
-*level* — nominal, elevated, critical — which the control plane can read through
+*level*, one of nominal, elevated and critical, which the control plane can read through
 `engine_pool_stats()` but which nothing inside the data plane acts on yet. Spilling before the
 cap rather than at it is the better strategy on paper and trades throughput for headroom, so it
 waits on a benchmark rather than on an opinion.
@@ -55,7 +55,7 @@ out with `memory.unbounded_memory`.
 ## Grace partitioning
 
 The core algorithm for aggregate and distinct is grace hashing, in
-`crates/bc-runtime/src/agg/spill.rs`:
+`crates/bc-runtime/src/agg/spill/mod.rs`:
 
 ```rust
 pub fn combine_finalize_spilling(
@@ -102,7 +102,8 @@ Partition count is sized from the state, not guessed: `grace_partitions` returns
 A skewed key set can overflow a single bucket even after partitioning. `merge_partition`
 handles that by recursing: if a partition's bytes still exceed the budget, it re-partitions
 with a *different salt* (`salt = 0x9E37_79B9_7F4A_7C15 * (depth+1) | 1`) into sub-buckets
-and reduces those one at a time, up to `MAX_DEPTH = 4`.
+and reduces those one at a time, up to `MAX_MERGE_DEPTH = 4`
+(`bc-runtime/src/agg/spill/mod.rs`).
 
 :::{warning}
 The different salt isn't an optimization. Re-hashing an overflowing bucket with the same
@@ -111,16 +112,21 @@ function puts every key back in the same bucket, and the recursion never termina
 
 ## What spills, and how
 
+Two mechanisms carry every stateful operator between them, and which one an operator takes
+follows from what its state is keyed on.
+
+![The two out-of-core mechanisms, and which operator takes which. An operator with keyed state takes grace partitioning: route by hash of the key into P buckets, one Arrow IPC file per bucket, then read one bucket at a time and run the ordinary in-memory kernel over it, the union of the buckets being the whole answer. A bucket still over budget is re-split under a salted hash, to a fan-out of at most 256 and a depth of at most 3, and each sub-bucket is an independent instance of the same operator. An operator with ordered state takes the external merge sort: sort into sized runs cut by size rather than by key, spill each, then merge up to 16 runs at a time with one batch per run resident, taking another pass over everything while more than one run is left, for log base 16 of the run count passes in all. Because the runs are cut by size, 64 MiB by default, key skew cannot defeat that family. What each operator writes differs: an aggregate writes partial state, one row per group per morsel rather than the input rows; a join co-partitions both sides by the join key and keeps only the build bucket resident while the probe streams through it; a window writes whole rows keyed by PARTITION BY, so every bucket holds complete partitions; DISTINCT ON is reduced to one row per key per morsel before it is written; and the sort writes sorted runs, over which median and n_unique stream a single pass instead of holding a per-group list. Both mechanisms return exactly what the in-memory kernel returns, and only peak memory differs.](/_static/diagrams/spill_ladder.svg)
+
 Every stateful operator has a spill path, and each one uses a mechanism suited to its
 state. The table names the mechanism and the file that implements it:
 
 | Operator | Mechanism | Code |
 |---|---|---|
-| Aggregate | grace partition + per-bucket combine | `bc-runtime/src/agg/spill.rs` |
+| Aggregate | grace partition + per-bucket combine | `bc-runtime/src/agg/spill/mod.rs` |
 | Distinct / UNION dedup | the same grace path with an empty agg list | `bc-interp/src/par.rs::distinct` |
 | Sort (full) | sorted runs + bounded k-way merge | `bc-interp/src/ops/external_sort.rs` |
-| Hash join | grace: co-partition both sides, join bucket-by-bucket | `bc-interp/src/join_par.rs` |
-| ASOF join | partition by the `by` keys | `bc-interp/src/join_par.rs` |
+| Hash join | grace: co-partition both sides, join bucket-by-bucket | `bc-interp/src/join_par/mod.rs` |
+| ASOF join | partition by the `by` keys | `bc-interp/src/join_par/mod.rs` |
 | Window (PARTITION BY) | partition on the partition keys | `bc-interp/src/window_spill.rs` |
 
 Top-N, a `Sort` carrying a `limit`, never spills. It runs a bounded heap, which is already
@@ -182,13 +188,13 @@ setting.
 
 ## Two tiers
 
-Local NVMe is fast but finite. `carbonite/spill.py::TieredSpillStore` writes to local disk
+Local NVMe is fast but finite. `carbonite/spill/store.py::TieredSpillStore` writes to local disk
 first and overflows to object storage when the local budget is exhausted.
 
 The local tier writes Arrow IPC files to the spill directory. Its budget is
 `memory.spill_local_budget_bytes`, which defaults to `None` and is then derived from
 measured free disk. Whatever the budget, the store clamps it to 90% of the *measured* free
-space on the filesystem holding the spill directory (`_SPILL_DISK_FRACTION`). That clamp is
+space on the filesystem holding the spill directory (`SPILL_DISK_FRACTION`). That clamp is
 what makes overflow track the disk that actually exists rather than a number someone typed
 into a config file two quarters ago, and the remaining sliver leaves room for other tenants
 and for log and temp writes.
@@ -240,10 +246,14 @@ once per merge pass, so a very large sort with a small fan-in pays multiple pass
 `sort_merge_fanin` reduces passes at the cost of more concurrent open files and more
 resident merge buffers.
 
-Recursion is bounded at depth 4 in Rust (`MAX_DEPTH`) and 3 on the out-of-core spill path
-(`dist/spill/buckets.py::GRACE_DEPTH`). That bound is one value for every breaker that
-grace-splits, so the aggregate, the join and the partitioned window all stop re-partitioning
-at the same depth.
+Recursion is bounded, by two different constants for two different recursions. The
+aggregate's own merge stops at `MAX_MERGE_DEPTH = 4` (`bc-runtime/src/agg/spill/mod.rs`).
+The shared grace re-split that the join, the partitioned window and `DISTINCT ON` take stops
+at `MAX_GRACE_SPLIT_DEPTH = 3`, with a fan-out capped at `MAX_GRACE_FANOUT = 256`
+(`bc-interp/src/spill_split.rs`); the distributed path matches it at
+`dist/spill/buckets.py::GRACE_DEPTH = 3`. So every breaker that grace-splits stops at the
+same depth as every other, and the aggregate's merge recursion is the one that goes a level
+further. There is no constant named `MAX_DEPTH`; this page named one until 2026-09-13.
 
 :::{warning}
 A key set so skewed that one group's state exceeds the budget on its own can't be partitioned

@@ -1,9 +1,10 @@
 # Core concepts
 
-Batcher has two halves. Python is the control plane: it builds a query plan and
-optimizes it. Rust is the data plane: it runs that plan over Apache Arrow record
-batches. Almost everything surprising about the API follows from that split, by way
-of the four ideas below.
+Batcher has two halves. Python is the control plane: it builds a query plan, optimizes
+it, and decides how much memory the result may cost, without ever touching a row. Rust
+is the data plane, and it runs that plan over Apache Arrow record batches. Almost
+everything surprising about the API follows from that split. The four pages below are the
+consequences worth knowing first.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -11,13 +12,13 @@ of the four ideas below.
 :::{grid-item-card} {octicon}`stack;1.1em` Lazy, immutable datasets
 :link: lazy
 :link-type: doc
-A {py:class}`Dataset <batcher.Dataset>` is a handle to a plan; nothing runs until a terminal operation.
+A {py:class}`Dataset <batcher.Dataset>` is a handle to a plan. Nothing runs until a terminal operation.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Expressions run in Rust
 :link: expressions
 :link-type: doc
-You describe column work; Rust evaluates it over whole Arrow batches.
+You describe column work. Rust evaluates it over whole Arrow batches.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` One core to a cluster

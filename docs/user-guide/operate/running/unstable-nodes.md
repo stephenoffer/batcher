@@ -67,14 +67,14 @@ log, and on a node without `pynvml`, nothing can be read and nothing is reported
 
 ## Set the collective timeout
 
-If your pipeline runs a multi-GPU collective, this is the highest-impact stability setting on
-the cluster and it is one environment variable.
+If your pipeline runs a multi-GPU collective, this is the highest-impact stability setting
+on the cluster. It is also one environment variable.
 
 A collective's default failure mode is to wait forever. When one rank dies or one device
-faults, the surviving ranks do not raise; they sit in the collective holding their GPUs until
+faults, the surviving ranks do not raise. They sit in the collective holding their GPUs until
 something outside kills them. From the orchestrator's side nothing has failed at all: the task
-is running, the actor is alive, and no progress is being made. Every recovery mechanism on this
-page is downstream of a failure being reported, so none of them ever runs.
+is running, the actor is alive, and no progress is being made. Every recovery mechanism on
+this page is downstream of a failure being reported, so none of them ever runs.
 
 Batcher sets `TORCH_NCCL_ASYNC_ERROR_HANDLING` and its older spelling on the GPU tasks it
 launches, which turns that hang into an ordinary task failure. It never overwrites a value you
@@ -107,9 +107,9 @@ set_config(
 )
 ```
 
-Do not raise `max_blocked_fraction` to solve a fleet that keeps failing. When every node fails
-every task the cause is almost never the fleet; it is a credential, an image, or a model file,
-and condemning more nodes replaces an error message with an outage.
+Do not raise `max_blocked_fraction` to solve a fleet that keeps failing. When every node
+fails every task the cause is almost never the fleet. It is a credential, an image, or a
+model file, and condemning more nodes replaces an error message with an outage.
 
 ## When a device corrupts rather than loses
 
@@ -127,9 +127,10 @@ the results independently.
 ## Requirements and limitations
 
 The Xid and node-fault readers need a readable `/dev/kmsg`, which means `CAP_SYSLOG` or a
-container that shares the host's kernel log. Device health needs `pynvml` on each worker
-(`pip install 'batcher-engine[nvml]'`), or the AMD equivalent. Where a source cannot be read, Batcher reports nothing rather than
-assuming the worst, so a fleet never drains because a base image changed.
+container that shares the host's kernel log. Device health needs `pynvml` on each worker,
+from `pip install 'batcher-engine[nvml]'`, or the AMD equivalent. Where a source cannot be
+read, Batcher reports nothing rather than assuming the worst, so a fleet never drains because
+a base image changed.
 
 Quarantine is keyed on the worker's placement within a fleet, so it is remembered across the
 stages of one job and not across separate jobs.

@@ -43,9 +43,9 @@ Every column type carries its own accessor, so the vocabulary matches the data:
 
 ```python
 # docs: skip
-bt.col("email").str.lower()           # string ops
-bt.col("signup_ts").dt.year()         # datetime parts
-bt.col("tags").list.contains("ai")    # list / array ops
+bt.col("email").str.lower()  # string ops
+bt.col("signup_ts").dt.year()  # datetime parts
+bt.col("tags").list.contains("ai")  # list / array ops
 ```
 
 

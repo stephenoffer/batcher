@@ -1,6 +1,6 @@
 # Imputation
 
-Imputing silently destroys information: "no value recorded" often predicts the target better than whatever you filled in. ``MissingIndicator`` keeps that signal as its own column, so impute *and* flag rather than choosing.
+Imputing silently destroys information: "no value recorded" often predicts the target better than whatever you filled in. `MissingIndicator` keeps that signal as its own column, so impute *and* flag rather than choosing.
 
 The whole script, executed on every test run:
 

@@ -1,8 +1,8 @@
 # Train/test split
 
 Every leaked test score traces back to a split. The model looks excellent offline and
-mediocre in production, and the reason is almost never the architecture. It is that a row in
-the test set had a twin in the training set. This page covers the three ways that
+mediocre in production, and the reason is almost never the architecture. A row in the test
+set had a twin in the training set. This page covers the three ways that
 happens and what to do instead.
 
 :::{warning}

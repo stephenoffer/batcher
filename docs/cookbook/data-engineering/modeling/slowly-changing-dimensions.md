@@ -33,9 +33,9 @@ import batcher as bt
 work = tempfile.mkdtemp()
 dim = os.path.join(work, "customer_dim.parquet")
 
-bt.from_pydict(
-    {"customer_id": [1, 2], "city": ["NYC", "LA"], "tier": ["gold", "free"]}
-).scd.type2(dim, keys="customer_id", track=["city", "tier"], as_of="2024-01-01")
+bt.from_pydict({"customer_id": [1, 2], "city": ["NYC", "LA"], "tier": ["gold", "free"]}).scd.type2(
+    dim, keys="customer_id", track=["city", "tier"], as_of="2024-01-01"
+)
 ```
 
 April's snapshot: customer 1 moved, customer 2 did not, customer 3 is new.
@@ -81,8 +81,7 @@ started on or before it and had not yet ended (an open version has `valid_to = N
 ```python
 as_of = "2024-02-15"
 snapshot = history.filter(
-    (bt.col("valid_from") <= as_of)
-    & (bt.col("valid_to").is_null() | (bt.col("valid_to") > as_of))
+    (bt.col("valid_from") <= as_of) & (bt.col("valid_to").is_null() | (bt.col("valid_to") > as_of))
 )
 print(snapshot.select("customer_id", "city").sort("customer_id").to_pydict())
 # {'customer_id': [1, 2], 'city': ['NYC', 'LA']}

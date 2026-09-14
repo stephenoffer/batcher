@@ -1,18 +1,15 @@
 # Scaling and distributions
 
-This page covers the preprocessors that change a numeric column's *scale* or its
-*shape*: the four scalers, the row-wise normalizer, the distribution reshapers, and the
-rank and label transforms.
-
-Reach for a scaler when features are on different scales and a distance or gradient
-step would otherwise be dominated by the largest one. Reach for a distribution reshaper
-when a column is heavily skewed and a linear rescale would leave it that way.
+Two different problems hide under "scale this column". If features sit on different
+scales and a distance or a gradient step is dominated by the largest one, you want a
+scaler. If a column is heavily skewed, a scaler will not help: it moves the numbers and
+leaves the shape exactly where it was, and you want a distribution reshaper instead.
+This page covers both, plus the row-wise normalizer and the rank and label transforms.
 
 ## Scaling numeric columns
 
-A scaler learns summary statistics in `fit` and rewrites each column in place. The
-columns named in the constructor are replaced, and the rest of the dataset passes
-through.
+A scaler learns summary statistics in `fit` and rewrites each column in place. The columns
+named in the constructor are replaced. The rest of the dataset passes through untouched.
 
 ```python
 import batcher as bt
@@ -26,14 +23,14 @@ print([round(v, 3) for v in scaled.column("age").to_pylist()])
 # [-1.342, -0.447, 0.447, 1.342]
 ```
 
-The fitted statistics live on the object, so the *same* scaler standardizes a
-held-out split with the training mean and standard deviation. Never refit on
-validation data, or the splits no longer share a scale:
+The fitted statistics live on the object, so the *same* scaler standardizes a held-out
+split with the training mean and standard deviation. Never refit on validation data. The
+two splits then sit on different scales, and nothing tells you:
 
 ```python
 val = bt.from_pydict({"age": [35.0], "score": [2.5]})
 print(scaler.transform(val).collect().column("age").to_pylist())
-# [0.0] — 35.0 is the training mean, so it standardizes to zero
+# [0.0]  (35.0 is the training mean, so it standardizes to zero)
 ```
 
 {py:class}`MinMaxScaler <batcher.ml.preprocessors.MinMaxScaler>` maps each column into `feature_range`, which defaults to `[0, 1]`, by its
@@ -48,7 +45,9 @@ from batcher.ml.preprocessors import MinMaxScaler, MaxAbsScaler, RobustScaler
 
 ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
 
-print([round(v, 3) for v in MinMaxScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist()])
+print(
+    [round(v, 3) for v in MinMaxScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist()]
+)
 # [0.0, 0.25, 0.5, 0.75, 1.0]
 print(MaxAbsScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist())
 # [0.2, 0.4, 0.6, 0.8, 1.0]
@@ -56,18 +55,17 @@ print(RobustScaler(["x"]).fit_transform(ds).collect().column("x").to_pylist())
 # [-1.0, -0.5, 0.0, 0.5, 1.0]
 ```
 
-A constant column with zero variance, zero range, or zero IQR is never divided by zero.
-The scaler falls back to a scale of 1.0, or maps to the bottom of `feature_range` for
+A constant column is never divided by zero. Zero variance, zero range, zero IQR: the
+scaler falls back to a scale of 1.0, or maps to the bottom of `feature_range` for
 `MinMaxScaler`, so the column survives the transform unchanged.
 
 ### Normalizing per row
 
-{py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>` is the row-wise scaler. It divides each row by its norm across the named
-columns, so every row becomes a unit vector. It is stateless, with nothing to
-learn, but it still follows the `fit` and `transform` contract, so use `transform`
-directly after construction, or `fit_transform`. The default `norm="l2"` divides by the
-square root of the sum of squares, `"l1"` by the sum of absolute values, and `"max"` by
-the largest absolute value.
+{py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>` is the row-wise scaler. It divides each row by its norm across the
+named columns, so every row comes out a unit vector. Nothing is learned, and this is one
+of the transforms that doesn't enforce the `fit` call, so `transform` straight after
+construction works. The default `norm="l2"` divides by the square root of the sum of
+squares, `"l1"` by the sum of absolute values, and `"max"` by the largest absolute value.
 
 ```python
 import batcher as bt
@@ -83,9 +81,9 @@ print(normalized.column("b").to_pylist())
 
 ## Reshaping a distribution
 
-Scaling changes a column's units; these change its *shape*, which is what a linear model,
-a distance metric, and a neural net actually need. Standardizing a log-normal column leaves
-it just as skewed, with a mean still sitting at the 70th percentile.
+Scaling changes a column's units. These change its *shape*, which is what a linear model,
+a distance metric, and a neural net actually need. Standardize a log-normal column and it
+comes out just as skewed, with a mean still sitting at the 70th percentile.
 
 {py:class}`QuantileTransformer <batcher.ml.preprocessors.QuantileTransformer>` is the most aggressive and the most reliable: it keeps only the
 *order* of the values, so the output is uniform whatever went in and an outlier cannot
@@ -99,10 +97,10 @@ ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 1000.0]})
 print(QuantileTransformer("x", n_quantiles=4).fit_transform(ds).to_pydict())
 ```
 
-{py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` is the data-driven middle ground. It finds the Yeo-Johnson power that
-makes the column most Gaussian by maximum likelihood, and it does so in **one pass**, because
-the likelihood at every candidate lambda is an aggregate, so the whole grid is evaluated
-together rather than one scan per optimizer iteration.
+{py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` is the data-driven middle ground. It finds the Yeo-Johnson power
+that makes the column most Gaussian by maximum likelihood, in one pass. The likelihood at
+every candidate lambda is an aggregate, so the whole grid is evaluated together instead of
+one scan per optimizer iteration.
 
 ```python
 from batcher.ml.preprocessors import PowerTransformer
@@ -129,9 +127,9 @@ count and every join key survive. Applying the *training* cut points to serving 
 point: a new record-breaking value is clamped rather than extrapolated into a region the
 model never saw.
 
-{py:class}`MissingIndicator <batcher.ml.preprocessors.MissingIndicator>` records which values were missing **before** an imputer fills them.
-Missingness is usually a signal, since a blank income field means something different from a
-low one, and imputing first destroys that signal permanently.
+{py:class}`MissingIndicator <batcher.ml.preprocessors.MissingIndicator>` records which values were missing *before* an imputer fills them.
+Missingness is usually a signal. A blank income field means something different from a low
+one, and once the imputer has run there is no way back to the distinction.
 
 ```python
 from batcher.ml.preprocessors import Chain, MissingIndicator, SimpleImputer

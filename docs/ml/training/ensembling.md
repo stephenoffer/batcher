@@ -4,9 +4,9 @@ This page describes how to combine several models into one prediction on Batcher
 to do it without the leak that makes a stacked ensemble look better than it is.
 
 Ensembling works because models make *different* mistakes. Two models that are individually
-mediocre but wrong about different rows combine into something better than either; two
-models that are wrong about the same rows combine into the same mistakes with more compute.
-That is the thing to check before reaching for any of this.
+mediocre but wrong about different rows combine into something better than either. Two models
+that are wrong about the same rows combine into the same mistakes with more compute. Check
+that before reaching for any of this.
 
 ## Averaging, first
 
@@ -37,9 +37,8 @@ a class neither model predicted. Blend the probability columns and threshold aft
 
 ## Voting, when the models emit labels
 
-Averaging class *labels* is meaningless: the mean of labels 0 and 2 is 1, which may be a
-class nobody predicted. {py:func}`majority_vote <batcher.ml.majority_vote>` counts votes
-instead:
+When all you have is labels, there is nothing to average.
+{py:func}`majority_vote <batcher.ml.majority_vote>` counts votes instead:
 
 ```python
 from batcher.ml.ensemble import majority_vote
@@ -62,8 +61,8 @@ A blend applies the same weights everywhere. A meta-model can learn that one bas
 the one to trust on short documents and another on long ones, which no fixed average can
 express. {py:class}`StackingEnsemble <batcher.ml.StackingEnsemble>` fits that meta-model.
 
-Base models are `(fit, predict)` callable pairs — the same shape
-{py:func}`cross_val_score <batcher.ml.cross_val_score>` takes — so a Batcher estimator, a
+Base models are `(fit, predict)` callable pairs, the same shape
+{py:func}`cross_val_score <batcher.ml.cross_val_score>` takes, so a Batcher estimator, a
 scikit-learn one, or a whole preprocessing pipeline all compose without an adapter:
 
 ```python
@@ -91,9 +90,8 @@ against `ridge` and `ols` here rather than against `x`.
 
 This is the one thing to get right. If the meta-model trains on predictions the base models
 made about rows they were *fitted on*, it learns to trust whichever base model memorized
-hardest — and that is the model that will do worst on data it has not seen. The ensemble
-then scores beautifully in development and badly in production, with nothing failing in
-between.
+hardest. That is the model that will do worst on data it has not seen. The ensemble then
+scores beautifully in development and badly in production, with nothing failing in between.
 
 `StackingEnsemble` avoids that by fitting the meta-model on out-of-fold predictions: every
 row is scored by base models that never saw it. You can build that table directly with

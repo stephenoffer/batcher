@@ -1,6 +1,6 @@
 # Feature scaling
 
-Every scaler follows the ``fit`` / ``transform`` split for a reason: the statistics come from the training set and are then *applied* to validation and production data. Fitting on everything is the classic leak, and the API makes the correct thing the easy thing.
+Every scaler follows the `fit` / `transform` split for a reason: the statistics come from the training set and are then *applied* to validation and production data. Fitting on everything is the classic leak, and the API makes the correct thing the easy thing.
 
 The whole script, executed on every test run:
 

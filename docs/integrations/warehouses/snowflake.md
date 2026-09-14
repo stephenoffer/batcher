@@ -1,8 +1,10 @@
 # Snowflake
 
-Snowflake is one of the two warehouses Batcher both reads and writes. {py:meth}`bt.read.snowflake(query) <batcher.api.io_namespace.reader.Reader.snowflake>`
-pulls a query result back as parallel Arrow chunks, and {py:meth}`ds.write.snowflake(table) <batcher.api.io_namespace.writer.Writer.snowflake>` ingests a
-dataset into a table.
+Snowflake is the one warehouse on this section's list that Batcher writes as well as reads.
+{py:meth}`bt.read.snowflake(query) <batcher.api.io_namespace.reader.Reader.snowflake>` pulls a
+query result back as parallel Arrow chunks, and
+{py:meth}`ds.write.snowflake(table) <batcher.api.io_namespace.writer.Writer.snowflake>` ingests a
+dataset into a table. BigQuery and Databricks are read-only here.
 
 | | |
 | --- | --- |
@@ -78,7 +80,7 @@ going back through the warehouse.
 
 ## Cost, which is the whole ballgame here
 
-Three things run up the bill, and all three are avoidable.
+The bill has three avoidable components.
 
 :::{important}
 **The query is submitted more than once.** `bt.read.snowflake(...)` is not free at
@@ -158,7 +160,9 @@ million rows and wrong for a few billion. For bulk loads, write Parquet to a sta
 There is no cross-shard transaction. Each shard of a distributed write commits its own rows as
 it finishes, and the driver's commit step is a no-op, so a write that dies halfway leaves the
 rows that already landed. Plan for it: write to a staging table and swap, or key the data so a
-re-run is idempotent.
+re-run is idempotent. `mode="overwrite"` is refused outright past the first shard, because every
+shard would replace the table with its own rows and the last one to finish would be all that
+survived.
 
 ## Failure modes worth knowing
 

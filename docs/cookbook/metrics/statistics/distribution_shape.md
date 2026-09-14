@@ -4,7 +4,7 @@ Shape decides which summary is honest. On a skewed column the mean is not the ty
 
 The whole script, executed on every test run:
 
-```{literalinclude} ../../../examples/statistics/distribution_shape.py
+```{literalinclude} ../../../../examples/statistics/distribution_shape.py
 :language: python
 :linenos:
 ```
@@ -19,5 +19,5 @@ python examples/statistics/distribution_shape.py
 
 - {doc}`/cookbook/metrics/statistics/association`: how strongly does one column relate to another?
 - {doc}`/cookbook/metrics/statistics/quantiles_and_histograms`: quantiles, histograms, and the exact-versus-approximate trade.
-- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and hypothesis tests.
 - {doc}`/api/models/ml-statistics`: the reference for every statistical function.

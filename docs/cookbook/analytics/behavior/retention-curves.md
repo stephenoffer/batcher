@@ -16,6 +16,7 @@ import datetime as dt
 import batcher as bt
 from batcher import col
 
+
 def may(day: int) -> dt.date:
     return dt.date(2024, 5, day)
 
@@ -72,11 +73,7 @@ production.
 Count the rows in each cell:
 
 ```python
-naive = (
-    labelled.group_by("cohort", "day_n")
-    .agg(active=bt.count())
-    .sort("cohort", "day_n")
-)
+naive = labelled.group_by("cohort", "day_n").agg(active=bt.count()).sort("cohort", "day_n")
 print(naive.to_pydict())
 # {'cohort': ['2024-05-01', '2024-05-01', '2024-05-01', '2024-05-02', '2024-05-02'],
 #  'day_n': [0, 1, 7, 0, 7], 'active': [4, 2, 2, 1, 1]}
@@ -109,9 +106,7 @@ render it.
 ```python
 cells = labelled.group_by("cohort", "day_n").agg(active=col("user").n_unique())
 sizes = (
-    labelled.filter(col("day_n") == 0)
-    .group_by("cohort")
-    .agg(cohort_size=col("user").n_unique())
+    labelled.filter(col("day_n") == 0).group_by("cohort").agg(cohort_size=col("user").n_unique())
 )
 
 curve = (
@@ -200,9 +195,10 @@ Say which one you are reporting. The two can differ by a factor of two on the sa
 :::{dropdown} Scaling notes: swapping the exact distinct count for a sketch
 `n_unique` is an exact distinct count, which means it holds every distinct user id per cell
 in memory. On a cohort table with hundreds of millions of users that is the step that hurts.
-`approx_n_unique` swaps it for a HyperLogLog sketch: bounded memory per group, ~2% error,
-and mergeable, so the answer is identical single-node and distributed. For a retention
-*curve*, 2% is well inside the noise you already have.
+`approx_n_unique` swaps it for a HyperLogLog sketch. Sixteen kilobytes per group at the
+default precision, ~0.8% relative error, and it merges by register-wise max, so the answer
+is identical single-node and distributed. On a retention *curve* that is well inside the
+noise you already have.
 
 ```python
 approx = (
@@ -224,5 +220,5 @@ print(approx.to_pydict()["active"])
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `min().over(...)` and the rest.
 - {doc}`Pivoting </user-guide/analyze/pivoting>`: laying the days out across the top.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why the HyperLogLog
-  sketch merges across partitions and the exact count does not.
+  sketch merges in bounded memory and the exact count carries every value it saw.
 - {doc}`Dataset API </api/relational/dataset>`: `group_by`, `join`, `pivot`.

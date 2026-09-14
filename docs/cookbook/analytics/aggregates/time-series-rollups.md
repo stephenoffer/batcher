@@ -120,7 +120,7 @@ Five rows, one per day, and June 3rd says zero out loud.
 Be deliberate about the fill. Zero is right for a count or a sum, because "no orders"
 really is zero revenue. It is wrong for an average, a price, or a gauge: the temperature
 on a day your sensor was offline was not 0 degrees. For those, leave the null, or carry the last
-known value forward with `col("x").forward_fill(order_by=["day"])`.
+known value forward with `col("x").forward_fill().over(order_by=["day"])`.
 :::
 
 ## Now the moving average means something
@@ -154,9 +154,8 @@ went quiet loses its zeros again, one region at a time.
 regions = bt.from_pydict({"region": ["us", "eu"]})
 grid = spine.cross_join(regions)
 
-by_region = (
-    events.group_by("region", day=col("ts").dt.truncate("day"))
-    .agg(revenue=col("amount").sum())
+by_region = events.group_by("region", day=col("ts").dt.truncate("day")).agg(
+    revenue=col("amount").sum()
 )
 dense_region = (
     grid.join(by_region, on=["day", "region"], how="left")

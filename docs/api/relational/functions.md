@@ -124,8 +124,8 @@ the hot path, so leave headroom rather than targeting the window exactly.
 ```
 
 A chat log and a fine-tuning set both arrive as a list of `{role, content}` structs per row.
-These read that column without a per-row loop: how many turns it has, how it ended, what the
-final answer was, and the whole exchange as text.
+These read that column without a per-row loop: the turn count, how the exchange ended, the
+final answer, and the whole thing rendered as text.
 
 ```{eval-rst}
 .. autosummary::

@@ -44,8 +44,8 @@ Each rule also carries a category (`REWRITE`, `SELECTION`, or `ENFORCE`) that dr
 The phases are a single forward pass, so a rule only ever sees the plan as it stands when
 its own phase runs. That is a problem for a *canonicalizing* rule, one that collapses a
 shape rather than improving it. `merge_projections` folds `Project(Project(x))` in
-`NORMALIZE`, and `merge_adjacent_filters` folds `Filter(Filter(x))` in `PUSHDOWN` — but
-projection pushdown stacks projections after `NORMALIZE` has finished, and join reordering
+`NORMALIZE`, and `merge_adjacent_filters` folds `Filter(Filter(x))` in `PUSHDOWN`.
+Projection pushdown then stacks projections after `NORMALIZE` has finished, and join reordering
 and fusion re-parent subtrees so that operators which were separated become adjacent again.
 By then the canonicalizer has run and nothing runs it a second time, so the redundant
 operator reaches the engine.
@@ -58,7 +58,7 @@ changes falls from 46 to 21.
 Only rules that declare `Rule.recanonicalize` take part. The flag means two things at once,
 and a rule needs both: the rewrite is semantics-preserving, and it is *contracting*, so it
 can never hand the engine a larger plan than it was given. Re-running the rewrite phases
-wholesale instead is both slower and worse — it costs 18.6% more planning time and removes
+wholesale instead is both slower and worse: it costs 18.6% more planning time and removes
 fewer nodes, because those phases also hold rules that legitimately grow a plan and
 re-running them partially undoes the first pass.
 
@@ -69,11 +69,11 @@ the rows a cheap one kept. `merge_adjacent_filters` would fuse that straight bac
 rules are exact inverses and only their phase order keeps them apart.
 
 Read the effect as plan quality rather than as throughput. An interleaved A/B on execution
-measures about 1.5% end to end, within the run-to-run noise of a shared machine. What the
-round buys is a plan that is stable under re-optimization, which matters because the
-adaptive executor re-optimizes each stage subtree mid-query: a plan that still shrinks under
-a second pass makes stage re-optimization change the plan shape for reasons unrelated to the
-measured cardinalities it is supposed to be reacting to.
+measures about 1.5% end to end, within the run-to-run noise of a shared machine. The round
+buys a plan that is stable under re-optimization, and that stability is the point. The
+adaptive executor re-optimizes each stage subtree mid-query, so a plan that a second pass
+would still shrink makes stage re-optimization change the plan shape for reasons unrelated
+to the measured cardinalities it is supposed to be reacting to.
 
 ## Shipped rules
 
@@ -141,16 +141,16 @@ on. The modules and what each one rewrites:
 | Family module | What it rewrites |
 |---|---|
 | `exprs/numeric` | identities whose soundness depends on the operand's type and nullability: `x // 1`, `x * 0`, `x % 1`, `pow(x, 0)`, `hypot(x, 0)`, and the `gcd`/`lcm`/shift folds |
-| `exprs/cast_unwrap` | Spark's `UnwrapCastInBinaryComparison` -- lifts a widening `int -> float` cast out of a comparison against a literal, which is what lets zone-map pruning and source pushdown see the predicate at all |
+| `exprs/cast_unwrap` | Spark's `UnwrapCastInBinaryComparison`: it lifts a widening `int -> float` cast out of a comparison against a literal, which is what lets zone-map pruning and source pushdown see the predicate at all |
 | `exprs/boolean_normalize` | drives `NOT` down to the leaves: both De Morgan laws (verified over the full Kleene cross-product) and double negation, so the comparisons underneath reach `fold_not_comparison` |
 | `exprs/comparisons` | the reflexive six, `x = x` through `x >= x`, folded to a constant on a non-nullable non-float operand |
 | `exprs/conditionals` | moving work across a `CASE`: pushing a foldable comparison into literal branches, flattening a nested `ELSE` ladder, unwrapping a boolean-branch `CASE` inside a filter, pruning a dominated `GREATEST`/`LEAST` literal |
 | `exprs/complex_types` | extract-over-construct (`make_struct(...).a`, `[x, y][0]`, `len([x, y])`) and list-function algebra (idempotence, involution, slice composition) |
-| `exprs/text_folds` | constant folding for the string functions -- lengths, the digests (`md5`/`sha1`/`sha256`/`crc32`), `hex`, the pads, `repeat`, `initcap`, and the trims, each verified against the engine and ASCII-guarded where Unicode case or whitespace handling could differ |
+| `exprs/text_folds` | constant folding for the string functions, meaning lengths, the digests (`md5`/`sha1`/`sha256`/`crc32`), `hex`, the pads, `repeat`, `initcap`, and the trims, each verified against the engine and ASCII-guarded where Unicode case or whitespace handling could differ |
 | `exprs/text_algebra` | the remaining regex de-specializations (`regexp_replace_all` to `replace`, `regexp_split` to `split`) and composing stacked `substr` calls |
 | `exprs/text` | regex de-specialization, where a metacharacter-free `regexp_matches` becomes `contains`, `starts_with`, `ends_with`, or `=`, plus the string identities `reverse(reverse(x))`, `repeat(x, 1)`, and a full-range `substr` |
 | `exprs/temporal` | reading a date part through a finer truncation ({py:meth}`year(date_trunc('day', t)) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.year>`), {py:meth}`last_day <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.last_day>` idempotence, and day/microsecond offset fusion |
-| `streaming/windows` | collapses nested event-time window alignment ({py:meth}`window(window(t, 5m), 15m) <batcher.Dataset.window>`) when the outer width is a whole multiple of the inner -- per-row work removed from a pipeline that never ends |
+| `streaming/windows` | collapses nested event-time window alignment ({py:meth}`window(window(t, 5m), 15m) <batcher.Dataset.window>`) when the outer width is a whole multiple of the inner, removing per-row work from a pipeline that never ends |
 | `relational/windows` | transposing two independent `Window` nodes into a canonical spec order so the collapse rule can find them, and pushing a top-N below an unpartitioned ranking window |
 
 Two constraints shape what these families can contain, and both are worth knowing
@@ -266,7 +266,7 @@ the same granularity, not a finer one. It also engages only on a joined query bi
 to pay for its own re-planning: 5M rows, or roughly 320 MB, per pipeline breaker the loop
 would cut at. Small queries never reach it.
 
-What has no equivalent in either engine is the *cross-query* half. Core records each
+The *cross-query* half has no equivalent in either engine. Core records each
 run's measured cardinalities, operator times, and peak memory into the MetadataHub, and
 the next run of that shape plans against them: sketch-backed cardinality, cost
 coefficients calibrated from measured operator times, and a UCB1 bandit over join

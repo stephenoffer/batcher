@@ -77,9 +77,11 @@ For train and test sets, prefer {py:meth}`ds.ml.train_test_split(...) <batcher.a
 ```python
 import pyarrow as pa
 
+
 def double(batch: pa.RecordBatch) -> pa.RecordBatch:
     doubled = pa.array([v * 2 for v in batch.column("amount").to_pylist()])
     return batch.set_column(batch.schema.get_field_index("amount"), "amount", doubled)
+
 
 print(ds.map_batches(double).to_pydict()["amount"])
 # [20, 40, 60, 80]

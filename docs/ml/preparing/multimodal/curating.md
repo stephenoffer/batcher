@@ -1,13 +1,13 @@
 # Curating a corpus
 
-A scraped corpus is mostly rows that decode perfectly and teach a model nothing. These are the screens that catch them.
+A scraped corpus is mostly rows that decode perfectly and teach a model nothing. This page
+covers the screens that catch them, for images and for scraped text.
 
-## Curating an image corpus
+## Screening an image corpus
 
-A scraped image corpus is full of rows that decode perfectly and teach a model nothing: blank
-placeholder tiles, all-white scans, out-of-focus photographs, and the grey box a CDN serves when
-an asset is missing. None of them fails a decode, so nothing upstream catches them, and a vision
-model trained on them learns the placeholder.
+Blank placeholder tiles, all-white scans, out-of-focus photographs, the gray box a CDN
+serves when an asset is missing. None of them fails a decode, so nothing upstream catches
+them, and a vision model trained on them learns the placeholder.
 
 {py:meth}`.image.brightness() <batcher.plan.expr_ir.image._ImageNamespace.brightness>` is the blank detector. It reduces an image to its mean luma in `[0, 1]`,
 and the useless rows sit at the extremes while a photograph of anything lands in the middle.
@@ -21,14 +21,14 @@ from batcher import col, lit
 
 brightness = col("bytes").image.brightness()
 usable = photos.filter(
-    (brightness > lit(0.05))          # not a black tile
-    & (brightness < lit(0.95))        # not a blown-out scan
+    (brightness > lit(0.05))  # not a black tile
+    & (brightness < lit(0.95))  # not a blown-out scan
     & (col("bytes").image.sharpness() > lit(1e-4))  # not out of focus
 )
 ```
 
-Sharpness values are small in absolute terms — a well-focused photograph lands around 0.01 to
-0.05 — so pick the threshold from a histogram of your own corpus rather than from a number you
+Sharpness values are small in absolute terms. A well-focused photograph lands around 0.01 to
+0.05, so pick the threshold from a histogram of your own corpus rather than from a number you
 read somewhere. It measures *detail*, not quality: a brick wall outscores a portrait, and a
 noisy image outscores a clean one. Use it to find the blurred tail, not to rank images against
 each other.
@@ -46,8 +46,8 @@ are, which is worth having beside `mime` for the same reason
 assembled by content type is full of files whose extension and container disagree, and those
 rows decode fine and break whatever downstream step branched on the name.
 
-The listing is by file extension, so a format the source does not name is invisible to it —
-the read returns nothing and the error reads as an empty directory rather than as an
+The listing is by file extension, so a format the source does not name is invisible to it.
+The read returns nothing, and the error reads as an empty directory rather than as an
 unlisted format. `.heic`, `.avif`, `.jfif`, `.jp2` and the rest are listed for that reason,
 even where Pillow needs a plugin to decode them: the rows are still worth having, because
 `bytes`, `size` and `mime` come from the read itself and an unparseable header nulls that
@@ -55,30 +55,30 @@ file's metadata columns rather than dropping its row.
 
 ## The rows a luma measure cannot see
 
-Brightness and sharpness both read the grey channel, so three classes of useless row get
+Brightness and sharpness both read the gray channel, so three classes of useless row get
 past them. Each has its own measure, and all three read the same downsampled copy the other
 two do, so adding them to a filter costs nothing beyond the decode already being paid.
 
 {py:meth}`.image.entropy() <batcher.plan.expr_ir.image._ImageNamespace.entropy>` is the
 Shannon entropy of the luma histogram, in bits. It separates the case brightness cannot: a
-mid-grey placeholder tile and a photograph of a foggy road have the same mean, and
+mid-gray placeholder tile and a photograph of a foggy road have the same mean, and
 completely different information content. A solid field scores 0 whatever shade it is, a
 two-tone logo near 1, and a photograph of anything between 6 and 8.
 
 {py:meth}`.image.colorfulness() <batcher.plan.expr_ir.image._ImageNamespace.colorfulness>`
 is the Hasler-Süsstrunk metric. A sepia-toned duplicate, a line drawing and a scanned page
 all have ordinary brightness, sharpness and entropy, and all of them are the wrong training
-data for a model meant to see colour. Roughly 0 for anything grey, 15 or more for a vivid
+data for a model meant to see color. Roughly 0 for anything gray, 15 or more for a vivid
 scene.
 
 {py:meth}`.image.is_grayscale() <batcher.plan.expr_ir.image._ImageNamespace.is_grayscale>`
-finds the greyscale images *stored* as three identical channels. No header reports it:
+finds the grayscale images *stored* as three identical channels. No header reports it:
 `decode()` says `RGB`, `has_alpha()` says false, and nothing says that two thirds of every
 tensor is a copy. Finding them is what lets a pipeline route them to a one-channel model
 instead of paying three times the bandwidth for one channel of information.
 
 {py:meth}`.image.mean_color() <batcher.plan.expr_ir.image._ImageNamespace.mean_color>`
-reports the three channel means as a struct. It is the cheapest colour summary there is, and
+reports the three channel means as a struct. It is the cheapest color summary there is, and
 it makes "find every product shot on a white background" and "cluster this corpus by
 palette" ordinary expressions rather than an embedding model.
 
@@ -88,9 +88,9 @@ from batcher import col, lit
 
 background = col("bytes").image.mean_color()
 usable = photos.filter(
-    (col("bytes").image.entropy() > lit(4.0))          # not a placeholder tile
-    & (col("bytes").image.colorfulness() > lit(5.0))   # not a scan or a line drawing
-    & ~col("bytes").image.is_grayscale()               # not grey stored as RGB
+    (col("bytes").image.entropy() > lit(4.0))  # not a placeholder tile
+    & (col("bytes").image.colorfulness() > lit(5.0))  # not a scan or a line drawing
+    & ~col("bytes").image.is_grayscale()  # not gray stored as RGB
 )
 on_white = photos.filter(background.struct.field("r") > lit(240.0))
 ```
@@ -99,7 +99,7 @@ on_white = photos.filter(background.struct.field("r") > lit(240.0))
 
 A camera does not rotate its sensor data. It records which way up it was held in the EXIF
 `Orientation` tag and stores the pixels as read, so a portrait phone photo is stored
-landscape with a "rotate 90" note attached. Every viewer honours that note, and so does
+landscape with a "rotate 90" note attached. Every viewer honors that note, and so does
 `cv2.imread` and anything built on `PIL.ImageOps.exif_transpose`.
 
 The decoder behind the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` namespace does not. A corpus of phone photographs therefore
@@ -150,9 +150,7 @@ It returns a plain integer, so no new operator is needed. Exact-duplicate collap
 import batcher as bt
 from batcher import col
 
-photos = bt.read.images("s3://bucket/scrape/").with_columns(
-    h=col("bytes").image.dhash()
-)
+photos = bt.read.images("s3://bucket/scrape/").with_columns(h=col("bytes").image.dhash())
 
 # Exact duplicates: one row per distinct image.
 unique = photos.distinct(subset=["h"])

@@ -12,7 +12,7 @@ def markdown_to_html_with_css(md_file, html_file):
     """Convert markdown to HTML with proper styling for academic documents."""
 
     # Read markdown content
-    with open(md_file, "r", encoding="utf-8") as f:
+    with open(md_file, encoding="utf-8") as f:
         md_content = f.read()
 
     # Configure markdown with extensions for better rendering

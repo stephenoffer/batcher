@@ -88,6 +88,10 @@ Nulls propagate the way SQL says they do, which is not the way a naive `map` wou
 The Kleene row is why the JIT has a separate ABI for compound predicates
 (`crates/bc-codegen/src/kleene.rs`) and cannot use a combined validity mask for them.
 
+Four rows are enough to watch the validity bitmap travel through those rules and come out meaning two different things:
+
+![The validity bitmap travelling through one expression over four rows. An Arrow column is two buffers: column a holds 3, 17, a null and 24 with validity 1, 1, 0, 1, and column b holds 9, 2, 9 and 8 with validity all 1. A null slot still holds a payload, and the bitmap beside it is the only thing that says to ignore that payload. Comparison carries the bitmap forward: a greater than 10 is false, true, unknown, true, with validity 1, 1, 0, 1, because Arrow's compare kernels return null and never false where an input is null, so row 3 is unknown rather than excluded. b less than 5 is false, true, false, false, all valid. Their and_kleene is false, true, false, false with validity 1, 1, 1, 1: false AND null is false, so row 3 is valid again, where Arrow's plain and would have propagated the null instead. What that boolean column means then depends on how it is used. Kept as a column, three values survive: true, false and unknown. Used as a filter, truthy() ANDs the values with the validity and leaves no bitmap on the result, so unknown folds to false and the row goes.](/_static/diagrams/expr_eval_nulls.svg)
+
 :::{warning}
 `x != x` does not detect NaN in this engine. The `!=` operator uses a *total* ordering, in
 which `NaN == NaN`, so the familiar idiom silently returns all-false. Use {py:meth}`is_nan <batcher.plan.expr_ir.core.Expr.is_nan>`, which is
@@ -106,14 +110,14 @@ The variants beyond the arithmetic core are grouped by family, one module each u
 | `binary.rs` | arithmetic, comparison, boolean, bitwise, the scalar fast path |
 | `cast.rs` | `CAST`, which is strict and errors on a bad value, and `TRY_CAST`, which yields null |
 | `str/` | string functions: `contains`, `replace`, `substr`, regex, JSON, and the rest |
-| `date.rs` | date/time extraction, `date_trunc`, `strftime`/`strptime`, date offsets |
+| `temporal/` | date/time extraction, `date_trunc`, `strftime`/`strptime`, date offsets, timezone conversion |
 | `math.rs` | unary/binary math, `coalesce`, `greatest`/`least`, `is_nan`/`is_inf` |
 | `list.rs`, `list_ops/` | list construction, indexing, slicing, `filter`/`transform` |
 | `map.rs`, `hash.rs`, `in_list.rs` | map lookup, hashing, `IN (...)` |
 | `media/` | image/audio/video decode: library-backed, per-row, heavy |
-| `security/`, `timezone.rs` | masking/encryption, timezone conversion |
+| `security/` | masking and encryption |
 
-The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the single name-to-type table, and the Python `CAST_DTYPES` set in `plan/types.py` is pinned to the live engine vocabulary by `tests/unit/test_dtype_registry_parity.py`, so the two cannot drift.
+The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the single name-to-type table, and the Python `CAST_DTYPES` set in `plan/types/` is pinned to the live engine vocabulary by `tests/unit/test_dtype_registry_parity.py`, so the two cannot drift.
 
 ## Media decode is different
 

@@ -36,10 +36,10 @@ sequential interpreter is the oracle; the other two must agree with it.
   rather than diverge. The JIT is bit-for-bit identical to the interpreter on its
   subset.
 
-A query can drop from a compiled pipeline back to the interpreter at any breaker.
-That is what lets adaptivity and compilation coexist: an artifact can be thrown
-away and the relational state, which lives in the runtime library rather than in
-generated code, survives.
+A query can drop from a compiled pipeline back to the interpreter at any breaker, which
+is how adaptivity and compilation coexist. Throwing a compiled artifact away costs the
+artifact and nothing else, because the relational state lives in the runtime library
+rather than in generated code.
 
 ## Which crate runs which scale
 
@@ -55,8 +55,10 @@ them. That mapping is the thing to know before touching a stateful operator:
 
 So a new stateful operator that has no mergeable form is not merely un-distributed. It
 is capped at the sequential path, and the failure surfaces at cluster scale as wrong
-results rather than as an error. CI asserts the invariant directly: single-node output
-must equal multi-worker output for every stateful operator. See
+results rather than as an error. `tests/integration/test_distributed.py` asserts the
+invariant directly, operator by operator: single-node output must equal multi-worker
+output. It calls `pytest.importorskip("ray")`, and CI installs no Ray, so a green PR gate
+says nothing about that arm. A recorded cluster run is the evidence. See
 {doc}`/architecture/execution` for why the algebra is shaped this way, and
 {doc}`/architecture/deep-dives/operators/mergeable-algebra` for a worked example.
 
@@ -68,14 +70,16 @@ live here, because these are the values you change or cite in code.
 Adaptive re-optimization triggers when an estimate was wrong by more than
 `optimizer.reoptimize_error` (default 2x). It engages only on a query that contains a
 join and whose total scan input clears 5M rows, or roughly 320 MB, for each pipeline
-breaker the loop would cut at (`api/adaptive/gating.py`) — about 10M rows for the
-simplest joined shape, and more for a many-join one, because each cut is what costs.
-Most small queries never reach it. Be precise about what
-that buys: this is stage-boundary re-optimization, the same mechanism and granularity as
-Spark AQE, not something finer. The two places the loop reaches further than AQE are
-that it runs single-node as well as distributed, and that what it measured is recorded
-to the MetadataHub and read by the *next* run. See {doc}`/architecture/internals/kyber` for that cross-query
-half.
+breaker the loop would cut at (`api/adaptive/gating.py`). That is about 10M rows for the
+simplest joined shape and more for a many-join one, because each cut is what costs. A
+query with no join is out at any size, which excludes more queries than the row floor
+does. Most small queries never reach the loop at all.
+
+A query that clears the gate gets stage-boundary re-optimization, the same mechanism and
+granularity as Spark AQE. It is not finer. Two things about it do reach further than
+AQE: it runs single-node as well as distributed, and what it measured is recorded to the
+MetadataHub and read by the *next* run. See {doc}`/architecture/internals/kyber` for that
+cross-query half.
 
 Carbonite's memory envelope throttles new allocations at `memory.soft_limit` (0.85 of
 the budget) and begins spilling at `memory.hard_limit` (0.90). Spilling is a property of

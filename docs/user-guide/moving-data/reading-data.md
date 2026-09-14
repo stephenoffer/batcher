@@ -177,10 +177,10 @@ and `read.table` accept the same path and option style.
 
 ```python
 # docs: skip
-ds = bt.read("data/events.parquet")          # format inferred from extension
-ds = bt.read("data/*.parquet")               # glob across many files
-ds = bt.read("output/events/")               # a directory: inferred from the files in it
-ds = bt.read("s3://bucket/events.parquet")   # object storage (needs [cloud])
+ds = bt.read("data/events.parquet")  # format inferred from extension
+ds = bt.read("data/*.parquet")  # glob across many files
+ds = bt.read("output/events/")  # a directory: inferred from the files in it
+ds = bt.read("s3://bucket/events.parquet")  # object storage (needs [cloud])
 ```
 
 A directory has no extension of its own, so the format comes from the files inside it.
@@ -194,7 +194,7 @@ by more than one entry is still read once.
 
 ```python
 # docs: skip
-ds = bt.read.parquet(["runs/2024-01/", "runs/2024-02/"])   # two outputs, one relation
+ds = bt.read.parquet(["runs/2024-01/", "runs/2024-02/"])  # two outputs, one relation
 ds = bt.read.parquet(["a/events.parquet", "b/*.parquet"])  # mixed spellings
 ```
 
@@ -219,53 +219,43 @@ frames = bt.read.images("s3://bucket/photos/*.jpg")
 
 ## Messy input
 
-Real corpora contain members that will not read. Batcher separates two failures that look
-alike and have opposite fixes, so reaching for the wrong flag cannot quietly delete data.
+Real corpora contain members that will not read. Batcher separates three failures that look
+alike and have different fixes, so reaching for the wrong flag cannot quietly delete data.
 
 An **unreadable file** is one whose bytes the format cannot parse at all: a truncated
 upload, a zero-byte object, a JPEG whose trailer never arrived. `on_error="skip"` drops the
-file and reads the rest, and `corrupt_files()` lists what went. Use it when the input is a
-corpus you do not control.
+file and reads the rest. Use it when the input is a corpus you do not control.
 
-```python
-# docs: skip
-ds = bt.read.parquet("s3://bucket/events/", on_error="skip")
-ds.to_pydict()
-print(ds.source.corrupt_files())
-```
-
-A **third** failure is neither of those: bytes that are readable but not in the encoding
-you asked for. A text corpus assembled from scrapes, exports and legacy systems is a
-mixture, and a single stray byte is not a reason to lose a file. `read.text` replaces what
-it cannot decode with U+FFFD by default, in both `mode="line"` and `mode="file"`, and
-`errors="strict"` turns it into a per-file failure that `on_error="skip"` will then drop:
+The source object behind the read keeps the audit trail. `corrupt_files()` names every
+path it dropped, so a short result is explainable rather than mysterious:
 
 ```python
 import os
 import tempfile
 
 import batcher as bt
+from batcher.io import ParquetSource
 
-d = tempfile.mkdtemp()
-with open(os.path.join(d, "legacy.txt"), "wb") as f:
-    _ = f.write("caf\xe9\n".encode("cp1252"))
+corpus = tempfile.mkdtemp()
+bt.from_pydict({"id": [1, 2]}).write.parquet(os.path.join(corpus, "good.parquet"))
+with open(os.path.join(corpus, "zbad.parquet"), "wb") as f:
+    _ = f.write(b"not a parquet file")
 
-print(bt.read.text(d).to_pydict()["text"])
-print(bt.read.text(d, encoding="cp1252").to_pydict()["text"])
+print(bt.read.parquet(corpus, on_error="skip").count())
+# 2
+
+source = ParquetSource(corpus, on_error="skip")
+_ = source.read()
+print([os.path.basename(path) for path in source.corrupt_files()])
+# ['zbad.parquet']
 ```
-
-Replacement is a fallback, not an answer: if you know what the bytes are, naming the
-`encoding` is the fix.
 
 A **malformed row** is one record inside a file that is otherwise fine: a CSV row carrying
 a field the header does not have, or an NDJSON line that is not JSON at all. The file is
-readable, so `on_error` is the wrong answer for it — dropping the file discards every good
-row to be rid of one bad line. Pass `on_bad_lines` instead, which drops the record.
+readable, so `on_error` is the wrong answer for it. Dropping the file would discard every
+good row to be rid of one bad line. Pass `on_bad_lines` instead, which drops the record.
 
 ```python
-import os
-import tempfile
-
 path = os.path.join(tempfile.mkdtemp(), "events.csv")
 with open(path, "w") as f:
     f.write("id,amount\n1,10\n2,20,stray\n3,30\n")
@@ -290,6 +280,24 @@ row and log it with the offending text), or `"skip"` (drop it silently). Dropped
 counted on the metrics export as `malformed_rows_total`, separately from the
 `skipped_total` that counts whole files, because a total mixing rows with files answers
 neither question.
+
+The third failure is **a wrong encoding**: bytes that are readable, but not in the encoding
+you asked for. A text corpus assembled from scrapes, exports and legacy systems is a
+mixture, and a single stray byte is not a reason to lose a file. `read.text` replaces what
+it cannot decode with U+FFFD by default, in both `mode="line"` and `mode="file"`.
+`errors="strict"` turns it into a per-file failure that `on_error="skip"` will then drop:
+
+```python
+d = tempfile.mkdtemp()
+with open(os.path.join(d, "legacy.txt"), "wb") as f:
+    _ = f.write("caf\xe9\n".encode("cp1252"))
+
+print(bt.read.text(d).to_pydict()["text"])
+print(bt.read.text(d, encoding="cp1252").to_pydict()["text"])
+```
+
+Replacement is a fallback, not an answer. If you know what the bytes are, naming the
+`encoding` is the fix.
 
 Coming from another engine, the spellings map as follows.
 

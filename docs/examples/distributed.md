@@ -34,6 +34,11 @@ assert single.schema == many.schema
 assert single.to_pydict() == many.to_pydict()
 ```
 
+Read that assertion for what it is. `num_partitions` divides the work locally and decides
+whether an operator spills. It does not distribute anything. The check proves the algebra is
+indifferent to how the work is cut, which is necessary and not sufficient: only
+`--distributed` against a real cluster exercises the shuffle.
+
 The claim to state carefully is about floating point. The multiset of rows, every column name
 and every column type are exact. Floating-point reductions are identical *up to
 reassociation*: `combine` is associative in exact arithmetic, IEEE addition is not, and the

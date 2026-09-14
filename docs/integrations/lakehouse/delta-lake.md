@@ -266,7 +266,7 @@ bound the window by time instead, taking the same spellings as `timestamp=` abov
 
 :::{note}
 Without a bound the feed is an unbounded source, so `collect()`, `count()` and joins raise. That is
-deliberate — consume it with `iter_batches()` or a streaming write.
+deliberate. Consume it with `iter_batches()` or a streaming write.
 :::
 
 ## Exactly-once writes from a stream
@@ -291,11 +291,12 @@ it.
 loser raises {py:exc}`CommitError <batcher.CommitError>`. Catch it and retry the write; the data files it already staged are
 unreferenced, and vacuum will reclaim them.
 
-**Deletion vectors.** A table with DVs enabled cannot be read file by file, because the data files
-still hold the deleted rows. Batcher detects that from the log and reads through delta-rs's
-DataFusion path, which applies the vectors. Correct, but it costs the split-parallel read and the
-exact row-count-from-log. If a Delta read is unexpectedly slow and single-threaded, check
-`delta.enableDeletionVectors`.
+**Deletion vectors.** A DV leaves its rows physically in the data file, marked deleted in the log.
+Batcher still reads one split per file, and each split applies its own file's vector before the
+predicate, so the split-parallel read survives. The row count survives too: it is the add actions'
+records less what the vectors delete, which is exact. What a DV table gives up is the
+whole-dataset scan fast path, since files carrying a vector are read fragment by fragment while
+the untouched ones stay on it.
 
 **Change data feed.** Needs `delta.enableChangeDataFeed = true` on the table *before* the commits
 you want to read. CDF is not retroactive, and turning it on later does not recover the history in

@@ -58,7 +58,7 @@ def test_referenced_columns_descends_into_every_child_node() -> None:
     children") and the IR snapshot's representative instances to rebuild each node
     with a probe column planted in one child, then asserts the walk finds it.
     """
-    from tests.unit.test_ir_snapshot import _representatives
+    from test_ir_snapshot import _representatives
 
     from batcher.plan.expr_rewrite.traverse import _EXPR_KIDS, _EXPR_REBUILD
 

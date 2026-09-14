@@ -1,5 +1,293 @@
 # Batcher CPU benchmark results
 
+## The board as it stands, on four engines (2026-09-13)
+
+A full sweep with `duckdb_arrow` in the lineup, which is what makes the rest of this file
+readable: `duckdb` is DuckDB on its own compressed storage, `duckdb_arrow` is the same DuckDB
+over the *same Arrow buffers Batcher reads*. Best-of-five, one process per case, 48-core box,
+nothing else running.
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars | losing cases |
+|---|---:|---:|---:|---:|
+| TPC-H sf1 | 0.72 | **0.25** | 0.54 | 6 of 22 |
+| operator mix | 0.75 | **0.47** | 0.16 | 13 of 46 |
+| ClickBench | 0.65 | **0.16** | 0.37 | 15 of 43 |
+| H2O groupby | 1.05 | **0.83** | 0.53 | 6 of 10 |
+| H2O join | 0.63 | **0.58** | 0.51 | **0 of 5** |
+| JSON | 0.35 | **0.32** | 0.01 | **0 of 5** |
+
+Forty losing cases out of 131. `benchmarks/results/LOSS_BACKLOG.md` carries all forty, ordered
+by absolute gap, with the `duckdb_arrow` time on every row.
+
+**Nineteen of the forty are storage, not execution** — both Arrow-native engines are behind
+Batcher on them and only DuckDB-native is ahead, by one to four milliseconds. Ten of ClickBench's
+fifteen losses are this shape (`cb-q41`: 6.1 ms against DuckDB-native's 4.3 and
+DuckDB-on-Arrow's **43.4**). They close by reading fewer bytes — `StringView`, dictionaries kept
+through the kernels, block statistics over in-memory inputs — which is ceiling 2 of
+`competitive_architecture.md` and a roadmap item, not a kernel to sharpen.
+
+**The other twenty-one are this engine's**, and the four largest are `h2o-gb-q8` (34 ms),
+`op-except` (22 ms), `h2o-gb-q7` (16 ms) and `op-join-build-large` (15 ms). Each has a
+diagnosis in the backlog; two of them have an attempt already measured and reverted.
+
+**What moved today**, all measured on this board against the same engines:
+
+| case | before | after |
+|---|---|---|
+| `op-join-range` | 329.0 ms (3.68x) | **79.6 ms (0.89x)** |
+| `op-expr-case` | 21.2 ms (2.08x) | **8.2 ms (0.68x)** |
+| `op-join-build-large` | 107 ms (1.89x) | **70.6 ms (1.27x)** |
+| `op-expr-date-part` | 9.0 ms (3.66x) | 6.0 ms (2.50x) |
+| `op-str-length` | 10.9 ms (3.96x) | 4.6 ms (1.53x) |
+
+## A four-arm CASE copied the batch eight times, and an unshardable join ran on one core (2026-09-12)
+
+Two operator losses closed, and a measurement lesson about which comparisons on this board are
+signal.
+
+### `op-expr-case`: 2.08x DuckDB -> 0.68x
+
+The case is a four-arm `CASE` bucketing `l_discount` into named bands, grouped. The identical
+ladder returning **integers** already won (6.8 ms against 10.5); the one returning **strings**
+lost at 21.2 against 10.2. So the cost was never the branching.
+
+`eval_case` evaluates each arm over the whole batch and folds the arms together with `zip`, so a
+four-arm `CASE` over six million rows builds **eight full-length arrays** to produce one, and a
+string is the most expensive thing to copy eight times. When every arm is a literal the
+selections already partition the rows, so the column can be built straight from them in one pass
+(`bc-expr/src/eval/branch/literal_case.rs`): offsets from the arms' own lengths, then one
+`extend_from_slice` a row.
+
+| | before | after | DuckDB |
+|---|---|---|---|
+| four-arm `CASE` to strings, grouped | 21.2 ms (473 ms CPU) | **8.2 ms (153 ms CPU)** | 10.2 ms |
+
+A NULL arm declines by construction rather than by a check: the control plane lowers `lit(None)`
+as `nullif(1, 1)`, which is not a literal. Mixed families decline too, so `coerce_numeric` keeps
+the `when(...).then(0).otherwise(x)` case it already handles.
+
+### `op-join-build-large`: 107 ms -> 68 ms, by fixing a probe count that read zero
+
+Two 1.5M-group aggregates over `lineitem`, joined and counted. The streaming executor cannot
+shard a plan that scans one source twice — the shape of every self-join and correlated subquery
+— so the whole probe pipeline runs on **one core** while the materializing executor partitions
+the same join across all of them. The hand-off for exactly this (`InterpError::PreferMaterializing`)
+was already there and never fired, for a reason that took an instrumented build to see.
+
+`spine_join_blocks_sharding` judges the join by comparing the probe side's rows against the
+build's. It takes the probe count from `leftmost_scan`, which **stops at a materialized node by
+design** — and in this shape the probe side *is* a materialized breaker (the aggregate the
+executor just evaluated). So the count came back zero, compared unfavourably against a 1.2M-row
+build, and the check declined every time. Counting the breaker's own output is what the join
+will actually probe with.
+
+With a probe count that exists, the second condition can be relaxed where it is safe to: an
+unshardable plan with a single hash join and a probe side over a million rows hands off even
+when the build is small enough to probe per morsel, because the alternative is not a better
+probe, it is one core.
+
+| | before | after |
+|---|---|---|
+| `op-join-build-large` | 107 ms | **68 ms** (DuckDB 55) |
+| operator mix, join/group-by third, 3 repeats | 0.745 | **0.717** |
+| TPC-H sf1 geomean, 5 repeats | 0.731 | 0.733 (unmoved, 2% spread) |
+
+**Two attempts before this one were reverted, and both looked reasonable.** Lowering the
+flat-probe admission ceiling for semi/anti joins left the target unmoved and cost `op-join-semi`
+12.9 -> 17.3 ms, because declining the morsel probe does not route to the partitioned join — it
+routes to the *sequential* join inside the streaming pipeline. Moving the hand-off judgement to
+before the sharding decision, rather than only after it fails, cost `op-join-agg` 29 -> 47 ms and
+`op-join-semi` 14 -> 22 ms while still not moving the target.
+
+### Tried and reverted: `EXCEPT` as a null-safe anti-join (47 ms -> 260 ms)
+
+`op-except` is the operator mix's second-largest execution loss — 47 ms against Polars' 23 —
+and the algorithm is the reason. `Dataset._set_membership` lowers `EXCEPT`/`INTERSECT` by
+tagging both sides, unioning them, grouping by the whole row and reading two membership flags
+per group: 7.5M rows through a 1.5M-group aggregate. A semi/anti join is the same answer and
+is what Polars does.
+
+It is not written that way because SQL compares NULLs **equal** in a set operation while a hash
+join drops NULL keys, so a naive anti-join keeps every null-keyed left row. That is fixable with
+no engine change: join on `(fill_null(c, standin), c IS NULL)` instead of `c`, which makes two
+NULLs meet and cannot collide a real value with a NULL. It is correct — the whole set-op
+differential suite passes, 115 cases including the NULL files — and it is **5.6x slower**:
+`EXCEPT` 43.8 -> 260.2 ms, `INTERSECT` 45.0 -> 111.1.
+
+The cause is that the second key column leaves the fast path. `hash_join_indices` has a
+single-integer-key route that hashes and compares native values; two columns go through
+`RowConverter`, which is a per-row encode and a byte-slice compare on every chain walk. The
+null-safety cost more than the algorithm saved.
+
+So the join form needs a **single** null-safe key, which means either an engine-level
+null-equal join mode or a proof that the key columns hold no NULLs (`kyber.metadata_answer`
+already answers `exact_null_count` where a source declares it). Both are real designs; neither
+is a lowering change, which is what this attempt assumed. The group-by form stays.
+
+### The measurement lesson: an 8% per-case move on this board is noise
+
+Comparing two single-pass boards showed eight TPC-H "regressions" from the join change —
+including q1 and q6, which contain no join at all. `--repeat 5` says why: the **median per-query
+spread is 11%** across the 22 TPC-H cases, while the geomean's spread is 1.4-2.3%. The two
+engines' geomeans are 0.731 and 0.733, which is the same number.
+
+The harness prints this and it is worth reading before acting on any single row: *"a single-pass
+per-query ratio is far less reproducible than the geomean above it — quote a row only if it was
+repeated, and never a row that crosses 1.00."* Every per-case number in this entry is either a
+30%+ move or was repeated.
+
+## A grouped aggregate on a join's probe side ran on the executor that is three times slower for it, and one order-preserving join that is not (2026-09-12)
+
+`op-join-build-large` — two 6M-row `GROUP BY l_orderkey` aggregates, 1.5M groups each, joined
+and counted — is the operator mix's second-largest loss at 1.93x DuckDB. This closes part of it
+and records the rest, because the part that is left has a measured diagnosis and no safe fix.
+
+### What was wrong: the same guard, applied on one side of the join only
+
+The streaming executor already knows that a **join-free grouped aggregate** belongs on the
+materializing executor: `builds::build_materializes_faster` routes it there, and the note beside
+it measures TPC-H q18's build side at 4,660 ms streamed against 736 ms materialized. That guard
+was applied to *build* sides and to whole plans, and not to the probe spine — so in a join whose
+two inputs are both grouped aggregates, one of them took the fast route and the other did not.
+
+`parallel::materialize_spine_breakers` now applies the identical guard. Measured on the shape,
+best of four, against the unchanged engine:
+
+| query | before | after |
+|---|---|---|
+| `agg(1.5M groups) ⋈ agg(1.5M groups)`, counted | 84.8 ms | **65.6 ms** |
+| the same with both filters (`op-join-build-large`) | 117.0 ms | **103.6 ms** |
+| a bare `GROUP BY l_orderkey` (control) | 12.9 ms | 12.9 ms |
+
+### What is still wrong, and what it is not
+
+The case still loses. `execution.streaming=False` runs the identical query in **39.8 ms** against
+the streaming executor's ~104 and DuckDB's 54.5, and the cause is *not* the aggregates — those
+now cost ~13 ms each on either route. It is the join: the streaming executor serves it with a
+flat per-morsel probe against a 1.2M-row build table, which `Admission::admits` allows for any
+build under `RADIX_MIN_BUILD_ROWS_BROADCAST` (~2.1M rows), while the materializing executor
+radix-partitions both sides into cache-resident buckets. The same join over pre-materialized
+inputs is 8.5 ms.
+
+Lowering that ceiling for semi/anti joins was tried and reverted: it left the case unmoved
+(105.7 ms) and cost `op-join-semi` 12.9 -> 17.3 ms and `op-join-anti` 13.1 -> 18.9 ms. The
+ceiling is a fitted constant defending a real trade; the fix wanted here is a cost comparison
+that reads the *probe* size too, not a smaller constant.
+
+### Where the rest of the board's losses are, measured rather than guessed
+
+Half the remaining losing cases are small queries losing by one to three milliseconds, and they
+share a cause that is not in any operator. **A query that computes nothing costs 1,046 us**, of
+which the engine call is 170 us: the other 876 us is control plane, spread thin across roughly
+ten subsystems at 50-150 us each (admission, the pressure probe, plan-cache keying, the learned
+stats bundle, metadata feedback, source resolution, resource decisions). Measured with the event
+log off, best of 200 runs of `SELECT SUM(a + 1) FROM t` over three rows.
+
+That is the whole of the gap on the cases where DuckDB answers in 2-5 ms. `h2o-gb-q4` is
+10.1 ms against 5.3; a 6M-row seven-group aggregate is 4.1 ms against 2.6 with *identical* CPU
+time (49 ms against 50), so the engine is doing the same work and the difference is what
+surrounds it. No single item on the profile is worth more than about 15% of the fixed cost, so
+closing it is a campaign rather than a fix, and it is the largest single lever left on the
+board: it would move `op-expr-*`, most of ClickBench's fourteen losing cases, and the
+low-cardinality h2o questions at once.
+
+### The parallel join that looked order-preserving and is not
+
+`stream::materialized_join_from` runs its join on one core, and the note beside it has said for
+some time that parallelizing it is worth ~55% of TPC-H q4 but needs an *order-preserving* join,
+because this executor's contract is the same rows in the same order as `crate::execute`.
+
+`join_par::broadcast_join` appears to be exactly that — build once, probe contiguous row ranges,
+concatenate in range order — and a test at 200,000 x 150,000 rows confirms it agrees with the
+sequential join on every join type. That test is worthless and the swap it certified fails
+`stream_oracle::a_semi_join_with_a_huge_build_matches_the_oracle`.
+
+The regime this arm actually runs in is the one the test did not reach. A semi join only lands
+here when its build is past the broadcast ceiling, and past a further threshold
+`hash_join_indices` flips to `semi_anti_swapped`: it builds the *small probe side* and marks it,
+so its output order is the build walk's, not the probe's. Measured across four sizes and four
+join types, exactly two cells disagree — inner/left above the radix threshold, and semi above the
+flip — and the second cell is the only one this caller ever sees.
+
+The matrix is now pinned in `join_par::tests::broadcast_matches_the_sequential_join_where_the_order_is_defined`,
+sized to include the flip, so the next person to reach for this join measures the regime it runs
+in rather than the one that agrees. **A positive control at the wrong size is worse than none:**
+it turns "not yet proven" into "proven safe" without changing what is true.
+
+## A range join against six buckets sorted six million rows, and a date part cost more than the group-by it fed (2026-09-12)
+
+Two operator losses from the expanded operator mix, both closed, and one methodology note
+about how the first of them was nearly mismeasured.
+
+### `op-join-range`: 329.0 ms -> 79.6 ms, from 3.68x DuckDB to 0.89x
+
+`SELECT b.lo, COUNT(*) FROM lineitem l JOIN (six discount bands) b ON l.l_discount >= b.lo
+AND l.l_discount < b.hi GROUP BY b.lo` was the largest single gap on the board — 239.6 ms
+against DuckDB, more than every ClickBench loss put together.
+
+The operator has two strategies and both sort the *left* side, because both answer "which
+right rows match this left row" by searching a sorted order. Against six rows that is six
+million rows sorted twice to answer six comparisons a row.
+
+`bc-runtime/src/join/range/small.rs` adds a third: with at most 32 right rows, scan each
+right row across the left key column with an Arrow comparison kernel, chunked at 65,536 rows
+and run in parallel. No sort, no universe, no mark array.
+
+Two details worth keeping:
+
+* **The gate is on size alone, never on the predicate.** So the scan serves one inequality or
+  two, every operator combination, and every join type — including the shape that motivated
+  it, which `band::bounds` structurally cannot see. The band path recognises two conditions
+  bounding one *right* key; a bucket table is the mirror of that (one left key bounded by two
+  right columns), which is an interval-stabbing query rather than a contiguous slice, so it
+  fell through to IEJoin.
+* **The oracle is the strategy it replaces.** The in-crate test runs the scan and IEJoin over
+  the same data for all sixteen operator pairs and all six join types and compares the index
+  pairs; `tests/differential/test_diff_range_join_small_side.py` holds the whole family
+  against DuckDB over 70,000 left rows with nulls. Both were mutation-checked: swapping one
+  `>=` for `>` inside the scan fails nine of the fourteen differential cases, and the case at
+  33 right rows keeps passing, which is also how the threshold is shown to be live.
+
+### `op-expr-date-part`: 3.66x -> 2.07x, and the 64-bit version was slower than doing nothing
+
+Arrow's `date_part` builds a `chrono::NaiveDateTime` per value. `SUM(EXTRACT(YEAR FROM
+l_shipdate))` over 6M rows spent 111 ms of CPU where the same aggregate over `l_linenumber +
+1` spent 25 ms — the extraction cost more than the aggregation it fed.
+
+The replacement is the civil-from-days decomposition (`bc-expr/src/eval/temporal/civil.rs`),
+and the first version of it **lost**: 12.8 ns a row against the kernel's 10.8. A 64-bit
+division by a constant is a widening multiply, and the decomposition is seven of them on a
+dependency chain. Biasing the values by a whole number of eras so they are non-negative, and
+doing the arithmetic in `u32`, makes every division a 32-bit multiply-high with no sign
+handling: **7.3 ns**. Day-of-week needs no decomposition at all — 2.8 ns against 12.4.
+
+| shape | before | after | DuckDB |
+|---|---|---|---|
+| `SUM(EXTRACT(YEAR FROM l_shipdate))` | 5.8 ms | **4.4 ms** | 1.5 ms |
+| `EXTRACT(YEAR ...)` as a group key | 7.4 ms | **5.5 ms** | 2.2 ms |
+
+Still a loss, and the rest of it is not the kernel: the same aggregate over `l_linenumber + 1`
+is 2.7 ms against DuckDB's 1.3, so about 1.4 ms of the remaining gap is per-query fixed cost
+that every small query here pays.
+
+Arrow's kernel stays the oracle and the fast path declines rather than extends it: only a
+`Date32` or a timezone-naive `Timestamp` takes it, and a column holding any value outside
+chrono's range falls back whole.
+
+### The methodology note: a compile during a benchmark run is worth 3.35x
+
+The first board run reported `h2o-join-q1` at 292.2 ms against DuckDB's 87.2 — a 3.35x loss
+on a shape the suite is built to measure. It does not reproduce. Re-run on a quiet box the
+same case is **71.0 ms against 90.5**, and every one of the five h2o-join questions wins
+(geomean 0.65x DuckDB, 0.48x Polars).
+
+The difference was `cargo test -p bc-runtime` and a release build, started by this session
+while the board was still running — `.claude/rules/concurrent-agents.md` warns about exactly
+this and it was still walked into, because the compile felt like "not a benchmark". A 48-core
+compile beside a 46-thread engine is not background noise. **Every number in this entry that
+matters was re-taken with nothing else on the box**, and the suites the contaminated run
+touched were re-run whole rather than patched case by case.
+
 ## Found and not fixed: a distributed `LIMIT` larger than its input loses row order, because the optimizer removes the `LIMIT` that asked for it (2026-09-12)
 
 **Pre-existing, root-caused, deliberately left alone.** Recorded so the next person does not

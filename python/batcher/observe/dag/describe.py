@@ -147,7 +147,10 @@ _DESCRIBERS = {
     "filter": lambda node: expr_text(node.get("predicate")),
     "window": _describe_aggregate,
     "distinct": lambda node: ", ".join(_alias(k) for k in node.get("keys", [])),
-    "union": lambda node: "all" if node.get("all") else "distinct",
+    # The IR field is `distinct` (`Union.to_ir`), not `all`. Reading a key the node does not
+    # carry made `.get(...)` return `None` for every union ever rendered, so `explain()` labelled
+    # a UNION ALL "distinct" and a UNION "all" — backwards, on both, silently.
+    "union": lambda node: "distinct" if node.get("distinct") else "all",
 }
 
 

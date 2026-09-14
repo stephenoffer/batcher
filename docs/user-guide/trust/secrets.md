@@ -14,14 +14,14 @@ Pass a key reference rather than the raw key:
 
 ```python
 # docs: skip
-enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))            # from the environment
+enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))  # from the environment
 enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "file:/run/secrets/aes"))  # from a mounted secret
 ```
 
 `env:NAME` reads an environment variable and `file:PATH` reads a mounted secret file. Only
-the reference travels in the plan IR, so plan logs, the profile, `explain()`, and the FFI
-boundary never see the secret. The data plane resolves it on the machine that runs the
-query, so a distributed query reads the key on each worker instead of shipping it over the
+the reference travels in the plan IR. Plan logs, the profile, `explain()`, and the FFI
+boundary never see the secret, and the data plane resolves it on the machine that runs the
+query, so a distributed query reads the key on each worker rather than shipping it over the
 wire.
 
 A `file:` reference is an ordinary path, so the round trip runs anywhere:
@@ -55,15 +55,18 @@ URI. That is the larger secret surface in most deployments.
 # docs: skip
 import batcher as bt
 
-bt.read.clickhouse(query="SELECT ...", host="ch.internal", database="events",
-                   password="env:CH_PASSWORD")
+bt.read.clickhouse(
+    query="SELECT ...", host="ch.internal", database="events", password="env:CH_PASSWORD"
+)
 
 bt.read.table("connectorx", query="SELECT ...", conn_uri="file:/run/secrets/pg_uri")
 
 bt.read.mongo(uri="env:MONGO_URI", database="app", collection="events")
 
-bt.read.parquet("oss://bucket/events/*.parquet",
-                storage_options={"key": "env:OSS_KEY", "secret": "cmd:prod/oss-secret"})
+bt.read.parquet(
+    "oss://bucket/events/*.parquet",
+    storage_options={"key": "env:OSS_KEY", "secret": "cmd:prod/oss-secret"},
+)
 ```
 
 All three schemes work here, including `cmd:`, and so do the `storage_options` an object
@@ -82,13 +85,14 @@ A literal password still works unchanged. This is additive, not a migration.
 Two schemes cover an external key store from anywhere in the engine, including the
 expression layer, and neither links a cloud SDK into it.
 
-**A file, via the platform's own secret delivery.** Vault Agent, the External Secrets
-Operator, and the Kubernetes secrets-store CSI driver all materialize a secret as a file,
-so `file:/run/secrets/aes-key` *is* the integration. Rotation, authentication, and audit
-stay with the platform that owns them.
+The first is a file the platform delivers. Vault Agent, the External Secrets Operator, and
+the Kubernetes secrets-store CSI driver all materialize a secret as a file, so
+`file:/run/secrets/aes-key` *is* the integration. Rotation, authentication, and audit stay
+with the platform that owns them.
 
-**`cmd:NAME`, via a helper program.** Batcher runs the operator-configured
-`BATCHER_SECRET_COMMAND` with `NAME` as its argument and takes stdout as the secret:
+The second is `cmd:NAME`, which goes through a helper program. Batcher runs the
+operator-configured `BATCHER_SECRET_COMMAND` with `NAME` as its argument and takes stdout as
+the secret:
 
 ```bash
 export BATCHER_SECRET_COMMAND=/usr/local/bin/fetch-secret   # your wrapper around
@@ -118,7 +122,7 @@ once:
 | `vault:` | `vault:secret/data/warehouse#password` | HashiCorp Vault KV, v1 or v2 |
 | `aws-sm:` | `aws-sm:prod/warehouse#password` | AWS Secrets Manager |
 | `aws-ssm:` | `aws-ssm:/prod/warehouse/password` | AWS SSM Parameter Store |
-| `gcp-sm:` | `gcp-sm:projects/p/secrets/db-password` | GCP Secret Manager |
+| `gcp-sm:` | `gcp-sm:projects/p/secrets/db-password` | Google Cloud Secret Manager |
 | `azure-kv:` | `azure-kv:https://v.vault.azure.net/secrets/db` | Azure Key Vault |
 
 ```python
@@ -133,12 +137,12 @@ The `#key` suffix selects a field when the stored secret is a JSON object, which
 the Secrets Manager console writes for anything with more than one field, and which key of
 a Vault path is meant.
 
-**Each of these resolves on the worker that opens the connection, against that machine's
-own identity.** On a distributed query only the reference travels in the split; each
-worker authenticates as itself through an instance profile, an IRSA role, a Workload
-Identity binding, or a Vault Kubernetes login. A node without an identity fails closed
-rather than inheriting the driver's. This is the same property the `env:`/`file:`/`cmd:`
-schemes have, and the reason all of them are references rather than values.
+Each of these resolves on the worker that opens the connection, against that machine's own
+identity. On a distributed query only the reference travels in the split, and each worker
+authenticates as itself through an instance profile, an IRSA role, a Workload Identity
+binding, or a Vault Kubernetes login. A node without an identity fails closed. It does not
+inherit the driver's. This is the same property the `env:`/`file:`/`cmd:` schemes have, and
+the reason all of them are references rather than values.
 
 Vault needs no extra package: its read is one authenticated GET. The three cloud stores
 need their vendor SDK, so install `batcher-engine[aws-secrets]`,

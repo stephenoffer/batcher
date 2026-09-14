@@ -4,7 +4,7 @@ Standard deviation is a poor summary of a long-tailed distribution, which descri
 
 The whole script, executed on every test run:
 
-```{literalinclude} ../../../examples/statistics/robust_dispersion.py
+```{literalinclude} ../../../../examples/statistics/robust_dispersion.py
 :language: python
 :linenos:
 ```
@@ -19,5 +19,5 @@ python examples/statistics/robust_dispersion.py
 
 - {doc}`/cookbook/metrics/statistics/quantiles_and_histograms`: quantiles, histograms, and the exact-versus-approximate trade.
 - {doc}`/cookbook/metrics/statistics/summary_statistics`: summary aggregates beyond mean and stddev.
-- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and hypothesis tests.
 - {doc}`/api/models/ml-statistics`: the reference for every statistical function.

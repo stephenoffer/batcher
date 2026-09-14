@@ -21,7 +21,7 @@ people = bt.from_pydict(
 
 contract = people.dq.in_range("age", 0, 120).accepted_values("country", ["US", "CA"])
 
-report = contract.validate()          # a report, no raise
+report = contract.validate()  # a report, no raise
 clean, rejected = contract.quarantine()  # both sides, for a dead-letter sink
 
 assert not report.ok
@@ -29,9 +29,9 @@ assert clean.count() + rejected.count() == people.count()
 assert rejected.to_pydict()["id"] == [4]
 ```
 
-`drop` keeps only the conforming rows and `fail` raises. Profiling first is what makes the
-thresholds defensible: writing a contract without looking at the null rate, cardinality and
-range is guessing.
+`drop` keeps only the conforming rows and `fail` raises. Profile first. Writing a contract
+without looking at the null rate, cardinality and range is guessing, and profiling is what
+makes the thresholds defensible.
 
 ## Checks that can actually fail
 
@@ -48,9 +48,8 @@ That distinction matters: an aggregate computed by a restricted principal is com
 the restricted rows, so a count cannot leak the size of the hidden set, and a masked column
 stays masked inside a group-by even when the query never projects it.
 
-Residency defaults to `off`, which makes every check pass. That is deliberate, so a fleet can
-measure in `advisory` before it blocks in `strict`, and it means setting the mode is the whole
-control.
+Residency defaults to `off`, so every check passes. That is deliberate: a fleet measures in
+`advisory` before it blocks in `strict`. Setting the mode is the whole control.
 
 ## Every script on this page
 

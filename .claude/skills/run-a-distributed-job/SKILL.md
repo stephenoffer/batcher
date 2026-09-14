@@ -79,13 +79,18 @@ comparing **order-independently** unless the query ends in an explicit `sort`:
 # Needs a cluster.
 import batcher as bt
 
+
 def pipeline() -> bt.Dataset:
-    return bt.read.parquet("s3://lake/sample/*.parquet").group_by("region").agg(
-        revenue=bt.col("amount").sum()
+    return (
+        bt.read.parquet("s3://lake/sample/*.parquet")
+        .group_by("region")
+        .agg(revenue=bt.col("amount").sum())
     )
+
 
 def rowset(t) -> set:
     return {tuple(r.values()) for r in t.to_pylist()}
+
 
 assert rowset(pipeline().collect()) == rowset(pipeline().collect(distributed=True, num_workers=2))
 ```
@@ -132,7 +137,7 @@ cfg = Config().replace(
     flow_control=FlowControlConfig(default_credits=16),
     distributed=DistributedConfig(namespace="nightly-etl", resilience="spot"),
 )
-bt.set_config(cfg)          # or: with bt.config_context(cfg): ...
+bt.set_config(cfg)  # or: with bt.config_context(cfg): ...
 ```
 
 - `MemoryConfig`: `soft_limit=0.85`, `hard_limit=0.9`, `max_memory_bytes=None` (auto-sensed —

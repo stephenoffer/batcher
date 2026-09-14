@@ -117,6 +117,11 @@ larger than the envelope raises `MemoryBudgetExceededError` naming the budget it
 rather than letting the process be killed. Put the smaller relation on the right of a range
 join.
 
+A right side of at most 32 rows over a large left one is cheaper still, because it needs no
+sort at all: the join compares each right row against the left key column directly. A bucket
+table, a set of price bands or a handful of date ranges is therefore the least expensive shape
+to join on, whatever the left side's size.
+
 Every operator that cannot spill refuses the same way, so one `except` covers them:
 
 ```python

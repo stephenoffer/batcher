@@ -1,6 +1,6 @@
 # Environment report
 
-Half of "it works on my machine" is an optional extra present in one environment and absent in the other. These calls answer that in one line, and they are the first thing to include when reporting a problem.
+Half of "it works on my machine" is an optional extra present in one environment and absent in the other. `bt.versions()` and `bt.show_versions()` answer that in one line. Paste them into any bug report. Check `engine_profile` before you trust a timing: a debug build and a release build are not comparable.
 
 The whole script, executed on every test run:
 

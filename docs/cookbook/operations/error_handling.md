@@ -1,6 +1,6 @@
 # Error handling
 
-Every error the engine raises descends from ``BatcherError``, so a pipeline can catch that one type at its boundary. The specific subclasses let you distinguish a user mistake (``PlanError``) from an environment problem (``IOError``) from a missing extra (``MissingDependencyError``), which is the difference between retrying and giving up.
+Every error the engine raises descends from `BatcherError`, so one handler at the pipeline boundary catches all of them. Catch a subclass when the response differs. `PlanError` is your mistake, `IOError` is the environment's, and `MissingDependencyError` means an optional extra was never installed, which is the difference between retrying and giving up. `ColumnNotFoundError` is also a `KeyError`, so mapping-style handling works on it too.
 
 The whole script, executed on every test run:
 

@@ -1,6 +1,6 @@
 # JIT compilation
 
-*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` tree into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
+*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns a scalar `bc_expr::Expr` tree, the one the interpreter evaluates, into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
 
 The problem it solves is allocation. The interpreter materializes a full Arrow array for every node of an expression tree. For `(a - b) * c` over a morsel that is two temporary 16,384-element arrays, three kernel passes, and three trips through memory. The values never stay in registers.
 
@@ -95,6 +95,10 @@ Anything else with nulls (`Case`, `Coalesce`) falls back to the interpreter for 
 The two fallbacks are independent, and both land on the same oracle. `try_compile` returning
 `None` means the *expression* is outside the subset. `eval` returning `Err` means *this
 batch* is, and only this batch reverts.
+
+Those two refusals leave the compiled path at different heights because they cost different amounts:
+
+![Where the JIT gives up, and how much it gives up each time. The compiled path runs down the left: bc-codegen's analyze() decides which types and operators can compile, a successful compile yields one Arc<CompiledExpr> that is Send plus Sync and shared by every worker, compiled exactly once, and bc-interp drives eval(batch) over 16,384 rows at a time, reusing that artifact for every morsel and never recompiling. The compile cache on the right, keyed on the expression and the schema and capped at 1024 entries, is asked before anything compiles, and a refusal is remembered too. The two refusal edges differ in blast radius. Failing analyze means the expression is outside the subset, so that operator never compiles at all and runs on Expr::eval, the interpreter and the oracle, for the life of the query. Failing at eval, on nulls the compiled body cannot carry, costs this batch only and the next one tries again. The subset is narrow on purpose: numeric, date and timestamp columns, arithmetic and comparison, and no strings.](/_static/diagrams/jit_fallback.svg)
 
 ## SIMD
 

@@ -21,6 +21,11 @@ metrics string. Routing bulk data through Ray objects reintroduces exactly the s
 and OOM overhead the columnar design removes.
 :::
 
+The two planes are physically separate channels between the same pair of workers, and that
+is the half of the paragraph above a reader skims.
+
+![A shuffle runs on two separate channels between the same pair of workers. On the control plane, Ray schedules the tasks and actors and carries an address, a ticket, a file path, a row count and a metrics JSON string, and nothing else: the mapper's Flight address goes up through Ray and the reducer's ticket comes back down. On the data plane, the mappers' partition_batches publishes every bucket including the empty ones, and the Arrow record batches travel directly to the reducers over do_exchange on gRPC, LZ4 by default and credit-bounded, one credit being one batch slot with the producer blocking at zero. The reducers fold arrivals into a running partial in Rust through gather_combine, so the intermediate never crosses back into Python. Bulk batches never pass through the Ray object store, because routing them through it reintroduces the serialization the columnar design removes.](/_static/diagrams/shuffle_dataflow.svg)
+
 ```text
    MAPPERS                                                REDUCERS
    ───────                                                ────────
@@ -53,7 +58,7 @@ A reducer fetching a bucket has three possible sources, and it picks the cheapes
 any configuration. The selector is pure, taking placement in and returning a mode, so the
 whole decision is the two comparisons below.
 
-![Carbonite routes one shuffle partition by placement. The same Flight address means one process, so DIRECT_MEMORY reads from the local store with no serialization. The same node identity means one host, so SHARED_MEMORY uses Arrow IPC over a memory map, which is selected today but not yet executed. Anything else falls back to NETWORK over credit-bounded Arrow Flight.](/_static/diagrams/transfer_modes.svg)
+![Carbonite routes one shuffle partition by placement. The same Flight address means one process, so DIRECT_MEMORY reads from the local store with no serialization. The same node identity means one host, so SHARED_MEMORY reads the bucket back through Arrow IPC over a memory map. Anything else falls back to NETWORK over credit-bounded Arrow Flight.](/_static/diagrams/transfer_modes.svg)
 
 | Source | Path | Cost |
 |---|---|---|
@@ -65,7 +70,7 @@ whole decision is the two comparisons below.
 address and node id. A matching Flight address means the same process, so `DIRECT_MEMORY`.
 Otherwise, two known and equal node identities mean the same host, so `SHARED_MEMORY`.
 Everything else is `NETWORK`. The same test is duplicated in Rust inside the concurrent
-gather in `crates/bc-py/src/shuffle.rs`, so a same-host bucket is read from shared memory
+gather in `crates/bc-py/src/shuffle/gather.rs`, so a same-host bucket is read from shared memory
 *inside* the parallel fetch rather than being serialized ahead of it. Cross-node buckets
 keep fanning out while the local ones are memcpy'd.
 
@@ -132,7 +137,7 @@ unambiguous signal: it means the worker is gone, never that the bucket happened 
 
 ## Fetching
 
-The reducer's gather is `crates/bc-py/src/shuffle.rs::drive`:
+The reducer's gather is `crates/bc-py/src/shuffle/gather.rs::drive`:
 
 1. Co-located buckets are read straight from the local store: no socket, no credit permit.
 1. The rest are spawned into a `JoinSet` bounded by a semaphore of
@@ -177,7 +182,7 @@ throughput at a fixed exchange width, and it does not license widening the excha
 the cluster: an exchange of `m` mappers and `r` reducers opens `m x r` streams, so a reducer
 count taken from the node count makes the *coordination* quadratic in the cluster while the
 bytes stay fixed. That is why the reducer count is sized from the data rather than the
-fleet — `aggregate_reducer_count` for an aggregate, whose exchanged volume is the group
+fleet: `aggregate_reducer_count` for an aggregate, whose exchanged volume is the group
 count, and `row_shuffle_reducer_count` for a join, sort or window, whose exchanged volume is
 the rows. Measured on a 64-worker fleet, a 64-group aggregate given one reducer per worker
 spent 302 ms moving a few kilobytes through 4,096 streams, against 91 ms through one.
@@ -230,8 +235,9 @@ where recompute transiently doubles live state it could be the cost that kills y
 
 So `ShuffleSession._shm_mirror_ok()` skips writing the mirror when the pressure monitor
 reports `SPILL` or worse. The reducer's read then misses, `fetch_shared` returns
-`Ok(None)`, and it falls back to Flight, which is bit-identical, so single-node equals
-distributed regardless. The fast path steps aside rather than risking OOM.
+`Ok(None)`, and it falls back to Flight, which carries the same batches. A missed mirror
+costs a memcpy's worth of latency and changes nothing else. The fast path steps aside rather
+than risking OOM.
 
 The mmap read itself is genuinely zero-copy: `read_mmap_zero_copy` wraps the mapping as an
 Arrow `Buffer::from_custom_allocation` so the decoded arrays point *into* it and the
@@ -255,7 +261,7 @@ be traced end to end:
 |---|---|
 | Flight server, handler, ticket, store | `crates/bc-transport/src/{exchange,handler,ticket,store}.rs` |
 | Shared-memory mmap path | `crates/bc-transport/src/shared.rs` |
-| Concurrent gather + fold | `crates/bc-py/src/shuffle.rs` |
+| Concurrent gather + fold | `crates/bc-py/src/shuffle/` |
 | The Ray actor hosting a worker's server | `python/batcher/dist/flight_worker.py` |
 | Per-operator shuffle driving | `python/batcher/dist/flight_{aggregate,join,sort,window}.py` |
 | Session, mode selection, reducer placement | `python/batcher/carbonite/transfer/` |

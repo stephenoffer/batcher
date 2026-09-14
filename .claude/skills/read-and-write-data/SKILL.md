@@ -43,7 +43,7 @@ directory**; it recovers the partition columns from the directory names and prun
 
 ```python
 ds.write(root, format="parquet", mode="overwrite", partition_by=["region"])
-back = bt.read.parquet_dataset(root)                    # columns: id, amount, region
+back = bt.read.parquet_dataset(root)  # columns: id, amount, region
 back.filter(bt.col("region") == "us").select("id", "amount").sort("id").to_pydict()
 # {'id': [1, 3], 'amount': [10.0, 30.0]}   ← the eu directory is never opened
 ```
@@ -54,8 +54,10 @@ decoding), `logs` (`pattern=` for grok capture), `documents` (PDF), `numpy`, `tf
 `webdataset`, `hdf5`, `zarr`.
 
 ```python
-bt.read.text(p).to_pydict()      # {'path': [...], 'line_number': [1, 2], 'text': ['hello', 'world']}
-bt.read.binary(p).select("size", "mime").to_pydict()   # {'size': [3], 'mime': ['application/octet-stream']}
+bt.read.text(p).to_pydict()  # {'path': [...], 'line_number': [1, 2], 'text': ['hello', 'world']}
+bt.read.binary(p).select(
+    "size", "mime"
+).to_pydict()  # {'size': [3], 'mime': ['application/octet-stream']}
 ```
 
 **Multimodal** — `images`, `audio`, `video`, `point_cloud`. These **list and describe by
@@ -103,10 +105,10 @@ source the typed methods do not wrap.
 needs a plain file path**:
 
 ```python
-bt.read("out/one.csv").count()             # 4    — extension inferred
-bt.read("out/*.parquet")                   # FormatError: could not infer a format
-bt.read("out/", format="parquet")          # fine — name it explicitly
-bt.read.parquet("out/**/*.parquet")        # fine — the typed method never guesses
+bt.read("out/one.csv").count()  # 4    — extension inferred
+bt.read("out/*.parquet")  # FormatError: could not infer a format
+bt.read("out/", format="parquet")  # fine — name it explicitly
+bt.read.parquet("out/**/*.parquet")  # fine — the typed method never guesses
 ```
 
 Prefer the typed `bt.read.<format>` method whenever the path is a directory or a glob.
@@ -145,9 +147,9 @@ databases and operational stores. Lakehouse sinks and `merge`/`merge_into` belon
 `"overwrite_partitions"` (replace only the partitions the new data covers).
 
 ```python
-ds.write(p, mode="error")     # PlanError: path already exists
-ds.write(p, mode="ignore")    # returns a manifest with 0 files
-ds.write(p, mode="append")    # PlanError for a file sink; fine for a table sink
+ds.write(p, mode="error")  # PlanError: path already exists
+ds.write(p, mode="ignore")  # returns a manifest with 0 files
+ds.write(p, mode="append")  # PlanError for a file sink; fine for a table sink
 ds.write(p, mode="overwrite_partitions", partition_by=["dt"])  # other dt= dirs survive
 ```
 
@@ -159,7 +161,7 @@ Spark's JDBC writer has no spelling for any of them.
 ```python
 ds.write.sql("orders", uri="mysql://db/shop", mode="upsert", key_columns="order_id")
 ds.write.sql("sessions", uri="postgresql://db/app", mode="delete", key_columns="sid")
-ds.write.dynamodb("scores", region_name="us-east-1")          # upsert is the default
+ds.write.dynamodb("scores", region_name="us-east-1")  # upsert is the default
 ```
 
 Pass `key_columns=` on the write that *creates* the table too. An upsert conflicts on the
@@ -198,9 +200,9 @@ and the driver concatenates them (a commutative merge) into one commit.
 
 ```python
 m = ds.write(root, format="parquet", partition_by=["region"])
-len(m.files)                        # 2
-sum(f.rows for f in m.files)        # 4
-m.files[0].partition_values         # {'region': 'us'}
+len(m.files)  # 2
+sum(f.rows for f in m.files)  # 4
+m.files[0].partition_values  # {'region': 'us'}
 ```
 
 **Layout knobs.** `partition_by=["region"]` writes Hive `region=us/` directories that a
@@ -227,7 +229,7 @@ re-run after a crash or spot preemption finishes only the unwritten shards. It i
 write. The engine enforces this rather than trusting you:
 
 ```python
-ds.write(p, format="parquet", resume=True)     # twice → still 4 rows
+ds.write(p, format="parquet", resume=True)  # twice → still 4 rows
 ds.group_by("region").agg(n=bt.count()).write(p2, format="parquet", resume=True)
 # PlanError: resume=True is exactly-once only on a deterministic plan ...
 ```
@@ -242,9 +244,9 @@ A file source infers its schema from metadata once and caches it. In the default
 for a directory written over months. Pass a reconciliation mode (`io/schema/evolution.py`):
 
 ```python
-bt.read.parquet(d)                         # ArrowInvalid: schema at index 1 was different
-bt.read.parquet(d, schema_mode="union")    # {'a': [1.0, 2.5], 'b': [None, 'x']}
-bt.read.parquet(d, schema_mode="latest")   # ['a', 'b'] — last file's schema wins
+bt.read.parquet(d)  # ArrowInvalid: schema at index 1 was different
+bt.read.parquet(d, schema_mode="union")  # {'a': [1.0, 2.5], 'b': [None, 'x']}
+bt.read.parquet(d, schema_mode="latest")  # ['a', 'b'] — last file's schema wins
 ```
 
 - `"strict"` — every file must match the first; anything else raises.
@@ -263,8 +265,8 @@ Don't re-implement coercion upstream. Note the asymmetry — the plan-time schem
 *source* types, the materialized result is widened:
 
 ```python
-ds.dtypes                # [DataType(int32), DataType(float)]   ← the file's types
-ds.collect().schema      # i: int64,  f: double                 ← what you actually get
+ds.dtypes  # [DataType(int32), DataType(float)]   ← the file's types
+ds.collect().schema  # i: int64,  f: double                 ← what you actually get
 ```
 
 ## Error tolerance
@@ -276,8 +278,8 @@ a job silently returns a fraction of its corpus, so decide which you have before
 `on_error=` (`io/base/_tolerance.py`) decides whether one of them kills the read:
 
 ```python
-bt.read.json(d)                      # ArrowInvalid — the default, "raise", is all-or-nothing
-bt.read.json(d, on_error="skip")     # {'a': [1]} — logs a WARNING, drops the file, continues
+bt.read.json(d)  # ArrowInvalid — the default, "raise", is all-or-nothing
+bt.read.json(d, on_error="skip")  # {'a': [1]} — logs a WARNING, drops the file, continues
 ```
 
 `"skip"` records every dropped path (`source.corrupt_files()`) so the loss is auditable
@@ -291,9 +293,9 @@ one stray line discards every good row in it. `on_bad_lines=` (`io/base/_bad_row
 drops the record instead:
 
 ```python
-bt.read.csv(p,  on_bad_lines="skip")   # drop it silently, counted as malformed_rows_total
-bt.read.json(p, on_bad_lines="warn")   # drop it and log the offending text
-bt.read.csv(p)                         # "error" — the default, and Spark's FAILFAST
+bt.read.csv(p, on_bad_lines="skip")  # drop it silently, counted as malformed_rows_total
+bt.read.json(p, on_bad_lines="warn")  # drop it and log the offending text
+bt.read.csv(p)  # "error" — the default, and Spark's FAILFAST
 ```
 
 Both readers carry the flag into byte-range splits, so a distributed read returns what the

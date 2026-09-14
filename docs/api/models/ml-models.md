@@ -4,8 +4,8 @@ This page is the reference for the model half of `batcher.ml`: the tabular infer
 plane, the estimators that fit inside the engine, the metrics that need a global
 ordering, and the selection and interpretation helpers.
 
-The single-pass metric *expressions* such as {py:func}`bt.rmse <batcher.rmse>` and {py:func}`bt.f1_score <batcher.f1_score>` live in
-{doc}`/api/relational/expressions` instead, because they are ordinary aggregates.
+The single-pass metric *expressions* such as {py:func}`bt.rmse <batcher.rmse>` and {py:func}`bt.f1_score <batcher.f1_score>` live on
+{doc}`/api/models/metrics` instead, because they are ordinary aggregates.
 
 ## Tabular models
 
@@ -160,10 +160,9 @@ overconfidence it shows in production.
 
 ## Evaluation
 
-`batcher.ml.metrics` holds the metrics that need a global ordering or return a table. The
-single-pass metric *expressions*, meaning `bt.rmse`, `bt.f1_score`, and the rest, are in the
-{doc}`expression reference </api/relational/expressions>` instead, because they are ordinary aggregates. See
-the {doc}`evaluation guide </ml/evaluation/evaluation>`.
+`batcher.ml.metrics` holds the metrics that need a global ordering or return a table.
+Everything here consumes a whole column at once. See the
+{doc}`evaluation guide </ml/evaluation/evaluation>`.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics
@@ -189,10 +188,9 @@ the {doc}`evaluation guide </ml/evaluation/evaluation>`.
 .. autodata:: METRIC_SETS
 ```
 
-A recommender is scored differently: what matters is the order within *one* query, averaged
-over queries. These compute the metric per group and then average, never pooling rows across
-groups, which silently rewards a model that ranks one heavy user well and everyone else
-badly.
+A recommender is scored differently. The order within *one* query decides it, averaged over
+queries, so these compute the metric per group and then average. Pooling rows across groups
+silently rewards a model that ranks one heavy user well and everyone else badly.
 
 ```{eval-rst}
 .. autofunction:: precision_at_k
@@ -248,7 +246,7 @@ a single streaming pass.
    :members:
 ```
 
-`batcher.ml.mixture` fits a Gaussian mixture, giving soft clustering and density estimation by EM.
+`batcher.ml.mixture` fits a Gaussian mixture by EM, which gives soft cluster membership and a density estimate at once.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.mixture
@@ -397,4 +395,4 @@ the filter half of scikit-learn's `SelectKBest`.
 - {doc}`/api/models/ml-statistics`: drift, fairness, resampling, and cross-validation.
 - {doc}`/ml/inference/tabular-models`: the guide to scoring a fitted model.
 - {doc}`/ml/evaluation/evaluation`: the guide to metrics and per-segment scoring.
-- {doc}`/cookbook/ml/index`: 16 runnable recipes across the `batcher.ml` surface.
+- {doc}`/cookbook/ml/index`: 27 runnable recipes across the `batcher.ml` surface.

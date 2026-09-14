@@ -12,11 +12,11 @@ a single time.
 Keeping the contract that small is what makes the backends interchangeable. A local vLLM
 engine holding weights on a GPU and a remote OpenAI-compatible HTTP endpoint both
 satisfy it, so {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`, `llm_generate`, and `llm_udf` take either without
-knowing which they got. It is also why the stub above works. A lambda returning a lambda
-is a legal `EngineFactory`, which is how you test a generation pipeline with no GPU.
+knowing which they got. A lambda returning a lambda is a legal `EngineFactory` too, which
+is how you test a generation pipeline with no GPU:
 
 ```python
-engine_factory = lambda: (lambda prompts: [p.upper() for p in prompts])
+engine_factory = lambda: lambda prompts: [p.upper() for p in prompts]
 print(engine_factory()(["a", "b"]))
 # ['A', 'B']
 ```
@@ -34,7 +34,7 @@ request, which is what `usage=True` reads to append the token-count columns.
 | `bedrock_engine(model, *, region, system, max_tokens=1024, temperature=None, additional_model_request_fields, on_error="raise", concurrency=8)` | Any model on AWS Bedrock, through the Converse API. One request shape across Claude, Llama, Mistral, Titan and Nova, so changing model family is a string change. Credentials come from the standard AWS chain, so a worker on EC2 or EKS needs none passed in. Needs `boto3`. |
 | `gemini_engine(model, *, api_key, base_url, system, max_tokens=1024, response_schema, safety_settings, on_error="raise", concurrency=8)` | A Gemini model over `generateContent`. Point `base_url` at a Vertex AI endpoint and pass an OAuth token to use Vertex instead. `response_schema` constrains the generation to a schema rather than asking for JSON. Reads `$GEMINI_API_KEY` or `$GOOGLE_API_KEY` when `api_key` is unset. |
 
-Both hosted engines also take `requests_per_minute` and `tokens_per_minute`, covered below.
+Every hosted engine also takes `requests_per_minute` and `tokens_per_minute`, covered below.
 
 ### Choosing between vLLM and SGLang
 
@@ -64,9 +64,9 @@ answered = ds.ml.generate(engine, prompt_column="question", num_gpus=2)
 ```
 
 Structured output is one keyword rather than a separate object. Pass `json_schema=` to
-constrain generation to a schema, `regex=` to a pattern, or `ebnf=` to a grammar; exactly one
-of the three, because a generation is constrained by one grammar and silently preferring one
-over another produces output shaped by a rule you did not pick.
+constrain generation to a schema, `regex=` to a pattern, or `ebnf=` to a grammar. Exactly one
+of the three. A generation is constrained by one grammar, and silently preferring one over
+another would produce output shaped by a rule you did not pick.
 
 ```python
 # docs: skip
@@ -179,9 +179,9 @@ caused the rejection, then sends it again, so throughput settles below the quota
 worker spends its time asleep. Some providers also count rejected requests against the quota,
 which makes the retries fund their own starvation.
 
-`http_engine` and `anthropic_engine` take `requests_per_minute` and `tokens_per_minute`. Each
-worker holds a token bucket refilled at that rate, and a request waits for capacity *before*
-going out. The send rate is then smooth at the quota rather than a sawtooth under it. The token
+`http_engine`, `anthropic_engine`, `bedrock_engine`, and `gemini_engine` all take
+`requests_per_minute` and `tokens_per_minute`. Each worker holds a token bucket refilled at that
+rate, and a request waits for capacity *before* going out. The send rate is then smooth at the quota rather than a sawtooth under it. The token
 dimension counts the prompt plus the reply the request reserved with `max_tokens`, because that
 is what a provider counts.
 
@@ -194,7 +194,7 @@ engine = http_engine(
     "some-model",
     api_key="...",
     concurrency=16,
-    requests_per_minute=500,     # per worker, not per fleet
+    requests_per_minute=500,  # per worker, not per fleet
     tokens_per_minute=400_000,
 )
 ```
@@ -202,8 +202,10 @@ engine = http_engine(
 The limit is **per worker**, deliberately: coordinating a fleet-wide limiter would put a
 synchronous round trip in front of every request. Divide the account quota by the number of
 workers and leave headroom, because a provider measures arrival at its edge, where two workers'
-bursts can coincide. Keep `retries` on as well — a limiter smooths your own send rate, it
+bursts can coincide. Keep `retries` on as well. A limiter smooths your own send rate. It
 cannot see the other traffic on the account.
+
+### What each engine does for throughput
 
 `vllm_engine` is the high-throughput path. The GPU stays saturated because vLLM
 batches continuously across in-flight requests. It enables **prefix caching** and
@@ -221,7 +223,7 @@ from batcher.ml import vllm_engine
 engine = vllm_engine(
     "meta-llama/Llama-3-70B",
     sampling={"temperature": 0.7, "top_p": 0.9, "max_tokens": 512},
-    tensor_parallel_size=4,          # shard the model across 4 GPUs
+    tensor_parallel_size=4,  # shard the model across 4 GPUs
     gpu_memory_utilization=0.92,
     quantization="awq",
 )
@@ -279,8 +281,8 @@ answers = llm_generate(
     ds.iter_batches(),
     engine,
     prompt_column="question",
-    num_workers=4,           # 4 model replicas in parallel
-    target_batch_rows=512,   # requests handed to each engine call
+    num_workers=4,  # 4 model replicas in parallel
+    target_batch_rows=512,  # requests handed to each engine call
 )
 ```
 

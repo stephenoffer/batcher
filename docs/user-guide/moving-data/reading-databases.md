@@ -8,11 +8,10 @@ import batcher as bt
 import pyarrow as pa
 ```
 
-The same `bt.read` namespace also reaches databases and warehouses, plus a handful
-of scientific container formats. They share one shape: `bt.read.<name>(path_or_uri,
-**opts)` hands back a lazy `Dataset`, and nothing is fetched until a terminal op
-runs. The database connectors (`mongo`, `cassandra`, `dynamodb`, `elasticsearch`)
-take their connection as keyword options rather than a path.
+They share one shape. `bt.read.<name>(path_or_uri, **opts)` hands back a lazy `Dataset`,
+and nothing is fetched until a terminal op runs. The database connectors (`mongo`,
+`cassandra`, `dynamodb`, `elasticsearch`) take their connection as keyword options rather
+than a path.
 
 | Reader | Reads | Needs |
 | --- | --- | --- |
@@ -96,6 +95,7 @@ server banners.
 import os
 import tempfile
 
+
 # Build a small crawl so the example runs without a download.
 def _record(kind, uri, payload):
     head = (
@@ -104,13 +104,23 @@ def _record(kind, uri, payload):
     ).encode()
     return head + payload + b"\r\n\r\n"
 
+
 def _response(status, body):
     return f"HTTP/1.1 {status}\r\nContent-Type: text/html\r\nServer: nginx\r\n\r\n".encode() + body
 
+
 crawl = os.path.join(tempfile.mkdtemp(), "segment.warc")
 with open(crawl, "wb") as fh:
-    fh.write(_record("response", "https://example.com/a", _response("200 OK", b"<html><p>Hello</p></html>")))
-    fh.write(_record("response", "https://example.com/b", _response("404 Not Found", b"<html>gone</html>")))
+    fh.write(
+        _record(
+            "response", "https://example.com/a", _response("200 OK", b"<html><p>Hello</p></html>")
+        )
+    )
+    fh.write(
+        _record(
+            "response", "https://example.com/b", _response("404 Not Found", b"<html>gone</html>")
+        )
+    )
     fh.write(_record("request", "https://example.com/a", b"GET /a HTTP/1.1\r\n\r\n"))
 
 pages = (
@@ -232,7 +242,7 @@ print(above_ground.select("x", "z").to_pydict())
 # {'x': [4.0], 'z': [0.5]}
 ```
 
-## The LiDAR preprocessing chain is native
+### The LiDAR preprocessing chain is native
 
 Because the cloud is columnar, the standard per-frame preprocessing is engine operators
 end to end. No Python runs per point, and one lazy plan fuses the stages rather than
@@ -261,6 +271,7 @@ downsampled = (
 
 # Ego frame -> world frame: a rigid transform is three projections, given a pose.
 import math
+
 yaw, tx, ty = 0.3, 10.0, 20.0
 cos, sin = math.cos(yaw), math.sin(yaw)
 world = above_ground.with_columns(
@@ -270,9 +281,9 @@ world = above_ground.with_columns(
 )
 
 # Range gating is plain arithmetic on the coordinates.
-near = above_ground.with_columns(
-    rho=(col("x") ** 2 + col("y") ** 2 + col("z") ** 2).sqrt()
-).filter(col("rho") < 25)
+near = above_ground.with_columns(rho=(col("x") ** 2 + col("y") ** 2 + col("z") ** 2).sqrt()).filter(
+    col("rho") < 25
+)
 ```
 
 ## Robot and vehicle logs (MCAP)
@@ -332,9 +343,11 @@ measurement and an MCAP log from the same drive align on one clock.
 can = bt.read.mdf("s3://fleet/drive.mf4", signals=["VehicleSpeed"])
 can = can.select("timestamp", speed=bt.col("value"))
 
-lidar = (bt.read.mcap("s3://fleet/drive.mcap")
-         .filter(bt.col("topic") == "/lidar/top")
-         .select(timestamp=bt.col("log_time"), sweep=bt.col("sequence")))
+lidar = (
+    bt.read.mcap("s3://fleet/drive.mcap")
+    .filter(bt.col("topic") == "/lidar/top")
+    .select(timestamp=bt.col("log_time"), sweep=bt.col("sequence"))
+)
 
 # Attach the vehicle speed to every LiDAR sweep, then keep the hard-braking ones.
 # This is scenario extraction across two file formats.
@@ -367,7 +380,7 @@ print(sorted(bt.read.parquet(events_root).columns))
 A partition column's *type* is a different question from its presence, because a Hive path
 segment carries only text, and the type has to be inferred back out of it. Strings,
 integers, and dates come back as they went in. A date key is recognized only when *every*
-directory value under that key is a full ``YYYY-MM-DD`` date, so a key that is a date in
+directory value under that key is a full `YYYY-MM-DD` date, so a key that is a date in
 one branch and something else in another stays text rather than failing to parse later:
 
 ```python
@@ -394,7 +407,7 @@ ds = bt.read.parquet("events/").with_columns(ratio=bt.col("ratio").cast("float64
 ```
 
 An integer key loses zero-padding, because the padding is not part of the number: a tree
-of ``month=01`` through ``month=12`` reads back as 1 through 12, and re-writing it would
+of `month=01` through `month=12` reads back as 1 through 12, and re-writing it would
 produce unpadded directory names. Where the padding is part of the identifier rather than
 a formatting choice, write the key as a string with a non-numeric marker in it, or use a
 format that records the partition schema.

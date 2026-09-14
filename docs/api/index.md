@@ -4,19 +4,23 @@ The API is small and lazy. A {py:class}`Dataset <batcher.Dataset>` is a handle t
 
 ## Three ways in
 
+The same surface is written up three times, for three different questions:
+
 | Start with | When |
 |---|---|
 | {doc}`/api/reference` | You want the one-page cheat sheet of the calls you reach for most |
 | The area pages below | You want a runnable example plus the full surface for one area |
-| {doc}`/api/complete` | You want the backstop index of every symbol without an area page |
+| {doc}`/api/complete/index` | You want the backstop index of every symbol without an area page |
 
 ## By area
 
+The area pages are grouped into three sections, each with its own index:
+
 | Group | Pages | Covers |
 |---|---|---|
-| {doc}`/api/relational/index` | 6 | `Dataset`, expressions, accessors, functions, SQL, and IO |
+| {doc}`/api/relational/index` | 11 | `Dataset`, expressions, accessors, functions, SQL, geospatial, graph, and IO |
 | {doc}`/api/models/index` | 5 | The `.ml` accessor, preprocessors, estimators, metrics, and statistics |
-| {doc}`/api/operations/index` | 3 | Configuration, governance, and the typed exceptions |
+| {doc}`/api/operations/index` | 4 | Configuration, streaming, governance, and the typed exceptions |
 
 ## See also
 
@@ -31,7 +35,7 @@ The API is small and lazy. A {py:class}`Dataset <batcher.Dataset>` is a handle t
 :caption: Reference
 
 reference
-complete
+complete/index
 ```
 
 ```{toctree}

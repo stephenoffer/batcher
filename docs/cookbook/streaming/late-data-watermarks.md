@@ -63,8 +63,7 @@ schema = pa.schema([("ts", pa.timestamp("us")), ("amount", pa.int64())])
 
 
 def feed():
-    yield pa.record_batch({"ts": [base, base + 30 * minute], "amount": [3, 5]},
-                          schema=schema)
+    yield pa.record_batch({"ts": [base, base + 30 * minute], "amount": [3, 5]}, schema=schema)
     yield pa.record_batch({"ts": [base + 130 * minute], "amount": [1]}, schema=schema)
     yield pa.record_batch({"ts": [base + 20 * minute], "amount": [100]}, schema=schema)
 
@@ -135,8 +134,8 @@ purpose. Raise it when a partition is legitimately bursty and you would rather w
 drop its rows; set it to zero to keep the fully conservative frontier that never advances
 past a silent partition.
 
-If nothing advances anyway — every partition idle, or a source that stopped producing —
-Batcher does not let it end in an OOM: retained state is checked against
+If nothing advances anyway, because every partition is idle or the source stopped
+producing, Batcher does not let it end in an OOM: retained state is checked against
 `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>`
 names the column whose watermark is not advancing. Read it as a diagnosis, not a budget
 request.
@@ -163,16 +162,17 @@ seen-key set does not grow forever. An at-least-once producer that re-sends on a
 exactly what this is for:
 
 ```python
-dedup_schema = pa.schema([
-    ("id", pa.string()),
-    ("ts", pa.timestamp("us")),
-    ("v", pa.int64()),
-])
+dedup_schema = pa.schema(
+    [
+        ("id", pa.string()),
+        ("ts", pa.timestamp("us")),
+        ("v", pa.int64()),
+    ]
+)
 
 
 def dupes():
-    yield pa.record_batch({"id": ["x", "y"], "ts": [base, base], "v": [1, 2]},
-                          schema=dedup_schema)
+    yield pa.record_batch({"id": ["x", "y"], "ts": [base, base], "v": [1, 2]}, schema=dedup_schema)
     yield pa.record_batch(
         {"id": ["x", "z"], "ts": [base + minute, base + minute], "v": [3, 4]},
         schema=dedup_schema,

@@ -6,7 +6,7 @@ A search index is a serving system with its own mappings and refresh semantics, 
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.elasticsearch(hosts=..., index=..., esql=...)` |
+| **Read** | {py:meth}`bt.read.elasticsearch(hosts=..., index=..., esql=...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` |
 | **Write** | {py:meth}`ds.write.elasticsearch(index, hosts=...) <batcher.api.io_namespace.writer.Writer.elasticsearch>`, over `_bulk` |
 | **Extra** | `pip install 'batcher-engine[elasticsearch]'` (ES 8.18+ for the Arrow path) |
 | **Parallelism** | Sliced scroll: one split per slice. The ES\|QL path is a single split. |
@@ -64,9 +64,13 @@ JSON document per hit crossing Python before it becomes a column.
 
 ## Credentials
 
-`hosts` and `api_key` are stored verbatim on the source and never logged. The connector's identity
-is the index name alone. Use an API key scoped to the indices you read. A scroll holds a cursor open
-on the cluster, and you don't want that key to be able to do anything else.
+`hosts` and `api_key` are stored verbatim on the source and never logged. The connector's
+identity, which keys its learned statistics, is `elasticsearch:<index>:<fingerprint>`, where the
+fingerprint is a `sha256` over the connection options with the credential-ish keys excluded. It
+used to be the index name alone, which made `orders` on staging and `orders` on production one
+relation as far as the optimizer was concerned. Use an API key scoped to the indices you read. A
+scroll holds a cursor open on the cluster, and you don't want that key to be able to do anything
+else.
 
 ## Predicate pushdown
 
@@ -140,10 +144,12 @@ cluster is a way to hurt production search latency.
 `_source` does not come back. ES|QL, which reads doc values, does not have this problem. One more
 reason to prefer it.
 
-**No row count.** There is no cheap exact count, so `count()` reads. If you want a count, ask ES|QL
-for one (`| STATS COUNT(*)`) and let the cluster compute it.
+**No cheap count on the ES|QL path.** The scroll path answers `count()` exactly from the
+`_count` API, one round trip, no scan. An ES|QL result has no such endpoint, so a count there
+means a second full query: ask for it in the pipeline with `| STATS COUNT(*)` and let the
+cluster compute it.
 
-## Write
+## Writing
 
 `ds.write.elasticsearch(index, hosts=...)` sends one `_bulk` request per 1,000 documents.
 

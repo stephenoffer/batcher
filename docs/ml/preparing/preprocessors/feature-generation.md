@@ -1,10 +1,9 @@
 # Generating features
 
-This page covers the preprocessors that *add* columns rather than rewrite existing
-ones: timestamp expansion, text surface statistics, lag and rolling history,
-dimensionality reduction, and assembling the result into a single tensor column.
-
-These run after the encoding and scaling steps, on columns that are already clean.
+These preprocessors *add* columns rather than rewrite existing ones: timestamp expansion,
+text surface statistics, lag and rolling history, dimensionality reduction, and assembling
+the result into a single tensor column. They run after encoding and scaling, on columns
+that are already clean.
 
 ```python
 import batcher as bt
@@ -13,9 +12,9 @@ import batcher as bt
 ## Features from a timestamp
 
 A raw timestamp is the least useful column in a feature table. A tree model can only split
-it into "before and after some instant", which generalizes to nothing; a linear model treats
-it as a number that grows forever. What a model can learn from is the *parts*, because those
-repeat.
+it into "before and after some instant", which generalizes to nothing. A linear model treats
+it as a number that grows forever. The *parts* are what a model can learn from, because
+those repeat.
 
 {py:class}`DateTimeFeaturizer <batcher.ml.preprocessors.DateTimeFeaturizer>` expands a timestamp into calendar parts as ordinary integer columns,
 which is what a tree wants, because it can split on "hour >= 18" directly.
@@ -39,23 +38,21 @@ fixes it. Two coordinates on a circle put them adjacent, which is the truth.
 ```python
 from batcher.ml.preprocessors import CyclicalEncoder
 
-hours = bt.from_pydict(
-    {"ordered_at": [dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2, 0)]}
-)
+hours = bt.from_pydict({"ordered_at": [dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2, 0)]})
 circle = CyclicalEncoder("ordered_at", parts=["hour"]).fit_transform(hours).to_pydict()
 print([round(v, 4) for v in circle["ordered_at_hour_cos"]])
 ```
 
-Both are stateless, so the same expression applies to training and serving data with nothing
-fitted in between.
+Both are stateless. The same expression applies to training and to serving data, with
+nothing fitted in between.
 
 ## Surface features from text
 
-An embedding is the powerful way to featurize text and the expensive one. A great many text
-signals need no model at all: whether a review is long, whether a message is all-caps, and how
+An embedding is the powerful way to featurize text and the expensive one. Plenty of text
+signal needs no model at all: whether a review is long, whether a message is all-caps, how
 many digits a field has. Those are what a gradient-boosted model actually splits on.
-{py:class}`TextStatFeaturizer <batcher.ml.preprocessors.TextStatFeaturizer>` computes them as pure string expressions, so a dozen text features over
-a billion rows is one pass and no GPU.
+{py:class}`TextStatFeaturizer <batcher.ml.preprocessors.TextStatFeaturizer>` computes them as pure string expressions, so a dozen text
+features over a billion rows is one pass and no GPU.
 
 ```python
 import batcher as bt
@@ -76,17 +73,15 @@ a rolling mean that includes the current row has the target's own value inside i
 feature, and a "last 7 days" window computed over the whole table mixes entities together.
 Both produce a cross-validated score no deployment reproduces, and neither raises.
 
-{py:class}`RollingFeaturizer <batcher.ml.preprocessors.RollingFeaturizer>`'s window therefore ends at the **previous** row by construction, with no
-option to include the current one, and both take a `partition_by` that keeps each series
-separate.
+{py:class}`RollingFeaturizer <batcher.ml.preprocessors.RollingFeaturizer>`'s window therefore ends at the **previous** row by construction,
+with no option to include the current one. It and {py:class}`LagFeaturizer <batcher.ml.preprocessors.LagFeaturizer>` both take a
+`partition_by` that keeps each series separate.
 
 ```python
 import batcher as bt
 from batcher.ml.preprocessors import LagFeaturizer, RollingFeaturizer
 
-sales = bt.from_pydict(
-    {"store": ["a", "a", "a"], "day": [1, 2, 3], "units": [10.0, 20.0, 60.0]}
-)
+sales = bt.from_pydict({"store": ["a", "a", "a"], "day": [1, 2, 3], "units": [10.0, 20.0, 60.0]})
 lagged = LagFeaturizer("units", order_by="day", lags=[1], partition_by="store")
 rolled = RollingFeaturizer("units", order_by="day", window=2, partition_by="store")
 out = rolled.fit_transform(lagged.fit_transform(sales)).sort("day")
@@ -99,8 +94,8 @@ drop them, or let a booster use the null as the signal it is.
 ## Fitting a curve with a linear model
 
 A linear model can only fit a straight line through a feature, so a relationship that bends
-has to be given the bend as extra columns. There are two ways to do that, and they behave
-very differently.
+has to be given the bend as extra columns. Two preprocessors do that. They behave very
+differently.
 
 {py:class}`PolynomialFeatures <batcher.ml.preprocessors.PolynomialFeatures>` adds powers and
 products. It is the right tool for interactions, where the point is that two features act
@@ -132,7 +127,7 @@ print([c for c in spline.transform(curved).columns if c.startswith("x_sp")])
 # ['x_sp0', 'x_sp1', 'x_sp2', 'x_sp3', 'x_sp4', 'x_sp5', 'x_sp6']
 ```
 
-The basis has `n_knots + degree - 1` columns, and every row's values sum to one, so the
+The basis has `n_knots + degree - 1` columns. Every row's values sum to one, so the
 expansion adds shape without adding scale.
 
 Knots go at the column's quantiles by default, following the data's density rather than its
@@ -173,24 +168,34 @@ obvious mistake to make here.
 
 ## Reducing dimensionality
 
-{py:class}`PCA <batcher.ml.preprocessors.PCA>` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan, because the mean and covariance are aggregates, and only the small eigendecomposition runs on the driver.
+{py:class}`PCA <batcher.ml.preprocessors.PCA>` projects a block of correlated numeric
+columns onto their top principal components, replacing them with a few uncorrelated `pc1`,
+`pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a
+wide table for a downstream model, and its `explained_variance_ratio_` tells you how many
+components to keep. The fit is a single scan, because the mean and covariance are
+aggregates, and only the small eigendecomposition runs on the driver.
 
 ```python
 from batcher.ml.preprocessors import PCA
 
-ds = bt.from_pydict({"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 2.1, 2.9, 4.0], "c": [4.0, 3.0, 2.0, 1.0]})
+ds = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0], "b": [1.0, 2.1, 2.9, 4.0], "c": [4.0, 3.0, 2.0, 1.0]}
+)
 reducer = PCA(["a", "b", "c"], n_components=2).fit(ds)
 print(reducer.transform(ds).columns)
 # ['pc1', 'pc2']
 ```
 
-{py:class}`TruncatedSVD <batcher.ml.preprocessors.TruncatedSVD>` is the same idea without centering the columns first, which is what you want on a non-negative or sparse feature block (a bag-of-words count matrix) where centering would destroy the structure. On centered data it coincides with `PCA`.
+{py:class}`TruncatedSVD <batcher.ml.preprocessors.TruncatedSVD>` is the same idea without
+centering the columns first, which is what you want on a non-negative or sparse feature
+block (a bag-of-words count matrix) where centering would destroy the structure. On centered
+data it coincides with `PCA`.
 
-## Reducing dimensionality without a covariance pass
+## Random projection
 
-`PCA` finds the directions carrying the most variance, which costs a covariance pass and an
-eigendecomposition over the full width. Sometimes you cannot afford that, and often you do
-not need it.
+`PCA` finds the directions carrying the most variance. That costs a covariance pass and an
+eigendecomposition over the full width. Often you cannot afford it, and often you do not
+need it.
 
 {py:class}`GaussianRandomProjection <batcher.ml.preprocessors.GaussianRandomProjection>` and
 {py:class}`SparseRandomProjection <batcher.ml.preprocessors.SparseRandomProjection>` multiply
@@ -207,7 +212,7 @@ print(len([c for c in projected.fit_transform(wide).columns if c.startswith("rp"
 # 64
 ```
 
-Nothing is read from the data, so these fit on a stream, and the matrix depends only on the
+Nothing is read from the data, so these fit on a stream. The matrix depends only on the
 seed and the input width, so training and serving cannot disagree.
 
 Use `johnson_lindenstrauss_min_dim` to size the target rather than guessing:
@@ -223,9 +228,9 @@ is much smaller for the same distance guarantee.
 
 ## Kernel features for a linear model
 
-A kernel SVM is often the best model on a medium tabular problem and the worst thing to put
-in a pipeline: it needs the full pairwise kernel matrix, so it is quadratic in rows and does
-not distribute.
+A kernel SVM is often the best model on a medium tabular problem. It is also the worst
+thing to put in a pipeline, because it needs the full pairwise kernel matrix: quadratic in
+rows, and it does not distribute.
 
 {py:class}`RBFSampler <batcher.ml.preprocessors.RBFSampler>` and
 {py:class}`Nystroem <batcher.ml.preprocessors.Nystroem>` map each row into a space where an
@@ -244,7 +249,7 @@ print(len([c for c in mapped.columns if c.startswith("rbf")]))
 # 64
 ```
 
-Scale first, as above. `gamma` is a distance in the feature space, so a column measured in
+Scale first, as above. `gamma` is a distance in the feature space. A column measured in
 millions and one measured in fractions cannot share a sensible value.
 
 `RBFSampler` draws its map from a seed and reads no data, so it works on a stream.
@@ -300,9 +305,7 @@ group's mean rather than the global one, which matters when the groups differ:
 ```python
 from batcher.ml.preprocessors import GroupImputer, GroupStatEncoder
 
-grouped = bt.from_pydict(
-    {"grp": ["x", "x", "y", "y"], "val": [1.0, 3.0, 5.0, None]}
-)
+grouped = bt.from_pydict({"grp": ["x", "x", "y", "y"], "val": [1.0, 3.0, 5.0, None]})
 encoded = GroupStatEncoder("val", by="grp", statistics=["mean"]).fit_transform(grouped)
 print(encoded.collect().column_names)
 # ['grp', 'val', 'val_mean_by_grp']
@@ -353,22 +356,9 @@ print(spec.dtypes)
 # {'age': 'float64', 'income': 'float64'}
 ```
 
-{py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` maps a text column through a user-supplied tokenizer, which is either a
-`str -> list` callable or any object with `.encode`, such as a HuggingFace tokenizer.
-Tokenization is inherently per-string, so it runs as a whole-batch `map_batches` UDF. It
-needs a real tokenizer, so it is shown but not run here.
-
-```python
-# docs: skip
-from batcher.ml.preprocessors import Tokenizer
-from transformers import AutoTokenizer
-
-hf = AutoTokenizer.from_pretrained("bert-base-uncased")
-tokenized = Tokenizer("text", hf, output_column="input_ids").fit_transform(ds)
-```
-
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/pipelines`: sequencing these steps and saving the fitted result.
 - {doc}`/ml/preparing/preprocessors/encoding`: making a categorical column numeric before it feeds these.
+- {doc}`/ml/preparing/tokenization`: {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>`, sequence packing, and label encoding for text.
 - {doc}`/user-guide/transform/columns/expression-recipes`: the same feature work written by hand as expressions.

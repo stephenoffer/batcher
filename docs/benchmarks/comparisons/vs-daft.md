@@ -13,14 +13,16 @@ page passed that gate first.
 
 ## Scorecard
 
-Each row is one workload shape, with the engine that won it and by how much. Read the
-ratios alongside the methodology above, not on their own:
+Each row is one workload shape, the engine that won it, and by how much. **The multiples in
+this table are speedups: bigger is a wider win for whoever is named.** Every other table on
+this page states its own convention, and two of them are time ratios where lower is better,
+so check the lead-in before reading a number off one:
 
 | Shape | Winner |
 |---|---|
 | Image decode → tensor | Batcher, 1.9×–2.4× (machine-dependent) |
-| Image curation / augmentation | Batcher, 5.7× — Daft has no native equivalent |
-| Audio preprocessing | Batcher — Daft has no native audio surface |
+| Image curation / augmentation | Batcher, 5.7x, against a per-row PIL UDF; Daft has no native equivalent |
+| Audio preprocessing | Batcher; Daft has no native audio surface |
 | Top-N / sort-limit | Batcher, 8x to 10x |
 | In-memory filter / sum kernels | Batcher, 6.7× / 18× |
 | Global aggregate, group-by, expression ETL | Tie |
@@ -73,8 +75,8 @@ Take the ratio you can reproduce on your own hardware rather than any of ours.
 
 The comparison changes shape once the pipeline moves past decode. Daft has no native entropy
 measure, perceptual hash, or photometric adjustment, so the screening-and-augmentation pass a
-corpus needs is a per-row PIL UDF for a Daft user. Against that baseline — the same three
-measures, on the same bytes — Batcher's native expressions run **5.7x** faster
+corpus needs is a per-row PIL UDF for a Daft user. Against that baseline, the same three
+measures on the same bytes, Batcher's native expressions run **5.7x** faster
 (1,298 ms against 7,361 ms for 2,000 frames):
 
 ```bash
@@ -87,8 +89,9 @@ and the geometry family are engine expressions here and user code there.
 
 ## In-memory kernels
 
-`microbench.py` loads roughly 60M TPC-H rows into Arrow once and times each engine's
-kernels with no I/O in the way. Single node, 16 cores:
+The kernel microbenchmark recorded in `benchmarks/BENCHMARK_RESULTS.md` loads roughly 60M
+TPC-H rows into Arrow once and times each engine's kernels with no I/O in the way. Single
+node, 16 cores. Its driver script is no longer in the tree, so the record is the only source:
 
 | Operator | Batcher | Daft | Batcher's lead |
 |---|---:|---:|:---:|
@@ -102,7 +105,7 @@ The full 11-case operator mix goes the same way: the latest sweep in `benchmarks
 
 ## Multi-join SQL
 
-A re-run at scale factor 1 on a 96-core node put **Batcher ahead on 18 of the 19 queries both engines answer**, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. The ratio is `batcher / daft`, so below 1 means Batcher is faster. The join result is a function of core count, so quote the machine with the number. {doc}`/benchmarks/results/tpch` carries the full per-query table.
+A re-run at scale factor 1 on a 96-core node put **Batcher ahead on 18 of the 19 queries both engines answer**, including q20 at 0.80x, q3 at 0.52x, q17 at 0.20x and q5 at 0.80x. These are `batcher / daft` time ratios, so below 1 means Batcher is faster. The join result is a function of core count, so quote the machine with the number. {doc}`/benchmarks/results/tpch` carries the full per-query table.
 
 The parallel radix join and the whole-partition window kernel are what moved this shape, taking q3 to 1.55x at 16 cores and to 0.52x at 96.
 

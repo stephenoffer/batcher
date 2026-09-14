@@ -35,7 +35,7 @@ revenue = (
     .agg(total=bt.col("amount").sum())
     .sort("total", descending=True)
 )
-print(revenue.to_pydict())   # nothing runs until here
+print(revenue.to_pydict())  # nothing runs until here
 ```
 
 ## Install

@@ -32,7 +32,7 @@ How work is sized and parallelized.
 | `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
 | `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
 | `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
-| `fast_path` | `False` | Skip the per-query orchestration for small in-memory plans that provably don't need it: run the optimizer (through its plan cache) and the engine, and nothing else. Result-invariant, and narrowly gated to plans that are single-node, CPU, in-memory, free of UDFs, and under a row and node cap. It keeps the cross-query learned-stats loop -- a query answered here still records what it measured -- but gives up observability: it does not appear in `explain(analyze=True)`, the event log, or the dashboard. Turn it on for a latency-sensitive serving path where the plan shape is already known good. See {doc}`/user-guide/operate/tuning/performance`. |
+| `fast_path` | `False` | Skip the per-query orchestration for small in-memory plans that provably don't need it: run the optimizer (through its plan cache) and the engine, and nothing else. Result-invariant, and narrowly gated to plans that are single-node, CPU, in-memory, free of UDFs, and under a row and node cap. It keeps the cross-query learned-stats loop, so a query answered here still records what it measured, but it gives up observability: it does not appear in `explain(analyze=True)`, the event log, or the dashboard. Turn it on for a latency-sensitive serving path where the plan shape is already known good. See {doc}`/user-guide/operate/tuning/performance`. |
 | `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
@@ -376,9 +376,7 @@ one and swap it onto `Config`. For example, to ship JSON logs and see every deci
 from batcher import Config
 from batcher.config import ObservabilityConfig
 
-cfg = Config().replace(
-    observability=ObservabilityConfig(log_level="INFO", log_format="json")
-)
+cfg = Config().replace(observability=ObservabilityConfig(log_level="INFO", log_format="json"))
 print((cfg.observability.resolved_log_level, cfg.observability.event_log))
 # ('INFO', True)
 ```

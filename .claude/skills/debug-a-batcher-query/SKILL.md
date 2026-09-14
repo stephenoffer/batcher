@@ -54,11 +54,12 @@ flags delete rows by design, and all three report it:
 
 ```python
 from batcher.observe import metrics
+
 metrics.start_metrics()
 ds.to_pydict()
 snap = metrics.metrics_snapshot()["skipped"]
-snap["total"]                     # whole inputs dropped by on_error="skip"
-snap["malformed_rows_total"]      # rows dropped by on_bad_lines= or max_errored_rows=
+snap["total"]  # whole inputs dropped by on_error="skip"
+snap["malformed_rows_total"]  # rows dropped by on_bad_lines= or max_errored_rows=
 snap["malformed_rows_by_source"]  # {"csv": 12, "map_batches": 3} — which one did it
 ```
 
@@ -77,11 +78,13 @@ Then shrink, then bisect. Never debug a wrong answer at full scale.
 
 ```python
 import duckdb, batcher as bt
-from conftest import assert_same, assert_same_ordered   # tests/differential/conftest.py
+from conftest import assert_same, assert_same_ordered  # tests/differential/conftest.py
 
 con = duckdb.connect()
-con.register("t", table)                       # `duck_materialize` instead for FLOAT+NaN
-assert_same(bt.from_arrow(table).filter(bt.col("k") > 1).collect(), con.sql("SELECT * FROM t WHERE k > 1"))
+con.register("t", table)  # `duck_materialize` instead for FLOAT+NaN
+assert_same(
+    bt.from_arrow(table).filter(bt.col("k") > 1).collect(), con.sql("SELECT * FROM t WHERE k > 1")
+)
 ```
 
 `assert_same` is order-*independent*: it **cannot see a sort bug**. For anything with an
@@ -95,10 +98,10 @@ Numeric tolerance is 9 decimal places; integers are compared exactly; NaN equals
    `{nulls, empty, one row, duplicates, -0.0/NaN, descending}`:
 
 ```python
-base   = ds.collect()
-spill  = ds.collect(spill=True)
+base = ds.collect()
+spill = ds.collect(spill=True)
 stream = pa.Table.from_batches(list(ds.iter_batches())) if base.num_rows else base.slice(0, 0)
-assert_tables_equal(spill,  base)
+assert_tables_equal(spill, base)
 assert_tables_equal(stream, base)
 ```
 
@@ -121,6 +124,7 @@ Memory lives on `MemoryConfig`; backpressure on `FlowControlConfig`.
 
 ```python
 from batcher.config import Config, MemoryConfig, config_context
+
 with config_context(Config().replace(memory=MemoryConfig(max_memory_bytes=2 << 30))):
     out = ds.collect(spill=True)
 ```
@@ -172,9 +176,9 @@ between the local and shuffled path (float `-0.0` vs `0.0`, nullable ints), or s
 finalizes correctly only when it sees every row at once.
 
 ```python
-one  = ds.collect(distributed=False)
+one = ds.collect(distributed=False)
 many = ds.collect(distributed=True, num_workers=4, num_partitions=16)
-assert_tables_equal(many, one)          # ordered=True if the query has an ORDER BY
+assert_tables_equal(many, one)  # ordered=True if the query has an ORDER BY
 ```
 
 Vary `num_partitions` (1 / 4 / 64) — a bug that appears only above 1 partition is in
@@ -198,11 +202,12 @@ If the unoptimized shape is right and the optimized one is wrong, a Kyber rule b
 semantics. Inspect the plan and the IR:
 
 ```python
-print(ds.explain())                                  # est≈N (exact | learned | default)
-print(ds.explain(analyze=True))                      # runs it: actual vs est, ms, cpu, backend, decisions
-ir = ds._plan.to_ir()                                # logical JSON IR (internal handle)
+print(ds.explain())  # est≈N (exact | learned | default)
+print(ds.explain(analyze=True))  # runs it: actual vs est, ms, cpu, backend, decisions
+ir = ds._plan.to_ir()  # logical JSON IR (internal handle)
 
 import json
+
 prof = json.loads(ds.explain(analyze=True, format="json"))
 prof["logical_ir"], prof["optimized_ir"], prof["decisions"], prof["adaptive_stages"]
 ```
@@ -215,8 +220,9 @@ on `collect()`. Do not cite one. The real seams are:
 
 ```python
 from batcher.kyber import Optimizer
-baseline = Optimizer(rules=[]).optimize(ds._plan).ir      # no rules at all
-full     = Optimizer().optimize(ds._plan).ir
+
+baseline = Optimizer(rules=[]).optimize(ds._plan).ir  # no rules at all
+full = Optimizer().optimize(ds._plan).ir
 ```
 
 Bisect by passing a shrinking `rules=` list until the wrong IR appears — that names the

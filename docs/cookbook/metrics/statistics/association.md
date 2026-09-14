@@ -4,7 +4,7 @@ Correlation is for two numeric columns. When one side is a category or a binary 
 
 The whole script, executed on every test run:
 
-```{literalinclude} ../../../examples/statistics/association.py
+```{literalinclude} ../../../../examples/statistics/association.py
 :language: python
 :linenos:
 ```
@@ -19,5 +19,5 @@ python examples/statistics/association.py
 
 - {doc}`/cookbook/metrics/statistics/ab_test_inference`: effect size, t-statistic, and intervals.
 - {doc}`/cookbook/metrics/statistics/distribution_shape`: is this column symmetric, skewed, or heavy-tailed?
-- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and hypothesis tests.
 - {doc}`/api/models/ml-statistics`: the reference for every statistical function.

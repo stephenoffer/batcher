@@ -25,8 +25,8 @@ If the query is *wrong*, stop: use `debug-a-batcher-query`. A fast wrong answer 
 ## 1. Measure — never guess
 
 ```python
-print(ds.explain(analyze=True))   # executes, then annotates every op
-stats = ds.stats()                # RunStats(ops, total_ms, rows)
+print(ds.explain(analyze=True))  # executes, then annotates every op
+stats = ds.stats()  # RunStats(ops, total_ms, rows)
 print(stats.bottleneck, stats.bottleneck_summary(), stats.spilled)
 ```
 
@@ -75,9 +75,9 @@ thing to look at, not the search. Broadcast kicks in under
 `collect()` materializes the whole table. If you are writing or reducing, stream:
 
 ```python
-for batch in ds.iter_batches(batch_size=65_536):   # bounded memory
+for batch in ds.iter_batches(batch_size=65_536):  # bounded memory
     consume(batch)
-ds.write(...)                                       # streams; never materializes
+ds.write(...)  # streams; never materializes
 ```
 
 Pushing an aggregate or `limit` into the plan beats collecting and post-processing in
@@ -115,7 +115,10 @@ Defaults are good; change them only against a measurement.
 
 ```python
 from batcher.config import Config, ExecutionConfig, config_context
-with config_context(Config().replace(execution=ExecutionConfig(morsel_rows=65_536, parallelism=16))):
+
+with config_context(
+    Config().replace(execution=ExecutionConfig(morsel_rows=65_536, parallelism=16))
+):
     out = ds.collect()
 ```
 
@@ -129,7 +132,7 @@ Stage-boundary re-planning on *measured* cardinalities — the moat, and the fix
 `explain(analyze=True)` shows a large `(Kx)` estimate error feeding a join.
 
 ```python
-out = ds.collect(adaptive=True)     # "auto" (default) | True | False
+out = ds.collect(adaptive=True)  # "auto" (default) | True | False
 ```
 
 Under `adaptive="auto"` it engages only when a join has a breaker-produced operand whose
@@ -196,7 +199,7 @@ and benchmark those skills require, verified through `/run-quality-gate`.
 ## See also
 
 - `.claude/rules/performance.md` — the competitive mandate and how we win
-- `docs/tutorials/foundations/optimizing-a-slow-query.md`, `docs/user-guide/operate/tuning/performance.md`
+- `docs/getting-started/tutorials/foundations/optimizing-a-slow-query.md`, `docs/user-guide/operate/tuning/performance.md`
 - `docs/user-guide/operate/tuning/explain-plans.md`, `docs/user-guide/operate/tuning/caching.md`, `docs/user-guide/operate/tuning/best-practices.md`
 - `docs/architecture/internals/kyber.md`, `docs/architecture/optimization.md`
 - `debug-a-batcher-query` — when the answer is wrong, not merely slow

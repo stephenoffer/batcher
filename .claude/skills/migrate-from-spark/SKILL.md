@@ -162,7 +162,7 @@ by changing the call. The dialect selects a **parser**. Where Spark and DuckDB g
 disagree on what a function *means*, the engine follows DuckDB, because DuckDB is the
 oracle every differential test in the repo is written against. These are the differences
 a port actually hits, each found by running Spark's own documented examples through
-`bt.sql` (`docs/architecture/internals/competitor_parity_census.md`):
+`bt.sql` (`docs/architecture/internals/parity/competitor_parity_census.md`):
 
 | Expression | Spark | Batcher (= DuckDB) |
 |---|---|---|

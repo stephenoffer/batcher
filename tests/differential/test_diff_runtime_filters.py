@@ -102,11 +102,20 @@ def _conjuncts(plan):
     return out
 
 
-def _pushed_not_null(ds, name: str = "k") -> bool:
+def _has_not_null(plan, name: str = "k") -> bool:
     return any(
         isinstance(c, IsNotNull) and isinstance(c.input, Col) and c.input.name == name
-        for c in _conjuncts(_optimized(ds))
+        for c in _conjuncts(plan)
     )
+
+
+def _pushed_not_null(ds, name: str = "k") -> bool:
+    return _has_not_null(_optimized(ds), name)
+
+
+def _join_side_has_not_null(ds, side: str, name: str = "k") -> bool:
+    join = next(node for node in walk(_optimized(ds)) if isinstance(node, Join))
+    return _has_not_null(getattr(join, side), name)
 
 
 def _empty_marked(ds) -> bool:
@@ -170,13 +179,16 @@ def test_null_keys_survive_exactly_where_the_join_says_they_must(duck, how):
     assert_same(ds.collect(), duck.sql(f"SELECT {cols} FROM nl {_SQL_JOIN[how]} nr ON nl.k = nr.k"))
 
 
-@pytest.mark.parametrize("how", ["inner", "semi", "right"])
-def test_is_not_null_fires_on_the_reducible_left(duck, how):
+@pytest.mark.parametrize("how", JOIN_TYPES)
+def test_is_not_null_fires_exactly_on_the_reducible_left(duck, how):
     left, right = _left(), _right()
     _reg(duck, "fl", left)
     _reg(duck, "fr", right)
     ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how=how)
-    assert _pushed_not_null(ds), "the implied IS NOT NULL never reached the plan"
+    expected_left = how in {"inner", "semi", "right"}
+    expected_right = how in {"anti", "inner", "left", "semi"}
+    assert _join_side_has_not_null(ds, "left") is expected_left
+    assert _join_side_has_not_null(ds, "right") is expected_right
     cols = _cols_sql(how, "fl", "fr")
     assert_same(ds.collect(), duck.sql(f"SELECT {cols} FROM fl {_SQL_JOIN[how]} fr ON fl.k = fr.k"))
 

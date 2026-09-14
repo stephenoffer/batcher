@@ -1,6 +1,6 @@
 # Schema without execution
 
-``ds.meta`` is the introspection accessor. Schema questions are answered from the plan, so they cost nothing: you can branch on whether a column is numeric before deciding what pipeline to build, without touching a row.
+`ds.meta.schema` never executes. A plan knows its own output types, so every question here is a field read against it, and you can branch on whether a column is numeric before deciding what pipeline to build. Row counts are a different matter: `ds.meta.shape()` is free only when the row count already is.
 
 The whole script, executed on every test run:
 

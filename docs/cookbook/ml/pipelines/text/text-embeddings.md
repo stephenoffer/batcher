@@ -67,7 +67,7 @@ vectors.write.parquet("s3://bucket/vectors.parquet")
 :::
 
 :::{tab-item} Your own encoder class
-For any other encoder, pass a **class**. `map_batches`, `infer`, and `embed` instantiate
+For any other encoder, pass a class. `map_batches`, `infer`, and `embed` instantiate
 it once per worker, and the constructor is where the weights load.
 
 ```python
@@ -174,9 +174,7 @@ qvec = (
     .to_pydict()["embedding"][0]
 )
 
-hits = embedded.with_columns(score=col("embedding").list.dot(array(*qvec))).top_k(
-    2, "score"
-)
+hits = embedded.with_columns(score=col("embedding").list.dot(array(*qvec))).top_k(2, "score")
 print(hits.to_pydict()["id"])
 # [1, 4]
 ```

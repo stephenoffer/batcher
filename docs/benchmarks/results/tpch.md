@@ -70,20 +70,20 @@ run at load average under 5.
 ## Where the suite stands at scale factor 1
 
 Re-measured 2026-08-15 on 96 cores / 184 GiB, release build, all 22 queries reporting `OK`.
-Geometric mean of the per-query ratios, `batcher / other` — **below 1.0x means Batcher is
-faster**:
+Geometric mean of the per-query ratios, `batcher / other`, so **below 1.0x means Batcher is
+faster**. The second figure in each cell is that ratio inverted, for readers who prefer a
+speedup:
 
 | Against | Geomean | Queries won |
 |---|---:|---|
-| DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x** — 3.9x faster | **22 of 22** |
-| Polars | **0.43x** — 2.4x faster | 21 of 22 |
-| Daft | **0.35x** — 2.9x faster | **20 of 20** |
-| DuckDB on its **native** compressed store (`duckdb`) | **0.79x** — 1.3x faster | **16 of 22** |
+| DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x**, 3.9x faster | **22 of 22** |
+| Polars | **0.43x**, 2.4x faster | 21 of 22 |
+| Daft | **0.35x**, 2.9x faster | **20 of 20** |
+| DuckDB on its **native** compressed store (`duckdb`) | **0.79x**, 1.3x faster | **16 of 22** |
 
 The last row is the one that changed: leading DuckDB's own storage engine *and* execution
-engine, rather than only its execution engine, is new as of this sweep — it read 0.99x on
-16 cores in July. {doc}`/benchmarks/results/scaling` has what happens at ten times the data,
-where the same comparison inverts.
+engine, rather than only its execution engine, was new as of this sweep. It read 0.99x on
+16 cores in July. {doc}`/benchmarks/results/scaling` has what happens at ten times the data.
 
 The earlier 16-core reading of this suite, for continuity: total **871 ms** against DuckDB's
 2,062 ms on the same Arrow (2.37x) and Polars' 1,101 ms (1.26x).
@@ -173,7 +173,7 @@ q4 to 1.51× against Daft.
 
 ## Kernels
 
-The in-memory microbenchmark in the run log (`benchmarks/microbench.py`) loads about 60M rows into Arrow once, so no I/O is in the way, and times each engine's kernels on the same 16 cores:
+The in-memory kernel microbenchmark recorded in `benchmarks/BENCHMARK_RESULTS.md` loads about 60M rows into Arrow once, so no I/O is in the way, and times each engine's kernels on the same 16 cores. Its driver script is no longer in the tree, so the record is the only source for these three rows:
 
 | Operator | Batcher | Daft | Polars |
 |---|---:|---:|---:|

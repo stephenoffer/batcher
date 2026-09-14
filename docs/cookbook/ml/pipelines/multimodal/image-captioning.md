@@ -1,7 +1,7 @@
 # Image captioning
 
 Captioning a product catalog is a vision-language model over a URL column. The model is
-the easy part. What sinks these jobs is everything on the way to it: a million HTTPS fetches
+the easy part. Everything on the way to it is where the job dies: a million HTTPS fetches
 run one at a time, images decoded on the same thread that should be feeding the GPU, and a
 single 404 that takes down a job five hours in.
 
@@ -102,7 +102,7 @@ one request per row carrying both the prompt and the image. A null image falls b
 text-only request rather than failing the batch.
 
 :::{note}
-Vision models go through the **completion** path, so `chat=True` is rejected for an
+Vision models go through the completion path, so `chat=True` is rejected for an
 `image_column`. That is a real constraint of how vLLM carries multimodal input, not a
 Batcher preference.
 :::
@@ -130,8 +130,8 @@ default, so the fixed part of the instruction is encoded once rather than a mill
 ## Resize before the model, not inside it
 
 A 4000×3000 product photo is 36 MB decoded, and a batch of them will exhaust host memory
-before the GPU sees anything. {py:meth}`.image.resize(w, h) <batcher.plan.expr_ir.image._ImageNamespace.resize>` decodes, resizes, and **re-encodes to
-PNG bytes**, so the column stays a compact blob that is cheap to ship, spill, and shuffle.
+before the GPU sees anything. {py:meth}`.image.resize(w, h) <batcher.plan.expr_ir.image._ImageNamespace.resize>` decodes, resizes, and re-encodes to
+PNG bytes, so the column stays a compact blob that is cheap to ship, spill, and shuffle.
 {py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` is the other half of the pair: it produces a tensor column, which
 is what you want when the next stage is a model that takes pixels directly.
 
@@ -156,13 +156,13 @@ Python UDF instead and that stage becomes the bottleneck the GPU waits on.
 
 The decode is CPU work and the forward pass is GPU work, and running them in lockstep idles
 whichever one is not running. Batcher overlaps them, decoding morsel *k+1* on the CPU while
-the GPU is still on morsel *k*, which took a two-stage ResNet-50 pipeline from **942 to
-2,504 img/s** and utilization from ~30% to **81%**. You inherit that by expressing the decode as
-an engine stage rather than doing it inside the model's `__call__`.
+the GPU is still on morsel *k*, which took a two-stage ResNet-50 pipeline from 942 to
+2,504 img/s and utilization from ~30% to 81%. You inherit that by expressing the decode as an
+engine stage rather than doing it inside the model's `__call__`.
 
 Two things to check when the GPU is idle anyway:
 
-- The engine factory is passed as a **class or a factory**, never an instance or a plain
+- The engine factory is passed as a class or a factory, never an instance or a plain
   function. A function rebuilds the engine, reloading the model, on every batch.
 - `max_concurrency` on the download is high enough that the fetch is not the bottleneck. A
   million sequential HTTPS round trips at 50 ms each is fourteen hours of nothing.
@@ -177,9 +177,8 @@ when you do not supply one.
 
 ```python
 # docs: skip
-written = (
-    catalog.with_columns(thumb=col("photo").image.resize(256, 256))
-    .ml.upload("thumb", "s3://bucket/thumbs/", name_column="sku", extension=".png")
+written = catalog.with_columns(thumb=col("photo").image.resize(256, 256)).ml.upload(
+    "thumb", "s3://bucket/thumbs/", name_column="sku", extension=".png"
 )
 ```
 :::

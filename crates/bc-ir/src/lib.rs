@@ -429,7 +429,11 @@ pub enum AggFunc {
     /// `approx_count_distinct` — bounded-memory distinct count via per-group HLL
     /// (mergeable; ~2% error). Skew-safe alternative to `CountDistinct`.
     ApproxCountDistinct,
-    /// `approx_quantile` — bounded-memory quantile via per-group KLL. The quantile
+    /// `approx_quantile` — bounded-memory quantile via a per-group DDSketch. This said
+    /// "KLL" until 2026-09-13, which was stale in the direction that matters: DDSketch is
+    /// chosen over KLL precisely because its merge is exactly order-independent, so a
+    /// reduce that takes partials in a different order returns the same sketch. See the
+    /// module header of `bc-runtime/src/agg/sketch.rs`. The quantile
     /// `p ∈ [0,1]` rides `AggregateItem::param` (as for `Quantile`). Skew-safe
     /// alternative to `Median`/`Quantile`.
     ApproxQuantile,

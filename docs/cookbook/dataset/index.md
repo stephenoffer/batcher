@@ -2,7 +2,7 @@
 
 This section holds 14 runnable recipes for the {py:class}`Dataset <batcher.Dataset>` verbs, grouped by what you are doing to the table.
 
-Every page embeds a complete, self-contained script from the [`examples/dataset/`](https://github.com/batcher/batcher/tree/main/examples/dataset) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/dataset/`](https://github.com/stephenoffer/batcher/tree/main/examples/dataset) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Group | Recipes | Covers |
 |---|---|---|

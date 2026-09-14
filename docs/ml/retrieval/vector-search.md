@@ -25,17 +25,14 @@ docs = bt.from_pydict(
 )
 query = array(1.0, 0.0)
 
-hits = (
-    docs.with_columns(dist=col("vec").list.cosine_distance(query))
-    .sort("dist")
-    .head(2)
-)
+hits = docs.with_columns(dist=col("vec").list.cosine_distance(query)).sort("dist").head(2)
 print(hits.select("id", "title").to_pydict())
 # {'id': [1, 3], 'title': ['cats', 'kittens']}
 ```
 
 {py:meth}`ds.ml.nearest_neighbors(query, column, k, metric) <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` is the one-call shorthand for exactly
-that projection → sort → limit, with `metric="cosine"` (default), `"l2"`, or `"dot"`:
+that projection → sort → limit, with `metric="cosine"` (default), `"l2"`, `"dot"`, `"l1"`,
+or `"hamming"`:
 
 ```python
 hits = docs.ml.nearest_neighbors([1.0, 0.0], column="vec", k=2)  # nearest first, + `distance`
@@ -54,14 +51,15 @@ a later {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNa
 scored = docs.ml.normalize_embeddings("vec").ml.similarity_to([1.0, 0.0], column="vec")
 ```
 
-{py:meth}`cosine_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is `1 - cosine_similarity`: 0 for identical direction, 1 for
+{py:meth}`cosine_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` computes `1 - cosine_similarity`: 0 for identical direction, 1 for
 orthogonal, 2 for opposite. It sorts ascending, so nearest comes first.
-{py:meth}`.list.l2_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is Euclidean, and `.list.dot` is the raw inner product. For the vector
-*magnitude* rather than a pairwise distance, {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` is the Euclidean length and
-{py:meth}`.list.l1_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l1_norm>` the Manhattan length, the sum of absolute values, used for L1
-normalization. {py:meth}`.list.max_abs() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.max_abs>` returns the largest magnitude in the row. That is the
-divisor for MaxAbs scaling, which maps a feature vector into `[-1, 1]` without shifting
-its zero.
+{py:meth}`.list.l2_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is Euclidean, and `.list.dot` the raw inner product.
+
+Three more read a single vector's *magnitude* rather than a pairwise distance.
+{py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` gives the Euclidean length. {py:meth}`.list.l1_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l1_norm>` gives the Manhattan
+length, the sum of absolute values, which is what L1 normalization divides by.
+{py:meth}`.list.max_abs() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.max_abs>` returns the largest magnitude in the row, the divisor for MaxAbs
+scaling, which maps a feature vector into `[-1, 1]` without shifting its zero.
 
 For other embedding geometries the engine has the matching metric. {py:meth}`.list.l1_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l1_distance>` is
 Manhattan distance, the sum of absolute differences. {py:meth}`.list.hamming_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.hamming_distance>` handles
@@ -72,6 +70,7 @@ exactly what a binary vector index ranks by:
 ```python
 # docs: skip
 from batcher import col
+
 # `bits` columns are quantized 0/1 embeddings; rank by how many bits differ.
 nearest = docs.with_columns(dist=col("bits").list.hamming_distance(query_bits)).sort("dist")
 ```
@@ -92,18 +91,21 @@ Use `top_k` rather than `sort().head(k)` when you only want the winners: it keep
 bounded heap instead of ordering the whole relation.
 
 ```python
-print(docs.with_columns(dist=col("vec").list.cosine_distance(query))
-      .top_k(2, by="dist", descending=False)
-      .select("id").to_pydict())
+print(
+    docs.with_columns(dist=col("vec").list.cosine_distance(query))
+    .top_k(2, by="dist", descending=False)
+    .select("id")
+    .to_pydict()
+)
 # {'id': [1, 3]}
 ```
 
 ## Filter first, then score
 
-The reason in-engine search is worth having is that a vector distance is another
-expression, so it composes with everything else. A metadata filter runs *before* the
-distance is computed, and the optimizer pushes it into the scan, so a query scoped to one
-tenant scores only that tenant's rows.
+A vector distance is another expression, so it composes with everything else. That is what
+in-engine search buys. A metadata filter runs *before* the distance is computed, and the
+optimizer pushes it into the scan, so a query scoped to one tenant scores only that tenant's
+rows.
 
 ```python
 scoped = bt.from_pydict(
@@ -155,7 +157,7 @@ distances, which buys back most of the recall an approximate index loses. Vector
 needs the `batcher-engine[lance]` extra.
 
 :::{warning}
-An ANN index is approximate by construction. It can miss a true nearest neighbour, and it
+An ANN index is approximate by construction. It can miss a true nearest neighbor, and it
 will not tell you that it did. If your application cannot tolerate that, as with a
 compliance lookup or a dedup key, brute force over a filtered candidate set is the honest
 answer, not a higher `nprobes`.
@@ -203,6 +205,10 @@ corpus size and query pattern to a row:
 | Millions of vectors, repeated queries, latency matters | Lance index + `vector_search` |
 | Every row of A against the nearest rows of B | `ds.ml.similarity_join` |
 | Exact duplicates or near-duplicate text, not vectors | `distinct` / `drop_near_duplicates` |
+
+The mechanics behind those rows invert what most readers expect, because the exact path is the one that distributes:
+
+![The two ways to answer a nearest-neighbour query, and the inversion that reads backwards until you see it: the exact path is the one that shards. Both start from one ds.ml.embed call that computes a fixed_size_list column of float32 vectors, one per row, inside the engine. Exact search needs no build step: ds.ml.nearest_neighbors(q, k) covers cosine, l2, l1, hamming and dot, lowers to a distance expression plus a sort and a limit k over Rust kernels in one scan, and shards, because a global top-k is the top-k of the shards' top-ks. It is mergeable, so one core or a hundred machines run it unchanged, it costs a full scan per query, and it is the recommended path to a few million rows. Approximate search needs the vectors written to Lance first: build_vector_index builds an IVF_PQ index, and vector_search(uri, q, k) is a single driver call into Lance against one unsharded dataset, returning k rows and a _distance column. nprobes and refine_factor are passed through verbatim and default to None, so Lance decides; raising either probes more of the index, buying recall back with time. Nothing here measures the recall given up, because recall_at_k scores a set you hand it and no code wires it to the index, and ds.ml.embed's default output_type='tensor' is not indexable, so build_vector_index raises rather than mis-index it.](/_static/diagrams/vector_index_search.svg)
 
 ## See also
 

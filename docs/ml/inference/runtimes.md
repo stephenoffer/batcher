@@ -61,7 +61,7 @@ udf = bt.ml.onnx_predictor(
 
 ### Execution providers
 
-The provider list is what decides where the graph runs, and getting it wrong is the classic silent slowdown: a CPU session on a GPU worker still returns correct answers, ten to fifty times slower, and nothing in the result says so.
+The provider list decides where the graph runs. Getting it wrong is the classic silent slowdown: a CPU session on a GPU worker still returns correct answers, ten to fifty times slower, and nothing in the result says so.
 
 Leaving `providers` unset auto-selects every accelerated provider the installed build offers, but only when the worker can actually see an accelerator. Name them explicitly to be certain:
 

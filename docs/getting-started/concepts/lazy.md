@@ -9,8 +9,8 @@ import batcher as bt
 
 ds = bt.from_pydict({"x": [1, 2, 3, 4], "g": ["a", "b", "a", "b"]})
 
-filtered = ds.filter(bt.col("x") > 1)     # ds is unchanged
-projected = filtered.select("x")          # filtered is unchanged
+filtered = ds.filter(bt.col("x") > 1)  # ds is unchanged
+projected = filtered.select("x")  # filtered is unchanged
 
 print(ds.columns)
 # ['x', 'g']
@@ -31,14 +31,14 @@ The common terminals:
 
 - {py:meth}`to_pydict() <batcher.Dataset.to_pydict>` gives you a column-oriented dict; {py:meth}`to_pylist() <batcher.Dataset.to_pylist>` gives you a list of
   row dicts.
-- `collect()` returns a `pyarrow.Table`, and `count()` returns only the row count.
+- {py:meth}`collect() <batcher.Dataset.collect>` returns a `pyarrow.Table`, and {py:meth}`count() <batcher.Dataset.count>` returns only the row count.
 - {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams Arrow record batches instead of materializing everything.
 - `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and the generic
   {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink.
 
 ```python
-plan = ds.filter(bt.col("x") >= 2).select("x")   # nothing runs yet
-print(plan.to_pydict())                            # runs here
+plan = ds.filter(bt.col("x") >= 2).select("x")  # nothing runs yet
+print(plan.to_pydict())  # runs here
 # {'x': [2, 3, 4]}
 ```
 

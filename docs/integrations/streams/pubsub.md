@@ -56,7 +56,7 @@ That `offset` is stable per message and useful for de-duplication, but it is not
 it is not a position you can seek to.
 
 Message *attributes* are Pub/Sub's spelling of Kafka's headers, and `include_headers=True`
-adds them as a `headers` column of `array<struct<key:string,value:binary>>` — the same type
+adds them as a `headers` column of `array<struct<key:string,value:binary>>`, the same type
 and the same option every broker here uses:
 
 ```python
@@ -82,18 +82,27 @@ import batcher as bt
 import pyarrow as pa
 from batcher import col
 
-schema = pa.schema([
-    ("key", pa.binary()), ("value", pa.binary()), ("partition", pa.int64()),
-    ("offset", pa.int64()), ("timestamp", pa.int64()), ("topic", pa.string()),
-])
-batch = pa.record_batch({
-    "key": [b"order-1", b"order-2", b"order-1"],          # the ordering key
-    "value": [b'{"sku":"a","qty":2}', b'{"sku":"b","qty":1}', b'{"sku":"a","qty":3}'],
-    "partition": [0, 0, 0],                                # always 0 on Pub/Sub
-    "offset": [7314159265358979, 2718281828459045, 1414213562373095],
-    "timestamp": [1700000000000, 1700000001000, 1700000002000],
-    "topic": ["projects/acme-prod/subscriptions/events-batcher"] * 3,
-}, schema=schema)
+schema = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
+batch = pa.record_batch(
+    {
+        "key": [b"order-1", b"order-2", b"order-1"],  # the ordering key
+        "value": [b'{"sku":"a","qty":2}', b'{"sku":"b","qty":1}', b'{"sku":"a","qty":3}'],
+        "partition": [0, 0, 0],  # always 0 on Pub/Sub
+        "offset": [7314159265358979, 2718281828459045, 1414213562373095],
+        "timestamp": [1700000000000, 1700000001000, 1700000002000],
+        "topic": ["projects/acme-prod/subscriptions/events-batcher"] * 3,
+    },
+    schema=schema,
+)
 
 # Stand in for the subscription; the pipeline below is what you run against the real one.
 events = bt.from_batches(lambda: iter([batch]), schema)
@@ -125,14 +134,15 @@ rate is your bottleneck, run several queries against several subscriptions on th
 and union the results downstream, or write a custom source (see
 {doc}`custom connectors </user-guide/moving-data/custom-connectors>`).
 
-`poll_size` maps to `max_messages` on the pull request. The service treats it as an upper
-bound and routinely returns far fewer, so the default 16,384 is optimistic rather than wrong.
-A value around 1,000 matches what the API will actually hand back.
+`poll_size` maps to `max_messages` on the pull request, and Pub/Sub rejects a request above
+1,000 with `InvalidArgument`. Batcher clamps to that ceiling before sending, so the engine's
+default of 16,384 never reaches the API and never needs to. Setting `poll_size=1_000` yourself
+documents the real batch size, and a smaller value is passed through untouched.
 
 ## Delivery: at-least-once, and the ack deadline
 
-Messages are acked after a batch has been assembled, in one `acknowledge` call for the whole
-poll. A crash before that ack means Pub/Sub redelivers, so nothing is lost.
+Messages are acked once the epoch carrying them has been published, not when the poll
+assembles them. A crash in between means Pub/Sub redelivers, so nothing is lost.
 
 :::{warning}
 The other half of that trade is duplicates, and the ack deadline is where they come from. The
@@ -142,7 +152,7 @@ a slow sink, and Pub/Sub has already redelivered them to somebody. There is no a
 loop in the source.
 :::
 
-Two ways to live with it.
+There are two ways to live with it.
 
 ::::{tab-set}
 
@@ -157,10 +167,9 @@ Deduplicate on the message id, which is what the `offset` column is for.
 
 ```python
 # docs: skip
-clean = (
-    bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000)
-    .drop_duplicates_within_watermark(["offset"], event_time="ts", lateness="10 minutes")
-)
+clean = bt.read.pubsub(
+    "projects/acme-prod/subscriptions/events-batcher", poll_size=1_000
+).drop_duplicates_within_watermark(["offset"], event_time="ts", lateness="10 minutes")
 ```
 :::
 
@@ -171,19 +180,16 @@ subscriber. The resume point on restart is the subscription's own unacked backlo
 right behavior for Pub/Sub, and it means the subscription, not the checkpoint, is what you
 must not delete between runs.
 
-## Writing the stream out
+## Writing
 
 :::{dropdown} A checkpointed write into a bronze Delta table
 ```python
 # docs: skip
-q = (
-    bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000)
-    .write.delta(
-        "lake/bronze/events",
-        trigger=bt.Trigger.processing_time("30 seconds"),
-        checkpoint="/var/lib/batcher/ckpt/bronze-events",
-        query_name="bronze-events",
-    )
+q = bt.read.pubsub("projects/acme-prod/subscriptions/events-batcher", poll_size=1_000).write.delta(
+    "lake/bronze/events",
+    trigger=bt.Trigger.processing_time("30 seconds"),
+    checkpoint="/var/lib/batcher/ckpt/bronze-events",
+    query_name="bronze-events",
 )
 q.await_termination()
 ```

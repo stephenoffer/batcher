@@ -73,11 +73,6 @@ _STAGED_RUN_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 _MAX_STAGED_DEPTH = 2
 
 
-def in_staged_run() -> bool:
-    """Whether this call is already inside the staged loop."""
-    return _STAGED_RUN_DEPTH.get() > 0
-
-
 def staged_depth_exhausted() -> bool:
     """Whether re-entering the staged loop is no longer allowed for this call."""
     return _STAGED_RUN_DEPTH.get() >= _MAX_STAGED_DEPTH

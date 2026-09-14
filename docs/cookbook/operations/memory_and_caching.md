@@ -1,6 +1,6 @@
 # Memory and caching
 
-``cache()`` is an execution hint, not a semantic change: the result is identical with or without it. Spilling is the same idea for memory: under a small budget the engine goes out of core rather than failing, and the answer does not change.
+`cache()` is an execution hint. The result is identical with it, without it, and at every storage level, so the only thing it can change is what the query costs. Read `cache_stats()` as a difference across a span of work rather than as an absolute, because the counters are lifetime figures for the process. Spilling is the same bargain for memory: under a small budget the engine goes out of core instead of failing, and the answer does not move.
 
 The whole script, executed on every test run:
 

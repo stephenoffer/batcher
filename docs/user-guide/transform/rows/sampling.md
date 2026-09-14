@@ -150,10 +150,7 @@ There is no `stratified=True` flag. Sample per stratum and union, which is expli
 about what the strata are and what fraction each one gets.
 
 ```python
-parts = [
-    ds.filter(bt.col("bucket") == b).sample(0.1, seed=11)
-    for b in range(4)
-]
+parts = [ds.filter(bt.col("bucket") == b).sample(0.1, seed=11) for b in range(4)]
 stratified = parts[0].union(*parts[1:])
 print(stratified.group_by("bucket").agg(n=bt.count()).sort("bucket").to_pydict())
 # {'bucket': [0, 1, 2, 3], 'n': [24, 23, 16, 25]}
@@ -189,9 +186,6 @@ print(ds.approx_n_unique("value"), ds.n_unique("value"))
 print(ds.approx_median("value"))
 # 499.5
 ```
-
-Sample when you want *rows*, such as data to eyeball, a dev fixture, or a subset to train
-on. Sketch when you want a *number*.
 
 ## See also
 

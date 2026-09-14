@@ -122,8 +122,8 @@ from itertools import islice
 from batcher.ml import ResumableSampler
 
 sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
-seen = list(islice(sampler, 3))   # three steps in
-state = sampler.state_dict()      # checkpoint, between steps
+seen = list(islice(sampler, 3))  # three steps in
+state = sampler.state_dict()  # checkpoint, between steps
 
 resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
 resumed.load_state_dict(state)
@@ -151,7 +151,7 @@ source decides which loader you get.
 ::::{tab-set}
 :::{tab-item} A corpus larger than RAM
 
-Write the corpus into shards with `batcher.io.formats.ml.write_shards` and read it with
+Write the corpus into shards with {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>` and read it back with
 `shard_stream_loader`, which keeps a bounded shard cache and holds the *identical*
 sample-order contract.
 
@@ -237,7 +237,7 @@ raw = bt.from_pydict(
 train, test = raw.ml.train_test_split(0.25, seed=0, key="id")
 
 pipeline = Chain(SimpleImputer(["age"]), StandardScaler(["age"]))
-pipeline.fit(train)                      # statistics from train only
+pipeline.fit(train)  # statistics from train only
 train_ready = pipeline.transform(train)  # lazy; runs in the engine
 test_ready = pipeline.transform(test)
 
@@ -257,7 +257,7 @@ improves, and the improvement is not real.
 - {doc}`PyTorch </ml/inference/pytorch>`: DDP and FSDP wiring on the training side.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit and transform contract.
 - {doc}`Streaming for training </ml/inference/streaming>`: the bounded-memory ingest path in depth.
-- {doc}`Distributed training pipeline </tutorials/ml/distributed-training-pipeline>`: the
+- {doc}`Distributed training pipeline </getting-started/tutorials/ml/distributed-training-pipeline>`: the
   tutorial, from raw files to a multi-rank loop.
 - {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: what the engine is
   doing while the ranks are reading.

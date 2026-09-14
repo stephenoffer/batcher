@@ -10,7 +10,10 @@ meaning which pages exist, where they live, and what the toctrees say, use `audi
 instead and come back here for the individual rewrites.
 
 Read `.claude/rules/documentation.md` first. It is the contract; this skill is the
-procedure for applying it.
+procedure for applying it. Two others sit beside it: `docs-grammar-style` answers a
+specific wording, link, or formatting question without re-reading the whole contract, and
+`write-in-a-human-voice` is the pass to run when the page reads templated rather than
+wrong, which the checklist below detects but does not fix.
 
 ## Before you edit
 
@@ -41,6 +44,10 @@ Work top to bottom. Each item is a question with a yes-or-no answer.
 - Are all headings sentence case, and does it stay at H3 or above?
 - Does every heading that only contains sub-headings have a lead-in paragraph?
 - If it reaches H4, or needs a preview to navigate, does it want splitting?
+- Is it under 500 lines, and is the directory it sits in under 12 pages? Both are gates
+  in `tests/docs/test_docs_structure.py`, so check before you add a section.
+- Does the *rendered* page stay navigable? An `autoclass` with `:members:` costs three
+  lines of source and hundreds of rendered ones.
 
 **Prose**
 

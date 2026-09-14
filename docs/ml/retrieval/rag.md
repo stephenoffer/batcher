@@ -88,9 +88,7 @@ corpus = bt.from_pydict(
         ],
     }
 )
-clean = corpus.distinct(["chunk"]).ml.drop_near_duplicates(
-    "chunk", threshold=0.7, key="chunk_id"
-)
+clean = corpus.distinct(["chunk"]).ml.drop_near_duplicates("chunk", threshold=0.7, key="chunk_id")
 print(sorted(clean.to_pydict()["chunk_id"]))
 # [1, 4]
 ```
@@ -166,9 +164,7 @@ print(retrieved.select("chunk_id", "chunk").to_pydict())
 # docs: skip
 from batcher.ml import vector_search
 
-hits = vector_search(
-    "s3://bucket/chunks.lance", question_vec, k=5, filter="tenant = 'acme'"
-)
+hits = vector_search("s3://bucket/chunks.lance", question_vec, k=5, filter="tenant = 'acme'")
 ```
 
 Metadata scoping is a predicate here, not a post-filter.
@@ -177,9 +173,9 @@ Metadata scoping is a predicate here, not a post-filter.
 ::::
 
 :::{tip}
-That `filter` runs against the index rather than against the k rows it returned, which is
-the difference between "5 results, all from this tenant" and "5 results, 2 of which you
-have to throw away". See {doc}`vector search </ml/retrieval/vector-search>`.
+That `filter` runs against the index rather than against the k rows it returned. The
+difference is "5 results, all from this tenant" against "5 results, 2 of which you have to
+throw away". See {doc}`vector search </ml/retrieval/vector-search>`.
 :::
 
 ## Building the prompt
@@ -227,8 +223,8 @@ regex. See {doc}`LLM inference </ml/retrieval/llm/index>`.
 
 Retrieval is two stages, and a vector search is only the first. A bi-encoder embeds each passage
 once, offline, without knowing what will be asked of it, so the vector cannot encode anything
-about how the passage relates to a particular query. That is what makes it fast enough to run
-over a whole corpus, and it is also its ceiling.
+about how the passage relates to a particular query. That ignorance is what makes it fast
+enough to run over a whole corpus, and it is also its ceiling.
 
 A **cross-encoder** reads the query and one passage together and scores that pair. It sees the
 interaction the bi-encoder had to discard, and it is substantially more accurate for it. It also
@@ -296,9 +292,9 @@ aligned, and the reranker's own scores land in `score_column`.
 `activation="sigmoid"` maps the raw logits into `[0, 1]`, which is what a threshold wants. It
 never changes the ordering, so leave it off if you only care about the ranking.
 
-Any callable works in place of a model id: `scorer` above is a zero-argument function returning
-a `CrossEncoderScorer`, which is the whole contract — a list of `(query, passage)` pairs in, one
-score per pair out, in order. That is the seam for a hosted reranking API, for a model this
+Any callable works in place of a model id. `scorer` above is a zero-argument function returning
+a `CrossEncoderScorer`, and that is the whole contract: a list of `(query, passage)` pairs in,
+one score per pair out, in order. Use the seam for a hosted reranking API, for a model this
 package does not know about, or for testing a pipeline with no GPU.
 
 ## Reranking for diversity
@@ -391,8 +387,8 @@ to 10 doubles the input bill of every request, and nothing in the pipeline says 
 On the answer side, {py:func}`bt.answer_groundedness <batcher.answer_groundedness>` measures how much of the answer its context backs
 at the vocabulary level, and {py:func}`bt.phrase_groundedness <batcher.phrase_groundedness>` does the same at the phrase level. Read
 them together. An answer built from the context's own words, rearranged into a claim the
-context never made, scores perfectly on the first and badly on the second — and that gap is
-what a confident hallucination looks like.
+context never made, scores perfectly on the first and badly on the second. That gap is what a
+confident hallucination looks like.
 
 ```python
 answers = bt.from_pydict(
@@ -439,7 +435,7 @@ retrieves nonsense with confident-looking distances.
 - {doc}`LLM inference </ml/retrieval/llm/index>`: engines, chat templates, structured output.
 - {doc}`Governance </user-guide/trust/governance>`: row filters and column masks, if the corpus
   is not all one tenant's.
-- {doc}`RAG from scratch </tutorials/ml/rag-from-scratch>`: the tutorial, built up step by
+- {doc}`RAG from scratch </getting-started/tutorials/ml/rag-from-scratch>`: the tutorial, built up step by
   step.
 - {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: the ingest half as a runnable job.
 - {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: how the engine

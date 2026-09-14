@@ -27,7 +27,7 @@ Arrow off the wire, and a bulk upsert back. Splits the `_id` range on request.
 :::{grid-item-card} {octicon}`key;1.1em` Key-value stores
 :link: /integrations/databases/key-value-stores
 :link-type: doc
-DynamoDB, Cassandra, Redis. A pinned partition key reads one partition, not the table.
+DynamoDB, Cassandra, Redis, HBase. A pinned partition key reads one partition, not the table.
 :::
 
 :::{grid-item-card} {octicon}`search;1.1em` Elasticsearch

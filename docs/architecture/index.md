@@ -46,13 +46,13 @@ Retries, shuffle recompute, epoch fencing, and backpressure.
 :::{grid-item-card} {octicon}`milestone;1.1em` What makes Batcher different
 :link: differentiators
 :link-type: doc
-The six design decisions that separate it from DuckDB, Spark, and Ray Data, and where each one stops.
+The six design decisions that separate it from DuckDB, Polars, Spark, and Ray Data, and where each one stops.
 :::
 
 :::{grid-item-card} {octicon}`telescope;1.1em` Deep dives
 :link: /architecture/deep-dives/index
 :link-type: doc
-Twenty-two pages, one mechanism each: the query lifecycle, the operators, memory, distribution, and the adaptive loop.
+Twenty-eight pages, one mechanism each: the query lifecycle, the operators, memory, distribution, and the adaptive loop.
 :::
 
 :::{grid-item-card} {octicon}`tools;1.1em` Internals

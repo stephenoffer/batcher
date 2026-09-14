@@ -1,15 +1,17 @@
 # Mergeable algebra
 
-*Mergeable algebra* is the rule that every stateful operator in Batcher is written once, as
-three functions, and that the same three functions serve one core, many cores, bounded memory,
-and many machines. This page describes those functions, the state shapes they force, and the
-single definition of key identity they all depend on.
+*Mergeable algebra* is the rule that a stateful operator is written once, and that the one
+implementation serves one core, many cores, bounded memory, and many machines. This page
+describes the three functions the aggregate is built from, the state shapes they force, the
+partitioning the other stateful operators reach the same guarantee through, and the single
+definition of key identity all of them depend on.
 
 The failure it exists to prevent is specific. Write a stateful operator twice, once for a
 single core and once for a cluster, and the two implementations eventually disagree on a float
 key, or on nulls, or on ties. The bug only appears when the data is big enough to shuffle.
 
-Every stateful operator in `bc-runtime` is built as three functions:
+Aggregation is the operator the rule is named after, and it is the one written as three
+functions:
 
 ```text
 partial(batch)   -> state
@@ -48,6 +50,27 @@ The invariant, stated as the test that must stay green:
 ```text
 combine_finalize(partition(partial(p_k))) over all partitions  ==  single-node result
 ```
+
+`DISTINCT` is the same shape, with an empty aggregate list. The other stateful operators reach
+the same guarantee a different way, and it is worth being exact about which is which, because
+"everything is partial/combine/finalize" is the claim this page used to make and the code does
+not support it. A join, a partitioned window and a sort hold state that does not fold: a hash
+table of build rows, a partition's row set, an ordering. What they do instead is *partition* so
+that no fold is needed. A join co-partitions both sides by the join key, so bucket `i` of the
+left joins only bucket `i` of the right. A window partitions on its `PARTITION BY` keys, so a
+partition is computed wherever it lands. A sort range-partitions the leading key, so
+concatenating the buckets in range order is the sorted relation. `bc-interp::dist` exposes both
+families: `partial_aggregate`/`combine_finalize` for the first, and `partition_batches`,
+`range_partition_batches` and `salted_partition_batches` for the second. Top-N is the odd one
+out again, bounded by a shared cut-off (`bc-runtime/src/topn.rs`) rather than by either.
+
+What all of them guarantee is the same: the rows, every column name, and every column type
+match the single-node result. Three things the query itself does not pin down are allowed to
+differ, and they are not defects. A float reduction reassociates, because `combine` is
+associative in exact arithmetic and IEEE addition is not. A window function that must break a
+tie its `ORDER BY` leaves open may break it differently. A `LIMIT` over a relation with no
+order may keep a different set of rows, because a hash-table walk order is not part of the
+query. Anything else that differs is a bug.
 
 ## Why associative *and* commutative
 
@@ -94,12 +117,17 @@ of memory linear in the group's values**. That is a real trade. When you can't a
 `approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
 (`crates/bc-sketches/`), which merges in constant space with a fixed seed.
 
-Read "mergeable" there as "in any order", not as "to the same bits". `approx_count_distinct`
-is a HyperLogLog, which folds register-wise by `max` and so does reach an identical state
-whatever order the partials arrive in. `approx_quantile` is a KLL or a TDigest, whose merge
-compacts and re-clusters, and that is order-sensitive by construction: two reduces that take
-the same partials in different orders return estimates that differ, within the rank error the
-sketch already promises. That is the sketch being approximate, not the merge being wrong.
+Both of those sketches reach the *same state* in any merge order, which is stronger than
+merging correctly and is why they are the two the aggregates use. A HyperLogLog folds
+register-wise by `max`. A DDSketch sums counts in fixed logarithmic buckets. Neither operation
+cares what order it sees its inputs in, and
+`agg/mod.rs::approx_quantile_is_merge_order_independent` pins it.
+
+That is not true of every sketch in `bc-sketches`. KLL and TDigest compact and re-cluster as
+they merge, so two reduces taking the same partials in different orders return estimates that
+differ, within the rank error the sketch already promises. Kyber uses those two for cardinality
+and quantile *estimates*, where an answer that varies inside its own error bound costs
+nothing.
 
 ## One canonical key
 
@@ -153,6 +181,11 @@ print(d.group_by("k").agg(n=bt.count()).to_pydict())
 ## The same algebra, four ways
 
 The point of doing this once is that the same three functions serve every execution mode.
+
+The figure below puts the four modes on one bus, so that what separates them shows up as the
+single thing it is: what carries a partial state from `partial` to `combine`.
+
+![One operator, written once, and the four transports that carry its partial state. Along the top rail, partial(batch) takes rows in and returns a state that is not the answer, combine(states) merges those states associatively and commutatively into one merged state per group, and finalize(state) takes the state in and returns rows. Below it, four execution modes feed that same combine and differ in nothing but what carries the partial to it: one core (bc-interp::execute) carries nothing and has one partial with nothing to merge, many cores (bc-interp::par) carry a thread hand-off of one partial per morsel, bounded memory (agg::spill) carries an IPC spill file read one partition at a time, and many machines (bc-interp::dist) carry a Flight stream hash-partitioned by key. The test that must stay green is that combine_finalize(partition(partial(p_k))) equals the single-node result, because arrival order cannot change the answer.](/_static/diagrams/mergeable_algebra.svg)
 
 ::::{tab-set}
 :::{tab-item} One core
@@ -216,6 +249,7 @@ from batcher import Config, config_context
 ds = bt.from_pydict({"g": [i % 3 for i in range(10_000)], "x": list(range(10_000))})
 base = Config()
 
+
 def run(morsel_rows, parallelism):
     cfg = base.replace(
         execution=dataclasses.replace(
@@ -225,8 +259,9 @@ def run(morsel_rows, parallelism):
     with config_context(cfg):
         return ds.group_by("g").agg(s=bt.col("x").sum()).sort("g").to_pydict()
 
-one_core = run(1024, 1)     # one partial, no combine
-eight = run(256, 8)         # ~40 partials, combined in an arbitrary order
+
+one_core = run(1024, 1)  # one partial, no combine
+eight = run(256, 8)  # ~40 partials, combined in an arbitrary order
 print(one_core == eight, one_core)
 ```
 
@@ -236,10 +271,11 @@ True {'g': [0, 1, 2], 's': [16668333, 16661667, 16665000]}
 
 ## The rule when you add an operator
 
-A stateful operator without a mergeable form caps the engine at a single node. That isn't an
-acceptable trade here, and it's why the `add-relational-operator` and
-`add-distributed-operator` skills both start at `bc-runtime`: write `partial`/`combine`/
-`finalize`, prove `combine` associates and commutes, and the parallel path, the spill path,
+A stateful operator with neither a mergeable form nor a partitioning caps the engine at a
+single node. That isn't an acceptable trade here, and it's why the `add-relational-operator`
+and `add-distributed-operator` skills both start at `bc-runtime`. If the state folds, write
+`partial`/`combine`/`finalize` and prove `combine` associates and commutes. If it doesn't,
+find the key that makes the buckets independent. Either way the parallel path, the spill path,
 and the distributed path all follow from it.
 
 If your operator genuinely has no mergeable form, that's a design conversation, not a `TODO`.
@@ -248,7 +284,7 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 
 - `crates/bc-runtime/src/agg/mod.rs`: `partial`, `combine`, `finalize`, `AggFunc`
 - `crates/bc-runtime/src/keys.rs`: the one canonical key policy
-- `crates/bc-runtime/src/agg/spill.rs`: grace aggregation (the same algebra, bounded)
+- `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation (the same algebra, bounded)
 - `crates/bc-interp/src/dist.rs`: the distributed primitives
 - `crates/bc-sketches/`: mergeable HLL / KLL / Count-Min, fixed seed
 

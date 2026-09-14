@@ -1,6 +1,6 @@
 # Streaming
 
-Batcher treats **batch as the bounded special case of streaming**. One {py:class}`Dataset <batcher.Dataset>`
+Batcher treats batch as the bounded special case of streaming. One {py:class}`Dataset <batcher.Dataset>`
 API (`group_by`, `window`, `join`, `with_columns`, `write`) runs over a finite table
 or an unbounded stream. Moving a pipeline from a one-off job to a continuous one
 means changing the *source*, or adding a `trigger`. There is no second API to learn
@@ -31,9 +31,11 @@ import pyarrow as pa
 
 schema = pa.schema([("user", pa.string()), ("amount", pa.int64())])
 
+
 def feed():
     yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema)
     yield pa.record_batch({"user": ["a", "c"], "amount": [7, 3]}, schema=schema)
+
 
 stream = bt.from_batches(feed, schema, bounded=False)
 # The bounded-memory streaming path is chosen automatically.
@@ -77,21 +79,22 @@ one bad record stops on it and stays stopped.
 ```python
 # docs: skip
 q = bt.read.files_incremental(
-    "s3://bucket/landing/", "csv",
+    "s3://bucket/landing/",
+    "csv",
     state_dir="s3://bucket/_seen",
     delimiter=";",
-    on_error="skip",        # a truncated upload drops the file
-    on_bad_lines="skip",    # a ragged line drops the line
+    on_error="skip",  # a truncated upload drops the file
+    on_bad_lines="skip",  # a ragged line drops the line
 ).write.delta("s3://lake/bronze", trigger="30 seconds")
 ```
 
 An option the reader does not accept is refused when the query is built, not when the file
 carrying it arrives.
 
-Every broker takes the same `starting_position=` — `"earliest"` or `"latest"` — whatever it
-calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's `ShardIteratorType`, Event
-Hubs' offset sentinel, Pulsar's `InitialPosition`). Each connector's native spelling still
-works, so an existing reader keeps reading.
+Every broker takes the same `starting_position=`, either `"earliest"` or `"latest"`,
+whatever it calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's
+`ShardIteratorType`, Event Hubs' offset sentinel, Pulsar's `InitialPosition`). Each
+connector's native spelling still works, so an existing reader keeps reading.
 
 The `rate` source generates rows and is handy for trying the API without external
 infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadence):
@@ -103,7 +106,7 @@ print(sum(rows))  # 10 generated (value, timestamp) rows
 ```
 
 `rate` promises rows per *second*, so how many land in a micro-batch depends on how long the
-previous one took — which makes it a poor benchmark input, because the thing being measured
+previous one took. That makes it a poor benchmark input, because the thing being measured
 changes the input. `rate_micro_batch` promises rows per *batch* instead, so a run is
 reproducible:
 
@@ -167,9 +170,11 @@ import pyarrow as pa
 
 schema = pa.schema([("user", pa.string()), ("amount", pa.int64())])
 
+
 def feed():
     yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema)
     yield pa.record_batch({"user": ["a"], "amount": [7]}, schema=schema)
+
 
 stream = bt.from_batches(feed, schema, bounded=False)
 
@@ -239,14 +244,21 @@ print(bt.OutputMode.COMPLETE)
 ```
 
 ```python
-agg_stream = bt.from_batches(feed, schema, bounded=False).group_by("user").agg(
-    total=col("amount").sum()
+agg_stream = (
+    bt.from_batches(feed, schema, bounded=False).group_by("user").agg(total=col("amount").sum())
 )
-q = agg_stream.write.memory("running_totals", trigger=bt.Trigger.available_now(),
-                            output_mode="complete")
+q = agg_stream.write.memory(
+    "running_totals", trigger=bt.Trigger.available_now(), output_mode="complete"
+)
 q.await_termination()
-print(dict(zip(*[bt.read_memory("running_totals").to_pydict()[c]
-                 for c in ("user", "total")], strict=True)))
+print(
+    dict(
+        zip(
+            *[bt.read_memory("running_totals").to_pydict()[c] for c in ("user", "total")],
+            strict=True,
+        )
+    )
+)
 ```
 
 ### Sizing the files a stream leaves behind
@@ -292,10 +304,12 @@ any other key, batch or streaming:
 import datetime as dt
 
 base = dt.datetime(2024, 1, 1)
-clicks = bt.from_pydict({
-    "ts": [base, base + dt.timedelta(minutes=30), base + dt.timedelta(minutes=90)],
-    "n": [1, 2, 3],
-})
+clicks = bt.from_pydict(
+    {
+        "ts": [base, base + dt.timedelta(minutes=30), base + dt.timedelta(minutes=90)],
+        "n": [1, 2, 3],
+    }
+)
 hourly = clicks.group_by(w=bt.window(col("ts"), "1h")).agg(hits=col("n").sum())
 print(hourly.to_pydict())  # 00:00 → 3, 01:00 → 3
 ```
@@ -350,8 +364,12 @@ windowed = (
     .group_by(w=bt.window(col("ts"), "1h"))
     .agg(hits=col("n").sum())
 )
-windowed.write.delta("gold/hourly", trigger=bt.Trigger.processing_time("1 minute"),
-                     output_mode="append", checkpoint="gold/_ckpt")
+windowed.write.delta(
+    "gold/hourly",
+    trigger=bt.Trigger.processing_time("1 minute"),
+    output_mode="append",
+    checkpoint="gold/_ckpt",
+)
 ```
 
 **Session windows** group consecutive events whose gap is below a timeout:
@@ -368,18 +386,12 @@ arbitrary keyed state, and the union of two streams all keep something between
 micro-batches, and each is bounded by a limit you choose rather than by the data. See
 {doc}`streaming-stateful`.
 
-Two of them are worth knowing about before you reach for a workaround, because both used
-to be refusals:
-
-- **Joining a stream to a static table.** Write it as an ordinary
-  {py:meth}`join <batcher.Dataset.join>`. The table is read once when the query starts and every
-  micro-batch joins against the whole of it. The join types that would need the *static*
-  side to be complete are refused, which is where Spark draws the line too. See
-  {doc}`/cookbook/streaming/stream-join`.
-- **Session windows.** {py:meth}`session_window <batcher.Dataset.session_window>` works over a stream. A session has no
-  end until the gap has passed with nothing arriving, so its rows are held until the
-  watermark says so and then aggregated by the same code the bounded path runs. See
-  {doc}`/cookbook/streaming/windowed-aggregation`.
+Joining a stream to a static table needs none of that vocabulary. Write it as an ordinary
+{py:meth}`join <batcher.Dataset.join>`: the table is read once when the query starts, and
+every micro-batch joins against the whole of it. Join types that would need the *static*
+side to be complete are refused, which is where Spark draws the line too. See
+{doc}`/cookbook/streaming/stream-join` for that join end to end, and
+{doc}`/cookbook/streaming/windowed-aggregation` for the session window.
 
 ## Exactly-once and checkpointing
 
@@ -399,6 +411,10 @@ commits nothing. That is what turns the engine's at-least-once replay into end-t
 exactly-once, and it is why the log holds exactly one transaction per micro-batch however
 many times one was retried.
 
+The ordering inside one micro-batch is what makes that replay safe, and it is the same order under every trigger:
+
+![One micro-batch as a cycle. A trigger fires on a processing-time interval or as an available_now drain. The engine stages the epoch, reading and computing while publishing nothing; writes the source position it consumed ahead of publishing anything; hands the rows to the sink; then snapshots state and commits with the sink's token. A dashed edge sleeps the rest of the interval before the next trigger, and a draining trigger skips that wait and stops when the source is spent. Because the position is durable before anything is published, the only epoch a crash can lose is one that was staged and not published, and the next run replays it into a sink that records its own query name and batch id and so commits nothing the second time.](../../_static/diagrams/streaming_microbatch.svg)
+
 Give the query a stable `query_name` if you rely on this: the name is the transaction's
 application id, so it has to be the same across restarts for the check to find the
 previous run's commits. Without one it is derived from the destination table, which is
@@ -407,7 +423,8 @@ stable but shared, so two different unnamed queries writing the same table would
 ```python
 # docs: skip
 q = bt.read.kafka(topic="orders").write(
-    "lake/bronze", format="parquet",
+    "lake/bronze",
+    format="parquet",
     trigger=bt.Trigger.processing_time("30 seconds"),
     checkpoint="lake/bronze/_checkpoint",
 )
@@ -421,15 +438,13 @@ Add `distributed=True` and each micro-batch runs as one **epoch across the clust
 instead of on the driver. The workers read their share of the epoch, run the pipeline,
 and write their own data files; the driver never touches a row.
 
-What it does *not* do is commit once per worker. The workers write their files without
-committing them, and the driver then publishes the whole epoch as a **single**
-transaction. So the guarantees above survive the fan-out unchanged:
-
-- **one transaction per micro-batch**, whatever the worker count. The log still reads as
-  a record of the stream, not of the machines that ran it.
-- **exactly-once**, because that one commit carries the micro-batch's transaction id. A
-  replayed epoch, from a lost worker or a restart, finds itself already committed and
-  writes nothing.
+It does not commit once per worker. The workers write their files without committing them,
+and the driver publishes the whole epoch as a single transaction. So the guarantees above
+survive the fan-out unchanged. There is one transaction per micro-batch whatever the worker
+count, and the log still reads as a record of the stream rather than of the machines that
+ran it. Exactly-once holds too, because that one commit carries the micro-batch's
+transaction id: a replayed epoch, from a lost worker or a restart, finds itself already
+committed and writes nothing.
 
 The source's offsets are written to the checkpoint *between* staging an epoch and
 publishing it. That bounds a crash to an epoch that was staged and never published, which
@@ -439,14 +454,19 @@ is one the next run safely replays.
 # docs: skip
 # New files land continuously; each arrival becomes one micro-batch, fanned across
 # the cluster, and one Delta transaction.
-q = (bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze/_seen")
-       .filter(col("status") == "ok")
-       .write.delta("lake/bronze",
-                    trigger=bt.Trigger.processing_time("1 minute"),
-                    checkpoint="lake/bronze/_ck",
-                    query_name="bronze-ingest",
-                    distributed=True, num_workers=16))
-q.stop()   # the query runs until you stop it — an idle minute is not the end of a stream
+q = (
+    bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze/_seen")
+    .filter(col("status") == "ok")
+    .write.delta(
+        "lake/bronze",
+        trigger=bt.Trigger.processing_time("1 minute"),
+        checkpoint="lake/bronze/_ck",
+        query_name="bronze-ingest",
+        distributed=True,
+        num_workers=16,
+    )
+)
+q.stop()  # the query runs until you stop it; an idle minute is not the end of a stream
 ```
 
 A streaming aggregation distributes too. Each worker aggregates only its share of the
@@ -469,22 +489,37 @@ checkpointed write out.
 # docs: skip
 # Bronze: raw ingestion.
 bt.read.kafka(topic="events").write(
-    "lake/bronze", format="parquet",
-    trigger=bt.Trigger.available_now(), checkpoint="lake/bronze/_ck")
+    "lake/bronze",
+    format="parquet",
+    trigger=bt.Trigger.available_now(),
+    checkpoint="lake/bronze/_ck",
+)
 
 # Silver: clean + dedup, reading bronze incrementally.
-(bt.read.files_incremental("lake/bronze", "parquet", state_dir="lake/silver/_seen")
-   .drop_duplicates_within_watermark(["id"], event_time="ts", lateness="10m")
-   .write("lake/silver", format="parquet",
-          trigger=bt.Trigger.available_now(), checkpoint="lake/silver/_ck"))
+(
+    bt.read.files_incremental("lake/bronze", "parquet", state_dir="lake/silver/_seen")
+    .drop_duplicates_within_watermark(["id"], event_time="ts", lateness="10m")
+    .write(
+        "lake/silver",
+        format="parquet",
+        trigger=bt.Trigger.available_now(),
+        checkpoint="lake/silver/_ck",
+    )
+)
 
 # Gold: windowed aggregates, reading silver incrementally.
-(bt.read.files_incremental("lake/silver", "parquet", state_dir="lake/gold/_seen")
-   .with_watermark("ts", "10m")
-   .group_by(w=bt.window(col("ts"), "1h"))
-   .agg(total=col("v").sum())
-   .write.delta("lake/gold", trigger=bt.Trigger.available_now(),
-                output_mode="append", checkpoint="lake/gold/_ck"))
+(
+    bt.read.files_incremental("lake/silver", "parquet", state_dir="lake/gold/_seen")
+    .with_watermark("ts", "10m")
+    .group_by(w=bt.window(col("ts"), "1h"))
+    .agg(total=col("v").sum())
+    .write.delta(
+        "lake/gold",
+        trigger=bt.Trigger.available_now(),
+        output_mode="append",
+        checkpoint="lake/gold/_ck",
+    )
+)
 ```
 
 ## See also

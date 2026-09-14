@@ -1,6 +1,6 @@
 # Source and sink registries
 
-``bt.read.parquet(...)`` is a façade over a registry of ``SourceFormat`` implementations. Reading the registry is how you discover what is supported in *this* build, rather than trusting a docs page that may predate an extra you have not installed.
+`bt.read.parquet(...)` is a façade over a registry of `SourceFormat` implementations. Reading the registry is how you discover what is supported in *this* build, rather than trusting a docs page that may predate an extra you have not installed.
 
 The whole script, executed on every test run:
 

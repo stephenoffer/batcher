@@ -1,11 +1,14 @@
 # Head to head
 
-This section holds one page per competing engine, with the measured standing against each
-and the architectural reason behind it.
+One page per competing engine, each with the measured standing and the architectural reason
+behind it. Read them when you are choosing between Batcher and something you already run.
 
-Read these when you are choosing between Batcher and something you already run. Read
-{doc}`/benchmarks/results/index` instead when you want the standing on a workload rather
-than against a name.
+Want the standing on a workload rather than against a name? {doc}`/benchmarks/results/index`
+is arranged that way instead.
+
+Every page below states its own ratio convention in each table's lead-in, because the
+scorecard tables report speedups and the operator tables report `batcher / competitor` times.
+The two read identically and mean opposite things.
 
 | Page | The short version |
 |---|---|

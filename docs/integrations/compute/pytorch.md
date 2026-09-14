@@ -1,8 +1,8 @@
 # PyTorch
 
 Batcher does not replace PyTorch's data loading. It replaces the part of it that is a data engine.
-Reading, filtering, joining, feature engineering, shuffling, sharding: those run in Rust over
-Arrow. What reaches the training loop is `{column: tensor}` dicts, already batched, already on the
+Reading, filtering, joining, feature engineering, shuffling and sharding run in Rust over Arrow,
+and what reaches the training loop is `{column: tensor}` dicts, already batched and already on the
 device.
 
 | | |
@@ -169,9 +169,9 @@ split is exactly balanced, deterministic in `(seed, epoch)`, and resumable mid-e
 
 :::{important}
 For batch inference, pass a **class** to `map_batches`. It is instantiated once per worker and the
-instance handles every batch. A plain function is rebuilt per batch, which reloads the model every
-time; that is the single most common inference foot-gun, and Batcher raises a `PerformanceWarning`
-when it sees a GPU stage given a function.
+instance handles every batch. A plain function is rebuilt per batch, so it reloads
+the model every time. That is the single most common inference foot-gun here, and Batcher raises
+a `PerformanceWarning` when it sees a GPU stage given a function.
 :::
 
 ```python
@@ -250,8 +250,8 @@ partition is recomputed. Side effects (writing to a feature store, POSTing to a 
 twice. Make them idempotent.
 
 **Don't do feature engineering in `__getitem__`.** Every row that goes through Python is a row the
-engine could have vectorized. Express it as a `map_batches` or an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` and the work runs in
-parallel, in Rust, before it becomes a tensor.
+engine could have vectorized. Express it as a `map_batches` or an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` instead. The work then
+runs in parallel, in Rust, before it becomes a tensor.
 
 ## See also
 

@@ -51,11 +51,11 @@ Re-planning mid-query on measured cardinalities, plus the cross-query learned-st
 
 | Group | Pages | Covers |
 |---|---|---|
-| {doc}`/architecture/deep-dives/query/index` | 4 | From `collect()` to Arrow: the plan IR, the interpreter, and the JIT |
-| {doc}`/architecture/deep-dives/operators/index` | 6 | Morsels, the mergeable triple, and the four stateful operators |
-| {doc}`/architecture/deep-dives/memory/index` | 4 | The columnar contract, the byte account, and what happens when it does not fit |
-| {doc}`/architecture/deep-dives/distribution/index` | 4 | The Flight shuffle, credit flow control, scheduling, and the GPU path |
-| {doc}`/architecture/deep-dives/adaptive/index` | 4 | Re-planning mid-query, cardinality, cost, and the learned loop |
+| {doc}`/architecture/deep-dives/query/index` | 5 | From `collect()` to Arrow: the plan IR, the interpreter, and the JIT |
+| {doc}`/architecture/deep-dives/operators/index` | 7 | Morsels, the mergeable triple, and the four stateful operators |
+| {doc}`/architecture/deep-dives/memory/index` | 5 | The columnar contract, the byte account, and what happens when it does not fit |
+| {doc}`/architecture/deep-dives/distribution/index` | 6 | The Flight shuffle, credit flow control, scheduling, and the GPU path |
+| {doc}`/architecture/deep-dives/adaptive/index` | 5 | Re-planning mid-query, cardinality, cost, and the learned loop |
 
 ## See also
 

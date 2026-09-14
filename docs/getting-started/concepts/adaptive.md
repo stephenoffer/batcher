@@ -15,13 +15,14 @@ For comparison, DuckDB plans once, before execution. Spark AQE re-plans at stage
 boundaries, and so does Batcher: it's the same mechanism at the same granularity, with
 the difference that Batcher does it single-node too. The loop also stays off below
 5,000,000 input rows for each pipeline breaker it would cut at, which is about 10,000,000
-rows for the simplest joined query, so most queries never reach it.
+rows for the simplest joined query. A query with no join never qualifies at any size.
+Most queries never reach the loop at all.
 
 The half with no equivalent elsewhere is what happens between runs. Batcher records what
 each query actually did into a sketch-backed store, so the next run plans against
 measured history rather than estimates alone.
 
-![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity and gated off below 20 million input rows. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](/_static/diagrams/adaptive_loop.svg)
+![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](/_static/diagrams/adaptive_loop.svg)
 
 ## A bad estimate, corrected
 
@@ -40,7 +41,7 @@ import batcher as bt
 ds = bt.from_pydict({"city": ["NYC", "LA", "NYC", "SF"], "amount": [10, 20, 30, 40]})
 plan = ds.filter(bt.col("amount") > 15).group_by("city").agg(total=bt.col("amount").sum())
 
-print(plan.stats().rows)   # rows the query actually produced
+print(plan.stats().rows)  # rows the query actually produced
 # 3
 ```
 

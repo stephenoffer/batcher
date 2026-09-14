@@ -7,10 +7,8 @@ them, and {py:class}`Chain <batcher.ml.preprocessors.Chain>` composes several in
 This page is the reference. For how they fit into a training workflow, read
 {doc}`/ml/preparing/preprocessors/index`.
 
-`batcher.ml.preprocessors` holds the fit/transform feature-engineering estimators.
-Each one `fit`s over a `Dataset` to learn its statistics, then `transform`s any `Dataset` with them. `Chain` composes several into one pipeline. See the
-{doc}`preprocessors guide </ml/preparing/preprocessors/index>` for how they fit into a training
-workflow.
+Every estimator implements the same `fit` / `transform` / `fit_transform` protocol, and
+`Chain` is itself one of them:
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.preprocessors
@@ -45,7 +43,7 @@ These rescale numeric columns:
 
 ## Distribution shaping
 
-These reshape a column's *distribution* rather than only its scale. Reach for them when a
+Reshaping a column's *distribution* rather than only its scale. Reach for these when a
 feature is heavily skewed or long-tailed and a linear rescale would leave it that way:
 
 ```{eval-rst}
@@ -169,8 +167,8 @@ The rest of the estimators cover discretization, missing values, text splitting,
 
 ## Feature selection
 
-These prune columns rather than transform them, and they hold the choice as fitted state so
-the validation split is pruned by the training split's decision:
+These prune columns rather than transform them. The choice is held as fitted state, so the
+validation split is pruned by the training split's decision:
 
 ```{eval-rst}
 .. autoclass:: SelectKBest
@@ -245,8 +243,8 @@ term's feature index arithmetically and so needs no fit pass at all:
 
 ## Derived and grouped features
 
-These build new columns out of existing ones: products and ratios that a linear model
-cannot learn on its own, and group-relative statistics that let a row see its cohort:
+New columns built out of existing ones: products and ratios that a linear model cannot learn
+on its own, and group-relative statistics that let a row see its cohort:
 
 ```{eval-rst}
 .. autoclass:: InteractionFeatures
@@ -292,8 +290,8 @@ feature. That is the most common leak in a forecasting pipeline, and one that ra
 
 ## Text surface features
 
-Cheap, interpretable text signals such as length, word count, and character mix, all needing no model
-and often carry most of the signal a gradient-boosted model splits on:
+Length, word count, and character mix. These need no model at all, and they often carry most
+of the signal a gradient-boosted model splits on:
 
 ```{eval-rst}
 .. autoclass:: TextStatFeaturizer
@@ -303,9 +301,9 @@ and often carry most of the signal a gradient-boosted model splits on:
 ## Persistence
 
 A fitted preprocessor's state has to outlive the process that fitted it, or a serving
-request is standardized with its own mean instead of the training set's. These read and
-write that state as plain JSON, which is reviewable, diffable, portable, and safe to load from a
-store you do not fully control, which a pickle is none of.
+request is standardized with its own mean instead of the training set's. These read and write
+that state as plain JSON: reviewable, diffable, portable, and safe to load from a store you
+do not fully control. A pickle is none of those.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.preprocessors

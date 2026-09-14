@@ -1,10 +1,11 @@
 # Testing strategy
 
-Batcher's claim is to be faster than DuckDB, Spark, and Polars *and*
-correct. That is only credible if correctness is proven mechanically against a
-reference on every change. So the rule is blunt: correctness before speed, and a
-fast wrong answer is a bug. The benchmark harness enforces that literally: it refuses
-to time a query whose result does not match the oracle.
+Batcher aims to beat DuckDB, Spark, and Polars *and* to be correct. Without the
+second half the first half is worth nothing, and it is credible only when correctness is
+proven mechanically against a reference on every change. So the rule is blunt.
+Correctness comes before speed, and a fast wrong answer is a bug. The benchmark harness
+enforces that literally: it refuses to time a query whose result does not match the
+oracle.
 
 ## Two oracles
 
@@ -22,8 +23,8 @@ hide by weakening a test.
 is the reference. The parallel executor and the Cranelift JIT must agree with it
 bit-for-bit on every supported input. A new `bc-runtime` primitive also gets the
 mergeability test: `combine_finalize(partition(partial(pₖ)))` over all partitions
-must equal the single-node result, which is what guarantees one core, many cores,
-and many machines compute the same thing.
+must equal the single-node result. That equality is the guarantee that one core, many
+cores, and many machines compute the same thing.
 
 ## Property-based behavior testing
 
@@ -38,12 +39,12 @@ The suite lives in `tests/property/`, and each file pins one invariant and drive
 an oracle.
 
 **Optimizer result-invariance** (`test_prop_optimizer_result_invariance.py`). Kyber's full
-154-rule set must change the *plan* and never the *answer*. Hypothesis builds a random typed
+rule set must change the *plan* and never the *answer*. Hypothesis builds a random typed
 table and a random valid pipeline (filters carrying redundant and absorbing boolean shapes,
 derived columns, group-by aggregates, distinct, sort, limit, union) and asserts
 
 ```text
-result(FULL 154 rules)  ==  result(NO rules)  ==  ds.collect()
+result(FULL rule set)  ==  result(NO rules)  ==  ds.collect()
 ```
 
 on an order-independent multiset compare, and on row order too when the pipeline is totally
@@ -196,11 +197,12 @@ The gate measures a **deterministic subset**, `tests/{unit,differential,property
 and deliberately excludes `tests/integration`. Those Ray, adaptive-learning, and
 distributed tests are stable on their own, and they run for correctness under `test-py`,
 but coverage instrumentation perturbs their timing enough to make them flaky, which
-would make an enforced gate non-deterministic. The floor is **62%** branch
-coverage of `python/batcher`, set just below the measured subset baseline of about 64%.
-Raise the `--cov-fail-under` value in the `cov-gate` recipe whenever a round of new
-tests lifts the baseline. (`just cov-py` reports the same subset with line-by-line
-misses and an HTML drill-down.)
+would make an enforced gate non-deterministic. The floor is **85%** branch coverage of
+`python/batcher`, against a subset baseline measured at 87% on 2026-08-01. It sat at 62
+for a while, twenty-five points below what the suite reached, which is a ratchet nobody
+tightens and therefore not a ratchet. Raise the `--cov-fail-under` value in the
+`cov-gate` recipe whenever a round of new tests lifts the baseline. (`just cov-py`
+reports the same subset with line-by-line misses and an HTML drill-down.)
 
 ## See also
 

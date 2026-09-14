@@ -1,6 +1,6 @@
 # Getting results out
 
-Prefer ``iter_batches``: it streams and stays columnar. ``iter_rows`` exists for the cases where you genuinely need one row at a time, and it is the slowest way to leave the engine, so treat reaching for it as a signal that the work belonged in an expression.
+Prefer `iter_batches`. It streams and stays columnar, so a result far larger than memory still comes back in bounded memory. `iter_rows` streams too, and per-row Python at the *end* of a pipeline is fine. Inside the query it is not, and that work belongs in an expression or a `map_batches`. `to_pylist` materializes the whole result, so reach for it only when you already know the size.
 
 The whole script, executed on every test run:
 

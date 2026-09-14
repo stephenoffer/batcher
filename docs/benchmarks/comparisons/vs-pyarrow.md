@@ -3,10 +3,10 @@
 This page compares Batcher and PyArrow's compute kernels on the suites where PyArrow can
 express the workload.
 
-PyArrow is the substrate rather than a competitor in the usual sense: Batcher's own data
-plane speaks Arrow, and on several suites the two read byte-identical buffers. What differs
-is everything above the buffer -- scheduling, the query optimizer, and whether an operator
-streams or materializes.
+PyArrow is the substrate rather than a competitor in the usual sense. Batcher's own data
+plane speaks Arrow, and on several suites the two read byte-identical buffers. Everything
+above the buffer differs: scheduling, the query optimizer, and whether an operator streams
+or materializes.
 
 ## Where a comparison exists at all
 
@@ -25,7 +25,9 @@ This site marks the two states differently on purpose.
 
 ## The measured standing
 
-48-core box, `batcher,pyarrow` pairwise, best of five, every row correctness-gated.
+48-core Xeon Platinum 8275CL, 92 GiB, `batcher,pyarrow` pairwise, best of five, every row
+correctness-gated. Measured 2026-09-11. Each cell is `batcher_ms / pyarrow_ms`, so lower is
+better.
 
 | Suite | b/pyarrow | Cases |
 |---|---:|---:|
@@ -36,8 +38,8 @@ The margin is wide because the comparison is not really kernel against kernel. P
 executes an operator over a whole table on one core; Batcher morselizes the same work into
 16,384-row batches across every core, and on the shapes where PyArrow must materialize an
 intermediate (a sort feeding a limit, a window over an ordered partition) it also pays for
-memory Batcher never allocates. Where the work is a single vectorized pass over one column,
-the two converge -- that is the same Arrow kernel underneath.
+memory Batcher never allocates. On a single vectorized pass over one column the two converge.
+It is the same Arrow kernel underneath.
 
 ## What this does not say
 

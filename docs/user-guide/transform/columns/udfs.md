@@ -94,10 +94,10 @@ which keeps every column alive.
 ## A class loads once per worker
 
 :::{tip}
-A plain function is re-created on every batch. A class is instantiated **once per
-worker** and then called per batch, which is the difference between loading a model once
-per batch and loading it once per worker. This is the single highest-leverage line in the
-API.
+A plain function is re-created on every batch. A class is instantiated *once per
+worker* and then called per batch, which is the difference between loading a model once
+per batch and loading it once per worker. Nothing else in this API buys as much for one
+word of typing.
 :::
 
 ```python
@@ -110,8 +110,11 @@ class Splitter:
         return batch.append_column("parts", pa.array(counts, pa.int64()))
 
 
-print(ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "parts"])
-      .select("text", "parts").to_pydict())
+print(
+    ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "parts"])
+    .select("text", "parts")
+    .to_pydict()
+)
 # {'text': ['a,b', 'c', 'd,e,f'], 'parts': [2, 1, 3]}
 ```
 
@@ -125,11 +128,15 @@ A model class almost never takes zero arguments, so `fn_constructor_args` and
 not the same as passing an instance:
 
 ```python
-print(ds.map_batches(
-    Splitter,
-    fn_constructor_args=(",",),
-    output_columns=["text", "price", "qty", "parts"],
-).select("parts").to_pydict())
+print(
+    ds.map_batches(
+        Splitter,
+        fn_constructor_args=(",",),
+        output_columns=["text", "price", "qty", "parts"],
+    )
+    .select("parts")
+    .to_pydict()
+)
 # {'parts': [2, 1, 3]}
 ```
 
@@ -149,9 +156,11 @@ def scale(batch):  # batch is {column: ndarray}
     return {"price": batch["price"] * 2.0, "qty": batch["qty"]}
 
 
-print(ds.select("price", "qty")
-      .map_batches(scale, batch_format="numpy", output_columns=["price", "qty"])
-      .to_pydict())
+print(
+    ds.select("price", "qty")
+    .map_batches(scale, batch_format="numpy", output_columns=["price", "qty"])
+    .to_pydict()
+)
 # {'price': [20.0, 40.0, 60.0], 'qty': [1, 2, 3]}
 ```
 
@@ -169,8 +178,9 @@ those columns is also boxed into a Python object for every row.
 :::{tab-item} flat_map
 
 ```python
-print(ds.select("text").flat_map(lambda row: [{"tok": t} for t in row["text"].split(",")])
-      .to_pydict())
+print(
+    ds.select("text").flat_map(lambda row: [{"tok": t} for t in row["text"].split(",")]).to_pydict()
+)
 # {'tok': ['a', 'b', 'c', 'd', 'e', 'f']}
 ```
 
@@ -330,10 +340,12 @@ Batcher spelling of pandas {py:meth}`groupby().apply() <batcher.Dataset.groupby>
 time series, a document's chunks.
 
 ```python
-sales = bt.from_pydict({
-    "region": ["west", "east", "west", "east"],
-    "amount": [10.0, 5.0, 7.0, 3.0],
-})
+sales = bt.from_pydict(
+    {
+        "region": ["west", "east", "west", "east"],
+        "amount": [10.0, 5.0, 7.0, 3.0],
+    }
+)
 
 
 def spread(group):  # group is a RecordBatch of one region's rows
@@ -344,9 +356,12 @@ def spread(group):  # group is a RecordBatch of one region's rows
     }
 
 
-print(sales.group_by("region")
-      .map_groups(spread, output_columns=["region", "spread"])
-      .sort("region").to_pydict())
+print(
+    sales.group_by("region")
+    .map_groups(spread, output_columns=["region", "spread"])
+    .sort("region")
+    .to_pydict()
+)
 # {'region': ['east', 'west'], 'spread': [2.0, 3.0]}
 ```
 
@@ -364,8 +379,11 @@ Two cases do not need a callback at all. A plain reduction is `.agg(...)`, which
 Rust. Broadcasting a group statistic back onto every row is a window:
 
 ```python
-print(sales.window(partition_by=["region"], functions={"total": ("sum", "amount")})
-      .sort("region", "amount").to_pydict()["total"])
+print(
+    sales.window(partition_by=["region"], functions={"total": ("sum", "amount")})
+    .sort("region", "amount")
+    .to_pydict()["total"]
+)
 # [8.0, 8.0, 17.0, 17.0]
 ```
 
@@ -379,75 +397,6 @@ matters.
 {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` accepts the plan is the same question as for
 {py:meth}`ds.group_by("k").agg(...).map_batches(fn) <batcher.Dataset.group_by>`. Check it on your plan before relying on it.
 :::
-
-## Running a UDF pipeline on a cluster
-
-A `map_batches` chain distributes on its own: each worker reads its own splits and runs the
-function over them, and nothing passes through the driver.
-
-A UDF with a *breaker* above it needs one more step, because the breaker cannot see through
-an opaque Python function to co-partition anything. Batcher runs the UDF as its own
-distributed stage, lands its output on cluster-shared scratch, and then dispatches the
-breaker over that — so the operator above gets the shuffle, the skew handling and the spill
-it always had. Sorts, `distinct`, windows and limits go through this, and so do joins and
-unions, where each operand that holds a UDF is staged separately:
-
-```python
-# docs: skip
-embedded = docs.map_batches(Embedder, num_gpus=1)
-enriched = embedded.join(metadata, on="doc_id").group_by("topic").agg(n=bt.col("doc_id").count())
-enriched.collect(distributed=True)
-```
-
-The staging needs a scratch directory every node can reach. On a cluster with no shared
-mount, point `memory.spill_dir` at a shared filesystem; without one Batcher raises rather
-than writing files a worker cannot open.
-
-## Tolerating dirty data
-
-A single malformed record should not kill a six-hour job. With `max_errored_rows` set,
-a batch whose `fn` raises is bisected to isolate the offending rows, and those rows are
-*dropped* up to the budget. Past the budget the error propagates, so a genuine bug on
-clean data still fails fast.
-
-```python
-raw = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
-
-
-def parse(batch):
-    return pa.RecordBatch.from_pydict(
-        {"n": [int(v) for v in batch.column("s").to_pylist()]}
-    )
-
-
-print(raw.map_batches(parse, output_columns=["n"], max_errored_rows=10).to_pydict())
-# {'n': [1, 2, 4]}
-```
-
-:::{important}
-Default is 0 (strict). Set it deliberately and keep it small. A budget of 1,000,000
-silently deleted rows is not resilience, it is a deletion policy nobody agreed to.
-:::
-
-The budget is one allowance per worker process, whichever way the stage runs: threads,
-worker processes, or a streamed window all draw down the same count. Across a cluster the
-honest bound is therefore `workers x max_errored_rows`. Every drop is published to the
-observability bus with the running total and the error text, so a long job reports the loss
-while it happens rather than at the end.
-
-The row callbacks take it too. `ds.map`, `ds.flat_map`, and `ds.ml.filter` all lower to a
-`map_batches` stage, so the same budget isolates a raising callback down to the rows that
-raised:
-
-```python
-def parse_row(row):
-    return {"n": int(row["s"])}
-
-
-rows = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
-print(rows.map(parse_row, output_columns=["n"], max_errored_rows=10).to_pydict())
-# {'n': [1, 2, 4]}
-```
 
 ## UDFs in SQL
 
@@ -465,27 +414,23 @@ Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or
 transforms a whole table, register it with `table=True` and it follows the `map_batches`
 contract, forwarding any `map_batches` option you pass alongside it.
 
-There is no aggregate form. An aggregate has to be mergeable — a partial, a combine, and a
-finalize — so that one machine and a hundred produce the same answer, and a Python callable
-over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate,
+There is no aggregate form. An aggregate has to be mergeable, built from a partial,
+a combine and a finalize, so that one machine and a hundred produce the same answer. A Python
+callable over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate,
 or `map_groups` for arbitrary Python over each group.
 
 An option the call form cannot honour is rejected at registration rather than ignored, so a
 misspelled keyword fails where you wrote it.
 
-## The distributed caveat
+## Taking it to a cluster
 
-:::{warning}
-Under `distributed=True`, a worker that gets preempted mid-batch is reassigned and its
-partition **recomputed**. So `fn` must be idempotent. A pure transform is safe. A `fn`
-that POSTs to an API, upserts into a vector DB, or increments an external counter can
-apply that effect twice. Make the sink idempotent by upserting on a key, or move the side
-effect out of the UDF and into a `write`.
-:::
+Distributing a UDF stage, surviving a batch that raises, and the idempotency a preempted
+worker demands are all on {doc}`Running a UDF at scale <udfs-at-scale>`.
 
 ## See also
 
 - {doc}`Expressions </user-guide/transform/columns/expressions>`: check here first, because the expression usually exists.
+- {doc}`Running a UDF at scale <udfs-at-scale>`: distributing a UDF stage, the `max_errored_rows` budget, and idempotency under retry.
 - {doc}`Inference </ml/inference/inference>`: the class-per-worker pattern with a real model.
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: see what a UDF does to the plan the optimizer builds.
 - {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: what an expression

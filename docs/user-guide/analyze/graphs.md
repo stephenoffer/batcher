@@ -40,8 +40,8 @@ tail makes triangle counting cost far more than its average degree suggests.
 
 ## Isolated nodes are invisible unless you say otherwise
 
-An edge table cannot express a node with no edges, because such a node appears in no row.
-That silently changes every per-node average:
+An edge table cannot express a node with no edges. Such a node appears in no row. That
+silently changes every per-node average:
 
 ```python
 g_edges_only = bg.Graph.from_edges(bt.from_pydict({"src": [1], "dst": [2]}))
@@ -74,13 +74,18 @@ edges (node 0 here) has nowhere to send its rank, and a hand-rolled PageRank tha
 not redistribute that mass quietly stops summing to 1 while still looking plausible.
 
 `personalized_pagerank` teleports back to a chosen set instead of anywhere, which is the
-recommendation primitive: seed it with what one user touched and the ranking that comes
-back is what else is close to those, measured through the whole graph.
+recommendation primitive. Seed it with the items one user touched, and the ranking that
+comes back orders everything else by closeness to those, measured through the whole graph.
 
 ```python
 chain = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 4]}))
 near_1 = bg.personalized_pagerank(chain, bt.from_pydict({"node": [1]}))
-print([(n, round(v, 3)) for n, v in zip(*near_1.sort("pagerank", descending=True).to_pydict().values())])
+print(
+    [
+        (n, round(v, 3))
+        for n, v in zip(*near_1.sort("pagerank", descending=True).to_pydict().values())
+    ]
+)
 # [(1, 0.314), (2, 0.267), (3, 0.227), (4, 0.193)]
 ```
 
@@ -151,8 +156,8 @@ print(bg.connected_components(dg).sort("node").to_pydict()["component"])
 
 ## Dependency graphs
 
-A build order, a task schedule and a package graph are all the same question: can these
-be ordered so every edge points forward, and if not, what is in the way.
+A build order, a task schedule and a package graph are one question. Can these be ordered
+so every edge points forward? If not, what is in the way?
 
 `topological_order` returns *levels* rather than a flat sequence, because nodes at the
 same level are mutually independent and a scheduler can run a whole level at once:
@@ -164,7 +169,7 @@ print(bg.topological_order(bg.Graph.from_edges(deps)).sort("node").to_pydict())
 ```
 
 A node inside or downstream of a cycle can never lose its last incoming edge, so it is
-simply absent from the order. That makes the count the acyclicity test, and it means the
+absent from the order. That makes the count the acyclicity test, and it means the
 diagnostic comes free:
 
 ```python
@@ -180,9 +185,7 @@ Triangles are the smallest structure that distinguishes a real social graph from
 one with the same degrees. If your friends know each other, the graph has triangles.
 
 ```python
-two_triangles = bt.from_pydict(
-    {"src": [1, 2, 1, 4, 5, 4], "dst": [2, 3, 3, 5, 6, 6]}
-)
+two_triangles = bt.from_pydict({"src": [1, 2, 1, 4, 5, 4], "dst": [2, 3, 3, 5, 6, 6]})
 cg = bg.Graph.from_edges(two_triangles)
 print(bg.triangles(cg).count(), round(bg.average_clustering(cg), 3))
 # 2 1.0
@@ -228,14 +231,14 @@ print(bg.shortest_path_lengths(dg, bt.from_pydict({"node": [1]})).sort("node").t
 # {'node': [1, 2, 3], 'distance': [0.0, 1.0, 2.0]}
 ```
 
-There is no all-pairs function, and that is deliberate: an all-pairs distance matrix is
+There is no all-pairs function. That is deliberate: an all-pairs distance matrix is
 quadratic in node count and does not fit anywhere. `harmonic_centrality` and
 `diameter_estimate` take a set of sources and are named for being estimates.
 
 ## Link prediction
 
-Which pairs that are not connected look like they should be. The scores differ in how
-much a shared neighbour is worth:
+Which unconnected pairs look like they should be? The scores differ in how much a shared
+neighbour is worth:
 
 ```python
 social = bt.from_pydict({"src": [1, 3, 1, 3], "dst": [2, 2, 4, 4]})
@@ -304,8 +307,8 @@ print(bg.propagate_features(flow, feats, ["x"], 2).sort("node").to_pydict())
 That stack of hop columns is what a GNN learns to weight. Handing it to a gradient-boosted
 model instead is a strong baseline that trains in seconds and is far easier to explain.
 
-`structural_features` goes the other way and describes each node by its position alone,
-needing no node attributes at all. On fraud and abuse problems those columns are
+`structural_features` goes the other way. It describes each node by its position alone,
+with no node attributes at all. On fraud and abuse problems those columns are
 frequently the strongest signal available, because the behaviour is a shape in the graph
 rather than a property of any single account.
 
@@ -318,9 +321,7 @@ arrive as edges. Four constructors make that step explicit.
 embedding space to every algorithm above:
 
 ```python
-vecs = bt.from_pydict(
-    {"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]}
-)
+vecs = bt.from_pydict({"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]})
 print(bg.knn_graph(vecs, 1).edges.sort("src").to_pydict()["dst"])
 # ['b', 'a', 'b']
 ```
@@ -381,16 +382,15 @@ category, or a geohash prefix. Choosing that key is the engineering in each of t
 an optimization to add later.
 :::
 
-
 ## Requirements and limitations
 
 - **Iterative algorithms pass per-node state through the driver once per round.** A lazy
   plan built fifty iterations deep would re-run every earlier iteration on execution, so
-  each round's state is collected and re-wrapped. The edge-side joins still distribute --
-  the state is one row per *node*, not per edge -- but the driver round-trip is the real
-  ceiling on an iterative algorithm here: a graph with more nodes than the driver can hold
-  will not finish, however many workers you add. The degree functions are single-pass and
-  have no such limit.
+  each round's state is collected and re-wrapped. The edge-side joins still distribute,
+  since the state is one row per *node* rather than per edge. The driver round-trip is the
+  real ceiling on an iterative algorithm here: a graph with more nodes than the driver can
+  hold will not finish, however many workers you add. The degree functions are single-pass
+  and have no such limit.
 - **Eleven algorithms cannot run under an explicit `distributed=True`.** They build a plan
   shape the distributed executor has no path for, so {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` on a
   file-backed graph raises {py:exc}`PlanError <batcher.PlanError>` rather than running. They still compute the right

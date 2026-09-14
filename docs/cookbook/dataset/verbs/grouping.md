@@ -1,6 +1,6 @@
 # Grouping and rollups
 
-``group_by().agg()`` is the workhorse. ``rollup`` and ``cube`` compute subtotals in the same pass, which is how you build a report with per-region, per-product, and grand-total rows without three separate queries and a union.
+`group_by().agg()` is the workhorse. `rollup` and `cube` add the subtotal rows, so a report with per-region, per-product and grand-total lines is one call rather than three queries you stack by hand. Underneath they are that stack: one ordinary `group_by` per level, unioned over a shared source list so the levels share one read of the input instead of taking one each.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/dataset/grouping.py
 
 ## See also
 
-- {doc}`/cookbook/dataset/cleaning/dq_contracts`: validate, fail, drop, or quarantine.
+- {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join for time series.
 - {doc}`/cookbook/dataset/verbs/iteration`: batches, rows, slices, and the single-value cases.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

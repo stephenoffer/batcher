@@ -102,8 +102,8 @@ import batcher as bt
 ds = bt.read.parquet("s3://bucket/train/*.parquet")
 for batch in ds.ml.iter_torch_batches(
     batch_size=256,
-    device="auto",                   # CUDA / ROCm / XPU / MPS / CPU
-    pin_memory=True,                 # fast async host→device copies
+    device="auto",  # CUDA / ROCm / XPU / MPS / CPU
+    pin_memory=True,  # fast async host→device copies
     local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
 ):
     train_step(batch["features"], batch["label"])
@@ -147,7 +147,7 @@ iterable = ds.ml.stream_loader(
     columns=["features", "label"],
     global_consumed=resume_offset,  # 0 for a fresh epoch
 )
-# stream_loader is the only shard authority — do not add a DistributedSampler.
+# stream_loader is the only shard authority: do not add a DistributedSampler.
 for batch in DataLoader(iterable, batch_size=None):  # batches are already sized
     train_step(batch["features"].cuda(), batch["label"].cuda())
 ```
@@ -240,7 +240,7 @@ properties a distributed training run depends on.
 | `DistributedSampler` | in-RAM index list (O(n) per rank) | no | yes (pads) | no |
 | WebDataset | shard order + local buffer (approximate) | no | `ddp_equalize` heuristic | no |
 | MosaicML Streaming | shard/block shuffle, bounded | yes (`state_dict`) | yes | yes |
-| **Batcher** | **exact, O(1) memory** | **yes (`state_dict`)** | **yes (drop or pad)** | **yes** |
+| **Batcher** | exact, O(1) memory | yes (`state_dict`) | yes (drop or pad) | yes |
 
 One distinction is worth being precise about. WebDataset and MosaicML shuffle
 *approximately*, using a shard permutation plus a local buffer, so two samples in the
@@ -258,8 +258,8 @@ from itertools import islice
 from batcher.ml import ResumableSampler
 
 sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
-seen = list(islice(sampler, 3))          # train three steps
-state = sampler.state_dict()             # checkpoint between steps
+seen = list(islice(sampler, 3))  # train three steps
+state = sampler.state_dict()  # checkpoint between steps
 
 resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
 resumed.load_state_dict(state)

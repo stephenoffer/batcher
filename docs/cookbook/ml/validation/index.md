@@ -2,8 +2,6 @@
 
 The three questions that decide whether a score is real: did it generalize, was the data balanced, and is anything in it an artifact.
 
-Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
-
 | Recipe | What it shows |
 |---|---|
 | {doc}`/cookbook/ml/validation/model_selection` | Cross-validation, learning curves, and feature importance, all in the engine |

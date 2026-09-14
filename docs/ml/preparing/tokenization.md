@@ -9,16 +9,24 @@ Which tool you reach for depends on what the text actually is:
 
 | The column holds | Reach for | What you get |
 | --- | --- | --- |
-| Documents to feed a model | {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` wrapping a fast tokenizer class | a `List<Int64>` column of token ids |
+| Documents to feed a model | {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` around a fast tokenizer | a `List<Int64>` column of token ids |
 | Documents for causal-LM pretraining | `pack_sequences` over that token column | dense fixed-length blocks, nothing padded |
 | A category, not a document | {py:class}`LabelEncoder <batcher.ml.preprocessors.LabelEncoder>` | one integer per distinct value, learned on the train split |
 
 ## The Tokenizer preprocessor
 
-`Tokenizer(column, tokenizer, output_column=None)` applies any callable from a string to
-a list. It is a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it has the standard `fit`, `transform`, and
-`fit_transform` contract, and it is stateless. There is nothing to learn, so `fit` is a
-no-op and `transform` runs anywhere.
+`Tokenizer(column, tokenizer, output_column=None)` takes either a plain `str -> list`
+callable or a HuggingFace-style tokenizer, meaning a callable object that also carries
+`.encode`. It is a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it has the standard `fit`, `transform`, and
+`fit_transform` contract. There is nothing to learn, so `fit` only marks the object
+fitted, but it still has to be called: `transform` without it raises
+{py:exc}`PlanError <batcher.PlanError>`.
+
+Which of the two you pass decides how the tokenizer is driven. A HuggingFace tokenizer is
+called **once per Arrow batch** over the whole list of texts, which is where its Rust fast
+path lives, and that is also what unlocks `max_length`, `truncation`, `padding`, and
+`attention_mask_column`. A plain `str -> list` callable is per string by construction and
+is applied per string, and passing any of those four arguments alongside one raises.
 
 ::::{tab-set}
 :::{tab-item} A whitespace split
@@ -42,7 +50,35 @@ print(tokenized.to_pydict())
 
 :::{tab-item} A HuggingFace tokenizer
 
-The real thing, as a class, with the fast (Rust) implementation.
+The real thing. Pass the tokenizer straight in.
+
+```python
+# docs: skip
+import batcher as bt
+from batcher.ml import Tokenizer
+from transformers import AutoTokenizer
+
+hf = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
+
+ds = bt.read.parquet("s3://bucket/corpus.parquet")
+tok = Tokenizer(
+    "text",
+    hf,
+    output_column="input_ids",
+    max_length=512,
+    truncation=True,
+    attention_mask_column="attention_mask",
+)
+tok.fit_transform(ds).write.parquet("s3://bucket/tokens.parquet")
+```
+
+:::
+
+:::{tab-item} A tokenizer you build yourself
+
+When the tokenizer needs constructor arguments a preprocessor can't carry, or you want to
+tokenize and do something else in the same pass, write the UDF yourself. Make it a class:
+the model loads once per worker rather than once per batch.
 
 ```python
 # docs: skip
@@ -84,15 +120,17 @@ tokens.write.parquet("s3://bucket/tokens.parquet")
 ::::
 
 :::{warning}
-A real tokenizer has to be constructed **once per worker**, which means a class, not a
-lambda. A lambda closing over a tokenizer object gets pickled to every worker, and a slow
-tokenizer re-created per batch will be the bottleneck of the whole job. The GPU you were
-trying to feed ends up waiting on the CPU stage that was supposed to feed it.
+A tokenizer you construct yourself has to be constructed **once per worker**, which means a
+class, not a lambda. A slow tokenizer re-created per batch will be the bottleneck of the
+whole job, and the GPU you were trying to feed ends up waiting on the CPU stage that was
+supposed to feed it.
 :::
 
-`num_workers` defaults to `"auto"`, which fans the calls across every local core. A fast
+The parallelism knobs live on {py:meth}`map_batches <batcher.Dataset.map_batches>`, not on the preprocessor.
+`num_workers` defaults to `"auto"`, which fans the calls across every local core, and a fast
 tokenizer releases the GIL, so threads are the right pool. A pure-Python tokenizer needs
-`multiprocessing=True` to get real parallelism.
+`multiprocessing=True` to get real parallelism. `Tokenizer.transform` calls `map_batches`
+with those defaults, so reach for the UDF directly when you need to change them.
 
 ## Token ids are a list column
 
@@ -206,9 +244,8 @@ maps each distinct value to an integer, learned by a `fit` over the training spl
 from batcher.ml import LabelEncoder
 
 labelled = bt.from_pydict({"sentiment": ["pos", "neg", "pos", "neu"]})
-enc = LabelEncoder("sentiment")
-enc.fit(labelled)
-print(enc.fit_transform(labelled).to_pydict())
+enc = LabelEncoder("sentiment").fit(labelled)
+print(enc.transform(labelled).to_pydict())
 # {'sentiment': [2, 0, 2, 1]}
 print(enc.classes_)
 # ['neg', 'neu', 'pos']
@@ -230,7 +267,7 @@ batch *n+1* runs while the GPU chews on batch *n*.
 scored = (
     bt.read.parquet("s3://bucket/corpus.parquet")
     .map_batches(HFTokenizer(), output_columns=["id", "text", "input_ids"])  # CPU
-    .ml.infer(Classifier, num_gpus=1, concurrency=4)                          # GPU
+    .ml.infer(Classifier, num_gpus=1, concurrency=4)  # GPU
 )
 ```
 

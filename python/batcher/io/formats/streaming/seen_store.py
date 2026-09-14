@@ -7,15 +7,20 @@ persists, for every file it has handed out, the file path plus its size and
 modification time, so a later pass can ask "which of these candidates have I not
 seen?" and get a stable answer.
 
-It uses only the Python standard library (``sqlite3``) — no extra dependency —
+It uses only the Python standard library (``sqlite3``), no extra dependency, and imports
+it at call time rather than at module scope, so importing the streaming format family does
+not require the extension —
 and a single small table keyed by path. Writes are committed eagerly so a crash
 mid-pass never re-emits already-processed files (exactly-once semantics).
 """
 
 from __future__ import annotations
 
-import sqlite3
 from types import TracebackType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import sqlite3
 
 __all__ = ["SeenStore"]
 
@@ -30,6 +35,21 @@ CREATE TABLE IF NOT EXISTS seen_files (
     mtime REAL    NOT NULL
 )
 """
+
+
+def _sqlite3_error() -> type[BaseException]:
+    """`sqlite3.Error`, imported at call time rather than at module scope.
+
+    `sqlite3` is stdlib, so this is not an optional-dependency guard. It is deferred
+    because a module-scope import makes *every* import of the streaming format family
+    require a working `_sqlite3` extension, and on 2026-09-13 a broken conda build of it
+    (`libstdc++` missing `CXXABI_1.3.15`) took down `just docs` while autodoc was
+    documenting `ForeachWriter`, a class with nothing to do with this store. Importing
+    a store you never construct should not need the store's backend.
+    """
+    import sqlite3
+
+    return sqlite3.Error
 
 
 def _tune(conn: sqlite3.Connection) -> None:
@@ -53,7 +73,7 @@ def _tune(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-    except sqlite3.Error:  # pragma: no cover - filesystem-dependent
+    except _sqlite3_error():  # pragma: no cover - filesystem-dependent
         pass
 
 
@@ -100,6 +120,8 @@ class SeenStore:
         depend on it. Access is serialized either way — recovery completes before the loop
         begins, then only the loop touches it — so the check is redundant, not protective.
         """
+        import sqlite3
+
         self._conn = sqlite3.connect(path, check_same_thread=False)
         _tune(self._conn)
         self._conn.execute(_SCHEMA)

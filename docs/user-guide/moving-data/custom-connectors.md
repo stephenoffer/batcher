@@ -16,7 +16,7 @@ from batcher.io import SINKS, SOURCES, FileSink, FileSource
 ## The read side
 
 A `Source` is a lazily-readable relation. It knows its `schema()` without touching
-the data, reads on demand (`read()` materializes, {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams), reports
+the data, reads on demand (`read()` materializes, `iter_batches()` streams), reports
 `row_count()` when that is cheap (and `None` when counting would cost a scan), and
 returns a stable `identity()` string that the metadata hub keys learned statistics
 under.
@@ -84,7 +84,7 @@ across workers instead of being read on one node.
 
 ## The write side
 
-A `Sink` takes the other direction. {py:obj}`write(table, path) <batcher.Dataset.write>` writes a single file
+A `Sink` takes the other direction. `write(table, path)` writes a single file
 atomically and returns a {py:class}`WrittenFile <batcher.io.WrittenFile>` (path, rows, bytes, and any Hive partition
 values). `write_partitioned(table, path, ...)` writes one shard of a directory
 write and returns a `WrittenFile` per file. `commit(manifest, path)` finalizes the

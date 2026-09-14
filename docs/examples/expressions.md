@@ -5,8 +5,8 @@ accessor namespaces, and the type rules that decide what an expression returns.
 
 ## The accessor namespaces
 
-Breadth lives on accessors rather than on `Expr` itself, so the fluent builder stays thin.
-`.str`, `.dt`, `.list`, `.struct`, `.map` and `.json` each carry their family.
+Breadth lives on accessors rather than on `Expr` itself, which keeps the fluent builder thin.
+`.str`, `.dt`, `.list`, `.struct`, `.map` and `.json` each carry their own family.
 
 ```python
 import batcher as bt
@@ -57,9 +57,8 @@ banded = orders.with_columns(
 assert banded.to_pydict()["band"] == ["small", "medium", "large"]
 ```
 
-There is no null literal to reach for. `bt.nullif(a, b)` is the expression that produces one,
-returning null where the two sides are equal, and `bt.coalesce` is how you consume nulls by
-supplying a fallback chain.
+There is no null literal. `bt.nullif(a, b)` produces one, returning null where the two sides
+are equal, and `bt.coalesce` consumes nulls by supplying a fallback chain.
 
 ## Selectors and horizontal folds
 
@@ -68,9 +67,7 @@ step possible without reflection in Python. The `*_horizontal` family is the row
 counterpart to an aggregate, for when a value is spread across columns rather than rows.
 
 ```python
-readings = bt.from_pydict(
-    {"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening": [2.0, 4.0]}
-)
+readings = bt.from_pydict({"sensor": ["a", "b"], "morning": [1.0, 3.0], "evening": [2.0, 4.0]})
 
 folded = readings.select(
     "sensor",
@@ -89,9 +86,8 @@ assert numeric.columns == ["morning", "evening"]
 
 ## Types
 
-Mixed arithmetic widens to the type that can hold both. True division always widens and
-floor division does not, which is the difference that turns a count into a fraction without
-anyone noticing.
+Mixed arithmetic widens to the type that can hold both. True division always widens; floor
+division does not. That difference turns a count into a fraction without anyone noticing.
 
 ```python
 counts = bt.from_pydict({"hits": [10, 5], "total": [10, 20]})

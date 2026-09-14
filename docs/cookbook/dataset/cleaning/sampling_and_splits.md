@@ -1,6 +1,6 @@
 # Sampling and splits
 
-Every one of these takes a seed, because an unseeded split is a split you cannot reproduce when the result looks wrong. ``stratified_split`` preserves class balance; a plain random split does not, and on an imbalanced problem that matters.
+An unseeded split is one you cannot reproduce when the result looks wrong. Pass `seed` to every call that takes one. `sample_per_group` does not: it caps each group by an ordering rather than at random, so it is already deterministic. `stratified_split` preserves class balance where a plain random split does not, and on an imbalanced problem that matters.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/dataset/sampling_and_splits.py
 
 ## See also
 
-- {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
-- {doc}`/cookbook/dataset/verbs/sql_interface`: SQL over the same engine, and mixing SQL with DataFrame verbs.
+- {doc}`/cookbook/dataset/cleaning/deduplication`: exact keys, whole rows, and keeping a chosen survivor.
+- {doc}`/cookbook/dataset/cleaning/dq_contracts`: validate, fail, drop, or quarantine.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1455 Python modules across 213 packages and 286 Rust files across 15 crates.
+Covering 1455 Python modules across 213 packages and 288 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -190,7 +190,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 |---|---|---|
 | `gating.py` | 335 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 99 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 599 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `staging.py` | 594 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -904,7 +904,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3175 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 574 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -1626,7 +1626,7 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `device_exchange.py` | 390 | Redistributing between the devices of one node without serializing them behind each other. |
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 178 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 235 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
@@ -1992,7 +1992,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `kinesis.py` | 496 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
 | `pulsar.py` | 419 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
-| `seen_store.py` | 183 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
+| `seen_store.py` | 205 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 644 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO
@@ -2015,7 +2015,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `location.py` | 113 | Where a checkpoint lives — local disk, or the object store the durability advice names. |
 | `logs.py` | 188 | Durable offset + commit logs for streaming-query checkpointing. |
 | `recovery.py` | 60 | The recovery decision at streaming-query start. |
-| `state_store.py` | 359 | Durable snapshots of a streaming query's running aggregation state. |
+| `state_store.py` | 364 | Durable snapshots of a streaming query's running aggregation state. |
 | `store.py` | 117 | `CheckpointStore` — the offset log, commit log, and state store under one dir. |
 
 ### `batcher/io/formats/streaming/codecs/` — 2 · neutral IO
@@ -2242,7 +2242,7 @@ The plan, in every shape the dashboard needs to show it.
 | module | lines | what it is |
 |---|---|---|
 | `build.py` | 269 | The executed plan as a laid-out graph — nodes, edges, and their measured stats. |
-| `describe.py` | 236 | Reading a plan IR node: what is a child, and what does this operator actually do. |
+| `describe.py` | 239 | Reading a plan IR node: what is a child, and what does this operator actually do. |
 | `diff.py` | 242 | What the optimizer actually did — the logical plan against the one that ran. |
 | `explain.py` | 146 | The plan as text — the EXPLAIN output every SQL engine's users already know how to read. |
 
@@ -2341,7 +2341,7 @@ The scalar expression algebra.
 | `nodes.py` | 529 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
-| `walk.py` | 460 | Structural traversals over the expression tree. |
+| `walk.py` | 379 | Structural traversals over the expression tree. |
 
 ### `batcher/plan/expr_ir/compat/` — 1 · contract
 
@@ -2550,7 +2550,7 @@ How a `QueryProfile` becomes something a person can read.
 | module | lines | what it is |
 |---|---|---|
 | `cells.py` | 118 | One operator's worth of rendered text: its estimate, its share bar, its notes. |
-| `layout.py` | 460 | Columns, sections, and the order they appear in — the profile as a page. |
+| `layout.py` | 444 | Columns, sections, and the order they appear in — the profile as a page. |
 | `options.py` | 151 | The knobs and the presentation vocabulary the profile renderer draws with. |
 | `tree.py` | 171 | Recovering the shape of a plan tree from a flat, pre-ordered operator list. |
 
@@ -2683,7 +2683,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 177 | A single generic registry pattern, used for every extension point. |
+| `registry.py` | 192 | A single generic registry pattern, used for every extension point. |
 | `sql_errors.py` | 57 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility
@@ -2955,8 +2955,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 697 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1520 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/mod.rs` | 713 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/parallel.rs` | 1589 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -3005,7 +3005,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 538 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
-| `join/range/mod.rs` | 659 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/mod.rs` | 665 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
+| `join/range/small.rs` | 174 | A range join whose right side is a handful of rows: scan, don't sort. |
 | `join/sort_merge.rs` | 206 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 360 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 391 | The one canonical form for grouping/partitioning keys. |
@@ -3053,7 +3054,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `depth.rs` | 120 | How deep a plan document is, measured without recursing into it. |
 | `engine_config.rs` | 198 | Execution tunables shipped from the Python control plane alongside the plan. |
 | `error.rs` | 26 | The crate's error type: how a malformed plan IR is rejected at the wire boundary. |
-| `lib.rs` | 891 | `bc-ir` — the query intermediate representation. |
+| `lib.rs` | 895 | `bc-ir` — the query intermediate representation. |
 
 ### `bc-expr`
 
@@ -3066,9 +3067,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `analyze.rs` | 526 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 174 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 762 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
-| `eval/branch/case.rs` | 64 | `CASE`: the first branch whose condition holds supplies the row's value. |
+| `eval/branch/case.rs` | 71 | `CASE`: the first branch whose condition holds supplies the row's value. |
 | `eval/branch/coalesce.rs` | 76 | `COALESCE`: the first argument with a value supplies the row's value. |
-| `eval/branch/mod.rs` | 145 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
+| `eval/branch/literal_case.rs` | 181 | A `CASE` whose arms are all literals, built in one pass instead of one array per arm. |
+| `eval/branch/mod.rs` | 146 | Short-circuiting evaluation of the branch-selecting forms: `CASE` and `COALESCE`. |
 | `eval/cast.rs` | 612 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
 | `eval/dispatch.rs` | 507 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
@@ -3133,7 +3135,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/html.rs` | 171 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 82 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
-| `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
+| `eval/str/like.rs` | 205 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
 | `eval/str/mod.rs` | 1807 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 155 | String functions whose input is a **number**, not a string. |
@@ -3143,7 +3145,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/quality/mod.rs` | 33 | Per-document text-quality measures — the LLM pretraining-corpus filters. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
 | `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
-| `eval/temporal/civil.rs` | 175 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
+| `eval/temporal/civil.rs` | 193 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
 | `eval/temporal/date.rs` | 630 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 161 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |

@@ -10,9 +10,9 @@ not partition order.
 Window { partition_keys, order_keys, functions, rank_limit }
 ```
 
-Partition by the keys (an empty key list is one partition over all rows), order within each
-partition, compute one output column per function, scatter each column back to the row positions
-it came from, and append them to the input columns.
+Partition by the keys, ordering within each partition, then compute one output column per
+function, scatter each column back to the row positions it came from, and append them to the
+input columns. An empty key list is one partition over all rows.
 
 ```text
    input rows in original order, and every one of them survives
@@ -46,7 +46,7 @@ in **original row order**, not partition order.
 
 ## Three families
 
-`crates/bc-runtime/src/window.rs` implements them, and they have genuinely different costs.
+`crates/bc-runtime/src/window/mod.rs` implements them, and they have genuinely different costs.
 
 | Family | Functions | Needs an ordering | Shape of the work |
 |---|---|---|---|
@@ -73,22 +73,22 @@ window bug.
 
 ## The whole-partition shortcut
 
-`window_partition_agg.rs` exists because a no-`ORDER BY` aggregate does not need any of the
+`window/partition_agg.rs` exists because a no-`ORDER BY` aggregate does not need any of the
 window machinery. It computes via **dense group ids**: reduce each group in one linear pass over
 the rows, then broadcast its value back by index. That is exactly a group-by aggregate followed
 by a scatter, and it skips the per-partition index lists and the scattered gather they force.
 
-It's the cheapest window in the engine, and it's the shape where Batcher's margin over DuckDB is
-narrowest, because there is so little work left to remove.
+It's the cheapest window in the engine. It is also the shape where Batcher's margin over DuckDB
+is narrowest, because there is so little work left to remove.
 
 ## Explicit `ROWS` frames
 
-`window_frame.rs` handles `ROWS BETWEEN <start> AND <end>`: for each row, aggregate the physical
+`window/frame/` handles `ROWS BETWEEN <start> AND <end>`: for each row, aggregate the physical
 rows in `[start, end]` of its ordered partition.
 
-Both frame edges are non-decreasing in the row position, since each is `pos + const` clamped to the
-partition, so the frame only ever slides right and never rewinds. That makes the frame a FIFO
-queue, and the kernel exploits it to run in **one pass** with no frame ever rescanned. A naive
+Both frame edges are non-decreasing in the row position, since each is `pos + const` clamped to
+the partition. The frame only ever slides right. That makes it a FIFO queue, and the kernel
+exploits the fact to run in **one pass** with no frame ever rescanned. A naive
 implementation that re-aggregates each frame is O(n·k), and for a wide frame that is the whole cost
 of the query.
 
@@ -103,13 +103,19 @@ monotonic deque, O(n) amortized. Only the aggregate functions take a frame at al
 `bc-runtime` does not depend on `bc-ir`, because the crate DAG points one way and does not bend
 for convenience, so the interpreter maps the IR enum onto these exactly as it does for
 `WindowFn`. `Rows` counts physical rows while `Range` and `Groups` count peer groups, and `Range`
-is reached only for peer bounds such as `CURRENT ROW` and `UNBOUNDED`. A numeric `RANGE` offset is
-not supported and falls back upstream.
+is reached for peer bounds such as `CURRENT ROW` and `UNBOUNDED`, and for a numeric `RANGE`
+offset too: `frame_bounds` dispatches `is_value_range()` to `value_range_bounds`, a binary search
+over the order key's values rather than a walk over peers.
 :::
+
+The figure below sets one tied row's `ROWS` frame beside its `RANGE` frame, which is the point
+where the two units stop agreeing.
+
+![What a tie in the ORDER BY key does to a frame. The rows are sorted once by the PARTITION BY keys and then the ORDER BY keys, so every partition comes out contiguous and each function's output column is scattered back to the row it came from in the original row order. Inside one ordered partition holding three rows tied on the order key, ROWS ... CURRENT ROW stops at the current row, which is pure position arithmetic, so each tied row gets a different answer, while RANGE ... CURRENT ROW runs to the end of the peer group, so all three tied rows get the same answer. GROUPS counts peer groups the way ROWS counts rows, a numeric RANGE offset is a binary search over the key's values rather than a walk over peers, and a null order key frames only its own null peer group. Both frame edges only ever slide right, so a frame is a FIFO queue and no frame is ever rescanned.](/_static/diagrams/window_frame_eval.svg)
 
 ## Parallelism
 
-`window_parallel.rs`. Hash-partition the rows by the `PARTITION BY` keys into buckets, so every
+`window/parallel.rs`. Hash-partition the rows by the `PARTITION BY` keys into buckets, so every
 window partition lands **wholly inside one bucket**, run the serial kernel on each bucket across
 rayon cores, and scatter each function's output column back to original row order. Partitioning
 only regroups whole partitions across buckets, and the final scatter restores positions, so the
@@ -156,7 +162,7 @@ usual `k` of one to ten the `log k` is two or three comparisons. Spark and Daft 
 exactly this (`WindowGroupLimitExec`, `window_partition_and_dynamic_frame`).
 
 **Where the bound is applied is the whole difference.** A first version hooked the selection above
-`window_with`, over the whole batch, and was **2 to 4x slower** — it traded the operator's
+`window_with`, over the whole batch, and was **2 to 4x slower**. It traded the operator's
 bucketed parallelism for the better complexity, running `O(n log k)` on one core against
 `O(n log n)` on ninety-six. Applied inside the per-bucket kernel it inherits that parallelism
 instead, and each worker heaps only the partitions it owns.
@@ -176,7 +182,7 @@ The win grows with partition size, which is what the complexity predicts. `k = 1
 because Kyber sends it down a different route entirely: `row_number() = 1` rewrites onto
 `DISTINCT ON`, a per-key argmin rather than any kind of sort.
 
-The bounded path declines to the ordering path on anything it does not cover — more than one
+The bounded path declines to the ordering path on anything it does not cover: more than one
 order key, a non-numeric or nullable one, more than one partition key, or a `groups x k` heap
 large next to the rows it selects from. A non-survivor is marked `k + 1` rather than null or
 zero, because the caller's mask is `rank <= k` and a zero would pass it.
@@ -210,19 +216,25 @@ print(out.explain())
 broadcast to every row. Same `sum()`, two different kernels, chosen by whether an `order_by` is
 present.
 
-:::{dropdown} Why the plan has two `window` nodes
+:::{dropdown} Why the plan has three `window` nodes
 ```text
-query plan (planned)                              4 operators
-─────────────────────────────────────────────────────────────
-OPERATOR                           ESTIMATE  NOTES
-sort  [ts]                            est≈3  (exact)
-└─ window  [by user · rank]           est≈3  (exact)
-   └─ window  [by user · sum]         est≈3  (exact)
-      └─ scan  [source 0]             est≈3  (exact)
+query plan (planned)                      7 operators
+─────────────────────────────────────────────────────
+OPERATOR                            ESTIMATE  NOTES
+sort  [dept, sal]                      est≈3  (exact)
+└─ project                             est≈3  (exact)
+   └─ window  [global]                 est≈3  (exact)
+      └─ project                       est≈3  (exact)
+         └─ window  [global]           est≈3  (exact)
+            └─ window  [global]        est≈3  (exact)
+               └─ scan  [source 0]     est≈3  (exact)
 ```
 
-The three functions do not share one `(partition, order)` spec, so they cannot share one node.
-The no-`ORDER BY` aggregate is planned separately and takes the dense-group-id shortcut.
+One node per `.over(...)`, stacked. Nothing merges two windows that happen to share a
+`(partition, order)` spec, which `rk` and `running` here do, so the merge is available work
+rather than something the plan already did. The no-`ORDER BY` `total` could not have joined
+them anyway: it takes the dense-group-id shortcut. The `project` nodes carry each appended
+column forward to the next window.
 :::
 
 ## Where it stands
@@ -250,11 +262,11 @@ a 16-core release build with every correctness check passing.
 
 ## Where the code lives
 
-- `crates/bc-runtime/src/window.rs`: `WindowFn`, the serial kernel, ranking and value functions
-- `crates/bc-runtime/src/window_frame.rs`: explicit `ROWS` frames, one-pass accumulator/deque
-- `crates/bc-runtime/src/window_partition_agg.rs`: whole-partition aggregates via dense ids
-- `crates/bc-runtime/src/window_parallel.rs`: bucket-parallel execution and the skew guard
-- `crates/bc-runtime/src/window_fill.rs`: {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
+- `crates/bc-runtime/src/window/mod.rs`: `WindowFn`, the serial kernel, ranking and value functions
+- `crates/bc-runtime/src/window/frame/`: explicit `ROWS` frames, one-pass accumulator/deque
+- `crates/bc-runtime/src/window/partition_agg.rs`: whole-partition aggregates via dense ids
+- `crates/bc-runtime/src/window/parallel.rs`: bucket-parallel execution and the skew guard
+- `crates/bc-runtime/src/window/fill.rs`: {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
 - `crates/bc-interp/src/window_spill.rs`: grace partitioning for bounded memory
 
 ## See also

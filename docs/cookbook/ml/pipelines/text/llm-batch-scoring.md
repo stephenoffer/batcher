@@ -9,7 +9,7 @@ time, after the GPU work is paid for.
 ## Label a column, with the domain pinned
 
 {py:meth}`ds.ml.classify(engine, labels=[...]) <batcher.api.dataset.ml.DatasetML.classify>` resolves the model's answer against the declared
-label set and **nulls anything that does not resolve to exactly one**. The output column's
+label set and nulls anything that does not resolve to exactly one. The output column's
 domain is the list you passed, not whatever the model felt like saying.
 
 An engine is a zero-argument callable returning a `list[str] -> list[str]` function.
@@ -115,7 +115,7 @@ paying a 7-second load on every execution.
 ## Typed columns, not JSON blobs
 
 {py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` appends one typed Arrow column per declared field. The
-**declaration** decides the type, not what the model emitted in a given batch.
+*declaration* decides the type, not what the model emitted in a given batch.
 
 :::{warning}
 That is the difference from {py:meth}`generate(parse_json=True) <batcher.api.dataset.ml.DatasetML.generate>`, whose struct type is inferred per

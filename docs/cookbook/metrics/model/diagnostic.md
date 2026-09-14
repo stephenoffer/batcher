@@ -18,6 +18,6 @@ python examples/metrics/diagnostic.py
 ## See also
 
 - {doc}`/cookbook/metrics/model/classification`: classification metrics computed as aggregates over a predictions table.
-- {doc}`/cookbook/metrics/embeddings`: monitoring a vector column in aggregate.
+- {doc}`/cookbook/metrics/model/probabilistic_losses`: losses that score a probability or a margin rather than a hard label.
 - {doc}`/ml/evaluation/evaluation`: scoring a model, per segment, in one pass.
 - {doc}`/api/models/metrics`: the complete metric vocabulary.

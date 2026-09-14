@@ -88,12 +88,12 @@ key column below is the identity the sink compares:
 | {py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` | none, but you are handed the `batch_id` | whatever idempotency key you build from it |
 | `for_each`, `console`, `memory` | none | none |
 
-**File sinks** (`ds.write(path, format="parquet")`) write one file per micro-batch, named
+File sinks (`ds.write(path, format="parquet")`) write one file per micro-batch, named
 `part-batch00000.parquet`, `part-batch00001.parquet`, and so on. On a replay of batch 7,
 the writer finds `part-batch00007.parquet` already there and skips it. Idempotence **by
 position**.
 
-**Delta** (`ds.write.delta(uri)`) commits each micro-batch as one transaction carrying a
+Delta (`ds.write.delta(uri)`) commits each micro-batch as one transaction carrying a
 `txn` action of `(app_id, batch_id)`, and checks the log for that pair before it writes
 anything. A replayed batch finds its own transaction already recorded, writes no file, and
 commits nothing. Idempotence **by transaction id**, which is strictly stronger: the log
@@ -103,7 +103,7 @@ ends up with exactly one commit per micro-batch no matter how often it was retri
 It must be stable across restarts, or the check will never find the previous run's
 commits. Name your queries.
 
-**`for_each_batch`, `for_each`, `console`, `memory`**: no dedup at all. `for_each_batch`
+`for_each_batch`, `for_each`, `console` and `memory` dedup nothing at all. `for_each_batch`
 does receive the `batch_id`, which is the hook. It is the same id on a replay, so you can
 use it as the idempotency key of your own upsert (a `MERGE` keyed on batch id, a Redis
 `SETNX`, whatever your target supports). The engine hands you the identifier and steps
@@ -157,7 +157,7 @@ def write_once(values):
 
 
 write_once([1, 2])
-write_once([9, 9])   # a *different* batch 0, into the same directory
+write_once([9, 9])  # a *different* batch 0, into the same directory
 print(bt.read.parquet(shared).to_pydict())
 # {'v': [1, 2]}
 ```
@@ -193,9 +193,9 @@ already-ingested files in its own `state_dir`, which is what makes it exactly-on
 file, and which is separate state you must also keep.
 
 :::{warning}
-One more, from `api/streaming.py`: on a spot/preemptible cluster, a node-local checkpoint
-path gets a warning, because a reclaimed node takes the checkpoint with it and the restart
-you were counting on cannot happen. Put the checkpoint on object storage.
+One more. Under `distributed.resilience="spot"`, a checkpoint path that looks node-local
+gets a warning, because a reclaimed node takes the checkpoint with it and the restart you
+were counting on cannot happen. Put the checkpoint on object storage.
 :::
 
 ## See also

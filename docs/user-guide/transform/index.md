@@ -2,6 +2,8 @@
 
 Reshape a dataset. This section splits along the line the API itself draws: the verbs that
 decide which rows survive, and the expression language that decides what a column contains.
+Neither runs anything on its own. Every call returns a new dataset and nothing executes
+until a terminal operation, so a whole chain of them reaches the optimizer as one plan.
 
 ::::{grid} 1 2 2 2
 :gutter: 3

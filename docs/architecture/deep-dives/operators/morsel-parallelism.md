@@ -80,6 +80,11 @@ Every one of these is a *scheduling* choice. The hash-shuffle that parallelizes 
 threads is the same mechanism the distributed layer uses across actors, and the per-bucket
 join is the same primitive. Nothing about operator semantics changes.
 
+The three zoom levels below follow one filter-and-project chain from the batches a source
+happened to emit down to a single worker's pass over a single morsel.
+
+![Three zoom levels on how a filter-and-project chain reaches the cores. First, morselize splits and coalesces whatever the source emitted into morsels, each full at 16,384 rows or 1 MiB, whichever bound trips first, so one over-budget row becomes a one-row morsel. Second, the morsel vector is handed to one cached pool through a single par_iter() call, one task per morsel, at a width of operator_cores() capped by the number of morsels the input can produce; an idle worker steals from a busy one, and that stealing is rayon's scheduler rather than a queue Batcher owns. Third, one worker's pass over one morsel: rows in, a filter compiled once by the JIT, survivors projected without ever being materialized, and a morsel out, collected in index order so filter and project preserve row order where the hash operators do not.](/_static/diagrams/morsel_scheduling.svg)
+
 Result *order* for the hash-based operators (aggregate, distinct, join) depends on the worker
 count and is therefore not stable across machines. These are unordered relations, so the tests
 compare them as multisets. A sort, by contrast, is order-defining, and its parallel path is
@@ -166,8 +171,10 @@ and state-merge overhead that only amortizes if the morsel is big enough. 16,384
 rows was chosen to sit in L2/L3 for narrow data; an un-coalesced source is what defeats it.
 
 How far a shape scales is set by Amdahl rather than by the morsel loop. The
-scan-and-aggregate core scales well, and `GROUP BY` alone reaches **19.2x** on 16 cores
-(`benchmarks/BENCHMARK_RESULTS.md`). The join is bounded by the serial prefixes around the
+scan-and-aggregate core scales well, and `GROUP BY` alone over TPC-H `lineitem` at scale
+factor 1 reaches **19.2x** on 16 cores against 1
+(`docs/architecture/internals/parity/databricks_parity.md`, in the repository rather than on
+this site). The join is bounded by the serial prefixes around the
 per-bucket work: materializing a side, gathering the probe side, and the shuffle itself. Two
 of those have been removed, so the radix partition is now a parallel
 histogram/prefix-sum/scatter and the probe side is gathered once via `interleave` rather than
@@ -188,7 +195,7 @@ concatenated and then re-gathered.
 - {doc}`Carbonite </architecture/internals/carbonite>`: who decides how big a morsel may get under pressure.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: the `morsel_rows` and `parallelism` knobs, applied.
 - {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the single-node numbers.
-- {doc}`Scaling benchmarks </benchmarks/results/scaling>`: where the 1.7x to 3.8x figure comes from.
+- {doc}`Scaling benchmarks </benchmarks/results/scaling>`: what the same schedule does across machines.
 - {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why the parallel schedule computes the same answer.
 - {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: the shuffle-and-bucket join in detail.
 - {doc}`Arrow and memory </architecture/deep-dives/memory/arrow-memory>`: the byte budget a morsel is bounded by.

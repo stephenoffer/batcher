@@ -94,11 +94,7 @@ The SQL tab spells the same snap-and-count with `FLOOR` and `CAST`:
 ::::{tab-set}
 :::{tab-item} DataFrame
 ```python
-hot = (
-    binned.group_by("lat_bin", "lon_bin")
-    .agg(pickups=bt.count())
-    .sort("pickups", descending=True)
-)
+hot = binned.group_by("lat_bin", "lon_bin").agg(pickups=bt.count()).sort("pickups", descending=True)
 print(hot.to_pydict())
 # {'lat_bin': [3777, 4071, 3780, 5150, -3387], 'lon_bin': [-12242, -7401, -12228, -13, 15120],
 #  'pickups': [2, 2, 1, 1, 1]}
@@ -171,9 +167,7 @@ Filtering to a region is a plain range predicate, and it does not need the grid 
 `between` reads better than four comparisons, and it is one expression rather than four:
 
 ```python
-bay_area = pickups.filter(
-    col("lat").between(37.7, 37.9) & col("lon").between(-122.5, -122.2)
-)
+bay_area = pickups.filter(col("lat").between(37.7, 37.9) & col("lon").between(-122.5, -122.2))
 print(bay_area.to_pydict()["id"])
 # [1, 2, 3]
 ```

@@ -1,12 +1,11 @@
 # Data loaders
 
-This page maps the training data loaders: which one to reach for in which situation, and
-what each one guarantees.
+This page maps the training data loaders: which one to reach for in which situation, and what
+each one guarantees.
 
-A training loop that waits on data is a loop with an expensive GPU sitting idle, and the
-usual cause is a loader doing per-row Python work that should have been a columnar
-operator. Shape the data in the engine, and let the loader do nothing but hand tensors to
-the step function.
+A training loop that waits on data is an expensive GPU sitting idle, and the usual cause is a
+loader doing per-row Python work that should have been a columnar operator. Shape the data in
+the engine. Let the loader do nothing but hand tensors to the step function.
 
 ## Which loader
 
@@ -85,9 +84,11 @@ prune the scan.
 Three options matter in a real loop. `pin_memory=True` page-locks the host tensors so the
 copy to the device can be asynchronous. `prefetch_batches`, which is 2 by default,
 overlaps that copy with the next batch's host work, so the GPU is not waiting on the PCIe
-bus. `local_shuffle_buffer_size` is a streaming approximation of a shuffle. It keeps a
-reservoir and draws from it, which is not a global permutation but costs nothing extra to
-read.
+bus. `local_shuffle_buffer_size` is a streaming approximation of a shuffle, and it is a block
+permutation rather than a reservoir. The loader fills a block to that row count or to
+256 MiB, whichever binds first, permutes the whole block once, and emits it. That costs
+nothing extra to read, and it is not a global permutation: a row never crosses a block
+boundary, so a corpus written in label order stays clumped.
 
 ```python
 # docs: skip
@@ -109,6 +110,10 @@ for batch in ds.ml.iter_torch_batches(
 
 For DDP, each rank needs a disjoint slice of a single global order. `ds.ml.stream_loader`
 returns a `torch.utils.data.IterableDataset` for one rank, already batched.
+
+The shard is a stride over the global order rather than a contiguous slice of it, which is what makes the order independent of the cluster size:
+
+![How one global order becomes one shard per rank. ds.ml.stream_loader computes a seeded permutation of every row the same way on every rank, independent of the cluster size. A rank's shard is a stride over that order rather than a contiguous split: rank 0 takes rows 0, W, 2W and so on, rank 1 takes 1, W+1, 2W+1, and the order is trimmed or padded to a multiple of world_size so every rank yields the same count. What one rank then does with its stride is three steps. It fills a shuffle block, to the requested row window or 256 MiB, whichever comes first, and permutes it once; that is not a reservoir, because a row never crosses a block boundary, so a corpus written in label order stays clumped. It converts the numeric columns to tensors, dropping non-numeric ones with a single announcement, and zero_copy views the Arrow buffer through dlpack where it can rather than copying. It then moves the batch to the device on its own copy stream, holding the pinned staging tensor for the next few batches so an in-flight copy cannot read memory that was already freed. Resume works because global_consumed counts positions in the global order, not in a rank's shard, which is why a run resumes on a differently sized cluster; it must land on a multiple of world_size at a synchronized step boundary or the ranks come back with unequal counts.](/_static/diagrams/data_loader_shards.svg)
 
 ```python
 # docs: skip
@@ -174,9 +179,9 @@ print(len(loader), sorted(next(iter(loader))))
 # 10 ['f', 'label']
 ```
 
-The corpus also reads back as an ordinary relation, which is what the questions asked
-*around* a training run need — class balance, null labels, a join against the source table,
-a check that this corpus is the one the features were fitted on:
+The corpus also reads back as an ordinary relation. That is what the questions asked *around*
+a training run need: class balance, null labels, a join against the source table, a check that
+this corpus is the one the features were fitted on.
 
 ```python
 corpus = bt.read.training_shards(path)
@@ -186,10 +191,10 @@ print(corpus.group_by("label").agg(n=bt.col("f").count()).sort("label").to_pydic
 # {'label': [0, 1], 'n': [50, 50]}
 ```
 
-The row count comes from the corpus index, so `count()` is answered without reading a shard,
-and each shard is its own read task — so a scan of the corpus fans out across a cluster the
-same way any other source does. The shards are plain Arrow IPC underneath, so
-`bt.read.arrow(f"{path}/*.arrow")` works too. This is a layout, not a private format.
+The row count comes from the corpus index, so `count()` is answered without reading a shard.
+Each shard is its own read task, so a scan fans out across a cluster the same way any other
+source does. The shards are plain Arrow IPC underneath, so `bt.read.arrow(f"{path}/*.arrow")`
+works too. This is a layout, not a private format.
 
 ### Why the shuffle is blocked, not global
 
@@ -218,7 +223,7 @@ loader = shard_stream_loader(
     epoch=epoch,
     seed=42,
     shuffle_block_size=8 * 65_536,  # eight shards wide
-    cache_size=9,                   # ...so nine shards stay resident
+    cache_size=9,  # ...so nine shards stay resident
 )
 ```
 
@@ -269,7 +274,7 @@ per-rank one.
 :::{warning}
 Read `state_dict()` from the object your loop iterates. Under `DataLoader(num_workers=k)`
 the loader is pickled into *k* worker processes, so the copy left in the parent never
-advances and reports a resume point of zero — which resumes by replaying the whole epoch.
+advances and reports a resume point of zero. That resumes by replaying the whole epoch.
 Checkpoint from a loop over the loader itself, or use `num_workers=0`.
 :::
 
@@ -286,7 +291,7 @@ lose as little as possible when something fails.
 
 The manifest is republished **as the write proceeds**, not once at the end, so the corpus on
 disk is readable at every moment. A write that dies leaves a shorter but complete corpus
-rather than a directory of orphaned shards, and `resume=True` continues it — the rows already
+rather than a directory of orphaned shards, and `resume=True` continues it. The rows already
 written are skipped from the source rather than re-encoded:
 
 ```python
@@ -305,7 +310,7 @@ print(index.total_rows)
 ```
 
 Only whole shards count as written. A partial one from the previous attempt is redone, so a
-corpus never ends up with a short shard in the middle — which would break global indexing
+corpus never ends up with a short shard in the middle. That would break global indexing
 without failing.
 
 Shards are published concurrently, which is what makes a large corpus write in reasonable
@@ -394,9 +399,9 @@ print(sorted(first), first["f0"].dtype.name, int(first["f0"].shape[0]))
 ```
 
 `drop_last` matters more here than under PyTorch: a fixed-shape Keras graph cannot take a
-short final batch. Add `.prefetch(tf.data.AUTOTUNE)` to the returned dataset for the
-overlap `prefetch_batches` gives the torch path — that knob belongs to `tf.data`, so this
-does not duplicate it.
+short final batch. Add `.prefetch(tf.data.AUTOTUNE)` to the returned dataset for the overlap
+`prefetch_batches` gives the torch path. That knob belongs to `tf.data`, so Batcher does not
+duplicate it.
 
 :::{note}
 `dtypes` is applied in NumPy, before TensorFlow sees the batch, which halves what has to
@@ -454,6 +459,6 @@ In order of frequency:
   loop with its shape intact.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: what the device is waiting on when it
   is waiting.
-- {doc}`Distributed training pipeline </tutorials/ml/distributed-training-pipeline>`: the
+- {doc}`Distributed training pipeline </getting-started/tutorials/ml/distributed-training-pipeline>`: the
   whole path, from files to a loop.
 - {doc}`ML API </api/models/ml>`: the loader and converter reference.

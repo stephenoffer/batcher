@@ -2,7 +2,7 @@
 
 This section holds 39 runnable recipes for the expression API, grouped by the column type they operate on.
 
-Every one runs in Rust over whole columns rather than row by row. Each page embeds a complete, self-contained script from the [`examples/expressions/`](https://github.com/batcher/batcher/tree/main/examples/expressions) directory, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every one runs in Rust over whole columns rather than row by row. Each page embeds a complete, self-contained script from the [`examples/expressions/`](https://github.com/stephenoffer/batcher/tree/main/examples/expressions) directory, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Group | Recipes | Covers |
 |---|---|---|

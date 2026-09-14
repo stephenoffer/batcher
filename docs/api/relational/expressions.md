@@ -42,7 +42,7 @@ print(out.to_pydict())
 # {'label': ['lo', 'hi', 'hi'], 'best': [2, 2, 3]}
 ```
 
-{py:func}`hash_rows <batcher.hash_rows>` digests the row's **values**, typed: an integer from its bits, a float from
+{py:func}`hash_rows <batcher.hash_rows>` digests the row's values, and does it typed: an integer from its bits, a float from
 its canonicalized IEEE bits (so `-0.0` and `0.0` agree, and every NaN agrees), a string
 from its UTF-8. It is order-sensitive, treats null as a positional value, and is stable
 across partitions, runs, machines and versions. That stability is what lets it key a reproducible split, a surrogate key, or a hash bucket. It's 3 to 10x faster than hashing `cast(col, "string")`, and unlike that idiom it doesn't depend on how a float prints.
@@ -197,19 +197,19 @@ Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
 row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
 (the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
 
-The **assembly-contiguity** aggregates measure how a set of lengths is distributed *by
-base* rather than by item, which is what genome-assembly quality is judged on:
+The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
+rather than by item, the measure genome-assembly quality is judged on:
 {py:meth}`.n50() <batcher.AggExpr>` (the length at which pieces at least that long hold half
 the total), {py:meth}`.n90() <batcher.AggExpr>` (the same at 90%),
-{py:meth}`.l50() <batcher.AggExpr>` (the *count* of pieces needed to reach half — N is a
-length, L is a count), and {py:meth}`.aun() <batcher.AggExpr>` (the area under the Nx curve,
+{py:meth}`.l50() <batcher.AggExpr>` (the *count* of pieces needed to reach half, since N is a
+length and L is a count), and {py:meth}`.aun() <batcher.AggExpr>` (the area under the Nx curve,
 `sum(l²)/sum(l)`, which is threshold-free and therefore continuous where N50 steps). None is
 a quantile of the same lengths: a median weighs every piece equally, so an assembly of one
 10 Mb chromosome plus a thousand 500 bp fragments has a median of 500 and an N50 of 10 Mb.
 All four are mergeable, so a value computed over a shuffle equals the single-node one. See
 {doc}`/cookbook/expressions/genomics/index`.
 
-The **distribution** aggregates read a group's whole value list rather than a running
+The distribution aggregates read a group's whole value list rather than a running
 total: `.entropy()` (base-2 Shannon entropy of the value distribution, DuckDB `entropy`),
 {py:meth}`.mad() <batcher.plan.expr_ir.core.Expr.mad>` (median absolute deviation, a spread measure a single outlier cannot move),
 `.kurtosis_pop()` (the population form of `.kurtosis()`), `.quantile_disc(q)` (the
@@ -221,7 +221,7 @@ wildly in magnitude), and {py:meth}`.any_value() <batcher.plan.expr_ir.core.Expr
 engine resolves "unspecified" to the group minimum so a distributed run agrees with a
 single-node one).
 
-For heavy skew, the bounded-memory **approximate** variants keep one fixed-size
+For heavy skew, the bounded-memory approximate variants keep one fixed-size
 sketch per group instead of every value, so a hot key cannot OOM: `.approx_n_unique()`
 (HLL, ~2% error) and `.approx_quantile(q)` / `.approx_median()` (DDSketch). They are
 mergeable, so results are identical single-node and distributed.
@@ -229,7 +229,7 @@ mergeable, so results are identical single-node and distributed.
 An aggregate does not have to appear inside `group_by(...).agg(...)`. In a `select`
 whose every item is an aggregate it means the whole-frame aggregation and returns one
 row. Anywhere else, including `with_columns`, a mixed `select`, and a `filter` predicate, it means
-the whole-frame aggregate **broadcast to every row**, which is `.over()` with no
+the whole-frame aggregate broadcast to every row, which is `.over()` with no
 partition:
 
 ```python
@@ -317,7 +317,11 @@ those rows null instead (the Polars default).
 
 ```python
 r = bt.from_pydict({"x": [1, 2, 3, 4]})
-print(r.with_columns(m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict())
+print(
+    r.with_columns(
+        m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)
+    ).to_pydict()
+)
 # {'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
 ```
 
@@ -406,11 +410,13 @@ likewise carry {py:meth}`.and_(o) <batcher.plan.expr_ir.core.Expr.and_>`, {py:me
 import batcher as bt
 
 ds = bt.from_pydict({"x": [1, None, 3], "y": [10, 20, 30]})
-print(ds.select(
-    filled=bt.col("x").fillna(0),
-    missing=bt.col("x").isna(),
-    total=bt.col("x").add(bt.col("y")),
-).to_pydict())
+print(
+    ds.select(
+        filled=bt.col("x").fillna(0),
+        missing=bt.col("x").isna(),
+        total=bt.col("x").add(bt.col("y")),
+    ).to_pydict()
+)
 # {'filled': [1, 0, 3], 'missing': [False, True, False], 'total': [11, None, 33]}
 ```
 
@@ -427,7 +433,7 @@ On `.list`, `.lengths()` (the legacy Polars name for `len`), `.element_at(i)` (t
 PySpark name for `get`), and `.argmin()` / `.argmax()` (the numpy names for
 `arg_min`/`arg_max`).
 
-Some names from other engines are deliberately **absent**, because they mean something different
+Some names from other engines are deliberately absent, because they mean something different
 here and a silently-wrong alias is worse than a missing one:
 
 | Absent name | Why |
@@ -450,4 +456,4 @@ separately, in {doc}`/api/relational/expressions-datascience`.
 - {doc}`/api/relational/functions`: the top-level scalar, horizontal, aggregate, and window functions.
 - {doc}`/api/models/metrics`: the scoring and statistical aggregates used inside `agg()`.
 - {doc}`/user-guide/transform/columns/expressions`: the same language taught rather than tabulated.
-- {doc}`/cookbook/expressions/index`: 34 runnable recipes for the methods on this page.
+- {doc}`/cookbook/expressions/index`: 39 runnable recipes for the methods on this page.

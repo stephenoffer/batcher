@@ -1,6 +1,6 @@
 # Truncating timestamps
 
-``truncate``/``floor`` round a timestamp down to a unit, which is how you build an hourly or daily rollup key. The ``*_start``/``*_end`` pairs snap to calendar boundaries, which is what a month-over-month report needs.
+`truncate`/`floor` round a timestamp down to a unit, which is how you build an hourly or daily rollup key. The `*_start`/`*_end` pairs snap to calendar boundaries, which is what a month-over-month report needs.
 
 The whole script, executed on every test run:
 

@@ -1,6 +1,6 @@
 # Calling a model
 
-The four shapes a generation call takes, from the one-liner to the class UDF.
+The shapes a generation call takes, from the one-liner to the class UDF.
 
 ## On a Dataset
 
@@ -28,7 +28,7 @@ testable with no GPU:
 ```python
 import batcher as bt
 
-shout = lambda: (lambda prompts: [p.upper() for p in prompts])
+shout = lambda: lambda prompts: [p.upper() for p in prompts]
 print(bt.from_pydict({"q": ["hi"]}).ml.generate(shout, prompt_column="q").to_pydict())
 # {'q': ['hi'], 'response': ['HI']}
 ```
@@ -71,9 +71,9 @@ print(list(pack_sequences([batch], seq_len=4))[0].column("tokens").to_pylist())
 # [[1, 2, 3, 4], [5, 6, 7, 8]]
 ```
 
-Every position in a packed sequence holds a real token, so the number of sequences a
-corpus produces falls in proportion to how much padding the unpacked form carried. The
-shorter the documents are relative to the context length, the larger that saving.
+The number of sequences a corpus produces therefore falls in proportion to how much padding
+the unpacked form carried. The shorter the documents are relative to the context length, the
+larger that saving.
 
 Packing is sequential and stateful. A document that does not fit is carried into the next
 sequence rather than padded, so it transforms a *batch stream* instead of running as a
@@ -97,16 +97,17 @@ engine = vllm_engine("meta-llama/Llama-3-8B", sampling={"max_tokens": 256, "temp
 answers = llm_generate(ds.iter_batches(), engine, prompt_column="question")
 ```
 
-`llm_generate` is an iterator transform. It takes an iterable of Arrow batches and an
-engine factory, and yields each batch with `output_column` appended, defaulting to
-`"response"`, in input order. The factory is a zero-arg callable run once per worker,
-so the model is loaded once and reused. Throughput comes from two layers. `num_workers`
-engine copies run in parallel, and inside each, the engine batches the requests it is
-handed. Batcher reshapes the incoming morsels into request lists of about
-`target_batch_rows` and lets the engine's own continuous batching schedule them across
-its accelerators. There is no outer latency controller, because the engine owns its
-batching. The prompt comes from `prompt_column` directly, or from a `template` that
-formats any of the row's columns into a prompt.
+`llm_generate` is an iterator transform. It takes an iterable of Arrow batches and an engine
+factory, and yields each batch with `output_column` appended, defaulting to `"response"`, in
+input order. The factory is a zero-arg callable run once per worker, so the model is loaded
+once and reused.
+
+Throughput comes from two layers. `num_workers` engine copies run in parallel, and inside each
+one the engine batches the requests it is handed: Batcher reshapes the incoming morsels into
+request lists of about `target_batch_rows` and lets the engine's own continuous batching
+schedule them across its accelerators. There is no outer latency controller. The engine owns
+its batching. The prompt comes from `prompt_column` directly, or from a `template` that formats
+any of the row's columns into a prompt.
 
 Because the result is an iterator of Arrow batches, it composes with the rest of the
 engine. Write it straight back out, or feed it into another stage:

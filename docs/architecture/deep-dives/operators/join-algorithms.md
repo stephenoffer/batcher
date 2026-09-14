@@ -94,13 +94,18 @@ amortizes.
 |---|---|---|
 | `hash` | the default: neither side is broadcastable | both sides hash-partitioned by key into one bucket per worker |
 | `broadcast` | the build side fits `optimizer.broadcast_max_bytes` | the build side is replicated; the probe side never moves |
-| `sort_merge` | the inputs already arrive in key order | no hash table; sort (or skip the sort) and merge |
+| `sort_merge` | the build side is too big to hash: at least 50 M rows per worker | no hash table; sort (or skip the sort) and merge |
 
 :::{note}
 All three produce the same relation. Only the data movement differs, so a wrong pick is slow
 rather than wrong. That is what makes the strategy safe for Kyber to learn (see
 {doc}`Learned metadata </architecture/deep-dives/adaptive/learned-metadata>`) rather than something a user must get right.
 :::
+
+The decision that picks among the three, and the two later points at which it is made again on
+better information, are below.
+
+![How a join strategy and a build side are picked. The decision is made from each side's estimated rows times row width, the join type, since only an inner join may swap sides, and the broadcast ceiling, which is a quarter of L3 and on a cluster that times 16 with a 64 MiB floor. If the smaller side is under the ceiling the join broadcasts and the probe side never moves; otherwise a build side above the row floor of 50 million rows per worker takes sort_merge, which builds no hash table, and everything else takes hash, the shuffle join that partitions both sides by key. The runtime always builds on the right, so Kyber swaps the inputs when the smaller side is the left, and only an inner join may be swapped. The same decision is then made twice more: the bandit substitutes a learned arm before the run, and at run time the driver shuffles a broadcast that measured bytes show no longer fits. All three arms produce the same relation, so a wrong pick is slow rather than wrong, which is what makes the choice safe to learn across runs.](/_static/diagrams/join_strategy_choice.svg)
 
 ::::{tab-set}
 :::{tab-item} hash (shuffle)
@@ -142,8 +147,10 @@ path. Nothing silently changes shape.
 :::{tab-item} sort_merge
 There is no hash table. Batcher sorts both sides by key and merges them. `join/sort_merge.rs`
 skips the sort when the indices already arrive in ascending key order, which it establishes in
-one linear pass, and that is what makes this the right pick for already-ordered inputs such as
-time series, an upstream `Sort`, or sorted lakehouse files. Output order differs from the hash
+one linear pass. That saving is real, but it is not what selects this strategy: `SORT_MERGE_MIN_ROWS`
+(50 M rows per worker) is. Kyber notes at `kyber/rules/selection.py:479` that preferring sort-merge
+for already-ordered inputs "was tried and reverted", because its encoding overhead loses to hash
+even when the sort is skipped. Only a build side genuinely too big to hash keeps it. Output order differs from the hash
 join, because these are unordered relations.
 :::
 ::::
@@ -192,7 +199,7 @@ parallelism on a string key against **25.1x** on an integer key over the identic
 is 2,235 ms against 39 ms.
 
 The fix is not a second join algorithm. A byte key of fifteen bytes or fewer packs losslessly
-into one `u128` — the length in the top byte, the value bytes below it — and that *is* a `Copy`
+into one `u128`, the length in the top byte and the value bytes below it. That *is* a `Copy`
 value, so it reaches the same radix join the integer paths use. The packing is **injective**, so
 "packs equal" and "bytes equal" are the same predicate, and the partitions, chains and matches
 are the ones the byte comparison would have produced. Longer keys keep the flat path.
@@ -214,8 +221,8 @@ parallelism rather than the packing is the shape of the cost: before, the join s
 
 :::{note}
 The build side still has to clear `RADIX_MIN_BUILD_ROWS` (65,536) for any radix arm to fire, so
-a string join against a small dimension table keeps the flat path — correctly, since the whole
-build table fits in cache and partitioning it would be overhead.
+a string join against a small dimension table keeps the flat path. That is correct: the whole
+build table fits in cache, and partitioning it would be overhead.
 :::
 
 ## Skew and spill
@@ -223,7 +230,7 @@ build table fits in cache and partitioning it would be overhead.
 **Skew.** A hash-partitioned bucket that is far hotter than the average would leave one worker
 grinding while the rest idle. `par.rs` compares each bucket against the average on both rows and
 bytes, using the `skew_bucket_factor` threshold with absolute row and byte floors so a small
-bucket is never called skewed. `join_par.rs` then spreads the hot bucket across workers by
+bucket is never called skewed. `join_par/mod.rs` then spreads the hot bucket across workers by
 broadcasting its build side and chunking its probe side. A `Full` join is ineligible, because it
 must reconcile unmatched rows on both sides.
 
@@ -233,6 +240,10 @@ The streaming variant does this **one input batch at a time**, so a build side f
 memory spills instead of OOMing at the materialize step. Bucket count is sized from the build
 batches' total bytes without materializing them, and the fixed-seed partitioner co-locates equal
 keys, so the union of per-bucket joins is the full join for every join type.
+
+The admission test, the fan-out, and what a single bucket pair costs are below.
+
+![The grace hash join, from admission to one bucket pair. admit sizes the build side as its Arrow bytes plus 12 bytes per build row; if it fits, one hash table is built on the right and probed by the left. If it does not, both sides are partitioned by the same hash of the join key, one batch at a time so neither side is ever fully materialized, and written to disk as join-left/part-i.arrow and join-right/part-i.arrow, with the bucket count sized from the larger side divided by the budget, from 2 to 256. Each bucket pair is then joined on its own, and only the build bucket is resident: the probe bucket streams past it in chunks, so the cost is one bucket rather than two. A build bucket still over budget is re-partitioned with a fresh salt, at most three deep, because a re-split is a re-hash and so cannot separate rows that share a key, which leaves one hot key in one bucket at every level.](/_static/diagrams/hash_join_spill.svg)
 
 ## ASOF
 
@@ -300,21 +311,24 @@ print(inner.explain())
 
 :::{dropdown} The `explain()` output, and the strategy it chose
 ```text
-query plan (planned)                          4 operators
-─────────────────────────────────────────────────────────
-OPERATOR                       ESTIMATE  NOTES
-sort  [id]                        est≈3  (default)
-└─ hash_join  [inner on id]       est≈3  (default)
-   ├─ scan  [source 0]            est≈3  (exact)
-   └─ scan  [source 1]            est≈3  (exact)
+query plan (planned)                                            6 operators
+───────────────────────────────────────────────────────────────────────────
+OPERATOR                         ESTIMATE  NOTES
+sort  [k]                           est≈1  (default)
+└─ hash_join  [inner on k]          est≈1  (default)
+   ├─ filter  [k ≥ 1 AND k ≤ 3]     est≈2  (default)
+   │  └─ scan  [source 1]           est≈3  (exact)  pushed[k ≥ 1 AND k ≤ 3]
+   └─ filter  [k ≥ 2 AND k ≤ 4]     est≈2  (default)
+      └─ scan  [source 0]           est≈3  (exact)  pushed[k ≥ 2 AND k ≤ 4]
 
 decisions:
-  - [kyber/selection] join build side: left≈3 right≈3 [exact] → broadcast
-  - ...
+  - [kyber/selection] join build side: left≈3 right≈3 [exact] → swap build→left + broadcast
 ```
 
-Both sides are three rows, so it broadcasts. The strategy is named in the decisions block, not
-in the tree.
+Both sides are three rows, so it broadcasts, and it swaps which side builds. The strategy is
+named in the decisions block, not in the tree. The two `filter` nodes are not in the query
+either: Kyber derived each side's key range from the other and pushed it into the scan, which
+is why the join's estimate falls to one row.
 :::
 
 The `None` in the left join is the null index in the index-pair builder, made visible.
@@ -335,7 +349,7 @@ Daft's by 1.7x to 2.2x at every scale measured.
 - `crates/bc-runtime/src/join/radix.rs`: the parallel three-phase partition
 - `crates/bc-runtime/src/join/stream.rs`: `BroadcastProbe`, the streaming probe
 - `crates/bc-runtime/src/join/sort_merge.rs`, `asof.rs`: the other two algorithms
-- `crates/bc-interp/src/join_par.rs`: grace join, broadcast join, skew detection
+- `crates/bc-interp/src/join_par/`: grace join, broadcast join, skew detection
 - `crates/bc-interp/src/ops/repartition.rs`: gather-once bucket construction
 
 ## See also

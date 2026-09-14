@@ -2,9 +2,10 @@
 """Draw `transfer_modes.svg` — how Carbonite routes one shuffle partition.
 
 Source of truth: `python/batcher/carbonite/transfer/locality.py::select_mode`.
-The diagram states the two comparisons the selector actually makes, in order, and
-marks SHARED_MEMORY as selected-but-not-yet-executed, which is what that module's
-docstring says today. Keep both in step.
+The diagram states the two comparisons the selector actually makes, in order.
+SHARED_MEMORY used to be drawn as selected-but-not-executed, copied from that module's
+docstring; both were stale and were corrected on 2026-09-13. The mirror is written by
+`ShuffleSession.publish` and read by `bc_py::shuffle::gather::fetch_shared`.
 
 Layout: three columns, each centered on its mode card, so the decision text, the
 arrow, and the outcome share one vertical axis.
@@ -46,12 +47,17 @@ body += [
     note(COLS[0], 372, "No serialization, no socket.", anchor="middle"),
     note(COLS[0], 390, "The concrete win over an object store.", anchor="middle"),
     card(358, CARD_TOP, 264, 92, "SHARED_MEMORY", "Arrow IPC over a memory map"),
-    note(COLS[1], 372, "Selected today, not yet executed:", anchor="middle"),
-    note(COLS[1], 390, "a planned Rust fast path.", anchor="middle"),
+    note(COLS[1], 372, "Mirrored on publish, read back", anchor="middle"),
+    note(COLS[1], 390, "by the reducer's fetch_shared.", anchor="middle"),
     card(642, CARD_TOP, 290, 92, "NETWORK", "credit-bounded Arrow Flight"),
     note(COLS[2], 372, "One credit is one batch slot.", anchor="middle"),
     note(COLS[2], 390, "The producer blocks at zero.", anchor="middle"),
-    note(490, 440, "locality_ratio reports the fraction of transfers that stayed off the network.", anchor="middle"),
+    note(
+        490,
+        440,
+        "locality_ratio reports the fraction of transfers that stayed off the network.",
+        anchor="middle",
+    ),
 ]
 
 write("transfer_modes", svg(W, H, "".join(body)))

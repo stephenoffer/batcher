@@ -60,8 +60,9 @@ print(latest.sort("user").to_pydict())
 :::{tab-item} SQL
 
 ```python
-print(bt.sql(
-    """
+print(
+    bt.sql(
+        """
     SELECT user, ts, status
     FROM (
         SELECT *, row_number() OVER (PARTITION BY user ORDER BY ts DESC) AS rn FROM t
@@ -69,8 +70,9 @@ print(bt.sql(
     WHERE rn = 1
     ORDER BY user
     """,
-    t=events,
-).to_pydict())
+        t=events,
+    ).to_pydict()
+)
 # {'user': ['a', 'b', 'c'], 'ts': [3, 4, 5], 'status': ['paid', 'paid', 'new']}
 ```
 
@@ -83,11 +85,11 @@ thing, not a different query.
 `keep="first"` takes the earliest row in `order_by` order; `keep="last"` takes the
 latest. Both *require* `order_by`, because without an order there is no first.
 
-`keep="any"` (the default) skips the ordering and takes an **arbitrary** row. Arbitrary
+`keep="any"` (the default) skips the ordering and takes an *arbitrary* row. Arbitrary
 means arbitrary: which row you get may differ between runs, and between a single-node and a
 distributed run, because the engine keeps whichever row it reached first. That is fine when
-the non-key columns are functionally dependent on the key — the rows it is choosing between
-are identical — and wrong when they are not. If the surviving row's other columns matter,
+the non-key columns are functionally dependent on the key, because the rows it is choosing
+between are then identical. It is wrong when they are not. If the surviving row's other columns matter,
 pass `order_by` with `"first"` or `"last"` and the choice becomes a property of your data
 rather than of the schedule.
 
@@ -108,8 +110,8 @@ every row.
 That matters most at scale, because the two shapes grow differently. A ranking sorts, so its
 cost grows faster than the data; a reduction is a hash pass, so it grows with it. On a 5%-
 distinct key the reduction is roughly 3x faster than the equivalent window at 2 million rows
-and 7 to 12x faster at 32 million — see the dedup section of
-`benchmarks/BENCHMARK_RESULTS.md` for the measurement and the hardware.
+and 7 to 12x faster at 32 million. The dedup section of
+`benchmarks/BENCHMARK_RESULTS.md` has the measurement and the hardware.
 
 If you want the rank itself rather than one row per key, write the window: see
 {doc}`window functions </user-guide/analyze/window-functions>`.
@@ -226,9 +228,7 @@ redelivery that arrives inside the lateness window is still caught.
 
 ```python
 # docs: skip
-deduped = stream.drop_duplicates_within_watermark(
-    ["event_id"], event_time="ts", lateness="10m"
-)
+deduped = stream.drop_duplicates_within_watermark(["event_id"], event_time="ts", lateness="10m")
 ```
 
 Over a bounded source it degrades to plain exact deduplication. See

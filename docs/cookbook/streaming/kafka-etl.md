@@ -15,7 +15,7 @@ the sink, not by the source. Everything below is arranged around that one fact.
 Every broker source (Kafka, Kinesis, Pulsar, Pub/Sub, Event Hubs) hands you the same
 six columns, and the payload is opaque bytes:
 
-| column | type | |
+| Column | Type | Notes |
 | --- | --- | --- |
 | `key` | binary | may be null |
 | `value` | binary | your payload, undecoded |
@@ -36,14 +36,16 @@ import pyarrow as pa
 import batcher as bt
 from batcher import col
 
-broker = pa.schema([
-    ("key", pa.binary()),
-    ("value", pa.binary()),
-    ("partition", pa.int64()),
-    ("offset", pa.int64()),
-    ("timestamp", pa.int64()),
-    ("topic", pa.string()),
-])
+broker = pa.schema(
+    [
+        ("key", pa.binary()),
+        ("value", pa.binary()),
+        ("partition", pa.int64()),
+        ("offset", pa.int64()),
+        ("timestamp", pa.int64()),
+        ("topic", pa.string()),
+    ]
+)
 
 payloads = [
     {"user": "u1", "event": "click", "amount": 3},
@@ -166,9 +168,7 @@ seen = os.path.join(root, "_seen")
 pq.write_table(pa.table({"user": ["u1", "u2"], "amount": [3, 5]}), f"{inbox}/001.parquet")
 
 first = bt.read.files_incremental(inbox, "parquet", state_dir=seen)
-q = first.filter(col("amount") > 2).write.memory(
-    "bronze_pass1", trigger=bt.Trigger.available_now()
-)
+q = first.filter(col("amount") > 2).write.memory("bronze_pass1", trigger=bt.Trigger.available_now())
 q.await_termination()
 print(bt.read_memory("bronze_pass1").to_pydict())
 # {'user': ['u1', 'u2'], 'amount': [3, 5]}

@@ -37,7 +37,7 @@ from _authoring import FONT, write
 
 W, H = 980, 400
 
-COL_X = (300, 528, 756)        # left edge of each capability column
+COL_X = (300, 528, 756)  # left edge of each capability column
 COL_W = 208
 ROW_Y = (150, 226, 302)
 ROW_H = 62
@@ -85,10 +85,10 @@ def cell(cx: float, cy: float, has: bool, text: str, emphasis: bool = False) -> 
 parts = [
     f'<rect x="0" y="0" width="{W}" height="{H}" rx="14" class="surf"/>',
     f'<text x="40" y="46" font-family="{FONT}" font-size="19" font-weight="700" class="t-head">'
-    f'What the adaptive loop actually buys</text>',
+    f"What the adaptive loop actually buys</text>",
     f'<text x="40" y="70" font-family="{FONT}" font-size="13" class="t-sub">'
-    f'Not a finer re-planning grain than Spark AQE. The same grain, in two places AQE and '
-    f'DuckDB do not reach.</text>',
+    f"Not a finer re-planning grain than Spark AQE. The same grain, in two places AQE and "
+    f"DuckDB do not reach.</text>",
 ]
 
 headers = (
@@ -105,13 +105,33 @@ for x, (h1, h2) in zip(COL_X, headers):
     ]
 
 rows = (
-    ("DuckDB", "static optimizer",
-     [(False, "optimizes once, up front"), (True, "single-node by design"), (False, "no cross-run state")]),
-    ("Spark AQE", "cluster only",
-     [(True, "at stage boundaries"), (False, "needs shuffle stages"), (False, "no cross-run state")]),
-    ("Batcher", "same grain, wider reach",
-     [(True, "at stage boundaries"), (True, "same loop, one node"),
-      (True, "sketches, costs, bandit")]),
+    (
+        "DuckDB",
+        "static optimizer",
+        [
+            (False, "optimizes once, up front"),
+            (True, "single-node by design"),
+            (False, "no cross-run state"),
+        ],
+    ),
+    (
+        "Spark AQE",
+        "cluster only",
+        [
+            (True, "at stage boundaries"),
+            (False, "needs shuffle stages"),
+            (False, "no cross-run state"),
+        ],
+    ),
+    (
+        "Batcher",
+        "same grain, wider reach",
+        [
+            (True, "at stage boundaries"),
+            (True, "same loop, one node"),
+            (True, "sketches, costs, bandit"),
+        ],
+    ),
 )
 for y, (name, sub, cells) in zip(ROW_Y, rows):
     emph = name == "Batcher"
@@ -126,12 +146,12 @@ for y, (name, sub, cells) in zip(ROW_Y, rows):
 
 parts += [
     f'<text x="40" y="{H - 42}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f'The within-query loop is the same mechanism and granularity as Spark AQE, not something '
-    f'finer. It also engages only on a joined query whose scan input clears 5M rows or '
-    f'roughly 320 MB per pipeline breaker,</text>',
+    f"The within-query loop is the same mechanism and granularity as Spark AQE, not something "
+    f"finer. It also engages only on a joined query whose scan input clears 5M rows or "
+    f"roughly 320 MB per pipeline breaker,</text>",
     f'<text x="40" y="{H - 24}" font-family="{FONT}" font-size="11.5" class="t-sub">'
-    f'so most small queries never use it. The third column is the half with no DuckDB or Spark '
-    f'equivalent. Source: docs/architecture/internals/competitive_architecture.md.</text>',
+    f"so most small queries never use it. The third column is the half with no DuckDB or Spark "
+    f"equivalent. Source: docs/architecture/internals/competitive_architecture.md.</text>",
 ]
 
 svg = (

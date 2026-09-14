@@ -110,9 +110,9 @@ read also joins and unions afterwards. The pairs a drifting directory actually p
 | `int32` and `int64` | `int64` |
 | `float32` and `float64` | `float64` |
 | an integer and a float | `float64` |
-| `decimal(10,2)` and `decimal(12,4)` | `decimal(12,4)` — the finer scale, the wider integer part |
+| `decimal(10,2)` and `decimal(12,4)` | `decimal(12,4)`: the finer scale, the wider integer part |
 | a decimal and an integer | a decimal wide enough for both, so the cents survive |
-| `timestamp[ms]` and `timestamp[us]` | `timestamp[us]` — the finer resolution |
+| `timestamp[ms]` and `timestamp[us]` | `timestamp[us]`, the finer resolution |
 | a date and a timestamp | the timestamp, since a date is midnight |
 | `string` and `large_string` | `large_string` |
 | a dictionary-encoded column and a plain one | the plain value type |
@@ -138,7 +138,7 @@ There is no common type for `int64` and `string`, and Batcher will not invent on
 stringifying your numbers:
 
 ```python
-from batcher._internal.errors import SchemaError
+from batcher import SchemaError
 
 bad = os.path.join(work, "bad")
 os.makedirs(bad)
@@ -176,7 +176,7 @@ pre-evolution version is still there at `version=N-1` if the new column turns ou
 garbage.
 
 :::{important}
-**Appending a wider batch to a Delta table does not widen the table.** The sink writes to
+Appending a wider batch to a Delta table does not widen the table. The sink writes to
 the table's committed schema. A column the table does not know about would land in the data
 files but stay invisible to the table, which is a silent loss that resurfaces as wrong data
 the day someone adds the column for real. The engine refuses that write rather than let it
@@ -187,9 +187,7 @@ happen.
 narrow = os.path.join(work, "narrow")
 bt.from_pydict({"id": [1], "amount": [10]}).write.delta(narrow, mode="overwrite")
 try:
-    bt.from_pydict({"id": [2], "amount": [20], "region": ["us"]}).write.delta(
-        narrow, mode="append"
-    )
+    bt.from_pydict({"id": [2], "amount": [20], "region": ["us"]}).write.delta(narrow, mode="append")
 except Exception as exc:
     print(type(exc).__name__)
 # CommitError
