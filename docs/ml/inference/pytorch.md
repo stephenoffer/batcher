@@ -153,7 +153,7 @@ come from, whether `iter_batches()`, a reader, or the output of {py:class}`Infer
 `run_pipeline`. Use them when you drive the loop yourself. Use
 `ds.ml.iter_torch_batches` when you want tensors straight out of a dataset.
 
-{py:meth}`to_numpy_batches(batches, columns=...) <batcher.api.dataset.ml.DatasetML.to_numpy_batches>` is the base of the other two. It yields one
+{py:func}`to_numpy_batches(batches, columns=...) <batcher.ml.to_numpy_batches>` is the base of the other two. It yields one
 `{column: ndarray}` dict per batch, with numeric non-null columns converted zero-copy. A
 tensor column, or a fixed-size list of numbers, comes back with its real `(n, width...)`
 shape rather than an object array, so an embedding or image column feeds a model as a
@@ -167,7 +167,7 @@ print({name: array.tolist() for name, array in arrays.items()})
 # {'f0': [0.1, 0.2], 'label': [0, 1]}
 ```
 
-`to_torch_iterable(batches, columns=...)` wraps that in a
+{py:func}`to_torch_iterable(batches, columns=...) <batcher.ml.to_torch_iterable>` wraps that in a
 `torch.utils.data.IterableDataset` yielding `{column: tensor}` dicts. It is the class
 from the previous section, minus the writing. Non-numeric columns are skipped, so keep
 text and ids in the engine rather than in the trainer's hot path. It is single-pass unless
@@ -185,7 +185,7 @@ for batch in DataLoader(stream, batch_size=None):  # batches are already sized
     loss.backward()
 ```
 
-`to_tf_dataset(batches, columns=...)` is the TensorFlow equivalent. It returns a
+{py:func}`to_tf_dataset(batches, columns=...) <batcher.ml.to_tf_dataset>` is the TensorFlow equivalent. It returns a
 `tf.data.Dataset` of `{column: tensor}` dicts, with the output signature derived from the
 first batch.
 

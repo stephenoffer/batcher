@@ -59,6 +59,12 @@ PageRank, components, communities, and graph-ML features.
 Full SQL that lowers to the same engine.
 :::
 
+:::{grid-item-card} {octicon}`beaker;1.1em` Model and AI functions in SQL
+:link: /user-guide/analyze/sql-model-functions
+:link-type: doc
+`ML_PREDICT`, `AI_GENERATE`, and `AI_EXTRACT`.
+:::
+
 :::{grid-item-card} {octicon}`zap;1.1em` Metadata shortcuts
 :link: /user-guide/analyze/metadata-shortcuts
 :link-type: doc
@@ -78,5 +84,6 @@ geospatial
 robotics
 graphs
 sql
+sql-model-functions
 metadata-shortcuts
 ```

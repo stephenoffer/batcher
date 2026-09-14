@@ -5,7 +5,7 @@ stays live forever, because another row for it might arrive tomorrow.
 
 :::{warning}
 Run a plain {py:meth}`group_by("user").agg(...) <batcher.Dataset.group_by>` against Kafka in `complete` mode and the state grows
-for as long as the job runs. Eventually it is the job's memory that ends the query.
+for as long as the job runs. Eventually the job's memory ends the query.
 :::
 
 Event-time windows fix this by making a group *finishable*. A window has an end. Once
@@ -56,9 +56,11 @@ Now the source never ends. Add {py:meth}`.with_watermark(time_col, lateness) <ba
 partial per open window, and a window is emitted the moment the watermark passes its
 end.
 
-The watermark is `max(event_time seen) - lateness`. Watch it work. The third micro-batch
-carries an event at 02:10, which pushes the watermark to 02:00 and closes the 00:00
-window:
+The watermark is the highest event time the stream has delivered, less the lateness. On a
+partitioned source the slowest partition sets it, which
+{doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` covers. Watch it
+work. The second micro-batch carries an event at 02:10, which pushes the watermark to 02:00
+and closes the 00:00 window:
 
 ```python
 import pyarrow as pa

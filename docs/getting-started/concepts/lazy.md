@@ -31,7 +31,7 @@ The common terminals:
 
 - {py:meth}`to_pydict() <batcher.Dataset.to_pydict>` gives you a column-oriented dict; {py:meth}`to_pylist() <batcher.Dataset.to_pylist>` gives you a list of
   row dicts.
-- `collect()` returns a `pyarrow.Table`, and `count()` returns only the row count.
+- {py:meth}`collect() <batcher.Dataset.collect>` returns a `pyarrow.Table`, and {py:meth}`count() <batcher.Dataset.count>` returns only the row count.
 - {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams Arrow record batches instead of materializing everything.
 - `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and the generic
   {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink.

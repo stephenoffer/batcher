@@ -11,8 +11,8 @@ compaction service. None of that belongs in a Rust/Arrow data plane. Reading is 
 | **Read** | `bt.read.hudi(path)`, with `as_of_instant=` |
 | **Write** | Not supported. `ds.write.hudi(...)` raises {py:exc}`BackendError <batcher.BackendError>`. |
 | **Extra** | `pip install 'batcher-engine[hudi]'` |
-| **Parallelism** | None at the source. `splits()` returns a single {py:class}`WholeSourceSplit <batcher.io.WholeSourceSplit>`. |
-| **Pushdown** | An AND of column-vs-literal comparisons, as hudi-rs filter tuples |
+| **Parallelism** | One split per file slice on copy-on-write. Merge-on-read reads whole. |
+| **Pushdown** | An AND of column-vs-literal comparisons, as hudi-rs filter tuples, pruning files |
 | **Incremental** | `HudiSource.read_incremental(start, end)` |
 
 That is the whole shape of this integration, and it fits the common case. Hudi tables are usually
@@ -118,27 +118,36 @@ events = bt.read.hudi(
 ```
 :::
 
-## How it parallelizes, and where it doesn't
+## How it parallelizes
+
+`HudiSource.splits()` asks the timeline for the surviving file slices and returns one
+{py:class}`HudiFileSliceSplit <batcher.io.formats.lakehouse.hudi.HudiFileSliceSplit>` per slice.
+A split carries locators only, the table root plus the slice's base-file path and the reader
+options, so it pickles cheaply and its worker opens that one file. The pushed predicate is applied
+*before* the enumeration, so a partition the filter excludes is never turned into a split at all.
+
+Each split's row count comes from its base file's Parquet footer rather than from hudi-rs's
+`HudiFileSlice.num_records`, which reports the whole table's total on every slice. That is
+metadata rather than a scan, and it is what lets the distributed planner bin-pack by real size.
 
 :::{important}
-Honestly: it doesn't, at the split level. `HudiSource.splits()` returns a single
-`WholeSourceSplit`. hudi-rs owns file-group resolution, log-file merging, and the read itself, and
-Batcher does not reach inside that to hand out one split per base file. So the *read* is one unit
-of work, and parallelism starts after it: batches morselize into the engine, and every operator
-downstream runs morsel-parallel across cores and across the cluster.
+**A merge-on-read table is read whole.** A MoR slice is a base file plus log files holding later
+updates and deletes, and the per-slice reader opens the base file only, so splitting one would
+resurrect superseded rows. A table with any log files therefore falls back to a single
+{py:class}`WholeSourceSplit <batcher.io.WholeSourceSplit>`, which hudi-rs merges correctly.
+Correctness first. The same fallback covers a timeline that cannot be enumerated at all.
 :::
 
-For a table that is a small dimension or a filtered slice, that is fine. For a multi-terabyte fact
-table, it is a real bottleneck, and the fix is upstream. Read the table's underlying Parquet with
-{py:meth}`bt.read.parquet_dataset <batcher.api.io_namespace.reader.Reader.parquet_dataset>`, which does split per file, if and only if you can guarantee the layout
-is copy-on-write with no pending log files. That guarantee is the catch, so measure before you take
-it.
+So the parallel read is a copy-on-write property, and a MoR fact table with a long log tail is
+still one unit of work at the source. Compaction upstream is what returns it to the split path.
 
-Predicate pushdown does work. An AND of column-vs-literal comparisons becomes hudi-rs filter tuples
-and prunes at the source. Anything it cannot express, such as an `OR` or a computed term, is not
-pushed, and the engine's own filter produces the same rows over a wider scan. If hudi-rs rejects
-the pushed filters outright, on a version or format mismatch, the read retries unfiltered rather
-than failing. A correct answer is never at stake, only I/O.
+Predicate pushdown prunes files, never rows. An AND of column-vs-literal comparisons becomes
+hudi-rs filter tuples, which eliminate whole slices by partition path and, from hudi-rs 0.5, by a
+base file's column statistics, so even an unpartitioned table skips files a predicate excludes.
+Anything the translation cannot express, an `OR` or a computed term, is left to the engine's own
+filter, which produces the same rows over a wider scan. If hudi-rs rejects the pushed filters
+outright, on a version or format mismatch, the read retries unfiltered rather than failing. A
+correct answer is never at stake, only I/O.
 
 ## Failure modes worth knowing
 
@@ -146,8 +155,11 @@ than failing. A correct answer is never at stake, only I/O.
 an MOR table with a long log-file tail reads slowly until the writer's compaction catches up. This
 is a property of the table, not the connector.
 
-**No exact count.** Hudi exposes no cheap row count here, so `count()` scans. Delta and Iceberg
-answer it from their logs; Hudi does not.
+**The count is a footer read, not a log read.** Delta and Iceberg answer a row count from their
+own metadata. Hudi's `HudiFileSlice.num_records` reports the whole table's total on every slice,
+so summing it overcounts by the slice count; Batcher reads each base file's Parquet footer
+instead. That is still metadata rather than a scan, and it is exact, but it costs one pass over
+the footers on a table with many slices.
 
 **Version skew.** hudi-rs tracks the Hudi spec independently of the Spark/Flink writer that
 produced your table. A table written by a much newer Hudi than the installed `hudi` package can

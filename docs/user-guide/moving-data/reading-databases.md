@@ -8,11 +8,10 @@ import batcher as bt
 import pyarrow as pa
 ```
 
-The same `bt.read` namespace also reaches databases and warehouses, plus a handful
-of scientific container formats. They share one shape: `bt.read.<name>(path_or_uri,
-**opts)` hands back a lazy `Dataset`, and nothing is fetched until a terminal op
-runs. The database connectors (`mongo`, `cassandra`, `dynamodb`, `elasticsearch`)
-take their connection as keyword options rather than a path.
+They share one shape. `bt.read.<name>(path_or_uri, **opts)` hands back a lazy `Dataset`,
+and nothing is fetched until a terminal op runs. The database connectors (`mongo`,
+`cassandra`, `dynamodb`, `elasticsearch`) take their connection as keyword options rather
+than a path.
 
 | Reader | Reads | Needs |
 | --- | --- | --- |
@@ -232,7 +231,7 @@ print(above_ground.select("x", "z").to_pydict())
 # {'x': [4.0], 'z': [0.5]}
 ```
 
-## The LiDAR preprocessing chain is native
+### The LiDAR preprocessing chain is native
 
 Because the cloud is columnar, the standard per-frame preprocessing is engine operators
 end to end. No Python runs per point, and one lazy plan fuses the stages rather than
@@ -367,7 +366,7 @@ print(sorted(bt.read.parquet(events_root).columns))
 A partition column's *type* is a different question from its presence, because a Hive path
 segment carries only text, and the type has to be inferred back out of it. Strings,
 integers, and dates come back as they went in. A date key is recognized only when *every*
-directory value under that key is a full ``YYYY-MM-DD`` date, so a key that is a date in
+directory value under that key is a full `YYYY-MM-DD` date, so a key that is a date in
 one branch and something else in another stays text rather than failing to parse later:
 
 ```python
@@ -394,7 +393,7 @@ ds = bt.read.parquet("events/").with_columns(ratio=bt.col("ratio").cast("float64
 ```
 
 An integer key loses zero-padding, because the padding is not part of the number: a tree
-of ``month=01`` through ``month=12`` reads back as 1 through 12, and re-writing it would
+of `month=01` through `month=12` reads back as 1 through 12, and re-writing it would
 produce unpadded directory names. Where the padding is part of the identifier rather than
 a formatting choice, write the key as a string with a non-numeric marker in it, or use a
 format that records the partition schema.

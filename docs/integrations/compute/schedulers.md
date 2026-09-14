@@ -6,9 +6,9 @@ as Kubernetes, Nomad or YARN; or a managed job service such as AWS Batch, SageMa
 Azure ML or SkyPilot.
 
 There is nothing to configure. Batcher reads what the scheduler already exported into the
-process and sizes itself against the *allocation* rather than against the machine. What this
-page explains is which facts it reads, why reading them matters, and what to check when a run
-looks like it is using a fraction of what you paid for.
+process and sizes itself against the *allocation* rather than against the machine. Below are
+the facts it reads, why each one matters, and what to check when a run looks like it is using
+a fraction of what you paid for.
 
 ## Why the allocation is not the machine
 
@@ -124,9 +124,9 @@ is killed, instead of losing the stage mid-write.
 single-node Ray on whichever node the script landed on. The job then runs, returns the right
 answer, and uses a quarter of the hardware it was billed for.
 
-Batcher cannot fix this from inside the process, so it says so: when the allocation is wider
-than the Ray cluster — including the case where no cluster is running at all — it logs a
-warning naming both counts, once per process. Bringing Ray up across the allocation is the
+Batcher cannot fix this from inside the process, so it says so. When the allocation is wider
+than the Ray cluster, including the case where no cluster is running at all, it logs a warning
+naming both counts, once per process. Bringing Ray up across the allocation is the
 launcher's job. Pass `distributed=False` if the single node is what you meant, and the notice
 stops.
 
@@ -163,9 +163,10 @@ container `/tmp` is an overlay on the root filesystem, so a spill that defaults 
 
 Batcher prefers, in order: the directory you named in `memory.spill_dir`; the per-job scratch
 directory the scheduler created (`_CONDOR_SCRATCH_DIR`, `SLURM_TMPDIR`, `PBS_JOBFS`); the best
-measured node-local volume; the system temp directory. Nothing is chosen from its name alone —
-a candidate has to exist, be writable (tested by writing, since `os.access` passes on a
-read-only mount), be on a real block device rather than tmpfs or an overlay, and have room.
+measured node-local volume; the system temp directory. Nothing is chosen from its name alone.
+A candidate has to exist, be writable, be on a real block device rather than tmpfs or an
+overlay, and have room. Writability is tested by writing, because `os.access` passes on a
+read-only mount.
 
 The scheduler's own directory is preferred because a spill should not outlive its job. It is
 also the only directory an HTCondor job is guaranteed to be able to write to.
@@ -240,7 +241,7 @@ equivalent) for the device grant, and `RANK`/`WORLD_SIZE` for the job's width.
 
 ## Requirements and limitations
 
-- Detection is **local reads only** — environment variables, the scheduler's own host files, and
+- Detection is local reads only: environment variables, the scheduler's own host files, and
   the firmware's description of the machine in `/sys/class/dmi/id`. Batcher never calls a
   metadata service or a scheduler API, because a network round trip on a control-plane path
   becomes a multi-second hang the moment a firewall blackholes it.

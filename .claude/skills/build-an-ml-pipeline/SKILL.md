@@ -317,7 +317,7 @@ Gemini or Vertex AI. All the hosted ones take `requests_per_minute` / `tokens_pe
 
 - `docs/ml/index.md`, `docs/ml/inference/inference.md`, `docs/ml/inference/batch-scoring.md`, `docs/ml/retrieval/embeddings.md`, `docs/ml/preparing/multimodal/index.md`, `docs/ml/inference/gpu.md`, `docs/ml/retrieval/llm/index.md`, `docs/ml/retrieval/vector-search.md`, `docs/ml/retrieval/rag.md`, `docs/ml/training/data-loaders.md`, `docs/ml/training/distributed-training.md`, `docs/api/models/preprocessors.md`, `docs/ml/inference/streaming.md`, `docs/ml/preparing/tokenization.md`, `docs/ml/training/serving.md`;
   `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/moving-data/cloud-storage.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/operate/tuning/explain-plans.md`.
-- `docs/tutorials/ml/batch-inference.md`, `docs/tutorials/ml/distributed-training-pipeline.md`, `docs/tutorials/ml/feature-engineering.md`;
+- `docs/getting-started/tutorials/ml/batch-inference.md`, `docs/getting-started/tutorials/ml/distributed-training-pipeline.md`, `docs/getting-started/tutorials/ml/feature-engineering.md`;
   `examples/ml_inference.py`, `examples/preprocessors.py`.
 - Skills: `run-a-distributed-job` (taking this to a cluster — GPU stages force distribution),
   `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-daft`.

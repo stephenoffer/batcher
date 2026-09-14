@@ -118,8 +118,9 @@ print(encoder.transform(bt.from_pydict({"c": ["never_seen"]})).to_pydict())
 
 {py:class}`HashingEncoder <batcher.ml.preprocessors.HashingEncoder>` hashes into a fixed number of buckets. Unbounded cardinality, no fitted
 state at all, and therefore no train/serve skew, at the cost of collisions, which a tree
-model tolerates better than most people expect. It uses the engine's stable `xxhash64`
-rather than Python's {py:meth}`hash() <batcher.plan.expr_ir.core.Expr.hash>`, which varies per process and would be a silent skew.
+model tolerates better than most people expect. It hashes with the engine's stable
+`str.xxhash64()` rather than Python's `hash()`. Python's varies from process to process,
+which would be a silent train/serve skew.
 
 {py:class}`BinaryEncoder <batcher.ml.preprocessors.BinaryEncoder>` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
 
@@ -212,8 +213,8 @@ print(imputer.transform(train).collect().column("age").to_pylist())
 ```
 
 The learned fill value in `imputer.statistics_` is reused on every split, so train and
-validation get the *same* fill. The standard impute-then-scale ordering composes by
-sequencing the objects, as **Composing a pipeline** below shows.
+validation get the *same* fill. Impute, then scale. Sequencing the objects is what composes
+that ordering, and {doc}`/ml/preparing/preprocessors/pipelines` covers it.
 
 ## Imputing from the other columns
 
@@ -241,10 +242,10 @@ print(round(SimpleImputer(["b"]).fit_transform(related).to_pydict()["b"][2], 3))
 `b` is exactly twice `a`, so 6.0 is the right answer and 7.2 is the column mean. That gap is
 the whole reason to pay for this.
 
-`fit` records the entire schedule — the initial per-column fill, then one model per
-incomplete column per round, in order — and `transform` replays it. A serving row is
-therefore imputed by the same models in the same sequence as a training row, which is the
-part a hand-rolled loop usually gets wrong.
+`fit` records the entire schedule: the initial per-column fill, then one model per
+incomplete column per round, in order. `transform` replays it. A serving row is therefore
+imputed by the same models in the same sequence as a training row, which is the part a
+hand-rolled loop usually gets wrong.
 
 The cost is real. A fit is up to `max_iter * len(incomplete columns)` model fits, each a
 pass over the data, so reach for `SimpleImputer` when the columns are unrelated. Rounds stop

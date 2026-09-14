@@ -1,15 +1,15 @@
 # Differences and verification
 
-This page covers the two things a port needs after the verbs translate: which familiar
-APIs Batcher deliberately does not have, and how to prove the ported script returns the
-same rows as the original.
+A port isn't finished when the verbs translate. Two things are left: which familiar APIs
+Batcher deliberately does not have, and how to prove the ported script returns the same
+rows as the original. This page covers both.
 
 ## What Batcher deliberately does not have
 
 Some familiar APIs are absent by design rather than by omission, and knowing which is
 which saves you looking for a workaround that doesn't exist. Batcher tells you at the
-point of use: every one of these raises an `AttributeError` naming the reason and the
-replacement, so you can discover the mapping from a traceback instead of this table.
+point of use. Every one of these raises an `AttributeError` naming the reason and the
+replacement, so you can find the mapping from a traceback instead of this table.
 
 | Absent | Why | Instead |
 |---|---|---|
@@ -21,15 +21,16 @@ replacement, so you can discover the mapping from a traceback instead of this ta
 | `df.resample` | Time bucketing is a grouping. | {py:meth}`ds.group_by(bucket=bt.col("t").dt.truncate("1h")).agg(...) <batcher.Dataset.group_by>` |
 | Looping over a {py:class}`GroupBy <batcher.GroupBy>` | It materializes one frame per key in Python and caps the job at one machine. | `.agg(...)`, or `.window(partition_by=[...])` to keep every row |
 
-Column attribute access (`df.amount`) is absent for a subtler reason: a column named
-`filter` or `join` would shadow a method, which is a real source of pandas bugs. Use
-`ds["amount"]` for the expression, or {py:func}`bt.col("amount") <batcher.col>` to build one.
+Column attribute access such as `df.amount` is absent for a subtler reason. A column
+named `filter` or `join` would shadow a method, which is a real source of pandas bugs.
+Use `ds["amount"]` for the expression, or {py:func}`bt.col("amount") <batcher.col>` to build one.
 
 ## The error messages teach you the mapping
 
-You don't have to memorize the translation tables at all. Type the method you already know, and the
-traceback tells you the Batcher spelling. This works at every level: on a {py:class}`Dataset <batcher.Dataset>`, on
-an expression, on a `GroupBy`, and on the `bt` package itself.
+You don't have to memorize the translation tables. Type the method you already know, and
+the traceback tells you the Batcher spelling. This works at every level: on a
+{py:class}`Dataset <batcher.Dataset>`, on an expression, on a `GroupBy`, and on the `bt`
+package itself.
 
 ```python
 import batcher as bt
@@ -69,9 +70,12 @@ such as `ds.filtr` or `bt.col("x").meen` points straight at `filter` and `mean`.
 
 ## Checking a port
 
-{py:meth}`ds.equals(other) <batcher.Dataset.equals>` compares *results*, not plans, so it answers the only question that
-matters after a migration. Row order is ignored by default, because a relation is
-unordered. Pass `ordered=True` after a `sort` when the emitted order is part of the
+{py:meth}`ds.equals(other) <batcher.Dataset.equals>` compares *results* rather than plans, so it answers the
+only question a migration raises. Both sides execute and their rows are compared, so two
+queries built out of completely different verbs count as equal when they agree, which is
+exactly the property a port needs and a plan-shape comparison cannot give you. Column
+names and types must match. Row order is ignored by default, because a relation is
+unordered. After a `sort`, pass `ordered=True` when the emitted order is part of the
 contract.
 
 ```python

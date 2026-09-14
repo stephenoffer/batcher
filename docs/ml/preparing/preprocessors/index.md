@@ -6,9 +6,8 @@ is distributed and spillable for free. `transform` is a lazy column rewrite. Fit
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
-Every preprocessor is importable from `batcher.ml.preprocessors`. Most are also
-re-exported from `batcher.ml`, with the exceptions of {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>` and
-{py:class}`PolynomialFeatures <batcher.ml.preprocessors.PolynomialFeatures>`, which you import from `batcher.ml.preprocessors`.
+Every preprocessor is importable from both `batcher.ml.preprocessors` and `batcher.ml`.
+`tests/unit/test_ml_preprocessing_workflow.py` pins that, so the two paths cannot drift.
 
 ## Splitting first
 
@@ -17,6 +16,10 @@ leak into your features. {py:meth}`ds.ml.train_test_split <batcher.api.dataset.m
 together cover every row, assigned by a reproducible hash of each row's own content.
 Each part is a plain row-wise filter, so the split streams, distributes, and is
 *partition-independent*. A row lands in the same part however the data is laid out.
+
+The two pipelines below differ by a single arrow into `fit`, and that arrow is the whole difference between an honest offline score and a leaking one:
+
+![Fitting on the training split and fitting on everything differ by one arrow, and nothing in the engine tells the two apart. On the correct path, scaler.fit(train) learns mean_ and scale_ from the training rows only, transform applies that one learned scale to both splits, and the held-out statistics never existed. On the leaking path, scaler.fit(ds) learns from every row, so the test rows help set the scale that is then applied to them, and every offline score afterwards is optimistic. Underneath, fit executes one aggregate and reads a few scalars back to the driver as the trailing-underscore state, while transform bakes those scalars into an expression and stays lazy. Nothing detects the leak: fit runs the same aggregate over whatever rows it is handed, with no error, no warning, and no flag.](/_static/diagrams/fit_transform_leakage.svg)
 
 ```python
 import batcher as bt
@@ -55,20 +58,24 @@ changes.
 ## The three-call contract
 
 Every preprocessor exposes the same {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>` API. `fit(ds)` runs a small aggregate,
-stores the learned state on the object, and returns `self`. Even a stateless transform
-such as {py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>`, {py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>`, or {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` needs a `fit` or `fit_transform`
-before `transform`. `transform(ds)` returns a new lazy {py:class}`Dataset <batcher.Dataset>` with the learned rewrite
-applied, and runs no work until a terminal op such as `collect` or `write.parquet`.
-`fit_transform(ds)` is `fit(ds).transform(ds)`, the common single-split path.
+stores the learned state on the object, and returns `self`. `transform(ds)` returns a new
+lazy {py:class}`Dataset <batcher.Dataset>` with the learned rewrite applied, and runs no work until a terminal op
+such as `collect` or `write.parquet`. `fit_transform(ds)` is `fit(ds).transform(ds)`, the
+common single-split path.
 
 `fit` is the one place a preprocessor *executes* and touches data. `transform` stays
-lazy, so it composes with the rest of the pipeline and runs inside the engine. Calling
-`transform` before `fit` raises {py:exc}`PlanError <batcher.PlanError>`.
+lazy, so it composes with the rest of the pipeline and runs inside the engine.
+
+Call `fit` even on a transform that learns nothing. Several of them enforce it:
+{py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>` and {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` raise {py:exc}`PlanError <batcher.PlanError>` on a `transform` that no `fit`
+preceded. Others don't check, and {py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>` is one, so a bare `transform` works
+there. Relying on that buys you nothing and breaks the moment the step moves into a
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` beside something stateful.
 
 ## Available preprocessors
 
-The table lists every preprocessor, what its `fit` learns, and what its `transform`
-does. Stateless entries learn nothing and only need a `fit` call to satisfy the contract.
+These are the ones you reach for most, with what each `fit` learns and what its
+`transform` does. {doc}`/api/models/preprocessors` has the rest.
 
 | Class | `fit` learns | `transform` |
 | --- | --- | --- |
@@ -97,9 +104,6 @@ does. Stateless entries learn nothing and only need a `fit` call to satisfy the 
 | {py:class}`FrequencyEncoder <batcher.ml.preprocessors.FrequencyEncoder>` | per-category frequency | replace a category with how often it occurs |
 | {py:class}`RareCategoryEncoder <batcher.ml.preprocessors.RareCategoryEncoder>` | the categories clearing `min_frequency` | collapse the tail into one bucket |
 | {py:class}`HashingEncoder <batcher.ml.preprocessors.HashingEncoder>` | nothing, stateless | hash a category into one of `n_buckets` |
-
-All preprocessors share the `Preprocessor` base contract of `fit`, `transform`, and
-`fit_transform`.
 
 Each scaler matches scikit-learn's definitions, and `StandardScaler` uses population
 variance. `fit` lowers to the existing {py:meth}`group_by().agg(...) <batcher.Dataset.group_by>` and {py:meth}`distinct() <batcher.Dataset.distinct>`
@@ -198,7 +202,7 @@ Fuzzy dedup with MinHash, and {py:meth}`similarity_join <batcher.api.dataset.ml.
 
 ## See also
 
-- {doc}`Feature engineering tutorial </tutorials/ml/feature-engineering>`: the full workflow
+- {doc}`Feature engineering tutorial </getting-started/tutorials/ml/feature-engineering>`: the full workflow
   from raw table to model-ready matrix, end to end, with `Chain`.
 - {doc}`PyTorch integration </ml/inference/pytorch>`: hand the assembled features to a training loop.
 - {doc}`ML API reference </api/models/ml>`: the complete `Preprocessor` surface.

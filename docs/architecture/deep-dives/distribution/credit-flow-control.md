@@ -89,6 +89,11 @@ The server runs a spawned pump task that drains inbound grant messages and calls
 `credits.add_permits(granted)`. Half the window is the refill point, so the producer never
 runs dry while a grant is in flight.
 
+Seed, spend, block and refill are one loop per channel, and the state worth seeing drawn is
+the one in the middle.
+
+![The credit protocol on one shuffle channel. The consumer opens the exchange, names the ticket and seeds the window at 16 credit slots, which becomes the producer's semaphore. The producer acquires one permit per batch before the Flight encoder ever sees it, so one batch spends one permit and the consumer's pending count rises by one. When the permits are exhausted the producer is blocked at zero and the next batch is never encoded. Once the consumer's pending count reaches 8, half the window, it sends a single grant covering all eight rather than one grant per batch, and the producer resumes. The top-up is clamped to the seeded window, so an over-granting consumer cannot make the producer buffer the whole partition, and batching the grants cuts control traffic without loosening the bound, because a grant is deferred and never anticipated. One credit is one in-flight batch slot, so the window is the channel's memory bound, about 16 MiB at a 1 MiB morsel, and Carbonite's AIMD controller sizes it per channel.](/_static/diagrams/credit_backpressure.svg)
+
 An `InflightGauge` runs alongside, tracking `current` and a high-water `max`. It isn't
 decoration. It's how the credit bound gets *tested*, surfaced as
 `ShuffleSession.max_inflight` so a test can assert that no channel ever held more batches
@@ -101,7 +106,7 @@ the single entry point, and it clamps every request:
 
 ```python
 # docs: skip
-# python/batcher/carbonite/policies.py
+# python/batcher/carbonite/policies/flow_control.py
 def credit_ceiling(config, effective_morsel_bytes=None) -> int:
     count_ceiling = fc.default_credits * fc.credit_ceiling_factor
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
@@ -159,7 +164,7 @@ adaptation can help. The rationale recorded alongside the default in
 with 4 credits against 7.7 MiB/s with 16.
 
 It is the cold-start value, and only that. Once this process has completed a fetch, the
-starting window comes from the measured bandwidth-delay product instead — see
+starting window comes from the measured bandwidth-delay product instead. See
 {ref}`measuring the window instead of probing for it <bdp-window>`.
 
 ## AIMD
@@ -211,8 +216,8 @@ a single threshold on a noisy ratio produces a window that grows and cuts on alt
 rounds.
 
 `carbonite.policies.congestion` fuses the two into one of three verdicts, with memory
-outranking occupancy unconditionally — a slow shuffle is recoverable and an OOM-killed worker
-is not.
+outranking occupancy unconditionally, because a slow shuffle is recoverable and an
+OOM-killed worker is not.
 
 | Verdict | What was observed | What the window does |
 |---|---|---|
@@ -249,8 +254,8 @@ evaluate `w_max + C(t - K)³` far out on the curve and leap straight to its ceil
 :::{note}
 The occupancy measurement is what makes this a control loop rather than a ramp. With memory
 as the only signal, every round on a healthy node read as "grow", so a channel climbed to its
-ceiling whether or not the extra credits moved a byte — reserving up to a full
-`credit_byte_budget` per channel of transit buffering, and manufacturing the very pressure it
+ceiling whether or not the extra credits moved a byte. That reserved up to a full
+`credit_byte_budget` per channel of transit buffering, and manufactured the very pressure it
 would then back off on. `ShuffleSession.stats()` reports `credit_hold_rate` for exactly this:
 a window pinned at its ceiling reading `STARVED` is being throttled by the ceiling, and the
 same window reading `SATURATED` found its bandwidth-delay product.
@@ -274,7 +279,7 @@ So the transport keeps two filters per peer, which is BBR's construction:
 
 | Estimate | Filter | Why that filter |
 |---|---|---|
-| `RTprop`, the propagation delay | running **minimum** of observed round trips | every error in a round-trip sample is non-negative — queueing, a busy worker, a lost scheduler slice — so the truth is the smallest sample, and an average is biased upward by all of them |
+| `RTprop`, the propagation delay | running **minimum** of observed round trips | every error in a round-trip sample is non-negative, whether from queueing, a busy worker or a lost scheduler slice, so the truth is the smallest sample, and an average is biased upward by all of them |
 | `BtlBw`, the bottleneck bandwidth | running **maximum** of observed delivery rates | a fetch can finish slower than the bottleneck allows but never faster, so the ceiling is the largest rate seen; averaging would be dragged down by every application-limited fetch, which on a wide shuffle is most of them |
 
 Their product is the bandwidth-delay product: the bytes a path holds when it is exactly busy.
@@ -302,7 +307,7 @@ acknowledgements.
 ### What it changes
 
 Only the *starting* window. The control law and the ceiling are unchanged, so a result cannot
-move — but the number of round trips spent finding the operating point can. Doubling from 16
+move. The number of round trips spent finding the operating point can. Doubling from 16
 credits to 64 costs two round trips, and on a 100 ms link that is 200 ms during which the
 transfer runs below the window it needs. A short bucket finishes inside that window and spends
 its entire life under-provisioned.
@@ -340,7 +345,7 @@ k x s_max / sum(s)  =  s_max / mean(s)
 
 which is the skew factor exactly. A shuffle with one bucket ten times the average takes ten
 times longer than it needs to, and every credit of the difference was already paid for.
-`proportional_windows` is that allocation, with a floor of one credit per channel — a zero
+`proportional_windows` is that allocation, with a floor of one credit per channel. A zero
 window is not a small share, it is a channel that never completes.
 
 ### Why the totals are differenced
@@ -352,7 +357,7 @@ That is not incidental. A controller acts once per round, so what it needs is th
 *that round*. A few seconds into a long shuffle the lifetime denominator is large enough that
 a round of pure starvation barely moves it, and a controller reading the lifetime figure
 converges on a number and then stops responding to the link entirely. A round that moved too
-little data to divide — one served entirely from locality, say — reports no opinion and leaves
+little data to divide, such as one served entirely from locality, reports no opinion and leaves
 the hysteresis band holding the last real verdict.
 
 ## Warm-starting a recurring channel
@@ -372,21 +377,23 @@ aggressively.
 
 Skipping slow start is the aggressive part, and it is worth only doing when the learned value
 has earned it. A shuffle whose window has scattered across an order of magnitude hasn't learned
-a window — it has averaged a bimodal population, and starting there *and* switching off the
+a window. It has averaged a bimodal population, and starting there *and* switching off the
 search that would find the answer independently is worse than never having learned.
 
 So the learned scalar carries its own dispersion. `metadata.smoothed` tracks an
 exponentially-weighted variance alongside the mean, on the same decay, and
 `ScalarEstimate.stable` asks whether there are enough observations and whether their
-coefficient of variation is inside the band. `load_shuffle_window` returns both, and slow start
-is skipped only for a window past runs actually agreed on. An unstable one still supplies the
-starting point — it is the best guess available — but keeps its ramp.
+coefficient of variation is inside the band. The two questions have separate callers, so they
+have separate functions: `load_shuffle_window` returns the number and
+`shuffle_window_is_stable` answers whether to trust it. Slow start is skipped only for a
+window past runs actually agreed on. An unstable one still supplies the
+starting point, the best guess available, but keeps its ramp.
 
 That dispersion buys a second thing, for every learned scalar in the engine rather than just
 this one. Plain exponential smoothing moves an estimate by `step × (value - prior)`, which is
 unbounded in the observation, so one GPU that thermally throttled or one shuffle measured while
 the node was swapping drags the learned value by however wrong it was. Clamping the deviation
-into `±3σ` before blending bounds any single run's influence — the same bounded-influence
+into `±3σ` before blending bounds any single run's influence, the same bounded-influence
 property `ml.HuberRegressor` provides against outliers in a fit. A settled estimate of 100 moves
 to 101 when handed 100,000, where before it moved to 10,090.
 
@@ -400,8 +407,8 @@ variance see what really happened.
 
 Credits cost a semaphore acquire per batch on the producer and one grant message per half
 window on the consumer. At 1 MiB batches that's negligible. At very small batches the
-per-batch permit is a real fraction of the work, which is one more reason morsels are
-16,384 rows and not 100.
+per-batch permit is a real fraction of the work, which is one more reason a morsel targets
+16,384 rows rather than 100.
 
 :::{warning}
 Striping is the sharp edge. `ClientPool::fetch_secured_striped` gives **each shard its own full

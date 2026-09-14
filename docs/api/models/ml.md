@@ -113,7 +113,7 @@ labelled = ds.ml.map_batches(Classifier, num_gpus=1, concurrency=4)
 
 ## infer and embed
 
-`ds.ml.infer(model, ...)` and `ds.ml.embed(model, ...)` are the inference-shaped calls. The quickest form is a **model identifier** plus the `column` to run on. The model loads once per worker and the result is appended, as a prediction for `infer` and a vector for `embed`. `infer` resolves a HuggingFace `transformers` pipeline, and `embed` resolves a `sentence-transformers` model.
+`ds.ml.infer(model, ...)` and `ds.ml.embed(model, ...)` are the inference-shaped calls. The quickest form is a model identifier plus the `column` to run on. The model loads once per worker and the result is appended, as a prediction for `infer` and a vector for `embed`. `infer` resolves a HuggingFace `transformers` pipeline, and `embed` resolves a `sentence-transformers` model.
 
 ```python
 # docs: skip
@@ -374,15 +374,15 @@ Build an index over an embedding column and query it:
 .. autodata:: EncoderFactory
 ```
 
-## The rest of the ML reference
+## See also
 
-The `batcher.ml` surface is large enough to be split by what you are doing:
+The rest of the `batcher.ml` reference splits by task:
 
 - {doc}`/api/models/preprocessors`: the fit/transform estimators, `Chain`, and persistence.
 - {doc}`/api/models/ml-models`: tabular scoring, in-engine estimators, and evaluation metrics.
 - {doc}`/api/models/ml-statistics`: drift, fairness, resampling, cross-validation, interpretation.
 
-## See also
+The guides behind this surface:
 
 - {doc}`Inference </ml/inference/inference>`: batch prediction and embeddings.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fit/transform feature engineering.
@@ -392,4 +392,5 @@ The `batcher.ml` surface is large enough to be split by what you are doing:
 - {doc}`GPU scheduling </ml/inference/gpu>`: how `num_gpus` and `concurrency` map to actors.
 - {doc}`Tabular models </ml/inference/tabular-models>`: scoring XGBoost, LightGBM, and scikit-learn.
 - {doc}`Evaluation </ml/evaluation/evaluation>`: metrics, per-segment scoring, diagnostic tables.
-- {doc}`Statistics and drift </ml/evaluation/statistics-and-drift>`: feature screening and monitoring.- {doc}`/cookbook/ml/index`: 16 runnable recipes across the `batcher.ml` surface.
+- {doc}`Statistics and drift </ml/evaluation/statistics-and-drift>`: feature screening and monitoring.
+- {doc}`/cookbook/ml/index`: 27 runnable recipes across the `batcher.ml` surface.

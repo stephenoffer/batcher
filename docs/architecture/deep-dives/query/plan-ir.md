@@ -4,6 +4,10 @@ Python builds the plan; Rust runs it. They meet at one JSON document, and that d
 a wire contract in the ordinary sense: two independent programs agree on a set of tags, and
 a disagreement is a bug that no compiler will catch for you.
 
+The document sits at the one point in the engine where a decision about work becomes the work itself.
+
+![The lowering chain with the plane boundary drawn across it. Above the line, in Python, nothing touches a row: a lazy immutable Dataset returns a new node per operation, those nodes form a validated LogicalPlan, Kyber rewrites plan to plan through seven phases from NORMALIZE to ENFORCE, and the rewritten tree lowers through to_ir() into a PhysicalPlan carrying the IR and its resource bounds. Below the line, in Rust, nothing chooses a plan: bc-py's execute_plan is the one FFI entry, serde deserializes the document into a bc-ir RelOp tree and hard-errors on an unknown tag, and bc-interp and bc-runtime walk that tree once over 16,384-row Arrow morsels. Exactly one edge crosses the boundary, carrying to_json() output plus the Arrow input batches, and nothing else crosses at all.](/_static/diagrams/plan_lowering.svg)
+
 ## Why JSON, and why it is cheap
 
 A plan is one document per execution, a few kilobytes, parsed once. Execution then runs for
@@ -19,9 +23,9 @@ C Data Interface. The IR carries the plan; the Arrow pointers carry the rows.
 
 The document nests two independent trees, each defined by one Rust type.
 
-`RelOp`, in `crates/bc-ir/src/lib.rs`, is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The fifteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `distinct`, `window`, `union`, `unnest`, `unpivot`, `row_id`, and `sample`.
+`RelOp`, in `crates/bc-ir/src/lib.rs`, is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The sixteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `range_join`, `distinct`, `window`, `union`, `unnest`, `row_id`, `unpivot`, and `sample`.
 
-{py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It uses the same attributes with `tag = "e"`, and its variants include `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, and `date`.
+`Expr`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It is the Rust type the Python {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` lowers to, it uses the same serde attributes with `tag = "e"`, and it runs to fifty-five variants rather than sixteen: `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, `date`, and the rest of the function surface.
 
 :::{important}
 There is exactly one of each. The interpreter, the JIT, the runtime primitives, and the
@@ -102,6 +106,10 @@ Vec<JoinOutputCol>`: which side each output column comes from, its name there, a
 in the result. The planner knows both schemas, so the engine does not have to
 re-derive them.
 
+Predicate and projection pushdown is what fills those reader-side hints behind the first of the three, and it leaves the plan's own `Filter` where it was:
+
+![The same plan before and after Kyber's pushdown phase. As written: Scan orders and Scan customers each read every row and every column, a Join on c_id consumes every matching row, a Filter on o_date then drops rows above the join, and a Project keeps o_id and c_name. As Kyber leaves it: the orders scan reads three columns, o_id, c_id and o_date, and carries the predicate as a source hint so the reader may skip row groups; the customers scan reads two, c_id and c_name; and the Filter now sits below the join, so the discarded rows are gone before the build. Two rules the picture pins. The Filter node is still in the plan afterwards, because source_predicates is only a hint to the connector and a source that translates none of the predicate, or only part of it, must still be correct. And only a conjunct naming one side of the join moves below it; one naming both stays above.](/_static/diagrams/pushdown_before_after.svg)
+
 ## Expressions
 
 An expression lowers on its own:
@@ -149,6 +157,10 @@ field Python emits and Rust does not know about is a loud parse error at the bou
 than a silently ignored instruction, and a silently ignored instruction is how a filter
 disappears and a query quietly returns too many rows.
 :::
+
+The two sides state the same contract, and a checker reads both rather than waiting for a query to exercise a tag:
+
+![One JSON document, written once and read once. Python's to_ir() writes the tag string held in plan/ir_tags.py, the wire carries it as an "op" key holding hash_join, and Rust serde must accept it into bc_ir::RelOp under deny_unknown_fields. Sixteen RelOp tags and fifty-five Expr tags today, plus nineteen function vocabularies underneath them. Below the spine, tools/lint_ir_contract.py reads the Python class on one side and the Rust enum body on the other and compares whole vocabularies. It runs no query, so a tag that no differential test names is still checked. The two drift directions fail in completely different ways: a tag Python emits that Rust rejects makes the plan fail to deserialize, which is loud but only for a query that uses that tag, while a tag Rust accepts that Python never emits leaves an engine capability unreachable, which is silent and raises nothing. Both sides change in one commit, or neither does.](/_static/diagrams/ir_wire_contract.svg)
 
 ::::{tab-set}
 :::{tab-item} The Python side

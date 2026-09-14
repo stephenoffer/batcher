@@ -14,7 +14,7 @@ pip install 'batcher-engine[cloud]'
 
 If a cloud scheme is used without the extra installed, the read fails with a message telling you to install it.
 
-Every example on this page needs a real bucket and credentials, so the blocks are shown but not executed.
+Most examples on this page need a real bucket and credentials, so their blocks are shown but not executed. The two that read and write local files run for real, and the prose says so where they appear.
 
 ## Reading from object storage
 
@@ -140,7 +140,7 @@ ds = bt.read.parquet(
 
 An option the backend does not accept is an error naming the option, rather than a connection that quietly used none of your settings.
 
-Any value there may be an `env:`, `file:` or `cmd:` reference, resolved on the machine that opens the connection — so a distributed read ships the reference to each worker and never the secret. See {doc}`/user-guide/trust/secrets`.
+Any value there may be an `env:`, `file:` or `cmd:` reference, resolved on the machine that opens the connection. A distributed read therefore ships the reference to each worker and never the secret. See {doc}`/user-guide/trust/secrets`.
 
 ## Bring your own filesystem or credentials
 

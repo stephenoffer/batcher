@@ -5,8 +5,7 @@ An expression is a small, typed description of a computation. It lowers to the
 Rust data plane and runs over Arrow batches, so the same code is fast on three
 rows or three billion.
 
-Every example on this page runs against the engine. Blocks share one namespace
-and execute in order.
+The blocks below build on each other in order.
 
 ```python
 import batcher as bt
@@ -39,7 +38,7 @@ print(out.to_pydict())
 
 Arithmetic uses `+ - * / %` and `**` (power). Reflected forms work, so a literal
 may lead: `2 * bt.col("x")`. Comparison uses `== != > >= < <=`. Boolean logic uses
-`&` (and), `|` (or), and `~` (not); parenthesize each side because `&` binds
+`&` (and), `|` (or), and `~` (not). Parenthesize each side, because `&` binds
 tighter than comparison.
 
 ```python
@@ -173,6 +172,9 @@ print(out.to_pydict())
 ```
 
 ## Membership, ranges, and casts
+
+Set membership, an inclusive range test, and a cast all read as methods on the column
+they apply to.
 
 ```python
 out = ds.select(
@@ -318,4 +320,4 @@ And for what happens to an expression after you write it:
   nodes becomes vectorized work over an Arrow batch.
 - {doc}`JIT compilation </architecture/deep-dives/query/jit-compilation>`: when the Cranelift tier compiles an
   arithmetic chain, and why it silently falls back rather than diverging.
-- {doc}`/cookbook/expressions/index`: 34 runnable recipes for the expression API.
+- {doc}`/cookbook/expressions/index`: 39 runnable recipes for the expression API.

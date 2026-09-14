@@ -374,22 +374,6 @@ def _footer(profile: QueryProfile, opts: RenderOptions) -> list[str]:
     return out
 
 
-class QueryProfileView:
-    """A `QueryProfile`-shaped stand-in for a sub-plan that shares the parent's totals.
-
-    The distributed worker sub-plan is a separate operator-id space with its own tree, but
-    its shares are only meaningful against the query's wall clock. Rather than fabricate a
-    second `QueryProfile` (which would then claim its own bottleneck, machine, and row
-    count), this exposes only what `_rows` reads.
-    """
-
-    __slots__ = ("ops", "total_ms")
-
-    def __init__(self, ops: tuple[OpProfile, ...], parent: QueryProfile) -> None:
-        self.ops = ops
-        self.total_ms = parent.total_ms
-
-
 def render_profile(
     profile: QueryProfile,
     *,

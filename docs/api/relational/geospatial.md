@@ -3,12 +3,13 @@
 Every `ST_*` function, grouped by what it does. Names and semantics follow PostGIS, so a
 ported query reads the same.
 
-A geometry column is **WKB in a Binary column**. That is the encoding GeoParquet,
-PostGIS and DuckDB spatial all store, so a column round-trips through any of them
-unconverted. A
-geometry that will not parse yields null rather than raising, because one corrupt row in
-a hundred million must not abort a scan; {py:func}`st_is_valid_reason <batcher.st_is_valid_reason>` names every bad row and
-why. A query bug, such as a negative radius or an unsupported EPSG code, does raise.
+A geometry column is WKB held in a Binary column. GeoParquet, PostGIS and DuckDB spatial
+all store that same encoding, so a column round-trips through any of them unconverted.
+
+A geometry that will not parse yields null rather than raising. One corrupt row in a
+hundred million must not abort a scan, and {py:func}`st_is_valid_reason <batcher.st_is_valid_reason>`
+will name every bad row and say why. A query bug does raise: a negative radius, an
+unsupported EPSG code.
 
 To learn these rather than look them up, start with
 {doc}`/user-guide/analyze/geospatial`.
@@ -40,7 +41,7 @@ Crossing between the WKB a geometry column holds and the text encodings people a
 
 ## Building and deriving geometry
 
-Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. {py:func}`st_envelope <batcher.st_envelope>` and {py:func}`st_convex_hull <batcher.st_convex_hull>` are the two rungs of a filter ladder: the box is exact to compute and is what an index stores, the hull is tighter but costs a sort.
+Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. {py:func}`st_envelope <batcher.st_envelope>` and {py:func}`st_convex_hull <batcher.st_convex_hull>` are the two rungs of a filter ladder. The box is exact to compute and an index stores it; the hull bounds the shape more tightly but costs a sort.
 
 ```{eval-rst}
 .. autosummary::
@@ -138,7 +139,7 @@ Two families, and mixing them up is silent. The planar functions answer in coord
 
 ## Spatial relationships
 
-The OGC predicates, which are the join conditions and filter clauses of spatial SQL. Touching counts as intersecting; `contains` and `covers` differ exactly on the boundary; and `st_intersects_extent` in front of `st_intersects` is the single biggest lever on a spatial join.
+The OGC predicates. These are the join conditions and filter clauses of spatial SQL, and three things about them are worth knowing before you write one: touching counts as intersecting, `contains` and `covers` differ exactly on the boundary, and putting `st_intersects_extent` in front of `st_intersects` is the single biggest lever on a spatial join.
 
 ```{eval-rst}
 .. autosummary::

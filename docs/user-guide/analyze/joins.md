@@ -186,8 +186,8 @@ enriched = orders.lookup_join(
 )
 ```
 
-The cost scales with the distinct keys in your data, not with the size of the store, which
-is what makes the join possible at all when the store is far larger than memory. It works
+The cost scales with the distinct keys in your data rather than with the size of the store,
+which is the only reason a store far larger than memory can be joined at all. It works
 unchanged single-node, distributed, and over an unbounded source, because the enrichment
 happens per batch. `rocksdb:///path/to/db` reads an embedded database instead of a server.
 
@@ -224,11 +224,10 @@ distinct keys, `batch_size=16384` runs seven times slower than the engine's own 
 Leave it alone unless you have measured a reason not to.
 :::
 
-What you give up is a consistent snapshot. The store is read as it stands when each batch
-arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer
+You give up a consistent snapshot. The store is read as it stands when each batch arrives, and `cache_ttl` bounds how stale a cached row may be. Where a point-in-time answer
 is what you meant, read the dimension as a dataset and use `join`.
 
-On this hardware, against an in-process store, a lookup join runs about twice as slow as the
+On a 96-core box, against an in-process store, a lookup join runs about twice as slow as the
 hash join it replaces while reading 0.25% of the dimension. That ratio is the mechanism's
 overhead, not its benefit: the case it is for is a store the hash join cannot read at all
 without pulling every row of it over the network. Reach for it when the dimension lives

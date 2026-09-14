@@ -26,6 +26,10 @@ The second is the larger workload. The first is an opt-in accelerator for relati
 
 Anything outside that set is *declined* rather than approximated, and the stage runs on the CPU engine instead. That distinction is the whole safety argument for the backend: a fallback costs time, and an approximation costs a wrong answer.
 
+That safety rests on a partition rather than on a list of features, and a partition is a shape.
+
+![Why the device tier needs machinery no other tier needs, and what that machinery buys. Every other execution tier consumes the same Rust bc_expr::Expr, so there is one definition of what a shape means and it cannot drift. The device tier cannot: cuDF has no Rust binding, so the tier is a second statement of the engine's semantics in another language. Every IR tag is therefore in exactly one of two sets. Translated, in SUPPORTED_OPS and exprs._HANDLERS: filter, project, aggregate, sort, distinct, limit, window, unnest, unpivot and row_id, with the expression vocabularies keyed beside them. Declined with a reason, in DECLINED_OPS and DECLINED_EXPRS: asof_join, range_join and sample are not translated, and the image, audio and geo expressions are Rust kernels with no dataframe equivalent to translate onto. There is no third state, because a tag in neither set fails test_gpu_vocabulary_contract, which makes a new operator a decision rather than an oversight. The plan then goes one way or the other whole: if every node translates it runs on the device under cuDF, one shard per device, and it is eligible only as a chain over a scan, a join of two chains, or a union of chains; if any node declines the whole plan runs on the CPU engine and returns the same rows more slowly. A decline costs time where an approximation would cost a wrong answer, which is why backend="gpu" is always safe to ask for.](/_static/diagrams/gpu_tier_decision.svg)
+
 The translator is parameterized by dataframe library. It runs on cuDF on a GPU worker and on pandas in the test suite, against the CPU engine as the oracle, so the same code a device executes is checked on every commit without a device. That check is what surfaced the cases where a dataframe library's default quietly disagrees with the engine: a null group key is a group rather than a dropped row, the sum of an all-null group is null rather than `0.0`, a null predicate drops its row, `NaN` orders above every number rather than comparing false, `substr` is 1-based, `%` takes the sign of the dividend, and `round` breaks halves away from zero.
 
 ### Using more than one device
@@ -50,7 +54,7 @@ The fan-out cuts several times more shards than there are devices, so each one i
 
 Each shard therefore asks for the fraction of a device it needs. The share is derived from the largest shard's estimated working set against one device's memory, rounded up to a packing quantum, and it is chosen from the *largest* shard rather than the average, because one fraction is granted to the whole fan-out and sizing it to the average is how the shard that most needed room is the one that doesn't get it. A broadcast join charges its replicated build side to every co-tenant, since four tasks on a device hold four copies of it rather than one between them.
 
-Over-packing degrades rather than fails. A shard granted a share it turns out not to fit falls into the subdivision ladder below, exactly as an under-estimated shard always did, and its retry goes back with a whole device. Under-packing has no such ladder: the idle device simply stays idle, and nothing reports it.
+Over-packing degrades rather than fails. A shard granted a share it turns out not to fit falls into the subdivision ladder below, exactly as an under-estimated shard always did, and its retry goes back with a whole device. Under-packing has no such ladder: the idle device stays idle, and nothing reports it.
 
 Set `gpu_pack_shards` to `False` to keep the previous one-device-per-shard behavior, `gpu_task_fraction` to pin the share for a fleet the estimator can't see, `gpu_max_tasks_per_device` to cap co-tenancy, and `gpu_shard_expansion` for a chain that materializes more than one intermediate.
 
@@ -220,6 +224,10 @@ The relational backend is a second statement of the engine's semantics in anothe
 
 That comparison is the only thing that finds this tier's characteristic failure. Every defect it has shipped has been a column *type* with correct values, which no value comparison can see: a DATE returning `timestamp[ms]`, an integer `abs` widening to double, an empty result losing its string columns to `null`, and `COUNT(DISTINCT ...)` returning `int32`. The translator's own tests run on pandas, so a cuDF-only behavior reaches a cluster before it reaches a test.
 
+There are two oracles behind that comparison, they cost very different things, and only one of them is on for every run.
+
+![The device tier's two oracles, and what each one can see. A device result is a `pyarrow.Table` from cuDF rather than from the engine, and it is checked before it is returned. The schema contract, `enforce_schema_contract`, is on for every device run: it reads a field list with no rows, no second execution and no device, holding the result against the engine's own `available_schema`, and it sees types. The shadow re-run, `shadow_verify`, is off by default behind `distributed.gpu_shadow_verify`: it re-runs the plan on the CPU engine and compares schema first and then values, and it is the only oracle for values. A result both agree on stands and is returned unchanged, so a verified run differs from an unverified one only in cost; if the CPU oracle itself raises, that is reported as verifying nothing and never as a pass. A difference is a defect and never a decline: the CPU engine answers instead, and it is reported through `note_gpu_failure`, which logs at warning level, rather than through `note_suppressed`, which is for declines, because the tier's contract is that a device changes where a plan runs and never what it computes. Every defect on record has been a column type with correct values: a DATE returning `timestamp[ms]` on a device where pandas gave `date32`, an integer `abs` widening to double, and an empty cuDF string column arriving as `null`.](/_static/diagrams/gpu_shadow_verify.svg)
+
 Measured on four `1xT4` workers with 8 CPUs each, warm, against Batcher's own CPU engine on the same data. TPC-H is scale factor 1 and ClickBench is an 8 million row subset of `hits`, both read from the same Parquet by both backends. These are Batcher against Batcher, not against another engine.
 
 | Query | Shape | CPU engine | GPU | Speedup |
@@ -251,7 +259,7 @@ The relational backend has no device-to-device shuffle, so it distributes only w
 
 A sharded relational result returns to the driver through the Ray object store, one message per shard, and the driver holds all of it. Two things follow. Splitting a *reducing* chain moves only one row per group per shard, so the driver sees a small result however large the input was. Splitting a **row-local** chain moves every surviving row: the ceiling stops being one device's memory and becomes the driver's, which is a better ceiling but not an absent one. And it is a deviation from the data-plane rule that bulk Arrow travels by Arrow Flight rather than as Ray objects, inherited from the original single-task backend and widened by sharding. Lifting it is the same work as the device-to-device exchange above.
 
-GPU tensors move between stages as Arrow through host memory. There's no device-to-device transport. That's a deliberate consequence of the Arrow-only invariant, and `docs/architecture/internals/rfc-gpu-transport.md` proposes changing it. That document is an in-tree proposal, not a description of shipped behavior.
+GPU tensors move between stages as Arrow through host memory. There's no device-to-device transport. That's a deliberate consequence of the Arrow-only invariant, and `docs/architecture/internals/rfcs/rfc-gpu-transport.md` proposes changing it. That document is an in-tree proposal, not a description of shipped behavior.
 
 ## Code map
 
@@ -265,11 +273,11 @@ rules on this page can be read directly:
 | OOM halving and dirty-row bisection | `python/batcher/core/udf/call.py` |
 | Threads vs processes policy | `python/batcher/core/udf/strategy.py` |
 | Distributed actor pools, warm pools | `python/batcher/dist/executors/map.py` |
-| Latency PID | `crates/bc-udf/src/batch_size.rs`, `python/batcher/ml/inference.py` |
+| Latency PID | `crates/bc-udf/src/batch_size.rs`, `python/batcher/ml/inference/` |
 | Throughput hill-climb | `python/batcher/ml/autobatch.py` |
 | Device detection, utilization, VRAM | `python/batcher/ml/gpu.py` |
 | GPU-vs-CPU backend policy | `python/batcher/kyber/gpu/policy.py` |
-| GPU relational backend routing | `python/batcher/api/terminal/gpu_backend.py` |
+| GPU relational backend routing | `python/batcher/api/terminal/gpu_backend/` |
 | Plan and expression translation to cuDF | `python/batcher/core/gpu_plan/` |
 | Mergeable split, shared by the optimizer and the backend | `python/batcher/plan/distribution/` |
 | Multi-device fan-out, shard recovery, worker-side reads | `python/batcher/dist/gpu/` |
@@ -282,10 +290,10 @@ rules on this page can be read directly:
 
 - {doc}`Architecture </architecture/index>`: why the GPU paths live in Python and not in the crates.
 - {doc}`Execution engine </architecture/internals/execution>`: the UDF stage this pipelines.
-- `docs/architecture/internals/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have.
+- `docs/architecture/internals/rfcs/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have.
 - {doc}`GPU guide </ml/inference/gpu>`: the knobs, from a user's side.
 - {doc}`ML guide </ml/index>`: how to write these pipelines.
-- {doc}`Batch inference tutorial </tutorials/ml/batch-inference>`: the pipeline this page is underneath.
+- {doc}`Batch inference tutorial </getting-started/tutorials/ml/batch-inference>`: the pipeline this page is underneath.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the numbers on this page, in context.
 - {doc}`Multimodal ingest benchmarks </benchmarks/results/multimodal-ingest>`: the decode side of the same pipeline.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: what crosses into the model.

@@ -1,6 +1,6 @@
 # Models and measurement
 
-Everything that fits a model or scores one, from the `.ml` accessor down to the individual metric functions.
+This section is the reference for everything that fits a model or scores one, from the `.ml` accessor down to the individual metric functions. Five pages split it by task:
 
 | Page | Covers |
 |---|---|

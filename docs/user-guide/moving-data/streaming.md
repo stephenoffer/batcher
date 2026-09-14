@@ -1,6 +1,6 @@
 # Streaming
 
-Batcher treats **batch as the bounded special case of streaming**. One {py:class}`Dataset <batcher.Dataset>`
+Batcher treats batch as the bounded special case of streaming. One {py:class}`Dataset <batcher.Dataset>`
 API (`group_by`, `window`, `join`, `with_columns`, `write`) runs over a finite table
 or an unbounded stream. Moving a pipeline from a one-off job to a continuous one
 means changing the *source*, or adding a `trigger`. There is no second API to learn
@@ -88,10 +88,10 @@ q = bt.read.files_incremental(
 An option the reader does not accept is refused when the query is built, not when the file
 carrying it arrives.
 
-Every broker takes the same `starting_position=` — `"earliest"` or `"latest"` — whatever it
-calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's `ShardIteratorType`, Event
-Hubs' offset sentinel, Pulsar's `InitialPosition`). Each connector's native spelling still
-works, so an existing reader keeps reading.
+Every broker takes the same `starting_position=`, either `"earliest"` or `"latest"`,
+whatever it calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's
+`ShardIteratorType`, Event Hubs' offset sentinel, Pulsar's `InitialPosition`). Each
+connector's native spelling still works, so an existing reader keeps reading.
 
 The `rate` source generates rows and is handy for trying the API without external
 infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadence):
@@ -103,7 +103,7 @@ print(sum(rows))  # 10 generated (value, timestamp) rows
 ```
 
 `rate` promises rows per *second*, so how many land in a micro-batch depends on how long the
-previous one took — which makes it a poor benchmark input, because the thing being measured
+previous one took. That makes it a poor benchmark input, because the thing being measured
 changes the input. `rate_micro_batch` promises rows per *batch* instead, so a run is
 reproducible:
 
@@ -368,18 +368,12 @@ arbitrary keyed state, and the union of two streams all keep something between
 micro-batches, and each is bounded by a limit you choose rather than by the data. See
 {doc}`streaming-stateful`.
 
-Two of them are worth knowing about before you reach for a workaround, because both used
-to be refusals:
-
-- **Joining a stream to a static table.** Write it as an ordinary
-  {py:meth}`join <batcher.Dataset.join>`. The table is read once when the query starts and every
-  micro-batch joins against the whole of it. The join types that would need the *static*
-  side to be complete are refused, which is where Spark draws the line too. See
-  {doc}`/cookbook/streaming/stream-join`.
-- **Session windows.** {py:meth}`session_window <batcher.Dataset.session_window>` works over a stream. A session has no
-  end until the gap has passed with nothing arriving, so its rows are held until the
-  watermark says so and then aggregated by the same code the bounded path runs. See
-  {doc}`/cookbook/streaming/windowed-aggregation`.
+Joining a stream to a static table needs none of that vocabulary. Write it as an ordinary
+{py:meth}`join <batcher.Dataset.join>`: the table is read once when the query starts, and
+every micro-batch joins against the whole of it. Join types that would need the *static*
+side to be complete are refused, which is where Spark draws the line too. See
+{doc}`/cookbook/streaming/stream-join` for that join end to end, and
+{doc}`/cookbook/streaming/windowed-aggregation` for the session window.
 
 ## Exactly-once and checkpointing
 
@@ -398,6 +392,10 @@ it first. A replayed batch finds its own transaction already recorded, writes no
 commits nothing. That is what turns the engine's at-least-once replay into end-to-end
 exactly-once, and it is why the log holds exactly one transaction per micro-batch however
 many times one was retried.
+
+The ordering inside one micro-batch is what makes that replay safe, and it is the same order under every trigger:
+
+![One micro-batch as a cycle. A trigger fires on a processing-time interval or as an available_now drain. The engine stages the epoch, reading and computing while publishing nothing; writes the source position it consumed ahead of publishing anything; hands the rows to the sink; then snapshots state and commits with the sink's token. A dashed edge sleeps the rest of the interval before the next trigger, and a draining trigger skips that wait and stops when the source is spent. Because the position is durable before anything is published, the only epoch a crash can lose is one that was staged and not published, and the next run replays it into a sink that records its own query name and batch id and so commits nothing the second time.](../../_static/diagrams/streaming_microbatch.svg)
 
 Give the query a stable `query_name` if you rely on this: the name is the transaction's
 application id, so it has to be the same across restarts for the check to find the
@@ -421,15 +419,13 @@ Add `distributed=True` and each micro-batch runs as one **epoch across the clust
 instead of on the driver. The workers read their share of the epoch, run the pipeline,
 and write their own data files; the driver never touches a row.
 
-What it does *not* do is commit once per worker. The workers write their files without
-committing them, and the driver then publishes the whole epoch as a **single**
-transaction. So the guarantees above survive the fan-out unchanged:
-
-- **one transaction per micro-batch**, whatever the worker count. The log still reads as
-  a record of the stream, not of the machines that ran it.
-- **exactly-once**, because that one commit carries the micro-batch's transaction id. A
-  replayed epoch, from a lost worker or a restart, finds itself already committed and
-  writes nothing.
+It does not commit once per worker. The workers write their files without committing them,
+and the driver publishes the whole epoch as a single transaction. So the guarantees above
+survive the fan-out unchanged. There is one transaction per micro-batch whatever the worker
+count, and the log still reads as a record of the stream rather than of the machines that
+ran it. Exactly-once holds too, because that one commit carries the micro-batch's
+transaction id: a replayed epoch, from a lost worker or a restart, finds itself already
+committed and writes nothing.
 
 The source's offsets are written to the checkpoint *between* staging an epoch and
 publishing it. That bounds a crash to an epoch that was staged and never published, which
@@ -446,7 +442,7 @@ q = (bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze
                     checkpoint="lake/bronze/_ck",
                     query_name="bronze-ingest",
                     distributed=True, num_workers=16))
-q.stop()   # the query runs until you stop it — an idle minute is not the end of a stream
+q.stop()   # the query runs until you stop it; an idle minute is not the end of a stream
 ```
 
 A streaming aggregation distributes too. Each worker aggregates only its share of the

@@ -33,11 +33,11 @@ result = filtered.select("x", "y")  # still no execution
 rows = result.collect()  # the plan runs here
 ```
 
-Deferring work until the terminal op is what makes whole-query optimization possible.
-By `collect`, the optimizer sees the entire computation and can push predicates and
-projections down, fuse operators, and choose join orders before a single batch is read.
-It's also what makes adaptive re-optimization possible mid-query, because there is one
-plan to revise rather than a sequence of already-executed steps.
+Deferring the work is what buys whole-query optimization. By `collect`, the optimizer
+sees the entire computation and can push predicates and projections down, fuse operators,
+and choose join orders before a single batch is read. It buys mid-query re-optimization
+too, because at any point there is still one plan to revise rather than a sequence of
+steps that have already run.
 
 The terminal operations are {py:meth}`collect() <batcher.Dataset.collect>`, which returns a PyArrow `Table`;
 `to_pydict()`; `count()`; `iter_batches()`, which streams a result without
@@ -67,10 +67,9 @@ scheduling granular and the working set in cache.
 
 ## Execution paths
 
-There is one set of operator semantics, exercised by three paths.
-
-The Tier-0 sequential interpreter is the reference. It is deterministic and kept
-obviously correct, and the other two paths are tested against it.
+There is one set of operator semantics, exercised by three paths. The Tier-0 sequential
+interpreter is the reference. It is deterministic and kept obviously correct, and the
+other two paths are tested against it.
 
 ![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
@@ -82,8 +81,10 @@ and reuses that across every morsel. On anything it doesn't support, the JIT fal
 to the interpreter rather than diverge, so it stays bit-for-bit identical to the
 interpreter on its subset.
 
-A compiled pipeline can drop back to the interpreter at any breaker, which is what
-lets compilation and adaptivity coexist.
+A compiled pipeline can drop back to the interpreter at any breaker. That is how
+compilation and adaptivity coexist: an abandoned pipeline costs a compiled artifact, not
+a correctness guarantee, because the relational state it was working on lives in the
+runtime library rather than in generated code.
 
 ## One algebra, single node to cluster
 
@@ -93,8 +94,11 @@ emits rows. Because `combine` is associative and commutative, partials merge in 
 order. That single implementation serves one core (the sequential interpreter),
 many cores (the parallel path builds partials and combines them), and many machines,
 where the distributed path composes the same `partial`, `combine`, and `finalize`.
-There is no separate distributed operator with its own semantics, so a
-result is identical whether it runs on a laptop or a cluster. CI asserts exactly that.
+There is no separate distributed operator with its own semantics, so the rows, the
+column names and the column types come back the same on a laptop and on a cluster.
+`tests/integration/test_distributed.py` asserts that equality operator by operator.
+It skips without Ray installed, which is the state CI runs in, so the arm that proves
+the claim runs only where a cluster is available.
 
 ## Adaptive re-optimization
 
@@ -106,18 +110,22 @@ continuing.
 
 This is stage-boundary re-optimization, the same granularity Spark AQE works at, and
 Batcher runs it single-node as well as distributed. DuckDB, by contrast, optimizes once
-before it runs. The loop is gated: `adaptive="auto"` is the default, and it turns on
-only for plans large enough and uncertain enough that measuring could flip a
-downstream decision. A separate cross-query loop feeds sketch-backed statistics from
-each run into the next, so estimates sharpen the more a query runs.
+before it runs. The loop is gated, and the gate is strict. `adaptive="auto"` is the
+default, and it engages only on a query that contains a join, that clears a size floor
+charged per pipeline breaker the loop would cut at, and where measuring could still flip
+a downstream decision. A query with no join never qualifies at any size. Most queries
+therefore never reach the loop at all, which
+{doc}`/architecture/internals/execution` states with the exact thresholds. A separate
+cross-query loop feeds sketch-backed statistics from each run into the next, so estimates
+sharpen the more a query runs.
 
 ## Memory and spilling
 
-Carbonite owns the memory envelope. It throttles new allocations as the budget fills
-and begins spilling to disk before the budget is exhausted. Aggregation, join, and sort
-all spill, so a query that doesn't fit in memory slows down rather than failing.
-Spilling is a property of the runtime primitive rather than a separate operator, so the
-plan doesn't change when a query goes out of core.
+Carbonite owns the memory envelope. It throttles new allocations as the budget fills and
+begins spilling to disk before the budget is exhausted, and because aggregation, join and
+sort all have a spill path, a query too large for memory keeps running on a slower one.
+It gets slower. It doesn't die. Spilling is a property of the runtime primitive rather
+than a separate operator, so the plan doesn't change when a query goes out of core.
 
 ## Distribution
 

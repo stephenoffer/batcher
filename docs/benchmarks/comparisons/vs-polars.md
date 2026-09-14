@@ -12,8 +12,10 @@ number on q6 rather than a fast one. That gate runs before every timing on this 
 
 ## Scorecard
 
-Each row is one workload shape, with the engine that won it and by how much. Read them
-against the methodology above rather than in isolation:
+Each row is one workload shape, the engine that won it, and by how much. **The multiples in
+this table are speedups: bigger is a wider win for whoever is named.** The operator tables
+below report `batcher / polars` time ratios instead, where lower is better, so check the
+lead-in before reading a number off one:
 
 | Shape | Winner |
 |---|---|

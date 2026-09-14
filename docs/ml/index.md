@@ -48,13 +48,16 @@ Sharding that stays balanced, and resumes where it stopped.
 
 ## In this section
 
+Start at inference if you already have a model, and at preparing if the data is not yet in
+shape for one. The counts are the pages each group's own index lists.
+
 | Group | Pages | Covers |
 |---|---|---|
-| {doc}`/ml/inference/index` | 6 | The core loop, model reuse, GPU placement, and the offline scoring job |
-| {doc}`/ml/preparing/index` | 2 | Media decode into tensor columns, and tokenization as a stage |
-| {doc}`/ml/evaluation/index` | 2 | Metrics, per-segment scoring, drift, and honest splits |
+| {doc}`/ml/inference/index` | 8 | The core loop, model reuse, GPU placement, and the offline scoring job |
+| {doc}`/ml/preparing/index` | 3 | Media decode into tensor columns, and tokenization as a stage |
+| {doc}`/ml/evaluation/index` | 3 | Metrics, per-segment scoring, drift, and honest splits |
 | {doc}`/ml/retrieval/index` | 6 | Encoding, vector search, RAG, and the LLM surface |
-| {doc}`/ml/training/index` | 5 | Serving patterns, sharded training feeds, and loaders |
+| {doc}`/ml/training/index` | 6 | Serving patterns, sharded training feeds, and loaders |
 
 ## See also
 

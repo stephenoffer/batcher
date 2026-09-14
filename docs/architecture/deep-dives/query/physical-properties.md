@@ -89,8 +89,8 @@ key, and it is the case that motivated recording the direction in the first plac
 ordering that could only describe ascending keys never matched it.
 
 No separate top-N rule does this, and one would not fire if it existed. The query reaches the
-rewrite phase as a `Limit` sitting *above* a plain `Sort` -- a sort only acquires its own
-`limit` in a later phase -- so eliminating the sort is what leaves the limit on the scan.
+rewrite phase as a `Limit` sitting *above* a plain `Sort`, because a sort only acquires its own
+`limit` in a later phase, so eliminating the sort is what leaves the limit on the scan.
 
 The rewrite declines whenever the ordering is not an exact prefix match, so
 `ORDER BY ts ASC LIMIT 10` over the same newest-first table keeps its sort.
@@ -145,6 +145,10 @@ one.
 An empty partitioning guarantees nothing and satisfies only an empty requirement. Leaving a
 partitioning unclaimed costs at most an unnecessary shuffle, so the safe answer is always to
 claim nothing.
+
+The two properties differ in shape as well as in their rules: an ordering is carried along the plan from operator to operator, while a partitioning is stored nowhere and recomputed by whoever needs it, at the point of decision.
+
+![Ordering and partitioning, which do not work alike. An ordering travels with the plan: Scan orders establishes the ordering (o_date) from a proved footer order, Filter preserves it, Project preserves it under the new column name as (day), and Aggregate destroys it, so an empty ordering leaves the far side and a later sort has to run. A partitioning is never carried, only recomputed: rows pass from a Join on k through a Filter to an Aggregate on (k, x) with no property riding along, and the point of decision, dist scheduling or the cost model, walks the plan again there and then. Nothing stores a partitioning and there is no Exchange node to enforce one. In that plan the delivered (k) sits inside the required (k, x), so the shuffle is skipped. The two contain in opposite directions: an ordering satisfies a requirement when it is longer, because rows sorted by (a, b) are also sorted by (a) while (a) alone does not satisfy (a, b); a partitioning satisfies one when it is a subset, because partitioning on (a) keeps every (a, b) group whole while partitioning on (a, b) does not keep an (a) group whole. Getting it backwards drops a sort that was needed or skips a shuffle that was not optional, and a wrong claim about either is a wrong answer, not a slow one.](/_static/diagrams/physical_properties.svg)
 
 ## Why a wrong claim is worse than no claim
 

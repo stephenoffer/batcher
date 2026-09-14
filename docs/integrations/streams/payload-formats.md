@@ -91,7 +91,7 @@ events = bt.read.kafka(
 The schema is required, not merely recommended, and the reason is the same one that makes
 declaring it useful: the plan is built before the first message is polled, so a type
 discovered on the first poll arrives after every expression that needed it. Inferring would
-not fail loudly either — the plan would carry an empty struct, the decode would produce real
+not fail loudly either. The plan would carry an empty struct, the decode would produce real
 fields, and the batch would be coerced back on the way out.
 
 Parsing is pyarrow's own JSON reader over the batch, so it is the same C++ path a JSON file
@@ -234,5 +234,5 @@ an inline `value_schema`, or drop `schema_registry` to write bare payloads.
 ## See also
 
 - {doc}`Kafka </integrations/streams/kafka>`: the connector these options are set on.
-- {doc}`Streaming pipelines </tutorials/pipelines/streaming-pipeline>`: triggers, watermarks, and checkpoints.
+- {doc}`Streaming pipelines </getting-started/tutorials/pipelines/streaming-pipeline>`: triggers, watermarks, and checkpoints.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the Avro file reader, which shares this type mapping.

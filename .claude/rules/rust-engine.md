@@ -61,8 +61,17 @@ ever disagree.
 ## Arrow is the only columnar contract
 
 - Every operator, the interpreter, the JIT, and the FFI boundary speak Arrow
-  `RecordBatch` (`bc_arrow::Morsel`, default 16,384 rows). Do not invent row
-  structs, bespoke buffers, or alternative columnar formats.
+  `RecordBatch` (`bc_arrow::Morsel`). Do not invent row structs, bespoke buffers, or
+  alternative columnar formats.
+- **A morsel is 16,384 rows *or* 1 MiB, whichever trips first**, and stating only the row
+  half is how a reader concludes that a wide batch morselizes on rows. `MorselTarget` holds
+  both bounds; `MorselTarget::rows()` disables the byte bound and is called "the historical
+  default", while `bc-interp::par` builds `MorselTarget::new(morsel_rows, morsel_bytes)`
+  against `DEFAULT_MORSEL_ROWS = 16_384` and `DEFAULT_MORSEL_BYTES = 1 MiB`. The byte bound
+  is the one that fires on the data this engine exists to carry: `par.rs`'s own test notes
+  100 rows of 64 KiB binary are "far under the 16,384-row target but well over the 1 MiB
+  byte budget, so the scan yields several morsels, not one". A single over-budget row
+  becomes a one-row morsel rather than being split.
 - The Python boundary is **zero-copy** via the Arrow C Data Interface
   (`arrow-pyarrow`). Don't serialize batches across FFI.
 - `bc-arrow` is the single place the workspace pins its arrow version. Use
@@ -125,16 +134,27 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
   and mergeable — but **"merge identically" is only true of some of them**, and the line
   runs where the algorithm does. HyperLogLog, Count-Min and Bloom fold by register-wise
   max, cell-wise sum and bitwise OR, so any merge order reaches a bit-identical state, and
-  `ColumnStats`' min/max/count/ndv fold the same way. KLL, TDigest and `FrequentItems`
-  **do not**: their merge compacts, re-clusters or evicts, which is order-sensitive by
-  construction, so a reduce that takes partials in a different order returns a different
-  answer — as does `ColumnStats`' quantile grid, which is a KLL. Measured over 39 seeds and
-  three merge orders, the worst *rank* disagreement was 0.0097 for KLL at k=200 and 0.0050
-  for TDigest at compression 100, which is the ~2/k the algorithm already promises rather
-  than a defect; `FrequentItems` reorders its tail the same way, which is what a
-  Misra-Gries counter does when two summaries meet. `crates/bc-sketches/tests/merge_order.rs` pins both halves. Do not write a test
-  asserting a quantile sketch merges to an identical state, and do not set out to "fix"
-  the fact that it does not.
+  `ColumnStats`' min/max/count/ndv fold the same way. KLL and TDigest **do not**: their
+  merge compacts and re-clusters, which is order-sensitive by construction, so a reduce
+  that takes partials in a different order returns a different answer, as does
+  `ColumnStats`' quantile grid, which is a KLL. What is asserted is that they land inside
+  the accuracy the sketch already promises: the worst *rank* disagreement recorded is
+  0.0097 for KLL at k=200 and 0.0050 for TDigest at compression 100, roughly the ~2/k the
+  algorithm promises rather than a defect. Do not write a test asserting a quantile sketch
+  merges to an identical state, and do not set out to "fix" the fact that it does not.
+
+  **Two things this entry got wrong, corrected 2026-09-13 by reading the test rather than
+  the comment above it.** `crates/bc-sketches/tests/merge_order.rs` has three test
+  functions, and they cover HLL/Count-Min/Bloom, `ColumnStats` scalars, and the two
+  quantile sketches. It loops `for seed in 1..12u64`, so **11 seeds** times three orders is
+  what is pinned; the "39 seeds" this entry used to cite appears only in a *comment*
+  describing an earlier sweep, and citing it as the committed measurement is the error this
+  file warns about elsewhere. And **`FrequentItems` is not tested by that file at all**, so
+  listing it as order-sensitive stated as fact something no test checks — while
+  `crates/bc-sketches/src/frequent.rs` argues at length for the opposite, that `merge` sums
+  counts and `heavy_hitters` sorts, making "the *algorithm* order-independent, which is a
+  stronger guarantee than a seed". One of those two files is wrong and the way to settle it
+  is a test, not an edit to either.
 - `bc-transport` is the Arrow Flight data-plane shuffle with **credit-based flow
   control** (Carbonite model: 1 credit = 1 batch slot; producer blocks at 0). The
   data plane bypasses the Ray object store entirely — do not route bulk batches

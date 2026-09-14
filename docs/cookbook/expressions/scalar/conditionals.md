@@ -1,6 +1,6 @@
 # Conditionals
 
-``bt.when(...).then(...).otherwise(...)`` is the columnar ``if``. Chain ``.when()`` for more branches; the first matching branch wins, exactly like SQL ``CASE``. Because it is an expression it runs in Rust, so a five-way bucketing is still one pass.
+`bt.when(...).then(...).otherwise(...)` is the columnar `if`. Chain `.when()` for more branches; the first matching branch wins, exactly like SQL `CASE`. Because it is an expression it runs in Rust, so a five-way bucketing is still one pass.
 
 The whole script, executed on every test run:
 

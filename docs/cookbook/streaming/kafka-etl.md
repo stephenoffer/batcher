@@ -15,7 +15,7 @@ the sink, not by the source. Everything below is arranged around that one fact.
 Every broker source (Kafka, Kinesis, Pulsar, Pub/Sub, Event Hubs) hands you the same
 six columns, and the payload is opaque bytes:
 
-| column | type | |
+| Column | Type | Notes |
 | --- | --- | --- |
 | `key` | binary | may be null |
 | `value` | binary | your payload, undecoded |

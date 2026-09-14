@@ -190,7 +190,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 |---|---|---|
 | `gating.py` | 335 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 99 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
-| `staging.py` | 599 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
+| `staging.py` | 594 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
 ### `batcher/api/dataset/` — 5 · conductor
 
@@ -904,7 +904,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3175 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 893 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 559 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 558 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 574 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -1626,7 +1626,7 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `device_exchange.py` | 390 | Redistributing between the devices of one node without serializing them behind each other. |
 | `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 178 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `locality.py` | 183 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 235 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 459 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
@@ -1992,7 +1992,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `kinesis.py` | 496 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
 | `pulsar.py` | 419 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
-| `seen_store.py` | 183 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
+| `seen_store.py` | 205 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 644 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO
@@ -2015,7 +2015,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `location.py` | 113 | Where a checkpoint lives — local disk, or the object store the durability advice names. |
 | `logs.py` | 188 | Durable offset + commit logs for streaming-query checkpointing. |
 | `recovery.py` | 60 | The recovery decision at streaming-query start. |
-| `state_store.py` | 359 | Durable snapshots of a streaming query's running aggregation state. |
+| `state_store.py` | 364 | Durable snapshots of a streaming query's running aggregation state. |
 | `store.py` | 117 | `CheckpointStore` — the offset log, commit log, and state store under one dir. |
 
 ### `batcher/io/formats/streaming/codecs/` — 2 · neutral IO
@@ -2341,7 +2341,7 @@ The scalar expression algebra.
 | `nodes.py` | 529 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
-| `walk.py` | 460 | Structural traversals over the expression tree. |
+| `walk.py` | 380 | Structural traversals over the expression tree. |
 
 ### `batcher/plan/expr_ir/compat/` — 1 · contract
 
@@ -2550,7 +2550,7 @@ How a `QueryProfile` becomes something a person can read.
 | module | lines | what it is |
 |---|---|---|
 | `cells.py` | 118 | One operator's worth of rendered text: its estimate, its share bar, its notes. |
-| `layout.py` | 460 | Columns, sections, and the order they appear in — the profile as a page. |
+| `layout.py` | 444 | Columns, sections, and the order they appear in — the profile as a page. |
 | `options.py` | 151 | The knobs and the presentation vocabulary the profile renderer draws with. |
 | `tree.py` | 171 | Recovering the shape of a plan tree from a flat, pre-ordered operator list. |
 
@@ -2683,7 +2683,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 177 | A single generic registry pattern, used for every extension point. |
+| `registry.py` | 192 | A single generic registry pattern, used for every extension point. |
 | `sql_errors.py` | 57 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility
@@ -3054,7 +3054,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `depth.rs` | 120 | How deep a plan document is, measured without recursing into it. |
 | `engine_config.rs` | 198 | Execution tunables shipped from the Python control plane alongside the plan. |
 | `error.rs` | 26 | The crate's error type: how a malformed plan IR is rejected at the wire boundary. |
-| `lib.rs` | 891 | `bc-ir` — the query intermediate representation. |
+| `lib.rs` | 895 | `bc-ir` — the query intermediate representation. |
 
 ### `bc-expr`
 

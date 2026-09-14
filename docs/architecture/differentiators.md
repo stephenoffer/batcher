@@ -2,19 +2,19 @@
 
 This page describes the design decisions that separate Batcher from DuckDB, Polars, Spark, and Ray Data, and what each one buys.
 
-Most engines are fast at one shape of work. The interesting question is not whether Batcher is fast, which {doc}`../benchmarks/index` answers with measured numbers, but which properties survive when the work changes: when the data outgrows a laptop, when the pipeline has to feed a model, when the same query runs every hour for a year.
+Most engines are fast at one shape of work. Whether Batcher is fast is a question {doc}`../benchmarks/index` answers with measured numbers. The question this page answers is which properties survive when the work changes: when the data outgrows a laptop, when the pipeline has to feed a model, when the same query runs every hour for a year.
 
-Six decisions account for most of that. Each section below says what the decision is and what it buys. Every claim is checked against the code that implements it.
+Six decisions account for most of that. Each section says what the decision is, what it buys, and where it stops. Every claim is checked against the code that implements it.
 
 ## One algebra from one core to a cluster
 
 Every stateful operator is written once, in `bc-runtime`, as three functions: `partial(batch)` produces a state, `combine(states)` merges them, and `finalize(state)` emits rows. `combine` is associative and commutative, so partial states merge in any order.
 
-That single implementation is what runs sequentially on one core, in parallel across many, and across a cluster over Arrow Flight. There is no second distributed operator with its own semantics, which is why a result is identical whether it was produced on one node or a hundred, and why CI can assert exactly that.
+That one implementation runs sequentially on a core, in parallel across many, and across a cluster over Arrow Flight. No second distributed operator carries its own semantics, so the rows, the column names and the column types come back the same on one node and on a hundred. `tests/integration/test_distributed.py` asserts that operator by operator. It needs a real Ray cluster and skips without one, which is the state CI runs in, so the assertion is evidence only where someone has run it on hardware.
 
-The practical consequence is that scaling out is a scheduling decision rather than a rewrite. The same script runs on a laptop and on a cluster, and distribution is cheap enough to decline: at TPC-H scale factor 1, where a network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff.
+Scaling out is then a scheduling decision rather than a rewrite. The same script runs on a laptop and on a cluster, and distribution is cheap enough to decline: at TPC-H scale factor 1, where a network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff.
 
-**The design constraint.** Every stateful operator must have a mergeable form, because one without it would be capped at a single machine. That constraint is what buys the guarantee.
+The price is a constraint on every new operator. A stateful operator with no mergeable form is capped at one machine, and the failure shows up at cluster scale as wrong results rather than as an error, so the constraint is what buys the guarantee.
 
 ## Speed without a second set of semantics
 
@@ -26,13 +26,11 @@ The sequential interpreter is the correctness oracle: simple, deterministic, and
 
 The edge that matters most is the dashed one. An expression the JIT does not support is not an error and not a slow compile. It falls back to the interpreter. A fast path that disagreed with the oracle would be worse than no fast path at all, so the JIT is required to be bit-for-bit identical on its subset and to decline everything else.
 
-This is why performance work here does not accumulate risk. A new tier can be added, and a compiled pipeline can be abandoned mid-query, without a second definition of what a query means.
-
-**The compiled subset.** The JIT compiles numeric, null-free arithmetic and comparison. Everything outside that subset runs on the interpreter, at the same result.
+So performance work here does not accumulate risk. A new tier can be added, and a compiled pipeline can be abandoned mid-query, without a second definition of what a query means. The compiled subset is narrow on purpose: numeric, null-free arithmetic and comparison. Everything outside it runs on the interpreter, at the same result.
 
 ## A learned loop that outlives the query
 
-This is the differentiator most often overstated, so it is worth stating precisely.
+This is the differentiator most often overstated. Here it is at full precision.
 
 ![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](/_static/diagrams/adaptive_positioning.svg)
 
@@ -49,11 +47,9 @@ Two things about it are genuinely different:
 
 On a cluster, Ray schedules tasks and carries control-plane metadata, and that is all it does. Only small `(address, ticket)` strings travel through Ray. Bulk Arrow batches move directly between workers over Arrow Flight, under credit-based flow control where one credit is one in-flight batch slot and a producer blocks when its credits reach zero.
 
-Routing bulk data through an object store is what produces spill storms under memory pressure, and avoiding it is the main reason Batcher's distributed numbers separate from Ray Data's by a wide margin. The credit bound is not merely intended: it is enforced by an in-flight gauge in `bc-transport`.
+An object store in the data path produces spill storms under memory pressure, and staying out of it is the main reason Batcher's distributed numbers separate from Ray Data's by a wide margin. The credit bound is enforced rather than intended. An in-flight gauge in `bc-transport` holds it.
 
-Within a node the transport picks the cheapest tier automatically, reading straight from the local store in the same process, memory-mapping a 64-byte-aligned Arrow IPC file across processes on the same node, and using Flight only between nodes. The shared-memory tier is worth roughly 23x a loopback Flight hop point to point, and it steps aside on its own when the node is under memory pressure.
-
-**How output is held.** The shuffle keeps published output in RAM with a spill path behind it, so a reducer reads from memory in the common case and from disk under pressure.
+Within a node the transport picks the cheapest tier automatically, reading straight from the local store in the same process, memory-mapping a 64-byte-aligned Arrow IPC file across processes on the same node, and using Flight only between nodes. The shared-memory tier is worth roughly 23x a loopback Flight hop point to point, and it steps aside on its own when the node is under memory pressure. Published output itself is held in RAM with a spill path behind it, so a reducer reads from memory in the common case and from disk under pressure.
 
 ## Batch, streaming, and models are one engine
 
@@ -63,7 +59,7 @@ Model work sits on the same engine rather than beside it. Images, audio, and vid
 
 The measured effect of that overlap is large and specific: a two-stage ResNet-50 pipeline went from 942 to 2,504 images per second, with GPU utilization rising from about 30% to 81%.
 
-**The execution model.** Streaming is micro-batch, so a trigger interval sets the latency floor and every batch carries the same operator semantics as a bounded query.
+One limit is worth stating against Flink rather than against a batch engine. Streaming here is micro-batch, so a trigger interval sets the latency floor, and Batcher cannot express the guarantees a true record-at-a-time engine offers.
 
 ## Correctness is mechanically proven, not asserted
 
@@ -71,9 +67,9 @@ Every claim above is only worth as much as the guarantee that the engine returns
 
 Relational behavior is differentially tested against DuckDB: the harness runs a query on both engines, compares results as a sorted row multiset within float tolerance, and a disagreement is a decision to surface rather than a test to weaken. Inside the Rust engine, the sequential interpreter is the reference and the parallel and JIT paths must match it. Property-based tests then cover the combinations an enumerated case cannot reach, asserting that the full optimizer rule set changes the plan and never the answer, that it converges to a deterministic fixpoint, and that every self-tuning knob is result-invariant.
 
-The benchmark harness applies the same rule to itself. It refuses to time a query whose result does not match the oracle, so a missing number on a benchmark page means a wrong answer rather than a slow one. That gate is what caught two other engines returning the wrong answer on TPC-H q6.
+The benchmark harness applies the same rule to itself. It refuses to time a query whose result does not match the oracle, so a missing number on a benchmark page means a wrong answer rather than a slow one. That gate is what caught Daft returning the wrong revenue on TPC-H q6, recorded in `benchmarks/BENCHMARK_RESULTS.md`.
 
-**The oracle's scope.** Relational behavior is checked against DuckDB. Behavior DuckDB does not define, such as multimodal decode or model scoring, is covered by ordinary tests.
+The oracle only reaches as far as DuckDB defines. Behavior it has no opinion on, such as multimodal decode or model scoring, is covered by ordinary tests instead.
 
 ## Requirements and limitations
 

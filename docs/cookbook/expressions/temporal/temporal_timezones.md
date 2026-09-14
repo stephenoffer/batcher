@@ -1,6 +1,6 @@
 # Time zones
 
-Store UTC, convert at the edge. A daily rollup computed in UTC and labeled as local time is wrong by up to a day at the boundary, and it is wrong quietly: the numbers look plausible, they are just attributed to the wrong day.
+Store UTC, convert at the edge. A daily rollup computed in UTC and labeled as local time is wrong by up to a day at the boundary, and it fails quietly: the numbers look plausible, and only the day they land on is off.
 
 The whole script, executed on every test run:
 

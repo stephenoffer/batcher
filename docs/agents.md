@@ -75,13 +75,15 @@ For work *on* Batcher rather than *with* it. These encode the invariants in
 | `run-quality-gate` | Before committing, opening a PR, or claiming a change works. |
 | `audit-codebase-health` | A periodic health pass over the whole tree: dead code, duplication, swallowed errors, tests that cannot fail, production readiness. Fixes what it finds. |
 
-Documentation is part of the engine, so it has its own pair. The contract they apply is
-`.claude/rules/documentation.md`.
+Documentation is part of the engine, so it has a set of its own. The contract all four
+apply is `.claude/rules/documentation.md`.
 
 | Skill | Use it when |
 |---|---|
 | `improve-a-docs-page` | Writing, rewriting, or reviewing one page under `docs/`: hierarchy, voice, executed code blocks, links, tables, and visuals. |
 | `audit-docs-structure` | Reorganizing `docs/`, adding a section, or diagnosing why readers can't find something. Produces a restructuring plan, not edits. |
+| `docs-grammar-style` | Settling a specific wording, link, table, or formatting question: the substitution table, the Sphinx roles, the glossary, and which syntax survives on which rendering surface. |
+| `write-in-a-human-voice` | A page, docstring, or write-up reads templated: a heading every eighty words, uniform sentences, a survey where a verdict belongs. Fixes shape first and diction last, without touching a fact. |
 
 {doc}`/architecture/internals/extending` is the companion contributor cookbook, holding the recipes
 and the registries. The skills are the procedures and the gates.

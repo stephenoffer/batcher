@@ -1,6 +1,6 @@
 # PII transforms
 
-These are ordinary expressions, so they run in Rust at full speed and compose with everything else. Pick by what you need back: masking is one-way and readable, hashing is one-way and joinable, encryption is reversible with the key.
+Masking, hashing and encryption are ordinary expressions here. They run in Rust over whole columns and compose with everything else. Pick by what you need back: masking is one-way and readable, hashing is one-way and joinable, encryption is reversible with the key.
 
 The whole script, executed on every test run:
 

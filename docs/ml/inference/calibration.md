@@ -6,9 +6,9 @@ make decisions against, with
 
 ## Why separation is not calibration
 
-A classifier that ranks rows well can still be wrong about *how* confident it is. A model whose 0.9 scores come true only half the time orders rows correctly and misprices every decision made against a threshold, which matters as soon as the score meets a cost.
+A classifier that ranks rows well can still be wrong about *how* confident it is. Take a model whose 0.9 scores come true only half the time. It orders rows correctly, and it misprices every decision made against a threshold. That bites as soon as the score meets a cost.
 
-{py:class}`CalibratedClassifierCV <batcher.ml.compose.calibration.CalibratedClassifierCV>` learns the mapping from score to probability. It splits the data into `cv` folds, fits the classifier on all but one, fits the mapping on the fold that model never saw, then averages those mappings and refits the classifier on everything. Calibrating on the training split instead learns the overconfidence the model shows on rows it memorized, which looks perfect in development and is wrong in use.
+{py:class}`CalibratedClassifierCV <batcher.ml.compose.calibration.CalibratedClassifierCV>` learns the mapping from score to probability. It splits the data into `cv` folds, fits the classifier on all but one, fits the mapping on the fold that model never saw, then averages those mappings and refits the classifier on everything. Calibrating on the training split instead learns the overconfidence the model shows on rows it memorized. That looks perfect in development and is wrong in use.
 
 Pass the estimator as a class, as with `OneVsRestClassifier`, because it fits one per fold:
 
@@ -28,7 +28,7 @@ print(sorted(model.predict(ds).columns)[:1])
 # ['calibrated']
 ```
 
-`method="sigmoid"` is Platt scaling, a two-parameter fit that suits a small held-out fold; `method="isotonic"` fits a free monotone step function, which corrects shapes a sigmoid cannot but needs considerably more data per fold before it stops fitting noise.
+`method="sigmoid"` is Platt scaling, a two-parameter fit that suits a small held-out fold. `method="isotonic"` fits a free monotone step function instead. Isotonic corrects shapes a sigmoid cannot, and it needs considerably more data per fold before it stops fitting noise.
 
 The fitted mapping is part of the model, so `save_model` writes it alongside the classifier and a loaded model calibrates exactly as the saved one did.
 

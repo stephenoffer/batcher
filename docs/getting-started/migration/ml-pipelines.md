@@ -1,10 +1,9 @@
 # Batch inference and ML pipelines
 
 This page covers the ML half of a port: running a model over batches, feeding a
-distributed trainer, and writing results back out. The relational work around the model
-goes through the same optimizer and resource manager as any other query.
+distributed trainer, and writing results back out.
 
-## Batch inference and ML pipelines
+## Running a model over batches
 
 {py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches, and {py:meth}`ds.ml.infer(model) <batcher.api.dataset.ml.DatasetML.infer>` and
 {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` run a model. Pass a class instead of an instance and the model
@@ -27,10 +26,12 @@ The entry points below cover the common ML shapes.
 | Resumable writes | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
 
 Settings other engines make you tune by hand are measured defaults here. Batch size
-adapts toward throughput under a VRAM cap, `num_gpus` adapts to observed GPU
-utilization, and there's no object-store proportion to set, because the data plane
-bypasses it. For timings, run `python benchmarks/run.py`, which checks every result
-against DuckDB and Polars before it reports a number.
+adapts toward throughput under a VRAM cap, and `num_gpus` adapts to observed GPU
+utilization. There's no object-store proportion to set, because the data plane bypasses
+it. For timings, run `python benchmarks/run.py`, which checks every result against
+DuckDB and Polars before it reports a number.
+
+## Where the time goes
 
 `ds.stats()` answers "where is my time going". It runs the query and reports measured
 rows, wall time, peak bytes, and spill per operator, plus which one was the bottleneck:
@@ -45,6 +46,8 @@ print(stats.rows, stats.bottleneck is not None)
 # 3 True
 ```
 
+## Writing results back out
+
 Batch writes are atomic and resumable, so a job killed by a spot preemption re-runs
 without losing or duplicating data, and `max_rows_per_file` bounds each output file:
 
@@ -58,6 +61,8 @@ print(bt.read.parquet("/tmp/bt_resume_demo").count())
 # 1000
 ```
 
+## Feeding a distributed trainer
+
 Feeding a distributed PyTorch trainer, whether DDP, FSDP, or DeepSpeed, uses
 {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>`. It gives every rank the same number of batches in a seed-reproducible
 order that's independent of world size, so a job can resume on a differently sized
@@ -70,6 +75,8 @@ loader = ds.ml.stream_loader(batch_size=256, world_size=8, rank=0, epoch=0, seed
 for batch in loader:          # {column: torch.Tensor}, this rank's shard
     train_step(batch)
 ```
+
+## Offline LLM generation
 
 Offline LLM batch inference wraps any text-generation engine, such as vLLM behind the
 `batcher-engine[vllm]` extra. The engine is built once per worker, and `template` and

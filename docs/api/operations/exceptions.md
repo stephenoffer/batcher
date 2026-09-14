@@ -43,8 +43,7 @@ except Exception as exc:
 
 ## The error types you may see
 
-Every error shares a common base, so a single `except` can catch them all, or you
-can catch a specific type when you want to react differently.
+Each row below names a type, then the part of the engine that raises it.
 
 | Error | Raised when |
 | --- | --- |
@@ -53,7 +52,7 @@ can catch a specific type when you want to react differently.
 | {py:exc}`OptimizationError <batcher.OptimizationError>` | The optimizer cannot produce a valid physical plan. |
 | {py:exc}`CompileError <batcher.CompileError>` | JIT compilation of a pipeline fails. The interpreter remains as a fallback, so this is rare. |
 | {py:exc}`ResourceError <batcher.ResourceError>` | The resource manager cannot satisfy a memory or credit request. |
-| `BackpressureAbort` | Execution is aborted because backpressure could not be relieved. |
+| `BackpressureAbort` | Execution is aborted because backpressure could not be relieved. A subclass of `ResourceError`, and the one error here that isn't re-exported at the top level: import it from `batcher._internal.errors` to name it directly. |
 | {py:exc}`IOError <batcher.IOError>` | A source or sink fails to read, write, list, or open a path. |
 | `DataQualityError` | A `ds.dq...fail()` expectation has violating rows. Carries the per-constraint counts. |
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
@@ -63,9 +62,8 @@ can catch a specific type when you want to react differently.
 
 ## Catching errors
 
-Because the types are internal, the safe pattern is to catch broadly and
-inspect the message, or to import the base type from its internal location if you
-need to branch on it.
+Catch the narrowest type you plan to act on, and {py:exc}`BatcherError <batcher.BatcherError>` when you only need
+to tell a Batcher failure from anything else.
 
 ```python
 import batcher as bt
@@ -79,7 +77,7 @@ except bt.BatcherError as exc:
 # query failed: projection 'missing' references unknown column(s) ['missing']; available: ['a']
 ```
 
-Catching {py:exc}`bt.BatcherError <batcher.BatcherError>` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
+Catching {py:exc}`bt.BatcherError <batcher.BatcherError>` covers every Batcher-specific failure and lets anything else through. A bug in your own batch function still reaches you as itself.
 
 ## See also
 

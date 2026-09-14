@@ -7,13 +7,13 @@ Batcher splits in two. Python is the control plane. It builds a query plan, opti
 it, and decides how much it should cost, but it never touches a row of data. Rust is
 the data plane, where every per-row and per-batch computation runs over Apache Arrow.
 The two meet at one boundary, a JSON plan plus zero-copy Arrow batches, and nothing
-else crosses it. That single split is what lets the optimizer be written in clean,
-malleable Python while the hot path runs at native speed.
+else crosses it. That split lets the optimizer stay clean, malleable Python while the
+hot path runs at native speed.
 
 The API is lazy. An operation doesn't compute anything. It returns a new plan, and work
 begins only at a terminal call such as `collect`. By then the optimizer sees the whole
-computation at once, which is what makes whole-query optimization, and re-optimization
-mid-query, possible.
+computation at once, which is the precondition for optimizing a query as a whole and for
+revising the plan mid-query.
 
 ## The two planes
 
@@ -38,23 +38,20 @@ point.
 The Python control plane is four independent subsystems plus a neutral contract layer.
 They don't import one another, and only the conductor wires them together.
 
-- **Kyber decides.** The optimizer rewrites plans and chooses physical strategies such
-  as join order, build side, and what to prune, using cardinality and cost. It never
-  makes execution happen.
-- **Carbonite protects.** The resource manager checks whether a plan fits, hands out
-  memory reservations and shuffle credits, and decides when to spill. It never
-  rewrites a plan or computes a result.
-- **Core measures.** The executor drives the engine through `bc-py`, runs the
-  adaptive re-optimization loop, and records what actually happened: real row counts,
-  operator times, and peak memory.
-- **Governance enforces.** Row filters and column masks are applied as a pure plan
-  rewrite, alongside column-level lineage.
+Kyber is the optimizer. It rewrites plans and chooses physical strategies such as join
+order, build side, and what to prune, using cardinality and cost, and it never makes
+execution happen. Carbonite is the resource manager: it checks whether a plan fits,
+hands out memory reservations and shuffle credits, and decides when to spill, without
+ever rewriting a plan or computing a result. Core is the executor. It drives the engine
+through `bc-py`, runs the adaptive re-optimization loop, and records what actually
+happened, meaning real row counts, operator times, and peak memory. Governance applies
+row filters and column masks as a pure plan rewrite, alongside column-level lineage.
 
 `plan` is the neutral layer they all share, holding the logical and physical plan nodes,
 the expression IR, and the JSON wire format, and it depends on none of them. `api` is
 the only conductor, and the only place that imports every subsystem. The verbs stay in
-their lanes: Core measures, Kyber decides, Carbonite protects. Keeping them separate is
-what makes the feedback loop below stable, because each side has exactly one job.
+their lanes: Core measures, Kyber decides, Carbonite protects. The separation keeps the
+feedback loop below stable, because each side has exactly one job.
 
 ## How a query runs
 
@@ -102,9 +99,9 @@ Stateful operators live in `bc-runtime` as mergeable primitives: `partial`, `com
 and `finalize`, with `combine` associative and commutative so partials merge in any
 order. The same implementation runs sequentially on one core, in parallel across many
 by morselizing and merging, and across machines, where the distributed path composes
-the identical primitives over Ray workers. A result is the same whether it ran on a
-laptop or a cluster, because there is no second distributed code path with its own
-semantics.
+the identical primitives over Ray workers. The rows, the column names and the column
+types come back the same whether the query ran on a laptop or a cluster. There is no
+second distributed code path with its own semantics to diverge from.
 
 ![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](/_static/diagrams/mergeable.svg)
 

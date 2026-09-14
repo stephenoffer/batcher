@@ -1,6 +1,7 @@
 # Methodology
 
-How the numbers were produced, and how to reproduce them.
+How the numbers were produced, and how to reproduce them. Read it before quoting a ratio
+off any other page in this section.
 
 ## Correctness gates the timer
 
@@ -12,14 +13,14 @@ fast wrong answer is a bug, not a win, and it never reaches these pages as a rat
 :::
 
 The engine that disagreed is still *timed*, and its milliseconds still appear in the table.
-That is deliberate: how fast a wrong answer was is diagnostic, and hiding it would make a
-failing engine indistinguishable from an absent one. What the harness refuses to do is
-*divide* the two, because a ratio is the suite's claim about which engine is faster and a
-number carries its disqualification only as long as the status column travels beside it.
+That is deliberate. How fast a wrong answer was is diagnostic, and hiding it would make a
+failing engine indistinguishable from an absent one. The harness refuses only to *divide*
+the two, because a ratio is the suite's claim about which engine is faster, and a number
+carries its disqualification only as long as the status column travels beside it.
 
 A result that asked for an order gets a second, separate check. The multiset comparison
 sorts both sides before comparing, so on its own it cannot tell a sorted result from an
-unsorted one — an engine that skipped its `ORDER BY` entirely would match. Every case
+unsorted one. An engine that skipped its `ORDER BY` entirely would match. Every case
 carrying an outermost `ORDER BY` is therefore also checked for monotonicity in its own
 order, per engine, and an engine that fails it is disqualified the same way a wrong value
 is.
@@ -36,8 +37,8 @@ So the suite records known semantic differences in `benchmarks/harness/divergenc
 with a verdict naming which engine is right and a citation. A row whose every difference is
 recorded reports **`DIVERGENT`**: it never reads `OK`, its ratio is still withheld, its
 reason prints beneath the table, and it does not fail the run. An unrecorded difference is
-still `FAILED`, and no entry can excuse a Batcher defect — entries name the engine that is
-the odd one out, so a Batcher error on the same query is unaffected.
+still `FAILED`. No entry can excuse a Batcher defect: entries name the engine that is the
+odd one out, so a Batcher error on the same query is unaffected.
 
 This is the same discipline the engine is built under: every relational operator is
 differential-tested against DuckDB, and the Tier-0 interpreter is the oracle that the
@@ -54,7 +55,8 @@ needs GPUs and a distributed benchmark needs a cluster. Each is labeled where it
 
 | Family | Hardware |
 |---|---|
-| Suite geomeans (TPC-H, TPC-DS, ClickBench, JOB, H2O, operators, JSON), 2026-08-15 | Single node, 96 cores, 184 GiB |
+| Suite geomeans (TPC-H, TPC-DS, ClickBench, JOB, H2O, operators, JSON), 2026-08-15 and 2026-08-25 | Single node, 96 cores, 184 GiB |
+| The full engine matrix and the Spark and PyArrow boards, 2026-09-11 | Single node, 48-core Xeon Platinum 8275CL, 92 GiB |
 | Older per-operator and connector figures | Single node, 16 cores, 30 GB |
 | Multimodal ingest (image, point cloud) | Single node, 96 cores |
 | `map_batches` ETL and training ingest | Single node, 96 cores, 188 GB |
@@ -82,12 +84,12 @@ are the representative way that engine is run, and both are why the like-for-lik
 | Engine | Configuration | Why |
 |---|---|---|
 | Batcher | Single-node, in-process | Its low-overhead strength |
-| DuckDB (`duckdb`) | Its **native** store, ingested untimed before the query | DuckDB at its best — the harder bar |
+| DuckDB (`duckdb`) | Its **native** store, ingested untimed before the query | DuckDB at its best, and the harder bar |
 | DuckDB (`duckdb_arrow`) | The **same zero-copy Arrow** Batcher runs on | The like-for-like execution comparison |
 | Daft | Native multithreaded local engine (`DAFT_RUNNER=native`), or its Ray runner for the cluster grid | Its fastest runner for each shape |
 | DuckDB, Polars | In-process | The only way they run |
-| Ray Data | Tables written to Parquet once, untimed, then read back with Ray-sized row groups | `from_arrow` makes one block, and a block is Ray's unit of parallelism — a one-block dataset runs every operator on a single core. The cost is that Ray decodes Parquet inside each timed run while the in-process engines read Arrow; the alternative was measuring Ray single-threaded |
-| DuckDB (both bars) | CPU and memory budget **pinned to Batcher's** | Left to their defaults DuckDB takes 80% of RAM and Batcher takes 90% of the whole machine — 147.1 against 165.6 GiB here, a 13% headroom advantage to Batcher before it spills. That decides nothing at sf1 and decides whether a query spills at all above 10M rows, which is the regime the project concedes it loses in. Threads are pinned for a second reason: the two agree at 92 on this box by separate auto-detections, and parity that holds by coincidence is parity nobody notices losing |
+| Ray Data | Tables written to Parquet once, untimed, then read back with Ray-sized row groups | `from_arrow` makes one block, and a block is Ray's unit of parallelism, so a one-block dataset runs every operator on a single core. The cost is that Ray decodes Parquet inside each timed run while the in-process engines read Arrow; the alternative was measuring Ray single-threaded |
+| DuckDB (both bars) | CPU and memory budget **pinned to Batcher's** | Left to their defaults DuckDB takes 80% of RAM and Batcher takes 90% of the whole machine: 147.1 against 165.6 GiB here, a 13% headroom advantage to Batcher before it spills. That decides nothing at sf1 and decides whether a query spills at all above 10M rows, which is the regime the project concedes it loses in. Threads are pinned for a second reason: the two agree at 92 on this box by separate auto-detections, and parity that holds by coincidence is parity nobody notices losing |
 | Distributed engines | Attached to the live cluster (`ray.init(address="auto")`) | Where they are designed to be strongest |
 
 ### Which surface each engine runs
@@ -97,14 +99,18 @@ Ray Data has no SQL surface and runs hand-written `ray.data.Dataset` pipelines; 
 native lazy-DataFrame pipelines, as its own published TPC-H benchmark does; Batcher runs
 DataFrame pipelines on 8 of the 22 queries and `bt.sql()` on the other 14; DuckDB and Spark
 run the SQL string throughout. The planned operator sequences of Batcher's two paths were
-diffed at sf1-proportional cardinalities and agree exactly on q1/q3/q5/q6 — including the
-six-table join — differing elsewhere only in the placement of one or two projection and
+diffed at sf1-proportional cardinalities and agree exactly on q1/q3/q5/q6, the
+six-table join included, differing elsewhere only in the placement of one or two projection and
 scan-pushdown nodes. The hand-written pipelines are not out-planning the SQL front-end.
 
 ## How much precision a geomean is entitled to
 
 Every headline figure here is a geometric mean of per-query `batcher_ms / engine_ms` ratios.
-Two things decide whether one is comparable to another, and both are now printed with it:
+That is a ratio of *times*, so lower is better and anything below 1.00 is a Batcher win.
+Every table on this site states the convention again in its own lead-in, because the
+inverted form reads identically and a reader who guesses wrong reads every row backwards.
+
+Two things decide whether one geomean is comparable to another, and both are printed with it:
 the **number of cases it averages** and the exclusions by status, since a mean over an
 unstated denominator is not comparable to a different one; and the **best-of-N** the run
 used, which `run.py` varies by scale.
@@ -123,19 +129,19 @@ precision the spread supports.
 prepared physical plan, so across `bench()`'s warm-up and repeats it plans once. DuckDB's
 `con.sql(query)` re-parses and re-plans on every call, because that is the API a DuckDB user
 writes. Measured on TPC-H sf1, giving DuckDB `PREPARE`d statements moves the geomean from
-**0.764 to 0.783 — 2.3% against Batcher**, with 15 of 22 queries moving against it and
+**0.764 to 0.783, 2.3% against Batcher**, with 15 of 22 queries moving against it and
 per-query planning running 8–20% on the plan-heavy shapes. It is left as it is because both
 sides are the ordinary way each engine is used, and it is recorded because 2.3% is real even
 though it sits below this suite's own 2.9% run-to-run spread.
 
 **Output format.** Batcher returns Arrow natively; DuckDB converts to it. Two attempts to
-isolate that conversion here disagreed in sign, so **no figure is quoted for it** — it is
+isolate that conversion here disagreed in sign, so **no figure is quoted for it**. It is
 named as a known asymmetry of unmeasured size rather than estimated.
 
 **Warm-up.** `bench()` discards one execution and reports the best of the next N, so every
-figure on the board is a *steady-state* one. That is the standard way to benchmark and it is
-not the asymmetry. The asymmetry is what the discarded execution costs each engine, which is
-not the same number: on TPC-H sf1 a first-seen query costs Batcher **2.60x** its steady state
+figure on the board is a *steady-state* one. That is the standard way to benchmark. The
+asymmetry is not the warm-up itself, it is the price of the discarded execution, and the two
+engines do not pay the same one: on TPC-H sf1 a first-seen query costs Batcher **2.60x** its steady state
 against DuckDB's **1.15x** (`benchmarks/scenarios/claims/learning_curve.py`, geomean over 22
 queries, 8 executions each in a fresh process). DuckDB's 1.15x is the page-cache, JIT and
 allocator floor both engines pay; the **2.27x excess** is Batcher's plan cache and learned
@@ -143,8 +149,8 @@ store filling up, and it is gone by the second or third execution, which is why 
 lands both engines in steady state and the comparison stays fair.
 
 It is recorded here because it is by far the largest of the three, and because of what it
-implies about scope rather than about bias: a user who runs a query **once** — the most common
-thing a user does — sees a number this board never prints, and the gap between the board and
+implies about scope rather than about bias: a user who runs a query **once**, the most common
+thing a user does, sees a number this board never prints, and the gap between the board and
 that number is engine-specific and roughly 2.3x, not the 2.3% of the planning row above. The
 board answers "how fast is this engine on a query it has seen before". `cold_start.py` and
 `learning_curve.py` are where the other question is answered, and neither feeds a headline
@@ -159,7 +165,7 @@ neutral packaging choice. On TPC-H sf1 over four alternated passes the suite geo
 **0.725 isolated against 0.693 in-process**, a 4.4% difference from a flag that changes
 nothing about the queries, against a pass-to-pass spread inside each mode of under 1%. Three
 quarters of it lands on the comparator, which is misleading about the cause. Run **alone**,
-DuckDB does not care which mode it is in (+1.3%, per-query signs 11 of 22 — a coin flip)
+DuckDB does not care which mode it is in (+1.3%, per-query signs 11 of 22, a coin flip)
 while Batcher gains **3.8%** from the shared process (15 of 22 queries faster). The capacity
 to benefit from one process is Batcher's, because cross-query carry-over is exactly what this
 engine has and DuckDB does not; in the paired lineup part of that gain is spent being crowded
@@ -174,26 +180,34 @@ And `--isolate` is **not** a cold-start measurement, which a note in
 `benchmarks/BENCHMARK_RESULTS.md` claimed until it was checked: the child still executes the
 query once for the correctness check, once as a warm-up, and N more times reporting only the
 best, so the plan cache and the learned store are warm when the number is taken. If it were
-the cold-start case Batcher would read ~2.6x its steady state; it reads 1.012x. What
-`--isolate` removes is cross-*query* carry-over, not cold start.
+the cold-start case Batcher would read ~2.6x its steady state. It reads 1.012x. The flag
+removes cross-*query* carry-over and nothing else.
 
 ## Suite coverage
 
-The harness registers **348 benchmarks across ten suites**, spanning the industry-standard
-analytics set and the workload families that are specific to Batcher's range:
+`python benchmarks/run.py --list` prints the live count. It stands at **373 benchmarks across
+ten suites**, spanning the industry-standard analytics set and the workload families that are
+specific to Batcher's range:
 
-| Suite | Queries | What it covers |
+| Suite | Cases | What it covers |
 |---|---:|---|
-| TPC-DS | 99 | The full official set, vendored from DuckDB's `tpcds` extension |
 | Join Order Benchmark | 113 | Join planning against the real IMDb dataset, 21 tables |
+| TPC-DS | 99 | The full official set, vendored from DuckDB's `tpcds` extension |
+| Operators | 46 | The data-plane kernel lineup in isolation |
 | ClickBench | 43 | Wide-table scan and aggregate on web analytics data |
 | Scan and I/O | 27 | Parquet, CSV, JSON, and the connectors |
 | TPC-H | 22 | The full official set, at scale factors 1 and 10 |
-| Operators | 21 | The data-plane kernel lineup in isolation |
 | H2O.ai db-benchmark, group-by | 10 | Grouping from 100 groups to 10M, the standard cardinality sweep |
 | H2O.ai db-benchmark, join | 5 | Five join shapes across small, medium, and large build sides |
 | Semi-structured JSON | 5 | Nested extraction and projection |
 | Images | 3 | Decode to tensor |
+
+Registered is not the same as timed, and two suites publish a smaller denominator than the
+column above. TPC-DS times **98 of its 99**: q67 fails the correctness gate on both engines,
+because float reassociation moves group sums in their last bits, which changes which sums tie,
+which moves an integer `rank()`. The Join Order Benchmark times **109 of its 113**; the other
+four do not clear the gate. Neither denominator is rounded up, and every geomean on this site
+prints the count it averaged.
 
 TPC-DS and the Join Order Benchmark exercise planning far harder than TPC-H does. The median
 JOB query joins 8 tables and the largest joins 17, which is the regime where join ordering

@@ -1,6 +1,6 @@
 # Regular expressions
 
-``extract`` pulls one capture group, ``extract_all`` returns a list column of every match, and ``replace_all`` rewrites every occurrence. The pattern is compiled once per operator rather than per row, which is the whole reason these live in the engine.
+`extract` pulls one capture group, `extract_all` returns a list column of every match, and `replace_all` rewrites every occurrence. The pattern is compiled once per operator rather than per row, which is the whole reason these live in the engine.
 
 The whole script, executed on every test run:
 

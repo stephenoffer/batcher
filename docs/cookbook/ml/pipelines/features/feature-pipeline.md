@@ -38,8 +38,8 @@ what else that decision buys.
 
 ## Chain the transforms
 
-{py:class}`Chain <batcher.ml.preprocessors.Chain>` is the sklearn `Pipeline` equivalent. It fits each step on the **previous step's
-output** and replays the fitted steps, in order, over any split. Sequencing this by hand
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` is the sklearn `Pipeline` equivalent. It fits each step on the previous step's
+output and replays the fitted steps, in order, over any split. Sequencing this by hand
 is where leaks appear: fit step *i* on data that steps *0..i-1* have not transformed and
 the statistics no longer match what the model will see at serving time. Nothing fails. The
 metric is wrong.
@@ -74,8 +74,7 @@ print(imputer.statistics_)
 ```
 
 :::{warning}
-That 44.0 is the *training* median, and it is the value that fills the test set's nulls
-too. Refit on test and the two splits stop sharing a scale, which is the leak in its most
+That 44.0 is the *training* median, and it fills the test set's nulls too. Refit on test and the two splits stop sharing a scale, which is the leak in its most
 common form. Nothing raises. The metric is wrong, and it is wrong in the flattering
 direction.
 :::

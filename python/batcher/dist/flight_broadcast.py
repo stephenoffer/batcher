@@ -99,7 +99,8 @@ def _output_budget(granted: int = 0) -> int:
         import psutil
 
         return int(psutil.virtual_memory().total * _OUTPUT_BUDGET_FRACTION)
-    except Exception:  # pragma: no cover - a bound we cannot size must not fail the query
+    except Exception as exc:  # pragma: no cover - optional host probe
+        note_suppressed("dist", "read node memory for a broadcast output bound", exc)
         return 0
 
 

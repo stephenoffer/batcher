@@ -1,10 +1,8 @@
 # Statistics cookbook
 
-This section holds 6 runnable recipes that compute statistics as aggregates in the engine, so a summary over a billion rows is one pass rather than a pull into pandas.
+Six recipes, ordered as a reading of one column. Summarize it, measure its spread, look at its shape, then relate it to something else. Every one is an aggregate the engine evaluates, so a summary over a billion rows is one pass rather than a pull into pandas.
 
-They are ordered as a reading of a column: summarize it, measure its spread, look at its shape, then relate it to something else.
-
-Every page embeds a complete, self-contained script from the [`examples/statistics/`](https://github.com/batcher/batcher/tree/main/examples/statistics) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Each page embeds a complete, self-contained script from [`examples/statistics/`](https://github.com/stephenoffer/batcher/tree/main/examples/statistics) that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|
@@ -17,7 +15,7 @@ Every page embeds a complete, self-contained script from the [`examples/statisti
 
 ## See also
 
-- {doc}`/ml/evaluation/statistics-and-drift`: the same aggregates applied to drift and honest splits.
+- {doc}`/ml/evaluation/statistics-and-drift`: the same aggregates applied to drift monitoring.
 - {doc}`/api/models/ml-statistics`: the statistical function reference.
 - {doc}`/cookbook/dataset/inspecting/profiling`: the first pass over an unfamiliar table.
 - {doc}`/cookbook/metrics/index`: scoring a model, as opposed to describing a column.

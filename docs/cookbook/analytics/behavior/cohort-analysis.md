@@ -57,9 +57,8 @@ print(naive.to_pydict())
 #  'revenue': [130.0, 70.0, 100.0, 20.0]}
 ```
 
-Four cohorts, seven user-slots, four actual users. Sum the `users` column and you
-get 7, which is more people than exist. Every retention number computed on top of
-this is wrong in the same direction: it inflates.
+Four cohorts, seven user-slots, four actual users. Sum the `users` column and you get 7,
+which is more people than exist.
 
 Follow `u1`'s three orders through both labellings and the difference is the whole page:
 
@@ -77,9 +76,9 @@ group aggregate. You want the label attached back to every row of that user inst
 collapsed, and {py:meth}`.over(partition_by=["user"]) <batcher.AggExpr.over>` does exactly that.
 :::
 
-`month_idx` is the month as a single integer (`year * 12 + month`), so subtracting
-two of them gives the number of months between, with no calendar arithmetic and no
-December-to-January wraparound bug.
+`month_idx` is the month as a single integer, `year * 12 + month`. Subtract two of them and
+you have the number of months between. No calendar arithmetic, and no December-to-January
+wraparound bug.
 
 ```python
 labelled = (
@@ -183,8 +182,8 @@ The nulls are the shape of the thing: the March cohort has no month-3 number bec
 month 3 has not happened.
 
 `pivot` runs an eager pre-pass to discover the distinct values of `period`. Pass
-`columns=[0, 1, 2, 3]` to fix them yourself and skip that pass, which is worth doing when the
-period range is known and the input is large.
+`columns=[0, 1, 2, 3]` to fix them yourself and skip it. Worth doing when the period range is
+known and the input is large.
 
 :::{dropdown} Scaling notes: the shuffle that decides whether this fits in memory
 The `min().over(partition_by=["user"])` is a hash shuffle on `user`. It is the expensive step,

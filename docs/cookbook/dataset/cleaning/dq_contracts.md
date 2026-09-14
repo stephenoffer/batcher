@@ -1,6 +1,6 @@
 # Data-quality contracts
 
-The four terminal calls are the whole design. ``validate()`` reports without changing the data, ``fail()`` raises, ``drop()`` silently removes bad rows, and ``quarantine()`` splits them out so you can inspect them. Choosing between them is a decision about who is responsible for the bad rows.
+The four terminal calls are the whole design. `validate()` reports without changing the data, `fail()` raises, `drop()` silently removes bad rows, and `quarantine()` splits them out so you can inspect them. Choosing between them is a decision about who is responsible for the bad rows.
 
 The whole script, executed on every test run:
 

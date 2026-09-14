@@ -135,8 +135,8 @@ purpose. Raise it when a partition is legitimately bursty and you would rather w
 drop its rows; set it to zero to keep the fully conservative frontier that never advances
 past a silent partition.
 
-If nothing advances anyway — every partition idle, or a source that stopped producing —
-Batcher does not let it end in an OOM: retained state is checked against
+If nothing advances anyway, because every partition is idle or the source stopped
+producing, Batcher does not let it end in an OOM: retained state is checked against
 `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>`
 names the column whose watermark is not advancing. Read it as a diagnosis, not a budget
 request.

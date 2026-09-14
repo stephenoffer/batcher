@@ -1554,22 +1554,25 @@ board (best-of-five, 48-core box, three engines plus Batcher):
 
 | suite | b/duckdb | b/duckdb_arrow | b/polars |
 |---|---:|---:|---:|
-| TPC-H sf1 | 0.71 | **0.25** | 0.52 |
-| operator mix | 0.74 | **0.47** | 0.16 |
-| ClickBench | 0.63 | **0.16** | 0.37 |
-| H2O groupby | 1.04 | **0.82** | 0.52 |
+| TPC-H sf1 | 0.72 | **0.25** | 0.54 |
+| operator mix | 0.75 | **0.47** | 0.16 |
+| ClickBench | 0.65 | **0.16** | 0.37 |
+| H2O groupby | 1.05 | **0.83** | 0.53 |
+| H2O join | 0.63 | **0.58** | 0.51 |
+| JSON | 0.35 | **0.32** | 0.01 |
 
 The third column is what the execution engine does on equal input: **four times faster than
-DuckDB on TPC-H and six on ClickBench**, over the identical bytes.
+DuckDB on TPC-H and six on ClickBench**, over the identical bytes. The two suites Batcher wins
+outright — every case of `h2o-join` and `json` — it wins on both bars.
 
 ### What that changes about the remaining losses
 
 It splits them in two, and the split is not obvious from the ratio alone.
 
-**Storage losses.** Every one of ClickBench's fifteen remaining losses is a case where Batcher
-is 5-20x *faster* than DuckDB over the same Arrow data — `cb-q41` 6.2 ms against 45.5,
-`cb-q37` 12.5 against 82.9, `cb-q39` 44.5 against 100.9 — and loses to DuckDB-native by one to
-four milliseconds. The `hits` table is wide and string-heavy, which is exactly what a dictionary
+**Storage losses — 19 of the 40, including ten of ClickBench's fifteen.** Each is a case where
+Batcher is *faster* than DuckDB over the same Arrow data and loses to DuckDB-native by one to
+four milliseconds: `cb-q41` 6.1 ms against DuckDB-on-Arrow's 43.4, `cb-q37` 11.4 against 80.0,
+`cb-q39` 44.7 against 101.1. The `hits` table is wide and string-heavy, which is exactly what a dictionary
 and a zone map are for. The sharpest single demonstration is a predicate that matches nothing:
 `WHERE l_comment LIKE 'zzzzq%'` over six million rows costs DuckDB **0.49 ms and 1 ms of CPU**,
 because its zone maps prove no block can contain a match, and costs Batcher 7.95 ms because it
@@ -1579,14 +1582,15 @@ Closing these means changing what Batcher reads, not how it computes: `StringVie
 preserved through the kernels, and block-level statistics over in-memory inputs. That is
 ceiling 2 and item 2 of the roadmap below, and until it lands these cases stay lost against
 DuckDB-native however fast the kernels get. Three string and temporal shapes that read as the
-worst kernel losses on this page — `str-length` 1.73x, `like-prefix` 2.34x, `date-part` 2.42x —
-are **wins of 0.42x, 0.48x and 0.55x** against the same engine on the same data.
+worst kernel losses on this page — `str-length` 1.53x, `like-prefix` 2.47x, `date-part` 2.50x —
+are **wins of 0.42x, 0.48x and 0.59x** against the same engine on the same data.
 
-**Execution losses.** Where `duckdb_arrow` or Polars *also* beats Batcher, the gap is the engine
-and it is worth fixing. As of this measurement that is `op-join-build-large` (107.6 against 60.2
-on Arrow), `op-sort-string-limit` (12.4 against 6.4), `h2o-gb-q8` (105.5 against 83.0),
-`h2o-gb-q7` (67.2 against 55.1), `op-except` (47.8 against Polars' 22.6) and TPC-H q21, q17, q8
-and q5, where Polars — also an Arrow engine — is the one ahead.
+**Execution losses — the other 21.** Where `duckdb_arrow` or Polars *also* beats Batcher, the
+gap is this engine's and is worth fixing here: `h2o-gb-q8` (104.9 against 83.2 on Arrow),
+`op-except` (46.6 against Polars' 24.7), `h2o-gb-q7` (66.8 against 56.7),
+`op-join-build-large` (70.6 against 60.5), `op-sort-string-limit` (11.1 against 6.4), and TPC-H
+q17, q8, q5 and q2, where Polars — also an Arrow engine — is the one ahead.
+`benchmarks/results/LOSS_BACKLOG.md` carries the whole board with this column on every row.
 
 **Neither column excuses the other.** A `duckdb_arrow` win is not "Batcher beats DuckDB": a user
 who hands DuckDB a table gets the native format and the number in the first column. Quote the

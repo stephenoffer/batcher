@@ -32,7 +32,7 @@ rather than converge to one.
 
 The canonicalization round exists because the pipeline is a single forward pass. A rule that
 collapses a shape, such as folding two adjacent filters into one conjunction, runs early and
-then never sees the plan again — but pushdown, join reordering, and fusion all re-create that
+then never sees the plan again. Pushdown, join reordering, and fusion all re-create that
 shape after it has run. The round re-applies exactly those contracting rewrites once the
 plan's structure has settled, so the engine is not handed an operator the optimizer already
 knew how to remove. See {doc}`internals/kyber` for what qualifies a rule to take part and why
@@ -67,7 +67,7 @@ whose statistics rule them out, and skip partitions entirely when the column is 
 partition key. On a selective scan that can cut the work by orders of magnitude.
 
 A source pushes what its backend can express, and no more. Every backend has terms it
-cannot spell: a database has no portable literal for `NaN`, a Parquet reader will not
+cannot spell. A database has no portable literal for `NaN`, and a Parquet reader will not
 prune on a temporal literal whose physical unit it cannot verify. When one term of an
 `AND` is untranslatable, the rest are still pushed, because dropping a conjunct only
 widens what the source returns and the engine keeps its own `Filter` to re-check every
@@ -99,15 +99,15 @@ ds = (
 
 ### Limit pushdown
 
-A limit pushes as early as the pipeline's semantics allow, so the engine can stop
-once it has enough rows instead of producing the full intermediate. Kyber pushes
-limits through projections and into the branches of a union.
+A limit pushes as early as the pipeline's semantics allow. The engine can then stop once
+it has enough rows instead of producing the full intermediate, and Kyber pushes limits
+through projections and into the branches of a union.
 
 ### Top-N fusion
 
 A `Limit` over a `Sort` is the special case worth its own operator. Sorting the whole
-input only to take the first N rows is wasted work, so Kyber fuses the pair into a
-single top-N operator that keeps only N rows in flight.
+input to take the first N rows is wasted work. Kyber fuses the pair into a single top-N
+operator that keeps only N rows in flight.
 
 ```python
 ds = ds.sort("score", descending=True).limit(100)  # fused into top-N
@@ -115,8 +115,8 @@ ds = ds.sort("score", descending=True).limit(100)  # fused into top-N
 
 ### Join reordering
 
-Join order dominates the cost of a multi-table query, because the wrong order
-materializes a large intermediate that a better order never builds. Kyber reorders
+Join order dominates the cost of a multi-table query. The wrong order materializes a
+large intermediate that a better order never builds. Kyber reorders
 joins cost-based, minimizing the estimated intermediate sizes, using dynamic
 programming over connected subsets of the join graph and falling back to a greedy
 builder when the graph is too large or too dense to search.
@@ -151,12 +151,14 @@ Kyber re-plans the rest of the query on the measured numbers before continuing. 
 same mechanism runs single-node and distributed.
 
 This is stage-boundary re-optimization, the same granularity Spark AQE adapts at, and
-the difference is that Batcher runs it on one machine too. DuckDB optimizes once,
-before execution, and never revises. The loop is gated by `adaptive="auto"`, the
-default, which engages it only when measuring could flip a downstream decision such as
-a build side or a join order. Kyber also carries a cross-query loop that neither DuckDB
-nor Spark has: sketch-backed statistics and a bandit over join strategies, both
-persisted between runs.
+Batcher runs it on one machine too. DuckDB optimizes once, before execution, and never
+revises. Read the gate carefully before assuming your query is in it. `adaptive="auto"`,
+the default, engages the loop only on a query that contains a join, that clears a size
+floor charged per pipeline breaker the loop would cut at, and where measuring could still
+flip a downstream decision such as a build side or a join order. A query with no join is
+out at any size. {doc}`/architecture/internals/execution` carries the exact thresholds.
+Kyber also carries a cross-query loop that neither DuckDB nor Spark has: sketch-backed
+statistics and a bandit over join strategies, both persisted between runs.
 
 This split is the reason the architecture keeps Core, which measures, and Kyber, which
 decides, as separate subsystems with a feedback loop between them.

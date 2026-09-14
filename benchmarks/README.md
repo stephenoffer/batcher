@@ -16,10 +16,23 @@ for unstructured multimodal ingest — against the engines Batcher claims to bea
 `duckdb` runs on its compressed *native* store (DuckDB at its best); `duckdb_arrow` runs the
 same query on the *same zero-copy Arrow* Batcher consumes — the like-for-like execution bar.
 The two separate DuckDB's storage engine from its execution engine, and **a ratio is
-meaningless without saying which bar it is against**: on h2o-groupby the same Batcher on the
-same queries reads 1.042x against native DuckDB and 0.03-0.15x against DuckDB-on-Arrow,
-because the first comparison is against dictionary-encoded storage Batcher has no equivalent
-for. Always name the bar. See `TPCH_FINDINGS.md`.
+meaningless without saying which bar it is against**. Measured 2026-09-13 on a 48-core box,
+the same Batcher on the same queries reads:
+
+| suite | vs duckdb (native) | vs duckdb_arrow (same Arrow) |
+|---|---:|---:|
+| TPC-H sf1 | 0.72 | 0.25 |
+| ClickBench | 0.65 | 0.16 |
+| H2O groupby | 1.05 | 0.83 |
+
+The first column is the headline bar and the second is what the execution engines do on equal
+input; the difference between them is DuckDB's dictionary-encoded, zone-mapped storage, which
+Batcher's Arrow-only invariant has no equivalent for. Always name the bar. See
+`results/LOSS_BACKLOG.md`, which carries both on every losing case, and `TPCH_FINDINGS.md`.
+
+An earlier revision of this paragraph quoted **0.03-0.15x** for h2o-groupby against
+DuckDB-on-Arrow. That was real when it was taken and is not now — today the same suite reads
+0.50x to 1.26x per case — which is the point of the date on every number in this directory.
 
 `duckdb_arrow` is **not** in the default lineup — it must be requested with
 `--engines batcher,duckdb,duckdb_arrow`. It was tried as a default and TPC-DS could not

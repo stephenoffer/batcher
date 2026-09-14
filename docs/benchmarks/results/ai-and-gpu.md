@@ -65,6 +65,32 @@ The simplest possible call, {py:meth}`ds.map_batches(Model, num_gpus=1) <batcher
 
 Byte-aware morselization is what makes the default safe on wide rows. A morsel splits at whichever bound trips first, count or bytes, so the 16-frame video clips above (about 0.6 MB per row) stream at 2,074.8 clip/s without a hand-picked batch size and without exhausting device memory.
 
+## Where this loses: a shuffle-free pipeline at scale
+
+Warm pools are worth most where a job is short, and nothing where it is long. Measured
+against Ray Data on a corpus built so that neither the read nor the page cache can decide the
+answer (`benchmarks/gpu_backend/compute_bound_inference.py`, 17 nodes, 192 cores, 8 T4s,
+2026-09-11), the same `map(cpu) -> map(gpu) -> agg` pipeline crosses over:
+
+| Rows | Batcher | Ray Data | Batcher GPU | Ray GPU |
+|---:|---:|---:|---:|---:|
+| 125,000 | **1.2 s** | 10.5 s | 25% | 5% |
+| 500,000 | **4.0 s** | 10.2 s | 40% | 18% |
+| 2,000,000 | 14.9 s | **14.4 s** | 50% | 50% |
+| 4,000,000 | 29.8 s | **22.6 s** | 48% | 65% |
+
+Both engines return identical answers at every scale. Two facts set the curve and both are
+worth quoting instead of the ratio. Ray Data costs about ten seconds before it does anything,
+which is where the 8.6x at 125,000 rows comes from: not a faster pipeline, an absent one.
+And Batcher stops scaling at about **134,000 row/s** with the devices at 48%, so the ceiling
+is its own scheduling rather than the T4s. A fused `map(cpu) -> map(gpu)` runs the CPU stage
+inside the actors holding the GPUs, on those nodes' cores, in threads. Ray Data's concurrency
+is processes, so it keeps climbing to 176,617 row/s against a device floor near 182,000.
+
+Do not quote a factor on this shape without naming the row count, and do not quote one at the
+saturated end at all. Both engines call the same kernels on the same devices there, and the
+engine at the floor cannot be beaten by more than the other's distance from it.
+
 ## Dirty data
 
 Real corpora contain rows that fail to decode. Error tolerance in Batcher is per row: with about 1% corrupt rows injected across 200,000 rows, `max_errored_rows` keeps 198,000 of them. One bad image costs you one image, not the block it landed in and not the job.

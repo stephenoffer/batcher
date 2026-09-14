@@ -4,7 +4,7 @@ The first two pages give you the shape shared by every operator. The next four a
 stateful operators themselves, each one an instance of that shape; the last takes the sort's
 behaviour at cluster scale on its own.
 
-- {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: why work is cut into 16,384-row chunks.
+- {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: why work is cut at 16,384 rows or 1 MiB, whichever comes first.
 - {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: `partial → combine → finalize`, and why one core and one cluster run the same code.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: a {py:meth}`group_by().agg() <batcher.Dataset.group_by>` from the morsel to the output rows, and the decisions made at runtime rather than at plan time.
 - {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: the one row-index primitive every join type and strategy is built on.
@@ -15,11 +15,11 @@ behaviour at cluster scale on its own.
 ```{toctree}
 :hidden:
 
+morsel-parallelism
+mergeable-algebra
 aggregation-internals
 join-algorithms
-mergeable-algebra
-morsel-parallelism
-sort-at-scale
 sort-internals
+sort-at-scale
 window-internals
 ```

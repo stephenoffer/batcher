@@ -27,8 +27,8 @@ people = bt.from_pydict(
 Constraint methods accumulate on `ds.dq` and return a new accessor, so they chain.
 {py:meth}`not_null <batcher.api.dataset.dq.DatasetDQ.not_null>` forbids nulls, {py:meth}`in_range <batcher.api.dataset.dq.DatasetDQ.in_range>` bounds a numeric column, and
 {py:meth}`accepted_values <batcher.api.dataset.dq.DatasetDQ.accepted_values>` restricts a column to a fixed set. The value constraints treat a
-NULL as valid so they compose independently; add `not_null` to forbid nulls
-explicitly. A terminal method then applies the accumulated checks.
+NULL as valid so they compose independently. Add `not_null` to forbid nulls explicitly. A
+terminal method then applies the accumulated checks.
 
 ```python
 report = (
@@ -62,8 +62,9 @@ The vocabulary below is the complete row-level set. Each entry is a method on `d
 | `references(cols, to=...)` | the foreign key resolves in another dataset |
 | `check(predicate, name=...)` | your own boolean expression is TRUE |
 
-`matches` requires a column to match a regular expression (NULL passes). `check`
-takes any boolean expression as a custom constraint with a name.
+A NULL passes `matches`, as it passes every other value constraint here. `check` is the
+escape hatch: it takes any boolean expression you can write and reports it under a name you
+choose.
 
 ```python
 codes = bt.from_pydict({"sku": ["A1", "B2", "zz", "C3"]})
@@ -107,10 +108,14 @@ print(worst.violations, round(worst.pass_rate, 2))
 # 1 0.8
 ```
 
+A chain ends in a terminal, and the terminals differ only in what becomes of the rows that failed:
+
+![One constraint chain, ds.dq.not_null('id').in_range('age', 0, 120), in which each constraint is a boolean Expr that is TRUE for a valid row. It lowers to FILTER, a keyless AGGREGATE, count() OVER (PARTITION BY keys) and a LEFT JOIN, and validity is forced to a non-null boolean, so the valid and invalid rows together are exactly the input. Three terminals split that partition three ways. fail() takes any violation and returns no dataset: it raises DataQualityError carrying a count per constraint, writes nothing to a dead-letter sink, and stops the run. drop() returns the passing rows as one lazy Dataset with no dead-letter side, so the violating rows are gone and nothing records them. quarantine() returns both, the valid rows and the violating ones as a second lazy Dataset to write to a dead-letter sink. annotate() is a fourth terminal, keeping every row and naming what each one failed, so a quarantined row can carry its reason. A NULL is not a violation, mostly=0.99 passes while one percent violate, and severity='warn' reports without enforcing anywhere.](../../_static/diagrams/dq_actions.svg)
+
 ## Drop invalid rows
 
-`drop` returns only the rows that satisfy every constraint. It is the cleansing
-path, for when bad rows should go away.
+`drop` returns only the rows that satisfy every constraint. Use it when the bad rows have
+no downstream reader and nobody needs to know which ones they were.
 
 ```python
 clean = people.dq.in_range("age", 0, 120).not_null("email").drop()
@@ -126,8 +131,8 @@ dead-letter sink instead of failing the run. The split is total: every input row
 lands in exactly one side.
 
 Both sides are lazy datasets built on the same input, so consuming both reads that input
-twice. When it is expensive to produce, {py:meth}`cache <batcher.Dataset.cache>` it before
-the split.
+twice, which is worth a {py:meth}`cache <batcher.Dataset.cache>` before the split whenever
+the input is expensive to produce. Read one side only and nothing is wasted.
 
 ```python
 good, bad = people.dq.in_range("age", 0, 120).quarantine()
@@ -155,9 +160,10 @@ failure counts by rule are one aggregation away.
 
 ## Fail the pipeline
 
-`fail` is the data-contract gate at a pipeline boundary: it raises
-{py:exc}`DataQualityError <batcher.DataQualityError>` (carrying the per-constraint counts) if any constraint is
-violated, and otherwise returns the dataset unchanged so the chain continues.
+`fail` is the data-contract gate at a pipeline boundary. It raises
+{py:exc}`DataQualityError <batcher.DataQualityError>` if any constraint is violated, and otherwise returns the
+dataset unchanged so the chain continues. The exception carries the per-constraint counts,
+and the message it carries names every rule that broke and how many rows broke it.
 
 ```python
 from batcher._internal.errors import DataQualityError
@@ -205,8 +211,9 @@ print(watched.drop().count())
 ## Scope a constraint to some rows
 
 Some rules apply to part of a table. `where` scopes every constraint added after it to the
-rows matching a predicate; a row outside the scope passes vacuously, so scoped and unscoped
-constraints compose in one chain.
+rows matching a predicate, and a row outside the scope passes vacuously rather than
+failing, which is what lets scoped and unscoped constraints sit in one chain without
+interfering.
 
 ```python
 addresses = bt.from_pydict(
@@ -219,8 +226,8 @@ print(scoped.validate().violations)
 
 ## Uniqueness and referential integrity
 
-`unique` requires a key (or key combination) to occur at most once; the report counts the
-duplicated *rows*, which is the same number `drop` removes.
+`unique` requires a key, or a key combination, to occur at most once. The report counts
+the duplicated *rows*, which is the same number `drop` removes.
 
 ```python
 dupes = bt.from_pydict({"id": [1, 1, 2, 3, 3]})
@@ -327,7 +334,7 @@ print(evolved.to_pydict())
 
 ## See also
 
-- {doc}`Data contracts </user-guide/trust/data-contracts>`: the checks a whole table fails, not a row — row counts, distributions, freshness, and schema.
+- {doc}`Data contracts </user-guide/trust/data-contracts>`: the checks a whole table fails rather than a row, such as row counts, distributions, freshness, and schema.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: ingest files, and reconcile the schemas that
   drifted between them.
 - {doc}`Transformations </user-guide/transform/rows/transformations>`: cleanse and reshape what survived the checks.

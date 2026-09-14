@@ -1,6 +1,6 @@
 # Inspecting a dataset
 
-The `meta` accessor answers from the plan and the footer, so these questions cost nothing and can decide what pipeline you build.
+What a table already knows about itself. `ds.meta` asks Kyber whether the answer is provable from the plan, a Parquet footer or a recorded sketch, and runs the query itself when it isn't. Either route returns the same answer, so these are safe to branch on. The deliberate exception is `ds.meta.approx`, which never executes at all. It reads sketches, so it is approximate, and where the source carries none it returns `None` rather than guess.
 
 Each page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, so a page that stops matching the engine fails the suite instead of drifting.
 

@@ -18,6 +18,6 @@ python examples/dataset/profiling.py
 ## See also
 
 - {doc}`/cookbook/dataset/cleaning/null_handling`: dropping, filling, and counting missing values.
-- {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
+- {doc}`/cookbook/dataset/inspecting/meta_columns`: bounds, uniqueness, nulls, and constancy.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -2,7 +2,7 @@
 
 Read a Parquet file with an `Int32` id column, print the schema, and you get `int64`.
 That is not a bug and it is not a lossy cast. It is the boundary contract: Batcher
-normalizes narrow numeric types **once**, at the FFI edge, so every operator, the
+normalizes narrow numeric types *once*, at the FFI edge, so every operator, the
 interpreter, and the JIT work on two numeric paths (`Int64` and `Float64`) instead of
 twelve. Knowing this up front saves you an afternoon of confusion the first time a schema
 assertion fails.
@@ -46,18 +46,16 @@ print(ds.schema)
 # day: date32[day]
 ```
 
-The widening is **value-preserving** (`Int32` fits in `Int64`, `Float32` in `Float64`)
+The widening is *value-preserving* (`Int32` fits in `Int64`, `Float32` in `Float64`)
 and it happens on the way in, so {py:obj}`ds.schema <batcher.Dataset.schema>` tells you the truth without executing
 anything.
 
-Consequences worth internalizing:
-
-An `Int32` overflow that would have wrapped in another engine does not wrap here, because
+Two consequences follow. An `Int32` overflow that would have wrapped in another engine does not wrap here, because
 the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it
 differs slightly from a `Float32` engine's answer, and it is the more accurate of the two.
 
 Widening moves the overflow boundary; it does not remove it. Scalar integer arithmetic
-**wraps** at the edge of `Int64`, silently, the way Rust and Polars do:
+*wraps* at the edge of `Int64`, silently, the way Rust and Polars do:
 
 ```python
 big = bt.from_pydict({"x": [2**63 - 1]})
@@ -100,8 +98,8 @@ order inside a partition never decides anything. How the rows are divided betwee
 still can, in that one case.
 
 So the rule to carry is: an integer *expression* can wrap, an integer *aggregate* cannot.
-If a column's values approach `2**63` and the arithmetic matters, cast before computing —
-`Float64` for magnitude, `decimal(38, s)` when the digits have to be exact.
+If a column's values approach `2**63` and the arithmetic matters, cast before computing.
+Use `Float64` for magnitude, `decimal(38, s)` when the digits have to be exact.
 
 ```python
 print(big.select(r=bt.col("x").cast("float64") + 1).to_pydict()["r"])
@@ -445,7 +443,7 @@ print(nested.explode("tags").to_pydict())
 # {'id': [1, 1, 2], 'tags': ['x', 'y', 'z']}
 ```
 
-A nested column can be a **key** too, with one exception. Grouping, `DISTINCT`, joins,
+A nested column can be a *key* too, with one exception. Grouping, `DISTINCT`, joins,
 windows and `UNION`(distinct) all identify rows by encoding the key columns into a single
 comparable byte string, and that encoding is defined for lists, structs, lists of structs
 and dictionary-encoded columns but not for maps: a map's entries have no canonical order,

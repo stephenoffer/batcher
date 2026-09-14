@@ -1,6 +1,6 @@
 # Deduplication
 
-"Remove duplicates" is under-specified until you say *which* copy survives. Keeping an arbitrary one is how a pipeline becomes non-deterministic; keeping the latest by a timestamp is almost always what was meant.
+"Remove duplicates" is under-specified. Which copy survives is the whole decision, and leaving it to an arbitrary one is how a pipeline becomes non-deterministic. The latest row by a timestamp is almost always what was meant.
 
 The whole script, executed on every test run:
 

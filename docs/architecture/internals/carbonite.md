@@ -20,7 +20,7 @@ reports what actually happened, which Kyber learns from on the next run.
 The `ResourceManager` is a thin orchestrator over four pluggable policies
 (admission, spill, flow control, and memory estimation) plus the memory subsystem:
 a buffer pool and a pressure monitor. Its job comes down to four decisions.
-{py:meth}`validate(plan) <batcher.api.dataset.dq.DatasetDQ.validate>` answers whether a plan is feasible; when it does not fit, the
+`validate(plan)` answers whether a plan is feasible. When it does not fit, the
 verdict carries a counter-offer for Kyber to re-plan around, such as a smaller credit
 window or a lower parallelism, rather than a flat rejection. `reserve(bytes)` accounts an
 allocation against the process-wide buffer pool with blocking semantics, so
@@ -109,15 +109,15 @@ different answers and only one of them is good news.
 
 The envelope is one process-wide figure, so a query that plans against all of it while
 others run has planned against memory it does not have. `execution.max_concurrent_queries`
-is what makes the division real: a query admitted while N are running compares its
-estimated peak against `1/N` of the envelope, which is Spark's `ExecutionMemoryPool` rule
-at query granularity. The concurrency limiter already divided the *cores* this way; the
+makes the division real. A query admitted while N are running compares its estimated peak
+against `1/N` of the envelope, which is Spark's `ExecutionMemoryPool` rule at query
+granularity. The concurrency limiter already divided the *cores* this way; the
 memory half is what stopped sixteen concurrent queries all reading as "fits" and all taking
 the in-memory path.
 
-The buffer pool keeps the whole envelope. What the share bounds is what a query *plans* to
-hold, not what the process may hold, and shrinking the pool would make a concurrent query's
-already-granted reservation retroactively unaffordable. A nested `collect()` inside a
+The buffer pool keeps the whole envelope. The share bounds what a query *plans* to hold
+rather than what the process may hold, because shrinking the pool would make a concurrent
+query's already-granted reservation retroactively unaffordable. A nested `collect()` inside a
 `map_batches` UDF takes no admission slot, so it cannot halve the budget of the query that
 is already paying for the machine. The default is unbounded concurrency, where the share is
 exactly 1 and nothing changes.
@@ -132,8 +132,8 @@ the same way a batch query does: through the config it is started under.
 
 `start_streaming_query` senses `memory.max_memory_bytes` from the live envelope, honoring a
 cgroup limit, and pins it for the query. That figure is what the data plane's spill backstop
-and every streaming operator's state cap derive from, so without it a streaming query ran on
-the static 8 GiB fallback -- a cap a 4 GiB container never reaches before the kernel kills
+and every streaming operator's state cap derive from. Without it a streaming query ran on
+the static 8 GiB fallback, a cap a 4 GiB container never reaches before the kernel kills
 it, and one that forces a 512 GiB host out of core a decade early.
 
 The micro-batch loop runs on its own thread, and a thread does not inherit context
@@ -171,11 +171,12 @@ credit_ceiling_factor`.
 | `aimd_alpha` / `aimd_beta` | `1` / `0.5` | Additive increase per round trip; multiplicative decrease on congestion. |
 | `backpressure_high` / `backpressure_low` | `0.70` / `0.40` | Buffer occupancy that throttles, then resumes, the producer. |
 
-By default the credit window is the static grant above. Setting
-`config.distributed.adaptive_credits` turns on a TCP-like AIMD controller that grows
-and shrinks the window per remote fetch from observed backpressure. It is off by
-default, so the static path stays unchanged and single-node-equals-distributed
-equivalence holds.
+`default_credits` is the window a channel opens with. `config.distributed.adaptive_credits`
+then governs what happens to it, and it is on by default: a TCP-like AIMD controller grows
+and shrinks the window per remote fetch from observed backpressure, so the shuffle backs off
+under memory pressure instead of holding a fixed window. Set it to `False` to pin the static
+grant. Either way the merged output is the same, because a credit window bounds in-flight
+batches and nothing else.
 
 ## Data transfer
 
@@ -216,41 +217,43 @@ cheapest for each one with **no configuration**:
 | Source | Path | Cost |
 |--------|------|------|
 | Same process | `DIRECT_MEMORY`, reading straight from the local store | no copy, no socket |
-| **Same node, different process** | `SHARED_MEMORY`, mmapping a 64-byte-aligned Arrow IPC file, decoded **zero-copy** | about a memcpy; **roughly 23× a loopback Flight hop** |
+| Same node, different process | `SHARED_MEMORY`, mmapping a 64-byte-aligned Arrow IPC file, decoded zero-copy | about a memcpy; roughly 23× a loopback Flight hop |
 | Another node | `NETWORK`, over credit-bounded Arrow Flight | one gRPC stream |
 
 The common GPU-cluster shape packs several worker actors per node, so many of a
 reducer's fetches are same-node-but-cross-process, which is exactly the tier the
-shared-memory path accelerates. It is **on by default** (`config.distributed.shared_memory_transfer`)
-and safe to leave on because it is:
+shared-memory path accelerates. It is on by default (`config.distributed.shared_memory_transfer`),
+and three properties make it safe to leave on.
 
-- **Adaptive / self-limiting.** The mmap file is a second copy (in tmpfs = RAM) on top
-  of the in-memory store Flight serves remote reducers from, so a mapper **skips** the
-  mirror whenever the node is under memory pressure (`PressureLevel.SPILL`+). The reducer
-  then falls back to Flight. On a churning spot node, where recompute transiently
-  doubles live state, the fast path steps aside rather than risking OOM.
-- **Concurrency-preserving.** Same-node buckets are read from shared memory *inside* the
-  concurrent gather, so cross-node buckets still fan out in parallel. You get the 23× on
-  the same-node fraction with no loss of cross-node throughput.
-- **Result-preserving.** A shm miss (bucket not mirrored, another node, shm unavailable)
-  transparently falls back to Flight, which is bit-identical, so single-node == distributed
-  holds regardless.
+It limits itself. The mmap file is a second copy (in tmpfs, so RAM) on top of the in-memory
+store Flight serves remote reducers from, so a mapper skips the mirror whenever the node is
+under memory pressure (`PressureLevel.SPILL`+) and the reducer falls back to Flight. On a
+churning spot node, where recompute transiently doubles live state, the fast path steps
+aside rather than risking OOM.
+
+It preserves concurrency. Same-node buckets are read from shared memory *inside* the
+concurrent gather, so cross-node buckets still fan out in parallel, and the same-node
+fraction gets the 23× with no loss of cross-node throughput.
+
+It preserves the result. A shm miss, whether the bucket was not mirrored or sits on another
+node or shared memory is unavailable, falls back to Flight transparently, and the bytes are
+identical either way.
 
 Measured on a real cluster: a single-node multi-actor gather (8 producers → 1 reducer)
-runs at **33.6 GB/s with shared memory vs 4.5 GB/s over loopback Flight** (7.5× through
-the full concurrent gather; ~23× point-to-point).
+runs at 33.6 GB/s with shared memory against 4.5 GB/s over loopback Flight, which is 7.5×
+through the full concurrent gather and about 23× point to point.
 
 ### Cross-node throughput scales with the cluster
 
 A single reducer's inbound rate is bounded by its NIC (~2.7 GB/s = ~22 Gbps on a T4
-node, i.e. line rate); the 10× is in the **aggregate** all-to-all, where every node
-reduces at once. Measured aggregate shuffle throughput: **2.0 → 6.9 → 15.2 GB/s at 2 → 4
-→ 8 nodes**. It grows with the node count, because the mergeable `partial → combine →
+node, i.e. line rate); the 10× is in the *aggregate* all-to-all, where every node
+reduces at once. Measured aggregate shuffle throughput: 2.0 → 6.9 → 15.2 GB/s at 2 → 4
+→ 8 nodes. It grows with the node count, because the mergeable `partial → combine →
 finalize` algebra plus credit flow control keep per-node memory bounded no matter how
-wide the cluster. The shuffle runtime's worker-thread pool is **auto-sized to the host's
-cores** (clamped to keep concurrent-decode throughput near the NIC without
-oversubscribing many-actor nodes); override with `BATCHER_SHUFFLE_RT_THREADS` only for an
-unusual node shape.
+wide the cluster. The shuffle runtime's worker-thread pool is auto-sized to the host's
+cores, clamped to keep concurrent-decode throughput near the NIC without oversubscribing
+many-actor nodes. Override it with `BATCHER_SHUFFLE_RT_THREADS` only for an unusual node
+shape.
 
 ## Self-tuning from measured metadata
 
@@ -288,8 +291,8 @@ so a first run is byte-for-byte the pre-learning behavior.
 
 The ratio only means something against the width the plan actually sized with, which Kyber
 publishes as `PlanProperties.row_size`. Rescaling against the flat `optimizer.row_bytes`
-default instead is wrong by `row_size / row_bytes` — one to two orders of magnitude on
-exactly the wide payloads the byte-true width exists to model. Measured: a 410 MB aggregate
+default instead is wrong by `row_size / row_bytes`, which is one to two orders of magnitude
+on exactly the wide payloads the byte-true width exists to model. Measured: a 410 MB aggregate
 over 4 KiB rows read as 26 GB, so every envelope decision took the spill branch the moment
 that family was learned, and the learner made the plan worse the more it knew.
 

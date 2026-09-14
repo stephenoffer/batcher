@@ -190,9 +190,6 @@ print(ds.approx_median("value"))
 # 499.5
 ```
 
-Sample when you want *rows*, such as data to eyeball, a dev fixture, or a subset to train
-on. Sketch when you want a *number*.
-
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the exact and approximate aggregate families.

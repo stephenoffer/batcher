@@ -13,6 +13,8 @@ guessed at is usually not the one costing the time.
 | {doc}`Reading a very large table <large-tables>` | What changes once planning a table costs more than reading it |
 | {doc}`Skewed keys and hostile data shapes <skew>` | Why a job that fits your budget on paper dies anyway, and which shapes still have a ceiling |
 | {doc}`Filter and column pushdown <pushdown>` | Which parts of a query the data source runs itself, and what stops that happening |
+| {doc}`Object storage and worker locality <object-storage>` | How many reads a scan keeps in flight, what the planner caches, and how a worker meets its own data twice |
+| {doc}`Running a query on the GPU <gpu>` | Asking for the device backend, what it does with several, and what it declines |
 
 ## See also
 
@@ -29,4 +31,6 @@ best-practices
 large-tables
 skew
 pushdown
+object-storage
+gpu
 ```

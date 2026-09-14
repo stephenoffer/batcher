@@ -1,9 +1,9 @@
 # Embeddings
 
-The expensive part of an embedding job is not the forward pass, it is everything around
-it: loading the model once per worker instead of once per batch, keeping the GPU fed,
-and not embedding the same document three times because the corpus has duplicates. Get
-those right and a 100M-document embed job is a scan with a GPU stage bolted to it.
+Three things around the forward pass cost more than the forward pass: loading the model once
+per worker instead of once per batch, keeping the GPU fed, and not embedding the same document
+three times because the corpus has duplicates. Get those right and a 100M-document embed job is
+a scan with a GPU stage bolted to it.
 
 ## Embed a column
 
@@ -143,9 +143,9 @@ print(unit.select(norm=col("embedding").list.l2_norm()).to_pydict())
 # {'norm': [1.0, 1.0, 1.0]}
 ```
 
-{py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` is how you check whether vectors from an unfamiliar source are already
-normalized before you spend a pass normalizing them again. Many hosted embedding APIs
-return unit vectors; many local models do not.
+Check an unfamiliar source with {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` before spending a pass normalizing vectors
+that are already normalized. Many hosted embedding APIs return unit vectors. Many local models
+do not.
 
 ## Binarize for cheap Hamming search
 
@@ -344,7 +344,7 @@ model, an ONNX runtime, and a hosted embedding API are interchangeable at this s
 
 ## Scoring embedding quality
 
-Once vectors exist, the questions you ask of them are numeric, and the metrics for that aggregate a per-row vector operation to a corpus score in one scan. {py:func}`bt.mean_cosine_similarity(query, doc) <batcher.mean_cosine_similarity>` is the headline retrieval-alignment number; {py:func}`bt.mean_euclidean_distance <batcher.mean_euclidean_distance>` and {py:func}`bt.mean_dot_product <batcher.mean_dot_product>` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
+Each of these aggregates a per-row vector operation to a corpus score in one scan. {py:func}`bt.mean_cosine_similarity(query, doc) <batcher.mean_cosine_similarity>` is the headline retrieval-alignment number. {py:func}`bt.mean_euclidean_distance <batcher.mean_euclidean_distance>` and {py:func}`bt.mean_dot_product <batcher.mean_dot_product>` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
 
 ```python
 import batcher as bt
@@ -353,7 +353,7 @@ pairs = bt.from_pydict({"q": [[1.0, 0.0], [1.0, 1.0]], "doc": [[1.0, 0.0], [0.0,
 print(pairs.agg(sim=bt.mean_cosine_similarity("q", "doc")).to_pydict())
 ```
 
-The single-column checks catch a degenerate index before it returns garbage: {py:func}`bt.unit_norm_rate <batcher.unit_norm_rate>` verifies the vectors are normalized the way a cosine index assumes, {py:func}`bt.zero_vector_rate <batcher.zero_vector_rate>` finds empty or failed embeddings, and {py:func}`bt.mean_embedding_norm <batcher.mean_embedding_norm>` tracks the average magnitude for drift. All compose with {py:meth}`group_by <batcher.Dataset.group_by>` to monitor per model, per source, or per day.
+The single-column checks catch a degenerate index before it returns garbage. {py:func}`bt.unit_norm_rate <batcher.unit_norm_rate>` verifies the vectors are normalized the way a cosine index assumes, {py:func}`bt.zero_vector_rate <batcher.zero_vector_rate>` finds empty or failed embeddings, and {py:func}`bt.mean_embedding_norm <batcher.mean_embedding_norm>` tracks the average magnitude for drift. All compose with {py:meth}`group_by <batcher.Dataset.group_by>` to monitor per model, per source, or per day.
 
 Match the drift metric to the distance space your index uses. {py:func}`bt.mean_cosine_distance <batcher.mean_cosine_distance>` is the `1 - cosine` form a cosine index ranks by, {py:func}`bt.mean_manhattan_distance <batcher.mean_manhattan_distance>` is the L1 metric that resists a single dominant dimension, {py:func}`bt.mean_angular_distance <batcher.mean_angular_distance>` is the true-metric angle some indexes build on, and {py:func}`bt.mean_hamming_distance <batcher.mean_hamming_distance>` is the bit-disagreement count for binary or product-quantized vectors.
 
@@ -378,10 +378,9 @@ print(round(mixed.agg(bad=bt.embedding_dim_drift("v", 3)).to_pydict()["bad"][0],
 ```
 
 The usual cause is a re-embed with a different model, or a read that spans a corpus embedded in
-two passes. That is also the failure `bt.mean_cosine_similarity` catches from the other side:
-score both populations against one fixed reference vector and compare the distributions. Two
-vector spaces mixed into one index look identical row by row and separate immediately in
-aggregate.
+two passes. `bt.mean_cosine_similarity` catches the same failure from the other side: score both
+populations against one fixed reference vector and compare the distributions. Two vector spaces
+mixed into one index look identical row by row. In aggregate they separate immediately.
 
 ## See also
 

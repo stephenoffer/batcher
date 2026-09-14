@@ -94,7 +94,7 @@ once per GPU actor. A plain function would rebuild it on every batch. See
 ## Chunking documents for RAG ingest
 
 A document is usually longer than an embedding model's context, so the ingest chain is
-**load, split, embed, index**. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` is the split stage. It
+load, split, embed, index. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` is the split stage. It
 slices text into fixed-size overlapping windows as a `List<Utf8>`, which `explode` turns
 into one row per chunk. Sizes are in characters, and a chunk boundary never splits a
 Unicode codepoint.
@@ -137,7 +137,7 @@ from sentence_transformers import SentenceTransformer
 from batcher.ml import embed
 
 
-def encoder_factory():  # an EncoderFactory — one model per worker
+def encoder_factory():  # an EncoderFactory: one model per worker
     model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
     return lambda texts: model.encode(texts)
 

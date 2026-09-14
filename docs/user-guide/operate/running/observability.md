@@ -1,9 +1,9 @@
 # Observability
 
-Batcher reports what it is doing through **one** channel. Every subsystem publishes to a
-single internal event bus, including the Kyber optimizer, the Carbonite resource manager,
-the Core executor, and the distributed scheduler. Everything you can *see* is a consumer
-of that bus:
+Batcher reports what it is doing through one channel. Every subsystem publishes to a single
+internal event bus, including the Kyber optimizer, the Carbonite resource manager, the Core
+executor, and the distributed scheduler. Everything you can *see* is a consumer of that
+bus:
 
 | Surface | What it is for | Default |
 | --- | --- | --- |
@@ -49,9 +49,9 @@ Or from the environment, without touching code:
 BATCHER_OBSERVABILITY_VERBOSITY=trace python job.py
 ```
 
-**`trace` is the only level where the two ladders differ.** Python's `logging` has no level
-below `DEBUG`, but the engine's Rust `tracing` spans do, and that is where per-morsel work
-is visible. So `trace` means `DEBUG` in Python and `TRACE` in Rust.
+`trace` is the only level where the two ladders differ. Python's `logging` has no level
+below `DEBUG`. The engine's Rust `tracing` spans do, and that is where per-morsel work is
+visible, so `trace` means `DEBUG` in Python and `TRACE` in Rust.
 
 ### Overriding one component
 
@@ -129,7 +129,7 @@ set_config(active_config().replace(
 ))
 ```
 
-Engine log records carry **structured fields**, not only a sentence. The terminal layout is
+Engine log records carry structured fields, not only a sentence. The terminal layout is
 [logfmt](https://brandur.org/logfmt), the `key=value` convention from Heroku and the Go
 ecosystem, behind a fixed-width prefix. One line is therefore both aligned for a human and
 parseable by a log processor without a bespoke regex per message. Values are quoted only when
@@ -152,8 +152,8 @@ platform without anyone re-parsing prose.
 
 Four fields are attached for you rather than by the call site:
 
-`query_id` names the query in flight, read from the ambient scope when the record is
-formatted rather than passed in — so a plain `logger.warning` deep inside a subsystem is
+`query_id` names the query in flight. It is read from the ambient scope when the record is
+formatted rather than passed in, so a plain `logger.warning` deep inside a subsystem is
 correlated too. It is the same id the {doc}`event log <observability>` document, the plan
 DAG, and the dashboard row use, which is what makes a log line joinable to the plan and the
 profile that describe the same run.
@@ -218,9 +218,9 @@ pencil on a lane, or on the pipeline page heading, to give it a real name such a
 rollup`, and a note beside it.
 
 A name is the one thing about a pipeline that outlives the process. It is written to
-`$BATCHER_HOME/pipelines.json` (default `~/.batcher/pipelines.json`), so a pipeline you
-named is still named after a restart. Everything else on the dashboard is a measurement
-that ages out of memory; the name is a fact about the pipeline as a thing you return to.
+`$BATCHER_HOME/pipelines.json`, which defaults to `~/.batcher/pipelines.json`, so a pipeline
+you named is still named after a restart. Everything else on the dashboard is a measurement
+that ages out of memory. The name does not.
 
 Within a run, **Steps** offers the plan graph, the pipeline stages, a flame view, a
 ranked list, and a sortable table. Each is annotated with rows out, elapsed time, spill
@@ -239,7 +239,7 @@ useful number when a query is slow for a reason the plan did not predict.
   rendering is the thing under suspicion.
 
 **Findings** carries what the engine concluded: the per-run insights, the optimizer and
-resource-manager decisions, and any **adaptive re-optimization**, meaning the points where the
+resource-manager decisions, and any adaptive re-optimization, meaning the points where the
 engine had counted the rows rather than estimated them and re-planned what was left.
 
 **Live** is the forward-looking page, for work measured in minutes rather than
@@ -257,8 +257,8 @@ and there is no Gantt chart of operator start times because the engine records h
 each operator took, not when it began.
 ```
 
-New to the dashboard, or arriving from another engine? The **Learn** page maps the panel
-you already know, such as a Spark UI tab, an Airflow view, or a DuckDB `EXPLAIN`, to its
+The **Learn** page is for anyone arriving from another engine. It maps the panel you
+already know, such as a Spark UI tab, an Airflow view, or a DuckDB `EXPLAIN`, to its
 equivalent here.
 
 {py:func}`start_ui <batcher.start_ui>` is idempotent. Calling it again returns the URL of the dashboard already
@@ -319,23 +319,21 @@ set_config(active_config().replace(
 ))
 ```
 
-Turning it off with `event_log=False` removes the per-query write. That is worth doing only
-if you run many small queries and nothing consumes the documents.
+`event_log=False` removes the per-query write. That is worth doing when you run many small
+queries and nothing consumes the documents. Otherwise leave it on.
 
 ## Metrics
 
-The event bus is the right tool when you want every detail of one query. When you want a
-handful of numbers scraped every fifteen seconds forever, use the counters instead:
-`metrics_snapshot` returns them as a nested dict of plain numbers, and `prometheus_text`
-renders the same numbers for a scraper. They cover throughput, the duration histogram,
-per-operator work, data-quality contracts, and what the run cost the machine in CPU,
-memory, and disk. See {doc}`Metrics <metrics>`.
+Everything above is built for one query at a time. A scrape loop wants a handful of numbers
+forever instead, and the same bus feeds process-wide counters for that: throughput, the
+duration histogram, per-operator work, data-quality contracts, and what the run cost the
+machine in CPU, memory, and disk. See {doc}`Metrics <metrics>`.
 
 ## OpenTelemetry
 
-If your organization already collects traces, emit into them rather than adding a second
-pane of glass. Batcher emits one span per query with a child span per operator, into the
-tracer your application configured. Batcher owns no exporter:
+If your organization already collects traces, emit into them rather than standing up a
+second place to look. Batcher emits one span per query with a child span per operator, into
+the tracer your application configured. It owns no exporter:
 
 ```python
 set_config(active_config().replace(
@@ -344,20 +342,20 @@ set_config(active_config().replace(
 ```
 
 This needs the `otel` extra, `pip install 'batcher-engine[otel]'`, plus a provider the host
-app sets up. It reuses the same measured profile as the event log, so enabling it adds the
-span emit and no extra measurement.
+app sets up. It reuses the same measured profile as the event log, so turning it on adds the
+span emit and nothing else. The measurement was already happening.
 
 The spans carry real timestamps. Emission happens after the query has finished, so the
 query span is placed over the interval the query actually occupied and each operator span
-is given its measured duration — a waterfall ranks the operators by length, the same
-ranking the `OP SHARE` column shows in
+is given its measured duration. A waterfall therefore ranks the operators by length, the
+same ranking the `OP SHARE` column shows in
 {doc}`explain(analyze=True) </user-guide/operate/tuning/explain-plans>`.
 
-What is deliberately *not* reconstructed is where each operator sat inside that interval.
+One thing is deliberately *not* reconstructed: where each operator sat inside that interval.
 The profile records a duration per operator and no start offset, so every operator span
-begins at the query's start. Laying them out end to end would look more like a waterfall
-and would be an invention, and on the streaming executor, where operators genuinely
-interleave, a wrong one.
+begins at the query's start. Laying them out end to end would look more like a waterfall and
+would be an invention. On the streaming executor, where operators genuinely interleave, it
+would be a wrong one.
 
 A query that raises produces a span too, with the exception recorded on it and the span
 status set to `ERROR`. Without it the one class of run you most want to find in a trace

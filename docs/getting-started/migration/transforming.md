@@ -4,8 +4,8 @@ This page maps the transformation verbs and terminal operations you already know
 their Batcher spellings, and lists the names Batcher accepts unchanged from pandas and
 Polars.
 
-Transformations are lazy and return a new {py:class}`Dataset <batcher.Dataset>`. A terminal operation is what makes
-the plan run.
+Transformations are lazy and return a new {py:class}`Dataset <batcher.Dataset>`. Only a terminal operation runs
+the plan.
 
 ## Transforming
 
@@ -66,7 +66,7 @@ still works.
 
 ## Terminal operations
 
-A terminal operation is what triggers the plan to run. These are the equivalents.
+A terminal operation is the call that makes the plan run. These are the equivalents.
 
 | Task | pandas | Polars | PySpark | Batcher |
 |------|--------|--------|---------|---------|
@@ -122,7 +122,7 @@ positional `int` as a row count and a `float` as a fraction, and accepts `frac=`
 {py:meth}`ds.select_dtypes() <batcher.Dataset.select_dtypes>` accepts a Python type, a dtype name, or a list of either, and an
 `exclude=` argument. {py:meth}`ds.rename() <batcher.Dataset.rename>` accepts a function applied to every column name.
 
-A **list of columns** works wherever a verb takes several, which is how Polars, PySpark
+A list of columns works wherever a verb takes several, which is how Polars, PySpark,
 and Ray Data all spell it. `ds.select(["a", "b"])`, `ds.sort(["a", "b"])` and
 `ds.group_by(["region"])` need no rewrite to positional arguments, and a list mixes with
 bare names in the same call. The verbs that read a list this way are `select`,
@@ -137,12 +137,12 @@ print(sales.select(["region", "v"]).sort(["region", "v"]).to_pydict())
 # {'region': ['e', 'e', 'w'], 'v': [1, 3, 2]}
 ```
 
-The exception is {py:meth}`ds.grouping_sets() <batcher.Dataset.grouping_sets>`, where each argument *is* a list — one
-grouping level per argument — so the lists are the meaning and are left alone.
+The exception is {py:meth}`ds.grouping_sets() <batcher.Dataset.grouping_sets>`, where each argument *is* a list: one
+grouping level per argument. There the lists carry the meaning, so they are left alone.
 
 An aggregate names its own output with {py:meth}`.alias() <batcher.AggExpr.alias>`, the Polars and PySpark
-spelling, as an alternative to the keyword form. It is the only positional spelling that
-can name a `bt.count()`, which has no input column to be named after:
+spelling, as an alternative to the keyword form. Only that spelling can name a
+`bt.count()`, which has no input column to be named after:
 
 ```python
 print(

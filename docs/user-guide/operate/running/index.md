@@ -1,8 +1,8 @@
 # Keeping it running
 
 These pages cover a job in production: seeing what it is doing, working out why it stopped,
-and surviving hardware that does not stay up. The GPU pages are the same concerns on a fleet
-where a single device can take a job down.
+and surviving hardware that does not stay up. The GPU pages are those same concerns on a
+fleet, where one sick device can take a job down. The table is the whole section.
 
 | Page | What it covers |
 |---|---|

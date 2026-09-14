@@ -1,9 +1,12 @@
 # Example library
 
-This page indexes the 500 runnable example scripts under `examples/`. Every script executes
-end to end against the built engine, asserts on its own output, and exits non-zero if
-anything is wrong, so running the directory is a release check rather than a documentation
-exercise.
+This page indexes the 512 runnable example scripts under `examples/`. Every one of them
+executes end to end against the built engine, asserts on its own output, and exits non-zero
+if anything is wrong. Running the directory is a release check, not a documentation exercise.
+
+The tables on these pages are generated from the scripts themselves by
+`python tools/example_library.py`, so the library cannot drift from the tree. The prose
+around them is written by hand.
 
 ```bash
 python examples/quickstart.py
@@ -18,8 +21,8 @@ Anything needing more than a handful of literal rows reads the public TPC-H mirr
 is synthetic while the network is up.
 
 The shared helper in `examples/_common/` restores the canonical TPC-H column names, which
-the mirror does not carry, caches a bounded slice of each table locally so 500 scripts do
-not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr
+the mirror does not carry, caches a bounded slice of each table locally so five hundred
+scripts do not each re-read S3, and falls back to a schema-identical stand-in with a notice on stderr
 when there is no network. Point the cache elsewhere with `BATCHER_EXAMPLES_CACHE`, or take
 more rows with `BATCHER_EXAMPLES_ROWS`.
 
@@ -52,6 +55,47 @@ Asking for `--device gpu` on a machine with no accelerator is an error rather th
 downgrade. The one time you type it deliberately is the time you need to know it did not
 happen.
 
+## Start at the root
+
+The scripts at the root of `examples/` are tours of one topic rather than focused
+demonstrations, so they are where to start on an unfamiliar area before dropping into the
+per-API scripts.
+
+`quickstart.py` is the headline pipeline: read, filter, group, aggregate, sort. If you run one
+script, run that one.
+
+Two of these need setup and are marked `# examples: skip`, so the test runner collects them
+without executing. `distributed.py` needs the optional `[ray]` extra and spins up a local
+cluster; `streaming_pipeline.py` needs a Kafka broker and a Delta sink. Both still show the
+real API shape, and running `distributed.py` directly is the fastest way to see single-node
+and distributed produce identical results.
+
+For a single script that touches every subsystem at once, use
+`examples/operations/release_check.py` instead. It checks the S3 read path, the scan, the
+plan surface, each relational operator, SQL, expressions, data quality, backend parity,
+partition parity, spill parity and the write path, and reports which one failed.
+
+<!-- library-table: . -->
+| Script | Shows |
+| --- | --- |
+| `examples/adaptive_optimization.py` | Adaptive re-optimization: the moat |
+| `examples/data_quality.py` | Data-quality checks: validate, quarantine, drop, and enforce a contract |
+| `examples/distributed.py` | Distributed execution: the same code, single-node or on a cluster (needs external setup) |
+| `examples/feature_engineering.py` | Feature engineering: derive model-ready columns from raw tabular data |
+| `examples/lakehouse_scd.py` | Lakehouse round-trip plus an SCD type-2 history build |
+| `examples/ml_inference.py` | Batch inference: score every row with a model-shaped callable |
+| `examples/performance_caching.py` | Performance: caching a reused result and spilling under a tiny memory budget |
+| `examples/preprocessors.py` | Feature engineering with fit/transform preprocessor objects |
+| `examples/quickstart.py` | Quickstart: build a lazy pipeline and run it |
+| `examples/spill.py` | Out-of-core execution: bounded memory via spill-to-disk |
+| `examples/sql.py` | SQL over Datasets - and blending SQL with Python |
+| `examples/streaming_pipeline.py` | Streaming micro-batch pipeline: Kafka in, windowed aggregate, Delta out (needs external setup) |
+| `examples/tabular_ml.py` | An end-to-end tabular ML workflow: split, fit, score, evaluate, monitor |
+| `examples/timeseries.py` | Time-series patterns: extract date parts, resample, and compute period change |
+| `examples/transformations_aggregations_joins.py` | Transformations, aggregations, and joins - the DataFrame core |
+| `examples/window_functions.py` | Window functions: per-partition aggregates and ranking |
+<!-- /library-table -->
+
 ## The sections
 
 Each page below indexes one part of the library and shows code lifted from the scripts it
@@ -60,20 +104,17 @@ executed; the rest run as part of the documentation build.
 
 | Page | Scripts | Covers |
 | --- | --- | --- |
-| {doc}`relational` | 102 | Select, filter, join, aggregate, window, reshape |
-| {doc}`expressions` | 105 | The expression language and every accessor namespace |
+| {doc}`relational` | 115 | Select, filter, join, aggregate, window, reshape, and the same plans as SQL |
+| {doc}`expressions` | 101 | The expression language and every accessor namespace |
 | {doc}`tpch` | 30 | All 22 TPC-H queries, plus scan cost and join order |
-| {doc}`io` | 39 | Every format, cloud paths, partitioning, schema handling |
-| {doc}`sql` | 12 | SQL over Datasets, CTEs, windows, dialects, null semantics |
+| {doc}`io` | 47 | Every format, cloud paths, partitioning, schema handling, Delta commits |
 | {doc}`machine-learning` | 57 | Preprocessing, estimators, evaluation, retrieval, inference |
 | {doc}`multimodal` | 11 | Images, blobs, and text analytics |
 | {doc}`accelerators` | 8 | Device selection and parity against the CPU oracle |
 | {doc}`distributed` | 18 | Mergeable equivalence, shuffle, streaming |
-| {doc}`lakehouse` | 8 | Delta commits, upserts, time travel, CDC, maintenance |
-| {doc}`data-quality` | 22 | Contracts, profiling, drift, governance, security |
+| {doc}`data-quality` | 23 | Contracts, profiling, drift, governance, security |
 | {doc}`operations` | 40 | Plans, profiling, configuration, errors, performance |
-| {doc}`analytics` | 42 | Statistics, time series, geospatial, graph |
-| {doc}`overviews` | 16 | The topic scripts at the root of `examples/` |
+| {doc}`analytics` | 46 | Statistics, time series, geospatial, graph |
 
 ```{toctree}
 :hidden:
@@ -82,14 +123,11 @@ relational
 expressions
 tpch
 io
-sql
 machine-learning
 multimodal
 accelerators
 distributed
-lakehouse
 data-quality
 operations
 analytics
-overviews
 ```

@@ -2,13 +2,13 @@
 
 This page covers measuring generation quality: lexical-overlap scores against a gold
 column, and the reference-free monitors a team watches when generation runs at scale.
-
 Every metric here is an expression that aggregates to a corpus score in one scan, so
-there is no Python loop over examples and every one of them composes with {py:meth}`group_by <batcher.Dataset.group_by>`.
+nothing loops over examples in Python and everything composes with
+{py:meth}`group_by <batcher.Dataset.group_by>`.
 
 ## Scoring against a reference
 
-Evaluating generations is comparing a generated column to a gold column.
+Compare a generated column to a gold one.
 {py:func}`bt.exact_match <batcher.exact_match>` is the strict character-for-character rate. {py:func}`bt.normalized_exact_match <batcher.normalized_exact_match>`
 applies SQuAD normalization first (lowercase, drop articles and punctuation), so casing and a
 trailing period do not count against a correct answer.
@@ -38,8 +38,8 @@ scored = bt.from_pydict(
 print(scored.group_by("model").agg(f1=bt.token_set_f1("answer", "gold")).sort("model").to_pydict())
 ```
 
-These are set-based by design, so they are stable and fast rather than a multiset BLEU/ROUGE score;
-each metric's docstring states this so it is never confused with one.
+These are set-based by design. That makes them stable and fast, and it makes them not a
+multiset BLEU or ROUGE score, which each metric's docstring says plainly.
 
 The token-set metrics split on whitespace, which fails on a language that does not put spaces
 between words. {py:func}`bt.char_ngram_f1 <batcher.char_ngram_f1>` scores the overlap of *character* n-grams instead, the idea behind
@@ -134,17 +134,18 @@ print(seqs.select(shared=bt.col("a").list.lcs_length(bt.col("b"))).to_pydict())
 # {'shared': [1.0]}
 ```
 
-ROUGE-L is the expensive one: its cost is quadratic in the two token counts, where every other
-metric here is linear. On sentences that is nothing; on thousand-token documents it is a million
-cell updates per row. Truncate, or score per sentence.
+ROUGE-L is the expensive one. Its cost is quadratic in the two token counts where every other
+metric on this page is linear, so on sentences it costs nothing and on thousand-token documents
+it is a million cell updates per row and it dominates the scan. Truncate, or score per sentence.
 
 All of these tokenize with the same SQuAD normalization the token-set metrics use, so the
-numbers are comparable across this page. That normalization is `str.squad_normalize` — lowercase,
-drop the standalone articles, delete punctuation, collapse whitespace, trim — and it is worth
-knowing two of its rules before reading a score. Punctuation is *deleted* rather than replaced,
-so `cat-dog` is one token while `cat, dog` is two; and the articles are dropped entirely, which
-is right for scoring an answer and wrong for most other cleaning. That is not what a reference BLEU implementation
-does, so use them to rank runs against each other rather than to publish against a paper.
+numbers are comparable across this page. That normalization is `str.squad_normalize`: lowercase,
+drop the standalone articles, delete punctuation, collapse whitespace, trim. Two of its rules
+are worth knowing before you read a score. Punctuation is *deleted* rather than replaced, so
+`cat-dog` is one token while `cat, dog` is two. The articles go entirely, which is right for
+scoring an answer and wrong for most other cleaning. None of that is what a reference BLEU
+implementation does. Rank runs against each other with these, and don't publish them against a
+paper.
 
 The two primitives underneath are on the expression accessors, for a score this page does not
 already spell. `str.token_ngrams(n)` turns a text column into its list of n-grams, and
@@ -162,11 +163,9 @@ print(grams.select(shared=pred.list.multiset_overlap(gold), total=pred.list.len(
 
 ## Scoring generations without a reference
 
-Most generations arrive with no gold answer to compare against, and the questions you still want
-answered are about the output itself: is it diverse or repeating, how long is it, and how often is
-it empty, a refusal, or cut off. These metrics take one output column and aggregate to a corpus
-number, so they run over a million generations in one scan and break down per model or per day with
-`group_by`.
+Most generations arrive with no gold answer. The questions you still want answered are about
+the output itself: is it diverse or repeating, how long is it, and how often is it empty, a
+refusal, or cut off. Each of these reads one output column.
 
 `bt.distinct_token_ratio` is the Distinct-1 diversity score, the cheap detector of a model
 degenerating into repetition. {py:func}`bt.mean_output_tokens <batcher.mean_output_tokens>` tracks verbosity and sizes the token bill.
@@ -194,8 +193,8 @@ print(
 # {'diversity': [0.8], 'refused': [0.25], 'truncated': [0.5]}
 ```
 
-They are lexical heuristics, so read them as monitors that catch a regression between runs, not as
-ground-truth judgments of a single generation.
+All of them are lexical heuristics. Read them as monitors that catch a regression between
+runs, not as judgments of a single generation.
 
 Before a run rather than after it, the token aggregates size the bill and the capacity.
 {py:func}`bt.total_token_estimate <batcher.total_token_estimate>` sums the corpus token estimate for a cost number, {py:func}`bt.token_budget_exceed_rate <batcher.token_budget_exceed_rate>`
@@ -258,8 +257,8 @@ print(
 
 ## More output monitors
 
-Four further families of single-scan monitors cover the rest of what a generation-at-scale team
-watches, and all compose with `group_by`.
+Seven further families of single-scan monitors cover the rest of what a generation-at-scale
+team watches. All of them compose with `group_by`.
 
 For a RAG pipeline, compare the answer column against its retrieved context. {py:func}`bt.answer_groundedness <batcher.answer_groundedness>`
 is the share of the answer's tokens the context supports, {py:func}`bt.context_utilization <batcher.context_utilization>` the share of the
@@ -280,21 +279,33 @@ For safety, {py:func}`bt.email_rate <batcher.email_rate>`, {py:func}`bt.phone_ra
 {py:func}`bt.ssn_like_rate <batcher.ssn_like_rate>` and {py:func}`bt.credit_card_like_rate <batcher.credit_card_like_rate>` catch structured identifiers, and
 {py:func}`bt.contains_any_rate <batcher.contains_any_rate>` is a configurable blocklist monitor over a list of terms.
 
+For formatting, {py:func}`bt.heading_rate <batcher.heading_rate>`, {py:func}`bt.bullet_list_rate <batcher.bullet_list_rate>`, {py:func}`bt.numbered_list_rate <batcher.numbered_list_rate>`,
+{py:func}`bt.markdown_link_rate <batcher.markdown_link_rate>`, {py:func}`bt.table_rate <batcher.table_rate>`, and {py:func}`bt.code_block_present_rate <batcher.code_block_present_rate>` check whether the model
+produced the Markdown elements a task asked for.
+
+For tone, {py:func}`bt.question_rate <batcher.question_rate>` catches a model deflecting an answer task with a question,
+{py:func}`bt.exclamation_rate <batcher.exclamation_rate>` and {py:func}`bt.politeness_rate <batcher.politeness_rate>` track register, {py:func}`bt.hedge_rate <batcher.hedge_rate>` flags uncertainty,
+{py:func}`bt.first_person_rate <batcher.first_person_rate>` measures first-person voice, and {py:func}`bt.contains_phrase_rate <batcher.contains_phrase_rate>` is a configurable
+phrase monitor.
+
+For language, {py:func}`bt.cjk_rate <batcher.cjk_rate>`, {py:func}`bt.cyrillic_rate <batcher.cyrillic_rate>`, and {py:func}`bt.arabic_rate <batcher.arabic_rate>` flag unexpected scripts,
+{py:func}`bt.emoji_rate <batcher.emoji_rate>` catches emoji spam, and {py:func}`bt.latin_only_rate <batcher.latin_only_rate>` is the clean-ASCII-output rate.
+
 ## Grading with a judge model
 
 Everything above compares surface forms. That cannot tell a correct paraphrase from a wrong
-answer, and for open-ended output that is most of what you need to know. The usual answer is to
-ask a stronger model, and the usual implementation is a Python loop over examples with a
-hand-rolled parser for whatever the judge wrote back.
+answer, and for open-ended output that is most of what you need to know. So you ask a stronger
+model. The usual implementation of that is a Python loop over examples with a hand-rolled parser
+for whatever the judge wrote back.
 
 `batcher.ml` has the three judge shapes as batch UDFs over the same `Engine` contract
 generation uses, so a judged eval is one scan with the answers already parsed into a column.
-Any callable from prompts to completions is an engine, which is why the examples here use a
+Any callable from prompts to completions is an engine. That is why the examples below run on a
 stub rather than a GPU.
 
 `llm_score_udf` grades against a rubric on a numeric scale. The answer is parsed as a leading
 number and range-checked, so a judge that wrote prose or answered off-scale yields null instead
-of poisoning the mean. Out-of-range is nulled rather than clamped on purpose: a judge answering
+of poisoning the mean. Out-of-range is nulled rather than clamped, on purpose. A judge answering
 8 on a 1-5 scale has not understood the rubric, and recording that as a 5 turns a
 misunderstanding into a strong positive.
 
@@ -343,17 +354,17 @@ data-quality gate wants: is this grounded in its context, does it follow the ins
 safe to ship. An unusable verdict is null rather than False, so a confused judge does not look
 like a failing dataset.
 
-A judge is a model, so it is wrong sometimes and its errors correlate with what it is judging:
-it prefers longer answers, answers that look like its own, and whichever option came first.
-Calibrate against human labels on a sample before trusting a number, and read a judged score as
-a comparison between runs rather than as ground truth.
+A judge is a model. It is wrong sometimes, and its errors correlate with what it is judging,
+because it prefers longer answers, answers that look like its own, and whichever option came
+first. Calibrate against human labels on a sample before trusting a number, and read a judged
+score as a comparison between runs rather than as ground truth.
 
 ## Monitoring the text the model was given
 
 The metrics above score what a model produced. An LLM application also reads text it did not
 write, and anything in a retrieved document, a scraped page, or a support ticket is in the
-model's context. An instruction sitting in a retrieved document looks the same to the model as
-one you wrote.
+model's context. To the model, an instruction sitting in a retrieved document looks exactly
+like one you wrote.
 
 {py:func}`bt.instruction_override_rate <batcher.instruction_override_rate>` counts the texts carrying an attempt to replace your
 instructions, and {py:func}`bt.jailbreak_marker_rate <batcher.jailbreak_marker_rate>` the ones carrying a known jailbreak framing. Run
@@ -384,8 +395,8 @@ contents the model decodes and follows.
 
 Where an agent turns text into actions, {py:func}`bt.code_execution_rate <batcher.code_execution_rate>` counts shell and interpreter
 calls, {py:func}`bt.sql_injection_rate <batcher.sql_injection_rate>` the textbook query payloads, and {py:func}`bt.unsafe_html_rate <batcher.unsafe_html_rate>` the active
-markup you must not render. None of the three is automatically a violation — a coding assistant
-emits shell commands legitimately — so read them as a volume to review.
+markup you must not render. None of the three is automatically a violation. A coding assistant
+emits shell commands legitimately. Read them as a volume to review.
 
 ### Monitoring what left
 
@@ -411,19 +422,7 @@ whose URL encodes the conversation is fetched on render with no click, and a
 `data:text/html;base64,` URI is a page you did not write running in your origin.
 
 Every monitor in this section is a surface heuristic. They size a problem across a corpus and
-alert on a change; they are not what should stand between a retrieved document and a tool call.
-
-For formatting, {py:func}`bt.heading_rate <batcher.heading_rate>`, {py:func}`bt.bullet_list_rate <batcher.bullet_list_rate>`, {py:func}`bt.numbered_list_rate <batcher.numbered_list_rate>`,
-{py:func}`bt.markdown_link_rate <batcher.markdown_link_rate>`, {py:func}`bt.table_rate <batcher.table_rate>`, and {py:func}`bt.code_block_present_rate <batcher.code_block_present_rate>` check whether the model
-produced the Markdown elements a task asked for.
-
-For tone, {py:func}`bt.question_rate <batcher.question_rate>` catches a model deflecting an answer task with a question,
-{py:func}`bt.exclamation_rate <batcher.exclamation_rate>` and {py:func}`bt.politeness_rate <batcher.politeness_rate>` track register, {py:func}`bt.hedge_rate <batcher.hedge_rate>` flags uncertainty,
-{py:func}`bt.first_person_rate <batcher.first_person_rate>` measures first-person voice, and {py:func}`bt.contains_phrase_rate <batcher.contains_phrase_rate>` is a configurable
-phrase monitor.
-
-For language, {py:func}`bt.cjk_rate <batcher.cjk_rate>`, {py:func}`bt.cyrillic_rate <batcher.cyrillic_rate>`, and {py:func}`bt.arabic_rate <batcher.arabic_rate>` flag unexpected scripts,
-{py:func}`bt.emoji_rate <batcher.emoji_rate>` catches emoji spam, and {py:func}`bt.latin_only_rate <batcher.latin_only_rate>` is the clean-ASCII-output rate.
+alert on a change. They are not what should stand between a retrieved document and a tool call.
 
 ## See also
 

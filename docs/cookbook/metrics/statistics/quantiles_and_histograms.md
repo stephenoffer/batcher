@@ -4,7 +4,7 @@ Exact quantiles need the whole column ordered. Sketch-backed ones need bounded m
 
 The whole script, executed on every test run:
 
-```{literalinclude} ../../../examples/statistics/quantiles_and_histograms.py
+```{literalinclude} ../../../../examples/statistics/quantiles_and_histograms.py
 :language: python
 :linenos:
 ```
@@ -19,5 +19,5 @@ python examples/statistics/quantiles_and_histograms.py
 
 - {doc}`/cookbook/metrics/statistics/distribution_shape`: is this column symmetric, skewed, or heavy-tailed?
 - {doc}`/cookbook/metrics/statistics/robust_dispersion`: quantile-based measures that one outlier cannot move.
-- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and hypothesis tests.
 - {doc}`/api/models/ml-statistics`: the reference for every statistical function.

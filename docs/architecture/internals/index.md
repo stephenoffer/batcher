@@ -1,7 +1,8 @@
 # Internals
 
 This section is the design-level record of the four control-plane subsystems, written for
-contributors. You don't need any of it to use Batcher.
+contributors. None of it is needed to use Batcher. Read it when you are about to change
+the engine.
 
 The engine is described at three zoom levels, all nested under the Architecture section, and
 they are meant to be read in this order:
@@ -14,13 +15,13 @@ they are meant to be read in this order:
 
 ## The layers
 
-Each subsystem owns exactly one decision, and the layering is what keeps that true.
+Each subsystem owns exactly one decision. The layering is what keeps that true.
 
 ![Batcher's layered architecture from the User API down through the Dataset API, Logical Plan, Kyber optimizer, Physical Plan, Execution Engine, Carbonite, and optional Ray.](/_static/diagrams/layer_stack.svg)
 
 Ray is an optional dependency used only for distributed scheduling. Single-node execution
-does not require it, and even on a cluster the data plane moves Arrow batches over Arrow
-Flight rather than through the Ray object store.
+never loads it. Even on a cluster the data plane moves Arrow batches over Arrow Flight
+rather than through the Ray object store, so only small control-plane strings transit Ray.
 
 The verbs stay in their lanes, and most subtle bugs in this codebase are a verb crossing
 one: **Core measures, Kyber decides, Carbonite protects.** A Kyber pass that collects
@@ -75,10 +76,12 @@ stability proofs, lives at `docs/architecture/internals/mathematical_foundations
 It is rendered to PDF by `internals/generate_pdf.py` rather than published as a page,
 because it carries its own cross-reference scheme.
 
-Several competitive and platform parity ledgers sit beside it in the repository and are
-also excluded from the build. They are working records for contributors deciding what to
-build next, and they name open gaps in a register a published page should not carry.
-`docs/conf.py` lists each one with the reason it is excluded.
+The contributor working records sit beside it, grouped into `audits/`, `parity/`,
+`programs/` and `rfcs/`, and `docs/conf.py` excludes each directory wholesale. They are
+notes for contributors deciding what to build next. Every one of them carries a register
+of open gaps and unmeasured claims, which is exactly what a published page must not carry,
+and excluding by directory means adding a record does not mean remembering to exclude it.
+The code-checked competitive scorecard is excluded for the same reason.
 
 ## See also
 

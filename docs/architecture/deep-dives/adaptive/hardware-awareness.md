@@ -4,20 +4,20 @@ This page describes what the optimizer knows about the machine it is planning fo
 knowledge comes from, and which parts of it are measured rather than assumed.
 
 Two plans that are identical on paper can differ tenfold in practice because of the hardware
-underneath them. A spill to local flash is cheap and a spill to a network volume is not; a byte
+underneath them. A spill to local flash is cheap. A spill to a network volume is not. A byte
 read from the page cache and a byte read from a cold object store are the same byte to a row
 count and two orders of magnitude apart in reality. An optimizer that ignores this is
 confidently right on one class of machine and confidently wrong on the rest.
 
 Kyber never samples hardware itself. It reads static facts from the layer below it, and it
-consumes *measurements* that Core recorded on earlier runs. That split is the architecture's
-rule: Core measures, Kyber decides, Carbonite protects.
+consumes *measurements* Core recorded on earlier runs. That split is the architecture's rule.
+Core measures, Kyber decides, Carbonite protects.
 
 ## The facts describe the process, not the host
 
 Every CPU, memory, and cache figure on this page is what *this process* may use, not what the
-machine contains. The distinction is invisible on a bare-metal box, where the two are the same
-number, and it is the whole problem inside a container. A Kubernetes pod, a Ray worker slice,
+machine contains. On a bare-metal box the two are the same number, so the distinction is invisible. Inside a
+container it is the whole problem. A Kubernetes pod, a Ray worker slice,
 and a Slurm allocation all see the host through the ordinary interfaces: `os.cpu_count()`
 reports the host's cores, `SC_PHYS_PAGES` reports the host's RAM, and `/sys` enumerates every
 core, cache, and NUMA node on the box whether or not this process can be scheduled on one.
@@ -40,11 +40,15 @@ different classes of machine. Reporting the host's numbers would give them one k
 their learned coefficients into a model wrong for both.
 
 The recurring failure is a probe that reads a host-wide source and forgets to narrow it. It
-never raises, and the number it returns is entirely plausible, so nothing downstream can tell
-it apart from a correct reading. A cpuset pin is the easier half to remember because it appears
+never raises. The number it returns is entirely plausible, so nothing downstream can tell it
+apart from a correct reading. A cpuset pin is the easier half to remember, because it appears
 in the affinity mask that `/sys` walks are already filtered by. A *bandwidth* quota is the
-harder half, because it appears in neither the mask nor `/sys`, and it is the one Kubernetes
-sets when you write a `cpu` limit.
+harder half. It appears in neither the mask nor `/sys`, and it is the one Kubernetes sets when
+you write a `cpu` limit.
+
+Narrowing is a fold, and what comes out of it reaches three decisions that have nothing else in common:
+
+![How the machine's real shape reaches a plan decision, as a fold and then a fan-out. Three bounds narrow what this process really gets rather than what the host reports: the affinity mask, which is the cpuset pin; the cgroup CFS quota, which is the Kubernetes cpu limit; and a batch scheduler's grant from Slurm, PBS, LSF or SGE. The tightest bound wins, never below 1, giving the effective machine in cores, memory and devices. available_parallelism honours the affinity mask but not the bandwidth quota, so a pod capped at 15 cores on a 16-core node reports 16 and sizes every pool one thread too wide; the count is re-read every 100 ms, so a worker pinned after process start is picked up. Three unrelated decisions then fan out. The core count sets shard and pool width, at every physical core plus a third of the SMT siblings. The memory ceiling sets the memory budget and spill, from the cgroup ceiling rather than the node's advertised RAM. The device inventory, with MIG profiles and NVLink and PCIe islands, sets device placement. The same record hashes to a 12-character fingerprint, and that fingerprint scopes every learned value measured in machine units, nanoseconds, bytes and batch sizes, so unlike machines never blend their coefficients. A statement about the data is never scoped: a column has the same distinct count whatever machine reads it.](/_static/diagrams/hardware_awareness.svg)
 
 ## The hardware fingerprint
 
@@ -80,15 +84,15 @@ reach them without importing each other:
 | NVLink, PCIe links, peer islands | where a multi-GPU exchange is placed |
 | Device model, generation, MIG profiles | which accelerator a stage should use |
 
-The storage class is read off the block device rather than assumed from the instance type,
-because it cannot be inferred: LVM over a network volume and LVM over local NVMe present the
-same device prefix and are thirty times apart.
+The storage class is read off the block device rather than assumed from the instance type. It
+cannot be inferred. LVM over a network volume and LVM over local NVMe present the same device
+prefix and are thirty times apart.
 
 ## What the optimizer measures
 
-Three loops carry hardware behavior from one run into the next. All three are keyed by the
-fingerprint, so a driver planning for workers of a different class reads the workers' history
-rather than its own.
+Three loops carry hardware behavior from one run into the next, and a fourth measurement sits
+beside them that prices nothing at all. All four are keyed by the fingerprint, so a driver
+planning for workers of a different class reads the workers' history rather than its own.
 
 **Cost coefficients.** Core records each operator's wall time and row counts. `calibration` fits
 the per-row coefficients from that history, shrunk toward the shipped defaults in proportion to
@@ -126,14 +130,14 @@ The only clock on the record is the operator's **whole** wall time, which includ
 So spilled bytes over elapsed time is not the device's throughput, it is a *lower bound* on it.
 A lower bound supports one inference and refuses the other. A high reading proves the device
 moved that many bytes per millisecond, so a class claiming it is slower is wrong and the factor
-may come down. A low reading proves nothing, because the operator may simply have been
-compute-bound, so the factor is left alone.
+may come down. A low reading proves nothing. The operator may have been compute-bound, so the factor is left
+alone.
 
 That asymmetry happens to line up with the bias it corrects. The structural reading errs toward
 pessimism, and pessimism is the direction a lower bound can disprove.
 
-The corrected factor is shrunk toward the class by how much evidence exists and never falls
-below the local-flash floor, so a handful of samples or one anomalous run cannot move a plan.
+The corrected factor is shrunk toward the class by how much evidence exists, and it never falls
+below the local-flash floor. One anomalous run cannot move a plan.
 
 ### When the box is holding the query back
 
@@ -142,8 +146,8 @@ inference*, which is a different job and worth separating.
 
 The per-task CPU share is sized from measured utilization: a family whose cores sat idle asks
 for less of a core, so several of its tasks pack onto one. That is right for a family that
-never wanted the cores and exactly backwards for one whose cores were taken away, and the two
-are indistinguishable from utilization alone. Getting it backwards starts a loop that feeds
+never wanted the cores and exactly backwards for one whose cores were taken away. From
+utilization alone the two are indistinguishable. Getting it backwards starts a loop that feeds
 itself, because a smaller reservation packs more tasks onto the contended cores, which lowers
 utilization further.
 
@@ -162,9 +166,9 @@ of two hundred, and it faults not at all. A container clamped to a third of its 
 measured as a perfectly quiet box while every core it was owed sat idle by decree. Under a
 container orchestrator this is the *usual* way a CPU gets clamped. **Thermal throttling** is
 the other way: the silicon slowing itself because it is too hot, which preempts nothing and
-faults nothing either. It is read from the CPU's own counters, as a delta since the previous
-query rather than a count since boot, because a machine that throttled during last month's
-heatwave is not throttling now. Those counters exist only on bare metal, so in a cloud guest
+faults nothing either. It is read from the CPU's own counters as a delta since the previous
+query, not a count since boot. A machine that throttled during last month's heatwave is not
+throttling now. Those counters exist only on bare metal, so in a cloud guest
 this signal reads zero and the quota one carries.
 
 Both are compared as a *median* over the family's history, for the same reason the preemption

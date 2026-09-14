@@ -1,6 +1,6 @@
 # Reshaping
 
-Long-to-wide and back is the most common reshape in reporting. Pivot needs to know the value columns it will produce, which means it materializes; unpivot is the cheap direction and is usually what a downstream model actually wants.
+Long-to-wide and back is the most common reshape in reporting. Pivot has to know which columns it will produce, so by default it runs an eager pre-pass over `on` to discover them. Pass `columns=[...]` and that pre-pass goes away. Unpivot needs none of it, and it is usually the direction a downstream model wants anyway.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/dataset/reshaping.py
 
 ## See also
 
-- {doc}`/cookbook/dataset/inspecting/profiling`: profiling a table you have just been handed.
-- {doc}`/cookbook/dataset/cleaning/sampling_and_splits`: reproducible subsets that do not leak.
+- {doc}`/cookbook/dataset/verbs/grouping`: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
+- {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join for time series.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -1,6 +1,6 @@
 # Preprocessor chains
 
-A ``Chain`` fits its steps in order and applies them in order, so the whole feature pipeline is a single object you fit on train and apply to everything else. That is what stops a validation set being scaled by its own statistics.
+A `Chain` fits its steps in order and applies them in order, so the whole feature pipeline is a single object you fit on train and apply to everything else. That is what stops a validation set being scaled by its own statistics.
 
 The whole script, executed on every test run:
 

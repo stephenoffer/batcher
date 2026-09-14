@@ -14,7 +14,7 @@ Expectations, and the fail/drop/quarantine choice.
 :::{grid-item-card} {octicon}`law;1.1em` Data contracts
 :link: /user-guide/trust/data-contracts
 :link-type: doc
-Row counts, distributions, freshness, and schema — the checks no single row fails.
+Row counts, distributions, freshness, and schema: the checks no single row fails.
 :::
 
 :::{grid-item-card} {octicon}`shield-lock;1.1em` Governance and security

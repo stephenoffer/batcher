@@ -1,6 +1,6 @@
 # Time differences
 
-``*_between`` gives a whole-unit difference between two columns, which is how you compute an age, a lead time, or a session length. ``offset_by`` shifts by a duration string, which is how you build a "30 days ago" cutoff without leaving the expression API.
+`*_between` gives a whole-unit difference between two columns, which is how you compute an age, a lead time, or a session length. `offset_by` shifts by a duration string, which is how you build a "30 days ago" cutoff without leaving the expression API.
 
 The whole script, executed on every test run:
 

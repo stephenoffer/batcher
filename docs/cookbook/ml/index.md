@@ -1,8 +1,8 @@
 # Machine learning cookbook
 
-This section holds 26 runnable pages for the `batcher.ml` surface, ordered the way a model gets built: prepare the features, fit something, check it, then run it. The last group is complete pipelines rather than single calls.
+This section holds 27 recipes for the `batcher.ml` surface, ordered the way a model gets built: prepare the features, fit something, check it, then run it. The last group is complete pipelines rather than single calls.
 
-Every page embeds a complete, self-contained script that builds its own in-memory data and asserts on its own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+The first four groups each embed one self-contained script that builds its own in-memory data and asserts on its own output, run end to end by `tests/docs/test_examples.py`. A pipeline page is a sequence of shorter blocks instead, executed in document order by `tests/docs/test_doc_examples.py`, with the stages that need a GPU or a cloud bucket shown but not run. Either way a page that stops matching the engine fails the suite rather than drifting.
 
 | Group | Pages | Covers |
 |---|---|---|
@@ -10,7 +10,7 @@ Every page embeds a complete, self-contained script that builds its own in-memor
 | {doc}`/cookbook/ml/estimators/index` | 4 | Linear models, GLMs, classifiers, clustering, and decomposition |
 | {doc}`/cookbook/ml/validation/index` | 3 | Cross-validation, class imbalance, and outliers |
 | {doc}`/cookbook/ml/inference/index` | 2 | Batch inference and vector search |
-| {doc}`/cookbook/ml/pipelines/index` | 10 | Whole workloads: embeddings, captioning, transcription, RAG, and training data |
+| {doc}`/cookbook/ml/pipelines/index` | 11 | Whole workloads: embeddings, captioning, transcription, RAG, and training data |
 
 ## See also
 

@@ -39,9 +39,9 @@ DIR_MAX_DEPTH = 5  # directory levels under a package/src root
 # fragment one cohesive family registry. Keyed by posix path relative to the repo root.
 DIR_ALLOW: dict[str, str] = {
     "python/batcher/dist/executors/ray_runtime": (
-        "13 modules against a cap of 12: one per scheduling concern the distributed executor "
+        "15 modules against a cap of 12: one per scheduling concern the distributed executor "
         "separates — topology/scaling, placement capacity, reducer fan-out, placement groups, "
-        "readiness, lifecycle, fault policies, bucket reduce. The 13th (`reducers`) exists "
+        "readiness, lifecycle, fault policies, bucket reduce. The extra modules exist "
         "because `scaling` was exactly at the 500-line limit, so the two caps pull opposite "
         "ways here; merging any pair back puts a module over the line limit, and nesting a "
         "package inside this one buys no navigability for modules nothing outside imports "
@@ -57,7 +57,7 @@ DIR_ALLOW: dict[str, str] = {
         "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
     "benchmarks/internals": (
-        "13 subsystem benchmarks against a cap of 12. Every one is a standalone `python "
+        "15 subsystem benchmarks against a cap of 12. Every one is a standalone `python "
         "benchmarks/internals/<name>.py` entry point, cited by that path from the docs and "
         "from the dated entries in `BENCHMARK_RESULTS.md` that record what it measured. "
         "Grouping them into subdirectories would rewrite those historical records to hide a "

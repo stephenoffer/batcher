@@ -1,6 +1,6 @@
 # Agreement metrics
 
-Correlation says the shapes match; these say the *values* match. A forecast that is perfectly correlated but biased high scores well on correlation and badly here, which is usually the honest answer.
+Correlation says the shapes match. These say the *values* match. A forecast that is perfectly correlated but biased high scores well on correlation and badly here, which is usually the honest answer.
 
 The whole script, executed on every test run:
 

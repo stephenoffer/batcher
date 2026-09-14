@@ -1,10 +1,14 @@
 # The adaptive layer
 
 Batcher re-optimizes at stage boundaries on measured cardinalities, the same mechanism and the
-same granularity as Spark AQE, but available single-node too. It is also off for queries under
-20M input rows, so most queries never reach it. What neither DuckDB nor Spark has is the second
-half: a sketch-backed *cross-query* learned-stats and bandit loop, so a plan improves the more
-a query runs. Read these pages for how both halves work and where each one stops.
+same granularity as Spark AQE, but available single-node too. The loop is selective about when
+it engages. A query needs a join, and it needs to clear a floor charged per stage: 5,000,000
+input rows or roughly 320 MB for each pipeline breaker the loop would cut at. A plan with no
+join never qualifies at any size. One shape skips the floor entirely: a distributed plan whose
+join operand already spans two sources has no one-shot route through the dispatcher, so staging
+is the only way it runs at all. What neither DuckDB nor Spark has is the second half, a
+sketch-backed *cross-query* learned-stats and bandit loop, so a plan improves the more a query
+runs. Read these pages for how both halves work and where each one stops.
 
 - {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: re-planning mid-query on measured cardinalities.
 - {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: how many rows a subtree will produce, how wrong that guess is, and how the engine tracks which.

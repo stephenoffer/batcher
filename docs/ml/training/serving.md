@@ -69,8 +69,8 @@ Arrow batch into requests the server can hold, and `pipeline_depth` keeps that m
 so the remote GPU is not idle while this worker encodes and decodes. Results stay in input
 order either way.
 
-`triton_client` reads the window from the model's own configuration on the server when you
-leave `max_batch_size` unset, which is where the number is declared and where it can be right.
+Leave `max_batch_size` unset and `triton_client` reads the window from the model's own
+configuration on the server, which is where the number is declared and where it can be right.
 The other adapters cannot ask, so state it yourself: for TorchServe it is the model's
 registered `batch_size`, and for a custom endpoint it is whatever that endpoint was built for.
 
@@ -151,9 +151,9 @@ scored = scored.with_columns(
 )
 ```
 
-{py:meth}`arg_sort <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` gives you positions, and {py:meth}`.list.gather(...) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.gather>` is what spends them. Together they
-turn a score vector and a candidate list into a ranked selection without a per-row loop, which
-is the shape of a reranking stage:
+{py:meth}`arg_sort <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` gives you positions and {py:meth}`.list.gather(...) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.gather>` spends them. Together they turn
+a score vector and a candidate list into a ranked selection without a per-row loop. That is the
+shape of a reranking stage:
 
 ```python
 import batcher as bt
@@ -166,7 +166,7 @@ print(candidates.select(top2=bt.col("docs").list.gather(best_first.list.head(2))
 # {'top2': [['high', 'mid']]}
 ```
 
-A cutoff wider than the candidate list is fine — the extra positions come back as nulls rather
+A cutoff wider than the candidate list is fine. The extra positions come back as nulls rather
 than an error, because a fixed `k` against a short candidate set is ordinary.
 
 Two more read the scores rather than reorder them. {py:meth}`.list.log_softmax() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.log_softmax>` is the log-domain
@@ -174,9 +174,9 @@ distribution, and it is not the same as taking the log of `softmax`: a probabili
 to underflow to zero there becomes `-inf`, while the log form stays finite. That is the whole
 reason a scoring pipeline carries log-probabilities.
 
-{py:meth}`.list.entropy() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.entropy>` reduces a row to its uncertainty in nats — zero when the model put all its
-mass on one class, `ln n` when it spread evenly over `n`. It is the routing signal for a
-cascade: answer the confident rows from the small model and send the rest somewhere more
+{py:meth}`.list.entropy() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.entropy>` reduces a row to its uncertainty in nats: zero when the model put all
+its mass on one class, `ln n` when it spread evenly over `n`. That is the routing signal for a
+cascade. Answer the confident rows from the small model and send the rest somewhere more
 expensive.
 
 ```python

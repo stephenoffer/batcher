@@ -71,6 +71,10 @@ Step 5 is what makes this work. A collected table is spliced back as an {py:clas
 
 On the distributed path a stage can stay partitioned on disk or on the Flight fleet instead of collecting to the driver, and its `row_count` feeds the next round the same way. A large multi-stage query never funnels every breaker's output through driver memory.
 
+Zoomed in on a single turn, the loop is a branch, and one side of it stops the loop:
+
+![One turn of the loop, at a single pipeline breaker. The query is planned with a join operand sized by a guess, carrying Provenance.DEFAULT so the optimizer knows it is guessing that one; the loop cuts at the lowest breaker whose inputs all stream, executes it, and takes an exact row count measured on the materialized result. The two outcomes go opposite ways. If the estimate held, meaning a symmetric q-error inside a 3x band against optimizer.reoptimize_error of 2.0, the loop stops cutting and finishes the rest in one shot. If it missed by more, the residual plan is re-planned on the size just measured, and build side, broadcast and join order are then chosen on rows rather than on a guess. The splice is a Scan over the stage's result, so the next stage's estimator reads an exact size rather than one more inherited guess. This is the same mechanism and the same granularity as Spark AQE, and nothing re-plans inside a stage. A breaker whose output size is already known exactly is not cut at all: across the 22 TPC-H shapes, 17 of 51 ran inline, fused into the subplan above them.](/_static/diagrams/reopt_at_breaker.svg)
+
 ## The trigger, and why its polarity runs backwards
 
 `gating._estimate_accurate` compares estimate against actual as a *symmetric q-error*:
@@ -93,11 +97,19 @@ The early exit has one guard. A residual plan that still has no one-shot distrib
 
 ## When it turns on
 
-`adaptive="auto"` is the default on {py:meth}`collect() <batcher.Dataset.collect>`. `gating.resolve_adaptive` asks measured history first and falls back to a structural heuristic:
+`adaptive="auto"` is the default on {py:meth}`collect() <batcher.Dataset.collect>`, and `gating.resolve_adaptive` resolves it. An explicit `True` or `False` wins outright. Everything else is asked in a fixed order, and the structural questions come before the learned one.
 
-- The plan requires staging on the distributed path, such as a 3-or-more-table star join that the one-shot dispatcher can't route at all. There staging isn't an optimization, it's the only distributed path, and it always wins.
-- Otherwise the `MetadataHub` decides, if it has measured this plan signature on both routes. `learned_adaptive_route` is a two-arm bandit over `staged` and `one_shot`, keyed by plan signature and rewarded with the whole query's wall time. Staging only re-plans equivalent algebra, so both arms return the identical relation.
-- With no history, the structural heuristic decides: the plan has a join, its total scan rows clear `_ADAPTIVE_MIN_ROWS_PER_STAGE` (5,000,000, a hard-coded module constant in `gating.py` rather than a config knob) multiplied by the number of pipeline breakers the loop would cut at, and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
+That order is the ladder below, with the two routes that bypass it drawn above the rungs:
+
+![When the within-query adaptive loop engages under adaptive equals auto. Two things skip the ladder: an explicit adaptive=True or False wins outright, and a distributed plan the one-shot dispatcher cannot route is staged whatever its size, because there staging is the only execution path rather than an optimization. Everything else passes three gates in order. Is there a join, since with no join there is nothing to re-decide. Does it clear the floor, which is charged per breaker and not per query. Is a join operand unsized, meaning breaker-produced and still a guess. Any no lands in the same place: plan once, run once, with no staging, no per-stage cut and no re-plan, which is where the great majority of queries land and is the cheaper path for them. A yes reaches stage, measure and re-plan, one breaker per stage, unless the route bandit, having measured both arms for this plan signature, says one-shot was faster. The floor itself is 5,000,000 rows OR about 320 MB, times the pipeline breakers the loop would cut at, so two breakers need 10,000,000 rows, four need 20,000,000 and six need 30,000,000. The flat 20,000,000-row whole-query gate is retired.](/_static/diagrams/adaptive_gating.svg)
+
+The distributed path asks first. A plan whose join operand already spans two sources, which is every star or snowflake query over three tables or more, has no one-shot route through the dispatcher at all. `dist.requires_staging` says so, and there staging isn't an optimization. It's the only way the query runs.
+
+Every other plan has to clear the size floor. It needs a join, and its total scan input needs to reach either 5,000,000 rows or roughly 320 MB, per pipeline breaker the loop would cut at. Both are module constants in `gating.py` rather than config knobs, and the byte floor is derived from the row floor rather than set beside it: `_ADAPTIVE_MIN_BYTES_PER_STAGE` is `_ADAPTIVE_MIN_ROWS_PER_STAGE` times the 64-byte row width `optimizer.row_bytes` assumes. The two are OR'd, so a query clears whichever of them suits its shape. That matters at both ends of the modality range. Twenty million rows of two `int64` keys is 320 MB, which the row floor admits. A million rows of decoded 224x224x3 images is 150 GB, which the row floor alone would turn adaptation off for.
+
+A plan over the floor still has to have something worth measuring. Some join operand must be non-streamable, so the loop can materialize it, and its size must be genuinely unknown. Provenance opens that second question without closing it, because `Provenance.DEFAULT` is sticky. The one-shot path never records an intermediate's measured cardinality against the operand's signature, so a shape can be estimated to within a percent of actual forever and still read as a guess. `kyber.estimate_is_reliable` settles it instead: an operand whose signature carries a run of observations that never left the re-optimization band counts as confidently sized whatever its label says, because a stage boundary there would have had nothing to correct. A cold hub knows nothing, and the gate then behaves exactly as it did before any history existed.
+
+Only a plan that survives all of that reaches the bandit. `learned_adaptive_route` is a two-arm bandit over `staged` and `one_shot`, keyed by plan signature and rewarded with the whole query's wall time. With a verdict it decides; without one the loop runs. Staging only re-plans equivalent algebra, so both arms return the identical relation.
 
 That floor is charged per cut rather than per query, because that is what staging costs. One breaker-produced operand is one materialization, one re-plan, and the fusion given up at one boundary; a snowflake pays that six times over. A single flat number has to be set for the worst shape it will meet, and the flat 20,000,000 this replaced was: it kept the loop away from the many-join shapes that measurably lost, at the price of never reaching the cheap two-breaker shapes at all. Per-stage, the same arithmetic lands at 20M for a four-cut plan, 10M for a two-cut one, and 30M for a six-cut one.
 
@@ -166,7 +178,9 @@ Re-optimization happens *between* stages, never mid-operator. A stage runs to co
 
 Only the seven breaker types segment. A badly mis-estimated selective filter is measured only when it feeds a breaker, which for a pure `scan -> filter -> collect` is never.
 
-Granularity has a floor, because staging materializes. A plan with many small breakers pays the control-plane round-trip at each one, which is why the accuracy early-exit exists and why the structural heuristic won't turn adaptivity on below the per-cut floor described above. The distributed-staging and learned-history paths ignore that floor, since one is a correctness requirement and the other has measured evidence for the shape.
+Granularity has a floor, because staging materializes. A plan with many small breakers pays the control-plane round-trip at each one, which is why the accuracy early-exit exists and why the gate won't turn adaptivity on below the per-cut floor described above. Distributed staging ignores that floor, because it is a correctness requirement rather than an optimization.
+
+The condition that excludes the most queries isn't the size floor at all. It's the join. `_large_enough` returns `False` the moment `joins(plan)` comes back empty, so a scan, filter, aggregate and sort of any width over any number of rows never reaches the loop. That is deliberate. Re-planning buys a better join order, build side, or broadcast decision, and a plan with no join has none of those to make.
 
 A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber optimize is skipped for a UDF plan and each stage is optimized on its own instead.
 
@@ -192,7 +206,7 @@ this page describes in the source:
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the pass pipeline that runs at each stage.
 - `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the regret and stability arguments.
 - {doc}`Adaptive execution </getting-started/concepts/adaptive>`: the same idea, without the code.
-- {doc}`Optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`: using this in anger.
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: using this in anger.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the `analyze=True` output above.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: the join shapes where re-planning pays.
 - {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: where the estimate under test comes from.

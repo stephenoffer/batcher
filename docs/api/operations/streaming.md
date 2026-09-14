@@ -6,9 +6,12 @@ that receives those reports as they happen.
 
 For how to use them, see {doc}`/user-guide/moving-data/streaming` and
 {doc}`/user-guide/moving-data/streaming-monitoring`. The handle a streaming write returns
-is documented with the rest of the {py:class}`Dataset <batcher.Dataset>` surface in {doc}`/api/complete`.
+is documented with the rest of the {py:class}`Dataset <batcher.Dataset>` surface in {doc}`/api/complete/dataset`.
 
 ## Triggers and output modes
+
+A trigger says when the engine fires a micro-batch. An output mode says how that batch's
+result reaches the sink. Both spell their values the way Spark does.
 
 ```{eval-rst}
 .. autoclass:: batcher.Trigger
@@ -18,10 +21,18 @@ is documented with the rest of the {py:class}`Dataset <batcher.Dataset>` surface
    :members:
 ```
 
-### Query progress and status
+The three modes are only distinguishable by what each one emits from the same input, so
+here is the same input three times:
 
-What a running query reports: one record per completed micro-batch, plus the state each
-stateful operator is holding and what it dropped as late.
+![What append, complete and update each emit for one sequence of micro-batches. Three batches of key-value pairs feed a grouped max. Append emits each batch's own rows and is legal only for a pipeline with no aggregate: make_processor raises at start() for append over an unwindowed aggregate, which needs a watermark and a windowed group key. Complete emits the whole running result on every trigger, including a third trigger that changed nothing. Update anti-joins the new result against the one it last emitted, over every column, so a group whose value did not move is not re-sent and that third trigger emits no rows at all. The sink adds its own restriction: a path or Delta sink accepts append only, so complete and update need a memory sink or for_each_batch.](/_static/diagrams/output_modes.svg)
+
+## Query progress and status
+
+A running query emits one `StreamingQueryProgress` record per completed micro-batch. The
+record carries that batch's row counts and duration, what each source contributed and the
+sink accepted, and one `StateOperatorProgress` per stateful operator holding state. That
+last one is where a late row goes: `num_late_inputs_dropped` counts the inputs that
+arrived behind the watermark and were discarded.
 
 ```{eval-rst}
 .. autoclass:: batcher.StreamingQueryProgress
@@ -40,10 +51,11 @@ stateful operator is holding and what it dropped as late.
    :members:
 ```
 
-### Listeners
+## Listeners
 
-Register a listener to receive every query's start, micro-batch, and termination as it
-happens, rather than polling `recent_progress`.
+A listener receives every query's start, micro-batch, and termination as it happens.
+Register one when polling `recent_progress` would miss a batch or arrive too late to act
+on it.
 
 ```{eval-rst}
 .. autoclass:: batcher.StreamingQueryListener
@@ -64,7 +76,6 @@ happens, rather than polling `recent_progress`.
 
 .. autofunction:: batcher.streaming_listeners
 ```
-
 
 ## Sinks
 

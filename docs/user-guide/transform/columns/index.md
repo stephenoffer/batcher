@@ -15,6 +15,7 @@ Read {doc}`Expressions <expressions>` first. The rest assume it.
 | {doc}`Expression recipes <expression-recipes>` | The jobs people actually reach for the language to do, assembled |
 | {doc}`The type system <type-system>` | What each type means here, and why a narrow integer widens at the boundary |
 | {doc}`User-defined functions <udfs>` | When an expression genuinely cannot express it, and how to write the batch callback that can |
+| {doc}`Running a UDF at scale <udfs-at-scale>` | Distributing a UDF stage, tolerating rows that raise, and idempotency under retry |
 
 ## See also
 
@@ -32,4 +33,5 @@ map-accessor
 expression-recipes
 type-system
 udfs
+udfs-at-scale
 ```

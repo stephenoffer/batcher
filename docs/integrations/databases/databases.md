@@ -15,8 +15,8 @@ The warehouse-specific pages cover the connectors that are not URI-routed: {doc}
 
 ## This is an analytical read path, not a serving one
 
-Batcher pushes a point lookup's predicate all the way down — the server does an index seek
-and returns one row — and the query still takes about 3.5 ms, against 0.01 ms for the same
+Batcher pushes a point lookup's predicate all the way down, so the server does an index
+seek and returns one row. The query still takes about 3.5 ms, against 0.01 ms for the same
 lookup through the driver directly. One Batcher process serves roughly 260 such queries a
 second, and threads do not raise that: the control plane is Python, so plan construction and
 optimization hold the GIL.
@@ -26,7 +26,7 @@ engine: a `Dataset` terminal op over a one-row table with no operators at all st
 ~1.9 ms. Amortized over a million rows that is nothing; at one row it *is* the query.
 
 So use these connectors to extract, join, aggregate and write back. Do not put them behind a
-request path that needs an answer per user action — call the driver for that. The measured
+request path that needs an answer per user action. Call the driver for that. The measured
 figures are in `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## Which backend serves which scheme
@@ -169,9 +169,9 @@ Column names are delimited for the dialect. Three ordinary names break unquoted:
 
 ### Two things that push only where the dialect is known
 
-A row cap and a top-N are pushed on an allow-list of dialects rather than on everything, and the asymmetry is deliberate. A missing cap costs the rows the server would have skipped. A cap the server cannot parse turns a working query into a syntax error, and a top-N pushed to a dialect with no `NULLS FIRST | LAST` clause returns the server's idea of the first n rather than the engine's — the *wrong rows*, silently, wherever a null sits.
+A row cap and a top-N are pushed on an allow-list of dialects rather than on everything, and the asymmetry is deliberate. A missing cap costs the rows the server would have skipped. A cap the server cannot parse turns a working query into a syntax error. Worse, a top-N pushed to a dialect with no `NULLS FIRST | LAST` clause returns the server's idea of the first n rather than the engine's, which is the *wrong rows*, silently, wherever a null sits.
 
-So `LIMIT` pushes to PostgreSQL, SQLite, DuckDB, MySQL and the rest of the allow-list, and not to SQL Server or Oracle, which spell it `TOP` and `FETCH FIRST`. A top-N pushes only where an explicit `NULLS` clause is accepted, which rules MySQL and SQL Server out entirely. A backend Batcher cannot place at all — ODBC, whose DSN names a driver rather than a dialect, or a `dbapi` read with no `uri=` and an unrecognized driver — pushes neither and quotes nothing, which is exactly what it did before it could name its dialect. Pass `dialect=` to say so yourself.
+So `LIMIT` pushes to PostgreSQL, SQLite, DuckDB, MySQL and the rest of the allow-list, and not to SQL Server or Oracle, which spell it `TOP` and `FETCH FIRST`. A top-N pushes only where an explicit `NULLS` clause is accepted, which rules MySQL and SQL Server out entirely. Some backends cannot be placed at all: ODBC, whose DSN names a driver rather than a dialect, and a `dbapi` read with no `uri=` and an unrecognized driver. Those push neither and quote nothing, which is exactly what the reader did everywhere before it could name its dialect. Pass `dialect=` to say so yourself.
 
 ### The schema probe
 

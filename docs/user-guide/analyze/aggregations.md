@@ -164,7 +164,6 @@ print(bivariate.to_pydict())
 
 A perfect correlation prints as `0.9999999999999998` rather than `1.0`: the coefficient is a ratio of floating-point sums, so the last bits are the arithmetic's, not the data's.
 
-
 ## Expressions over aggregates
 
 An `agg` keyword takes not just a single aggregate but a whole expression *over*
@@ -268,9 +267,10 @@ print(approx.to_pydict())
 # {'category': ['a', 'b'], 'exact': [3, 2], 'approx': [3, 2]}
 ```
 
-## Multiple grouping keys
+## Grouping keys
 
-Pass several keys to {py:meth}`group_by <batcher.Dataset.group_by>` to group by each unique combination.
+A key is a column name or an expression, and there can be any number of them. Pass several
+names to {py:meth}`group_by <batcher.Dataset.group_by>` to group by each unique combination.
 
 ```python
 sales = bt.from_pydict(
@@ -286,6 +286,21 @@ by_pair = sales.group_by("category", "region").agg(
 print(by_pair.to_pydict())
 # {'category': ['a', 'a', 'b', 'b'], 'region': ['east', 'west', 'east', 'west'],
 #  'total': [20.0, 10.0, 40.0, 30.0], 'n': [1, 1, 1, 1]}
+```
+
+A derived key works the same way. Define it in
+{py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass the expression straight to
+`group_by`) and group on the result.
+
+```python
+buckets = (
+    ds.with_columns(tier=bt.when(bt.col("price") >= 30.0).then(bt.lit("high")).otherwise(bt.lit("low")))
+    .group_by("tier")
+    .agg(n=bt.count(), revenue=bt.col("price").sum())
+    .sort("tier")
+)
+print(buckets.to_pydict())
+# {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
 
 ## Global aggregates
@@ -320,8 +335,8 @@ print(ds.skewness("price"), ds.kurtosis("price"), ds.mad("price"))
 ```
 
 {py:meth}`mad <batcher.Dataset.mad>` is the mean absolute deviation. It does not square the
-deviations the way the standard deviation does, so one far-out value moves it far less —
-which is the spread to prefer when outliers are expected rather than exceptional.
+deviations the way the standard deviation does, so one far-out value moves it far less.
+Prefer it when outliers are expected rather than exceptional.
 
 {py:meth}`any <batcher.Dataset.any>` and {py:meth}`all <batcher.Dataset.all>` reduce a
 boolean column. Both return `None` for an empty or all-null column rather than `False` or
@@ -331,22 +346,6 @@ boolean column. Both return `None` for an empty or all-null column rather than `
 flags = bt.from_pydict({"ok": [True, True, False]})
 print(flags.any("ok"), flags.all("ok"))
 # True False
-```
-
-## Derived grouping keys
-
-`group_by` accepts derived expressions, not just column names. Define the key in
-{py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass an expression) and group on it.
-
-```python
-buckets = (
-    ds.with_columns(tier=bt.when(bt.col("price") >= 30.0).then(bt.lit("high")).otherwise(bt.lit("low")))
-    .group_by("tier")
-    .agg(n=bt.count(), revenue=bt.col("price").sum())
-    .sort("tier")
-)
-print(buckets.to_pydict())
-# {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
 
 ## See also

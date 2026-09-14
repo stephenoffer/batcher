@@ -1,6 +1,6 @@
 # List transforms
 
-``explode`` then ``group_by`` re-collects is the expensive way to map over list elements. ``.list.transform`` and ``.list.filter`` do it in place, which keeps the row count fixed and avoids the shuffle a regroup would cost. Both take an *expression* over ``bt.element()`` (the current element), not a Python lambda, so the body runs in Rust.
+`explode` then `group_by` re-collects is the expensive way to map over list elements. `.list.transform` and `.list.filter` do it in place, which keeps the row count fixed and avoids the shuffle a regroup would cost. Both take an *expression* over `bt.element()` (the current element), not a Python lambda, so the body runs in Rust.
 
 The whole script, executed on every test run:
 

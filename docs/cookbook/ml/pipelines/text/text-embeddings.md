@@ -67,7 +67,7 @@ vectors.write.parquet("s3://bucket/vectors.parquet")
 :::
 
 :::{tab-item} Your own encoder class
-For any other encoder, pass a **class**. `map_batches`, `infer`, and `embed` instantiate
+For any other encoder, pass a class. `map_batches`, `infer`, and `embed` instantiate
 it once per worker, and the constructor is where the weights load.
 
 ```python

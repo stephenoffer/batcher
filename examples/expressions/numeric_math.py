@@ -2,7 +2,9 @@
 
 All of these are columnar and fuse into a single pass, so a chain of ten of them is not
 ten scans. Watch the division operators in particular: ``/`` is true division and
-``floordiv`` truncates, and mixing them up is a quiet source of off-by-one bugs.
+``floordiv`` *floors*, so ``-7 // 2`` is ``-4`` rather than ``-3``. That is deliberately
+not SQL integer division, which truncates toward zero, and mixing the two up is a quiet
+source of off-by-one bugs on negative values.
 
     python examples/expressions/numeric_math.py
 """

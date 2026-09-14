@@ -1,6 +1,6 @@
 # Masking and row filters
 
-Governance in Batcher is a *rewrite*: the policy is compiled into the plan before it runs, so there is no unenforced path around it and no per-row Python check. A ``SecurityCatalog`` declares the policy, a ``Principal`` is the identity, and ``bt.security(...)`` installs both for the duration of a block.
+Governance in Batcher is a *rewrite*: the policy is compiled into the plan before it runs, so there is no unenforced path around it and no per-row Python check. A `SecurityCatalog` declares the policy, a `Principal` is the identity, and `bt.security(...)` installs both for the duration of a block.
 
 The whole script, executed on every test run:
 

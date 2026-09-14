@@ -46,7 +46,7 @@ from "the data is not what you promised" from "the file is not there". Catching 
 
 ```python
 import batcher as bt
-from batcher._internal.errors import ColumnNotFoundError, PlanError
+from batcher import ColumnNotFoundError, PlanError
 
 orders = bt.from_pydict({"id": [1, 2, 3]})
 

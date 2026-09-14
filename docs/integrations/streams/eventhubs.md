@@ -10,7 +10,7 @@ client. Read only. Batcher has no Event Hubs sink.
 | **Extra** | `pip install 'batcher-engine[eventhubs]'` |
 | **Parallelism** | One split per partition, fixed at hub creation |
 | **Auth** | Connection string only. No `DefaultAzureCredential`, no managed identity. |
-| **Restart** | None. The native reader re-applies `starting_position` on every restart. |
+| **Restart** | The checkpointed per-partition offset; `starting_position` when there is none |
 
 ```bash
 pip install 'batcher-engine[eventhubs]'
@@ -18,11 +18,13 @@ pip install 'batcher-engine[eventhubs]'
 
 ## Two ways in, and they are not equivalent
 
-Every Event Hubs namespace at Standard tier or above speaks the Kafka protocol on port 9093.
-`bt.read.kafka` works against it, needs no Azure SDK, and (this is the part that matters) gets
-you a working seek-on-resume and a per-partition split assignment. Use the native reader when
-you are already on the Azure SDK and would rather not add `confluent-kafka`, or when the
-protocol endpoint is unavailable (Basic tier).
+Every Event Hubs namespace at Standard tier or above speaks the Kafka protocol on port 9093,
+and `bt.read.kafka` works against it with no Azure SDK at all. Prefer it. Both readers split per
+partition and both honour a checkpoint, so what the Kafka path adds is a consumer-group offset
+to fall back on when there is no checkpoint, a bounded offset-range read for a backfill, and a
+client Batcher is not reaching into the private internals of. Take the native reader when you
+are already on the Azure SDK and would rather not add `confluent-kafka`, or when the protocol
+endpoint is unavailable (Basic tier).
 
 ::::{tab-set}
 
@@ -57,7 +59,7 @@ events = bt.read.eventhubs(
     "telemetry",
     connection_str="Endpoint=sb://acme-ns.servicebus.windows.net/;SharedAccessKeyName=reader;SharedAccessKey=...",
     consumer_group="$Default",
-    starting_position="-1",
+    starting_position="earliest",
     poll_size=1_000,
 )
 ```
@@ -72,30 +74,29 @@ managed identity today.
 
 ## The rows you get
 
-`starting_position` defaults to `"-1"`, which is the beginning of the retained stream, so a
-new query replays whatever retention holds (one to seven days on Standard). `"@latest"` starts
-at the tip.
+`starting_position` defaults to `"earliest"`, the beginning of the retained stream, so a new
+query replays whatever retention holds (one to seven days on Standard). `"latest"` starts at
+the tip. Those are the words every broker on this section shares; Event Hubs' own sentinels
+`"-1"` and `"@latest"` are accepted too, as is an explicit offset string you recorded earlier.
 
 Rows arrive in the fixed broker schema (`key`, `value`, `partition`, `offset`, `timestamp`,
 `topic`), with `partition` the Event Hubs partition id, `offset` the native offset, `timestamp`
 the enqueued time in milliseconds, and `topic` the hub name.
 
-## `value` must be UTF-8 text
+## What lands in `value`
 
-:::{warning}
-The reader converts each event with `body_as_str()` and re-encodes to bytes. A payload that is
-not valid UTF-8, meaning Avro, Protobuf, or anything else binary, raises on decode rather than
-arriving as opaque bytes. Every other broker source in Batcher hands you the raw payload. This
-one does not.
-:::
+An ordinary producer sends an AMQP `DATA` body, and that reaches `value` as the raw bytes it
+was, undecoded, exactly as every other broker source here delivers a payload. A multi-section
+event has its sections joined. Protobuf, an Avro frame and a compressed blob all pass through
+intact; nothing is decoded or re-encoded on the way.
 
-If your hub carries binary bodies, read it through the Kafka endpoint above, where the payload
-passes through untouched.
+The exception is a structured AMQP body, `SEQUENCE` or `VALUE`, which has no byte encoding of
+its own. Those are rendered as JSON, so the `.json` accessor can parse them downstream.
 
 ## Decoding the payload
 
-Because the body arrives as UTF-8 text in `value`, decoding is an ordinary expression, and it
-runs in Rust rather than in a Python loop. The block below stands a local batch in for the hub,
+The payload is opaque bytes, so decoding it is your first transformation. Write it as
+expressions and it runs in Rust rather than in a Python loop. The block below stands a local batch in for the hub,
 using the same six columns the reader delivers, so the pipeline runs here as written:
 
 ```python
@@ -142,24 +143,19 @@ Partition count is fixed at hub creation and cannot be raised on an existing hub
 tier), so it is your read-parallelism ceiling and you have to pick it up front. Four partitions
 means four workers can read; the fifth has nothing to do.
 
-## Restart semantics, before you rely on a checkpoint
+## Restart semantics
 
-:::{important}
-The native reader has no working resume. It records a checkpointed position as every other
-broker source does, but nothing consults it: each poll re-derives its consumer from
-`starting_position`. A restarted query starts from `starting_position` again, not from where it
-stopped. Concretely, with the default `"-1"`, a restart replays the whole retained stream.
-:::
+With a `checkpoint=` set, the native reader resumes where it stopped. Each partition's
+checkpointed offset is what its consumer is opened at, and a recovery drops the cached consumer
+so the next poll reopens it there. A live offset is exclusive, so the resume is strictly after
+the last delivered event. Without a checkpoint, every restart begins at `starting_position`,
+which with the default `"earliest"` replays the whole retained stream.
 
-Live with it one of three ways:
-
-1. Use the Kafka endpoint at the top of this page, where consumer-group offsets and the
-   checkpointed seek both work.
-1. Make the sink idempotent and let the replay wash out. A Delta sink with a stable
-   `query_name` commits one transaction per micro-batch and recognizes a replayed batch, and
-   {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` handles the rest.
-1. Set `starting_position` on restart from a position you tracked yourself. Workable, but you
-   are now doing the checkpoint's job by hand.
+The delivery guarantee is still at-least-once, because the checkpoint records what was
+published rather than what was acknowledged by Azure. Make the sink idempotent: a Delta sink
+with a stable `query_name` commits one transaction per micro-batch and recognizes a replayed
+one, and {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>`
+handles the rest.
 
 :::{dropdown} What the reader is coupled to underneath
 Azure's own Blob checkpoint store is not used. Neither is the SDK's public receive loop: the
@@ -168,7 +164,7 @@ consumer, which is a real coupling to the SDK's internals. Pin `azure-eventhub`,
 before you upgrade it.
 :::
 
-## Writing the stream out
+## Writing
 
 ```python
 # docs: skip
@@ -192,8 +188,9 @@ or {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>`.
 
 ## Failure modes worth knowing
 
-A new consumer is constructed on every poll rather than held open. On a busy hub that is AMQP
-link setup in the hot loop, and it costs you throughput.
+A partition's consumer is opened once and reused across polls, so its own prefetch survives
+and a short trigger interval does not pay for an AMQP link negotiation per partition per poll.
+A recovery is the only thing that rebuilds one.
 
 Azure allows five readers per consumer group per partition. Batcher's per-partition split
 assignment is one reader each, which is fine, until you run two queries on the same

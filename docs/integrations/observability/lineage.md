@@ -80,10 +80,11 @@ assert sorted(ds.lineage()["name"]) == sorted([f"{path}.first", f"{path}.last"])
 
 ## Requirements and limitations
 
-Emission never delays a query. Events go to a bounded queue drained by one background
-thread, so a receiver that is down, slow, or saturated costs a dropped event and a debug
-log line rather than latency. A backend that has been unreachable long enough to fill the
-queue loses the oldest events first.
+Emission never delays a query. Events go to a bounded queue drained FIFO by one background
+thread, so a receiver that is down, slow, or saturated costs a dropped event and a debug log
+line rather than latency. Once the queue is full it is the *arriving* event that is dropped,
+not one already in it, so a backend that recovers finds the oldest surviving events intact and
+delivers them in order.
 
 Lineage over-approximates and never under-approximates. An opaque `map_batches` stage is
 treated as though every output column derives from every input column, because a false

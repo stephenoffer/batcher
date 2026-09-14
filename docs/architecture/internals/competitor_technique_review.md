@@ -628,6 +628,15 @@ substantial operator.
 the binned rewrite turns on a bucket width `W` nobody could choose safely at plan time, and a
 badly chosen `W` is a pessimization rather than a win.
 
+**A third strategy landed 2026-09-12, for the shape neither of the two above serves.** IEJoin
+and the band both sort the *left* side, which is the wrong algorithm against a bucket table —
+price bands, IP ranges, a histogram's edges, a date dimension. With at most 32 right rows the
+join is now `|R|` vectorized comparisons over the left key column, chunked and parallel, with no
+sort at all: the operator mix's `op-join-range` (six discount bands against `lineitem`) went
+**329 ms to 80 ms**, from 3.68x DuckDB to 0.89x. It also covers the mirror of the band —
+one left key bounded by two right columns — which `band::bounds` structurally cannot see. See
+`competitive_architecture.md` ceiling 7.
+
 **The result is mixed and the ledger says so.** The quadratic *plan* is gone — `n = 2,000,000`
 went from not running at all to 1.1 s — but DuckDB's own IEJoin is still **1.3-2.9x faster**, and
 the gap widens with `n`, because `PhysicalIEJoin` decomposes the sorted union into blocks and

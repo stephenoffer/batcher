@@ -417,6 +417,6 @@ Here is the whole decision:
   envelope.
 - {doc}`On-disk artifacts </architecture/deep-dives/memory/on-disk-artifacts>`: everything the
   engine writes to local disk, the cache's second tier among it.
-- {doc}`Optimizing a slow query </tutorials/foundations/optimizing-a-slow-query>`: caching in its
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: caching in its
   place, among the other fixes.
 - {doc}`/cookbook/operations/memory_and_caching`: caching a reused branch, and spilling under a tight budget, as a script.

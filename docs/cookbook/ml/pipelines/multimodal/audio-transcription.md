@@ -18,7 +18,7 @@ at the same mono waveform column, and neither one touches Python per sample.
 :::{tab-item} A directory of clips
 
 {py:meth}`bt.read.audio(..., decode=True, sample_rate=16000) <batcher.api.io_namespace.reader.Reader.audio>` lists the files, decodes them, and
-resamples natively, giving you a `list<float>` waveform column per row.
+resamples natively. Each row carries a `list<float>` waveform column.
 
 ```python
 # docs: skip
@@ -39,7 +39,7 @@ When the audio is already a column of encoded bytes (downloaded, or read from a 
 averages the channels down to mono. {py:meth}`.audio.resample(rate) <batcher.plan.expr_ir.audio._AudioNamespace.resample>` decodes and band-limit-resamples
 in one native pass, which is the one you want in front of a model with a fixed input rate.
 
-When the model wants **mel features** rather than a raw waveform (Whisper, wav2vec2, HuBERT
+When the model wants mel features rather than a raw waveform (Whisper, wav2vec2, HuBERT
 all do), {py:meth}`.audio.mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80) <batcher.plan.expr_ir.audio._AudioNamespace.mel_spectrogram>` decodes,
 resamples, and computes the mel power spectrogram in one native pass. Its output
 numerically matches `torchaudio.transforms.MelSpectrogram`, so it drops straight into a
@@ -60,8 +60,8 @@ every one of those samples is paid for twice: once in the spectrogram and again 
 sequence length.
 
 {py:meth}`.audio.trim_silence() <batcher.plan.expr_ir.audio._AudioNamespace.trim_silence>` drops the leading and trailing quiet. It leaves interior pauses alone,
-because those carry the timing an acoustic model reads — an utterance with its pauses removed is
-not the same utterance. A clip that is quiet throughout trims to an empty list, which is how you
+because those carry the timing an acoustic model reads. An utterance with its pauses removed
+is not the same utterance. A clip that is quiet throughout trims to an empty list, which is how you
 find the silent recordings:
 
 ```python
@@ -75,7 +75,7 @@ quieter one, so mismatched levels cost accuracy invisibly. It is peak, not loudn
 normalization: a clip with one loud click stays quiet everywhere else.
 
 {py:meth}`.audio.zero_crossing_rate() <batcher.plan.expr_ir.audio._AudioNamespace.zero_crossing_rate>` is the cheapest useful descriptor of a waveform and the classic
-voiced/unvoiced split — a vowel crosses zero rarely, a fricative constantly. It separates speech
+voiced/unvoiced split: a vowel crosses zero rarely, a fricative constantly. It separates speech
 from silence-with-hiss without computing a spectrogram, which makes it a good first-pass filter
 over a corpus nobody has curated.
 
@@ -87,7 +87,7 @@ usable = clips.filter(
 )
 ```
 
-For classical speech models (and many audio classifiers) that want the compact **MFCC**
+For classical speech models (and many audio classifiers) that want the compact MFCC
 feature instead, {py:meth}`.audio.mfcc(rate, n_mfcc=13) <batcher.plan.expr_ir.audio._AudioNamespace.mfcc>` runs the whole
 `mel → AmplitudeToDB → DCT` chain natively. Its output numerically matches
 `torchaudio.transforms.MFCC`:
@@ -196,9 +196,9 @@ error.
 
 ### When you need the model stage yourself
 
-Reach for a class when the forward pass needs options `ds.ml.infer` does not expose — return
-timestamps, a forced language, a beam width — or when the model is not a `transformers`
-pipeline at all. The constructor loads the weights once per worker, `__call__`
+Reach for a class when the forward pass needs options `ds.ml.infer` does not expose, such as
+returned timestamps, a forced language, or a beam width. Reach for it too when the model is
+not a `transformers` pipeline at all. The constructor loads the weights once per worker, `__call__`
 runs the forward pass on each batch.
 
 :::{warning}
@@ -251,7 +251,7 @@ are dropped up to that budget, and the rest of the batch goes through. Beyond th
 error propagates, so a genuine bug on clean data still fails fast.
 :::
 
-Batcher's audio pipeline (torchaudio mel features into a ResNet-18) runs at **38,546 clip/s**
+Batcher's audio pipeline, torchaudio mel features into a ResNet-18, runs at 38,546 clip/s
 on 8xT4, and none of that comes from the model. It comes from the decode running in the data
 plane and the CPU stage overlapping the GPU stage instead of taking turns.
 

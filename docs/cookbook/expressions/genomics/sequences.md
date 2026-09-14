@@ -47,7 +47,7 @@ A six-frame translation is the three `frame` values, plus the same three over {p
 
 Matching is defined on *sets of bases* rather than on text, and that is what makes this different from a regular expression over the literal characters. Ambiguity works in both directions: an `N` in the reference is consistent with every pattern base, so it matches. A character-class regex gets that half wrong.
 
-Matches overlap, so `AA` occurs three times in `AAAA`. That is the biologically meaningful count — tandem repeats and overlapping binding sites are real — and it is what separates this from a replace-and-measure spelling, which counts only non-overlapping occurrences. Positions are 1-based, matching every genome browser, GFF file, and VCF record you would compare them against.
+Matches overlap, so `AA` occurs three times in `AAAA`. That is the biologically meaningful count, since tandem repeats and overlapping binding sites are real, and it is what separates this from a replace-and-measure spelling, which counts only non-overlapping occurrences. Positions are 1-based, matching every genome browser, GFF file, and VCF record you would compare them against.
 
 A motif containing a character that is not an IUPAC code raises rather than matching nothing, because a column of empty lists would hide the typo.
 

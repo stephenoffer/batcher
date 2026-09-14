@@ -156,22 +156,28 @@ would happen if you refit at serving time.
 
 An impression log is mostly negatives already. An *interaction* log (purchases, likes) is
 all positives, and a model trained on it learns to predict 1. Sample negatives from the
-items the user did not touch: a cross join to the candidate space, an anti-join against the
-positives, and a `sample` to size it.
+items the user did not touch: a cross join to the candidate space, an anti-join, and a
+`sample` to size it.
+
+Two different sets do two different jobs below. The positive labels come from `labels`, the
+window the model is being asked to predict, so they line up with features drawn from
+`history`. The anti-join runs against every pair the user ever touched, because an item
+clicked on day 1 is not a negative just for falling outside the label window.
 
 ```python
-positives = events.filter(col("clicked") == 1).select("user_id", "item_id")
+positives = labels.filter(col("clicked") == 1).select("user_id", "item_id")
+touched = events.filter(col("clicked") == 1).select("user_id", "item_id")
 users = events.select("user_id").distinct()
 catalog = events.select("item_id").distinct()
 
 negatives = (
     users.cross_join(catalog)
-    .join(positives, on=["user_id", "item_id"], how="anti")
+    .join(touched, on=["user_id", "item_id"], how="anti")
     .sample(0.5, seed=7)
     .with_columns(clicked=bt.lit(0))
 )
 print(positives.count(), negatives.count())
-# 5 4
+# 2 4
 ```
 
 The cross join is the part that scales badly on a real catalog. A million users times a
@@ -181,14 +187,18 @@ The operators are the same; only the size of `catalog` changes.
 
 ## Then split, then fit
 
-The features are built. Split by user so no user appears on both sides, fit the scalers on
-train only, and stream the result into the model.
+Attach the history features to the labelled rows, split by user so no user lands on both
+sides, then fit the scalers on train only and stream the result into the model.
 
 ```python
 labelled = positives.with_columns(clicked=bt.lit(1)).union(negatives)
-train, test = labelled.ml.train_test_split(0.25, seed=0, key="user_id")
+training_rows = labelled.join(user_features, on="user_id", how="left").join(
+    item_features, on="item_id", how="left"
+)
+
+train, test = training_rows.ml.train_test_split(0.25, seed=0, key="user_id")
 print(train.count(), test.count())
-# 6 3
+# 4 2
 ```
 
 Splitting on `user_id` rather than on the row is the difference between measuring

@@ -32,7 +32,7 @@ in and the shared machinery it should build on rather than reinvent.
 | An IO format (a reader/writer) | `io/formats/<category>/<fmt>.py` | {py:class}`FileSource <batcher.io.FileSource>`/{py:class}`FileSink <batcher.io.FileSink>` + `@SOURCES.register` |
 | A relational operator | Rust `bc-runtime` + `plan/logical/` | see the `add-relational-operator` skill |
 
-The golden rule: **per-row work lives in Rust** behind the JSON IR. Python builds and
+The golden rule: per-row work lives in Rust, behind the JSON IR. Python builds and
 optimizes the plan, and it never iterates a tuple. If a recipe has you writing a Python
 loop over data, stop: that work belongs in the data plane.
 
@@ -62,7 +62,7 @@ Steps:
 ## Add an expression IR node
 
 Reach for a new node only when you need a *new wire shape* the engine deserializes
-(i.e. you are also adding a `bc_expr::Expr` variant in Rust). Nodes are **declarative**:
+(i.e. you are also adding a `bc_expr::Expr` variant in Rust). Nodes are declarative:
 subclass `IRNode`, set the wire `tag`, and annotate each field with a factory. The
 generic `IRNode.to_ir` assembles the JSON, so you write no `to_ir` and no `__init__`.
 
@@ -161,11 +161,11 @@ cap, and the subpackage is allowlisted in `tools/lint_structure.py`. If your fam
 no home yet, add a new `extra/<family>.py` and register it with one import line in
 `rules/extra/__init__.py`. Importing that package runs the module's `@rule` decorators.
 
-A rule must be **idempotent**. Return `None` once there is nothing left to rewrite, so
+A rule must be idempotent. Return `None` once there is nothing left to rewrite, so
 the rule never matches its own output, the fixpoint iteration terminates, and the whole
 set stays confluent.
 
-For a **whole-plan** rewrite, do not hand-roll the per-node `isinstance` ladder. The
+For a whole-plan rewrite, do not hand-roll the per-node `isinstance` ladder. The
 structural recursion, and the identity-preserving rebuild the fixpoint detector relies
 on, is the shared `transform_up` from `plan/visitor.py`. Write only the per-node logic:
 
@@ -178,12 +178,12 @@ def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
     return transform_up(plan, push)   # children visited and rebuilt generically
 ```
 
-Invariants: a rule **decides, never executes**. No engine calls and no metric
+Invariants: a rule *decides, never executes*. No engine calls and no metric
 collection, because that is Core's lane. Every rule needs a `tests/unit/` plan-shape test
 proving the rewrite is *semantics-preserving* and a `tests/differential/` test
 showing the optimized query still matches DuckDB. Your rule then joins the whole set
 under `tests/property/test_prop_optimizer_result_invariance.py`, which
-property-tests that the full 154-rule set is result-invariant and converges to a
+property-tests that the full rule set is result-invariant and converges to a
 deterministic fixpoint. A rule that interferes with another, or fails to reach a
 fixpoint, fails there even when its own tests pass. See the `add-kyber-optimizer-pass`
 skill for the full treatment.
@@ -231,7 +231,6 @@ tests it must land with: `add-relational-operator`, `add-expression-or-function`
 `add-kyber-optimizer-pass`, `add-distributed-operator`, `add-an-io-format-or-connector`,
 and `run-quality-gate`. See {doc}`/agents` for the full catalog, including the
 usage and migration skills aimed at people building *with* Batcher rather than on it.
-
 
 ## See also
 

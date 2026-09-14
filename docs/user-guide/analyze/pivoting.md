@@ -118,8 +118,7 @@ value. Once `aggregate=` stops being enough, write that out yourself: same plan 
 same cost, and you get a different aggregate per column or a filter inside one cell.
 :::
 
-Writing it out by hand is what you do when you need something the operator does not
-offer.
+Written out by hand, one cell can sum while another counts:
 
 ```python
 by_hand = sales.group_by("region").agg(
@@ -129,9 +128,6 @@ by_hand = sales.group_by("region").agg(
 print(by_hand.sort("region").to_pydict())
 # {'region': ['east', 'west'], 'q1': [30.0, 15.0], 'q2_rows': [1, 1]}
 ```
-
-Same plan shape, same cost, and full control. Reach for it as soon as `aggregate=` stops
-being enough.
 
 ## Round-tripping
 

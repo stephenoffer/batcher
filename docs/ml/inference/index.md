@@ -16,12 +16,12 @@ call. Everything else in this section is about where that work runs and how it i
 ```{toctree}
 :hidden:
 
-batch-scoring
+inference
+tabular-models
+runtimes
 calibration
 gpu
-inference
+batch-scoring
 pytorch
-runtimes
 streaming
-tabular-models
 ```

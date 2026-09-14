@@ -53,13 +53,16 @@ Every broker source shares one fixed schema: `key`, `value`, `partition`, `offse
 | --- | --- |
 | `key` | The record's partition key, UTF-8 encoded |
 | `value` | The record `Data` blob, raw bytes, undecoded |
-| `partition` | The index of the shard in the discovered shard list |
+| `partition` | The shard's own number, parsed out of its `ShardId` |
 | `offset` | The sequence number, reduced modulo 2^63 |
 | `timestamp` | `ApproximateArrivalTimestamp`, in milliseconds |
 | `topic` | The stream name |
 
-The two that surprise people are `partition` and `offset`. `partition` is the *index* of the
-shard in the discovered shard list, not the shard id. `offset` is the sequence number, which
+The two that surprise people are `partition` and `offset`. `partition` is the number embedded
+in the shard's `ShardId`, so `shardId-000000000005` reads as `5`. Kinesis assigns that number
+once and never reuses it, which is what keeps a checkpointed position pointing at the same shard
+across a reshard. A `ShardId` that does not fit the format falls back to a `sha256` digest,
+stable across processes and workers. `offset` is the sequence number, which
 is a large decimal string, reduced modulo 2^63 so it fits an int64 column. It stays monotonic
 within a shard, but it is not the sequence number and you cannot hand it back to AWS. The
 real sequence number is kept out of band as the resume token, which is what recovery uses. It
@@ -113,29 +116,24 @@ budget runs out. Add shards, or move the other consumers to enhanced fan-out.
 
 ## Resharding
 
-:::{note}
-`ListShards` is paginated, so every shard of the stream is discovered however many there are.
-The list is then fetched once and cached for the life of the source.
-:::
+`ListShards` is paginated, so every shard is discovered however many there are, and the list is
+cached. A reshard invalidates it rather than outliving it: a shard closes when its children
+replace it, `GetRecords` says so by returning no next iterator, and the reader retires the
+parent, drops the cached listing, and reads the fresh one's lineage to adopt the children. So a
+running query follows a split or a merge without a restart, and it costs one `ListShards` per
+reshard.
 
-:::{warning}
-Because the list is cached, a stream that is resharded *while a query is running* is not
-re-discovered. Splits are addressed by index into the list captured at planning time. Restart
-the query after a reshard.
-:::
-
-Splits are addressed by *index into that list*. Split a shard, merge two, or scale a stream
-while a query is running, and the index-to-shard mapping shifts under you. A resumed query can
-end up reading a different shard than the one its checkpointed sequence number belongs to.
-
-Restart the query after a resharding event. Do not reshard under a long-lived reader and
-assume it followed.
+That works because `partition` is the shard's own number rather than its position in a list. A
+checkpointed sequence number therefore still names the shard it was taken from, whatever the
+listing looks like afterwards.
 
 ## Restart semantics
 
 `iterator_type` defaults to `"TRIM_HORIZON"`: a fresh query replays the entire retention
 window (24 hours by default, up to 365 days if you have paid for it). `"LATEST"` starts at the
-tip and drops the backlog. Neither is right for every job; pick deliberately.
+tip and drops the backlog. Neither is right for every job; pick deliberately. `starting_position`
+is accepted as well, with `"earliest"` and `"latest"` mapping onto those two, so a pipeline that
+reads several brokers can spell the choice one way throughout.
 
 ::::{tab-set}
 

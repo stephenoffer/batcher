@@ -163,7 +163,7 @@ The residual scale is re-estimated on every pass rather than fixed from the star
 
 A ridge penalty has to be chosen, and the usual way costs a fit per candidate per fold. {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` does not need that. Ridge builds its normal equations from the first and second moments of the features and the target, and those moments do not depend on the penalty, so every candidate is solved from the same numbers. The held-out squared error expands into the same moments, so scoring a candidate on a fold reads no rows either.
 
-What remains is one grouped aggregate: the moments per fold. Each fold's training moments are the total minus that fold's, because moments add, and every combination is then arithmetic on small matrices:
+One grouped aggregate remains: the moments per fold. Each fold's training moments are the total minus that fold's, because moments add, and every combination is then arithmetic on small matrices:
 
 ```python
 import batcher as bt
@@ -286,9 +286,8 @@ When the groups *are* the labels, {py:class}`batcher.ml.cluster.NearestCentroid 
 
 The estimators in `batcher.ml` fit *on* the engine, so a model can be trained across a
 cluster. {py:func}`save_model <batcher.ml.save_model>` and
-{py:func}`load_model <batcher.ml.load_model>` are what move it afterwards — without them the
-only route from a fitted model to a prediction is to fit again, which is not a serving
-story.
+{py:func}`load_model <batcher.ml.load_model>` move it afterwards. Without them the only
+route from a fitted model to a prediction is to fit again, which is not a serving story.
 
 ```python
 import os
@@ -311,7 +310,7 @@ print(served.predict(bt.from_pydict({"x": [10.0]})).to_pydict()["prediction"])
 The path may be a cloud URI, because a fitted model belongs next to the data it scores
 rather than on the machine that fitted it.
 
-What is written is JSON, not a pickle, and for the same reasons the preprocessors use JSON:
+The file is JSON, not a pickle, for the same reasons the preprocessors use JSON:
 you can read what the model will do, a reviewer can diff it, it survives a class moving or a
 slot being renamed, and it is safe to load from a store you do not fully control.
 
@@ -325,8 +324,8 @@ print(sorted(json.loads(open(target).read())))
 `state` holds what `fit` learned, under scikit-learn's trailing-underscore names, and
 {py:func}`model_to_dict <batcher.ml.model_to_dict>` and
 {py:func}`model_from_dict <batcher.ml.model_from_dict>` are the same conversion without the
-file, for when the model travels inside something else — a config blob, a registry row, a
-message payload:
+file, for when the model travels inside something else: a config blob, a registry row, or a
+message payload.
 
 ```python
 from batcher.ml import model_from_dict, model_to_dict
@@ -338,9 +337,9 @@ print(model_from_dict(document).coef_)
 # [2.0]
 ```
 
-`params` holds the constructor arguments — read from the constructor's own signature, so a
-parameter an estimator keeps privately (`Ridge` takes `alpha` and stores `_alpha`) is still
-recorded under the name that rebuilds it.
+`params` holds the constructor arguments, read from the constructor's own signature. A
+parameter an estimator keeps privately, such as the `alpha` that `Ridge` stores as
+`_alpha`, is still recorded under the name that rebuilds it.
 
 ## Fitting on a reshaped target
 
@@ -349,8 +348,8 @@ duration, a claim amount and a count all violate that: they are non-negative, ri
 and their spread grows with their level, so a regression fitted directly on them spends its
 capacity on the long tail and under-predicts the body.
 
-Fitting on `log1p(y)` and exponentiating back is the standard fix, and the third step —
-remembering to invert at serving time — is the one that gets forgotten. Predictions are then
+Fitting on `log1p(y)` and exponentiating back is the standard fix. The third step,
+remembering to invert at serving time, is the one that gets forgotten. Predictions are then
 wrong by a factor of *e*, with the right shape and no error.
 {py:class}`TransformedTargetRegressor <batcher.ml.TransformedTargetRegressor>` wraps the pair
 so the inverse cannot be lost:
@@ -372,7 +371,7 @@ print([round(v, 3) for v in model.predict(skewed).to_pydict()["prediction"]])
 ```
 
 The prediction comes back on the original scale, so a metric computed against the
-untransformed truth means what it says — comparing a model fitted on `log1p(y)` against one
+untransformed truth means what it says. Comparing a model fitted on `log1p(y)` against one
 fitted on `y` is otherwise comparing two different quantities and calling the smaller number
 better.
 
@@ -403,24 +402,22 @@ print(model.predict(bt.from_pydict({"x": [0.5, 10.5]})).to_pydict()["prediction"
 # ['low', 'high']
 ```
 
-A k-NN model has no parameters — it *is* its training data — so `fit` keeps a reference set
+A k-NN model has no parameters. It *is* its training data, so `fit` keeps a reference set
 and `predict` measures against it. Batcher folds that reference set into the prediction as
 literals, exactly the way a fitted linear model folds in its coefficients, so scoring is one
 arithmetic expression over the feature columns with no join and no shuffle.
 
-That is what makes it distribute unchanged, and it is also why the reference set is capped.
+That is what makes it distribute unchanged. It is also why the reference set is capped.
 Exact k-NN costs one distance per scored row per reference row, and nothing removes that:
 measured on this engine, scoring the reference set against itself takes about 0.4s at 200
 rows and 4s at 1,000. Past `max_reference` the fit fails and names the ways out rather than
 building a query nobody wants to wait for.
 
-Two habits matter more here than for most models:
-
-- **Scale the features first.** Distance treats every column alike, so a column measured in
-  millions decides every neighbour and one measured in fractions is ignored.
-- **Reach for an index when the corpus is large.**
-  {py:func}`build_vector_index <batcher.ml.build_vector_index>` is the approximate route;
-  a broadcast reference set is not.
+Two habits matter more here than for most models. Scale the features first, because
+distance treats every column alike: a column measured in millions decides every neighbour,
+and one measured in fractions is ignored. Then reach for an index once the corpus is large.
+{py:func}`build_vector_index <batcher.ml.build_vector_index>` is the approximate route, and
+a broadcast reference set is not one.
 
 Ties at the k-th distance all count as neighbours, so a row can have more than `k` of them.
 The alternative would be to break the tie by reference-set order, which makes a prediction

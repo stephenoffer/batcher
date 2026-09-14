@@ -1,13 +1,14 @@
 # Relational operations
 
-This page covers the scripts that exercise the relational core: choosing columns, filtering
-rows, joining, aggregating, and computing over windows.
+This page covers the scripts that exercise the relational core in both of its spellings:
+choosing columns, filtering rows, joining, aggregating, computing over windows, and running
+the same plans as SQL.
 
 ## Projections and filters
 
 `select` decides the entire output shape, so anything it does not name is gone.
-`with_columns` keeps every existing column and adds or replaces. Reaching for the first when
-you meant the second is how a column quietly disappears three steps later.
+`with_columns` keeps every existing column and adds or replaces. Confuse the two and a column
+quietly disappears three steps later.
 
 ```python
 import batcher as bt
@@ -28,16 +29,16 @@ widened = orders.with_columns(price_in_thousands=col("o_totalprice") / 1000.0)
 assert widened.columns == [*orders.columns, "price_in_thousands"]
 ```
 
-Predicates combine with `&`, `|` and `~`, and the parentheses are mandatory because Python
-binds those tighter than the comparisons. The subtler point is three-valued logic: a
-comparison against null is null rather than false, so a row with a null key survives neither
-`x == 1` nor `x != 1`.
+Predicates combine with `&`, `|` and `~`. The parentheses are mandatory, because Python binds
+those tighter than the comparisons. Three-valued logic is the subtler point: a comparison
+against null is null rather than false, so a row with a null key survives neither `x == 1`
+nor `x != 1`.
 
 ## Joins
 
 The join type decides what happens to rows with no partner. Semi and anti are the filtering
-joins: both return only left-hand columns, and neither can increase the row count, which is
-what makes them the right tool for a membership test.
+joins. Both return only left-hand columns and neither can increase the row count, which makes
+them the right tool for a membership test.
 
 ```python
 orders = bt.from_pydict({"id": [1, 2, 3], "cid": [10, 20, 99]})
@@ -51,8 +52,8 @@ assert with_customer.columns == orders.columns
 ```
 
 Fan-out is the trap. An inner join emits one row per matching pair, so a right side with
-three rows for a key turns one left row into three. Checking the key's uniqueness first is
-one count, and aggregating the many side before the join removes the problem entirely.
+three rows for a key turns one left row into three. Check the key's uniqueness first; it is
+one count. Aggregating the many side before the join removes the problem entirely.
 
 ## Aggregation
 
@@ -81,12 +82,12 @@ assert result["l_shipmode"] == sorted(result["l_shipmode"])
 ```
 
 Two distinctions are worth holding onto. `bt.count()` counts rows while `col(x).count()`
-counts non-null values of x, and they differ the moment a column has nulls. And an empty sum
-is null rather than zero, while an empty count is zero rather than null.
+counts non-null values of x, and they differ the moment a column has nulls. The other is
+emptiness: an empty sum is null, an empty count is zero.
 
 ## Windows
 
-A group-by replaces the rows with one row per group; a window adds a column and keeps every
+A group-by replaces the rows with one row per group. A window adds a column and keeps every
 row. Reach for the window when downstream steps still need the detail.
 
 ```python
@@ -111,11 +112,56 @@ pairs, so the ranking direction is part of the window rather than a separate arg
 the default frame is the whole partition, so `last_value` returns the partition's last value
 rather than the current row.
 
+## SQL
+
+### SQL and the DataFrame API are the same thing
+
+A query is parsed into the logical plan the DataFrame API builds, so `bt.sql` returns a lazy
+Dataset rather than a materialized table. That means the two spellings interoperate freely
+and you can move between them mid-pipeline.
+
+```python
+import batcher as bt
+from batcher import col
+
+sales = bt.from_pydict(
+    {"region": ["west", "east", "west"], "amount": [10, 20, 30]}
+)
+
+summary = bt.sql(
+    "SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region",
+    sales=sales,
+)
+
+# Still a Dataset, so the DataFrame API picks up where the query left off.
+biggest = summary.filter(col("total") > 15).sort("total", descending=True)
+assert biggest.to_pydict()["region"] == ["west", "east"]
+```
+
+`ds.sql` is the same thing scoped to one Dataset, which it calls `self`. `bt.Session` gives a
+query its own catalog, which is what you want when two parts of a process register tables
+under the same names.
+
+### Where SQL surprises people
+
+Group and order by the alias, not by an ordinal. `ORDER BY 1` against a computed projection
+does not resolve, and the error names the column it could not find.
+
+Three-valued logic behaves as the standard requires, which is to say it catches people out.
+`COUNT(*)` counts rows while `COUNT(column)` counts non-nulls; a comparison against null is
+null, so neither `= 10` nor `<> 10` keeps a null row; and `IS NULL` is the only test that
+finds them. `examples/sql_queries/null_semantics_in_sql.py` asserts all three against a real
+left join.
+
+The parser takes a dialect, so a query written for another engine runs before it is ported.
+That matters for a migration. Prove the old query still returns the same rows here, and only
+then rewrite it.
+
 ## Every script on this page
 
-The table below lists the relational scripts in path order.
+The table below lists the relational and SQL scripts in path order.
 
-<!-- library-table: relational,joins,aggregations,windows,dataset -->
+<!-- library-table: relational,joins,aggregations,windows,dataset,sql_queries -->
 | Script | Shows |
 | --- | --- |
 | `examples/relational/anti_join_reconciliation.py` | Reconciling two datasets: what is in one and not the other, both ways |
@@ -221,4 +267,16 @@ The table below lists the relational scripts in path order.
 | `examples/dataset/reshaping.py` | Reshaping: pivot, unpivot, explode, unnest, and set operations |
 | `examples/dataset/sampling_and_splits.py` | Sampling and splitting: reproducible subsets that do not leak |
 | `examples/dataset/sql_interface.py` | SQL over the same engine, and mixing SQL with DataFrame verbs |
+| `examples/sql_queries/aggregates_and_having.py` | GROUP BY and HAVING in SQL, and the DataFrame equivalent |
+| `examples/sql_queries/basics.py` | SQL over Datasets: bt.sql with named table bindings |
+| `examples/sql_queries/ctes_and_views.py` | Naming intermediate results: CTEs in a query, views in a catalog |
+| `examples/sql_queries/date_and_string_functions.py` | Date and string functions in SQL over real data |
+| `examples/sql_queries/joins_and_subqueries.py` | Joins, CTEs and subqueries in SQL over real TPC-H tables |
+| `examples/sql_queries/mixing_sql_and_dataframe.py` | Moving between SQL and the DataFrame API mid-pipeline |
+| `examples/sql_queries/null_semantics_in_sql.py` | Three-valued logic in SQL, and where it surprises people |
+| `examples/sql_queries/set_operations_and_cases.py` | UNION, CASE and IN, written as SQL over real tables |
+| `examples/sql_queries/spark_dialect.py` | Reading SQL written for another engine |
+| `examples/sql_queries/sql_over_files.py` | Querying a file directly from SQL |
+| `examples/sql_queries/window_frames_in_sql.py` | Window frames spelled out in SQL |
+| `examples/sql_queries/window_functions.py` | Window functions in SQL, with the frame spelled out |
 <!-- /library-table -->

@@ -373,7 +373,7 @@ def ray_with_capacity():
     """
     ray = pytest.importorskip("ray")
     pytest.importorskip("ray.data")
-    from tests._ray_cluster import init_test_ray, shutdown_test_ray
+    from _ray_cluster import init_test_ray, shutdown_test_ray
 
     started = init_test_ray(2)
     private = False

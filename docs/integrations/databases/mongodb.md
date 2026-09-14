@@ -17,7 +17,7 @@ wire. No per-row Python, no `dict` per document. That is the only reason a Mongo
 doing at analytical scale, and it is why this connector cares about your documents having a
 *stable* shape.
 
-## Read
+## Reading
 
 ::::{tab-set}
 
@@ -54,9 +54,13 @@ recent = bt.read.mongo(
 
 ::::
 
-The URI carries the credentials. It is stored verbatim on the source and never logged: the
-connector's `identity()` is `mongo:<database>.<collection>`, deliberately free of the connection
-string, so a plan dump or a log line cannot leak your password.
+The URI carries the credentials. It is stored verbatim on the source and never logged. The
+connector's `identity()`, which is the key its learned statistics live under, is
+`mongo:<database>.<collection>:<fingerprint>`, where the fingerprint is a `sha256` over the
+connection options with the credential-ish keys excluded. So a plan dump or a log line cannot
+leak your password, the same collection on staging and on production does not share one
+statistics entry, and rotating the password neither leaks into the key nor orphans what has
+already been learned.
 
 ## Predicate pushdown
 
@@ -114,7 +118,7 @@ not thousands.
 `count()` is answered by `count_documents` with the pushed filter, so an unfiltered count moves no
 documents.
 
-## Write
+## Writing
 
 `ds.write.mongo(collection, uri=..., database=...)` applies every row in one `bulk_write` per batch, never a per-row round trip. `mode` says what it applies:
 
@@ -140,9 +144,9 @@ scored.write.mongo(
 )
 ```
 
-Two things follow from "upsert on a key". First, the write is idempotent: re-running the job
-replaces the same documents rather than duplicating them, which is what makes a retried or
-recomputed partition safe. Second, it is a *replace*, not a field merge.
+"Upsert on a key" buys idempotency: re-running the job replaces the same documents rather than
+duplicating them, which is what makes a retried or recomputed partition safe. It also costs
+something, because it is a *replace* rather than a field merge.
 
 :::{important}
 The matched document is replaced wholesale by the row, so columns you did not select are not

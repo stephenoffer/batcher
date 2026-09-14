@@ -2,10 +2,8 @@
 
 This page is the reference for the statistical surface of `batcher.ml`: distribution
 statistics and drift comparisons, fairness metrics, resampling for imbalanced labels,
-cross-validated scoring and splits, and model interpretation.
-
-These are the numbers you compute *around* a model rather than inside it, and every one
-of them is an engine query.
+cross-validated scoring and splits, and model interpretation. These are the numbers you
+compute *around* a model rather than inside it. Every one is an engine query.
 
 ## Statistics and drift
 
@@ -163,19 +161,10 @@ sample, because both techniques re-score through the engine.
 .. autofunction:: partial_dependence
 ```
 
-- {doc}`Inference </ml/inference/inference>`: batch prediction and embeddings.
-- {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fit/transform feature engineering.
-- {doc}`Multimodal </ml/preparing/multimodal/index>`: download, decode, tensors, vector search.
-- {doc}`Serving </ml/training/serving>` and {doc}`LLM inference </ml/retrieval/llm/index>`.
-- {doc}`PyTorch </ml/inference/pytorch>` and {doc}`streaming </ml/inference/streaming>` training loaders.
-- {doc}`GPU scheduling </ml/inference/gpu>`: how `num_gpus` and `concurrency` map to actors.
-- {doc}`Tabular models </ml/inference/tabular-models>`: scoring XGBoost, LightGBM, and scikit-learn.
-- {doc}`Evaluation </ml/evaluation/evaluation>`: metrics, per-segment scoring, diagnostic tables.
-- {doc}`Statistics and drift </ml/evaluation/statistics-and-drift>`: feature screening and monitoring.
-
 ## See also
 
 - {doc}`/api/models/ml-models`: the estimators and metrics these statistics are computed around.
 - {doc}`/ml/evaluation/statistics-and-drift`: the guide, with the monitoring workflow.
+- {doc}`/ml/evaluation/splits-and-resampling`: the guide to the resampling and splitting functions above.
 - {doc}`/ml/evaluation/evaluation`: per-segment scoring and the diagnostic tables.
 - {doc}`/cookbook/metrics/statistics/index`: 6 runnable recipes for these statistics in the engine.

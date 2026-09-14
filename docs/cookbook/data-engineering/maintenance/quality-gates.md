@@ -76,7 +76,7 @@ that failed:
 otherwise returns the dataset so the chain continues.
 
 ```python
-from batcher._internal.errors import DataQualityError
+from batcher import DataQualityError
 
 try:
     batch.dq.not_null("amount").fail()

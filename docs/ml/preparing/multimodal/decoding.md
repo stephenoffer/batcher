@@ -49,14 +49,14 @@ video = bt.read.video("data/videos/", decode=True, size=(112, 112), num_frames=8
 
 `size=(height, width)` says what shape every row must be; `fit` says how an image whose
 aspect ratio is not already that shape gets there. All three produce the same fixed-shape
-column, so nothing downstream can tell them apart — which is why the choice is worth
+column, so nothing downstream can tell them apart. That is why the choice is worth
 making rather than inheriting.
 
 | `fit` | What happens to a mismatched ratio | Reach for it when |
 |---|---|---|
 | `"stretch"` (default) | squashed to the exact size | the model was trained the same way |
-| `"letterbox"` | scaled inside the box, remainder padded grey | detection: stretching moves every predicted box off its object |
-| `"center_crop"` | centre kept at native resolution, border discarded | the subject is centred and the border is clutter |
+| `"letterbox"` | scaled inside the box, remainder padded gray | detection: stretching moves every predicted box off its object |
+| `"center_crop"` | center kept at native resolution, border discarded | the subject is centered and the border is clutter |
 
 ```python
 # docs: skip
@@ -85,8 +85,8 @@ Decode is fast because it runs in the data plane, not a Python loop. Image decod
 SIMD JPEG, including a DCT-scaled path for large frames feeding small model inputs, and
 SIMD resize, fanned out per row across every core. The result crosses into a shaped
 tensor column with no per-batch re-type step. On a 96-core node that decodes and resizes
-**5,693 images per second**, which is **2.4x Daft**, and streams LiDAR point clouds at
-**21,467 frames per second**. See
+5,693 images per second, which is 2.4x Daft, and streams LiDAR point clouds at 21,467
+frames per second. See
 {doc}`Multimodal ingest benchmarks </benchmarks/results/multimodal-ingest>` and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 
@@ -201,8 +201,8 @@ print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[
 ### Identifying bytes that did not come from a file
 
 The media and blob readers give you a `mime` column, sniffed from each file's leading bytes
-rather than its name. Bytes that arrive any other way — a download, a blob column in a
-Parquet table, a payload pulled out of an archive — have no such column and no filename to
+rather than its name. A download, a blob column in a Parquet table, a payload pulled out
+of an archive: bytes that arrive any other way have no such column and no filename to
 guess from. `.str.mime_type()` reads the same magic-number table as an expression:
 
 ```python
@@ -230,19 +230,19 @@ you `coalesce` in whatever you know instead.
 
 ### What a bad row does
 
-Every decode operation answers **null** for a row it cannot read: null input bytes,
+Every decode operation answers null for a row it cannot read: null input bytes,
 truncated files, a codec the build does not have. The batch is never failed, because one
 corrupt file in a scrape of millions is normal and losing the other millions to it is not.
 
 That extends to a column of nothing but nulls, which is a shape a media pipeline produces
-constantly — a download stage where every fetch failed, an outer join that matched nothing,
+constantly: a download stage where every fetch failed, an outer join that matched nothing,
 a partition filtered empty upstream. Such a column is typed `null` rather than `binary`,
 and the decode operations read it as "all rows are null" rather than as a type mismatch.
 
 An image too large to decode is a bad row too. The decoders carry a 512 MiB ceiling on the
-pixel data one image may produce, so a "decompression bomb" — a small file declaring
-enormous dimensions, such as the gigapixel scans and panoramas a real corpus contains
-without malice — nulls its row rather than allocating. `.image.decode()` still reads its
+pixel data one image may produce, so a "decompression bomb" nulls its row rather than
+allocating. That is a small file declaring enormous dimensions, such as the gigapixel
+scans and panoramas a real corpus contains without malice. `.image.decode()` still reads its
 header, so a corpus can be surveyed for oversized images before it is decoded:
 
 ```python
@@ -295,12 +295,12 @@ Follow it with `letterbox` or `to_tensor` to get back to one shape a model can b
 ready = patches.with_columns(x=col("patch").image.letterbox(224, 224))
 ```
 
-A window that runs past an edge is clipped to what exists, rather than padded — a crop is
+A window that runs past an edge is clipped to what exists, rather than padded. A crop is
 something you look at, and inventing black pixels there invents data. A window that is
 null, negative, empty, or entirely outside the image nulls **that row only**. That last
 part matters at corpus scale: boxes come from a model that sometimes declines to predict,
 or from a join that sometimes matches nothing, and one unusable box should not cost the
-batch it travelled in.
+batch it traveled in.
 
 ### Choosing how an image is resized
 
@@ -319,8 +319,8 @@ stretched image moves every box the model predicts off its object. `center_crop`
 answer either: it discards the border, which is where the missed detections are.
 
 `letterbox` is the standard detection preprocessing. It scales the whole image to fit,
-centres it on the canvas, and fills the remainder with a constant the model learns to
-ignore. The default fill of `114` is the YOLO family's grey, so a model trained against
+centers it on the canvas, and fills the remainder with a constant the model learns to
+ignore. The default fill of `114` is the YOLO family's gray, so a model trained against
 that preprocessing sees the padding it expects.
 
 ```python

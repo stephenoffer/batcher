@@ -1,8 +1,8 @@
 # Operations cookbook
 
-This section holds 7 runnable recipes for running the engine, ordered the way you meet them: configure it, watch it, then deal with what it tells you.
+Seven runnable recipes for operating the engine, ordered the way you meet them: configure it, watch it, then deal with what it tells you.
 
-Every page embeds a complete, self-contained script from the [`examples/operations/`](https://github.com/batcher/batcher/tree/main/examples/operations) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/operations/`](https://github.com/stephenoffer/batcher/tree/main/examples/operations) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|

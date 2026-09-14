@@ -1,6 +1,6 @@
 # Nulls and casting
 
-Null is not zero and not empty string, and every aggregate skips it. Casting is where a schema mismatch between two sources gets resolved, and where an unparseable value becomes a null rather than an error.
+Null is not zero and not empty string, and every column aggregate skips it. Casting is where a schema mismatch between two sources gets resolved, and the strictness is a choice: `cast` raises on a value it cannot parse, while `try_cast` turns that value into a null instead. The second one fails silently. That is the point, and the risk.
 
 The whole script, executed on every test run:
 

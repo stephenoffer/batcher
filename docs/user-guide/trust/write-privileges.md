@@ -48,7 +48,7 @@ with bt.security(writes, loader):
 print(bt.read.parquet(loading).to_pydict())
 ```
 
-**Granting one privilege does not confer another**, which is the whole reason to grant
+Granting one privilege does not confer another, which is the whole reason to grant
 `INSERT` rather than "write". The load job above can add today's data and cannot drop
 yesterday's, because `overwrite` destroys the rows already there and therefore needs
 `DELETE` as well:
@@ -107,12 +107,14 @@ Write decisions are audited in the same {py:class}`GovernanceEvent <batcher.Gove
 shape a read produces, with `privilege` naming the write and `visible` naming the columns
 written, so "who touched this table" is one query over one log.
 
-## Maintenance runs outside the block
+## The two rewrites a block refuses
 
-{py:func}`bt.compact() <batcher.compact>` reads a table and writes the result back over it.
-Inside a `security()` block that read is the *principal's* view, so the write would replace
-the table with it: the masked value in place of the real one, and no column at all where the
-principal had no `SELECT`. Batcher refuses it rather than doing it.
+Some writes read the target and write the result back over it. Inside a `security()` block
+that read is the *principal's* view, so the write would replace the table with it: the
+masked value in place of the real one, and no column at all where the principal had no
+`SELECT`. Batcher refuses both of them rather than doing it.
+
+{py:func}`bt.compact() <batcher.compact>` is the first.
 
 ```python
 from batcher._internal.errors import AccessDeniedError
@@ -126,6 +128,18 @@ except AccessDeniedError as exc:
 
 Run maintenance outside the block, with the engine's own authority over the table, which is
 how a warehouse runs `OPTIMIZE` anyway.
+
+The second is a copy-on-write {py:meth}`ds.merge() <batcher.Dataset.merge>`, which reads the
+files it will rewrite, composes the clauses over them, and writes the result back. Every row
+the clauses do *not* match is carried through the principal's view and rewritten that way, so
+a governed copy-on-write merge is refused too. A merge into Delta or Iceberg is not: the
+format's own client merges against the raw table inside itself, so nothing is read through
+the view and nothing can be written back narrowed.
+
+The refusal is unconditional on the table being governed, not conditional on the view
+actually being narrower. Deciding "narrower" would need the table's raw column list, which is
+the one thing a governed context cannot obtain without the bypass the refusal exists to
+avoid.
 
 {py:func}`bt.vacuum() <batcher.vacuum>` is different: it deletes files no live version
 references, so it never writes a view back. A real vacuum needs `DELETE`. A dry run needs

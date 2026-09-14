@@ -1,7 +1,7 @@
 # Operate
 
-Run the pipeline and understand what it did. This section splits in two: making a correct
-query fast, and keeping a running job healthy.
+Run the pipeline and understand what it did. The section splits in two. One half is making a
+correct query fast, the other is keeping a running job healthy.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -28,10 +28,12 @@ come and go.
 | {doc}`Performance and memory <tuning/performance>` | The levers that make a correct query fast, inside a memory envelope |
 | {doc}`Caching results <tuning/caching>` | Reuse a result instead of recomputing the plan |
 | {doc}`Reading query plans <tuning/explain-plans>` | The plan and the measured profile, and how to find the expensive operator |
+| {doc}`Pushdown <tuning/pushdown>` | What the optimizer can push into the scan, and what blocks it |
 | {doc}`Best practices <tuning/best-practices>` | Patterns for pipelines that stay fast |
 | {doc}`Reading a very large table <tuning/large-tables>` | Plan-time pruning, sampled estimates, and how the work is divided |
 | {doc}`Observability <running/observability>` | The one event channel, structured logs, the dashboard, and the metrics export |
 | {doc}`The terminal <running/terminal>` | What a query prints while it runs, and the one line it leaves behind |
+| {doc}`Metrics <running/metrics>` | The counters a scrape loop reads, and what each execution path reports |
 | {doc}`Troubleshooting <running/troubleshooting>` | The common failures, by symptom |
 | {doc}`GPU fleets <running/gpu-fleets>` | Power budgets, fabric-aware placement, device health, residency |
 | {doc}`Diagnose a slow GPU stage <running/gpu-diagnosis>` | Why a GPU stage was slow, when the answer is not in the plan |

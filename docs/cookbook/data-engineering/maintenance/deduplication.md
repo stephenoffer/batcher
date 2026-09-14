@@ -172,7 +172,7 @@ looked nice.
 
 ## Picking the tool
 
-Four tools deduplicate, and they differ in what they hand back and what they cost. Match
+Three tools deduplicate, and they differ in what they hand back and what they cost. Match
 the row to the question you actually need answered:
 
 | Tool | Gives you | Costs | Reach for it when |

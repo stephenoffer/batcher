@@ -1,14 +1,19 @@
 # Stateful streaming operators
 
-This page describes the streaming operators that **remember something between
-micro-batches**: watermark deduplication, the stream-stream interval join, the stream-static
-join, session windows, arbitrary keyed state, and the union that interleaves two streams. Windows and watermarks are on
-{doc}`streaming`, because they are the mechanism these lean on rather than an operator.
+This page describes the streaming operators that remember something between micro-batches:
+watermark deduplication, the stream-stream interval join, the stream-static join, session
+windows, arbitrary keyed state, and the union that interleaves two streams. Windows and
+watermarks are on {doc}`streaming`, because they are the mechanism these lean on rather than
+an operator.
 
-They share one problem and one answer. The problem is that state over an unbounded input is
-unbounded unless something releases it; the answer is always a *bound you choose* — a
-watermark, an interval, a TTL. An operator here with no bound set is one whose memory grows
-for the life of the query.
+They share one problem and one answer. State over an unbounded input grows without limit
+unless something releases it. The answer is always a *bound you choose*: a watermark, an
+interval, a TTL. An operator here with no bound set is one whose memory grows for the life
+of the query.
+
+Several of the operators below bound their state with a watermark, which is a frontier over event time rather than over arrival order:
+
+![Seven records plotted left to right in the order they arrived, with event time on the vertical axis. A step line tracks the highest event time the stream has seen, and the watermark is that line lowered by the five minutes of allowed lateness, rising in steps as higher event times arrive. Record 4 carries event time 10:03 and arrives after a 10:05 record, so it is out of order, but it is still at or above the frontier as that frontier stood before its own batch, and it is kept. Record 6 carries 09:58, below the frontier, so it is filtered out in Rust before the aggregate sees it and counted as num_late_inputs_dropped on the progress record. Across several partitions the watermark is the minimum of the partitions' event-time maxima, so one slow partition holds the whole frontier back. A late row is dropped and counted, never buffered or re-emitted.](../../_static/diagrams/watermark_late_data.svg)
 
 Every example on this page starts from the same imports and clock:
 
@@ -39,7 +44,7 @@ records = bt.from_pydict({
 })
 deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
                                                    lateness="1h")
-print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'] — the second 'x' dropped
+print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'], the second 'x' dropped
 ```
 
 A deduplicated stream writes to a sink like any other streaming query, which is usually
@@ -53,6 +58,10 @@ deduped.write.delta("lake/silver/events", trigger=bt.Trigger.processing_time("30
 `checkpoint=` is refused here. The seen-key set is not a source offset, so a restart would
 resume with an empty one while the offset log said otherwise, which looks exactly like
 exactly-once recovery and is not. The sink's own idempotency still applies.
+
+That idempotency belongs to the write rather than to the stream, and which write you chose is what decides it:
+
+![The same 5,000-row batch delivered twice to the same table, in two lanes. Written with write.delta(table, mode='append'), the first delivery lands 5,000 rows and the replay lands 5,000 more, leaving 10,000 rows over 5,000 distinct keys, so every key appears twice. Written with write.delta(table, merge_on='o_orderkey'), the replay finds every key already present and rewrites those rows rather than adding them, leaving 5,000 rows over 5,000 distinct keys and the batch's own total rather than a doubled one; a third delivery changes nothing again. The append has no key to match on and cannot tell the two deliveries apart. A streaming write gets the same property from the Delta txn action, which records the query name and batch id so a replayed id commits nothing, and resuming also needs the position the write reached, recorded with it.](../../_static/diagrams/exactly_once.svg)
 
 ## Stream-to-stream joins
 
@@ -68,19 +77,19 @@ clicks2 = bt.from_pydict({"ad": ["a"], "clicked": [base + dt.timedelta(minutes=2
 attributed = impressions.join_stream(
     clicks2, on="ad", left_time="shown", right_time="clicked", within="5m"
 )
-print(attributed.to_pydict()["ad"])  # ['a'] — clicked within 5 minutes of shown
+print(attributed.to_pydict()["ad"])  # ['a'], clicked within 5 minutes of shown
 ```
 
 `how=` takes `"inner"` (the default), `"left"`, `"right"`, and `"full"`. An unmatched row
 is emitted null-padded at the moment the watermark guarantees no partner can still arrive
-for it — which is the only moment that statement is decidable about an unbounded stream,
-and why the interval is required rather than optional:
+for it. That is the only moment such a statement is decidable about an unbounded stream,
+which is why the interval is required rather than optional:
 
 ```python
 unclicked = impressions.join_stream(
     clicks2, on="ad", left_time="shown", right_time="clicked", within="5m", how="left"
 )
-print(sorted(unclicked.to_pydict()["ad"]))  # ['a', 'b'] — 'b' with null click columns
+print(sorted(unclicked.to_pydict()["ad"]))  # ['a', 'b'], with 'b' carrying null click columns
 ```
 
 A joined stream writes to a sink like any other streaming query:
@@ -91,10 +100,10 @@ attributed.write.delta("lake/attribution", trigger=bt.Trigger.processing_time("3
 ```
 
 `checkpoint=` is the one thing it refuses. A join's state is two buffered sides and two
-watermarks, none of it addressable by a source offset, so there is nothing to resume from
-— and accepting the argument would restart from an empty join on every restart while
-looking exactly like exactly-once recovery. The sink's own idempotency still applies, so a
-replayed micro-batch does not duplicate rows.
+watermarks, none of it addressable by a source offset, so there is nothing to resume from.
+Accepting the argument would restart from an empty join every time while looking exactly
+like exactly-once recovery. The sink's own idempotency still applies, so a replayed
+micro-batch does not duplicate rows.
 
 ## Stream-to-static joins
 
@@ -165,6 +174,10 @@ for batch in visits.session_window(
 # [1]
 ```
 
+A session differs from the fixed windows on {doc}`streaming` in one way, and it is a difference in shape over time:
+
+![The same eight events on one event-time axis, bucketed three ways, each window labelled with how many events it caught. Tumbling, written window(ts, '10m'), lays a fixed grid and puts every event in exactly one window: 4, then 1, then 3. Sliding, written window(ts, '10m', '5m') and then unnested, keeps that grid and adds the offset windows in between, two of them catching 2 events each, so an event is counted twice; a sliding window whose hop equals its width is a tumbling window. A session window with a five-minute gap has no grid at all, because the data sets both bounds: one session catches 5 events and a later one catches 3, and a gap of exactly five minutes does not split a session.](../../_static/diagrams/window_types.svg)
+
 The buffer holds rows for sessions still open, which is the live key space times the gap
 rather than the length of the stream. A source whose event time stalls never closes a
 session, so the retained rows are checked against `memory.streaming_state_max_bytes` and a
@@ -208,13 +221,13 @@ is not called, which is what keeps a million-key state from becoming a million P
 per trigger.
 
 State must be a flat mapping of scalars, because the whole key space is checkpointed as one
-Arrow batch — so a query resumes with its state intact. Keep a large payload elsewhere and
-hold a reference to it in state.
+Arrow batch, which is what lets a query resume with its state intact. Keep a large payload
+elsewhere and hold a reference to it in state.
 
 :::{warning}
 `state_ttl` is what bounds the memory. Without one, a key is remembered for the life of the
 query, which is correct only if the key space is. An unbounded key space and no TTL ends in
-a `ResourceError` against `memory.streaming_state_max_bytes` — loudly, but hours later.
+a `ResourceError` against `memory.streaming_state_max_bytes`. Loudly, but hours later.
 :::
 
 :::{note}
@@ -260,27 +273,28 @@ read. That is the same property {py:meth}`join_stream <batcher.Dataset.join_stre
 and for the same reason: one driver thread, and the source decides when its read returns.
 :::
 
-
 ## When state outgrows memory
 
 `memory.streaming_state_max_bytes` caps what one streaming operator may hold. A **windowed**
 aggregate that reaches it moves its oldest windows to disk and keeps running. Everything else
 still stops with a `ResourceError`.
 
-The asymmetry is not an oversight, it is what the operators make possible. A watermark only
-moves forward, so a windowed aggregate evicts its windows in increasing order — a window
-written to disk is read back exactly once, when it closes, and never searched for. That is an
-ordered run of files, which is cheap. A running aggregate with no watermark finalizes every
-group on every micro-batch, so its state has no cold end to shed; making that spill needs a
-keyed store with point lookups, which Batcher does not have.
+The asymmetry follows from the operators. A watermark only moves forward, so a windowed
+aggregate evicts its windows in increasing order: a window written to disk is read back
+exactly once, when it closes, and never searched for. That is an ordered run of files, which
+is cheap. A running aggregate with no watermark finalizes every group on every micro-batch,
+so its state has no cold end to shed. Making that spill needs a keyed store with point
+lookups, which Batcher does not have.
 
 You do not configure any of this. Spilling starts when the cap is reached and stops when
-resident state is back under it, splitting at the median window start so the newest windows —
-the ones incoming rows land in — stay in memory:
+resident state is back under it, splitting at the median window start so the newest windows,
+the ones incoming rows land in, stay in memory:
 
 ```python
 # docs: skip
-with bt.option_context("memory.streaming_state_max_bytes", 512 << 20):
+from batcher.config import option_context
+
+with option_context("memory.streaming_state_max_bytes", 512 << 20):
     query = (
         events.with_watermark("ts", "1 hour")
         .group_by(w=bt.window(col("ts"), "5 minutes"), user=col("user"))
@@ -295,13 +309,13 @@ it. Watch `memory_used_bytes` against `num_rows_total` to see the split.
 
 `memory_used_bytes` also counts what `update` output mode retains beside the aggregate. That
 mode diffs each result against a copy of the one before it, so a query in `update` holds the
-aggregate **twice** — and the cap counts both. If a query that used to run now reaches the
+aggregate **twice**, and the cap counts both. If a query that used to run now reaches the
 cap sooner, this is why: it was always using that memory, and the budget was reporting half
 of it.
 
 A `ResourceError` still happens, and it now means something narrower than it used to: the
-**newest** windows alone exceed the cap. No amount of disk fixes that — it is a key space too
-wide for the envelope, or a watermark that has stopped closing anything.
+**newest** windows alone exceed the cap. No amount of disk fixes that. Either the key space
+is too wide for the envelope, or the watermark has stopped closing anything.
 
 ### What spilling costs
 
@@ -311,7 +325,7 @@ the answer is unchanged, which
 pins against the same query run entirely in memory.
 
 Spilled runs go to `memory.spill_dir` when you set one, and to the engine's usual scratch
-location otherwise — the same disk every other spill uses. They are scratch: a restart rebuilds
+location otherwise, which is the same disk every other spill uses. They are scratch: a restart rebuilds
 them from the checkpoint, and the query deletes them when it stops.
 
 ## How state is checkpointed
@@ -319,7 +333,12 @@ them from the checkpoint, and the query deletes them when it stops.
 A stateful query with a `checkpoint=` location persists its state so a restart resumes
 instead of recomputing. What it writes per micro-batch depends on the operator.
 
-A **running aggregate** — a `group_by(...).agg(...)` with no watermark — records a
+What ends up on disk is three directories with a fixed write order, and that order is what a
+restart reads backwards:
+
+![What a stateful query keeps in memory and what it writes to the checkpoint. A micro-batch is partial-aggregated and combined into a running state of one row per group. The checkpoint directory holds three things: the source offsets, written before the batch runs; a state directory holding a base snapshot plus one delta per batch; and a commit log written last. A restart seeks each source to the last committed batch's position, rebuilds the state by combining the newest snapshot with every delta recorded after it, and replays the batch that appears in offsets but not in commits. A delta costs the batch's own distinct group count rather than the whole state, so the per-epoch cost stops growing with the state it protects. Both folds can express an eviction in a delta: the unwatermarked aggregate never removes a row, and the windowed aggregate removes only a prefix on a totally ordered axis, which one integer bound in each entry describes.](/_static/diagrams/state_store.svg)
+
+A **running aggregate**, meaning a `group_by(...).agg(...)` with no watermark, records a
 *changelog*: the partial aggregate that micro-batch folded in, rather than the whole state.
 It can, because an aggregate's `combine` is associative and commutative, so combining a
 snapshot with every partial recorded after it reconstructs exactly the state the whole
@@ -327,8 +346,8 @@ snapshot would have held. Recovery replays the chain.
 
 That matters because this is the operator whose state only grows. Nothing closes a group, so
 a query that has accumulated ten million of them was rewriting ten million rows on every
-trigger — a checkpoint whose cost rises for the life of the query, with the flush on the
-critical path of every epoch. A changelog entry costs the *batch's* distinct group count
+trigger. That is a checkpoint whose cost rises for the life of the query, with the flush on
+the critical path of every epoch. A changelog entry costs the *batch's* distinct group count
 instead:
 
 | Micro-batches | Whole snapshot per epoch | Changelog | Reduction |
@@ -341,7 +360,7 @@ instead:
 The reduction grows with the run because the two costs scale differently: writing the whole
 state every epoch is quadratic in the number of epochs, and writing a changelog is linear.
 The figures are bytes written to the checkpoint, one group per row on the `rate` source,
-from `benchmarks/scenarios/streaming/state_checkpoint.py` — run it to reproduce them. They
+from `benchmarks/scenarios/streaming/state_checkpoint.py`. Run it to reproduce them. They
 are a write-volume measurement, not a wall-clock one: the flush is on the critical path of
 every epoch, so fewer bytes is less latency, but how much depends entirely on what the
 checkpoint is written to.
@@ -350,7 +369,7 @@ A **windowed** aggregate records one too, for a different reason. It *removes* s
 is normally what disqualifies an operator: a changelog says what went in and has no way to
 say what came out, so replaying one would resurrect the windows eviction already emitted. It
 qualifies because its removal is not arbitrary. Eviction drops every window whose start is at
-or below a threshold, on a totally ordered axis, so what it removes is always a **prefix** —
+or below a threshold, on a totally ordered axis, so what it removes is always a **prefix**,
 and a prefix is described by its upper bound. That single integer rides in each entry, and
 replay combines the partials and re-applies it.
 
@@ -370,7 +389,9 @@ every epoch.
 
 ```python
 # docs: skip
-with bt.option_context("streaming.checkpoint_delta_interval", 25):
+from batcher.config import option_context
+
+with option_context("streaming.checkpoint_delta_interval", 25):
     query = (
         events.group_by("user")
         .agg(total=col("amount").sum())
@@ -378,14 +399,14 @@ with bt.option_context("streaming.checkpoint_delta_interval", 25):
     )
 ```
 
-A changelog entry is only written when it is genuinely smaller than the state — at least
+A changelog entry is only written when it is genuinely smaller than the state: at least
 twice as small. A stream whose every micro-batch touches every group gets whole snapshots,
 because for that shape a chain would write more, not less. You do not have to know which
 shape you have.
 
 A windowed aggregate that has spilled writes a **multi-part** snapshot: its resident state and
 each spilled run go into one file, streamed, so the checkpoint never pulls a state larger than
-the memory cap back into memory to persist it. Recovery combines the parts — the same
+the memory cap back into memory to persist it. Recovery combines the parts, because the same
 `combine` that makes the changelog sound makes the split into parts invisible. On an object
 store the snapshot buffers rather than streams, because a PUT needs the whole object.
 

@@ -79,7 +79,7 @@ back to starting a local Ray only when nothing is reachable.
 Detection is env-var only, never a metadata-service call on a hot path. It covers Anyscale, any
 KubeRay-operated cluster, which is the on-prem, self-hosted, and any-cloud Kubernetes case, and an
 explicit `BATCHER_RAY_CLUSTER=1` escape hatch for a platform none of those name. No platform is
-privileged; batcher behaves identically wherever it runs. If detection is wrong, `_ensure_ray`
+privileged, and Batcher behaves identically wherever it runs. If detection is wrong, `_ensure_ray`
 still falls back to a local start when no cluster turns out to be reachable, so a false positive
 degrades rather than fails.
 
@@ -98,9 +98,9 @@ matters:
 | `ray_address`, or `RAY_ADDRESS` | Raises. You named a cluster, and running single-node in its place is a wrong answer, not a degraded one. |
 | Detected from the environment | Starts a local single-node Ray, so a dev run inside a workspace whose cluster is down still works. |
 
-You do not need to pre-install batcher on the workers: when batcher initializes Ray against a
-cluster it ships its own package (including the compiled extension) via `runtime_env`. Set
-`trust_cluster_image=True` to skip that upload when your image already bakes batcher in.
+You do not need to pre-install Batcher on the workers. When it initializes Ray against a
+cluster it ships its own package, compiled extension included, via `runtime_env`. Set
+`trust_cluster_image=True` to skip that upload when your image already bakes Batcher in.
 
 ```python
 from batcher import Config
@@ -119,10 +119,10 @@ first task, usually with an import error naming the native module.
 `namespace` isolates a job's shuffle actors. Two jobs in one namespace can see each other's actors.
 
 `transport` picks the shuffle. `"auto"` chooses Flight on a genuine multi-node cluster and a disk
-shuffle on a single node. The disk shuffle writes to a driver-local `work_dir`, so it is correct
-only on one node or with `shared_filesystem=True`, which is why `"auto"` will not choose it across
-nodes. Forcing `transport="disk"` on a multi-node cluster without a shared filesystem is a way to
-get tasks that cannot find their input.
+shuffle on a single node. The disk shuffle hands paths between tasks rather than bytes, so every
+path has to resolve on whichever node picks the task up. That holds on one node, and on a cluster
+where `shared_filesystem=True` says every worker mounts the same scratch at the same path. Forcing
+`transport="disk"` anywhere else is a way to get tasks that cannot find their input.
 
 `shuffle_token` (also read from `BATCHER_SHUFFLE_TOKEN`) authenticates Flight fetches, and
 `distributed.tls` turns on TLS/mTLS between workers. On a shared or untrusted network, set both.
@@ -211,25 +211,25 @@ transfer exceeding 40% of total AWS spend on distributed workloads, and 20-40% a
 synchronous ones. A fleet spread evenly over three zones sends about two thirds of its shuffle
 across that boundary for no benefit, since the bundles are interchangeable. Batcher picks the zone
 with the most free capacity that can host the whole fleet and reserves the bundles there. It is a
-no-op on a single-zone cluster, on nodes with no zone label, and whenever no one zone has room —
-and because the pin is on the bundles rather than the tasks, a group that cannot form is abandoned
-at the placement timeout and the stage falls back to ordinary scheduling. Set
+no-op on a single-zone cluster, on nodes with no zone label, and whenever no one zone has room.
+The pin is on the bundles rather than the tasks, so a group that cannot form is abandoned at the
+placement timeout and the stage falls back to ordinary scheduling. Set
 `distributed.zone_aware_placement=False` when zone diversity is being bought deliberately for
 availability.
 
 If you control how the cluster is provisioned, pinning it there is better still: a single-AZ
 compute config (`STRICT_ZONAL_PACK` on Anyscale) removes the cross-zone traffic rather than
 routing around it, and also covers the head node. The runtime pin exists for the case where that
-is not available — most obviously an accelerator fleet, where scarce instance types make
-cross-zone autoscaling the only way to get capacity at all, and the cluster therefore spans zones
-whether the job wants it to or not.
+is not available. An accelerator fleet is the obvious one: scarce instance types make cross-zone
+autoscaling the only way to get capacity at all, so the cluster spans zones whether the job wants
+it to or not.
 
 **A shuffle replica avoids the primary's failure domain, not just its node.** With
 `distributed.shuffle_replication` above 1, each mapper's output is copied to a survivor so a
 worker loss costs a re-fetch rather than a recompute. The copy has always gone to a different
 node; it now also prefers a node that is *not* spot when the primary's is. A spot reclamation
 takes an instance group rather than a machine, so a second copy on another spot node goes away
-in the same wave as the first — on exactly the fleet the `spot` resilience profile turns
+in the same wave as the first, on exactly the fleet the `spot` resilience profile turns
 replication on for. Spot is read from `ray.io/market-type` and from the Karpenter, EKS, and GKE
 capacity labels, since a KubeRay fleet is labelled by whichever provisioner brought the node up.
 It is a preference, never an exclusion: an all-spot fleet, or one with no capacity labels at
@@ -287,8 +287,8 @@ everywhere. Batcher's own progress reporting is unaffected, since it reads the e
 rather than Ray's.
 
 **A reservation that does not form now says why.** A gang that cannot be satisfied used to fall
-back silently, and the tasks it fell back to ask for the same resources the bundles did — so the
-query would hang at a barrier with nothing anywhere explaining it. Batcher now compares the ask
+back silently, and the tasks it fell back to ask for the same resources the bundles did. The query
+would hang at a barrier with nothing anywhere explaining it. Batcher now compares the ask
 against the live topology and reports the outcome: an ask no node can host names the binding
 resource and the widest node's figure, an ask every candidate node is too busy for says the cluster
 is full and by how much, and a cluster with room says nothing at all. The same diagnosis is
@@ -324,8 +324,8 @@ instead of clamping to the pre-scale size. The wait is bounded by `autoscale_wai
 by default: a bounded wait on an autoscaling cluster, off on a fixed one), and it stops early
 once capacity has been flat for `autoscale_stall_s` or never grew at all within
 `autoscale_startup_grace_s`. If your jobs consistently run on too few workers, those are the
-knobs — `placement_timeout_s` is a different thing, and it bounds the gang reservation that
-happens *after* the fan-out is chosen.
+knobs. `placement_timeout_s` is a different thing: it bounds the gang reservation that happens
+*after* the fan-out is chosen.
 
 **Ray started locally by accident.** On a managed workspace that exports no `RAY_ADDRESS`, an
 explicit `ray.init()` in your own code before Batcher's can strand the job on a local single-node

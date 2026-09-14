@@ -20,4 +20,4 @@ python examples/ml/outlier_detection.py
 - {doc}`/cookbook/ml/validation/model_selection`: cross-validation, learning curves, and feature importance, all in the engine.
 - {doc}`/cookbook/ml/preprocessing/preprocessing_binning`: discretizing, clipping, and reshaping the distribution of a numeric column.
 - {doc}`/ml/index`: the ML surface these recipes sit on.
-- {doc}`/ml/preparing/preprocessors/index`: the fit and transform steps most pipelines start with.
+- {doc}`/ml/evaluation/statistics-and-drift`: the outlier rules and the statistics around them, in full.

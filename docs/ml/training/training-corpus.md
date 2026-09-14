@@ -1,9 +1,9 @@
 # Preparing a training corpus
 
-This page covers the three steps between having text and being able to train on it: mixing
-several sources at the ratio you meant, dropping the documents that are not prose, and removing
-the evaluation data that leaked in. Each one is a data bug that presents as a model bug when
-it's skipped, which is why they're worth doing before the expensive part.
+This page covers the four steps between having text and being able to train on it: mixing
+several sources at the ratio you meant, dropping the documents that are not prose, removing the
+evaluation data that leaked in, and ordering what's left so a batch isn't mostly padding. Skip
+any of them and you get a data bug that presents as a model bug.
 
 Everything here is in `batcher.ml` and built on the public {py:class}`Dataset <batcher.Dataset>` API, so each step is a plan
 the optimizer sees whole rather than a pass over materialized rows.
@@ -88,8 +88,8 @@ once. A null document fails everything, since a row the filter can't read isn't 
 on.
 
 When the filter removes something it should have kept, `bt.ml.quality_flags` answers the next
-question. It appends one boolean per rule, true where the document passes, plus `passes_all` —
-so a dropped row explains itself instead of having to be re-derived by hand.
+question. It appends one boolean per rule, true where the document passes, plus `passes_all`, so
+a dropped row explains itself instead of having to be re-derived by hand.
 
 ```python
 from batcher.ml import quality_flags
@@ -131,15 +131,15 @@ print(decontaminate(train, "text", evals, n=4).to_pydict()["text"])
 
 `n` is the whole judgement. The default of 13 tokens is where the published pipelines settled:
 long enough that an accidental match between unrelated documents is vanishingly unlikely, short
-enough to catch a quoted question. Shorter spans start matching ordinary English, and then you
-are deleting real training data to remove contamination that was never there.
+enough to catch a quoted question. Go shorter and spans start matching ordinary English. You are
+then deleting real training data to remove contamination that was never there.
 
 Measure with `contamination_rate` before removing. A small rate is contamination to drop. A
 large one usually means `n` is too short for your corpus, not that your corpus is ruined.
 
 Matching uses the same normalization the grounding metrics use, so a requoted question with
-different casing or punctuation still matches. It's verbatim overlap, so a paraphrase of a test
-question does not: this removes copies, not leakage in general.
+different casing or punctuation still matches. A paraphrase of a test question does not, because
+the check is verbatim overlap. This removes copies, not leakage in general.
 
 The check runs as a join rather than a scan per document, so it scales the way every other join
 here does instead of being quadratic in the corpus size.
@@ -148,9 +148,8 @@ here does instead of being quadratic in the corpus size.
 
 A training batch is a rectangle. Every sequence in it is padded to the longest one, and every
 padded position costs the same attention arithmetic as a real token while teaching the model
-nothing. On a corpus whose lengths vary — which is every natural-language corpus — a randomly
-ordered batch pairs a 40-token example with a 2,000-token one and spends most of its compute on
-padding.
+nothing. Lengths vary on every natural-language corpus, so a randomly ordered batch pairs a
+40-token example with a 2,000-token one and spends most of its compute on padding.
 
 Sorting the whole corpus by length fixes that and breaks the training: the model then sees all
 the short examples first and all the long ones last, which is a curriculum nobody chose.

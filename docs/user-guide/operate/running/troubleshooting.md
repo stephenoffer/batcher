@@ -14,7 +14,7 @@ and follow it. The rest of this page covers the exceptions themselves.
 |---|---|
 | Nothing ran, or the result is a {py:class}`Dataset <batcher.Dataset>` repr | "Nothing happened when I called a transformation", below |
 | The answer is wrong | {doc}`/user-guide/operate/tuning/explain-plans`, then {doc}`/user-guide/trust/data-quality` to assert what you expected |
-| Correct, but too slow | {doc}`/user-guide/operate/tuning/performance`, then {doc}`/tutorials/foundations/optimizing-a-slow-query` |
+| Correct, but too slow | {doc}`/user-guide/operate/tuning/performance`, then {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` |
 | A query is taking far too long and you want it to stop | "Stopping a query that is taking too long", below |
 | Out of memory | "A large query runs out of memory", below, and {doc}`/architecture/deep-dives/memory/spilling` |
 | The same query keeps recomputing | {doc}`/user-guide/operate/tuning/caching` |
@@ -161,9 +161,9 @@ except bt.ColumnNotFoundError as exc:
 
 The available columns are truncated rather than listed in full, so a miss against a
 400-column table does not bury the error under the schema it is complaining about. When you
-want the whole list, it is on the exception as `.available` -- along with `.column`,
+want the whole list, it is on the exception as `.available`, along with `.column`,
 `.suggestion` and `.hint`, which is what a script should read. The rendered sentence is for
-people and may be reworded; the fields are the contract.
+people and may be reworded. The fields are the contract.
 
 Catch a narrower type when you want to react differently. The catchable types are all
 reachable as `bt.<Name>`:
@@ -192,11 +192,24 @@ Because several also subclass a builtin, existing `except ValueError` /
 
 ## Stopping a query that is taking too long
 
-Ctrl-C during a long `collect()` stops it. That is worth stating because it did not always: the engine releases the interpreter lock while it runs, so Python had no opportunity to deliver the signal until the query finished on its own, and Ctrl-C appeared to do nothing.
+Ctrl-C during a long `collect()` stops it. That is worth stating because it did not always.
+The engine releases the interpreter lock while it runs, so Python had no opportunity to
+deliver the signal until the query finished on its own, and Ctrl-C appeared to do nothing.
 
-Cancellation is *cooperative*. The engine checks between morsels, between operators, and between the merge passes of a spilling sort, so a query stops at the next such point rather than instantly. A query part-way through building a join's hash table stops when that build completes. A cancelled query raises `QueryCancelledError`; it never returns a partial result, because rows that look complete and are not are worse than an error.
+Cancellation is *cooperative*. The engine checks between morsels, between operators, and
+between the merge passes of a spilling sort, so a query stops at the next such point rather
+than instantly. A query part-way through building a join's hash table stops when that build
+completes. A cancelled query never returns a partial result, because rows that look
+complete and are not are worse than an error.
 
-To stop a query from somewhere other than the keyboard, such as another thread or a notebook cell, list what is running and cancel by id:
+What it raises depends on who cancelled it. Ctrl-C comes back as `KeyboardInterrupt`, which
+is what pressing it is supposed to produce. A cancel from another thread raises
+`QueryCancelledError` instead, because nobody pressed anything. A second Ctrl-C reaches
+Python's previous handler, so the usual hard interrupt still escapes a query that will not
+stop.
+
+To stop a query from somewhere other than the keyboard, such as another thread or a notebook
+cell, list what is running and cancel by id:
 
 ```python
 import batcher as bt
@@ -205,7 +218,10 @@ print(bt.running_queries())
 # []
 ```
 
-Each terminal operation registers one id for its duration, so {py:func}`running_queries() <batcher.running_queries>` is empty between queries. From a second thread, {py:func}`bt.cancel_query(query_id) <batcher.cancel_query>` asks that one to stop and returns whether it was still running:
+Each terminal operation registers one id for its duration, so
+{py:func}`running_queries() <batcher.running_queries>` is empty between queries. From a
+second thread, {py:func}`bt.cancel_query(query_id) <batcher.cancel_query>` asks that one to
+stop and returns whether it was still running:
 
 ```python
 import batcher as bt
@@ -214,10 +230,13 @@ print(bt.cancel_query("q-already-finished"))
 # False
 ```
 
-`False` means the query had already finished. That is not an error: a cancel and a completion racing has no correct loser.
+`False` means the query had already finished. That is not an error. A cancel and a
+completion racing has no correct loser.
 
 ```{note}
-This covers a query running in *this* process. On a distributed run the driver cancels its own execution and the Ray tasks it launched, but there is no cluster-wide admission queue to cancel a query queued on another driver.
+This covers a query running in *this* process. On a distributed run the driver cancels its
+own execution and the Ray tasks it launched, but there is no cluster-wide admission queue to
+cancel a query queued on another driver.
 ```
 
 ## A large query runs out of memory

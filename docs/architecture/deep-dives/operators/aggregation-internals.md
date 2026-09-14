@@ -44,7 +44,7 @@ spill and no walk over a column list per row.
 
 The larger reason for the arrangement is what happens when the group table resizes. A resize
 rehashes every entry the table already holds, and what an entry holds is a *representative row
-index* — so rehashing means reading that row back out of every key column, one random access
+index*, so rehashing means reading that row back out of every key column: one random access
 each into an array as large as the relation. Keeping the hashes live turns that into a single
 array read, which is why they are materialized for the whole assignment rather than computed
 and discarded per row.
@@ -151,7 +151,7 @@ Worth stating plainly, because the mechanism measures far better than the query 
 **small** win. One `partial` call over 6M sorted rows is up to 6x faster, but the engine
 morselizes and never makes that call, so an A/B of two builds over the same data measures
 1.0-1.2x end to end. What the design buys reliably is that it costs nothing when it does not
-apply — unordered input measured at parity — which is what makes attempting it on every
+apply, with unordered input measured at parity, which is what makes attempting it on every
 aggregate the right default.
 
 The state is still proportional to the group count. A sorted group-by can in principle hold one
@@ -341,13 +341,18 @@ no. Under pressure, bounded beats fast.
 
 ## Spilling is the same algebra
 
-`agg/spill.rs` bounds peak memory to one hash partition. Per-morsel partials are routed to one
+`agg/spill/mod.rs` bounds peak memory to one hash partition. Per-morsel partials are routed to one
 of P partitions by a hash of the group key and written to a `SpillStore`; because a key always
 hashes to the same partition, running `combine` + `finalize` one partition at a time produces
 the global aggregate. `MemSpillStore` keeps the partitions in memory (used to prove the grace
 algebra matches the oracle); `DiskSpillStore` streams them to Arrow IPC files, optionally
 compressed. The IPC stream self-describes its compression, so the codec choice trades CPU for
 bytes and cannot change a result.
+
+The three phases below show what the operator is holding at each step: the partial state, the
+routing that spills all of it, and the merge that reads one partition back at a time.
+
+![What an aggregation holds, and what it spills. partial assigns dense group ids, through a hash table, a direct map, or no table at all when the key arrives sorted, then scatters one row of state columns per group; that state is not the answer, because mean carries a sum and a count, var carries mean, M2 and count, and median carries the group's values as a list, and only finalize turns one into a number. The spill phase routes every partial to one of P partitions by a hash of the group key and writes them as Arrow IPC, so nothing is kept resident and this is not an eviction policy, and because a key always hashes to the same partition a group is never split across two of them. The merge then reads one partition at a time, combines the states by key and finalizes, re-partitioning with a fresh salt when a partition is still over budget, so peak memory is one partition rather than one hash table. This is the same algebra the distributed path runs, with combine reading from disk instead of from the network.](/_static/diagrams/agg_spill_states.svg)
 
 ## DISTINCT
 
@@ -446,7 +451,7 @@ state instead, and merge in constant space.
 - `crates/bc-runtime/src/agg/group/assign.rs`: dense ids, the three key paths
 - `crates/bc-runtime/src/agg/group/combine.rs`: the parallel radix regroup
 - `crates/bc-runtime/src/agg/fused.rs`: the fused scalar accumulators
-- `crates/bc-runtime/src/agg/spill.rs`: grace aggregation
+- `crates/bc-runtime/src/agg/spill/mod.rs`: grace aggregation
 - `crates/bc-runtime/src/agg/{var,median,sketch,stats,argextreme,distinct,counted}.rs`: the state shapes
 - `crates/bc-interp/src/agg_par.rs`: the measured partition-vs-preaggregate decision
 

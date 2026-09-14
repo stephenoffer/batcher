@@ -11,7 +11,7 @@
 | **Parallelism** | One split per partition, from the `num_partitions` you declare |
 | **Subscription** | `ConsumerType.Shared`, so no per-key ordering |
 | **Auth** | Not wired. `pulsar.Client(service_url)` and nothing else. |
-| **Restart** | The subscription cursor on the broker; no seek is applied |
+| **Restart** | A checkpointed `MessageId`, applied as a consumer seek; else the broker cursor |
 
 ```bash
 pip install 'batcher-engine[pulsar]'
@@ -44,7 +44,7 @@ Two of those columns mean something slightly different on Pulsar.
 
 :::{dropdown} What `offset` and `timestamp` actually hold here
 `offset` is not a Pulsar concept at all. The `MessageId` is a `(ledger_id, entry_id)` pair,
-and Batcher folds it into one int64 (`ledger << 20 | entry`) so it fits the shared schema. It
+and Batcher folds it into one int64 (`ledger << 32 | entry`) so it fits the shared schema. It
 is monotonic within a ledger. It is not something you can hand back to a Pulsar client, and it
 is not comparable across ledgers.
 
@@ -88,12 +88,13 @@ Batcher offers no `Key_Shared` or `Failover` subscription type. Reorder downstre
 the ordering you get.
 :::
 
-Messages are acknowledged after a batch has been assembled, so a crash before the ack leaves
-them unacked and Pulsar redelivers them. That is at-least-once. Your resume point is the
-subscription cursor on the broker, not Batcher's checkpoint: a checkpointed position is
-recorded, but no seek is applied to a live Pulsar consumer, so a restarted query picks up
-wherever the cursor left off. Give every distinct pipeline its own `subscription` name, keep
-it stable across restarts, and make your sink idempotent.
+Messages are acknowledged once the epoch that carries them has been published, not when the
+poll assembles them, so a crash in between leaves them unacked and Pulsar redelivers them. That
+is at-least-once. With a `checkpoint=` set, the recorded `MessageId` is applied as a real
+per-consumer `seek` on restart, so recovery resumes from the checkpoint rather than from
+wherever the subscription cursor happened to sit. Without one, the cursor is the resume point.
+Either way, give every distinct pipeline its own `subscription` name, keep it stable across
+restarts, and make your sink idempotent.
 
 The `subscription` name doubles as the isolation boundary. Two pipelines sharing a name share
 the message stream, and each sees roughly half the messages.
@@ -138,7 +139,7 @@ Because a shared subscription gives no per-key ordering, an aggregate like the o
 safe (addition commutes) while a last-write-wins or state-machine transition is not. That is
 the practical shape of the warning above.
 
-## Writing the stream out
+## Writing
 
 ```python
 # docs: skip

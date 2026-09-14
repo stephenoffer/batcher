@@ -4,10 +4,10 @@ Building the input, and reading a conversation column back out.
 
 ## Rows with no prompt
 
-A null in `prompt_column` renders as empty text and is sent to the engine like any other
-row. That costs something: a decode slot on a GPU engine, and a billed request on a hosted
-one. The answer that comes back is also indistinguishable from a real one, because an engine
-given an empty prompt still generates something.
+A null in `prompt_column` renders as empty text and is sent to the engine like any other row.
+That costs a decode slot on a GPU engine, and a billed request on a hosted one. Worse, the
+answer that comes back is indistinguishable from a real one, because an engine given an empty
+prompt still generates something.
 
 Pass `skip_null_prompts=True` to leave those rows out of the request and give them a null
 output instead:
@@ -29,10 +29,10 @@ print(kept.to_pydict()["response"])
 Every appended column follows, so the token counts, the finish reason, and the
 log-probabilities are null on that row too and a cost report sums only what was generated.
 
-It is off by default, so an existing pipeline's output does not change under it. It applies
-to the prompt column itself: with a `template` the prompt is built from other columns, so a
-null *field* renders as empty text and the row is still sent, because the row does have a
-prompt. Filtering is always available and needs no flag:
+It is off by default, so an existing pipeline's output does not change under it. It applies to
+the prompt column itself. With a `template` the prompt is built from other columns, so a null
+*field* renders as empty text and the row is still sent: the row does have a prompt. Filtering
+is always available and needs no flag:
 
 ```python
 # docs: skip
@@ -107,21 +107,21 @@ list, {py:func}`bt.chatml_prompt <batcher.chatml_prompt>` renders a row's turns 
 in the Alpaca instruction layout. Check which template your model was trained on: a mismatch
 degrades quality quietly rather than raising.
 
-### Reading a conversation column
+## Reading a conversation column
 
 A chat log, a fine-tuning set, and an agent trace all arrive the same way: a list of
 `{role, content}` structs per row. Every question you want to ask of that column looks like a
-per-row loop, and none of it needs to be — a list of structs is a columnar value, and the
+per-row loop. None of it is. A list of structs is a columnar value, and the
 {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` higher-order functions reach inside it.
 
 {py:func}`bt.conversation_turns <batcher.conversation_turns>` counts messages, optionally for one role. Counting the assistant's
 turns is the more useful form: a log full of user messages with no answers is a collection
 failure, not a short conversation, and length alone cannot tell them apart.
 
-{py:func}`bt.ends_with_role <batcher.ends_with_role>` is the completeness check for a fine-tuning corpus. A conversation ending
-on a user turn was cut off — the export stopped mid-exchange, or the reply failed and was never
-written — and training on it teaches the model to stop where an answer should start. Those rows
-look identical to complete ones by every other measure.
+{py:func}`bt.ends_with_role <batcher.ends_with_role>` is the completeness check for a fine-tuning corpus. A conversation
+ending on a user turn was cut off, either because the export stopped mid-exchange or because the
+reply failed and was never written, and training on it teaches the model to stop where an answer
+should start. Those rows look identical to complete ones by every other measure.
 
 ```python
 chats = bt.from_pydict(
@@ -142,11 +142,12 @@ print(
 # {'turns': [2, 1], 'replies': [1, 0], 'complete': [True, False]}
 ```
 
-{py:func}`bt.last_message <batcher.last_message>` pulls one turn out. Without a role it is how the conversation ended; with
+{py:func}`bt.last_message <batcher.last_message>` pulls one turn out. Without a role it is how the conversation ended. With
 `"user"` it is the request the final answer responded to, and with `"assistant"` the answer
-itself — which is the pair every generation metric on {doc}`/ml/retrieval/llm-evaluation` wants. A
-conversation with no message of that role yields null rather than an empty string, so those
-rows stay countable instead of scoring as empty answers.
+itself, which together are the pair every generation metric on
+{doc}`/ml/retrieval/llm-evaluation` wants. A conversation with no message of that role yields
+null rather than an empty string, so those rows stay countable instead of scoring as empty
+answers.
 
 {py:func}`bt.render_messages <batcher.render_messages>` flattens the whole exchange to text, one message per line prefixed by its
 role, for a spot check or a lexical metric over the conversation rather than its last turn.
@@ -161,10 +162,11 @@ The `role` and `content` field names are parameters, because the convention is n
 and renaming a struct field to fit a hard-coded assumption is a materialization nobody should
 have to pay for.
 
-### Staying inside the context window
+## Staying inside the context window
 
-Overrunning a context window rarely raises. The serving stack truncates the prompt, or leaves so
-few tokens that the answer stops mid-sentence, and the run finishes looking successful.
+Overrunning a context window rarely raises. The serving stack truncates the prompt, or leaves
+so few tokens that the answer stops mid-sentence, and the run finishes looking successful. You
+find out from the outputs.
 
 {py:func}`bt.prompt_token_estimate <batcher.prompt_token_estimate>` prices an assembled prompt from its parts before the concatenation
 exists as a column, which is what you want to route long rows to a larger-window model or to

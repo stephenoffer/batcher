@@ -291,7 +291,7 @@ destroys time travel past the window — irreversibly.
 
 ## See also
 
-- Docs: `docs/user-guide/moving-data/lakehouse.md`; `docs/tutorials/pipelines/building-a-lakehouse.md`;
+- Docs: `docs/user-guide/moving-data/lakehouse.md`; `docs/getting-started/tutorials/pipelines/building-a-lakehouse.md`;
   `docs/integrations/lakehouse/delta-lake.md`, `docs/integrations/lakehouse/iceberg.md`, `docs/integrations/lakehouse/hudi.md`, `docs/integrations/warehouses/databricks.md`, `docs/integrations/warehouses/snowflake.md`;
   `docs/cookbook/data-engineering/ingest/cdc-pipeline.md`, `docs/cookbook/data-engineering/modeling/slowly-changing-dimensions.md`, `docs/cookbook/data-engineering/maintenance/partition-backfill.md`, `docs/cookbook/data-engineering/ingest/late-arriving-data.md`, `docs/cookbook/data-engineering/maintenance/file-compaction.md`, `docs/cookbook/dataset/cleaning/deduplication.md`.
 - Code: `api/merge/{builder,clauses,cdc,execute}.py`; `api/dataset/scd.py`;

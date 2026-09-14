@@ -8,8 +8,8 @@ Read {doc}`/ml/retrieval/llm/index` first for how the generation itself runs.
 
 ## Extracting typed columns
 
-No analyst can filter, join, or aggregate a string, so turning it into a column is the
-actual ETL step. Two Dataset methods do it.
+Nobody can filter, join, or aggregate a string. Turning it into a column is the actual ETL
+step, and two Dataset methods do it.
 
 {py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` appends one **typed** column per declared field. The
 declaration decides the Arrow type, not whatever the model happened to emit:
@@ -171,8 +171,8 @@ print(
 
 Three more read the answer conventions that {doc}`llm-evaluation` already measures the
 *compliance* of. {py:func}`bt.extract_boxed <batcher.extract_boxed>` reads the LaTeX `\boxed{}` a math benchmark grades on, and
-{py:func}`bt.extract_last_number <batcher.extract_last_number>` reads the conclusion of a reasoning chain — which is not the same as
-{py:func}`bt.extract_first_number <batcher.extract_first_number>`, because a model that reasons before answering emits its intermediate
+{py:func}`bt.extract_last_number <batcher.extract_last_number>` reads the conclusion of a reasoning chain. That is not the same as
+{py:func}`bt.extract_first_number <batcher.extract_first_number>`: a model that reasons before answering emits its intermediate
 quantities first.
 
 ```python
@@ -205,13 +205,11 @@ print(
 
 ## Structured output
 
-Constrain generation to a JSON schema so every row is parseable, then parse it into a
-struct column. `guided_json` on the engine forces the model's decoding to the schema,
-and `parse_json=True` on `llm_generate` parses each output into a struct. A row that
-fails to parse gets a null rather than failing the batch. Prefer `ds.ml.extract` above
-when the fields are known, because it pins the Arrow types. Pair the two so that guided
-decoding makes the output well-formed and `parse_json` turns it into typed columns you
-can query downstream.
+Constrain generation to a JSON schema so every row is parseable, then parse it into a struct
+column. `guided_json` on the engine forces the model's decoding to the schema, and
+`parse_json=True` on `llm_generate` parses each output into a struct. A row that fails to parse
+gets a null rather than failing the batch. Prefer `ds.ml.extract` when the fields are known,
+because it pins the Arrow types. Pair the two otherwise.
 
 ```python
 # docs: skip

@@ -66,9 +66,9 @@ transcribe = clips.filter(col("has_audio"))
 gpu_decodable = clips.filter(col("codec").is_in(["h264", "hevc"]))
 ```
 
-A container with no video stream at all — an audio-only `.mp4`, an `.mkv` holding only
-subtitles — reports `width`, `height` and `codec` as null and `has_audio` as true. That is
-what tells it apart from a truncated file, which nulls everything.
+Some containers hold no video stream at all: an audio-only `.mp4`, an `.mkv` holding only
+subtitles. Those report `width`, `height` and `codec` as null and `has_audio` as true,
+which is what tells them apart from a truncated file. A truncated file nulls everything.
 
 ## Sample frames for a model
 
@@ -93,7 +93,7 @@ rather than guessing.
 
 The frames are the indices `numpy.linspace(0, num_frames - 1, n)` names, which is what the
 reference preprocessing of the common video models uses, and they are found by decoding
-the clip in order — so the *n*-th frame really is the *n*-th. The clip is never decoded
+the clip in order, so the *n*-th frame really is the *n*-th. The clip is never decoded
 past the last wanted frame, and only the wanted frames are kept, so peak memory is the
 output plus one frame rather than the whole clip. That distinction is worth the sentence:
 a minute of 1080p at 30 fps is about 11 GB decoded, for eight frames of output.
@@ -140,8 +140,8 @@ bounded by the keyframe interval rather than by how far into the clip the target
 `frame_at` takes its timestamp from a **column** as readily as from a constant, which is
 the usual case rather than the exotic one: a detection, a caption, or a scene boundary
 already carries the moment it refers to. A row whose timestamp is null or negative is
-null, and only that row — the timestamps come from something that does not answer for
-every row, and one missing moment should not cost the batch it travelled in.
+null, and only that row. Timestamps come from something that does not answer for
+every row, and one missing moment should not cost the batch it traveled in.
 
 `frame_at` returns the frame a player displays at that instant. A `second` past the end of
 a clip whose duration is known yields null rather than the last frame, because handing back
@@ -177,9 +177,9 @@ in the data plane, row-parallel, with no Python in the loop. On a build that rep
   the native kernel directly and silently substituting a different implementation for it
   would be worse than saying so.
 
-The fallback decodes `decode_concurrency` clips at once (PyAV releases the GIL inside the
-codec, so the work genuinely overlaps). The cost is memory: peak residency is that many
-clips rather than one, so lower it to `1` for GB-sized clips.
+The fallback decodes `decode_concurrency` clips at once, and the work genuinely overlaps
+because PyAV releases the GIL inside the codec. The cost is memory. Peak residency is that
+many clips rather than one, so lower it to `1` for GB-sized clips.
 
 ## Requirements and limitations
 

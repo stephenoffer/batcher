@@ -11,7 +11,7 @@ plane. Distribution, file formats, and ML backends arrive through extras.
 ## Requirements
 
 - Python 3.11 or newer.
-- A 64-bit platform (Linux, macOS, or Windows).
+- A 64-bit platform: Linux, macOS, or Windows.
 
 Releases ship the compiled engine as a native extension module, so you don't need a
 Rust toolchain to install one.

@@ -21,7 +21,7 @@ ds = bt.from_pydict(
 )
 ```
 
-## sort
+## Ordering by one or more keys
 
 `sort(*by, descending=False, nulls_first=False)` takes column names or expressions.
 
@@ -70,7 +70,7 @@ print(ds.sort(bt.col("name").str.len(), descending=True).select("name").to_pydic
 
 Two rows with the same key can come back in either order, and the order can change
 between a sequential run, a multi-core run, and a distributed one. `ann` and `cy` both
-score 30 above; nothing promises which comes first. If the order of tied rows matters
+score 30 above, and nothing promises which comes first. If the order of tied rows matters
 (and it usually does, the moment you `head(n)` or write the result), add a tiebreaker
 key that is unique.
 
@@ -179,7 +179,7 @@ order-preserving integer, which is linear in the rows. A string key has to compa
 a column is available in both forms, ordering by the fixed-width one is materially cheaper, and
 ordering by an `id` and rendering the label afterwards is cheaper still.
 
-Sorting by **several** fixed-width keys is not more expensive than sorting by one, as long as
+Sorting by *several* fixed-width keys is not more expensive than sorting by one, as long as
 their combined value ranges are narrow. The engine measures each key's live range and packs the
 whole tuple into a single integer, so `ORDER BY <date>, <priority>` costs about what
 `ORDER BY <date>` costs. Mixed directions are free, and so is a key that turns out to be
@@ -207,7 +207,7 @@ print(events.sort("day", "priority", descending=[False, True]).to_pydict()["labe
 # ['a', 'c', 'b']
 ```
 
-None of this changes the answer, only the time. If the key you have is a string, sort on it.
+None of this changes the answer. Only the time. If the key you have is a string, sort on it.
 The point is to reach for a fixed-width key when one is genuinely available, rather than to
 reshape data around the sort.
 
@@ -226,7 +226,7 @@ than trusting a claim that they are sorted, so a wrong claim cannot produce a wr
 ```python
 import batcher as bt
 
-# Two already-sorted sources, concatenated — the shape a partitioned table has.
+# Two already-sorted sources, concatenated: the shape a partitioned table has.
 early = bt.from_pydict({"ts": [1, 3, 5, 7], "v": ["a", "b", "c", "d"]})
 late = bt.from_pydict({"ts": [2, 4, 6, 8], "v": ["e", "f", "g", "h"]})
 merged = bt.concat([early, late]).sort("ts")
@@ -240,9 +240,9 @@ merge, and sorts at its usual cost. On six million rows a fully sorted or run-st
 1.1x to 1.3x faster than a random one, and the remainder is the cost of moving the rows into
 their new order, which no ordering trick removes.
 
-Descending data counts as ordered too, and reversing it is free — but only when the descending
-stretch has no repeated keys, because reversing a run holding two equal rows would put the later
-one first and the engine's sort keeps ties in input order.
+Descending data counts as ordered too, and reversing it is free. That holds only when the
+descending stretch has no repeated keys: reversing a run holding two equal rows would put the
+later one first, and the engine's sort keeps ties in input order.
 
 ### Binary keys
 

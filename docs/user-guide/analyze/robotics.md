@@ -84,7 +84,7 @@ print(in_world.select("world_x", "world_y", "world_z").to_pydict())
 The transform rotates and then translates. The other order is a different transform and
 gets a different, wrong answer for every point that is not at the origin.
 
-Going the other way — a world-frame obstacle expressed relative to the vehicle — is
+Going the other way, to a world-frame obstacle expressed relative to the vehicle, is
 {py:func}`se3_inverse_transform <batcher.se3_inverse_transform>`:
 
 ```python
@@ -176,8 +176,8 @@ table with {py:meth}`join_asof <batcher.Dataset.join_asof>` twice: once backward
 pose at or before each timestamp, and once forward for the one after.
 
 `t` is not clamped, so a measurement whose timestamp falls just past the last logged pose
-extrapolates along the same arc rather than pinning to the endpoint. That is usually what
-you want, and it is worth knowing you are doing it.
+extrapolates along the same arc rather than pinning to the endpoint. That is usually the
+behaviour you want, and it is worth knowing you are relying on it.
 
 ## Filtering a point cloud
 

@@ -1,6 +1,6 @@
 # Intervals: BED, GFF, and VCF as joinable tables
 
-Three formats carry the coordinate half of genomics: BED holds intervals, GFF and GTF hold annotations, and VCF holds variants. Reading them into tables is what turns "which variants fall in a coding exon" into a join and a filter rather than a script — and a join optimizes, streams, and distributes like any other query.
+Three formats carry the coordinate half of genomics: BED holds intervals, GFF and GTF hold annotations, and VCF holds variants. Reading them into tables is what turns "which variants fall in a coding exon" into a join and a filter rather than a script, and a join optimizes, streams, and distributes like any other query.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/expressions/genomics_intervals.py
 
 ## The coordinate trap
 
-BED is **0-based and half-open**. GFF and VCF are **1-based and inclusive**. A BED interval `chr1 0 100` and a GFF feature `chr1 1 100` describe the same hundred bases and share no number.
+BED is 0-based and half-open. GFF and VCF are 1-based and inclusive. A BED interval `chr1 0 100` and a GFF feature `chr1 1 100` describe the same hundred bases and share no number.
 
 Nothing in this engine converts between them. Each reader reports exactly what its file says, and a comparison across formats needs the conversion written down:
 
@@ -27,7 +27,7 @@ Nothing in this engine converts between them. Each reader reports exactly what i
 beds_1based = beds.with_columns(start_1=bt.col("start") + 1, end_1=bt.col("end"))
 ```
 
-That is deliberate and it is the most important thing on this page. A silent normalization would make an interval disagree with the file it came from and with every other tool in the pipeline, and the resulting off-by-one is invisible: every row still has plausible coordinates. Writing the conversion out is the only way it stays reviewable.
+That is deliberate. A silent normalization would make an interval disagree with the file it came from and with every other tool in the pipeline, and the resulting off-by-one is invisible: every row still has plausible coordinates. Writing the conversion out is the only way it stays reviewable.
 
 ## Reading BED
 
@@ -41,7 +41,7 @@ A directory mixing BED3 and BED6 files produces files with different schemas. Th
 
 {py:meth}`bt.read.gff <batcher.api.io_namespace.reader.Reader.gff>` reads both dialects through one source, because they differ only in how the ninth column encodes its attributes.
 
-That column arrives as **raw text**. Parsing it here would mean guessing the dialect — a `.gff` extension is used for both, and the encodings are not reliably distinguishable — or producing a `Map` whose keys differ per row and per feature type. The honest shape is the text plus the engine's own string vocabulary:
+That column arrives as raw text. Parsing it here would mean guessing the dialect, since a `.gff` extension is used for both and the encodings are not reliably distinguishable, or else producing a `Map` whose keys differ per row and per feature type. The honest shape is the text plus the engine's own string vocabulary:
 
 ```python
 # docs: skip
@@ -57,9 +57,9 @@ bt.col("attributes").str.regexp_extract(r'gene_id "([^"]+)"', 1)
 
 {py:meth}`bt.read.vcf <batcher.api.io_namespace.reader.Reader.vcf>` takes its column list partly from the file: the eight fixed columns are the specification's, and everything after them comes from the `#CHROM` header line. A sites-only VCF yields eight columns; a joint-called cohort yields those plus `format` and one column per sample.
 
-The specification's names are lower-cased to match every other column in the engine. A **sample** name is not: it identifies a library and gets matched against a manifest, so folding its case could quietly merge two cohorts.
+The specification's names are lower-cased to match every other column in the engine. A sample name is not: it identifies a library and gets matched against a manifest, so folding its case could quietly merge two cohorts.
 
-`INFO` and the genotype columns are raw text for the same reason GFF's attributes are — their keys are declared per file in the `##INFO` and `##FORMAT` metadata and differ per row:
+`INFO` and the genotype columns are raw text for the same reason GFF's attributes are: their keys are declared per file in the `##INFO` and `##FORMAT` metadata, and differ per row. Pull a field out with the string vocabulary:
 
 ```python
 # docs: skip
@@ -83,25 +83,19 @@ in_target = (
 
 This is why the readers carry no interval logic of their own. The engine already has the join, the filter pushdown, the optimizer, and the distributed execution; an interval operation bolted onto a reader would have none of them.
 
-## Requirements and limitations
-
-- **VCF is read-only.** A valid VCF needs a `##` metadata block declaring every `INFO` and `FORMAT` key its records use, and that cannot be reconstructed from the columns alone. Writing one without it would produce a file that parses and that no caller can interpret, so the sink is deliberately absent. Write Parquet, or BED if you only need the intervals.
-- **Splits are whole files** for all three. None has a byte-addressable record boundary: a `#` is legal inside a GFF attribute and a VCF `INFO` field, so a line found from a random offset is not necessarily a record start. These formats are normally delivered per chromosome or per cohort shard, which is where the parallelism comes from.
-- **BED writes the leading run** of standard columns only. BED is positional, so a table with `chrom/start/end/strand` but no `name` writes BED3 — a gap cannot be expressed without shifting every later field.
-
 ## Surviving a bad corpus
 
-Every reader here honours `on_error="skip"`, which drops an unreadable file and carries on
-rather than aborting the scan. A corpus at scale always contains a few bad members — a
-truncated upload, an interrupted write — and losing a 10,000-file run to one of them is the
-wrong default.
+Every reader here honors `on_error="skip"`, which drops an unreadable file and carries on rather than aborting the scan. A corpus at scale always contains a few bad members, a truncated upload or an interrupted write, and losing a 10,000-file run to one of them is the wrong default.
 
 ```{warning}
-The granularity is **per file, not per record**. One malformed line loses the whole file it
-is in, including every good record before it. For a 50 GB FASTQ, where a truncated final
-record is the commonest corruption there is, that is an expensive trade — convert to Parquet
-once, or split the run into shards, if it is the wrong one for you.
+The granularity is per file, not per record. One malformed line loses the whole file it is in, including every good record before it. For a 50 GB FASTQ, where a truncated final record is the commonest corruption there is, that is an expensive trade. Convert to Parquet once, or split the run into shards, if it is the wrong one for you.
 ```
+
+## Requirements and limitations
+
+- VCF is read-only. A valid VCF needs a `##` metadata block declaring every `INFO` and `FORMAT` key its records use, and that cannot be reconstructed from the columns alone. Writing one without it would produce a file that parses and that no caller can interpret, so the sink is deliberately absent. Write Parquet, or BED if you only need the intervals.
+- Splits are whole files for all three. None has a byte-addressable record boundary: a `#` is legal inside a GFF attribute and a VCF `INFO` field, so a line found from a random offset is not necessarily a record start. These formats are normally delivered per chromosome or per cohort shard, which is where the parallelism comes from.
+- BED writes the leading run of standard columns only. BED is positional, so a table with `chrom/start/end/strand` but no `name` writes BED3, because a gap cannot be expressed without shifting every later field.
 
 ## See also
 

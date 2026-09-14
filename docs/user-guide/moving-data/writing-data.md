@@ -42,6 +42,8 @@ print(back.to_pydict())
 
 ## CSV and JSON
 
+Both take the same path-and-options shape as `write.parquet`:
+
 ```python
 # docs: skip
 ds.write.csv("output/data.csv")

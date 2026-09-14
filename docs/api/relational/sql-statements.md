@@ -15,12 +15,12 @@ s.register("events", bt.from_pydict({"id": [1, 2, 3], "amount": [30.0, 40.0, 5.0
 
 ## Defining tables and views with SQL
 
-`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a **lazy** dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
+`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a lazy dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
 
 ```python
 s.sql("CREATE VIEW big_events AS SELECT id, amount FROM events WHERE amount > 25")
 print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
-# {'id': [3, 4, 5], 'amount': [30.0, 40.0, 50.0]}
+# {'id': [1, 2], 'amount': [30.0, 40.0]}
 ```
 
 ## MERGE INTO
@@ -43,7 +43,7 @@ print(s.sql("SELECT * FROM stock ORDER BY sku").to_pydict())
 
 All three clause populations are supported, each with an optional `AND` condition:
 `WHEN MATCHED`, `WHEN NOT MATCHED`, and `WHEN NOT MATCHED BY SOURCE`. A matched or
-by-source clause may `UPDATE SET` or `DELETE`; a not-matched clause may `INSERT`. The
+by-source clause may `UPDATE SET` or `DELETE`. A not-matched clause may `INSERT`. The
 `USING` side may be a table or a subquery.
 
 ```{important}
@@ -94,7 +94,7 @@ print(s.sql("SELECT table_name FROM information_schema.tables ORDER BY table_nam
 
 `information_schema.tables` carries `table_catalog`, `table_schema`, `table_name` and
 `table_type`. `information_schema.columns` carries those first three plus `column_name`,
-`ordinal_position`, `column_default`, `is_nullable` and `data_type` — the columns a
+`ordinal_position`, `column_default`, `is_nullable` and `data_type`, which are the columns a
 reflection actually selects. DuckDB's views are wider; the extra columns are null for an
 Arrow relation, and padding them out would be inventing a shape rather than reporting one.
 

@@ -120,7 +120,7 @@ Five rows, one per day, and June 3rd says zero out loud.
 Be deliberate about the fill. Zero is right for a count or a sum, because "no orders"
 really is zero revenue. It is wrong for an average, a price, or a gauge: the temperature
 on a day your sensor was offline was not 0 degrees. For those, leave the null, or carry the last
-known value forward with `col("x").forward_fill(order_by=["day"])`.
+known value forward with `col("x").forward_fill().over(order_by=["day"])`.
 :::
 
 ## Now the moving average means something

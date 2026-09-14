@@ -24,7 +24,7 @@ An analytics table is loaded. An operational table is *maintained*: a batch of o
 | `delete` | Delete the rows whose keys match. | Yes |
 | `delete_insert` | Delete these keys, then insert these rows, in one transaction. | Yes |
 
-`append` is the default, because a write that says nothing about keys should add rows rather than replace a table.
+`append` is the default. A write that says nothing about keys should add rows, not replace a table.
 
 ```python
 import os
@@ -81,35 +81,36 @@ CREATE TABLE "orders" ("id" INTEGER NOT NULL, "amount" REAL, PRIMARY KEY ("id"))
 
 Writing into a table you created yourself needs none of this. Batcher creates a table only when one is absent, and `create_table=False` turns even that off.
 
-## Three semantics worth knowing before the first run
+## Semantics the mode name does not show
 
-Each of these decides whether the result is right, and each is invisible from the mode name.
+Three behaviors decide whether the result is right, and none of them is visible from the
+word you passed to `mode`.
 
-**An upsert of a subset of columns is a column-level merge, not a row replacement.** Write
-`id` and `status` into a table that also has `amount`, and only `status` changes; `amount`
-keeps the value it had. That is what `ON CONFLICT DO UPDATE SET` does, and it is usually
-what you want — two pipelines can maintain different columns of the same key without
-reading each other's. It is also the opposite of `ds.write.mongo`, whose upsert *replaces*
-the document, so a column absent from the frame is lost there.
+An upsert of a subset of columns is a column-level merge rather than a row replacement.
+Write `id` and `status` into a table that also has `amount`, and only `status` changes;
+`amount` keeps the value it had. That is what `ON CONFLICT DO UPDATE SET` does, and it is
+usually what you want, because two pipelines can then maintain different columns of the same
+key without reading each other's. It is the opposite of `ds.write.mongo`, whose upsert
+*replaces* the document, so a column absent from the frame is lost there.
 
-**A repeated key inside one write behaves differently per mode.** `upsert`, `update` and
-`delete` bind one statement per row, so the last row for a key wins — quietly, and in frame
+A repeated key inside one write behaves differently per mode. `upsert`, `update` and
+`delete` bind one statement per row, so the last row for a key wins. Quietly, and in frame
 order, which a distributed write does not fix. `delete_insert` deletes the key once and then
 inserts every row, so a repeated key becomes a repeated row and the target's own key
 constraint rejects it. Deduplicate first with
 {py:meth}`ds.drop_duplicates(subset=...) <batcher.Dataset.drop_duplicates>` when the source
 can carry more than one row per key.
 
-**A column the frame does not have is not written.** For `append` that means the column
-takes its database default, or `NULL` — the write does not fail. For `upsert` it means the
-column is not updated, which is the merge behavior above. Either way nothing warns, because
-both are ordinary SQL; if the frame's shape is meant to match the table, check it.
+A column the frame does not have is not written at all. For `append` that means the column
+takes its database default, or `NULL`, and the write does not fail. For `upsert` it means
+the column is not updated, which is the merge behavior above. Nothing warns either way,
+because both are ordinary SQL. If the frame's shape is meant to match the table, check it.
 
 ## Which backend serves the write
 
 You do not choose. Two things decide it, and neither is a preference.
 
-Row-level DML is not expressible as an Arrow ingest: `adbc_ingest` appends a table and has no disposition meaning "update the rows holding these keys". And ADBC does not reach most operational databases. It has drivers for PostgreSQL, SQLite, DuckDB, Snowflake, BigQuery and FlightSQL, which leaves MySQL, MariaDB, Oracle and SQL Server with a PEP 249 driver and nothing else.
+Row-level DML is not expressible as an Arrow ingest: `adbc_ingest` appends a table and has no disposition meaning "update the rows holding these keys". Reach is the other half, because ADBC has drivers for PostgreSQL, SQLite, DuckDB, Snowflake, BigQuery and FlightSQL, which leaves MySQL, MariaDB, Oracle and SQL Server with a PEP 249 driver and nothing else.
 
 | Write | Backend |
 | --- | --- |
@@ -184,8 +185,8 @@ query = bt.read.kafka("orders").write(
 Use `mode="upsert"`, not `mode="append"`, and the reason is exactly-once. The engine
 records a micro-batch's source offset before processing it, so a crash between processing
 and committing leaves a batch the next run replays. An append writes those rows a second
-time. An upsert writes the same keys to the same values, which makes the replay a no-op —
-the same end-to-end guarantee a Delta stream gets from its `(app_id, batch_id)`
+time. An upsert writes the same keys to the same values, which makes the replay a no-op.
+That is the same end-to-end guarantee a Delta stream gets from its `(app_id, batch_id)`
 transaction, reached by a different route. Batcher does not warn about at-least-once
 delivery for a keyed mode, because for a keyed mode it does not apply.
 
@@ -195,7 +196,7 @@ is still there for a write that needs more than one statement per batch.
 
 ## Retries
 
-A deadlock, a serialization failure, a lock-wait timeout or a dropped connection is the server saying "run this again", and each is retried with jittered exponential backoff. `retries=` sets how many extra attempts, and `retries=0` turns it off. Anything unrecognized is raised immediately, so a syntax error or a constraint violation fails fast instead of spending the retry budget.
+A deadlock, a serialization failure, a lock-wait timeout or a dropped connection is the server saying "run this again". Each is retried with jittered exponential backoff. `retries=` sets how many extra attempts, and `retries=0` turns it off. Anything unrecognized is raised immediately, so a syntax error or a constraint violation fails fast instead of spending the retry budget.
 
 A retry re-runs a transaction the server already rolled back, so it starts from the state the first attempt did. The one case no retry can decide is a connection lost *after* the server committed: an upsert absorbs the repeat, an append duplicates it. Prefer a keyed mode wherever keys exist.
 
@@ -233,25 +234,25 @@ conn.close()
 
 Pass `commit_writes=True` to have Batcher commit a borrowed connection instead. A connection cannot be shipped to a worker, so `connection=` is single-node; `uri=` is what scales out.
 
-**The table must already exist** on this path, which is why the example creates it. Batcher creates a missing table by asking whether it exists first, and on PostgreSQL a statement that fails aborts the entire transaction — so asking about a table that is not there would destroy work the caller did before handing the connection over. Batcher will not do that to a connection it does not own. Use `uri=` if you want the table created for you.
+**The table must already exist** on this path, which is why the example creates it. Batcher creates a missing table by asking whether it exists first, and on PostgreSQL a statement that fails aborts the entire transaction. Asking about a table that is not there would therefore destroy work the caller did before handing the connection over. Batcher will not do that to a connection it does not own. Use `uri=` if you want the table created for you.
 
 ## What this costs
 
-The DB-API path materializes every value as a Python object, because a cursor is row-shaped and there is no way to hand a driver a column. The conversion is column-wise and once per chunk rather than once per row, but it is real, and it is why a plain append to a database ADBC covers still goes through ADBC.
+The DB-API path materializes every value as a Python object. A cursor is row-shaped, and there is no way to hand a driver a column. The conversion is column-wise and once per chunk rather than once per row, but it is real, and it is why a plain append to a database ADBC covers still goes through ADBC.
 
 `rows_per_statement` is the chunk size and defaults to 1,000. It is not only a throughput knob: several wire protocols cap the parameters one statement may carry, and PostgreSQL's limit of 65,535 means a ten-column insert overflows at 6,554 rows. Raise it for a narrow table, lower it if a driver complains about statement size.
 
-A driver accepts the Python types it knows, and Arrow produces some that it does not. `decimal.Decimal` is the usual one: SQLite has no decimal type and its driver refuses to adapt one. Batcher will not choose a lossy encoding on your behalf, so the write raises naming the columns being bound. Cast the column first, with `ds.cast({"amount": "float64"})`, or register an adapter with your driver.
+A driver accepts the Python types it knows, and Arrow produces some that it does not. `decimal.Decimal` is the usual one. SQLite has no decimal type and its driver refuses to adapt one. Batcher will not choose a lossy encoding on your behalf, so the write raises naming the columns being bound. Cast the column first, with `ds.cast({"amount": "float64"})`, or register an adapter with your driver.
 
 ## Requirements and limitations
 
-Nested Arrow types (list, struct, map) have no portable SQL column type, so `create_table` refuses them rather than picking an encoding for you. Create the table yourself with the encoding you want and write into it with `mode="append"`, or flatten the column first.
+Nested Arrow types have no portable SQL column type. `create_table` refuses a list, a struct or a map rather than picking an encoding for you. Create the table yourself with the encoding you want and write into it with `mode="append"`, or flatten the column first.
 
 A row whose key column is null matches no row on any database, because SQL equality against null is unknown rather than true. Such rows are counted and reported at warning level rather than silently doing nothing.
 
 `update` and `delete` do not report which keys matched nothing. The server's affected-row count is recorded on the manifest as `stats["affected_rows"]` where the driver reports one, which is the closest available signal.
 
-There is no cross-shard transaction, and no cross-*call* transaction. Two `write` calls are two transactions unless you pass your own `connection=` and commit it yourself.
+There is no cross-shard transaction. There is no cross-*call* transaction either, so two `write` calls are two transactions unless you pass your own `connection=` and commit it yourself.
 
 Each write opens and closes its own connection. For a batch job that is one connect; for a streaming query it is one per micro-batch, so a one-second trigger dials the database once a second and a distributed stream does so once per shard. Check the server's connection limit before running a short trigger interval across many workers, or hold the connection yourself with `connection=` on a single-node stream.
 
@@ -273,7 +274,7 @@ The refusals are about the stores, not about unfinished work. DynamoDB has no `a
 
 All five default to `upsert` rather than to `ds.write`'s usual `overwrite`, for the same reason: these stores are maintained rather than replaced, and a destructive default would empty one on a call that never said so.
 
-Each of these APIs reports partial failure inside a success, and each sink reads the response rather than the status code. `BatchWriteItem` returns the requests it did not apply under `UnprocessedItems` with a 200 — those are retried with backoff, and a remainder that survives raises. `_bulk` reports per-document failures inside an HTTP 200. Cassandra's concurrent execution returns a success flag per statement. A sink that trusted the call would have written some of its rows and reported success, which is the quietest kind of data loss there is.
+Each of these APIs reports partial failure inside a success, and each sink reads the response rather than the status code. `BatchWriteItem` returns the requests it did not apply under `UnprocessedItems` with a 200; those are retried with backoff, and a remainder that survives raises. `_bulk` reports per-document failures inside an HTTP 200. Cassandra's concurrent execution returns a success flag per statement. A sink that trusted the call would have written some of its rows and reported success, which is the quietest kind of data loss there is.
 
 ```python
 # docs: skip

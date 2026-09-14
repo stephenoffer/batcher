@@ -77,7 +77,7 @@ print(out["key_a"], out["key_b"], [round(j, 2) for j in out["jaccard"]])
 MinHash reduces each document to a fixed-length signature whose positional
 agreement estimates Jaccard similarity over character n-gram shingles, and LSH banding turns
 the similarity join into an equi-join on a band hash. Every candidate pair is then
-**verified** against the threshold, so banding costs recall, never precision. No pair below
+verified against the threshold, so banding costs recall, never precision. No pair below
 `threshold` is ever returned, but a similar pair can miss every band and be missed.
 :::
 
@@ -115,7 +115,7 @@ print(titles.ml.near_duplicates("text", threshold=0.7, ngram=3, key="doc_id").co
 ## Matching a short field against a reference value
 
 MinHash/LSH clusters a *column* against itself. When you instead need to score each row
-against one **known** string, reach for the edit metrics on {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`. That covers deduping a
+against one *known* string, reach for the edit metrics on {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`. That covers deduping a
 name column against a canonical spelling, or resolving records to a reference list.
 {py:meth}`.str.jaro_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_similarity>` and {py:meth}`.str.jaro_winkler_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_winkler_similarity>` return a `[0, 1]` score, and
 Jaro-Winkler weights a shared prefix, which is what you want for names. {py:meth}`.str.levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>`

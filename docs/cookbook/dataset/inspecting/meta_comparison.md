@@ -1,6 +1,6 @@
 # Join estimates
 
-``ds.meta.against(other)`` answers the question that saves the most time in practice: will this join produce anything at all? A join that silently returns zero rows because the keys never overlap is one of the most common quiet failures in a pipeline.
+`ds.meta.against(other)` asks the question worth asking first: will this join produce anything at all? A join that returns zero rows because the keys never overlap is one of the quietest failures a pipeline has. The two footers usually knew.
 
 The whole script, executed on every test run:
 

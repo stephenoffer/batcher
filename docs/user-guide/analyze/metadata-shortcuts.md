@@ -9,7 +9,7 @@ them once and remember them forever. So when you ask "how many rows is that?", o
 this column have gaps?", or "is `id` actually unique?", there is very often nothing to
 compute, only something to read.
 
-**You do not have to ask for this.** It happens underneath the API you already use:
+You do not have to ask for any of it. It happens underneath the API you already use:
 
 ```python
 # docs: skip
@@ -20,7 +20,7 @@ ds = bt.read.parquet("s3://warehouse/events/")      # 10 billion rows
 ds.count()                                          # a footer read
 ds.min("amount"), ds.max("amount")                  # a footer read
 ds.null_count()                                     # a footer read
-ds.filter(bt.col("amount") > 10**9).collect()       # provably empty — the files go unread
+ds.filter(bt.col("amount") > 10**9).collect()       # provably empty: the files go unread
 ds.join(dim, on="region_id").collect()              # key ranges disjoint? no shuffle at all
 ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()   # a contract the footer discharges
 ```
@@ -28,7 +28,7 @@ ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()   # a contract the footer
 Each of those is an ordinary call. Each one, on this data, costs a metadata round trip
 instead of a scan. Nothing in that snippet mentions metadata, and that is the point.
 
-The rest of this page explains **when** it fires, so you can tell why something was slow.
+The rest of this page explains *when* it fires, so you can tell why something was slow.
 It then covers {py:obj}`ds.meta <batcher.Dataset.meta>`, an *optional* introspection namespace for asking the metadata
 layer directly. You will rarely need it. Reach for it when you want to know what the engine
 knows, or to ask something the ordinary API has no spelling for, such as "would this join
@@ -39,7 +39,7 @@ match anything?" or "how many files am I about to open?".
 **A shortcut returns exactly what executing would return.** Not an estimate of it, not a
 usually-right version of it. The same value.
 
-That is not a hope, it is how the layer is built. Kyber only answers from a statistic whose
+That is not a hope. It is how the layer is built: Kyber only answers from a statistic whose
 provenance is *exact*, meaning a footer bound, a manifest count, or an immutable relation's
 own measurement. If the statistic it needs is missing or merely estimated, it declines, and
 `ds.meta` quietly runs the query that computes the answer instead. Which of the two happened
@@ -74,7 +74,7 @@ which is the answer a footer usually already contains.
 
 ## Introspection: `ds.meta`
 
-Everything from here on is the **optional** namespace. You do not need it for any of the speed
+Everything from here on is the *optional* namespace. You do not need it for any of the speed
 above. It exists to ask the metadata layer directly: what does the engine know, why wasn't
 that free, and the handful of questions the ordinary API has no spelling for.
 
@@ -101,7 +101,7 @@ ds = bt.from_pydict(
 
 ### What it costs, and when it doesn't help
 
-A filter is what usually takes the shortcut away. A footer's minimum is the smallest value
+A filter usually takes the shortcut away. A footer's minimum is the smallest value
 *in the file*; once you filter the file, it is only a bound on the smallest surviving value,
 and a bound is not an answer. Joins, computed columns, and `map_batches` do the same.
 
@@ -125,7 +125,7 @@ the boolean forms, and `none_match` is the one a pruning decision reads best as.
 ```python
 assert ds.meta.shape() == (4, 8)
 assert ds.meta.count_where(bt.col("amount").is_null()) == 0
-assert ds.meta.none_match(bt.col("amount") > 1_000_000)  # provably no such row — no scan
+assert ds.meta.none_match(bt.col("amount") > 1_000_000)  # provably no such row, no scan
 assert ds.meta.all_match(bt.col("status") == "ok")
 assert ds.meta.any_match(bt.col("amount") > 50)
 assert ds.meta.is_empty_where(bt.col("amount") > 1_000_000)
@@ -152,10 +152,10 @@ answered from a recorded statistic when there is one, and from a query when ther
 ```python
 c = ds.meta.col("amount")
 
-assert c.bounds() == (3.25, 99.0)   # (min, max) — one footer read, not two passes
+assert c.bounds() == (3.25, 99.0)   # (min, max), one footer read not two passes
 assert c.range() == 95.75           # max - min
 assert c.midpoint() == 51.125       # the center of the range (not the mean, not the median)
-assert c.abs_max() == 99.0          # max(|min|, |max|) — does this fit in an int32?
+assert c.abs_max() == 99.0          # max(|min|, |max|): does this fit in an int32?
 assert c.n_unique() == 4            # exact COUNT(DISTINCT)
 assert c.is_unique()                # every non-null value occurs once?
 assert not c.has_duplicates()
@@ -172,9 +172,9 @@ assert c.mean() == 34.4375
 assert c.summary()["n_unique"] == 4  # all of the above, as one dict
 ```
 
-`sum` and `mean` are the ones with an interesting economics. No footer records a sum, so
-they usually run an aggregate. But an immutable in-memory relation *computes and caches* one
-the first time you ask, so the second query that needs it is free. That is the
+`sum` and `mean` are the interesting pair. No footer records a sum, so they usually run an
+aggregate. But an immutable in-memory relation *computes and caches* one the first time you
+ask, so the second query that needs it is free. That is the
 learned-metadata idea in miniature: a query that gets cheaper the more it runs.
 
 ## Predicates on a column with `ds.meta.col(...).check`
@@ -196,16 +196,16 @@ assert amt.all_greater_equal(3.25)
 assert amt.all_less_than(1000)
 assert amt.all_less_equal(99.0)
 
-assert not amt.any_greater_than(1_000_000)  # the maximum decides — in *both* directions
+assert not amt.any_greater_than(1_000_000)  # the maximum decides, in *both* directions
 assert amt.any_greater_equal(99.0)
 assert not amt.any_less_than(0)
 assert not amt.any_less_equal(0)
 ```
 
 `any_greater_than` is worth dwelling on. A maximum *above* the threshold proves a match
-exists, and a maximum *at or below* it proves none does. The second half is what lets
-`WHERE amount > 1000000` over a column whose maximum is 99 be answered "no rows" without
-opening the file.
+exists, and a maximum *at or below* it proves none does. That second half answers
+`WHERE amount > 1000000` over a column whose maximum is 99 with "no rows", without opening
+the file.
 
 Membership is the other half, and it is **asymmetric** on purpose:
 
@@ -216,7 +216,7 @@ assert not ids.contains(9999)     # absence is provable; presence usually is not
 assert ids.never_equals(9999)     # the spelling a skip decision reads as
 assert not ids.may_contain(9999)  # free, one-sided: False is a proof of absence
 assert ids.contains(3)
-assert ids.any_in([3, 4])         # SQL IN — refuted for free when every candidate is out of range
+assert ids.any_in([3, 4])         # SQL IN, refuted for free when every candidate is out of range
 assert ids.none_in([9998, 9999])
 ```
 
@@ -236,7 +236,7 @@ assert ds.meta.nulls.counts()["amount"] == 0  # every column, one question
 assert ds.meta.nulls.fractions()["amount"] == 0.0
 assert ds.meta.nulls.total() == 0
 assert not ds.meta.nulls.any()
-assert ds.meta.nulls.is_complete()  # no null anywhere — the data-contract question
+assert ds.meta.nulls.is_complete()  # no null anywhere: the data-contract question
 assert ds.meta.nulls.columns_with_nulls() == []
 assert "amount" in ds.meta.nulls.complete_columns()
 ```
@@ -335,7 +335,7 @@ returns `None` if nobody has measured it yet.
 ```python
 approx = ds.meta.approx
 
-assert approx.rows() == 4.0        # the cost model's estimate — always available
+assert approx.rows() == 4.0        # the cost model's estimate, always available
 assert approx.memory_bytes() > 0   # size a buffer, a broadcast, a spill threshold
 assert approx.row_bytes() > 0
 assert approx.column_bytes("amount") == 32.0

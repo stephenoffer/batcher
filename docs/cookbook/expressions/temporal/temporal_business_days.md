@@ -1,6 +1,6 @@
 # Business days
 
-Reports almost always want weekdays only, and almost always want a string at the end. Both are expressions, so the filter pushes down toward the scan and the formatting happens in Rust rather than in a Python ``strftime`` loop.
+Reports almost always want weekdays only, and almost always want a string at the end. Both are expressions, so the filter pushes down toward the scan and the formatting happens in Rust rather than in a Python `strftime` loop.
 
 The whole script, executed on every test run:
 

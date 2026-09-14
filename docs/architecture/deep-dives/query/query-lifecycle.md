@@ -92,6 +92,10 @@ Kyber rewrites the logical plan by pushing down predicates and projections, fusi
 Neither subsystem touches data. Kyber decides, Carbonite protects, Core measures. The verbs
 stay in their lanes because the subsystems cannot import one another.
 
+Drawn as the ring it is, with the outcome of admission the list above flattens:
+
+![The contract loop a terminal op drives, as a clockwise ring of four stations, each carrying the verb that keeps it in its lane. Kyber DECIDES, in kyber.optimize_full, and hands Carbonite a PhysicalPlan with a resource bound per operator. Carbonite PROTECTS, in carbonite.validate, and when the plan fits it reserves and runs it. Core MEASURES, in core.execute, and returns per-operator metrics: actual rows, time, peak bytes. The MetadataHub REMEMBERS, in collect_source_metadata, and the dashed edge from it back to Kyber is read on the next run, not this one. Admission has a third outcome besides pass and fail: a plan that will not fit in memory gets a counter-offer and is routed out-of-core, to spill and then run. Any other binding constraint raises instead, because spilling only ever answers a memory constraint.](/_static/diagrams/query_lifecycle.svg)
+
 ### 4 and 5. Lower and execute
 
 `PhysicalPlan.to_json()` serializes the relational IR. Core calls the one FFI entry point:
@@ -149,17 +153,18 @@ print(q.sort("g").to_pydict())
 
 :::{dropdown} The plan side of that output
 ```text
-query plan (planned)                             3 operators
-────────────────────────────────────────────────────────────
-OPERATOR                      ESTIMATE  NOTES
-aggregate  [by k · sum]          est≈1  (default)
-└─ filter  [v > 10]              est≈1  (default)
-   └─ scan  [source 0]           est≈4  (exact)  pushed[v > 10]
+query plan (planned)                          3 operators
+─────────────────────────────────────────────────────────
+OPERATOR                 ESTIMATE  NOTES
+aggregate  [by g · sum]     est≈1  (default)
+└─ filter  [x > 1]          est≈3  (default)
+   └─ scan  [source 0]      est≈4  (exact)  pushed[x > 1]
 ```
 
 `est≈4 (exact)` on the scan is the metadata layer: the row count of an in-memory relation is
-known exactly. The two nodes above it carry `default` provenance: nobody has measured a
-selectivity for this predicate yet. Run the query a few times and Kyber will have.
+known exactly. The two nodes above it carry `default` provenance, because nobody has measured a
+selectivity for this predicate yet. Run the query a few times and Kyber will have. The predicate
+itself is already inside the scan, which is what `pushed[x > 1]` records.
 :::
 
 `explain(format="json")` returns the same tree as a document, with the measured columns

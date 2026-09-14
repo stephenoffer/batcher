@@ -37,13 +37,13 @@ the port returns the same rows.
 ## Where to go next
 
 Once a query runs, the docs split by what you are trying to do. Reach for
-{doc}`../tutorials/index` if you want to be walked through a complete pipeline,
+{doc}`tutorials/index` if you want to be walked through a complete pipeline,
 {doc}`../user-guide/index` if you want one capability at a time, and
 {doc}`../cookbook/index` if you would rather start from working code and change it.
 
 ## See also
 
-- {doc}`/tutorials/paths/index`: an ordered reading list for your role.
+- {doc}`/getting-started/tutorials/paths/index`: an ordered reading list for your role.
 - {doc}`/getting-started/migration/index`: the verb-by-verb mapping if you are coming from Spark,
   pandas, Polars, DuckDB, or Daft.
 - {doc}`../api/reference`: the one-page cheat sheet to keep open while you work.
@@ -55,5 +55,6 @@ Once a query runs, the docs split by what you are trying to do. Reach for
 installation
 quickstart
 concepts/index
+tutorials/index
 migration/index
 ```

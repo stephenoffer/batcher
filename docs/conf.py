@@ -127,98 +127,28 @@ exclude_patterns = [
     ".DS_Store",
     "requirements.txt",
     "Makefile",
+    # The contributor working records, grouped by kind. These are measured ledgers, audits,
+    # program logs and RFCs: each carries an explicit "what this did not do" or "still
+    # unmeasured" register, which is exactly what a published page must not carry. They are
+    # excluded by directory rather than one line per file, so adding a record does not mean
+    # remembering to exclude it.
+    "architecture/internals/parity/*",
+    "architecture/internals/audits/*",
+    "architecture/internals/programs/*",
+    "architecture/internals/rfcs/*",
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
     "architecture/internals/mathematical_foundations.md",
-    # A measured audit of the connectors at TB/PB scale, kept in-tree as the record behind
-    # the scale work. A working document for contributors, not a published page.
-    "architecture/internals/connector_scale_audit.md",
-    # The measured record of the distributed scale-out pass: where the aggregate ladder stops
-    # being linear, and the three findings behind it. Same reason as the audit above, plus an
-    # explicit "what this pass deliberately did not do" register.
-    "architecture/internals/distributed_scaling_audit.md",
-    # The enterprise-requirement scorecard against the commercial platforms (Databricks,
-    # Snowflake, SageMaker, Anyscale, SkyPilot). Every cell carries an evidence citation or
-    # reads UNMEASURED. A working record for contributors deciding what to build next, and it
-    # names gaps in a register a published page should not carry.
-    "architecture/internals/platform_parity_scorecard.md",
-    # The record of one pass over the governance key: what a policy is matched against, and
-    # the five ways a read evaded it. Kept in-tree as the reasoning behind the refusals,
-    # including the one argument (why a governed MERGE is refused rather than repaired) that
-    # a reader will otherwise want to reopen. Working document, not a published page.
-    "architecture/internals/governance_bypass_audit.md",
-    # A value-level audit of the 132 text-quality metrics: one defect (`mean_line_length`
-    # counts the line separators, biasing short-line documents up to 80% high) and four
-    # apparent defects that are not. Working document, not a published page.
-    "architecture/internals/text_metric_audit.md",
-    # The three per-platform ledgers the scorecard above hoists from. Same reason: working
-    # records with an explicit ⚠️ register of claims that still need a primary source, which
-    # is exactly the kind of thing a published page must not carry.
-    "architecture/internals/snowflake_parity.md",
-    "architecture/internals/anyscale_parity.md",
-    "architecture/internals/orchestration_parity.md",
-    # The record of the GPU-datacenter alignment program: what landed, the rules it followed,
-    # and an explicit register of what it did not do (no Rust data-plane work, no measurement
-    # on real GPU hardware). A working document for contributors, and the "what we did not do"
-    # register is exactly what a published page must not carry.
-    "architecture/internals/gpu_datacenter_program.md",
-    # The record of the inter-GPU fabric program that continues it: rails, peer islands, the
-    # exchange schedule, and the first Rust data-plane work in this area. Same reason again —
-    # it carries an explicit "decided against reported" register and a "not done" list.
-    "architecture/internals/gpu_fabric_program.md",
-    # The record of the cluster-topology work that gave the optimizer the fleet's shape. Same
-    # reason as the program above: it carries an explicit "not done" register and an explicit
-    # "not benchmarked" caveat, neither of which belongs on a published page.
-    "architecture/internals/cluster_topology_program.md",
-    # Design proposal (RFC), not a published page — kept in-tree for contributors,
-    # excluded from the site build until/unless its proposals are accepted.
-    "architecture/internals/rfc-gpu-transport.md",
-    # RFC: the streaming/pipelined executor tier that closes the single-node scale gap to
-    # DuckDB (fixes the sf100 OOM, kills the high-selectivity gather tax) while preserving
-    # every invariant. In-tree for contributors; not a site page until accepted.
-    "architecture/internals/rfc-streaming-executor.md",
     # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
     # Flink / Daft / Snowflake: where it genuinely wins, where it loses, the
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "architecture/internals/competitive_architecture.md",
-    # A code audit of which single-node operators and optimizations keep scaling as nodes are
-    # added, and which are O(1) in the node count. Carries an explicit "what this did not do"
-    # register and names an unclosed gap, so it is a working record rather than a site page.
-    "architecture/internals/single_node_scaleout_audit.md",
-    # A code audit of how much batch and streaming share: which operator semantics are one
-    # implementation, which differences are earned, and the one divergence that is a gap.
-    # Working record with an explicit "did not check" register, not a site page.
-    "architecture/internals/batch_streaming_sharing_audit.md",
     # The parts list behind that scorecard: which specific mechanisms DuckDB / Polars /
     # DataFusion / Spark / Daft have that Batcher does not, each cited to the
     # competitor file it was read from, plus the ranked build order. A contributor working
     # record, not a site page.
     "architecture/internals/competitor_technique_review.md",
-    # The other half of that review: gaps found by *executing* the reference engines and
-    # Batcher side by side over their whole function surface, the wrong answers that
-    # measurement turned up, and the build log against them. A contributor working record,
-    # not a site page.
-    "architecture/internals/competitor_parity_census.md",
-    # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
-    # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
-    # path, and the enterprise surface — plus the Databricks claims that are secondary-
-    # sourced and must not be cited. A working record for contributors, not a site page.
-    "architecture/internals/databricks_parity.md",
-    # A code-checked audit of which Ray performance pitfalls Batcher avoids by design and
-    # which it still inherits, read against a field-engineering corpus. A contributor
-    # working record like the parity scorecards above, not a site page.
-    "architecture/internals/ray_pitfall_parity.md",
-    # An audit of whether the hardware metrics Batcher collects are actually acted upon by the
-    # optimizer (mostly they are not), plus the catalog of optimizations the unspent measured
-    # metadata makes possible. It names live defects and carries reproduction scripts for two of
-    # them, so it is a contributor working record, not a site page.
-    "architecture/internals/kyber_optimization_backlog.md",
-    # The tombstone for the fourteen working ledgers retired on 2026-07-29: what they were,
-    # what was still open, and why they are not coming back. It exists so a contributor (or an
-    # agent) who finds one missing reads "retired on purpose" instead of restoring it. Written
-    # for that reader, not for a user, so it is excluded rather than wired into a toctree.
-    "architecture/internals/retired_ledgers.md",
     # The authoring guide for the diagram sources that live beside it (palette, the
     # rsvg-convert render step). A contributor note in an asset directory, not a page.
     "_static/diagrams/README.md",
@@ -298,7 +228,7 @@ autodoc_mock_imports = [
     "vllm",
 ]
 
-# The generated API reference (docs/api/complete.md) renders docstrings written in a
+# The generated API reference (docs/api/complete/) renders docstrings written in a
 # light Markdown style. Treat a bare `backtick` span as inline code so single
 # backticks don't need an explicit role, and suppress the docutils inline-markup
 # warnings those Markdown-isms (e.g. `Dataset`s) would otherwise raise under -W.

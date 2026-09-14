@@ -4,8 +4,7 @@ This page covers the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._S
 namespace, which holds every method that only makes sense for a string column. The other
 namespaces are in {doc}`/user-guide/transform/columns/expression-accessors`.
 
-Every example runs against the engine, and the blocks below share one namespace and
-execute in order.
+The blocks below build on each other in order.
 
 ```python
 import batcher as bt
@@ -21,7 +20,7 @@ ds = bt.from_pydict(
 
 The `.str` namespace covers casing and trimming, search, slicing, padding,
 encoding. Search methods such as `contains`, `starts_with`, and `like` are
-case-sensitive; use `ilike` for case-insensitive matching.
+case-sensitive. Use `ilike` when they should not be.
 
 ```python
 out = ds.select(
@@ -64,8 +63,8 @@ print(out.to_pydict())
 # {'is_conf': [True, False, False], 'second': ['app', 'local', ''], 'head': ['etc/app', 'usr/local', '  a   b  '], 'tidy': ['etc/app/conf', 'usr/local/bin', 'a b']}
 ```
 
-`ascii` returns the codepoint of the first character; `bit_length` and `octet_length`
-measure the encoded size in bits and UTF-8 bytes, not characters. {py:meth}`levenshtein(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>`
+`ascii` returns the codepoint of the first character. `bit_length` and `octet_length`
+measure the encoded size in bits and UTF-8 bytes rather than in characters. {py:meth}`levenshtein(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>`
 gives the edit distance to a constant string and `soundex` its phonetic key.
 
 ```python
@@ -110,11 +109,6 @@ print(out.to_pydict())
 # {'name': ['events.parquet', 'in.csv'], 'first': ['/', 'raw'], 'folder': ['/data/2024', 'raw'], 'parts': [['/', 'data', '2024', 'events.parquet'], ['raw', 'in.csv']], 'quoted': ['%2Fdata%2F2024%2Fevents.parquet', 'raw%2Fin.csv']}
 ```
 
-On `.list`, `concat(other)` appends and is deliberately not `union`: it keeps duplicates
-and order, and a null list counts as *empty*, so `concat` of `[1,2]` and `[2,3]` is
-`[1,2,2,3]` where `union` is `[1,2,3]`. `has_all(other)` and `has_any(other)` test
-containment and, unlike `concat`, are null when either side is null.
-
 {py:meth}`to_binary <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_binary>` renders a value's UTF-8 bytes as `0`/`1` text and {py:meth}`from_binary <batcher.plan.expr_ir.namespaces.strings._StrNamespace.from_binary>` reads it back
 (undecodable input is null, the rule `unhex` also follows).
 
@@ -143,6 +137,13 @@ print(out.to_pydict())
 
 The styles are `snake`, `upper_snake`, `camel`, `pascal`, `kebab`, `upper_kebab`,
 `title`, `sentence`, `dot`, and `train`.
+
+:::{note}
+Recasing is idempotent in every style that joins with a separator. `camel` and `pascal`
+join with nothing, so an input with consecutive single-letter words can't survive a round
+trip: `a_b_c` becomes `aBC`, which reads back as two words. Prefer a separator style when
+the result will be parsed again.
+:::
 
 ## Compressed payloads inside a column
 
@@ -180,13 +181,6 @@ else.
 `deflate` is the one codec that can't tell a corrupt frame from a valid one: raw deflate
 carries no header and no checksum. Use `zlib` or `gzip` where detection matters. They wrap
 the same algorithm in a frame that can be validated.
-:::
-
-:::{note}
-Recasing is idempotent in every style that joins with a separator. `camel` and `pascal`
-join with nothing, so an input with consecutive single-letter words can't survive a round
-trip: `a_b_c` becomes `aBC`, which reads back as two words. Prefer a separator style when
-the result will be parsed again.
 :::
 
 ## Regex
@@ -243,7 +237,8 @@ print(out.to_pydict())
 
 Parsing string columns into temporal types also lives on `.str`:
 {py:meth}`to_date(format) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_date>` yields a `Date` and {py:meth}`to_datetime(format) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_datetime>` a `Timestamp`, each
-reading a chrono/strftime pattern. Once parsed, reach for the `.dt` accessor below.
+reading a chrono/strftime pattern. Once parsed, the `.dt` accessor on
+{doc}`/user-guide/transform/columns/expression-accessors` takes over.
 
 ```python
 day_strs = bt.from_pydict({"d": ["2024-01-15", "2024-06-01"]})

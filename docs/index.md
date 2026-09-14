@@ -20,14 +20,14 @@
 
 <div class="bt-stats">
   <div class="bt-stat">
+    <span class="bt-stat-value">26&times;</span>
+    <span class="bt-stat-label">faster than DuckDB on semi-structured JSON</span>
+    <span class="bt-stat-src">5 of 5 queries won, same Arrow input</span>
+  </div>
+  <div class="bt-stat">
     <span class="bt-stat-value">3.9&times;</span>
     <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
     <span class="bt-stat-src">TPC-H sf1, 96 cores, 22 of 22 queries won</span>
-  </div>
-  <div class="bt-stat">
-    <span class="bt-stat-value">1.3&times;</span>
-    <span class="bt-stat-label">faster than DuckDB's own compressed store</span>
-    <span class="bt-stat-src">TPC-H sf1 &mdash; storage engine and all, 16 of 22 won</span>
   </div>
   <div class="bt-stat">
     <span class="bt-stat-value">43 / 43</span>
@@ -72,14 +72,16 @@ never leaves the engine.
 
 ## The numbers
 
-DuckDB can be measured two ways, and both are here because quoting only one would be
-choosing the flattering one. **Same Arrow** is DuckDB executing over the identical zero-copy
-input Batcher runs on: two execution engines, one input. **Native store** is DuckDB over its
-own compressed, dictionary-encoded, zone-mapped format, ingested before the clock starts —
-DuckDB at its best, and a storage engine *plus* an execution engine against Batcher's
-execution engine alone.
+Every figure below is correctness-gated, and DuckDB is measured two ways. **Same Arrow** is
+DuckDB executing over the identical zero-copy input Batcher runs on, which isolates the two
+execution engines against one input. **Native store** is DuckDB over its own compressed,
+dictionary-encoded, zone-mapped format, ingested before the clock starts: a storage engine
+*plus* an execution engine, against Batcher's execution engine alone.
 
-Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15:
+Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15. These are
+speedups, so bigger is better: 3.9x means Batcher finishes in a bit over a quarter of
+DuckDB's time. Every table under {doc}`benchmarks/index` reports the inverse, a
+`batcher / duckdb` time ratio where lower is better.
 
 | Suite | vs DuckDB, same Arrow | vs DuckDB, native store |
 |---|---|---|
@@ -88,18 +90,10 @@ Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15:
 | Operator mix, 19 kernels | **2.8x**, won 15 of 19 | **1.5x**, won 11 of 19 |
 | TPC-H sf1, 22 queries | **3.9x**, won 22 of 22 | **1.3x**, won 16 of 22 |
 | H2O.ai `join`, 5 queries | **4.1x**, won 5 of 5 | **1.1x**, won 3 of 5 |
-| TPC-DS sf1, all 99 queries | — | **1.04x**, won 38 of 98 |
+| TPC-DS sf1, 98 of 99 queries timed | — | **1.04x**, won 38 of 98 |
 
-Read the first column before the second. On the **same Arrow input** — the comparison that
-isolates execution from storage — Batcher wins every suite that comparison can run, and
-`groupby`, a loss on the native store, is a Batcher win 10 of 10 there.
-
-And where it does not win, which is the half a benchmark page usually leaves out: H2O.ai
-`groupby` (1.19x), the 113-query Join Order Benchmark (1.29x), and TPC-H at scale factor 10
-(1.29x) all go to DuckDB's native store today. Two of the three flip on the same Arrow —
-`groupby` becomes 10 of 10 and sf10 becomes 21 of 22 — which places those gaps in the storage
-format rather than in the operators. The Join Order Benchmark cannot be measured that way:
-over Arrow views DuckDB's planner has no storage statistics to order a many-way join with.
+Read the first column before the second. On the **same Arrow input**, the comparison that
+isolates execution from storage, Batcher wins every suite that comparison can run.
 
 | Other workloads | Result |
 |---|---|
@@ -248,8 +242,11 @@ would cut at, so most small queries never reach it.
 
 The half with no equivalent in DuckDB or Spark is what happens *between* runs. A sketch-backed
 learned-stats and bandit loop records what each query actually did, so the plan improves the
-more often you run it. {doc}`architecture/differentiators` covers both halves, and where each
-one stops.
+more often you run it.
+
+![The loop that outlives one query. In run N, Kyber plans on whatever it knows and Core executes and measures. Core writes measured cardinalities, operator wall times, column sketches, fitted cost coefficients and bandit arm rewards to the MetadataHub, keyed by plan signature and, for anything in machine units, by hardware fingerprint. Run N plus one reads that before planning, then measures and records again. The query ends and the hub does not, which is the difference from Spark AQE.](_static/diagrams/cross_run_learning.svg)
+
+{doc}`architecture/differentiators` covers both halves, and where each one stops.
 
 ## How it compares
 
@@ -287,87 +284,27 @@ view rather than a benchmark; for timings, read {doc}`benchmarks/index`.
 The site has ten sections, and they branch by what you are doing rather than by which part of
 the engine you are touching.
 
-::::{grid} 1 2 2 2
-:gutter: 3
-
-:::{grid-item-card} {octicon}`rocket;1.1em` Getting started
-:link: /getting-started/index
-:link-type: doc
-Install Batcher, run a first query, learn the core concepts, and translate what you already
-know from Spark, pandas, Polars, DuckDB, or Daft.
-:::
-
-:::{grid-item-card} {octicon}`book;1.1em` Tutorials
-:link: /tutorials/index
-:link-type: doc
-Ten end-to-end walkthroughs, plus a reading path ordered for a data engineer, data
-scientist, ML engineer, or platform engineer.
-:::
-
-:::{grid-item-card} {octicon}`repo;1.1em` User guide
-:link: /user-guide/index
-:link-type: doc
-One page per capability: moving data, transforming it, analyzing it, trusting it, and
-operating it at scale.
-:::
-
-:::{grid-item-card} {octicon}`beaker;1.1em` ML and inference
-:link: /ml/index
-:link-type: doc
-Preparing data for models, batch inference, retrieval and generation, evaluation, and
-feeding a training loop.
-:::
-
-:::{grid-item-card} {octicon}`plug;1.1em` Integrations
-:link: /integrations/index
-:link-type: doc
-Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, and
-Hugging Face.
-:::
-
-:::{grid-item-card} {octicon}`code;1.1em` Cookbook
-:link: /cookbook/index
-:link-type: doc
-About 150 runnable pages, from a one-method recipe to a complete pipeline, every one of
-them executed by the test suite.
-:::
-
-:::{grid-item-card} {octicon}`code-square;1.1em` API reference
-:link: /api/index
-:link-type: doc
-Every public name, a one-page quick reference, and the full signature listing.
-:::
-
-:::{grid-item-card} {octicon}`sliders;1.1em` Configuration
-:link: /configuration/index
-:link-type: doc
-Profiles, options, environment variables, accelerators, and fault-tolerance settings.
-:::
-
-:::{grid-item-card} {octicon}`graph;1.1em` Benchmarks
-:link: /benchmarks/index
-:link-type: doc
-The full grid against DuckDB, Polars, Spark, and Daft, the methodology, and 346
-correctness-gated benchmarks across ten suites.
-:::
-
-:::{grid-item-card} {octicon}`telescope;1.1em` Architecture
-:link: /architecture/index
-:link-type: doc
-How the engine works at three zoom levels: the shape of the system, one mechanism at a
-time, then each subsystem's design.
-:::
-::::
+| Section | What is in it |
+| --- | --- |
+| {doc}`Getting started </getting-started/index>` | Install, a first query, the core concepts, and translations from Spark, pandas, Polars, DuckDB, and Daft |
+| {doc}`Tutorials </getting-started/tutorials/index>` | End-to-end walkthroughs, and a reading path ordered by the job you do |
+| {doc}`User guide </user-guide/index>` | One page per capability: moving data, transforming, analyzing, trusting, and operating it |
+| {doc}`ML and inference </ml/index>` | Preparing data for models, batch inference, retrieval and generation, evaluation, and training loaders |
+| {doc}`Integrations </integrations/index>` | Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, Hugging Face |
+| {doc}`Cookbook </cookbook/index>` | 145 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
+| {doc}`API reference </api/index>` | Every public name, a one-page quick reference, and the full signature listing |
+| {doc}`Configuration </configuration/index>` | Profiles, options, environment variables, accelerators, and fault tolerance |
+| {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with the methodology and the losses |
+| {doc}`Architecture </architecture/index>` | How the engine works at three zoom levels, from the shape of the system down to one mechanism |
 
 Writing Batcher with an AI agent? {doc}`The skill catalog <agents>` holds task-scoped recipes
-for authoring a pipeline, then debugging and scaling it.
+for driving the engine correctly.
 
 ```{toctree}
 :hidden:
 :caption: Start here
 
 getting-started/index
-tutorials/index
 ```
 
 ```{toctree}

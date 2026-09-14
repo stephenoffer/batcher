@@ -32,11 +32,11 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 ## The short version
 
-Batcher leads the classical analytics suites against DuckDB reading the same Arrow — 22 of 22 TPC-H at scale factor 1, 43 of 43 ClickBench, 5 of 5 JSON — and, since 2026-08-15, against DuckDB's own native compressed store as well — TPC-H sf1, all 99 queries of TPC-DS, ClickBench, JSON, the operator mix and the H2O.ai join task. That second bar is the harder one and the one worth arguing about: it puts DuckDB's storage engine *and* its execution engine against Batcher's execution engine alone. Where Batcher still loses is stated in the table below rather than omitted from it.
+Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 43 of 43 ClickBench, 5 of 5 JSON. Since 2026-08-15 it also leads against DuckDB's own native compressed store on TPC-H sf1, TPC-DS, ClickBench, JSON, the operator mix and the H2O.ai join task. That second bar is the harder one and the one worth arguing about, because it puts DuckDB's storage engine *and* its execution engine against Batcher's execution engine alone.
 
 Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
-Coverage is **346 benchmarks across ten suites**, including the full 99-query TPC-DS set, all 113 Join Order Benchmark queries against the real IMDb dataset, and the H2O.ai db-benchmark group-by and join sweeps. {doc}`methodology` lists them.
+Coverage is **373 benchmarks across ten suites** (`python benchmarks/run.py --list` prints the live count), including the full 99-query TPC-DS set, all 113 Join Order Benchmark queries against the real IMDb dataset, and the H2O.ai db-benchmark group-by and join sweeps. Registered is not the same as timed: TPC-DS publishes 98 of its 99 and the Join Order Benchmark 109 of its 113, because the rest do not clear the correctness gate. {doc}`methodology` says why.
 
 For the standing against every engine at once, read {doc}`the full engine matrix </benchmarks/results/engine-matrix>`. It publishes the gaps as well as the wins, and labels which kind each gap is: an engine that cannot express a suite, one that did not finish it, and one that could not be held in memory beside Batcher are three different things and none of them is a ratio.
 
@@ -52,10 +52,20 @@ same zero-copy Arrow Batcher runs on (the like-for-like one). Lower is better an
 | **Operator mix** (19) | **0.66x**, 11 of 19 | **0.36x**, 15 of 19 | **0.12x**, 19 of 19 | **0.12x**, 15 of 15 |
 | **TPC-H sf1** (22) | **0.79x**, 16 of 22 | **0.26x**, 22 of 22 | **0.43x**, 20 of 22 | **0.35x**, 20 of 20 |
 | **H2O.ai `join`** (5) | **0.93x**, 3 of 5 | **0.24x**, 5 of 5 | **0.69x** | — |
-| **TPC-DS sf1** (99) | **0.96x**, 38 of 98 | — | — | — |
+| **TPC-DS sf1** (98 of 99 timed) | **0.96x**, 38 of 98 | — | — | — |
 | **H2O.ai `groupby`** (10) | 1.19x, 4 of 10 | **0.09x**, 10 of 10 | **0.42x** | — |
 | **TPC-H sf10** (22) | 1.29x, 8 of 22 | — | **0.37x**, 18 of 22 | **0.42x**, 16 of 20 |
 | **Join Order Benchmark** (113) | 1.29x, 35 of 109 | — | — | — |
+
+A `—` in that table means no figure exists, never a tie. DuckDB over registered Arrow views
+is killed on TPC-DS q64, and the Join Order Benchmark measures join *ordering*, which a
+planner reading Arrow views has no storage statistics to do.
+
+One row has moved since the sweep. TPC-H sf10 read **0.963x** on 2026-08-25, a win, measured
+as a same-day A/B against the tree on the same 96-core node: q9 456 to 233 ms, q13 325 to
+174, q5 189 to 122, and a suite total of 2,938 ms down to 2,323. The row above is left at its
+2026-08-15 value because the rest of the table was taken that day and a mixed-date row is
+worse than a stale one.
 
 | Other workloads | Measured |
 |---|---|
@@ -73,7 +83,7 @@ That last row is honest about *what it measures* and the same caveat applies ins
 table: five of the 43 ClickBench queries and two of the 19 operator cases are **answered from
 recorded column statistics rather than executed**. An unfiltered `SUM`, `AVG` or
 `COUNT(DISTINCT)` over an immutable in-memory relation is served from a statistic the first
-run computed. The answers are exact — they match DuckDB — but the timing is a memo lookup, not
+run computed. The answers are exact and match DuckDB, but the timing is a memo lookup rather than
 a scan. Excluding those cases, ClickBench is **0.77x over 38 queries** and the operator mix
 **0.76x over 17**. Use those figures when the claim is about execution speed.
 :::
@@ -94,9 +104,9 @@ Those rows were not all measured on the same machine, because the workload famil
 
 ## Reading the comparisons
 
-Every table on this site is a like-for-like execution comparison: the same Arrow buffers, the same queries, and a correctness gate before any timing is recorded.
+Every table on this site is a like-for-like execution comparison: the same Arrow buffers, the same queries, and a correctness gate before any timing is recorded. Every ratio is a ratio of times, so lower is better.
 
-One comparison on these pages is deliberately not like-for-like, and it is published anyway because it is what you get from `duckdb` at a prompt. Measured against DuckDB's own compressed format rather than shared Arrow, DuckDB decompresses its own layout as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Batcher trades that storage format away on purpose, because the same operators that read that Arrow also run distributed, stream, and carry tensors. Give both engines the same Arrow buffers and the same queries are 2x to 5x Batcher wins.
+One comparison on these pages is deliberately not like-for-like, and it is published anyway because it is what you get from `duckdb` at a prompt. Measured against DuckDB's own compressed format rather than shared Arrow, DuckDB decompresses its own layout as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Batcher trades that storage format away on purpose, because the same operators that read that Arrow also run distributed, stream, and carry tensors. Give both engines the same Arrow buffers and the same queries go to Batcher by 2.8x on the operator mix and 25x on JSON, which is the right-hand column of the table above.
 
 Correctness is not part of that trade: Batcher matches DuckDB on all 22 TPC-H queries.
 
@@ -117,7 +127,7 @@ Every number here is regenerated by the harness in `benchmarks/`, and the comple
 
 ```bash
 python benchmarks/run.py --benchmark tpch --tier single     # vs DuckDB / Polars
-python benchmarks/run.py --benchmark tpcds                  # all 99 queries
+python benchmarks/run.py --benchmark tpcds                  # 99 queries, 98 timed
 python benchmarks/run.py --benchmark job                    # all 113 queries, real IMDb
 python benchmarks/run.py --benchmark operators --tier multi # the data-plane lineup
 python benchmarks/scenarios/image_decode.py                 # multimodal ingest
@@ -185,7 +195,7 @@ The distributed runs, and the full scale-out grid.
 - {doc}`/architecture/deep-dives/operators/morsel-parallelism` and {doc}`/architecture/deep-dives/query/jit-compilation` for the two mechanisms behind most of the operator wins.
 - {doc}`/architecture/deep-dives/operators/mergeable-algebra` for why the distributed result matches the single-node one, and for the one place floating-point reassociation shows through.
 - {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for the stage-boundary re-optimization and the cross-query learned-stats loop, which no number on this page captures.
-- {doc}`/tutorials/foundations/optimizing-a-slow-query` for the diagnosis loop.
+- {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query` for the diagnosis loop.
 
 ```{toctree}
 :hidden:

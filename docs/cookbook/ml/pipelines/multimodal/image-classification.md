@@ -4,8 +4,8 @@ The GPU is not the bottleneck in an image-classification job. Decoding JPEGs is.
 decode and the forward pass in lockstep and the device sits idle through every decode,
 which is how a ResNet-50 pipeline ends up at 942 img/s and ~30% utilization. Overlap them
 so the CPU decodes morsel *k+1* while the GPU is still on morsel *k*, and the same hardware
-does **2,504 img/s at 81%**. Batcher overlaps stages by default. The job of this
-page is to not get in its way.
+does 2,504 img/s at 81%. Batcher overlaps stages by default. The job of this page is to not
+get in its way.
 
 ## Read, decode, classify
 
@@ -200,7 +200,7 @@ error tolerance will fix it.
 
 `num_gpus` is how much of a device each actor holds; `concurrency` is how many actors
 run. A ResNet-50 fills a T4, so `num_gpus=1, concurrency=4` across four devices. A small
-model does not: `num_gpus=0.5, concurrency=4` packs two actors per GPU and roughly
+model does not: `num_gpus=0.5, concurrency=8` packs two actors per GPU and roughly
 doubles throughput on an EfficientNet-B0-sized network. Or state `model_memory_gb` and
 let Kyber pick the fraction. Anything you set explicitly is honored, and only what you leave
 unset is chosen for you.

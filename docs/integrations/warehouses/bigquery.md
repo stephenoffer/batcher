@@ -111,7 +111,7 @@ client and pulls Arrow batches straight from the API.
 
 ## Push the projection down, or pay for the columns
 
-Two pushdowns matter, and they behave differently.
+The two pushdowns here do not behave alike, and the asymmetry is what costs money.
 
 Predicates are pushed. A `filter` that Kyber can translate becomes the read session's
 `row_restriction`, evaluated server-side before a byte moves. You can also set `row_restriction=`

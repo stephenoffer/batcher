@@ -118,7 +118,7 @@ python/batcher/     Control plane — never touches a tuple in the hot path
   io/ observe/ plan/ metadata/           NEUTRAL — importable by anyone
   config/ _internal/   `_internal.native` is the ONE engine accessor
 crates/             Data plane — pure Rust + Arrow (only bc-py links PyO3)
-  bc-arrow Morsel(16,384) · bc-expr the one Expr · bc-ir the one RelOp
+  bc-arrow Morsel(16k|1MiB) · bc-expr the one Expr · bc-ir the one RelOp
   bc-runtime mergeable agg/join/shuffle/window + `keys` (the ONE key identity)
              — NOT sorting: every sort lives in bc-interp::ops
   bc-codegen Cranelift JIT · bc-interp Tier-0 execute/par/dist + sorts + spill
@@ -162,7 +162,8 @@ is not a substitute.
 `add-distributed-operator` · `add-kyber-optimizer-pass` · `add-an-io-format-or-connector` ·
 `run-quality-gate`
 
-**Documenting it:** `improve-a-docs-page` (one page) · `audit-docs-structure` (the whole site)
+**Documenting it:** `improve-a-docs-page` · `audit-docs-structure` ·
+`docs-grammar-style` · `write-in-a-human-voice` (reads generated)
 
 **Using the engine:** `write-a-batcher-pipeline` (the default for relational authoring;
 it routes to the rest) ·
@@ -174,8 +175,7 @@ it routes to the rest) ·
 **Migrating onto it:** `migrate-from-spark` · `migrate-from-polars-or-pandas` ·
 `migrate-from-duckdb-sql` · `migrate-from-daft`
 
-The user-facing catalog is `docs/agents.md`; `tests/docs/test_skill_coverage.py`
-fails if a skill is added without being listed there.
+Catalog: `docs/agents.md` (`tests/docs/test_skill_coverage.py` fails on an unlisted skill).
 
 ## Source of truth
 

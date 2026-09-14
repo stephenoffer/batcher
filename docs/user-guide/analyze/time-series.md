@@ -65,9 +65,8 @@ with {py:meth}`unnest <batcher.Dataset.unnest>` before grouping.
 ## Fill the buckets with no rows
 
 A group-by only emits buckets that have rows in them, so the result above jumps straight
-from 09:30 to nothing. When a downstream consumer needs an unbroken grid — a plot, a join
-against another series, a model that assumes fixed spacing — build the grid and left-join
-onto it.
+from 09:30 to nothing. A plot, a join against another series, a model that assumes fixed
+spacing: each of those needs an unbroken grid. Build the grid and left-join onto it.
 
 {py:func}`bt.date_range <batcher.date_range>` is the grid, and a cross join with the
 distinct keys gives one row per (key, bucket).
@@ -98,7 +97,8 @@ print(carried.to_pydict()["mean"], carried.to_pydict()["n"])
 ```
 
 A missing *count* is genuinely zero. A missing *temperature* is not, so it is carried
-forward instead — and the row count beside it is what tells a reader the value was carried.
+forward instead. The count beside it is how a reader knows the value was carried rather
+than measured.
 
 ## Fill gaps within a series
 
@@ -143,11 +143,11 @@ print(smoothed.to_pydict()["trailing"], smoothed.to_pydict()["seen"])
 ```
 
 The fourth reading is half an hour after the third, so its five-minute window holds only
-itself — and `rolling_count_by` says so.
+itself. `rolling_count_by` says so.
 
 {py:meth}`ewm_mean <batcher.plan.expr_ir.core.Expr.ewm_mean>` smooths differently: instead
 of a window with a hard edge, every past reading contributes with a weight that decays as it
-ages. Spell the decay however you think about it — `alpha`, `span` for the N-period EMA of
+ages. Spell the decay however you think about it: `alpha`, `span` for the N-period EMA of
 technical analysis, `half_life`, or `com`.
 
 ```python
@@ -163,9 +163,9 @@ print(
 `ewm_std` and `ewm_var` give the matching spread over the same weights, which is what makes
 a live volatility band or control limit.
 
-`ewm_mean` decays once per *row*, which is right only when the readings are evenly spaced.
-For the irregular feed above it is not: the half-hour gap costs exactly the weight one
-minute would. {py:meth}`ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` decays by
+`ewm_mean` decays once per *row*, which is right only when the readings are evenly spaced,
+and for the irregular feed above they are not: the half-hour gap costs exactly the weight
+one minute would. {py:meth}`ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` decays by
 elapsed time instead, so the smoother says the same thing whatever the sampling rate did.
 
 ```python
@@ -179,8 +179,8 @@ print(
 ```
 
 The fourth reading is half an hour after the third, so almost all of the old signal has
-decayed away and the result sits close to the new reading of 26.0 — where the per-row form
-above, counting that gap as one step, still returned 23.9.
+decayed away and the result sits close to the new reading of 26.0. The per-row form above
+counted that gap as a single step and returned 23.9.
 
 ## Filter by time of day
 
@@ -188,7 +188,7 @@ The date dominates a timestamp's ordering, so comparing timestamps cannot expres
 market hours" or "on the night shift".
 {py:meth}`is_between_time <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.is_between_time>`
 filters on the clock time with the date discarded, and it handles a window that wraps past
-midnight — which is the case the obvious hour comparison silently returns nothing for.
+midnight. That wrap is the case the obvious hour comparison silently returns nothing for.
 
 ```python
 clock = bt.from_pydict(
@@ -214,12 +214,12 @@ print(
 window, which is why the wrap is handled in one tested place rather than at each call site.
 
 {py:meth}`time_of_day <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.time_of_day>`
-gives the same clock reading as a number — microseconds since midnight — which is what you
-group by to compare a load curve across days, or subtract to get "minutes into the session".
+gives the same clock reading as a number, in microseconds since midnight. Group by it to
+compare a load curve across days, or subtract it for "minutes into the session".
 
 ## Align two series with different clocks
 
-Two feeds almost never share a clock, so an equi-join on the timestamp finds nothing.
+Two feeds almost never share a clock. An equi-join on the timestamp finds nothing.
 {py:meth}`join_asof <batcher.Dataset.join_asof>` matches each left row to the nearest right
 row instead, and `tolerance` bounds how stale that match may be.
 
@@ -267,9 +267,9 @@ earlier one, which is what makes a run id a segmentation rather than a grouping.
 
 ## Requirements and limitations
 
-- Every operation on this page that carries a value along an order — the fills,
-  `interpolate`, `rle_id`, the EWM family — requires `order_by`. An unordered relation has
-  no "previous row", and a morsel-parallel or distributed scan will not supply one.
+- Every operation on this page that carries a value along an order requires `order_by`:
+  the fills, `interpolate`, `rle_id`, and the EWM family. An unordered relation has no
+  "previous row", and a morsel-parallel or distributed scan will not supply one.
 - Window durations are fixed-length. `"1mo"` and `"1y"` are rejected for window widths and
   for a rolling `window_size`, because they have no constant microsecond length. Use
   {py:meth}`.dt.truncate("month") <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.truncate>`

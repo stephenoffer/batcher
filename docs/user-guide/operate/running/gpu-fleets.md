@@ -72,20 +72,22 @@ print(resident.speedup > scan.speedup)
 # True
 ```
 
-The same scan is roughly 2x on an H100 and 0.5x on a T4 — slower than the CPU outright, because
-a PCIe 3.0 copy costs more than scanning the data. On a Grace-Blackwell package the coherent
-host link is an order of magnitude faster and the same stage is worth offloading.
+The same scan is roughly 2x on an H100 and 0.5x on a T4. That is slower than the CPU
+outright, because a PCIe 3.0 copy costs more than scanning the data. On a Grace-Blackwell
+package the coherent host link is an order of magnitude faster, and the same stage is worth
+offloading.
 
 Batcher declines to route a stage to a device this model says loses, and says so in the plan's
-reason. Two conditions bound that, both deliberate: the fleet's device model must be known
-(an unlabelled cluster gets no opinion), and the fleet must not already have *measured* a
-GPU/CPU crossover for itself. A measurement from this hardware outranks a model whose
+reason. Two conditions bound that, both deliberate. The fleet's device model must be known, so
+an unlabelled cluster gets no opinion. And the fleet must not already have *measured* a
+GPU/CPU crossover for itself: a measurement from this hardware outranks a model whose
 CPU-bandwidth constant may not describe it, so once Batcher has timed both backends here it
 decides on those timings instead.
 
-Two things change the answer, and both are worth reaching for before a faster device: keeping
-the data resident (a stage fed by another GPU stage pays no copy at all), and giving the stage
-more work per byte. A stage below its device's roofline ridge is a copy with a kernel attached.
+Two things change the answer, and both are worth reaching for before a faster device. Keeping
+the data resident costs nothing, because a stage fed by another GPU stage pays no copy at all.
+Giving the stage more work per byte is the other. A stage below its device's roofline ridge is
+a copy with a kernel attached.
 
 ## Budget the power a job may draw
 
@@ -276,7 +278,7 @@ print(plan.profile.name, plan.instances_per_device, plan.devices_needed)
 
 Fourteen small workers land on two devices rather than fourteen. Set `prefer_mig=False` on
 {py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>` to keep whole devices instead. Creating the instances themselves is a
-privileged driver operation your platform performs at provisioning time; Batcher plans against
+privileged driver operation your platform performs at provisioning time. Batcher plans against
 them and never reconfigures a device.
 
 ## Size an inference stage by its KV cache
@@ -284,7 +286,7 @@ them and never reconfigures a device.
 A language model's weights are a fixed cost paid once. The variable cost is the key/value
 cache, which grows with every token of every sequence in flight, and it is what actually runs a
 device out of memory. A stage told to run 256 concurrent sequences on a device that holds 40
-does not run slowly: it either fails on the first full batch, or the serving engine preempts
+does not run slowly. It either fails on the first full batch, or the serving engine preempts
 and recomputes, which reads as a throughput regression with no error anywhere.
 
 ```python
@@ -332,8 +334,7 @@ working as intended and a power-bound fleet cannot afford to drop the slot. A de
 uncorrectable ECC errors is quarantined outright, whatever it costs in throughput.
 
 Health checking needs `pynvml` on every worker, which is why it is off by default. Install it
-with `pip install 'batcher-engine[nvml]'`. Without it, every device is assumed healthy,
-exactly as before.
+with `pip install 'batcher-engine[nvml]'`. Without it every device is assumed healthy.
 
 ```{important}
 Absent telemetry never quarantines anything. A fleet that loses its telemetry keeps
@@ -435,8 +436,9 @@ that is merely busy.
 - Device power, bandwidth, and interconnect figures cover the datacenter accelerators Batcher
   recognizes by model name. An unrecognized model reports unknown, and every decision falls
   back to its prior behavior rather than to a substituted figure.
-- Live telemetry requires `pynvml` (`pip install 'batcher-engine[nvml]'`) and a mounted driver.
-  Without it, power reporting falls back to the modelled draw and health checking is inert.
+- Live telemetry requires `pynvml`, from `pip install 'batcher-engine[nvml]'`, and a mounted
+  driver. Without it, power reporting falls back to the modelled draw and health checking is
+  inert.
 - Fabric-aware placement needs node labels. Batcher cannot discover a rack or an RDMA partition
   on its own.
 - MIG instances must already exist. Batcher plans against the profiles a device supports and

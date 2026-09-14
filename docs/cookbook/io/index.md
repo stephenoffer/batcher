@@ -2,7 +2,7 @@
 
 This section holds 6 runnable recipes for getting data in and out, ordered from the format you will reach for first to the registry behind all of them.
 
-Every page embeds a complete, self-contained script from the [`examples/io/`](https://github.com/batcher/batcher/tree/main/examples/io) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
+Every page embeds a complete, self-contained script from the [`examples/io/`](https://github.com/stephenoffer/batcher/tree/main/examples/io) directory. The scripts build their own in-memory data and assert on their own output, and `tests/docs/test_examples.py` runs all of them, so a page that stops matching the engine fails the suite instead of drifting.
 
 | Recipe | What it shows |
 |---|---|

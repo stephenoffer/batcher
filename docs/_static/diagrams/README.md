@@ -84,3 +84,99 @@ source so the picture cannot drift away from the audit:
 Current diagrams: `hub`, `lifecycle`, `mergeable`, `two_planes`, `layer_stack`,
 `data_flow`, `pipeline_breakers`, `carbonite_loop`, `adaptive_loop`, `transfer_modes`,
 `inference_stages`. Charts: `gpu_utilization`, `stage_overlap`.
+
+## Where each diagram belongs
+
+Every diagram is drawn by the script of the same name in `tools/diagrams/`, and the
+script's docstring names the source files it was read from. A diagram not yet embedded
+on its page is not finished, so this table is the checklist as well as the index.
+
+### Operator internals
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `morsel_scheduling.svg` | `docs/architecture/deep-dives/operators/morsel-parallelism.md` |
+| `hash_join_spill.svg` | `docs/architecture/deep-dives/operators/join-algorithms.md` |
+| `join_strategy_choice.svg` | `docs/architecture/deep-dives/operators/join-algorithms.md` |
+| `sort_run_merge.svg` | `docs/architecture/deep-dives/operators/sort-internals.md` |
+| `topn_heap.svg` | `docs/architecture/deep-dives/operators/sort-internals.md` |
+| `agg_spill_states.svg` | `docs/architecture/deep-dives/operators/aggregation-internals.md` |
+| `window_frame_eval.svg` | `docs/architecture/deep-dives/operators/window-internals.md` |
+| `mergeable_algebra.svg` | `docs/architecture/deep-dives/operators/mergeable-algebra.md` |
+
+### Query and plan
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `plan_lowering.svg` | `docs/architecture/deep-dives/query/plan-ir.md` |
+| `ir_wire_contract.svg` | `docs/architecture/deep-dives/query/plan-ir.md` |
+| `query_lifecycle.svg` | `docs/architecture/deep-dives/query/query-lifecycle.md` |
+| `jit_fallback.svg` | `docs/architecture/deep-dives/query/jit-compilation.md` |
+| `expr_eval_nulls.svg` | `docs/architecture/deep-dives/query/expression-evaluation.md` |
+| `physical_properties.svg` | `docs/architecture/deep-dives/query/physical-properties.md` |
+| `pushdown_before_after.svg` | `docs/architecture/deep-dives/query/plan-ir.md` |
+| `join_order_search.svg` | `docs/architecture/deep-dives/adaptive/cost-model.md` |
+
+### Adaptive and learning
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `reopt_at_breaker.svg` | `docs/architecture/deep-dives/adaptive/adaptive-reoptimization.md` |
+| `adaptive_gating.svg` | `docs/architecture/deep-dives/adaptive/adaptive-reoptimization.md` |
+| `cardinality_sketches.svg` | `docs/architecture/deep-dives/adaptive/cardinality-estimation.md` |
+| `cost_model_inputs.svg` | `docs/architecture/deep-dives/adaptive/cost-model.md` |
+| `cross_run_learning.svg` | `docs/architecture/deep-dives/adaptive/learned-metadata.md` |
+| `bandit_tuning.svg` | `docs/architecture/deep-dives/adaptive/learned-metadata.md` |
+| `hardware_awareness.svg` | `docs/architecture/deep-dives/adaptive/hardware-awareness.md` |
+
+### Memory and spill
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `buffer_pool_zones.svg` | `docs/architecture/deep-dives/memory/buffer-pool.md` |
+| `memory_envelope.svg` | `docs/architecture/deep-dives/memory/buffer-pool.md` |
+| `spill_ladder.svg` | `docs/architecture/deep-dives/memory/spilling.md` |
+| `arrow_memory_layout.svg` | `docs/architecture/deep-dives/memory/arrow-memory.md` |
+| `spill_artifacts.svg` | `docs/architecture/deep-dives/memory/on-disk-artifacts.md` |
+| `tensor_column_layout.svg` | `docs/architecture/deep-dives/memory/tensor-columns.md` |
+| `credit_backpressure.svg` | `docs/architecture/deep-dives/distribution/credit-flow-control.md` |
+
+### Distribution and the device tier
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `distributed_stages.svg` | `docs/architecture/deep-dives/distribution/distributed-scheduling.md` |
+| `shuffle_dataflow.svg` | `docs/architecture/deep-dives/distribution/shuffle-flight.md` |
+| `single_node_equals_distributed.svg` | `docs/architecture/deep-dives/distribution/index.md` |
+| `partition_aware_planning.svg` | `docs/architecture/deep-dives/distribution/partition-aware-planning.md` |
+| `gpu_tier_decision.svg` | `docs/architecture/deep-dives/distribution/gpu-execution.md` |
+| `gpu_shadow_verify.svg` | `docs/architecture/deep-dives/distribution/gpu-execution.md` |
+| `gpu_fabric_topology.svg` | `docs/architecture/deep-dives/distribution/gpu-fabric.md` |
+| `fault_recovery.svg` | `docs/architecture/fault-tolerance.md` |
+
+### Streaming and the lakehouse
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `streaming_microbatch.svg` | `docs/user-guide/moving-data/streaming.md` |
+| `watermark_late_data.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
+| `window_types.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
+| `state_store.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
+| `exactly_once.svg` | `docs/user-guide/moving-data/streaming-stateful.md` |
+| `output_modes.svg` | `docs/api/operations/streaming.md` |
+| `delta_commit_log.svg` | `docs/user-guide/moving-data/lakehouse.md` |
+| `merge_into_branches.svg` | `docs/user-guide/moving-data/lakehouse.md` |
+| `scd_type2_timeline.svg` | `docs/user-guide/moving-data/lakehouse.md` |
+
+### Models, governance and quality
+
+| Diagram | Page it belongs on |
+| --- | --- |
+| `fit_transform_leakage.svg` | `docs/ml/preparing/preprocessors/index.md` |
+| `inference_actor_pool.svg` | `docs/ml/inference/batch-scoring.md` |
+| `vector_index_search.svg` | `docs/ml/retrieval/vector-search.md` |
+| `data_loader_shards.svg` | `docs/ml/training/data-loaders.md` |
+| `metrics_as_aggregates.svg` | `docs/ml/evaluation/evaluation.md` |
+| `policy_plan_rewrite.svg` | `docs/user-guide/trust/governance.md` |
+| `column_lineage.svg` | `docs/user-guide/trust/governance.md` |
+| `dq_actions.svg` | `docs/user-guide/trust/data-quality.md` |

@@ -19,7 +19,7 @@ ds = bt.from_pydict(
 )
 ```
 
-## filter
+## Writing a predicate
 
 Pass a boolean expression to `filter`. Only rows where it is true are kept.
 
@@ -28,32 +28,31 @@ print(ds.filter(bt.col("age") > 25).to_pydict())
 # {'name': ['ann', 'cy'], 'age': [30, 40], 'city': ['nyc', 'nyc']}
 ```
 
-## Comparison and boolean operators
-
 Comparisons (`==`, `!=`, `>`, `>=`, `<`, `<=`) produce boolean columns. Combine
-them with `&` (and), `|` (or), and `~` (not). Parenthesize each comparison;
-the operators bind tighter than you may expect.
+them with `&` (and), `|` (or), and `~` (not). Parenthesize each comparison. The
+operators bind tighter than you may expect.
 
 ```python
 print(ds.filter((bt.col("age") > 20) & (bt.col("city") == "sf")).to_pydict())
 # {'name': ['bob', 'eve'], 'age': [25, 22], 'city': ['sf', 'sf']}
 ```
 
+`~` negates a whole predicate, so it takes parentheses too.
+
 ```python
 print(ds.filter(~(bt.col("city") == "nyc")).to_pydict())
 # {'name': ['bob', 'dan', 'eve'], 'age': [25, None, 22], 'city': ['sf', 'la', 'sf']}
 ```
 
-## is_in
+## Membership, ranges, and nulls
 
+Three predicates cover most of what a chain of comparisons would otherwise spell out.
 {py:meth}`is_in <batcher.plan.expr_ir.core.Expr.is_in>` keeps rows whose value is in a given collection.
 
 ```python
 print(ds.filter(bt.col("city").is_in(["nyc", "la"])).to_pydict())
 # {'name': ['ann', 'cy', 'dan'], 'age': [30, 40, None], 'city': ['nyc', 'nyc', 'la']}
 ```
-
-## between
 
 `between` is an inclusive range test on both bounds.
 
@@ -62,9 +61,9 @@ print(ds.filter(bt.col("age").between(23, 35)).to_pydict())
 # {'name': ['ann', 'bob'], 'age': [30, 25], 'city': ['nyc', 'sf']}
 ```
 
-## Null tests
-
-{py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>` keeps rows where a column is null; {py:meth}`is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` keeps the rest.
+Null gets its own pair of methods rather than a comparison, because a comparison
+against null answers null rather than true, and a filter keeps only the rows that are
+true. {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>` keeps rows where a column is null, and {py:meth}`is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` keeps the rest.
 
 ```python
 print(ds.filter(bt.col("age").is_null()).to_pydict())
@@ -74,7 +73,10 @@ print(ds.filter(bt.col("age").is_not_null()).to_pydict())
 # {'name': ['ann', 'bob', 'cy', 'eve'], 'age': [30, 25, 40, 22], 'city': ['nyc', 'sf', 'nyc', 'sf']}
 ```
 
-## distinct
+That is also why `age > 25` dropped `dan` at the top of the page. The comparison never
+said false. It said nothing.
+
+## Trimming the result
 
 `distinct` removes duplicate rows across all columns.
 
@@ -84,10 +86,10 @@ print(cities.distinct().sort("city").to_pydict())
 # {'city': ['la', 'nyc', 'sf']}
 ```
 
-## limit and head
-
-`limit(n, offset=0)` keeps `n` rows starting after `offset`. `head(n)` is the
-common case of the first `n` rows.
+`limit(n, offset=0)` keeps `n` rows starting after `offset`, and `head(n)` is the
+common case of the first `n` rows. Both examples below sort first on purpose. Over a
+relation with no order a limit keeps some `n` rows rather than a defined `n`, and which
+ones you get is a property of the schedule rather than of the query.
 
 ```python
 print(ds.sort("name").limit(2).to_pydict())

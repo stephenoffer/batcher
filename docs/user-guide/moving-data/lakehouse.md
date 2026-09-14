@@ -1,12 +1,11 @@
 # Lakehouse table formats
 
-Batcher reads and writes the transactional table formats that back a lakehouse:
-Delta Lake, Apache Iceberg, Apache Hudi. It also covers the maintenance patterns
-built on top of them, `MERGE` upserts and partition backfills and
-slowly-changing-dimension history. A Delta write is a single atomic commit, so a
-reader never sees a partial table, and time travel lets you query any past version.
-The mergeable engine runs all of this on one core or across a cluster, with an
-identical result.
+Batcher reads and writes the transactional table formats that back a lakehouse: Delta
+Lake, Apache Iceberg, and Apache Hudi. This page also covers the maintenance patterns
+built on top of them, meaning `MERGE` upserts, partition backfills, and
+slowly-changing-dimension history. A Delta write is a single atomic commit, so a reader
+never sees a partial table, and time travel reads any past version. The mergeable engine
+runs all of this on one core or across a cluster, with an identical result.
 
 ## Setup
 
@@ -49,6 +48,10 @@ read the table as it was at an earlier commit. The first write above is version 
 print(bt.read.delta(table_uri, version=0).sort("id").to_pydict())
 # {'id': [1, 2, 3], 'amount': [10, 20, 30]}
 ```
+
+Reading an older version works because a commit only ever adds files and retires references to them, and {py:func}`bt.vacuum <batcher.vacuum>`, which defaults to a dry run, is the one maintenance step that deletes the files those older versions still need:
+
+![A grid of four commits against five data files. Version 0 creates the table with f1 and f2, version 1 appends f3, version 2 is a merge that adds f4 and removes f2, and version 3 is a compact that adds f5 and removes f1 and f3. Each row marks which files that version holds live, so reading version=1 reads f1, f2 and f3 while reading the latest reads f4 and f5. A remove action retires a file from the log and leaves it on storage, which is the only reason reading version 1 still works: compact bin-packed f1 and f3 into f5 and left both on storage, so versions 1 and 2 still read. Three files, f1, f2 and f3, are referenced by no live version. Vacuum is the only operation that deletes, reclaiming unreferenced files once they are older than a retention window, and because that is what makes time travel to those versions irreversible it defaults to a dry run.](../../_static/diagrams/delta_commit_log.svg)
 
 ## Merge (upsert)
 
@@ -97,6 +100,10 @@ The clause `when_not_matched_by_source` acts on target rows the change set never
 mentioned, which is how a snapshot load expires departed rows and how an SCD-2 load closes
 out a version. It has no source row, so `source_col` is an error inside it (and
 `target_col` is an error inside an insert clause, which has no target row yet).
+
+Every key falls into exactly one of three populations, and against a Delta or Iceberg target all three land in one commit:
+
+![One MERGE INTO over a target holding keys 1, 2 and 3 and a change set holding keys 2, 3 and 4. Each key falls into exactly one population. Not matched by source is key 1, which only update, update_all and delete may act on, contributing 1 target row. Matched is keys 2 and 3, which take the same three actions, contributing 2 rows. Not matched is key 4, which only insert and insert_all may act on, contributing 1 new row. Clauses are tried in the order they were added and the first match wins, and no clause is observable on its own because all three land in one Delta commit that rewrites only the data files the join touches. The alternative, a delete followed by an append, is two commits with an interval in between during which readers see the rows gone and not yet replaced. One commit is a property of a transactional target: on a plain directory there is no log, so the merge writes its new files and then deletes the ones it replaced, and a crash between the two leaves both copies of a key. A when_not_matched_by_source clause forces a full rewrite, because every target row is a candidate and no file can be skipped.](../../_static/diagrams/merge_into_branches.svg)
 
 ## Partition backfill with replace_where
 
@@ -155,6 +162,10 @@ Type 2 keeps every version with effective-dating columns. When a tracked attribu
 changes, the current row is expired (`valid_to = as_of`, `is_current = False`) and a
 new version is appended (`valid_from = as_of`, `is_current = True`). `as_of` is the
 effective timestamp of the batch.
+
+One key's history across such a change, on a date axis:
+
+![One natural key, id = 1, tracked on the city column, before and after a load. Before the load the table holds a single row: city NYC, valid_from 2024-01-01, valid_to NULL, is_current true, an interval still open. A type 2 load with as_of 2024-06-01 carrying city LA for that key expires the first row, which keeps its valid_from of 2024-01-01 and gains valid_to 2024-06-01 with is_current false, and appends a second row with valid_from 2024-06-01, valid_to NULL and is_current true. On the shared date axis the two intervals meet exactly at the load date, with no gap and no overlap. A key whose tracked columns did not change is not touched at all, and a key the target has never seen is inserted as a first open version.](../../_static/diagrams/scd_type2_timeline.svg)
 
 ```python
 dim = os.path.join(work, "customer_dim.parquet")
@@ -224,11 +235,11 @@ print(bt.read.parquet(cdc).sort("id").select("id", "city").to_pydict())
 
 Three rules make this safe against a feed you do not control:
 
-* Within a batch, only the greatest-`sequence_by` change per key survives, so
+- Within a batch, only the greatest-`sequence_by` change per key survives, so
   redeliveries and out-of-order rows collapse to the latest.
-* `sequence_by` is **stored in the target**, so a *later* batch can recognize a change
+- `sequence_by` is **stored in the target**, so a *later* batch can recognize a change
   older than what already landed and discard it, rather than resurrecting old data.
-* A row matching `deletes` removes the target row. A delete for an absent key is a
+- A row matching `deletes` removes the target row. A delete for an absent key is a
   tombstone and changes nothing.
 
 ```python

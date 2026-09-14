@@ -17,7 +17,7 @@ python examples/metrics/probabilistic_losses.py
 
 ## See also
 
-- {doc}`/cookbook/metrics/embeddings`: monitoring a vector column in aggregate.
+- {doc}`/cookbook/metrics/model/classification`: classification metrics computed as aggregates over a predictions table.
 - {doc}`/cookbook/metrics/model/regression_errors`: absolute, squared, percentage, and robust.
 - {doc}`/ml/evaluation/evaluation`: scoring a model, per segment, in one pass.
 - {doc}`/api/models/metrics`: the complete metric vocabulary.

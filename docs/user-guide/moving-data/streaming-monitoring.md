@@ -27,7 +27,7 @@ q.stop()               # halt at the next micro-batch boundary
 bt.streams()           # all active streaming queries
 ```
 
-{py:meth}`explain <batcher.StreamingQuery.explain>` shows the *planned* tree only. `Dataset.explain(analyze=True)` runs the
+`q.explain()` shows the *planned* tree only. `Dataset.explain(analyze=True)` runs the
 query to measure it, which a stream cannot do twice: the source has moved on, and running
 it again would double-consume the topic. Per-micro-batch measurements live in
 `recent_progress` instead.
@@ -61,7 +61,7 @@ to be late for.
 
 Falling behind is one of the two ways a streaming query goes wrong. The other is dropping
 rows quietly. A windowed aggregation discards every row that arrives below its watermark,
-which is correct and produces a total that is simply short. `num_late_rows` on each
+which is correct and produces a total that is short. `num_late_rows` on each
 micro-batch is the count of what it discarded:
 
 ```python
@@ -185,7 +185,6 @@ last `progress_history` micro-batches, not every batch since the query started.
 
 Apply it for one query with {py:func}`bt.config_context(cfg) <batcher.config_context>`, or process-wide with
 {py:func}`bt.set_config(cfg) <batcher.set_config>`.
-
 
 ## Shipping progress somewhere else
 

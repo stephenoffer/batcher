@@ -9,8 +9,8 @@ ever seen is retained, because a click for it could theoretically arrive next ye
 runs for a week and then dies on memory.
 :::
 
-The fix is not a bigger heap. It is admitting that a click ten hours after its impression
-is not an attribution, and telling the engine so, in the join itself.
+A bigger heap only buys a longer week. The fix is to admit that a click ten hours after
+its impression is not an attribution, and to tell the engine so inside the join itself.
 
 ## The interval is the contract
 
@@ -123,7 +123,7 @@ for a straggler; it costs you exactly that much more buffer.
 
 :::{important}
 **A stream-stream join has no checkpoint.** It writes to a sink like any other streaming
-query — `joined.write.delta(..., trigger=...)` runs — but passing `checkpoint=` is refused
+query, so `joined.write.delta(..., trigger=...)` runs. Passing `checkpoint=` is refused
 rather than accepted, because the join's state is two buffered sides and two watermarks,
 none of it addressable by a source offset. A restart therefore begins with an empty join
 and re-reads from wherever the sources start. The sink's own idempotency still applies, so
@@ -139,7 +139,7 @@ still arrive for it.
 # docs: skip
 unattributed = impressions.join_stream(
     clicks, on="ad", left_time="shown", right_time="clicked", within="30m", how="left"
-).filter(col("clicked").is_null())
+).filter(bt.col("clicked").is_null())
 ```
 
 :::{note}

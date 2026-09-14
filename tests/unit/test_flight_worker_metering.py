@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from tests._fake_ray import install_fake_ray
+from _fake_ray import install_fake_ray
 
 from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
 

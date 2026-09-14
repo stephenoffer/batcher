@@ -1,6 +1,6 @@
-# Statistics, drift, and cross-validation
+# Statistics and drift
 
-This page covers the analysis surface around a model rather than the model itself: the statistics that tell you whether a feature is worth having, the drift measures that tell you whether it still is, and the splits that make a validation score trustworthy.
+This page covers the analysis surface around a model rather than the model itself: the statistics and profiles that tell you whether a feature is worth having, the outlier rules and hypothesis tests you judge them with, and the drift measures that tell you whether they still hold once the model is deployed.
 
 ## Statistical expressions
 
@@ -15,7 +15,7 @@ print(ds.agg(median=bt.col("latency").median(), robust=bt.trimean("latency")).to
 
 ### Robust spread
 
-The mean and the standard deviation are the wrong summary for most real columns, because a single bad row moves both without limit. These are built from quantiles instead:
+The mean and the standard deviation are the wrong summary for most real columns. A single bad row moves both without limit. These are built from quantiles instead:
 
 | Function | What it measures |
 |---|---|
@@ -33,7 +33,7 @@ ds = bt.from_pydict({"counts": [8.0, 12.0, 9.0, 11.0, 10.0]})
 print(ds.agg(fano=bt.index_of_dispersion("counts"), snr=bt.signal_to_noise("counts")).to_pydict())
 ```
 
-{py:func}`bt.geometric_std <batcher.geometric_std>` is the multiplicative standard deviation for a strictly positive, log-normal column that spans orders of magnitude: a value of 2 means a typical observation is within a factor of 2 of the geometric mean, which describes scatter on a log scale honestly where an ordinary standard deviation is dominated by the largest values.
+{py:func}`bt.geometric_std <batcher.geometric_std>` is the multiplicative standard deviation for a strictly positive, log-normal column that spans orders of magnitude. A value of 2 means a typical observation sits within a factor of 2 of the geometric mean. That describes scatter on a log scale honestly, where an ordinary standard deviation is dominated by the largest values.
 
 ### Distribution shape
 
@@ -76,7 +76,7 @@ print(
 )
 ```
 
-{py:func}`welch_t_statistic <batcher.welch_t_statistic>` is the unequal-variance test, which is the one to use by default. {py:func}`cohens_d <batcher.cohens_d>` and {py:func}`hedges_g <batcher.hedges_g>` give the effect *size*, which is what distinguishes a real effect from a merely detectable one. At a large enough row count every difference is "significant".
+{py:func}`welch_t_statistic <batcher.welch_t_statistic>` is the unequal-variance test. Use it by default. {py:func}`cohens_d <batcher.cohens_d>` and {py:func}`hedges_g <batcher.hedges_g>` give the effect *size*, which is what distinguishes a real effect from a merely detectable one. At a large enough row count every difference is "significant".
 
 {py:func}`proportion_z_statistic <batcher.proportion_z_statistic>` is the conversion-rate equivalent, and {py:func}`mean_ci_half_width <batcher.mean_ci_half_width>` / {py:func}`proportion_ci_half_width <batcher.proportion_ci_half_width>` give the error bar. {py:func}`group_mean <batcher.group_mean>` is the building block all of them share: the mean of a column over the rows a boolean expression selects. Reach for it directly whenever you want one arm's average without running a second query.
 
@@ -127,9 +127,9 @@ cats = bt.from_pydict({"a": ["x", "x", "y", "y"], "b": ["p", "p", "q", "q"]})
 print(entropy(cats, "a"), cramers_v(cats, "a", "b"), mutual_information(cats, "a", "b"))
 ```
 
-`spearman_corr` sees a monotone relationship a Pearson correlation underrates, and is immune to outliers because an extreme value contributes only its rank. `cramers_v` is the categorical counterpart of a correlation and, unlike `chi_square`, does not grow with the row count, so it ranks features consistently across datasets of different sizes.
+`spearman_corr` sees a monotone relationship a Pearson correlation underrates. How extreme an outlier is does not matter. It contributes only its rank. `cramers_v` is the categorical counterpart of a correlation. Unlike `chi_square` it does not grow with the row count, so it ranks features consistently across datasets of different sizes.
 
-`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with, which is what flags redundant features and multicollinearity. `partial_correlation` goes one step further and removes a confounder: two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on that multicollinearity per feature, measuring how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
+`correlation_matrix` and `covariance_matrix` give the whole pairwise structure of a feature set in one scan, returned as a labeled square `Dataset`. Reading down a column shows what a feature moves with. That flags redundant features and multicollinearity. `partial_correlation` goes one step further and removes a confounder: two features can correlate only because both track a third, and the partial correlation is what survives holding that third fixed. `variance_inflation_factor` puts a number on that multicollinearity per feature, measuring how much the rest of the set inflates each column's variance. A VIF above 5 or 10 flags a feature whose linear-model coefficient will be unstable.
 
 Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fraction of one categorical column's uncertainty that knowing the other removes, so `theils_u(ds, "x", "y")` and `theils_u(ds, "y", "x")` differ and answer "does `x` predict `y`" rather than "are they related". For a numeric column against a grouping, `eta_squared` and its bias-corrected sibling `epsilon_squared` are the bounded effect sizes `anova_f` lacks: both read as "this grouping explains 30% of the variance" and stay comparable across sample sizes, which a raw F never is. `omega_squared` corrects the bias furthest for generalizing beyond the sample, and `cohens_f` is the effect-size scale a power analysis is specified on.
 
@@ -162,8 +162,8 @@ different kinds of signal, so a feature strong on any of them survives.
 
 `f_classif_scores` and `f_regression_scores` score every feature in **one pass** over the
 data, however wide the table is. Both statistics are recoverable from mergeable moments, so
-a hundred features ride a single `group_by` rather than costing a hundred scans, which is
-what makes them usable as a first screen on a wide frame and on the distributed path where
+a hundred features ride a single `group_by` rather than costing a hundred scans. That is
+what makes them usable as a first screen on a wide frame, and on the distributed path where
 each scan is a pass across the cluster.
 
 `chi2_scores` and `mutual_info_scores` still cost a pass per feature: each needs its own
@@ -187,8 +187,9 @@ Once a model is trained, `batcher.ml.interpret` says *why* it predicts what it d
 the whole dataset, because it re-scores through the engine rather than on a driver sample.
 
 `permutation_importance` ranks features by how far the error rises when each is shuffled. It
-is model-agnostic and honest in a way a tree's built-in importance is not: a tree can call a
-feature important because it split on it, even when permuting the feature changes nothing.
+is model-agnostic. That makes it honest in a way a tree's built-in importance is not: a tree
+can call a feature important because it split on it, even when permuting the feature changes
+nothing.
 
 ```python
 # docs: skip
@@ -266,7 +267,7 @@ today = bt.from_pydict({"x": [float(i) + 60 for i in range(200)]})
 print(round(population_stability_index(train, today, "x", buckets=5), 4))
 ```
 
-The bin edges always come from the **reference** distribution and are then applied unchanged to the current data, so a shift shows up as mass moving between bins rather than as the bins themselves moving. Deriving edges separately for each side would make two very different distributions look identical.
+The bin edges always come from the *reference* distribution, then apply unchanged to the current data. A shift shows up as mass moving between bins rather than as the bins themselves moving. Deriving edges separately for each side would make two very different distributions look identical.
 
 Read the numbers with the conventions the monitoring literature settled on:
 
@@ -278,7 +279,7 @@ Read the numbers with the conventions the monitoring literature settled on:
 | `categorical_drift` | The share of mass that would have to move for the two to match. |
 | `information_value` | Below 0.02 useless; 0.02 to 0.1 weak; 0.1 to 0.3 medium; above 0.3 strong. |
 
-`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, which is what makes it appendable to a monitoring table. A single PSI is far less informative than its history:
+`drift_report` runs the whole check and returns a `Dataset` ordered by descending PSI, which makes it appendable to a monitoring table. A single PSI is far less informative than its history:
 
 ```python
 report = drift_report(train, today, ["x"], buckets=5)
@@ -287,130 +288,9 @@ print(report.columns)
 
 `woe_table` and `information_value` are the scorecard pair: bin a feature and report the log odds of a positive in each bin. A monotone WOE column is what makes a feature usable in a linear scorecard, and the shape of the table tells you where to merge bins.
 
-## Resampling for imbalanced learning
-
-A classifier trained on a 1%-positive dataset learns to predict "negative" and scores well on
-accuracy while being useless. `batcher.ml.sampling` reshapes the class balance as a relational
-operation: an exact content-hashed filter or concatenation, never a driver-side shuffle. That is
-what lets it run over a dataset larger than memory.
-
-```python
-import batcher as bt
-from batcher.ml.sampling import class_counts, class_weights, oversample, undersample
-
-ds = bt.from_pydict({"y": [0] * 100 + [1] * 10, "x": list(range(110))})
-print(class_counts(undersample(ds, "y"), "y"))   # exactly balanced by discarding
-print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicating
-```
-
-`undersample` discards majority rows; `oversample` duplicates minority rows deterministically;
-`balanced_sample` moves every class to the median count. When the model supports it, prefer
-{py:meth}`class_weights <batcher.Dataset.class_weights>` (a `{class: weight}` dict for the model's ``class_weight``) or `sample_weights`
-(a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
-single row. `class_counts` is the first thing to look at.
-
-{py:func}`smote <batcher.ml.smote>` is the alternative to duplicating. `oversample` repeats
-minority rows, so a model can still memorize the exact points and tighten its boundary around
-them rather than around the region they occupy. SMOTE makes *new* points instead, each on the
-segment between a real minority row and one of its nearest minority neighbours:
-
-```python
-from batcher.ml import smote
-
-rare = bt.from_pydict(
-    {"x": [0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 5.3, 5.4],
-     "label": ["rare"] * 3 + ["common"] * 5}
-)
-print(smote(rare, "label", minority="rare", features=["x"]).count())
-# 10
-```
-
-The synthetic rows are interpolations, never extrapolations, so they stay inside the
-minority region. Both random draws are content hashes of the row, so the same input produces
-the same synthetic rows however the data is partitioned — an imbalanced experiment stays
-repeatable.
-
-Two things to know before using it. Scale the features first, because distance decides which
-neighbours a row is drawn towards and therefore where the new points land. And only the
-`features` and the label are filled: any other column is null on a synthetic row, because
-there is no honest value to interpolate for an identifier or a free-text field.
-
-`stratified_sample` is the different tool for a different job: it keeps the same fraction of *every* stratum rather than equalizing them, so it shrinks a dataset for a quick experiment while preserving its class balance. You get a proportional 10% sample rather than 10% of the whole, which would starve the rare classes.
-
-```python
-from batcher.ml.sampling import class_counts, stratified_sample
-
-ds = bt.from_pydict({"y": [0] * 100 + [1] * 20, "x": list(range(120))})
-print(class_counts(stratified_sample(ds, "y", 0.5, seed=1), "y"))  # {0: 50, 1: 10}
-```
-
-## Holding out a test set that still has the rare class in it
-
-`ds.ml.train_test_split` assigns each row by a content hash, which makes the split proportional in expectation and nothing more. On 200 rows with ten positives and a quarter held out, the test half should get two or three. Across seeds it gets between one and four, and one positive makes precision, recall and AUC meaningless without anything reporting a problem.
-
-`stratify=` names a column whose distribution to hold constant across both halves:
-
-```python
-sales = bt.from_pydict(
-    {
-        "amount": [float(i) for i in range(200)],
-        "fraud": [1 if i % 20 == 0 else 0 for i in range(200)],
-    }
-)
-
-plain = sales.ml.train_test_split(test_size=0.25, seed=3)[1]
-kept = sales.ml.train_test_split(test_size=0.25, seed=3, stratify="fraud")[1]
-print(sum(plain.to_pydict()["fraud"]), sum(kept.to_pydict()["fraud"]))
-# 4 3
-```
-
-The stratified count is the same for every seed, because it is a property of the split rather than of the draw. Every label with at least two rows reaches both halves, and the cut rounds towards putting a rare class in the test half rather than away from it. A label with a single row goes to train, since a model that never saw the class is the worse of the two mistakes.
-
-Reach for {py:func}`stratified_split <batcher.ml.splitting.stratified_split>` directly when you want the same behaviour outside the `ds.ml` surface.
-
-## Cross-validation splits
-
-A fold here is a **content hash** of each row compared against fold boundaries, never a materialized shuffle. That means a fold is an ordinary row-wise filter, the assignment is identical however the data is partitioned, and the training half of a fold stays lazy until something reads it.
-
-```python
-ds = bt.range(0, 1000)
-folds = ds.ml.kfold(5, key="value")
-print(sum(validate.count() for _, validate in folds))
-```
-
-Two options select the variant your data needs, and choosing correctly is usually the difference between a trustworthy score and a misleading one:
-
-`stratify=` keeps each label's proportion identical in every fold. Use it whenever the label is imbalanced, or the fold-to-fold variance in the score measures the split rather than the model.
-
-```python
-ds = bt.from_pydict({"y": [0] * 90 + [1] * 10, "x": list(range(100))})
-folds = ds.ml.kfold(5, key="x", stratify="y")
-print([v.filter(bt.col("y") == 1).count() for _, v in folds])
-```
-
-`group=` keeps every row of a group in the same fold. Use it whenever rows repeat an entity such as a user, a patient, a session, or a document. Without it the model memorizes the entity rather than the pattern, cross-validation looks excellent, and production does not. This is the most common silent leak in applied ML.
-
-For a time series, neither applies: a random fold puts next week's rows in the training set, so the model sees the future and the validation score is one no deployment will reproduce.
-
-```python
-ds = bt.from_pydict({"t": list(range(100)), "x": list(range(100))})
-print([(train.count(), validate.count()) for train, validate in ds.ml.time_series_split("t", 4)])
-```
-
-`expanding=True` (the default) grows the training window with each split, matching a model retrained on all history; `expanding=False` slides a fixed-width window, matching one that deliberately forgets.
-
-`batcher.ml.model_selection` runs the loop end to end: `cross_val_score` fits and scores a
-model on each fold (the spread across folds is the honesty a single number hides),
-`cross_val_predict` gives every row its out-of-fold prediction (the unbiased input a stacking
-ensemble needs), and `learning_curve` scores against training-set size to answer whether more
-data would help. Each takes a `fit` and a `predict` callable, so any scikit-learn-style model
-composes.
-
-{py:func}`batcher.ml.splitting.fold_column <batcher.ml.splitting.fold_column>` is the primitive underneath. Reach for it when the split should outlive the pipeline that created it: it writes one column that every downstream job can filter on without re-deriving the assignment.
-
 ## Hypothesis tests
 
-A test statistic says how large an effect is; the p-value says how surprising it is under the null hypothesis, and the p-value is what you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a {py:class}`TestResult <batcher.ml.stats.TestResult>` carrying the statistic, its degrees of freedom, and the p-value.
+A test statistic says how large an effect is. The p-value says how surprising it is under the null hypothesis. That is the number you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a {py:class}`TestResult <batcher.ml.stats.TestResult>` carrying the statistic, its degrees of freedom, and the p-value.
 
 Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for Welch's two-sample test of two groups, `anova_test` to extend that to several groups, `chi_square_test` for the independence of two categorical columns, and `normality_test` (Jarque-Bera) to screen a column before assuming it is Gaussian. `pearson_test` and `spearman_test` add a p-value to a linear or monotone correlation, `proportion_ztest` checks a success rate against a target (with `binomial_test` the exact small-sample version), and `mcnemar_test` compares two classifiers' error rates on the same rows. `mcnemar_test` is the paired test to reach for when deciding whether one model genuinely beats another.
 
@@ -425,9 +305,9 @@ result = t_test_ind(ds, "x", "g")
 print(round(result.pvalue, 4), result.pvalue < 0.05)
 ```
 
-`bartlett_test` and `levene_test` check the equal-variance assumption a t-test and an ANOVA quietly rely on. Bartlett's is the powerful choice for normal groups, and Levene's (median-centered) is the robust default.
+`bartlett_test` and `levene_test` check the equal-variance assumption a t-test and an ANOVA quietly rely on. Bartlett's has more power on normal groups. Levene's, median-centered, is the robust default.
 
-When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (two groups) and `kruskal_wallis` (several) are the rank-based, distribution-free alternatives, asking whether one group tends to larger ranks rather than a larger mean. For *paired* measurements such as a before/after or matched-pair design, `wilcoxon_signed_rank` is the distribution-free replacement for the paired t-test. `friedman_test` extends that to several treatments measured on the same blocks, giving you the non-parametric repeated-measures ANOVA.
+When the data itself is too skewed or ordinal for a t-test, `mann_whitney_u` (two groups) and `kruskal_wallis` (several) are the rank-based, distribution-free alternatives, asking whether one group tends to larger ranks rather than a larger mean. For *paired* measurements such as a before/after or matched-pair design, `wilcoxon_signed_rank` is the distribution-free replacement for the paired t-test. `friedman_test` extends that to several treatments measured on the same blocks: the non-parametric repeated-measures ANOVA.
 
 Report `cliffs_delta` or `common_language_effect_size` beside a Mann-Whitney result. The test says *whether* two groups differ; these say *how much*, as the probability that a random member of one exceeds a random member of the other.
 
@@ -456,10 +336,9 @@ A drift measure needs a reference column with more than one distinct value. A co
 
 `js_divergence` does not reach 1 for a wholly shifted column, because the outermost reference bins are open-ended and absorb everything beyond them. Alert on `population_stability_index`, which has no such ceiling; use JS to compare across columns.
 
-Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split, and `group_kfold`'s folds vary further because groups differ in size.
-
 ## See also
 
+- {doc}`/ml/evaluation/splits-and-resampling`: rebalance a rare class, hold out a test set, and build the folds.
 - {doc}`/ml/evaluation/evaluation`: score a model once you have a trustworthy split.
 - {doc}`/ml/preparing/preprocessors/index`: the transforms these statistics tell you a column needs.
 - {doc}`/user-guide/trust/data-quality`: assert contracts rather than measure them.

@@ -24,7 +24,7 @@ for d in docs/*/; do echo "$(find "$d" -name '*.md' | wc -l) $d"; done | sort -r
 # has no hard cap, but a page past ~400 lines is usually two pages)
 find docs -name '*.md' -not -path '*_build*' | xargs wc -l | sort -rn | head -25
 
-# Orphans and dangling toctree entries, in seconds rather than a full build
+# Orphans, dangling entries, oversized pages, over-full directories, depth: seconds
 pytest tests/docs/test_docs_structure.py -q
 
 # Deep headings: an H4 anywhere is a split signal
@@ -56,9 +56,17 @@ children in prose is a bare list of links.
 case is a page reachable only from the toctree and linked from nothing: technically
 wired, practically undiscoverable. Cross-link it from the pages whose readers need it.
 
-**Oversized and undersized pages.** A page past roughly 400 lines, or one that reaches
-H4, usually wants splitting along its own H2 seams. The reverse is also a finding: three
-short pages that each say one paragraph want to be one page with three sections.
+**Oversized and undersized pages.** 500 lines is the hard limit and the test enforces it;
+a page past roughly 400, or one that reaches H4, usually already wants splitting along its
+own H2 seams. Judge the *rendered* page too: an `autoclass` with `:members:` is three lines
+of source and hundreds of rendered ones. The reverse is also a finding: three short pages
+that each say one paragraph want to be one page with three sections.
+
+**Over-full and over-broad directories.** At most 12 pages and 10 subdirectories per level,
+at most 5 levels deep, counting files `conf.py` excludes as well as published ones. The
+remedy is a subdirectory grouped by responsibility, or merging the short pages; it is never
+a flattened filename. When a directory holds only excluded working records, group them by
+kind and exclude the group by directory rather than one line per file.
 
 **Duplicate and contradictory coverage.** When two pages define the same concept, pick
 the canonical home, reduce the other to a sentence and a `{doc}` link, and check they

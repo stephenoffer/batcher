@@ -46,11 +46,13 @@ times the rows, so **ten times the time is the line to beat**:
 
 Nine of thirteen are **sublinear**: a scan, a filter and most joins cost less than ten times
 as much for ten times the rows, because at scale factor 1 they do not fill the machine and at
-scale factor 10 they do. Four are superlinear, and they are named rather than averaged away —
+scale factor 10 they do. Four are superlinear, and they are named rather than averaged away:
 q5, q9, q13 and q18. q13 and q18 each carry a very high-cardinality `GROUP BY` (1.5M and 15M
 groups at sf10), q9 builds the largest intermediate in the benchmark, and q5 is the six-way
-join. Against DuckDB's native store the suite is **0.79x at sf1 and 1.29x at sf10**, so ten
-times the data is currently where the single-node lead is lost.
+join. Against DuckDB's native store the suite read **0.79x at sf1 and 1.29x at sf10** on that date.
+A later pass took sf10 to **0.963x** (2026-08-25, same node, same-day A/B), which moved three
+of those four queries: q9 456 to 233 ms, q13 325 to 174, q5 189 to 122. Ten times the data
+no longer costs the single-node lead.
 
 DuckDB's column reads 2.4x to 4.7x throughout, and that is not a better scaling law: it is a
 fixed per-query cost that dominates its scale-factor-1 numbers and disappears by scale factor
@@ -59,8 +61,8 @@ fixed per-query cost that dominates its scale-factor-1 numbers and disappears by
 ## Scaling with cores: a gather-bound join saturates near 10x
 
 More cores is the third axis, and the honest curve is not a straight line. The H2O.ai `join`
-q5 shape (10M x 10M inner join, 9M rows and 13 columns out — a query whose cost is dominated
-by materializing its own output) with the worker count pinned:
+q5 shape, a 10M x 10M inner join emitting 9M rows and 13 columns, whose cost is dominated
+by materializing its own output. Worker count pinned:
 
 | Threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -68,8 +70,8 @@ by materializing its own output) with the worker count pinned:
 | Speedup | 1.0x | 2.0x | 3.4x | 5.8x | 8.8x | 9.8x | **10.1x** | 8.6x |
 | Efficiency | 100% | 101% | 85% | 72% | 55% | 31% | 21% | 13% |
 
-Linear to two cores, 85% efficient at four, and then a ceiling near **10x** — an Amdahl serial
-fraction of roughly 9%, already reached by sixteen cores. Past this box's 48 *physical* cores
+Linear to two cores, 85% efficient at four, and then a ceiling near **10x**. That is an
+Amdahl serial fraction of roughly 9%, already reached by sixteen cores. Past this box's 48 *physical* cores
 it gets worse, which is why the executor's default width is every physical core plus a third
 of the SMT siblings rather than every hardware thread.
 
@@ -224,13 +226,11 @@ group-by sum on 8×T4, cuDF as the per-GPU data plane:
 
 | Rows | Single-GPU cuDF | Batcher distributed over 8 GPUs |
 |---|---:|---:|
-| 200M (fits one GPU) | **1,983 M rows/s** | 768 M rows/s |
 | 600M | **OOM** | 10,731 M rows/s |
 | 1.2B | **OOM** | 13,358 M rows/s |
 | 2.0B | **OOM** | 10,799 M rows/s |
 
-Below one GPU's memory, single-GPU cuDF wins, because the cross-device combine is not free.
-Above it, distribution is the only thing that runs. That is a distribution win over a compute win,
+Past one GPU's memory, distribution is the only thing that runs. That is a distribution win over a compute win,
 and it is exactly why a data engine should integrate a GPU dataframe rather than reimplement
 one.
 

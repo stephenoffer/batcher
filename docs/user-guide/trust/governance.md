@@ -57,9 +57,9 @@ only authorizes.
 
 ## Column access
 
-`grant` gives a role `SELECT` on some columns. The **first grant on a table switches
-that table to deny-by-default**, so installing a catalog never silently locks out
-queries against tables nobody wrote a policy about.
+`grant` gives a role `SELECT` on some columns. The first grant on a table switches that
+table to deny-by-default, so installing a catalog never silently locks out queries against
+tables nobody wrote a policy about.
 
 ```python
 catalog = (
@@ -135,7 +135,7 @@ Classify a column once with `tag`, then govern every column carrying that tag wi
 `email` as `pii` wherever it appears, write one policy, and tables added later are
 covered automatically.
 
-The masks themselves are ordinary expressions ({doc}``mask` <../api/complete>`,
+The masks themselves are ordinary expressions ({doc}``mask` </api/complete/governance>`,
 {py:func}`hmac_sha256 <batcher.hmac_sha256>`, {py:func}`aes_encrypt <batcher.aes_encrypt>`), so they run in the Rust data plane at full speed.
 
 ```python
@@ -159,7 +159,7 @@ column, grouping by it, or joining it against known plaintext:
 with bt.security(catalog, analyst):
     ds = bt.read.parquet(customers)
 
-print(ds.filter(bt.col("email") == "a@x.com").count())  # 0 — the filter sees the mask
+print(ds.filter(bt.col("email") == "a@x.com").count())  # 0: the filter sees the mask
 ```
 
 An explicit `mask_column` overrides the tag-derived mask for that one column, and a
@@ -170,8 +170,8 @@ reason to classify a column at all. `mask_column` records a {py:class}`ColumnMas
 `table`.`column`: precise, and one entry per column per table. `mask_tag` records a
 {py:class}`TagMask <batcher.governance.TagMask>`, bound to a *tag*, so it governs every column carrying that tag in every table,
 including the table someone adds next quarter that nobody will remember to come back and
-mask. Per-column bindings are what you reach for to override a case; tags are what make
-the catalog survive the tenth table.
+mask. Reach for a per-column binding to override one case. Reach for a tag when you want
+the catalog to still work at the tenth table.
 
 ## Row-level security
 
@@ -186,7 +186,7 @@ catalog = catalog.filter_rows(
 )
 
 with bt.security(catalog, analyst):
-    print(bt.read.parquet(customers).count())  # 2 — only the EU rows
+    print(bt.read.parquet(customers).count())  # 2, the EU rows only
 ```
 
 The row filter is applied **below** column pruning, so a policy may reference columns
@@ -221,8 +221,8 @@ with bt.security(catalog, analyst):
     print(bt.read.parquet(customers).explain())
 ```
 
-The `project` is the columns the analyst may select, read through their masks; the
-`filter` under it is the row-access predicate; the `scan` sees the whole table. The
+The `project` is the columns the analyst may select, read through their masks. The
+`filter` under it is the row-access predicate. The `scan` sees the whole table. The
 estimate drops from 4 rows to 2 because the row policy is a predicate like any other:
 
 ```text
@@ -240,15 +240,18 @@ decisions:
 (The throughput under `decisions:` is measured; it reads 0 MB/s here because the whole
 table is a few kilobytes.)
 
-The order matters in both directions. The filter sits *below* the projection, so a row
-policy may reference `region` even though the analyst has no `SELECT` on it; a row-access
-policy runs with the catalog's authority, not the caller's. The masked projection sits at
-the leaf, below everything the user wrote, so no operator above it can ever see a raw
-value.
+The order matters in both directions. The filter sits *below* the projection, which is
+what lets a row policy reference `region` when the analyst holds no `SELECT` on it. The
+masked projection sits at the leaf, below everything the user wrote, so no operator above
+it can ever see a raw value.
 
 Because it is a rewrite and not a check, there is no enforcement code on the hot path to
 bypass and no execution mode that skips it. `collect`, `count`, `iter_batches`, `write`,
 and the distributed path all run the same governed plan.
+
+Drawn against the plan you wrote, the rewrite injects two operators and changes nothing else:
+
+![Governance as a plan rewrite. enforce(plan, tables, principal, catalog) is pure and runs once, before the optimizer: a plan goes in, and a governed plan plus its audit events come out. The plan you wrote is an aggregate of sum(amount) by region directly over a scan of customers, reading all rows and all columns. The plan that runs keeps that aggregate untouched and injects two operators beneath it: a project carrying the columns you may read, through their masks, and below it a filter carrying the row-access predicate, both above the same scan of the whole table. The order is load-bearing in both directions. The filter sits below the project, so a row policy may read a column you hold no SELECT on; the project sits at the leaf, so no operator you wrote ever sees a raw value. A denied column is removed from the output rather than flagged, so there is no check to bypass, and collect, count, iter_batches, write and the distributed path all run this same plan.](../../_static/diagrams/policy_plan_rewrite.svg)
 
 ## Choosing a protection
 
@@ -263,9 +266,9 @@ match after masking:
 | `aes_encrypt`   | yes, with the key | yes       | data that must be read back  |
 
 "Joinable" means equal inputs produce equal outputs, so the protected column still
-groups and equi-joins. Every expression in Batcher must be deterministic (the sequential
-interpreter is the correctness oracle that the parallel executor and the JIT are checked
-against), so `aes_encrypt` uses AES-256-GCM-SIV, the AEAD whose security does not
+groups and equi-joins. Every expression in Batcher must be deterministic, because the
+sequential interpreter is the correctness oracle the parallel executor and the JIT are
+checked against. So `aes_encrypt` uses AES-256-GCM-SIV, the AEAD whose security does not
 collapse under the fixed nonce that determinism forces.
 
 The price of that determinism is that equality is observable: an encrypted column
@@ -319,7 +322,7 @@ after = bt.from_pydict(
 
 fp_before = before.select(fp=bt.hash_rows(*cols)).to_pydict()["fp"]
 fp_after = after.select(fp=bt.hash_rows(*cols)).to_pydict()["fp"]
-print([i for i, (a, b) in enumerate(zip(fp_before, fp_after)) if a != b])  # [1] — only row 1 changed
+print([i for i, (a, b) in enumerate(zip(fp_before, fp_after)) if a != b])  # [1]; row 1 changed
 ```
 
 For a single column, the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>` digests produce a per-value fingerprint.
@@ -360,7 +363,7 @@ its whole life, including terminal operations run after the block exits.
 with bt.security(catalog, analyst):
     ds = bt.read.parquet(customers)
 
-print(ds.count())  # still 2 — the plan was governed when the table was read
+print(ds.count())  # still 2. The plan was governed when the table was read
 ```
 
 Nested blocks restore the outer policy on exit. A table read outside any block is
@@ -385,7 +388,7 @@ print(seen[0].visible, seen[0].denied, seen[0].masked)
 
 The event names columns and policies, never **values** and never key material, so it is
 safe to write to a log that outlives the data. It is produced by the same traversal that
-rewrites the plan, so what you record is by construction what was enforced. Every
+rewrites the plan, so the record is by construction what was enforced. Every
 decision is also logged at `INFO` on the `batcher.governance` logger, whether or not you
 pass a sink.
 
@@ -442,12 +445,16 @@ Two properties make the answer trustworthy:
 
 A column built only from literals, or generated by {py:meth}`with_row_index <batcher.Dataset.with_row_index>`, has no origin.
 
+The rules that surprise people are all visible in one plan:
+
+![One plan analyzed without running it. Scans of orders, holding customer_id and amount, and of customers, holding id, region and ssn, feed a join on customer_id = id, then a filter on ssn is not null, then an aggregate grouped by region. column_lineage over that plan reports region as deriving from customers.region, the group key's own expression; total as deriving from orders.amount, the sum's input column; and n, a count(), as having no origin at all, because it reads no column. customers.ssn appears in none of the three: the filter chose which rows survived rather than what any value is, so it carries no lineage. Tag customers.ssn as PII and the tag follows nothing here; tag customers.region and it follows the first column. An operator the analysis does not model, map_batches above all, is opaque, so every output column is reported as deriving from every input column. It over-approximates on purpose, because a false 'might carry PII' costs a review and a false 'cannot' costs a breach.](../../_static/diagrams/column_lineage.svg)
+
 ## Persisting a policy
 
 The masks and row filters above are Python callables. Flexible in process, impossible to
 store. For a policy your platform keeps in an external store and reconstructs each
-session, build the catalog from the **declarative** factories instead. They are picklable,
-so a catalog built from them survives a round-trip and enforces identically.
+session, build the catalog from the declarative factories instead. They are picklable, so
+a catalog built from them survives a round-trip and enforces identically.
 
 ```python
 from batcher.governance import Pseudonymize, Nullify, MatchesAttribute
@@ -462,7 +469,7 @@ catalog = (
 ```
 
 {py:class}`Redact <batcher.governance.Redact>`, {py:class}`Pseudonymize <batcher.governance.Pseudonymize>`, {py:class}`Encrypt <batcher.governance.Encrypt>`, and {py:class}`Nullify <batcher.governance.Nullify>` cover the masking shapes an enterprise
-policy uses (and lower to the data-plane functions above); {py:class}`MatchesAttribute <batcher.governance.MatchesAttribute>` and
+policy uses, and they lower to the data-plane functions above. {py:class}`MatchesAttribute <batcher.governance.MatchesAttribute>` and
 {py:class}`AttributeIn <batcher.governance.AttributeIn>` cover attribute-based row access. Batcher persists nothing itself. It hands
 you picklable policy objects and enforces the catalog you give it. Where that policy lives
 is your platform's decision.
@@ -478,7 +485,7 @@ own store and check into review.
 
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine rows before they reach a
   consumer.
-- {doc}`Complete API reference </api/complete>`: `SecurityCatalog`, `Principal`,
+- {doc}`Complete API reference </api/complete/governance>`: `SecurityCatalog`, `Principal`,
   `GovernanceEvent`, and `security`.
 - {doc}`Agent skills </agents>`: `apply-governance-and-security`, the same
   surface as a procedure, with what to verify before trusting an enforced plan.

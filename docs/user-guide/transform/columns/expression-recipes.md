@@ -4,8 +4,8 @@ This page assembles the expression language into the jobs people actually reach 
 for: porting a pandas or Polars script, building features for a model, and curating a
 text corpus for training.
 
-Read {doc}`/user-guide/transform/columns/expressions` and {doc}`/user-guide/transform/columns/expression-accessors` first. Every example here
-runs against the engine, and blocks share one namespace and execute in order.
+Read {doc}`/user-guide/transform/columns/expressions` and {doc}`/user-guide/transform/columns/expression-accessors` first. The blocks
+below build on each other in order.
 
 ```python
 import batcher as bt
@@ -93,9 +93,9 @@ string with no cased characters, where Python's are false. Use `str.slice` rathe
 
 ## Feature engineering for data science
 
-The expression layer carries the transforms a model pipeline needs, so feature
-engineering runs in the engine rather than in pandas. The scaling and encoding functions
-each accept `partition_by=` to fit per group: `zscore`, `minmax_scale`, `maxabs_scale`,
+Feature engineering runs in the engine, not in pandas. The expression layer carries the
+transforms a model pipeline needs, and the scaling and encoding functions each accept
+`partition_by=` to fit per group: `zscore`, `minmax_scale`, `maxabs_scale`,
 `mean_center`, `label_encode`, and `hash_bucket` for a reproducible split key. Activations (`sigmoid`, `logit`, `relu`, `softplus`), share/ratio features
 ({py:meth}`pct_of_total <batcher.plan.expr_ir.core.Expr.pct_of_total>`, {py:meth}`cumulative_pct <batcher.plan.expr_ir.core.Expr.cumulative_pct>`, {py:meth}`normalize_l1 <batcher.plan.expr_ir.core.Expr.normalize_l1>`, {py:meth}`rank_pct <batcher.plan.expr_ir.core.Expr.rank_pct>`, {py:meth}`safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>`), and the
 expanding statistics ({py:meth}`expanding_mean <batcher.plan.expr_ir.core.Expr.expanding_mean>`, {py:meth}`expanding_var <batcher.plan.expr_ir.core.Expr.expanding_var>`, {py:meth}`expanding_std <batcher.plan.expr_ir.core.Expr.expanding_std>`) round it out.
@@ -137,25 +137,7 @@ print(out.to_pydict())
 # {'weekend': [True], 'week': [1], 'words': [2], 'clean': ['Hi there']}
 ```
 
-Filtering a text corpus needs a different kind of measure: not what a document says, but how much of it repeats. A page that is mostly a navigation menu, a template header, or the same sentence emitted twice by a scraper is repetitive rather than short, so a length threshold does not catch it. {py:meth}`duplicate_line_ratio <batcher.plan.expr_ir.namespaces.strings._StrNamespace.duplicate_line_ratio>` and {py:meth}`duplicate_paragraph_ratio <batcher.plan.expr_ir.namespaces.strings._StrNamespace.duplicate_paragraph_ratio>` report the share of the document taken up by repeated lines and repeated blank-line-separated paragraphs. Both weigh by *characters* rather than by count, following Gopher, so one repeated long paragraph counts for more than one repeated word.
-
-```python
-docs = bt.from_pydict(
-    {
-        "body": [
-            "unique one\nunique two\nunique three\nunique four",
-            "same line\nsame line\nsame line\nsame line",
-        ]
-    }
-)
-out = docs.select(dup=bt.col("body").str.duplicate_line_ratio())
-print(out.to_pydict())
-# {'dup': [0.0, 0.75]}
-```
-
-Each is null where the document has nothing to measure, so an empty extraction fails a threshold rather than sliding under it. The corpus-level aggregates of the same properties are in {doc}`/api/models/metrics`.
-
-For column profiling, {py:func}`bt.q1 <batcher.q1>` / {py:func}`bt.q3 <batcher.q3>` / {py:func}`bt.iqr <batcher.iqr>` give the robust spread,
+For column profiling, {py:func}`bt.q1 <batcher.q1>` / {py:func}`bt.q3 <batcher.q3>` / {py:func}`bt.iqr <batcher.iqr>` give the spread an outlier cannot move,
 {py:func}`bt.value_range <batcher.value_range>` the full spread, {py:func}`bt.null_rate <batcher.null_rate>` / {py:func}`bt.non_null_rate <batcher.non_null_rate>` completeness, and
 {py:func}`bt.nunique_ratio <batcher.nunique_ratio>` the cardinality ratio that separates identifiers from categoricals.
 
@@ -192,6 +174,33 @@ kept = corpus.filter(
 print(kept.to_pydict())
 # {'text': ['Real prose, with sentences and words.']}
 ```
+
+Length is not the only signal. A second measure asks not what a document says but how
+much of it repeats. A page
+that is mostly a navigation menu, a template header, or the same sentence emitted twice by
+a scraper is repetitive rather than short, so a length threshold never catches it.
+{py:meth}`duplicate_line_ratio <batcher.plan.expr_ir.namespaces.strings._StrNamespace.duplicate_line_ratio>` and {py:meth}`duplicate_paragraph_ratio <batcher.plan.expr_ir.namespaces.strings._StrNamespace.duplicate_paragraph_ratio>` report the share of the
+document taken up by repeated lines and by repeated blank-line-separated paragraphs. Both
+weigh by *characters* rather than by count, following Gopher, so one repeated long
+paragraph counts for more than one repeated word.
+
+```python
+docs = bt.from_pydict(
+    {
+        "body": [
+            "unique one\nunique two\nunique three\nunique four",
+            "same line\nsame line\nsame line\nsame line",
+        ]
+    }
+)
+out = docs.select(dup=bt.col("body").str.duplicate_line_ratio())
+print(out.to_pydict())
+# {'dup': [0.0, 0.75]}
+```
+
+Each is null where the document has nothing to measure, so an empty extraction fails a
+threshold rather than sliding under it. The corpus-level aggregates of the same properties
+are in {doc}`/api/models/metrics`.
 
 Document shape adds {py:meth}`paragraph_count <batcher.plan.expr_ir.namespaces.strings._StrNamespace.paragraph_count>`, {py:meth}`is_single_line <batcher.plan.expr_ir.namespaces.strings._StrNamespace.is_single_line>`, {py:meth}`ends_with_punctuation <batcher.plan.expr_ir.namespaces.strings._StrNamespace.ends_with_punctuation>`,
 {py:meth}`has_repeated_punctuation <batcher.plan.expr_ir.namespaces.strings._StrNamespace.has_repeated_punctuation>`, {py:meth}`quote_count <batcher.plan.expr_ir.namespaces.strings._StrNamespace.quote_count>`, {py:meth}`paren_count <batcher.plan.expr_ir.namespaces.strings._StrNamespace.paren_count>`, {py:meth}`digit_to_word_ratio <batcher.plan.expr_ir.namespaces.strings._StrNamespace.digit_to_word_ratio>`, and the

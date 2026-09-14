@@ -78,7 +78,7 @@ output is recomputed from its (durable) source partition and re-fetched.
 | `shuffle_port_range` | `None` | `(min, max)` the Flight shuffle listener may bind, instead of an OS-ephemeral port. Also read from `BATCHER_SHUFFLE_PORT_RANGE` (`"40000-40100"`). |
 
 :::{important}
-**Retry counts are a step function, not a dial.** Ray treats any non-zero `max_retries` as "this task is safe to rerun" and then retries *system* errors — spot preemption, worker crash, node loss — without decrementing the count. The number bounds only application errors. At `0` the task becomes non-retryable and a single preemption kills it permanently.
+**Retry counts are a step function, not a dial.** Ray treats any non-zero `max_retries` as "this task is safe to rerun" and then retries *system* errors (spot preemption, worker crash, node loss) without decrementing the count. The number bounds only application errors. At `0` the task becomes non-retryable and a single preemption kills it permanently.
 
 So `task_max_retries=2` means "unlimited preemption retries, two application retries", and lowering it to `0` to reduce retry noise silently removes every spot protection on that path. The same holds for `actor_max_restarts`. On a churning cluster set `resilience="spot"`, which raises both rather than leaving you to reason about the step.
 :::

@@ -1,21 +1,19 @@
 # Governance
 
-Row filters, column masks, and lineage. Governance is a **plan rewrite**, not a runtime
-check: {py:obj}`enforce <batcher.governance.enforce>` rewrites the `LogicalPlan` before it
+Row filters, column masks, and lineage. Governance is a plan rewrite rather than a runtime
+check. {py:obj}`enforce <batcher.governance.enforce>` rewrites the `LogicalPlan` before it
 executes, so a principal who may not see a column never causes that column to be read.
-There's no filtering pass after the fact, and no privileged bypass to forget.
+There is no filtering pass after the fact, no privileged bypass to forget, and no execution
+path that can skip enforcement. A principal who may not read a column doesn't read it and
+then get filtered. The column never enters the plan, which is also why a policy costs a
+pushed-down filter rather than a per-row callback.
 
 ```python
 from batcher.governance import Principal, SecurityCatalog, Grant, Redact, enforce
 ```
 
-The {doc}`governance guide </user-guide/trust/governance>` is the worked introduction; this
+The {doc}`governance guide </user-guide/trust/governance>` is the worked introduction. This
 page is the symbol reference.
-
-:::{important}
-Because enforcement is a rewrite rather than a check, there is no execution path that can
-skip it. A principal who may not read a column doesn't read it and then get filtered. The column never enters the plan. That's also why a policy costs a pushed-down filter rather than a per-row callback.
-:::
 
 ## Identity
 
@@ -73,7 +71,9 @@ honest answer when each trust domain runs its own process.
 {py:obj}`HmacTokenVerifier <batcher.governance.authn.HmacTokenVerifier>` checks a compact
 signed token against a shared key, using only the standard library. {py:obj}`JwtVerifier
 <batcher.governance.authn.JwtVerifier>` validates an OIDC ID token against the provider's
-JWKS, and needs the optional `pyjwt` dependency.
+JWKS, and needs the optional `pyjwt` dependency. For anything else, implement
+{py:obj}`CredentialVerifier <batcher.governance.authn.CredentialVerifier>`, which is the
+protocol all three satisfy.
 
 ```{eval-rst}
 .. autoclass:: batcher.governance.authn.ProcessIdentityVerifier
@@ -90,7 +90,7 @@ JWKS, and needs the optional `pyjwt` dependency.
 ```
 
 ```{warning}
-Verification is a **deployment** control, not a security boundary. Code running inside the
+Verification is a deployment control rather than a security boundary. Code running inside the
 engine's process can construct a `Principal` with any `issuer` it likes, and no in-process
 mechanism can stop it. What this buys is that a query whose identity nobody established is
 refused instead of silently trusted. The boundary is still the process, so run one per
@@ -168,8 +168,8 @@ ordinary pushed-down filter and costs nothing extra.
 A mask changes how a column *reads* rather than whether it reads at all. An analyst sees
 `XXXX1234`, while the fraud team sees the number. Bind a mask to one column with
 {py:obj}`ColumnMask <batcher.governance.ColumnMask>`, or to a *tag* with
-{py:obj}`TagMask <batcher.governance.TagMask>` so it applies everywhere that tag
-appears, however many tables grow later.
+{py:obj}`TagMask <batcher.governance.TagMask>` so it applies wherever that tag
+appears, including in tables added later.
 
 ```{eval-rst}
 .. autoclass:: ColumnMask
@@ -200,8 +200,9 @@ is deterministic, so masked values still join and group correctly. {py:obj}`Encr
 
 ## Enforcement and lineage
 
-{py:obj}`enforce <batcher.governance.enforce>` applies the catalog to a plan and reports
-what it did, so the rewrite is auditable rather than invisible.
+{py:obj}`enforce <batcher.governance.enforce>` returns the rewritten plan together with a
+{py:obj}`GovernanceEvent <batcher.GovernanceEvent>` for every rule it applied.
+Both come out of one traversal, so the audit record is by construction the enforcement.
 {py:obj}`column_lineage <batcher.governance.column_lineage>` traces each output column back
 to the source columns it derives from. That is how a tag on a source column keeps masking a
 value three transformations downstream, after it has been renamed and cast and aggregated.
@@ -216,9 +217,10 @@ value three transformations downstream, after it has been renamed and cast and a
 
 ## Data residency
 
-A residency rule answers a different question from a grant: not who may read a dataset but
-*where it may be computed on*. That is the half of a sovereignty obligation a scheduler can
-break silently, by placing a stage in whichever region has spare accelerator capacity.
+A residency rule answers a different question from a grant. A grant says who may read a
+dataset. A residency rule says *where it may be computed*. That second half of a
+sovereignty obligation is the one a scheduler can break silently, by placing a stage in
+whichever region has spare accelerator capacity.
 
 {py:obj}`ResidencyCatalog <batcher.governance.ResidencyCatalog>` holds the rules and resolves
 a placement to a {py:obj}`ResidencyVerdict <batcher.governance.ResidencyVerdict>`. Its `mode`

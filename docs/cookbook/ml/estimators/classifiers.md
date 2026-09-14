@@ -20,4 +20,4 @@ python examples/ml/classifiers.py
 - {doc}`/cookbook/ml/inference/batch_inference`: a model over every row, without a Python loop.
 - {doc}`/cookbook/ml/estimators/clustering_and_decomposition`: KMeans, Gaussian mixtures, PCA, and truncated SVD.
 - {doc}`/ml/index`: the ML surface these recipes sit on.
-- {doc}`/ml/preparing/preprocessors/index`: the fit and transform steps most pipelines start with.
+- {doc}`/ml/evaluation/index`: scoring the model once it is fitted, as engine expressions.

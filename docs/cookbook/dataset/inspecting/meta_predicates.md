@@ -1,6 +1,6 @@
 # Cheap data checks
 
-These short-circuit. ``any_match`` stops at the first matching row rather than counting them all, which makes "does this table contain any bad rows?" much cheaper than "how many bad rows does it contain?".
+These short-circuit. `any_match` stops at the first matching row rather than counting them all, which makes "does this table contain any bad rows?" much cheaper than "how many bad rows does it contain?".
 
 The whole script, executed on every test run:
 

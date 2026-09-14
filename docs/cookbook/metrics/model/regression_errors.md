@@ -18,6 +18,6 @@ python examples/metrics/regression_errors.py
 ## See also
 
 - {doc}`/cookbook/metrics/model/probabilistic_losses`: losses that score a probability or a margin rather than a hard label.
-- {doc}`/cookbook/metrics/text/text_diversity`: repetition, truncation, refusal, and empty output.
+- {doc}`/cookbook/metrics/model/agreement`: how well a prediction tracks the truth, not just how close.
 - {doc}`/ml/evaluation/evaluation`: scoring a model, per segment, in one pass.
 - {doc}`/api/models/metrics`: the complete metric vocabulary.

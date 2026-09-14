@@ -13,12 +13,13 @@ instead, on {doc}`/api/models/ml-models`.
 
 ## Model metrics
 
-Scoring aggregates over a column of labels and a column of predictions. They are ordinary
-aggregates, so they compose with `group_by(...).agg(...)` to score per segment in one pass.
-See the {doc}`model evaluation guide </ml/evaluation/evaluation>`.
+Scoring aggregates over a column of labels and a column of predictions. See the
+{doc}`model evaluation guide </ml/evaluation/evaluation>`.
 
-The classification metrics take a label column and a predicted-label column, plus
-`positive=` to say which label value counts as positive:
+### Classification
+
+These take a label column and a predicted-label column, plus `positive=` to say which
+label value counts as positive:
 
 ```{eval-rst}
 .. autosummary::
@@ -56,7 +57,9 @@ The classification metrics take a label column and a predicted-label column, plu
    prevalence_threshold
 ```
 
-The regression metrics take a truth column and a prediction column:
+### Regression
+
+These take a truth column and a prediction column:
 
 ```{eval-rst}
 .. autosummary::
@@ -88,7 +91,9 @@ The regression metrics take a truth column and a prediction column:
    kling_gupta_efficiency
 ```
 
-The probabilistic metrics score a predicted *probability* rather than a hard label:
+### Probabilistic predictions
+
+These score a predicted *probability* rather than a hard label:
 
 ```{eval-rst}
 .. autosummary::
@@ -101,9 +106,11 @@ The probabilistic metrics score a predicted *probability* rather than a hard lab
    squared_hinge_loss
 ```
 
-The generation metrics score a model's generated text against a reference string. The token-set
-metrics split on whitespace; the character n-gram metrics (chrF-style) need no word boundaries, so
-they score languages without spaces such as Chinese or Japanese:
+### Generated text against a reference
+
+These score a model's output against a reference string. The token-set metrics split on
+whitespace. The character n-gram metrics (chrF-style) need no word boundaries at all, so they
+score languages without spaces such as Chinese or Japanese:
 
 ```{eval-rst}
 .. autosummary::
@@ -123,8 +130,8 @@ they score languages without spaces such as Chinese or Japanese:
    char_ngram_jaccard
 ```
 
-The clipped word n-gram metrics count repeats rather than sets, which is what BLEU and ROUGE-N
-are defined on. Each caps an n-gram at the number of times the reference contains it, so a
+The clipped word n-gram metrics count repeats rather than sets, the definition BLEU and
+ROUGE-N use. Each caps an n-gram at the number of times the reference contains it, so a
 generation that loops on one correct phrase cannot score a perfect precision:
 
 ```{eval-rst}
@@ -144,7 +151,9 @@ generation that loops on one correct phrase cannot score a perfect precision:
    rouge_l_f1
 ```
 
-The embedding metrics score fixed-width vector columns for retrieval quality and drift:
+### Embeddings
+
+These score fixed-width vector columns for retrieval quality and drift:
 
 ```{eval-rst}
 .. autosummary::
@@ -164,7 +173,9 @@ The embedding metrics score fixed-width vector columns for retrieval quality and
    embedding_dim_drift
 ```
 
-The generation-quality metrics score an output column on its own, with no reference: diversity,
+### Generated text on its own
+
+With no reference to compare against, these read the output column alone: diversity,
 verbosity, and the empty, refusal, and truncation rates a team watches on a dashboard.
 
 ```{eval-rst}
@@ -209,6 +220,8 @@ spray punctuation, drift into non-ASCII, emit a URL, leak a code block, or run t
    mean_word_length
 ```
 
+### Token cost and output shape
+
 The token and cost aggregates size an LLM run before it is paid for: the total token bill, the
 fraction of rows that overflow a context window, and the token-length tail that sizes the window.
 
@@ -239,6 +252,8 @@ for: valid JSON, an extractable JSON object, or an answer inside a named tag.
    boxed_answer_rate
 ```
 
+### Retrieval grounding
+
 The RAG grounding metrics compare a generated answer column against its retrieved context column,
 measuring how much of the answer the context supports and how much is unsupported.
 
@@ -254,10 +269,10 @@ measuring how much of the answer the context supports and how much is unsupporte
    citation_rate
 ```
 
-The phrase-level pair is the harder test. Token overlap scores an answer built from the
-context's own vocabulary and rearranged into a claim the context never made, which is what a
-confident hallucination looks like; requiring whole spans to match catches it. The last group
-scores the *retrieval* rather than the answer, over a list column of passages:
+The phrase-level pair is the harder test. A confident hallucination is built from the context's
+own vocabulary and rearranged into a claim the context never made, so token overlap scores it
+well. Requiring whole spans to match catches it. The last group scores the *retrieval* rather
+than the answer, over a list column of passages:
 
 ```{eval-rst}
 .. autosummary::
@@ -271,6 +286,8 @@ scores the *retrieval* rather than the answer, over a list column of passages:
    mean_retrieved_passages
    context_token_estimate
 ```
+
+### Readability and repetition
 
 The readability metrics score how complex a generated column reads, for matching a target reading
 level.
@@ -300,6 +317,8 @@ producing new content.
    repeated_line_rate
    compression_ratio_proxy
 ```
+
+### Safety, injection, and leakage
 
 The PII and safety monitors flag a generated column that leaks a contact detail, a structured
 identifier, or a blocklisted term.
@@ -336,7 +355,7 @@ watch rather than a count of successful attacks:
    unsafe_html_rate
 ```
 
-The leakage monitors score what left — a credential recited into an answer, a payload encoded
+The leakage monitors score what left. A credential recited into an answer, a payload encoded
 past a reviewer, a link built to carry the conversation to someone else's host:
 
 ```{eval-rst}
@@ -350,6 +369,8 @@ past a reviewer, a link built to carry the conversation to someone else's host:
    data_uri_rate
    url_exfiltration_rate
 ```
+
+### Formatting, tone, and script
 
 The formatting metrics check whether generated text used the Markdown elements a task asked for.
 
@@ -366,8 +387,8 @@ The formatting metrics check whether generated text used the Markdown elements a
    code_block_present_rate
 ```
 
-The tone metrics track the register of generated text, catching a model that hedges, over-excites,
-or deflects a question.
+The tone metrics track the register of generated text. They catch a model that hedges,
+over-excites, or deflects a question.
 
 ```{eval-rst}
 .. autosummary::
@@ -441,4 +462,4 @@ Descriptive and inferential statistics as aggregates. See the
 - {doc}`/ml/evaluation/evaluation`: the guide to scoring a model with these.
 - {doc}`/api/models/ml-models`: the table-returning metrics and the in-engine estimators.
 - {doc}`/api/models/ml-statistics`: drift comparisons and cross-validated scoring.
-- {doc}`/cookbook/metrics/index`: 14 runnable recipes computing these metrics as aggregates.
+- {doc}`/cookbook/metrics/index`: 20 runnable recipes computing these metrics as aggregates.

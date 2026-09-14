@@ -37,10 +37,10 @@ Install the extra with `pip install 'batcher-engine[mlflow]'`.
 On the worker that scores with it, once, and against that machine's own MLflow
 configuration. Only the URI travels in the plan.
 
-That matters for two reasons. A distributed run resolves the reference on each worker, so a
-worker authenticates to the tracking server as itself rather than inheriting a session from
-the driver. And the artifact is never copied through the driver, which for a large model is
-the difference between one download per worker and one download plus a fan-out.
+That has consequences on both ends. A distributed run resolves the reference on each worker, so
+a worker authenticates to the tracking server as itself rather than inheriting a session from
+the driver. And the artifact is never copied through the driver, which for a large model is the
+difference between one download per worker and one download plus a fan-out.
 
 Set `MLFLOW_TRACKING_URI` in the worker environment, or configure MLflow in your host
 process before the query runs.

@@ -1,6 +1,6 @@
 # Fuzzy matching
 
-Edit distances count operations (lower is closer); the Jaro family returns a similarity in [0, 1] (higher is closer). Pick by the error you expect: typos favour Levenshtein, transposed characters favour Damerau.
+Edit distances count operations (lower is closer); the Jaro family returns a similarity in [0, 1] (higher is closer). Pick by the error you expect: typos favor Levenshtein, transposed characters favor Damerau.
 
 The whole script, executed on every test run:
 

@@ -1,9 +1,9 @@
 # Accelerator options
 
 This page documents the `accelerator` configuration section: the facts about a GPU fleet that
-Batcher cannot discover for itself. What a rack's power budget is, what a kilowatt-hour costs
-here, how carbon-intense this grid is, when a device stops being worth scheduling on, and how
-inference stages are sized against their KV cache.
+Batcher cannot discover for itself. A rack's power budget, the local price of a kilowatt-hour,
+the grid's carbon intensity, the point at which a device stops being worth scheduling on, and
+how inference stages are sized against their KV cache.
 
 Every default is inert. A deployment that sets none of these places work exactly as it did
 before, which is what makes each control safe to turn on one at a time.
@@ -107,7 +107,7 @@ hundred shards makes thousands of them, so `allocator="pool"` is the setting wit
 constant-factor effect on GPU query time. It is off by default because a pool reserves memory
 that a co-tenant on the same device can then no longer see.
 
-The pool is sized from what Carbonite says is reservable, which is the device's capacity less
+Carbonite sizes the pool from what it calls reservable: the device's capacity less
 `vram_headroom` and less whatever another process already holds. A device that cannot report
 its memory gets no pool at all rather than one sized from a guess.
 
@@ -178,7 +178,7 @@ silent conditions called out by device:
 - ECC disabled, an exclusive compute mode, a power limit at the part's floor, or persistence
   mode off, each of which costs throughput or correctness without raising anything;
 - how many MIG instances the device is partitioned into, or the AMD compute and memory
-  partition it is in, which changes what every other figure on the row is about;
+  partition it is in, which changes the meaning of every other figure on the row;
 - the RDMA ports that are up, what they have carried, and what they got wrong carrying it, or
   where there is no RDMA, the Ethernet links and the rate a shuffle is priced against;
 - the container limits that cost the job something: a `/dev/shm` too small to stage a worker's

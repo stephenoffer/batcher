@@ -5,11 +5,10 @@ on it, and turning positions into keys you can group by.
 
 ## What a geometry is here
 
-A geometry column is **WKB in a Binary column**. That is not an internal detail you can
-ignore, it is the reason geospatial work is fast: WKB is what GeoParquet, PostGIS,
-GeoPackage and DuckDB spatial all store, so a geometry column round-trips through any of
-them with no conversion, and every operator, spill path and shuffle the engine already
-has moves it without a new physical type.
+A geometry column is **WKB in a Binary column**. Don't skip past that as an internal
+detail. GeoParquet, PostGIS, GeoPackage and DuckDB spatial all store WKB, so a geometry
+column round-trips through any of them with no conversion, and every operator, spill path
+and shuffle the engine already has moves it without a new physical type.
 
 You do not have to build one to start. Every `st_*` function accepts a text column and
 parses it, detecting WKT, EWKT, GeoJSON and hex WKB by content:
@@ -50,8 +49,8 @@ print(located.select("city", wkt=bt.st_as_text(col("geom"))).to_pydict()["wkt"])
 ```
 
 :::{warning}
-Longitude first is what WKT, GeoJSON and PostGIS all use, and it is the opposite of how
-latitude and longitude are usually spoken. Reversing them puts Zurich in the Indian
+WKT, GeoJSON and PostGIS all put longitude first, which is the opposite of the order
+latitude and longitude are usually spoken in. Reversing them puts Zurich in the Indian
 Ocean and raises no error, because both orderings are valid coordinates.
 {py:func}`st_flip_coordinates <batcher.st_flip_coordinates>` is the fix once you notice.
 :::
@@ -268,8 +267,8 @@ before binning, since the function bins whatever coordinates it is given.
 ## Simplify before you shuffle
 
 Vertex count drives the cost of every predicate, every byte written and every byte
-shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the highest-leverage change you can make to a large
-geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` tells you what the tolerance cost you:
+shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the single biggest win available on a large
+geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` measures what the tolerance cost you:
 
 ```python
 detailed = bt.from_pydict(
@@ -288,10 +287,10 @@ print(
 
 ## What it costs
 
-Every `ST_*` function is a scalar expression evaluated per row in Rust, so cost is linear
-in rows and independent of how many rows there are. `benchmarks/geospatial.py` measures
-it; on a 16-core machine at 200k and 800k rows the throughput is flat, which is what
-linear scaling looks like:
+Every `ST_*` function is a scalar expression evaluated per row in Rust, so the cost is
+linear in the row count and the price per row doesn't move as that count grows.
+`benchmarks/geospatial.py` measures it. On a 16-core machine at 200k and 800k rows the
+throughput is flat, which is what linear scaling looks like:
 
 | Expression | Throughput |
 | --- | --- |
@@ -317,13 +316,13 @@ worth the extra clause and why materializing the four bound columns is worth the
   points of two shapes. For point pairs, which is most proximity work, those coincide
   exactly. For extended geometries they over-report by at most a segment length, so they
   are an upper bound; run {py:func}`st_segmentize <batcher.st_segmentize>` first when the answer must be tight.
-- **`st_transform` covers four families of reference system**, listed above, and rejects
+- `st_transform` covers the four families of reference system listed above and rejects
   everything else by EPSG code. Reprojecting between datums such as NAD 27 or OSGB 36
   needs a grid shift that is not built in.
 - **There is no polygon overlay.** `st_intersection`, `st_union` and `st_difference` do
   not exist. {py:func}`st_collect <batcher.st_collect>` concatenates without computing one, which is what you want
   before a single {py:func}`st_envelope <batcher.st_envelope>` or {py:func}`st_convex_hull <batcher.st_convex_hull>`.
-- **A geometry with a NaN coordinate is treated as unparseable** and yields null, because
+- A geometry with a NaN coordinate is treated as unparseable and yields null, because
   every predicate is a chain of comparisons and NaN makes all of them false in both
   directions.
 

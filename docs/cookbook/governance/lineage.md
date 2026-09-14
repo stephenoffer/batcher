@@ -1,6 +1,6 @@
 # Column lineage
 
-Lineage is computed from the plan, so it is exact rather than a guess from parsing SQL text. That is what makes it usable for an impact analysis: if this source column changes, which outputs move?
+Lineage is computed from the plan rather than guessed by parsing SQL text, so it is exact. Exactness is what an impact analysis needs: if this source column changes, which outputs move?
 
 The whole script, executed on every test run:
 

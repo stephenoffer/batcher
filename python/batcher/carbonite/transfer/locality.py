@@ -10,8 +10,13 @@ a `TransferMode` from where the data sits relative to the fetcher:
   no serialization, no socket. The concrete win over the Ray object store.
 - `DEVICE_P2P` — two devices on one node with a direct path between them: the copy
   crosses the fabric or a PCIe switch and never reaches host memory.
-- `SHARED_MEMORY` — same node, different process: Arrow IPC over a memory map
-  (a future Rust fast path; selected here, not yet executed — see `ShuffleSession`).
+- `SHARED_MEMORY` — same node, different process: Arrow IPC over a memory map.
+  This docstring described it as "a future Rust fast path, selected here but not yet
+  executed" until 2026-09-13, and that had stopped being true: `ShuffleSession.publish`
+  mirrors the bucket through `server.publish_shared` into `bc_transport::publish_shared`,
+  and the reducer reads it back through `bc_py::shuffle::gather`'s `fetch_shared`. The
+  stale sentence had already been copied into a published page's alt text and into
+  `tools/diagrams/transfer_modes.py`, so it was wrong in three places from one source.
 - `NETWORK` — different node: credit-bounded Arrow Flight.
 
 The two device modes rank where they do because the consumer is a device. A peer copy

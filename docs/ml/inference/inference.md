@@ -89,18 +89,6 @@ scored = reviews.ml.infer(
 `ds.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text")` is the same
 shortcut for embedding models, appending a vector column; it needs the `st` extra.
 
-## Overlapping a CPU stage with the GPU
-
-A single call runs one stage at a time. `run_pipeline` overlaps them: each stage gets its
-own thread and its worker is built once, and a credit window bounds how many finished
-batches may sit between one stage and the next.
-
-![An inference pipeline with each stage on its own thread. Arrow batches flow from the source through a CPU stage that decodes and tokenizes, then through a GPU stage running the model, then out. A bounded credit window sits between each pair of stages, so a stage blocks once its window to the next stage is full. That bound keeps a fast stage from running ahead into memory, lets stages overlap so the GPU is fed while the CPU decodes, and preserves output order while the run streams.](/_static/diagrams/inference_stages.svg)
-
-That bound is what keeps a fast decoder from filling memory ahead of a slow model, and
-it's why the run streams rather than materializing. See {doc}`/architecture/deep-dives/distribution/credit-flow-control`
-for the same mechanism applied to the distributed shuffle.
-
 ## Batch formats and tensor columns
 
 By default the callable receives and returns a `pyarrow.RecordBatch` with no copy and
@@ -145,15 +133,15 @@ Inference does not have to run on a GPU, and most of it does not. A model stage 
 pool, and the load-once class shape matters exactly as much, because loading a model per batch
 is expensive wherever it happens.
 
-Two things the engine does for you here, and they are the two a hand-written CPU stage usually
-misses.
+Three defaults on this path are worth knowing, because a hand-written CPU stage usually gets
+them wrong.
 
 The forward runs under `torch.inference_mode()`. Without it every forward builds a backward
 graph nobody reads and holds each layer's activations alive for the whole call: measured on a
 12-layer forward over 8,192 rows, **409.5 MB of peak resident memory against 39.9 MB**. Speed
 is unchanged either way, so this is about how large a batch fits and whether the worker
-survives, not about throughput. A stage that computes a gradient as its *result* — a saliency
-map, an adversarial perturbation, an influence score — declines with
+survives, not about throughput. Some stages compute a gradient as their result: a saliency
+map, an adversarial perturbation, an influence score. Those opt out with
 `batcher_inference_mode = False` on the class.
 
 Half precision is *not* applied on CPU. It changes the numbers, it needs tensor cores to be
@@ -165,8 +153,8 @@ library's threads by the number of concurrent calls, and it is wrong: measured o
 host, eight concurrent calls at full threads ran in 565 ms against 769 ms for the same work
 with threads divided evenly, and four concurrent calls went from 318 ms to 1,543 ms. Torch's
 intra-op pool is work-stealing, so oversubscription costs far less than starving each operator
-does. What the engine does cap is the pool to the *container's* usable cores under a cgroup
-quota, where torch would otherwise size itself to the host.
+does. The engine caps one thing only: the pool size, held to the *container's* usable cores
+under a cgroup quota, where torch would otherwise size itself to the host.
 
 For an exported model on CPU, {py:func}`bt.ml.openvino_predictor <batcher.ml.openvino_predictor>`
 and {py:func}`bt.ml.onnx_predictor <batcher.ml.onnx_predictor>` are usually faster than the
@@ -205,8 +193,8 @@ embedded = docs.ml.embed(Embedder, batch_size=256, num_gpus=1, concurrency=2)
 
 ## Driving the pool yourself
 
-`ds.ml.infer` runs on a `Dataset`. Sometimes what you hold is a bare stream of Arrow
-batches instead: the output of {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a reader, or a previous stage.
+`ds.ml.infer` runs on a `Dataset`. Sometimes you hold a bare stream of Arrow batches
+instead: the output of {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a reader, or a previous stage.
 {py:class}`InferencePool <batcher.ml.InferencePool>` gives you that same worker pool with no plan around it.
 
 Two callables define it. A `Worker` maps one `pyarrow.RecordBatch` to one
@@ -222,10 +210,10 @@ import pyarrow.compute as pc
 from batcher.ml import InferencePool
 
 
-def make_worker():  # a WorkerFactory — called once per pool slot
+def make_worker():  # a WorkerFactory, called once per pool slot
     scale = pa.scalar(2.0)  # stands in for the weights you would load here
 
-    def worker(batch):  # a Worker — called once per batch
+    def worker(batch):  # a Worker, called once per batch
         return batch.append_column("scaled", pc.multiply(batch.column("x"), scale))
 
     return worker
@@ -256,13 +244,19 @@ the GPU idles while the CPU decodes the next batch. `run_pipeline` runs each {py
 its own thread with a bounded queue between them, so the GPU stage works on batch *k*
 while the CPU stage prepares *k+1*.
 
+![An inference pipeline with each stage on its own thread. Arrow batches flow from the source through a CPU stage that decodes and tokenizes, then through a GPU stage running the model, then out. A bounded credit window sits between each pair of stages, so a stage blocks once its window to the next stage is full. That bound keeps a fast stage from running ahead into memory, lets stages overlap so the GPU is fed while the CPU decodes, and preserves output order while the run streams.](/_static/diagrams/inference_stages.svg)
+
 Each `Stage` carries a factory, a `credits` count, and a `num_gpus` placement hint. The
 factory is built once on that stage's thread, the same load-once contract as
-`WorkerFactory`.
-Credits are the backpressure. They cap how many finished batches may sit between one
-stage and the next, so a slow consumer blocks its producer instead of letting the queue
-grow without bound. Peak memory is the sum of the stages' credits, counted in batches,
-not in the length of the stream.
+`WorkerFactory`. Credits are the backpressure. They cap how many finished batches may sit
+between one stage and the next, so a slow consumer blocks its producer instead of letting
+the queue grow without bound. Peak memory is the sum of the stages' credits, counted in
+batches, not in the length of the stream.
+
+That bound keeps a fast decoder from filling memory ahead of a slow model, and it is why
+the run streams rather than materializing. See
+{doc}`/architecture/deep-dives/distribution/credit-flow-control` for the same mechanism
+applied to the distributed shuffle.
 
 ```python
 import pyarrow as pa

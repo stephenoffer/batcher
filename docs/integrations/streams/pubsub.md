@@ -56,7 +56,7 @@ That `offset` is stable per message and useful for de-duplication, but it is not
 it is not a position you can seek to.
 
 Message *attributes* are Pub/Sub's spelling of Kafka's headers, and `include_headers=True`
-adds them as a `headers` column of `array<struct<key:string,value:binary>>` — the same type
+adds them as a `headers` column of `array<struct<key:string,value:binary>>`, the same type
 and the same option every broker here uses:
 
 ```python
@@ -125,14 +125,15 @@ rate is your bottleneck, run several queries against several subscriptions on th
 and union the results downstream, or write a custom source (see
 {doc}`custom connectors </user-guide/moving-data/custom-connectors>`).
 
-`poll_size` maps to `max_messages` on the pull request. The service treats it as an upper
-bound and routinely returns far fewer, so the default 16,384 is optimistic rather than wrong.
-A value around 1,000 matches what the API will actually hand back.
+`poll_size` maps to `max_messages` on the pull request, and Pub/Sub rejects a request above
+1,000 with `InvalidArgument`. Batcher clamps to that ceiling before sending, so the engine's
+default of 16,384 never reaches the API and never needs to. Setting `poll_size=1_000` yourself
+documents the real batch size, and a smaller value is passed through untouched.
 
 ## Delivery: at-least-once, and the ack deadline
 
-Messages are acked after a batch has been assembled, in one `acknowledge` call for the whole
-poll. A crash before that ack means Pub/Sub redelivers, so nothing is lost.
+Messages are acked once the epoch carrying them has been published, not when the poll
+assembles them. A crash in between means Pub/Sub redelivers, so nothing is lost.
 
 :::{warning}
 The other half of that trade is duplicates, and the ack deadline is where they come from. The
@@ -142,7 +143,7 @@ a slow sink, and Pub/Sub has already redelivered them to somebody. There is no a
 loop in the source.
 :::
 
-Two ways to live with it.
+There are two ways to live with it.
 
 ::::{tab-set}
 
@@ -171,7 +172,7 @@ subscriber. The resume point on restart is the subscription's own unacked backlo
 right behavior for Pub/Sub, and it means the subscription, not the checkpoint, is what you
 must not delete between runs.
 
-## Writing the stream out
+## Writing
 
 :::{dropdown} A checkpointed write into a bronze Delta table
 ```python

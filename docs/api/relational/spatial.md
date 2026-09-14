@@ -24,9 +24,9 @@ conventions:
 | Pose application | Rotate, then translate |
 
 Scalar-last is the one that bites. ROS, SciPy and Eigen's storage order put `w` last;
-nuScenes, the Waymo protos and Eigen's *constructor* put it first. Reading a quaternion
-from one and passing it to the other is not an error anything can detect, it is a
-different and entirely plausible rotation. Every function here takes the four components
+nuScenes, the Waymo protos and Eigen's *constructor* put it first. Read a quaternion out of
+one and pass it to the other and you get a different, entirely plausible rotation, with
+nothing anywhere able to detect the mistake. Every function here takes the four components
 as separate arguments so the order is written at the call site.
 
 A quaternion whose components are all zero names no rotation. Every function returns
@@ -144,9 +144,9 @@ row-major.
 
 ## Combining and interpolating rotations
 
-{py:func}`quat_slerp_x <batcher.quat_slerp_x>` and its siblings are what make sensor
-fusion work: poses arrive at the localizer's rate and measurements at each sensor's, so
-almost every measurement needs the pose *between* two logged poses.
+Sensor fusion runs on {py:func}`quat_slerp_x <batcher.quat_slerp_x>` and its siblings.
+Poses arrive at the localizer's rate and measurements at each sensor's, so almost every
+measurement needs the pose *between* two logged poses.
 
 ```{eval-rst}
 .. autosummary::

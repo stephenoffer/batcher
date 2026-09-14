@@ -26,11 +26,17 @@ heavier machinery engages only when it can't. The knobs live in `config.distribu
 documented in {doc}`../configuration/options`.
 
 Every layer below is a mechanism for *repeating* work that was lost. Two things bound them,
-because repetition alone is not recovery. A failure is first classified — retry here, retry
-elsewhere, or do not retry — since a failure local to one machine that is retried in place
-walks the whole queue onto it. And retries are drawn from a job-wide budget, so a fleet broken
-in some way no probe catches fails quickly with the first real error rather than slowly with
-the last one. Both are configured in {doc}`../configuration/fault-tolerance`.
+because repetition alone is not recovery. A failure is classified first into one of three
+verdicts: retry here, retry elsewhere, or do not retry. A failure local to one machine that
+is retried in place walks the whole queue onto it. Retries are also drawn from a job-wide
+budget, so a fleet broken in some way no probe catches fails quickly with the first real
+error rather than slowly with the last one. Both are configured in
+{doc}`../configuration/fault-tolerance`.
+
+The figure below shows that classification, the three verdicts it reaches, and what each price
+of a recompute depends on having been arranged beforehand.
+
+![Recovery classifies a failure before it retries, and only one of the three verdicts is a retry. A task that raised, or whose worker stopped answering, is classified as lost data to be recomputed when it is a RayError that is not a RayTaskError, meaning an actor, a worker or a node died, and likewise for a RetryableShuffleError from an unreachable peer or a ResourceError from a spill file on an ephemeral disk. A deterministic bug, such as a UDF exception, a bad cast, a schema mismatch or a broken runtime environment, is re-raised instead, because every retry re-runs it, burns the job-wide budget, and reports a resource error for a Python bug. An uncontained ECC fault, where the device kept running and answered wrongly, leaves results untrusted and recovery refuses to continue at all, since work already finished there is as suspect as the task that failed. A recompute then costs one of three prices: re-read the source partition and re-run the map by default, usually the longest phase; fetch an off-node replica when shuffle_replication is above 1 and the copy was acknowledged before the bucket was advertised; or migrate while the worker is still alive, given advance notice from spot metadata, a SIGTERM or a Slurm deadline. Recovery introduces its own hazard, a worker presumed dead that is not, so each round carries a higher epoch and a reducer discards any batch arriving under a stale one.](/_static/diagrams/fault_recovery.svg)
 
 ### Ray-level task and actor retries
 
@@ -98,9 +104,8 @@ recomputed partition must not be double-counted with a straggling original. Each
 recovery round runs under a monotonically increasing *epoch*. A reducer accepts a
 partition tagged with the current epoch and fences out any batch arriving under a stale
 epoch, discarding it. A zombie producer that wakes up after its work was reassigned
-therefore can't corrupt the result, because its late bytes are ignored. Combined with
-the deterministic-task invariant, fencing is what lets a recomputed partition be merged
-in safely.
+therefore can't corrupt the result, because its late bytes are ignored. Fencing and the
+deterministic-task invariant together make a recomputed partition safe to merge back in.
 
 ## Straggler mitigation
 
@@ -121,8 +126,10 @@ cfg = base.replace(
 )
 ```
 
-`speculation_max_backups=0` (the default) disables it, and the barrier behaves like
-a plain wait. Speculation is bounded so it never oversubscribes the cluster.
+The default is `speculation_max_backups=1`, so one backup chases the single worst
+straggler and nothing else. Set it to `0` and the barrier becomes a plain wait. The
+bound is what keeps a uniformly slow stage from spawning a backup per task and
+oversubscribing the cluster.
 
 ## Credit-based backpressure
 
@@ -161,10 +168,11 @@ otherwise come from.
 
 Rather than tune each knob, pick a `config.distributed.resilience` profile. `"default"`
 keeps conservative budgets tuned for a stable on-demand cluster. `"spot"` hardens them
-as a bundle for a churning preemptible cluster, raising actor restarts and recompute
-attempts to ride out repeated loss, turning on the HTTP/2 keepalive so a dropped peer
-is noticed fast, adding one speculative backup so a degraded node can't stall a
-barrier, and setting `shuffle_replication` to 2. A profile applies *below* any value
+as a bundle for a churning preemptible cluster. It raises actor restarts, task retries
+and recompute attempts to ride out repeated loss, spaces the recovery backoff so a
+preemption *wave* isn't retried in a tight loop, turns on the HTTP/2 keepalive so a
+dropped peer is noticed fast, lets a stage wait briefly for the autoscaler to replace
+churned capacity, and sets `shuffle_replication` to 2. A profile applies *below* any value
 you set explicitly, so an explicit override beats the profile, and the profile beats
 the default. A preemptible environment is auto-detected and switched to `"spot"` when
 `resilience` is left at `"default"`.
@@ -185,20 +193,21 @@ host maintenance doesn't migrate the fleet. The AWS probe presents an IMDSv2 ses
 without which it is silently dead on any instance launched with `HttpTokens=required`.
 
 Only one of those endpoints can answer on a given node, and on a neocloud, an HPC cluster or
-on-prem hardware none of them can. So Batcher skips the platforms this node isn't — using both
-the provider it detected from the environment and what the firmware says the node was built as,
-so a GPU cloud reselling hyperscaler capacity keeps the endpoint that answers for it — and
-stops probing an endpoint that has been unreachable three times running. A metadata service doesn't appear partway through a job, and
-the alternative was paying a timeout per endpoint on every poll for the life of the worker.
-Reachability is what resets that count, not the answer: a spot node spends its whole life
-being told "not draining", which still proves the endpoint is there.
+on-prem hardware none of them can. So Batcher skips the platforms this node isn't. It reads
+both the provider it detected from the environment and what the firmware says the node was
+built as, so a GPU cloud reselling hyperscaler capacity keeps the endpoint that answers for
+it. It also stops probing an endpoint that has been unreachable three times running. A
+metadata service doesn't appear partway through a job, and the alternative was paying a
+timeout per endpoint on every poll for the life of the worker. Reachability resets that
+count rather than the answer: a spot node spends its whole life being told "not draining",
+which still proves the endpoint is there.
 
 A signal arrives from an orchestrator. `SIGTERM` is what Kubernetes sends on eviction and
 what Slurm sends when a job hits its time limit. `SIGUSR1` is Slurm's early warning, sent
 ahead of the limit when the job was submitted with `--signal=B:USR1@120`. Batcher chains
 to whatever handler you already installed, so your own checkpoint hook still runs.
 
-A wall-clock deadline is simply known. This is the case a batch scheduler leaves you in:
+A wall-clock deadline is known in advance. This is the case a batch scheduler leaves you in:
 a Slurm allocation is not reclaimed with a notice, it just ends at a time fixed when the
 job was submitted, and every process in it is killed then. Batcher reads
 `SLURM_JOB_END_TIME` and begins draining `config.distributed.drain_lead_s` seconds
@@ -215,8 +224,8 @@ export BATCHER_DEADLINE_SECONDS=$(( 2 * 3600 ))
 ```
 
 The lease is measured from when the process started, read from `/proc`. That is exact for a
-script that starts Python first, and over-states the remaining time by however long a job
-script spends before it — which drains late, so prefer the absolute form below when your
+script that starts Python first. It over-states the remaining time by however long a job
+script spends before that, which drains late, so prefer the absolute form below when your
 launcher knows the moment.
 
 Any launcher that knows the exact moment its lease expires can give that instead, as Unix
@@ -279,9 +288,9 @@ storage and re-run the map, usually the longest phase of a query. Setting
 on an off-node survivor, so a reducer fetches the byte-identical bucket instead, at the
 cost of one extra network copy.
 
-The mergeable algebra is what makes that trade affordable. What a mapper publishes is
-pre-aggregated partial state, typically far smaller than the source that produced it,
-so copying it is much cheaper than regenerating it. A replica is advertised only once
+The mergeable algebra makes that trade affordable. A mapper publishes pre-aggregated
+partial state, typically far smaller than the source that produced it, so copying it is
+much cheaper than regenerating it. A replica is advertised only once
 its copy has been acknowledged, and a source's replicas are retired when it's
 recomputed, so a reducer can never read a stale replica under a superseded epoch.
 

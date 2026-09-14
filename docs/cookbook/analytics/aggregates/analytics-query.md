@@ -107,4 +107,4 @@ Three edits turn this into a real query, and each one is a single line:
   operators this page leans on, in full.
 - {doc}`/user-guide/analyze/joins`: join types, and which side gets built.
 - {doc}`/cookbook/data-engineering/ingest/etl-pipeline`: the same treatment for an ingest pipeline, ending in a written table.
-- {doc}`/tutorials/foundations/optimizing-a-slow-query`: what to do when this shape meets real data.
+- {doc}`/getting-started/tutorials/foundations/optimizing-a-slow-query`: what to do when this shape meets real data.

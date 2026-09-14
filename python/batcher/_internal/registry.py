@@ -173,5 +173,20 @@ class Registry(Generic[T]):
 
         The default `object.__repr__` — an address — is useless at exactly the moment
         a registry is printed, which is while working out why a lookup missed.
+
+        This deliberately does **not** call `complete`, unlike every other method here
+        that reports a whole-registry view. A repr is a debugging aid, and it is called
+        by tooling that never asked for the deferred import: Sphinx's autodoc reprs
+        every module attribute it documents. Completing here turns printing a registry
+        into importing every lakehouse, warehouse, NoSQL, SQL and streaming connector,
+        and turns any failure inside one of those imports into a failure of the print.
+        That is not hypothetical — it is how `just docs` came to die on a broken stdlib
+        `sqlite3`: autodoc reprd `SOURCES`, the repr imported the streaming family, and
+        the traceback named Sphinx rather than the interpreter. So the repr reports what
+        is registered *now*, and says when that is not yet the whole list.
         """
-        return f"Registry({self._kind!r}, {len(self._items)} registered: {self.names()})"
+        pending = "" if self._completed else " so far, deferred families not loaded"
+        return (
+            f"Registry({self._kind!r}, {len(self._items)} registered{pending}: "
+            f"{sorted(self._items)})"
+        )

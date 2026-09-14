@@ -4,7 +4,7 @@ This page describes how Batcher skips a shuffle entirely when the table on disk 
 
 ## What a partitioned table already did for you
 
-A partitioned table stores each value's rows apart from the others. A Hive-partitioned Parquet tree does it with a directory per value:
+A partitioned table stores each value's rows apart from the others. A Hive-partitioned Parquet tree uses a directory per value:
 
 ```text
 sales/
@@ -13,7 +13,7 @@ sales/
   day=2026-08-03/part-0.parquet
 ```
 
-Every row for the 1st is inside one directory. Batcher reads such a table one directory per split, and a split is the unit of assignment: it goes to one worker, whole, never cut in half. So by the time the read finishes, every row for the 1st is on one worker.
+Every row for the 1st is inside one directory. Batcher reads such a table one directory per split. A split is the unit of assignment: it goes to one worker, whole, and is never cut in half. So by the time the read finishes, every row for the 1st is on one worker.
 
 That is precisely what a shuffle by `day` would have arranged. A `GROUP BY day` over this table therefore needs no exchange at all. Each worker folds its own directories to final groups, and the driver concatenates them.
 
@@ -43,15 +43,19 @@ The elimination applies when all three hold. Each one is load-bearing, and the t
 
 Every split declares the same clustering columns. A set where one split names `day` and the next names nothing has no column every row can be located by, and guarantees nothing. This is the half that is *checked*, by `io/splits/clustering.py::declared_clustering`.
 
-Splits sharing a value are assigned together. This is the half that is *established*, by grouping. It is the one that matters and the one no individual split can promise: two splits at `day=2026-08-01` on two different workers would make a query that skipped its shuffle report the day twice.
+Splits sharing a value are assigned together. This is the half that is *established*, by grouping. It is the one that matters. No individual split can promise it: two splits at `day=2026-08-01` on two different workers would make a query that skipped its shuffle report the day twice.
 
-Every clustering column is a group key. Grouping by a *superset* is fine, because `(day, region)` groups are inside `day` groups, which are inside one directory. Grouping by a column the table is not partitioned by is not: `region` repeats in every directory, so its groups straddle every worker.
+Every clustering column is a group key. Grouping by a *superset* is fine, because `(day, region)` groups are inside `day` groups, which are inside one directory. Grouping by a column the table is not partitioned by is not. `region` repeats in every directory, so its groups straddle every worker.
 
 The grouping keeps enough of the read's parallelism to be worth the exchange it saves.
 
 This is the only thing the aligned plan gives up, and how much it gives up depends entirely on the reader. A Hive tree already splits one-per-partition, so grouping changes nothing and the aligned plan runs exactly the tasks the shuffle would have. A Delta or Iceberg table splits per data file, so a partition of eight files becomes one assignable unit, and a table with fewer partitions than the fleet has workers ends up running on a fraction of it while the shuffle uses all of it.
 
 So the test is written against the two task counts the plans would actually run: `min(groups, workers)` for the aligned plan, `min(splits, workers)` for the shuffle. Both are capped by the fleet because neither plan can use more workers than exist, which is why the same layout can be aligned on a small fleet and shuffled on a large one. The floors come from measurement rather than taste, and the section below shows what they were set from.
+
+In code the first condition is two separate tests, one checked and one established, so the decision is four tests wide, and they do not fail in the same currency.
+
+![The tests that let a read replace a shuffle, and what each one costs when it is wrong. A directory per value, assigned whole, puts every row for a value on one worker, which is exactly what a shuffle by that column arranges. Four tests then decide whether the exchange may go. Does every split declare the same clustering columns, or none do, checked by declared_clustering. Are a value's splits assigned together as one unit, established by group_by_clustering, which no individual split can promise. Do the group keys contain the clustering columns, the containment held by properties.satisfies. And are enough tasks left to be worth it, at least two and at least a quarter of the shuffle's count, read off scan_clustering_for. The first three are correctness: a group split across two workers returns two partial sums, each labelled final. The fourth is a judgment about speed. Any one test failing falls back to the hash shuffle, where every row crosses the network and the answer is never wrong; passing all four runs with no exchange, each worker folding its own directories, and publishes the decision to explain(analyze=True) as a core / exchange entry. Three things unclaim the layout: a glob path, whose per-file splits record no partition value; grouping below the split, since month= sits under every year= directory; and a Limit in the chain, because clustering places rows and does not finish them.](/_static/diagrams/partition_aware_planning.svg)
 
 ## Why the check is exact and not a declaration
 
@@ -61,7 +65,7 @@ A group split across two workers comes back as two rows, each carrying a partial
 
 So the guarantee is verified against the split set the read will actually use, rather than declared by the source and trusted. That costs one pass over a list of strings on the driver.
 
-The split set is planned with the same arguments the executor will use, including the same partition count and the same pushed projection and predicate, so what the check inspects is the set the read gets and not a lookalike. It is then checked a second time, inside the executor, against the splits it is about to assign: if they no longer declare what the plan was chosen on, the read **raises** rather than falling back. A fallback would be a wrong answer, because by that point the plan has no combine in it.
+The split set is planned with the same arguments the executor will use, including the same partition count and the same pushed projection and predicate. So what the check inspects is the set the read gets, not a lookalike. It is then checked a second time, inside the executor, against the splits it is about to assign. If they no longer declare what the plan was chosen on, the read **raises** rather than falling back. A fallback would be a wrong answer, because by that point the plan has no combine in it.
 
 Values are compared *typed* rather than as the strings a directory name gives, so `x=01` and `x=1` are not mistaken for two partitions of one value.
 
@@ -69,7 +73,7 @@ Values are compared *typed* rather than as the strings a directory name gives, s
 
 The decision splits across two layers along the line the architecture already draws.
 
-Kyber owns the question "what distribution does this relation already have". `kyber/properties.py::clustered_on` propagates a clustering up through the operators that cannot disturb it: a `Filter`, a `Limit` and a `Distinct` only remove rows, and removing a row never moves another one to a different worker; a `Project` carries the clustering forward under its output names. Anything else leaves it unclaimed, which costs at most a needless shuffle.
+Kyber owns the question "what distribution does this relation already have". `kyber/properties.py::clustered_on` propagates a clustering up through the operators that cannot disturb it. A `Filter`, a `Limit` and a `Distinct` only remove rows, and removing a row never moves another one to a different worker. A `Project` carries the clustering forward under its output names. Anything else leaves it unclaimed, which costs at most a needless shuffle.
 
 `dist` supplies the one part of the answer only it can see, which is what the split set actually guarantees, and then schedules against the result. It does not re-derive the containment rule, so the two cannot drift.
 
@@ -81,13 +85,13 @@ Aggregation, deduplication and windowing, in both the disk and Flight transports
 
 A dedup is a group-by that keeps one row per group, so it eliminates the same exchange under the same condition. A whole-row `DISTINCT` groups on every column, which contains the partition columns by definition, so any clustered layout aligns it. A `DISTINCT ON` aligns when its keys cover the clustering.
 
-One shape is excluded outright. A `DISTINCT` carrying a limit would keep `n` rows per partition and concatenate them, which is `n x partitions` rows.
+One shape is excluded outright. A `DISTINCT` carrying a limit would keep `n` rows per partition and concatenate them. That is `n x partitions` rows.
 
 A window computes each partition independently, so co-locating a partition's rows is the only thing its shuffle establishes, and a `ROW_NUMBER() OVER (PARTITION BY day ...)` over a directory-per-day table has that already. The frame and the ordering need no attention because both are *within* a partition, and a `rank_limit` is per-partition too.
 
-`COUNT(DISTINCT)` benefits twice over, and it is the most expensive shape here. It lowers to an aggregate over a `Distinct`, so the shuffle path has to dedup globally before it can count anything. A dedup only ever collapses rows that agree, and rows that agree on the partition columns are already on one worker, so over a clustered relation the per-partition dedup is already the global one.
+`COUNT(DISTINCT)` benefits twice over, and it is the most expensive shape here. It lowers to an aggregate over a `Distinct`, so the shuffle path has to dedup globally before it can count anything. A dedup only ever collapses rows that agree. Rows that agree on the partition columns are already on one worker, so over a clustered relation the per-partition dedup is already the global one.
 
-That is what the chain check is for, and it is also where the clustering property alone would mislead. A `Limit` between the scan and the aggregate does not move a row between workers, so the relation is still clustered by every measure this page has given. But `limit(100).group_by(day)` run per partition keeps a hundred rows on *each* of them, which is a different query. Clustering says where rows are; it does not say that a per-partition computation is complete. Only `Filter`, `Project` and an unlimited `Distinct` are allowed in the chain.
+That is what the chain check is for, and it is also where the clustering property alone would mislead. A `Limit` between the scan and the aggregate does not move a row between workers, so the relation is still clustered by every measure this page has given. But `limit(100).group_by(day)` run per partition keeps a hundred rows on *each* of them, which is a different query. Clustering says where rows are. It does not say that a per-partition computation is complete. Only `Filter`, `Project` and an unlimited `Distinct` are allowed in the chain.
 
 Because nothing is combined across partitions, a **non-mergeable** aggregate is correct here too. `median` and `n_unique` carry per-group partial state that a shuffle has to merge; aligned, each group is finalized where it was read and there is nothing to merge.
 
@@ -99,7 +103,7 @@ The shuffle path returns exactly the same rows, so nothing about a result tells 
 core / exchange   aggregate needs no shuffle: the table is already partitioned by day
 ```
 
-If you expect the line and it isn't there, work down the three conditions. The most common reason is the third, and it is worth checking before the others: a lakehouse table with many small files per partition and few partitions relative to the fleet is the shape where shuffling genuinely wins, and the scheduler chose it.
+If you expect the line and it isn't there, work down the three conditions. The most common reason is the third. Check it before the others. A lakehouse table with many small files per partition and few partitions relative to the fleet is the shape where shuffling genuinely wins, and the scheduler chose it.
 
 ## Measured
 
@@ -113,7 +117,7 @@ On 8,000,000 rows grouped by the partition column on an eight-worker local clust
 
 Produced by `benchmarks/internals/partition_aligned.py`, which checks the two paths return the same rows before reporting either time. The engine under it was a *debug* build, which slows the local aggregation both paths do while leaving the shuffle's orchestration alone, so a release engine should widen these rather than close them.
 
-Delta's smaller ratio is the read, not the elimination: four files per partition against one, through pyarrow's per-file open rather than one directory scan. The `COUNT(DISTINCT)` row understates its own case, because `v` here holds only a thousand distinct values; the shuffle it removes carries the *deduped* rows, so the gap grows with the column's cardinality.
+Delta's smaller ratio is the read, not the elimination: four files per partition against one, through pyarrow's per-file open rather than one directory scan. The `COUNT(DISTINCT)` row understates its own case, because `v` here holds only a thousand distinct values. The shuffle it removes carries the *deduped* rows, so the gap grows with the column's cardinality.
 
 ### Where it stops paying
 
@@ -126,19 +130,19 @@ Delta's smaller ratio is the read, not the elimination: four files per partition
 
 Both losses are the column where the aligned plan has **one task**: the whole query runs on one worker while the shuffle spreads the read across the fleet. A Hive tree at one partition is a wash rather than a loss, because its shuffle has one split to work with too and is equally serial.
 
-A ratio cannot see that, which is why the rule is not one. Delta at one partition keeps a *quarter* of the shuffle's parallelism and loses 1.6x; Delta at two partitions keeps the same quarter and wins 1.3x. What separates them is the absolute task count, not the fraction.
+A ratio cannot see that, which is why the rule is not one. Delta at one partition keeps a *quarter* of the shuffle's parallelism and loses 1.6x. Delta at two partitions keeps the same quarter and wins 1.3x. What separates them is the absolute task count, not the fraction.
 
-So there are two conditions, and the scheduler applies both: at least two tasks unless the shuffle would not have had two either, and at least a quarter of what the shuffle would have run. The first rules out the serial plan; the second keeps a two-partition table off a five-hundred-worker fleet, which a fixed-width sweep cannot reach but arithmetic can.
+So there are two conditions, and the scheduler applies both: at least two tasks unless the shuffle would not have had two either, and at least a quarter of what the shuffle would have run. The first rules out the serial plan. The second keeps a two-partition table off a five-hundred-worker fleet, which a fixed-width sweep cannot reach but arithmetic can.
 
 ## Requirements and limitations
 
-A nested `year=/month=` tree is clustered on the **year**, and that is the complete guarantee rather than a partial one. Grouping by `(year, month)` is aligned, because those groups sit inside `year` groups and the containment does the work. Grouping by `month` alone is not, and no split granularity would change that: `month=1` exists under every year, so its rows are spread across every top-level directory, and splitting per leaf directory would only make a split's value `(year, month)` while `month` alone still straddles them.
+A nested `year=/month=` tree is clustered on the **year**, and that is the complete guarantee rather than a partial one. Grouping by `(year, month)` is aligned, because those groups sit inside `year` groups and the containment does the work. Grouping by `month` alone is not, and no split granularity would change that. `month=1` exists under every year, so its rows are spread across every top-level directory. Splitting per leaf directory would only make a split's value `(year, month)`, while `month` alone still straddles them.
 
 Hive-partitioned Parquet trees, Delta tables and Iceberg tables declare a clustering. A Parquet path containing a glob falls back to per-file splits that record no partition value, so it guarantees nothing about where equal values live. Any other layout carrying the same guarantee can join in by exposing `clustering_columns` and `clustering_value` on its splits.
 
 Iceberg needs one extra care that the other two don't, because it is the only one whose partitioning can change under an existing table. Its partition spec can evolve, and a file written before the change carries a partition record holding the *old* spec's fields. Reading that against the current spec's columns groups by the wrong thing entirely, so a file whose `spec_id` is not the current one declares no clustering, which makes the whole set refuse rather than be half-trusted.
 
-Iceberg also stores `transform(column)` rather than the column, so what a split declares is the partition field's **source column**. That is the sound claim and the useful one: every transform is a deterministic function of its column, so equal column values always produce equal partition values and land in the same group, which is what lets `GROUP BY ts` over a `days(ts)`-partitioned table skip its shuffle. The tests exercise the identity transform; writing a `bucket`- or `days`-partitioned table needs the `pyiceberg-core` extra, which this repository does not depend on.
+Iceberg also stores `transform(column)` rather than the column, so what a split declares is the partition field's **source column**. That is the sound claim and the useful one. Every transform is a deterministic function of its column, so equal column values always produce equal partition values and land in the same group, which is what lets `GROUP BY ts` over a `days(ts)`-partitioned table skip its shuffle. The tests exercise the identity transform; writing a `bucket`- or `days`-partitioned table needs the `pyiceberg-core` extra, which this repository does not depend on.
 
 Joins do not use it yet. A join whose both sides are partitioned by the join key is co-partitioned on disk and could skip its shuffle on the same argument, but it needs both sides to agree on the layout, which is a stronger condition than either single-input operator has to meet.
 

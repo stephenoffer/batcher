@@ -21,10 +21,10 @@ how it splits, and what pushes down. Start there before you read the prose.
 
 | Group | Pages | Covers |
 |---|---|---|
-| {doc}`/integrations/streams/index` | 5 | Kafka, Kinesis, Pulsar, Pub/Sub, and Event Hubs |
+| {doc}`/integrations/streams/index` | 6 | Kafka, Kinesis, Pulsar, Pub/Sub, Event Hubs, and the payload formats they carry |
 | {doc}`/integrations/warehouses/index` | 3 | Snowflake, BigQuery, and Databricks |
 | {doc}`/integrations/lakehouse/index` | 3 | Delta Lake, Apache Iceberg, and Apache Hudi |
-| {doc}`/integrations/databases/index` | 3 | SQL databases over one URI, plus MongoDB and Elasticsearch |
+| {doc}`/integrations/databases/index` | 5 | SQL databases over one URI, the write path, the key-value stores, MongoDB, and Elasticsearch |
 | {doc}`/integrations/compute/index` | 5 | Ray, PyTorch, Hugging Face, MLflow, and batch schedulers |
 | {doc}`/integrations/observability/index` | 2 | Prometheus and Grafana, and OpenLineage |
 

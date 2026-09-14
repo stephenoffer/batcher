@@ -115,9 +115,9 @@ time ({doc}`schema evolution </cookbook/data-engineering/modeling/schema-evoluti
   {doc}`Writing data </user-guide/moving-data/writing-data>`: the reader and the sink, in full.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>` and {doc}`Kafka </integrations/streams/kafka>`:
   the systems the recipes talk to, and what each guarantees.
-- {doc}`Building a lakehouse </tutorials/pipelines/building-a-lakehouse>`: these pieces assembled
+- {doc}`Building a lakehouse </getting-started/tutorials/pipelines/building-a-lakehouse>`: these pieces assembled
   into one pipeline, end to end.
-- {doc}`Data engineer learning path </tutorials/paths/data-engineer>`: a reading order.
+- {doc}`Data engineer learning path </getting-started/tutorials/paths/data-engineer>`: a reading order.
 
 ```{toctree}
 :hidden:

@@ -200,9 +200,10 @@ Say which one you are reporting. The two can differ by a factor of two on the sa
 :::{dropdown} Scaling notes: swapping the exact distinct count for a sketch
 `n_unique` is an exact distinct count, which means it holds every distinct user id per cell
 in memory. On a cohort table with hundreds of millions of users that is the step that hurts.
-`approx_n_unique` swaps it for a HyperLogLog sketch: bounded memory per group, ~2% error,
-and mergeable, so the answer is identical single-node and distributed. For a retention
-*curve*, 2% is well inside the noise you already have.
+`approx_n_unique` swaps it for a HyperLogLog sketch. Sixteen kilobytes per group at the
+default precision, ~0.8% relative error, and it merges by register-wise max, so the answer
+is identical single-node and distributed. On a retention *curve* that is well inside the
+noise you already have.
 
 ```python
 approx = (
@@ -224,5 +225,5 @@ print(approx.to_pydict()["active"])
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `min().over(...)` and the rest.
 - {doc}`Pivoting </user-guide/analyze/pivoting>`: laying the days out across the top.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: why the HyperLogLog
-  sketch merges across partitions and the exact count does not.
+  sketch merges in bounded memory and the exact count carries every value it saw.
 - {doc}`Dataset API </api/relational/dataset>`: `group_by`, `join`, `pivot`.

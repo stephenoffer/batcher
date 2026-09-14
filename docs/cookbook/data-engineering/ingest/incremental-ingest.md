@@ -145,9 +145,8 @@ upstream mutates files, this pattern is the wrong one. Read a change feed instea
 {doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`).
 
 `state_dir` is single-writer. Two ingest jobs pointed at one landing zone and one state
-directory will race on the SQLite store. Give each consumer its own `state_dir`, and they
-are cheap, and separate consumers of the same directory is exactly what separate stores
-are for.
+directory will race on the SQLite store. Give each consumer its own. Stores are cheap, and
+two independent consumers of one landing zone is exactly the case they exist for.
 
 The listing has a lexical fast path: files whose names sort after the greatest name
 seen so far are the only candidates. Name your files with a timestamp or a monotonic

@@ -1,6 +1,6 @@
 # Inspecting a query
 
-``explain()`` shows the optimized plan, which is where you confirm a predicate really was pushed into the scan. Reading the plan is faster than guessing, and it is the only way to tell a fused pipeline from three separate passes.
+`explain()` prints the optimized plan, one line per operator with its row estimate. That is where you confirm the filter really runs below the aggregate rather than above it. Guessing is slower. When you want to assert on plan shape in a test, `ds.meta.explain()` returns the plan as a dict instead of a string.
 
 The whole script, executed on every test run:
 

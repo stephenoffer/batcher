@@ -26,7 +26,8 @@ Two groups, and the split is not about memory:
 This table is about {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`. A
 *materializing* terminal such as `head()` or `to_pydict()` is stricter, because it has to
 return one finished result: it refuses a top-N or a keyed `distinct(subset=...)` over a
-stream outright. See "Looking at a stream before you build on it" below.
+stream outright. {doc}`streaming` has the detail, under "Looking at a stream before you
+build on it".
 
 The second group folds its input into one running state and finalizes when the input
 stops. That is the right answer for a source that ends, including an unbounded-by-type
@@ -61,7 +62,7 @@ q = (stream.group_by("user").agg(total=col("amount").sum())
 ```
 
 `output_mode="update"` emits the groups that changed this trigger and `"complete"` emits
-every group every trigger. Both are covered in the "Output modes" section below.
+every group every trigger. {doc}`streaming` covers both under "Output modes".
 
 ## What a streaming aggregate emits above itself
 
@@ -123,7 +124,6 @@ low-rate stream responsive: without it the window would wait for four million ro
 topic considerably longer. Raise it to trade first-row latency for larger, more efficient
 windows. It applies only to unbounded sources, so batch reads keep the size-based window
 and their existing throughput unchanged. See {doc}`/configuration/options`.
-
 
 ## See also
 

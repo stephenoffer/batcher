@@ -1,5 +1,45 @@
 # Batcher CPU benchmark results
 
+## The board as it stands, on four engines (2026-09-13)
+
+A full sweep with `duckdb_arrow` in the lineup, which is what makes the rest of this file
+readable: `duckdb` is DuckDB on its own compressed storage, `duckdb_arrow` is the same DuckDB
+over the *same Arrow buffers Batcher reads*. Best-of-five, one process per case, 48-core box,
+nothing else running.
+
+| suite | b/duckdb | b/duckdb_arrow | b/polars | losing cases |
+|---|---:|---:|---:|---:|
+| TPC-H sf1 | 0.72 | **0.25** | 0.54 | 6 of 22 |
+| operator mix | 0.75 | **0.47** | 0.16 | 13 of 46 |
+| ClickBench | 0.65 | **0.16** | 0.37 | 15 of 43 |
+| H2O groupby | 1.05 | **0.83** | 0.53 | 6 of 10 |
+| H2O join | 0.63 | **0.58** | 0.51 | **0 of 5** |
+| JSON | 0.35 | **0.32** | 0.01 | **0 of 5** |
+
+Forty losing cases out of 131. `benchmarks/results/LOSS_BACKLOG.md` carries all forty, ordered
+by absolute gap, with the `duckdb_arrow` time on every row.
+
+**Nineteen of the forty are storage, not execution** — both Arrow-native engines are behind
+Batcher on them and only DuckDB-native is ahead, by one to four milliseconds. Ten of ClickBench's
+fifteen losses are this shape (`cb-q41`: 6.1 ms against DuckDB-native's 4.3 and
+DuckDB-on-Arrow's **43.4**). They close by reading fewer bytes — `StringView`, dictionaries kept
+through the kernels, block statistics over in-memory inputs — which is ceiling 2 of
+`competitive_architecture.md` and a roadmap item, not a kernel to sharpen.
+
+**The other twenty-one are this engine's**, and the four largest are `h2o-gb-q8` (34 ms),
+`op-except` (22 ms), `h2o-gb-q7` (16 ms) and `op-join-build-large` (15 ms). Each has a
+diagnosis in the backlog; two of them have an attempt already measured and reverted.
+
+**What moved today**, all measured on this board against the same engines:
+
+| case | before | after |
+|---|---|---|
+| `op-join-range` | 329.0 ms (3.68x) | **79.6 ms (0.89x)** |
+| `op-expr-case` | 21.2 ms (2.08x) | **8.2 ms (0.68x)** |
+| `op-join-build-large` | 107 ms (1.89x) | **70.6 ms (1.27x)** |
+| `op-expr-date-part` | 9.0 ms (3.66x) | 6.0 ms (2.50x) |
+| `op-str-length` | 10.9 ms (3.96x) | 4.6 ms (1.53x) |
+
 ## A four-arm CASE copied the batch eight times, and an unshardable join ran on one core (2026-09-12)
 
 Two operator losses closed, and a measurement lesson about which comparisons on this board are

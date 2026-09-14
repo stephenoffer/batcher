@@ -12,10 +12,11 @@ and the schema itself. For the row-level vocabulary and the fail/drop/quarantine
 ## What makes a contract relation-level
 
 A relation-level constraint is one number over the whole table, compared against bounds. It
-lives on the same {py:obj}`ds.dq <batcher.Dataset.dq>` accessor and mixes freely with row-level checks in one chain,
-but it behaves differently at the terminal: there is no violating row, so `drop` and
-`quarantine` refuse it rather than quietly enforcing a subset of your contract. Check these
-with `validate` or `fail`.
+lives on the same {py:obj}`ds.dq <batcher.Dataset.dq>` accessor and mixes freely with row-level checks in one
+chain. It parts company at the terminal. There is no violating row, so `drop` and
+`quarantine` refuse a relation-level constraint rather than quietly enforcing the subset of
+your contract that happens to have rows attached to it. Check these with `validate` or
+`fail`.
 
 ```python
 import batcher as bt
@@ -54,8 +55,8 @@ print(str(orders.dq.row_count_between(low=1000).validate()))
 
 A bound on a summary statistic catches the failures that arrive as valid values: a unit
 change, a truncated feed, a default silently applied upstream. `mean_between` and
-`sum_between` are the direct measures; `median_between` and `quantile_between` survive the
-outliers that move a mean, which makes them the right choice on a skewed column;
+`sum_between` are the direct measures. `median_between` and `quantile_between` survive the
+outliers that move a mean, which is what makes them the right choice on a skewed column.
 `stddev_between` catches a column that was replaced by a constant.
 
 ```python
@@ -135,8 +136,8 @@ The schema is known before anything runs, so a schema constraint costs nothing a
 putting first in every chain. When a column is missing, every value constraint written
 against it fails too, and a report naming five broken checks hides the one cause.
 
-`has_columns` requires columns to be present, `column_types` pins their types, and
-`no_unexpected_columns` catches the *widening* change: a new column is harmless to every
+`has_columns` requires columns to be present, and `column_types` pins their types.
+`no_unexpected_columns` catches the *widening* change. A new column is harmless to every
 query that names its columns, right up to the point where it carries data nobody has
 classified.
 
@@ -165,9 +166,9 @@ that would be wrong for a reason the error would not name.
 
 ## Publishing the result
 
-`ValidationReport.to_dict` renders the whole report as plain data: the summary counts plus
-one entry per constraint with its severity, tolerance, pass rate, and measured value. That
-is the shape a metrics sink or a run log wants.
+`ValidationReport.to_dict` renders the whole report as plain data, the summary counts plus
+one entry per constraint carrying its severity, tolerance, pass rate and measured value,
+which is the shape a metrics sink or a run log wants. The mapping is JSON-serializable.
 
 ```python
 payload = orders.dq.row_count_between(1).mean_between("amount", 1.0, 500.0).validate().to_dict()
