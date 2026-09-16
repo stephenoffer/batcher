@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1455 Python modules across 213 packages and 288 Rust files across 15 crates.
+Covering 1457 Python modules across 213 packages and 288 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -319,9 +319,10 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 268 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 677 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 649 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 260 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 418 | The three ways the conductor can execute an admitted plan, plus the source read. |
+| `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
 ### `batcher/api/security/` — 5 · conductor
 
@@ -394,7 +395,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 707 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1461 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1467 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 712 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 440 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -435,8 +436,8 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 | module | lines | what it is |
 |---|---|---|
 | `bounded.py` | 180 | The shapes whose bounded-memory streaming driver is a running fold over the stream. |
-| `dispatch.py` | 538 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
-| `pipeline.py` | 212 | How a streaming strategy is *driven*, once `dispatch` has chosen one. |
+| `dispatch.py` | 539 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `pipeline.py` | 242 | How a streaming strategy is *driven*, once `dispatch` has chosen one. |
 | `rebatch.py` | 99 | The exact output-shape contract for `iter_batches`: how many rows, in what chunks. |
 | `session.py` | 239 | The streaming session window — sessions whose end you only learn by waiting. |
 | `static_join.py` | 212 | The stream-static join — enrich a stream from a table that does not move. |
@@ -1063,9 +1064,9 @@ Out-of-core execution on one node: scratch plumbing, and the spilling aggregate.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 566 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
+| `aggregate.py` | 569 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
 | `buckets.py` | 351 | Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them. |
-| `scratch.py` | 144 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
+| `scratch.py` | 168 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
 | `staging.py` | 128 | Which inputs of a spilling breaker are themselves breakers, and how to stage them. |
 
 ### `batcher/dist/spill_breakers/` — 4 · backend
@@ -1074,9 +1075,9 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 431 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
-| `sort.py` | 364 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
-| `window.py` | 150 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
+| `join.py` | 443 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `sort.py` | 375 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
+| `window.py` | 153 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
 ### `batcher/dist/streaming/` — 4 · backend
 
@@ -1175,7 +1176,8 @@ Learned strategy + parameter tuning — self-tuning physical decisions from meas
 | `bandit.py` | 436 | A deterministic UCB1 bandit over a fixed arm set — and the join-strategy choice on it. |
 | `crossover.py` | 244 | An OLS two-line crossover — where one algorithm overtakes another, learned from timings. |
 | `priors.py` | 220 | Per-signature learned scalars — the priors that seed sizing and pre-aggregation. |
-| `topn_bound.py` | 282 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
+| `topn_bound.py` | 333 | Learned top-N bounds: remember the k-th best value a top-N returned, and use it on the |
+| `topn_footer.py` | 206 | First-run top-N bounds, derived from Parquet row-group statistics rather than remembered. |
 
 ### `batcher/kyber/metadata_filter_count/` — 3 · subsystem
 
@@ -1686,7 +1688,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 
 | module | lines | what it is |
 |---|---|---|
-| `drivers.py` | 633 | Bounded-memory drivers for a top-level operator over a streaming source. |
+| `drivers.py` | 634 | Bounded-memory drivers for a top-level operator over a streaming source. |
 | `keyed_state.py` | 374 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
 | `spill.py` | 227 | Cold windows of a streaming aggregate's state, held on disk instead of in memory. |
 
@@ -1697,7 +1699,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 | module | lines | what it is |
 |---|---|---|
 | `running.py` | 142 | `_AggFold` — the running (unwatermarked) streaming aggregate. |
-| `shared.py` | 171 | Pieces both streaming folds need: the empty-aggregate identity and the state guard. |
+| `shared.py` | 175 | Pieces both streaming folds need: the empty-aggregate identity and the state guard. |
 | `windowed.py` | 700 | `_WindowedAggFold` — the watermark-bounded windowed aggregate, its spill tier and its |
 
 ### `batcher/core/streaming_query/` — 3 · subsystem
@@ -2066,7 +2068,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `dataset.py` | 700 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
-| `source.py` | 530 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
+| `source.py` | 559 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
 
 ### `batcher/io/formats/unstructured/` — 2 · neutral IO
 
@@ -3241,7 +3243,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `page_index.rs` | 266 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
-| `row_filter.rs` | 352 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_filter.rs` | 399 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `split_read.rs` | 259 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 416 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 

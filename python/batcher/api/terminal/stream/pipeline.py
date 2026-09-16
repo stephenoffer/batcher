@@ -24,9 +24,9 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.io.source import Source
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.logical import Limit, LogicalPlan, Sort
 
-__all__ = ["_apply_peeled", "_iter_streaming", "_pushdown"]
+__all__ = ["_apply_peeled", "_iter_streaming", "_pushdown", "_stream_topn"]
 
 
 def _apply_peeled(
@@ -91,6 +91,36 @@ def _pushdown(plan: LogicalPlan) -> list[str] | None:
     from batcher import kyber
 
     return kyber.required_columns_per_source(plan).get(0)
+
+
+def _stream_topn(
+    plan: Limit, sources: list[Source], batch_size: int | None
+) -> Iterator[pa.RecordBatch]:
+    """Stream a top-N with memory bounded by `n`, starting from a footer-proved bound if any.
+
+    `collect()` seeds a top-N from its source's row-group statistics in
+    `api.orchestration.topn_seeding`; a streamed top-N reaches `core.streaming.stream_topn`
+    without passing through there, so it read every row group of a clustered table that
+    `collect()` answered from one. Only a footer bound applies here: a remembered one is
+    checked by counting the result, and a stream has no result to count until it has already
+    been yielded. The seeded `Filter` is pushed to the reader as well as kept in the driver's
+    sub-plan, so it prunes I/O and still removes any row a coarser reader returns.
+    """
+    from batcher.api.orchestration.topn_seeding import footer_seed
+    from batcher.core.streaming import stream_topn
+    from batcher.kyber.rules.projections import required_predicates_per_source
+
+    seed = footer_seed(plan, sources, None)
+    target = seed.plan if seed is not None else plan
+    assert isinstance(target, Limit) and isinstance(target.input, Sort)
+    yield from stream_topn(
+        target.input,
+        target.n,
+        sources[0],
+        batch_size,
+        projection=_pushdown(target),
+        predicate=required_predicates_per_source(target).get(0),
+    )
 
 
 def _window_latency(source: Source) -> float | None:

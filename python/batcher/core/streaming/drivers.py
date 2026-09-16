@@ -363,6 +363,7 @@ def stream_topn(
     batch_size: int | None = None,
     *,
     projection: list[str] | None = None,
+    predicate: dict | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Top-N (`sort` + `limit`) over a streaming source, with memory bounded by N.
 
@@ -412,7 +413,7 @@ def stream_topn(
             return running
         return [b for b in nat.execute_plan(sort_ir, [merged], cfg_json) if b.num_rows]
 
-    for batch in _read(source, projection):
+    for batch in _read(source, projection, predicate):
         if batch.num_rows == 0:
             continue
         pending.append(batch)

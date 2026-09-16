@@ -26,6 +26,7 @@ from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import FileSplit, Split, parquet_row_group_splits
 from batcher.io.splits.parquet import _parquet_footer
+from batcher.io.stats import RowGroupBounds
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
 
@@ -181,7 +182,7 @@ class ParquetSource(FileSource):
         # expressible here, so this is not expected to be None — but a superset is still a
         # correct answer, so an absent expression degrades to pruning alone rather than
         # failing. Built once and shared: it is immutable and thread-safe.
-        pa_filter = to_pyarrow_expression(predicate)
+        pa_filter = to_pyarrow_expression(predicate, self._read_schema_or_none())
 
         def _read_one(f: str) -> list[pa.RecordBatch] | None:
             # `[]` row-groups = every row-group in the file; the reader prunes from there.
@@ -351,7 +352,7 @@ class ParquetSource(FileSource):
             native = self._native_read_filtered(projection, predicate)
             if native is not None:
                 return native
-        pa_filter = to_pyarrow_expression(predicate)
+        pa_filter = to_pyarrow_expression(predicate, self._read_schema_or_none())
         if pa_filter is None:
             batched = self._native_read_many(projection)
             return batched if batched is not None else super().read(projection)
@@ -426,7 +427,7 @@ class ParquetSource(FileSource):
         if self._schema_mode != "strict":
             yield from super().iter_batches(projection)
             return
-        pa_filter = to_pyarrow_expression(predicate)
+        pa_filter = to_pyarrow_expression(predicate, self._read_schema_or_none())
         if pa_filter is None:
             yield from super().iter_batches(projection)
             return
@@ -495,6 +496,34 @@ class ParquetSource(FileSource):
         ):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
         return parquet_row_group_splits(path, target_size, predicate, self._fs)
+
+    def row_group_bounds(self, columns: list[str]) -> list[RowGroupBounds] | None:
+        """Per-row-group min/max/null-count of `columns`, read from the footers alone.
+
+        Where `statistics` folds every row group into one bound per column, this keeps them
+        apart, which is what a top-N needs: which row groups hold the largest values is
+        exactly what a dataset-wide max throws away.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> bounds = ParquetSource("events/").row_group_bounds(["ts"])  # doctest: +SKIP
+                >>> bounds[0].num_rows  # doctest: +SKIP
+                1000000
+
+        Args:
+            columns: The columns whose statistics to return.
+
+        Returns:
+            One entry per row group of every file, in file order, or None when the source
+            has more files than a per-file footer sweep is worth.
+        """
+        from batcher.io.stats import parquet_row_group_bounds
+
+        if self._too_many_files_to_sweep():
+            return None
+        return parquet_row_group_bounds(self._fs, self._files(), columns)
 
     def statistics(self) -> SourceStatistics | None:
         """Footer-derived row count + per-column min/max/null, no data scan.

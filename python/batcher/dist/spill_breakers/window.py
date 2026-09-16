@@ -14,6 +14,7 @@ from batcher.dist.executor import _relabel_single_source, _single_source
 from batcher.dist.spill import (
     _fd_safe,
     _iter_spill_morsels,
+    map_predicate,
     map_projection,
 )
 from batcher.dist.spill.buckets import (
@@ -94,7 +95,9 @@ def stream_spilling_window(
 
     with spill_scratch("batcher_win_spill_", spill_dir) as store:
         writers = BucketWriters(store, "win_bucket")
-        for batch in _iter_spill_morsels(source, map_projection(window, sid)):
+        for batch in _iter_spill_morsels(
+            source, map_projection(window, sid), map_predicate(window, sid)
+        ):
             rows = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if rows:
                 writers.add(nat.partition_batches(rows, pk_indices, n_buckets))

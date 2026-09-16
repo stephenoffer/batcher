@@ -61,7 +61,9 @@ def _rebatch(result: pa.RecordBatch, batch_size: int | None) -> Iterator[pa.Reco
             yield result.slice(off, batch_size)
 
 
-def _read(source: Source, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+def _read(
+    source: Source, projection: list[str] | None, predicate: dict | None = None
+) -> Iterator[pa.RecordBatch]:
     """Read `source` through the projection Kyber decided for this plan.
 
     Every driver in this module used to call ``source.iter_batches(None)`` — decoding *every*
@@ -78,11 +80,13 @@ def _read(source: Source, projection: list[str] | None) -> Iterator[pa.RecordBat
     Args:
         source: The stream to read.
         projection: Columns the plan needs, or ``None`` to read everything.
+        predicate: A predicate the conductor pushed for this plan, or ``None``. A superset
+            is always legal, because the driver's own sub-plan still applies its `Filter`.
 
     Returns:
         An iterator of the source's record batches, narrowed where the source can.
     """
-    return iter_source(source, projection, None)
+    return iter_source(source, projection, predicate)
 
 
 def streaming_state_budget() -> int:

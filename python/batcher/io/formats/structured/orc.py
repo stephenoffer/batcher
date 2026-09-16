@@ -282,7 +282,7 @@ class ORCSource(FileSource):
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        flt = to_pyarrow_expression(predicate)
+        flt = to_pyarrow_expression(predicate, self.schema())
         if flt is None:
             return super().read(projection)
         import pyarrow.dataset as pads
@@ -293,7 +293,7 @@ class ORCSource(FileSource):
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        flt = to_pyarrow_expression(predicate)
+        flt = to_pyarrow_expression(predicate, self.schema())
         if flt is None:
             yield from super().iter_batches(projection)
             return
