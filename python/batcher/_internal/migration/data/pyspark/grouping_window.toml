@@ -1,0 +1,35 @@
+# PySpark 4.2.0 -> Batcher migration registry: GroupedData, Window and WindowSpec.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[GroupedData]
+agg = { status = "canonical", batcher = "GroupBy.agg" }
+apply = { status = "mismatch", batcher = "GroupBy.map_groups", note = "deprecated grouped-map pandas UDF: fn(pandas.DataFrame) with a declared schema; map_groups passes a pyarrow.RecordBatch and infers the schema", wave = "W11" }
+applyInArrow = { status = "param", batcher = "GroupBy.map_groups", need = "schema= and a key-aware fn(key, table) signature", wave = "W11" }
+applyInPandas = { status = "param", batcher = "GroupBy.map_groups", need = "batch_format='pandas', schema=, and a key-aware fn(key, pdf) signature", wave = "W11" }
+applyInPandasWithState = { status = "param", batcher = "Dataset.transform_with_state", need = "GroupState with timeouts and outputMode", wave = "W10" }
+avg = { status = "param", batcher = "GroupBy.mean", need = "Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
+cogroup = { status = "gap", need = "cogroup two grouped Datasets for applyInPandas/applyInArrow", wave = "W10" }
+count = { status = "mismatch", batcher = "GroupBy.count", note = "Spark counts rows into one 'count' column; GroupBy.count counts non-null values per column. Codemod: GroupBy.len(name='count')", wave = "W0" }
+max = { status = "param", batcher = "GroupBy.max", need = "Spark names the output 'max(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
+mean = { status = "param", batcher = "GroupBy.mean", need = "Spark names the output 'avg(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
+min = { status = "param", batcher = "GroupBy.min", need = "Spark names the output 'min(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
+pivot = { status = "param", batcher = "Dataset.pivot", need = "groupBy(...).pivot(col, values).agg(*exprs) chain with expression aggregates and several value columns", wave = "W2" }
+sum = { status = "param", batcher = "GroupBy.sum", need = "Spark names the output 'sum(x)' and defaults to numeric columns only; Batcher keeps the column name and includes every non-key column", wave = "W2" }
+transformWithState = { status = "param", batcher = "Dataset.transform_with_state", need = "StatefulProcessor class protocol: timers, value/list/map state, initial state", wave = "W10" }
+transformWithStateInPandas = { status = "param", batcher = "Dataset.transform_with_state", need = "StatefulProcessor class protocol over pandas batches: timers, value/list/map state, initial state", wave = "W10" }
+
+[Window]
+currentRow = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+orderBy = { status = "mismatch", batcher = ["AggExpr.over", "WindowExpr.over"], note = "Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row_number/lag. Codemod passes (col, False, True) keys", wave = "W0" }
+partitionBy = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+rangeBetween = { status = "param", batcher = ["AggExpr.over", "WindowExpr.over"], need = "RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets)", wave = "W5" }
+rowsBetween = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+unboundedFollowing = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+unboundedPreceding = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+
+[WindowSpec]
+orderBy = { status = "mismatch", batcher = ["AggExpr.over", "WindowExpr.over"], note = "Spark window order puts nulls first for ascending keys; Batcher puts nulls last, which changes rank/row_number/lag. Codemod passes (col, False, True) keys", wave = "W0" }
+partitionBy = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }
+rangeBetween = { status = "param", batcher = ["AggExpr.over", "WindowExpr.over"], need = "RANGE frames with value offsets on the order key (frame units 'range' are unverified for non-zero offsets)", wave = "W5" }
+rowsBetween = { status = "canonical", batcher = ["AggExpr.over", "WindowExpr.over"] }

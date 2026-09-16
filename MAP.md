@@ -2106,7 +2106,7 @@ Predicate translation for source-side pushdown.
 | `arrow.py` | 223 | IR to a `pyarrow.dataset.Expression`, for every file-format and lakehouse reader. |
 | `iceberg.py` | 92 | IR to a `pyiceberg` row filter, for Iceberg scans and ``replace_where``. |
 | `mongo.py` | 92 | IR to a MongoDB filter document, for the Mongo source. |
-| `native.py` | 146 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
+| `native.py` | 155 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
 | `sql.py` | 155 | IR to a SQL ``WHERE`` fragment, for the warehouse and JDBC-style connectors. |
 
 ### `batcher/io/schema/` — 2 · neutral IO
@@ -3259,10 +3259,10 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
-| `page_index.rs` | 266 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
-| `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
+| `page_index.rs` | 277 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
+| `predicate.rs` | 358 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
-| `row_filter.rs` | 399 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_filter.rs` | 419 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `split_read.rs` | 259 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 416 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 

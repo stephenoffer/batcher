@@ -1,0 +1,69 @@
+# Daft 0.7.25 -> Batcher: Image, video, audio, File and AI functions.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Expression]
+convert_image = { status = "mismatch", batcher = "Expr.image.convert", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+crop = { status = "mismatch", batcher = "Expr.image.crop", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type; Daft takes one bbox tuple, Batcher four arguments", wave = "W12" }
+decode_image = { status = "mismatch", batcher = "Expr.image.decode", note = "Daft decode_image yields decoded pixel arrays (Image type, mode=RGB, on_error=); Batcher image.decode yields a header struct without pixels. Needs an Image logical type", wave = "W12" }
+decode_image_file = { status = "gap", need = "File logical type with image decode", wave = "W12" }
+download = { status = "param", batcher = "Dataset.ml.download", need = "an Expression-level download usable inside select/with_columns, with io_config=", wave = "W12" }
+encode_image = { status = "mismatch", batcher = "Expr.image.encode", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+file_exists = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+file_path = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+file_size = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+hdf5_attrs = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+hdf5_keys = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+hdf5_metadata = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+image_attribute = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_channel = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_file_metadata = { status = "gap", need = "File logical type with image header metadata", wave = "W12" }
+image_hash = { status = "mismatch", batcher = "Expr.image.phash", note = "Daft image_hash(method=, hash_size=, binbits=) follows the imagehash library (phash/dhash/ahash/whash/colorhash) over decoded images; Batcher phash/dhash/ahash return a fixed 64-bit Int64 over encoded bytes. Param: method=, hash_size=", wave = "W12" }
+image_height = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_mode = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_to_tensor = { status = "mismatch", batcher = "Expr.image.to_tensor", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type; Daft infers shape from the image, Batcher requires width and height and flattens to RGB8", wave = "W12" }
+image_width = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+resize = { status = "mismatch", batcher = "Expr.image.resize", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+upload = { status = "param", batcher = "Dataset.ml.upload", need = "an Expression-level upload to a column-valued location, with io_config=", wave = "W12" }
+video_frames = { status = "mismatch", batcher = "Expr.video.frames", note = "Daft decodes every frame in a [start_time, end_time) range with per-frame metadata; Batcher frames(num_frames, width, height) samples a fixed count of evenly spaced frames. Param: start_time=/end_time=/is_key_frame=", wave = "W12" }
+video_keyframes = { status = "gap", need = "keyframe extraction over a time range", wave = "W12" }
+video_metadata = { status = "param", batcher = "Expr.video.decode", need = "VideoFile input and Daft's metadata field names", wave = "W12" }
+
+[functions]
+audio_file = { status = "gap", need = "File logical type constructor from a URL column", wave = "W12" }
+audio_metadata = { status = "param", batcher = "Expr.audio.decode", need = "AudioFile input and Daft's metadata field names", wave = "W12" }
+classify_image = { status = "mismatch", batcher = "Dataset.ml.classify", note = "Daft classify_image is a zero-shot image classifier (no LLM) returned as an Expression; Batcher ml.classify prompts an LLM engine over image_column. Needs a zero-shot image classifier", wave = "W12" }
+classify_text = { status = "mismatch", batcher = "Dataset.ml.classify", note = "Daft classify_text is a zero-shot embedding classifier (no LLM) returned as an Expression; Batcher ml.classify prompts an LLM engine. Needs a zero-shot embedding classifier", wave = "W12" }
+convert_image = { status = "mismatch", batcher = "Expr.image.convert", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+crop = { status = "mismatch", batcher = "Expr.image.crop", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type; Daft takes one bbox tuple, Batcher four arguments", wave = "W12" }
+decode_image = { status = "mismatch", batcher = "Expr.image.decode", note = "Daft decode_image yields decoded pixel arrays (Image type, mode=RGB, on_error=); Batcher image.decode yields a header struct without pixels. Needs an Image logical type", wave = "W12" }
+decode_image_file = { status = "gap", need = "File logical type with image decode", wave = "W12" }
+download = { status = "param", batcher = "Dataset.ml.download", need = "an Expression-level download usable inside select/with_columns, with io_config=", wave = "W12" }
+embed_image = { status = "param", batcher = "Dataset.ml.embed", need = "an Expression-level form over images with provider=/model=", wave = "W12" }
+embed_text = { status = "param", batcher = "Dataset.ml.embed", need = "an Expression-level form with provider=/model=/dimensions= resolved from a session provider", wave = "W12" }
+encode_image = { status = "mismatch", batcher = "Expr.image.encode", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+file = { status = "gap", need = "File logical type constructor from a URL column", wave = "W12" }
+file_exists = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+file_path = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+file_size = { status = "gap", need = "File logical type and its .file accessor", wave = "W12" }
+hdf5_attrs = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+hdf5_file = { status = "gap", need = "File logical type constructor from a URL column", wave = "W12" }
+hdf5_keys = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+hdf5_metadata = { status = "gap", need = "HDF5 File type with attribute/key/metadata accessors", wave = "W12" }
+image_attribute = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_channel = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_file = { status = "gap", need = "File logical type constructor from a URL column", wave = "W12" }
+image_file_metadata = { status = "gap", need = "File logical type with image header metadata", wave = "W12" }
+image_hash = { status = "mismatch", batcher = "Expr.image.phash", note = "Daft image_hash(method=, hash_size=, binbits=) follows the imagehash library (phash/dhash/ahash/whash/colorhash) over decoded images; Batcher phash/dhash/ahash return a fixed 64-bit Int64 over encoded bytes. Param: method=, hash_size=", wave = "W12" }
+image_height = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_mode = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+image_to_tensor = { status = "mismatch", batcher = "Expr.image.to_tensor", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type; Daft infers shape from the image, Batcher requires width and height and flattens to RGB8", wave = "W12" }
+image_width = { status = "param", batcher = ["Expr.image.decode", "Expr.struct.field"], need = "a direct accessor over the decoded Image type (today: image.decode() then struct.field over encoded bytes)", wave = "W12" }
+llm_generate = { status = "param", batcher = "batcher.ml.llm_generate", need = "an Expression-level form taking model=/provider=('vllm'|'openai')", wave = "W12" }
+prompt = { status = "param", batcher = "Dataset.ml.generate", need = "an Expression-level prompt with return_format= structured output and provider/model resolved from the session", wave = "W12" }
+resample = { status = "param", batcher = "Expr.audio.resample", need = "AudioFile input (Batcher resamples encoded audio bytes)", wave = "W12" }
+resize = { status = "mismatch", batcher = "Expr.image.resize", note = "Daft operates on its decoded Image logical type; Batcher's .image accessor reads and re-encodes encoded image bytes (PNG by default), so inputs and outputs have different types. Needs an Image logical type", wave = "W12" }
+upload = { status = "param", batcher = "Dataset.ml.upload", need = "an Expression-level upload to a column-valued location, with io_config=", wave = "W12" }
+video_file = { status = "gap", need = "File logical type constructor from a URL column", wave = "W12" }
+video_frames = { status = "mismatch", batcher = "Expr.video.frames", note = "Daft decodes every frame in a [start_time, end_time) range with per-frame metadata; Batcher frames(num_frames, width, height) samples a fixed count of evenly spaced frames. Param: start_time=/end_time=/is_key_frame=", wave = "W12" }
+video_keyframes = { status = "gap", need = "keyframe extraction over a time range", wave = "W12" }
+video_metadata = { status = "param", batcher = "Expr.video.decode", need = "VideoFile input and Daft's metadata field names", wave = "W12" }

@@ -1,0 +1,79 @@
+# Ray Data 2.58 `ray.data` module names and their Batcher spelling.
+
+["ray.data"]
+ActorPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "compute=ActorPoolStrategy(min_size, max_size, initial_size, max_tasks_in_flight_per_actor); Batcher has concurrency=int|(min, max) only", wave = "WF" }
+BlockBasedFileDatasink = { status = "mismatch", batcher = "batcher.io.FileSink", note = "Ray subclasses implement write_block_to_file(block, file) and get a file per block; Batcher FileSink implements write(table, path)/write_partitioned and commits from a WriteManifest.", wave = "W11" }
+Catalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+CatalogAccessMode = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+ClickHouseTableSettings = { status = "gap", need = "ClickHouse writer table settings (engine, order_by, partition_by) for write_clickhouse", wave = "W13" }
+DataContext = { status = "mismatch", batcher = "bt.Config", note = "Ray DataContext is a mutable process singleton (DataContext.get_current().x = ...); Batcher Config is frozen and applied through set_config/config_context with Config.replace.", wave = "W9" }
+DataIterator = { status = "gap", need = "DataIterator object (shared, stateful iterator with iter_* methods and state_dict)", wave = "W8" }
+DatabricksUnityCatalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+Dataset = { status = "canonical", batcher = "bt.Dataset" }
+DatasetContext = { status = "out_of_scope", reason = "deprecated alias of DataContext kept for backward compatibility" }
+DatasetIterator = { status = "out_of_scope", reason = "deprecated alias of DataIterator kept for backward compatibility" }
+DatasetSummary = { status = "mismatch", batcher = "Dataset.describe", note = "Ray DatasetSummary groups statistics by data type and exposes to_pandas(); Batcher describe() returns a Dataset with a statistic column.", wave = "W0" }
+Datasink = { status = "mismatch", batcher = "batcher.io.Sink", note = "Ray Datasink protocol: write(blocks, ctx) per task plus on_write_start/on_write_complete/on_write_failed; Batcher Sink: write(table, path)/write_partitioned and commit(manifest, path). No Ray-protocol adapter.", wave = "W11" }
+Datasource = { status = "mismatch", batcher = "batcher.io.Source", note = "Ray Datasource protocol: get_read_tasks(parallelism) plus estimate_inmemory_data_size and pushdown negotiation; Batcher Source: splits(), read/iter_batches(projection), schema(), row_count(). No Ray-protocol adapter.", wave = "W11" }
+ExecutionOptions = { status = "mismatch", batcher = "bt.ExecutionConfig", note = "Ray ExecutionOptions carries resource_limits/preserve_order/verbose_progress for one Dataset execution; Batcher ExecutionConfig is part of the process/context Config and has no per-execution CPU/GPU/object-store caps.", wave = "W9" }
+ExecutionResources = { status = "param", batcher = "bt.ExecutionConfig", need = "per-execution cpu/gpu/memory/object_store_memory resource caps", wave = "W9" }
+FileShuffleConfig = { status = "param", batcher = "bt.read.parquet", need = "shuffle= FileShuffleConfig(seed) to randomize file read order per epoch", wave = "W2" }
+KafkaAuthConfig = { status = "param", batcher = "bt.read.kafka", need = "typed SASL/SSL auth config object (security_protocol, sasl_mechanism, credentials); Batcher takes consumer options as keyword opts", wave = "W13" }
+MixStoppingCondition = { status = "gap", need = "stopping condition for Dataset.mix weighted interleave", wave = "W8" }
+NodeIdStr = { status = "out_of_scope", reason = "type alias for a Ray node id string used by locality_hints; Batcher placement is not addressed by node id" }
+Preprocessor = { status = "canonical", batcher = "batcher.ml.Preprocessor" }
+RandomSeedConfig = { status = "param", batcher = "Dataset.shuffle", need = "RandomSeedConfig(seed, reseed_after_execution=True): a new permutation per epoch from one base seed", wave = "W2" }
+ReadTask = { status = "mismatch", batcher = "batcher.io.Split", note = "Ray ReadTask is a serializable callable returning blocks plus BlockMetadata; Batcher Split is an independently readable slice a Source reads.", wave = "W11" }
+ReaderFormat = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+ResolvedSource = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+RowBasedFileDatasink = { status = "gap", need = "file datasink writing one file per row (write_row_to_file)", wave = "W11" }
+SaveMode = { status = "param", batcher = "Dataset.write.iceberg", need = "SaveMode enum across sinks, including UPSERT for iceberg/lance and APPEND for file sinks (Batcher mode strings cover overwrite/overwrite_partitions/error/ignore/append on table sinks only)", wave = "W13" }
+Schema = { status = "mismatch", batcher = "Dataset.schema", note = "Ray Schema wraps a pyarrow or pandas schema with .names/.types; Batcher returns pyarrow.Schema directly.", wave = "W0" }
+SinkMode = { status = "gap", need = "ClickHouse sink mode enum (CREATE, APPEND, OVERWRITE) for write_clickhouse", wave = "W13" }
+StreamingAggFn = { status = "gap", need = "user streaming aggregation function protocol for Dataset.streaming_aggregate", wave = "W10" }
+TaskPoolStrategy = { status = "param", batcher = "Dataset.map_batches", need = "compute=TaskPoolStrategy(size) stateless task pool sizing; Batcher sizes stateless fan-out with num_workers only", wave = "WF" }
+from_arrow = { status = "param", batcher = "bt.from_arrow", need = "a list of pyarrow Tables (Batcher accepts a Table, a RecordBatch or a list of RecordBatches and raises TypeError on a list of Tables)", wave = "W2" }
+from_arrow_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
+from_blocks = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
+from_daft = { status = "gap", need = "import a Daft DataFrame", wave = "W8" }
+from_dask = { status = "canonical", batcher = "bt.from_dask" }
+from_huggingface = { status = "param", batcher = "bt.from_huggingface", need = "datasets.IterableDataset (streaming) input; Batcher takes an Arrow-backed datasets.Dataset only", wave = "W13" }
+from_items = { status = "canonical", batcher = "bt.from_items" }
+from_mars = { status = "out_of_scope", reason = "Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (bt.from_pandas)" }
+from_modin = { status = "out_of_scope", reason = "Modin wraps pandas; convert with modin's _to_pandas() and bt.from_pandas" }
+from_numpy = { status = "canonical", batcher = "bt.from_numpy" }
+from_numpy_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
+from_pandas = { status = "param", batcher = "bt.from_pandas", need = "a list of pandas DataFrames (Ray concatenates them)", wave = "W2" }
+from_pandas_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
+from_spark = { status = "canonical", batcher = "bt.from_spark" }
+from_tf = { status = "mismatch", batcher = "bt.from_tf", note = "A tf.data.Dataset of dict elements converts identically; for non-dict elements Ray names the column 'item' and Batcher names it 'data'. Codemod: .rename(data='item').", wave = "W0" }
+from_torch = { status = "mismatch", batcher = "bt.from_torch", note = "Ray from_torch wraps each item of a map-style torch Dataset in an 'item' column; Batcher from_torch adapts tensors (one column per tensor) and raises AttributeError on a Dataset whose items are not tensors.", wave = "W0" }
+range = { status = "mismatch", batcher = "bt.range", note = "Ray range(n) names its column 'id'; Batcher bt.range names it 'value'. Codemod: bt.range(n, name='id').", wave = "W0" }
+range_tensor = { status = "gap", need = "range of fixed-shape tensor rows (range_tensor(n, shape=))", wave = "W11" }
+read_audio = { status = "mismatch", batcher = "bt.read.audio", note = "Ray decodes by default into 'amplitude' and 'sample_rate' columns; Batcher read.audio defaults decode=False. Codemod passes decode=True; verify output column names.", wave = "W12" }
+read_avro = { status = "alias", batcher = "bt.read.avro" }
+read_binary_files = { status = "mismatch", batcher = "bt.read.binary", note = "Ray yields a 'bytes' column (plus 'path' with include_paths=True); Batcher yields uri, bytes, size and mime columns. Codemod: .select('bytes') or rename uri to path.", wave = "W0" }
+read_clickhouse = { status = "mismatch", batcher = "bt.read.clickhouse", note = "Ray read_clickhouse(table=, dsn=, columns=, filter=, order_by=) builds the query; Batcher read.clickhouse(query, **opts) takes SQL.", wave = "W13" }
+read_csv = { status = "alias", batcher = "bt.read.csv" }
+read_datasource = { status = "gap", need = "read through a user Datasource implementation", wave = "W11" }
+read_delta = { status = "alias", batcher = "bt.read.delta" }
+read_delta_sharing_tables = { status = "canonical", batcher = "bt.read.delta_sharing" }
+read_hudi = { status = "canonical", batcher = "bt.read.hudi" }
+read_iceberg = { status = "alias", batcher = "bt.read.iceberg" }
+read_images = { status = "mismatch", batcher = "bt.read.images", note = "Ray decodes images by default into an 'image' ndarray column (mode=, size=); Batcher read.images defaults decode=False. Codemod passes decode=True.", wave = "W12" }
+read_json = { status = "mismatch", batcher = "bt.read.json", note = "Ray read_json defaults lines=False and reads JSON documents (including a top-level array); Batcher read.json reads newline-delimited JSON only and fails on a JSON array file.", wave = "W2" }
+read_kafka = { status = "mismatch", batcher = "bt.read.kafka", note = "Ray read_kafka is bounded (trigger='once', start_offset='earliest', end_offset='latest'); Batcher read.kafka is an unbounded streaming source. Codemod passes starting_offsets='earliest', ending_offsets='latest'.", wave = "W10" }
+read_lance = { status = "canonical", batcher = "bt.read.lance" }
+read_lerobot = { status = "gap", need = "LeRobot robotics dataset reader", wave = "W12" }
+read_mcap = { status = "mismatch", batcher = "bt.read.mcap", note = "Both emit one row per message with topic, log_time, publish_time, sequence and data; Ray decodes JSON-encoded payloads into Python objects in 'data' and adds channel_id (include_metadata=True), while Batcher keeps every payload encoded as bytes.", wave = "W13" }
+read_mongo = { status = "canonical", batcher = "bt.read.mongo" }
+read_numpy = { status = "canonical", batcher = "bt.read.numpy" }
+read_parquet = { status = "alias", batcher = "bt.read.parquet" }
+read_snowflake = { status = "canonical", batcher = "bt.read.snowflake" }
+read_sql = { status = "mismatch", batcher = "bt.read.sql", note = "Ray read_sql(sql, connection_factory) calls a DB-API connection factory per read task and shards with shard_keys=; Batcher read.sql(query, uri=/connection=) takes a URI or one connection and has no shard_keys.", wave = "W13" }
+read_text = { status = "mismatch", batcher = "bt.read.text", note = "Ray yields a single 'text' column (drop_empty_lines=True); Batcher read.text also yields path and line_number columns. Codemod: .select('text').", wave = "W0" }
+read_tfrecords = { status = "mismatch", batcher = "bt.read.tfrecord", note = "Ray parses each tf.train.Example into one column per feature; Batcher yields the raw serialized payload in a 'record' binary column to decode downstream.", wave = "W13" }
+read_unity_catalog = { status = "gap", need = "Databricks Unity Catalog reader and its catalog types (Catalog, CatalogAccessMode, DatabricksUnityCatalog, ReaderFormat, ResolvedSource)", wave = "W9" }
+read_videos = { status = "mismatch", batcher = "bt.read.video", note = "Ray emits one row per decoded frame ('frame', 'frame_index'); Batcher read.video defaults decode=False and samples num_frames=8 per video.", wave = "W12" }
+read_webdataset = { status = "mismatch", batcher = "bt.read.webdataset", note = "Ray applies a default decoder (txt to str, cls to int, jpg/png to ndarray, json to objects); Batcher yields __key__ plus one raw binary column per extension.", wave = "W13" }
+read_zarr = { status = "mismatch", batcher = "bt.read.zarr", note = "Ray reads a whole store long-form, one row per chunk (array, chunk_index, chunk_slices, chunk), or wide-form with align_axis_0=True; Batcher reads one array with one row per leading-axis element (a 'value' column for 1-D, one column per trailing index for 2-D).", wave = "W13" }

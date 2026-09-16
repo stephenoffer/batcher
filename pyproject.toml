@@ -78,6 +78,10 @@ gcp-secrets = ["google-cloud-secret-manager>=2.16"]
 azure-secrets = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
+# `python -m batcher.migrate`: the codemod that rewrites code onto Batcher's one spelling per
+# capability, and between Batcher and PySpark/Polars/Daft/Ray Data. It parses and rewrites
+# source with libcst and never imports the engine, so it installs without a build.
+migrate = ["libcst>=1.1"]
 # Live GPU telemetry (`_internal.hardware.nvml`): SM utilization, VRAM actually resident,
 # board power, thermal/ECC health. Ray reports a device *count* and nothing else, so this is
 # the only source for any of it, and three things the GPU path advertises are blind without
@@ -303,7 +307,7 @@ layers = [
     # one-way, which it is not (`ml` imports `api` 77 times, `api` imports `ml` 17). `:` is
     # import-linter's "these siblings may import each other" — the accurate statement.
     # Everything BELOW still may not reach up into any of them, which is the part that matters.
-    "api : ml : graph : _sql",
+    "api : ml : graph : _sql : migrate",
     "dist",
     "kyber | carbonite | core | governance",
     "interop",

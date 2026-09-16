@@ -1,0 +1,98 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, strings, binary and hashing.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+aes_decrypt = { status = "mismatch", batcher = "bt.aes_decrypt", note = "Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/aad= and returns BINARY; bt.aes_decrypt reads base64 AES-256-GCM-SIV. Ciphertexts do not interoperate", wave = "W2" }
+aes_encrypt = { status = "mismatch", batcher = "bt.aes_encrypt", note = "Spark defaults to AES-GCM over a 16/24/32-byte key with mode=/padding=/iv=/aad= and returns BINARY; bt.aes_encrypt writes base64 AES-256-GCM-SIV. Ciphertexts do not interoperate", wave = "W2" }
+ascii = { status = "canonical", batcher = "Expr.str.ascii" }
+base64 = { status = "canonical", batcher = "Expr.str.base64" }
+bit_length = { status = "canonical", batcher = "Expr.str.bit_length" }
+btrim = { status = "canonical", batcher = "Expr.str.trim" }
+char = { status = "mismatch", batcher = "Expr.chr", note = "Spark char(n) returns the character for n mod 256 (char(321) is 'A'); Expr.chr returns the Unicode code point (chr(321) is 'Ł')", wave = "W0" }
+char_length = { status = "canonical", batcher = "Expr.str.len_chars" }
+character_length = { status = "canonical", batcher = "Expr.str.len_chars" }
+collate = { status = "gap", need = "collation-aware string comparison (collate(col, name))", wave = "W14" }
+collation = { status = "gap", need = "report a column's collation", wave = "W14" }
+concat = { status = "mismatch", batcher = ["bt.concat", "bt.concat_str"], note = "Spark concat returns null when any input is null and also concatenates arrays; bt.concat/concat_str skip null inputs. Needs ignore_nulls=False", wave = "W0" }
+concat_ws = { status = "canonical", batcher = "bt.concat_ws" }
+contains = { status = "mismatch", batcher = "Expr.str.contains", note = "bt.contains is a column-name selector, not a string predicate; F.contains(left, right) is Expr.str.contains", wave = "W0" }
+crc32 = { status = "canonical", batcher = "Expr.str.crc32" }
+decode = { status = "gap", need = "decode BINARY to STRING with a named charset", wave = "W3" }
+elt = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (elt)", wave = "W1" }
+encode = { status = "gap", need = "encode STRING to BINARY with a named charset", wave = "W3" }
+endswith = { status = "canonical", batcher = "Expr.str.ends_with" }
+find_in_set = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (find_in_set)", wave = "W1" }
+format_number = { status = "gap", need = "format a number with grouping separators to d decimal places", wave = "W3" }
+format_string = { status = "mismatch", batcher = "bt.format_string", note = "Spark uses printf-style placeholders (%s, %d, %.2f); bt.format_string uses {} placeholders", wave = "W0" }
+hash = { status = "mismatch", batcher = "Expr.hash", note = "Spark hash is 32-bit Murmur3 with seed 42 over one or more columns ('ABC' -> -757602832); Expr.hash is a different 64-bit hash of one value", wave = "W0" }
+hex = { status = "mismatch", batcher = "Expr.str.hex", note = "Spark hex(integer) renders the number in base 16 (hex(17) is '11'); Expr.str.hex hex-encodes the text bytes. Integers need Expr.to_base(16)", wave = "W0" }
+ilike = { status = "param", batcher = "Expr.str.ilike", need = "escapeChar= and a column-valued pattern", wave = "W2" }
+initcap = { status = "mismatch", batcher = "Expr.str.to_titlecase", note = "Spark capitalizes only after whitespace ('hello-world' -> 'Hello-world'); Batcher also capitalizes after punctuation ('Hello-World')", wave = "W0" }
+instr = { status = "canonical", batcher = "Expr.str.position" }
+is_valid_utf8 = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (is_valid_utf8)", wave = "W1" }
+lcase = { status = "canonical", batcher = "Expr.str.lower" }
+left = { status = "mismatch", batcher = "Expr.str.left", note = "Spark left(n) returns '' when n <= 0; Batcher left(-k) drops k characters from the end", wave = "W0" }
+length = { status = "canonical", batcher = "Expr.str.len_chars" }
+levenshtein = { status = "param", batcher = "Expr.str.levenshtein", need = "column-valued right operand and threshold= (returns -1 beyond it)", wave = "W2" }
+like = { status = "param", batcher = "Expr.str.like", need = "escapeChar= and a column-valued pattern", wave = "W2" }
+locate = { status = "param", batcher = "Expr.str.position", need = "pos= start position", wave = "W2" }
+lower = { status = "canonical", batcher = "Expr.str.lower" }
+lpad = { status = "canonical", batcher = "Expr.str.lpad" }
+ltrim = { status = "canonical", batcher = "Expr.str.strip_chars_start" }
+make_valid_utf8 = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (make_valid_utf8)", wave = "W1" }
+mask = { status = "mismatch", batcher = "bt.mask", note = "Spark mask(col, upperChar='X', lowerChar='x', digitChar='n', otherChar) replaces by character class; bt.mask replaces every character with one char and can reveal the ends", wave = "W0" }
+md5 = { status = "canonical", batcher = "Expr.str.md5" }
+octet_length = { status = "canonical", batcher = "Expr.str.octet_length" }
+overlay = { status = "canonical", batcher = "Expr.str.overlay" }
+parse_url = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (parse_url)", wave = "W1" }
+position = { status = "param", batcher = "Expr.str.position", need = "start= position", wave = "W2" }
+printf = { status = "mismatch", batcher = "bt.format_string", note = "Spark uses printf-style placeholders (%s, %d, %.2f); bt.format_string uses {} placeholders", wave = "W0" }
+quote = { status = "gap", need = "quote a string as a SQL literal", wave = "W3" }
+randstr = { status = "gap", need = "random string of a given length", wave = "W3" }
+regexp = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+regexp_count = { status = "canonical", batcher = "Expr.str.count_matches" }
+regexp_extract = { status = "canonical", batcher = "Expr.str.extract" }
+regexp_extract_all = { status = "mismatch", batcher = "Expr.str.extract_all", note = "Spark idx defaults to 1 (the first capture group); Expr.str.extract_all returns whole matches and takes no group argument. Needs group=", wave = "W0" }
+regexp_instr = { status = "gap", need = "position of the first regex match", wave = "W3" }
+regexp_like = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+regexp_replace = { status = "mismatch", batcher = "Expr.str.replace_all", note = "Spark replaces every match and writes backreferences as $1; Expr.str.replace_all takes \\1 and leaves $1 literal. Spark also accepts column-valued pattern and replacement", wave = "W0" }
+regexp_substr = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (regexp_substr, null when there is no match)", wave = "W1" }
+repeat = { status = "canonical", batcher = "Expr.str.repeat" }
+replace = { status = "canonical", batcher = "Expr.str.replace" }
+reverse = { status = "canonical", batcher = ["Expr.str.reverse", "Expr.list.reverse"] }
+right = { status = "mismatch", batcher = "Expr.str.right", note = "Spark right(n) returns '' when n <= 0; Batcher right(-k) drops k characters from the start", wave = "W0" }
+rlike = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+rpad = { status = "canonical", batcher = "Expr.str.rpad" }
+rtrim = { status = "canonical", batcher = "Expr.str.strip_chars_end" }
+sentences = { status = "gap", need = "split text into sentences of words (locale-aware)", wave = "W3" }
+sha = { status = "canonical", batcher = "Expr.str.sha1" }
+sha1 = { status = "canonical", batcher = "Expr.str.sha1" }
+sha2 = { status = "param", batcher = "Expr.str.sha256", need = "numBits= 224/384/512 (only SHA-256 today)", wave = "W2" }
+soundex = { status = "canonical", batcher = "Expr.str.soundex" }
+split = { status = "mismatch", batcher = "Expr.str.split", note = "Spark's pattern is a Java regex with limit=; Expr.str.split is literal. Use Expr.str.regexp_split, which lacks limit=", wave = "W0" }
+split_part = { status = "canonical", batcher = "Expr.str.split_part" }
+startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
+substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
+substring = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substring('hello', 0, 2) is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
+substring_index = { status = "canonical", batcher = "Expr.str.substring_index" }
+to_binary = { status = "mismatch", batcher = "Expr.str.to_binary", note = "Spark to_binary encodes to BINARY by format (hex, utf-8, base64); Expr.str.to_binary renders the bytes as '0'/'1' text", wave = "W0" }
+to_char = { status = "gap", need = "format numbers and dates with a format string", wave = "W3" }
+to_number = { status = "gap", need = "parse a string to a number with a format string", wave = "W3" }
+to_varchar = { status = "gap", need = "format numbers and dates with a format string", wave = "W3" }
+translate = { status = "canonical", batcher = "Expr.str.translate" }
+trim = { status = "canonical", batcher = "Expr.str.trim" }
+try_aes_decrypt = { status = "gap", need = "Spark-compatible AES decrypt returning null on failure (modes GCM/CBC/ECB)", wave = "W3" }
+try_parse_url = { status = "gap", need = "parse_url returning null on malformed URLs", wave = "W3" }
+try_to_binary = { status = "gap", need = "to_binary returning null on invalid input", wave = "W3" }
+try_to_number = { status = "gap", need = "to_number returning null on invalid input", wave = "W3" }
+try_url_decode = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (try_url_decode)", wave = "W1" }
+try_validate_utf8 = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (try_validate_utf8)", wave = "W1" }
+ucase = { status = "canonical", batcher = "Expr.str.upper" }
+unbase64 = { status = "mismatch", batcher = "Expr.str.from_base64", note = "Spark returns BINARY; Expr.str.from_base64 returns UTF-8 text (null when the bytes are not valid text)", wave = "W0" }
+unhex = { status = "mismatch", batcher = "Expr.str.unhex", note = "Spark returns BINARY; Expr.str.unhex returns UTF-8 text (null when the bytes are not valid text)", wave = "W0" }
+upper = { status = "canonical", batcher = "Expr.str.upper" }
+url_decode = { status = "mismatch", batcher = "Expr.str.url_decode", note = "Spark decodes application/x-www-form-urlencoded, so '+' becomes a space; Batcher leaves '+'", wave = "W0" }
+url_encode = { status = "mismatch", batcher = "Expr.str.url_encode", note = "Spark encodes a space as '+'; Batcher encodes it as '%20'", wave = "W0" }
+validate_utf8 = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (validate_utf8)", wave = "W1" }
+xxhash64 = { status = "mismatch", batcher = "Expr.str.xxhash64", note = "Spark hashes one or more typed columns with seed 42 ('ABC' -> 4105715581806190027); Batcher hashes one string's bytes ('ABC' -> -1843406881296486760)", wave = "W0" }

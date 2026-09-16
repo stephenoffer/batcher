@@ -1,0 +1,83 @@
+# Ray Data 2.58 `ray.data.aggregate` and `ray.data.expressions` module names and their Batcher spelling.
+
+[aggregate]
+AbsMax = { status = "canonical", batcher = ["Expr.abs", "Expr.max"] }
+AccumulatorType = { status = "out_of_scope", reason = "typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API" }
+AggOutputType = { status = "out_of_scope", reason = "typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API" }
+AggregateFn = { status = "gap", need = "user-defined accumulator aggregate (init/accumulate_row/merge/finalize) usable in agg", wave = "W11" }
+AggregateFnV2 = { status = "gap", need = "user-defined vectorized aggregate over block columns (aggregate_block/combine/finalize)", wave = "W11" }
+Any = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+ApproximateQuantile = { status = "param", batcher = "Expr.approx_quantile", need = "a list of quantiles in one aggregate returning a list, quantile_precision=", wave = "W2" }
+ApproximateTopK = { status = "mismatch", batcher = "Expr.top_k", note = "Ray ApproximateTopK(on, k) returns [{column: value, 'count': n}] records; Batcher Expr.top_k returns the values only (exactly, most frequent first) and is being renamed mode_top_k per Appendix D.", wave = "W0" }
+ArrowAggSpec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+AsList = { status = "canonical", batcher = "Expr.array_agg" }
+Block = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
+BlockAccessor = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
+BlockColumn = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
+BlockColumnAccessor = { status = "out_of_scope", reason = "Ray block abstraction imported for AggregateFnV2 implementers; Batcher has no blocks (aggregates are mergeable Arrow kernels in bc-runtime)" }
+Callable = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Collection = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Count = { status = "mismatch", batcher = ["bt.count", "Expr.count"], note = "Ray Count() counts rows, and Count(on) defaults ignore_nulls=False so it also counts nulls; Batcher col(x).count() skips nulls. Codemod: bt.count() for both unless ignore_nulls=True, then col(x).count().", wave = "W0" }
+CountDistinct = { status = "canonical", batcher = "Expr.count_distinct" }
+Deprecated = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
+Dict = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Generic = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+KeyType = { status = "out_of_scope", reason = "typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API" }
+List = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Max = { status = "canonical", batcher = "Expr.max" }
+Mean = { status = "canonical", batcher = "Expr.mean" }
+Min = { status = "canonical", batcher = "Expr.min" }
+MissingValuePercentage = { status = "mismatch", batcher = "bt.null_rate", note = "Ray returns a percentage in [0, 100] and counts NaN as missing; Batcher null_rate returns a fraction in [0, 1] and counts only nulls. Codemod: bt.null_rate(x) * 100 after fill_nan(None).", wave = "W0" }
+Optional = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Protocol = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+PublicAPI = { status = "out_of_scope", reason = "ray.util.annotations decorator imported into the module, not Ray Data API" }
+Quantile = { status = "canonical", batcher = "Expr.quantile" }
+Set = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Std = { status = "mismatch", batcher = "Expr.std", note = "Ray Std(on, ddof=1) returns NaN for a group with one non-null value and takes ddof=; Batcher std is sample std (ddof=1 fixed) and returns null there.", wave = "W0" }
+Sum = { status = "canonical", batcher = "Expr.sum" }
+SupportsRichComparisonType = { status = "out_of_scope", reason = "typing helper imported or defined for AggregateFn signatures (TypeVar/typing alias), not Ray Data API" }
+TypeVar = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Union = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+Unique = { status = "gap", need = "aggregate collecting each group's distinct values into a list (ignore_nulls=False keeps None)", wave = "W11" }
+ValueCounter = { status = "mismatch", batcher = "Dataset.value_counts", note = "Ray ValueCounter(on) is an aggregate returning {'values': [...], 'counts': [...]} per group; Batcher value_counts(column) is a Dataset verb returning one row per value, sorted by count.", wave = "W0" }
+ZeroPercentage = { status = "gap", need = "percentage of zero values in a numeric column (ignore_nulls=)", wave = "W11" }
+abc = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+count_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+distinct_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+enum = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+is_null = { status = "out_of_scope", reason = "ray.data._internal.util helper imported into the module, not Ray Data API" }
+math = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+mean_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+minmax_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+missing_pct_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+np = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+pa = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+pc = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+pickle = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+re = { status = "out_of_scope", reason = "module import plumbing, not Ray Data API" }
+sum_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+zero_pct_spec = { status = "out_of_scope", reason = "Ray-internal Arrow aggregation kernel spec (ray.data._internal.arrow_aggregation) re-exported by import, not Ray Data API" }
+
+[expressions]
+AliasExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+BinaryExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+ColumnExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+DownloadExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+Expr = { status = "canonical", batcher = "bt.Expr" }
+LiteralExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+MonotonicallyIncreasingIdExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+Operation = { status = "out_of_scope", reason = "enum of binary operators inside Ray's expression AST; Batcher exposes operators as Python operators on Expr" }
+RandomExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+StarExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+UDFExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+UUIDExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+UnaryExpr = { status = "out_of_scope", reason = "expression AST node class Ray's planner builds from col/lit/udf; users do not construct it, and Batcher's Expr nodes are internal to its JSON IR" }
+col = { status = "canonical", batcher = "bt.col" }
+download = { status = "mismatch", batcher = "Dataset.ml.download", note = "Ray download(uri_column) is an expression usable in with_column; Batcher ds.ml.download(url_column, output_column='bytes') is a Dataset verb.", wave = "W12" }
+lit = { status = "canonical", batcher = "bt.lit" }
+monotonically_increasing_id = { status = "mismatch", batcher = "Dataset.with_row_index", note = "Ray monotonically_increasing_id() is an expression yielding unique, increasing, non-consecutive ids (task id in the upper bits); Batcher with_row_index(name) is a Dataset verb yielding consecutive row positions.", wave = "W8" }
+pyarrow_udf = { status = "gap", need = "expression-level batch UDF decorator over pyarrow arrays with a declared return type, usable inside with_columns", wave = "W11" }
+random = { status = "mismatch", batcher = "Dataset.with_random", note = "Ray random(seed=None, reseed_after_execution=True) is an expression reseeded per execution; Batcher with_random(name, seed=0) is a Dataset verb that is deterministic by seed and row position.", wave = "W3" }
+star = { status = "canonical", batcher = "bt.all" }
+udf = { status = "gap", need = "expression-level batch UDF decorator with a declared return type, usable inside with_columns (bt.udf wraps a map_batches transform instead)", wave = "W11" }
+uuid = { status = "gap", need = "per-row UUID4 expression", wave = "W3" }

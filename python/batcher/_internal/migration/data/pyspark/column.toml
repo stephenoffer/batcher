@@ -1,0 +1,41 @@
+# PySpark 4.2.0 -> Batcher migration registry: Column methods.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[Column]
+alias = { status = "canonical", batcher = "Expr.alias" }
+asc = { status = "mismatch", batcher = "Dataset.sort", note = "Spark asc() sorts nulls first; Batcher ascending sorts nulls last. Codemod passes nulls_first=True", wave = "W0" }
+asc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
+asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
+astype = { status = "alias", batcher = "Expr.cast" }
+between = { status = "canonical", batcher = "Expr.between" }
+bitwiseAND = { status = "canonical", batcher = "Expr.bitwise_and" }
+bitwiseOR = { status = "canonical", batcher = "Expr.bitwise_or" }
+bitwiseXOR = { status = "canonical", batcher = "Expr.bitwise_xor" }
+cast = { status = "param", batcher = "Expr.cast", need = "Spark DataType objects and DDL type strings (array<int>, map<string,int>, struct<...>)", wave = "W11" }
+contains = { status = "canonical", batcher = "Expr.str.contains" }
+desc = { status = "canonical", batcher = "Dataset.sort" }
+desc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
+desc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
+dropFields = { status = "gap", need = "drop nested struct fields in place", wave = "W8" }
+endswith = { status = "canonical", batcher = "Expr.str.ends_with" }
+eqNullSafe = { status = "canonical", batcher = "Expr.eq_missing" }
+getField = { status = "canonical", batcher = "Expr.struct.field" }
+getItem = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark getItem(-1) on an array is out of bounds (an error under ANSI, the 4.x default; null otherwise); Expr.list.get(-1) returns the last element. Map keys go through Expr.map.get", wave = "W0" }
+ilike = { status = "canonical", batcher = "Expr.str.ilike" }
+isNaN = { status = "mismatch", batcher = "Expr.is_nan", note = "Spark isNaN(null) is false; Expr.is_nan(null) is null", wave = "W0" }
+isNotNull = { status = "canonical", batcher = "Expr.is_not_null" }
+isNull = { status = "canonical", batcher = "Expr.is_null" }
+isin = { status = "alias", batcher = "Expr.is_in" }
+like = { status = "canonical", batcher = "Expr.str.like" }
+name = { status = "canonical", batcher = "Expr.alias" }
+otherwise = { status = "canonical", batcher = "CaseBuilder.otherwise" }
+outer = { status = "gap", need = "outer column reference for lateral joins and correlated subqueries", wave = "W8" }
+over = { status = "param", batcher = ["AggExpr.over", "WindowExpr.over"], need = "a reusable Window spec object, and over() on every Expr rather than only aggregates and window functions", wave = "WF" }
+rlike = { status = "canonical", batcher = "Expr.str.regexp_matches" }
+startswith = { status = "canonical", batcher = "Expr.str.starts_with" }
+substr = { status = "mismatch", batcher = "Expr.str.substr", note = "Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h')", wave = "W0" }
+transform = { status = "gap", need = "apply a Column -> Column function fluently (Column.transform(f))", wave = "W1" }
+try_cast = { status = "canonical", batcher = "Expr.try_cast" }
+when = { status = "canonical", batcher = "CaseBuilder.when" }
+withField = { status = "gap", need = "add or replace a nested struct field in place", wave = "W8" }

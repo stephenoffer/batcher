@@ -1,0 +1,43 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[polars]
+CompatLevel = { status = "param", batcher = "Dataset.write.arrow", need = "compat_level= for IPC writers", wave = "W2" }
+CredentialProvider = { status = "param", batcher = "batcher.io.credentials", need = "a credential-provider object accepted by every reader and writer", wave = "W13" }
+CredentialProviderAWS = { status = "param", batcher = "batcher.io.credentials", need = "AWS credential-provider object", wave = "W13" }
+CredentialProviderAzure = { status = "param", batcher = "batcher.io.credentials", need = "Azure credential-provider object", wave = "W13" }
+CredentialProviderFunction = { status = "param", batcher = "batcher.io.credentials", need = "callable credential-provider protocol", wave = "W13" }
+CredentialProviderFunctionReturn = { status = "param", batcher = "batcher.io.credentials", need = "credential-provider return type (credentials, expiry)", wave = "W13" }
+CredentialProviderGCP = { status = "param", batcher = "batcher.io.credentials", need = "Google Cloud credential-provider object", wave = "W13" }
+FileProviderArgs = { status = "gap", need = "per-partition file-name provider for sinks", wave = "W13" }
+PartitionBy = { status = "param", batcher = "Dataset.write.parquet", need = "a PartitionBy object (key columns, include_key, per-partition file names)", wave = "W13" }
+ScanCastOptions = { status = "param", batcher = "bt.read.parquet", need = "cast_options= for schema-evolution casts on scan", wave = "W2" }
+from_dataframe = { status = "gap", need = "DataFrame interchange protocol import", wave = "W13" }
+json_normalize = { status = "gap", need = "json_normalize (flatten nested JSON records)", wave = "W13" }
+read_avro = { status = "alias", batcher = "bt.read.avro" }
+read_clipboard = { status = "out_of_scope", reason = "clipboard IO is a desktop convenience, not a data engine source" }
+read_csv = { status = "alias", batcher = "bt.read.csv" }
+read_csv_batched = { status = "canonical", batcher = ["bt.read.csv", "Dataset.iter_batches"] }
+read_database = { status = "alias", batcher = "bt.read.sql" }
+read_database_uri = { status = "canonical", batcher = "bt.read.sql" }
+read_delta = { status = "alias", batcher = "bt.read.delta" }
+read_excel = { status = "alias", batcher = "bt.read.excel" }
+read_ipc = { status = "alias", batcher = "bt.read.arrow" }
+read_ipc_schema = { status = "gap", need = "read an IPC file's schema without data", wave = "W13" }
+read_ipc_stream = { status = "param", batcher = "bt.read.arrow", need = "Arrow IPC stream format (not only the file format)", wave = "W2" }
+read_json = { status = "mismatch", batcher = "bt.read.json", note = "Polars read_json parses one JSON document (an array of rows); Batcher's read_json and bt.read.json read newline-delimited JSON. Param: lines=False", wave = "W0" }
+read_lines = { status = "canonical", batcher = "bt.read.text" }
+read_ndjson = { status = "alias", batcher = "bt.read.json" }
+read_ods = { status = "param", batcher = "bt.read.excel", need = "OpenDocument spreadsheet (.ods) input", wave = "W2" }
+read_parquet = { status = "alias", batcher = "bt.read.parquet" }
+read_parquet_metadata = { status = "gap", need = "read Parquet key-value metadata", wave = "W13" }
+read_parquet_schema = { status = "gap", need = "read a Parquet file's schema without data", wave = "W13" }
+scan_csv = { status = "param", batcher = "bt.read.csv", need = "reader options: comment_prefix=, ignore_errors=, n_rows=, row_index_name=, include_file_paths=, missing_columns=, infer_schema_length=, decimal_comma=, truncate_ragged_lines=, credential_provider=, retries=", wave = "W2" }
+scan_delta = { status = "param", batcher = "bt.read.delta", need = "reader options: storage_options=, delta_table_options=", wave = "W2" }
+scan_iceberg = { status = "param", batcher = "bt.read.iceberg", need = "reader options: a table path/object rather than a catalog identifier, storage_options=", wave = "W2" }
+scan_ipc = { status = "param", batcher = "bt.read.arrow", need = "reader options: row_index_name=, include_file_paths=, n_rows=", wave = "W2" }
+scan_lines = { status = "param", batcher = "bt.read.text", need = "reader options: name=, n_rows=, include_file_paths=", wave = "W2" }
+scan_ndjson = { status = "param", batcher = "bt.read.json", need = "reader options: infer_schema_length=, ignore_errors=, row_index_name=, include_file_paths=", wave = "W2" }
+scan_parquet = { status = "param", batcher = "bt.read.parquet", need = "reader options: row_index_name=, include_file_paths=, allow_missing_columns=, cast_options=, credential_provider=, retries=", wave = "W2" }
+scan_pyarrow_dataset = { status = "gap", need = "scan a pyarrow.dataset.Dataset lazily", wave = "W13" }

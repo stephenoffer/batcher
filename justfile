@@ -137,6 +137,19 @@ gen-exports:
 map:
     python tools/gen_map.py
 
+# Re-enumerate every public name in the installed PySpark, Polars, Daft and Ray Data into
+# tools/parity/surfaces/. The migration registry must classify each one exactly once
+# (tests/unit/test_migration_registry.py), so this is how a competitor upgrade becomes a
+# reviewable diff of names instead of a silent change in what "full parity" means.
+parity-snapshot:
+    python tools/parity/surfaces.py
+
+# Second spellings on the public surface: two names bound to one function, or a method that
+# only forwards its parameters to another public method. Report mode until the alias removal
+# lands; then this becomes `--check` and joins the pre-commit hook.
+lint-aliases:
+    python tools/lint_aliases.py
+
 # Copy-paste detector. The subsystems cannot import each other, so copy-paste is the only
 # *wrong* way to share between them — this is what catches it.
 lint-duplication:

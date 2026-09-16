@@ -1,0 +1,123 @@
+# Daft 0.7.25 -> Batcher: DataFrame verbs, grouped aggregation and the Window spec.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[DataFrame]
+agg = { status = "canonical", batcher = "Dataset.agg" }
+agg_concat = { status = "canonical", batcher = ["Dataset.agg", "Expr.str.join"] }
+agg_list = { status = "canonical", batcher = ["Dataset.agg", "Expr.array_agg"] }
+agg_set = { status = "param", batcher = "Expr.array_agg", need = "distinct=True for a global set aggregate", wave = "W2" }
+any_value = { status = "canonical", batcher = ["Dataset.agg", "Expr.any_value"] }
+collect = { status = "mismatch", batcher = "Dataset.collect", note = "Daft collect() materializes and returns the DataFrame for further chaining; Batcher collect() returns a pyarrow.Table. Rewrite: Dataset.cache() to keep chaining", wave = "W0" }
+column_names = { status = "canonical", batcher = "Dataset.columns" }
+columns = { status = "mismatch", batcher = "Dataset.columns", note = "Daft columns is a list of column Expressions; Batcher columns is a list of names. Rewrite: [bt.col(c) for c in ds.columns]", wave = "W0" }
+concat = { status = "canonical", batcher = "Dataset.union" }
+count = { status = "mismatch", batcher = "Dataset.count", note = "Daft count() returns a one-row DataFrame ({'count': [n]}), and count(*cols) counts non-null values per column; Batcher count() returns a Python int of rows. Rewrite: ds.agg(n=bt.count())", wave = "W0" }
+count_distinct = { status = "canonical", batcher = ["Dataset.agg", "Expr.count_distinct"] }
+count_rows = { status = "canonical", batcher = "Dataset.count" }
+describe = { status = "mismatch", batcher = "Dataset.describe", note = "Daft describe() returns the schema as a DataFrame (column_name, type); Batcher describe() returns summary statistics. Rewrite: Dataset.schema", wave = "W0" }
+distinct = { status = "canonical", batcher = "Dataset.distinct" }
+drop_duplicates = { status = "alias", batcher = "Dataset.distinct" }
+drop_nan = { status = "gap", need = "drop rows holding NaN in any (or the given) float columns", wave = "W8" }
+drop_null = { status = "canonical", batcher = "Dataset.drop_nulls" }
+except_all = { status = "canonical", batcher = "Dataset.except_" }
+except_distinct = { status = "canonical", batcher = "Dataset.except_" }
+exclude = { status = "canonical", batcher = "Dataset.drop" }
+explain = { status = "mismatch", batcher = "Dataset.explain", note = "Daft explain() prints the plan (show_all= adds the physical plan); Batcher explain() returns the plan as a string. Rewrite: print(ds.explain())", wave = "W0" }
+explode = { status = "mismatch", batcher = "Dataset.explode", note = "Daft explode keeps a null or empty list as one row with a null value and accepts several columns at once; Batcher explode drops those rows and takes one column. Param: outer=True, multiple columns", wave = "W0" }
+filter = { status = "param", batcher = "Dataset.filter", need = "a SQL-string predicate (Batcher routes strings through Dataset.query)", wave = "WF" }
+groupby = { status = "alias", batcher = "Dataset.group_by" }
+intersect = { status = "canonical", batcher = "Dataset.intersect" }
+intersect_all = { status = "canonical", batcher = "Dataset.intersect" }
+into_batches = { status = "mismatch", batcher = "Dataset.repartition", note = "Daft into_batches re-chunks execution into batch_size-row partitions; Batcher sizes morsels itself and repartition only lays out written files", wave = "W8" }
+into_partitions = { status = "mismatch", batcher = "Dataset.repartition", note = "Daft into_partitions(n) splits or coalesces execution partitions preserving order; Batcher repartition(num_files) only sets how the next write lays out files", wave = "W8" }
+iter_partitions = { status = "out_of_scope", reason = "exposes Daft MicroPartitions or Ray ObjectRefs; Batcher has no user-visible partitions (iterate Arrow batches with iter_batches)" }
+iter_rows = { status = "mismatch", batcher = "Dataset.iter_rows", note = "Daft iter_rows yields dicts by default; Batcher yields tuples unless named=True. Param: named=True", wave = "W0" }
+join = { status = "mismatch", batcher = "Dataset.join", note = "Daft names a clashing right column 'right.<col>' (prefix= / suffix=) and accepts strategy= hints; Batcher appends suffix='_right'. Param: prefix='right.', suffix=''", wave = "W0" }
+join_asof = { status = "canonical", batcher = "Dataset.join_asof" }
+limit = { status = "canonical", batcher = "Dataset.limit" }
+max = { status = "mismatch", batcher = "Dataset.max", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.max takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...)", wave = "W0" }
+mean = { status = "mismatch", batcher = "Dataset.mean", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.mean takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...)", wave = "W0" }
+melt = { status = "alias", batcher = "Dataset.unpivot" }
+metrics = { status = "param", batcher = "Dataset.stats", need = "metrics of the last execution without re-running the query", wave = "W8" }
+min = { status = "mismatch", batcher = "Dataset.min", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.min takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...)", wave = "W0" }
+num_partitions = { status = "out_of_scope", reason = "Batcher plans carry no partition count; execution parallelism is engine-owned" }
+offset = { status = "param", batcher = "Dataset.limit", need = "offset without a limit", wave = "W2" }
+pipe = { status = "canonical", batcher = "Dataset.pipe" }
+pivot = { status = "canonical", batcher = "Dataset.pivot" }
+product = { status = "mismatch", batcher = "Dataset.product", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.product takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...)", wave = "W0" }
+repartition = { status = "mismatch", batcher = "Dataset.repartition", note = "Daft repartition(num, *partition_by) hash-partitions execution; Batcher repartition sets the file layout of the next write and leaves the data unchanged", wave = "W8" }
+sample = { status = "param", batcher = "Dataset.sample", need = "with_replacement=True", wave = "W2" }
+schema = { status = "mismatch", batcher = "Dataset.schema", note = "Daft schema() is a method returning a daft Schema; Batcher schema is a property holding a pyarrow.Schema. Rewrite: ds.schema without the call", wave = "W0" }
+select = { status = "canonical", batcher = "Dataset.select" }
+show = { status = "param", batcher = "Dataset.show", need = "format=/verbose=/max_width=/align= display options (Daft defaults to 8 rows, Batcher to 10)", wave = "W2" }
+shuffle = { status = "canonical", batcher = "Dataset.shuffle" }
+skew = { status = "mismatch", batcher = "Dataset.skewness", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.skewness takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft skew is the population value, Batcher the sample value. Param: bias=True", wave = "W0" }
+skip_existing = { status = "gap", need = "anti-join against keys already present in an existing output (resumable pipelines)", wave = "W13" }
+skipped_corrupt_files = { status = "gap", need = "report of files skipped under ignore_corrupt_files=True", wave = "W13" }
+sort = { status = "mismatch", batcher = "Dataset.sort", note = "Daft sort(desc=True) places nulls first by default (nulls_first follows desc); Batcher places nulls last. Param: nulls_first=True when descending", wave = "W0" }
+stddev = { status = "mismatch", batcher = "Dataset.std", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.std takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=", wave = "W0" }
+sum = { status = "mismatch", batcher = "Dataset.sum", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.sum takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...)", wave = "W0" }
+summarize = { status = "mismatch", batcher = "Dataset.describe", note = "Daft summarize() returns one row per column (column, type, min, max, count, count_nulls, approx_count_distinct); Batcher describe() returns one row per statistic with a column per input column", wave = "W8" }
+to_arrow = { status = "canonical", batcher = "Dataset.to_arrow" }
+to_arrow_iter = { status = "canonical", batcher = "Dataset.iter_batches" }
+to_dask_dataframe = { status = "gap", need = "export to a Dask DataFrame", wave = "W13" }
+to_pandas = { status = "canonical", batcher = "Dataset.to_pandas" }
+to_pydict = { status = "canonical", batcher = "Dataset.to_pydict" }
+to_pylist = { status = "canonical", batcher = "Dataset.to_pylist" }
+to_ray_dataset = { status = "canonical", batcher = "Dataset.to_ray_dataset" }
+to_torch_dataloader = { status = "alias", batcher = "Dataset.ml.to_torch_dataloader" }
+to_torch_iter_dataset = { status = "param", batcher = "Dataset.ml.iter_torch_batches", need = "a row-wise torch IterableDataset with shard_strategy='file' and world_size/rank sharding", wave = "W12" }
+to_torch_map_dataset = { status = "gap", need = "a map-style (random access) torch Dataset", wave = "W12" }
+transform = { status = "alias", batcher = "Dataset.pipe" }
+union = { status = "mismatch", batcher = "Dataset.union", note = "Daft union is UNION DISTINCT; Batcher union is UNION ALL. Param: distinct=True", wave = "W0" }
+union_all = { status = "canonical", batcher = "Dataset.union" }
+union_all_by_name = { status = "param", batcher = "Dataset.union", need = "by_name=True column matching", wave = "W2" }
+union_by_name = { status = "param", batcher = "Dataset.union", need = "by_name=True column matching (with distinct=True)", wave = "W2" }
+unique = { status = "alias", batcher = "Dataset.distinct" }
+unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
+var = { status = "mismatch", batcher = "Dataset.var", note = "Daft returns a one-row DataFrame (one column per argument, all numeric columns when none given); Batcher's Dataset.var takes exactly one column and returns a Python scalar. Rewrite: ds.agg(...); Daft also takes ddof=", wave = "W0" }
+where = { status = "param", batcher = "Dataset.filter", need = "a SQL-string predicate (Batcher routes strings through Dataset.query)", wave = "WF" }
+with_column = { status = "alias", batcher = "Dataset.with_columns" }
+with_column_renamed = { status = "canonical", batcher = "Dataset.rename" }
+with_columns = { status = "canonical", batcher = "Dataset.with_columns" }
+with_columns_renamed = { status = "canonical", batcher = "Dataset.rename" }
+write_bigtable = { status = "gap", need = "Google Cloud Bigtable sink", wave = "W13" }
+write_clickhouse = { status = "gap", need = "ClickHouse sink (bt.read.clickhouse exists, no writer)", wave = "W13" }
+write_csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Daft write_csv defaults to write_mode='append' and returns a DataFrame of written paths; Batcher ds.write.csv defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks", wave = "W13" }
+write_deltalake = { status = "canonical", batcher = "Dataset.write.delta" }
+write_huggingface = { status = "gap", need = "Hugging Face Hub dataset sink", wave = "W13" }
+write_iceberg = { status = "param", batcher = "Dataset.write.iceberg", need = "a PyIceberg Table object target, overwrite_filter= and snapshot_properties=", wave = "W13" }
+write_json = { status = "mismatch", batcher = "Dataset.write.json", note = "Daft write_json defaults to write_mode='append' and returns a DataFrame of written paths; Batcher ds.write.json defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks", wave = "W13" }
+write_lance = { status = "param", batcher = "Dataset.write.lance", need = "mode= create/append/overwrite/merge with left_on/right_on", wave = "W13" }
+write_paimon = { status = "gap", need = "Apache Paimon sink", wave = "W13" }
+write_parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Daft write_parquet defaults to write_mode='append' and returns a DataFrame of written paths; Batcher ds.write.parquet defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks; Daft compresses with snappy by default, Batcher with zstd", wave = "W13" }
+write_sink = { status = "gap", need = "a user DataSink protocol adapter", wave = "W13" }
+write_sql = { status = "param", batcher = "Dataset.write.sql", need = "a connection factory callable and write_mode='fail'", wave = "W13" }
+write_turbopuffer = { status = "gap", need = "Turbopuffer vector-store sink", wave = "W13" }
+
+[GroupedDataFrame]
+agg = { status = "canonical", batcher = "GroupBy.agg" }
+any_value = { status = "canonical", batcher = ["GroupBy.agg", "Expr.any_value"] }
+count = { status = "canonical", batcher = "GroupBy.count" }
+count_distinct = { status = "param", batcher = "GroupBy.n_unique", need = "the count_distinct spelling Appendix D keeps (today GroupBy.n_unique)", wave = "WF" }
+list_agg = { status = "canonical", batcher = "GroupBy.array_agg" }
+list_agg_distinct = { status = "param", batcher = "GroupBy.array_agg", need = "distinct=True (distinct values, nulls dropped)", wave = "W2" }
+map_groups = { status = "param", batcher = "GroupBy.map_groups", need = "a Daft-style UDF Expression argument whose result column is named after its first input", wave = "W11" }
+max = { status = "canonical", batcher = "GroupBy.max" }
+mean = { status = "canonical", batcher = "GroupBy.mean" }
+min = { status = "canonical", batcher = "GroupBy.min" }
+product = { status = "canonical", batcher = "GroupBy.product" }
+skew = { status = "mismatch", batcher = "GroupBy.skewness", note = "Daft skew is the population (biased) skewness; Batcher skewness is the sample-adjusted value. Param: bias=True", wave = "W0" }
+stddev = { status = "param", batcher = "GroupBy.std", need = "ddof=", wave = "W2" }
+string_agg = { status = "canonical", batcher = ["GroupBy.agg", "Expr.str.join"] }
+sum = { status = "canonical", batcher = "GroupBy.sum" }
+var = { status = "param", batcher = "GroupBy.var", need = "ddof=", wave = "W2" }
+
+[Window]
+current_row = { status = "canonical", batcher = "WindowExpr.over" }
+order_by = { status = "mismatch", batcher = "WindowExpr.over", note = "A Daft Window with order_by and no explicit frame applies an aggregate over the whole partition; Batcher's over(order_by=) uses SQL's running frame (sum over [None,20,30] is 50,50,50 vs null,20,50). Param: frame=(None, None)", wave = "W0" }
+partition_by = { status = "canonical", batcher = "WindowExpr.over" }
+range_between = { status = "param", batcher = "WindowExpr.over", need = "min_periods= on a range frame", wave = "W5" }
+rows_between = { status = "param", batcher = "WindowExpr.over", need = "min_periods= on a rows frame", wave = "W5" }
+unbounded_following = { status = "canonical", batcher = "WindowExpr.over" }
+unbounded_preceding = { status = "canonical", batcher = "WindowExpr.over" }

@@ -1,0 +1,72 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, math and bitwise.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+abs = { status = "canonical", batcher = "Expr.abs" }
+acos = { status = "canonical", batcher = "Expr.arccos" }
+acosh = { status = "canonical", batcher = "Expr.arccosh" }
+asin = { status = "canonical", batcher = "Expr.arcsin" }
+asinh = { status = "canonical", batcher = "Expr.arcsinh" }
+atan = { status = "canonical", batcher = "Expr.arctan" }
+atan2 = { status = "alias", batcher = "bt.arctan2" }
+atanh = { status = "canonical", batcher = "Expr.arctanh" }
+bin = { status = "mismatch", batcher = "Expr.to_base", note = "Spark bin(-1) renders the 64-bit two's complement (64 ones); Expr.to_base(2) renders '-1'", wave = "W0" }
+bit_count = { status = "canonical", batcher = "Expr.bit_count" }
+bit_get = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (bit_get)", wave = "W1" }
+bitwise_not = { status = "gap", need = "integer bitwise NOT (~ on Expr is boolean-only and raises on integers)", wave = "W3" }
+bround = { status = "param", batcher = "Expr.round", need = "mode='half_even' rounding with scale=", wave = "W2" }
+cbrt = { status = "canonical", batcher = "Expr.cbrt" }
+ceil = { status = "param", batcher = "Expr.ceil", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+ceiling = { status = "param", batcher = "Expr.ceil", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+conv = { status = "gap", need = "convert a number string between bases", wave = "W3" }
+cos = { status = "canonical", batcher = "Expr.cos" }
+cosh = { status = "canonical", batcher = "Expr.cosh" }
+cot = { status = "canonical", batcher = "Expr.cot" }
+csc = { status = "canonical", batcher = "Expr.csc" }
+degrees = { status = "canonical", batcher = "Expr.degrees" }
+e = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (e)", wave = "W1" }
+exp = { status = "canonical", batcher = "Expr.exp" }
+expm1 = { status = "canonical", batcher = "Expr.expm1" }
+factorial = { status = "mismatch", batcher = "Expr.factorial", note = "Spark returns null outside 0..20 and a BIGINT; Batcher raises on out-of-range input and returns Float64", wave = "W0" }
+floor = { status = "param", batcher = "Expr.floor", need = "scale= digits, and a BIGINT result for scale-less input", wave = "W2" }
+getbit = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (getbit)", wave = "W1" }
+greatest = { status = "canonical", batcher = "bt.greatest" }
+hypot = { status = "canonical", batcher = "bt.hypot" }
+least = { status = "canonical", batcher = "bt.least" }
+ln = { status = "canonical", batcher = "Expr.ln" }
+log = { status = "param", batcher = ["bt.log", "Expr.ln"], need = "one-argument natural-log form log(col)", wave = "W2" }
+log10 = { status = "canonical", batcher = "Expr.log10" }
+log1p = { status = "canonical", batcher = "Expr.log1p" }
+log2 = { status = "canonical", batcher = "Expr.log2" }
+nanvl = { status = "canonical", batcher = "bt.nanvl" }
+negate = { status = "canonical", batcher = "op:neg" }
+negative = { status = "canonical", batcher = "op:neg" }
+pi = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (pi)", wave = "W1" }
+pmod = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (pmod)", wave = "W1" }
+positive = { status = "gap", need = "unary plus identity on an expression", wave = "W1" }
+pow = { status = "canonical", batcher = "op:pow" }
+power = { status = "canonical", batcher = "op:pow" }
+radians = { status = "canonical", batcher = "Expr.radians" }
+rand = { status = "param", batcher = "Dataset.with_random", need = "expression form rand(seed) usable inside select/with_columns", wave = "W2" }
+randn = { status = "param", batcher = "Dataset.with_random", need = "expression form randn(seed) (normal=True) usable inside select/with_columns", wave = "W2" }
+rint = { status = "canonical", batcher = "Expr.rint" }
+round = { status = "canonical", batcher = "Expr.round" }
+sec = { status = "canonical", batcher = "Expr.sec" }
+shiftleft = { status = "canonical", batcher = "op:lshift" }
+shiftright = { status = "canonical", batcher = "op:rshift" }
+shiftrightunsigned = { status = "gap", need = "unsigned (logical) right shift", wave = "W3" }
+sign = { status = "canonical", batcher = "Expr.sign" }
+signum = { status = "canonical", batcher = "Expr.sign" }
+sin = { status = "canonical", batcher = "Expr.sin" }
+sinh = { status = "canonical", batcher = "Expr.sinh" }
+sqrt = { status = "canonical", batcher = "Expr.sqrt" }
+tan = { status = "canonical", batcher = "Expr.tan" }
+tanh = { status = "canonical", batcher = "Expr.tanh" }
+try_add = { status = "gap", need = "addition returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+try_divide = { status = "canonical", batcher = "Expr.safe_divide" }
+try_mod = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (try_mod)", wave = "W1" }
+try_multiply = { status = "gap", need = "multiplication returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+try_subtract = { status = "gap", need = "subtraction returning null on overflow (Batcher integer arithmetic wraps)", wave = "W3" }
+uniform = { status = "gap", need = "uniform random value in [min, max) with seed", wave = "W3" }
+width_bucket = { status = "canonical", batcher = "bt.width_bucket" }

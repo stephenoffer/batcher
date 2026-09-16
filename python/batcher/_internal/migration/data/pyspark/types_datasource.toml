@@ -1,0 +1,64 @@
+# PySpark 4.2.0 -> Batcher migration registry: types and the Python DataSource API.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[types]
+ArrayType = { status = "param", batcher = "Expr.cast", need = "nested list type names in cast and schema (array<int> / list<int64>)", wave = "W11" }
+BinaryType = { status = "canonical", batcher = "Expr.cast" }
+BooleanType = { status = "canonical", batcher = "Expr.cast" }
+ByteType = { status = "canonical", batcher = "Expr.cast" }
+CalendarIntervalType = { status = "gap", need = "calendar interval type", wave = "W6" }
+CharType = { status = "param", batcher = "Expr.cast", need = "char(n) with fixed length and padding semantics", wave = "W11" }
+DataType = { status = "param", batcher = "Expr.cast", need = "DataType objects with fromDDL/simpleString/json round-trips", wave = "W11" }
+DateType = { status = "canonical", batcher = "Expr.cast" }
+DayTimeIntervalType = { status = "gap", need = "day-time interval type", wave = "W6" }
+DecimalType = { status = "canonical", batcher = "Expr.cast" }
+DoubleType = { status = "canonical", batcher = "Expr.cast" }
+FloatType = { status = "canonical", batcher = "Expr.cast" }
+Geography = { status = "gap", need = "geography value type", wave = "W14" }
+GeographyType = { status = "gap", need = "geography logical type with SRID", wave = "W14" }
+Geometry = { status = "param", batcher = "bt.st_geom_from_wkb", need = "a logical Geometry value type (Batcher geometries are WKB binary)", wave = "W14" }
+GeometryType = { status = "param", batcher = "bt.st_geom_from_wkb", need = "a logical Geometry column type with SRID (Batcher geometries are WKB binary)", wave = "W14" }
+IntegerType = { status = "canonical", batcher = "Expr.cast" }
+LongType = { status = "canonical", batcher = "Expr.cast" }
+MapType = { status = "param", batcher = "Expr.cast", need = "map type names in cast and schema (map<string,int>)", wave = "W11" }
+NullType = { status = "param", batcher = "Expr.cast", need = "cast to the null type (Batcher raises 'Casting from Int64 to Null not supported')", wave = "W11" }
+Row = { status = "mismatch", batcher = "Dataset.to_pylist", note = "Spark results are Row objects with attribute access; Batcher rows are dicts (to_pylist) or tuples (iter_rows)", wave = "W0" }
+ShortType = { status = "canonical", batcher = "Expr.cast" }
+StringType = { status = "canonical", batcher = "Expr.cast" }
+StructField = { status = "param", batcher = "Expr.cast", need = "Spark StructField objects and their DDL spelling as cast/schema targets", wave = "W11" }
+StructType = { status = "param", batcher = "Expr.cast", need = "Spark StructType objects and their DDL spelling as cast/schema targets (struct<...> and 'a INT, b STRING' schemas)", wave = "W11" }
+TimeType = { status = "gap", need = "TIME type", wave = "W6" }
+TimestampNTZType = { status = "canonical", batcher = "Expr.cast" }
+TimestampType = { status = "mismatch", batcher = "Expr.cast", note = "Spark TimestampType is an instant rendered in the session time zone (LTZ); Batcher timestamps are naive and read as UTC", wave = "W6" }
+VarcharType = { status = "param", batcher = "Expr.cast", need = "varchar(n) length enforcement", wave = "W11" }
+VariantType = { status = "gap", need = "VARIANT semi-structured type", wave = "W7" }
+VariantVal = { status = "gap", need = "VARIANT value object", wave = "W7" }
+YearMonthIntervalType = { status = "gap", need = "year-month interval type", wave = "W6" }
+
+[datasource]
+DataSource = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSource class protocol (name/schema/reader/writer) registered by short name", wave = "W11" }
+DataSourceArrowWriter = { status = "param", batcher = "batcher.io.Sink", need = "Arrow-batch writer protocol with per-task commit messages and abort()", wave = "W11" }
+DataSourceReader = { status = "param", batcher = "batcher.io.Source", need = "partitions()/read(partition) protocol with pushFilters", wave = "W11" }
+DataSourceRegistration = { status = "param", batcher = "batcher.io.SOURCES", need = "register(DataSource class) on the session", wave = "W11" }
+DataSourceStreamArrowWriter = { status = "param", batcher = "batcher.io.Sink", need = "streaming Arrow writer with per-micro-batch commit/abort", wave = "W10" }
+DataSourceStreamReader = { status = "param", batcher = "batcher.io.Source", need = "streaming offsets protocol: initialOffset/latestOffset/partitions/commit", wave = "W10" }
+DataSourceStreamWriter = { status = "param", batcher = "batcher.io.Sink", need = "streaming writer with per-micro-batch commit/abort", wave = "W10" }
+DataSourceWriter = { status = "param", batcher = "batcher.io.Sink", need = "writer protocol with per-task commit messages and abort()", wave = "W11" }
+EqualNullSafe = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+EqualTo = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+Filter = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+GreaterThan = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+GreaterThanOrEqual = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+In = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+InputPartition = { status = "canonical", batcher = "batcher.io.Split" }
+IsNotNull = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+IsNull = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+LessThan = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+LessThanOrEqual = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+Not = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+SimpleDataSourceStreamReader = { status = "param", batcher = "batcher.io.Source", need = "simple streaming reader: read(start) returning rows and the next offset", wave = "W10" }
+StringContains = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+StringEndsWith = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+StringStartsWith = { status = "param", batcher = "batcher.io.Source", need = "Spark DataSourceReader.pushFilters protocol and its filter classes (Batcher sources take pushdown through the plan, not filter objects)", wave = "W11" }
+WriterCommitMessage = { status = "param", batcher = "batcher.io.WriteManifest", need = "per-task commit message returned by a writer and passed to commit()", wave = "W11" }

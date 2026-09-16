@@ -1,0 +1,26 @@
+# Ray Data 2.58 `GroupedData` and `DataIterator` methods and their Batcher spelling.
+
+[GroupedData]
+aggregate = { status = "mismatch", batcher = "GroupBy.agg", note = "Ray aggregate(*AggregateFn) names outputs 'sum(x)'/'count()' and its Count counts nulls by default; Batcher agg takes AggExpr with alias names and col(x).count() skips nulls.", wave = "W0" }
+count = { status = "mismatch", batcher = "GroupBy.len", note = "Ray count() adds one 'count()' column of rows per group; Batcher GroupBy.count counts non-null values per column. Codemod: group_by(k).len(name='count()').", wave = "W0" }
+map_groups = { status = "mismatch", batcher = "GroupBy.map_groups", note = "Ray map_groups hands fn batch_format='default' ({col: ndarray}); Batcher passes a pyarrow RecordBatch. Also missing: batch_format=, fn_args/fn_kwargs/fn_constructor_args/fn_constructor_kwargs, compute, concurrency, num_cpus, num_gpus, memory, ray_remote_args.", wave = "WF" }
+max = { status = "mismatch", batcher = "GroupBy.max", note = "Ray names the output column 'max(x)' and accepts on=list or None (every column) plus ignore_nulls=False; Batcher names it after the input column. Codemod: agg(**{'max(x)': col('x').max()}).", wave = "W0" }
+mean = { status = "mismatch", batcher = "GroupBy.mean", note = "Ray names the output column 'mean(x)' and accepts on=list or None (every column) plus ignore_nulls=False; Batcher names it after the input column. Codemod: agg(**{'mean(x)': col('x').mean()}).", wave = "W0" }
+min = { status = "mismatch", batcher = "GroupBy.min", note = "Ray names the output column 'min(x)' and accepts on=list or None (every column) plus ignore_nulls=False; Batcher names it after the input column. Codemod: agg(**{'min(x)': col('x').min()}).", wave = "W0" }
+std = { status = "mismatch", batcher = "GroupBy.std", note = "Ray names the output 'std(x)', takes ddof= and on=list/None, and returns NaN for a group with one non-null value; Batcher names it 'x' (sample std, ddof=1 fixed) and returns null there.", wave = "W0" }
+sum = { status = "mismatch", batcher = "GroupBy.sum", note = "Ray names the output column 'sum(x)' and accepts on=list or None (every column) plus ignore_nulls=False; Batcher names it after the input column. Codemod: agg(**{'sum(x)': col('x').sum()}).", wave = "W0" }
+with_column = { status = "mismatch", batcher = ["Dataset.with_columns", "AggExpr.over"], note = "Ray grouped with_column(name, expr) evaluates expr within each group and keeps every row; Batcher spells it on the Dataset as a window: with_columns(name=agg.over(partition_by=keys)).", wave = "W5" }
+
+[DataIterator]
+get_context = { status = "mismatch", batcher = "bt.active_config", note = "Ray returns the DataContext of the iterated dataset; Batcher configuration is process/context scoped (active_config).", wave = "W9" }
+iter_batches = { status = "mismatch", batcher = ["Dataset.iter_batches", "Dataset.ml.to_numpy_batches"], note = "Ray yields batch_format='default' ({col: ndarray}) batches of 256 rows; Batcher iter_batches yields pyarrow RecordBatches and has no batch_format, drop_last, local_shuffle_buffer_size/seed or prefetch_batches. Codemod today: ds.ml.to_numpy_batches(batch_size=256).", wave = "W2" }
+iter_jax_batches = { status = "gap", need = "streaming iterator of JAX array batches", wave = "W8" }
+iter_rows = { status = "mismatch", batcher = "Dataset.iter_rows", note = "Ray yields dict rows; Batcher yields tuples unless named=True.", wave = "W0" }
+iter_tf_batches = { status = "mismatch", batcher = "Dataset.ml.to_tf", note = "Ray yields TensorFlow tensor batches of 256 rows; Batcher ds.ml.to_tf returns a tf.data.Dataset. Pass batch_size=256.", wave = "W8" }
+iter_torch_batches = { status = "mismatch", batcher = "Dataset.ml.iter_torch_batches", note = "Ray defaults batch_size=256 and prefetch_batches=1; Batcher defaults batch_size=None (engine morsel size) and prefetch_batches=2.", wave = "W0" }
+materialize = { status = "mismatch", batcher = "Dataset.cache", note = "Ray materializes the iterator's remaining data into the object store now; Batcher cache() is lazy and fills on the first terminal op.", wave = "W0" }
+schema = { status = "mismatch", batcher = "Dataset.schema", note = "Ray schema() is a method returning ray.data.Schema; Batcher schema is a property returning pyarrow.Schema.", wave = "W0" }
+state_dict = { status = "param", batcher = "Dataset.ml.stream_loader", need = "state_dict()/load_state_dict checkpoint of iterator position (stream_loader resumes only through global_consumed=)", wave = "W8" }
+stats = { status = "mismatch", batcher = "Dataset.stats", note = "Ray returns a timing string of the iteration; Batcher stats() executes and returns RunStats.", wave = "W0" }
+to_tf = { status = "mismatch", batcher = "Dataset.ml.to_tf", note = "Ray to_tf(feature_columns, label_columns) yields (features, labels) with batch_size=1 default; Batcher ds.ml.to_tf yields {column: tensor} dicts with no feature/label split.", wave = "W8" }
+to_torch = { status = "mismatch", batcher = "batcher.ml.to_torch_iterable", note = "Ray to_torch(label_column, feature_columns, ...) returns an IterableDataset of (features, label) with batch_size=1; Batcher to_torch_iterable wraps Arrow batches as {column: tensor} dicts with no label/feature split or dtype arguments.", wave = "W8" }

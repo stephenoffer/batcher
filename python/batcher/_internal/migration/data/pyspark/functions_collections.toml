@@ -1,0 +1,95 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, arrays, maps, structs and semi-structured.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+aggregate = { status = "gap", need = "higher-order function with a Python lambda over array elements (fold with initial value and finish)", wave = "W4" }
+array = { status = "canonical", batcher = "bt.array" }
+array_append = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_append)", wave = "W1" }
+array_compact = { status = "canonical", batcher = "Expr.list.drop_nulls" }
+array_contains = { status = "mismatch", batcher = "Expr.list.contains", note = "Spark returns null when the value is absent and the array holds a null; Expr.list.contains returns false. Spark also accepts a column-valued value", wave = "W0" }
+array_distinct = { status = "mismatch", batcher = "Expr.list.unique", note = "Spark keeps one null element; Expr.list.unique drops nulls", wave = "W0" }
+array_except = { status = "canonical", batcher = "Expr.list.difference" }
+array_insert = { status = "gap", need = "insert an element at a 1-based (negative from end) position", wave = "W3" }
+array_intersect = { status = "canonical", batcher = "Expr.list.intersect" }
+array_join = { status = "param", batcher = "Expr.list.join", need = "null_replacement= (nulls are skipped today, as in Spark's default)", wave = "W2" }
+array_max = { status = "canonical", batcher = "Expr.list.max" }
+array_min = { status = "canonical", batcher = "Expr.list.min" }
+array_position = { status = "mismatch", batcher = "Expr.list.position", note = "Spark returns 0 when the value is absent; Expr.list.position returns null", wave = "W0" }
+array_prepend = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_prepend)", wave = "W1" }
+array_remove = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_remove)", wave = "W1" }
+array_repeat = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (array_repeat)", wave = "W1" }
+array_size = { status = "canonical", batcher = "Expr.list.len" }
+array_sort = { status = "param", batcher = "Expr.list.sort", need = "comparator= lambda", wave = "W4" }
+array_union = { status = "canonical", batcher = "Expr.list.union" }
+arrays_overlap = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (arrays_overlap)", wave = "W1" }
+arrays_zip = { status = "gap", need = "zip arrays into an array of structs", wave = "W3" }
+cardinality = { status = "canonical", batcher = ["Expr.list.len", "Expr.map.len"] }
+create_map = { status = "gap", need = "map from alternating key/value expressions", wave = "W4" }
+element_at = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark element_at is 1-based with negative indexes counting from the end (and a key lookup on maps); Expr.list.get is 0-based. Codemod subtracts 1 for positive literals", wave = "W0" }
+exists = { status = "gap", need = "higher-order function with a Python lambda over array elements (any element matches)", wave = "W4" }
+explode = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing key/value columns", wave = "W8" }
+explode_outer = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing key/value columns", wave = "W8" }
+filter = { status = "param", batcher = "Expr.list.filter", need = "Python lambda form, including the (x, i) index form (bt.element() today)", wave = "W4" }
+flatten = { status = "mismatch", batcher = "Expr.list.flatten", note = "Spark returns null when any inner array is null; Expr.list.flatten skips the null inner array", wave = "W0" }
+forall = { status = "gap", need = "higher-order function with a Python lambda over array elements (every element matches)", wave = "W4" }
+from_csv = { status = "gap", need = "parse a CSV string column into a struct with a schema", wave = "W7" }
+from_json = { status = "gap", need = "parse a JSON string column into a typed struct/array/map with a schema", wave = "W7" }
+from_xml = { status = "gap", need = "parse an XML string column into a struct with a schema", wave = "W7" }
+get = { status = "mismatch", batcher = "Expr.list.get", note = "Spark get(arr, -1) returns null; Expr.list.get(-1) returns the last element", wave = "W0" }
+get_json_object = { status = "canonical", batcher = "Expr.json.extract_string" }
+inline = { status = "param", batcher = ["Dataset.explode", "Dataset.unnest"], need = "generator usable inside select that explodes an array of structs into columns", wave = "W8" }
+inline_outer = { status = "param", batcher = ["Dataset.explode", "Dataset.unnest"], need = "generator usable inside select that explodes an array of structs into columns, keeping empty rows", wave = "W8" }
+is_valid_variant = { status = "gap", need = "VARIANT validity check", wave = "W7" }
+is_variant_null = { status = "gap", need = "VARIANT null check", wave = "W7" }
+json_array_length = { status = "canonical", batcher = "Expr.json.array_length" }
+json_object_keys = { status = "canonical", batcher = "Expr.json.keys" }
+json_tuple = { status = "gap", need = "extract several top-level JSON fields as a generator", wave = "W7" }
+map_concat = { status = "gap", need = "union of maps with last-key-wins (dedup kernel)", wave = "W4" }
+map_contains_key = { status = "canonical", batcher = "Expr.map.contains" }
+map_entries = { status = "canonical", batcher = "Expr.map.entries" }
+map_filter = { status = "gap", need = "higher-order function with a Python lambda over map entries (filter)", wave = "W4" }
+map_from_arrays = { status = "canonical", batcher = "bt.map_from_arrays" }
+map_from_entries = { status = "gap", need = "map from an array of key/value structs", wave = "W4" }
+map_keys = { status = "canonical", batcher = "Expr.map.keys" }
+map_values = { status = "canonical", batcher = "Expr.map.values" }
+map_zip_with = { status = "gap", need = "higher-order function with a Python lambda over two maps merged by key", wave = "W4" }
+named_struct = { status = "canonical", batcher = "bt.named_struct" }
+parse_json = { status = "gap", need = "parse a JSON string into VARIANT", wave = "W7" }
+posexplode = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing pos/key/value columns", wave = "W8" }
+posexplode_outer = { status = "param", batcher = "Dataset.explode", need = "generator usable inside select, and map input producing pos/key/value columns", wave = "W8" }
+reduce = { status = "gap", need = "higher-order function with a Python lambda over array elements (fold with initial value and finish)", wave = "W4" }
+schema_of_csv = { status = "gap", need = "infer a DDL schema from a CSV string", wave = "W7" }
+schema_of_json = { status = "gap", need = "infer a DDL schema from a JSON string", wave = "W7" }
+schema_of_variant = { status = "gap", need = "VARIANT schema inference", wave = "W7" }
+schema_of_variant_agg = { status = "gap", need = "VARIANT merged schema aggregate", wave = "W7" }
+schema_of_xml = { status = "gap", need = "infer a DDL schema from an XML string", wave = "W7" }
+sequence = { status = "param", batcher = "bt.sequence", need = "date and timestamp sequences with an interval step", wave = "W6" }
+shuffle = { status = "gap", need = "random permutation of an array with seed", wave = "W3" }
+size = { status = "canonical", batcher = ["Expr.list.len", "Expr.map.len"] }
+slice = { status = "mismatch", batcher = "Expr.list.slice", note = "Spark slice is 1-based with negative starts counting from the end; Expr.list.slice is 0-based. Codemod subtracts 1 for positive literal starts", wave = "W0" }
+sort_array = { status = "mismatch", batcher = "Expr.list.sort", note = "Spark sort_array ascending puts nulls first (descending puts them last); Expr.list.sort puts nulls last. Needs nulls_first= and descending=", wave = "W0" }
+stack = { status = "gap", need = "stack(n, ...) generator separating columns into rows", wave = "W8" }
+str_to_map = { status = "gap", need = "split a delimited string into a map", wave = "W4" }
+struct = { status = "param", batcher = "bt.struct", need = "positional columns named after their source columns (Batcher takes name=expr keywords)", wave = "W2" }
+to_csv = { status = "gap", need = "render a struct as a CSV string", wave = "W7" }
+to_json = { status = "gap", need = "render a struct/array/map as a JSON string", wave = "W7" }
+to_variant_object = { status = "gap", need = "convert nested values to VARIANT objects", wave = "W7" }
+to_xml = { status = "gap", need = "render a struct as an XML string", wave = "W7" }
+transform = { status = "param", batcher = "Expr.list.transform", need = "Python lambda form, including the (x, i) index form (bt.element() today)", wave = "W4" }
+transform_keys = { status = "gap", need = "higher-order function with a Python lambda over map keys", wave = "W4" }
+transform_values = { status = "gap", need = "higher-order function with a Python lambda over map values", wave = "W4" }
+try_element_at = { status = "mismatch", batcher = ["Expr.list.get", "Expr.map.get"], note = "Spark try_element_at is 1-based with negative indexes counting from the end; Expr.list.get is 0-based", wave = "W0" }
+try_parse_json = { status = "gap", need = "parse a JSON string into VARIANT, null on error", wave = "W7" }
+try_variant_get = { status = "gap", need = "VARIANT path extraction with cast, null on error", wave = "W7" }
+variant_get = { status = "gap", need = "VARIANT path extraction with cast", wave = "W7" }
+xpath = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_boolean = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_double = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_float = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_int = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_long = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_number = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_short = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+xpath_string = { status = "gap", need = "XPath over an XML string", wave = "W7" }
+zip_with = { status = "gap", need = "higher-order function with a Python lambda over two arrays element-wise", wave = "W4" }

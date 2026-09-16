@@ -1,0 +1,51 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+[GroupBy]
+agg = { status = "canonical", batcher = "GroupBy.agg" }
+all = { status = "canonical", batcher = "GroupBy.array_agg" }
+count = { status = "mismatch", batcher = "GroupBy.count", note = "Polars counts rows per group (a 'count' column); Batcher counts non-null values of each column. GroupBy.len is the row count", wave = "W0" }
+first = { status = "param", batcher = "GroupBy.first", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+having = { status = "gap", need = "GroupBy.having (filter groups by an aggregate predicate)", wave = "W8" }
+head = { status = "param", batcher = "GroupBy.head", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+last = { status = "param", batcher = "GroupBy.last", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+len = { status = "canonical", batcher = "GroupBy.len" }
+map_groups = { status = "mismatch", batcher = "GroupBy.map_groups", note = "Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches", wave = "W0" }
+max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars ignores NaN in max; Batcher orders NaN above every number and returns NaN. Param: nan_policy='ignore'", wave = "W0" }
+mean = { status = "canonical", batcher = "GroupBy.mean" }
+median = { status = "canonical", batcher = "GroupBy.median" }
+min = { status = "canonical", batcher = "GroupBy.min" }
+n_unique = { status = "mismatch", batcher = "GroupBy.n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+quantile = { status = "mismatch", batcher = "GroupBy.quantile", note = "Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=", wave = "W0" }
+sum = { status = "mismatch", batcher = "GroupBy.sum", note = "Polars sums an all-null group to 0; Batcher returns null. Param: empty_value=0", wave = "W0" }
+tail = { status = "param", batcher = "GroupBy.tail", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+
+[LazyGroupBy]
+agg = { status = "canonical", batcher = "GroupBy.agg" }
+all = { status = "canonical", batcher = "GroupBy.array_agg" }
+count = { status = "mismatch", batcher = "GroupBy.count", note = "Polars counts rows per group (a 'count' column); Batcher counts non-null values of each column. GroupBy.len is the row count", wave = "W0" }
+first = { status = "param", batcher = "GroupBy.first", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+having = { status = "gap", need = "GroupBy.having (filter groups by an aggregate predicate)", wave = "W8" }
+head = { status = "param", batcher = "GroupBy.head", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+last = { status = "param", batcher = "GroupBy.last", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+len = { status = "canonical", batcher = "GroupBy.len" }
+map_groups = { status = "mismatch", batcher = "GroupBy.map_groups", note = "Polars passes each group to fn as a DataFrame; Batcher passes pyarrow RecordBatches", wave = "W0" }
+max = { status = "mismatch", batcher = "GroupBy.max", note = "Polars ignores NaN in max; Batcher orders NaN above every number and returns NaN. Param: nan_policy='ignore'", wave = "W0" }
+mean = { status = "canonical", batcher = "GroupBy.mean" }
+median = { status = "canonical", batcher = "GroupBy.median" }
+min = { status = "canonical", batcher = "GroupBy.min" }
+n_unique = { status = "mismatch", batcher = "GroupBy.n_unique", note = "Polars counts null as a distinct value; Batcher skips nulls. Param: count_nulls=True", wave = "W0" }
+quantile = { status = "mismatch", batcher = "GroupBy.quantile", note = "Polars defaults to interpolation='nearest'; Batcher interpolates linearly. Param: interpolation=", wave = "W0" }
+sum = { status = "mismatch", batcher = "GroupBy.sum", note = "Polars sums an all-null group to 0; Batcher returns null. Param: empty_value=0", wave = "W0" }
+tail = { status = "param", batcher = "GroupBy.tail", need = "order_by optional (Polars takes the implicit row order)", wave = "W2" }
+
+[DynamicGroupBy]
+agg = { status = "gap", need = "DynamicGroupBy.agg (group_by_dynamic windows)", wave = "W5" }
+having = { status = "gap", need = "DynamicGroupBy.having", wave = "W5" }
+map_groups = { status = "gap", need = "DynamicGroupBy.map_groups", wave = "W5" }
+
+[RollingGroupBy]
+agg = { status = "gap", need = "RollingGroupBy.agg (frame rolling windows)", wave = "W5" }
+having = { status = "gap", need = "RollingGroupBy.having", wave = "W5" }
+map_groups = { status = "gap", need = "RollingGroupBy.map_groups", wave = "W5" }

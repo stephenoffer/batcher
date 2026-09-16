@@ -1,0 +1,71 @@
+# PySpark 4.2.0 -> Batcher migration registry: pyspark.sql.functions, conditionals, sorting, UDFs, session and geospatial.
+# One row per name in tools/parity/surfaces/pyspark.json; see batcher/_internal/migration/schema.py
+# for the statuses. Seeded from the plan's Appendix A census and re-verified against the live surface.
+
+[functions]
+AnalyzeArgument = { status = "gap", need = "Python UDTF protocol: analyze() argument descriptor", wave = "W11" }
+AnalyzeResult = { status = "gap", need = "Python UDTF protocol: analyze() result with schema, partitioning and ordering", wave = "W11" }
+ArrowUDFType = { status = "gap", need = "Arrow UDF eval types (scalar, scalar-iterator, grouped-agg) as expressions", wave = "W11" }
+OrderingColumn = { status = "gap", need = "Python UDTF protocol: analyze() ordering column", wave = "W11" }
+PandasUDFType = { status = "gap", need = "pandas UDF eval types (scalar, scalar-iterator, grouped-map, grouped-agg) as expressions", wave = "W11" }
+PartitioningColumn = { status = "gap", need = "Python UDTF protocol: analyze() partitioning column", wave = "W11" }
+SelectedColumn = { status = "gap", need = "Python UDTF protocol: analyze() selected column", wave = "W11" }
+SkipRestOfInputTableException = { status = "gap", need = "Python UDTF protocol: skip the rest of the input table", wave = "W11" }
+UserDefinedFunction = { status = "param", batcher = "bt.udf", need = "a UDF object applied to columns as an Expr, with returnType= and asNondeterministic()", wave = "W11" }
+UserDefinedTableFunction = { status = "gap", need = "Python UDTF protocol: UDTF object callable from the DataFrame API", wave = "W11" }
+arrow_udf = { status = "param", batcher = "Dataset.map_batches", need = "Arrow UDF usable as a column expression (column in, column out) with returnType=", wave = "W11" }
+arrow_udtf = { status = "gap", need = "Python UDTF protocol: Arrow-batched UDTF", wave = "W11" }
+asc = { status = "mismatch", batcher = "Dataset.sort", note = "Spark asc(col) sorts nulls first; Batcher ascending sorts nulls last. Codemod passes nulls_first=True", wave = "W0" }
+asc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
+asc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
+assert_true = { status = "gap", need = "raise when a condition is false", wave = "W3" }
+broadcast = { status = "out_of_scope", reason = "no join-hint IR; Kyber picks the build side from measured cardinalities (revisit)" }
+bucket = { status = "mismatch", batcher = "Expr.hash_bucket", note = "Spark bucket is the Iceberg partition transform (Murmur3 hash mod N, null stays null); Expr.hash_bucket uses a different hash and maps null to a bucket", wave = "W0" }
+call_function = { status = "gap", need = "Python constructor over the existing Spark-dialect SQL kernel (call_function by name)", wave = "W1" }
+call_udf = { status = "gap", need = "call a registered UDF by name from the DataFrame API", wave = "W11" }
+coalesce = { status = "canonical", batcher = "bt.coalesce" }
+col = { status = "canonical", batcher = "bt.col" }
+column = { status = "canonical", batcher = "bt.col" }
+current_catalog = { status = "gap", need = "current catalog name", wave = "W9" }
+current_database = { status = "gap", need = "current database name", wave = "W9" }
+current_path = { status = "gap", need = "current SQL path", wave = "W9" }
+current_schema = { status = "gap", need = "current schema name", wave = "W9" }
+current_user = { status = "gap", need = "current user name", wave = "W9" }
+desc = { status = "canonical", batcher = "Dataset.sort" }
+desc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
+desc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
+equal_null = { status = "canonical", batcher = "Expr.eq_missing" }
+expr = { status = "gap", need = "parse a SQL expression string into an Expr (bt.expr)", wave = "W1" }
+ifnull = { status = "canonical", batcher = "Expr.fill_null" }
+input_file_block_length = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
+input_file_block_start = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
+input_file_name = { status = "gap", need = "input-file metadata column", wave = "W8" }
+isnan = { status = "mismatch", batcher = "Expr.is_nan", note = "Spark isnan(null) is false; Expr.is_nan(null) is null", wave = "W0" }
+isnotnull = { status = "canonical", batcher = "Expr.is_not_null" }
+isnull = { status = "canonical", batcher = "Expr.is_null" }
+java_method = { status = "out_of_scope", reason = "JVM reflection; no JVM" }
+lit = { status = "canonical", batcher = "bt.lit" }
+monotonically_increasing_id = { status = "canonical", batcher = "Dataset.with_row_index" }
+nullif = { status = "canonical", batcher = "bt.nullif" }
+nullifzero = { status = "canonical", batcher = "bt.nullif" }
+nvl = { status = "canonical", batcher = "Expr.fill_null" }
+nvl2 = { status = "canonical", batcher = ["bt.when", "CaseBuilder.then", "CaseBuilder.otherwise", "Expr.is_not_null"] }
+pandas_udf = { status = "param", batcher = "Dataset.map_batches", need = "pandas UDF usable as a column expression (Series in, Series out) with returnType=", wave = "W11" }
+raise_error = { status = "gap", need = "raise an error with a message from an expression", wave = "W3" }
+reflect = { status = "out_of_scope", reason = "JVM reflection; no JVM" }
+session_user = { status = "gap", need = "current session user name", wave = "W9" }
+spark_partition_id = { status = "out_of_scope", reason = "Spark task partition id; Batcher partitions are an engine-internal detail" }
+st_asbinary = { status = "param", batcher = "bt.st_as_binary", need = "endianness= and GEOMETRY/GEOGRAPHY logical input types", wave = "W14" }
+st_geogfromwkb = { status = "gap", need = "GEOGRAPHY constructor from WKB", wave = "W14" }
+st_geomfromwkb = { status = "param", batcher = "bt.st_geom_from_wkb", need = "srid= argument", wave = "W14" }
+st_setsrid = { status = "canonical", batcher = "bt.st_set_srid" }
+st_srid = { status = "canonical", batcher = "bt.st_srid" }
+try_reflect = { status = "out_of_scope", reason = "JVM reflection; no JVM" }
+typeof = { status = "gap", need = "DDL type name of an expression's type", wave = "W11" }
+udf = { status = "mismatch", batcher = "bt.udf", note = "Spark udf(f, returnType) returns a function applied to columns that yields a Column; bt.udf wraps a batch function applied to a whole Dataset (fn(ds))", wave = "W0" }
+udtf = { status = "gap", need = "Python UDTF protocol: @udtf class decorator with eval/terminate", wave = "W11" }
+unwrap_udt = { status = "out_of_scope", reason = "JVM user-defined types; no JVM" }
+user = { status = "gap", need = "current user name", wave = "W9" }
+version = { status = "mismatch", batcher = "bt.engine_version", note = "Spark version() is a column expression; bt.engine_version() returns a Python str", wave = "W1" }
+when = { status = "param", batcher = ["bt.when", "CaseBuilder.then"], need = "when(condition, value) in one call, and a chain without otherwise() returning null", wave = "WF" }
+zeroifnull = { status = "canonical", batcher = "Expr.fill_null" }

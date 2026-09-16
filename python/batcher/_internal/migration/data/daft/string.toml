@@ -1,0 +1,127 @@
+# Daft 0.7.25 -> Batcher: String functions, on Expression and daft.functions.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[Expression]
+ascii = { status = "canonical", batcher = "Expr.str.ascii" }
+capitalize = { status = "canonical", batcher = "Expr.str.capitalize" }
+compress = { status = "canonical", batcher = "Expr.str.compress" }
+concat = { status = "mismatch", batcher = "bt.concat_str", note = "Daft concat(a, b) is null if either side is null; Batcher concat_str skips nulls ('z' vs null). Param: ignore_nulls=False", wave = "W0" }
+contains = { status = "param", batcher = "Expr.str.contains", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+count_matches = { status = "mismatch", batcher = "Expr.str.count_matches", note = "Daft count_matches counts literal patterns (with whole_words= and case_sensitive=); Batcher count_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole_words=, case_sensitive=", wave = "W0" }
+damerau_levenshtein_distance = { status = "mismatch", batcher = "Expr.str.damerau_levenshtein", note = "Daft computes the restricted (optimal string alignment) distance; Batcher computes unrestricted Damerau-Levenshtein ('ca' vs 'abc' is 3 vs 2), and takes only a constant target. Param: restricted=True", wave = "W0" }
+decode = { status = "mismatch", batcher = "Expr.str.from_base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods", wave = "W3" }
+decompress = { status = "canonical", batcher = "Expr.str.decompress" }
+encode = { status = "mismatch", batcher = "Expr.str.base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods", wave = "W3" }
+endswith = { status = "param", batcher = "Expr.str.ends_with", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+find = { status = "mismatch", batcher = "Expr.str.position", note = "Daft find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Param: base=0 with -1 for missing", wave = "W0" }
+hamming_distance_str = { status = "param", batcher = "Expr.str.hamming", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+ilike = { status = "param", batcher = "Expr.str.ilike", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+jaro_similarity = { status = "param", batcher = "Expr.str.jaro_similarity", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+jaro_winkler_similarity = { status = "param", batcher = "Expr.str.jaro_winkler_similarity", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+left = { status = "param", batcher = "Expr.str.left", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+length = { status = "canonical", batcher = ["Expr.str.len_chars", "Expr.list.len"] }
+length_bytes = { status = "canonical", batcher = "Expr.str.octet_length" }
+levenshtein_distance = { status = "param", batcher = "Expr.str.levenshtein", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (Batcher compares against a constant string only)", wave = "W2" }
+like = { status = "param", batcher = "Expr.str.like", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+lower = { status = "canonical", batcher = "Expr.str.lower" }
+lpad = { status = "param", batcher = "Expr.str.lpad", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+lstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Daft lstrip removes all leading whitespace; Batcher removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+normalize = { status = "gap", need = "normalize(remove_punct=, lowercase=, nfd_unicode=, white_space=) (Batcher has only the fixed squad_normalize and normalize_whitespace)", wave = "W3" }
+parse_url = { status = "gap", need = "URL parsing into a {scheme, username, password, host, port, path, query, fragment} struct", wave = "W3" }
+regexp = { status = "param", batcher = "Expr.str.regexp_matches", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+regexp_count = { status = "param", batcher = "Expr.str.count_matches", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+regexp_extract = { status = "mismatch", batcher = "Expr.str.extract", note = "Daft index defaults to 0 (whole match) and a non-matching row is null; Batcher str.extract defaults to group 1 and returns '' on no match. Param: group=0, null on no match", wave = "W0" }
+regexp_extract_all = { status = "param", batcher = "Expr.str.extract_all", need = "index= capture group (Batcher returns whole matches only)", wave = "W2" }
+regexp_replace = { status = "mismatch", batcher = "Expr.str.replace_all", note = "Daft replacement strings use $1/${1} backreferences; Batcher replace_all only honours \\1, so '$1' is inserted literally. Param: $-style backreferences", wave = "W0" }
+regexp_split = { status = "param", batcher = "Expr.str.regexp_split", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+repeat = { status = "param", batcher = "Expr.str.repeat", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+replace = { status = "mismatch", batcher = "Expr.str.replace", note = "Expr.replace remaps values through a dict; Daft replace(search, replacement) is literal substring replacement, which is Expr.str.replace", wave = "W0" }
+reverse = { status = "canonical", batcher = "Expr.str.reverse" }
+right = { status = "param", batcher = "Expr.str.right", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+rpad = { status = "param", batcher = "Expr.str.rpad", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+rstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_end", note = "Daft rstrip removes all trailing whitespace (e.g. a tab); Batcher removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+soundex = { status = "canonical", batcher = "Expr.str.soundex" }
+split = { status = "param", batcher = "Expr.str.split", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+split_part = { status = "param", batcher = "Expr.str.split_part", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+startswith = { status = "param", batcher = "Expr.str.starts_with", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+strip = { status = "mismatch", batcher = "Expr.str.trim", note = "Daft strip removes all whitespace (tabs, newlines); Batcher trim() removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+substr = { status = "param", batcher = "Expr.str.slice", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr", wave = "W2" }
+substring_index = { status = "param", batcher = "Expr.str.substring_index", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+to_camel_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_kebab_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_snake_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_title_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_camel_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_kebab_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_snake_case = { status = "canonical", batcher = "Expr.str.to_case" }
+translate = { status = "param", batcher = "Expr.str.translate", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+try_compress = { status = "canonical", batcher = "Expr.str.compress" }
+try_decode = { status = "mismatch", batcher = "Expr.str.from_base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods; the try_ form nulls on failure", wave = "W3" }
+try_decompress = { status = "canonical", batcher = "Expr.str.decompress" }
+try_encode = { status = "mismatch", batcher = "Expr.str.base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods; the try_ form nulls on failure", wave = "W3" }
+upper = { status = "canonical", batcher = "Expr.str.upper" }
+
+[functions]
+ascii_func = { status = "canonical", batcher = "Expr.str.ascii" }
+capitalize = { status = "canonical", batcher = "Expr.str.capitalize" }
+chr_func = { status = "canonical", batcher = "Expr.chr" }
+compress = { status = "canonical", batcher = "Expr.str.compress" }
+concat = { status = "mismatch", batcher = "bt.concat_str", note = "bt.concat concatenates datasets; the string form is concat_str, and Daft concat(a, b) is null if either side is null where concat_str skips nulls. Param: ignore_nulls=False", wave = "W0" }
+concat_ws = { status = "canonical", batcher = "bt.concat_ws" }
+contains = { status = "mismatch", batcher = "Expr.str.contains", note = "bt.contains is a column-name selector, not a string predicate; Daft contains(expr, substr) tests values. Rewrite: col.str.contains(substr)", wave = "W0" }
+count_matches = { status = "mismatch", batcher = "Expr.str.count_matches", note = "Daft count_matches counts literal patterns (with whole_words= and case_sensitive=); Batcher count_matches counts regex matches ('.' on 'a.b.c' is 2 vs 5). Param: literal=True, whole_words=, case_sensitive=", wave = "W0" }
+damerau_levenshtein_distance = { status = "mismatch", batcher = "Expr.str.damerau_levenshtein", note = "Daft computes the restricted (optimal string alignment) distance; Batcher computes unrestricted Damerau-Levenshtein ('ca' vs 'abc' is 3 vs 2), and takes only a constant target. Param: restricted=True", wave = "W0" }
+decode = { status = "mismatch", batcher = "Expr.str.from_base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods", wave = "W3" }
+decompress = { status = "canonical", batcher = "Expr.str.decompress" }
+encode = { status = "mismatch", batcher = "Expr.str.base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods", wave = "W3" }
+endswith = { status = "param", batcher = "Expr.str.ends_with", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+find = { status = "mismatch", batcher = "Expr.str.position", note = "Daft find is 0-based and returns -1 when absent; Batcher position is 1-based and returns 0. Param: base=0 with -1 for missing", wave = "W0" }
+format = { status = "mismatch", batcher = "bt.format_string", note = "Daft format propagates a null argument to a null result; Batcher format_string renders null as empty. Param: ignore_nulls=False", wave = "W0" }
+guess_mime_type = { status = "canonical", batcher = "Expr.str.mime_type" }
+hamming_distance_str = { status = "param", batcher = "Expr.str.hamming", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+ilike = { status = "param", batcher = "Expr.str.ilike", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+jaro_similarity = { status = "param", batcher = "Expr.str.jaro_similarity", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+jaro_winkler_similarity = { status = "param", batcher = "Expr.str.jaro_winkler_similarity", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (constant target only)", wave = "W2" }
+left = { status = "param", batcher = "Expr.str.left", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+length = { status = "canonical", batcher = ["Expr.str.len_chars", "Expr.list.len"] }
+length_bytes = { status = "canonical", batcher = "Expr.str.octet_length" }
+levenshtein_distance = { status = "param", batcher = "Expr.str.levenshtein", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (Batcher compares against a constant string only)", wave = "W2" }
+like = { status = "param", batcher = "Expr.str.like", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+lower = { status = "canonical", batcher = "Expr.str.lower" }
+lpad = { status = "param", batcher = "Expr.str.lpad", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+lstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_start", note = "Daft lstrip removes all leading whitespace; Batcher removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+normalize = { status = "gap", need = "normalize(remove_punct=, lowercase=, nfd_unicode=, white_space=) (Batcher has only the fixed squad_normalize and normalize_whitespace)", wave = "W3" }
+parse_url = { status = "gap", need = "URL parsing into a {scheme, username, password, host, port, path, query, fragment} struct", wave = "W3" }
+regexp = { status = "param", batcher = "Expr.str.regexp_matches", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+regexp_count = { status = "param", batcher = "Expr.str.count_matches", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+regexp_extract = { status = "mismatch", batcher = "Expr.str.extract", note = "Daft index defaults to 0 (whole match) and a non-matching row is null; Batcher str.extract defaults to group 1 and returns '' on no match. Param: group=0, null on no match", wave = "W0" }
+regexp_extract_all = { status = "param", batcher = "Expr.str.extract_all", need = "index= capture group (Batcher returns whole matches only)", wave = "W2" }
+regexp_replace = { status = "mismatch", batcher = "Expr.str.replace_all", note = "Daft replacement strings use $1/${1} backreferences; Batcher replace_all only honours \\1, so '$1' is inserted literally. Param: $-style backreferences", wave = "W0" }
+regexp_split = { status = "param", batcher = "Expr.str.regexp_split", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+repeat = { status = "param", batcher = "Expr.str.repeat", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+replace = { status = "param", batcher = "Expr.str.replace", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+reverse = { status = "canonical", batcher = "Expr.str.reverse" }
+right = { status = "param", batcher = "Expr.str.right", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+rpad = { status = "param", batcher = "Expr.str.rpad", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+rstrip = { status = "mismatch", batcher = "Expr.str.strip_chars_end", note = "Daft rstrip removes all trailing whitespace (e.g. a tab); Batcher removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+soundex = { status = "canonical", batcher = "Expr.str.soundex" }
+space = { status = "gap", need = "space(n) with a column-valued n", wave = "W3" }
+split = { status = "param", batcher = "Expr.str.split", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+split_part = { status = "param", batcher = "Expr.str.split_part", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+startswith = { status = "param", batcher = "Expr.str.starts_with", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+strip = { status = "mismatch", batcher = "Expr.str.trim", note = "Daft strip removes all whitespace (tabs, newlines); Batcher trim() removes only the ASCII space by default. Param: chars=whitespace", wave = "W0" }
+substr = { status = "param", batcher = "Expr.str.slice", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression); Daft substr is 0-based like str.slice, not 1-based like str.substr", wave = "W2" }
+substring_index = { status = "param", batcher = "Expr.str.substring_index", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+to_camel_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_kebab_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_snake_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_title_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_camel_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_kebab_case = { status = "canonical", batcher = "Expr.str.to_case" }
+to_upper_snake_case = { status = "canonical", batcher = "Expr.str.to_case" }
+translate = { status = "param", batcher = "Expr.str.translate", need = "column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression)", wave = "W2" }
+try_compress = { status = "canonical", batcher = "Expr.str.compress" }
+try_decode = { status = "mismatch", batcher = "Expr.str.from_base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods; the try_ form nulls on failure", wave = "W3" }
+try_decompress = { status = "canonical", batcher = "Expr.str.decompress" }
+try_encode = { status = "mismatch", batcher = "Expr.str.base64", note = "Daft encode/decode switch charset ('utf-8', 'base64', 'hex', ...) and return binary; Batcher spells each codec separately (str.base64/from_base64, str.hex/unhex, cast('binary')) and returns strings. Param: a charset= codec on one pair of methods; the try_ form nulls on failure", wave = "W3" }
+upper = { status = "canonical", batcher = "Expr.str.upper" }

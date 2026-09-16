@@ -1,0 +1,39 @@
+# Ray Data 2.58 `ray.data.preprocessors` and `Preprocessor` methods, and their Batcher spelling.
+
+[preprocessors]
+Categorizer = { status = "gap", need = "convert columns to pandas CategoricalDtype with fitted categories", wave = "W11" }
+Chain = { status = "canonical", batcher = "batcher.ml.Chain" }
+Concatenator = { status = "mismatch", batcher = "batcher.ml.Concatenator", note = "Ray defaults output_column_name='concat_out', drops the input columns and emits an ndarray column (dtype=, flatten=, raise_if_missing=); Batcher defaults output_column='features', keeps the inputs (drop=False) and emits a list column. Codemod: output_column='concat_out', drop=True.", wave = "W0" }
+CountVectorizer = { status = "mismatch", batcher = "batcher.ml.CountVectorizer", note = "Ray tokenizes by splitting on single spaces without lowercasing (tokenization_fn=) over several columns and writes a count vector per column; Batcher follows scikit-learn (lowercase=True, token_pattern of 2+ word chars, vocabulary order) on one column into a 'features' output. Codemod: lowercase=False, token_pattern=r'[^ ]+'.", wave = "W0" }
+CustomKBinsDiscretizer = { status = "gap", need = "discretize by explicit per-column bin edges (bins=, right=, include_lowest=, duplicates=, dtypes=)", wave = "W11" }
+FeatureHasher = { status = "gap", need = "hash a set of numeric count columns into a fixed-size feature vector (num_features, output_column)", wave = "W11" }
+HashingVectorizer = { status = "mismatch", batcher = "batcher.ml.HashingVectorizer", note = "Ray emits raw hashed counts of space-split tokens using its own simple_hash over several columns; Batcher follows scikit-learn (lowercase=True, token_pattern of 2+ word chars, norm='l2') and hashes tokens with a different function, so bucket indices differ even with norm=None.", wave = "W0" }
+LabelEncoder = { status = "param", batcher = "batcher.ml.LabelEncoder", need = "output_column= (write the encoded label to a new column)", wave = "W2" }
+MaxAbsScaler = { status = "param", batcher = "batcher.ml.MaxAbsScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+MinMaxScaler = { status = "param", batcher = "batcher.ml.MinMaxScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+MultiHotEncoder = { status = "mismatch", batcher = "batcher.ml.MultiHotEncoder", note = "Ray replaces the list column with one multi-hot vector column (max_categories per column, several columns); Batcher keeps the input and appends one 0/1 column per category named '<col>_<value>'.", wave = "W0" }
+Normalizer = { status = "param", batcher = "batcher.ml.Normalizer", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+OneHotEncoder = { status = "mismatch", batcher = "batcher.ml.OneHotEncoder", note = "Ray replaces each column with one one-hot vector column; Batcher drops the input and appends one 0/1 column per category named '<col>_<value>'.", wave = "W0" }
+OrdinalEncoder = { status = "param", batcher = "batcher.ml.OrdinalEncoder", need = "encode_lists= (encode each element of a list column), output_columns=", wave = "W2" }
+PowerTransformer = { status = "mismatch", batcher = "batcher.ml.PowerTransformer", note = "Ray applies a fixed, user-given power (power=, method='yeo-johnson'|'box-cox') with no standardization; Batcher fits the Yeo-Johnson lambda per column and standardizes by default.", wave = "W0" }
+RobustScaler = { status = "mismatch", batcher = "batcher.ml.RobustScaler", note = "Ray takes quantile_range as fractions (0.25, 0.75) and estimates quantiles with an approximate sketch (quantile_precision=800); Batcher takes percentages (25.0, 75.0) and scales with exact interpolated quantiles, so the IQR and the output differ on small data.", wave = "W0" }
+SimpleImputer = { status = "param", batcher = "batcher.ml.SimpleImputer", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+StandardScaler = { status = "param", batcher = "batcher.ml.StandardScaler", need = "output_columns= (write results to new columns and keep the inputs)", wave = "W2" }
+Tokenizer = { status = "param", batcher = "batcher.ml.Tokenizer", need = "default tokenization_fn (Ray splits on single spaces when none is given; Batcher requires tokenizer=, e.g. lambda s: s.split(' ')), several columns, output_columns=", wave = "W2" }
+TorchVisionPreprocessor = { status = "gap", need = "apply a torchvision transform to image columns (batched=, output_columns=)", wave = "W12" }
+UniformKBinsDiscretizer = { status = "mismatch", batcher = "batcher.ml.KBinsDiscretizer", note = "Batcher KBinsDiscretizer defaults strategy='quantile'; pass strategy='uniform', n_bins=bins. Missing: per-column bins dict, right=, include_lowest=, duplicates=, dtypes=, output_columns=.", wave = "W2" }
+
+[Preprocessor]
+FitStatus = { status = "mismatch", batcher = "batcher.ml.Preprocessor", note = "Ray FitStatus enum (NOT_FITTABLE, NOT_FITTED, PARTIALLY_FITTED, FITTED); Batcher Preprocessor exposes a boolean is_fitted.", wave = "W11" }
+deserialize = { status = "mismatch", batcher = "batcher.ml.load", note = "Ray Preprocessor.deserialize(str) rebuilds from a string; Batcher batcher.ml.load reads a saved preprocessor from a path.", wave = "W11" }
+fit = { status = "canonical", batcher = "batcher.ml.Preprocessor" }
+fit_status = { status = "mismatch", batcher = "batcher.ml.Preprocessor", note = "Ray fit_status() returns a FitStatus enum; Batcher Preprocessor.is_fitted is a boolean.", wave = "W11" }
+fit_transform = { status = "canonical", batcher = "batcher.ml.Preprocessor" }
+get_input_columns = { status = "gap", need = "introspect the columns a preprocessor reads", wave = "W11" }
+get_output_columns = { status = "gap", need = "introspect the columns a preprocessor writes", wave = "W11" }
+has_stats = { status = "out_of_scope", reason = "Ray Preprocessor internals used by its fit planner and batch-format negotiation; Batcher preprocessors compile to Expr projections" }
+preferred_batch_format = { status = "out_of_scope", reason = "Ray Preprocessor internals used by its fit planner and batch-format negotiation; Batcher preprocessors compile to Expr projections" }
+serialize = { status = "mismatch", batcher = "batcher.ml.save", note = "Ray Preprocessor.serialize() returns a string; Batcher batcher.ml.save writes to a path.", wave = "W11" }
+stat_computation_plan = { status = "out_of_scope", reason = "Ray Preprocessor internals used by its fit planner and batch-format negotiation; Batcher preprocessors compile to Expr projections" }
+transform = { status = "canonical", batcher = "batcher.ml.Preprocessor" }
+transform_batch = { status = "gap", need = "apply a fitted preprocessor to one in-memory batch (pandas/numpy/pyarrow) outside a Dataset", wave = "W11" }

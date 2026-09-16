@@ -1,0 +1,102 @@
+# Daft 0.7.25 -> Batcher: DataType constructors, predicates and accessors.
+# Semantics checked by side-by-side runs where a mapping was in doubt; the row contract is in ../../schema.py.
+
+[DataType]
+binary = { status = "canonical", batcher = "Expr.cast" }
+bool = { status = "canonical", batcher = "Expr.cast" }
+date = { status = "canonical", batcher = "Expr.cast" }
+decimal128 = { status = "canonical", batcher = "Expr.cast" }
+dtype = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+duration = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for duration (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+embedding = { status = "gap", need = "embedding logical type", wave = "W12" }
+extension = { status = "gap", need = "extension types", wave = "W11" }
+fields = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+file = { status = "gap", need = "file logical type", wave = "W12" }
+fixed_size_binary = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for fixed_size_binary (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+fixed_size_list = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for fixed_size_list (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+float16 = { status = "canonical", batcher = "Expr.cast" }
+float32 = { status = "canonical", batcher = "Expr.cast" }
+float64 = { status = "canonical", batcher = "Expr.cast" }
+from_arrow_type = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers)", wave = "W11" }
+from_numpy_dtype = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers)", wave = "W11" }
+from_sql = { status = "gap", need = "parse a SQL/DDL type string into a type", wave = "W2" }
+image = { status = "gap", need = "image logical type", wave = "W12" }
+image_mode = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+infer_from_object = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers)", wave = "W11" }
+infer_from_type = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers)", wave = "W11" }
+int16 = { status = "canonical", batcher = "Expr.cast" }
+int32 = { status = "canonical", batcher = "Expr.cast" }
+int64 = { status = "canonical", batcher = "Expr.cast" }
+int8 = { status = "canonical", batcher = "Expr.cast" }
+interval = { status = "gap", need = "interval (month-day-nano) type", wave = "W6" }
+is_binary = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_boolean = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_date = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_decimal128 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_duration = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_embedding = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_extension = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_file = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_fixed_shape_image = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_fixed_shape_sparse_tensor = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_fixed_shape_tensor = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_fixed_size_binary = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_fixed_size_list = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_float16 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_float32 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_float64 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_image = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_int16 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_int32 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_int64 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_int8 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_integer = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_interval = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_list = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_logical = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_map = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_null = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_numeric = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_python = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_sparse_tensor = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_string = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_struct = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_temporal = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_tensor = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_time = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_timestamp = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_uint16 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_uint32 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_uint64 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_uint8 = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_union = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+is_uuid = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type predicates; today use pyarrow.types on Dataset.schema)", wave = "W11" }
+key_type = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+list = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for list (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+map = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for map (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+null = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for null (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+precision = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+python = { status = "out_of_scope", reason = "Python object dtype: per-row Python objects cannot cross the Arrow data plane" }
+scale = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+shape = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+size = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+sparse_tensor = { status = "gap", need = "sparse_tensor logical type", wave = "W12" }
+string = { status = "canonical", batcher = "Expr.cast" }
+struct = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for struct (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+tensor = { status = "gap", need = "tensor logical type", wave = "W12" }
+time = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for time (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+timestamp = { status = "param", batcher = "Expr.cast", need = "a type-string grammar for timestamp (Batcher's cast names only primitive and decimal types)", wave = "W2" }
+timeunit = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+timezone = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+to_arrow_dtype = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type conversion and inference helpers)", wave = "W11" }
+type_ids = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+uint16 = { status = "canonical", batcher = "Expr.cast" }
+uint32 = { status = "canonical", batcher = "Expr.cast" }
+uint64 = { status = "canonical", batcher = "Expr.cast" }
+uint8 = { status = "canonical", batcher = "Expr.cast" }
+union = { status = "gap", need = "union type", wave = "W11" }
+union_fields = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+union_mode = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+use_offset_indices = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }
+uuid = { status = "gap", need = "UUID logical type", wave = "W11" }
+value_type = { status = "gap", need = "a DataType object model; Batcher names types with Arrow type strings or pyarrow types (type parameter accessors)", wave = "W11" }

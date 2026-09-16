@@ -1,0 +1,145 @@
+# Batcher's own second spellings, and the one spelling each collapses to.
+#
+# One table per receiver (the dotted receiver spellings of tools/parity/batcher_targets.py);
+# each key is a spelling being removed and its value the spelling that stays. The choice
+# follows the parity plan's naming rule: the spelling shared by the most of Polars, Spark,
+# Daft, Ray Data and DuckDB, with a tie going to Polars.
+#
+# Three consumers read this: the `batcher.migrate` codemod rewrites the removed spelling to the
+# kept one in existing code, the migration-error guidance names the kept spelling when the
+# removed one is typed, and tests/unit/test_migration_renames.py checks that every second
+# spelling `tools/lint_aliases.py` finds has a decision here. Where the kept spelling is today
+# the delegate and the removed one holds the implementation (`acos` -> `arccos`), the
+# implementation moves under the kept name as part of the removal.
+
+[Dataset]
+append = "union"
+assign = "with_columns"
+astype = "cast"
+coalesce = "repartition"
+difference = "except_"
+drop_duplicates = "distinct"
+dropna = "drop_nulls"
+empty = "is_empty"
+fillna = "fill_null"
+groupby = "group_by"
+head = "limit"
+height = "count"
+merge = "join"
+nlargest = "top_k"
+nsmallest = "bottom_k"
+persist = "cache"
+sample_frac = "sample"
+to_dict = "to_pydict"
+to_dicts = "to_pylist"
+transform = "pipe"
+unique = "distinct"
+unpersist = "uncache"
+vstack = "union"
+with_row_count = "with_row_index"
+
+["Dataset.meta"]
+# `none_match` stays: it completes the `all_match`/`any_match` family a reader scans first.
+is_empty_where = "none_match"
+
+["Dataset.ml"]
+to_torch = "iter_torch_batches"
+
+[Expr]
+acos = "arccos"
+acosh = "arccosh"
+asin = "arcsin"
+asinh = "arcsinh"
+atan = "arctan"
+atanh = "arctanh"
+all = "bool_and"
+any = "bool_or"
+approx_n_unique = "approx_count_distinct"
+astype = "cast"
+clip_max = "clip"
+clip_min = "clip"
+cumcount = "cum_count"
+cummax = "cum_max"
+cummin = "cum_min"
+cumprod = "cum_prod"
+cumsum = "cum_sum"
+fillna = "fill_null"
+is_between = "between"
+isin = "is_in"
+isna = "is_null"
+isnull = "is_null"
+kurt = "kurtosis"
+log = "ln"
+n_unique = "count_distinct"
+notna = "is_not_null"
+notnull = "is_not_null"
+nunique = "count_distinct"
+prod = "product"
+rename = "alias"
+skewness = "skew"
+
+["Expr.dt"]
+day_name = "dayname"
+day_of_week = "dayofweek"
+day_of_year = "dayofyear"
+daysinmonth = "days_in_month"
+is_weekday = "is_business_day"
+isodow = "weekday"
+month_end = "last_day"
+month_name = "monthname"
+ordinal_day = "dayofyear"
+to_string = "strftime"
+week_of_year = "week"
+weekofyear = "week"
+
+["Expr.list"]
+argmax = "arg_max"
+argmin = "arg_min"
+dim = "len"
+lengths = "len"
+magnitude = "l2_norm"
+max_pool = "max"
+mean_pool = "mean"
+
+["Expr.str"]
+head = "left"
+initcap = "to_titlecase"
+isalnum = "is_alnum"
+isalpha = "is_alpha"
+isdigit = "is_numeric"
+isspace = "is_space"
+len = "len_chars"
+len_bytes = "octet_length"
+ljust = "rpad"
+lstrip = "strip_chars_start"
+pad_end = "rpad"
+pad_start = "lpad"
+regexp_escape = "escape_regex"
+regexp_extract = "extract"
+regexp_extract_all = "extract_all"
+regexp_replace_all = "replace_all"
+removeprefix = "strip_prefix"
+removesuffix = "strip_suffix"
+rjust = "lpad"
+rstrip = "strip_chars_end"
+strip = "trim"
+strip_chars = "trim"
+tail = "right"
+title = "to_titlecase"
+to_lowercase = "lower"
+to_uppercase = "upper"
+truncate_chars = "left"
+
+[GroupBy]
+size = "len"
+
+[StreamingQuery]
+awaitTermination = "await_termination"
+processAllAvailable = "process_all_available"
+
+[bt]
+atan2 = "arctan2"
+from_dict = "from_pydict"
+from_dicts = "from_pylist"
+max_horizontal = "greatest"
+min_horizontal = "least"

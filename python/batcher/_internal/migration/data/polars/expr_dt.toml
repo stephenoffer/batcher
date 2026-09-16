@@ -1,0 +1,52 @@
+# Polars 1.40.0 -> Batcher migration registry. Generated from a side-by-side census; see
+# python/batcher/_internal/migration/schema.py for the row contract.
+
+
+["Expr.dt"]
+add_business_days = { status = "gap", need = "Expr.dt.add_business_days", wave = "W6" }
+base_utc_offset = { status = "gap", need = "Expr.dt.base_utc_offset (a time-zone-aware Datetime type)", wave = "W6" }
+cast_time_unit = { status = "gap", need = "Expr.dt.cast_time_unit (ms/us/ns)", wave = "W6" }
+century = { status = "canonical", batcher = "Expr.dt.century" }
+combine = { status = "gap", need = "Expr.dt.combine (date + TIME)", wave = "W6" }
+convert_time_zone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Polars converts a tz-aware column to one target zone; Batcher's convert_timezone takes (from, to) over naive timestamps", wave = "W6" }
+date = { status = "canonical", batcher = "Expr.dt.date" }
+datetime = { status = "gap", need = "Expr.dt.datetime (naive local datetime of a time-zone-aware Datetime type)", wave = "W6" }
+day = { status = "canonical", batcher = "Expr.dt.day" }
+days_in_month = { status = "canonical", batcher = "Expr.dt.days_in_month" }
+dst_offset = { status = "gap", need = "Expr.dt.dst_offset (a time-zone-aware Datetime type)", wave = "W6" }
+epoch = { status = "mismatch", batcher = "Expr.dt.epoch", note = "Polars epoch() defaults to time_unit='us' (microseconds); Batcher's epoch returns seconds. Param: time_unit=", wave = "W0" }
+hour = { status = "canonical", batcher = "Expr.dt.hour" }
+is_business_day = { status = "param", batcher = "Expr.dt.is_business_day", need = "week_mask=, holidays=", wave = "W2" }
+is_leap_year = { status = "canonical", batcher = "Expr.dt.is_leap_year" }
+iso_year = { status = "canonical", batcher = "Expr.dt.iso_year" }
+microsecond = { status = "canonical", batcher = "Expr.dt.microsecond" }
+millennium = { status = "canonical", batcher = "Expr.dt.millennium" }
+millisecond = { status = "canonical", batcher = "Expr.dt.millisecond" }
+minute = { status = "canonical", batcher = "Expr.dt.minute" }
+month = { status = "canonical", batcher = "Expr.dt.month" }
+month_end = { status = "mismatch", batcher = "Expr.dt.last_day", note = "on a Datetime Polars keeps the time of day and returns Datetime; Batcher returns a Date", wave = "W0" }
+month_start = { status = "mismatch", batcher = "Expr.dt.month_start", note = "Polars keeps the input type and the time of day (Date stays Date); Batcher returns a midnight Timestamp", wave = "W0" }
+nanosecond = { status = "canonical", batcher = "Expr.dt.nanosecond" }
+offset_by = { status = "canonical", batcher = "Expr.dt.offset_by" }
+ordinal_day = { status = "alias", batcher = "Expr.dt.dayofyear" }
+quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
+replace = { status = "gap", need = "Expr.dt.replace (set year/month/.../microsecond fields)", wave = "W6" }
+replace_time_zone = { status = "gap", need = "Expr.dt.replace_time_zone (a time-zone-aware Datetime type)", wave = "W6" }
+round = { status = "param", batcher = "Expr.dt.round", need = "multiples such as '15m' and offset=", wave = "W2" }
+second = { status = "param", batcher = "Expr.dt.second", need = "fractional=", wave = "W2" }
+strftime = { status = "canonical", batcher = "Expr.dt.strftime" }
+time = { status = "gap", need = "Expr.dt.time (needs a TIME type; time_of_day returns an integer)", wave = "W6" }
+timestamp = { status = "canonical", batcher = "Expr.dt.timestamp" }
+to_string = { status = "mismatch", batcher = "Expr.dt.strftime", note = "with no format Polars renders '2024-01-31 12:30:15.123456'; Batcher renders ISO '2024-01-31T12:30:15' without fractional seconds", wave = "W0" }
+total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
+total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
+total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
+total_milliseconds = { status = "gap", need = "Duration total_milliseconds", wave = "W6" }
+total_minutes = { status = "gap", need = "Duration total_minutes", wave = "W6" }
+total_nanoseconds = { status = "gap", need = "Duration total_nanoseconds", wave = "W6" }
+total_seconds = { status = "gap", need = "Duration total_seconds", wave = "W6" }
+truncate = { status = "mismatch", batcher = "Expr.dt.truncate", note = "on a Date Polars returns a Date; Batcher returns a Timestamp. Polars also accepts multiples ('15m') and offset=, which Batcher refuses", wave = "W0" }
+week = { status = "canonical", batcher = "Expr.dt.week" }
+weekday = { status = "canonical", batcher = "Expr.dt.weekday" }
+with_time_unit = { status = "gap", need = "Expr.dt.with_time_unit", wave = "W6" }
+year = { status = "canonical", batcher = "Expr.dt.year" }
