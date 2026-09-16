@@ -48,45 +48,9 @@ OPERATORS = {
 
 _SUBPACKAGES = ("batcher.config", "batcher.ml", "batcher.io", "batcher.graph", "batcher.governance")
 
-# Which Batcher receiver a user reaches for when they type a name from a competitor surface.
-# It is what the no-alias check looks the *competitor's* spelling up on: if `withColumn` were
-# ever an attribute of `Dataset`, that would be a second spelling, whatever the row says.
-# Surfaces with no Batcher receiver (Spark's `types`, Ray's `DataContext`) are absent.
-SURFACE_RECEIVERS: dict[tuple[str, str], str] = {
-    **{
-        ("pyspark", s): "Dataset"
-        for s in ("DataFrame", "DataFrameNaFunctions", "DataFrameStatFunctions")
-    },
-    ("pyspark", "GroupedData"): "GroupBy",
-    ("pyspark", "Column"): "Expr",
-    ("pyspark", "functions"): "bt",
-    ("pyspark", "WindowSpec"): "WindowExpr",
-    ("pyspark", "DataFrameReader"): "bt.read",
-    ("pyspark", "DataStreamReader"): "bt.read",
-    ("pyspark", "DataFrameWriter"): "Dataset.write",
-    ("pyspark", "DataFrameWriterV2"): "Dataset.write",
-    ("pyspark", "DataStreamWriter"): "Dataset.write",
-    ("pyspark", "StreamingQuery"): "StreamingQuery",
-    ("pyspark", "SparkSession"): "Session",
-    ("pyspark", "Catalog"): "Session",
-    **{("polars", s): "Dataset" for s in ("LazyFrame", "DataFrame")},
-    **{("polars", s): "GroupBy" for s in ("GroupBy", "LazyGroupBy")},
-    ("polars", "Expr"): "Expr",
-    **{("polars", f"Expr.{ns}"): f"Expr.{ns}" for ns in ("str", "dt", "list", "struct")},
-    ("polars", "polars"): "bt",
-    ("polars", "SQLContext"): "Session",
-    ("daft", "DataFrame"): "Dataset",
-    ("daft", "Expression"): "Expr",
-    ("daft", "functions"): "bt",
-    ("daft", "GroupedDataFrame"): "GroupBy",
-    ("daft", "daft"): "bt",
-    ("daft", "Session"): "Session",
-    ("ray_data", "Dataset"): "Dataset",
-    ("ray_data", "GroupedData"): "GroupBy",
-    ("ray_data", "ray.data"): "bt",
-    ("ray_data", "Expr"): "Expr",
-    **{("ray_data", f"Expr.{ns}"): f"Expr.{ns}" for ns in ("str", "list", "dt", "struct", "map")},
-}
+# Which Batcher receiver a user reaches for from each competitor surface. It is runtime data
+# (the migration-error guidance reads it), so it lives in the package.
+from batcher._internal.migration.hints import SURFACE_RECEIVERS  # noqa: E402
 
 
 @lru_cache(maxsize=1)

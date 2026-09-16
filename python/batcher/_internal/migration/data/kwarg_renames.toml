@@ -1,0 +1,47 @@
+# Second keyword spellings, and the one each collapses to.
+#
+# One table per method, as `["<receiver>.<method>"]`; each key is a keyword being removed.
+# A value is the kept keyword, `"*"` when the value becomes positional arguments, `"!<kw>"`
+# when the kept keyword is the logical negation (`ascending` -> `descending`), or
+# `"nulls_first"` for pandas' `na_position="first"|"last"`. Tables for a *removed* method
+# (`Dataset.melt`) are applied before that method is renamed, so its pandas keywords land on
+# the kept method's spelling. See `python/batcher/_internal/migration/renames.py`.
+
+["Dataset.sort"]
+ascending = "!descending"
+by = "*"
+na_position = "nulls_first"
+
+["Dataset.sort_values"]
+ascending = "!descending"
+by = "*"
+
+["Dataset.drop"]
+columns = "*"
+labels = "*"
+
+["Dataset.rename"]
+columns = "*"
+
+["Dataset.sample"]
+frac = "fraction"
+random_state = "seed"
+
+["Dataset.sample_frac"]
+frac = "fraction"
+
+["Dataset.pivot"]
+aggfunc = "aggregate"
+
+["Dataset.melt"]
+id_vars = "index"
+value_vars = "on"
+var_name = "variable_name"
+
+["Dataset.nlargest"]
+columns = "by"
+n = "k"
+
+["Dataset.nsmallest"]
+columns = "by"
+n = "k"

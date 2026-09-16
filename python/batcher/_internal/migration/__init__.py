@@ -7,23 +7,30 @@ Not part of the public API.
 
 from __future__ import annotations
 
-from batcher._internal.migration.loader import (
-    DATA_DIR,
-    Registry,
-    load_registry,
+from batcher._internal.migration.loader import DATA_DIR, Registry, load_registry, load_returns
+from batcher._internal.migration.renames import (
+    OPERATORS,
+    TRANSFORMS,
+    KwargRename,
+    Rename,
+    load_kwarg_renames,
     load_renames,
-    load_returns,
 )
 from batcher._internal.migration.schema import ENGINES, WAVES, Mapping, RegistryError, Status
 
 __all__ = [
     "DATA_DIR",
     "ENGINES",
+    "OPERATORS",
+    "TRANSFORMS",
     "WAVES",
+    "KwargRename",
     "Mapping",
     "Registry",
     "RegistryError",
+    "Rename",
     "Status",
+    "load_kwarg_renames",
     "load_registry",
     "load_renames",
     "load_returns",

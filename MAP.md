@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1464 Python modules across 215 packages and 288 Rust files across 15 crates.
+Covering 1466 Python modules across 215 packages and 288 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -236,7 +236,7 @@ Migration-error guidance: the traceback is the documentation.
 | `_dataset_naming.py` | 246 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
 | `_dataset_table.py` | 408 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
 | `_groupby_table.py` | 132 | The GroupBy half of the migration-error table. |
-| `dataset.py` | 56 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
+| `dataset.py` | 57 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
 | `groupby.py` | 34 | `GroupBy.__getattr__`'s answer: an actionable error for a grouped API Batcher lacks. |
 
 ### `batcher/api/dataset/dq/` — 5 · conductor
@@ -2106,7 +2106,7 @@ Predicate translation for source-side pushdown.
 | `arrow.py` | 223 | IR to a `pyarrow.dataset.Expression`, for every file-format and lakehouse reader. |
 | `iceberg.py` | 92 | IR to a `pyiceberg` row filter, for Iceberg scans and ``replace_where``. |
 | `mongo.py` | 92 | IR to a MongoDB filter document, for the Mongo source. |
-| `native.py` | 155 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
+| `native.py` | 146 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
 | `sql.py` | 155 | IR to a SQL ``WHERE`` fragment, for the warehouse and JDBC-style connectors. |
 
 ### `batcher/io/schema/` — 2 · neutral IO
@@ -2352,7 +2352,7 @@ Ecosystem-compatible spellings bound onto `Expr`.
 | module | lines | what it is |
 |---|---|---|
 | `binder.py` | 45 | Attach the compatibility aliases onto `Expr`. |
-| `guidance.py` | 255 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `guidance.py` | 259 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
 | `names.py` | 453 | pandas-compatible names for `Expr` methods that Batcher spells differently. |
 | `namespaces.py` | 310 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 | `operators.py` | 385 | Method-form spellings of the `Expr` operators (the pandas ``Series.add`` family). |
@@ -2713,7 +2713,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 | module | lines | what it is |
 |---|---|---|
 | `hierarchy.py` | 725 | The Batcher exception hierarchy. |
-| `suggest.py` | 390 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
+| `suggest.py` | 402 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 80 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
 ### `batcher/_internal/hardware/` — 0 · utility
@@ -2833,7 +2833,9 @@ The migration registry: every PySpark, Polars, Daft and Ray Data name, and its B
 
 | module | lines | what it is |
 |---|---|---|
-| `loader.py` | 159 | Load the migration registry from its TOML files. |
+| `hints.py` | 147 | The migration half of an `AttributeError`: what a removed or foreign spelling is called here. |
+| `loader.py` | 136 | Load the migration registry from its TOML files. |
+| `renames.py` | 187 | The rename decisions for Batcher's own second spellings, as typed rules the codemod can apply. |
 | `schema.py` | 157 | The shape of one migration-registry row: a competitor's name and what it becomes here. |
 
 ### `batcher/_internal/site/` — 0 · utility
@@ -2905,7 +2907,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | module | lines | what it is |
 |---|---|---|
 | `__main__.py` | 100 | `python -m batcher.migrate`: rewrite scripts onto Batcher's one spelling per capability. |
-| `canonical.py` | 161 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
+| `canonical.py` | 401 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
 | `receivers.py` | 412 | Which expressions in a script are Batcher objects, and which Batcher receiver each one is. |
 
 ## Rust data plane — `crates/`
@@ -3259,10 +3261,10 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
-| `page_index.rs` | 277 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
-| `predicate.rs` | 358 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
+| `page_index.rs` | 266 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
+| `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
-| `row_filter.rs` | 419 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_filter.rs` | 414 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `split_read.rs` | 259 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 416 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 

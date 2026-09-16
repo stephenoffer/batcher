@@ -14,12 +14,14 @@ import pytest
 
 pytest.importorskip("libcst")
 
-from batcher._internal.migration import load_renames, load_returns
+from batcher._internal.migration import load_kwarg_renames, load_renames, load_returns
 from batcher.migrate import canonicalize
 
 
 def _run(source: str) -> tuple[str, object]:
-    return canonicalize(textwrap.dedent(source), load_renames(), load_returns())
+    return canonicalize(
+        textwrap.dedent(source), load_renames(), load_returns(), load_kwarg_renames()
+    )
 
 
 def test_dataset_methods_rename_on_batcher_and_not_on_pandas() -> None:
@@ -197,3 +199,85 @@ def test_self_inside_a_batcher_class_and_type_checking_imports() -> None:
     assert out.count("return self.limit(3)") == 1
     assert out.count("return self.head(3)") == 1
     assert "return e.is_null()" in out
+
+
+def test_paths_calls_and_top_level_reader_imports() -> None:
+    out, _ = _run(
+        """
+        import batcher as bt
+        from batcher import read_csv, col
+
+        ds = bt.from_pydict({"x": [1]})
+        ds.to_parquet("out")
+        n = ds.height
+        e = ds.empty
+        a = bt.read_parquet("p")
+        b = read_csv("c")
+        """
+    )
+    assert 'ds.write.parquet("out")' in out
+    assert "n = ds.count()" in out
+    assert "e = ds.is_empty()" in out
+    assert 'a = bt.read.parquet("p")' in out
+    assert "from batcher import read, col" in out
+    assert 'b = read.csv("c")' in out
+
+
+def test_operator_methods_become_operators() -> None:
+    out, report = _run(
+        """
+        import batcher as bt
+
+        x = bt.col("a").add(bt.col("b") * 2)
+        y = bt.col("a").ge(3)
+        z = bt.col("f").not_()
+        w = bt.col("a").add(1, fill=0)
+        """
+    )
+    assert 'x = (bt.col("a") + (bt.col("b") * 2))' in out
+    assert 'y = (bt.col("a") >= 3)' in out
+    assert 'z = (~bt.col("f"))' in out
+    assert 'w = bt.col("a").add(1, fill=0)' in out
+    assert [e.old for e in report.unresolved] == ["add"]
+
+
+def test_argument_reshaping_transforms() -> None:
+    out, report = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"x": [1]})
+        a = ds.with_column("y", bt.col("x") + 1)
+        b = ds.with_column("has space", bt.col("x"))
+        c = ds.slice(10, 5)
+        d = ds.slice(10)
+        """
+    )
+    assert 'a = ds.with_columns(y=bt.col("x") + 1)' in out
+    assert 'b = ds.with_columns(**{"has space": bt.col("x")})' in out
+    assert "c = ds.limit(5, offset=10)" in out
+    assert "d = ds.slice(10)" in out
+    assert "slice" in {e.old for e in report.unresolved}
+
+
+def test_pandas_keywords_are_rewritten_or_reported() -> None:
+    out, report = _run(
+        """
+        import batcher as bt
+
+        ds = bt.from_pydict({"x": [1]})
+        a = ds.sort(by=["x", "y"], ascending=[True, False], na_position="first")
+        b = ds.sort_values("x", ascending=False)
+        c = ds.sample(frac=0.5, random_state=7)
+        d = ds.melt(id_vars=["k"], value_vars=["v"], var_name="n")
+        e = ds.nlargest(3, "x")
+        f = ds.sort(by=cols, ascending=flag)
+        """
+    )
+    assert 'a = ds.sort("x", "y", descending=[False, True], nulls_first=True)' in out
+    assert 'b = ds.sort("x", descending=True)' in out
+    assert "c = ds.sample(fraction=0.5, seed=7)" in out
+    assert 'd = ds.unpivot(index=["k"], on=["v"], variable_name="n")' in out
+    assert 'e = ds.top_k(3, "x")' in out
+    assert "f = ds.sort(by=cols, ascending=flag)" in out
+    assert {e.old for e in report.unresolved} == {"sort(by=)", "sort(ascending=)"}

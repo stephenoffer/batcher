@@ -15,6 +15,8 @@ typo and a `Dataset` typo read identically.
 
 from __future__ import annotations
 
+import re
+
 from batcher._internal.errors import absent_error, public_members
 
 __all__ = ["EXPR_UNSUPPORTED", "expr_attribute_error"]
@@ -144,7 +146,7 @@ def expr_attribute_error(expr: object, name: str) -> AttributeError:
         An `AttributeError` that explains the absence and names the Batcher spelling,
         accessor, or Dataset method to use instead.
     """
-    return absent_error("Expr", name, EXPR_UNSUPPORTED, public_members(type(expr)))
+    return absent_error("Expr", name, EXPR_UNSUPPORTED, public_members(type(expr)), receiver="Expr")
 
 
 # --- typed-accessor migration tables -------------------------------------------------
@@ -252,4 +254,6 @@ def accessor_attribute_error(
         An `AttributeError` naming the Batcher accessor method to use instead, or a
         `Did you mean ...?` against the accessor's real methods for a near miss.
     """
-    return absent_error(label, name, table, public_members(type(accessor)))
+    namespace = re.search(r"'\.(\w+)' accessor", label)
+    receiver = f"Expr.{namespace.group(1)}" if namespace else None
+    return absent_error(label, name, table, public_members(type(accessor)), receiver=receiver)

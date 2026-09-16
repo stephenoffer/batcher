@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from batcher._internal.errors import ConfigError
-from batcher._internal.migration import load_renames, load_returns
+from batcher._internal.migration import load_kwarg_renames, load_renames, load_returns
 from batcher.migrate.canonical import canonicalize
 
 _IMPLEMENTED = {("batcher", "batcher")}
@@ -59,13 +59,13 @@ def main(argv: list[str] | None = None) -> int:
             f"--from {args.source} --to {args.target} is not implemented yet; "
             "only --from batcher --to batcher (the canonical-name rewrite) is"
         )
-    renames, returns = load_renames(), load_returns()
+    renames, returns, kwargs = load_renames(), load_returns(), load_kwarg_renames()
     changed = 0
     report: dict[str, dict[str, list[dict[str, object]]]] = {}
     for path in _python_files(args.paths):
         before = path.read_text()
         try:
-            after, sites = canonicalize(before, renames, returns)
+            after, sites = canonicalize(before, renames, returns, kwargs)
         except Exception as exc:  # an unparseable file is reported, not fatal to the run
             print(f"{path}: skipped, {type(exc).__name__}: {exc}", file=sys.stderr)
             continue
@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
                 "unresolved": [vars(e) for e in sites.unresolved],
             }
         for edit in sites.unresolved:
-            print(f"{path}:{edit.line}: left `{edit.old}` alone: receiver unknown", file=sys.stderr)
+            print(f"{path}:{edit.line}: left `{edit.old}` alone: {edit.new}", file=sys.stderr)
         if after == before:
             continue
         changed += 1

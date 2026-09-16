@@ -141,4 +141,4 @@ def top_level_attribute_error(name: str, members: Iterable[str]) -> AttributeErr
     Returns:
         An `AttributeError` that names the Batcher spelling to use instead.
     """
-    return absent_error("batcher", name, TOP_LEVEL_UNSUPPORTED, members)
+    return absent_error("batcher", name, TOP_LEVEL_UNSUPPORTED, members, receiver="bt")

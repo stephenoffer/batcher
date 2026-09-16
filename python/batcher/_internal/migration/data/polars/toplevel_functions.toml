@@ -69,7 +69,7 @@ from_dicts = { status = "alias", batcher = "bt.from_pylist" }
 from_epoch = { status = "mismatch", batcher = "bt.from_epoch", note = "Polars reads a bare string argument as a column name; Batcher reads it as a string literal, so from_epoch('a', 'b') silently computes over the constants. Param: strings as column names (all-null result); Batcher also lacks time_unit='d'", wave = "W0" }
 from_numpy = { status = "param", batcher = "bt.from_numpy", need = "2-D arrays with schema= and orient=", wave = "W2" }
 from_pandas = { status = "canonical", batcher = "bt.from_pandas" }
-from_records = { status = "mismatch", batcher = "bt.from_records", note = "Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=", wave = "W0" }
+from_records = { status = "mismatch", batcher = "bt.from_pylist", note = "Polars takes schema= and orient= and can read a sequence of sequences as columns; Batcher reads rows with columns=", wave = "W0" }
 from_repr = { status = "out_of_scope", reason = "parsing a printed table repr is a notebook convenience, not engine surface" }
 from_torch = { status = "canonical", batcher = "bt.from_torch" }
 get_extension_type = { status = "gap", need = "extension type registry", wave = "W11" }

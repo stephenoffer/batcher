@@ -31,4 +31,4 @@ def groupby_attribute_error(gb: GroupBy, name: str) -> AttributeError:
         to use instead.
     """
     members = [n for n in dir(type(gb)) if not n.startswith("_")]
-    return absent_error("GroupBy", name, GROUPBY_UNSUPPORTED, members)
+    return absent_error("GroupBy", name, GROUPBY_UNSUPPORTED, members, receiver="GroupBy")

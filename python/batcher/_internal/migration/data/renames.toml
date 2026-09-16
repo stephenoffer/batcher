@@ -1,16 +1,22 @@
 # Batcher's own second spellings, and the one spelling each collapses to.
 #
-# One table per receiver (the dotted receiver spellings of tools/parity/batcher_targets.py);
-# each key is a spelling being removed and its value the spelling that stays. The choice
-# follows the parity plan's naming rule: the spelling shared by the most of Polars, Spark,
-# Daft, Ray Data and DuckDB, with a tie going to Polars.
+# One table per receiver (the receiver spellings of tools/parity/batcher_targets.py); each key
+# is a spelling being removed. The choice follows the parity plan's naming rule: the spelling
+# shared by the most of Polars, Spark, Daft, Ray Data and DuckDB, with a tie going to Polars.
 #
-# Three consumers read this: the `batcher.migrate` codemod rewrites the removed spelling to the
-# kept one in existing code, the migration-error guidance names the kept spelling when the
-# removed one is typed, and tests/unit/test_migration_renames.py checks that every second
-# spelling `tools/lint_aliases.py` finds has a decision here. Where the kept spelling is today
-# the delegate and the removed one holds the implementation (`acos` -> `arccos`), the
+# A value is the kept attribute name, or an inline table when the replacement is not a plain
+# rename: `{ to = "write.csv" }` (a dotted path from the same receiver), `{ to = "count",
+# call = true }` (a property replaced by a call), `{ operator = "add" }` (an operator), or
+# `{ transform = "...", to = "..." }` (an argument reshaping). The rule types and their
+# validation live in python/batcher/_internal/migration/renames.py.
+#
+# Three consumers read this: the `batcher.migrate` codemod rewrites the removed spelling in
+# existing code, the migration-error guidance names the replacement when the removed spelling
+# is typed, and tests/unit/test_migration_renames.py checks that every second spelling
+# `tools/lint_aliases.py` finds has a decision here. Where the kept spelling is today the
+# delegate and the removed one holds the implementation (`acos` -> `arccos`), the
 # implementation moves under the kept name as part of the removal.
+
 
 [Dataset]
 append = "union"
@@ -20,22 +26,31 @@ coalesce = "repartition"
 difference = "except_"
 drop_duplicates = "distinct"
 dropna = "drop_nulls"
-empty = "is_empty"
+empty = { to = "is_empty", call = true }
 fillna = "fill_null"
 groupby = "group_by"
 head = "limit"
-height = "count"
+height = { to = "count", call = true }
+melt = "unpivot"
 merge = "join"
 nlargest = "top_k"
 nsmallest = "bottom_k"
 persist = "cache"
 sample_frac = "sample"
+slice = { transform = "slice_to_limit", to = "limit" }
+sort_values = "sort"
+to_csv = { to = "write.csv" }
 to_dict = "to_pydict"
 to_dicts = "to_pylist"
+to_json = { to = "write.json" }
+to_parquet = { to = "write.parquet" }
+to_tf = { to = "ml.to_tf" }
+to_torch_dataloader = { to = "ml.to_torch_dataloader" }
 transform = "pipe"
 unique = "distinct"
 unpersist = "uncache"
 vstack = "union"
+with_column = { transform = "with_column", to = "with_columns" }
 with_row_count = "with_row_index"
 
 ["Dataset.meta"]
@@ -48,14 +63,16 @@ to_torch = "iter_torch_batches"
 [Expr]
 acos = "arccos"
 acosh = "arccosh"
-asin = "arcsin"
-asinh = "arcsinh"
-atan = "arctan"
-atanh = "arctanh"
+add = { operator = "add" }
 all = "bool_and"
+and_ = { operator = "and" }
 any = "bool_or"
 approx_n_unique = "approx_count_distinct"
+asin = "arcsin"
+asinh = "arcsinh"
 astype = "cast"
+atan = "arctan"
+atanh = "arctanh"
 clip_max = "clip"
 clip_min = "clip"
 cumcount = "cum_count"
@@ -63,26 +80,44 @@ cummax = "cum_max"
 cummin = "cum_min"
 cumprod = "cum_prod"
 cumsum = "cum_sum"
+div = { operator = "truediv" }
+eq = { operator = "eq" }
 fillna = "fill_null"
+floordiv = { operator = "floordiv" }
+ge = { operator = "ge" }
+gt = { operator = "gt" }
 is_between = "between"
 isin = "is_in"
 isna = "is_null"
 isnull = "is_null"
 kurt = "kurtosis"
+le = { operator = "le" }
 log = "ln"
+lt = { operator = "lt" }
+mod = { operator = "mod" }
+mul = { operator = "mul" }
 n_unique = "count_distinct"
+ne = { operator = "ne" }
+neg = { operator = "neg" }
+not_ = { operator = "invert" }
 notna = "is_not_null"
 notnull = "is_not_null"
 nunique = "count_distinct"
+or_ = { operator = "or" }
+pow = { operator = "pow" }
 prod = "product"
 rename = "alias"
 skewness = "skew"
+sub = { operator = "sub" }
+truediv = { operator = "truediv" }
+xor = { operator = "xor" }
 
 ["Expr.dt"]
 day_name = "dayname"
 day_of_week = "dayofweek"
 day_of_year = "dayofyear"
 daysinmonth = "days_in_month"
+floor = "truncate"
 is_weekday = "is_business_day"
 isodow = "weekday"
 month_end = "last_day"
@@ -96,10 +131,14 @@ weekofyear = "week"
 argmax = "arg_max"
 argmin = "arg_min"
 dim = "len"
+element_at = "get"
 lengths = "len"
 magnitude = "l2_norm"
 max_pool = "max"
 mean_pool = "mean"
+set_difference = "difference"
+set_intersection = "intersect"
+set_union = "union"
 
 ["Expr.str"]
 head = "left"
@@ -135,11 +174,34 @@ size = "len"
 
 [StreamingQuery]
 awaitTermination = "await_termination"
+isActive = "is_active"
+lastProgress = "last_progress"
 processAllAvailable = "process_all_available"
+recentProgress = "recent_progress"
+runId = "run_id"
 
 [bt]
 atan2 = "arctan2"
 from_dict = "from_pydict"
 from_dicts = "from_pylist"
+from_records = "from_pylist"
 max_horizontal = "greatest"
 min_horizontal = "least"
+read_avro = { to = "read.avro" }
+read_csv = { to = "read.csv" }
+read_database = { to = "read.sql" }
+read_delta = { to = "read.delta" }
+read_excel = { to = "read.excel" }
+read_iceberg = { to = "read.iceberg" }
+read_ipc = { to = "read.arrow" }
+read_json = { to = "read.json" }
+read_ndjson = { to = "read.json" }
+read_orc = { to = "read.orc" }
+read_parquet = { to = "read.parquet" }
+read_table = { to = "read.table" }
+
+[Trigger]
+AvailableNow = "available_now"
+Continuous = "continuous"
+Once = "once"
+ProcessingTime = "processing_time"

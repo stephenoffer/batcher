@@ -53,4 +53,5 @@ def attribute_error_for(ds: Dataset, name: str) -> AttributeError:
             f"ds[{name!r}] for the expression, or bt.col({name!r}) to build one."
         )
 
-    return absent_error("Dataset", name, DATASET_UNSUPPORTED, [*_method_names(ds), *columns])
+    members = [*_method_names(ds), *columns]
+    return absent_error("Dataset", name, DATASET_UNSUPPORTED, members, receiver="Dataset")

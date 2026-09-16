@@ -28,7 +28,7 @@ from pathlib import Path
 
 from batcher._internal.migration.schema import ENGINES, Mapping, RegistryError, Status, validate
 
-__all__ = ["DATA_DIR", "Registry", "load_registry", "load_renames", "load_returns"]
+__all__ = ["DATA_DIR", "Registry", "load_registry", "load_returns"]
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -121,29 +121,6 @@ def _load(data_dir: Path) -> Registry:
         for path in sorted((data_dir / engine).glob("*.toml")):
             _parse(engine, path, rows)
     return Registry(rows)
-
-
-@lru_cache(maxsize=1)
-def load_renames() -> dict[str, dict[str, str]]:
-    """Batcher's own second spellings, as `{receiver: {removed: kept}}`.
-
-    Returns:
-        The decisions in `data/renames.toml`, one table per receiver.
-
-    Raises:
-        RegistryError: When a value is not a string, or a kept spelling is itself removed,
-            which would make a rename chain the codemod could only apply in some order.
-    """
-    doc = tomllib.loads((DATA_DIR / "renames.toml").read_text())
-    for receiver, table in doc.items():
-        for removed, kept in table.items():
-            if not isinstance(kept, str):
-                raise RegistryError(f"renames.toml: {receiver}.{removed} must map to a string")
-            if kept in table:
-                raise RegistryError(
-                    f"renames.toml: {receiver}.{removed} -> {kept}, but {kept} is removed too"
-                )
-    return doc
 
 
 @lru_cache(maxsize=1)
