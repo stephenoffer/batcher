@@ -22,7 +22,7 @@ import threading
 import uuid
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, SortOrder, as_sort_orders
@@ -360,6 +360,35 @@ class SourceStatistics:
         return RelStats(
             rows=rows,
             provenance=prov,
-            columns=dict(self.columns),
+            columns=self._columns_for_reasoning(),
             sorted_by=as_sort_orders(self.sorted_by),
         )
+
+    def _columns_for_reasoning(self) -> dict[str, ColumnStat]:
+        """The column bundles, with every float `max` a NaN may exceed made unknown.
+
+        A footer or manifest keeps NaN out of a float column's bounds, and the engine ranks NaN
+        above every number, so such a `max` is an upper bound on the non-NaN values only. The
+        optimizer read it as a bound on the column: over a row group of `[0.1, 0.5, NaN]`,
+        `filter(x > 0.9)` was proven empty and `collect()`, `count()`, `is_empty()` and
+        `iter_batches()` all answered with no rows where executing the filter keeps the NaN.
+
+        Clearing the max here, at the one bridge every scan's statistics cross, makes each
+        proof built on it undecidable at once -- zone-map pruning, filtered counts, the
+        column summary -- rather than guarding each consumer and missing the next. The
+        minimum stays: no NaN is below it. A source whose bounds were computed in the
+        engine's own order (`bounds_include_nan`) keeps its max, which is then exact.
+        """
+        if self.bounds_include_nan:
+            return dict(self.columns)
+        return {
+            name: replace(stat, max=None) if _is_float(stat.max) else stat
+            for name, stat in self.columns.items()
+        }
+
+
+def _is_float(value: object) -> bool:
+    """Whether a recorded bound is a floating-point value (`bool` and `int` are not)."""
+    import numbers
+
+    return isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral)

@@ -33,6 +33,29 @@ predicate. That single rule is what makes pushdown safe to reason about:
 So a predicate that fails to push is a performance question, never a correctness one. You
 never need to check whether a filter "worked".
 
+### Floating-point columns and NaN
+
+Batcher sorts `NaN` above every number, so `NaN > 0.9` is true, the same as in `ORDER BY`. Parquet, Delta, and Iceberg leave `NaN` out of a float column's recorded minimum and maximum, so a file's recorded maximum can sit below a `NaN` it holds. Batcher therefore never skips a row group or a file on a float column's maximum for `>`, `>=`, or `!=`, and a filter over Parquet keeps exactly the `NaN` rows the same filter keeps in memory:
+
+```python
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import batcher as bt
+
+floats = pa.table({"reading": [0.1, 0.5, float("nan")]})
+pq.write_table(floats, "readings.parquet")
+
+high = bt.read.parquet("readings.parquet").filter(bt.col("reading") > 0.9)
+print(high.count())
+```
+
+```text
+1
+```
+
+A filter using `<`, `<=`, or `=` still skips on the recorded bounds, because no `NaN` satisfies it. DuckDB behaves the same way when you read with `can_have_nan=true`. Its default trusts the recorded maximum and can skip `NaN` rows.
+
 ## What pushes
 
 Batcher translates this subset of a predicate:

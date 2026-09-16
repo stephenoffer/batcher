@@ -14,30 +14,32 @@
 //!
 //! # Why this may drop rows at all
 //!
-//! Every other pruning step here is *superset-safe*: it may only skip blocks that provably
-//! hold no match, and the engine keeps its own `Filter` regardless. This one removes
-//! individual rows, so it needs a stronger guarantee — the pushed predicate must be
-//! **equivalent** to the `Filter` above the scan, not merely implied by it.
+//! Every other pruning step here skips whole blocks that provably hold no match, and the engine
+//! keeps its own `Filter` regardless. This one removes individual rows, so it needs the
+//! row-level form of the same guarantee: **every row the `Filter` above the scan keeps, the
+//! pushed predicate keeps too.** Keeping *more* is fine, because that `Filter` still runs.
 //!
-//! It is. `batcher.io.predicate.to_native_predicate` is all-or-nothing: any term it cannot
-//! translate makes the *whole* expression unpushable and it emits nothing. So a predicate that
-//! arrives here is a complete translation of that `Filter`, and dropping a row that fails it
-//! removes a row the `Filter` would have removed anyway.
+//! `batcher.io.predicate.to_native_predicate` is all-or-nothing: any term it cannot translate
+//! makes the *whole* expression unpushable and it emits nothing. So a predicate that arrives
+//! here is a complete translation of that `Filter`, and the remaining question is only whether
+//! each comparison is evaluated here at least as permissively as the engine evaluates it.
+//! [`Pred`] has no negation, so a superset at every comparison is a superset of the whole.
 //!
 //! # The subset hazard, and how this avoids it
 //!
 //! Returning *more* rows than the predicate selects is always safe (the `Filter` still runs).
-//! Returning *fewer* is a silent wrong answer. Two ways that could happen, both closed here:
+//! Returning *fewer* is a silent wrong answer. Three ways that could happen, all closed here:
 //!
 //! * **A lossy literal cast.** `col_i32 < 5000000000` casts the literal to `Int32` under
 //!   arrow's safe cast and yields `null` — every comparison then goes false and the read
 //!   returns *no rows* where the truth is *all rows*. [`lit_array`] therefore casts and then
 //!   casts **back**, and refuses the pushdown unless the value round-trips exactly.
-//! * **A type this module reasons about differently from the engine.** Floats need the
-//!   engine's `-0.0`/NaN canonicalization (`bc_arrow::canon_float_array`) to compare
-//!   identically, and decimals need `eval_binary`'s precision/scale alignment. Rather than
-//!   restate either here — a second semantics, in a crate that cannot see the first —
-//!   [`pushable`] simply refuses both. They keep the block-level pruning they already had.
+//! * **Floats, whose order here differs from the engine's.** Arrow's kernels use IEEE
+//!   `totalOrder`; the engine canonicalizes first (`bc_arrow::canon_float_array`), so its
+//!   zeros are one value and every NaN is the greatest. Rather than restate that
+//!   canonicalization, [`float_superset`] keeps every row the two orders could disagree on.
+//! * **Decimals**, which need `eval_binary`'s precision/scale alignment. [`pushable`] refuses
+//!   them outright; they keep the block-level pruning they already had.
 //!
 //! Pushability is decided **once, up front, against the file schema** ([`build`]), never per
 //! batch. A per-batch evaluation that somehow still fails returns an all-true mask rather than
@@ -107,12 +109,14 @@ fn lit_array(lit: &Lit, dt: &DataType) -> Option<ArrayRef> {
 /// compares by plain arrow kernels in both places.
 fn comparable(dt: &DataType) -> bool {
     use DataType::{
-        Boolean, Date32, Date64, Int16, Int32, Int64, Int8, LargeUtf8, UInt16, UInt32, UInt64,
-        UInt8, Utf8,
+        Boolean, Date32, Date64, Float32, Float64, Int16, Int32, Int64, Int8, LargeUtf8, UInt16,
+        UInt32, UInt64, UInt8, Utf8,
     };
     matches!(
         dt,
         Boolean
+            | Float32
+            | Float64
             | Int8
             | Int16
             | Int32
@@ -132,7 +136,11 @@ fn comparable(dt: &DataType) -> bool {
 fn pushable(pred: &Pred, schema: &Schema) -> bool {
     match pred {
         Pred::Cmp { col, lit, .. } => match schema.field_with_name(col) {
-            Ok(f) => comparable(f.data_type()) && lit_array(lit, f.data_type()).is_some(),
+            Ok(f) => {
+                comparable(f.data_type())
+                    && !matches!(lit, Lit::Float(v) if v.is_nan())
+                    && lit_array(lit, f.data_type()).is_some()
+            }
             Err(_) => false,
         },
         // `IS NULL` reads only the validity bitmap, so it is type-agnostic — but the column
@@ -158,7 +166,7 @@ fn eval(pred: &Pred, batch: &RecordBatch) -> Option<BooleanArray> {
             let arr_dyn: &dyn Array = arr.as_ref();
             let lhs: &dyn Datum = &arr_dyn;
             let rhs: &dyn Datum = &scalar;
-            match op {
+            let mask = match op {
                 CmpOp::Eq => cmp::eq(lhs, rhs),
                 CmpOp::Ne => cmp::neq(lhs, rhs),
                 CmpOp::Lt => cmp::lt(lhs, rhs),
@@ -166,7 +174,8 @@ fn eval(pred: &Pred, batch: &RecordBatch) -> Option<BooleanArray> {
                 CmpOp::Gt => cmp::gt(lhs, rhs),
                 CmpOp::Ge => cmp::gt_eq(lhs, rhs),
             }
-            .ok()
+            .ok()?;
+            float_superset(mask, arr.as_ref(), lit)
         }
         Pred::IsNull { col, negated } => {
             let arr = batch.column_by_name(col)?;
@@ -187,6 +196,44 @@ fn eval(pred: &Pred, batch: &RecordBatch) -> Option<BooleanArray> {
             boolean::or_kleene(&eval(left, batch)?, &eval(right, batch)?).ok()
         }
     }
+}
+
+/// Widen a float comparison's mask to every row whose answer the engine could decide otherwise.
+///
+/// Arrow's float kernels order by IEEE `totalOrder`, where `-0.0 < 0.0` and a sign-bit NaN sorts
+/// below `-inf`. The engine canonicalizes first (`bc_arrow::canon_float_array`): both zeros are
+/// one value and every NaN is the greatest. The two orders disagree only on rows that are NaN,
+/// and on rows that are a zero compared against a zero literal, so those rows are kept whatever
+/// the kernel said.
+///
+/// That makes the float mask a **superset** of the engine's rather than equal to it, which is
+/// all removing rows here needs: every row dropped fails the kernel comparison on a value where
+/// the two orders agree, so the engine's `Filter` -- which still runs above the scan -- would
+/// drop it too. Restating the canonicalization here instead would be the second float semantics
+/// the module docs warn against; keeping the disputed rows needs none.
+fn float_superset(mask: BooleanArray, arr: &dyn Array, lit: &Lit) -> Option<BooleanArray> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, Float64Type};
+
+    let zero_lit = matches!(lit, Lit::Float(v) if *v == 0.0) || matches!(lit, Lit::Int(0));
+    let disputed = match arr.data_type() {
+        DataType::Float64 => {
+            let v = arr.as_primitive::<Float64Type>().values();
+            BooleanArray::from_iter(
+                v.iter()
+                    .map(|x| Some(x.is_nan() || (zero_lit && *x == 0.0))),
+            )
+        }
+        DataType::Float32 => {
+            let v = arr.as_primitive::<Float32Type>().values();
+            BooleanArray::from_iter(
+                v.iter()
+                    .map(|x| Some(x.is_nan() || (zero_lit && *x == 0.0))),
+            )
+        }
+        _ => return Some(mask),
+    };
+    boolean::or(&mask, &disputed).ok()
 }
 
 /// The predicate's columns if it can be pushed into the decode at all, else `None`.
@@ -374,17 +421,102 @@ mod tests {
     }
 
     #[test]
-    fn float_and_decimal_columns_are_refused() {
-        // Both need semantics this crate deliberately does not restate (canonical floats,
-        // decimal scale alignment), so they must never install a row filter.
-        assert!(!pushable(
-            &cmp_pred("f", CmpOp::Lt, Lit::Float(1.0)),
-            &schema()
-        ));
+    fn decimal_columns_and_nan_literals_are_refused() {
+        // Decimals need scale alignment this crate deliberately does not restate, so they
+        // must never install a row filter. A NaN literal has no order to be a superset of.
         assert!(!pushable(
             &cmp_pred("d", CmpOp::Lt, Lit::Float(1.0)),
             &schema()
         ));
+        assert!(!pushable(
+            &cmp_pred("f", CmpOp::Lt, Lit::Float(f64::NAN)),
+            &schema()
+        ));
+        // A finite float literal pushes, as a superset (see `float_superset`).
+        assert!(pushable(
+            &cmp_pred("f", CmpOp::Lt, Lit::Float(1.0)),
+            &schema()
+        ));
+    }
+
+    /// The engine's answer for `x <op> lit`: canonicalize both sides, then compare in the
+    /// order the engine uses. A null compares to null, which `WHERE` treats as false.
+    fn engine_keeps(values: &Float64Array, op: CmpOp, lit: f64) -> Vec<bool> {
+        let canon = bc_arrow::canon_float_array(&(Arc::new(values.clone()) as ArrayRef));
+        let lit =
+            bc_arrow::canon_float_array(&(Arc::new(Float64Array::from(vec![lit])) as ArrayRef));
+        let scalar = Scalar::new(lit);
+        let lhs: &dyn Datum = &canon.as_ref();
+        let m = match op {
+            CmpOp::Eq => cmp::eq(lhs, &scalar),
+            CmpOp::Ne => cmp::neq(lhs, &scalar),
+            CmpOp::Lt => cmp::lt(lhs, &scalar),
+            CmpOp::Le => cmp::lt_eq(lhs, &scalar),
+            CmpOp::Gt => cmp::gt(lhs, &scalar),
+            CmpOp::Ge => cmp::gt_eq(lhs, &scalar),
+        }
+        .unwrap();
+        (0..m.len()).map(|i| m.is_valid(i) && m.value(i)).collect()
+    }
+
+    #[test]
+    fn a_float_mask_keeps_every_row_the_engine_keeps() {
+        // The values the two float orders disagree on, and their neighbours: both zeros, a
+        // quiet and a sign-bit NaN, both infinities, and a null.
+        let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+        let values = Float64Array::from(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(negative_nan),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(-1.5),
+            Some(0.05),
+            Some(0.07),
+            Some(3.0),
+            None,
+        ]);
+        let s = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(s, vec![Arc::new(values.clone()) as ArrayRef]).unwrap();
+        let ops = [
+            ("=", CmpOp::Eq),
+            ("!=", CmpOp::Ne),
+            ("<", CmpOp::Lt),
+            ("<=", CmpOp::Le),
+            (">", CmpOp::Gt),
+            (">=", CmpOp::Ge),
+        ];
+        for lit in [0.0, -0.0, 0.05, -1.5, 3.0, f64::INFINITY] {
+            for (name, op) in ops {
+                let kept = mask_of(&cmp_pred("f", op, Lit::Float(lit)), &batch);
+                for (i, engine) in engine_keeps(&values, op, lit).into_iter().enumerate() {
+                    let value = values.is_valid(i).then(|| values.value(i));
+                    assert!(
+                        !engine || kept.value(i),
+                        "x = {value:?}, x {name} {lit}: the engine keeps the row and the row \
+                         filter dropped it",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_float_mask_still_removes_rows_the_orders_agree_on() {
+        // The positive control: a superset that kept everything would pass the test above.
+        let values = Float64Array::from(vec![0.01, 0.06, 0.09, f64::NAN]);
+        let s = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(s, vec![Arc::new(values) as ArrayRef]).unwrap();
+        let p = Pred::And {
+            left: Box::new(cmp_pred("f", CmpOp::Ge, Lit::Float(0.05))),
+            right: Box::new(cmp_pred("f", CmpOp::Le, Lit::Float(0.07))),
+        };
+        let kept = mask_of(&p, &batch);
+        assert_eq!(
+            (0..4).map(|i| kept.value(i)).collect::<Vec<_>>(),
+            vec![false, true, false, true]
+        );
     }
 
     #[test]
@@ -426,7 +558,7 @@ mod tests {
         // subset (wrong), so `pushable` is all-or-nothing for both.
         let p = Pred::And {
             left: Box::new(cmp_pred("i64", CmpOp::Lt, Lit::Int(5))),
-            right: Box::new(cmp_pred("f", CmpOp::Lt, Lit::Float(1.0))),
+            right: Box::new(cmp_pred("d", CmpOp::Lt, Lit::Float(1.0))),
         };
         assert!(!pushable(&p, &schema()));
     }
@@ -434,7 +566,7 @@ mod tests {
     #[test]
     fn is_null_pushes_on_any_type() {
         // It reads the validity bitmap only, so even the refused value types are fine.
-        for c in ["i64", "f", "d"] {
+        for c in ["i64", "d"] {
             assert!(pushable(
                 &Pred::IsNull {
                     col: c.to_string(),

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1457 Python modules across 213 packages and 288 Rust files across 15 crates.
+Covering 1464 Python modules across 215 packages and 288 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -289,7 +289,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 336 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1861 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1992 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -577,7 +577,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `limits.py` | 266 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 350 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 392 | How many GPUs one LLM engine replica needs, and what that choice costs. |
-| `sglang.py` | 349 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
+| `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -1954,7 +1954,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 137 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 326 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -2103,7 +2103,7 @@ Predicate translation for source-side pushdown.
 |---|---|---|
 | `_literals.py` | 194 | Literal unwrapping and the column-vs-literal shapes every translator needs. |
 | `_shapes.py` | 136 | Recognizers for the predicate shapes the translators share. |
-| `arrow.py` | 195 | IR to a `pyarrow.dataset.Expression`, for every file-format and lakehouse reader. |
+| `arrow.py` | 223 | IR to a `pyarrow.dataset.Expression`, for every file-format and lakehouse reader. |
 | `iceberg.py` | 92 | IR to a `pyiceberg` row filter, for Iceberg scans and ``replace_where``. |
 | `mongo.py` | 92 | IR to a MongoDB filter document, for the Mongo source. |
 | `native.py` | 146 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
@@ -2156,7 +2156,7 @@ Splits — independently-readable, picklable slices of a source.
 | `columnar_footer.py` | 438 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
 | `file_identity.py` | 221 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
 | `file_listing.py` | 60 | Statistics for a source where one row *is* one file, read from the listing alone. |
-| `file_skipping.py` | 402 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
+| `file_skipping.py` | 415 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
 | `free_counts.py` | 75 | Free row counts from file headers — metadata that costs one header read. |
 | `key_pruning.py` | 265 | Key-driven file pruning — the copy-on-write MERGE's "which files must I rewrite?". |
 | `lakehouse_manifest.py` | 190 | Manifest-derived statistics for lakehouse tables (Delta, Iceberg). |
@@ -2304,7 +2304,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `ir_tags.py` | 279 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 197 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 365 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 394 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 646 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 346 | Shared traversal for `LogicalPlan` trees. |
 
@@ -2335,7 +2335,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 403 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6178 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6179 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 353 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 467 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2827,6 +2827,15 @@ Making this process's device work legible to the tools that measure devices.
 | `nvtx.py` | 199 | Naming this process's work so an external device profiler can see the engine in it. |
 | `ranges.py` | 188 | Timing device work correctly, and labelling it so an external profiler agrees with us. |
 
+### `batcher/_internal/migration/` — 0 · utility
+
+The migration registry: every PySpark, Polars, Daft and Ray Data name, and its Batcher spelling.
+
+| module | lines | what it is |
+|---|---|---|
+| `loader.py` | 159 | Load the migration registry from its TOML files. |
+| `schema.py` | 157 | The shape of one migration-registry row: a competitor's name and what it becomes here. |
+
 ### `batcher/_internal/site/` — 0 · utility
 
 Where this process is running — the provider, the scheduler, and the node's local disks.
@@ -2888,6 +2897,16 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | `arrays.py` | 309 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
 | `diagnostics.py` | 149 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
+
+### `batcher/migrate/` — ?
+
+`batcher.migrate`: rewrite code onto, and off, Batcher's API, driven by the migration registry.
+
+| module | lines | what it is |
+|---|---|---|
+| `__main__.py` | 100 | `python -m batcher.migrate`: rewrite scripts onto Batcher's one spelling per capability. |
+| `canonical.py` | 161 | Rewrite Batcher's own removed second spellings to the one spelling that stays. |
+| `receivers.py` | 412 | Which expressions in a script are Batcher objects, and which Batcher receiver each one is. |
 
 ## Rust data plane — `crates/`
 
@@ -3241,7 +3260,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `page_index.rs` | 266 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
-| `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
+| `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
 | `row_filter.rs` | 399 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `split_read.rs` | 259 | Split an oversized object-store read into several concurrent range GETs. |

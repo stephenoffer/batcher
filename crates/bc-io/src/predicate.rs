@@ -273,15 +273,22 @@ fn i64_unsigned(v: Option<&i64>) -> Option<i128> {
     v.map(|x| i128::from(*x as u64))
 }
 
-/// `range_survives` for float bounds, but a NaN bound *keeps* the group (never prunes).
+/// `range_survives` for float bounds, which cannot see the NaNs a block may hold.
 ///
-/// Per the Parquet spec a writer must exclude NaN from float min/max, but writers have
-/// violated this (parquet-mr < 1.10, PARQUET-1246, wrote NaN into double/float stats when
-/// NaN was the first value in a page). A NaN bound compares false against every literal,
-/// so feeding it to `range_survives` would prune the group for *any* ordering predicate
-/// (`NaN > lit`, `NaN < lit` are both false) — silently dropping rows that actually match.
-/// Since these readers ingest untrusted files from every writer, a NaN bound is treated as
-/// "unknown" and the group is kept (superset-safe), matching how a missing stat is handled.
+/// The engine ranks NaN **above every number** (`bc_arrow::canon_float_array`, the same total
+/// order `ORDER BY` uses), so `NaN > lit`, `NaN >= lit` and `NaN != lit` are all true. The
+/// Parquet spec, though, tells writers to leave NaN *out* of a float column's min/max, so a
+/// footer `max` is the largest non-NaN value and says nothing about whether a NaN is present.
+/// Pruning `x > lit` on it therefore dropped every NaN row that the same filter keeps over
+/// the same data in memory: a row group of `[0.1, 0.5, NaN]` answered `x > 0.9` with no rows
+/// instead of one. So those three comparisons never prune on a float column; `<`, `<=` and
+/// `=` still do, because no NaN satisfies them and `min` is unaffected by a NaN's absence.
+/// DuckDB reaches the same answer through its `can_have_nan` option, which leaves a float's
+/// max unknown.
+///
+/// A NaN *bound* keeps the group too. Writers have violated the spec (parquet-mr < 1.10,
+/// PARQUET-1246, wrote NaN into stats when it was a page's first value), and a NaN compares
+/// false against every literal, so it would otherwise prune for any ordering predicate.
 pub(crate) fn float_range_survives(
     min: Option<f64>,
     max: Option<f64>,
@@ -289,6 +296,9 @@ pub(crate) fn float_range_survives(
     op: CmpOp,
 ) -> bool {
     if min.is_some_and(f64::is_nan) || max.is_some_and(f64::is_nan) {
+        return true;
+    }
+    if matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Ne) {
         return true;
     }
     range_survives(min, max, lit, op)
@@ -416,9 +426,22 @@ mod tests {
             !range_survives(Some(f64::NAN), Some(f64::NAN), 2.0, CmpOp::Gt),
             "raw range_survives prunes on a NaN bound — the bug the guard prevents"
         );
-        // A clean (non-NaN) float range still prunes exactly as before.
-        assert!(!float_range_survives(Some(1.0), Some(2.0), 5.0, CmpOp::Gt));
-        assert!(float_range_survives(Some(1.0), Some(2.0), 1.5, CmpOp::Gt));
+        // A clean (non-NaN) float range still prunes the comparisons no NaN can satisfy.
+        assert!(!float_range_survives(Some(1.0), Some(2.0), 0.5, CmpOp::Lt));
+        assert!(!float_range_survives(Some(1.0), Some(2.0), 5.0, CmpOp::Eq));
+        assert!(float_range_survives(Some(1.0), Some(2.0), 1.5, CmpOp::Lt));
+    }
+
+    #[test]
+    fn a_float_max_does_not_prune_what_a_nan_would_satisfy() {
+        // `[1.0, 2.0]` is what a footer records for a block of `1.0, 2.0, NaN`: the spec keeps
+        // NaN out of the bounds. The engine ranks NaN greatest, so the NaN row satisfies
+        // `> 5`, `>= 5` and `!= 2`, and pruning the block on its max drops it.
+        assert!(float_range_survives(Some(1.0), Some(2.0), 5.0, CmpOp::Gt));
+        assert!(float_range_survives(Some(1.0), Some(2.0), 5.0, CmpOp::Ge));
+        assert!(float_range_survives(Some(2.0), Some(2.0), 2.0, CmpOp::Ne));
+        // The integer path is untouched: an integer block has no NaN to hide.
+        assert!(!range_survives(Some(1i64), Some(2i64), 5, CmpOp::Gt));
     }
 
     #[test]

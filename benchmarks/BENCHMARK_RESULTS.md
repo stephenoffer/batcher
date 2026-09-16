@@ -28797,3 +28797,56 @@ Read with the caveats, which matter more than the numbers:
   4.3 s. A completed query against a dead one is worth recording and is not a ratio.
 - Daft failed every pipeline in this run with `No flotilla workers became available within
   120s`, which is a deployment failure on this fleet rather than a result about Daft.
+
+## 2026-09-16 (single-node) — the scan under a top-N, a spill and a float filter
+
+Machine: 48-core Xeon 8275CL (46 available), 92 GiB, release engine. Review:
+`docs/architecture/internals/competitor_technique_review.md` item 27.
+
+### `benchmarks/internals/operators/parquet_topn.py`, default arguments
+
+40M rows in 8 files, 500,000-row row groups, clustered on a millisecond timestamp. Load per core
+0.16 at start. Every top-N result was checked in order against DuckDB before it was timed.
+
+| `ORDER BY ts LIMIT 10` | batcher warm | duckdb | polars |
+|---|---:|---:|---:|
+| DESC | **45.3 ms** | 91.5 ms | 1,203.1 ms |
+| ASC | 46.6 ms | **33.4 ms** | 1,198.0 ms |
+
+Before this change the same warm query took 433 ms. A timestamp bound was never stored,
+because the hub rejected a `datetime` and the error was suppressed, so no warm run had a
+bound to start from.
+
+The script's `batcher cold` column (955 ms) is **not a top-N number**, and it is recorded
+separately for that reason. It is the first query of a fresh interpreter, and any first query
+costs that much: in three fresh processes, a point filter over the same files took 829-882 ms
+and the top-N run right after it took **134 ms**. So 134 ms is the first run of the top-N,
+proved from the footers with nothing learned, against 422 ms before. The ~850 ms per-process
+first-query cost is its own finding and is not addressed here.
+
+| `collect(spill=True)`, 5% clustered filter then `GROUP BY` | best of 5 |
+|---|---:|
+| predicate not pushed into the spill read (the old tap) | 1,189.1 ms |
+| predicate pushed | **95.2 ms (12.5x)** |
+
+### TPC-H sf10 on the Parquet scan path: no regression from the NaN fix
+
+`benchmarks/run.py --benchmark tpch --scale 10 --scan --source <local mirror> --engines
+batcher,duckdb`, over a local copy written by `tools/mirror_bench_data.py`. Two sandboxes built
+from the same working tree differ only in the NaN-aware float pruning and the float row filter,
+and ran alternately, two rounds each. Every run passed every correctness check.
+
+| | round 1 | round 2 |
+|---|---:|---:|
+| b/duckdb, before | 1.522 | 1.532 |
+| b/duckdb, after | 1.527 | 1.526 |
+
+Per query, best of the two rounds, after against before: **geomean 1.003**, range 0.89 (q9) to
+1.15 (q7), and both extremes sit inside the round-to-round spread of their own arm.
+
+**Read the 1.52x itself.** This board is usually quoted in memory, where sf10 was 0.93x on
+2026-08-26. Read from Parquet it is 1.52x, 21 of 22 queries lose, and q15 (0.11x, answered from
+a cached subplan) and q22 (0.79x) are the only wins. The single-node gap to DuckDB at sf10 is the
+scan, as the 2026-09-08 decomposition said, and on this 48-core box it is decode CPU rather than
+idle cores. Three `lineitem` columns cost 4.1 CPU-seconds to decode natively against 2.6 for
+DuckDB to decode *and* sum them.

@@ -150,6 +150,8 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
 | 26 | Composite integer keys hashed **column at a time**, and that table presized | DuckDB, Polars | **Landed** (`hash_columns_i64` + `GroupGrowth` in `assign_groups_int64_multi`) | 1.4x-6.2x on a multi-key integer `GROUP BY` with many groups; 1.07x-1.12x at low cardinality. Generalizing either half to the *other* group paths loses — see item 26 |
 | 11 | Compressed materialization — narrow a key to its *measured* range | DuckDB | **Landed for the multi-key sort** (`packed_multi_sort_indices`); **measured and reverted** for the composite group key | 1.5-3.0x on a multi-key `ORDER BY`; 0.86x-1.04x on grouping, so not taken there — see 11 |
+| 27a | A top-N bound proved from row-group statistics | DuckDB `RowGroupPruner` | **Landed** (`kyber/learned_tuning/topn_footer.py` + `api/orchestration/topn_seeding.py`) | `ORDER BY ts DESC LIMIT 10` on 40M clustered rows: first run 422 -> 134 ms, warm 433 -> 45 ms, DuckDB 92 |
+| 27d | Float bounds that cannot see NaN | DuckDB `can_have_nan` | **Fixed** — a wrong answer at four layers, invisible to the DuckDB oracle at its default | Correctness: NaN rows returned by every terminal |
 
 **Status correction, 2026-07-29.** Items 3, 4 and 8 were recorded as absent or open and are
 landed; item 6 was recorded as partially closed and is in fact *inert on the live path*. Three
@@ -3308,6 +3310,120 @@ is the interleaved A/B above; this row exists so the shape has a number in the s
 so the next session has something to A/B a build against. It belongs in
 `benchmarks/BENCHMARK_RESULTS.md` and is recorded here instead only because that file was being
 rewritten by another session at the time.
+
+## 27. The scan under a top-N, a spill and a float filter — four gaps, one of them a wrong answer (2026-09-16)
+
+A pass started from the operator suite at `HEAD` (46 cases, **0.75x DuckDB and 0.16x Polars** by
+geomean, every correctness gate passing) and found the operator surface is not where the
+remaining single-node losses are. The largest remaining single-case losses were one string
+kernel against DuckDB's inline string prefix (`LIKE 'the%'`, 2.63x) and DuckDB's anti-join for
+`EXCEPT` (1.58x), both a few milliseconds. So it read the scan side instead, where DuckDB's
+optimizer has a pass Batcher did not.
+
+### 27a. A top-N bound proved from row-group statistics — **landed**
+
+DuckDB's `RowGroupPruner` (`src/optimizer/row_group_pruner.cpp`) orders a table's row groups by
+the sort key's zone map for `ORDER BY k LIMIT n`, and prunes the ones that cannot reach the
+answer. Batcher had half of this: `kyber/learned_tuning/topn_bound.py` remembers the k-th value
+from the *previous* run, so every first run read the whole relation.
+`kyber/learned_tuning/topn_footer.py` computes the bound from the footers instead. For a
+descending sort it walks the row groups from the largest `min`, summing non-null row counts, and
+stops at the group that brings the sum to `k`. Its `min` is a value `k` rows provably reach, so
+`key >= min` removes only rows strictly worse than the k-th, and predicate pushdown skips every
+row group whose `max` is below it. The conductor applies it in
+`api/orchestration/topn_seeding.py`, and on `collect(spill=True)` and `iter_batches()` too,
+because a proved bound needs no row count to check.
+
+Measured on a 40M-row, 8-file event table clustered on its timestamp, `ORDER BY ts DESC LIMIT 10`:
+the first run went from **422 ms to 134 ms** with nothing learned, and the warm run from 433 to
+**45 ms**, against DuckDB's 92 ms and Polars' 1,203 ms. The ascending warm run is 47 ms against
+DuckDB's 33. A fresh interpreter's *first* query of any kind costs another ~850 ms, which is not
+this bound's and is recorded as its own finding. It declines floats, strings, nanosecond timestamps, nulls-first
+orderings, anything but a renaming `Project` between the sort and the scan, and any bound that
+would leave more than half the rows. The recorded run is in `BENCHMARK_RESULTS.md`, produced by
+`benchmarks/internals/operators/parquet_topn.py`.
+
+### 27b. The learned bound had never worked on a temporal key
+
+Found while measuring 27a. The hub stores JSON, `record_topn_bound` stored the k-th value raw,
+and for a `datetime` that raised inside a `try` that recorded the error as a suppressed hint.
+So the *most common* top-N shape, the latest events, never seeded: every warm run of the
+timestamp query read all 40M rows, 433 ms, while the identical integer query was answered from
+35 rows. Non-JSON bounds are now stored as a one-element Arrow IPC stream. Warm: **433 to 39 ms**.
+It is recorded here because it is the pattern this document keeps finding: a feature measured
+at 19x on the shape it was built on, silently inert on the shape users write.
+
+### 27c. A spilled query never pushed a predicate
+
+Every out-of-core phase reads through `dist/spill/scratch.py::_iter_spill_morsels`, which took a
+projection and no predicate. So `collect(spill=True)` decoded every row group that `collect()`
+pruned, on exactly the queries that spill because their inputs are large. `map_predicate` now
+sits beside `map_projection` for aggregate, join, sort and window. A 5%-selective clustered
+filter under a spilled group-by: **1,189 to 95 ms (12.5x)**.
+
+### 27d. A float filter over Parquet dropped NaN rows — **a wrong answer at every layer**
+
+The engine ranks NaN above every number (`bc_arrow::canon_float_array`), so `x > 0.9` is true
+for a NaN row. Parquet, Delta and Iceberg keep NaN out of a float column's recorded min/max. Four
+separate layers pruned `x > v` on that max: the native reader's row-group and page pruning
+(`bc-io/src/predicate.rs`), the pyarrow filter the Parquet source re-applies, manifest file
+skipping, and Kyber's zone-map rules via `SourceStatistics.to_relstats`. Over a row group of
+`[0.1, 0.5, NaN]`, `collect()`, `count()`, `is_empty()`, `iter_batches()` and `collect(spill=True)`
+all answered no rows where the same filter over the same table in memory keeps one.
+
+**Every differential test passed through this, and the reason is the lesson.** DuckDB has the
+identical behaviour by default: its Parquet reader trusts the float max unless you pass
+`can_have_nan=true` (`extension/parquet/parquet_statistics.cpp`). The oracle agreed with the bug.
+The fix follows DuckDB's `can_have_nan=true` semantics everywhere: a float max cannot prove `>`,
+`>=` or `!=` empty, and the pyarrow translation Or-s `is_nan` into `>` and `>=`, which makes it
+exact under negation too. `<`, `<=` and `=` keep their pruning, because no NaN satisfies them.
+The tests compare against DuckDB **with** `can_have_nan=true` and against Batcher's own in-memory
+answer.
+
+What it costs: no row group or file is skipped on a float column's max for `>`, `>=` or `!=`.
+Those predicates prune well only on a float column clustered across files, which analytic
+tables rarely have. The integer, date and timestamp paths are untouched. Measured on TPC-H sf10
+read from Parquet, alternating builds with and without it: per-query geomean **1.003**, every
+correctness check passing (`BENCHMARK_RESULTS.md`, 2026-09-16).
+
+### 27e. Float predicates now filter inside the Parquet decode
+
+`bc-io`'s row filter decodes the predicate columns first and the rest only for surviving rows,
+and it refused floats outright because its comparison order differs from the engine's. It now
+admits them as a **superset**: every row the two orders could disagree on, NaN and a zero against
+a zero literal, is kept, and the engine's `Filter` above the scan decides. Pinned against the
+engine's own canonicalization in `row_filter::tests::a_float_mask_keeps_every_row_the_engine_keeps`.
+An interleaved A/B at sf10 put a selective filter on `l_extendedprice` at **163-169 ms before and
+101-108 ms after**. q6 did not move (186-199 against 181-214 ms), because its payload is one
+column and the saving is the payload's decode.
+
+### 27f. `EXCEPT` as a distinct anti-join — built as a prototype, measured, not taken
+
+`op-except` is 1.58x DuckDB while `op-intersect` is at parity, and DuckDB plans `EXCEPT` as an
+anti-join. Batcher lowers both to one membership group-by (`Dataset._set_membership`), so the
+obvious move is `left.distinct()` anti-joined to the right side on NULL-safe keys. At the
+benchmark's shape (1.5M distinct left keys, 6M right rows over 1.5M keys, in memory): the
+membership group-by took **57 ms**, the anti-join **141 ms**, DuckDB **39 ms**. The semi-join form
+of `INTERSECT` took 49 ms against the group-by's 55 and DuckDB's 67, which is not worth a second
+lowering. The anti-join builds on the 6M-row side; the group-by aggregates both sides once. Do not
+rebuild this without a right-side distinct in front of it, and measure that first.
+
+And the float row filter in 27e is not free on a permissive read: q6's filtered read, isolated,
+costs 294 ms and 6.3 CPU-seconds with the filter against 144 ms and 3.3 without, because
+decoding through a fragmented 12.5% selection costs more than the one payload column it skips.
+The end-to-end query does not move, because the filter hands the engine 7.5M rows instead of 60M.
+A width-aware admission rule (payload columns against predicate columns) is the open refinement.
+
+### What this pass did not do, and where the single-node gap now is
+
+The sf10 decomposition in `BENCHMARK_RESULTS.md` (2026-09-08) put the loss in the Parquet reader,
+on a 16-core box, as a read and an execute that do not overlap. Re-measured here on 48 cores it
+is the read's **total CPU**, not its occupancy: three `lineitem` columns decode in 4.1 CPU-seconds
+against DuckDB's 2.6 for decoding *and* summing them, at 34-43 cores busy. A prototype that folded
+each file into a partial aggregate concurrently, overlapping read and execute through the
+existing mergeable primitives, was **slower** on every shape (sum 40 to 82 ms, q1 about 400 to
+540 ms), and is not the lever on a box this wide. What remains is per-value decode cost in
+arrow-rs 56, which is a dependency question, and DuckDB's inline-prefix strings, item 2.
 
 ## Things Batcher already has, so do not "add" them
 

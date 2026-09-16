@@ -223,6 +223,11 @@ def _comparison(
     if aligned is None:
         return None
     lo, hi, value = aligned
+    if op in ("gt", "ge", "ne") and _is_float_bound(hi):
+        # Delta, Iceberg and Parquet all keep NaN out of a float column's recorded max, and
+        # the engine ranks NaN above every number, so `x > v` holds for a NaN row in a file
+        # whose max is below `v`. A float max cannot rule these three out.
+        return None
 
     try:
         # A file whose values are all NULL matches no comparison (NULL OP x is never
@@ -237,6 +242,14 @@ def _comparison(
     except Exception as exc:
         note_suppressed("io", "evaluate zone-map prune", exc)
         return None  # a type that will not compare prunes nothing
+
+
+def _is_float_bound(bound: Any) -> bool:
+    """Whether a manifest bound column holds floating-point values."""
+    import pyarrow as pa
+
+    bound_type = getattr(bound, "type", None)
+    return bound_type is not None and pa.types.is_floating(bound_type)
 
 
 def _align(lo: Any, hi: Any, value: Any, kind: str, pc: Any) -> tuple[Any, Any, Any] | None:
