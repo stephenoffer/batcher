@@ -1593,7 +1593,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
 | `cpu_budget.py` | 126 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 669 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
-| `morsel.py` | 328 | How big a morsel should be, given memory pressure and the rows' measured width. |
+| `morsel.py` | 350 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 469 | Whether a query goes out of core, and what shape its spilled state takes. |
@@ -2987,7 +2987,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1727 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1718 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -3073,8 +3073,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 439 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 749 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1577 | Window functions — partition, order, and append one column per function. |
-| `window/parallel.rs` | 303 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
+| `window/mod.rs` | 1685 | Window functions — partition, order, and append one column per function. |
+| `window/parallel.rs` | 385 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 352 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
 | `window/running_par.rs` | 163 | Parallel prefix scan for *running* (frameless, ordered) window aggregates. |
 | `window/series.rs` | 311 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
