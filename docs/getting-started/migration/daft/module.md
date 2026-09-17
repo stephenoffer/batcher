@@ -61,7 +61,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `from_arrow` | `bt.from_arrow` | param | Missing: an iterable of Arrow tables or any ArrowStreamExportable. Wave W2. |
 | `from_dask_dataframe` | `bt.from_dask` | canonical |  |
 | `from_files` | n/a | gap | Not yet: DataFrame of File references from a glob. Wave W12. |
-| `from_glob_path` | n/a | gap | Not yet: DataFrame of path/size/num\_rows metadata from a glob without reading contents. Wave W13. |
+| `from_glob_path` | `bt.read.binary` | mismatch | Differs: port as bt.read.binary(glob).select(uri, size), answered from the listing; the columns are uri and size, not path, size and num\_rows. Wave W13. |
 | `from_pandas` | `bt.from_pandas` | canonical |  |
 | `from_pydict` | `bt.from_pydict` | canonical |  |
 | `from_pylist` | `bt.from_pylist` | canonical |  |
@@ -116,7 +116,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `read_parquet` | `bt.read.parquet` | alias |  |
 | `read_sql` | `bt.read.sql` | param | Missing: partition\_col=/num\_partitions= parallel range partitioning and a connection factory callable. Wave W13. |
 | `read_table` | `bt.read.table` | mismatch | Differs: Daft read\_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier). Wave W9. |
-| `read_text` | `bt.read.text` | mismatch | Differs: Daft read\_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line\_number columns and keeps blank lines. Param: skip\_blank\_lines=True, text column only. Wave W13. |
+| `read_text` | `bt.read.text` | param | Missing: Daft reads each line as a row by default; pass skip\_blank\_lines= to match. Daft read\_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line\_number columns and keeps blank lines. Param: skip\_blank\_lines=True, text column only. Wave W13. |
 | `read_video_frames` | `bt.read.video` | mismatch | Differs: Daft read\_video\_frames yields one row per decoded frame (image\_height/width, sample\_interval\_seconds); Batcher read.video yields one row per file with num\_frames sampled frames. Wave W12. |
 | `read_warc` | `bt.read.warc` | mismatch | Differs: Daft read\_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake\_cases them ('warc\_record\_id'). Wave W13. |
 | `read_webdataset` | `bt.read.webdataset` | param | Missing: batch\_size= and Daft's column layout (not verified against Daft). Wave W13. |
@@ -138,7 +138,7 @@ The following table maps the 130 names on the `daft` module, sorted alphabetical
 | `set_runner_ray` | `Dataset.collect` | param | Missing: a process-wide switch to distributed execution (Batcher opts in per collect(distributed=...)). Wave W9. |
 | `set_session` | n/a | gap | Not yet: a process-default session object (current\_session/set\_session/session). Wave W9. |
 | `sql` | `bt.sql` | param | Missing: register\_globals= discovery of DataFrames bound to Python variables. Wave W1. |
-| `sql_expr` | n/a | gap | Not yet: parse a SQL string into an Expr (bt.expr). Wave W1. |
+| `sql_expr` | `bt.sql_expr` | canonical |  |
 | `Table` | n/a | gap | Not yet: Catalog/Table/Identifier objects with namespaces and table lifecycle. Wave W9. |
 | `TimeUnit` | n/a | gap | Not yet: time unit enum (Batcher takes unit strings). Wave W11. |
 | `udaf` | n/a | gap | Not yet: user-defined mergeable aggregate functions (partial/combine/finalize) from a class. Wave W11. |

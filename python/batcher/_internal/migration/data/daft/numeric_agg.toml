@@ -140,7 +140,7 @@ not_nan = { status = "canonical", batcher = "Expr.is_not_nan" }
 over = { status = "param", batcher = ["Expr.over"], need = "a Window spec object", wave = "WF" }
 percentile = { status = "canonical", batcher = "Expr.quantile" }
 pi = { status = "canonical", batcher = "bt.pi" }
-pmod = { status = "gap", need = "positive modulo (Batcher % truncates toward zero, so pmod(-7, 3) is -1 not 2)", wave = "W3" }
+pmod = { status = "canonical", batcher = "bt.pmod" }
 pow = { status = "canonical", batcher = "op:pow" }
 power = { status = "canonical", batcher = "op:pow" }
 product = { status = "canonical", batcher = "bt.product" }

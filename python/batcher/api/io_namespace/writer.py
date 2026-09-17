@@ -683,6 +683,14 @@ class Writer:
         sink_kwargs = dict(opts)
         if dml_mode:
             sink_kwargs["mode"] = mode
+        elif fmt in _DATABASE_SINKS and mode in ("error", "ignore"):
+            # The existence gate above asks the filesystem, which cannot see a table, and
+            # the sink only takes append/overwrite. Mapping `error` to overwrite replaced
+            # the very table the caller asked to protect, so refuse instead.
+            raise PlanError(
+                f"write(): mode={mode!r} is not supported for the {fmt!r} sink, which cannot "
+                "check whether its table exists; pass mode='append' or mode='overwrite'"
+            )
         elif fmt in _MODE_AWARE_SINKS:
             sink_kwargs["mode"] = mode if mode in ("append", "overwrite") else "overwrite"
 
@@ -1997,12 +2005,6 @@ class Writer:
                 ...     "analytics.orders", host="localhost", password="env:CH_PASSWORD"
                 ... )
         """
-        if mode not in ("append", "overwrite"):
-            # Checked here because `__call__` maps every other save mode on a table sink to
-            # "overwrite", and for this sink an overwrite is a TRUNCATE.
-            from batcher._internal.errors import PlanError
-
-            raise PlanError(f"write.clickhouse mode must be 'append' or 'overwrite', got {mode!r}")
         return self(table, "clickhouse", mode=mode, **opts)
 
     def mongo(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:

@@ -28,7 +28,7 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 | `atanh` | `Expr.arctanh` | canonical |  |
 | `bin` | `Expr.to_base` | canonical |  |
 | `bit_count` | `Expr.bit_count` | canonical |  |
-| `bit_get` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (bit\_get). Wave W1. |
+| `bit_get` | `bt.bit_get` | canonical |  |
 | `bitwise_not` | n/a | gap | Not yet: integer bitwise NOT (\~ on Expr is boolean-only and raises on integers). Wave W3. |
 | `bround` | `Expr.round` | param | Missing: a column-valued scale. Wave W2. |
 | `cbrt` | `Expr.cbrt` | canonical |  |
@@ -40,12 +40,12 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 | `cot` | `Expr.cot` | canonical |  |
 | `csc` | `Expr.csc` | canonical |  |
 | `degrees` | `Expr.degrees` | canonical |  |
-| `e` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (e). Wave W1. |
+| `e` | `bt.e` | canonical |  |
 | `exp` | `Expr.exp` | canonical |  |
 | `expm1` | `Expr.expm1` | canonical |  |
 | `factorial` | `Expr.factorial` | mismatch | Differs: Batcher returns Int64 and raises outside 0..20; Spark returns null there. Port as bt.when(n.between(0, 20)).then(n.factorial()). Wave W0. |
 | `floor` | `Expr.floor` | param | Missing: scale= digits, and a BIGINT result for scale-less input. Wave W2. |
-| `getbit` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (getbit). Wave W1. |
+| `getbit` | `bt.bit_get` | canonical |  |
 | `greatest` | `bt.greatest` | canonical |  |
 | `hypot` | `bt.hypot` | canonical |  |
 | `least` | `bt.least` | canonical |  |
@@ -57,9 +57,9 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 | `nanvl` | `bt.nanvl` | canonical |  |
 | `negate` | `-` operator | canonical |  |
 | `negative` | `-` operator | canonical |  |
-| `pi` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (pi). Wave W1. |
-| `pmod` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (pmod). Wave W1. |
-| `positive` | n/a | gap | Not yet: unary plus identity on an expression. Wave W1. |
+| `pi` | `bt.pi` | canonical |  |
+| `pmod` | `bt.pmod` | canonical |  |
+| `positive` | `Expr` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
 | `radians` | `Expr.radians` | canonical |  |
@@ -80,7 +80,7 @@ The following table maps the 67 names on the `pyspark.sql.functions` module, sor
 | `tanh` | `Expr.tanh` | canonical |  |
 | `try_add` | n/a | gap | Not yet: addition returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
 | `try_divide` | `Expr.safe_divide` | canonical |  |
-| `try_mod` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (try\_mod). Wave W1. |
+| `try_mod` | `%` operator | canonical |  |
 | `try_multiply` | n/a | gap | Not yet: multiplication returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
 | `try_subtract` | n/a | gap | Not yet: subtraction returning null on overflow (Batcher integer arithmetic wraps). Wave W3. |
 | `uniform` | n/a | gap | Not yet: uniform random value in \[min, max) with seed. Wave W3. |
@@ -103,7 +103,7 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `assert_true` | n/a | gap | Not yet: raise when a condition is false. Wave W3. |
 | `broadcast` | n/a | out of scope | Declined: no join-hint IR; Kyber picks the build side from measured cardinalities (revisit). |
 | `bucket` | `Expr.hash_bucket` | canonical |  |
-| `call_function` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (call\_function by name). Wave W1. |
+| `call_function` | `bt.call_function` | param | Missing: functions registered from Python with bt.register\_function. Wave W2. |
 | `call_udf` | n/a | gap | Not yet: call a registered UDF by name from the DataFrame API. Wave W11. |
 | `coalesce` | `bt.coalesce` | canonical |  |
 | `col` | `bt.col` | canonical |  |
@@ -117,7 +117,7 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `desc_nulls_first` | `Dataset.sort` | canonical |  |
 | `desc_nulls_last` | `Dataset.sort` | canonical |  |
 | `equal_null` | `Expr.eq_missing` | canonical |  |
-| `expr` | n/a | gap | Not yet: parse a SQL expression string into an Expr (bt.expr). Wave W1. |
+| `expr` | `bt.sql_expr` | canonical |  |
 | `ifnull` | `Expr.fill_null` | canonical |  |
 | `input_file_block_length` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |
 | `input_file_block_start` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |

@@ -82,13 +82,13 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `shift` | n/a | gap | Not yet: Dataset.shift (every column). Wave W5. |
 | `show` | `Dataset.show` | param | Missing: Polars' default limit of 5 and its formatting options. Wave W2. |
 | `show_graph` | n/a | gap | Not yet: Dataset.show\_graph (plan diagram). Wave W8. |
-| `sink_batches` | `Dataset.iter_batches` | param | Missing: callback sink that runs to completion, streaming. Wave W13. |
-| `sink_csv` | `Dataset.write.csv` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
-| `sink_delta` | `Dataset.write.delta` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
-| `sink_iceberg` | `Dataset.write.iceberg` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
-| `sink_ipc` | `Dataset.write.arrow` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
-| `sink_ndjson` | `Dataset.write.json` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
-| `sink_parquet` | `Dataset.write.parquet` | param | Missing: lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets. Wave W13. |
+| `sink_batches` | `Dataset.iter_batches` | canonical |  |
+| `sink_csv` | `Dataset.write.csv` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
+| `sink_delta` | `Dataset.write.delta` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
+| `sink_iceberg` | `Dataset.write.iceberg` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
+| `sink_ipc` | `Dataset.write.arrow` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
+| `sink_ndjson` | `Dataset.write.json` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
+| `sink_parquet` | `Dataset.write.parquet` | param | Missing: streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first. Wave W13. |
 | `slice` | `Dataset.limit` | alias |  |
 | `sort` | `Dataset.sort` | mismatch | Differs: Polars places nulls first by default (nulls\_last=False); Batcher places them last. Param: nulls\_first=True (exists). Wave W0. |
 | `sql` | `Dataset.sql` | canonical |  |
@@ -246,7 +246,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `write_excel` | n/a | gap | Not yet: Dataset.write.excel. Wave W13. |
 | `write_iceberg` | `Dataset.write.iceberg` | canonical |  |
 | `write_ipc` | `Dataset.write.arrow` | param | Missing: compression=, compat\_level=. Wave W2. |
-| `write_ipc_stream` | n/a | gap | Not yet: Dataset.write IPC stream format. Wave W13. |
+| `write_ipc_stream` | `Dataset.write.arrow` | canonical |  |
 | `write_json` | `Dataset.write.json` | mismatch | Differs: Polars write\_json writes one JSON array of row objects; Batcher's json writer writes newline-delimited JSON. Param: lines=False. Wave W0. |
 | `write_ndjson` | `Dataset.write.json` | param | Missing: compression=. Wave W2. |
 | `write_parquet` | `Dataset.write.parquet` | param | Missing: compression\_level=, statistics=, row\_group\_size=, data\_page\_size=, metadata=. Wave W2. |

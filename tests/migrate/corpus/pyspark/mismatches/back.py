@@ -9,9 +9,8 @@ joined = df.select(F.concat(F.col("s"), F.lit("!")).alias("loud"))
 parts = df.select(F.split("s", " ").alias("parts"))
 # batcher-migrate: PySpark `functions.explode` is `Dataset.explode` in Batcher, but this call does not carry over 1:1
 exploded = df.select(F.explode("xs").alias("x"))
-# batcher-migrate: PySpark `DataFrame.selectExpr` has no Batcher equivalent yet: SQL expression strings in select (bt.expr)
-# batcher-migrate: PySpark `Dataset.selectExpr` has no exact PySpark spelling; left as written
-computed = df.selectExpr("size(xs) as n")
+# batcher-migrate: PySpark `bt.sql_expr` has no exact PySpark spelling; left as written
+computed = df.select(bt.sql_expr("size(xs) as n", dialect="spark"))
 # batcher-migrate: PySpark `functions.broadcast` is not provided by Batcher: no join-hint IR; Kyber picks the build side from measured cardinalities (revisit)
 small = F.broadcast(df)
 # batcher-migrate: PySpark `DataFrame.rdd` is not provided by Batcher: no RDD or JVM context

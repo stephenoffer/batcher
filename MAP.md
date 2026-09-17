@@ -300,7 +300,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1860 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2170 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 2172 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -2347,7 +2347,7 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 487 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6580 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 6608 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 362 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2936,7 +2936,7 @@ The `sem.<name>` transforms registry templates call for what the template DSL ca
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 199 | The transform registry, the context a transform reads, and the node helpers they share. |
-| `columns.py` | 230 | Transforms over column references, argument checks, positions and date patterns. |
+| `columns.py` | 248 | Transforms over column references, argument checks, positions and date patterns. |
 | `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
 | `relational.py` | 235 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
 

@@ -67,13 +67,13 @@ set_sorted = { status = "out_of_scope", reason = "sortedness flags are engine-ow
 shift = { status = "gap", need = "Dataset.shift (every column)", wave = "W5" }
 show = { status = "param", batcher = "Dataset.show", need = "Polars' default limit of 5 and its formatting options", wave = "W2" }
 show_graph = { status = "gap", need = "Dataset.show_graph (plan diagram)", wave = "W8" }
-sink_batches = { status = "param", batcher = "Dataset.iter_batches", need = "callback sink that runs to completion, streaming", wave = "W13" }
-sink_csv = { status = "param", batcher = "Dataset.write.csv", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
-sink_delta = { status = "param", batcher = "Dataset.write.delta", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
-sink_iceberg = { status = "param", batcher = "Dataset.write.iceberg", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
-sink_ipc = { status = "param", batcher = "Dataset.write.arrow", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
-sink_ndjson = { status = "param", batcher = "Dataset.write.json", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
-sink_parquet = { status = "param", batcher = "Dataset.write.parquet", need = "lazy/partitioned streaming sink: lazy=True returning a deferred plan, PartitionBy targets", wave = "W13" }
+sink_batches = { status = "canonical", batcher = "Dataset.iter_batches" }
+sink_csv = { status = "param", batcher = "Dataset.write.csv", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
+sink_delta = { status = "param", batcher = "Dataset.write.delta", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
+sink_iceberg = { status = "param", batcher = "Dataset.write.iceberg", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
+sink_ipc = { status = "param", batcher = "Dataset.write.arrow", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
+sink_ndjson = { status = "param", batcher = "Dataset.write.json", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
+sink_parquet = { status = "param", batcher = "Dataset.write.parquet", need = "streams batch by batch when the plan has no pipeline breaker; one with a breaker materializes it first", wave = "W13" }
 slice = { status = "alias", batcher = "Dataset.limit" }
 sort = { status = "mismatch", batcher = "Dataset.sort", note = "Polars places nulls first by default (nulls_last=False); Batcher places them last. Param: nulls_first=True (exists)", wave = "W0", template = 'sort(by, *more_by, descending=False, nulls_last=False, maintain_order=False) -> self.sort(sem.polars_sort(by, more_by, descending, nulls_last), sem.expect(maintain_order, False))' }
 sql = { status = "canonical", batcher = "Dataset.sql" }
@@ -226,7 +226,7 @@ write_delta = { status = "mismatch", batcher = "Dataset.write.delta", note = "Po
 write_excel = { status = "gap", need = "Dataset.write.excel", wave = "W13" }
 write_iceberg = { status = "canonical", batcher = "Dataset.write.iceberg" }
 write_ipc = { status = "param", batcher = "Dataset.write.arrow", need = "compression=, compat_level=", wave = "W2" }
-write_ipc_stream = { status = "gap", need = "Dataset.write IPC stream format", wave = "W13" }
+write_ipc_stream = { status = "canonical", batcher = "Dataset.write.arrow", template = 'write_ipc_stream(file) -> self.write.arrow(file, ipc_format="stream")' }
 write_json = { status = "mismatch", batcher = "Dataset.write.json", note = "Polars write_json writes one JSON array of row objects; Batcher's json writer writes newline-delimited JSON. Param: lines=False", wave = "W0" }
 write_ndjson = { status = "param", batcher = "Dataset.write.json", need = "compression=", wave = "W2" }
 write_parquet = { status = "param", batcher = "Dataset.write.parquet", need = "compression_level=, statistics=, row_group_size=, data_page_size=, metadata=", wave = "W2" }

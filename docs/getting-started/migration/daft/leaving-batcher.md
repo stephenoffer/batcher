@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Daft
 
-The following table maps 218 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
+The following table maps 223 Batcher spellings to the Daft names that compute the same thing, sorted by Batcher spelling. Each Daft name is prefixed with the class or module it lives on.
 
 | Batcher | Daft |
 |---|---|
@@ -34,6 +34,7 @@ The following table maps 218 Batcher spellings to the Daft names that compute th
 | `bt.count_distinct` | `functions.count_distinct` |
 | `bt.Dataset` | `daft.DataFrame` |
 | `bt.dense_rank` | `functions.dense_rank` |
+| `bt.e` | `functions.e` |
 | `bt.element` | `daft.element` |
 | `bt.Expr` | `daft.Expression` |
 | `bt.from_dask` | `daft.from_dask_dataframe` |
@@ -58,6 +59,8 @@ The following table maps 218 Batcher spellings to the Daft names that compute th
 | `bt.partition_hours` | `Expression.partition_hours`, `functions.partition_hours` |
 | `bt.partition_months` | `Expression.partition_months`, `functions.partition_months` |
 | `bt.partition_years` | `Expression.partition_years`, `functions.partition_years` |
+| `bt.pi` | `functions.pi` |
+| `bt.pmod` | `functions.pmod` |
 | `bt.product` | `functions.product` |
 | `bt.rank` | `functions.rank` |
 | `bt.read.csv` | `daft.read_csv` |
@@ -69,6 +72,7 @@ The following table maps 218 Batcher spellings to the Daft names that compute th
 | `bt.register_function` | `daft.attach_function` |
 | `bt.row_number` | `functions.row_number` |
 | `bt.skew` | `functions.skew` |
+| `bt.sql_expr` | `daft.sql_expr` |
 | `bt.sum_horizontal` | `functions.columns_sum` |
 | `bt.sum` | `functions.sum` |
 | `bt` | `daft.functions` |
@@ -103,6 +107,7 @@ The following table maps 218 Batcher spellings to the Daft names that compute th
 | `Dataset.union` | `DataFrame.concat`, `DataFrame.union_all` |
 | `Dataset.unpivot` | `DataFrame.melt`, `DataFrame.unpivot` |
 | `Dataset.with_columns` | `DataFrame.with_column`, `DataFrame.with_columns` |
+| `Dataset.write.clickhouse` | `DataFrame.write_clickhouse` |
 | `Dataset.write.delta` | `DataFrame.write_deltalake` |
 | `Expr.abs` | `Expression.abs`, `functions.abs` |
 | `Expr.alias` | `Expression.alias` |

@@ -20,7 +20,7 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 |---|---|---|---|
 | `aggregate` | n/a | gap | Not yet: higher-order function with a Python lambda over array elements (fold with initial value and finish). Wave W4. |
 | `array` | `bt.array` | canonical |  |
-| `array_append` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_append). Wave W1. |
+| `array_append` | `Expr.list.append` | canonical |  |
 | `array_compact` | `Expr.list.drop_nulls` | canonical |  |
 | `array_contains` | `Expr.list.contains` | canonical |  |
 | `array_distinct` | `Expr.list.unique` | canonical |  |
@@ -31,13 +31,13 @@ The following table maps the 90 names on the `pyspark.sql.functions` module, sor
 | `array_max` | `Expr.list.max` | canonical |  |
 | `array_min` | `Expr.list.min` | canonical |  |
 | `array_position` | `Expr.list.position` | canonical |  |
-| `array_prepend` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_prepend). Wave W1. |
-| `array_remove` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_remove). Wave W1. |
+| `array_prepend` | `Expr.list.prepend` | canonical |  |
+| `array_remove` | `Expr.list.remove` | param | Missing: a column-valued element. Wave W2. |
 | `array_repeat` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (array\_repeat). Wave W1. |
 | `array_size` | `Expr.list.len` | canonical |  |
 | `array_sort` | `Expr.list.sort` | param | Missing: comparator= lambda. Wave W4. |
 | `array_union` | `Expr.list.union` | canonical |  |
-| `arrays_overlap` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (arrays\_overlap). Wave W1. |
+| `arrays_overlap` | `Expr.list.has_any` | canonical |  |
 | `arrays_zip` | n/a | gap | Not yet: zip arrays into an array of structs. Wave W3. |
 | `cardinality` | `Expr.list.len` + `Expr.map.len` | canonical |  |
 | `create_map` | n/a | gap | Not yet: map from alternating key/value expressions. Wave W4. |

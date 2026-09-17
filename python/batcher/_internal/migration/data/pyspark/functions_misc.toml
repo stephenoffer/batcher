@@ -35,7 +35,7 @@ desc = { status = "canonical", batcher = "Dataset.sort" }
 desc_nulls_first = { status = "canonical", batcher = "Dataset.sort" }
 desc_nulls_last = { status = "canonical", batcher = "Dataset.sort" }
 equal_null = { status = "canonical", batcher = "Expr.eq_missing" }
-expr = { status = "canonical", batcher = "bt.sql_expr", template = 'expr(str) -> bt.sql_expr(str)' }
+expr = { status = "canonical", batcher = "bt.sql_expr", template = 'expr(str) -> bt.sql_expr(str, dialect="spark")' }
 ifnull = { status = "canonical", batcher = "Expr.fill_null" }
 input_file_block_length = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
 input_file_block_start = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }

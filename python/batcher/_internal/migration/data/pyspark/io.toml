@@ -51,8 +51,8 @@ partitionBy = { status = "canonical", batcher = "Dataset.write" }
 save = { status = "mismatch", batcher = "Dataset.write", note = "Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly", wave = "W0" }
 saveAsTable = { status = "gap", need = "save as a managed catalog table", wave = "W9" }
 sortBy = { status = "param", batcher = "Dataset.write", need = "sort within buckets, paired with bucketBy", wave = "W13" }
-text = { status = "gap", need = "plain-text writer (single string column)", wave = "W13" }
-xml = { status = "gap", need = "XML writer", wave = "W13" }
+text = { status = "canonical", batcher = "Dataset.write.text" }
+xml = { status = "canonical", batcher = "Dataset.write.xml" }
 
 [DataFrameWriterV2]
 append = { status = "param", batcher = "Dataset.write.iceberg", need = "DataFrameWriterV2 chain against a catalog table identifier: append", wave = "W9" }

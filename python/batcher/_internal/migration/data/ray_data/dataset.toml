@@ -79,7 +79,7 @@ unique = { status = "mismatch", batcher = ["Dataset.select", "Dataset.distinct",
 with_column = { status = "alias", batcher = "Dataset.with_columns", template = 'with_column(column_name, expr) -> self.with_columns(**{column_name: expr})' }
 with_columns = { status = "canonical", batcher = "Dataset.with_columns" }
 write_bigquery = { status = "gap", need = "BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it)", wave = "W13" }
-write_clickhouse = { status = "gap", need = "ClickHouse writer with SinkMode and ClickHouseTableSettings", wave = "W13" }
+write_clickhouse = { status = "param", batcher = "Dataset.write.clickhouse", need = "creating the table (Ray's CREATE mode); Batcher inserts into an existing table", wave = "W13" }
 write_csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Ray write_csv defaults mode=SaveMode.APPEND and writes a directory of CSV files; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing.", wave = "W2" }
 write_datasink = { status = "gap", need = "write through a user Datasink implementation", wave = "W11" }
 write_delta = { status = "mismatch", batcher = "Dataset.write.delta", note = "Both default to append, but Ray write_delta defaults schema_mode='merge' (new columns evolve the table) while Batcher defaults merge_schema=False. Pass merge_schema=True.", wave = "W0" }
@@ -89,11 +89,11 @@ write_json = { status = "mismatch", batcher = "Dataset.write.json", note = "Ray 
 write_kafka = { status = "mismatch", batcher = "Dataset.write.kafka", note = "Ray write_kafka is a one-shot batch produce (key_field, key/value serializers); Batcher write.kafka starts a StreamingQuery that must be awaited.", wave = "W10" }
 write_lance = { status = "param", batcher = "Dataset.write.lance", need = "mode= (Ray defaults SaveMode.CREATE), min_rows_per_file/max_rows_per_file, data_storage_version, table_id/namespace", wave = "W13" }
 write_mongo = { status = "mismatch", batcher = "Dataset.write.mongo", note = "Ray write_mongo(uri, database, collection) inserts; Batcher write.mongo(collection) defaults mode='upsert'. Pass mode='append' and the connection options.", wave = "W13" }
-write_numpy = { status = "gap", need = ".npy writer for one column", wave = "W13" }
+write_numpy = { status = "canonical", batcher = "Dataset.write.numpy" }
 write_parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Ray write_parquet defaults mode=SaveMode.APPEND into a directory; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing.", wave = "W2" }
 write_snowflake = { status = "mismatch", batcher = "Dataset.write.snowflake", note = "Ray write_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Pass mode='append'.", wave = "W0" }
 write_sql = { status = "mismatch", batcher = "Dataset.write.sql", note = "Ray write_sql(sql, connection_factory) executes a user INSERT statement per row batch through a DB-API connection factory; Batcher write.sql(table, mode=, key_columns=) writes a table by name.", wave = "W13" }
-write_tfrecords = { status = "gap", need = "TFRecord writer", wave = "W13" }
+write_tfrecords = { status = "param", batcher = "Dataset.write.tfrecord", need = "tf_schema=", wave = "W13" }
 write_turbopuffer = { status = "gap", need = "Turbopuffer vector-namespace writer", wave = "W13" }
-write_webdataset = { status = "gap", need = "WebDataset (tar shard) writer", wave = "W13" }
+write_webdataset = { status = "mismatch", batcher = "Dataset.write.webdataset", note = "cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated __key__ is refused", wave = "W13" }
 zip = { status = "gap", need = "column-wise zip of datasets by row position with a row-count check", wave = "W8" }

@@ -124,7 +124,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `set_random_seed` | n/a | gap | Not yet: set\_random\_seed (global seed for sample/shuffle). Wave W8. |
 | `show_versions` | `bt.show_versions` | canonical |  |
 | `sql` | `bt.sql` | param | Missing: discover frames from the caller's globals, eager= flag. Wave W2. |
-| `sql_expr` | n/a | gap | Not yet: sql\_expr (SQL expression string to Expr). Wave W8. |
+| `sql_expr` | `bt.sql_expr` | canonical |  |
 | `SQLContext` | `bt.Session` | canonical |  |
 | `std` | `bt.std` | param | Missing: ddof=. Wave W2. |
 | `StringCache` | n/a | out of scope | Declined: no global Categorical string cache: Arrow dictionaries are per batch. |

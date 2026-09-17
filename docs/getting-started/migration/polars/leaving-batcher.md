@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 263 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 267 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -83,6 +83,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `bt.Selector` | `selectors.Selector` |
 | `bt.Session` | `polars.SQLContext` |
 | `bt.show_versions` | `polars.show_versions` |
+| `bt.sql_expr` | `polars.sql_expr` |
 | `bt.starts_with` | `selectors.starts_with` |
 | `bt.temporal` | `selectors.temporal` |
 | `bt.versions` | `polars.build_info` |
@@ -104,6 +105,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Dataset.gather_every` | `DataFrame.gather_every`, `LazyFrame.gather_every` |
 | `Dataset.glimpse` | `DataFrame.glimpse` |
 | `Dataset.is_empty` | `DataFrame.is_empty` |
+| `Dataset.iter_batches` | `LazyFrame.sink_batches` |
 | `Dataset.iter_rows` | `DataFrame.iter_rows`, `DataFrame.rows` |
 | `Dataset.limit` | `DataFrame.head`, `DataFrame.limit`, `DataFrame.slice`, `LazyFrame.head`, `LazyFrame.limit`, `LazyFrame.slice` |
 | `Dataset.null_count` | `DataFrame.null_count`, `LazyFrame.null_count` |
@@ -124,6 +126,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Dataset.with_columns` | `DataFrame.with_columns`, `LazyFrame.with_columns` |
 | `Dataset.with_columns` + `Dataset.select` | `DataFrame.insert_column` |
 | `Dataset.with_row_index` | `DataFrame.with_row_count`, `DataFrame.with_row_index`, `LazyFrame.with_row_count`, `LazyFrame.with_row_index` |
+| `Dataset.write.arrow` | `DataFrame.write_ipc_stream` |
 | `Dataset.write.avro` | `DataFrame.write_avro` |
 | `Dataset.write.iceberg` | `DataFrame.write_iceberg` |
 | `Dataset` | `DataFrame.lazy`, `LazyFrame.lazy` |
@@ -232,6 +235,7 @@ The following table maps 263 Batcher spellings to the Polars names that compute 
 | `Expr.pct_change` | `Expr.pct_change` |
 | `Expr.peak_max` | `Expr.peak_max` |
 | `Expr.peak_min` | `Expr.peak_min` |
+| `Expr.pipe` | `Expr.pipe` |
 | `Expr.product` | `Expr.product` |
 | `Expr.quantile` | `Expr.quantile` |
 | `Expr.radians` | `Expr.radians` |

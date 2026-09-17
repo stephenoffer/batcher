@@ -96,7 +96,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `with_column` | `Dataset.with_columns` | alias |  |
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `write_bigquery` | n/a | gap | Not yet: BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it). Wave W13. |
-| `write_clickhouse` | n/a | gap | Not yet: ClickHouse writer with SinkMode and ClickHouseTableSettings. Wave W13. |
+| `write_clickhouse` | `Dataset.write.clickhouse` | param | Missing: creating the table (Ray's CREATE mode); Batcher inserts into an existing table. Wave W13. |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Ray write\_csv defaults mode=SaveMode.APPEND and writes a directory of CSV files; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
 | `write_datasink` | n/a | gap | Not yet: write through a user Datasink implementation. Wave W11. |
 | `write_delta` | `Dataset.write.delta` | mismatch | Differs: Both default to append, but Ray write\_delta defaults schema\_mode='merge' (new columns evolve the table) while Batcher defaults merge\_schema=False. Pass merge\_schema=True. Wave W0. |
@@ -106,13 +106,13 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `write_kafka` | `Dataset.write.kafka` | mismatch | Differs: Ray write\_kafka is a one-shot batch produce (key\_field, key/value serializers); Batcher write.kafka starts a StreamingQuery that must be awaited. Wave W10. |
 | `write_lance` | `Dataset.write.lance` | param | Missing: mode= (Ray defaults SaveMode.CREATE), min\_rows\_per\_file/max\_rows\_per\_file, data\_storage\_version, table\_id/namespace. Wave W13. |
 | `write_mongo` | `Dataset.write.mongo` | mismatch | Differs: Ray write\_mongo(uri, database, collection) inserts; Batcher write.mongo(collection) defaults mode='upsert'. Pass mode='append' and the connection options. Wave W13. |
-| `write_numpy` | n/a | gap | Not yet: .npy writer for one column. Wave W13. |
+| `write_numpy` | `Dataset.write.numpy` | canonical |  |
 | `write_parquet` | `Dataset.write.parquet` | mismatch | Differs: Ray write\_parquet defaults mode=SaveMode.APPEND into a directory; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
 | `write_snowflake` | `Dataset.write.snowflake` | mismatch | Differs: Ray write\_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Pass mode='append'. Wave W0. |
 | `write_sql` | `Dataset.write.sql` | mismatch | Differs: Ray write\_sql(sql, connection\_factory) executes a user INSERT statement per row batch through a DB-API connection factory; Batcher write.sql(table, mode=, key\_columns=) writes a table by name. Wave W13. |
-| `write_tfrecords` | n/a | gap | Not yet: TFRecord writer. Wave W13. |
+| `write_tfrecords` | `Dataset.write.tfrecord` | param | Missing: tf\_schema=. Wave W13. |
 | `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-namespace writer. Wave W13. |
-| `write_webdataset` | n/a | gap | Not yet: WebDataset (tar shard) writer. Wave W13. |
+| `write_webdataset` | `Dataset.write.webdataset` | mismatch | Differs: cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated \_\_key\_\_ is refused. Wave W13. |
 | `zip` | n/a | gap | Not yet: column-wise zip of datasets by row position with a row-count check. Wave W8. |
 
 ## `GroupedData`

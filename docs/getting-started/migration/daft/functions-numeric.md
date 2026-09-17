@@ -131,7 +131,7 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `csc` | `Expr.csc` | canonical |  |
 | `degrees` | `Expr.degrees` | canonical |  |
 | `dense_rank` | `bt.dense_rank` | canonical |  |
-| `e` | n/a | gap | Not yet: Euler's number constant expression (bt.lit(math.e) works today). Wave W1. |
+| `e` | `bt.e` | canonical |  |
 | `exp` | `Expr.exp` | canonical |  |
 | `expm1` | `Expr.expm1` | canonical |  |
 | `factorial` | `Expr.factorial` | canonical |  |
@@ -160,8 +160,8 @@ The following table maps the 89 names on the `daft.functions` module, sorted alp
 | `not_nan` | `Expr.is_not_nan` | canonical |  |
 | `over` | `Expr.over` | param | Missing: a Window spec object. Wave WF. |
 | `percentile` | `Expr.quantile` | canonical |  |
-| `pi` | n/a | gap | Not yet: pi constant expression (bt.lit(math.pi) works today). Wave W1. |
-| `pmod` | n/a | gap | Not yet: positive modulo (Batcher % truncates toward zero, so pmod(-7, 3) is -1 not 2). Wave W3. |
+| `pi` | `bt.pi` | canonical |  |
+| `pmod` | `bt.pmod` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `power` | `**` operator | canonical |  |
 | `product` | `bt.product` | canonical |  |

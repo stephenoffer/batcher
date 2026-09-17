@@ -76,8 +76,8 @@ The following table maps the 18 names on `DataFrameWriter`, sorted alphabeticall
 | `save` | `Dataset.write` | mismatch | Differs: Spark's default save mode is errorifexists; Batcher's is overwrite. Pass mode='error' explicitly. Wave W0. |
 | `saveAsTable` | n/a | gap | Not yet: save as a managed catalog table. Wave W9. |
 | `sortBy` | `Dataset.write` | param | Missing: sort within buckets, paired with bucketBy. Wave W13. |
-| `text` | n/a | gap | Not yet: plain-text writer (single string column). Wave W13. |
-| `xml` | n/a | gap | Not yet: XML writer. Wave W13. |
+| `text` | `Dataset.write.text` | canonical |  |
+| `xml` | `Dataset.write.xml` | canonical |  |
 
 ## `DataFrameWriterV2`
 

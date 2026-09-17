@@ -64,7 +64,7 @@ execution_config_ctx = { status = "param", batcher = "bt.config_context", need =
 from_arrow = { status = "param", batcher = "bt.from_arrow", need = "an iterable of Arrow tables or any ArrowStreamExportable", wave = "W2" }
 from_dask_dataframe = { status = "canonical", batcher = "bt.from_dask" }
 from_files = { status = "gap", need = "DataFrame of File references from a glob", wave = "W12" }
-from_glob_path = { status = "gap", need = "DataFrame of path/size/num_rows metadata from a glob without reading contents", wave = "W13" }
+from_glob_path = { status = "mismatch", batcher = "bt.read.binary", note = "port as bt.read.binary(glob).select(uri, size), answered from the listing; the columns are uri and size, not path, size and num_rows", wave = "W13" }
 from_pandas = { status = "canonical", batcher = "bt.from_pandas" }
 from_pydict = { status = "canonical", batcher = "bt.from_pydict" }
 from_pylist = { status = "canonical", batcher = "bt.from_pylist" }
@@ -109,7 +109,7 @@ read_paimon = { status = "gap", need = "Apache Paimon reader", wave = "W13" }
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_sql = { status = "param", batcher = "bt.read.sql", need = "partition_col=/num_partitions= parallel range partitioning and a connection factory callable", wave = "W13" }
 read_table = { status = "mismatch", batcher = "bt.read.table", note = "Daft read_table(identifier) reads a table from the session catalog; bt.read.table(name) constructs a registered connector by name. Rewrite: Session.table(identifier)", wave = "W9" }
-read_text = { status = "mismatch", batcher = "bt.read.text", note = "Daft read_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line_number columns and keeps blank lines. Param: skip_blank_lines=True, text column only", wave = "W13" }
+read_text = { status = "param", batcher = "bt.read.text", need = "Daft reads each line as a row by default; pass skip_blank_lines= to match", note = "Daft read_text yields one 'text' column and skips blank lines by default; Batcher read.text adds path and line_number columns and keeps blank lines. Param: skip_blank_lines=True, text column only", wave = "W13" }
 read_video_frames = { status = "mismatch", batcher = "bt.read.video", note = "Daft read_video_frames yields one row per decoded frame (image_height/width, sample_interval_seconds); Batcher read.video yields one row per file with num_frames sampled frames", wave = "W12" }
 read_warc = { status = "mismatch", batcher = "bt.read.warc", note = "Daft read_warc keeps WARC header names ('WARC-Record-ID', ...); Batcher read.warc snake_cases them ('warc_record_id')", wave = "W13" }
 read_webdataset = { status = "param", batcher = "bt.read.webdataset", need = "batch_size= and Daft's column layout (not verified against Daft)", wave = "W13" }

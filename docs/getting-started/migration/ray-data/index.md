@@ -51,7 +51,7 @@ The following table lists the waves that hold Ray Data rows, in delivery order:
 | W10 | Streaming | 4 |
 | W11 | UDFs | 45 |
 | W12 | AI and multimodal | 19 |
-| W13 | Readers and writers | 21 |
+| W13 | Readers and writers | 20 |
 
 ## Pages
 
@@ -59,7 +59,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataset` | 117 | 11 | 15 | 59 | 16 | 16 |
+| {doc}`dataset` | 117 | 12 | 17 | 60 | 12 | 16 |
 | {doc}`expressions` | 179 | 83 | 2 | 20 | 17 | 57 |
 | {doc}`io` | 96 | 19 | 11 | 32 | 22 | 12 |
 | {doc}`udfs-ai-multimodal` | 46 | 4 | 15 | 15 | 9 | 3 |

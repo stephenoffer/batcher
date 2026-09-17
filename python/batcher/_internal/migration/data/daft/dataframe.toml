@@ -82,7 +82,7 @@ with_column_renamed = { status = "canonical", batcher = "Dataset.rename" }
 with_columns = { status = "canonical", batcher = "Dataset.with_columns" }
 with_columns_renamed = { status = "canonical", batcher = "Dataset.rename" }
 write_bigtable = { status = "gap", need = "Google Cloud Bigtable sink", wave = "W13" }
-write_clickhouse = { status = "gap", need = "ClickHouse sink (bt.read.clickhouse exists, no writer)", wave = "W13" }
+write_clickhouse = { status = "canonical", batcher = "Dataset.write.clickhouse" }
 write_csv = { status = "mismatch", batcher = "Dataset.write.csv", note = "Daft write_csv defaults to write_mode='append' and returns a DataFrame of written paths; Batcher ds.write.csv defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks", wave = "W13" }
 write_deltalake = { status = "canonical", batcher = "Dataset.write.delta" }
 write_huggingface = { status = "gap", need = "Hugging Face Hub dataset sink", wave = "W13" }

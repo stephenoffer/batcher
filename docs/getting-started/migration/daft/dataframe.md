@@ -98,7 +98,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `with_columns` | `Dataset.with_columns` | canonical |  |
 | `with_columns_renamed` | `Dataset.rename` | canonical |  |
 | `write_bigtable` | n/a | gap | Not yet: Google Cloud Bigtable sink. Wave W13. |
-| `write_clickhouse` | n/a | gap | Not yet: ClickHouse sink (bt.read.clickhouse exists, no writer). Wave W13. |
+| `write_clickhouse` | `Dataset.write.clickhouse` | canonical |  |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Daft write\_csv defaults to write\_mode='append' and returns a DataFrame of written paths; Batcher ds.write.csv defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks. Wave W13. |
 | `write_deltalake` | `Dataset.write.delta` | canonical |  |
 | `write_huggingface` | n/a | gap | Not yet: Hugging Face Hub dataset sink. Wave W13. |

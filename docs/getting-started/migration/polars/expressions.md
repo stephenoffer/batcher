@@ -161,7 +161,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `pct_change` | `Expr.pct_change` | canonical |  |
 | `peak_max` | `Expr.peak_max` | canonical |  |
 | `peak_min` | `Expr.peak_min` | canonical |  |
-| `pipe` | n/a | gap | Not yet: Expr.pipe. Wave W8. |
+| `pipe` | `Expr.pipe` | canonical |  |
 | `pow` | `**` operator | alias |  |
 | `product` | `Expr.product` | canonical |  |
 | `qcut` | n/a | gap | Not yet: Expr.qcut (quantile binning). Wave W3. |

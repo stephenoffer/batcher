@@ -41,9 +41,9 @@ The following table lists the waves that hold Daft rows, in delivery order:
 |---|---|---|
 | WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 4 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 42 |
-| W1 | Python constructors over SQL functions Batcher already has | 5 |
+| W1 | Python constructors over SQL functions Batcher already has | 2 |
 | W2 | Missing parameters across all four engines | 104 |
-| W3 | Scalar functions | 31 |
+| W3 | Scalar functions | 30 |
 | W4 | Maps, higher-order functions, and list reduction | 12 |
 | W5 | Window functions, including rolling and dynamic group-by | 10 |
 | W6 | Temporal types: `TIME`, intervals, and a session time zone | 38 |
@@ -52,7 +52,7 @@ The following table lists the waves that hold Daft rows, in delivery order:
 | W9 | Catalogs and tables | 111 |
 | W11 | UDFs | 81 |
 | W12 | AI and multimodal | 102 |
-| W13 | Readers and writers | 33 |
+| W13 | Readers and writers | 32 |
 
 ## Pages
 
@@ -60,9 +60,9 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 115 | 56 | 18 | 28 | 11 | 2 |
-| {doc}`module` | 130 | 21 | 26 | 12 | 59 | 12 |
-| {doc}`functions-numeric` | 160 | 131 | 23 | 1 | 5 | 0 |
+| {doc}`dataframe` | 115 | 57 | 18 | 28 | 10 | 2 |
+| {doc}`module` | 130 | 22 | 27 | 12 | 57 | 12 |
+| {doc}`functions-numeric` | 160 | 134 | 23 | 1 | 2 | 0 |
 | {doc}`functions-strings` | 121 | 52 | 46 | 18 | 5 | 0 |
 | {doc}`functions-temporal` | 100 | 56 | 13 | 9 | 22 | 0 |
 | {doc}`functions-nested` | 157 | 71 | 29 | 10 | 38 | 9 |

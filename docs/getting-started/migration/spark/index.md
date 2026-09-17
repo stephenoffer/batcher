@@ -41,8 +41,8 @@ The following table lists the waves that hold PySpark rows, in delivery order:
 |---|---|---|
 | WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 3 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 71 |
-| W1 | Python constructors over SQL functions Batcher already has | 29 |
-| W2 | Missing parameters across all four engines | 71 |
+| W1 | Python constructors over SQL functions Batcher already has | 2 |
+| W2 | Missing parameters across all four engines | 74 |
 | W3 | Scalar functions | 28 |
 | W4 | Maps, higher-order functions, and list reduction | 16 |
 | W5 | Window functions, including rolling and dynamic group-by | 4 |
@@ -52,7 +52,7 @@ The following table lists the waves that hold PySpark rows, in delivery order:
 | W9 | Catalogs and tables | 71 |
 | W10 | Streaming | 28 |
 | W11 | UDFs | 61 |
-| W13 | Readers and writers | 9 |
+| W13 | Readers and writers | 7 |
 | W14 | Sketches, collations, and the geography type | 73 |
 
 ## Pages
@@ -61,14 +61,14 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 152 | 53 | 45 | 26 | 22 | 6 |
-| {doc}`expressions` | 36 | 26 | 2 | 4 | 4 | 0 |
+| {doc}`dataframe` | 152 | 54 | 45 | 26 | 21 | 6 |
+| {doc}`expressions` | 36 | 27 | 2 | 4 | 3 | 0 |
 | {doc}`functions-aggregates` | 135 | 49 | 13 | 5 | 68 | 0 |
-| {doc}`functions-collections` | 90 | 23 | 12 | 5 | 50 | 0 |
-| {doc}`functions-math-and-misc` | 133 | 67 | 13 | 5 | 40 | 8 |
-| {doc}`functions-strings` | 93 | 45 | 6 | 17 | 25 | 0 |
-| {doc}`functions-temporal` | 88 | 36 | 11 | 9 | 32 | 0 |
-| {doc}`io` | 70 | 23 | 19 | 16 | 12 | 0 |
+| {doc}`functions-collections` | 90 | 26 | 13 | 5 | 46 | 0 |
+| {doc}`functions-math-and-misc` | 133 | 75 | 14 | 5 | 31 | 8 |
+| {doc}`functions-strings` | 93 | 53 | 7 | 17 | 16 | 0 |
+| {doc}`functions-temporal` | 88 | 39 | 11 | 9 | 29 | 0 |
+| {doc}`io` | 70 | 25 | 19 | 16 | 10 | 0 |
 | {doc}`session-and-sql` | 101 | 37 | 10 | 1 | 46 | 7 |
 | {doc}`types-and-data-sources` | 57 | 13 | 34 | 2 | 8 | 0 |
 

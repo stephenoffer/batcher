@@ -50,7 +50,7 @@ The following table maps the 36 names on `Column`, sorted alphabetically.
 | `rlike` | `Expr.str.regexp_matches` | canonical |  |
 | `startswith` | `Expr.str.starts_with` | canonical |  |
 | `substr` | `Expr.str.substr` | mismatch | Differs: Spark treats start position 0 as 1 (substr(0, 2) of 'hello' is 'he'); Batcher counts position 0 as before the string ('h'). Wave W0. |
-| `transform` | n/a | gap | Not yet: apply a Column -\> Column function fluently (Column.transform(f)). Wave W1. |
+| `transform` | `Expr.pipe` | canonical |  |
 | `try_cast` | `Expr.try_cast` | canonical |  |
 | `when` | `CaseBuilder.when` | canonical |  |
 | `withField` | n/a | gap | Not yet: add or replace a nested struct field in place. Wave W8. |

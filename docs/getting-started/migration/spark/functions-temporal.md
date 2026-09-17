@@ -60,8 +60,8 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `month` | `Expr.dt.month` | canonical |  |
 | `monthname` | `Expr.dt.monthname` | canonical |  |
 | `months` | `bt.partition_months` | canonical |  |
-| `months_between` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (months\_between with roundOff). Wave W1. |
-| `next_day` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (next\_day). Wave W1. |
+| `months_between` | `Expr.dt.months_between` | canonical |  |
+| `next_day` | `Expr.dt.next_day` | canonical |  |
 | `now` | `bt.current_timestamp` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `second` | `Expr.dt.second` | canonical |  |
@@ -95,7 +95,7 @@ The following table maps the 88 names on the `pyspark.sql.functions` module, sor
 | `try_to_date` | n/a | gap | Not yet: to\_date with Java patterns returning null on invalid input. Wave W6. |
 | `try_to_time` | n/a | gap | Not yet: to\_time returning null on invalid input. Wave W6. |
 | `try_to_timestamp` | n/a | gap | Not yet: to\_timestamp with Java patterns returning null on invalid input. Wave W6. |
-| `unix_date` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (unix\_date). Wave W1. |
+| `unix_date` | `bt.partition_days` | canonical |  |
 | `unix_micros` | `Expr.dt.epoch_us` | canonical |  |
 | `unix_millis` | `Expr.dt.epoch_ms` | canonical |  |
 | `unix_seconds` | `Expr.dt.epoch` | canonical |  |

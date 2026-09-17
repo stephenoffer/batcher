@@ -14,10 +14,11 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 273 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 291 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
+| `%` operator | `functions.try_mod` |
 | `**` operator | `functions.pow`, `functions.power` |
 | `-` operator | `functions.negate`, `functions.negative` |
 | `AggExpr.over` + `WindowExpr.over` | `Window.currentRow`, `Window.partitionBy`, `Window.rowsBetween`, `Window.unboundedFollowing`, `Window.unboundedPreceding`, `WindowSpec.partitionBy`, `WindowSpec.rowsBetween` |
@@ -33,6 +34,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `bt.array` | `functions.array` |
 | `bt.await_any_termination` | `StreamingQueryManager.awaitAnyTermination` |
 | `bt.bit_and` | `functions.bit_and` |
+| `bt.bit_get` | `functions.bit_get`, `functions.getbit` |
 | `bt.bit_or` | `functions.bit_or` |
 | `bt.bit_xor` | `functions.bit_xor` |
 | `bt.bool_and` | `functions.bool_and`, `functions.every` |
@@ -50,6 +52,8 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `bt.current_date` | `functions.curdate`, `functions.current_date` |
 | `bt.current_timestamp` | `functions.current_timestamp`, `functions.now` |
 | `bt.dense_rank` | `functions.dense_rank` |
+| `bt.e` | `functions.e` |
+| `bt.elt` | `functions.elt` |
 | `bt.engine_version` | `SparkSession.version` |
 | `bt.from_epoch` | `functions.timestamp_micros`, `functions.timestamp_millis`, `functions.timestamp_seconds` |
 | `bt.from_unix_date` | `functions.date_from_unix_date` |
@@ -71,11 +75,13 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `bt.nanvl` | `functions.nanvl` |
 | `bt.ntile` | `functions.ntile` |
 | `bt.nullif` | `functions.nullif`, `functions.nullifzero` |
-| `bt.partition_days` | `functions.days` |
+| `bt.partition_days` | `functions.days`, `functions.unix_date` |
 | `bt.partition_hours` | `functions.hours` |
 | `bt.partition_months` | `functions.months` |
 | `bt.partition_years` | `functions.years` |
 | `bt.percent_rank` | `functions.percent_rank` |
+| `bt.pi` | `functions.pi` |
+| `bt.pmod` | `functions.pmod` |
 | `bt.product` | `functions.product` |
 | `bt.range` | `SparkSession.range` |
 | `bt.rank` | `functions.rank` |
@@ -101,6 +107,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `bt.Session` | `SparkSession.newSession` |
 | `bt.Session` + `bt.set_config` | `SparkSession.Builder`, `SparkSession.builder` |
 | `bt.skew` | `functions.skewness` |
+| `bt.sql_expr` | `functions.expr` |
 | `bt.st_set_srid` | `functions.st_setsrid` |
 | `bt.st_srid` | `functions.st_srid` |
 | `bt.std` | `functions.std`, `functions.stddev_samp`, `functions.stddev` |
@@ -137,7 +144,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Dataset.pipe` | `DataFrame.transform` |
 | `Dataset.repartition` | `DataFrame.coalesce` |
 | `Dataset.rollup` | `DataFrame.rollup` |
-| `Dataset.select` | `DataFrame.select` |
+| `Dataset.select` | `DataFrame.selectExpr`, `DataFrame.select` |
 | `Dataset.sort` | `Column.asc_nulls_first`, `Column.asc_nulls_last`, `Column.desc_nulls_first`, `Column.desc_nulls_last`, `Column.desc`, `functions.asc_nulls_first`, `functions.asc_nulls_last`, `functions.desc_nulls_first`, `functions.desc_nulls_last`, `functions.desc` |
 | `Dataset.to_arrow` | `DataFrame.toArrow` |
 | `Dataset.to_pandas` | `DataFrame.toPandas` |
@@ -147,6 +154,8 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Dataset.with_row_index` | `functions.monotonically_increasing_id` |
 | `Dataset.with_watermark` | `DataFrame.withWatermark` |
 | `Dataset.write.for_each` | `DataStreamWriter.foreach` |
+| `Dataset.write.text` | `DataFrameWriter.text` |
+| `Dataset.write.xml` | `DataFrameWriter.xml` |
 | `Dataset.write` | `DataFrame.writeStream`, `DataFrameWriter.format`, `DataFrameWriter.mode`, `DataFrameWriter.option`, `DataFrameWriter.options`, `DataFrameWriter.partitionBy`, `DataStreamWriter.format`, `DataStreamWriter.option`, `DataStreamWriter.options`, `DataStreamWriter.outputMode`, `DataStreamWriter.partitionBy`, `DataStreamWriter.queryName`, `DataStreamWriter.start` |
 | `Dataset.write` + `bt.Trigger` | `DataStreamWriter.trigger` |
 | `Expr.abs` | `functions.abs` |
@@ -164,7 +173,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.bitwise_and` | `Column.bitwiseAND` |
 | `Expr.bitwise_or` | `Column.bitwiseOR` |
 | `Expr.bitwise_xor` | `Column.bitwiseXOR` |
-| `Expr.cast` | `Column.astype`, `types.BinaryType`, `types.BooleanType`, `types.ByteType`, `types.DateType`, `types.DecimalType`, `types.DoubleType`, `types.FloatType`, `types.IntegerType`, `types.LongType`, `types.ShortType`, `types.StringType`, `types.TimestampNTZType` |
+| `Expr.cast` | `Column.astype`, `functions.make_valid_utf8`, `functions.try_validate_utf8`, `functions.validate_utf8`, `types.BinaryType`, `types.BooleanType`, `types.ByteType`, `types.DateType`, `types.DecimalType`, `types.DoubleType`, `types.FloatType`, `types.IntegerType`, `types.LongType`, `types.ShortType`, `types.StringType`, `types.TimestampNTZType` |
 | `Expr.cbrt` | `functions.cbrt` |
 | `Expr.cos` | `functions.cos` |
 | `Expr.cosh` | `functions.cosh` |
@@ -186,6 +195,8 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.dt.minute` | `functions.minute` |
 | `Expr.dt.month` | `functions.month` |
 | `Expr.dt.monthname` | `functions.monthname` |
+| `Expr.dt.months_between` | `functions.months_between` |
+| `Expr.dt.next_day` | `functions.next_day` |
 | `Expr.dt.quarter` | `functions.quarter` |
 | `Expr.dt.second` | `functions.second` |
 | `Expr.dt.truncate` | `functions.date_trunc` |
@@ -197,21 +208,24 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.fill_null` | `functions.ifnull`, `functions.nvl`, `functions.zeroifnull` |
 | `Expr.hash_bucket` | `functions.bucket` |
 | `Expr.is_in` | `Column.isin` |
-| `Expr.is_not_null` | `Column.isNotNull`, `functions.isnotnull` |
+| `Expr.is_not_null` | `Column.isNotNull`, `functions.is_valid_utf8`, `functions.isnotnull` |
 | `Expr.is_null` | `Column.isNull`, `functions.isnull` |
 | `Expr.json.array_length` | `functions.json_array_length` |
 | `Expr.json.extract_string` | `functions.get_json_object` |
 | `Expr.json.keys` | `functions.json_object_keys` |
+| `Expr.list.append` | `functions.array_append` |
 | `Expr.list.contains` | `functions.array_contains` |
 | `Expr.list.difference` | `functions.array_except` |
 | `Expr.list.drop_nulls` | `functions.array_compact` |
 | `Expr.list.flatten` | `functions.flatten` |
+| `Expr.list.has_any` | `functions.arrays_overlap` |
 | `Expr.list.intersect` | `functions.array_intersect` |
 | `Expr.list.len` | `functions.array_size` |
 | `Expr.list.len` + `Expr.map.len` | `functions.cardinality`, `functions.size` |
 | `Expr.list.max` | `functions.array_max` |
 | `Expr.list.min` | `functions.array_min` |
 | `Expr.list.position` | `functions.array_position` |
+| `Expr.list.prepend` | `functions.array_prepend` |
 | `Expr.list.union` | `functions.array_union` |
 | `Expr.list.unique` | `functions.array_distinct` |
 | `Expr.ln` | `functions.ln` |
@@ -223,6 +237,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.map.keys` | `functions.map_keys` |
 | `Expr.map.values` | `functions.map_values` |
 | `Expr.mean` | `functions.avg` |
+| `Expr.pipe` | `Column.transform` |
 | `Expr.radians` | `functions.radians` |
 | `Expr.round` | `functions.rint`, `functions.round` |
 | `Expr.safe_divide` | `functions.try_divide` |
@@ -239,7 +254,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.str.crc32` | `functions.crc32` |
 | `Expr.str.ends_with` | `Column.endswith`, `functions.endswith` |
 | `Expr.str.extract_all` | `functions.regexp_extract_all` |
-| `Expr.str.extract` | `functions.regexp_extract` |
+| `Expr.str.extract` | `functions.regexp_extract`, `functions.regexp_substr` |
 | `Expr.str.from_base64` | `functions.unbase64` |
 | `Expr.str.hex` | `functions.hex` |
 | `Expr.str.ilike` | `Column.ilike` |
@@ -251,6 +266,7 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.str.md5` | `functions.md5` |
 | `Expr.str.octet_length` | `functions.octet_length` |
 | `Expr.str.overlay` | `functions.overlay` |
+| `Expr.str.parse_url` | `functions.parse_url` |
 | `Expr.str.position` | `functions.instr` |
 | `Expr.str.regexp_matches` | `Column.rlike`, `functions.regexp_like`, `functions.regexp`, `functions.rlike` |
 | `Expr.str.repeat` | `functions.repeat` |
@@ -269,12 +285,14 @@ The following table maps 273 Batcher spellings to the PySpark names that compute
 | `Expr.str.trim` | `functions.btrim`, `functions.trim` |
 | `Expr.str.unhex` | `functions.unhex` |
 | `Expr.str.upper` | `functions.ucase`, `functions.upper` |
+| `Expr.str.url_decode` | `functions.try_url_decode` |
 | `Expr.str.url_encode` | `functions.url_encode` |
 | `Expr.struct.field` | `Column.getField` |
 | `Expr.tan` | `functions.tan` |
 | `Expr.tanh` | `functions.tanh` |
 | `Expr.to_base` | `functions.bin` |
 | `Expr.try_cast` | `Column.try_cast` |
+| `Expr` | `functions.positive` |
 | `GroupBy.agg` | `GroupedData.agg` |
 | `lshift` operator | `functions.shiftleft` |
 | `rshift` operator | `functions.shiftright` |

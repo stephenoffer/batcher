@@ -46,10 +46,10 @@ The following table lists the waves that hold Polars rows, in delivery order:
 | W5 | Window functions, including rolling and dynamic group-by | 36 |
 | W6 | Temporal types: `TIME`, intervals, and a session time zone | 33 |
 | W7 | Semi-structured data: JSON, CSV, and XML functions | 2 |
-| W8 | Relational `DataFrame` gaps | 143 |
+| W8 | Relational `DataFrame` gaps | 141 |
 | W9 | Catalogs and tables | 1 |
 | W11 | UDFs | 74 |
-| W13 | Readers and writers | 24 |
+| W13 | Readers and writers | 22 |
 
 ## Pages
 
@@ -57,11 +57,11 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 265 | 81 | 69 | 50 | 51 | 14 |
-| {doc}`expressions` | 218 | 91 | 29 | 18 | 77 | 3 |
+| {doc}`dataframe` | 265 | 83 | 68 | 50 | 50 | 14 |
+| {doc}`expressions` | 218 | 92 | 29 | 18 | 76 | 3 |
 | {doc}`expression-namespaces` | 219 | 99 | 33 | 15 | 72 | 0 |
-| {doc}`functions` | 163 | 40 | 27 | 18 | 71 | 7 |
-| {doc}`io` | 38 | 11 | 18 | 1 | 7 | 1 |
+| {doc}`functions` | 163 | 41 | 27 | 18 | 70 | 7 |
+| {doc}`io` | 38 | 11 | 19 | 3 | 4 | 1 |
 | {doc}`types` | 37 | 16 | 6 | 1 | 9 | 5 |
 | {doc}`session-and-sql` | 45 | 12 | 2 | 0 | 28 | 3 |
 

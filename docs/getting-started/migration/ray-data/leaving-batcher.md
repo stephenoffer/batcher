@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Ray Data
 
-The following table maps 110 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
+The following table maps 111 Batcher spellings to the Ray Data names that compute the same thing, sorted by Batcher spelling. Each Ray Data name is prefixed with the class or module it lives on.
 
 | Batcher | Ray Data |
 |---|---|
@@ -53,6 +53,7 @@ The following table maps 110 Batcher spellings to the Ray Data names that comput
 | `Dataset.to_spark` | `Dataset.to_spark` |
 | `Dataset.union` | `Dataset.union` |
 | `Dataset.with_columns` | `Dataset.with_column`, `Dataset.with_columns` |
+| `Dataset.write.numpy` | `Dataset.write_numpy` |
 | `Dataset` | `Dataset.copy` |
 | `Expr.abs` | `Expr.abs` |
 | `Expr.abs` + `Expr.max` | `aggregate.AbsMax` |

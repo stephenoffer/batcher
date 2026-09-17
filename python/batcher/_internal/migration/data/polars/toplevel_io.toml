@@ -13,7 +13,7 @@ CredentialProviderGCP = { status = "param", batcher = "batcher.io.credentials", 
 FileProviderArgs = { status = "gap", need = "per-partition file-name provider for sinks", wave = "W13" }
 PartitionBy = { status = "param", batcher = "Dataset.write.parquet", need = "a PartitionBy object (key columns, include_key, per-partition file names)", wave = "W13" }
 ScanCastOptions = { status = "param", batcher = "bt.read.parquet", need = "cast_options= for schema-evolution casts on scan", wave = "W2" }
-from_dataframe = { status = "gap", need = "DataFrame interchange protocol import", wave = "W13" }
+from_dataframe = { status = "param", batcher = "bt.from_any", need = "allow_copy= and rechunk=", wave = "W13" }
 json_normalize = { status = "gap", need = "json_normalize (flatten nested JSON records)", wave = "W13" }
 read_avro = { status = "alias", batcher = "bt.read.avro" }
 read_clipboard = { status = "out_of_scope", reason = "clipboard IO is a desktop convenience, not a data engine source" }
@@ -24,7 +24,7 @@ read_database_uri = { status = "canonical", batcher = "bt.read.sql" }
 read_delta = { status = "alias", batcher = "bt.read.delta" }
 read_excel = { status = "alias", batcher = "bt.read.excel" }
 read_ipc = { status = "alias", batcher = "bt.read.arrow" }
-read_ipc_schema = { status = "gap", need = "read an IPC file's schema without data", wave = "W13" }
+read_ipc_schema = { status = "mismatch", batcher = "bt.read.arrow", note = "port as bt.read.arrow(path).schema, which reads the footer only and returns an Arrow schema rather than a dict", wave = "W13" }
 read_ipc_stream = { status = "param", batcher = "bt.read.arrow", need = "Arrow IPC stream format (not only the file format)", wave = "W2" }
 read_json = { status = "mismatch", batcher = "bt.read.json", note = "Polars read_json parses one JSON document (an array of rows); Batcher's read_json and bt.read.json read newline-delimited JSON. Param: lines=False", wave = "W0" }
 read_lines = { status = "canonical", batcher = "bt.read.text" }
@@ -32,7 +32,7 @@ read_ndjson = { status = "alias", batcher = "bt.read.json" }
 read_ods = { status = "param", batcher = "bt.read.excel", need = "OpenDocument spreadsheet (.ods) input", wave = "W2" }
 read_parquet = { status = "alias", batcher = "bt.read.parquet" }
 read_parquet_metadata = { status = "gap", need = "read Parquet key-value metadata", wave = "W13" }
-read_parquet_schema = { status = "gap", need = "read a Parquet file's schema without data", wave = "W13" }
+read_parquet_schema = { status = "mismatch", batcher = "bt.read.parquet", note = "port as bt.read.parquet(path).schema, which reads the footer only and returns an Arrow schema rather than a dict", wave = "W13" }
 scan_csv = { status = "param", batcher = "bt.read.csv", need = "reader options: comment_prefix=, ignore_errors=, n_rows=, row_index_name=, include_file_paths=, missing_columns=, infer_schema_length=, decimal_comma=, truncate_ragged_lines=, credential_provider=, retries=", wave = "W2", template = 'scan_csv(source) -> bt.read.csv(source)' }
 scan_delta = { status = "param", batcher = "bt.read.delta", need = "reader options: storage_options=, delta_table_options=", wave = "W2" }
 scan_iceberg = { status = "param", batcher = "bt.read.iceberg", need = "reader options: a table path/object rather than a catalog identifier, storage_options=", wave = "W2" }

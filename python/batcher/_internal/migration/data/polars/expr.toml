@@ -146,7 +146,7 @@ over = { status = "param", batcher = ["Expr.over"], template = 'over(partition_b
 pct_change = { status = "canonical", batcher = "Expr.pct_change" }
 peak_max = { status = "canonical", batcher = "Expr.peak_max", template = 'peak_max() -> self.peak_max(edges=True, propagate_nulls=True)' }
 peak_min = { status = "canonical", batcher = "Expr.peak_min", template = 'peak_min() -> self.peak_min(propagate_nulls=True)' }
-pipe = { status = "gap", need = "Expr.pipe", wave = "W8" }
+pipe = { status = "canonical", batcher = "Expr.pipe" }
 pow = { status = "alias", batcher = "op:pow" }
 product = { status = "canonical", batcher = "Expr.product", template = 'product() -> self.product(empty_value=1)' }
 qcut = { status = "gap", need = "Expr.qcut (quantile binning)", wave = "W3" }

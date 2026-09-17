@@ -99,7 +99,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `scalar` | n/a | gap | Not yet: scalar subquery as a column. Wave W8. |
 | `schema` | `Dataset.schema` | mismatch | Differs: Spark returns a StructType; Batcher returns a pyarrow.Schema. Wave W0. |
 | `select` | `Dataset.select` | canonical |  |
-| `selectExpr` | n/a | gap | Not yet: SQL expression strings in select (bt.expr). Wave W1. |
+| `selectExpr` | `Dataset.select` | canonical |  |
 | `semanticHash` | n/a | gap | Not yet: semantic hash of the logical plan. Wave W8. |
 | `show` | `Dataset.show` | param | Missing: truncate= and vertical= display options (Spark shows 20 rows by default). Wave W2. |
 | `sort` | `Dataset.sort` | mismatch | Differs: Spark ascending order puts nulls first; Batcher puts nulls last. Codemod passes nulls\_first=True for ascending keys. Wave W0. |

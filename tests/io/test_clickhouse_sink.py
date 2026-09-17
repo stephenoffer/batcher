@@ -117,10 +117,20 @@ def test_a_multi_shard_overwrite_is_refused(driver):
 
 def test_modes_and_options_are_checked_before_connecting(driver):
     ds = bt.from_pydict({"id": [1]})
-    with pytest.raises(PlanError, match="'append' or 'overwrite'"):
+    with pytest.raises(PlanError, match="mode='append' or mode='overwrite'"):
         ds.write.clickhouse("orders", host="ch", mode="error")
     with pytest.raises(FormatError, match="Did you mean 'host'"):
         ds.write.clickhouse("orders", hots="ch")
     with pytest.raises(PlanError, match="partition_by"):
         ds.write.clickhouse("orders", host="ch", partition_by=["id"])
     assert driver == []
+
+
+@pytest.mark.parametrize("fmt", ["snowflake", "dbapi", "adbc"])
+@pytest.mark.parametrize("mode", ["error", "ignore"])
+def test_a_protective_mode_on_any_table_sink_is_refused_not_overwritten(fmt, mode) -> None:
+    """`error`/`ignore` cannot be checked against a table, so no table sink may treat them as
+    overwrite; before this was refused, `write.snowflake(t, mode="error")` replaced the table."""
+    ds = bt.from_pydict({"id": [1]})
+    with pytest.raises(PlanError, match="cannot check whether its table exists"):
+        ds.write(f"orders_{fmt}", fmt, mode=mode)

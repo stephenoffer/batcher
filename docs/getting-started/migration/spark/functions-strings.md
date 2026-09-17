@@ -34,10 +34,10 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `contains` | `Expr.str.contains` | mismatch | Differs: bt.contains is a column-name selector, not a string predicate; F.contains(left, right) is Expr.str.contains. Wave W0. |
 | `crc32` | `Expr.str.crc32` | canonical |  |
 | `decode` | n/a | gap | Not yet: decode BINARY to STRING with a named charset. Wave W3. |
-| `elt` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (elt). Wave W1. |
+| `elt` | `bt.elt` | canonical |  |
 | `encode` | n/a | gap | Not yet: encode STRING to BINARY with a named charset. Wave W3. |
 | `endswith` | `Expr.str.ends_with` | canonical |  |
-| `find_in_set` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (find\_in\_set). Wave W1. |
+| `find_in_set` | `Expr.str.find_in_set` | param | Missing: a column-valued needle. Wave W2. |
 | `format_number` | n/a | gap | Not yet: format a number with grouping separators to d decimal places. Wave W3. |
 | `format_string` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
 | `hash` | `Expr.hash` | mismatch | Differs: port as bt.hash\_rows(\*cols, seed=42, algorithm=murmur3), cast to int32 where Spark's result is IntegerType. Wave W0. |
@@ -45,7 +45,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `ilike` | `Expr.str.ilike` | param | Missing: escapeChar= and a column-valued pattern. Wave W2. |
 | `initcap` | `Expr.str.to_titlecase` | canonical |  |
 | `instr` | `Expr.str.position` | canonical |  |
-| `is_valid_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (is\_valid\_utf8). Wave W1. |
+| `is_valid_utf8` | `Expr.is_not_null` | canonical |  |
 | `lcase` | `Expr.str.lower` | canonical |  |
 | `left` | `Expr.str.left` | mismatch | Differs: Spark left(n) returns '' when n \<= 0; Batcher left(-k) drops k characters from the end. Wave W0. |
 | `length` | `Expr.str.len_chars` | canonical |  |
@@ -55,12 +55,12 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `lower` | `Expr.str.lower` | canonical |  |
 | `lpad` | `Expr.str.lpad` | canonical |  |
 | `ltrim` | `Expr.str.strip_chars_start` | canonical |  |
-| `make_valid_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (make\_valid\_utf8). Wave W1. |
+| `make_valid_utf8` | `Expr.cast` | canonical |  |
 | `mask` | `bt.mask` | canonical |  |
 | `md5` | `Expr.str.md5` | canonical |  |
 | `octet_length` | `Expr.str.octet_length` | canonical |  |
 | `overlay` | `Expr.str.overlay` | canonical |  |
-| `parse_url` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (parse\_url). Wave W1. |
+| `parse_url` | `Expr.str.parse_url` | canonical |  |
 | `position` | `Expr.str.position` | param | Missing: start= position. Wave W2. |
 | `printf` | `bt.format_string` | mismatch | Differs: Spark uses printf-style placeholders (%s, %d, %.2f); bt.format\_string uses \{\} placeholders. Wave W0. |
 | `quote` | n/a | gap | Not yet: quote a string as a SQL literal. Wave W3. |
@@ -72,7 +72,7 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `regexp_instr` | n/a | gap | Not yet: position of the first regex match. Wave W3. |
 | `regexp_like` | `Expr.str.regexp_matches` | canonical |  |
 | `regexp_replace` | `Expr.str.replace_all` | mismatch | Differs: Spark reads \$1 back-references and Java regex syntax; replace\_all(backrefs=dollar) reads \$1. Java-only constructs (lookaround, the \\\$ escape) and column-valued patterns need a manual port. Wave W0. |
-| `regexp_substr` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (regexp\_substr, null when there is no match). Wave W1. |
+| `regexp_substr` | `Expr.str.extract` | canonical |  |
 | `repeat` | `Expr.str.repeat` | canonical |  |
 | `replace` | `Expr.str.replace` | canonical |  |
 | `reverse` | `Expr.str.reverse` + `Expr.list.reverse` | canonical |  |
@@ -101,13 +101,13 @@ The following table maps the 93 names on the `pyspark.sql.functions` module, sor
 | `try_parse_url` | n/a | gap | Not yet: parse\_url returning null on malformed URLs. Wave W3. |
 | `try_to_binary` | n/a | gap | Not yet: to\_binary returning null on invalid input. Wave W3. |
 | `try_to_number` | n/a | gap | Not yet: to\_number returning null on invalid input. Wave W3. |
-| `try_url_decode` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (try\_url\_decode). Wave W1. |
-| `try_validate_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (try\_validate\_utf8). Wave W1. |
+| `try_url_decode` | `Expr.str.url_decode` | canonical |  |
+| `try_validate_utf8` | `Expr.cast` | canonical |  |
 | `ucase` | `Expr.str.upper` | canonical |  |
 | `unbase64` | `Expr.str.from_base64` | canonical |  |
 | `unhex` | `Expr.str.unhex` | canonical |  |
 | `upper` | `Expr.str.upper` | canonical |  |
 | `url_decode` | `Expr.str.url_decode` | mismatch | Differs: with form=True the decode matches Spark; a malformed escape stays as written where Spark raises. Wave W0. |
 | `url_encode` | `Expr.str.url_encode` | canonical |  |
-| `validate_utf8` | n/a | gap | Not yet: Python constructor over the existing Spark-dialect SQL kernel (validate\_utf8). Wave W1. |
+| `validate_utf8` | `Expr.cast` | canonical |  |
 | `xxhash64` | `Expr.str.xxhash64` | mismatch | Differs: for one string or binary column, xxhash64(col) is col.str.xxhash64(seed=42). Several columns or other types chain the seed in Spark and need a manual port. Wave W0. |

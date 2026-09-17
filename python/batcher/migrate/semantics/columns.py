@@ -20,6 +20,7 @@ from batcher.migrate.semantics.base import (
     expression_surfaces,
     flatten,
     is_none,
+    keyword,
     string,
     transform,
 )
@@ -121,6 +122,23 @@ def column_names(ctx: Context, values: list[Bound] | Bound) -> list[Any] | None:
         if name is None:
             return None
         out.append(cst.Arg(name))
+    return out or None
+
+
+@transform
+def spark_sql_exprs(_ctx: Context, values: list[Bound]) -> list[Any] | None:
+    """Spark SQL expression strings (`selectExpr("size(xs) AS n")`) as `bt.sql_expr` calls.
+
+    The dialect is passed explicitly: Spark's function vocabulary (`size`, `nvl`) is not the
+    session default's, so the same text parsed without it fails or means something else.
+    """
+    out = []
+    for value in flatten(values):
+        if not isinstance(value.node, (cst.SimpleString, cst.ConcatenatedString)):
+            return None
+        out.append(
+            cst.Arg(call("bt.sql_expr", [cst.Arg(value.node), keyword("dialect", string("spark"))]))
+        )
     return out or None
 
 
