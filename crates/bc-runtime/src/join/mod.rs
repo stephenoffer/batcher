@@ -27,6 +27,7 @@ use crate::error::RuntimeError;
 mod asof;
 mod build;
 mod dense;
+mod key_bits;
 mod key_filter;
 mod radix;
 mod range;
@@ -816,6 +817,10 @@ struct JoinTable {
     /// key's range alone. `next` and `unique` mean exactly what they mean for the hash path,
     /// so the probe loop below is shared.
     dense: Option<dense::DenseHeads>,
+    /// Exact membership over a single-`Int64` build key whose range is too wide for `dense`
+    /// but narrow enough to bitmap — a probe for an absent key returns before it is hashed.
+    /// Replaces `bloom` when present; see [`key_bits`].
+    key_bits: Option<key_bits::KeyBits>,
     next: Vec<u32>,
     /// Whether no build key repeats — so every chain has length exactly 1.
     ///
@@ -862,6 +867,17 @@ struct JoinTable {
     /// two relaxed atomics per morsel rather than two per row, and every tier — sequential,
     /// morsel-parallel, and distributed — adapts independently on what it actually sees.
     bloom_trial: BloomTrial,
+}
+
+/// A probe range's "definitely absent" test, consulted before the hash lookup. Either kind only
+/// ever skips a lookup that would have returned `None`.
+#[derive(Clone, Copy)]
+enum Prefilter<'a> {
+    None,
+    /// Per-shard blooms, indexed like the heads.
+    Bloom(&'a [BloomFilter]),
+    /// The exact key-range bitmap.
+    Bits(&'a key_bits::KeyBits),
 }
 
 /// Probe rows to observe before ruling on the bloom. One morsel-ish sample: long enough that
@@ -927,11 +943,16 @@ impl JoinTable {
         // checked first because it subsumes the hash build entirely: no build-side hashing,
         // no probe-side hashing, and no bloom (the "is this key present" question the bloom
         // approximates is answered exactly, by the same indexed load that finds the head).
+        let mut key_bits = None;
         if let Some((right, _)) = keys.dense_keys() {
-            if let Some(d) = dense::DenseHeads::build(right, right_rows, right_null) {
+            let bounds = dense::key_bounds(right, right_rows, right_null);
+            if let Some(d) = bounds
+                .and_then(|b| dense::DenseHeads::build_within(right, right_rows, right_null, b))
+            {
                 return Self {
                     heads: Vec::new(),
                     dense: Some(d.heads),
+                    key_bits: None,
                     next: build::stitch_chain(d.links, right_rows, d.unique),
                     unique: d.unique,
                     state,
@@ -939,7 +960,11 @@ impl JoinTable {
                     bloom_trial: BloomTrial::default(),
                 };
             }
+            key_bits =
+                bounds.and_then(|b| key_bits::KeyBits::build(right, right_null, b.lo, b.span));
         }
+        // An exact bitmap answers every question the bloom approximates, more cheaply.
+        let use_bloom = use_bloom && key_bits.is_none();
 
         let shards = build::shard_count(right_rows);
         if shards > 1 {
@@ -953,6 +978,7 @@ impl JoinTable {
             return Self {
                 heads,
                 dense: None,
+                key_bits,
                 next,
                 unique,
                 state,
@@ -995,6 +1021,7 @@ impl JoinTable {
         Self {
             heads: vec![heads],
             dense: None,
+            key_bits,
             next,
             unique,
             state,
@@ -1017,10 +1044,43 @@ impl JoinTable {
             .iter()
             .map(|h| h.capacity() * (std::mem::size_of::<u32>() + 1))
             .sum();
-        let dense = self.dense.as_ref().map_or(0, dense::DenseHeads::heap_bytes);
+        let dense = self.dense.as_ref().map_or(0, dense::DenseHeads::heap_bytes)
+            + self
+                .key_bits
+                .as_ref()
+                .map_or(0, key_bits::KeyBits::heap_bytes);
         let next = self.next.capacity() * std::mem::size_of::<u32>();
         let bloom: usize = self.bloom.iter().map(|b| (b.num_bits() / 8) as usize).sum();
         heads + dense + next + bloom
+    }
+
+    /// Which pre-filter a probe range should consult, decided once per range: the exact key
+    /// bitmap when there is one, else the bloom, and neither once the trial has shown the
+    /// probe side mostly matches (a filter that rejects nothing is pure overhead).
+    #[inline]
+    fn prefilter(&self) -> Prefilter<'_> {
+        if !self.bloom_trial.worth_consulting() {
+            return Prefilter::None;
+        }
+        match (&self.key_bits, self.bloom.is_empty()) {
+            (Some(bits), _) => Prefilter::Bits(bits),
+            (None, false) => Prefilter::Bloom(&self.bloom),
+            (None, true) => Prefilter::None,
+        }
+    }
+
+    /// Split a bitmap pre-filter out so a probe loop can test it inline, before the call into
+    /// [`Self::head_for`]: a rejected row then costs a bit test rather than a function call.
+    /// The lookup is handed [`Prefilter::None`] in its place, so no row is tested twice.
+    #[inline]
+    fn hoist_bits<'a, K: JoinKeys>(
+        keys: &'a K,
+        pre: Prefilter<'a>,
+    ) -> (Option<(&'a key_bits::KeyBits, &'a [i64])>, Prefilter<'a>) {
+        match (pre, keys.dense_keys()) {
+            (Prefilter::Bits(b), Some((_, left))) => (Some((b, left)), Prefilter::None),
+            _ => (None, pre),
+        }
     }
 
     /// The chain head for probe (left) row `l` — `None` for a null key, a bloom miss,
@@ -1034,7 +1094,7 @@ impl JoinTable {
         keys: &K,
         l: usize,
         is_null: bool,
-        bloom: Option<&[BloomFilter]>,
+        pre: Prefilter<'_>,
         rejected: &mut u64,
     ) -> Option<u32> {
         if is_null {
@@ -1048,6 +1108,13 @@ impl JoinTable {
             let (_, left) = keys.dense_keys().expect("dense table implies i64 keys");
             return d.head(left[l]);
         }
+        if let Prefilter::Bits(bits) = pre {
+            let (_, left) = keys.dense_keys().expect("key bits imply i64 keys");
+            if !bits.contains(left[l]) {
+                *rejected += 1;
+                return None;
+            }
+        }
         let hash = keys.hash_left(&self.state, l);
         // The build put this key in exactly one shard, chosen from its hash — so the probe
         // finds it there without any coordination. One shard (the small-build case) reduces to
@@ -1057,7 +1124,7 @@ impl JoinTable {
         let shard = build::shard_of(hash, self.heads.len());
         // A bloom miss is definitive (no false negatives): the key is not on the build
         // side, so the chain is provably empty — skip the hash-table lookup.
-        if bloom.is_some_and(|b| !b[shard].contains_hash(hash)) {
+        if matches!(pre, Prefilter::Bloom(b) if !b[shard].contains_hash(hash)) {
             *rejected += 1;
             return None;
         }
@@ -1085,8 +1152,17 @@ impl JoinTable {
         let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
         // Decide once per range whether to consult the bloom, then tally what it rejected so
         // the next range can re-decide. `None` here is exactly the "no bloom" path.
-        let bloom = Some(self.bloom.as_slice())
-            .filter(|b| !b.is_empty() && self.bloom_trial.worth_consulting());
+        let pre = self.prefilter();
+        let (inline_bits, pre) = Self::hoist_bits(keys, pre);
+        if let Some(bits) = inline_bits.filter(|_| {
+            right_matched.is_none() && matches!(join_type, JoinType::Inner | JoinType::Semi)
+        }) {
+            let seen = range.len() as u64;
+            let rejected =
+                self.probe_range_bits(keys, range, left_null, join_type, bits, left_out, right_out);
+            self.bloom_trial.observe(seen, rejected);
+            return;
+        }
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {
@@ -1095,7 +1171,12 @@ impl JoinTable {
             // so this is a predicted null-pointer test, not the 16 KB per-morsel mask a foreign-key
             // probe (its key never null) used to allocate and zero for nothing.
             let is_null = left_null.is_some_and(|m| m[i]);
-            let head = self.head_for(keys, i, is_null, bloom, &mut rejected);
+            let head = if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
+                rejected += 1;
+                None
+            } else {
+                self.head_for(keys, i, is_null, pre, &mut rejected)
+            };
             match join_type {
                 JoinType::Semi => {
                     if head.is_some() {
@@ -1146,7 +1227,7 @@ impl JoinTable {
         }
         // Only meaningful while the bloom was actually consulted; once it is latched off the
         // rate is frozen at whatever the trial measured.
-        if bloom.is_some() {
+        if inline_bits.is_some() || !matches!(pre, Prefilter::None) {
             self.bloom_trial.observe(seen, rejected);
         }
     }
@@ -1177,13 +1258,17 @@ impl JoinTable {
         matched: &[std::sync::atomic::AtomicBool],
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        let bloom = Some(self.bloom.as_slice())
-            .filter(|b| !b.is_empty() && self.bloom_trial.worth_consulting());
+        let pre = self.prefilter();
+        let (inline_bits, pre) = Self::hoist_bits(keys, pre);
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {
+            if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
+                rejected += 1;
+                continue;
+            }
             let is_null = probe_null.is_some_and(|m| m[i]);
-            let Some(mut r) = self.head_for(keys, i, is_null, bloom, &mut rejected) else {
+            let Some(mut r) = self.head_for(keys, i, is_null, pre, &mut rejected) else {
                 continue;
             };
             matched[r as usize].store(true, Relaxed);
@@ -1202,7 +1287,7 @@ impl JoinTable {
                 matched[r as usize].store(true, Relaxed);
             }
         }
-        if bloom.is_some() {
+        if inline_bits.is_some() || !matches!(pre, Prefilter::None) {
             self.bloom_trial.observe(seen, rejected);
         }
     }
